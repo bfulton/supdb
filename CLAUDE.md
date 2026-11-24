@@ -3514,6 +3514,51 @@ is what said the wait and not the engine was wrong. The count is read
 before the clock moves now (`advance_tick`). The rule: a wait reads its
 baseline before it causes the event, never after.
 
+**A clock moved under a job that runs when nothing else does.** The
+controller's builds and warms run at the idle CPU class, and the zpages
+tests step the controller by an injected clock, a tick a tenth of a second
+of it, each waited for. Four copies of the test binary at once -- every
+core busy, as under the gate's stress or on a slow hosted runner -- failed
+one to five tests a copy at eight sites, and every failure but one had a
+build in flight: a wait of four hundred ticks ran out with the build still
+running, a build of milliseconds having taken thirteen seconds of the wall,
+and one waited for by the wall ran past thirty. The one without a build in
+flight was the same thing a step later: the trial waits out a dwell of ten
+times the last build's wall on the injected clock, the waits had ticked
+through the starved build, its wall on that clock was some thirty-eight
+seconds, and the test's minute was a sixth of the dwell. A count of ticks
+is no bound on a job the host schedules last, and a clock moved under the
+job makes it as long as the host is slow. The clock moves now only once no
+job of the builder's is pending (`advance_tick`, `jobs_ended`, from
+`ZCounts::warm_starts`, `warm_collected` and `job_ends` beside the builds'
+counts), each wait reads its condition on the wall while one is
+(`settled_or`), so that a state that stands only while a job runs is read
+as the old waits read it by ticking through the job, and every wait on such
+a job is bounded by `JOB_WALL`, five minutes. Holding the clock turned up
+the tests that had leaned on its moving. One counted the steps from a
+crossing to the buy, which waits for the partitions to have stood still two
+seconds of the clock (`zselect::EAGER_SETTLE`), and the builds ahead had
+used those seconds up; it lets the store stand now. One read which came
+first after a build ahead, the sample or the next build, at the next tick,
+after however far the chain had run, and it failed under load before the
+change as well, two runs in twenty; it holds the next build at its start and
+reads the choice. And a hold lifted leaves the thread's waiting bit standing
+until the thread wakes, which at the idle class is a while, so a build just
+released read as held and the clock moved under it, once in 928 tests:
+`Db::zpage_build_held` asks for a hold still set. Beside them the census
+test compared two stores' busy wall a read, measured one after the other --
+two stretches of a loaded host -- and read 4.03 against its bound of 4; the
+stores' windows alternate now and each is read by its median. The rules: a
+test that moves its own clock holds it while a job of the system's runs,
+since the job's wall on that clock is whatever the host makes it and
+anything drawn from it -- a dwell, a settle -- moves with the host; a wait
+bounded by a count of steps is bounded by the steps' pace and not the
+job's; a state a test reads while a job runs is held, or read on the wall
+as the job runs, never at the next step; a flag that says a thread is held
+is read for whether the hold stands, not whether the thread has noticed it
+lifted; and two quantities a test compares are measured in the same stretch
+of the host.
+
 **A bet whose loss cost what it was placed beside.** The builds ahead at
 landing bet that a store passing a share of its budget will pass the
 whole, and the first version built as a bought build does: it dropped the

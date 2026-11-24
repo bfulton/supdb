@@ -31,7 +31,7 @@ jobs:
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 300
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       # The toolchain rust-toolchain.toml names, the one the local gate runs
       # under; no workflow names a version or a channel of its own.
       - name: The pinned toolchain
@@ -52,7 +52,7 @@ jobs:
       # may find it gone and build. Restored here and saved by a step of
       # its own after the table: the one action that does both saves only
       # where the job passed, and a cell under the margin fails the job.
-      - uses: actions/cache/restore@v4
+      - uses: actions/cache/restore@v6
         id: tools
         with:
           path: bench/comparators-tools
@@ -81,12 +81,12 @@ jobs:
           COMPARATORS_TOOLS: ${{ github.workspace }}/bench/comparators-tools
         run: sh bench/scripts/comparators.sh comparators-ci
       # The db_bench this run built, whatever the table said of the cells.
-      - uses: actions/cache/save@v4
+      - uses: actions/cache/save@v6
         if: always() && steps.tools.outputs.cache-hit != 'true' && hashFiles('bench/comparators-tools/db_bench-*') != ''
         with:
           path: bench/comparators-tools
           key: ${{ steps.tools.outputs.cache-primary-key }}
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         if: always()
         with:
           name: comparators

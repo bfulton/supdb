@@ -4241,7 +4241,7 @@ fn at_the_census_the_controller_copies_heads_only_where_the_model_says_the_store
         "building: {:?}",
         db.zpage_counts()
     );
-    wait_for("the build at its hold", || db.zpage_build_waiting());
+    wait_for_job("the build at its hold", || db.zpage_build_waiting());
     same_window(
         &scanned(&db, &first, 50),
         &window(&model, &first, 50),
@@ -5383,7 +5383,7 @@ fn builds_collected(db: &Db) {
             return;
         }
         assert!(
-            t.elapsed().as_secs() < 30,
+            t.elapsed() < JOB_WALL,
             "a build in flight was not collected: {c:?}"
         );
         std::thread::sleep(std::time::Duration::from_millis(2));
@@ -5413,7 +5413,7 @@ fn store_without_form_files(
     let t = std::time::Instant::now();
     while db.zpage_counts().build_starts == 0 {
         assert!(
-            t.elapsed().as_secs() < 30,
+            t.elapsed() < JOB_WALL,
             "no build started: {:?}",
             db.zpage_counts()
         );
@@ -5425,7 +5425,7 @@ fn store_without_form_files(
     // alone.
     while !db.zpage_build_waiting() {
         assert!(
-            t.elapsed().as_secs() < 30,
+            t.elapsed() < JOB_WALL,
             "the build did not reach its hold: {:?}",
             db.zpage_counts()
         );
@@ -6470,7 +6470,7 @@ fn a_refused_form_file_is_built_again_at_the_open_without_a_settle() {
             break;
         }
         assert!(
-            c.build_failed == 0 && t.elapsed().as_secs() < 30,
+            c.build_failed == 0 && t.elapsed() < JOB_WALL,
             "no build after the open: {c:?}"
         );
         std::thread::sleep(std::time::Duration::from_millis(2));
@@ -7191,6 +7191,7 @@ fn the_model_moves_the_rung_between_fits_and_suspect_on_the_injected_budget() {
     // moves the rung.
     let tick = |db: &Db, secs: u64| {
         for _ in 0..secs {
+            jobs_ended(db);
             inject.advance(std::time::Duration::from_secs(1));
             let was = db.zpage_counts().sel_s1;
             let t = std::time::Instant::now();
@@ -7408,9 +7409,14 @@ fn blocked_store_at(
 /// on the step count returned with the tick's looks still to run -- to
 /// read their counts before they were made, or to change the budget and
 /// the heat under them.
+///
+/// And the clock moves only once any job of the controller's running has
+/// ended (`while_running`), so that no wait in this file moves it under a
+/// job.
 #[cfg(target_os = "linux")]
 fn advance_tick(db: &Db, d: std::time::Duration) {
     let inject = db.options().zpages_inject.clone().unwrap();
+    jobs_ended(db);
     let was = db.zpage_counts().tick_ends;
     inject.advance(d);
     wait_tick_past(db, was);
@@ -7429,89 +7435,131 @@ fn wait_tick_past(db: &Db, was: u64) {
     assert!(db.zpage_counts().tick_ends > was, "the tick ended");
 }
 
-/// Ticks of the injected clock until `cond` holds of the counts, at most
-/// `max` of them: whether it held.
-#[cfg(target_os = "linux")]
-fn tick_until(db: &Db, max: u32, cond: impl Fn(&supdb::db::ZCounts) -> bool) -> bool {
-    for _ in 0..max {
-        if cond(&db.zpage_counts()) {
-            return true;
-        }
-        wait_steps(db, 1);
+/// How long a wait gives a job of the controller's the wall before it is
+/// read as stuck. The builder's builds and warms run at the idle CPU class
+/// (`idle_cpu_priority`), which runs only when no other thread wants the
+/// core, so on a host whose every core is busy -- four copies of this
+/// binary at once -- a build of milliseconds took thirteen seconds, and one
+/// waited for by the wall still ran past thirty.
+const JOB_WALL: std::time::Duration = std::time::Duration::from_secs(300);
+
+/// Whether a job of the controller's is pending by the counts and not
+/// parked at a test's hold that is still set (`Db::zpage_build_held`, not
+/// the waiting bit alone, which stands after a hold is lifted until the
+/// thread wakes): a build or a warm
+/// on the builder's thread that has not returned (`ZCounts::job_ends`), or
+/// a build at a merge's output finish on its thread
+/// (`ZCounts::finish_live`); or one that has returned and is not yet taken
+/// in where the turn its thread wakes takes it in
+/// (`Options::zpages_drive_at_job_end`, once a tick has ended and left a
+/// decision for that turn to drive by). Elsewhere a returned job waits for
+/// a tick, and a wait for it ticks.
+fn running(db: &Db, c: &supdb::db::ZCounts) -> bool {
+    if db.zpage_build_held() {
+        return false;
     }
-    cond(&db.zpage_counts())
+    let taken = db.options().zpages_drive_at_job_end && c.tick_ends > 0;
+    c.build_starts + c.warm_starts > c.job_ends
+        || c.finish_live > 0
+        || (taken && c.job_ends > c.build_collected + c.warm_collected)
 }
 
-/// Ticks of the injected clock until `cond` holds of the counts, for as
-/// long as a minute of the wall allows rather than for a count of ticks: a
-/// build ahead runs on the builder's thread at its own pace and is
-/// collected only at a tick, and a stride build's read-back of the device
-/// beside other processes' tests takes the device's time, which no count of
-/// ticks bounds. A build in flight by the counts (`building`) is given a few
-/// milliseconds of the wall before the next tick, so that the injected
-/// clock moves with the builds and not with the wait.
+/// The wall waited out, the injected clock held, for as long as a job of
+/// the controller's is pending (`running`) and `JOB_WALL` allows: whether
+/// it settled. Every move of the clock waits here first (`jobs_ended`). A wait that
+/// moved the clock on while a job ran made the job as long on that clock
+/// as the host was slow, and the controller reads its last build's wall
+/// off that clock -- the dwell before a trial is ten times it -- so a test
+/// that waited a minute for the dwell to run out waited for a dwell of six
+/// minutes once a build had been starved for thirteen seconds; and a wait
+/// that counted its ticks ran out of them with the build still running.
+/// Held, a job takes no time on the clock, as on a host fast enough to
+/// finish it between two ticks.
+fn while_running(db: &Db) -> bool {
+    let t = std::time::Instant::now();
+    while running(db, &db.zpage_counts()) {
+        if t.elapsed() >= JOB_WALL {
+            return false;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(2));
+    }
+    true
+}
+
+/// `while_running`, and a job still running at `JOB_WALL` a failure: what
+/// every move of the injected clock past a store's open waits for first.
+fn jobs_ended(db: &Db) {
+    assert!(
+        while_running(db),
+        "a job of the controller's ran past {JOB_WALL:?}: {:?}",
+        db.zpage_counts()
+    );
+}
+
+/// Whether `cond` holds of the counts, read every few milliseconds of the
+/// wall while a job of the controller's is pending (`running`), the
+/// injected clock held: true as soon as it holds, false once the jobs have
+/// settled with it not holding. A wait reads its condition here before it
+/// moves the clock, so that a state that stands only while a job runs --
+/// two builds ahead of three done -- is read as the old waits read it by
+/// ticking through the job, and the clock still moves under no job.
 #[cfg(target_os = "linux")]
-fn tick_until_built(db: &Db, cond: impl Fn(&supdb::db::ZCounts) -> bool) -> bool {
+fn settled_or(db: &Db, cond: &impl Fn(&supdb::db::ZCounts) -> bool) -> bool {
     let t = std::time::Instant::now();
     loop {
         let c = db.zpage_counts();
         if cond(&c) {
             return true;
         }
-        if t.elapsed().as_secs() >= 60 {
+        if !running(db, &c) {
             return false;
         }
-        if building(&c) {
-            std::thread::sleep(std::time::Duration::from_millis(5));
+        assert!(
+            t.elapsed() < JOB_WALL,
+            "a job of the controller's ran past {JOB_WALL:?}: {c:?}"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(2));
+    }
+}
+
+/// Ticks of the injected clock until `cond` holds of the counts, at most
+/// `max` of them: whether it held. A tick waits for any job running first
+/// (`advance_tick`), so a job's wall spends none of them.
+#[cfg(target_os = "linux")]
+fn tick_until(db: &Db, max: u32, cond: impl Fn(&supdb::db::ZCounts) -> bool) -> bool {
+    for _ in 0..max {
+        if settled_or(db, &cond) {
+            return true;
+        }
+        wait_steps(db, 1);
+    }
+    settled_or(db, &cond)
+}
+
+/// Ticks of the injected clock until `cond` holds of the counts, for as
+/// long as a minute of the wall allows rather than for a count of ticks: for
+/// what the device's time bounds and no count of ticks does, such as a
+/// stride build's read-back beside other processes' tests.
+#[cfg(target_os = "linux")]
+fn tick_until_built(db: &Db, cond: impl Fn(&supdb::db::ZCounts) -> bool) -> bool {
+    let t = std::time::Instant::now();
+    loop {
+        if settled_or(db, &cond) {
+            return true;
+        }
+        if t.elapsed().as_secs() >= 60 {
+            return false;
         }
         wait_steps(db, 1);
     }
 }
 
 /// Whether a build is in flight by the counts: one started on the builder's
-/// thread and not yet taken in, which a collect does only at a tick
-/// (`ZCounts::build_collected`, counted once whatever came of the build), or
-/// one at a merge's output finish still on its thread
-/// (`ZCounts::finish_live`). The one definition the waits read.
+/// thread and not yet taken in (`ZCounts::build_collected`, counted once
+/// whatever came of the build), or one at a merge's output finish still on
+/// its thread (`ZCounts::finish_live`).
 fn building(c: &supdb::db::ZCounts) -> bool {
     c.build_starts > c.build_collected || c.finish_live > 0
-}
-
-/// `drive_to` past its four hundred rounds for as long as a build is in
-/// flight and a minute of the wall allows, each such round given a few
-/// milliseconds of the wall first: the controller's builds of a stride
-/// store's partitions run at the device's pace beside other processes'
-/// tests, which no fixed count of rounds bounds.
-#[cfg(target_os = "linux")]
-#[allow(clippy::too_many_arguments)]
-fn drive_to_built(
-    db: &Db,
-    r: &Reader,
-    keys: &[Vec<u8>],
-    inject: &supdb::ZInject,
-    at: &mut usize,
-    per: usize,
-    faults: u64,
-    phase: u8,
-) -> bool {
-    let t = std::time::Instant::now();
-    let mut rounds = 0u32;
-    loop {
-        let c = db.zpage_counts();
-        if c.phase == phase {
-            return true;
-        }
-        let busy = building(&c);
-        if t.elapsed().as_secs() >= 60 || (rounds >= 400 && !busy) {
-            return false;
-        }
-        if busy {
-            std::thread::sleep(std::time::Duration::from_millis(5));
-        }
-        reads(r, keys, inject, per, at, faults);
-        close_window(db, r, &keys[0]);
-        rounds += 1;
-    }
 }
 
 /// `n` census ticks of the injected clock, each waited for.
@@ -7569,14 +7617,27 @@ fn drive_to(
     phase: u8,
     max: usize,
 ) -> bool {
+    let reached = |c: &supdb::db::ZCounts| c.phase == phase;
     for _ in 0..max {
-        reads(r, keys, inject, per, at, faults);
-        close_window(db, r, &keys[0]);
-        if db.zpage_counts().phase == phase {
+        if settled_or(db, &reached) {
             return true;
         }
+        reads(r, keys, inject, per, at, faults);
+        close_window(db, r, &keys[0]);
     }
-    db.zpage_counts().phase == phase
+    settled_or(db, &reached)
+}
+
+/// `cond` waited for, up to `JOB_WALL`: for what a job of the builder's
+/// brings -- a build at its hold, the builds ahead done -- on a thread of
+/// the idle class, which ten seconds did not bound on a loaded host.
+#[cfg(target_os = "linux")]
+fn wait_for_job(what: &str, cond: impl Fn() -> bool) {
+    let t = std::time::Instant::now();
+    while !cond() {
+        assert!(t.elapsed() < JOB_WALL, "{what}");
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
 }
 
 /// `cond` waited for, up to ten seconds.
@@ -8010,7 +8071,7 @@ fn auto_serves_raw_until_the_form_file_is_whole() {
         "building: {:?}",
         db.zpage_counts()
     );
-    wait_for("the build at its hold", || db.zpage_build_waiting());
+    wait_for_job("the build at its hold", || db.zpage_build_waiting());
     reads(&r, &keys, &inject, 640, &mut at, 1);
     let c = db.zpage_counts();
     assert_eq!((c.gate, c.phase), (1, 2), "{c:?}");
@@ -8171,7 +8232,7 @@ fn a_cancelled_build_counts_as_a_switch() {
     let mut at = 0usize;
     db.hold_zpage_build(true);
     assert!(drive_to(&db, &r, &keys, &inject, &mut at, 640, 1, 2, 400));
-    wait_for("the build at its hold", || db.zpage_build_waiting());
+    wait_for_job("the build at its hold", || db.zpage_build_waiting());
     // The reads stop faulting: three evidence intervals under half the
     // entry threshold, and the build is given up.
     assert!(
@@ -8275,13 +8336,13 @@ fn stretch_until(
 ) -> bool {
     let mut at = 0usize;
     for _ in 0..max {
-        reads(r, hot, inject, 64, &mut at, faults);
-        close_window(db, r, &hot[0]);
-        if cond(&db.zpage_counts()) {
+        if settled_or(db, &cond) {
             return true;
         }
+        reads(r, hot, inject, 64, &mut at, faults);
+        close_window(db, r, &hot[0]);
     }
-    cond(&db.zpage_counts())
+    settled_or(db, &cond)
 }
 
 /// E2's footprint: a handle's distinct compact pages are counted while the
@@ -8611,6 +8672,82 @@ fn form_files_on_disk_are_dormant_under_auto_and_attached_when_the_form_is_wante
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// A build parked at its hold reads as held while the hold stands and as
+/// not held the moment the hold is lifted (`Db::zpage_build_held`), where
+/// its waiting bit stands until the thread wakes (`Db::zpage_build_waiting`),
+/// which at the idle class can be long enough for a wait to move the
+/// injected clock under a build about to run; and once the controller is at
+/// rest every job of the builder's it started has returned and been taken
+/// in, the warms after the install as well as the builds
+/// (`ZCounts::warm_starts`, `warm_collected`, `job_ends`): the sums the
+/// waits here read a job in flight by, so a job counted started and never
+/// ended would hold every wait in this file for `JOB_WALL`.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_lifted_hold_holds_nothing_and_the_builders_jobs_balance_at_rest() {
+    let (dir, db, model, inject) = auto_store_with(
+        "auto-held",
+        1 << 20,
+        1_000_000.0,
+        FAULT_1MS,
+        |o| {
+            o.zpages_prebuild = true;
+            o.zpages_cover_resident = false;
+            o.zpages_suspect_at_crossing = false;
+        },
+        |db| db.hold_zpage_build(true),
+    );
+    for _ in 0..400 {
+        if db.zpage_build_waiting() {
+            break;
+        }
+        wait_steps(&db, 1);
+    }
+    let c = db.zpage_counts();
+    assert!(
+        db.zpage_build_waiting() && db.zpage_build_held(),
+        "a build at its hold, held: {c:?}"
+    );
+    assert!(
+        c.build_starts > c.job_ends,
+        "the held build has not returned: {c:?}"
+    );
+    db.hold_zpage_build(false);
+    assert!(!db.zpage_build_held(), "a lifted hold holds nothing");
+    assert!(
+        tick_until(&db, 400, |c| c.prebuilt >= c.partitions && c.partitions > 0),
+        "built ahead: {:?}",
+        db.zpage_counts()
+    );
+    let keys: Vec<Vec<u8>> = model.keys().cloned().collect();
+    let r = db.reader().unwrap();
+    let mut at = 0usize;
+    assert!(
+        drive_to(&db, &r, &keys, &inject, &mut at, 640, 1, 3, 400),
+        "COMPACT: {:?}",
+        db.zpage_counts()
+    );
+    assert!(
+        tick_until(&db, 400, |c| c.attached >= c.partitions
+            && c.warms >= c.partitions),
+        "every file attached and warmed: {:?}",
+        db.zpage_counts()
+    );
+    let c = db.zpage_counts();
+    assert!(
+        c.warm_starts >= c.partitions,
+        "the warms counted started: {c:?}"
+    );
+    assert_eq!(
+        (c.build_starts + c.warm_starts, c.job_ends),
+        (c.job_ends, c.build_collected + c.warm_collected),
+        "every job started returned and was taken in: {c:?}"
+    );
+    drop(r);
+    db.close().unwrap();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// A store past its budget with the builds ahead on
 /// (`Options::zpages_prebuild`): every partition's form file is built and
 /// left on disk unattached while the controller is in SUSPECT, the raw
@@ -8859,7 +8996,7 @@ fn the_crossing_asks_for_the_raw_pages_of_a_cold_partition_with_no_form_file() {
         db.hold_zpage_build(true);
         if ahead {
             let t = std::time::Instant::now();
-            while !db.zpage_build_waiting() && t.elapsed().as_secs() < 60 {
+            while !db.zpage_build_waiting() && t.elapsed() < JOB_WALL {
                 wait_steps(&db, 1);
             }
             assert!(db.zpage_build_waiting(), "{what}: a build held");
@@ -8964,7 +9101,7 @@ fn the_builders_turn_comes_at_a_jobs_end_and_not_only_at_a_step() {
             db.zpage_counts()
         );
         if on {
-            wait_for(&format!("{what}: every partition built ahead"), || {
+            wait_for_job(&format!("{what}: every partition built ahead"), || {
                 db.zpage_counts().prebuilt >= parts
             });
             let c = db.zpage_counts();
@@ -9107,10 +9244,7 @@ fn the_sample_starts_between_builds_ahead_when_told_to() {
         );
         let t = std::time::Instant::now();
         while !db.zpage_build_waiting() {
-            assert!(
-                t.elapsed().as_secs() < 20,
-                "the build never reached its hold"
-            );
+            assert!(t.elapsed() < JOB_WALL, "the build never reached its hold");
             std::thread::sleep(std::time::Duration::from_millis(5));
         }
         wait_steps(&db, 3);
@@ -9119,32 +9253,53 @@ fn the_sample_starts_between_builds_ahead_when_told_to() {
             0,
             "a sample beside a build ahead in flight"
         );
+        // The next build ahead held at its start and the first let go: the
+        // turn that takes the first in chooses between the sample and the
+        // next build, and the choice is read with the next one held, since
+        // read at the next tick it is read after however many builds the
+        // chain ran meanwhile -- on a loaded host a race the test lost both
+        // ways.
+        db.hold_zpage_build(true);
         db.hold_zpage_rename(false);
-        // The counts at the first tick that shows a sample started: the
-        // sample's count is bumped at its start, in the tick.
-        let mut first: Option<supdb::db::ZCounts> = None;
-        for _ in 0..400 {
-            let c = db.zpage_counts();
-            if first.is_none() && c.samples > 0 {
-                first = Some(c);
-            }
-            if first.is_some() && c.prebuilt + c.ahead_cold >= c.partitions {
-                break;
-            }
-            wait_steps(&db, 1);
+        assert!(
+            tick_until(&db, 400, |c| c.build_collected >= 1 && c.build_starts >= 2),
+            "the first build ahead in, the next started: {:?}",
+            db.zpage_counts()
+        );
+        let t = std::time::Instant::now();
+        while !db.zpage_build_waiting() {
+            assert!(
+                t.elapsed() < JOB_WALL,
+                "the next build never reached its hold"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(2));
         }
-        let f = first.unwrap_or_else(|| panic!("no sample: {:?}", db.zpage_counts()));
+        let f = db.zpage_counts();
         assert!(f.partitions >= 3, "{f:?}");
         let left = f.partitions - (f.prebuilt + f.ahead_cold).min(f.partitions);
+        assert!(left > 0, "builds ahead still due: {f:?}");
         if between {
             assert!(
-                left > 0,
-                "the sample waited for the last build ahead: {f:?}"
+                f.samples > 0,
+                "the sample started at the first build's end, before the next: {f:?}"
             );
+            db.hold_zpage_build(false);
         } else {
             assert_eq!(
-                left, 0,
+                f.samples, 0,
                 "a sample between builds ahead without the option: {f:?}"
+            );
+            // Without the option the sample waits for the last build ahead.
+            db.hold_zpage_build(false);
+            assert!(
+                tick_until(&db, 400, |c| c.samples > 0),
+                "no sample: {:?}",
+                db.zpage_counts()
+            );
+            let c = db.zpage_counts();
+            assert!(
+                c.prebuilt + c.ahead_cold >= c.partitions,
+                "the sample after the last build ahead: {c:?}"
             );
         }
         db.close().unwrap();
@@ -9256,7 +9411,7 @@ fn builds_ahead_run_beside_scans_past_the_line_and_the_attach_follows() {
                 "{what}: nothing built ahead beside the scans: {:?}",
                 db.zpage_counts()
             );
-            wait_for("a build ahead at its hold", || db.zpage_build_waiting());
+            wait_for_job("a build ahead at its hold", || db.zpage_build_waiting());
             // `sample_us` is written as the reading is collected, where the
             // files on disk are counted; one tick more and the selector
             // holds it.
@@ -9507,7 +9662,7 @@ fn an_output_being_built_at_its_finish_is_not_built_ahead_again() {
         "{what}: a file beside every partition before the rewrite: {:?}",
         form_files(&dir)
     );
-    wait_for("the builds ahead to end", || !db.zpage_build_waiting());
+    wait_for_job("the builds ahead to end", || !db.zpage_build_waiting());
     let starts = db.zpage_counts().build_starts;
     db.hold_zpage_build(true);
     let mut rng = Rng(0x5EED);
@@ -10313,7 +10468,7 @@ fn a_build_ahead_over_resident_records_holds_no_sample() {
             "{what}: past FITS with a build ahead in flight: {:?}",
             db.zpage_counts()
         );
-        wait_for(&format!("{what}: the build at its hold"), || {
+        wait_for_job(&format!("{what}: the build at its hold"), || {
             db.zpage_build_waiting()
         });
         inject.set_records_resident(0.0);
@@ -10952,6 +11107,12 @@ fn the_reading_at_the_crossing_comes_from_the_files_on_disk() {
             "{what}: built ahead: {:?}",
             db.zpage_counts()
         );
+        // The partitions stood still for the settle the attach on the
+        // model's word waits for (`zselect::EAGER_SETTLE`), which the steps
+        // counted below are not about: the builds ahead take no time on the
+        // injected clock (`advance_tick`), so the load's last landing is as
+        // recent on it as the builds' end.
+        wait_secs(&db, supdb::db::zselect::EAGER_SETTLE.as_secs() + 1, 1);
         let n = db.zpage_counts().partitions;
         assert!(n >= 12, "{what}: partitions enough: {n}");
         let gone = gone.min(n as usize / 3);
@@ -11820,6 +11981,7 @@ fn a_partition_its_form_serves_drops_its_raw_pages_when_asked() {
 /// work's turn has looked at it.
 fn recode_look(db: &Db, by: std::time::Duration) {
     let inject = db.options().zpages_inject.clone().unwrap();
+    jobs_ended(db);
     let was = db.zpage_counts().recode_looks;
     inject.advance(by);
     let t = std::time::Instant::now();
@@ -12014,6 +12176,7 @@ fn hot_look(db: &Db, by: std::time::Duration) {
         );
         std::thread::sleep(std::time::Duration::from_millis(2));
     }
+    jobs_ended(db);
     let was = db.zpage_counts().hot_looks;
     inject.advance(by);
     let t = std::time::Instant::now();
@@ -12031,12 +12194,12 @@ fn hot_look(db: &Db, by: std::time::Duration) {
 #[cfg(target_os = "linux")]
 fn hot_until(db: &Db, max: u32, cond: impl Fn(&supdb::db::ZCounts) -> bool) -> bool {
     for _ in 0..max {
-        if cond(&db.zpage_counts()) {
+        if settled_or(db, &cond) {
             return true;
         }
         hot_look(db, std::time::Duration::from_millis(200));
     }
-    cond(&db.zpage_counts())
+    settled_or(db, &cond)
 }
 
 /// The store's partitions: each put out of this process's page tables and
@@ -14833,46 +14996,58 @@ fn a_form_the_parsing_encoder_wrote_answers_as_the_greedy_ones_in_fewer_bytes() 
 /// shorter window or with the option off. A window closed by its count
 /// has its reads' wall alone, so the window after it is a hundred
 /// milliseconds of reads, tens of thousands through the compact form of a
-/// small store, whatever length the drive to COMPACT left; three windows
-/// closed through the ticks after it then stamp one read in sixteen with
-/// the option and every read without, and the busy wall a read, scaled
-/// from the stamps, is within a factor of four of the wall every stamp
-/// gives, since a wall left unscaled would be a sixteenth of it.
+/// small store, whatever length the drive to COMPACT left; windows closed
+/// through the ticks after it then stamp one read in sixteen with the
+/// option and every read without, and the busy wall a read, scaled from
+/// the stamps, is within a factor of four of the wall every stamp gives,
+/// since a wall left unscaled would be a sixteenth of it. The two stores
+/// are open at once and their windows alternate, and each store's figure
+/// is its median window's: measured one store after the other, the
+/// figures were of two stretches of a loaded host, and the option's read
+/// 1561 ns against 387 once beside three other copies of this binary.
 #[cfg(target_os = "linux")]
 #[test]
 fn the_census_stamps_a_long_windows_wall_on_one_operation_in_sixteen() {
-    let mut per_read = [0.0f64; 2];
-    for (i, on) in [true, false].into_iter().enumerate() {
-        let what = format!("census sample {on}");
-        let (dir, db, _model, inject, r, keys, mut at) =
-            compact_store_with(&format!("census-sample-{on}"), 1 << 20, |o| {
-                o.zpages_census_sample = on;
-            });
-        // The seam's price of a fault cleared, so a window's busy wall is
-        // the stamps' own and not the faults'; no faults are injected.
-        inject
-            .fault_cost_ns
-            .store(0, std::sync::atomic::Ordering::Release);
-        // A window closed by its count, which sizes the next at a hundred
-        // milliseconds of these reads.
+    let stores: Vec<_> = [true, false]
+        .into_iter()
+        .map(|on| {
+            let (dir, db, _model, inject, r, keys, at) =
+                compact_store_with(&format!("census-sample-{on}"), 1 << 20, |o| {
+                    o.zpages_census_sample = on;
+                });
+            // The seam's price of a fault cleared, so a window's busy wall
+            // is the stamps' own and not the faults'; no faults are
+            // injected.
+            inject
+                .fault_cost_ns
+                .store(0, std::sync::atomic::Ordering::Release);
+            (on, dir, db, inject, r, keys, at)
+        })
+        .collect();
+    let mut stores = stores;
+    // A window closed by its count in each, which sizes the next at a
+    // hundred milliseconds of these reads.
+    for (on, _, db, inject, r, keys, at) in stores.iter_mut() {
         let was = db.zpage_counts().census_windows;
         let mut n = 0usize;
         while db.zpage_counts().census_windows == was {
-            reads(&r, &keys, &inject, 4096, &mut at, 0);
+            reads(r, keys, inject, 4096, at, 0);
             n += 4096;
             assert!(
                 n <= 4 << 20,
-                "{what}: a window closed by its count within four million reads: {:?}",
+                "census sample {on}: a window closed by its count within four million reads: {:?}",
                 db.zpage_counts()
             );
         }
-        // Three windows closed through the ticks, each over a stretch of
-        // reads: each window's reads, its stamps and its busy wall.
-        let mut windows: Vec<(u64, u64, u64)> = Vec::new();
-        for _ in 0..3 {
+    }
+    // Five windows of each closed through the ticks, the stores in turn:
+    // each window's reads, its stamps and its busy wall.
+    let mut windows: [Vec<(u64, u64, u64)>; 2] = [Vec::new(), Vec::new()];
+    for _ in 0..5 {
+        for (i, (on, _, db, inject, r, keys, at)) in stores.iter_mut().enumerate() {
             let b = db.zpage_counts();
-            reads(&r, &keys, &inject, 1024, &mut at, 0);
-            close_window(&db, &r, &keys[0]);
+            reads(r, keys, inject, 1024, at, 0);
+            close_window(db, r, &keys[0]);
             let c = db.zpage_counts();
             let (dw, dr, ds, dbusy) = (
                 c.census_windows - b.census_windows,
@@ -14882,24 +15057,31 @@ fn the_census_stamps_a_long_windows_wall_on_one_operation_in_sixteen() {
             );
             assert!(
                 dw >= 1 && dr >= 1024 && dbusy > 0,
-                "{what}: a window closed through the ticks: {c:?}"
+                "census sample {on}: a window closed through the ticks: {c:?}"
             );
-            windows.push((dr, ds, dbusy));
+            windows[i].push((dr, ds, dbusy));
         }
-        let (reads_n, stamped, busy) = windows
-            .iter()
-            .fold((0, 0, 0), |a, w| (a.0 + w.0, a.1 + w.1, a.2 + w.2));
+    }
+    let mut per_read = [0.0f64; 2];
+    for (i, w) in windows.iter().enumerate() {
+        let on = i == 0;
         if on {
-            for &(dr, ds, _) in &windows {
+            for &(dr, ds, _) in w {
                 assert!(
                     ds >= 1 && ds * 8 <= dr,
-                    "{what}: one read in sixteen stamped: {ds} of {dr}; {windows:?}"
+                    "census sample {on}: one read in sixteen stamped: {ds} of {dr}; {w:?}"
                 );
             }
         } else {
-            assert_eq!(stamped, reads_n, "{what}: every read stamped: {windows:?}");
+            for &(dr, ds, _) in w {
+                assert_eq!(ds, dr, "census sample {on}: every read stamped: {w:?}");
+            }
         }
-        per_read[i] = busy as f64 / reads_n as f64;
+        let mut each: Vec<f64> = w.iter().map(|&(dr, _, b)| b as f64 / dr as f64).collect();
+        each.sort_by(f64::total_cmp);
+        per_read[i] = each[each.len() / 2];
+    }
+    for (_, dir, db, _, r, _, _) in stores {
         drop(r);
         db.close().unwrap();
         let _ = std::fs::remove_dir_all(&dir);
@@ -14907,7 +15089,7 @@ fn the_census_stamps_a_long_windows_wall_on_one_operation_in_sixteen() {
     let ratio = per_read[0] / per_read[1];
     assert!(
         (0.25..=4.0).contains(&ratio),
-        "the scaled busy wall a read against every read stamped: {:.0} ns against {:.0} ns",
+        "the scaled busy wall a read against every read stamped: {:.0} ns against {:.0} ns; {windows:?}",
         per_read[0],
         per_read[1]
     );
@@ -17123,7 +17305,7 @@ fn a_stride_file_built_ahead_is_trusted_at_its_late_attach_where_its_read_back_r
         let r = db.reader().unwrap();
         let mut at = 0usize;
         assert!(
-            drive_to_built(&db, &r, &keys, &inject, &mut at, 640, 1, 3),
+            drive_to(&db, &r, &keys, &inject, &mut at, 640, 1, 3, 400),
             "{what}: COMPACT: {:?}",
             db.zpage_counts()
         );
@@ -17212,7 +17394,7 @@ fn a_build_in_flight_at_the_crossing_has_the_file_it_dropped_asked_back() {
         db.hold_zpage_build(true);
         inject.set_budget(raw * 3 / 2);
         let t = std::time::Instant::now();
-        while !db.zpage_build_waiting() && t.elapsed().as_secs() < 60 {
+        while !db.zpage_build_waiting() && t.elapsed() < JOB_WALL {
             wait_steps(&db, 1);
         }
         let c = db.zpage_counts();
@@ -17505,7 +17687,7 @@ fn a_build_ahead_in_flight_across_a_promotion_is_the_one_build_of_its_form_file(
     let r = db.reader().unwrap();
     let mut at = 0usize;
     assert!(
-        drive_to_built(&db, &r, &keys, &inject, &mut at, 640, 1, 3),
+        drive_to(&db, &r, &keys, &inject, &mut at, 640, 1, 3, 400),
         "{what}: COMPACT: {:?}",
         db.zpage_counts()
     );
@@ -17556,7 +17738,7 @@ fn a_build_ahead_bought_while_in_flight_is_trusted_at_once_where_its_read_back_r
     let r = db.reader().unwrap();
     let mut at = 0usize;
     assert!(
-        drive_to_built(&db, &r, &keys, &inject, &mut at, 640, 1, 3),
+        drive_to(&db, &r, &keys, &inject, &mut at, 640, 1, 3, 400),
         "{what}: COMPACT with the build held: {:?}",
         db.zpage_counts()
     );
@@ -18493,6 +18675,7 @@ fn numbered_soft_load(db: &mut Db, n: usize, w: usize, seed: u64, twice: bool) -
 #[cfg(target_os = "linux")]
 fn convert_look(db: &Db, by: std::time::Duration) {
     let inject = db.options().zpages_inject.clone().unwrap();
+    jobs_ended(db);
     let was = db.zpage_counts().stride_convert_looks;
     inject.advance(by);
     let t = std::time::Instant::now();
@@ -18500,6 +18683,7 @@ fn convert_look(db: &Db, by: std::time::Duration) {
     while db.zpage_counts().stride_convert_looks == was && t.elapsed().as_secs() < 60 {
         std::thread::sleep(std::time::Duration::from_millis(2));
         if nudged.elapsed().as_millis() >= 200 {
+            jobs_ended(db);
             inject.advance(std::time::Duration::from_millis(100));
             nudged = std::time::Instant::now();
         }
@@ -19469,7 +19653,7 @@ fn the_conversion_looks_beside_a_build_and_starts_the_move_that_is_due_when_it_e
     db.hold_zpage_build(true);
     db.zpages_convert_ask(1);
     let t = std::time::Instant::now();
-    while !db.zpage_build_waiting() && t.elapsed().as_secs() < 60 {
+    while !db.zpage_build_waiting() && t.elapsed() < JOB_WALL {
         wait_steps(&db, 1);
     }
     let held = db.zpage_counts();
@@ -19508,7 +19692,7 @@ fn the_conversion_looks_beside_a_build_and_starts_the_move_that_is_due_when_it_e
     convert_look(&db, sec);
     db.hold_zpage_build(false);
     let t = std::time::Instant::now();
-    while db.zpage_counts().build_collected == held.build_collected && t.elapsed().as_secs() < 60 {
+    while db.zpage_counts().build_collected == held.build_collected && t.elapsed() < JOB_WALL {
         std::thread::sleep(std::time::Duration::from_millis(100));
         wait_steps(&db, 1);
     }
@@ -19594,7 +19778,7 @@ fn a_partitions_own_build_comes_before_a_conversion_that_is_due() {
     db.hold_zpage_rename(true);
     convert_look(&db, sec);
     let t = std::time::Instant::now();
-    while !db.zpage_build_waiting() && t.elapsed().as_secs() < 60 {
+    while !db.zpage_build_waiting() && t.elapsed() < JOB_WALL {
         wait_steps(&db, 1);
         std::thread::sleep(std::time::Duration::from_millis(20));
     }
@@ -19609,7 +19793,7 @@ fn a_partitions_own_build_comes_before_a_conversion_that_is_due() {
     db.hold_zpage_rename(false);
     // The first build to be taken in, and the turn that took it through.
     let t = std::time::Instant::now();
-    while db.zpage_counts().build_collected == c1.build_collected && t.elapsed().as_secs() < 60 {
+    while db.zpage_counts().build_collected == c1.build_collected && t.elapsed() < JOB_WALL {
         wait_steps(&db, 1);
         std::thread::sleep(std::time::Duration::from_millis(20));
     }
@@ -19633,7 +19817,7 @@ fn a_partitions_own_build_comes_before_a_conversion_that_is_due() {
     // The move that waited for it starts at the turn that took the build
     // in, whichever turn that was, and is the one job held now.
     let t = std::time::Instant::now();
-    while !db.zpage_build_waiting() && t.elapsed().as_secs() < 60 {
+    while !db.zpage_build_waiting() && t.elapsed() < JOB_WALL {
         wait_steps(&db, 1);
         std::thread::sleep(std::time::Duration::from_millis(20));
     }
@@ -19708,7 +19892,7 @@ fn a_conversions_file_is_dropped_as_it_is_written_and_asked_back() {
         inject.set_convert_price(std::time::Duration::from_millis(200));
         convert_look(&db, sec);
         let t = std::time::Instant::now();
-        while !db.zpage_build_waiting() && t.elapsed().as_secs() < 60 {
+        while !db.zpage_build_waiting() && t.elapsed() < JOB_WALL {
             wait_steps(&db, 1);
             std::thread::sleep(std::time::Duration::from_millis(20));
         }
@@ -19839,7 +20023,7 @@ fn a_conversion_in_flight_is_priced_as_made() {
         db.hold_zpage_build(true);
         db.zpages_convert_ask(0);
         let t = std::time::Instant::now();
-        while !db.zpage_build_waiting() && t.elapsed().as_secs() < 60 {
+        while !db.zpage_build_waiting() && t.elapsed() < JOB_WALL {
             wait_steps(&db, 1);
         }
         let held = db.zpage_counts();
@@ -19904,7 +20088,7 @@ fn a_conversion_in_flight_is_priced_as_made() {
         db.hold_zpage_build(true);
         db.zpages_convert_ask(1);
         let t = std::time::Instant::now();
-        while !db.zpage_build_waiting() && t.elapsed().as_secs() < 60 {
+        while !db.zpage_build_waiting() && t.elapsed() < JOB_WALL {
             wait_steps(&db, 1);
         }
         let held = db.zpage_counts();
@@ -20347,7 +20531,7 @@ fn the_hot_raw_policy_stands_down_beside_the_stride_form() {
             let r = db.reader().unwrap();
             let mut at = 0usize;
             assert!(
-                drive_to_built(&db, &r, &keys, &inject, &mut at, 640, 1, 3),
+                drive_to(&db, &r, &keys, &inject, &mut at, 640, 1, 3, 400),
                 "{what}: COMPACT: {:?}",
                 db.zpage_counts()
             );
@@ -20422,7 +20606,7 @@ fn the_hot_raw_policy_releases_a_block_partition_beside_stride_files_and_never_a
         let r = db.reader().unwrap();
         let mut at = 0usize;
         assert!(
-            drive_to_built(&db, &r, &keys, &inject, &mut at, 640, 1, 3),
+            drive_to(&db, &r, &keys, &inject, &mut at, 640, 1, 3, 400),
             "{what}: COMPACT: {:?}",
             db.zpage_counts()
         );
@@ -20569,7 +20753,7 @@ fn the_footprint_counts_a_stride_partition_whole() {
     let r = db.reader().unwrap();
     let mut at = 0usize;
     assert!(
-        drive_to_built(&db, &r, &keys, &inject, &mut at, 640, 1, 3),
+        drive_to(&db, &r, &keys, &inject, &mut at, 640, 1, 3, 400),
         "{what}: COMPACT: {:?}",
         db.zpage_counts()
     );
@@ -20674,7 +20858,7 @@ fn the_words_kept_for_stride_files_are_held_to_the_live_partitions() {
     let r = db.reader().unwrap();
     let mut at = 0usize;
     assert!(
-        drive_to_built(&db, &r, &keys, &inject, &mut at, 640, 1, 3),
+        drive_to(&db, &r, &keys, &inject, &mut at, 640, 1, 3, 400),
         "{what}: COMPACT: {:?}",
         db.zpage_counts()
     );
