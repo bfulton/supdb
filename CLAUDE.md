@@ -6592,6 +6592,35 @@ predicate is held to a mutant like the rest -- a test for the cache
 holding nothing survived its own removal, the model answering the same
 without it, and came out.
 
+**A sort kept for an order the walk no longer lacked, and a compare for
+a fold that could not happen.** The scan snapshot's build sorted a
+table's entries by their keys' offsets before it copied the keys, from
+when the table was walked in the order of its hash slots, whose keys lie
+at random; the entries are walked in the order they were made now, which
+is the order their keys were copied in, so the sort was three radix
+passes and two arrays of twelve bytes a key over an order the entries
+already had, and the build and the extension each kept a twenty-four-byte
+entry a key beside the records they sort where an offset word does. The
+extension compared every key it pushed with the one before it, for a
+fold that cannot happen between entries of one table, and its batch lies
+in the arena in the table's order while it is pushed in key order, so
+each compare was a random read. Under a bound every byte a build touches
+is a fresh page the group reclaims a cached one for: the first scan after
+the lag sweep's ten-percent burst at ten million keys under 1 GiB sorted
+309,000 keys in 41-82 ms, 25 of 41 in the first touches of 42 MB, and
+with the offsets kept and the compare gone read 30 ms at the median of
+six against 54 (`Options::snapshot_build_lean`,
+`Options::snapshot_extend_unfolded`; `supdb-snapold` is both before). A
+profile of that scan under perf's fault events read it eight times longer
+and named the merge loop, and one under its sampling alone five times
+longer; a timer of the build's steps in a run nothing profiled named the
+fresh pages. The rules: when the order a loop walks in changes, the work
+that recovered the old order is read again; a compare whose answer an
+invariant of the structure fixes is not made; and a phase that allocates
+under a bound is priced by its fresh bytes before its instructions, by a
+timer of its steps and not by a profile whose own cost lands on the same
+faults.
+
 ## Standing limitations
 
 These are the engine's, as opposed to refuted predictions. Each is a curve

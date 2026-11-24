@@ -1027,6 +1027,17 @@ pub struct Supdb {
     /// default: `supdb-zrewarmturn` looks at every turn, `supdb-zrewarmtick`
     /// at the controller's step alone.
     zrewarmturn: Option<bool>,
+    /// The snapshot's extension pushing its batch without the fold's
+    /// compare (`Options::snapshot_extend_unfolded`), `None` for the
+    /// engine's default: `supdb-snapfolded` compares each key with the
+    /// one before it.
+    snapunfolded: Option<bool>,
+    /// The snapshot's build and extension keeping a key's place as an
+    /// offset word and copying the keys in the table's order
+    /// (`Options::snapshot_build_lean`), `None` for the engine's default:
+    /// `supdb-snapfat` is the shape before, and `supdb-snapold` the shape
+    /// before of both.
+    snaplean: Option<bool>,
     /// The partitions' heads copied at the controller's census while the
     /// block cache holds the raw records' place, whatever the model says
     /// of the raw form (`Options::heads_owned_beside_copies`), `None` for
@@ -2406,6 +2417,17 @@ struct Policy {
     /// default: `supdb-zrewarmturn` looks at every turn, `supdb-zrewarmtick`
     /// at the controller's step alone.
     zrewarmturn: Option<bool>,
+    /// The snapshot's extension pushing its batch without the fold's
+    /// compare (`Options::snapshot_extend_unfolded`), `None` for the
+    /// engine's default: `supdb-snapfolded` compares each key with the
+    /// one before it.
+    snapunfolded: Option<bool>,
+    /// The snapshot's build and extension keeping a key's place as an
+    /// offset word and copying the keys in the table's order
+    /// (`Options::snapshot_build_lean`), `None` for the engine's default:
+    /// `supdb-snapfat` is the shape before, and `supdb-snapold` the shape
+    /// before of both.
+    snaplean: Option<bool>,
     /// The partitions' heads copied at the controller's census while the
     /// block cache holds the raw records' place, whatever the model says
     /// of the raw form (`Options::heads_owned_beside_copies`), `None` for
@@ -3233,6 +3255,8 @@ impl Default for Policy {
             rewarmrawscans: None,
             rewarmrawmaps: None,
             zrewarmturn: None,
+            snapunfolded: None,
+            snaplean: None,
             headscopies: None,
             snapkept: None,
             zbuycross: None,
@@ -7870,6 +7894,45 @@ impl Supdb {
         )
     }
 
+    /// `supdb` with the snapshot's extension comparing each batch key with
+    /// the one before it for a fold (`Options::snapshot_extend_unfolded`
+    /// off).
+    pub fn create_snapfolded(path: &Path) -> Res<Supdb> {
+        Supdb::with_policy(
+            path,
+            Policy {
+                snapunfolded: Some(false),
+                ..Policy::default()
+            },
+        )
+    }
+
+    /// `supdb` with the snapshot's build and extension as they were
+    /// (`Options::snapshot_build_lean` off).
+    pub fn create_snapfat(path: &Path) -> Res<Supdb> {
+        Supdb::with_policy(
+            path,
+            Policy {
+                snaplean: Some(false),
+                ..Policy::default()
+            },
+        )
+    }
+
+    /// `supdb` with the snapshot's build and extension both as they were
+    /// (`Options::snapshot_build_lean` and
+    /// `Options::snapshot_extend_unfolded` off).
+    pub fn create_snapold(path: &Path) -> Res<Supdb> {
+        Supdb::with_policy(
+            path,
+            Policy {
+                snaplean: Some(false),
+                snapunfolded: Some(false),
+                ..Policy::default()
+            },
+        )
+    }
+
     /// `supdb` with the merge path's scan snapshot kept to the commit by
     /// the upkeep thread while the writer's forms are given up
     /// (`Options::forms_off_snapshot_kept`): the first scan after a burst
@@ -9828,6 +9891,8 @@ impl Supdb {
             rewarmrawscans,
             rewarmrawmaps,
             zrewarmturn,
+            snapunfolded,
+            snaplean,
             headscopies,
             snapkept,
             zbuycross,
@@ -10339,6 +10404,9 @@ impl Supdb {
                 .unwrap_or(supdb::Options::default().zpages_rewarm_raw_maps),
             zpages_rewarm_every_turn: zrewarmturn
                 .unwrap_or(supdb::Options::default().zpages_rewarm_every_turn),
+            snapshot_extend_unfolded: snapunfolded
+                .unwrap_or(supdb::Options::default().snapshot_extend_unfolded),
+            snapshot_build_lean: snaplean.unwrap_or(supdb::Options::default().snapshot_build_lean),
             heads_owned_beside_copies: headscopies
                 .unwrap_or(supdb::Options::default().heads_owned_beside_copies),
             zpages_buy_crosses: zbuycross.unwrap_or(supdb::Options::default().zpages_buy_crosses),
@@ -10822,6 +10890,8 @@ impl Supdb {
             rewarmrawscans,
             rewarmrawmaps,
             zrewarmturn,
+            snapunfolded,
+            snaplean,
             headscopies,
             snapkept,
             zbuycross,
@@ -12433,6 +12503,15 @@ impl Engine for Supdb {
         }
         if self.zrewarmturn == Some(false) {
             return "supdb-zrewarmtick";
+        }
+        if self.snaplean == Some(false) && self.snapunfolded == Some(false) {
+            return "supdb-snapold";
+        }
+        if self.snapunfolded == Some(false) {
+            return "supdb-snapfolded";
+        }
+        if self.snaplean == Some(false) {
+            return "supdb-snapfat";
         }
         if self.headscopies == Some(false) {
             return "supdb-headsmodel";
@@ -14584,6 +14663,9 @@ pub fn guarantee(arm: &str) -> Option<Guarantee> {
         | "supdb-rewarmrawnomap"
         | "supdb-zrewarmturn"
         | "supdb-zrewarmtick"
+        | "supdb-snapfolded"
+        | "supdb-snapfat"
+        | "supdb-snapold"
         | "supdb-headsmodel"
         | "supdb-snapkept"
         | "supdb-zbuycross"
@@ -16537,6 +16619,9 @@ pub fn open(arm: &str, dir: &Path, map_gb: usize) -> Res<Box<dyn Engine>> {
         "supdb-rewarmrawnomap" => supdb_arm(Supdb::create_rewarmrawnomap, dir)?,
         "supdb-zrewarmturn" => supdb_arm(Supdb::create_zrewarmturn, dir)?,
         "supdb-zrewarmtick" => supdb_arm(Supdb::create_zrewarmtick, dir)?,
+        "supdb-snapfolded" => supdb_arm(Supdb::create_snapfolded, dir)?,
+        "supdb-snapfat" => supdb_arm(Supdb::create_snapfat, dir)?,
+        "supdb-snapold" => supdb_arm(Supdb::create_snapold, dir)?,
         "supdb-headsmodel" => supdb_arm(Supdb::create_headsmodel, dir)?,
         "supdb-snapkept" => supdb_arm(Supdb::create_snapkept, dir)?,
         "supdb-zbuycross" => supdb_arm(Supdb::create_zbuycross, dir)?,
@@ -18625,6 +18710,22 @@ mod tests {
                     let o = z.db.as_ref().unwrap().options();
                     assert_eq!(o.zpages_rewarm_every_turn, on, "{arm}");
                 }
+                assert!(b.snapshot_extend_unfolded && b.snapshot_build_lean);
+                let z = Supdb::create_snapfolded(&dir("snapfolded")).unwrap();
+                assert_eq!(z.name(), "supdb-snapfolded");
+                assert_eq!(z.features(), base.features());
+                let o = z.db.as_ref().unwrap().options();
+                assert!(!o.snapshot_extend_unfolded && o.snapshot_build_lean);
+                let z = Supdb::create_snapfat(&dir("snapfat")).unwrap();
+                assert_eq!(z.name(), "supdb-snapfat");
+                assert_eq!(z.features(), base.features());
+                let o = z.db.as_ref().unwrap().options();
+                assert!(o.snapshot_extend_unfolded && !o.snapshot_build_lean);
+                let z = Supdb::create_snapold(&dir("snapold")).unwrap();
+                assert_eq!(z.name(), "supdb-snapold");
+                assert_eq!(z.features(), base.features());
+                let o = z.db.as_ref().unwrap().options();
+                assert!(!o.snapshot_extend_unfolded && !o.snapshot_build_lean);
             }
             {
                 let z = Supdb::create_headsmodel(&dir("headsmodel")).unwrap();

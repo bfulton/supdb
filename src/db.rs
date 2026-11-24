@@ -4442,6 +4442,53 @@ pub struct Options {
     /// pass, where the chain landed inside it (`docs/engine.md`). Off
     /// drops it at every publish; `supdb-snapdrops` is the arm.
     pub snapshot_stands: bool,
+    /// The snapshot's extension pushes each key of its batch without
+    /// comparing it with the key before it (`Snapshot::extend`). The
+    /// compare was for a fold that cannot happen there: the batch and the
+    /// run it is merged into are entries of one live table, which gives a
+    /// key one slot, so no two of them hold the same key. The batch's keys
+    /// are appended to the arena in the table's order and pushed in key
+    /// order, so each compare read two arena slices at random: at the lag
+    /// sweep's ten-percent point at ten million keys under 1 GiB, the first
+    /// scan extends an empty run by 309,000 keys, and the merge loop was
+    /// two fifths of the scanning thread's samples over that scan, the
+    /// radix a fifth and the rest fresh pages. The batch key's own bytes
+    /// are read now only while the run has entries left to walk past. At
+    /// the one-percent point, whose first scan extends an empty run by
+    /// 99,500 keys, the merge took 1.4 ms against 6.2, and over the full
+    /// rewrite at three million keys, where the run and the batch are
+    /// alike in size and the walk reads the run's keys, 222 ms of the
+    /// extensions' merges against 246. Off is the compare;
+    /// `supdb-snapfolded` is the arm, and `supdb-snapold` the arm with
+    /// `snapshot_build_lean` off too.
+    pub snapshot_extend_unfolded: bool,
+    /// The snapshot's build and extension keep a key's place as one
+    /// offset word where they kept a pending entry of six, and the build
+    /// copies the keys in the table's entry order. It sorted the entries
+    /// by their keys' offsets first, from when the table was walked in
+    /// the order of its hash slots, whose keys lie at random; the entries
+    /// are walked in the order they were made now, which for a hash
+    /// table is the order its keys were copied in, so the sort was three
+    /// radix passes and two arrays of twelve bytes a key over an order
+    /// the entries already had, and both paths kept a twenty-four-byte
+    /// entry a key beside the records they sort. Where a snapshot puts a
+    /// key in its own arena says nothing about its order, which the
+    /// records' sort gives, so an ordered table, whose straddling keys
+    /// are copied apart from its stream, takes the same path. Under a
+    /// bound every byte of that is a fresh page the group reclaims a
+    /// cached one for: at the lag sweep's ten-percent point at ten
+    /// million keys under 1 GiB the first scan's sort of 309,000 keys
+    /// took 41 ms, about 25 of them in the first touches of 42 MB, and
+    /// this takes 13.6 MB of them away. A snapshot that copies the runs
+    /// (`snapshot_runs`) builds as before. With the extension unfolded,
+    /// the first scans' snapshot phase there read 30 ms at the median of
+    /// six against 54, at the one-percent point 10.6 against 16.8 and
+    /// after the full rewrite 47 against 56, and the ten-percent pass
+    /// ahead in both orders (`pair.sh supdb supdb-snapold 10000000 --bound
+    /// 1073741824 --reps 3 --ops-div 10 --passes load,lag` under
+    /// `SUPDB_LAG_COUNTERS=1`). Off is the shape before; `supdb-snapfat`
+    /// is the arm.
+    pub snapshot_build_lean: bool,
     /// A frozen table keeps its own sorted snapshot (`FrozenSnaps`): the
     /// seal, a freeze's carry, the keeper or the first scan sets it, and
     /// every later reader of the table -- the seal for its records, a
@@ -7164,6 +7211,8 @@ impl Default for Options {
             upkeep_pass_pct: 0,
             snapshot_carry: false,
             snapshot_stands: true,
+            snapshot_extend_unfolded: true,
+            snapshot_build_lean: true,
             frozen_snaps: true,
             overlay_merge: true,
             scan_lazy_snapshot: false,
@@ -20150,6 +20199,10 @@ struct Shared {
     /// run rather than sorting everything again; the count that should
     /// rise where `snap_builds` stops.
     snap_extends: AtomicU64,
+    /// Builds that kept a key's place as an offset and copied the keys
+    /// in the table's order (`Options::snapshot_build_lean`), of
+    /// `snap_builds`.
+    snap_lean_builds: AtomicU64,
     /// Snapshots republished with their stale runs copied again
     /// (`Snapshot::refreshed`).
     snap_refreshes: AtomicU64,
@@ -23389,7 +23442,14 @@ impl Snapshot {
     /// over one burst of writes. Only for a run with nothing filed into
     /// it: a handle's side runs are that handle's own and are not what
     /// gets published.
-    fn extend(&self, mem: &MemTable, to: usize, runs: bool) -> Snapshot {
+    fn extend(
+        &self,
+        mem: &MemTable,
+        to: usize,
+        runs: bool,
+        unfolded: bool,
+        lean: bool,
+    ) -> Snapshot {
         debug_assert!(
             self.ents.iter().all(|e| e.frozen == u32::MAX),
             "an extension is of live runs; a frozen table's own is a base"
@@ -23400,7 +23460,12 @@ impl Snapshot {
         let log_at = mem.log_len();
         let arena = self.arena.clone();
         let mut rscratch: Vec<(u64, u32)> = Vec::new();
-        let mut batch: Vec<SnapKey> = Vec::with_capacity(to - from);
+        // Under `snapshot_build_lean` a batch key's place is one offset
+        // word, its keys back to back in one reservation, its length the
+        // next offset less its own and its slot its place in the batch.
+        let lean = lean && !runs;
+        let mut batch: Vec<SnapKey> = Vec::with_capacity(if lean { 0 } else { to - from });
+        let mut offs: Vec<u32> = Vec::with_capacity(if lean { to - from + 1 } else { 0 });
         // The batch's order from its keys' prefix words, as the build
         // takes it: the sort that compared the keys through the arena
         // was two block lookups a compare, a millisecond for five
@@ -23408,25 +23473,56 @@ impl Snapshot {
         // words touches the arena only for keys alike through sixteen
         // bytes.
         let mut recs: Vec<(u64, u64, u32)> = Vec::with_capacity(to - from);
-        for i in from..to {
-            let e = mem.entry(i);
-            let key = mem.key_of(e);
-            let (a, b) = key_prefix(key);
-            recs.push((a, b, batch.len() as u32));
-            let lrun = if runs {
-                arena.copy_run(mem, e, &mut rscratch)
-            } else {
-                NO_RUN
-            };
-            batch.push(SnapKey {
-                off: arena.append(key),
-                len: key.len() as u32,
-                mem: i as u32,
-                frozen: u32::MAX,
-                lrun,
-                frun: NO_RUN,
-            });
+        if lean {
+            let total: usize = (from..to).map(|i| mem.entry(i).key_len() as usize).sum();
+            let (mut at, mut room) = arena.reserve_bytes(total);
+            for i in from..to {
+                let key = mem.key_of(mem.entry(i));
+                let (a, b) = key_prefix(key);
+                recs.push((a, b, offs.len() as u32));
+                let (head, rest) = std::mem::take(&mut room).split_at_mut(key.len());
+                head.copy_from_slice(key);
+                room = rest;
+                offs.push(at);
+                at += key.len() as u32;
+            }
+            offs.push(at);
+        } else {
+            for i in from..to {
+                let e = mem.entry(i);
+                let key = mem.key_of(e);
+                let (a, b) = key_prefix(key);
+                recs.push((a, b, batch.len() as u32));
+                let lrun = if runs {
+                    arena.copy_run(mem, e, &mut rscratch)
+                } else {
+                    NO_RUN
+                };
+                batch.push(SnapKey {
+                    off: arena.append(key),
+                    len: key.len() as u32,
+                    mem: i as u32,
+                    frozen: u32::MAX,
+                    lrun,
+                    frun: NO_RUN,
+                });
+            }
         }
+        let batch_at = |j: usize| -> SnapKey {
+            if lean {
+                SnapKey {
+                    off: offs[j],
+                    len: offs[j + 1] - offs[j],
+                    mem: (from + j) as u32,
+                    frozen: u32::MAX,
+                    lrun: NO_RUN,
+                    frun: NO_RUN,
+                }
+            } else {
+                batch[j]
+            }
+        };
+        let count = to - from;
         let key_at = |e: &SnapKey| arena.slice(e.off, e.len);
         if recs.len() > 1 {
             let mut pscratch: Vec<(u64, u64, u32)> = Vec::new();
@@ -23442,8 +23538,8 @@ impl Snapshot {
                     // A batch holds each key once, so the index only
                     // settles what the keys cannot, as the build's does.
                     recs[i..j].sort_by(|x, y| {
-                        key_at(&batch[x.2 as usize])
-                            .cmp(key_at(&batch[y.2 as usize]))
+                        key_at(&batch_at(x.2 as usize))
+                            .cmp(key_at(&batch_at(y.2 as usize)))
                             .then(x.2.cmp(&y.2))
                     });
                 }
@@ -23454,7 +23550,7 @@ impl Snapshot {
             arena: self.arena.clone(),
             runs,
             bases: self.bases.clone(),
-            ents: Vec::with_capacity(self.ents.len() + batch.len()),
+            ents: Vec::with_capacity(self.ents.len() + count),
             log_at,
             live_len: to,
             side: Vec::new(),
@@ -23475,24 +23571,42 @@ impl Snapshot {
         // a key -- fourteen for a thousand keys over ten thousand, two
         // milliseconds of a scan pass of four at a hundred thousand --
         // and the gallop alone still seven.
-        let sparse = self.ents.len() > 64 * batch.len();
+        let sparse = self.ents.len() > 64 * count;
         let mut i = 0usize;
         for r in &recs {
-            let b = batch[r.2 as usize];
-            let key = key_at(&b);
-            let below = |a: &SnapKey| self.key_of(a) <= key;
-            let at = if sparse {
-                i + gallop_point(&self.ents[i..], below)
+            let b = batch_at(r.2 as usize);
+            // With the run walked to its end the key is not read at all
+            // under `snapshot_extend_unfolded`: what is left of the batch
+            // follows the run whole.
+            let at = if unfolded && i == self.ents.len() {
+                i
             } else {
-                let mut at = i;
-                while at < self.ents.len() && below(&self.ents[at]) {
-                    at += 1;
+                let key = key_at(&b);
+                let below = |a: &SnapKey| self.key_of(a) <= key;
+                if sparse {
+                    i + gallop_point(&self.ents[i..], below)
+                } else {
+                    let mut at = i;
+                    while at < self.ents.len() && below(&self.ents[at]) {
+                        at += 1;
+                    }
+                    at
                 }
-                at
             };
             out.ents.extend_from_slice(&self.ents[i..at]);
             i = at;
-            out.push_sorted(b);
+            if unfolded {
+                // One table's entries: a key is in one of them, so the
+                // fold `push_sorted` asks after never happens here, and
+                // the order the merge made is what a checked build holds.
+                debug_assert!(
+                    out.ents.last().is_none_or(|l| self.key_of(l) < key_at(&b)),
+                    "an extension's batch key at or below the entry before it"
+                );
+                out.push_folded(b, false);
+            } else {
+                out.push_sorted(b);
+            }
         }
         out.ents.extend_from_slice(&self.ents[i..]);
         // A run written again since this snapshot copied it, found by
@@ -26775,7 +26889,106 @@ impl Reader {
             bounds: Default::default(),
         };
         let mut rscratch: Vec<(u64, u32)> = Vec::new();
-        if self.opts.scan_snapshot_arena {
+        // The tables in the order the build takes them, the frozen one's
+        // entries first, and the key bytes each will copy
+        // (`snapshot_build_lean`).
+        let tables = [
+            (frozen, frozen.map_or(0, |f| f.len())),
+            (live.map(|(m, _)| m), live_len),
+        ];
+        let lean = self.opts.snapshot_build_lean && self.opts.scan_snapshot_arena && !runs;
+        if lean {
+            let mut bytes = [0usize; 2];
+            for (t, &(m, upto)) in tables.iter().enumerate() {
+                if let Some(m) = m {
+                    bytes[t] = (0..upto).map(|i| m.entry(i).key_len() as usize).sum();
+                }
+            }
+            self.shared
+                .snap_lean_builds
+                .fetch_add(1, AtomicOrdering::Relaxed);
+            // One offset a key, in the arena's order, the frozen table's
+            // keys and then the live one's, each table's back to back in
+            // a reservation of its own as the radix build copies them; a
+            // key's length is the next offset less its own.
+            let mut offs: Vec<u32> = Vec::with_capacity(n + 1);
+            let mut recs: Vec<(u64, u64, u32)> = Vec::with_capacity(n);
+            let mut ends: Vec<(usize, u32)> = Vec::with_capacity(2);
+            for (t, &(m, upto)) in tables.iter().enumerate() {
+                let Some(m) = m else { continue };
+                let (mut at, mut room) = snap.arena.reserve_bytes(bytes[t]);
+                for i in 0..upto {
+                    let e = m.entry(i);
+                    let k = m.key_at(e.key_off, e.key_len());
+                    let (a, b) = key_prefix(k);
+                    recs.push((a, b, offs.len() as u32));
+                    let (head, rest) = std::mem::take(&mut room).split_at_mut(k.len());
+                    head.copy_from_slice(k);
+                    room = rest;
+                    offs.push(at);
+                    at += k.len() as u32;
+                }
+                ends.push((offs.len(), at));
+            }
+            // A key's place: its offset, its length to the next offset or
+            // to its table's end, and its slot in its table.
+            let fr_n = tables[0].1;
+            let key_of = |j: usize| -> SnapKey {
+                let off = offs[j];
+                let end = ends
+                    .iter()
+                    .find(|&&(upto, _)| j + 1 == upto)
+                    .map_or_else(|| offs[j + 1], |&(_, end)| end);
+                let (mem, frozen) = if frozen.is_some() && j < fr_n {
+                    (u32::MAX, j as u32)
+                } else {
+                    let i = if frozen.is_some() { j - fr_n } else { j };
+                    (i as u32, u32::MAX)
+                };
+                SnapKey {
+                    off,
+                    len: end - off,
+                    mem,
+                    frozen,
+                    lrun: NO_RUN,
+                    frun: NO_RUN,
+                }
+            };
+            let mut rscratch2: Vec<(u64, u64, u32)> = Vec::new();
+            radix_by_prefix(&mut recs, &mut rscratch2);
+            drop(rscratch2);
+            let arena = &snap.arena;
+            let mut i = 0;
+            while i < recs.len() {
+                let mut j = i + 1;
+                while j < recs.len() && (recs[j].0, recs[j].1) == (recs[i].0, recs[i].1) {
+                    j += 1;
+                }
+                if j - i > 1 {
+                    recs[i..j].sort_by(|x, y| {
+                        let (kx, ky) = (key_of(x.2 as usize), key_of(y.2 as usize));
+                        arena
+                            .slice(kx.off, kx.len)
+                            .cmp(arena.slice(ky.off, ky.len))
+                            .then(x.2.cmp(&y.2))
+                    });
+                }
+                i = j;
+            }
+            let mut last: Option<(u64, u64, u32)> = None;
+            for r in recs {
+                let e = key_of(r.2 as usize);
+                let same = last.is_some_and(|(a, b, len)| {
+                    (a, b, len) == (r.0, r.1, e.len)
+                        && (len <= 16
+                            || snap.ents.last().is_some_and(|l| {
+                                snap.arena.slice(l.off, l.len) == snap.arena.slice(e.off, e.len)
+                            }))
+                });
+                snap.push_folded(e, same);
+                last = Some((r.0, r.1, e.len));
+            }
+        } else if self.opts.scan_snapshot_arena {
             // Arena build. The hash table is walked in slot order, which
             // visits the key bytes in random order -- one cache miss a key,
             // and at 428k keys that walk, not the sort, was most of the
@@ -28373,7 +28586,13 @@ impl Reader {
                 self.shared
                     .snap_extends
                     .fetch_add(1, AtomicOrdering::Relaxed);
-                std::sync::Arc::new(s.extend(self.mem(), to, self.opts.snapshot_runs))
+                std::sync::Arc::new(s.extend(
+                    self.mem(),
+                    to,
+                    self.opts.snapshot_runs,
+                    self.opts.snapshot_extend_unfolded,
+                    self.opts.snapshot_build_lean,
+                ))
             }
             None => std::sync::Arc::new(self.build_snapshot(to)),
         };
@@ -35229,6 +35448,7 @@ impl Db {
             blk_upkeep: AtomicU64::new(0),
             forms_events: Default::default(),
             snap_extends: AtomicU64::new(0),
+            snap_lean_builds: AtomicU64::new(0),
             snap_refreshes: AtomicU64::new(0),
             keeper_thread: std::sync::OnceLock::new(),
             next_seg: AtomicU64::new(next_seg),
@@ -36037,6 +36257,7 @@ impl Db {
             blk_upkeep: AtomicU64::new(0),
             forms_events: Default::default(),
             snap_extends: AtomicU64::new(0),
+            snap_lean_builds: AtomicU64::new(0),
             snap_refreshes: AtomicU64::new(0),
             keeper_thread: std::sync::OnceLock::new(),
             next_seg: AtomicU64::new(next_seg),
@@ -38680,6 +38901,12 @@ impl Db {
     /// sort of everything; see `Snapshot::extend`.
     pub fn snapshot_extends(&self) -> u64 {
         self.shared.snap_extends.load(AtomicOrdering::Relaxed)
+    }
+
+    /// Snapshot builds that took the lean path
+    /// (`Options::snapshot_build_lean`), of `snapshot_builds`.
+    pub fn snapshot_lean_builds(&self) -> u64 {
+        self.shared.snap_lean_builds.load(AtomicOrdering::Relaxed)
     }
 
     /// EXPERIMENT: snapshots republished with their stale runs copied
@@ -41521,7 +41748,13 @@ impl Reader {
                 self.shared
                     .snap_extends
                     .fetch_add(1, AtomicOrdering::Relaxed);
-                std::sync::Arc::new(s.extend(mem, len, self.opts.snapshot_runs))
+                std::sync::Arc::new(s.extend(
+                    mem,
+                    len,
+                    self.opts.snapshot_runs,
+                    self.opts.snapshot_extend_unfolded,
+                    self.opts.snapshot_build_lean,
+                ))
             }
             None => std::sync::Arc::new(self.build_snapshot(len)),
         };
@@ -41640,7 +41873,13 @@ impl Reader {
             self.shared
                 .snap_extends
                 .fetch_add(1, AtomicOrdering::Relaxed);
-            std::sync::Arc::new(s.extend(live, live.len(), s.runs))
+            std::sync::Arc::new(s.extend(
+                live,
+                live.len(),
+                s.runs,
+                self.opts.snapshot_extend_unfolded,
+                self.opts.snapshot_build_lean,
+            ))
         } else {
             s
         };

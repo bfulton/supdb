@@ -12318,7 +12318,7 @@ fn a_snapshot_carried_forward_folds_a_live_write_onto_a_frozen_key() {
 /// The carry with the forms holding the pieces' fold alone.
 #[test]
 fn the_carried_snapshot_answers_the_same_model_with_pieces_only_forms() {
-    carry_model_with(true, true);
+    carry_model_with(true, true, false, false);
 }
 
 /// The same on the merge path, where the snapshot's runs are what a scan
@@ -12342,11 +12342,13 @@ fn a_snapshot_carried_forward_on_the_merge_path_folds_it_too() {
 /// bytes and written out of order, half between the run's keys, carried
 /// forward by the walk. Keys of every batch are checked at every start.
 fn extend_order_model(block_cache: bool) {
-    extend_order_model_with(block_cache, false)
+    extend_order_model_with(block_cache, false, false, false)
 }
 
-fn extend_order_model_with(block_cache: bool, pieces_only: bool) {
-    let d = dir(&format!("extend-order-{block_cache}-{pieces_only}"));
+fn extend_order_model_with(block_cache: bool, pieces_only: bool, unfolded: bool, lean: bool) {
+    let d = dir(&format!(
+        "extend-order-{block_cache}-{pieces_only}-{unfolded}-{lean}"
+    ));
     let opts = Options {
         seal_bytes: 1 << 20,
         partition_bytes: Some(2 << 10),
@@ -12354,6 +12356,8 @@ fn extend_order_model_with(block_cache: bool, pieces_only: bool) {
         scan_cache_ahead: false,
         share_snapshot: true,
         forms_pieces_only: pieces_only,
+        snapshot_extend_unfolded: unfolded,
+        snapshot_build_lean: lean,
         // The seal's copy is what is tested, and nothing scans the
         // store before its seal: built whatever the reads
         // (`Options::seal_snapshot_far`).
@@ -12434,12 +12438,197 @@ fn the_extension_gallops_a_sparse_batch_and_walks_a_dense_one_into_the_run() {
 /// The extension's order with the forms holding the pieces' fold alone.
 #[test]
 fn the_extended_snapshot_answers_the_same_model_with_pieces_only_forms() {
-    extend_order_model_with(true, true);
+    extend_order_model_with(true, true, false, false);
 }
 
 #[test]
 fn the_extension_orders_a_batch_alike_through_sixteen_bytes_on_the_merge_path() {
     extend_order_model(false);
+}
+
+/// The extension's batch pushed without the fold's compare
+/// (`Options::snapshot_extend_unfolded`): the same model through the
+/// sparse gallop, the dense walk with keys alike through sixteen bytes,
+/// and the run walked to its end, where the rest of the batch is pushed
+/// without reading a key, on both scan paths; and the carry over a
+/// frozen table's own snapshot, an extension of an empty run whose live
+/// writes fold onto the frozen keys in the merge after it and not in the
+/// extension, under the order a checked build asserts at every push.
+/// A scan's extension of its own live run, the route the lag sweep's
+/// first scans take (`refresh_snapshot_to`): the batch past the keys
+/// held, so the walk is the dense one, into a run of interleaved keys
+/// with some alike through sixteen bytes, then a batch above every key
+/// -- the run walked to its end at the batch's first key, the rest
+/// pushed without a read under `Options::snapshot_extend_unfolded` --
+/// and one below every key. Each scan extends and none sorts again, and
+/// the model holds the answer, under either shape and on either path.
+fn extend_live_run_model(block_cache: bool, unfolded: bool, lean: bool) {
+    let d = dir(&format!("extend-live-{block_cache}-{unfolded}-{lean}"));
+    let opts = Options {
+        seal_bytes: 256 << 20,
+        partition_bytes: Some(2 << 10),
+        scan_block_cache: block_cache,
+        scan_cache_ahead: false,
+        share_snapshot: true,
+        snapshot_extend_unfolded: unfolded,
+        snapshot_build_lean: lean,
+        ..common::options()
+    };
+    let mut db = Db::create(&d, opts).unwrap();
+    let mut m = ScanModel::default();
+    let key = |k: u32| format!("key-{k:06}");
+    for k in (0..12000u32).step_by(3) {
+        m.append(&mut db, &key(k), "p");
+    }
+    db.commit().unwrap();
+    db.flush().unwrap();
+    m.flushed();
+    assert!(db.levels().0 > 1, "several partitions");
+    let mut sink = 0usize;
+    let mut scan = |db: &mut Db| {
+        db.scan(key(0).as_bytes(), 100, kv(&mut |_k, v| sink += v.len()))
+            .unwrap();
+    };
+    // The run: a sort of the live keys, at the first scan over them.
+    for k in (1..12000u32).step_by(3) {
+        m.append(&mut db, &key(k), "a");
+    }
+    db.commit().unwrap();
+    let (b0, l0) = (db.snapshot_builds(), db.snapshot_lean_builds());
+    scan(&mut db);
+    assert_eq!(db.snapshot_builds(), b0 + 1, "the run is one sort");
+    assert_eq!(
+        db.snapshot_lean_builds(),
+        l0 + u64::from(lean),
+        "a hash table's keys lie in its order: the lean build takes them"
+    );
+    let (b1, e1) = (db.snapshot_builds(), db.snapshot_extends());
+    // Dense, past the run's count: keys between the run's, and keys
+    // alike through sixteen bytes in an order that is not theirs.
+    for k in (2..12000u32).step_by(3) {
+        m.append(&mut db, &key(k), "b");
+    }
+    let tie = |i: u32| format!("tiekey-000000000{i:05}");
+    let mut x = 11u32;
+    for _ in 0..1500 {
+        x = x.wrapping_mul(1_103_515_245).wrapping_add(12_345);
+        m.append(&mut db, &tie((x >> 8) % 100_000), "t");
+    }
+    db.commit().unwrap();
+    scan(&mut db);
+    assert_eq!(
+        (db.snapshot_builds(), db.snapshot_extends()),
+        (b1, e1 + 1),
+        "a dense batch walked into the run, not sorted again"
+    );
+    m.check(&db, "a dense batch walked into a live run");
+    // Above every key, more of them than the run holds: the walk passes
+    // the run at the batch's first key.
+    for k in 0..14000u32 {
+        m.append(&mut db, &format!("zz-{k:06}"), "z");
+    }
+    db.commit().unwrap();
+    scan(&mut db);
+    assert_eq!(
+        (db.snapshot_builds(), db.snapshot_extends()),
+        (b1, e1 + 2),
+        "a batch above the run extends it"
+    );
+    m.check(&db, "a batch above every key of the run");
+    // Below every key: the run stands whole after the batch.
+    for k in 0..30000u32 {
+        m.append(&mut db, &format!("aa-{k:06}"), "y");
+    }
+    db.commit().unwrap();
+    scan(&mut db);
+    assert_eq!(
+        (db.snapshot_builds(), db.snapshot_extends()),
+        (b1, e1 + 3),
+        "a batch below the run extends it"
+    );
+    m.check(&db, "a batch below every key of the run");
+}
+
+#[test]
+fn a_scan_extends_its_live_run_without_the_fold_compare() {
+    extend_live_run_model(true, true, false);
+    extend_live_run_model(false, true, false);
+}
+
+#[test]
+fn a_scan_extends_its_live_run_with_the_fold_compare() {
+    extend_live_run_model(true, false, false);
+    extend_live_run_model(false, false, false);
+}
+
+/// The lean build over an ordered table, a direct run in progress
+/// (`Options::snapshot_build_lean`): with short keys every key is read
+/// in the run's stream, and with keys of a kilobyte most block seams
+/// fall inside one and the key is copied apart from the stream, past
+/// the bias, so the table's keys do not lie in its entries' order. The
+/// snapshot copies them in that order either way, and the model holds.
+fn lean_ordered_model(n: u32, val: usize, pad: usize) {
+    let d = dir(&format!("lean-ordered-{n}-{val}-{pad}"));
+    let opts = Options {
+        seal_bytes: 256 << 20,
+        snapshot_build_lean: true,
+        snapshot_extend_unfolded: true,
+        ..common::options()
+    };
+    let mut db = Db::create(&d, opts).unwrap();
+    let mut m = ScanModel::default();
+    let v = "v".repeat(val);
+    let pad = "k".repeat(pad);
+    for k in 0..n {
+        m.append(&mut db, &format!("key-{k:08}{pad}"), &v);
+        if k % 1000 == 999 {
+            db.commit().unwrap();
+        }
+    }
+    db.commit().unwrap();
+    let (b0, l0) = (db.snapshot_builds(), db.snapshot_lean_builds());
+    let mut sink = 0usize;
+    db.scan(b"key-", 100, kv(&mut |_k, v| sink += v.len()))
+        .unwrap();
+    assert_eq!(
+        (db.snapshot_builds() - b0, db.snapshot_lean_builds() - l0),
+        (1, 1),
+        "the scan's sort of the ordered table is a lean one"
+    );
+    m.check(&db, "a lean snapshot of an ordered table");
+}
+
+#[test]
+fn the_lean_snapshot_of_an_ordered_table_takes_its_copied_keys_too() {
+    lean_ordered_model(2000, 100, 0);
+    lean_ordered_model(20000, 100, 900);
+}
+
+/// The lean build and extension (`Options::snapshot_build_lean`): a
+/// key's place an offset word and the keys copied in the table's order,
+/// through every model the extension is held to, folded and not, on
+/// both scan paths, over a frozen table's base and with the pieces'
+/// fold alone in the forms.
+#[test]
+fn the_lean_snapshot_answers_every_model() {
+    for unfolded in [true, false] {
+        extend_live_run_model(true, unfolded, true);
+        extend_live_run_model(false, unfolded, true);
+        extend_order_model_with(true, false, unfolded, true);
+        extend_order_model_with(false, false, unfolded, true);
+        extend_order_model_with(true, true, unfolded, true);
+        carry_model_with(true, false, unfolded, true);
+        carry_model_with(false, false, unfolded, true);
+    }
+}
+
+#[test]
+fn the_extension_without_the_fold_compare_answers_every_model() {
+    extend_order_model_with(true, false, true, false);
+    extend_order_model_with(false, false, true, false);
+    extend_order_model_with(true, true, true, false);
+    carry_model_with(true, false, true, false);
+    carry_model_with(false, false, true, false);
 }
 
 /// The seal cap and the merge trigger follow the reads
@@ -12545,11 +12734,13 @@ fn the_cap_and_the_trigger_follow_the_reads_and_relax_over_a_write_only_stretch(
 }
 
 fn carry_model(block_cache: bool) {
-    carry_model_with(block_cache, false)
+    carry_model_with(block_cache, false, false, false)
 }
 
-fn carry_model_with(block_cache: bool, pieces_only: bool) {
-    let d = dir(&format!("extend-snap-{block_cache}-{pieces_only}"));
+fn carry_model_with(block_cache: bool, pieces_only: bool, unfolded: bool, lean: bool) {
+    let d = dir(&format!(
+        "extend-snap-{block_cache}-{pieces_only}-{unfolded}-{lean}"
+    ));
     let opts = Options {
         seal_bytes: 1 << 20,
         partition_bytes: Some(2 << 10),
@@ -12557,6 +12748,8 @@ fn carry_model_with(block_cache: bool, pieces_only: bool) {
         scan_cache_ahead: false,
         share_snapshot: true,
         forms_pieces_only: pieces_only,
+        snapshot_extend_unfolded: unfolded,
+        snapshot_build_lean: lean,
         // The seal's copy is what is tested, and nothing scans the
         // store before its seal: built whatever the reads
         // (`Options::seal_snapshot_far`).
