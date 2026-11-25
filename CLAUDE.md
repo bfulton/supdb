@@ -6983,6 +6983,25 @@ where those things are made and not where they are used; and a guard a
 mutant cannot be caught without is read for whether a change elsewhere has
 made it dead.
 
+**A reader's protocol needed only where the writer can still reach.** The
+shared table's overwrites in place made every read of its values a copy
+between two readings of the record's lock, and the audit of the readers
+found the live table's in eight places and the frozen tables' in as many
+again: a table the freeze has published frozen can still be overwritten by
+a writer that took the state before the publish, for as long as the grace
+that waits it out. Closing the table to overwrites before the publish, and
+waiting out the writers that may be making one then, takes the frozen
+tables out of the protocol: by the publish no overwrite is in flight and
+none can start, and the frozen tables read as they always have
+(`Db::close_in_place`). The same audit found a hole in the shape already
+shipped: `sync` under `adaptive_shape` hands the live table to a seal
+without a freeze, and a handle may still be writing it, so the shared mode
+refuses the option. The rules: when a mechanism puts a protocol on readers,
+the writer's side is moved first to shrink the set of states the protocol
+has to cover, since every reader of a state left in the set is a site to
+convert and to test; and an audit of the paths that read a structure is
+also an audit of the paths that hand it to someone else.
+
 ## Standing limitations
 
 These are the engine's, as opposed to refuted predictions. Each is a curve

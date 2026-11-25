@@ -1309,6 +1309,43 @@ The waits left are the slot, the entry and the key. The levers on them:
 - A value overwritten in place in that record, under the stripe's version,
   which would make the probe FASTER's two misses.
 
+All three are built:
+- **The index is sized by keys** (`Options::shared_index_slots`).
+  `supdb-heldsharedbig` takes three slots a key of the store, a million and
+  8 MiB at three hundred thousand keys, half of FASTER's index. The cap's
+  sizing is the arm `supdb-heldsharedbigcapindex`.
+- **A new key is a record** (`Options::shared_records`): the chain's head,
+  its count, its lock and its entry's number, then the key, then its first
+  write, one reservation in the value arena. The index slot names the
+  record, and the entry names the record only for the walks by number.
+  `supdb-heldsharedbignorecords` keeps entries and chunks apart.
+- **A put of a value of the length it replaces overwrites it in place**
+  (`Options::shared_in_place`), under the record's lock as a sequence
+  lock's writer writes. A read of the live table copies the key's chain
+  between two equal, even readings of that lock. A freeze closes the table
+  to overwrites, waits out the writers that may be making one and settles
+  the table before it publishes it frozen, so no frozen table is read that
+  way. `supdb-heldsharedbignoinplace` lays its puts down.
+
+Paired and profiled at `80bf367`, with the same passes and reps:
+- **Against FASTER** (`pair.sh supdb-heldsharedbig faster 300000`), at
+  three threads, ours over FASTER's by the mean of the two orders: RMW
+  0.89x, A 0.87x, the uniform RMW 0.95x and the uniform A 0.86x. Listed
+  first, the arm read 0.96-1.02x of FASTER's in all four. Listed second, it
+  read 0.75-0.95x: the order effect the probe's pairings showed, at the
+  arm's cost both times.
+- **The overwrite alone** (`pair.sh supdb-heldsharedbig
+  supdb-heldsharedbignoinplace 300000`) read the uniform RMW at three
+  threads 1.24x in both orders, the RMW 1.17x by the mean, and A within a
+  sixteenth either way, 1.03x scrambled and 0.94x uniform.
+- **The record**, profiled arm against arm (`supdb-heldsharedbignorecords`
+  beside it in one run): one thread's RMW windows took about a tenth to a
+  fifth fewer samples for the same operations. The entry's decode, a fifth of the
+  thread without records, is gone; the record's own load takes its place,
+  the second of two misses, as FASTER's record is.
+- **The index's size** resolved nothing in its pairing, cells moving both
+  ways between the orders.
+
 #### Beside FASTER out of core
 
 A store larger than memory is what FASTER's log is made for, and the
