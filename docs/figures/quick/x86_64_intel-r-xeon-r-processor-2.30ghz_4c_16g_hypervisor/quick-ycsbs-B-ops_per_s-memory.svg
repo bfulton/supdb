@@ -1,8 +1,8 @@
 <svg xmlns="http://www.w3.org/2000/svg" width="760" height="420" viewBox="0 0 760 420" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" fill="#1b1b1b">
 <rect width="760" height="420" fill="white"/>
-<text x="72" y="28" font-size="15" font-weight="600">At 3×10⁵ keys supdb is level with FASTER</text>
+<text x="72" y="28" font-size="15" font-weight="600">At 3×10⁵ keys supdb is 1.1× ahead of FASTER</text>
 <text x="72" y="47" font-size="12">YCSB-B, read-mostly (95/5 read/update, scrambled zipfian), throughput, in memory until a checkpoint, to 3×10⁵ keys</text>
-<text x="72" y="64" font-size="11" fill="#6b6b6b">x86_64/intel-r-xeon-r-processor-2.30ghz/4c/16g/hypervisor · 8167720 · 2026-11-25 · median with 95% CI over 5 reps</text>
+<text x="72" y="64" font-size="11" fill="#6b6b6b">x86_64/intel-r-xeon-r-processor-2.30ghz/4c/16g/hypervisor · fdf9f10 · 2026-11-25 · median with 95% CI over 5 reps</text>
 <line x1="72" y1="372" x2="610" y2="372" stroke="#c8c8c8" stroke-width="1"/>
 <line x1="72" y1="88" x2="72" y2="372" stroke="#c8c8c8" stroke-width="1"/>
 <line x1="98.3" y1="372" x2="98.3" y2="378" stroke="#c8c8c8" stroke-width="1"/>
@@ -23,11 +23,10 @@
 <line x1="67" y1="88.0" x2="72" y2="88.0" stroke="#c8c8c8" stroke-width="1"/>
 <text x="63" y="92.0" font-size="11" text-anchor="end" fill="#6b6b6b">10M</text>
 <text x="10" y="80" font-size="11" text-anchor="start" fill="#6b6b6b">ops/s</text>
-<path d="M98.3,134.1 L255.1,160.6 L426.9,208.0 L583.7,277.2 L583.7,305.6 L426.9,266.0 L255.1,260.9 L98.3,215.8 Z" fill="#8c8c8c" fill-opacity="0.10"/>
-<path d="M98.3,258.3 L255.1,246.5 L426.9,252.7 L583.7,254.5 L583.7,302.7 L426.9,303.3 L255.1,274.0 L98.3,285.2 Z" fill="#1b1b1b" fill-opacity="0.10"/>
-<path d="M98.3,154.1 L255.1,217.9 L426.9,222.6 L583.7,295.8 " fill="none" stroke="#8c8c8c" stroke-width="1.6" stroke-linejoin="round" stroke-linecap="round"/>
-<path d="M98.3,274.7 L255.1,246.9 L426.9,279.9 L583.7,294.1 " fill="none" stroke="#1b1b1b" stroke-width="2" stroke-linejoin="round" stroke-linecap="round"/>
-<text x="618.0" y="298.1" font-size="11" fill="#1b1b1b">supdb (in memory until a sync)</text>
-<line x1="612.0" y1="295.8" x2="616.0" y2="307.1" stroke="#8c8c8c" stroke-width="0.75"/>
-<text x="618.0" y="311.1" font-size="11" fill="#8c8c8c">FASTER</text>
+<path d="M98.3,126.1 L255.1,165.3 L426.9,171.9 L583.7,225.4 L583.7,330.2 L426.9,257.9 L255.1,271.0 L98.3,207.9 Z" fill="#8c8c8c" fill-opacity="0.10"/>
+<path d="M98.3,249.9 L255.1,191.2 L426.9,241.0 L583.7,236.1 L583.7,295.1 L426.9,262.0 L255.1,253.8 L98.3,266.4 Z" fill="#1b1b1b" fill-opacity="0.10"/>
+<path d="M98.3,173.9 L255.1,175.9 L426.9,238.6 L583.7,281.9 " fill="none" stroke="#8c8c8c" stroke-width="1.6" stroke-linejoin="round" stroke-linecap="round"/>
+<path d="M98.3,263.4 L255.1,228.1 L426.9,258.0 L583.7,271.2 " fill="none" stroke="#1b1b1b" stroke-width="2" stroke-linejoin="round" stroke-linecap="round"/>
+<text x="618.0" y="275.2" font-size="11" fill="#1b1b1b">supdb (in memory until a sync)</text>
+<text x="618.0" y="288.2" font-size="11" fill="#8c8c8c">FASTER</text>
 </svg>
