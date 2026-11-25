@@ -20318,9 +20318,12 @@ fn the_lean_direct_run_writes_the_walks_bytes() {
 /// durable landing every time -- the readable signal comes before the
 /// flush's ask, and the loop leaves the landing to the ask
 /// (`SealJob::early_hint`), where landed first it paid that fsync there;
-/// and every key reads back through a handle and after a reopen. A store
-/// whose run closes with commits unsynced, and the option off, close on the
-/// seal thread as before.
+/// and every key reads back through a handle and after a reopen. The seal
+/// is held between its phases across the flush: a seal thread whose fsync
+/// ends before the segment work reads the flush's ask is landed whole by
+/// the loop, and the drain answered the strict way, which a loaded host
+/// made once in twelve stores. A store whose run closes with commits
+/// unsynced, and the option off, close on the seal thread as before.
 #[test]
 fn a_synced_runs_drain_closes_on_the_writer_and_defers_its_directory_sync() {
     let keys = drain_keys(true, 3000);
@@ -20331,8 +20334,13 @@ fn a_synced_runs_drain_closes_on_the_writer_and_defers_its_directory_sync() {
         let mut db = Db::create(&d, opts.clone()).unwrap();
         drain_load(&mut db, &keys);
         db.fail_next_presync();
+        db.hold_seal_durable(true);
+        let release = db.release_seal_durable_after(std::time::Duration::from_secs(30));
         db.flush().unwrap();
         let w = db.seal_waits();
+        db.hold_seal_durable(false);
+        drop(release);
+        wait_for("the seal's durable landing", || !db.in_flight().0);
         assert_eq!(
             (w.closes_inline, w.drains_early, w.drains_beside),
             (1, 1, 0),
@@ -23231,7 +23239,16 @@ fn a_durable_flush_is_answered_at_its_seals_readable_landing() {
         drain_load(&mut db, &keys);
         db.hold_seal_landing(true);
         let _release = db.release_seal_landing_after(std::time::Duration::from_secs(1));
+        // And between its phases across the flush: where the close runs
+        // on the writer (`Options::close_readable_inline`) the landing's
+        // hold is the writer's, the ask comes after the readable signal,
+        // and a seal whose fsync ended first would be landed whole by the
+        // loop and the drain answered the strict way.
+        db.hold_seal_durable(true);
+        let durable = db.release_seal_durable_after(std::time::Duration::from_secs(30));
         db.flush().unwrap();
+        db.hold_seal_durable(false);
+        drop(durable);
         // Landed as no flush's: its slot synced where it was written and
         // the run's temp name retired behind it, with no ask to pay a
         // slot left owed.
@@ -23403,8 +23420,16 @@ fn a_flush_owed_anything_waits_for_its_seals_fsync() {
         };
         let mut db = Db::create(&d, opts.clone()).unwrap();
         drain_load(&mut db, &keys);
+        // Held between its phases, as the early answer needs: a seal
+        // whose fsync ends before the segment work reads the flush's ask
+        // is landed whole, and the drain answered the strict way.
+        db.hold_seal_durable(true);
+        let release = db.release_seal_durable_after(std::time::Duration::from_secs(30));
         db.flush().unwrap();
         assert_eq!(db.seal_waits().drains_early, 1);
+        db.hold_seal_durable(false);
+        drop(release);
+        wait_for("the seal's durable landing", || !db.in_flight().0);
         let more: Vec<Vec<u8>> = keys
             .iter()
             .step_by(7)
