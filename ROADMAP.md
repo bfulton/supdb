@@ -1274,6 +1274,14 @@ turned on neither.
   the stride form went under a cipher, `work_probe::main` one
   instruction a key over the commit before with no instruction of its
   hot code changed (`CLAUDE.md`, "A second way for a check to say yes").
+  The merge probe reads red by it since the merge's asks covered their
+  inputs' directories (`b63c2de`): `compact_run` ten instructions a key
+  over `9e7ae54` in a plain store, which asks nothing ahead, the sum by
+  mnemonic +2.0M of `xchg %ax,%ax`, `nopl` and `nopw` against -0.4M of
+  `data16` and the rest the same to within a few instructions over the
+  run, with the ask's look out of line and the plain walk's source
+  unchanged (`COST_DIR` and `COST_BASE_TARGET` kept, each binary under
+  `--dump-instr=yes --dump-line=no`, summed by mnemonic).
   Done for that when the count is taken by instruction and a function's
   sum leaves its padding out, with a red input in which a gain of
   padding alone reads green beside a gain of one instruction that reads
