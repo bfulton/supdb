@@ -1250,6 +1250,39 @@ what was left. The levers are in that order:
 - a shared table sized for the held log's promise and not by the seal's
   share of the store.
 
+The first and the last are built, with the second:
+- **A put or a delete recycles what it replaces** (`Options::shared_recycles`,
+  on in the shared mode). It lays its tombstone over nothing, since none of
+  the table's readers is isolated from a write and nothing reads past the
+  tombstone. The chain it replaces is one put's pair or one delete's
+  tombstone, which its writer keeps by length. Each batch of 128 such ranges
+  is tagged by a bump of the epoch, and the pins are read at the bump. A
+  range serves a write of its length once every reader is pinned at or past
+  its tag, so bytes a reader may hold are never written again under it
+  (`TableLocal`).
+- **A handle's read-modify-write** (`Reader::rmw`) is one probe and one hold
+  of the key's stripe where the live chain holds a tombstone. That covers
+  every key a put has reached, and is FASTER's `Rmw` as one operation.
+  Elsewhere it is a read and then a put.
+- **`supdb-heldsharedbig`** sizes the table at twice the store's records as
+  FASTER's log counts them (`Options::shared_table_bytes`), so the table
+  holds every key with room for the ranges not yet reused. Its index is
+  twice the bytes of FASTER's.
+
+Paired at `7b895b9`, with the same passes and reps as above:
+- **Against FASTER** (`pair.sh supdb-heldsharedbig faster 300000`), the
+  writers scale. At three threads A reads 5.8M operations a second, 0.75x
+  and 0.82x of FASTER's by the two orders. RMW reads 4.7-5.1M, 0.56x and
+  0.68x, where the appending arm read 1.55M. At one thread RMW is 0.54-0.63x
+  of FASTER's, so what is left is each operation's cost, not the scaling.
+- **The recycling alone** (`pair.sh supdb-heldshared
+  supdb-heldsharednorecycle 300000`), at the seal's cap, reads the scrambled
+  A at three threads 1.62x and 1.85x of the appending arm. The uniform A and
+  RMW move by an eighth or less either way, and the scrambled A at one
+  thread a fifth, in opposite directions in the two orders. Under uniform
+  keys the distinct keys alone fill a table of a tenth of the store, so it
+  freezes whatever its puts reuse.
+
 #### Beside FASTER out of core
 
 A store larger than memory is what FASTER's log is made for, and the

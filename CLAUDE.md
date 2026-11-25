@@ -6964,6 +6964,25 @@ publication is the store-buffering shape, which release and acquire do not
 order, so it gets a sequentially consistent fence and a litmus test that
 fails without it.
 
+**A reading of who holds a thing, used for a thing made after it.** The
+shared table's writers reuse the ranges their puts replaced once every
+reader is pinned past the epoch the range was tagged at, and the first
+version read the pins when a reuse was refused and kept the answer for the
+asks after it: `u64::MAX` where no reader was pinned. A reader that pinned
+later, and read the head a later put retired, was covered by nothing that
+reading saw, and its bytes were written again under it, which the
+single-writer test's pinned reader showed on its first run. The pins are
+read now at the bump that makes a batch's ranges ready, after every swap
+that retired them, so a reader the walk misses pins after those swaps and
+cannot reach them (`TableLocal::retire`). Bounding the old reading by the
+epoch it was taken at closed the hole too, and once the reading moved to
+the bump that bound was an equivalent mutant, no test able to tell it
+apart, and came out. The rules: an answer to "who can still see this" is an
+answer about the things that existed when it was asked, so it is taken
+where those things are made and not where they are used; and a guard a
+mutant cannot be caught without is read for whether a change elsewhere has
+made it dead.
+
 ## Standing limitations
 
 These are the engine's, as opposed to refuted predictions. Each is a curve
