@@ -302,14 +302,15 @@ does beside them.
 ## Arms
 
 Every comparison is guarantee-matched: durable against durable, buffered
-against buffered. An arm is either a shipping supdb configuration or the
-comparator a user would otherwise pick.
+against buffered, held in memory against held in memory. An arm is either
+a shipping supdb configuration or the comparator a user would otherwise
+pick.
 
 | guarantee | supdb | comparators |
 |---|---|---|
 | durable per batch | `supdb` (default), `supdb-forms`, `supdb-settle`, `supdb-nosnap`, `supdb-noadvice`, `supdb-nocache`, `supdb-cache256` | `lmdb`, `rocksdb-tuned`, and in the bounded roster `rocksdb-tuned-lz4` |
 | buffered | `supdb-ingest` | `lmdb-nosync`, `rocksdb-tuned-nosync` |
-| in memory until a checkpoint | | `faster`, where it is built |
+| in memory until a checkpoint | `supdb-heldnoframes`, and in the bounded roster `supdb-heldpart`, where `faster` is built | `faster`, where it is built |
 
 `faster` is Microsoft's FASTER, its C++ store: the comparator a user would
 otherwise pick for point gets and puts alone, a hash index over a log that
@@ -317,15 +318,48 @@ updates in place. Its promise is weaker than a buffered commit's and it has
 no stronger one to configure. A write is in the process's memory when it
 returns and reaches the device at a checkpoint, so a process that is killed
 loses what it wrote since, where a buffered arm's every commit is in the
-kernel. That is a guarantee of its own with one arm in it: the suite
-compares `faster` with nothing and draws no figure of it, and its cells are
-in the row for a reader who sets them beside the buffered group's and says
-what differs. It has no ordered scan and the arm does not reopen a store, so
-it runs no scan workload, no YCSB E and no recovery workload, and its row
-has no cell there. A load's window ends where the arm's guarantee is met,
+kernel. That is a guarantee of its own, `supdb-held` the engine's arm of
+it. It has no ordered scan and the arm does not reopen a store, so it runs
+no scan workload, no YCSB E and no recovery workload, and its row has no
+cell there. A load's window ends where the arm's guarantee is met,
 which for FASTER is a checkpoint of its log, written in whole pages of
 32 MiB. Read-modify-write in the `threads` workloads is FASTER's own single
 operation, and a read and then a write for every other arm.
+
+`supdb-heldnoframes` is `supdb-ingest` opened under the one policy of the
+engine's that promises what FASTER does (`SyncPolicy::Explicit`) with its
+log building no frames (`Options::held_frames` off): a commit is in the
+memtable alone, the arm's `sync` is its drain as its sibling's is, and a
+process that is killed loses what it committed since. It is in the roster
+where `faster` is and in no other, the pair being what it is measured for.
+`supdb-held` is the same arm with the frames the log holds, which the drain
+that covers them drops unwritten: the roster's arm of the guarantee until
+the frames were priced at a quarter of an update's instructions, and kept
+for pricing.
+
+The two differ on the ordered scan and the reopen, which `faster` has not
+got and has no setting for. The check that holds a guarantee's arms to one
+set of features (`engines::check_matched`, where a run starts) refuses
+every difference but the ones written down for it by arm and by axis
+(`engines::ALLOWED_GAPS`): `faster`, those two axes, and only where
+`faster` is the arm without the feature. An arm beside it that lacked a
+scan, a difference on any other axis, and a `faster` that had what its
+neighbour lacked are each refused as before. So the comparison is over the
+workloads both arms have, the loads, the point reads, the mixes without a
+scan and the update bursts, and a figure of the group is drawn where both
+have the cell; `supdb-heldnoframes` runs the scan workloads, E and the recovery
+workloads as well, with nothing beside it there and no figure, and what a
+killed process cost it is its `unrecovered_batches`: of a shuffled load,
+every batch no seal's manifest covered, which at a rung
+that seals nothing is all of them; of an ordered load none, a run's
+records going to the run's own file at each commit under every policy.
+
+`supdb-held1m` and `supdb-held8m` pin the bytes the held log spills at
+(`Options::wal_hold_bytes`) where the arm takes the engine's, and
+`supdb-heldmarch` has the held log leave the bytes it dropped where they
+lay whenever much is held behind them, so its frames go on into fresh
+pages where the default's write over the dropped ones
+(`Options::wal_hold_reuses`); all three are in no roster.
 
 The store is not a crate. `scripts/faster.sh` fetches its sources at the
 commit `vendor/faster/PIN` names and installs the libraries they link, and
@@ -440,7 +474,20 @@ raw form alone (`supdb-nozpages`), the shape the engine shipped before
 the compact form's controller was its default, and the durable
 comparators: LMDB with its
 readahead off (`lmdb-nordahead`), as LMDB's documentation configures a
-store larger than memory, and RocksDB tuned. The bound is chosen so that
+store larger than memory, and RocksDB tuned; and, where FASTER is built,
+FASTER beside `supdb-heldpart`, which is `supdb` under FASTER's promise.
+A store larger than memory is what FASTER's log is made for -- its tail
+in memory, the rest read from the device with `O_DIRECT`, past the page
+cache -- and it sizes its index and that tail at open and reads nothing
+of the group it runs in, so the pass tells it the bound beside the key
+count and it divides the bound as a user of it would
+(`engines::faster_sizes`): the index at its own benchmark's ratio rounded
+down, the 64 MiB page of overflow buckets it allocates at open, a quarter
+of the bound for the process, and the rest to the log in whole pages.
+The in-core roster's arm of the guarantee, `supdb-held`, is the buffered
+arm's shape, which leaves partitioning a flush to the background and had
+never run under a bound, so the bounded roster has the shape it runs
+everywhere else. The bound is chosen so that
 the top rung is out of core for every engine: a store of ten million keys
 is 1.3 GB in LMDB and 1.4 in supdb's raw form, so under 1.5 GiB LMDB's
 fits and supdb's sits at the edge of its budget, and under 1.25 GiB both
@@ -817,6 +864,23 @@ refuted);
 store with tombstones probe every source again after its tombstone pass,
 where the default keeps what the pass found of each source
 (`Options::read_probes_once`);
+`supdb-pointexts` and `supdb-ingestpointexts` have a point read rebuild
+the extent of every record it reads and walk the run by it, where the
+default takes the values of the common record, the compact record with a
+fixed run, from the record where it lies (`Options::point_fixed`), and
+`supdb-pointsources` and `supdb-ingestpointsources` have every point read
+take the general read of its sources, where the default reads a partition
+and the live table alone, or the partition, its pieces, the frozen tables
+and the live one in a single pass, wherever each holds the key in its
+common shape (`Options::point_lone`), and
+`supdb-nopool` and `supdb-ingestnopool` unmap every block a table gives
+back at its drop, where the default keeps them for the next tables
+(`Options::blocks_pool_bytes`);
+`supdb-layersasone` and `supdb-ingestlayersasone` have that single pass
+set up for every source before it asks one, where the default asks the
+live table first and ends there at a tombstone, with the pieces over the
+key's partition placed at the state's publish
+(`Options::point_layers_lean`);
 `supdb-zhotresident` is `supdb` with the hot-raw fill asking for the
 partitions the reads have not skewed by how much of their records the cache
 holds, most first (`Options::zpages_hot_fill_resident_first`);
@@ -1193,9 +1257,12 @@ size: a bar hides the knee, and the knee is the finding.
   Tick labels are sparse and in the unit's natural form — 10⁴, 10⁵, not
   10000, 100000 — with the unit stated once on the axis.
 - The title is the message in numbers: supdb's factor against each
-  comparator at the top rung, in whichever direction the quantity is good.
-  The context and the provenance (class, engine commit, date, reps) are
-  the two lines under it.
+  comparator at the top rung, in whichever direction the quantity is good,
+  supdb being the guarantee's own arm of it (`supdb`, `supdb-ingest`,
+  `supdb-held`). The context and the provenance (class, engine commit,
+  date, reps) are the two lines under it.
+- A figure is a comparison: in the memory guarantee, whose two arms do
+  not run the same workloads, a cell one arm has alone is drawn nowhere.
 - One typeface, two sizes. Black on white. A palette that reads in
   greyscale and to a colour-blind reader.
 

@@ -663,9 +663,10 @@ pub fn phase_mark(arm: &str, phase: &str, edge: &str) {
 /// `Db::fill_owed_due`), and the stride form's reads, first-touch checks,
 /// cursor values and builds over the window beside the stride files the
 /// store holds after it (`zs`), so that a stride arm's cell is read by the
-/// form that served it. The lag sweep prints one a
-/// point (`SUPDB_LAG_COUNTERS`) and the mixes one a mix
-/// (`SUPDB_MIX_COUNTERS`).
+/// form that served it, and the writer's point reads by the path that
+/// answered them, with the ones a tombstone in the live table's chain ended
+/// (`gets`). The lag sweep prints one a point (`SUPDB_LAG_COUNTERS`) and
+/// the mixes one a mix (`SUPDB_MIX_COUNTERS`).
 fn counters_line(
     tag: &str,
     arm: &str,
@@ -678,7 +679,7 @@ fn counters_line(
     let get = |c: &[(&str, f64)], n: &str| c.iter().find(|(k, _)| *k == n).map_or(0.0, |(_, v)| *v);
     let d = |n: &str| get(c1, n) - get(c0, n);
     eprintln!(
-        "{tag} {arm} {point} flt up {flt_up} main {flt_main} memfree_mb {} burst_ms {burst_ms:.1} pass_ms {pass_ms:.1} | ph take {:.2} sync {:.2} settle {:.2} snap {:.2} ahead {:.2} install {:.2} | thread {:.1}ms/{:.0}p holds {:.0}/{:.1}ms maint {:.1}ms | built up {:.0} eng {:.0} rd {:.0} cloned {:.0} | snaps {:.0} refr {:.0} stood {:.0} dropped_mb {:.0} | walks {:.0}/{:.0}/{:.0} starts {:.0}/{:.0} | pieces {:.0} unsealed {:.0} handles-scans {:.0} | z reads {:.0} dec {:.0} scans {:.0} groups {:.0} memo {:.0}/{:.0} pf {:.0} | steps settle {:.1} snap {:.1} fillwalk {:.1} fillbuild {:.1} ms fills {:.0} cuts {:.0} left {:.0} owed {:.0} | zs reads {:.0} checks {:.0} cursor {:.0} builds {:.0} files {:.0}",
+        "{tag} {arm} {point} flt up {flt_up} main {flt_main} memfree_mb {} burst_ms {burst_ms:.1} pass_ms {pass_ms:.1} | ph take {:.2} sync {:.2} settle {:.2} snap {:.2} ahead {:.2} install {:.2} | thread {:.1}ms/{:.0}p holds {:.0}/{:.1}ms maint {:.1}ms | built up {:.0} eng {:.0} rd {:.0} cloned {:.0} | snaps {:.0} refr {:.0} stood {:.0} dropped_mb {:.0} | walks {:.0}/{:.0}/{:.0} starts {:.0}/{:.0} | pieces {:.0} unsealed {:.0} handles-scans {:.0} | z reads {:.0} dec {:.0} scans {:.0} groups {:.0} memo {:.0}/{:.0} pf {:.0} | steps settle {:.1} snap {:.1} fillwalk {:.1} fillbuild {:.1} ms fills {:.0} cuts {:.0} left {:.0} owed {:.0} | zs reads {:.0} checks {:.0} cursor {:.0} builds {:.0} files {:.0} | gets lone {:.0} layers {:.0} placed {:.0} live {:.0}",
         mem_free_mb(),
         d("scan_take_us") / 1e3,
         d("scan_sync_us") / 1e3,
@@ -726,7 +727,11 @@ fn counters_line(
         d("zpage_stride_page_checks"),
         d("zpage_stride_cursor_reads"),
         d("zpage_stride_builds"),
-        get(c1, "zpage_stride_files_at_end")
+        get(c1, "zpage_stride_files_at_end"),
+        d("reads_lone"),
+        d("reads_layers"),
+        d("reads_placed"),
+        d("reads_live_ended")
     );
     // The process's memory beside the structures that count their own: the
     // resident bytes, what the allocator has handed out and what it holds
@@ -907,7 +912,7 @@ fn counters_line(
 /// a pass's window of them says other threads' unmaps and advice cost the
 /// scanning thread in interrupts, which no fault count and no CPU clock
 /// shows. Zeros where the file or a row cannot be read.
-fn irq_counts() -> [u64; 2] {
+pub fn irq_counts() -> [u64; 2] {
     let Ok(text) = std::fs::read_to_string("/proc/interrupts") else {
         return [0; 2];
     };
@@ -2126,6 +2131,15 @@ impl OnePass {
         for (t, x) in &self.scan_mixed_threaded {
             v.push((format!("scan-mixed entries_per_s_{t}t"), *x));
         }
+        // The threaded writers' mixes, named as their row's quantities are
+        // (`pass_measurements`), which a pairing left out while every row
+        // carried them.
+        for (name, t, x) in &self.mix_threaded {
+            v.push((
+                format!("threads-{name} {}", threaded_quantity("ops_per_s", *t)),
+                *x,
+            ));
+        }
         for (c, x) in &self.ycsb_ops_s {
             v.push((format!("ycsb-{c} ops_per_s"), *x));
         }
@@ -2992,6 +3006,7 @@ fn one_pass(
     let mut counting = Counting::new(plan.bound.as_ref(), dir, trace)?;
     let prime_a = prime_fresh_pool(prime_bytes_for(size, plan.bound_bytes()))?;
     engines::set_store_keys(size);
+    engines::set_store_bound(plan.bound_bytes());
     let mut e = engines::open(arm, dir, map_gb)?;
     // An engine with no ordered scan (FASTER's hash store) runs every
     // workload made of point operations and none of the scans: the scan
@@ -3307,6 +3322,7 @@ fn one_pass(
         prime_b = prime_fresh_pool(prime_bytes_for(size, plan.bound_bytes()))?;
         std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
         engines::set_store_keys(size);
+        engines::set_store_bound(plan.bound_bytes());
         let mut e = engines::open(arm, dir, map_gb)?;
         shuf_s = shuffled_load(e.as_mut(), arm, size, plan, payload, &mut counting)?;
         // What the shuffled load freed, returned before the sweep: its
@@ -3358,6 +3374,7 @@ fn one_pass(
         let _ = std::fs::remove_dir_all(dir);
         std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
         engines::set_store_keys(size);
+        engines::set_store_bound(plan.bound_bytes());
         let mut e = engines::open(arm, dir, map_gb)?;
         load(e.as_mut(), size, plan, payload, |i| i)?;
         release_freed_memory();
@@ -3695,7 +3712,11 @@ fn unrecovered(
 /// keeps a commit in the writer's buffer until a write piece is whole. So
 /// the batches a buffered arm's store does not hold are counted and
 /// recorded (`unrecovered_batches`), and its first read is recorded only
-/// where it found the key.
+/// where it found the key. An arm of the memory guarantee promised less
+/// again, nothing of a commit until a sync or a checkpoint, and is counted
+/// the same way: the held log's arm loses every batch no seal's manifest
+/// covered and no spill wrote, which is its whole shuffled load at a rung
+/// that seals nothing, and that is the quantity and no failure.
 fn recover_store(
     arm: &str,
     dir: &Path,
@@ -4974,21 +4995,40 @@ fn threaded_mix(
 /// the reads, the scans and the commits -- summed over the mix and printed
 /// as one `mixkinds` line a mix on stderr, for both arms alike, since the
 /// clock reads around every operation are a cost the rows must not carry.
-/// A mix's rate names none of its kinds; this names each.
+/// A mix's rate names none of its kinds; this names each. Beside them
+/// the machine's TLB shootdowns and function-call interrupts over the mix
+/// (`irq_counts`), which a store to a page a load mapped to the kernel's
+/// zero page costs every busy CPU, and which no time by kind shows.
 struct MixKinds {
     on: bool,
     gets: (u64, f64),
     scans: (u64, f64),
     commits: (u64, f64),
+    irq0: [u64; 2],
+    /// The engine's seals and the milliseconds its commits spent freezing
+    /// at the mix's start (`seals`, `freeze_ms`; zeros for an engine that
+    /// counts neither), so the commits' time is read beside the freezes
+    /// inside it.
+    seals0: [f64; 2],
+}
+
+/// The engine's seals and freeze milliseconds as its counters have them.
+fn seal_counts(e: &dyn Engine) -> [f64; 2] {
+    let c = e.counters();
+    let get = |k: &str| c.iter().find(|(n, _)| *n == k).map_or(0.0, |(_, v)| *v);
+    [get("seals"), get("freeze_ms")]
 }
 
 impl MixKinds {
-    fn new() -> MixKinds {
+    fn new(e: &dyn Engine) -> MixKinds {
+        let on = std::env::var_os("SUPDB_MIX_KINDS").is_some();
         MixKinds {
-            on: std::env::var_os("SUPDB_MIX_KINDS").is_some(),
+            on,
             gets: (0, 0.0),
             scans: (0, 0.0),
             commits: (0, 0.0),
+            irq0: if on { irq_counts() } else { [0; 2] },
+            seals0: if on { seal_counts(e) } else { [0.0; 2] },
         }
     }
 
@@ -5003,17 +5043,23 @@ impl MixKinds {
         }
     }
 
-    fn report(&self, arm: &str, mix: &str, size: u64, ops: u64, total: f64) {
+    fn report(&self, e: &dyn Engine, arm: &str, mix: &str, size: u64, ops: u64, total: f64) {
         if self.on {
+            let irq = irq_counts();
+            let seals = seal_counts(e);
             eprintln!(
-                "mixkinds {arm} {mix} size {size} ops {ops} gets {} {:.3} scans {} {:.3} commits {} {:.3} total {:.3}",
+                "mixkinds {arm} {mix} size {size} ops {ops} gets {} {:.3} scans {} {:.3} commits {} {:.3} total {:.3} tlb {} cal {} seals {} freeze {:.3}",
                 self.gets.0,
                 self.gets.1 * 1e3,
                 self.scans.0,
                 self.scans.1 * 1e3,
                 self.commits.0,
                 self.commits.1 * 1e3,
-                total * 1e3
+                total * 1e3,
+                irq[0] - self.irq0[0],
+                irq[1] - self.irq0[1],
+                seals[0] - self.seals0[0],
+                seals[1] - self.seals0[1]
             );
         }
     }
@@ -5157,7 +5203,7 @@ fn ycsb(
     let mut kb = [0u8; KEY_SIZE];
     let mut wbuf = Batch::with_capacity(YCSB_BATCH, payload.value_size());
     let mut wbuf_is_insert = false;
-    let mut kinds = MixKinds::new();
+    let mut kinds = MixKinds::new(&*e);
     // A key that exists: a draw at or above the committed keys is drawn
     // again, which only the scrambled family's fixed space can produce.
     let existing = |keys: &mut KeyGen, committed: u64| loop {
@@ -5213,7 +5259,7 @@ fn ycsb(
     flush_ycsb(&mut wbuf, e, wbuf_is_insert)?;
     MixKinds::add(&mut kinds.commits, t0);
     let total = t.elapsed().as_secs_f64();
-    kinds.report(arm, mix, size, ops, total);
+    kinds.report(&*e, arm, mix, size, ops, total);
     Ok(total)
 }
 
@@ -7074,6 +7120,36 @@ mod tests {
                 "a scan from {k} with {committed_then} keys committed"
             );
         }
+    }
+
+    /// A pairing reads what a row carries: every quantity a pass puts in a
+    /// row (`pass_measurements`) is in the list `ab` pairs (`OnePass::flat`)
+    /// under the row's workload and quantity, where the threaded writers'
+    /// mixes had been in every row and in no pairing.
+    #[test]
+    fn a_pairing_carries_every_quantity_a_row_carries() {
+        let _pass = TRIM.read().unwrap_or_else(|e| e.into_inner());
+        let root = std::env::temp_dir().join(format!("supdb-bench-flat-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let mut plan = Plan::new(Scale::Quick, vec![], 30_000, 4);
+        let payload = Payload::new(plan.value_size, plan.compress, 0xE1);
+        plan.passes = Passes::parse(
+            "load,read,read-threaded,scan,scan-threaded,mixes,scan-mixed,mixes-scrambled,lag,mixes-threaded",
+        )
+        .unwrap();
+        let one = one_pass("supdb", &root.join("one"), 2_000, 1, &plan, &payload, None).unwrap();
+        let flat: std::collections::BTreeSet<String> =
+            one.flat().into_iter().map(|(n, _)| n).collect();
+        let row = pass_measurements(2_000, "supdb", Guarantee::Durable, &one);
+        assert!(
+            row.iter().any(|m| m.workload.starts_with("threads-")),
+            "the pass ran the threaded writers' mixes"
+        );
+        for m in &row {
+            let name = format!("{} {}", m.workload, m.quantity);
+            assert!(flat.contains(&name), "the pairing leaves out {name}");
+        }
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     /// The second family runs in a pass after the threaded scans on the

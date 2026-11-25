@@ -315,6 +315,45 @@ banked on its controls -- floors and comparators in band -- so the next
 window carries the new definition; the engine's part of the step was
 read by alternating two binaries in one sitting, never from the row.
 
+**The harness's copy carried a vector's bookkeeping, and one arm's did
+not.** `consume` copied each value into a thread-local `Vec` behind a
+`RefCell`: a borrow flag set and cleared, the vector's length and
+capacity checked, and a call into libc's copy with a run-time length, on
+every value of every arm that lends one. FASTER's arm, whose read copies
+the value out itself, copies a constant hundred bytes into a fixed array
+and paid none of it. Counted by callgrind over the clean point reads of
+`examples/point_ops.rs` (`valgrind --tool=callgrind --collect-atstart=no
+--toggle-collect='point_ops::phase_reads_clean'
+target/release/examples/point_ops ARM 100000 1 zipf 1`, at `d4aabaf` and
+at the commit of this entry), the bookkeeping was 42 instructions of
+`supdb-ingest`'s 539 a read and 38 of `lmdb-nosync`'s 1,895, beside
+FASTER's 415: a thirteenth of supdb's read, and a third of what
+separated it from FASTER's, in a cell read as the engine's. The copy goes
+into a fixed thread-local array now, at a constant size where the value is
+the suite's (`run::VALUE_SIZE`) and at its own length otherwise, the
+vector kept for a value longer than the array. RocksDB's count is no
+measure of it: between the two binaries its read moved by ninety
+instructions the other way in its memtable's own search, so the step is
+read there in the harness's symbols, libc's copy gone at 55 a read and 14
+in its place. Two readings on the way were short of it. A scratch
+version built to check an estimate off the listing counted 25, with every
+length's path inline, where the one that landed, the other lengths behind
+a call, counts 42. And reading the value where it lies, a fold of its
+words with no copy at all, counted 32 *more* than the vector's copy at a
+run-time length, a loop a word at a time against libc's vector moves; in
+FASTER's arm, over a buffer of a constant hundred bytes, the same fold
+counted 13. Every arm's read and scan
+series step with it, comparators included, by a few percent of a point
+read, and the first row after it banks on its controls as a definition
+step. The entry on allocation above says an overhead every arm pays is
+invisible in every ratio. It is not quite: an equal cost is a larger share
+of the faster arm's cell, so it draws every ratio toward one, and an arm
+that does not pay it is flattered by the whole of it. The rule: what the harness adds to an operation is counted
+in instructions beside the operation, per arm, and held to the arm that
+pays least; and a test holds the copy to having been made
+(`a_consumed_value_is_copied_into_the_threads_buffer`), since a `consume`
+that copied nothing would post a rate like any other.
+
 **A host that moved on an axis no floor read.** A quick row read the
 buffered arm's load at three hundred thousand keys at 0.41x of LMDB,
 five slow reps of five, where the two rows before read 1.1-1.2x and
@@ -805,6 +844,40 @@ arm is `Guarantee::Memory` now, alone there, and the check is as it was.
 Its cells beside the buffered group's are a reader's comparison, made
 with the difference said, never the suite's.
 
+**A difference excused by arm is not an axis dropped.** The engine's arm
+of FASTER's guarantee (`supdb-held`, the log held in the process) differs
+from `faster` on the two axes that first fix skipped: it scans in order
+and reopens a store. A row with both was refused where it starts, as it
+should have been, so the pair was read by pairings alone and no row
+held the engine beside FASTER under one promise. The check takes a list
+now of the differences it lets stand (`engines::ALLOWED_GAPS`): an arm,
+and the axes that arm has no setting for, excused only where that arm is
+the one without the feature. What separates it from the fix above is what
+the next mistake looks like under each. An axis skipped says nothing of
+who may differ on it, so the next arm to differ there passes unseen, in
+any group; an entry names one arm, so a second arm without a scan is
+refused beside `supdb-held` until somebody writes it down and says why no
+setting equalizes it. Three things came with the list. An entry is for
+what an arm cannot have, never for a setting nobody matched: durability,
+checksums and reading one's own writes are on no entry, and a comparator
+that can turn one off turns it off. With a difference excused for one
+arm, matching is no longer transitive -- two arms may each match `faster`
+and not each other -- so the check asks every pair of a group where it
+had asked neighbours. And no real arm makes the check's red inputs, the
+roster being green by construction, so the excusing is a function of two
+names and two feature sets that the test hands hand-built ones: the
+excused pair either way round, the same gap on an arm the list does not
+name, the listed arm with the feature its neighbour lacks, each other
+axis, and the group of three. What the excused arm lacks the other runs
+alone: `supdb-held` has the scans, E and the recoveries in the row with
+nothing beside them and no figure, the group's figures being the cells
+both have, and what a killed process cost it there is a quantity
+(`unrecovered_batches`, its whole shuffled load where nothing sealed),
+where for a durable arm it is a failure. The roster's own test of legend
+names is what said the figures had to know the arm at all
+(`every_roster_arm_has_a_legend_name`): the filtered run of the new tests
+was green with it red.
+
 **A cell an arm cannot have is no sample, not a NaN one.** A phase a
 pass leaves out leaves a NaN where its rate would be, which was every
 phase `bench ab --passes` left out and nothing in a row, since a row was
@@ -817,6 +890,33 @@ that place drops a NaN now, so an arm that cannot run a workload and a row
 of some passes (`bench run --passes`) both write rows the gate and the
 figures read. The check that found it was the quick group, the only one
 that reads a row it has just written.
+
+**An arm sized for the roster it was written in, run in another.** The
+bounded roster had no FASTER, and nothing said why: its arm sized FASTER's
+index and in-memory log for the store alone, a log of at least 1 GiB, so
+no bound the bounded rows use could hold it. FASTER allocates both at open,
+reads its log's files with `O_DIRECT` and reads nothing of the group it
+runs in, so the pass tells it the bound beside the key count
+(`engines::set_store_bound`) and it divides the bound
+(`engines::faster_sizes`). The first division left an eighth of the bound
+for the process and was killed seven seconds into the load at ten million
+keys under 1 GiB; the process's mappings mid-load, read beside FASTER's
+source, named the 64 MiB page of overflow buckets the index allocates and
+zeroes at open, which the division had not counted, and the probe's whole
+process held 140-170 MiB beyond the index and the log
+(`POINT_OPS_BOUND=1073741824 point_ops faster 10000000 1`). With the page
+counted and a quarter left, its passes peaked at 876-877 MiB of 1,024
+(`memory.max_usage_in_bytes` of each pass's group, read from outside the
+run). The engine's arm beside it came with the same assumption the other
+way: `supdb-held` is the buffered arm under FASTER's promise, the buffered
+arm leaves partitioning a flush to the background, and no bounded row had
+run that shape -- beside `supdb` it read the lag sweep's scans three to six
+times slower, and the bound killed it at the full rewrite in one run of
+two. The bounded roster has `supdb-heldpart`, `supdb` under the held log.
+The rule: an arm moved into a roster is run there before it is believed to
+fit, its memory is sized from what the process measures to hold and never
+from a share chosen beforehand, and the engine's arm of a guarantee is the
+shape the roster it sits in runs everywhere else.
 
 **A comparator's own benchmark can be the broken one.** FASTER's C++
 benchmark at the pinned commit tests `result == Status::Ok` after an

@@ -561,7 +561,21 @@ count of pages a load first-touches is the engine's lever
 (`docs/engine.md`, the pages a load touches). Count the pages per key
 before the instructions per key: the writer's two key copies cost 64
 bytes a key of fresh memory and a few nanoseconds of CPU, and the pages
-were the loss. And a derivation moved to the finish is one pass -- the
+were the loss. It came again on the update beside FASTER's: a fifth of
+its instructions taken out moved its time by a twentieth, and the
+samples of the phase split by the kernel's fault path and the rest said
+why before anything else was built -- half of the update was faults,
+0.09 a write, where FASTER takes none (`docs/engine.md`, updates beside
+FASTER's). The faults were the held log's own buffer marching through
+fresh pages, which the rule that compacts it had left to do so for a
+whole run, so the count of what a structure first-touches is read for
+the structures built this session too, not only for the old ones. And a
+callgrind file counts calls made while collection was off: a toggled
+phase showed half again the calls of the phase's updates, and FASTER's
+upsert a hundred and twenty-five thousand for a phase of seventeen, the
+load and the phase after among them; a phase's figure a call is its
+collected instructions over the phase's own operations, never over the
+calls the file lists. And a derivation moved to the finish is one pass -- the
 first version of the derived close read the entries five times and the
 keys three, and gave back at the drain what it had saved at the commits.
 
@@ -582,6 +596,24 @@ no other cell can have moved, two sittings of the phase column are the
 verdict and the rate is noted as unresolved -- the record path
 (`Options::direct_put_one`) took the commits a tenth lower in both
 sittings while the rate read 1.12x and then 0.98x.
+
+A fresh page first touched by a load costs a second fault and a flush
+when the store comes. The load maps the kernel's shared zero page
+read-only, and the store after it replaces that mapping by copy on write,
+which flushes the TLB on every CPU a thread of the process is busy on: an
+IPI to each through the hypervisor. A hash table probes its slot before it
+writes it, so every page of a memtable's index, mapped zeroed at each
+doubling, took that shape, and the writer paid nothing visible until the
+upkeep thread was kept alert beside it after the scans: the updates of the
+point probe then took 157-165 shootdowns a run, a third of an update's
+samples in the flush's wait, where an index populated for writing as it is
+mapped takes 0-4 (`Options::index_populated`; the probe's
+`POINT_OPS_FAULTS=1` prints the shootdowns from `/proc/interrupts`). A
+fault count does not show it -- the extra faults were a twentieth -- and
+the price of each is set by what the other cores are doing, so a buffer
+that is read before it is written is mapped for writing first, and a write
+that slows when another thread wakes is read beside the machine's
+shootdowns.
 
 An instrument in the measured path is priced by taking it away in the
 suite, and the pairing that prices it has to differ in the instrument.
@@ -654,6 +686,90 @@ suite's own arms answer most of these questions without a probe at all,
 and `bench ab` prices two of them in one process; reach for a probe only
 when no pair of arms isolates what you are asking.
 
+An operation that trails a comparator by a constant factor at every
+rung is counted against the comparator's own instructions before any
+hypothesis about its misses. The point get and the put trailed FASTER by
+a quarter to four fifths in every cell of the first row that carried it,
+and the first three readings were of memory: the fence in the pin, the
+hash's serial multiplies, the record a line apart from its slot. FASTER's
+hash is the same serial chain, its get takes the same two dependent
+misses, and the arm without the fence read level twice. Callgrind toggled
+on one phase of `bench/examples/point_ops.rs`, the same keys through both
+arms, read 959 instructions a get against 415 and 1,213 a put against
+555, and the listing by executed instruction (`--dump-instr=yes`, joined
+to `objdump -d -l` by address) read as layers each setting up for a case
+the store was not in: no line over three percent, and two fifths of the
+whole gone once the common store had a read of its own (`docs/engine.md`,
+point gets and puts beside FASTER). Three things about the instrument
+cost an hour each. The linker folds identical functions, so three phase
+functions with one body were one symbol and one toggle; each holds a
+constant of its own now. Valgrind runs one thread at a time and its
+clock fifty times slow, so the store a phase meets under it is not the
+native one: the count of the gets after the updates moved by a fifth
+between builds, which read as the build's. And a phase of a sixth of a
+small store's keys is two milliseconds, where this host's two speeds are a
+quarter apart: the read phases go over their keys several times, and a
+rate is the median of alternated runs of two binaries, never one run of
+each.
+
+That moving count was then explained without a count, and the
+explanation stood in two files: an idle seal firing under
+the slowed clock, a piece under gets that natively have none, so the
+phase was set aside as valgrind's and its gets were not looked at. The
+probe's shape line of the time printed the pieces standing, and read
+none natively. It printed no frozen table, and a seal in flight is one.
+Given a count of the reads by the read that answered them
+(`POINT_OPS_SHAPE=1`, `Reader::point_lean_reads`,
+`point_placed_reads`), one native run said every get of that phase is
+the layered read's and no idle seal fires in either run: the updates
+cross the seal cap, a tenth of the store, natively too; the seal lands
+a few milliseconds into the phase, and under valgrind never inside it.
+So the phase the notes had excused was the store every scrambled mix
+and every F reads, and its get was 1,052 instructions to FASTER's 417
+(`docs/engine.md`, gets over a written store). The rules: a difference
+between the native store and valgrind's is established by counting both,
+never by reasoning from the clock; a shape line prints every source a
+read may consult, the ones in flight too, or it reads "none" off the one
+it leaves out; and a count is taken of the store the native run has
+(`POINT_OPS_LAND=1` joins the seal first), with the native share of each
+path read beside it. The same counter refuted the first fix in one run:
+the lean read left a store with a frozen table to the old one, as a
+state that lasts milliseconds, and two fifths of a short phase's gets
+went there, a seal's milliseconds being most of the time between two
+seals at that size.
+
+And an instruction count is half of a get's price where the keys are
+cold. Read class by class over a few thousand keys, every line cached
+and every branch learned, the layered get was within a third of
+FASTER's; in the phase, over a sixth of the store in no order, it was
+two thirds behind where the clean get is level. No count shows that and
+no single timing resolves it here, the same binary reading 128 to 250 ns
+between runs. What showed it was the samples of one run laid to the
+phase they fell in (`perf record --call-graph dwarf`, the phase's
+function on each stack): the load of a partition's slot took three
+times the samples a read in the layered phase that it takes in the
+clean one, and the record's half again. A get waits on those two lines
+and a loop of gets overlaps one get's waits with the next one's as far
+as the core's window reaches, so a longer path with an unpredictable
+branch ahead of the partition's lookup costs its instructions and then
+the overlap. The slot asked for at the top of the read took its wait
+back to the clean read's, 11% of the phase, measured by a scratch
+toggle alternated eighteen times a side with the phases it cannot reach
+level. By their times over their counts, three programs ran within a
+sixth of one rate of instructions a cycle there, over 417, 497 and 838
+instructions, so past the first prefetch the lever on a cold get is its
+length. Price a read path warm
+by class and cold in the mix, both, before its count is read as its
+cost.
+It came again as an order: a read that asked the live table before
+finding the partition saved 78 instructions on every read the table
+ends and cost the rest 11, and the gets timed apart from the commits read
+the scrambled mixes 4-16% slower with it in both sittings -- for a read
+the table does not end, the live probe had been the lead of the asks
+behind it. An ask's lead is part of a read's price, so a reordering is
+timed by kind on the mixes whose reads go past the step it moves, never
+judged by its count.
+
 A decoder timed on one input is timed on an input it has learned. The
 form's LZ4 decode read 1.1 µs a page decoding one page over and over
 and 3.4 cycling the file's pages, and the cache level was not it:
@@ -708,6 +824,21 @@ divided by the loads had said before anything was built. Price a load by
 the latency the profile's self time over the loads implies, against a
 miss's, before building a lever on the miss.
 
+A load whose address is the arithmetic of another load's contents waits
+for that one, and a structure that keeps a length in its header pays a
+miss after the header's for every field the length places. The segment
+read of the mixes FASTER won was the slot, the record's header and then
+the value: laid on the read's instructions, 34 samples of 225 on the
+slot's load, 107 on the header's and 61 on the value's first load, two
+lines on, and five at most anywhere else. FASTER's record has its value
+at a fixed offset, so the core issues both its lines at once. The value's
+lines asked for as soon as the slot names the record -- the section's
+mean record length is the guess, and a wrong guess asks for a line too
+many or too few -- read the clean read pass a fifth to a third faster
+(`Options::point_record_ahead`, `docs/engine.md`, a record asked for at
+its slot). Before a lever on a read's misses, lay its samples on its
+loads and ask of each which earlier load its address waited for.
+
 A pass that reads bimodal across rounds is two shapes, not noise. The
 run keeper's lag pass at ten thousand keys read 2 µs a scan in four
 rounds and 15-36 in three, and the rounds split on the probe's own
@@ -740,7 +871,8 @@ entries the writer is rewriting are the cost, each an ownership the
 next update pays for, and three cache-line separations guessed at
 before the bisect moved nothing and were taken out. The mixes have a
 timer by kind (`SUPDB_MIX_KINDS=1`, a `mixkinds` line per mix on
-stderr for every arm, its reads, scans and commits apart), which read
+stderr for every arm, its reads, scans and commits apart, and the seals
+and the freezes' time inside the commits), which read
 the E gap as the scans' alone and the tax as the commits' and the
 gets'; `SUPDB_MIX_EVENTS=1` prints each mix's form events, upkeep
 passes and snapshot builds beside its counters; `SUPDB_MIX_CENSUS=1`
@@ -1349,6 +1481,35 @@ the entries' range (`Options::direct_log_range`; `supdb-ordlog` and
 write and a fresh page a thousand that said nothing the entry count
 did not, and whose tail the truncation of an uncommitted run never
 trimmed. A run that kept no table at all is the shape left to price.
+
+A third policy holds the log in the process (`SyncPolicy::Explicit`): a
+commit's frames stay in the buffer they were built in, the committed
+batches behind the one being staged, and reach the log's file at a `sync`,
+which syncs them, and unsynced at a rotation, at a cap
+(`Options::wal_hold_bytes`) and where the store is dropped. Nothing is
+promised of a commit until a `sync`, a `flush` or the close, which is what
+FASTER promises between two checkpoints, and the suite's arm of it sits in
+FASTER's row (`supdb-held`). Three rules hold it to the order above. A held
+batch is a frame of the live file that no sync has covered and that
+nothing has written either: `frames_unsynced` and `holds_no_frame` count
+it, so a run that begins over it does not say everything before it was
+synced, a rotation behind it leaves a loose header, and a drain that
+covers it waits for its slot's fdatasync. A held batch goes to the file it
+committed under, ahead of the rotation: its CRC carries that file's seed,
+and the next file's would refuse it. And a held batch is dropped unwritten
+only below a sequence a manifest *on the device* covers
+(`Shared::log_covered`, stored by a publish after its synced write, with
+the sequence that manifest carries): `Maint::covered_seq` rises at a seal's
+readable landing, ahead of its fsyncs and its manifest, and frames dropped
+behind that are a gap above where the open after a crash replays from,
+which it reads as a record lost and refuses. Under the pending slot the
+sequence told is the one that stood before the landing, since that slot
+covers its seal only where the segments read back whole. Dropped so, the
+frames leave a gap in the file below every later open's start, where a
+replay checks nothing, which is how a store that seals as it goes and is
+flushed at its end writes its log to no file at all. `Db::crash` forgets
+the store without dropping it, so a test's crash takes what the log held,
+and a store dropped without its close writes it.
 
 **A file a store names never changes.** A segment, its ordered index
 and its form file are each written under a temp name and renamed or
@@ -2219,7 +2380,20 @@ pinned beside the rounds, its thread off its core on a loaded runner
 for as long as the reads -- the last round's forms waiting for that pin,
 rightly, once on a hosted macOS runner and one run in a hundred beside
 five others; the pins in the table at the failure named the slot, and
-the test's segment work runs inside the writer's operations now. The
+the test's segment work runs inside the writer's operations now. And as a sum over two stores: the bounds
+walk test (`a_bounds_walk_places_a_boundary_by_its_head_and_reads_its_record_only_on_a_tie`)
+holds one store's boundaries placed by head plus records read to the
+other store's records, from counters every walk of a store adds to, and
+near reads two walks of the same boundaries race inside the seal: the
+landing's of the piece, and the upkeep thread's of the unsealed keys,
+which are the piece's keys. Where the landing published first the pass
+found nothing unsealed and walked nothing, so a store counted one walk
+or two by the thread's turn: eight runs of 240 beside eight busy loops,
+either store, against none of 240 with the fix under the same load. A scratch line at each of the three
+walks' call sites named the two, and holding the upkeep's pass across
+the landing (`hold_upkeep_pass`) gave the gate's exact numbers every
+run. The test settles the store before the seal now, so the pass is done
+in both stores before anything races it. The
 rule: a test that
 needs a state holds it, and a bet on timing loses the first time the
 thing it bets against gets faster; a state the test needs only to have
@@ -4771,7 +4945,17 @@ the seam's cost where one is set, publishes the price it carried
 the price to the seam's. The rule is the one the decode's seam was written
 for, read across the path: every measured cost a test's premise depends
 on goes through the seam, and a path that takes two costs from one timing
-takes both from it.
+takes both from it. It came again as a sample: the census's busy wall
+stamps one operation in sixteen and scales the stamps to the window
+(`Options::zpages_census_sample`), and the test that holds the scaling to
+the wall every stamp gives read the sampled arm at thirty times the other
+once in a gate run, a single stamped read stalled a few milliseconds among
+two hundred and multiplied by sixteen; it passed alone, in the whole binary
+and beside eight busy loops. The stamp's wall comes through the seam now
+(`ZInject::op_wall_ns`), and the test holds the ratio to a tenth of one,
+where a wall left unscaled reads a sixteenth. An estimate that multiplies
+a sample is an outlier's amplifier, so a test of the estimate prices the
+sample.
 
 **A regime read off a state the regulated work can enter.** The pace that
 holds a syncing commit behind the upkeep thread is for a store in core, and

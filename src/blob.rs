@@ -1664,12 +1664,74 @@ impl<B: Bytes> Blob<B> {
             .unwrap_or(Ok(0))
     }
 
+    /// `read_all_hashed` with the common record read where it lies
+    /// (`FlatIndex::read_fixed_hashed`, `Options::point_fixed`), and every
+    /// other record as `read_all_hashed` reads it, out of line: with the
+    /// general read's frame beside it, the common read saved and restored
+    /// six registers it never used.
+    #[inline]
+    pub fn read_all_fixed_hashed<F: FnMut(&[u8])>(
+        &self,
+        key: &[u8],
+        h: u64,
+        ahead: bool,
+        f: &mut F,
+    ) -> Result<u64> {
+        if let Some((sec, idx)) = self.flat() {
+            if let Some(n) = idx.read_fixed_hashed(sec, key, h, ahead, f) {
+                return Ok(n);
+            }
+        }
+        self.read_all_hashed_apart(key, h, f)
+    }
+
+    /// A key's record where it is the common one
+    /// (`FlatIndex::find_fixed_hashed`): `Some(None)` for a key this
+    /// segment does not hold, `None` for a record of another shape and
+    /// for a reader with no whole index. The engine's layered read is its
+    /// caller, which the wasm reader does not carry.
+    #[cfg(not(target_family = "wasm"))]
+    #[inline]
+    pub(crate) fn find_fixed_hashed(
+        &self,
+        key: &[u8],
+        h: u64,
+        ahead: bool,
+    ) -> Option<Option<crate::flatindex::CompactFixed<'_>>> {
+        let (sec, idx) = self.flat()?;
+        idx.find_fixed_hashed(sec, key, h, ahead)
+    }
+
+    /// `read_all_hashed`, never inlined (`read_all_fixed_hashed`).
+    #[cold]
+    #[inline(never)]
+    fn read_all_hashed_apart<F: FnMut(&[u8])>(&self, key: &[u8], h: u64, f: &mut F) -> Result<u64> {
+        self.read_all_hashed(key, h, f)
+    }
+
     /// `lookup` for a key whose index hash the caller has taken.
     pub fn lookup_hashed(&self, key: &[u8], h: u64) -> Option<Exts<'_>> {
         let Some((sec, idx)) = self.flat() else {
             return self.lookup(key);
         };
         idx.lookup_full_hashed(sec, key, h).map(|(e, _)| e)
+    }
+
+    /// The key index's slot table as an address and a mask
+    /// (`FlatIndex::slot_table`), for a reader that asks for slots' lines
+    /// at every read and would otherwise find the section each time.
+    #[cfg(not(target_family = "wasm"))]
+    pub fn slot_table(&self) -> Option<(usize, usize)> {
+        let (sec, idx) = self.flat()?;
+        idx.slot_table(sec)
+    }
+
+    /// The address of the first hash slot a lookup of index hash `h`
+    /// reads, as `prefetch_slot` finds it, for a test of a cached one.
+    #[cfg(all(test, not(target_family = "wasm")))]
+    pub(crate) fn slot_addr(&self, h: u64) -> Option<usize> {
+        let (sec, idx) = self.flat()?;
+        Some(sec.as_ptr() as usize + idx.slot_pos(sec.len(), h)?)
     }
 
     /// A hint to fetch the line of the first hash slot a lookup of index

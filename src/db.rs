@@ -197,10 +197,11 @@ fn get_uvarint(buf: &[u8], p: &mut usize) -> Option<u64> {
     }
 }
 
-/// When a commit reaches the device. A commit is WRITTEN on every commit
-/// under every policy, to the WAL or, for a run of ordered ingest, to the
-/// run's own file, so a process's death takes nothing a commit returned
-/// for; this decides only the barrier. `EveryN(n)` bounds loss at n
+/// When a commit reaches the device. Under `Always` and `EveryN` a commit
+/// is WRITTEN at the commit, to the WAL or, for a run of ordered ingest, to
+/// the run's own file, so a process's death takes nothing a commit
+/// returned for, and the policy decides only the barrier; `Explicit` is the
+/// one policy that writes nothing at a commit. `EveryN(n)` bounds loss at n
 /// batches: on a crash, replay stops at the first frame that is torn or
 /// missing and the sequence-gap check refuses anything past a hole, so an
 /// unsynced tail is lost whole and never served in part. A run's records
@@ -219,6 +220,37 @@ pub enum SyncPolicy {
     /// One sync per `n` commits, of everything committed so far, and
     /// always at `sync`, flush and close.
     EveryN(u32),
+    /// Nothing at a commit: the commit's frames stay in the process, and
+    /// nothing is promised of it until a `sync`, a `flush` or the close,
+    /// each of which promises everything committed before it as it does
+    /// under the other policies. A process's death, like a machine's,
+    /// takes the commits since the last of those, whole and never in
+    /// part, which is what FASTER promises between two checkpoints, for
+    /// the caller who would otherwise pick it.
+    ///
+    /// The frames the log holds (`Options::wal_hold_bytes` of them at
+    /// most) are written to its file by a `sync`, which syncs them, and
+    /// unsynced at a rotation, at the cap and where the store is dropped;
+    /// and the frames whose records a seal has made durable meanwhile, in
+    /// a segment a manifest on the device names, are dropped and never
+    /// written, so a store that seals as it goes and is flushed at its
+    /// end writes its log to no file at all. A run of ordered ingest
+    /// writes each commit to its own file as it does under `EveryN`,
+    /// unsynced, and stands or falls with the frames before it.
+    Explicit,
+}
+
+/// What a log that holds its commits in the process is holding, and what
+/// its holding has come to (`Db::wal_held`, `SyncPolicy::Explicit`).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct WalHeld {
+    /// Bytes of committed batches in the process now, in no file.
+    pub held: u64,
+    /// Bytes dropped unwritten, their records durable in a segment.
+    pub dropped: u64,
+    /// Bytes written to the log's file by a spill, and the spills.
+    pub spilled: u64,
+    pub spills: u64,
 }
 
 /// The window the merge asks ahead of its second pass where
@@ -1513,6 +1545,24 @@ pub struct Options {
     /// `read_hash_once`, whose word names the lines. `supdb-readnoahead`
     /// and `supdb-ingestreadnoahead` ask for the memtable's slot alone.
     pub read_lines_ahead: bool,
+    /// The read that places its sources (`Reader::read_placed`) asks the
+    /// live table before it finds the key's partition and asks for its
+    /// lines (`read_lines_ahead`), and finds them only where the live
+    /// table's chain did not end the read: a put leaves a tombstone under
+    /// its value, so a read of a key the table has written since its last
+    /// seal ends there, three in five of the mixes A and F at three
+    /// hundred thousand keys under the held log and a fifth to a third of
+    /// the scrambled A, B and F (`SUPDB_MIX_COUNTERS`, `gets ... live`).
+    /// It saves 78 instructions of a read the live table ends and costs
+    /// the others their asks' lead, the live probe: timed by kind in two
+    /// sittings of twelve pairs (`pair.sh SUPDB_MIX_KINDS=1
+    /// supdb-heldnoframes supdb-heldlivelast 300000 --reps 12`, at
+    /// `636f613`, where the order before was the arm), F's gets read 0.99x and 0.95x of the order before and
+    /// the scrambled mixes' 1.04-1.16x slower in both, where a third of
+    /// their gets or fewer end in the live table. Off: the partition and
+    /// its asks first, as before. On: `supdb-livefirst`, and
+    /// `supdb-heldlivefirst` under the held log with no frames.
+    pub point_live_first: bool,
     /// A point read or a count over a store with tombstones reads each
     /// source once: the pass that finds the newest tombstone, newest source
     /// first, keeps what it found of each source it probed -- the live
@@ -1528,6 +1578,129 @@ pub struct Options {
     /// Off, the value pass probes every source again, the shape before:
     /// `supdb-probestwice`, and `supdb-ingestprobestwice` buffered.
     pub read_probes_once: bool,
+    /// A point read takes a key's values from its record where it lies,
+    /// where the record is the common one -- the compact record with a
+    /// fixed run, the shipped writer's for values of one width
+    /// (`FlatIndex::read_fixed_hashed`) -- and reads every other record
+    /// through its extents as before. The general read rebuilds the
+    /// record's extent from its header, hands it up and walks the run by
+    /// it (`with_lookup_hashed`, `Blob::read_exts`), layers a scan's walk
+    /// had been spared since `compact_fixed_at` and the point read had
+    /// not: 354 instructions of a get's 959 over a store just loaded,
+    /// against FASTER's 415 for the whole get, by callgrind at a hundred
+    /// thousand keys (`bench/examples/point_ops.rs`). The values are the
+    /// same bytes in the same order. Needs `read_hash_once`. Off, every
+    /// record is read through its extents: `supdb-pointexts`, and
+    /// `supdb-ingestpointexts` buffered.
+    pub point_fixed: bool,
+    /// A point read of a segment asks for the lines of the key's record
+    /// past its first as soon as the slot names the record, out to the
+    /// section's mean record length (`FlatIndex::ask_record`), and reads
+    /// the header beside them. The value's place is the header's
+    /// arithmetic, so a read without the ask waits on the slot, then on
+    /// the header's line, then on the value's lines: by the samples of
+    /// the scrambled D and F mixes at three hundred thousand keys, the
+    /// slot's load took 34 of the segment read's 225, the header's 107
+    /// and the value's last line 61, and almost none of the rest were
+    /// instructions. Off, the record is read as it is reached:
+    /// `supdb-norecordahead`, and `supdb-heldnorecordahead` under the
+    /// held log.
+    pub point_record_ahead: bool,
+    /// A point read of a store whose sources hold the key in their common
+    /// shape reads them in one pass, newest first, on its own frame. Two
+    /// reads stand in for the general one. A store with no frozen table
+    /// and no level-0 piece, which is every store between a drain and the
+    /// next seal, is read as its partition and the live table alone
+    /// (`Reader::read_lone`): the key hashed once, the live table's chain
+    /// for it read once to its newest tombstone, the partition found by
+    /// its fence and the record read where no tombstone masks it. A store
+    /// with pieces or frozen tables is read the same way over each of them
+    /// (`Reader::read_layers`), a piece asked once for its record, which
+    /// is kept. The general read is written for a key in any number of
+    /// sources in any record shape: the newest tombstone found by a pass
+    /// of its own, what it probed carried in a structure, the pieces over
+    /// the range found by two searches, the frozen tables and the live one
+    /// each asked in turn, a chain's offsets in a vector; with one source
+    /// it still set each of those up, about three hundred instructions of
+    /// a get's 747 over a store just loaded once the record was read in
+    /// place (`point_fixed`), by callgrind at a hundred thousand keys
+    /// (`bench/examples/point_ops.rs`). The same values in the same order:
+    /// the newest tombstone the pass finds is the newest of the read's
+    /// sources, and with none the partition's values come first. A
+    /// partition a form file may serve, a run of ordered ingest in
+    /// progress, a store with no partition yet, a chain of more live
+    /// values than the read's frame holds, a range under more pieces than
+    /// it holds, a record of another shape in a piece and a store under
+    /// any option that reads a partition another way (`point_via_ord`,
+    /// `exts_by_value`) take the general read; `Reader::point_lean_reads`
+    /// counts the reads that did not. Needs `read_hash_once` and
+    /// `point_fixed`. Off: `supdb-pointsources`, and
+    /// `supdb-ingestpointsources` buffered.
+    pub point_lone: bool,
+    /// The layered read asks its sources in the order of what each costs,
+    /// sets up for none it does not reach, and asks for the partition's
+    /// first line before it reads anything (`Reader::read_placed`). A
+    /// store a write mix has sealed once is a partition, a piece and a
+    /// live table for as long as the piece waits for its merge, with a
+    /// frozen table beside them for the milliseconds of each seal, and
+    /// `read_layers` over it executes 1,052 instructions a get where the
+    /// read of a store just loaded executes 497 and FASTER's whole get
+    /// 417, by callgrind at a hundred thousand keys with the seal landed
+    /// (`bench/examples/point_ops.rs` under `POINT_OPS_LAND=1`, the
+    /// `reads_dirty` phase, `supdb-ingestlayersasone`; this read 838),
+    /// and no line of it over three in a hundred:
+    /// the partitions counted and the key's found by two searches of the
+    /// segments, the pieces over it by two more, a frame of eight hundred
+    /// bytes cleared for three frozen tables and eight pieces where one
+    /// piece stood, each chunk of a table's chain reached by three
+    /// lookups of its block, and all of it ahead of the one probe that
+    /// answers three reads in ten, the live table's, whose tombstone
+    /// masks everything older.
+    ///
+    /// Here the partitions' count and each one's run of pieces are the
+    /// state's, taken at its publish (`State::placing`), and a store of
+    /// one partition is not searched; the live table is asked first, and
+    /// a tombstone there ends the read with the table's own values; the
+    /// frozen tables are asked after it, newest first, the same way; a
+    /// chunk's header is one lookup and its value another
+    /// (`MemTable::live_small_hashed`); and the pieces' records and the
+    /// tables' values are kept in the order found, on a frame nothing
+    /// clears. The same values in the same order as `read_layers` hands
+    /// over, from the same sources.
+    ///
+    /// And the partition's first hash slot is asked for as soon as the
+    /// key is hashed, ahead of the tables' probes and the pieces' filters
+    /// (under `read_lines_ahead`). A get over keys the cache does not
+    /// hold waits on two lines of the partition, the slot and then the
+    /// record, and what a loop of gets costs is how far those waits
+    /// overlap from one get to the next: sampled by phase
+    /// (`perf record --call-graph dwarf` over the same probe), the load
+    /// of a partition's record took half again the samples a read in the
+    /// layered read that it takes in the read of a store just loaded,
+    /// behind a longer path and the live table's probe, whose branch no
+    /// predictor learns. The ask starts the first wait before either.
+    ///
+    /// A store whose merges follow its reads (`adaptive_cap`,
+    /// `adaptive_trigger`), which counts a read a piece consulted, and a
+    /// frozen table that was a run of ordered ingest are `read_layers`'
+    /// still, with everything it leaves to the general read.
+    /// `Reader::point_placed_reads` counts the reads this one answered.
+    /// Needs `point_lone`. Off: `supdb-layersasone`, and
+    /// `supdb-ingestlayersasone` buffered.
+    pub point_layers_lean: bool,
+    /// The placed read (`point_layers_lean`) takes a range under any
+    /// number of pieces, and leaves to the general read only a key with
+    /// more records than its frame keeps (`LAYERS_PIECES`) above the newest
+    /// tombstone, where it had left every range under more than that many
+    /// pieces. A put's tombstone ends the walk at the newest piece that
+    /// holds the key, so under puts a read keeps one or two. It asks for
+    /// the newest pieces' filters, at most `PLACED_ASKS` of them, as it did
+    /// for all of them. Beside a writer that appends faster than its merges
+    /// fold -- a live handle beside the overwriting arm's writer, the
+    /// threaded writers' mixes -- ten to thirty pieces stood over a
+    /// partition and every read took the general path. Off: the bound by
+    /// the pieces, `supdb-heldinplacepieces`.
+    pub point_placed_runs: bool,
     /// EXPERIMENT: a point read of a partition whose ordered index holds
     /// whole keys (`OrdIndex::uniform`: every key one length, no longer
     /// than the common prefix and eight bytes) finds its rank through the
@@ -4709,6 +4882,75 @@ pub struct Options {
     /// were touched before. `supdb-heapblocks` is the arm that keeps the
     /// heap shape.
     pub blocks_mapped: bool,
+    /// The most bytes of a store's mapped blocks its tables gave back that
+    /// it keeps for its next tables instead of unmapping (`blocks::BlockPool`);
+    /// none keeps none. A table's blocks are mapped fresh and every page
+    /// of them faults at its first touch, about a microsecond and a half
+    /// on this guest, so the next table after a seal faulted once every
+    /// twenty updates or so of a write mix and the update paid it: by
+    /// samples of the update phase, half of an update's time was the
+    /// kernel's fault path where FASTER's takes none. The table after a
+    /// seal asks for the lengths the one before gave back, so a pool of
+    /// two tables' blocks gives it pages already touched. The pool keeps
+    /// nothing while the store is out of core -- the controller's gate
+    /// away from the raw form, or the form forced -- and gives back what
+    /// it holds as the gate leaves the raw form: its pages are resident
+    /// memory the page cache's tenants cannot have, which is why
+    /// `blocks_mapped` exists. Under `blocks_mapped` alone; zero:
+    /// `supdb-nopool`, and `supdb-ingestnopool` buffered.
+    pub blocks_pool_bytes: usize,
+    /// A memtable's hash index, a zeroed block mapped fresh at every
+    /// doubling, is populated for writing as it is mapped
+    /// (`blocks::Source::alloc`, `MADV_POPULATE_WRITE`), so that the
+    /// first touch of each of its pages is a write. An insert probes its
+    /// slot with a load before its store, and a load is a fresh page's
+    /// first touch: it maps the kernel's shared zero page, read-only, and
+    /// the store after it is a copy-on-write fault that replaces a PTE
+    /// already present, which flushes the TLB of every CPU the process
+    /// runs on. With the upkeep thread alert on another core that flush is
+    /// an IPI and its answer through the hypervisor: after a scan pass at
+    /// three hundred thousand keys the updates over the fresh table took
+    /// 157-165 shootdowns in every run unpopulated and 0-4 populated, and
+    /// an update read 182-246 ns populated against 186-337, five pairs of
+    /// six run in both orders (`POINT_OPS_FAULTS=1 POINT_OPS_SCAN=1
+    /// point_ops supdb-heldnoframes 300000 1 zipf-plain 6` beside
+    /// `supdb-heldindexzeropage`). FASTER zeroes its index at its open.
+    /// Off, the index's pages fault as they are probed:
+    /// `supdb-indexzeropage`, and `supdb-heldindexzeropage` under the held
+    /// log with no frames.
+    pub index_populated: bool,
+    /// A memtable hashes a sixteen-byte key by a folded multiply of its two
+    /// words, seven instructions, where it took the key's FNV word, a
+    /// multiply a byte, and a finish over it: fifty instructions of every
+    /// put and of every read the live table ends, which need no other
+    /// source's hash. A memtable is the process's own, rebuilt from the
+    /// log at an open, so its hash is nobody else's; the segments' indexes
+    /// and filters keep FNV, and a read that goes on past the live table
+    /// takes that word as well. Linear probing at the half load the index
+    /// grows at reads 1.49 slots a lookup over the suite's numbered keys
+    /// and over random ids either way. Off, every key's hash is FNV's:
+    /// `supdb-memfnv`, and `supdb-heldmemfnv` under the held log with no
+    /// frames.
+    pub mem_hash_fold: bool,
+    /// PROTOTYPE: under the held log (`SyncPolicy::Explicit`), which
+    /// promises nothing of isolation, a put to a key whose live-table chain
+    /// is one value over the tombstone a put lays down, and whose new value
+    /// has that value's length, overwrites the value's bytes where they lie
+    /// instead of laying down a tombstone and a value after them, as
+    /// FASTER updates a record in its mutable region. The write is still
+    /// logged, so whatever keeps a copy of the key's values reads its chain
+    /// again, and it is charged to the seal's count as the log's entry, the
+    /// one thing it grows. The writer's own reads are the only ones that
+    /// may see the bytes while it writes them. So a put overwrites only
+    /// while no handle the caller made is live (`Db::put_pinned`), and
+    /// appends beside one; a handle is claimed only with nothing staged
+    /// (`Db::reader`), so what it reads was committed and stays as it read
+    /// it; and the shape refuses the engine's threads that read a live
+    /// table's values beside the writer: the block cache and its upkeep
+    /// thread (`scan_block_cache`, `Upkeep::Inline` alone), the run keeper
+    /// and the kept merge snapshot. Off: `supdb-held`'s shape, a put
+    /// appending.
+    pub put_in_place: bool,
     /// A job's large per-key arrays -- a seal's sort of its
     /// table, a segment writer's copy of every key with its span, its
     /// record's offset and its hash, the ordered index builder's keys, a
@@ -5827,6 +6069,47 @@ pub struct Options {
     /// sittings, with the write mixes' commits 2-3% slower in both
     /// (`docs/engine.md`). Off is `supdb-walkeep`.
     pub wal_drop_bytes: usize,
+    /// Under `SyncPolicy::Explicit`, the most bytes of committed frames
+    /// the log keeps in the process before it writes them to its file,
+    /// unsynced: the bound on the memory a store that never calls `sync`
+    /// holds for its log, and the size of the one write that then stands
+    /// in for a write a commit. The frames a durable segment has covered
+    /// are dropped first and never written, so a store whose seals keep
+    /// up with its writes reaches the cap in a burst alone. Nothing under
+    /// the other policies.
+    pub wal_hold_bytes: usize,
+    /// A holding log closes the gap its dropped batches leave whenever the
+    /// gap is at least as large as what it still holds behind it, and the
+    /// commits after write over pages already touched (`Wal::drop_covered`,
+    /// `SyncPolicy::Explicit`). Off, it closes the gap only where less
+    /// than `HOLD_COMPACT` is held behind it, and otherwise leaves the
+    /// dropped bytes where they lay until the buffer empties, so new
+    /// frames go on into the buffer's untouched reservation. A seal's
+    /// landing leaves held behind it what was committed while the seal
+    /// ran, which at a hundred thousand keys and up is more than that,
+    /// and the buffer went through fresh pages for the whole of a run: a
+    /// page every two dozen updates of the suite's, half of the held
+    /// arm's writer faults in the write mixes, and half of an update's
+    /// time, the kernel's fault path, by samples of the update phase
+    /// (`docs/engine.md`, a log held in the process). Moving a byte costs
+    /// a tenth of a nanosecond, a fresh page's byte here four tenths, and
+    /// a frame is moved about once in its life, since a seal's landing
+    /// comes about once a frame's. Off: `supdb-heldmarch`.
+    pub wal_hold_reuses: bool,
+    /// Under `SyncPolicy::Explicit`, whether a commit builds the frames the
+    /// log holds. Off, it builds none: the records take their sequence
+    /// numbers as they would, a `sync` is a `flush`, and what no drain has
+    /// covered is in the memtable alone, so a store dropped without its
+    /// close loses it, as the policy's promise already allowed and as
+    /// FASTER's store does without a checkpoint. The frames were a fifth
+    /// of an update's instructions -- 150 of 808, the records copied into
+    /// the buffer and the batch's CRC (`bench/examples/point_ops.rs` under
+    /// callgrind) -- for a buffer the drain that covers them drops
+    /// unwritten. A commit no durable manifest covers yet counts as one no
+    /// sync has covered, for whatever asks the log (`Db::owes_sync`, a
+    /// run's note, a drain's wait for its slot, a rotation's header).
+    /// Refused under every other policy, whose promise is the log.
+    pub held_frames: bool,
     /// How many of the controller's builds ahead run at once
     /// (`zpages_land_pct`): the second in a slot of its own beside the
     /// builder's, which the controller's own jobs keep. An ordered load of
@@ -6866,6 +7149,18 @@ pub struct Options {
 }
 
 impl Options {
+    /// Whether a point read takes the two-source or the layered read
+    /// where the store allows one (`point_lone`): the option, the two it
+    /// needs, and none of the arms that read a partition another way.
+    #[inline(always)]
+    fn point_lone_on(&self) -> bool {
+        self.point_lone
+            && self.point_fixed
+            && self.read_hash_once
+            && !self.exts_by_value
+            && !self.point_via_ord
+    }
+
     /// Whether the store keeps `Shared::points_far`, for the options that
     /// read it: `scan_cache_copies_fit` and `merge_chains_writes_uncovered`.
     fn tracks_points(&self) -> bool {
@@ -6991,11 +7286,40 @@ impl Options {
 
 impl Options {
     /// How a table's blocks are made, for `MemTable::new`.
-    fn block_shape(&self) -> BlockShape {
+    /// How the store's tables make their blocks, from `pool`, the store's
+    /// (`Options::blocks_pool_bytes`).
+    fn block_shape(&self, pool: &Option<std::sync::Arc<blocks::BlockPool>>) -> BlockShape {
         BlockShape {
             prefault: self.prefault,
+            index_populated: self.index_populated,
+            fold_hash: self.mem_hash_fold,
             mapped: self.blocks_mapped,
+            pool: pool.clone(),
         }
+    }
+
+    /// The store's pool of given-back blocks, where it keeps one: on
+    /// from the start unless the compact form is forced, which is a store
+    /// read out of core (`blocks::BlockPool`, `Options::blocks_pool_bytes`).
+    ///
+    /// Its cap is the option's, held to a sixty-fourth of the memory limit
+    /// the store opens under (`zfile::read_budget`): sixteen megabytes
+    /// under a gibibyte, the option's sixty-four from four gibibytes up. A
+    /// store under a bound runs at the raw form until the controller's
+    /// census, and a shuffled load's tables there are a hundred megabytes
+    /// each, so a pool at the option's cap would hold a sixteenth of the
+    /// bound through the load, where the loads at ten million keys have
+    /// been killed for less.
+    fn block_pool(&self) -> Option<std::sync::Arc<blocks::BlockPool>> {
+        if !self.blocks_mapped || self.blocks_pool_bytes == 0 {
+            return None;
+        }
+        let limit = zfile::read_budget().map_or(u64::MAX, |b| b.limit);
+        let cap = (self.blocks_pool_bytes as u64).min(limit / 64) as usize;
+        Some(std::sync::Arc::new(blocks::BlockPool::new(
+            cap,
+            self.zpages != ZPages::Always,
+        )))
     }
 }
 
@@ -7045,7 +7369,13 @@ impl Default for Options {
             asym_pins: false,
             exts_by_value: false,
             read_hash_once: true,
+            point_fixed: true,
+            point_record_ahead: true,
+            point_lone: true,
+            point_layers_lean: true,
+            point_placed_runs: true,
             read_lines_ahead: true,
+            point_live_first: false,
             read_probes_once: true,
             point_via_ord: false,
             zpages: ZPages::Auto,
@@ -7248,6 +7578,10 @@ impl Default for Options {
             upkeep_fill_yields: true,
             upkeep_fill_skips_posted: true,
             blocks_mapped: true,
+            blocks_pool_bytes: 64 << 20,
+            index_populated: true,
+            mem_hash_fold: true,
+            put_in_place: false,
             jobs_mapped: true,
             jobs_mapped_when_short: false,
             jobs_pooled: false,
@@ -7314,6 +7648,9 @@ impl Default for Options {
             forms_trim_bytes: 32 << 20,
             forms_fit_when_short: true,
             wal_drop_bytes: 1 << 20,
+            wal_hold_bytes: 64 << 20,
+            wal_hold_reuses: true,
+            held_frames: true,
             zpages_ahead_builders: 2,
             zpages_sample_between: false,
             zpages_cover_resident: true,
@@ -7443,8 +7780,47 @@ struct Wal {
     path: PathBuf,
     /// Sequence of the next record to be written.
     seq: u64,
-    /// Buffered frames since the last commit.
+    /// The frames the file does not hold: the batch being staged, from
+    /// `batch_at`, behind the committed batches a holding log keeps
+    /// (`SyncPolicy::Explicit`), of which a policy that writes every
+    /// commit has none.
     pending: Vec<u8>,
+    /// Where the batch being staged begins in `pending`: the end of the
+    /// committed batches held before it, and zero under a policy that
+    /// writes every commit.
+    batch_at: usize,
+    /// Where the held batches begin in `pending`: the bytes before it are
+    /// batches dropped as covered and left where they lay
+    /// (`drop_covered`), dead until the buffer next empties. Zero under a
+    /// policy that writes every commit.
+    held_from: usize,
+    /// The most of `pending` ever written into: what of its reservation
+    /// the process has touched (`Db::memory_census`).
+    touched: usize,
+    /// The held batches, oldest first: the sequence number after each
+    /// one's commit frame, and where the batch ends in `pending`. One a
+    /// manifest on the device covers is dropped unwritten
+    /// (`drop_covered`).
+    marks: std::collections::VecDeque<(u64, usize)>,
+    /// The bytes of committed batches the log holds before it writes
+    /// them out (`Options::wal_hold_bytes`); none under a policy that
+    /// writes every commit.
+    hold: Option<usize>,
+    /// Whether a drop closes its gap whenever the gap is the larger
+    /// (`Options::wal_hold_reuses`).
+    hold_reuses: bool,
+    /// Whether the log builds no frames (`Options::held_frames` off): a
+    /// record and a commit take their sequence numbers and write nothing.
+    frameless: bool,
+    /// Whether a batch with no frames is being staged: records taken since
+    /// the last commit, under `frameless`.
+    unframed_staged: bool,
+    /// What this file's held batches came to: the bytes dropped unwritten
+    /// as covered, the bytes written out by a spill, and the spills
+    /// (`Db::wal_held`).
+    held_dropped: u64,
+    held_spilled: u64,
+    spills: u64,
     /// Bytes handed to the file so far, and how many of them were behind a
     /// barrier at the last `sync`. The difference is exactly what a power
     /// loss may take, and `Db::wal_durable` reports it so a crash
@@ -7518,6 +7894,33 @@ fn wal_ahead(opts: &Options) -> Option<(u64, bool, u64)> {
         ahead,
         opts.wal_ahead_small_runs,
         opts.seal_bytes as u64 + ahead,
+    ))
+}
+
+/// The most a holding log reserves for its buffer at once, whatever its
+/// cap (`Wal::set_hold`), and the room past the cap for the batch that
+/// crosses it; a buffer past either grows as any vector does.
+const HOLD_RESERVE_MAX: usize = 256 << 20;
+const HOLD_ROOM: usize = 1 << 20;
+
+/// The most a holding log moves to close the gap its dropped batches left
+/// (`Wal::drop_covered`): with fewer bytes than this still held behind
+/// them, the held bytes go to the buffer's head and the next commits
+/// reuse pages already touched; with more, the dropped bytes stay where
+/// they lay, dead, until the buffer empties. Moved whatever their size,
+/// the bytes still held were megabytes on the writer's path at a seal's
+/// landing.
+const HOLD_COMPACT: usize = 64 << 10;
+
+/// How much of its committed frames the log holds in the process, where
+/// the policy is to hold them (`SyncPolicy::Explicit`,
+/// `Options::wal_hold_bytes`); none under a policy that writes every
+/// commit.
+fn wal_hold(opts: &Options) -> Option<(usize, bool, bool)> {
+    matches!(opts.sync, SyncPolicy::Explicit).then_some((
+        opts.wal_hold_bytes,
+        opts.wal_hold_reuses,
+        opts.held_frames,
     ))
 }
 
@@ -7598,12 +8001,115 @@ const WAL_PUT: u8 = 0;
 const WAL_DEL: u8 = 1;
 const WAL_COMMIT: u8 = 2;
 
+/// One frame appended to `pending` (`Wal::frame` says the layout), under
+/// sequence number `seq` and the log's CRC seed, in the batch that begins
+/// at `batch_at`: the commit frame's builder, and the definition a record
+/// frame written in one reservation is held to (`wal_record`).
+fn wal_frame(
+    pending: &mut Vec<u8>,
+    batch_at: usize,
+    seq: u64,
+    seed: u32,
+    kind: u8,
+    key: &[u8],
+    value: &[u8],
+) {
+    // From `batch_at`, `pending` holds exactly this batch's record frames:
+    // the whole of it where `write` empties it at every commit, and what
+    // follows the committed batches where the log holds them
+    // (`SyncPolicy::Explicit`).
+    let batch_crc = if kind == WAL_COMMIT {
+        crc32(&pending[batch_at..]) ^ seed
+    } else {
+        0
+    };
+    let body_at = pending.len() + FRAME_HEADER;
+    pending.extend_from_slice(&[0u8; FRAME_HEADER]);
+    pending.extend_from_slice(&seq.to_le_bytes());
+    pending.push(kind);
+    if kind == WAL_COMMIT {
+        pending.extend_from_slice(&batch_crc.to_le_bytes());
+    } else {
+        put_uvarint(pending, key.len() as u64);
+        pending.extend_from_slice(key);
+        if kind == WAL_PUT {
+            pending.extend_from_slice(value);
+        }
+    }
+    let body_len = (pending.len() - body_at) as u32;
+    let crc = if kind == WAL_COMMIT {
+        crc32(&pending[body_at..]) ^ seed
+    } else {
+        0
+    };
+    pending[body_at - 8..body_at - 4].copy_from_slice(&body_len.to_le_bytes());
+    pending[body_at - 4..body_at].copy_from_slice(&crc.to_le_bytes());
+}
+
+/// A record frame of `Wal::frame`'s layout appended to `pending`, byte for
+/// byte what `frame` makes of the same record under sequence number `seq`:
+/// `value` is a put's and empty for a delete. One reservation and the bytes
+/// written where they go, where `frame` grew the buffer seven times a
+/// record and patched its head: 195 instructions a put's two frames, of
+/// 1,213 (callgrind, `bench/examples/point_ops.rs`).
+#[inline]
+fn wal_record(pending: &mut Vec<u8>, seq: u64, kind: u8, key: &[u8], value: &[u8]) {
+    debug_assert!(kind == WAL_PUT || (kind == WAL_DEL && value.is_empty()));
+    let klen = key.len();
+    // The key length's uvarint, as `put_uvarint` writes it.
+    let mut var = [0u8; 10];
+    let mut vn = 0;
+    let mut v = klen as u64;
+    loop {
+        let b = (v & 0x7f) as u8;
+        v >>= 7;
+        if v == 0 {
+            var[vn] = b;
+            vn += 1;
+            break;
+        }
+        var[vn] = b | 0x80;
+        vn += 1;
+    }
+    let body = 8 + 1 + vn + klen + value.len();
+    let total = FRAME_HEADER + body;
+    pending.reserve(total);
+    let at = pending.len();
+    // SAFETY: `total` bytes past the length are reserved above, and every
+    // one of them is written below before the length covers it; the
+    // sources are slices that cannot overlap the vector's spare capacity.
+    unsafe {
+        let p = pending.as_mut_ptr().add(at);
+        std::ptr::copy_nonoverlapping((body as u32).to_le_bytes().as_ptr(), p, 4);
+        // A record frame's CRC word is zero: the batch's is the commit
+        // frame's.
+        std::ptr::write_bytes(p.add(4), 0, 4);
+        std::ptr::copy_nonoverlapping(seq.to_le_bytes().as_ptr(), p.add(8), 8);
+        p.add(16).write(kind);
+        let mut q = p.add(17);
+        std::ptr::copy_nonoverlapping(var.as_ptr(), q, vn);
+        q = q.add(vn);
+        std::ptr::copy_nonoverlapping(key.as_ptr(), q, klen);
+        q = q.add(klen);
+        std::ptr::copy_nonoverlapping(value.as_ptr(), q, value.len());
+        pending.set_len(at + total);
+    }
+}
+
 /// A helper still writing the reach joined at the file's close, since a
 /// closed file is a spare to recycle, and a helper still writing zeros into
 /// a recycled file would write them over its next life's frames
 /// (`Options::wal_ahead_beside`).
+///
+/// And what the log holds in the process goes to its file first
+/// (`SyncPolicy::Explicit`), unsynced: a store dropped without its close
+/// is left as a process that ended is under the policies that write every
+/// commit, its commits in the file and none of them promised. A store
+/// left as a crash leaves it is not dropped (`Db::crash`), and takes what
+/// it held with it.
 impl Drop for Wal {
     fn drop(&mut self) {
+        let _ = self.spill();
         if let Some(h) = self.zeroing.take() {
             let _ = h.join();
         }
@@ -7623,6 +8129,17 @@ impl Wal {
             path: path.to_path_buf(),
             seq: 0,
             pending: Vec::new(),
+            batch_at: 0,
+            held_from: 0,
+            touched: 0,
+            marks: std::collections::VecDeque::new(),
+            hold: None,
+            hold_reuses: false,
+            frameless: false,
+            unframed_staged: false,
+            held_dropped: 0,
+            held_spilled: 0,
+            spills: 0,
             written: WAL_MAGIC.len() as u64,
             synced: 0,
             seed: wal_seed(id),
@@ -7695,6 +8212,17 @@ impl Wal {
             path: path.to_path_buf(),
             seq: 0,
             pending: Vec::new(),
+            batch_at: 0,
+            held_from: 0,
+            touched: 0,
+            marks: std::collections::VecDeque::new(),
+            hold: None,
+            hold_reuses: false,
+            frameless: false,
+            unframed_staged: false,
+            held_dropped: 0,
+            held_spilled: 0,
+            spills: 0,
             written: WAL_MAGIC.len() as u64,
             synced: 0,
             seed: wal_seed(id),
@@ -7795,6 +8323,17 @@ impl Wal {
             path: path.to_path_buf(),
             seq,
             pending: Vec::new(),
+            batch_at: 0,
+            held_from: 0,
+            touched: 0,
+            marks: std::collections::VecDeque::new(),
+            hold: None,
+            hold_reuses: false,
+            frameless: false,
+            unframed_staged: false,
+            held_dropped: 0,
+            held_spilled: 0,
+            spills: 0,
             written,
             synced,
             seed: wal_seed(id),
@@ -7830,65 +8369,188 @@ impl Wal {
     /// frame bought, at one CRC setup and finish per batch instead of per
     /// record: 92 of the 677 instructions a record cost.
     fn frame(&mut self, kind: u8, key: &[u8], value: &[u8]) {
-        // `pending` holds exactly this batch's record frames: `write`
-        // empties it at every commit.
-        let batch_crc = if kind == WAL_COMMIT {
-            crc32(&self.pending) ^ self.seed
-        } else {
-            0
-        };
-        let body_at = self.pending.len() + FRAME_HEADER;
-        self.pending.extend_from_slice(&[0u8; FRAME_HEADER]);
-        self.pending.extend_from_slice(&self.seq.to_le_bytes());
-        self.pending.push(kind);
-        if kind == WAL_COMMIT {
-            self.pending.extend_from_slice(&batch_crc.to_le_bytes());
-        } else {
-            put_uvarint(&mut self.pending, key.len() as u64);
-            self.pending.extend_from_slice(key);
-            if kind == WAL_PUT {
-                self.pending.extend_from_slice(value);
-            }
+        wal_frame(
+            &mut self.pending,
+            self.batch_at,
+            self.seq,
+            self.seed,
+            kind,
+            key,
+            value,
+        );
+        self.seq += 1;
+    }
+
+    /// A record frame appended to `pending` (`wal_record`).
+    #[inline]
+    fn record(&mut self, kind: u8, key: &[u8], value: &[u8]) {
+        if self.frameless {
+            self.seq += 1;
+            self.unframed_staged = true;
+            return;
         }
-        let body_len = (self.pending.len() - body_at) as u32;
-        let crc = if kind == WAL_COMMIT {
-            crc32(&self.pending[body_at..]) ^ self.seed
-        } else {
-            0
-        };
-        self.pending[body_at - 8..body_at - 4].copy_from_slice(&body_len.to_le_bytes());
-        self.pending[body_at - 4..body_at].copy_from_slice(&crc.to_le_bytes());
+        wal_record(&mut self.pending, self.seq, kind, key, value);
         self.seq += 1;
     }
 
     fn append(&mut self, key: &[u8], value: &[u8]) {
-        self.frame(WAL_PUT, key, value);
+        self.record(WAL_PUT, key, value);
     }
 
     fn delete(&mut self, key: &[u8]) {
-        self.frame(WAL_DEL, key, &[]);
+        self.record(WAL_DEL, key, &[]);
     }
 
     /// Close the batch: a commit frame after its records, so replay applies
-    /// them all or none of them. Nothing pending, nothing to close.
+    /// them all or none of them. Nothing staged, nothing to close.
     fn mark_commit(&mut self) {
-        if !self.pending.is_empty() {
+        if self.frameless {
+            // The commit's number, as its frame would have taken it.
+            if self.unframed_staged {
+                self.seq += 1;
+                self.unframed_staged = false;
+            }
+            return;
+        }
+        if self.staged() {
             self.frame(WAL_COMMIT, &[], &[]);
         }
     }
 
+    /// Whether a batch is being staged: frames no commit frame has closed
+    /// and given to the log.
+    fn staged(&self) -> bool {
+        self.pending.len() > self.batch_at || self.unframed_staged
+    }
+
+    /// The log made to hold its committed batches in the process, `cap`
+    /// bytes of them at most (`SyncPolicy::Explicit`,
+    /// `Options::wal_hold_bytes`), in a buffer reserved whole here: the
+    /// reservation is address space until it is written into, and a
+    /// buffer left to grow copied everything it held each time it
+    /// doubled, fourteen megabytes inside one mix of the suite's, whose
+    /// commits ran a third longer for it than with the log written.
+    fn set_hold(&mut self, cap: usize, reuses: bool, frames: bool) {
+        self.hold = Some(cap);
+        self.hold_reuses = reuses;
+        self.frameless = !frames;
+        if frames {
+            self.pending.reserve(cap.min(HOLD_RESERVE_MAX) + HOLD_ROOM);
+        }
+    }
+
+    /// The batch `mark_commit` closed, given to the log: written to the
+    /// file, or kept where the log holds its commits
+    /// (`SyncPolicy::Explicit`), its end noted so that a batch a manifest
+    /// on the device comes to cover is dropped unwritten (`drop_covered`),
+    /// and the held batches written out once they pass the cap (`spill`).
     fn write(&mut self) -> Result<()> {
-        if self.pending.is_empty() {
+        let Some(cap) = self.hold else {
+            return self.put_out(0);
+        };
+        if self.staged() {
+            self.batch_at = self.pending.len();
+            self.touched = self.touched.max(self.batch_at);
+            self.marks.push_back((self.seq, self.batch_at));
+        }
+        // The cap is of the buffer, the dropped batches left in it among
+        // them: what the process holds for its log.
+        if self.batch_at > cap {
+            self.spill()?;
+        }
+        Ok(())
+    }
+
+    /// The batches the log holds written to its file, unsynced, in the
+    /// order they committed and as one write: at a sync, which syncs them
+    /// (`sync`); at a rotation, since a batch's CRC is seeded by the file
+    /// it committed under and the file after it would refuse it
+    /// (`Db::rotate_wal_as`); at the cap; and where the store is dropped.
+    /// A batch still being staged stays staged. Nothing where nothing is
+    /// held, which is every call under a policy that writes each commit.
+    /// A write that fails leaves every batch held, as it was.
+    fn spill(&mut self) -> Result<()> {
+        if self.batch_at == self.held_from {
+            return Ok(());
+        }
+        let staged = self.staged().then(|| self.pending.split_off(self.batch_at));
+        let bytes = (self.batch_at - self.held_from) as u64;
+        let out = self.put_out(self.held_from);
+        if out.is_ok() {
+            self.batch_at = 0;
+            self.held_from = 0;
+            self.marks.clear();
+            self.held_spilled += bytes;
+            self.spills += 1;
+        }
+        if let Some(s) = staged {
+            self.pending.extend_from_slice(&s);
+        }
+        out
+    }
+
+    /// The held batches whose every record a manifest on the device
+    /// covers -- those that end at or before `covered` -- dropped, never
+    /// written: their records are in segments that manifest names, and no
+    /// open replays a frame below what its manifest covers. The file is
+    /// left with a gap where they would have stood, below the sequence
+    /// every open from here on starts at, where a replay checks no
+    /// continuity (`Wal::replay`).
+    ///
+    /// `covered` is a sequence a manifest that is on the device covers,
+    /// and never one a landing has only published (`Shared::log_covered`):
+    /// dropped behind a manifest a crash can take back, the frames are a
+    /// gap above where the open replays from, which it reads as a record
+    /// lost, and the store does not open. Answers the bytes dropped.
+    fn drop_covered(&mut self, covered: u64) -> usize {
+        let mut cut = 0;
+        while let Some(&(end_seq, end)) = self.marks.front() {
+            if end_seq > covered {
+                break;
+            }
+            cut = end;
+            self.marks.pop_front();
+        }
+        if cut == 0 {
+            return 0;
+        }
+        let dropped = cut - self.held_from;
+        self.held_from = cut;
+        self.held_dropped += dropped as u64;
+        // What is left behind the dropped batches goes to the buffer's
+        // head where it is little, or no more than the gap
+        // (`Options::wal_hold_reuses`), and the commits to come write over
+        // pages already touched; where it is much, it stays, and the
+        // dropped bytes with it (`HOLD_COMPACT`).
+        let behind = self.pending.len() - cut;
+        if behind <= HOLD_COMPACT || (self.hold_reuses && behind <= cut) {
+            self.pending.drain(..cut);
+            for m in &mut self.marks {
+                m.1 -= cut;
+            }
+            self.batch_at -= cut;
+            self.held_from = 0;
+        }
+        dropped
+    }
+
+    /// `pending` from `from` written to the file and the buffer emptied:
+    /// the batch a commit closed, the whole buffer, under a policy that
+    /// writes each commit, or the batches a holding log spills, past the
+    /// dropped ones it left at the buffer's head (`spill`).
+    fn put_out(&mut self, from: usize) -> Result<()> {
+        if self.pending.len() == from {
+            self.pending.clear();
             return Ok(());
         }
         self.join_zeroing()?;
-        let end = self.written + self.pending.len() as u64;
+        let end = self.written + (self.pending.len() - from) as u64;
         let grow = if self.ahead == 0 {
             false
         } else if !self.ahead_runs {
             // The whole reach, kept at least half ahead of every write.
             end + self.ahead / 2 > self.extent
-        } else if self.pending.len() as u64 > WAL_AHEAD_COMMIT {
+        } else if (self.pending.len() - from) as u64 > WAL_AHEAD_COMMIT {
             // A large write appends, pre-writes nothing and ends the run
             // (`Options::wal_ahead_small_runs`).
             self.ahead_run = 0;
@@ -7897,7 +8559,7 @@ impl Wal {
             // A small write counts toward its run, and one that grows the
             // file, and so pays the journal commit either way, pre-writes
             // a reach once the run has written one itself.
-            self.ahead_run += self.pending.len() as u64;
+            self.ahead_run += (self.pending.len() - from) as u64;
             end > self.extent && self.ahead_run >= self.ahead
         };
         let mut due = None;
@@ -7931,11 +8593,17 @@ impl Wal {
             0
         };
         if pad > 0 {
-            self.pending.resize(self.pending.len() + pad, 0);
-            self.file.write_all(&self.pending)?;
+            // The zeros leave the buffer whether the write succeeds or
+            // not: left in after a failed one, they stood between the
+            // batches a holding log still keeps and the next one it takes.
+            let len = self.pending.len();
+            self.pending.resize(len + pad, 0);
+            let wrote = self.file.write_all(&self.pending[from..]);
+            self.pending.truncate(len);
+            wrote?;
             self.file.seek(SeekFrom::Start(end))?;
         } else {
-            self.file.write_all(&self.pending)?;
+            self.file.write_all(&self.pending[from..])?;
         }
         self.written = end;
         self.pending.clear();
@@ -7949,6 +8617,9 @@ impl Wal {
     }
 
     fn sync(&mut self) -> Result<()> {
+        // What the log holds is written first: a sync acknowledges every
+        // commit before it, wherever the commit left its frames.
+        self.spill()?;
         self.join_zeroing()?;
         self.file.sync_data()?;
         self.synced = self.written;
@@ -8050,8 +8721,14 @@ impl Wal {
     /// fdatasync, 0.4 to 0.9 ms on the drain for frames the log did
     /// not hold. The header needs no sync of its own: an open takes a
     /// file short of it, or torn inside it, as a log with nothing in it.
+    ///
+    /// A batch the log holds in the process (`SyncPolicy::Explicit`) is a
+    /// frame of this file's that no sync has covered, and that nothing
+    /// has written either: everything that asks whether the log is behind
+    /// a sync -- a run's note, a rotation's header, a drain's wait for
+    /// its slot -- is asking about it too.
     fn frames_unsynced(&self) -> bool {
-        self.written > self.synced.max(WAL_MAGIC.len() as u64)
+        self.batch_at > self.held_from || self.written > self.synced.max(WAL_MAGIC.len() as u64)
     }
 
     /// The header rewritten chained once no file before this one is
@@ -8073,7 +8750,9 @@ impl Wal {
 
     /// Whether the file holds no frame: its header and nothing after it.
     fn holds_no_frame(&self) -> bool {
-        self.written <= WAL_MAGIC.len() as u64 && self.pending.is_empty()
+        // What a holding log dropped and left in its buffer is no frame
+        // of the file's (`held_from`).
+        self.written <= WAL_MAGIC.len() as u64 && self.pending.len() == self.held_from
     }
 
     /// The header of a file that holds no frame yet rewritten to say a run
@@ -8391,6 +9070,9 @@ const BLOOM_BITS_PER_KEY: u32 = 10;
 #[derive(Clone)]
 pub(crate) struct BlockedBloom {
     blocks: Vec<[u64; 8]>,
+    /// What `block_of` takes a hash's remainder by the block count with
+    /// (`BlockedBloom::magic_for`).
+    magic: u64,
 }
 
 /// A Bloom built from FNV words as they come: `add` takes each word and,
@@ -8460,9 +9142,43 @@ impl BlockedBloom {
     }
 
     fn with_capacity(n: usize) -> BlockedBloom {
-        BlockedBloom {
-            blocks: vec![[0u64; 8]; BlockedBloom::blocks_for(n)],
+        BlockedBloom::of_blocks(vec![[0u64; 8]; BlockedBloom::blocks_for(n)])
+    }
+
+    fn of_blocks(blocks: Vec<[u64; 8]>) -> BlockedBloom {
+        let magic = BlockedBloom::magic_for(blocks.len());
+        BlockedBloom { blocks, magic }
+    }
+
+    /// The multiplier `block_of` reduces by for `n` blocks: the ceiling of
+    /// 2^64 over `n`, which for one block wraps to nothing and reduces
+    /// every hash to block zero.
+    fn magic_for(n: usize) -> u64 {
+        (u64::MAX / (n as u64).max(1)).wrapping_add(1)
+    }
+
+    /// The block a hash's high half names: that half's remainder by the
+    /// block count, the mapping `BLOOM_SIG` covers, taken by two
+    /// multiplies where it was a divide (Lemire's remainder, exact for a
+    /// dividend and a divisor of thirty-two bits each). A point read over
+    /// a piece took the divide twice, at the hint for the block and at
+    /// the test of it, twenty-odd cycles each behind which the test's
+    /// answer waits. A filter of more blocks than thirty-two bits count,
+    /// which is more than a quarter of a terabyte of filter, keeps the
+    /// half as it is, every value of it being under the count.
+    #[inline(always)]
+    fn block_of(&self, h: u64) -> usize {
+        BlockedBloom::reduce(h >> 32, self.blocks.len() as u64, self.magic)
+    }
+
+    /// `a`'s remainder by `n`, for `a` under 2^32 and `magic` the
+    /// multiplier `magic_for(n)` gives (`block_of`).
+    #[inline(always)]
+    fn reduce(a: u64, n: u64, magic: u64) -> usize {
+        if n > u64::from(u32::MAX) {
+            return a as usize;
         }
+        ((u128::from(magic.wrapping_mul(a)) * u128::from(n)) >> 64) as usize
     }
 
     /// The hash's first half: the word `flatindex::key_hash` computes
@@ -8503,7 +9219,7 @@ impl BlockedBloom {
     /// A hint to fetch the block `add_fnv(h)` sets bits in; nothing is read.
     #[inline]
     fn prefetch_fnv(&self, h: u64) {
-        let bi = (BlockedBloom::finalize(h) >> 32) as usize % self.blocks.len();
+        let bi = self.block_of(BlockedBloom::finalize(h));
         prefetch_lines(self.blocks[bi].as_ptr() as *const u8, 64);
     }
 
@@ -8520,7 +9236,7 @@ impl BlockedBloom {
     }
 
     fn slots_of(&self, h: u64) -> (usize, [(usize, u64); BLOOM_PROBES as usize]) {
-        let bi = (h >> 32) as usize % self.blocks.len();
+        let bi = self.block_of(h);
         let mut probes = [(0usize, 0u64); BLOOM_PROBES as usize];
         let mut x = h;
         for p in &mut probes {
@@ -8557,7 +9273,7 @@ impl BlockedBloom {
     /// is read.
     #[inline]
     fn prefetch_hash(&self, h: u64) {
-        let bi = (h >> 32) as usize % self.blocks.len();
+        let bi = self.block_of(h);
         prefetch_lines(self.blocks[bi].as_ptr() as *const u8, 64);
     }
 
@@ -8599,7 +9315,7 @@ impl BlockedBloom {
                 b
             })
             .collect();
-        Some(BlockedBloom { blocks })
+        Some(BlockedBloom::of_blocks(blocks))
     }
 }
 
@@ -9204,6 +9920,14 @@ struct Seg {
     /// values alone come to where its keys are one width, as the stride
     /// form asks (`Seg::stride_bytes`).
     key0_len: u32,
+    /// The key index's slot table, the address of its first slot and the
+    /// mask a hash takes a slot by (`Blob::slot_table`), or zeros for an
+    /// index without one: taken at the open, so a read's ask for its slot
+    /// (`Seg::prefetch_slot`) is an add and a mask where finding the
+    /// section through the blob at every read was thirty-two instructions
+    /// of a get. An address and not a pointer: the mapping lives as long
+    /// as the segment, and a hint faults on no address anyway.
+    slot_ask: [usize; 2],
     /// Reads of the raw form while the hot-raw policy holds this partition
     /// there (`zfile::DECLINED_HOT_RAW`), one in sixteen per thread
     /// (`Seg::hot_read`): the partition's heat, as a form file's opens are
@@ -12798,6 +13522,7 @@ impl Seg {
         if advise_ord {
             ord.advise_random();
         }
+        let slot_ask = blob.slot_table().map_or([0, 0], |(a, m)| [a, m]);
         // `pcs-` is a range-ALIGNED L0 piece: a seal split at the live
         // partition boundaries, so it carries a fence like a partition and
         // overlaps only the pieces of its own range. That alignment is what
@@ -12843,6 +13568,7 @@ impl Seg {
                 z_drop_noted: std::sync::atomic::AtomicBool::new(false),
                 z_stride_no: std::sync::atomic::AtomicU8::new(0),
                 key0_len,
+                slot_ask,
                 z_rebuilds: std::sync::atomic::AtomicU8::new(0),
                 z_retry: std::sync::Mutex::new(None),
                 z_backoff: AtomicU64::new(0),
@@ -12891,6 +13617,7 @@ impl Seg {
                 z_drop_noted: std::sync::atomic::AtomicBool::new(false),
                 z_stride_no: std::sync::atomic::AtomicU8::new(0),
                 key0_len,
+                slot_ask,
                 z_rebuilds: std::sync::atomic::AtomicU8::new(0),
                 z_retry: std::sync::Mutex::new(None),
                 z_backoff: AtomicU64::new(0),
@@ -12931,6 +13658,7 @@ impl Seg {
             z_drop_noted: std::sync::atomic::AtomicBool::new(false),
             z_stride_no: std::sync::atomic::AtomicU8::new(0),
             key0_len,
+            slot_ask,
             z_rebuilds: std::sync::atomic::AtomicU8::new(0),
             z_retry: std::sync::Mutex::new(None),
             z_backoff: AtomicU64::new(0),
@@ -13066,7 +13794,7 @@ impl Seg {
 
     /// `may_hold` for a key whose FNV word (`flatindex::key_hash`) the
     /// caller has taken (`Options::read_hash_once`).
-    #[inline]
+    #[inline(always)]
     fn may_hold_fnv(&self, key: &[u8], fnv: u64) -> bool {
         if self.below_lo(key) {
             return false;
@@ -13087,8 +13815,28 @@ impl Seg {
     fn prefetch_probe(&self, fnv: u64) {
         match &self.bloom {
             Some(b) => b.prefetch_fnv(fnv),
-            None => self.raw().prefetch_slot(fnv),
+            None => self.prefetch_slot(fnv),
         }
+    }
+
+    /// A hint to fetch the line of the first hash slot a lookup of the
+    /// key with FNV word `fnv` reads, by the address the open took
+    /// (`slot_ask`); nothing is read, and nothing is asked of an index
+    /// without a slot table.
+    #[inline]
+    fn prefetch_slot(&self, fnv: u64) {
+        if let Some(a) = self.slot_addr(fnv) {
+            prefetch_lines(a as *const u8, crate::flatindex::SLOT_BYTES);
+        }
+    }
+
+    /// The address of the first hash slot a lookup of the key with FNV
+    /// word `fnv` reads, by the slot table the open took; `None` for an
+    /// index without one.
+    #[inline(always)]
+    fn slot_addr(&self, fnv: u64) -> Option<usize> {
+        let [base, mask] = self.slot_ask;
+        (base != 0).then(|| base + ((fnv as usize) & mask) * crate::flatindex::SLOT_BYTES)
     }
 
     /// Could this segment hold anything at or after `from`?
@@ -13140,10 +13888,19 @@ struct CommitMark {
 /// `Sync` below asserts.
 /// How a table's blocks are made: populated ahead of the fill
 /// (`Options::prefault`) and mapped from the kernel (`Options::blocks_mapped`).
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 struct BlockShape {
     prefault: bool,
+    /// The hash index populated for writing as it is mapped
+    /// (`Options::index_populated`).
+    index_populated: bool,
+    /// Sixteen-byte keys hashed by a fold of their words
+    /// (`Options::mem_hash_fold`).
+    fold_hash: bool,
     mapped: bool,
+    /// The store's pool of blocks its tables gave back
+    /// (`Options::blocks_pool_bytes`); none where it keeps none.
+    pool: Option<std::sync::Arc<blocks::BlockPool>>,
 }
 
 struct MemTable {
@@ -13151,6 +13908,10 @@ struct MemTable {
     /// -- are mapped from the kernel (`Options::blocks_mapped`); the seal's
     /// snapshot copy of the table follows it.
     mapped: bool,
+    /// Whether the index hashes a sixteen-byte key by the fold of its
+    /// words (`Options::mem_hash_fold`, `MemTable::hash`), fixed for the
+    /// table's life: every hash handed to it is the table's own.
+    fold_hash: bool,
     /// Every entry in the order it was made -- key order, when
     /// `ordered`, since ordered ingest pushes each key above the last and
     /// a lookup there is a binary search, never a probe.
@@ -13456,6 +14217,21 @@ fn slot_of(hash: u64, mask: usize) -> usize {
 
 const NO_CHUNK: u64 = u64::MAX;
 
+/// The live chunks of a key a point read holds on its own frame
+/// (`MemTable::live_offs_small`).
+const LIVE_SMALL: usize = 8;
+
+/// The pieces over a range a point read keeps the records of on its own
+/// frame (`Reader::read_layers`); a range under more takes the general
+/// read. The placed read keeps the records of the pieces that hold the key
+/// down to the newest tombstone, and with `Options::point_placed_runs` it
+/// is that count it bounds (`Reader::read_placed`).
+const LAYERS_PIECES: usize = 8;
+
+/// The most pieces' filters a placed read asks for ahead of its probes, the
+/// newest (`Reader::place`, `Options::point_placed_runs`).
+const PLACED_ASKS: usize = 4 * LAYERS_PIECES;
+
 /// No watermark: every chunk in a chain is visible, committed or not.
 const SEE_ALL: u64 = u64::MAX;
 
@@ -13463,6 +14239,18 @@ fn mem_hash(key: &[u8]) -> u64 {
     // FNV-1a, then a splitmix finish; the std SipHash was part of what the
     // memtable's decomposition priced.
     mem_hash_of(crate::flatindex::key_hash(key))
+}
+
+/// A sixteen-byte key's memtable hash under `Options::mem_hash_fold`: the
+/// two words' folded 128-bit product, each word moved off zero by a
+/// constant first, the halves of the product exclusive-or'd. Two loads, a
+/// multiply and a few operations, where FNV takes a multiply a byte.
+#[inline(always)]
+fn fold_hash16(key: &[u8; 16]) -> u64 {
+    let a = u64::from_le_bytes(key[..8].try_into().expect("eight bytes"));
+    let b = u64::from_le_bytes(key[8..].try_into().expect("eight bytes"));
+    let m = u128::from(a ^ 0x9E37_79B9_7F4A_7C15) * u128::from(b ^ 0xD6E8_FEB8_6659_FD93);
+    ((m as u64) ^ ((m >> 64) as u64)) | 1 // 0 marks a vacant slot
 }
 
 /// The memtable's hash from the key's FNV word (`flatindex::key_hash`), the
@@ -13491,7 +14279,7 @@ struct Index {
 struct Slots {
     ptr: *mut AtomicU64,
     n: usize,
-    mapped: bool,
+    src: blocks::Source,
 }
 
 // SAFETY: the words are atomics, read and written through shared
@@ -13500,10 +14288,9 @@ unsafe impl Send for Slots {}
 unsafe impl Sync for Slots {}
 
 impl Slots {
-    fn new(n: usize, mapped: bool) -> Slots {
-        let ptr =
-            blocks::alloc(n * std::mem::size_of::<AtomicU64>(), true, mapped) as *mut AtomicU64;
-        Slots { ptr, n, mapped }
+    fn new(n: usize, src: blocks::Source) -> Slots {
+        let ptr = src.alloc(n * std::mem::size_of::<AtomicU64>(), true) as *mut AtomicU64;
+        Slots { ptr, n, src }
     }
 }
 
@@ -13520,20 +14307,19 @@ impl Drop for Slots {
     fn drop(&mut self) {
         // SAFETY: allocated by `new` with this length.
         unsafe {
-            blocks::free(
+            self.src.free(
                 self.ptr as *mut u8,
                 self.n * std::mem::size_of::<AtomicU64>(),
-                self.mapped,
             )
         };
     }
 }
 
 impl Index {
-    fn with_slots(n: usize, mapped: bool) -> Index {
+    fn with_slots(n: usize, src: blocks::Source) -> Index {
         debug_assert!(n.is_power_of_two());
         Index {
-            slots: Slots::new(n, mapped),
+            slots: Slots::new(n, src),
             mask: n - 1,
         }
     }
@@ -13635,9 +14421,10 @@ struct ByteArena {
     /// so reclaimed and waiting.
     retired: UnsafeCell<Vec<(u64, *mut u8)>>,
     free: UnsafeCell<Vec<*mut u8>>,
-    /// Whether the blocks are mapped from the kernel (`blocks::alloc`,
-    /// `Options::blocks_mapped`).
-    mapped: bool,
+    /// Where the blocks come from: mapped from the kernel or not
+    /// (`Options::blocks_mapped`), and the store's pool
+    /// (`Options::blocks_pool_bytes`).
+    src: blocks::Source,
 }
 
 #[derive(Default)]
@@ -13655,12 +14442,12 @@ struct ArenaTail {
 }
 
 impl ByteArena {
-    fn new(prefault: bool, mapped: bool) -> ByteArena {
-        ByteArena::with_shift(prefault, ARENA_SHIFT, mapped)
+    fn new(prefault: bool, src: blocks::Source) -> ByteArena {
+        ByteArena::with_shift(prefault, ARENA_SHIFT, src)
     }
 
     /// An arena of blocks of `1 << shift` bytes.
-    fn with_shift(prefault: bool, shift: u32, mapped: bool) -> ByteArena {
+    fn with_shift(prefault: bool, shift: u32, src: blocks::Source) -> ByteArena {
         ByteArena {
             blocks: (0..ARENA_BLOCKS)
                 .map(|_| AtomicPtr::new(std::ptr::null_mut()))
@@ -13672,7 +14459,7 @@ impl ByteArena {
             shift,
             retired: UnsafeCell::new(Vec::new()),
             free: UnsafeCell::new(Vec::new()),
-            mapped,
+            src,
         }
     }
 
@@ -13788,7 +14575,7 @@ impl ByteArena {
             // it, and zeroing a fresh table's first blocks -- eleven
             // megabytes with the slabs -- cost its first write 3.7 ms,
             // which was 3x of ycsb-B at ten thousand keys. Freed by `Drop`.
-            let p = blocks::alloc(cap, false, self.mapped);
+            let p = self.src.alloc(cap, false);
             self.caps[b].store(cap, AtomicOrdering::Release);
             self.blocks[b].store(p, AtomicOrdering::Release);
             t.at = b << self.shift;
@@ -13808,7 +14595,12 @@ impl ByteArena {
         }
         let off = t.at;
         t.at += n;
-        self.used.fetch_add(n, AtomicOrdering::Relaxed);
+        // One writer, so a load and a store: the locked add was twenty
+        // cycles a reservation, three or four a put.
+        self.used.store(
+            self.used.load(AtomicOrdering::Relaxed) + n,
+            AtomicOrdering::Relaxed,
+        );
         off
     }
 
@@ -13857,7 +14649,12 @@ impl ByteArena {
                 t.at - t.block_start,
             );
         }
-        self.used.fetch_add(n, AtomicOrdering::Relaxed);
+        // One writer, so a load and a store: the locked add was twenty
+        // cycles a reservation, three or four a put.
+        self.used.store(
+            self.used.load(AtomicOrdering::Relaxed) + n,
+            AtomicOrdering::Relaxed,
+        );
         off
     }
 
@@ -13880,7 +14677,7 @@ impl ByteArena {
         let p = match unsafe { &mut *self.free.get() }.pop() {
             Some(p) => p,
             // Freed by `Drop`.
-            None => blocks::alloc(self.block_len(), false, self.mapped),
+            None => self.src.alloc(self.block_len(), false),
         };
         self.caps[b].store(self.block_len(), AtomicOrdering::Release);
         self.blocks[b].store(p, AtomicOrdering::Release);
@@ -13966,6 +14763,11 @@ impl ByteArena {
         unsafe { (*self.tail.get()).at }
     }
 
+    // Inlined: a dozen instructions that every read of a key, a chunk's
+    // header or a value makes, and a call each, six or seven a point read
+    // of an unsealed key and twelve a put, 94 and 162 instructions by
+    // callgrind (`bench/examples/point_ops.rs`).
+    #[inline]
     fn block(&self, off: usize, len: usize) -> (*mut u8, usize) {
         let b = off >> self.shift;
         let w = off & (self.block_len() - 1);
@@ -13981,6 +14783,17 @@ impl ByteArena {
         (p, w)
     }
 
+    /// Writer: a reserved range at `off`, `len` long, handed to `f` to
+    /// fill: one block lookup for a chunk's header and its value, where a
+    /// `write` each was three.
+    #[inline]
+    fn fill(&self, off: usize, len: usize, f: impl FnOnce(&mut [u8])) {
+        let (p, w) = self.block(off, len);
+        // SAFETY: inside the block, a range this writer reserved and no
+        // reader can reach until it is published, borrowed for the call.
+        f(unsafe { std::slice::from_raw_parts_mut(p.add(w), len) })
+    }
+
     /// Writer: `bytes` into a reserved range at `off`.
     fn write(&self, off: usize, bytes: &[u8]) {
         let (p, w) = self.block(off, bytes.len());
@@ -13989,7 +14802,41 @@ impl ByteArena {
         unsafe { std::ptr::copy_nonoverlapping(bytes.as_ptr(), p.add(w), bytes.len()) };
     }
 
+    /// Anyone: a memtable chunk's header at `off` (`CHUNK_HDR` bytes: the
+    /// previous chunk and the value's length) and the room after it in
+    /// its block, from one block lookup, where a slice for the header and
+    /// another for the value were two. A chunk is one reservation, and a
+    /// reservation never straddles a block (`reserve`), so a value the
+    /// header names is in the header's block; `ArenaChunk::value` holds it
+    /// to the room.
+    #[inline]
+    fn chunk(&self, off: usize) -> ArenaChunk<'_> {
+        let b = off >> self.shift;
+        let w = off & (self.block_len() - 1);
+        let p = self.blocks[b].load(AtomicOrdering::Acquire);
+        assert!(
+            !p.is_null(),
+            "memtable arena: an offset past what was published"
+        );
+        let room = self.caps[b]
+            .load(AtomicOrdering::Acquire)
+            .checked_sub(w + CHUNK_HDR)
+            .expect("memtable arena: a read past its block");
+        // SAFETY: inside the block, as checked: header bytes the writer
+        // wrote before publishing the offset that names them.
+        let hdr = unsafe { std::slice::from_raw_parts(p.add(w), CHUNK_HDR) };
+        ArenaChunk {
+            prev: u64::from_le_bytes(hdr[..8].try_into().expect("eight bytes")),
+            len: u32::from_le_bytes(hdr[8..].try_into().expect("four bytes")),
+            // SAFETY: the header's end, inside the block.
+            value: unsafe { p.add(w + CHUNK_HDR) },
+            room,
+            _arena: std::marker::PhantomData,
+        }
+    }
+
     /// Anyone: published bytes at `off`.
+    #[inline]
     fn slice(&self, off: usize, len: usize) -> &[u8] {
         let (p, w) = self.block(off, len);
         // SAFETY: inside a block that lives as long as the arena, bytes
@@ -14018,6 +14865,30 @@ impl ByteArena {
     }
 }
 
+/// A chunk's header as `ByteArena::chunk` read it, with where its value
+/// starts and the bytes its block has from there.
+struct ArenaChunk<'a> {
+    prev: u64,
+    len: u32,
+    value: *const u8,
+    room: usize,
+    _arena: std::marker::PhantomData<&'a ByteArena>,
+}
+
+impl<'a> ArenaChunk<'a> {
+    /// The value the header's length names; not for a tombstone, whose
+    /// length is no value's.
+    #[inline]
+    fn value(&self) -> &'a [u8] {
+        let len = self.len as usize;
+        assert!(len <= self.room, "memtable arena: a read past its block");
+        // SAFETY: inside the chunk's block, as checked; bytes the writer
+        // wrote with the header, before publishing the offset that names
+        // them.
+        unsafe { std::slice::from_raw_parts(self.value, len) }
+    }
+}
+
 impl Drop for ByteArena {
     fn drop(&mut self) {
         for (b, cap) in self.blocks.iter().zip(self.caps.iter()) {
@@ -14025,18 +14896,18 @@ impl Drop for ByteArena {
             if !p.is_null() {
                 let cap = cap.load(AtomicOrdering::Relaxed);
                 // SAFETY: allocated by `reserve` with this length.
-                unsafe { blocks::free(p, cap, self.mapped) };
+                unsafe { self.src.free(p, cap) };
             }
         }
         // The recycled blocks, retired or waiting: plain blocks every one.
         let len = self.block_len();
         for &(_, p) in self.retired.get_mut().iter() {
             // SAFETY: allocated by `block_at` with this length, owned here.
-            unsafe { blocks::free(p, len, self.mapped) };
+            unsafe { self.src.free(p, len) };
         }
         for &p in self.free.get_mut().iter() {
             // SAFETY: as above.
-            unsafe { blocks::free(p, len, self.mapped) };
+            unsafe { self.src.free(p, len) };
         }
     }
 }
@@ -14051,9 +14922,8 @@ const SLAB_BLOCKS: usize = 1 << 12;
 
 struct Slab<T> {
     blocks: Box<[AtomicPtr<T>]>,
-    /// Whether the blocks are mapped from the kernel (`blocks::alloc`,
-    /// `Options::blocks_mapped`).
-    mapped: bool,
+    /// Where the blocks come from (`ByteArena::src`).
+    src: blocks::Source,
     len: AtomicUsize,
     /// The most entries ever published, which a truncation leaves where
     /// it was: a reader that loaded the length before a truncation may
@@ -14064,12 +14934,12 @@ struct Slab<T> {
 }
 
 impl<T> Slab<T> {
-    fn new(mapped: bool) -> Slab<T> {
+    fn new(src: blocks::Source) -> Slab<T> {
         Slab {
             blocks: (0..SLAB_BLOCKS)
                 .map(|_| AtomicPtr::new(std::ptr::null_mut()))
                 .collect(),
-            mapped,
+            src,
             len: AtomicUsize::new(0),
             #[cfg(debug_assertions)]
             pushed: AtomicUsize::new(0),
@@ -14115,7 +14985,7 @@ impl<T> Slab<T> {
             // Not zeroed: an entry is read only below `len`, and each is
             // written whole before `len` covers it. See the arena. Freed
             // by `Drop`.
-            p = blocks::alloc(Self::block_bytes(), false, self.mapped) as *mut T;
+            p = self.src.alloc(Self::block_bytes(), false) as *mut T;
             self.blocks[b].store(p, AtomicOrdering::Release);
         }
         // SAFETY: inside the block, at a number no reader has been given.
@@ -14169,7 +15039,7 @@ impl<T> Drop for Slab<T> {
             let p = b.load(AtomicOrdering::Relaxed);
             if !p.is_null() {
                 // SAFETY: allocated by `push` with this length.
-                unsafe { blocks::free(p as *mut u8, Self::block_bytes(), self.mapped) };
+                unsafe { self.src.free(p as *mut u8, Self::block_bytes()) };
             }
         }
     }
@@ -14724,11 +15594,22 @@ impl MemTable {
     }
 
     fn new(shape: BlockShape) -> MemTable {
-        let BlockShape { prefault, mapped } = shape;
+        let BlockShape {
+            prefault,
+            index_populated,
+            fold_hash,
+            mapped,
+            pool,
+        } = shape;
+        let src = || blocks::Source::new(mapped, pool.clone());
         MemTable {
             mapped,
-            entries: Slab::new(mapped),
-            index: AtomicPtr::new(Box::into_raw(Box::new(Index::with_slots(1024, mapped)))),
+            fold_hash,
+            entries: Slab::new(src()),
+            index: AtomicPtr::new(Box::into_raw(Box::new(Index::with_slots(
+                1024,
+                src().populated(index_populated),
+            )))),
             ordered: false,
             refs: false,
             stream: false,
@@ -14742,16 +15623,16 @@ impl MemTable {
             keys_in_stream: false,
             log_range: false,
             slim_entries: false,
-            slim: Slab::new(mapped),
-            vals2: ByteArena::new(prefault, mapped),
+            slim: Slab::new(src()),
+            vals2: ByteArena::new(prefault, src()),
             staging: UnsafeCell::new(Staging::default()),
-            keys: ByteArena::new(prefault, mapped),
-            vals: ByteArena::new(prefault, mapped),
+            keys: ByteArena::new(prefault, src()),
+            vals: ByteArena::new(prefault, src()),
             tombs: AtomicUsize::new(0),
             marks: Default::default(),
             mark: AtomicU64::new(0),
             retired: UnsafeCell::new(Vec::new()),
-            log: Slab::new(mapped),
+            log: Slab::new(src()),
             snaps: FrozenSnaps::new(),
         }
     }
@@ -14770,11 +15651,21 @@ impl MemTable {
         log_range: bool,
         slim_entries: bool,
     ) -> MemTable {
-        let BlockShape { prefault, mapped } = shape;
+        // An ordered table keeps no hash index, the one block a shape's
+        // population and its hash are for.
+        let BlockShape {
+            prefault,
+            index_populated: _,
+            fold_hash: _,
+            mapped,
+            pool,
+        } = shape;
+        let src = || blocks::Source::new(mapped, pool.clone());
         debug_assert!(!(refs && stream.is_some()), "two shapes of one table");
         MemTable {
             mapped,
-            entries: Slab::new(mapped),
+            fold_hash: false,
+            entries: Slab::new(src()),
             index: AtomicPtr::new(std::ptr::null_mut()),
             ordered: true,
             refs,
@@ -14789,20 +15680,20 @@ impl MemTable {
             keys_in_stream: stream.is_some() && keys_in_stream,
             log_range,
             slim_entries: stream.is_some() && keys_in_stream && slim_entries,
-            slim: Slab::new(mapped),
-            vals2: ByteArena::new(prefault, mapped),
+            slim: Slab::new(src()),
+            vals2: ByteArena::new(prefault, src()),
             staging: UnsafeCell::new(Staging::default()),
-            keys: ByteArena::new(prefault, mapped),
+            keys: ByteArena::new(prefault, src()),
             vals: if stream.is_some() && recycle {
-                ByteArena::with_shift(prefault, STREAM_SHIFT, mapped)
+                ByteArena::with_shift(prefault, STREAM_SHIFT, src())
             } else {
-                ByteArena::new(prefault, mapped)
+                ByteArena::new(prefault, src())
             },
             tombs: AtomicUsize::new(0),
             marks: Default::default(),
             mark: AtomicU64::new(0),
             retired: UnsafeCell::new(Vec::new()),
-            log: Slab::new(mapped),
+            log: Slab::new(src()),
             snaps: FrozenSnaps::new(),
         }
     }
@@ -15109,7 +16000,10 @@ impl MemTable {
             e.head.store(off + 1, AtomicOrdering::Release);
             match value {
                 Some(_) => {
-                    e.count.fetch_add(1, AtomicOrdering::Relaxed);
+                    e.count.store(
+                        e.count.load(AtomicOrdering::Relaxed) + 1,
+                        AtomicOrdering::Relaxed,
+                    );
                 }
                 None => e.count.store(0, AtomicOrdering::Relaxed),
             }
@@ -15128,24 +16022,68 @@ impl MemTable {
     /// A tombstone and then `value` on `key`'s chain, one probe for both:
     /// what a put is, and half the misses of a delete then an append at
     /// thirty million keys.
-    fn put(&self, hash: u64, key: &[u8], value: &[u8], rd: &Readers) {
+    ///
+    /// A key the table does not hold yet, which is most of a write mix's
+    /// puts after a seal has emptied the table, gets its entry with both
+    /// chunks laid down in one reservation (`new_put_entry`), where a
+    /// tombstone's entry and then the value's chunk were two reservations
+    /// and five lookups of a block, and goes into the index at the slot
+    /// where the probe for it found none (`index_insert_at`), where the
+    /// insert walked the probe's slots again.
+    ///
+    /// Whether the put overwrote the key's value where it lies, which it
+    /// tries where `overwrite` says it may (`Options::put_in_place`,
+    /// `MemTable::overwrite`, `Db::put_pinned`), growing the table by its
+    /// log's entry alone.
+    fn put(&self, hash: u64, key: &[u8], value: &[u8], rd: &Readers, overwrite: bool) -> bool {
         assert!(!self.ordered, "a put never reaches an ordered memtable");
-        if let Some(id) = self.probe(hash, key) {
-            let e = self.fat(id);
-            let tomb = self.push_tomb(e.chain_head());
-            let off = self.push_chunk(tomb, value);
-            e.head.store(off + 1, AtomicOrdering::Release);
-            e.count.store(1, AtomicOrdering::Relaxed);
-            self.log_write(id, false);
-            return;
-        }
-        let id = self.new_entry(hash, key, None);
-        let e = self.fat(id);
-        let off = self.push_chunk(e.chain_head(), value);
-        e.head.store(off + 1, AtomicOrdering::Release);
-        e.count.store(1, AtomicOrdering::Relaxed);
-        self.index_insert(hash, id, rd);
+        let vacant = match self.probe_or_vacant(hash, key) {
+            Ok(id) => {
+                let e = self.fat(id);
+                let head = e.chain_head();
+                if overwrite && self.overwrite(head, value) {
+                    self.log_write(id, false);
+                    return true;
+                }
+                let off = self.push_tomb_chunk(head, value);
+                e.head.store(off + 1, AtomicOrdering::Release);
+                e.count.store(1, AtomicOrdering::Relaxed);
+                self.log_write(id, false);
+                return false;
+            }
+            Err(slot) => slot,
+        };
+        let id = self.new_put_entry(hash, key, value);
+        self.index_insert_at(hash, id, vacant, rd);
         self.log_write(id, true);
+        false
+    }
+
+    /// Writer: `value` over the bytes of the chain's head at `head`, where
+    /// the head is a put's -- a value laid down in one reservation right
+    /// after the tombstone it is chained to (`push_tomb_chunk`), so that it
+    /// is the key's one live value and masks everything older -- and is
+    /// `value`'s length; false, with nothing written, otherwise. What a put
+    /// leaves is the same either way: the chain's one value, the new one,
+    /// over a tombstone. Sound only while no other thread reads the table's
+    /// values: no handle live (`Db::put_pinned`), and none of the engine's
+    /// threads that read a live table's values (`check_options`).
+    fn overwrite(&self, head: u64, value: &[u8]) -> bool {
+        if head == NO_CHUNK || head < CHUNK_HDR as u64 {
+            return false;
+        }
+        // By the head's offset less the header, never the link's plus it:
+        // a key whose first write in the table was an append links to
+        // nothing (`NO_CHUNK`), and the sum overflows.
+        let c = self.vals.chunk(head as usize);
+        if c.len as usize != value.len() || head - CHUNK_HDR as u64 != c.prev {
+            return false;
+        }
+        if self.vals.chunk(c.prev as usize).len != TOMB_LEN {
+            return false;
+        }
+        self.vals.write(head as usize + CHUNK_HDR, value);
+        true
     }
 
     /// End every value of `key` before this point: a tombstone chunk at the
@@ -15163,19 +16101,7 @@ impl MemTable {
     /// Writer: a new entry, its key and first chunk written, published by
     /// the slab's length; the index is the caller's.
     fn new_entry(&self, hash: u64, key: &[u8], value: Option<&[u8]>) -> usize {
-        // A copy in `keys`, marked as one where the table's keys are
-        // otherwise read in the stream.
-        let copy = || -> u32 {
-            let key_off = self.keys.reserve(key.len());
-            self.keys.write(key_off, key);
-            let off = u32::try_from(key_off).expect("a memtable's keys stay under four gigabytes");
-            debug_assert!(off & KEYS_BIAS == 0 || !self.keys_in_stream);
-            if self.keys_in_stream {
-                off | KEYS_BIAS
-            } else {
-                off
-            }
-        };
+        let copy = || self.copy_key(key);
         let (off, count, key_off) = match value {
             Some(v) if self.stream => {
                 let (head, rec) = self.push_record(key, v);
@@ -15224,6 +16150,46 @@ impl MemTable {
         })
     }
 
+    /// Writer: `key` copied into `keys`, and the span's offset, marked as a
+    /// copy where the table's keys are otherwise read in the stream.
+    fn copy_key(&self, key: &[u8]) -> u32 {
+        let key_off = self.keys.reserve(key.len());
+        self.keys.write(key_off, key);
+        let off = u32::try_from(key_off).expect("a memtable's keys stay under four gigabytes");
+        debug_assert!(off & KEYS_BIAS == 0 || !self.keys_in_stream);
+        if self.keys_in_stream {
+            off | KEYS_BIAS
+        } else {
+            off
+        }
+    }
+
+    /// Writer: the entry a put makes of a key the table does not hold, its
+    /// tombstone and its value over it laid down in one reservation
+    /// (`push_tomb_chunk`), its key copied, published by the slab's
+    /// length; the index is the caller's. The entry `new_entry` makes with
+    /// a tombstone and `push_chunk` then gives its value, the two chunks
+    /// side by side wherever a block's end does not part them.
+    fn new_put_entry(&self, hash: u64, key: &[u8], value: &[u8]) -> usize {
+        debug_assert!(
+            !self.ordered && !self.stream && !self.refs && !self.slim_entries,
+            "a put's entry is a hashed table's"
+        );
+        debug_assert!(
+            key.len() <= usize::from(u16::MAX),
+            "a key fits a record's length word"
+        );
+        let off = self.push_tomb_chunk(NO_CHUNK, value);
+        let key_off = self.copy_key(key);
+        self.entries.push(MemEntry {
+            hash: (hash >> 32) as u32,
+            key_off,
+            klen: key.len() as u16,
+            head: AtomicU64::new(off + 1),
+            count: AtomicU32::new(1),
+        })
+    }
+
     /// The slim word for a stream record whose head is `head`, whose key
     /// is at `key_off` and `klen` long; `None` where the record needs the
     /// fat entry: a key copied (`KEYS_BIAS`), a value copied across a
@@ -15257,11 +16223,29 @@ impl MemTable {
         idx.slots[i].store(Index::word(hash, id), AtomicOrdering::Release);
     }
 
+    /// Writer: entry `id` into the index at `vacant`, the slot where a
+    /// probe for its key just found none (`probe_or_vacant`), which is the
+    /// slot `index_insert` would walk to: only the writer inserts, and
+    /// nothing has since. A table at half load is rebuilt and inserted
+    /// into by `index_insert`.
+    fn index_insert_at(&self, hash: u64, id: usize, vacant: usize, rd: &Readers) {
+        let idx = self.index().expect("a hashed table has an index");
+        if self.len() * 2 > idx.slots.len() {
+            return self.index_insert(hash, id, rd);
+        }
+        debug_assert_eq!(
+            idx.slots[vacant].load(AtomicOrdering::Relaxed),
+            0,
+            "the probe's vacant slot is vacant at the insert"
+        );
+        idx.slots[vacant].store(Index::word(hash, id), AtomicOrdering::Release);
+    }
+
     /// Writer: a table twice the size with every entry reinserted,
     /// published, the old one retired at the epoch the publish bumps.
     fn rebuild_index(&self, old: &Index, rd: &Readers) -> &Index {
         let cap = old.slots.len() * 2;
-        let fresh = Index::with_slots(cap, old.slots.mapped);
+        let fresh = Index::with_slots(cap, old.slots.src.clone());
         for id in 0..self.len() {
             let hash = u64::from(self.fat(id).hash) << 32;
             let mut i = slot_of(hash, fresh.mask);
@@ -15306,11 +16290,15 @@ impl MemTable {
             a.write(off + CHUNK_HDR, value);
             return off as u64 | REF_STAGED | if sel == 1 { REF_ARENA2 } else { 0 };
         }
-        let off = self.vals.reserve(CHUNK_HDR + value.len());
-        self.vals.write(off, &prev.to_le_bytes());
-        self.vals
-            .write(off + 8, &(value.len() as u32).to_le_bytes());
-        self.vals.write(off + CHUNK_HDR, value);
+        // One lookup of the block for the header and the value, where a
+        // `write` each was three.
+        let len = CHUNK_HDR + value.len();
+        let off = self.vals.reserve(len);
+        self.vals.fill(off, len, |b| {
+            b[..8].copy_from_slice(&prev.to_le_bytes());
+            b[8..CHUNK_HDR].copy_from_slice(&(value.len() as u32).to_le_bytes());
+            b[CHUNK_HDR..].copy_from_slice(value);
+        });
         off as u64
     }
 
@@ -15558,10 +16546,44 @@ impl MemTable {
 
     fn push_tomb(&self, prev: u64) -> u64 {
         let off = self.vals.reserve(CHUNK_HDR);
-        self.vals.write(off, &prev.to_le_bytes());
-        self.vals.write(off + 8, &TOMB_LEN.to_le_bytes());
-        self.tombs.fetch_add(1, AtomicOrdering::Relaxed);
+        self.vals.fill(off, CHUNK_HDR, |b| {
+            b[..8].copy_from_slice(&prev.to_le_bytes());
+            b[8..].copy_from_slice(&TOMB_LEN.to_le_bytes());
+        });
+        self.note_tomb();
         off as u64
+    }
+
+    /// Writer: one more tombstone in the table. A load and a store, the
+    /// table having one writer.
+    #[inline]
+    fn note_tomb(&self) {
+        self.tombs.store(
+            self.tombs.load(AtomicOrdering::Relaxed) + 1,
+            AtomicOrdering::Relaxed,
+        );
+    }
+
+    /// Writer: a tombstone over `prev` and `value` over the tombstone, the
+    /// two chunks a put makes of a key the table holds, in one
+    /// reservation and one block lookup; the value's chunk is returned,
+    /// the tombstone the header's length before it. What `push_tomb` and
+    /// then `push_chunk` lay down, except that the two are never parted
+    /// by a block's end.
+    fn push_tomb_chunk(&self, prev: u64, value: &[u8]) -> u64 {
+        debug_assert!(!self.refs && !self.stream, "a hashed table's chunks");
+        let len = 2 * CHUNK_HDR + value.len();
+        let off = self.vals.reserve(len);
+        let chunk = (off + CHUNK_HDR) as u64;
+        self.vals.fill(off, len, |b| {
+            b[..8].copy_from_slice(&prev.to_le_bytes());
+            b[8..CHUNK_HDR].copy_from_slice(&TOMB_LEN.to_le_bytes());
+            b[CHUNK_HDR..CHUNK_HDR + 8].copy_from_slice(&(off as u64).to_le_bytes());
+            b[CHUNK_HDR + 8..2 * CHUNK_HDR].copy_from_slice(&(value.len() as u32).to_le_bytes());
+            b[2 * CHUNK_HDR..].copy_from_slice(value);
+        });
+        self.note_tomb();
+        chunk
     }
 
     /// A tagged head's arena and the offset in it (`refs` only).
@@ -15777,6 +16799,80 @@ impl MemTable {
         tomb
     }
 
+    /// `live_offs_into` for a short chain, into a buffer on the caller's
+    /// frame: the live chunks newest first in `buf`, how many, and whether
+    /// a tombstone cut the chain; `None` for a chain of more live chunks
+    /// than `buf` holds, which `live_chain` reads. A key written by `put`
+    /// has one, and a point read of it allocated and freed a vector for
+    /// that one offset, 49 instructions of the allocator's by callgrind.
+    #[inline]
+    fn live_offs_small(
+        &self,
+        e: Entry<'_>,
+        wm: u64,
+        buf: &mut [usize; LIVE_SMALL],
+    ) -> Option<(usize, bool)> {
+        let mut at = MemTable::head(e);
+        let mut n = 0;
+        while at != NO_CHUNK {
+            if at >= wm {
+                at = self.chunk_prev(at);
+                continue;
+            }
+            if self.is_tomb(at) {
+                return Some((n, true));
+            }
+            if n == LIVE_SMALL {
+                return None;
+            }
+            buf[n] = at as usize;
+            n += 1;
+            at = self.chunk_prev(at);
+        }
+        Some((n, false))
+    }
+
+    /// `live_offs_small` for a hashed table, the values themselves where
+    /// that finds their offsets: the key's live values newest first in
+    /// `buf`, how many, and whether a tombstone cut the chain; `None` for
+    /// more live values than `buf` holds. A hashed table's every chunk is
+    /// in `vals` under its plain offset, so a chunk's header is one
+    /// lookup of its block, its predecessor and its length together, and
+    /// its value a second, where the offsets' walk and `value_at` behind
+    /// it looked the block up for the length, for the predecessor, and
+    /// for the length again before the value: five lookups of a block for
+    /// a key a `put` wrote, a value and the tombstone under it, where
+    /// this makes three.
+    #[inline(always)]
+    fn live_small_hashed<'t>(
+        &'t self,
+        e: Entry<'t>,
+        wm: u64,
+        buf: &mut [std::mem::MaybeUninit<&'t [u8]>; LIVE_SMALL],
+    ) -> Option<(usize, bool)> {
+        debug_assert!(
+            !self.ordered && !self.stream && !self.refs,
+            "a hashed table's chunks are in its arena, under plain offsets"
+        );
+        let mut at = MemTable::head(e);
+        let mut n = 0;
+        while at != NO_CHUNK {
+            let c = self.vals.chunk(at as usize);
+            if at < wm {
+                if c.len == TOMB_LEN {
+                    return Some((n, true));
+                }
+                if n == LIVE_SMALL {
+                    return None;
+                }
+                buf[n].write(c.value());
+                n += 1;
+            }
+            at = c.prev;
+        }
+        Some((n, false))
+    }
+
     /// Whether a tombstone sits anywhere in the key's chain below `wm`.
     fn has_tomb(&self, e: Entry<'_>, wm: u64) -> bool {
         let mut at = MemTable::head(e);
@@ -15840,9 +16936,9 @@ impl MemTable {
         if self.ordered {
             return self.get(key, upto);
         }
-        self.probe(hash, key)
-            .filter(|&i| i < upto)
-            .map(|i| self.entry(i))
+        self.probe_entry(hash, key)
+            .filter(|&(i, _)| i < upto)
+            .map(|(_, e)| e)
     }
 
     /// The entry number holding `key`, if the table has it among the
@@ -15881,7 +16977,7 @@ impl MemTable {
             }
             return None;
         }
-        self.probe(mem_hash(key), key).filter(|&i| i < upto)
+        self.probe(self.hash(key), key).filter(|&i| i < upto)
     }
 
     /// A hint to fetch the slot line `key` probes first, and its hash for
@@ -15890,7 +16986,7 @@ impl MemTable {
     /// while the line comes in. At thirty million keys the slot and the
     /// entry behind it are both misses, and this hides the first.
     fn prefetch(&self, key: &[u8]) -> u64 {
-        self.prefetch_hashed(mem_hash(key))
+        self.prefetch_hashed(self.hash(key))
     }
 
     /// `prefetch` for a key whose hash (`mem_hash`) the caller has.
@@ -15902,7 +16998,67 @@ impl MemTable {
         hash
     }
 
+    /// `probe` for the writer's put: the entry holding `key`, or the vacant
+    /// slot its probe ended at, for `index_insert_at`.
+    /// This table's hash of `key`: the fold of its words where the table
+    /// folds and the key is sixteen bytes (`Options::mem_hash_fold`), and
+    /// otherwise the hash of its FNV word.
+    #[inline(always)]
+    fn hash(&self, key: &[u8]) -> u64 {
+        if self.fold_hash {
+            if let Ok(k) = <&[u8; 16]>::try_from(key) {
+                return fold_hash16(k);
+            }
+        }
+        mem_hash(key)
+    }
+
+    /// `hash` for a key whose FNV word `fnv` the caller has taken.
+    #[inline(always)]
+    fn hash_with(&self, key: &[u8], fnv: u64) -> u64 {
+        if self.fold_hash {
+            if let Ok(k) = <&[u8; 16]>::try_from(key) {
+                return fold_hash16(k);
+            }
+        }
+        mem_hash_of(fnv)
+    }
+
+    /// Whether `hash` takes no FNV word for `key`, so that a read the
+    /// table ends need not take one.
+    #[inline(always)]
+    fn folds(&self, key: &[u8]) -> bool {
+        self.fold_hash && key.len() == 16
+    }
+
+    fn probe_or_vacant(&self, hash: u64, key: &[u8]) -> std::result::Result<usize, usize> {
+        let idx = self.index().expect("a hashed table has an index");
+        let mut i = slot_of(hash, idx.mask);
+        loop {
+            let s = idx.slots[i].load(AtomicOrdering::Acquire);
+            if s == 0 {
+                return Err(i);
+            }
+            if s >> 32 == hash >> 32 {
+                let id = ((s & 0xffff_ffff) - 1) as usize;
+                let e = self.entry(id);
+                if crate::flatindex::key_eq(self.key_of(e), key) {
+                    return Ok(id);
+                }
+            }
+            i = (i + 1) & idx.mask;
+        }
+    }
+
     fn probe(&self, hash: u64, key: &[u8]) -> Option<usize> {
+        self.probe_entry(hash, key).map(|(id, _)| id)
+    }
+
+    /// `probe` with the entry its key compare decoded, which is what a
+    /// read takes next: decoded once where a read that took the number
+    /// decoded it again, twenty-one instructions of a get the live table
+    /// answers (`bench/examples/point_ops.rs`, `POINT_OPS_CLASSES=1`).
+    fn probe_entry(&self, hash: u64, key: &[u8]) -> Option<(usize, Entry<'_>)> {
         let idx = self.index()?;
         let mut i = slot_of(hash, idx.mask);
         loop {
@@ -15914,8 +17070,8 @@ impl MemTable {
             if s >> 32 == hash >> 32 {
                 let id = ((s & 0xffff_ffff) - 1) as usize;
                 let e = self.entry(id);
-                if self.key_of(e) == key {
-                    return Some(id);
+                if crate::flatindex::key_eq(self.key_of(e), key) {
+                    return Some((id, e));
                 }
             }
             i = (i + 1) & idx.mask;
@@ -16050,9 +17206,27 @@ fn ref_pack(off: u64, len: u32) -> u64 {
 /// read, and the suite's unpinned arm faulted in a third of its runs once
 /// the segment work moved to a thread of its own.
 fn check_options(opts: &Options) -> Result<()> {
+    if !opts.held_frames && !matches!(opts.sync, SyncPolicy::Explicit) {
+        return Err(err(
+            "held_frames off is a held log's shape: only SyncPolicy::Explicit keeps no frames",
+        ));
+    }
     if opts.direct_stream && opts.direct_table_refs {
         return Err(err(
             "direct_stream and direct_table_refs are two shapes of one table",
+        ));
+    }
+    if opts.put_in_place
+        && (!matches!(opts.sync, SyncPolicy::Explicit)
+            || opts.scan_block_cache
+            || opts.snapshot_keeper
+            || opts.forms_off_snapshot_kept
+            || opts.upkeep != Upkeep::Inline)
+    {
+        return Err(err(
+            "put_in_place overwrites a live table's values under the writer alone: \
+             it needs SyncPolicy::Explicit, Upkeep::Inline, and scan_block_cache, \
+             snapshot_keeper and forms_off_snapshot_kept off",
         ));
     }
     if !opts.writer_pins && (opts.publish_in_background || opts.snapshot_keeper) {
@@ -19626,6 +20800,16 @@ struct State {
     /// binary search instead of a walk over all of them; see
     /// `pieces_over`. Refreshed by `sort_segs`.
     l0_aligned: bool,
+    /// How many of `segs` are partitions, which sort first.
+    parts: usize,
+    /// Each partition's run of pieces in `segs[parts..]`, by the
+    /// partition's place, where every piece is aligned to one
+    /// (`l0_aligned`); empty where no piece stands or one is unaligned,
+    /// and then a read consults them all. What `pieces_aligned_over`
+    /// finds by two searches of the pieces, taken once where the segments
+    /// are published (`State::placing`) for the point read that asks at
+    /// every key (`pieces_placed`, `Options::point_layers_lean`).
+    piece_runs: Vec<(u32, u32)>,
     /// Whether any live segment holds a tombstone, found once here: a
     /// read asked it of every segment, forty-one pointer chases a read
     /// at thirty million keys.
@@ -19924,6 +21108,9 @@ struct Shared {
     retired: RetireList<Box<State>>,
     /// Which form a read takes (`ZGate`).
     zgate: ZGate,
+    /// The store's pool of blocks its tables gave back
+    /// (`Options::blocks_pool_bytes`), turned off with the gate.
+    block_pool: Option<std::sync::Arc<blocks::BlockPool>>,
     /// Whether a raw walk asks for its records ahead of it
     /// (`Options::scan_raw_ahead`): the option, and the partitions' key and
     /// value bytes past the last-level cache where
@@ -20094,6 +21281,15 @@ struct Shared {
     /// the publish once the slot or the rename is durable; see
     /// `Db::manifest_seq`.
     manifest_seq: AtomicU64,
+    /// The sequence a manifest that is on the device covers, as this
+    /// process has made one so: stored by the segment work once a slot
+    /// or a rename is durable, with the sequence that manifest carries,
+    /// and never with the one a readable landing has only published
+    /// (`Maint::note_covered`). The writer drops the frames its log
+    /// holds below it (`Db::log_trim`, `SyncPolicy::Explicit`). Zero
+    /// until this process has made a manifest durable: the one the open
+    /// read may have been in the page cache alone.
+    log_covered: AtomicU64,
     /// Patches that found the form shared with a published copy and had
     /// to copy it before writing (`Arc::make_mut` on a shared form).
     forms_cloned: AtomicU64,
@@ -21408,6 +22604,19 @@ pub struct Reader {
     /// ones: a count every reader thread bumped on one line is what the
     /// threaded cells it is meant to be read beside would price.
     ord_served: std::cell::Cell<u64>,
+    /// Point reads this handle answered by the two-source read and by the
+    /// layered one (`Reader::read_lone`, `Reader::read_layers`,
+    /// `Options::point_lone`), for a test that has to know which read its
+    /// store took (`point_lean_reads`).
+    lone_reads: std::cell::Cell<u64>,
+    layer_reads: std::cell::Cell<u64>,
+    /// Of `layer_reads`, the ones `read_placed` answered
+    /// (`Options::point_layers_lean`).
+    placed_reads: std::cell::Cell<u64>,
+    /// Of the lean reads, the ones a tombstone in the live table's chain
+    /// ended: answered by the live table alone, whatever the store below
+    /// it holds (`point_live_ended_reads`).
+    live_ended: std::cell::Cell<u64>,
     ord_declined: std::cell::Cell<u64>,
     /// This handle's memo of decoded groups (`zfile::ZMemo`,
     /// `Options::zpages_memo`), which goes with the handle.
@@ -22193,6 +23402,9 @@ pub struct Db {
     /// a loose run if it fails (`flush`).
     drain_run: Option<(PathBuf, bool)>,
     mem_bytes: usize,
+    /// The puts that overwrote a value where it lay
+    /// (`Options::put_in_place`, `Db::puts_in_place`).
+    puts_in_place: u64,
     /// The segment ordered ingest streams into, while one is open. The
     /// memtable is ordered exactly while a run is forming or open.
     direct: Option<Direct>,
@@ -22232,6 +23444,12 @@ pub struct Db {
     wal_dir_unsynced: bool,
     /// Commits written since the last barrier, for `SyncPolicy::EveryN`.
     unsynced: u32,
+    /// The sequence the last commit with no frames ended at
+    /// (`Options::held_frames` off): that commit and every one before it
+    /// are in the memtable alone until a manifest on the device covers it
+    /// (`Shared::log_covered`), and until then the log answers as one with
+    /// frames no sync has covered (`Db::log_unsynced`).
+    unframed_to: u64,
     /// The writes since the last read over lag, and the live table with
     /// the log position they were last counted to (`Db::lag_tick`,
     /// `Options::adaptive_cap`): the table by identity -- its address,
@@ -22277,6 +23495,10 @@ pub struct Db {
     /// The pre-writes the log's closed files made and the writer's time on
     /// them (`Wal::ahead_writes`), for `Db::wal_ahead_counts`.
     wal_ahead_done: (u64, u64),
+    /// What the batches the log's closed files held came to: the bytes
+    /// dropped unwritten, the bytes spilled, and the spills
+    /// (`Wal::held_dropped`), for `Db::wal_held`.
+    wal_held_done: (u64, u64, u64),
     /// `Options::scan_forms_off_stale_writes`: the writes made in small
     /// commits, with the forms given up, since the store's last scan or
     /// the last batch of a burst; and what the count is taken against, the
@@ -22490,9 +23712,12 @@ impl Drop for Reader {
         }
         if let Some(slot) = self.slot {
             if self.counted {
+                // A release: a writer that overwrites in place once the
+                // count reads nothing does so after this handle's reads
+                // (`Options::put_in_place`, `Db::put_pinned`).
                 self.shared
                     .live_handles
-                    .fetch_sub(1, AtomicOrdering::Relaxed);
+                    .fetch_sub(1, AtomicOrdering::Release);
             }
             self.shared.readers.release(slot);
         }
@@ -24331,9 +25556,13 @@ impl Reader {
     fn zcensus_end(&self) {
         let mut w = self.zwin.get();
         debug_assert!(w.counting);
+        let wall = match self.opts.zpages_inject.as_ref().and_then(|i| i.op_wall()) {
+            Some(d) => d,
+            None => w.t0.elapsed(),
+        };
         w.busy = w
             .busy
-            .saturating_add(w.t0.elapsed().as_nanos().min(u64::MAX as u128) as u64);
+            .saturating_add(wall.as_nanos().min(u64::MAX as u128) as u64);
         w.counting = false;
         self.zwin_counting.set(false);
         self.zwin.set(w);
@@ -24770,23 +25999,72 @@ impl State {
     }
 
     /// The level-0 pieces a read of a key in partition `at` consults.
+    #[inline]
     fn pieces_over(&self, np: usize, at: usize) -> &[std::sync::Arc<Seg>] {
         let l0 = &self.segs[np..];
-        if !self.l0_aligned || at >= np {
+        // No piece at all is the store a drain left, and every read of
+        // one paid the call and the two searches below to learn it: 49
+        // instructions of a point read's 959, by callgrind.
+        if l0.is_empty() || !self.l0_aligned || at >= np {
             return l0;
         }
+        self.pieces_aligned_over(l0, at)
+    }
+
+    /// `pieces_over` for a store whose pieces are aligned to its
+    /// partitions: the run of them over partition `at`.
+    fn pieces_aligned_over<'a>(
+        &'a self,
+        l0: &'a [std::sync::Arc<Seg>],
+        at: usize,
+    ) -> &'a [std::sync::Arc<Seg>] {
+        let (from, to) = State::aligned_run(self.segs[at].lo.as_slice(), l0);
+        &l0[from..to]
+    }
+
+    /// The run of `l0`, pieces each aligned to a partition, over the
+    /// partition whose lower fence is `lo`: the one definition, which
+    /// `pieces_aligned_over` asks at a read and `placing` at a publish.
+    fn aligned_run(lo: &[u8], l0: &[std::sync::Arc<Seg>]) -> (usize, usize) {
         // The first partition's lower fence is empty, and so is that of
         // every piece aligned to it; see `below_lo` for why an empty fence
         // is never handed to a compare.
-        let lo = self.segs[at].lo.as_slice();
         let before =
             |s: &std::sync::Arc<Seg>| !lo.is_empty() && (s.lo.is_empty() || s.lo.as_slice() < lo);
         let same = |s: &std::sync::Arc<Seg>| {
             s.lo.is_empty() == lo.is_empty() && (lo.is_empty() || s.lo.as_slice() == lo)
         };
         let from = l0.partition_point(before);
-        let to = from + l0[from..].partition_point(same);
-        &l0[from..to]
+        (from, from + l0[from..].partition_point(same))
+    }
+
+    /// `parts` and `piece_runs` for sorted segments and their
+    /// `l0_aligned`.
+    fn placing(segs: &[std::sync::Arc<Seg>], l0_aligned: bool) -> (usize, Vec<(u32, u32)>) {
+        let np = segs.partition_point(|s| s.level > 0);
+        let l0 = &segs[np..];
+        if l0.is_empty() || !l0_aligned {
+            return (np, Vec::new());
+        }
+        let runs = segs[..np]
+            .iter()
+            .map(|p| {
+                let (from, to) = State::aligned_run(p.lo.as_slice(), l0);
+                (from as u32, to as u32)
+            })
+            .collect();
+        (np, runs)
+    }
+
+    /// `pieces_over(self.parts, at)` by the runs the publish took
+    /// (`piece_runs`): a load where that is two searches of the pieces.
+    #[inline(always)]
+    fn pieces_placed(&self, at: usize) -> &[std::sync::Arc<Seg>] {
+        let l0 = &self.segs[self.parts..];
+        match self.piece_runs.get(at) {
+            Some(&(from, to)) => &l0[from as usize..to as usize],
+            None => l0,
+        }
     }
 }
 
@@ -25113,8 +26391,14 @@ impl Reader {
         {
             return;
         }
-        let mut m = self.mode_note.get();
         if self.slot.is_none() {
+            // The writer's note where it lies: taken out of its cell and
+            // put back, the whole note was copied twice a read for one
+            // count, 33 instructions of a point read by callgrind.
+            // SAFETY: the handle is one thread's (`Reader` is not `Sync`)
+            // and nothing below reaches the cell again while the borrow
+            // is out.
+            let m = unsafe { &mut *self.mode_note.as_ptr() };
             if scan {
                 m.scans += 1;
             } else {
@@ -25136,9 +26420,9 @@ impl Reader {
                     .write_quiet
                     .store(false, AtomicOrdering::Release);
             }
-            self.mode_note.set(m);
             return;
         }
+        let mut m = self.mode_note.get();
         let now = (self.state().gen, self.mem().committed_log());
         let (at, shared) = if scan {
             (&mut m.scan_at, &self.shared.mode_scans)
@@ -25167,10 +26451,20 @@ impl Reader {
         }
     }
 
+    #[inline]
     fn advise(&self, random: bool) {
         if self.opts.read_advice != ReadAdvice::Adaptive || self.advice_random() == random {
             return;
         }
+        self.advise_switch(random);
+    }
+
+    /// `advise` where the mode changes: out of line, since every read asks
+    /// and one in a phase switches, and the call alone was 23
+    /// instructions of a point read.
+    #[cold]
+    #[inline(never)]
+    fn advise_switch(&self, random: bool) {
         self.set_advice_random(random);
         // Segments only. A segment's pages are walked in whichever way the
         // workload is walking them, so the advice follows the phase; the
@@ -25693,6 +26987,31 @@ impl Reader {
     /// `Reader` for its own.
     pub fn ord_point_reads(&self) -> (u64, u64) {
         (self.ord_served.get(), self.ord_declined.get())
+    }
+
+    /// Point reads this handle answered by the read of a partition and
+    /// the live table alone, and by the layered read of every source in
+    /// its common shape (`Options::point_lone`); both zero without the
+    /// option, and a read counted in neither took the general read. A
+    /// handle's own count, as `ord_point_reads` is.
+    pub fn point_lean_reads(&self) -> (u64, u64) {
+        (self.lone_reads.get(), self.layer_reads.get())
+    }
+
+    /// Of the layered reads `point_lean_reads` counts, the ones the read
+    /// that places its sources first answered
+    /// (`Options::point_layers_lean`, `Reader::read_placed`); the rest
+    /// were `read_layers`'. A handle's own count.
+    pub fn point_placed_reads(&self) -> u64 {
+        self.placed_reads.get()
+    }
+
+    /// Of the reads `point_lean_reads` counts, the ones a tombstone in the
+    /// live table's chain ended, so that nothing below the live table was
+    /// read: what share of a workload's gets a path that asked the live
+    /// table first would answer there. A handle's own count.
+    pub fn point_live_ended_reads(&self) -> u64 {
+        self.live_ended.get()
     }
 
     /// `key`'s values in a partition read through the partition's ordered
@@ -26706,6 +28025,448 @@ impl Reader {
         // an accessor at every step, thirty nanoseconds on a read of two
         // hundred at three hundred thousand keys.
         let st = self.state();
+        if let Some(n) = self.read_lone(st, key, &mut f) {
+            return n;
+        }
+        if let Some(n) = self.read_placed(st, key, &mut f) {
+            return n;
+        }
+        if let Some(n) = self.read_layers(st, key, &mut f) {
+            return n;
+        }
+        self.read_sources(st, key, f)
+    }
+
+    /// `read_layers` with its sources asked in the order of what each
+    /// costs (`Options::point_layers_lean`): `None`, with nothing handed to
+    /// `f`, for every store and key that read leaves to the general one,
+    /// and for a store whose merges follow its reads or with a frozen
+    /// table that was a run of ordered ingest, which are that read's.
+    ///
+    /// The key's partition and the pieces over it come from the state
+    /// (`State::parts`, `pieces_placed`), and the partition's first hash
+    /// slot and the pieces' filter blocks are asked for before anything
+    /// is read. Then the live table: a tombstone in the key's chain masks
+    /// every older source, and the read ends with the chain's values
+    /// after it. Then the frozen tables newest first, the same way, and
+    /// the pieces newest first, each that may hold the key asked once for
+    /// its record, to the newest tombstone; the partition where none
+    /// masks it; and the values oldest first, the partition's, the
+    /// pieces', the frozen tables' and the live one's, as `read_layers`
+    /// hands them over. Nothing is handed to `f` before the last source
+    /// is asked, so a `None` from any of them hands over nothing.
+    #[inline(never)]
+    fn read_placed<F: FnMut(&[u8])>(
+        &self,
+        st: &State,
+        key: &[u8],
+        f: &mut F,
+    ) -> Option<Result<u64>> {
+        if !self.opts.point_layers_lean || !self.opts.point_lone_on() {
+            return None;
+        }
+        let (segs, mem) = (&st.segs, &*st.mem);
+        let (np, nf) = (st.parts, st.frozen.len());
+        if np == 0 || mem.ordered || nf > FROZEN_CAP || self.lag_adapts() {
+            return None;
+        }
+        if self.opts.zpages != ZPages::Off && self.z_on() {
+            return None;
+        }
+        // The key's FNV word, which every source below the tables takes,
+        // after the live table where the table is asked first and its
+        // hash is not made from the word (`Options::mem_hash_fold`), so a
+        // read the table ends takes none.
+        let late = self.opts.point_live_first && mem.folds(key);
+        let fnv0 = if late {
+            0
+        } else {
+            crate::flatindex::key_hash(key)
+        };
+        // The key's partition and the pieces over it, and the asks for
+        // the lines their probes will load first: before the live table's
+        // probe, or after it where the live table is asked first and its
+        // chain did not end the read (`Options::point_live_first`).
+        let placed = if self.opts.point_live_first {
+            None
+        } else {
+            Some(Reader::place(&self.opts, st, key, fnv0)?)
+        };
+        // The live table first: the values of the key's chain newest
+        // first, the first `live_n` of `live`. They are slices of the
+        // table's arena, which the state holds for the read. Every table
+        // of a store is made with one shape, so the frozen tables below
+        // take the live one's hash.
+        let mh = mem.hash_with(key, fnv0);
+        let mut live = [std::mem::MaybeUninit::<&[u8]>::uninit(); LIVE_SMALL];
+        let mut live_n = 0;
+        let found = mem
+            .probe_entry(mh, key)
+            .filter(|&(i, _)| i < self.len_bound.get());
+        if let Some((_, e)) = found {
+            let (n, tomb) = mem.live_small_hashed(e, self.wm(), &mut live)?;
+            if tomb {
+                // The tombstone masks every older source: the read is
+                // the chain's values after it.
+                for v in live[..n].iter().rev() {
+                    // SAFETY: the first `n` are written.
+                    f(unsafe { v.assume_init() });
+                }
+                self.layer_reads.set(self.layer_reads.get() + 1);
+                self.placed_reads.set(self.placed_reads.get() + 1);
+                self.live_ended.set(self.live_ended.get() + 1);
+                return Some(Ok(n as u64));
+            }
+            live_n = n;
+        }
+        let fnv = if late {
+            crate::flatindex::key_hash(key)
+        } else {
+            fnv0
+        };
+        let (at, l0) = match placed {
+            Some(p) => p,
+            None => Reader::place(&self.opts, st, key, fnv)?,
+        };
+        // The frozen tables newest first, where a seal is in flight: each
+        // one's values as the live table's, the first `frozen_n[i]` of
+        // `frozen[i]`, and `since` the oldest the pass reached, which is
+        // the one a tombstone cut it at where one did.
+        let mut frozen = [[std::mem::MaybeUninit::<&[u8]>::uninit(); LIVE_SMALL]; FROZEN_CAP];
+        let mut frozen_n = [0usize; FROZEN_CAP];
+        let mut since = nf;
+        let mut cut = false;
+        for i in (0..nf).rev() {
+            let fr = &*st.frozen[i];
+            if fr.ordered {
+                return None;
+            }
+            since = i;
+            if let Some((_, e)) = fr.probe_entry(mh, key) {
+                (frozen_n[i], cut) = fr.live_small_hashed(e, SEE_ALL, &mut frozen[i])?;
+                if cut {
+                    break;
+                }
+            }
+        }
+        // The pieces newest first, to the newest tombstone, where no
+        // table cut the read: the records found, newest first, the first
+        // `held` of `runs`.
+        let mut runs = [std::mem::MaybeUninit::<(&[u8], usize)>::uninit(); LAYERS_PIECES];
+        let mut held = 0;
+        if !cut {
+            for seg in l0.iter().rev() {
+                if !seg.may_hold_fnv(key, fnv) {
+                    continue;
+                }
+                if let Some(c) =
+                    seg.raw()
+                        .find_fixed_hashed(key, fnv, self.opts.point_record_ahead)?
+                {
+                    // More records above the newest tombstone than the
+                    // frame keeps: the general read's
+                    // (`Options::point_placed_runs`).
+                    if held == LAYERS_PIECES {
+                        return None;
+                    }
+                    runs[held].write((c.run, c.records));
+                    held += 1;
+                    if c.tomb {
+                        cut = true;
+                        break;
+                    }
+                }
+            }
+        }
+        // Oldest first from the tombstone on: the partition where nothing
+        // masks it, the pieces, the frozen tables the pass reached and the
+        // live one.
+        let mut n = live_n as u64;
+        if !cut {
+            if let Some(seg) = segs[..np].get(at).filter(|s| s.may_hold_fnv(key, fnv)) {
+                match seg
+                    .raw()
+                    .read_all_fixed_hashed(key, fnv, self.opts.point_record_ahead, f)
+                {
+                    Ok(k) => n += k,
+                    Err(e) => return Some(Err(err(&format!("segment read: {e}")))),
+                }
+            }
+        }
+        for r in runs[..held].iter().rev() {
+            // SAFETY: the first `held` are written.
+            let (run, records) = unsafe { r.assume_init() };
+            n += crate::flatindex::each_fixed(run, records, f);
+        }
+        for (vals, &k) in frozen[since..nf].iter().zip(&frozen_n[since..nf]) {
+            for v in vals[..k].iter().rev() {
+                // SAFETY: the first `frozen_n[i]` of table `i` are written.
+                f(unsafe { v.assume_init() });
+            }
+            n += k as u64;
+        }
+        for v in live[..live_n].iter().rev() {
+            // SAFETY: the first `live_n` are written.
+            f(unsafe { v.assume_init() });
+        }
+        self.layer_reads.set(self.layer_reads.get() + 1);
+        self.placed_reads.set(self.placed_reads.get() + 1);
+        Some(Ok(n))
+    }
+
+    /// A point read over a partition, the pieces over its range, the
+    /// frozen tables and the live one, where each holds the key in its
+    /// common shape (`Options::point_lone`): `None`, with nothing handed
+    /// to `f`, for any other store or key, which `read_sources` reads.
+    ///
+    /// One pass, newest source first, to the newest tombstone: the live
+    /// table's chain and each frozen table's read once onto this frame
+    /// (`MemTable::live_offs_small`), each piece that may hold the key
+    /// asked once for its record (`Blob::find_fixed_hashed`), which is
+    /// kept. Then the values oldest first from that tombstone on, the
+    /// partition's first where no tombstone masks it, as `read_sources`
+    /// orders them and from the same sources: its pass for the tombstone
+    /// asks the same tables and pieces, and what it finds live it reads
+    /// again, or carries in a structure a read of one source builds too.
+    #[inline(never)]
+    fn read_layers<F: FnMut(&[u8])>(
+        &self,
+        st: &State,
+        key: &[u8],
+        f: &mut F,
+    ) -> Option<Result<u64>> {
+        if !self.opts.point_lone_on() {
+            return None;
+        }
+        let (segs, mem) = (&st.segs, &*st.mem);
+        let nf = st.frozen.len();
+        if mem.ordered || nf > FROZEN_CAP {
+            return None;
+        }
+        if self.opts.zpages != ZPages::Off && self.z_on() {
+            return None;
+        }
+        // No partition yet is the general read's to count
+        // (`count_unshaped`).
+        let np = segs.partition_point(|s| s.level > 0);
+        if np == 0 {
+            return None;
+        }
+        let at = segs[..np].partition_point(|s| s.hi.as_ref().is_some_and(|h| h.as_slice() <= key));
+        let l0 = st.pieces_over(np, at);
+        if l0.len() > LAYERS_PIECES {
+            return None;
+        }
+        let fnv = crate::flatindex::key_hash(key);
+        let mh = mem.hash_with(key, fnv);
+        if self.opts.read_lines_ahead {
+            for seg in l0 {
+                seg.prefetch_probe(fnv);
+            }
+        }
+        // A point read pays lag per piece it consults, as the general
+        // read counts it.
+        if !l0.is_empty() && self.lag_adapts() {
+            self.count_lag();
+        }
+        // Newest first, to the newest tombstone: `cut` once one is found.
+        // A source the pass does not reach, being older than the
+        // tombstone, keeps a count of no values, so the values after the
+        // pass are every source's in order with nothing to skip.
+        let mut cut = false;
+        let mut live_offs = [0usize; LIVE_SMALL];
+        let mut live_n = 0;
+        if !mem.is_empty() {
+            if let Some(e) = mem.get_with(mh, key, self.len_bound.get()) {
+                (live_n, cut) = mem.live_offs_small(e, self.wm(), &mut live_offs)?;
+            }
+        }
+        let mut fr_offs = [[0usize; LIVE_SMALL]; FROZEN_CAP];
+        let mut fr_n = [0usize; FROZEN_CAP];
+        if !cut {
+            for i in (0..nf).rev() {
+                let fr = &st.frozen[i];
+                if let Some(e) = fr.get_with(mh, key, MemTable::ALL) {
+                    (fr_n[i], cut) = fr.live_offs_small(e, SEE_ALL, &mut fr_offs[i])?;
+                    if cut {
+                        break;
+                    }
+                }
+            }
+        }
+        let mut runs: [(&[u8], usize); LAYERS_PIECES] = [(&[], 0); LAYERS_PIECES];
+        if !cut {
+            for i in (0..l0.len()).rev() {
+                let seg = &l0[i];
+                if !seg.may_hold_fnv(key, fnv) {
+                    continue;
+                }
+                if let Some(c) =
+                    seg.raw()
+                        .find_fixed_hashed(key, fnv, self.opts.point_record_ahead)?
+                {
+                    runs[i] = (c.run, c.records);
+                    if c.tomb {
+                        cut = true;
+                        break;
+                    }
+                }
+            }
+        }
+        // Oldest first from the tombstone on.
+        let mut n = 0u64;
+        if !cut {
+            if let Some(seg) = segs[..np].get(at).filter(|s| s.may_hold_fnv(key, fnv)) {
+                match seg
+                    .raw()
+                    .read_all_fixed_hashed(key, fnv, self.opts.point_record_ahead, f)
+                {
+                    Ok(k) => n += k,
+                    Err(e) => return Some(Err(err(&format!("segment read: {e}")))),
+                }
+            }
+        }
+        for &(run, records) in &runs[..l0.len()] {
+            if records > 0 {
+                n += crate::flatindex::each_fixed(run, records, f);
+            }
+        }
+        for i in 0..nf {
+            for &off in fr_offs[i][..fr_n[i]].iter().rev() {
+                f(st.frozen[i].value_at(off));
+            }
+            n += fr_n[i] as u64;
+        }
+        for &off in live_offs[..live_n].iter().rev() {
+            f(mem.value_at(off));
+        }
+        self.layer_reads.set(self.layer_reads.get() + 1);
+        Some(Ok(n + live_n as u64))
+    }
+
+    /// A point read where the key's sources are the partition and the
+    /// live table (`Options::point_lone`): `None`, with nothing handed to
+    /// `f`, for every other store, which `read_sources` reads.
+    #[inline(always)]
+    fn read_lone<F: FnMut(&[u8])>(&self, st: &State, key: &[u8], f: &mut F) -> Option<Result<u64>> {
+        if !self.opts.point_lone_on() {
+            return None;
+        }
+        // Partitions sort first, so a last segment that is one says there
+        // is no piece; no segment at all is the general read's to count
+        // (`count_unshaped`).
+        let segs = &st.segs;
+        let mem = &*st.mem;
+        if !segs.last().is_some_and(|s| s.level > 0) || !st.frozen.is_empty() || mem.ordered {
+            return None;
+        }
+        // A partition a form file may serve is dispatched by the general
+        // read.
+        if self.opts.zpages != ZPages::Off && self.z_on() {
+            return None;
+        }
+        // The key's FNV word, which the partition's read takes, before the
+        // live table only where the table's hash is made from it
+        // (`Options::mem_hash_fold`), so a read the table ends takes none.
+        let folds = mem.folds(key);
+        let fnv0 = if folds {
+            0
+        } else {
+            crate::flatindex::key_hash(key)
+        };
+        // The live table over the partition: the key's chain there read
+        // once, newest first to its newest tombstone, which masks the
+        // partition; then the partition where none does, and the chain's
+        // live values oldest first, as `read_sources` orders them.
+        let mut offs = [0usize; LIVE_SMALL];
+        let (n, tomb) = if mem.is_empty() {
+            (0, false)
+        } else {
+            match mem.get_with(mem.hash_with(key, fnv0), key, self.len_bound.get()) {
+                Some(e) => mem.live_offs_small(e, self.wm(), &mut offs)?,
+                None => (0, false),
+            }
+        };
+        let mut below = 0;
+        if !tomb {
+            let fnv = if folds {
+                crate::flatindex::key_hash(key)
+            } else {
+                fnv0
+            };
+            let at = if segs.len() == 1 {
+                0
+            } else {
+                segs.partition_point(|s| s.hi.as_ref().is_some_and(|h| h.as_slice() <= key))
+            };
+            if let Some(seg) = segs.get(at).filter(|s| s.may_hold_fnv(key, fnv)) {
+                match seg
+                    .raw()
+                    .read_all_fixed_hashed(key, fnv, self.opts.point_record_ahead, f)
+                {
+                    Ok(k) => below = k,
+                    Err(e) => return Some(Err(err(&format!("segment read: {e}")))),
+                }
+            }
+        }
+        for &off in offs[..n].iter().rev() {
+            f(mem.value_at(off));
+        }
+        self.lone_reads.set(self.lone_reads.get() + 1);
+        if tomb {
+            self.live_ended.set(self.live_ended.get() + 1);
+        }
+        Some(Ok(below + n as u64))
+    }
+
+    /// The placed read's partition for `key` and the pieces over it, with
+    /// the asks for the lines their probes load first where the options
+    /// ask (`read_lines_ahead`); `None` where the pieces are more than the
+    /// read takes. Inlined at both of the read's places for it, since as a
+    /// closure it was a call and fifty instructions of every read.
+    #[inline(always)]
+    fn place<'s>(
+        opts: &Options,
+        st: &'s State,
+        key: &[u8],
+        fnv: u64,
+    ) -> Option<(usize, &'s [std::sync::Arc<Seg>])> {
+        let (segs, np) = (&st.segs, st.parts);
+        let at = if np == 1 {
+            0
+        } else {
+            segs[..np].partition_point(|s| s.hi.as_ref().is_some_and(|h| h.as_slice() <= key))
+        };
+        let l0 = st.pieces_placed(at);
+        debug_assert!(
+            std::ptr::eq(l0, st.pieces_over(np, at)),
+            "the pieces a publish placed over a partition are the ones a search finds"
+        );
+        if !opts.point_placed_runs && l0.len() > LAYERS_PIECES {
+            return None;
+        }
+        if opts.read_lines_ahead {
+            // The partition's slot first: it is the read's longest wait
+            // where no tombstone masks the partition, and the tables'
+            // probes and the pieces' filters are the lead for it. The
+            // newest pieces' filters, which the walk asks first.
+            if let Some(seg) = segs[..np].get(at) {
+                seg.prefetch_slot(fnv);
+            }
+            for seg in l0.iter().rev().take(PLACED_ASKS) {
+                seg.prefetch_probe(fnv);
+            }
+        }
+        Some((at, l0))
+    }
+
+    /// A point read over every source that may hold the key: the
+    /// partition, the pieces over its range, the frozen tables and the
+    /// live one, from the newest tombstone on. Never inlined: beside the
+    /// single-source read its frame, eight hundred bytes and six saved
+    /// registers, was every read's.
+    #[inline(never)]
+    fn read_sources<F: FnMut(&[u8])>(&self, st: &State, key: &[u8], mut f: F) -> Result<u64> {
         let (segs, mem) = (&st.segs, &*st.mem);
         let mem_empty = mem.is_empty();
         // The key's FNV word once, every source's hash taken from it
@@ -26716,7 +28477,13 @@ impl Reader {
         } else {
             0
         };
-        let mem_h = |k: &[u8]| if once { mem_hash_of(fnv) } else { mem_hash(k) };
+        let mem_h = |k: &[u8]| {
+            if once {
+                mem.hash_with(k, fnv)
+            } else {
+                mem.hash(k)
+            }
+        };
         let hash = if mem_empty {
             0
         } else {
@@ -26750,7 +28517,7 @@ impl Reader {
             }
             if !part_z && tombs {
                 if let Some(seg) = part {
-                    seg.raw().prefetch_slot(fnv);
+                    seg.prefetch_slot(fnv);
                 }
             }
         }
@@ -26781,9 +28548,13 @@ impl Reader {
         // The segment read lends the extents on the index's frame; the arm
         // takes them by value, the shape before (`Options::exts_by_value`).
         let by_value = self.opts.exts_by_value;
+        let fixed = self.opts.point_fixed;
+        let ahead = self.opts.point_record_ahead;
         let seg_read = |seg: &Seg, f: &mut F| {
             if by_value {
                 seg.raw().read_all_by_value(key, f)
+            } else if once && fixed {
+                seg.raw().read_all_fixed_hashed(key, fnv, ahead, f)
             } else if once {
                 seg.raw().read_all_hashed(key, fnv, f)
             } else {
@@ -28830,6 +30601,10 @@ impl Reader {
     }
 
     /// The replaced states no pinned reader can still be walking.
+    // Out of line: `leave` asks at every operation's end and one in
+    // thousands sweeps, and inlined there the sweep's frame was thirteen
+    // instructions of every read's end.
+    #[inline(never)]
     fn sweep_retired_states(&self) {
         self.shared
             .retired
@@ -28838,6 +30613,10 @@ impl Reader {
 
     /// The form files taken out of their cells that no pinned reader can
     /// still be walking, freed.
+    // Out of line: `leave` asks at every operation's end and one in
+    // thousands sweeps, and inlined there the sweep's frame was thirteen
+    // instructions of every read's end.
+    #[inline(never)]
     fn sweep_retired_z(&self) {
         if self.shared.retired_z.len() == 0 {
             return;
@@ -28877,6 +30656,10 @@ impl Reader {
     /// identity -- some freed and as many retired since read the same --
     /// and the retry bounds what that costs. A call is a few relaxed
     /// loads, and a sweep one in the span of a retry.
+    // Out of line: `leave` asks at every operation's end and one in
+    // thousands sweeps, and inlined there the sweep's frame was thirteen
+    // instructions of every read's end.
+    #[inline(never)]
     fn sweep_at_leave(&self) {
         let sh = &self.shared;
         let waiting = sh.retired_snaps.len() + sh.retired_forms.len() + sh.retired_z.len();
@@ -34793,7 +36576,13 @@ impl Reader {
         } else {
             0
         };
-        let mem_h = |k: &[u8]| if once { mem_hash_of(fnv) } else { mem_hash(k) };
+        let mem_h = |k: &[u8]| {
+            if once {
+                mem.hash_with(k, fnv)
+            } else {
+                mem.hash(k)
+            }
+        };
         let hash = if mem_empty {
             0
         } else {
@@ -34826,7 +36615,7 @@ impl Reader {
             }
             if !part_z && tombs {
                 if let Some(seg) = part {
-                    seg.raw().prefetch_slot(fnv);
+                    seg.prefetch_slot(fnv);
                 }
             }
         }
@@ -34972,6 +36761,43 @@ impl Db {
         dir.join(format!("spare-{id:08}"))
     }
 
+    /// The batch being staged closed and given to the log (`Wal::write`):
+    /// what a commit does with its frames under every policy. Where the
+    /// log holds its commits (`SyncPolicy::Explicit`), the batches a
+    /// manifest on the device has come to cover are dropped first, so the
+    /// cap is met by frames nothing covers yet.
+    fn log_commit(&mut self) -> Result<()> {
+        if self.wal.frameless {
+            let staged = self.wal.staged();
+            self.wal.mark_commit();
+            if staged {
+                self.unframed_to = self.wal.seq;
+            }
+            return Ok(());
+        }
+        self.wal.mark_commit();
+        self.log_trim();
+        self.wal.write()
+    }
+
+    /// Whether the log is behind a sync: frames no sync has covered, or
+    /// commits a log with no frames took that no manifest on the device
+    /// covers yet (`Options::held_frames`), which nothing but a drain makes
+    /// durable.
+    fn log_unsynced(&self) -> bool {
+        self.wal.frames_unsynced()
+            || self.unframed_to > self.shared.log_covered.load(AtomicOrdering::Acquire)
+    }
+
+    /// The log's held batches that a manifest on the device covers,
+    /// dropped unwritten (`Wal::drop_covered`, `Shared::log_covered`).
+    fn log_trim(&mut self) {
+        if self.wal.batch_at > self.wal.held_from {
+            let covered = self.shared.log_covered.load(AtomicOrdering::Acquire);
+            self.wal.drop_covered(covered);
+        }
+    }
+
     /// The live WAL rotated once it passes `seal_bytes`, where seals no
     /// longer rotate it (`Options::seal_rotates_wal` off): synced first,
     /// since replay carries each file's sequence into the next and refuses
@@ -35020,7 +36846,13 @@ impl Db {
     /// header says so (`WAL_LOOSE_RUN`), so that a replay which finds the
     /// run short ends the log at that file's start and nowhere inside one.
     fn rotate_wal_as(&mut self, after_run: bool) -> Result<()> {
-        let unsynced = self.wal.frames_unsynced();
+        // What the log holds goes to the file it committed under, less
+        // what a durable segment has covered: the next file's seed would
+        // refuse a batch of this one's, and its header is to say what
+        // this file was left with (`SyncPolicy::Explicit`).
+        self.log_trim();
+        self.wal.spill()?;
+        let unsynced = self.log_unsynced();
         let loose = unsynced || after_run;
         let kind = if after_run {
             WAL_LOOSE_RUN
@@ -35035,6 +36867,9 @@ impl Db {
         self.wal_id += 1;
         self.wal_ahead_done.0 += old_wal.ahead_writes;
         self.wal_ahead_done.1 += old_wal.ahead_wait_ns;
+        self.wal_held_done.0 += old_wal.held_dropped;
+        self.wal_held_done.1 += old_wal.held_spilled;
+        self.wal_held_done.2 += old_wal.spills;
         SealCounts::add(
             &self.shared.seal_counts.rotated_unsynced,
             old_wal.written - old_wal.synced.min(old_wal.written),
@@ -35100,6 +36935,9 @@ impl Db {
             self.loose_wals.remove(0);
         }
         self.wal.chain()?;
+        // With what the log holds (`Wal::sync`, `SyncPolicy::Explicit`),
+        // less what a durable segment covers, which the commit every
+        // caller has just made dropped (`log_commit`).
         self.wal.sync()?;
         self.wal.drop_synced(self.opts.wal_drop_bytes as u64);
         self.unsynced = 0;
@@ -35116,7 +36954,7 @@ impl Db {
     /// that said "synced" over something a sync would still have to do is
     /// a store that refuses to open after a crash it should have survived.
     fn owes_sync(&self) -> bool {
-        self.wal.frames_unsynced()
+        self.log_unsynced()
             || self.wal.loose
             || self.wal_dir_unsynced
             || !self.loose_wals.is_empty()
@@ -35283,6 +37121,14 @@ impl Db {
     /// has one, else a fresh file -- never over the live file's own name,
     /// which a create would truncate and a retirement would delete.
     fn next_wal(&mut self, id: u64, kind: u8) -> Result<Wal> {
+        let mut wal = self.next_wal_file(id, kind)?;
+        if let Some((cap, reuses, frames)) = wal_hold(&self.opts) {
+            wal.set_hold(cap, reuses, frames);
+        }
+        Ok(wal)
+    }
+
+    fn next_wal_file(&mut self, id: u64, kind: u8) -> Result<Wal> {
         let path = Db::wal_path(&self.dir, id);
         if path == self.wal.path {
             return Err(err("a rotation named the live WAL"));
@@ -35443,6 +37289,9 @@ impl Db {
         std::fs::create_dir_all(dir)?;
         let lock = StoreLock::take(dir)?;
         let mut wal = Wal::create(&Db::wal_path(dir, 0), 0, WAL_CHAINED)?;
+        if let Some((cap, reuses, frames)) = wal_hold(&opts) {
+            wal.set_hold(cap, reuses, frames);
+        }
         let mut spare_wal: *mut PathBuf = std::ptr::null_mut();
         let next_seg = 0u64;
         if let Some((ahead, runs, cap)) = wal_ahead(&opts) {
@@ -35480,11 +37329,13 @@ impl Db {
             manifest_write(dir, 0, 0, &[], false)?;
         }
         let segs: Vec<std::sync::Arc<Seg>> = Vec::new();
+        let block_pool = opts.block_pool();
         let mean_key_bytes = 0;
         let store_bytes = 0;
         let data_bytes = 0;
         let l0_aligned = false;
         let segs_tombs = false;
+        let (parts, piece_runs) = State::placing(&segs, l0_aligned);
         let layout = segs
             .iter()
             .take_while(|s| s.level > 0)
@@ -35500,7 +37351,7 @@ impl Db {
             scans: AtomicU64::new(0),
             forms_bytes: AtomicUsize::new(0),
             segs,
-            mem: std::sync::Arc::new(MemTable::new(opts.block_shape())),
+            mem: std::sync::Arc::new(MemTable::new(opts.block_shape(&block_pool))),
             frozen: Vec::new(),
             gen: 1,
             lives: 0,
@@ -35509,6 +37360,8 @@ impl Db {
             store_bytes,
             data_bytes,
             l0_aligned,
+            parts,
+            piece_runs,
             segs_tombs,
             layout,
         };
@@ -35555,10 +37408,12 @@ impl Db {
             z_redrop_owe: std::sync::atomic::AtomicBool::new(false),
             zsettle_hold: std::sync::atomic::AtomicBool::new(opts.zpages_hold_after_settle),
             zgate: ZGate::new(opts.zpages),
+            block_pool: block_pool.clone(),
             asks: AskCounts::default(),
             run_remaps: AtomicU64::new(0),
             stream_recycled: AtomicU64::new(0),
             manifest_seq: AtomicU64::new(0),
+            log_covered: AtomicU64::new(0),
             forms_cloned: AtomicU64::new(0),
             form_takes: AtomicU64::new(0),
             forms_rebased: AtomicU64::new(0),
@@ -35670,6 +37525,10 @@ impl Db {
             scan_ns: std::cell::Cell::new([0; 6]),
             forms_off_now: std::cell::Cell::new(false),
             ord_served: std::cell::Cell::new(0),
+            lone_reads: std::cell::Cell::new(0),
+            layer_reads: std::cell::Cell::new(0),
+            placed_reads: std::cell::Cell::new(0),
+            live_ended: std::cell::Cell::new(0),
             ord_declined: std::cell::Cell::new(0),
             zmemo: opts.handle_memo(),
             zwin: std::cell::Cell::new(ZWindow::closed()),
@@ -35712,6 +37571,7 @@ impl Db {
             loose_runs: Vec::new(),
             drain_run: None,
             mem_bytes: 0,
+            puts_in_place: 0,
             direct: None,
             mem_handed: None,
             read_mode: (0, 0, true),
@@ -35730,6 +37590,7 @@ impl Db {
             upkeep_since_scan: 0,
             pace_runs: PaceRuns::default(),
             wal_ahead_done: (0, 0),
+            wal_held_done: (0, 0, 0),
             forms_off_quiet: 0,
             forms_off_log: (0, 0),
             forms_off_life: 0,
@@ -35741,6 +37602,7 @@ impl Db {
             upkeep_hand: Hand::Lend,
             upkeep_file_first: false,
             unsynced: 0,
+            unframed_to: 0,
             lag_writes: usize::MAX,
             lag_log: (0, 0),
             phase_ns: [0; 3],
@@ -36121,6 +37983,7 @@ impl Db {
         let mut segs: Vec<std::sync::Arc<Seg>> =
             segs.into_iter().map(std::sync::Arc::new).collect();
         let l0_aligned = sort_segs(&mut segs);
+        let (parts, piece_runs) = State::placing(&segs, l0_aligned);
         // A store reopened under `Always` attaches the form files it finds
         // for its partitions. One that does not check out is counted and
         // the partition is read from the raw form until a settle builds it
@@ -36176,7 +38039,8 @@ impl Db {
             }
         }
         wal_ids.sort_unstable();
-        let mem = MemTable::new(opts.block_shape());
+        let block_pool = opts.block_pool();
+        let mem = MemTable::new(opts.block_shape(&block_pool));
         // Replay's own table, for the index resizes a replayed delete
         // frees through; nothing reads beside it.
         let readers = Readers::new(false, true);
@@ -36216,10 +38080,10 @@ impl Db {
                         replay_max.extend_from_slice(k);
                     }
                     if kind == WAL_DEL {
-                        mem.delete(mem_hash(k), k, &readers);
+                        mem.delete(mem.hash(k), k, &readers);
                         mem_bytes += k.len() + 16;
                     } else {
-                        mem.append(mem_hash(k), k, v, &readers);
+                        mem.append(mem.hash(k), k, v, &readers);
                         mem_bytes += k.len() + v.len();
                     }
                 },
@@ -36269,6 +38133,9 @@ impl Db {
             }
         }
         let mut wal = Wal::open_append(&wal_path, wal_id, from)?;
+        if let Some((cap, reuses, frames)) = wal_hold(&opts) {
+            wal.set_hold(cap, reuses, frames);
+        }
         if let Some((ahead, runs, cap)) = wal_ahead(&opts) {
             wal.set_ahead(
                 ahead,
@@ -36318,6 +38185,8 @@ impl Db {
             store_bytes,
             data_bytes,
             l0_aligned,
+            parts,
+            piece_runs,
             segs_tombs,
             layout,
         };
@@ -36364,10 +38233,12 @@ impl Db {
             z_redrop_owe: std::sync::atomic::AtomicBool::new(false),
             zsettle_hold: std::sync::atomic::AtomicBool::new(opts.zpages_hold_after_settle),
             zgate: ZGate::new(opts.zpages),
+            block_pool: block_pool.clone(),
             asks: AskCounts::default(),
             run_remaps: AtomicU64::new(0),
             stream_recycled: AtomicU64::new(0),
             manifest_seq: AtomicU64::new(0),
+            log_covered: AtomicU64::new(0),
             forms_cloned: AtomicU64::new(0),
             form_takes: AtomicU64::new(0),
             forms_rebased: AtomicU64::new(0),
@@ -36479,6 +38350,10 @@ impl Db {
             scan_ns: std::cell::Cell::new([0; 6]),
             forms_off_now: std::cell::Cell::new(false),
             ord_served: std::cell::Cell::new(0),
+            lone_reads: std::cell::Cell::new(0),
+            layer_reads: std::cell::Cell::new(0),
+            placed_reads: std::cell::Cell::new(0),
+            live_ended: std::cell::Cell::new(0),
             ord_declined: std::cell::Cell::new(0),
             zmemo: opts.handle_memo(),
             zwin: std::cell::Cell::new(ZWindow::closed()),
@@ -36525,6 +38400,7 @@ impl Db {
             loose_runs: Vec::new(),
             drain_run: None,
             mem_bytes,
+            puts_in_place: 0,
             direct: None,
             mem_handed: None,
             read_mode: (0, 0, true),
@@ -36543,6 +38419,7 @@ impl Db {
             upkeep_since_scan: 0,
             pace_runs: PaceRuns::default(),
             wal_ahead_done: (0, 0),
+            wal_held_done: (0, 0, 0),
             forms_off_quiet: 0,
             forms_off_log: (0, 0),
             forms_off_life: 0,
@@ -36554,6 +38431,7 @@ impl Db {
             upkeep_hand: Hand::Lend,
             upkeep_file_first: false,
             unsynced: 0,
+            unframed_to: 0,
             lag_writes: usize::MAX,
             lag_log: (0, 0),
             phase_ns: [0; 3],
@@ -36597,7 +38475,7 @@ impl Db {
                     self.set_mem_with(
                         std::sync::Arc::new(MemTable::new_ordered(
                             self.opts.direct_table_refs,
-                            self.opts.block_shape(),
+                            self.opts.block_shape(&self.shared.block_pool),
                             self.opts
                                 .direct_stream
                                 .then_some(self.opts.segment.compact_records),
@@ -36612,8 +38490,8 @@ impl Db {
                 }
                 self.max_key.clear();
                 self.max_key.extend_from_slice(key);
-                self.mem()
-                    .append(mem_hash(key), key, value, &self.shared.readers);
+                let mem = self.mem();
+                mem.append(mem.hash(key), key, value, &self.shared.readers);
                 self.mem_bytes += key.len() + value.len();
                 return;
             }
@@ -36855,7 +38733,7 @@ impl Db {
     }
 
     fn direct_can_open(&self) -> bool {
-        self.opts.direct_ingest && self.mem().is_empty() && self.wal.pending.is_empty()
+        self.opts.direct_ingest && self.mem().is_empty() && !self.wal.staged()
     }
 
     /// Whether a write goes into the direct run: a key above the store's
@@ -36898,8 +38776,8 @@ impl Db {
         }
         for (k, v) in tail {
             self.wal.append(&k, &v);
-            self.mem()
-                .append(mem_hash(&k), &k, &v, &self.shared.readers);
+            let mem = self.mem();
+            mem.append(mem.hash(&k), &k, &v, &self.shared.readers);
             self.mem_bytes += k.len() + v.len();
         }
     }
@@ -36944,6 +38822,21 @@ impl Db {
     /// onto its key until each read walked the pile.
     pub fn put(&mut self, key: &[u8], value: &[u8]) {
         let _op = self.op();
+        self.put_pinned(key, value);
+    }
+
+    /// `put` for every record of `items`, pinned once for all of them, as
+    /// `append_batch` is for a load's: the pin, its fence and the unpin a
+    /// record were 88 instructions of an update's 1,213 by callgrind
+    /// (`bench/examples/point_ops.rs`), and the fence a locked store.
+    pub fn put_batch(&mut self, items: &[(&[u8], &[u8])]) {
+        let _op = self.op();
+        for &(key, value) in items {
+            self.put_pinned(key, value);
+        }
+    }
+
+    fn put_pinned(&mut self, key: &[u8], value: &[u8]) {
         if !self.writes_go() {
             return;
         }
@@ -36957,8 +38850,24 @@ impl Db {
         let hash = self.mem().prefetch(key);
         self.wal.delete(key);
         self.wal.append(key, value);
-        self.mem().put(hash, key, value, &self.shared.readers);
-        self.mem_bytes += key.len() + 16 + key.len() + value.len();
+        // A put overwrites only while no handle the caller made is live
+        // (`Options::put_in_place`): a handle is made by the writer or by
+        // a live handle, so at a count of nothing none exists and none can
+        // appear before this put returns, and the acquire orders the put
+        // after the last read of whichever handle dropped last. An
+        // overwrite grows the table by its log's entry alone, which is
+        // what it is charged toward the seal.
+        let overwrite =
+            self.opts.put_in_place && self.shared.live_handles.load(AtomicOrdering::Acquire) == 0;
+        if self
+            .mem()
+            .put(hash, key, value, &self.shared.readers, overwrite)
+        {
+            self.mem_bytes += std::mem::size_of::<u32>();
+            self.puts_in_place += 1;
+        } else {
+            self.mem_bytes += key.len() + 16 + key.len() + value.len();
+        }
     }
 
     /// End every value of `key` written before this point; later appends
@@ -37032,13 +38941,13 @@ impl Db {
         if self.mem().ordered {
             self.commit_direct()?;
         } else {
-            self.wal.mark_commit();
-            self.wal.write()?;
+            self.log_commit()?;
             self.mem().commit();
-            self.unsynced += 1;
+            self.unsynced = self.unsynced.saturating_add(1);
             let due = match self.opts.sync {
                 SyncPolicy::Always => true,
                 SyncPolicy::EveryN(n) => self.unsynced >= n.max(1),
+                SyncPolicy::Explicit => false,
             };
             // The upkeep handed over before the barrier, so the thread
             // works while the device syncs -- unless a seal's phase is to
@@ -37200,20 +39109,20 @@ impl Db {
             // (`Options::drain_syncs_wal`). A sync owed and not yet paid
             // -- a failed one, or the staged frames under `Always` -- is
             // paid here; one the log holds nothing for is skipped.
-            let staged = !self.wal.pending.is_empty();
-            self.wal.mark_commit();
-            self.wal.write()?;
+            let staged = self.wal.staged();
+            self.log_commit()?;
             self.mem().commit();
             if staged {
-                self.unsynced += 1;
+                self.unsynced = self.unsynced.saturating_add(1);
             }
             let due = self.opts.drain_syncs_wal
                 || match self.opts.sync {
                     SyncPolicy::Always => true,
                     SyncPolicy::EveryN(n) => self.unsynced >= n.max(1),
+                    SyncPolicy::Explicit => false,
                 };
             if due
-                && (self.wal.frames_unsynced()
+                && (self.log_unsynced()
                     || !self.loose_wals.is_empty()
                     || !self.loose_runs.is_empty()
                     || self.wal_dir_unsynced)
@@ -37349,10 +39258,11 @@ impl Db {
         d.committed = mem.len();
         d.unsynced = true;
         mem.commit();
-        self.unsynced += 1;
+        self.unsynced = self.unsynced.saturating_add(1);
         let due = match self.r.opts.sync {
             SyncPolicy::Always => true,
             SyncPolicy::EveryN(n) => self.unsynced >= n.max(1),
+            SyncPolicy::Explicit => false,
         };
         if due {
             // What the policy acknowledges here is every commit so far,
@@ -37450,7 +39360,9 @@ impl Db {
         self.mem_bytes = 0;
         let Some(d) = self.direct.take() else {
             // A run forming with nothing committed: no file, nothing to close.
-            self.set_mem(std::sync::Arc::new(MemTable::new(self.opts.block_shape())));
+            self.set_mem(std::sync::Arc::new(MemTable::new(
+                self.opts.block_shape(&self.shared.block_pool),
+            )));
             return Ok(());
         };
         self.land_seal()?;
@@ -37715,24 +39627,23 @@ impl Db {
             return self.close_direct();
         }
         if self.opts.seal_rotates_wal {
-            self.wal.mark_commit();
-            self.wal.write()?;
+            self.log_commit()?;
             self.mem().commit();
             self.sync_wal()?;
         } else {
             // What is staged commits as any commit does, synced when the
             // policy is due and not otherwise: the seal no longer rotates
             // the file, so nothing about the seal needs the log synced.
-            let staged = !self.wal.pending.is_empty();
-            self.wal.mark_commit();
-            self.wal.write()?;
+            let staged = self.wal.staged();
+            self.log_commit()?;
             self.mem().commit();
             if staged {
-                self.unsynced += 1;
+                self.unsynced = self.unsynced.saturating_add(1);
             }
             let due = match self.opts.sync {
                 SyncPolicy::Always => staged,
                 SyncPolicy::EveryN(n) => self.unsynced >= n.max(1),
+                SyncPolicy::Explicit => false,
             };
             if due {
                 self.sync_wal()?;
@@ -38261,6 +40172,11 @@ impl Db {
     /// tail out of memory; `flush` is the other answer, and the difference
     /// was priced at 11% of a canonical load window.
     pub fn sync(&mut self) -> Result<()> {
+        // With no frames, nothing but a segment holds a commit: the sync's
+        // promise is the drain's (`Options::held_frames`).
+        if self.wal.frameless {
+            return self.flush();
+        }
         let _op = self.op();
         self.commit_staged()?;
         // The promise is this call's, whatever the policy left unsynced:
@@ -38628,7 +40544,9 @@ impl Db {
         let settled_at = self.state() as *const State;
         let from = Db::replaced_from(&self.opts, &self.shared);
         let complete = self.fs().tables_complete.get();
-        let fresh = std::sync::Arc::new(MemTable::new(self.opts.block_shape()));
+        let fresh = std::sync::Arc::new(MemTable::new(
+            self.opts.block_shape(&self.shared.block_pool),
+        ));
         let carried = std::cell::Cell::new(false);
         let pieces_only = self.opts.forms_pieces_only;
         let by_capacity = self.opts.counts_capacity();
@@ -38677,7 +40595,9 @@ impl Db {
     /// vouch for nothing until a publish into it says otherwise -- so a
     /// handle at it builds its own blocks until the upkeep has looked.
     fn freeze_swap(&mut self, table: &std::sync::Arc<MemTable>) -> bool {
-        let fresh = std::sync::Arc::new(MemTable::new(self.opts.block_shape()));
+        let fresh = std::sync::Arc::new(MemTable::new(
+            self.opts.block_shape(&self.shared.block_pool),
+        ));
         let from = Db::replaced_from(&self.opts, &self.shared);
         let Some(old) = self.try_publish_writer_away(|cur| {
             if !std::sync::Arc::ptr_eq(&cur.mem, table) || cur.frozen.len() >= FROZEN_CAP {
@@ -38721,6 +40641,8 @@ impl Db {
             store_bytes: cur.store_bytes,
             data_bytes: cur.data_bytes,
             l0_aligned: cur.l0_aligned,
+            parts: cur.parts,
+            piece_runs: cur.piece_runs.clone(),
             segs_tombs: cur.segs_tombs,
             layout: cur.layout.clone(),
         }
@@ -38975,6 +40897,8 @@ impl Db {
                 store_bytes: cur.store_bytes,
                 data_bytes: cur.data_bytes,
                 l0_aligned: cur.l0_aligned,
+                parts: cur.parts,
+                piece_runs: cur.piece_runs.clone(),
                 segs_tombs: cur.segs_tombs,
                 layout: cur.layout.clone(),
             };
@@ -39013,6 +40937,33 @@ impl Db {
     /// seal, the freeze or another reader had not sorted them first.
     pub fn frozen_sorts(&self) -> u64 {
         self.shared.frozen_sorts.load(AtomicOrdering::Relaxed)
+    }
+
+    /// PROTOTYPE: the puts this store's writer has made over the value a
+    /// put left where it lay, since the open (`Options::put_in_place`).
+    pub fn puts_in_place(&self) -> u64 {
+        self.puts_in_place
+    }
+
+    /// `Reader::reader`, the writer's: under `Options::put_in_place`
+    /// refused while the live table holds a write no commit has covered,
+    /// since a put may have overwritten a committed value there, and a
+    /// handle under `Latest` or `Snapshot` would read the overwrite as
+    /// committed. A put overwrites nothing while a handle is live
+    /// (`Db::put_pinned`), so what a handle claimed after a commit reads
+    /// was committed, and stays as it read it.
+    pub fn reader(&self) -> Result<Reader> {
+        if self.opts.put_in_place {
+            let _e = self.enter();
+            let mem = self.mem();
+            if !mem.ordered && mem.log_len() > mem.committed_at().0 {
+                return Err(err(
+                    "put_in_place: a handle is claimed with nothing staged, since a \
+                     staged put may have overwritten a committed value; commit first",
+                ));
+            }
+        }
+        self.r.reader()
     }
 
     /// EXPERIMENT: scan snapshots built over this store's life. Sharing
@@ -39362,6 +41313,10 @@ impl Reader {
             scan_ns: std::cell::Cell::new([0; 6]),
             forms_off_now: std::cell::Cell::new(false),
             ord_served: std::cell::Cell::new(0),
+            lone_reads: std::cell::Cell::new(0),
+            layer_reads: std::cell::Cell::new(0),
+            placed_reads: std::cell::Cell::new(0),
+            live_ended: std::cell::Cell::new(0),
             ord_declined: std::cell::Cell::new(0),
             zmemo: self.opts.handle_memo(),
             zwin: std::cell::Cell::new(ZWindow::closed()),
@@ -39402,6 +41357,10 @@ impl Reader {
                 scan_ns: std::cell::Cell::new([0; 6]),
                 forms_off_now: std::cell::Cell::new(false),
                 ord_served: std::cell::Cell::new(0),
+                lone_reads: std::cell::Cell::new(0),
+                layer_reads: std::cell::Cell::new(0),
+                placed_reads: std::cell::Cell::new(0),
+                live_ended: std::cell::Cell::new(0),
                 ord_declined: std::cell::Cell::new(0),
                 zmemo: self.opts.handle_memo(),
                 zwin: std::cell::Cell::new(ZWindow::closed()),
@@ -39449,6 +41408,10 @@ impl Reader {
             scan_ns: std::cell::Cell::new([0; 6]),
             forms_off_now: std::cell::Cell::new(false),
             ord_served: std::cell::Cell::new(0),
+            lone_reads: std::cell::Cell::new(0),
+            layer_reads: std::cell::Cell::new(0),
+            placed_reads: std::cell::Cell::new(0),
+            live_ended: std::cell::Cell::new(0),
             ord_declined: std::cell::Cell::new(0),
             zmemo: self.opts.handle_memo(),
             zwin: std::cell::Cell::new(ZWindow::closed()),
@@ -39944,7 +41907,7 @@ impl Db {
             wal,
             tmp,
             draining,
-            wal_unsynced: self.wal.frames_unsynced() || !self.loose_wals.is_empty(),
+            wal_unsynced: self.log_unsynced() || !self.loose_wals.is_empty(),
         };
         // Counted before it is sent, so the count never reads zero with a
         // seal in flight.
@@ -40371,6 +42334,49 @@ impl Db {
             self.wal_ahead_done.0 + self.wal.ahead_writes,
             self.wal_ahead_done.1 + self.wal.ahead_wait_ns,
         )
+    }
+
+    /// What the log holds in the process and what its holding has come to
+    /// (`SyncPolicy::Explicit`): the bytes of committed batches held now,
+    /// the bytes dropped unwritten behind a manifest on the device, the
+    /// bytes written out by a spill, and the spills. Zeros under a policy
+    /// that writes every commit. The held bytes are as the last commit,
+    /// sync or rotation left them: a landing since has dropped nothing
+    /// until the writer next looks.
+    /// The store's pool of blocks its tables gave back
+    /// (`Options::blocks_pool_bytes`): the bytes it holds, and the blocks
+    /// its tables took from it and gave to it over its life. Zeros where
+    /// it keeps none.
+    pub fn block_pool_counts(&self) -> (usize, usize, usize) {
+        self.shared
+            .block_pool
+            .as_ref()
+            .map_or((0, 0, 0), |p| p.counts())
+    }
+
+    /// The blocks the store's tables asked of its pool that it held none
+    /// of the length of, so mapped fresh, and their bytes, over its life
+    /// (`Options::blocks_pool_bytes`). Zeros where it keeps none.
+    pub fn block_pool_misses(&self) -> (usize, usize) {
+        self.shared
+            .block_pool
+            .as_ref()
+            .map_or((0, 0), |p| p.misses())
+    }
+
+    /// Whether the store's pool of given-back blocks keeps blocks now
+    /// (`Options::blocks_pool_bytes`); false where it has none.
+    pub fn block_pool_on(&self) -> bool {
+        self.shared.block_pool.as_ref().is_some_and(|p| p.is_on())
+    }
+
+    pub fn wal_held(&self) -> WalHeld {
+        WalHeld {
+            held: (self.wal.batch_at - self.wal.held_from) as u64,
+            dropped: self.wal_held_done.0 + self.wal.held_dropped,
+            spilled: self.wal_held_done.1 + self.wal.held_spilled,
+            spills: self.wal_held_done.2 + self.wal.spills,
+        }
     }
 
     /// A test's: the log's pre-write in flight joined, and the length of
@@ -40984,6 +42990,9 @@ impl Db {
     #[doc(hidden)]
     pub fn zgate_set(&self, gate: u8) {
         self.shared.zgate.store(gate);
+        if let Some(pool) = &self.shared.block_pool {
+            pool.set_on(gate == zselect::GATE_RAW);
+        }
     }
 
     /// A test's: while `on`, a form file build on the builder's thread waits
@@ -42637,6 +44646,10 @@ impl Reader {
             scan_ns: std::cell::Cell::new([0; 6]),
             forms_off_now: std::cell::Cell::new(false),
             ord_served: std::cell::Cell::new(0),
+            lone_reads: std::cell::Cell::new(0),
+            layer_reads: std::cell::Cell::new(0),
+            placed_reads: std::cell::Cell::new(0),
+            live_ended: std::cell::Cell::new(0),
             ord_declined: std::cell::Cell::new(0),
             zmemo: self.opts.handle_memo(),
             zwin: std::cell::Cell::new(ZWindow::closed()),
@@ -43542,7 +45555,32 @@ impl Db {
     #[doc(hidden)]
     pub fn memory_census(&self) -> Vec<(String, u64)> {
         let handed: Vec<_> = self.mem_handed.iter().cloned().collect();
-        self.r.memory_census_with(&handed)
+        let mut c = self.r.memory_census_with(&handed);
+        // The log's buffer, by what it allocates: a batch's frames under a
+        // policy that writes every commit, and every batch the log holds
+        // under the one that does not (`SyncPolicy::Explicit`), up to its
+        // cap, which is an owner of the process's memory as a table is. Of
+        // a holding log's reservation, what it has written into: the rest
+        // is address space no page stands behind.
+        let wal = self.wal.touched.max(self.wal.pending.len());
+        let wal = if self.wal.hold.is_some() {
+            wal
+        } else {
+            self.wal.pending.capacity()
+        };
+        c.push(("wal_buffer".to_string(), wal as u64));
+        // The blocks the store's pool holds for its next tables, and over
+        // its life the blocks it gave out, took back and held none of the
+        // length of, with the kibibytes mapped fresh for those: counts, and
+        // not bytes the process holds.
+        let (held, takes, gives) = self.block_pool_counts();
+        let (misses, missed) = self.block_pool_misses();
+        c.push(("block_pool".to_string(), held as u64));
+        c.push(("block_pool_takes_n".to_string(), takes as u64));
+        c.push(("block_pool_gives_n".to_string(), gives as u64));
+        c.push(("block_pool_misses_n".to_string(), misses as u64));
+        c.push(("block_pool_missed_kib_n".to_string(), (missed >> 10) as u64));
+        c
     }
 
     /// The writer's block cache by partition (`Reader::forms_by_partition`).
@@ -48254,6 +50292,9 @@ impl Maint {
         self.rank_before_publish(&segs)?;
         self.publish_segs_with(segs, false, Some(table));
         self.shared.drain_steps.stamp(17);
+        // What the manifests on the device cover as this landing begins:
+        // the seal before this one's end, durable before this one landed.
+        let covered_before = self.covered_seq;
         for name in names {
             self.covered_seq = self.covered_seq.max(Db::name_end_seq(name).unwrap_or(0));
         }
@@ -48267,6 +50308,11 @@ impl Maint {
             self.shared
                 .manifest_seq
                 .store(self.manifest_seq, AtomicOrdering::Release);
+            // The pending slot covers this seal's records only once its
+            // segments read back whole, and the slot before otherwise:
+            // what is covered whichever the open takes is what stood
+            // before this landing.
+            self.note_covered(covered_before);
             self.retire_covered();
             SealCounts::add(
                 &self.shared.seal_counts.publish_ns,
@@ -48634,9 +50680,14 @@ impl Maint {
         landed: Option<&std::sync::Arc<MemTable>>,
     ) {
         let l0_aligned = sort_segs(&mut segs);
+        let (parts, piece_runs) = State::placing(&segs, l0_aligned);
         // One fresh table for every attempt: a landing that lost the swap
         // installs the same empty table on its retry.
-        let fresh = landed.map(|_| std::sync::Arc::new(MemTable::new(self.opts.block_shape())));
+        let fresh = landed.map(|_| {
+            std::sync::Arc::new(MemTable::new(
+                self.opts.block_shape(&self.shared.block_pool),
+            ))
+        });
         debug_assert!(
             Self::partitions_tile(&segs),
             "a segment publish left partitions that do not tile the key space: {:?}",
@@ -48732,6 +50783,8 @@ impl Maint {
                 store_bytes,
                 data_bytes,
                 l0_aligned,
+                parts,
+                piece_runs: piece_runs.clone(),
                 segs_tombs,
             };
             let rebases = if swapped_live {
@@ -49423,6 +51476,21 @@ impl Maint {
         Ok(())
     }
 
+    /// `covered` is on the device, in a manifest whose every name is a
+    /// segment on the device: told to the writer, whose log may drop the
+    /// frames it holds below it (`Shared::log_covered`). Only ever with
+    /// the sequence a manifest was written with, after the write that
+    /// made it durable returned. A slot a drain left owed its sync
+    /// (`publish_unsynced`) is not told when the sync is paid: a drain is
+    /// answered ahead of its slot only where the log held nothing as its
+    /// seal was handed (`SealJob::wal_unsynced`), so nothing the log holds
+    /// ends below what that slot covers, and the next publish tells it.
+    fn note_covered(&self, covered: u64) {
+        self.shared
+            .log_covered
+            .fetch_max(covered, AtomicOrdering::AcqRel);
+    }
+
     /// The slot a drain left unsynced made durable, and the WAL and temp
     /// names it covers retired: after the drain's answer, before a
     /// settle returns, and at the close.
@@ -49508,6 +51576,7 @@ impl Maint {
             self.shared
                 .manifest_seq
                 .store(self.manifest_seq, AtomicOrdering::Release);
+            self.note_covered(self.covered_seq);
             // A slot owed its sync is superseded by this one, durable and
             // newer, and what waited behind it retires now.
             let owed = self.slot_sync_due.take().is_some();
@@ -49529,6 +51598,7 @@ impl Maint {
         self.shared
             .manifest_seq
             .store(self.manifest_seq, AtomicOrdering::Release);
+        self.note_covered(self.covered_seq);
         if let Some(p) = spare {
             if self.wake.is_some() {
                 // On a thread of its own: unlinked at the idle tick, off the
@@ -54469,6 +56539,11 @@ impl Maint {
         let ev = &self.shared.z;
         let was = self.shared.zgate.load();
         self.shared.zgate.store(d.gate);
+        // The pool keeps blocks only while the raw form serves, and gives
+        // back what it holds as the gate leaves it (`blocks::BlockPool`).
+        if let Some(pool) = &self.shared.block_pool {
+            pool.set_on(d.gate == zselect::GATE_RAW);
+        }
         // The raw pages of every partition the form now serves, where the
         // attaches left them for the reads the gate kept raw
         // (`Options::zpages_drop_at_install`).
@@ -55875,6 +57950,12 @@ impl Drop for Db {
                 }
             }
         }
+        // Behind the segment work's last landing: what the log still
+        // holds that a durable segment covers is dropped here, and the
+        // rest goes to the file as the log itself drops
+        // (`SyncPolicy::Explicit`), so a store flushed and closed writes
+        // none of what its flush made durable.
+        self.log_trim();
         // The jobs' pool (`Options::jobs_pooled`): this store's hold on it
         // let go, and what its jobs left in it unmapped, every one of them
         // having ended above.
@@ -56058,7 +58139,10 @@ mod streaming_writes {
                 false,
                 BlockShape {
                     prefault: false,
+                    index_populated: true,
+                    fold_hash: false,
                     mapped: true,
+                    pool: None,
                 },
                 Some(compact),
                 true,
@@ -56154,6 +58238,18 @@ mod landing_facts {
         std::fs::rename(&tmp, dir.join(&name)).unwrap();
         let walked = Seg::open(&dir, &name, false, false, true, true).unwrap();
         let handed = Seg::open_landed(&dir, &name, false, false, true, Some(facts)).unwrap();
+        // The slot a read asks for by the table the open took is the one
+        // the blob finds, for keys it holds and keys it does not: a hint
+        // aimed anywhere else would pass every check of what reads answer.
+        for k in ["key-00000001", "key-00004999", "nope", "key-99999999"] {
+            let fnv = crate::flatindex::key_hash(k.as_bytes());
+            assert!(
+                walked.slot_ask[0] != 0,
+                "a segment's index has a slot table"
+            );
+            assert_eq!(walked.slot_addr(fnv), walked.raw().slot_addr(fnv), "{k}");
+            assert_eq!(handed.slot_addr(fnv), handed.raw().slot_addr(fnv), "{k}");
+        }
         assert_eq!(walked.tombs, handed.tombs);
         assert_eq!(
             walked.bloom.as_ref().unwrap().blocks,
@@ -56207,6 +58303,84 @@ mod landing_facts {
             let plain = BlockedBloom::from_fnv(&hashes[..n], false);
             let ahead = BlockedBloom::from_fnv(&hashes[..n], true);
             assert_eq!(plain.blocks, ahead.blocks, "{n} words, asked ahead");
+        }
+    }
+
+    /// The block a hash names is its high half's remainder by the block
+    /// count, the mapping a stored filter's words were set under
+    /// (`BLOOM_SIG`), whatever takes the remainder: `reduce`, which takes
+    /// it by two multiplies, is held to the divide it stands in for, at
+    /// block counts of one, of powers of two and either side of them, of
+    /// primes, at the last count thirty-two bits hold and past it, and at
+    /// dividends at each count's edges, at the half's own and across it.
+    #[test]
+    fn the_block_a_hash_names_is_the_remainder_a_divide_gives() {
+        let top = u64::from(u32::MAX);
+        let mut x = 0x9e37_79b9_7f4a_7c15u64;
+        let mut next = || {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            x
+        };
+        let mut counts = vec![
+            1u64,
+            2,
+            3,
+            5,
+            7,
+            8,
+            63,
+            64,
+            65,
+            1000,
+            4096,
+            4097,
+            123_457,
+            1 << 20,
+            (1 << 20) + 1,
+            (1 << 31) - 1,
+            1 << 31,
+            (1 << 31) + 1,
+            top - 1,
+            top,
+            top + 1,
+            1 << 40,
+        ];
+        for _ in 0..200 {
+            counts.push(next() % top + 1);
+        }
+        for n in counts {
+            let magic = BlockedBloom::magic_for(n as usize);
+            let mut halves = vec![0u64, 1, 2, top - 1, top, top / 2, top / 2 + 1];
+            for edge in [n.saturating_sub(1), n, n + 1, 2 * n, 2 * n + 1, 3 * n - 1] {
+                if edge <= top {
+                    halves.push(edge);
+                }
+            }
+            for _ in 0..2000 {
+                halves.push(next() >> 32);
+            }
+            for a in halves {
+                assert_eq!(
+                    BlockedBloom::reduce(a, n, magic) as u64,
+                    a % n,
+                    "{a} by {n}"
+                );
+            }
+        }
+        // And a filter's own: every key's block is the one the divide
+        // names, so its words are the ones a stored filter holds.
+        for keys in [1usize, 7, 51, 52, 1000, 5000] {
+            let b = BlockedBloom::with_capacity(keys);
+            assert_eq!(b.magic, BlockedBloom::magic_for(b.blocks.len()));
+            for _ in 0..2000 {
+                let h = next();
+                assert_eq!(b.block_of(h), (h >> 32) as usize % b.blocks.len());
+            }
+            let words = b.words();
+            let back = BlockedBloom::from_words(&words).expect("whole blocks");
+            assert_eq!(back.magic, b.magic, "a filter read back reduces as it did");
         }
     }
 }
@@ -56335,7 +58509,10 @@ mod threading {
         want.insert(0usize, (0usize, 0u64));
         let dry = super::MemTable::new(super::BlockShape {
             prefault: false,
+            index_populated: true,
+            fold_hash: false,
             mapped: true,
+            pool: None,
         });
         fill(
             &dry,
@@ -56346,7 +58523,10 @@ mod threading {
         );
         let mem = super::MemTable::new(super::BlockShape {
             prefault: false,
+            index_populated: true,
+            fold_hash: false,
             mapped: true,
+            pool: None,
         });
         let stop = AtomicBool::new(false);
         std::thread::scope(|s| {
@@ -56371,6 +58551,265 @@ mod threading {
             let reads = reader.join().unwrap();
             assert!(reads > 1000, "the reader read beside the writer: {reads}");
         });
+    }
+}
+
+#[cfg(test)]
+mod put_index {
+    use super::*;
+
+    fn table() -> MemTable {
+        MemTable::new(BlockShape {
+            prefault: false,
+            index_populated: true,
+            fold_hash: false,
+            mapped: true,
+            pool: None,
+        })
+    }
+
+    /// The hash index's population (`Options::index_populated`) goes from
+    /// the options to the table's shape, from the shape to the index's
+    /// source, and from that source to every index the table doubles into,
+    /// whose source is the one before's: on by default, and off where the
+    /// option is.
+    #[test]
+    fn the_index_population_reaches_every_index_a_table_grows() {
+        assert!(Options::default().index_populated, "the default");
+        let rd = Readers::new(false, true);
+        for on in [true, false] {
+            let opts = Options {
+                index_populated: on,
+                ..Options::default()
+            };
+            let shape = opts.block_shape(&None);
+            assert_eq!(shape.index_populated, on);
+            let m = MemTable::new(shape);
+            assert_eq!(
+                m.index().unwrap().slots.src.populates(),
+                on,
+                "the first index"
+            );
+            let first = m.index().unwrap().slots.len();
+            for i in 0..4_000u32 {
+                let k = format!("pop-{i:08}").into_bytes();
+                m.put(mem_hash(&k), &k, b"v", &rd, false);
+            }
+            let ix = m.index().unwrap();
+            assert!(ix.slots.len() > first, "the index grew");
+            assert_eq!(ix.slots.src.populates(), on, "a grown index");
+        }
+    }
+
+    /// A table that folds (`Options::mem_hash_fold`) hashes a sixteen-byte
+    /// key by the fold and every other key by its FNV word, the same way
+    /// at the writer's entry (`MemTable::hash`) as at a reader's that has
+    /// the word already (`hash_with`), and finds every key it was handed
+    /// both ways, sixteen bytes and not, in one table; one that does not
+    /// fold hashes every key by FNV.
+    #[test]
+    fn a_folding_table_hashes_one_way_at_both_ends() {
+        let rd = Readers::new(false, true);
+        for fold in [true, false] {
+            let m = MemTable::new(BlockShape {
+                prefault: false,
+                index_populated: true,
+                fold_hash: fold,
+                mapped: true,
+                pool: None,
+            });
+            let keys: Vec<Vec<u8>> = (0..3_000u64)
+                .map(|i| {
+                    if i % 3 == 0 {
+                        format!("k{i:06}").into_bytes()
+                    } else {
+                        format!("{i:016}").into_bytes()
+                    }
+                })
+                .collect();
+            for k in &keys {
+                let fnv = crate::flatindex::key_hash(k);
+                assert_eq!(m.hash(k), m.hash_with(k, fnv), "both ends");
+                let folded = fold && k.len() == 16;
+                assert_eq!(m.folds(k), folded);
+                if folded {
+                    assert_eq!(m.hash(k), fold_hash16(k.as_slice().try_into().unwrap()));
+                    assert_ne!(m.hash(k), mem_hash(k), "the fold is not FNV's");
+                } else {
+                    assert_eq!(m.hash(k), mem_hash(k));
+                }
+                m.put(m.hash(k), k, b"v", &rd, false);
+            }
+            for k in &keys {
+                let fnv = crate::flatindex::key_hash(k);
+                assert!(m.get(k, MemTable::ALL).is_some(), "found by its own hash");
+                assert!(
+                    m.get_with(m.hash_with(k, fnv), k, MemTable::ALL).is_some(),
+                    "found by the reader's"
+                );
+            }
+        }
+    }
+
+    /// A table that overwrites (`Options::put_in_place`) writes a put over
+    /// the value a put left, where the lengths agree, and grows its arena
+    /// by nothing; a value of another length, and a chain an append has
+    /// grown past one value, take a tombstone and a value as before. Every
+    /// read answers the last put either way, and a table that does not
+    /// overwrite appends every put.
+    #[test]
+    fn a_put_overwrites_a_put_of_its_length_and_appends_anything_else() {
+        let rd = Readers::new(false, true);
+        for in_place in [true, false] {
+            let m = MemTable::new(BlockShape {
+                prefault: false,
+                index_populated: true,
+                fold_hash: true,
+                mapped: true,
+                pool: None,
+            });
+            let k = b"overwritten-key".to_vec();
+            let wrote = |m: &MemTable, v: &[u8]| m.put(m.hash(&k), &k, v, &rd, in_place);
+            assert!(!wrote(&m, b"first"), "a new key's put appends");
+            let used = m.vals.used();
+            assert_eq!(wrote(&m, b"secnd"), in_place, "a put of the same length");
+            assert_eq!(m.vals.used() == used, in_place, "the arena is where it was");
+            assert_eq!(values(&m, &k), Some((vec![b"secnd".to_vec()], true)));
+            assert!(
+                !wrote(&m, b"longer value"),
+                "a put of another length appends"
+            );
+            assert_eq!(values(&m, &k), Some((vec![b"longer value".to_vec()], true)));
+            assert_eq!(wrote(&m, b"longer VALUE"), in_place, "and is a put's again");
+            assert_eq!(values(&m, &k), Some((vec![b"longer VALUE".to_vec()], true)));
+            // An append makes the chain two values: the head's predecessor
+            // is a value, not the tombstone, so the next put appends.
+            m.append(m.hash(&k), &k, b"extra value!", &rd);
+            assert!(!wrote(&m, b"after append"), "a chain of two values");
+            assert_eq!(values(&m, &k), Some((vec![b"after append".to_vec()], true)));
+            // The writes are logged as writes either way.
+            assert_eq!(m.log_len(), 6);
+            // An empty value's chunk is a header alone, as long as a
+            // tombstone's, so a head appended right after one sits where a
+            // put's would: only the tombstone check tells them apart.
+            let j = b"empty-then-more".to_vec();
+            m.append(m.hash(&j), &j, b"", &rd);
+            m.append(m.hash(&j), &j, b"abc", &rd);
+            assert!(
+                !m.put(m.hash(&j), &j, b"xyz", &rd, in_place),
+                "no tombstone under the head"
+            );
+            assert_eq!(values(&m, &j), Some((vec![b"xyz".to_vec()], true)));
+            // A key whose first write in the table is an append: its one
+            // value links to nothing and stands over no tombstone, so an
+            // older source's values below it are live, and a put of its
+            // length appends the tombstone that masks them.
+            let a = b"appended-first".to_vec();
+            m.append(m.hash(&a), &a, b"abcd", &rd);
+            assert!(
+                !m.put(m.hash(&a), &a, b"wxyz", &rd, in_place),
+                "a value that links to nothing"
+            );
+            assert_eq!(values(&m, &a), Some((vec![b"wxyz".to_vec()], true)));
+        }
+    }
+
+    /// A key's live values in the table as a reader takes them, oldest
+    /// first, and whether a tombstone ends its chain.
+    fn values(m: &MemTable, key: &[u8]) -> Option<(Vec<Vec<u8>>, bool)> {
+        let e = m.get(key, MemTable::ALL)?;
+        let (offs, tomb) = m.live_chain(e, SEE_ALL);
+        Some((offs.iter().map(|&o| m.value_at(o).to_vec()).collect(), tomb))
+    }
+
+    /// A table that takes nothing but puts of keys it does not hold grows
+    /// its index as one that takes appends does, before it is half full,
+    /// since a put inserts at the slot its probe found (`index_insert_at`)
+    /// and the insert that rebuilds is reached only at half load: twenty
+    /// thousand keys, nineteen doublings of none, and every key a put of a
+    /// value over a tombstone, read back. A put that missed the rebuild
+    /// would fill the index and probe for a vacant slot for ever.
+    #[test]
+    fn a_table_of_puts_alone_grows_its_index_at_half_load() {
+        let rd = Readers::new(false, true);
+        let m = table();
+        let key = |i: u32| format!("put-{i:011}").into_bytes();
+        let mut grew = 0;
+        let mut slots = m.index().unwrap().slots.len();
+        for i in 0..20_000u32 {
+            let k = key(i);
+            m.put(mem_hash(&k), &k, format!("v{i}").as_bytes(), &rd, false);
+            let now = m.index().unwrap().slots.len();
+            if now != slots {
+                grew += 1;
+                slots = now;
+            }
+            assert!(
+                m.len() * 2 <= slots,
+                "{} entries in an index of {slots} slots",
+                m.len()
+            );
+        }
+        assert!(grew >= 4, "the index grew {grew} times");
+        for i in 0..20_000u32 {
+            assert_eq!(
+                values(&m, &key(i)),
+                Some((vec![format!("v{i}").into_bytes()], true)),
+                "key {i}"
+            );
+        }
+        // Again over every key: the put of a key the table holds.
+        for i in (0..20_000u32).step_by(3) {
+            let k = key(i);
+            m.put(mem_hash(&k), &k, format!("w{i}").as_bytes(), &rd, false);
+        }
+        for i in 0..20_000u32 {
+            let want = if i % 3 == 0 { "w" } else { "v" };
+            assert_eq!(
+                values(&m, &key(i)),
+                Some((vec![format!("{want}{i}").into_bytes()], true)),
+                "key {i} after the second put"
+            );
+        }
+        assert_eq!(m.len(), 20_000, "a second put makes no entry");
+    }
+
+    /// Two keys whose hashes share the half an index slot keeps, found by
+    /// search, are two entries: the put's probe tells a key from another
+    /// that shares its tag by the key, as a reader's does, and the second
+    /// key's put lands at the vacant slot after the first's. A compare the
+    /// probe reaches only on such a pair is tested with the pair built.
+    #[test]
+    fn two_keys_that_share_a_tag_are_two_entries() {
+        let key = |i: u32| format!("k{i:015}").into_bytes();
+        let mut seen: std::collections::HashMap<u32, u32> = Default::default();
+        let (a, b) = (0u32..4_000_000)
+            .find_map(|i| {
+                let tag = (mem_hash(&key(i)) >> 32) as u32;
+                seen.insert(tag, i).map(|j| (j, i))
+            })
+            .expect("two keys of one tag among four million");
+        let (ka, kb) = (key(a), key(b));
+        assert_ne!(ka, kb);
+        assert_eq!(mem_hash(&ka) >> 32, mem_hash(&kb) >> 32, "one tag");
+        let rd = Readers::new(false, true);
+        let m = table();
+        m.put(mem_hash(&ka), &ka, b"a1", &rd, false);
+        m.put(mem_hash(&kb), &kb, b"b1", &rd, false);
+        assert_eq!(m.len(), 2, "two keys, two entries");
+        assert_eq!(values(&m, &ka), Some((vec![b"a1".to_vec()], true)));
+        assert_eq!(values(&m, &kb), Some((vec![b"b1".to_vec()], true)));
+        let (ia, ib) = (
+            m.probe_or_vacant(mem_hash(&ka), &ka),
+            m.probe_or_vacant(mem_hash(&kb), &kb),
+        );
+        assert!(ia.is_ok() && ib.is_ok() && ia != ib, "{ia:?} {ib:?}");
+        // A second put of each lands on its own chain.
+        m.put(mem_hash(&kb), &kb, b"b2", &rd, false);
+        m.put(mem_hash(&ka), &ka, b"a2", &rd, false);
+        assert_eq!(m.len(), 2);
+        assert_eq!(values(&m, &ka), Some((vec![b"a2".to_vec()], true)));
+        assert_eq!(values(&m, &kb), Some((vec![b"b2".to_vec()], true)));
     }
 }
 
@@ -56800,5 +59239,343 @@ mod finish_coding {
         );
         db.close().unwrap();
         let _ = std::fs::remove_dir_all(&base);
+    }
+}
+
+#[cfg(test)]
+mod wal_frames {
+    use super::*;
+
+    /// A record frame written in one reservation (`wal_record`) is the
+    /// frame `wal_frame` grows, byte for byte, for a put and for a delete,
+    /// over keys whose length's uvarint is one byte, two and three, the
+    /// empty key and the empty value, appended after frames already in
+    /// the buffer and under any sequence number.
+    #[test]
+    fn a_record_written_in_one_reservation_is_the_frame_grown() {
+        let key_lens = [0usize, 1, 16, 127, 128, 129, 300, 16_383, 16_384, 20_000];
+        let val_lens = [0usize, 1, 100, 4_096];
+        let (mut grown, mut once) = (Vec::new(), Vec::new());
+        let mut seq = 0xfedc_ba98_7654_3210u64;
+        for &kl in &key_lens {
+            let key: Vec<u8> = (0..kl).map(|i| (i * 7 + kl) as u8).collect();
+            for &vl in &val_lens {
+                let value: Vec<u8> = (0..vl).map(|i| (i * 13 + vl) as u8).collect();
+                wal_frame(&mut grown, 0, seq, 0x5eed, WAL_PUT, &key, &value);
+                wal_record(&mut once, seq, WAL_PUT, &key, &value);
+                seq = seq.wrapping_add(1);
+                assert_eq!(
+                    grown, once,
+                    "a put of a {kl}-byte key and a {vl}-byte value"
+                );
+            }
+            wal_frame(&mut grown, 0, seq, 0x5eed, WAL_DEL, &key, &[]);
+            wal_record(&mut once, seq, WAL_DEL, &key, &[]);
+            seq = seq.wrapping_add(1);
+            assert_eq!(grown, once, "a delete of a {kl}-byte key");
+        }
+        assert!(grown.len() > 100_000, "the frames compared were written");
+    }
+
+    fn held_log(name: &str) -> (PathBuf, Wal) {
+        let dir = std::env::temp_dir().join(format!("supdb-next-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("wal-00000007");
+        let mut w = Wal::create(&path, 7, WAL_CHAINED).unwrap();
+        w.set_hold(16 << 20, true, true);
+        (path, w)
+    }
+
+    /// What a replay of `path` applies from `from`, as `key=value` and
+    /// `-key` for a delete, or the open's refusal.
+    fn replayed(path: &Path, from: u64) -> Result<Vec<String>> {
+        let mut got = Vec::new();
+        let s = |b: &[u8]| String::from_utf8_lossy(b).into_owned();
+        Wal::replay(
+            path,
+            7,
+            from,
+            true,
+            |kind, k, v| {
+                got.push(match kind {
+                    WAL_PUT => format!("{}={}", s(k), s(v)),
+                    _ => format!("-{}", s(k)),
+                })
+            },
+            |next, _| Ok(next),
+        )?;
+        Ok(got)
+    }
+
+    /// A log that holds its commits (`SyncPolicy::Explicit`) writes none of
+    /// them until it spills, each batch under a CRC of its own frames and
+    /// no other batch's; a batch dropped as covered is in the file never,
+    /// and the batches after it are, behind a gap a replay from the
+    /// covered sequence reads past and a replay from below it refuses; and
+    /// a batch still being staged when the held ones spill stays staged,
+    /// to commit behind them.
+    #[test]
+    fn a_holding_log_writes_what_it_was_not_told_was_covered() {
+        let (path, mut w) = held_log("wal-hold");
+        let header = WAL_MAGIC.len() as u64;
+        let mut ends = Vec::new();
+        for (k, v) in [("a", "1"), ("b", "2"), ("c", "3")] {
+            w.delete(k.as_bytes());
+            w.append(k.as_bytes(), v.as_bytes());
+            w.mark_commit();
+            w.write().unwrap();
+            ends.push(w.seq);
+        }
+        assert_eq!(w.marks.len(), 3, "a mark a batch");
+        assert!(!w.staged() && w.batch_at == w.pending.len());
+        assert!(w.frames_unsynced(), "held frames are frames no sync covers");
+        assert!(!w.holds_no_frame());
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().len(),
+            header,
+            "a held batch reached the file"
+        );
+        assert!(replayed(&path, 0).unwrap().is_empty());
+
+        // Nothing is covered below the first batch's end.
+        assert_eq!(w.drop_covered(ends[0] - 1), 0);
+        assert_eq!(w.marks.len(), 3);
+        // The first batch covered: dropped, the two after it kept.
+        let held = w.batch_at;
+        let cut = w.drop_covered(ends[0]);
+        assert!(cut > 0 && w.batch_at == held - cut && w.pending.len() == held - cut);
+        assert_eq!(w.marks.len(), 2);
+        assert_eq!(
+            w.marks.back().unwrap().1,
+            w.batch_at,
+            "the marks moved with the bytes"
+        );
+        assert_eq!((w.held_dropped, w.held_spilled), (cut as u64, 0));
+
+        // A batch being staged as the held ones spill.
+        w.append(b"d", b"4");
+        assert!(w.staged());
+        w.spill().unwrap();
+        assert_eq!((w.batch_at, w.marks.len(), w.spills), (0, 0, 1));
+        assert!(w.staged(), "the staged batch went with the spill");
+        assert_eq!(w.held_spilled, (held - cut) as u64);
+        assert_eq!(std::fs::metadata(&path).unwrap().len(), w.written);
+        assert_eq!(
+            replayed(&path, ends[0]).unwrap(),
+            ["-b", "b=2", "-c", "c=3"],
+            "the batches behind the dropped one, each under its own CRC"
+        );
+        // The staged batch commits behind them, held, and a sync writes it.
+        w.mark_commit();
+        w.write().unwrap();
+        assert_eq!(w.marks.len(), 1);
+        assert_eq!(
+            replayed(&path, ends[0]).unwrap().len(),
+            4,
+            "held, not written"
+        );
+        w.sync().unwrap();
+        assert!(!w.frames_unsynced());
+        assert_eq!(
+            replayed(&path, ends[0]).unwrap(),
+            ["-b", "b=2", "-c", "c=3", "d=4"]
+        );
+        // From the covered sequence on, as above; from inside what was
+        // dropped, the gap is a record lost.
+        assert_eq!(replayed(&path, ends[1]).unwrap(), ["-c", "c=3", "d=4"]);
+        assert!(
+            replayed(&path, 0).is_err(),
+            "a replay from below the dropped batch read past the gap"
+        );
+        drop(w);
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    /// A holding log spills once it holds more than its cap, at the commit
+    /// that crosses it and with that commit's batch; and what it holds as
+    /// it is dropped goes to its file, where a log left as a crash leaves
+    /// it takes what it held with it.
+    #[test]
+    fn a_holding_log_spills_at_its_cap_and_at_its_drop() {
+        let (path, mut w) = held_log("wal-cap");
+        let header = WAL_MAGIC.len() as u64;
+        w.set_hold(64, true, true);
+        w.append(b"a", b"1");
+        w.mark_commit();
+        w.write().unwrap();
+        assert!(
+            w.batch_at > 0 && w.batch_at <= 64,
+            "one small batch is under the cap"
+        );
+        assert_eq!(w.spills, 0);
+        w.append(b"b", &[b'2'; 64]);
+        w.mark_commit();
+        w.write().unwrap();
+        assert_eq!(
+            (w.spills, w.batch_at),
+            (1, 0),
+            "the commit that crossed the cap"
+        );
+        assert_eq!(replayed(&path, 0).unwrap().len(), 2);
+        assert!(w.written > header && w.synced == 0, "a spill syncs nothing");
+        // Held at the drop: written. Held at a crash: gone.
+        w.append(b"c", b"3");
+        w.mark_commit();
+        w.write().unwrap();
+        assert_eq!(replayed(&path, 0).unwrap().len(), 2);
+        let seq = w.seq;
+        drop(w);
+        assert_eq!(
+            replayed(&path, 0).unwrap().len(),
+            3,
+            "the drop wrote what was held"
+        );
+        let mut w = Wal::open_append(&path, 7, seq).unwrap();
+        w.set_hold(16 << 20, true, true);
+        w.append(b"d", b"4");
+        w.mark_commit();
+        w.write().unwrap();
+        std::mem::forget(w);
+        assert_eq!(
+            replayed(&path, 0).unwrap().len(),
+            3,
+            "a crashed log wrote what it held"
+        );
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    /// Under the rule before `Options::wal_hold_reuses`: a batch dropped
+    /// with much still held behind it is left where it lay and nothing is
+    /// moved: the held batches begin past it, a second drop counts from
+    /// the first, a spill writes from where they begin and no byte of what
+    /// was dropped, and the buffer starts over at its head once it is
+    /// empty, in the memory it reserved at the start, which it never
+    /// outgrew.
+    #[test]
+    fn a_holding_log_leaves_a_large_drop_where_it_lay() {
+        let (path, mut w) = held_log("wal-dead");
+        w.hold_reuses = false;
+        let header = WAL_MAGIC.len() as u64;
+        let (at, cap) = (w.pending.as_ptr(), w.pending.capacity());
+        assert!(cap >= 16 << 20, "the buffer is reserved at its cap");
+        // Each batch more than the log moves to close a gap.
+        let big = vec![b'v'; HOLD_COMPACT];
+        let mut ends = Vec::new();
+        for k in [b"a", b"b", b"c"] {
+            w.append(k, &big);
+            w.mark_commit();
+            w.write().unwrap();
+            ends.push((w.seq, w.batch_at));
+        }
+        let (held, len) = (w.batch_at, w.pending.len());
+        let (one, two) = (ends[0].1, ends[1].1);
+        assert_eq!(w.drop_covered(ends[0].0), one);
+        assert_eq!(
+            (w.held_from, w.batch_at, w.pending.len()),
+            (one, held, len),
+            "the batches behind a large drop were moved"
+        );
+        assert!(w.frames_unsynced() && !w.holds_no_frame());
+        assert_eq!(
+            w.drop_covered(ends[1].0),
+            two - one,
+            "counted from the drop before"
+        );
+        assert_eq!((w.held_from, w.held_dropped), (two, two as u64));
+        // A batch staged behind them, and the spill: the third batch
+        // alone reaches the file.
+        w.append(b"d", &big);
+        let staged = w.pending.len() - len;
+        w.spill().unwrap();
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().len(),
+            header + (held - two) as u64,
+            "a spill wrote what the log had dropped"
+        );
+        assert_eq!((w.held_from, w.batch_at), (0, 0));
+        assert!(
+            w.staged() && w.pending.len() == staged,
+            "the staged batch is at the head"
+        );
+        assert_eq!(replayed(&path, ends[1].0).unwrap().len(), 1);
+        // Committed, covered and dropped with nothing behind it: the
+        // buffer is empty and starts over.
+        w.mark_commit();
+        w.write().unwrap();
+        assert!(w.drop_covered(w.seq) > 0);
+        assert_eq!((w.held_from, w.batch_at, w.pending.len()), (0, 0, 0));
+        assert!(!w.staged() && w.marks.is_empty());
+        assert_eq!(
+            (w.pending.as_ptr(), w.pending.capacity()),
+            (at, cap),
+            "the buffer was allocated again"
+        );
+        assert!(
+            w.touched >= held,
+            "what the buffer was written into is counted"
+        );
+        drop(w);
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    /// A drop that leaves no more held behind it than it dropped moves
+    /// what is held to the buffer's head, whatever its size
+    /// (`Options::wal_hold_reuses`), so the commits after it write over
+    /// pages the dropped batches touched; one that leaves more holds it
+    /// where it lay, as the rule before did. The marks, the batch and the
+    /// counts follow the move, the spill writes exactly the held batches,
+    /// and a replay reads them, the buffer never reallocated.
+    #[test]
+    fn a_holding_log_moves_what_it_holds_behind_a_larger_drop() {
+        let (path, mut w) = held_log("wal-reuse");
+        let header = WAL_MAGIC.len() as u64;
+        let at = w.pending.as_ptr();
+        // Each batch more than the rule before moved.
+        let big = vec![b'v'; HOLD_COMPACT];
+        let mut ends = Vec::new();
+        for k in [b"a", b"b", b"c"] {
+            w.append(k, &big);
+            w.mark_commit();
+            w.write().unwrap();
+            ends.push((w.seq, w.batch_at));
+        }
+        let (held, len) = (w.batch_at, w.pending.len());
+        let (one, two) = (ends[0].1, ends[1].1);
+        // One batch dropped, two behind it: they stay.
+        assert_eq!(w.drop_covered(ends[0].0), one);
+        assert_eq!(
+            (w.held_from, w.batch_at, w.pending.len()),
+            (one, held, len),
+            "more held behind the drop than it dropped: left where it lay"
+        );
+        // Two dropped, one behind: the one goes to the head.
+        assert_eq!(w.drop_covered(ends[1].0), two - one);
+        assert_eq!(
+            (w.held_from, w.batch_at, w.pending.len()),
+            (0, held - two, len - two),
+            "no more held behind the drop than it dropped: moved"
+        );
+        assert_eq!(
+            w.marks.iter().map(|m| m.1).collect::<Vec<_>>(),
+            vec![held - two],
+            "the held batch's mark moved with it"
+        );
+        assert_eq!(w.held_dropped, two as u64, "the drops counted once");
+        assert!(w.frames_unsynced() && !w.holds_no_frame());
+        // A batch staged behind it, and the spill: the third batch alone
+        // reaches the file, from the head.
+        w.append(b"d", &big);
+        let staged = w.pending.len() - (len - two);
+        w.spill().unwrap();
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().len(),
+            header + (held - two) as u64,
+            "a spill wrote the held batch and nothing dropped"
+        );
+        assert!(w.staged() && w.pending.len() == staged);
+        assert_eq!(replayed(&path, ends[1].0).unwrap().len(), 1);
+        assert_eq!(w.pending.as_ptr(), at, "the buffer never reallocated");
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
     }
 }

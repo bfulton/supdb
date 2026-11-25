@@ -65,6 +65,35 @@ pub(crate) const REC_VERSION: u32 = VERSION;
 pub(crate) const HEADER: usize = 192;
 /// Bytes per hash slot: a tag in the top eight bits, a record offset below.
 const SLOT: usize = 8;
+
+/// A hash slot's bytes, for an ask of a slot's line from outside the
+/// index (`FlatIndex::slot_table`).
+pub(crate) const SLOT_BYTES: usize = SLOT;
+/// The most of a record a point read asks for ahead of its header
+/// (`FlatIndex::ask_record`): four lines, past which a value is read in
+/// order and the core's own prefetch follows it.
+const ASK_RECORD_MAX: usize = 256;
+
+#[cfg(debug_assertions)]
+thread_local! {
+    static RECORDS_ASKED: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// The records this thread's point reads asked for ahead of their headers
+/// (`FlatIndex::ask_record`, `Options::point_record_ahead`), counted in a
+/// build with debug assertions -- the tests' -- and zero in every other,
+/// so that a read pays nothing for the count: what holds the option to
+/// firing, since an ask changes no answer.
+pub fn records_asked() -> u64 {
+    #[cfg(debug_assertions)]
+    {
+        RECORDS_ASKED.with(|c| c.get())
+    }
+    #[cfg(not(debug_assertions))]
+    {
+        0
+    }
+}
 /// The most of the hash table that may be occupied: three quarters.
 const HASH_LOAD_NUM: usize = 3;
 const HASH_LOAD_DEN: usize = 4;
@@ -1671,6 +1700,10 @@ pub struct FlatIndex {
     /// (`Blob::prefetch_ranks_est`). Taken once here and never divided
     /// for on a scan.
     mean_record_len: usize,
+    /// The bytes past a record's first that a point read asks for ahead
+    /// of its header (`ask_record`): the mean record length less one,
+    /// at most `ASK_RECORD_MAX` less one. Taken once here.
+    ask_span: usize,
     /// Absolute offset of the record region within the section, and how much
     /// of it is reserved. `bump` is where the next in-place update lands.
     recs_off: usize,
@@ -1706,11 +1739,60 @@ pub struct FlatIndex {
 #[inline]
 pub fn key_hash(key: &[u8]) -> u64 {
     let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    // A sixteen-byte key, the suite's, by a loop of a constant count: the
+    // same bytes in the same order, three instructions each where the
+    // loop over a slice's length was five and a dispatch on the length,
+    // 75 instructions of a point read against 52.
+    if let Ok(k) = <&[u8; 16]>::try_from(key) {
+        for &b in k {
+            h ^= b as u64;
+            h = h.wrapping_mul(0x1000_0000_01b3);
+        }
+        return h;
+    }
     for &b in key {
         h ^= b as u64;
         h = h.wrapping_mul(0x1000_0000_01b3);
     }
     h
+}
+
+/// Each value of a fixed run of `records` values (`CompactFixed`), in
+/// order, and how many: what `index::each_value` hands over for the
+/// extent `compact_ext` makes of the same header. `records` divides the
+/// run's length and is not zero, which `compact_fixed_tomb_at` holds.
+#[inline(always)]
+pub(crate) fn each_fixed(run: &[u8], records: usize, f: &mut impl FnMut(&[u8])) -> u64 {
+    if records == 1 {
+        f(run);
+    } else {
+        for v in run.chunks_exact(run.len() / records) {
+            f(v);
+        }
+    }
+    records as u64
+}
+
+/// Whether two keys are the same bytes. Keys of eight to sixteen bytes,
+/// the suite's and most stores', compare as two words each, the first
+/// eight bytes and the last eight, which overlap where the key is short of
+/// sixteen: the library's compare is a call and a dispatch on the length,
+/// twenty instructions of a point read for sixteen bytes.
+#[inline(always)]
+pub(crate) fn key_eq(a: &[u8], b: &[u8]) -> bool {
+    let n = a.len();
+    if n != b.len() {
+        return false;
+    }
+    if !(8..=16).contains(&n) {
+        return a == b;
+    }
+    let w = |k: &[u8], at: usize| {
+        let mut x = [0u8; 8];
+        x.copy_from_slice(&k[at..at + 8]);
+        u64::from_ne_bytes(x)
+    };
+    (w(a, 0) ^ w(b, 0)) | (w(a, n - 8) ^ w(b, n - 8)) == 0
 }
 
 /// True if `sec` looks like this format rather than the varint one.
@@ -1872,6 +1954,7 @@ impl FlatIndex {
             mask: hash_cap - 1,
             nkeys,
             mean_record_len: (recs_len / nkeys.max(1)).max(1),
+            ask_span: (recs_len / nkeys.max(1)).clamp(1, ASK_RECORD_MAX) - 1,
             recs_off,
             recs_cap,
             bump,
@@ -1943,6 +2026,15 @@ impl FlatIndex {
         self.with_lookup_hashed(sec, key, hash_of(key), f)
     }
 
+    /// The address of the hash region's first slot in `sec`, the section
+    /// this index was parsed from, and the mask a hash takes a slot by:
+    /// what `slot_pos` computes from at every ask, taken once by a
+    /// segment for its reads' asks (`Seg::prefetch_slot`). `None` for an
+    /// index whose hash region is not inside the section.
+    pub fn slot_table(&self, sec: &[u8]) -> Option<(usize, usize)> {
+        (self.hash.1 <= sec.len()).then(|| (sec.as_ptr() as usize + self.hash.0, self.mask))
+    }
+
     /// Where in the section the first slot a lookup of hash `h` reads
     /// lies, for a hint to fetch its line ahead of the lookup; `None` for
     /// an index whose hash region is not inside the section.
@@ -1950,6 +2042,39 @@ impl FlatIndex {
     pub fn slot_pos(&self, sec_len: usize, h: u64) -> Option<usize> {
         let at = self.hash.0 + ((h as usize) & self.mask) * SLOT;
         (self.hash.1 <= sec_len && at + SLOT <= self.hash.1).then_some(at)
+    }
+
+    /// A hint to fetch the lines of the record at `off` in `recs` past
+    /// the line it starts on, out to the region's mean record length and
+    /// at most `ASK_RECORD_MAX` bytes; nothing is read, and an address the
+    /// hint names stays inside `recs`. A record shorter than the mean asks
+    /// for a line of the next record at most, and one longer is read past
+    /// the hint as before.
+    #[inline(always)]
+    pub(crate) fn ask_record(&self, recs: &[u8], off: usize) {
+        #[cfg(debug_assertions)]
+        RECORDS_ASKED.with(|c| c.set(c.get() + 1));
+        #[cfg(target_arch = "x86_64")]
+        {
+            use std::arch::x86_64::{_mm_prefetch, _MM_HINT_T0};
+            // A slot names an offset under 2^56, so neither sum wraps; an
+            // empty region's `last` does, and a slot into one fails the
+            // record's read after the hint.
+            let end = (off + self.ask_span).min(recs.len().wrapping_sub(1));
+            let p = recs.as_ptr();
+            let mut a = off + 64;
+            // SAFETY: a prefetch is a hint that faults on no address; the
+            // ones named are inside `recs` wherever it holds the record.
+            unsafe {
+                while a < end {
+                    _mm_prefetch(p.wrapping_add(a) as *const i8, _MM_HINT_T0);
+                    a += 64;
+                }
+                _mm_prefetch(p.wrapping_add(end) as *const i8, _MM_HINT_T0);
+            }
+        }
+        #[cfg(not(target_arch = "x86_64"))]
+        let _ = (recs, off, self.ask_span);
     }
 
     /// `with_lookup` for a key whose hash the caller has already taken, as
@@ -1985,6 +2110,80 @@ impl FlatIndex {
             s = (s + 1) & self.mask;
         }
         None
+    }
+
+    /// A key's record where it is the common one, the compact record with
+    /// a fixed run (`compact_fixed_tomb_at`): its run where it lies, the
+    /// count of values in it and its tombstone flag. `Some(None)` for a
+    /// key the index does not hold. `None` where a record the probe has to
+    /// judge is any other shape, which `with_lookup_hashed` reads, as it
+    /// reads every record with this off (`Options::point_fixed`).
+    ///
+    /// The same record `with_lookup_hashed` finds, without the extent it
+    /// rebuilds from the record's header for `Blob::read_exts` to walk the
+    /// run by: that path was 354 of a point read's 959 instructions over a
+    /// store just loaded, by callgrind at a hundred thousand keys
+    /// (`bench/examples/point_ops.rs`), for one slot, one key compare and
+    /// one slice.
+    ///
+    /// With `ahead`, the record's lines past its first are asked for the
+    /// moment its slot names it, out to the region's mean record length
+    /// (`ask_record`): the value's place is the header's arithmetic, so
+    /// without the ask the value's lines are a third miss behind the
+    /// slot's and the header's (`Options::point_record_ahead`).
+    #[inline(always)]
+    pub(crate) fn find_fixed_hashed<'a>(
+        &self,
+        sec: &'a [u8],
+        key: &[u8],
+        h: u64,
+        ahead: bool,
+    ) -> Option<Option<CompactFixed<'a>>> {
+        let hash = sec.get(self.hash.0..self.hash.1)?;
+        let recs = sec.get(self.recs.0..self.recs.1)?;
+        let tag = ((h >> 56) | 1) & 0xff;
+        let mut s = (h as usize) & self.mask;
+        for _ in 0..self.hash_cap {
+            let packed = rd_u64(hash, s * SLOT)?;
+            if packed == 0 {
+                return Some(None);
+            }
+            if packed >> 56 == tag {
+                let off = (packed & 0x00ff_ffff_ffff_ffff) as usize;
+                if ahead {
+                    self.ask_record(recs, off);
+                }
+                let c = compact_fixed_tomb_at(recs, off)?;
+                if key_eq(c.key, key) {
+                    return Some(Some(c));
+                }
+            }
+            s = (s + 1) & self.mask;
+        }
+        Some(None)
+    }
+
+    /// A point read's values where the key's record is the common one
+    /// (`find_fixed_hashed`): each value handed to `f` from the record
+    /// where it lies, and the count; `Some(0)` for a key the index does
+    /// not hold, and `None`, with nothing handed to `f`, for a record of
+    /// any other shape. The same values as `with_lookup_hashed` and
+    /// `Blob::read_exts` hand over for such a record. A run's tombstone
+    /// flag is read past, as `Blob::read_exts` reads past it: which
+    /// sources' values are live is the caller's to say.
+    #[inline]
+    pub fn read_fixed_hashed(
+        &self,
+        sec: &[u8],
+        key: &[u8],
+        h: u64,
+        ahead: bool,
+        f: &mut impl FnMut(&[u8]),
+    ) -> Option<u64> {
+        Some(match self.find_fixed_hashed(sec, key, h, ahead)? {
+            Some(c) => each_fixed(c.run, c.records, f),
+            None => 0,
+        })
     }
 
     /// `lookup`, with the record's tail of inline runs.

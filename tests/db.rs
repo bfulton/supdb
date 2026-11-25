@@ -2262,6 +2262,161 @@ fn ord_probes(shape: OrdShape) -> Vec<Vec<u8>> {
     v
 }
 
+/// `Options::point_record_ahead` changes what a point read asks for ahead
+/// of a segment's record and nothing it returns: the fixture's store -- a
+/// partition, a piece with tombstones and a live table over both -- read
+/// with the option on and off through the writer and through a handle,
+/// answers every probe as the model does over the piece, with a table
+/// frozen in a held seal, after the seal lands, folded into the partition
+/// and under a live table after that; and under each of the settings that
+/// send those states to the four reads that read a segment's record where
+/// it lies -- the layered read that places its sources first, the one
+/// that does not, the two-source read and the general read. The asks this
+/// thread made say the option fired in each state: some with it on, none
+/// with it off (`flatindex::records_asked`, which counts in a build with
+/// debug assertions alone), since a read that never asked and one that
+/// always did answer the same; and a total over the states would not see
+/// one read that stopped asking beside another that still did.
+#[test]
+fn a_point_read_that_asks_for_its_record_answers_as_one_that_does_not() {
+    assert!(Options::default().point_record_ahead, "the default");
+    for shape in [
+        OrdShape::Short,
+        OrdShape::Mixed,
+        OrdShape::Wide,
+        OrdShape::Binary,
+    ] {
+        for (lone, first) in [(true, true), (true, false), (false, true)] {
+            for ahead in [true, false] {
+                let name = format!("recordahead-{shape:?}-{lone}-{first}-{ahead}");
+                let mut fx = ord_fixture_with(
+                    &name,
+                    shape,
+                    Options {
+                        point_record_ahead: ahead,
+                        point_lone: lone,
+                        point_layers_lean: first,
+                        ..common::options()
+                    },
+                );
+                let key = |k: u32| ord_key(shape, k);
+                let show = |p: &[u8]| String::from_utf8_lossy(p).into_owned();
+                let probes = ord_probes(shape);
+                // Every probe through the writer and through a handle, the
+                // asks they made, and that the option fired as it is set:
+                // not where the compact form is forced, as the stride
+                // switch forces it, whose partitions the general read
+                // dispatches to their form files.
+                let check = |fx: &OrdFixture, when: &str| {
+                    let h = fx.db.reader().unwrap();
+                    let before = supdb::flatindex::records_asked();
+                    for p in &probes {
+                        let want = fx.model.get(p).cloned().unwrap_or_default();
+                        assert_eq!(read_vec(&fx.db, p), want, "{name} {when}: {}", show(p));
+                        assert_eq!(
+                            read_vec(&h, p),
+                            want,
+                            "{name} {when}, a handle: {}",
+                            show(p)
+                        );
+                    }
+                    let asked = supdb::flatindex::records_asked() - before;
+                    if cfg!(debug_assertions) && !common::stride_switch() {
+                        if ahead {
+                            assert!(asked > 0, "{name} {when}: the reads asked for no record");
+                        } else {
+                            assert_eq!(asked, 0, "{name} {when}: asks with the option off");
+                        }
+                    }
+                };
+                check(&fx, "over a piece");
+                // The layered reads ask at two sites, a piece's record and
+                // the partition's, and a total over the probes sees one
+                // site stop asking beside the other: so keys the partition
+                // alone holds (even, no piece's and no table's, by the
+                // fixture's moduli), whose reads only the partition's site
+                // can ask for, and keys whose newest source is the piece's
+                // tombstone and a value, whose reads only the piece's site
+                // can, each read through the writer and a handle.
+                if lone && cfg!(debug_assertions) && !common::stride_switch() {
+                    let h = fx.db.reader().unwrap();
+                    let only_part: Vec<u32> = (0u32..4_000)
+                        .step_by(2)
+                        .filter(|k| {
+                            [2, 4, 8, 10].contains(&(k % 12)) && ![4, 8].contains(&(k % 16))
+                        })
+                        .take(40)
+                        .collect();
+                    // A tombstone and a value after it: a tombstone alone
+                    // is no fixed record, which the placed read declines
+                    // to the read after it, whose site would ask for it.
+                    let piece_tomb: Vec<u32> = (0u32..4_000)
+                        .step_by(24)
+                        .filter(|k| ![4, 8].contains(&(k % 16)))
+                        .take(40)
+                        .collect();
+                    for (what, keys) in [
+                        ("the partition's", &only_part),
+                        ("the piece's", &piece_tomb),
+                    ] {
+                        let before = supdb::flatindex::records_asked();
+                        for &k in keys.iter() {
+                            let want = fx.model.get(&key(k)).cloned().unwrap_or_default();
+                            assert_eq!(read_vec(&fx.db, &key(k)), want, "{name}: {k}");
+                            assert_eq!(read_vec(&h, &key(k)), want, "{name}, a handle: {k}");
+                        }
+                        let asked = supdb::flatindex::records_asked() - before;
+                        let reads = 2 * keys.len() as u64;
+                        if ahead {
+                            assert!(
+                                asked >= reads,
+                                "{name}: {asked} asks at {what} site over {reads} reads"
+                            );
+                        } else {
+                            assert_eq!(asked, 0, "{name}: asks at {what} site with the option off");
+                        }
+                    }
+                }
+                fx.db.hold_seal_landing(true);
+                fx.db.seal().unwrap();
+                assert!(fx.db.frozen_tables() >= 1, "{name}: a frozen table");
+                for k in (3u32..4_010).step_by(11) {
+                    if k.is_multiple_of(3) {
+                        fx.db.delete(&key(k));
+                        fx.model.insert(key(k), Vec::new());
+                    } else {
+                        let v = format!("v5-{k}").into_bytes();
+                        fx.db.append(&key(k), &v);
+                        fx.model.entry(key(k)).or_default().push(v);
+                    }
+                }
+                fx.db.commit().unwrap();
+                check(&fx, "with the seal held");
+                fx.db.hold_seal_landing(false);
+                fx.db.settle().unwrap();
+                check(&fx, "after the landing");
+                fx.db.flush().unwrap();
+                fx.db.settle().unwrap();
+                assert_eq!(fx.db.levels().1, 0, "{name}: no piece after the flush");
+                check(&fx, "over the partitions alone");
+                for k in (0u32..4_020).step_by(7) {
+                    if k.is_multiple_of(2) {
+                        let v = format!("v6-{k}").into_bytes();
+                        fx.db.put(&key(k), &v);
+                        fx.model.insert(key(k), vec![v]);
+                    } else {
+                        fx.db.delete(&key(k));
+                        fx.model.insert(key(k), Vec::new());
+                    }
+                }
+                fx.db.commit().unwrap();
+                check(&fx, "under a live table");
+                fx.db.close().unwrap();
+            }
+        }
+    }
+}
+
 /// `Options::read_hash_once` and `Options::read_lines_ahead` change how a
 /// point read hashes its key and what it asks for ahead, and nothing it
 /// returns: the fixture's store -- a partition, a piece with tombstones and
@@ -2333,6 +2488,473 @@ fn a_point_read_hashed_once_answers_as_one_hashed_per_source() {
             fx.db.hold_seal_landing(false);
             fx.db.settle().unwrap();
             check(&fx, "after the landing");
+            fx.db.close().unwrap();
+        }
+    }
+}
+
+/// A store's tables take back the blocks the tables before them gave
+/// (`Options::blocks_pool_bytes`): the live table made at a freeze maps its
+/// blocks while the frozen one is in flight, and the tables after the first
+/// two take theirs from the pool. A store of many seals takes blocks from
+/// its pool and answers every key as the model does, with the store
+/// reopened over what it wrote; with the gate away from the raw form the
+/// pool holds nothing and takes nothing; and a store with no pool counts
+/// none. The controller is off, since its every step stores its own gate
+/// over the one a test sets (`Db::zgate_set`).
+#[test]
+fn a_store_takes_back_the_blocks_its_tables_gave() {
+    // The controller's gate at the raw form, and at its census.
+    const RAW: u8 = 0;
+    const CENSUS: u8 = 1;
+    for (name, pool, gate) in [
+        ("blockpool", true, RAW),
+        ("blockpool-census", true, CENSUS),
+        ("blockpool-none", false, RAW),
+    ] {
+        let d = dir(name);
+        // The controller off, so the gate stays where the test sets it:
+        // its step stores its own gate, and the pool's state with it.
+        let opts = Options {
+            seal_bytes: 1 << 20,
+            blocks_pool_bytes: if pool { 64 << 20 } else { 0 },
+            zpages: supdb::ZPages::Off,
+            ..common::options()
+        };
+        let mut db = Db::create(&d, opts.clone()).unwrap();
+        db.zgate_set(gate);
+        assert_eq!(
+            db.block_pool_on(),
+            pool && gate == RAW,
+            "{name}: the pool on with the raw form alone"
+        );
+        let mut want: BTreeMap<Vec<u8>, Vec<u8>> = BTreeMap::new();
+        let key = |k: u32| format!("pool-{:08}", (k as u64 * 2_654_435_761) % 200_000).into_bytes();
+        for round in 0..12u32 {
+            for k in 0..20_000u32 {
+                let v = format!("r{round}-{k}").into_bytes();
+                db.put(&key(k), &v);
+                want.insert(key(k), v);
+            }
+            db.commit().unwrap();
+            db.settle().unwrap();
+        }
+        let (held, takes, gives) = db.block_pool_counts();
+        if pool && gate == RAW {
+            assert!(
+                takes > 0 && gives > 0,
+                "{name}: no block taken back: held {held} takes {takes} gives {gives}"
+            );
+            assert!(held <= 64 << 20, "{name}: the pool past its cap: {held}");
+        } else {
+            assert_eq!(
+                (held, takes),
+                (0, 0),
+                "{name}: a pool that keeps nothing: gives {gives}"
+            );
+        }
+        let check = |db: &Db, when: &str| {
+            for (k, v) in want.iter().step_by(7) {
+                assert_eq!(read_vec(db, k), vec![v.clone()], "{name} {when}");
+            }
+        };
+        check(&db, "after the seals");
+        let census = db.memory_census();
+        let pooled = census
+            .iter()
+            .find(|(k, _)| k == "block_pool")
+            .map(|(_, v)| *v);
+        assert_eq!(
+            pooled,
+            Some(held as u64),
+            "{name}: the census counts the pool"
+        );
+        db.close().unwrap();
+        let db = Db::open(&d, opts).unwrap();
+        check(&db, "reopened");
+        db.close().unwrap();
+        let _ = std::fs::remove_dir_all(&d);
+    }
+    // A store whose form is forced is read out of core from its open: its
+    // pool keeps nothing from the start, before any step of the
+    // controller's could turn it off.
+    let d = dir("blockpool-forced");
+    let db = Db::create(
+        &d,
+        Options {
+            zpages: supdb::ZPages::Always,
+            ..common::options()
+        },
+    )
+    .unwrap();
+    assert!(!db.block_pool_on(), "a forced form's store pools nothing");
+    db.close().unwrap();
+    let _ = std::fs::remove_dir_all(&d);
+}
+
+/// The placed read takes a range under more pieces than its frame keeps the
+/// records of (`Options::point_placed_runs`): twelve pieces of puts stand
+/// over the partition, kept by a merge trigger above them and no promotion,
+/// and every key's read is
+/// the placed one, through the writer and through a handle, and answers as
+/// the model does; a key appended to in every piece has more records above
+/// its newest tombstone than the frame keeps and is the general read's, as
+/// it answers right too; and with the option off no read over the range is
+/// placed. Under the stride switch, whose forced form sends a partition's
+/// reads to the general read, the answers alone are held.
+#[test]
+fn a_placed_read_takes_a_range_under_more_pieces_than_its_frame_keeps() {
+    for runs in [true, false] {
+        let d = dir(&format!("placed-runs-{runs}"));
+        let opts = Options {
+            point_placed_runs: runs,
+            l0_trigger: 1000,
+            promote: false,
+            ..common::options()
+        };
+        let mut db = Db::open(&d, opts).unwrap();
+        let key = |i: u32| format!("{i:016}").into_bytes();
+        let mut model: BTreeMap<Vec<u8>, Vec<Vec<u8>>> = BTreeMap::new();
+        for i in 0..2000u32 {
+            let v = format!("base-{i}").into_bytes();
+            db.put(&key(i), &v);
+            model.insert(key(i), vec![v]);
+        }
+        db.commit().unwrap();
+        db.flush().unwrap();
+        db.settle().unwrap();
+        let many = key(1999);
+        for p in 0..12u32 {
+            for i in (p * 7..1990).step_by(97) {
+                let v = format!("p{p}-{i}").into_bytes();
+                db.put(&key(i), &v);
+                model.insert(key(i), vec![v]);
+            }
+            let v = format!("appended-{p}").into_bytes();
+            db.append(&many, &v);
+            model.get_mut(&many).unwrap().push(v);
+            db.commit().unwrap();
+            db.seal().unwrap();
+            db.settle().unwrap();
+        }
+        assert!(
+            db.levels().1 >= 12,
+            "twelve pieces stand: {:?}",
+            db.levels()
+        );
+        let h = db.reader().unwrap();
+        let placed = (db.point_placed_reads(), h.point_placed_reads());
+        for (k, want) in &model {
+            assert_eq!(&read_vec(&db, k), want, "runs {runs}: the writer");
+            assert_eq!(&read_vec(&h, k), want, "runs {runs}: a handle");
+        }
+        let n = model.len() as u64;
+        let placed = (
+            db.point_placed_reads() - placed.0,
+            h.point_placed_reads() - placed.1,
+        );
+        // A partition a form file may serve is the general read's, as the
+        // stride switch forces it (`common::stride_switch`): there the reads
+        // are held to the model alone.
+        if common::stride_switch() {
+            assert_eq!(placed, (0, 0), "the forced form's reads are general");
+        } else if runs {
+            assert_eq!(
+                placed,
+                (n - 1, n - 1),
+                "every read placed but the appended key's"
+            );
+        } else {
+            assert_eq!(placed, (0, 0), "no read placed over twelve pieces");
+        }
+        drop(h);
+        db.close().unwrap();
+        let _ = std::fs::remove_dir_all(&d);
+    }
+}
+
+/// `Options::point_fixed` and `Options::point_lone` change the path a point
+/// read takes and nothing it returns: the fixture's store -- a partition, a
+/// piece with tombstones and a live table over both -- read with each of
+/// the four settings through the writer and through a handle answers every
+/// probe as the model does, with a table frozen in a held seal between the
+/// piece and the live table, after the seal lands, and after a flush has
+/// folded everything into the partition, with nothing unsealed and then
+/// with puts and deletes over it. The counts say which read answered: the
+/// layered one while a piece or a frozen table stands, the two-source one
+/// over the partition alone, and neither with the option off -- a store
+/// read by the general path alone would pass every comparison here.
+///
+/// `Options::point_layers_lean` is a third setting of the same kind, over
+/// the layered read alone: with it every layered read is the one that
+/// places its sources first (`Reader::point_placed_reads`), over a piece,
+/// with one frozen table and with two, and without it none is, so the two
+/// layered reads are each held to the model in every state here and
+/// neither passes on the other's answers. A key of more live values than
+/// either keeps on its frame, in the live table and in a frozen one, is
+/// the general read's under every setting, and a key of exactly as many is
+/// not.
+#[test]
+fn a_lean_point_read_answers_as_the_general_one() {
+    let d = Options::default();
+    assert!(
+        d.point_fixed && d.point_lone && d.point_layers_lean,
+        "the default"
+    );
+    for shape in [
+        OrdShape::Short,
+        OrdShape::Mixed,
+        OrdShape::Wide,
+        OrdShape::Binary,
+    ] {
+        for (fixed, lone, first) in [
+            (true, true, true),
+            (true, true, false),
+            (true, false, true),
+            (false, true, true),
+            (false, false, true),
+        ] {
+            let name = format!("leanread-{shape:?}-{fixed}-{lone}-{first}");
+            let mut fx = ord_fixture_with(
+                &name,
+                shape,
+                Options {
+                    point_fixed: fixed,
+                    point_lone: lone,
+                    point_layers_lean: first,
+                    ..common::options()
+                },
+            );
+            let key = |k: u32| ord_key(shape, k);
+            let show = |p: &[u8]| String::from_utf8_lossy(p).into_owned();
+            let probes = ord_probes(shape);
+            // Every probe through the writer and through a handle, and what
+            // the two made of them: (two-source, layered) reads, and of
+            // the layered ones those the read that places its sources
+            // first answered, which is all of them with its option on and
+            // none with it off.
+            let check = |fx: &OrdFixture, when: &str| -> (u64, u64) {
+                let h = fx.db.reader().unwrap();
+                let before = fx.db.point_lean_reads();
+                let placed_before = fx.db.point_placed_reads();
+                for p in &probes {
+                    let want = fx.model.get(p).cloned().unwrap_or_default();
+                    assert_eq!(read_vec(&fx.db, p), want, "{name} {when}: {}", show(p));
+                    assert_eq!(
+                        read_vec(&h, p),
+                        want,
+                        "{name} {when}, a handle: {}",
+                        show(p)
+                    );
+                }
+                let after = fx.db.point_lean_reads();
+                assert_eq!(
+                    h.point_lean_reads(),
+                    (after.0 - before.0, after.1 - before.1),
+                    "{name} {when}: a handle takes the path the writer takes"
+                );
+                let placed = fx.db.point_placed_reads() - placed_before;
+                assert_eq!(
+                    h.point_placed_reads(),
+                    placed,
+                    "{name} {when}: a handle's layered reads are the writer's kind"
+                );
+                assert_eq!(
+                    placed,
+                    if first { after.1 - before.1 } else { 0 },
+                    "{name} {when}: which layered read answered"
+                );
+                (after.0 - before.0, after.1 - before.1)
+            };
+            let reads = probes.len() as u64;
+            // Which read a store may take: both options, or neither path.
+            // And neither where the compact form is forced, as the stride
+            // switch forces it (`common::stride_switch`): a partition a
+            // form file may serve is dispatched by the general read, so
+            // there the four settings are held to the model alone.
+            let lean = fixed && lone && !common::stride_switch();
+            // A partition, a piece and the live table: the layered read,
+            // for every key whose records are the common shape.
+            let (two, layered) = check(&fx, "over a piece");
+            assert_eq!(two, 0, "{name}: a piece stands");
+            if lean {
+                assert!(
+                    layered * 2 > reads,
+                    "{name}: {layered} of {reads} reads layered"
+                );
+            } else {
+                assert_eq!(layered, 0, "{name}: the option is off");
+            }
+            // A table frozen in a seal that does not land, and a live table
+            // over it with tombstones over all four sources and values
+            // after some. Three values on some keys of the table about to
+            // freeze and three on some keys of the live one after it, since
+            // a chain is read newest first and handed over oldest first,
+            // and a chain of one value reads the same either way.
+            for k in (2u32..4_010).step_by(11) {
+                for i in 0..3 {
+                    let v = format!("v3{i}-{k}").into_bytes();
+                    fx.db.append(&key(k), &v);
+                    fx.model.entry(key(k)).or_default().push(v);
+                }
+            }
+            // Chains as long as a lean read's frame holds and one value
+            // longer, in the table about to freeze and then in the live
+            // one: under a put, so that the chain is the key's whole
+            // answer and its length the count.
+            let long = |fx: &mut OrdFixture, tag: &str, k: u32, n: usize| {
+                fx.db.put(&key(k), format!("{tag}0-{k}").as_bytes());
+                fx.model
+                    .insert(key(k), vec![format!("{tag}0-{k}").into_bytes()]);
+                for i in 1..n {
+                    let v = format!("{tag}{i}-{k}").into_bytes();
+                    fx.db.append(&key(k), &v);
+                    fx.model.entry(key(k)).or_default().push(v);
+                }
+            };
+            long(&mut fx, "f8", 600, 8);
+            long(&mut fx, "f9", 601, 9);
+            fx.db.commit().unwrap();
+            fx.db.hold_seal_landing(true);
+            fx.db.seal().unwrap();
+            assert!(fx.db.frozen_tables() >= 1, "{name}: a frozen table");
+            long(&mut fx, "l8", 602, 8);
+            long(&mut fx, "l9", 603, 9);
+            fx.db.commit().unwrap();
+            for (k, n, lean_reads) in [(600, 8, 1), (601, 9, 0), (602, 8, 1), (603, 9, 0)] {
+                let before = fx.db.point_lean_reads().1;
+                let got = read_vec(&fx.db, &key(k));
+                assert_eq!(got.len(), n, "{name}: the chain of key {k}");
+                assert_eq!(
+                    &got,
+                    fx.model.get(&key(k)).unwrap(),
+                    "{name}: the chain of key {k}"
+                );
+                assert_eq!(
+                    fx.db.point_lean_reads().1 - before,
+                    if lean { lean_reads } else { 0 },
+                    "{name}: a chain of {n} values and the layered reads"
+                );
+            }
+            for k in (1u32..4_010).step_by(9) {
+                if k.is_multiple_of(2) {
+                    fx.db.delete(&key(k));
+                    fx.model.insert(key(k), Vec::new());
+                } else {
+                    let v = format!("v4-{k}").into_bytes();
+                    fx.db.append(&key(k), &v);
+                    fx.model.entry(key(k)).or_default().push(v);
+                }
+            }
+            for k in (3u32..4_010).step_by(13) {
+                for i in 0..3 {
+                    let v = format!("v4{i}-{k}").into_bytes();
+                    fx.db.append(&key(k), &v);
+                    fx.model.entry(key(k)).or_default().push(v);
+                }
+            }
+            fx.db.commit().unwrap();
+            let (two, layered) = check(&fx, "with the seal held");
+            assert_eq!(two, 0, "{name}: a frozen table stands");
+            assert_eq!(layered > 0, lean, "{name}: with the seal held");
+            // A second table frozen behind the first, with a value on keys
+            // the first holds three of: the frozen tables are read newest
+            // first and their values handed over oldest table first.
+            for k in (2u32..4_010).step_by(11) {
+                let v = format!("v6-{k}").into_bytes();
+                fx.db.append(&key(k), &v);
+                fx.model.entry(key(k)).or_default().push(v);
+            }
+            fx.db.commit().unwrap();
+            fx.db.seal().unwrap();
+            assert!(fx.db.frozen_tables() >= 2, "{name}: two frozen tables");
+            let (two, layered) = check(&fx, "with two seals held");
+            assert_eq!(two, 0, "{name}: two frozen tables stand");
+            assert_eq!(layered > 0, lean, "{name}: with two seals held");
+            // Writes staged and not committed: the writer reads its own,
+            // and a handle reads the store as the last commit left it. On
+            // keys the live table holds a committed value of, so that the
+            // staged one is a chunk past the handle's watermark on a chain
+            // it reads, and on keys it does not, whose entry is one past
+            // the handle's count.
+            {
+                let staged: Vec<u32> = (5u32..4_010).step_by(17).collect();
+                for &k in staged.iter().step_by(2) {
+                    let v = format!("v7a-{k}").into_bytes();
+                    fx.db.append(&key(k), &v);
+                    fx.model.entry(key(k)).or_default().push(v);
+                }
+                fx.db.commit().unwrap();
+                let h = fx.db.reader().unwrap();
+                for &k in &staged {
+                    fx.db.append(&key(k), format!("v7-{k}").as_bytes());
+                }
+                for &k in &staged {
+                    let before = fx.model.get(&key(k)).cloned().unwrap_or_default();
+                    assert_eq!(
+                        read_vec(&h, &key(k)),
+                        before,
+                        "{name}: a handle beside a staged write of {k}"
+                    );
+                    let mut own = before;
+                    own.push(format!("v7-{k}").into_bytes());
+                    assert_eq!(
+                        read_vec(&fx.db, &key(k)),
+                        own,
+                        "{name}: the writer's own staged write of {k}"
+                    );
+                }
+                fx.db.commit().unwrap();
+                for &k in &staged {
+                    fx.model
+                        .entry(key(k))
+                        .or_default()
+                        .push(format!("v7-{k}").into_bytes());
+                }
+            }
+            fx.db.hold_seal_landing(false);
+            fx.db.settle().unwrap();
+            let (_, layered) = check(&fx, "after the landing");
+            assert_eq!(layered > 0, lean, "{name}: after the landing");
+            // Everything folded into the partition: one source.
+            fx.db.flush().unwrap();
+            fx.db.settle().unwrap();
+            assert_eq!(fx.db.levels().1, 0, "{name}: no piece after the flush");
+            let (two, layered) = check(&fx, "over the partitions alone");
+            assert_eq!(layered, 0, "{name}: no piece and no frozen table");
+            if lean {
+                assert!(two * 2 > reads, "{name}: {two} of {reads} reads two-source");
+            } else {
+                assert_eq!(two, 0, "{name}: the option is off");
+            }
+            // And the live table over it: a put, a delete, an append and a
+            // key nothing held.
+            for k in (0u32..4_020).step_by(7) {
+                match k % 4 {
+                    0 => {
+                        let v = format!("v5-{k}").into_bytes();
+                        fx.db.put(&key(k), &v);
+                        fx.model.insert(key(k), vec![v]);
+                    }
+                    1 => {
+                        fx.db.delete(&key(k));
+                        fx.model.insert(key(k), Vec::new());
+                    }
+                    _ => {
+                        // Two values, for the order a chain is handed
+                        // over in.
+                        for i in 0..2 {
+                            let v = format!("v5{i}-{k}").into_bytes();
+                            fx.db.append(&key(k), &v);
+                            fx.model.entry(key(k)).or_default().push(v);
+                        }
+                    }
+                }
+            }
+            fx.db.commit().unwrap();
+            let (two, layered) = check(&fx, "under a live table");
+            assert_eq!(layered, 0, "{name}: no piece under the live table");
+            assert_eq!(two > 0, lean, "{name}: under a live table");
             fx.db.close().unwrap();
         }
     }
@@ -21753,6 +22375,14 @@ fn a_bounds_walk_places_a_boundary_by_its_head_and_reads_its_record_only_on_a_ti
                 db.commit().unwrap();
             };
             write(&mut db, &mut want, 0);
+            // The upkeep thread's pass for the write, done before the seal.
+            // Near reads it walks the unsealed keys against the same
+            // boundaries the landing walks the piece against, the same
+            // keys, so the two count alike; left to race the seal it walked
+            // in one store and found the table landed and nothing to walk
+            // in the other, and the two stores' counts were one walk and
+            // two, one run in thirty beside eight busy loops.
+            db.settle().unwrap();
             let before = db.zpage_counts();
             db.seal().unwrap();
             db.settle().unwrap();
@@ -22038,4 +22668,240 @@ fn a_landing_leaves_its_pieces_bounds_where_no_table_stands_to_read_them() {
         db.close().unwrap();
         let _ = std::fs::remove_dir_all(&d);
     }
+}
+
+/// A store whose puts overwrite in place (`Options::put_in_place`) answers
+/// the last put of every key, by point read and by scan, while its puts
+/// overwrite and append in turn, across the seals its writes make and a
+/// close and reopen; it is refused where one of the engine's threads would
+/// read a live value as the writer overwrites it -- a policy that promises
+/// isolation, the block cache, an upkeep thread; and a handle is claimed
+/// only with nothing staged, reads what was committed, and is never beside
+/// an overwrite: the puts append while one lives, on its thread or another,
+/// and overwrite again once it is dropped.
+#[test]
+fn a_store_that_overwrites_its_puts_answers_the_last_put() {
+    // The scan snapshot copies a key's chain under `snapshot_runs`, and the
+    // copy is read again only where the log says the key was written since.
+    for runs in [false, true] {
+        overwriting_store_answers_the_last_put(runs);
+    }
+}
+
+fn overwriting_store_answers_the_last_put(runs: bool) {
+    let opts = || Options {
+        sync: supdb::SyncPolicy::Explicit,
+        put_in_place: true,
+        upkeep: supdb::Upkeep::Inline,
+        scan_block_cache: false,
+        snapshot_runs: runs,
+        seal_bytes: 64 << 10,
+        ..common::options()
+    };
+    for (i, bad) in [
+        Options {
+            sync: supdb::SyncPolicy::Always,
+            ..opts()
+        },
+        Options {
+            scan_block_cache: true,
+            ..opts()
+        },
+        Options {
+            upkeep: supdb::Upkeep::Background(1),
+            ..opts()
+        },
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let d = dir(&format!("put-in-place-refused-{runs}-{i}"));
+        assert!(Db::open(&d, bad).is_err(), "combination {i} is refused");
+    }
+    let d = dir("put-in-place");
+    let mut db = Db::open(&d, opts()).unwrap();
+    let mut model: BTreeMap<Vec<u8>, Vec<u8>> = BTreeMap::new();
+    let check = |db: &Db, model: &BTreeMap<Vec<u8>, Vec<u8>>, when: &str| {
+        for (k, want) in model {
+            let mut got = Vec::new();
+            db.read_all(k, vf(&mut |v| got.push(v.to_vec()))).unwrap();
+            assert_eq!(
+                got,
+                vec![want.clone()],
+                "{when}: {}",
+                String::from_utf8_lossy(k)
+            );
+        }
+        let mut seen = Vec::new();
+        db.scan(
+            b"",
+            usize::MAX,
+            kv(&mut |k, v| seen.push((k.to_vec(), v.to_vec()))),
+        )
+        .unwrap();
+        let want: Vec<(Vec<u8>, Vec<u8>)> =
+            model.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
+        assert_eq!(seen, want, "{when}: the scan");
+    };
+    for round in 0..40u32 {
+        for i in 0..400u32 {
+            let k = format!("{:016}", (i * 7919) % 400).into_bytes();
+            // Mostly the length the last put had, so the put overwrites;
+            // every fifth round a longer one, so it appends.
+            let pad = if round % 5 == 4 { "-longer" } else { "" };
+            let v = format!("r{round:04}-i{i:05}{pad}").into_bytes();
+            db.put(&k, &v);
+            model.insert(k, v);
+        }
+        if round % 3 == 0 {
+            db.append(b"0000000000000007", b"appended");
+            model
+                .get_mut(b"0000000000000007".as_slice())
+                .unwrap()
+                .clear();
+            db.put(b"0000000000000007", b"after-the-append");
+            model.insert(b"0000000000000007".to_vec(), b"after-the-append".to_vec());
+        }
+        db.commit().unwrap();
+        if round % 10 == 9 {
+            check(&db, &model, &format!("round {round}"));
+        }
+    }
+    // A store of partitions alone, whose scans emit the live table's keys
+    // from the snapshot's copies of their runs (`snapshot_runs`) where the
+    // log says nothing has written them since: every key put once into a
+    // fresh table, then a scan, then overwrites of values the snapshot
+    // copied, with no seal between, then a scan. An overwrite is a write
+    // the log says so of, or the scan reads the copy.
+    db.flush().unwrap();
+    for i in 0..400u32 {
+        let k = format!("{:016}", i).into_bytes();
+        let v = format!("fresh-{i:05}").into_bytes();
+        db.put(&k, &v);
+        model.insert(k, v);
+    }
+    db.commit().unwrap();
+    let before = db.puts_in_place();
+    for turn in 0..4u32 {
+        check(&db, &model, &format!("before overwrites {turn}"));
+        for i in (0..400u32).step_by(7) {
+            let k = format!("{:016}", i).into_bytes();
+            let len = model[&k].len();
+            let mut v = format!("o{turn}-{i:05}").into_bytes();
+            v.resize(len, b'.');
+            db.put(&k, &v);
+            model.insert(k, v);
+        }
+        db.commit().unwrap();
+    }
+    check(&db, &model, "after overwrites");
+    // Every key a turn writes holds the one value the fresh put left, of
+    // the length the turn writes, so each of its puts overwrote.
+    assert_eq!(
+        db.puts_in_place() - before,
+        4 * (0..400).step_by(7).count() as u64,
+        "every put of the turns overwrote"
+    );
+    // A handle: refused with a put staged, claimed after the commit, and
+    // the puts beside it append.
+    let k7 = b"0000000000000007".to_vec();
+    let len7 = model[&k7].len();
+    let mut staged = b"staged".to_vec();
+    staged.resize(len7, b'.');
+    db.put(&k7, &staged);
+    assert!(db.reader().is_err(), "a handle refused with a put staged");
+    db.commit().unwrap();
+    model.insert(k7.clone(), staged);
+    let h = db.reader().unwrap();
+    let before = db.puts_in_place();
+    for i in (0..400u32).step_by(7) {
+        let k = format!("{:016}", i).into_bytes();
+        let mut v = format!("h-{i:05}").into_bytes();
+        v.resize(model[&k].len(), b'.');
+        db.put(&k, &v);
+        model.insert(k, v);
+    }
+    db.commit().unwrap();
+    assert_eq!(
+        db.puts_in_place(),
+        before,
+        "no overwrite while a handle lives"
+    );
+    check(&db, &model, "beside a handle");
+    for (k, want) in &model {
+        let mut got = Vec::new();
+        h.read_all(k, vf(&mut |v| got.push(v.to_vec()))).unwrap();
+        assert_eq!(got, vec![want.clone()], "the handle reads the last commit");
+    }
+    // On another thread, reading as the writer puts values of one length
+    // into the keys it reads: every value it reads is one of them whole.
+    let keys: Vec<Vec<u8>> = (0..64u32)
+        .map(|i| format!("{:016}", i).into_bytes())
+        .collect();
+    let fill = |n: u32, len: usize| {
+        let mut v = vec![b'a' + (n % 26) as u8; len];
+        v[0] = b'#';
+        v
+    };
+    for k in &keys {
+        let v = fill(0, 24);
+        db.put(k, &v);
+        model.insert(k.clone(), v);
+    }
+    db.commit().unwrap();
+    let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let (keys2, stop2) = (keys.clone(), stop.clone());
+    let reads = std::thread::spawn(move || {
+        let mut n = 0u64;
+        while !stop2.load(std::sync::atomic::Ordering::Relaxed) {
+            for k in &keys2 {
+                h.read_all(
+                    k,
+                    vf(&mut |v| {
+                        assert_eq!(v.len(), 24, "a value of the length written");
+                        assert_eq!(v[0], b'#', "a value whole");
+                        assert!(v[1..].iter().all(|&b| b == v[1]), "a value torn: {v:?}");
+                    }),
+                )
+                .unwrap();
+                n += 1;
+            }
+        }
+        n
+    });
+    let before = db.puts_in_place();
+    for round in 1..200u32 {
+        for k in &keys {
+            let v = fill(round, 24);
+            db.put(k, &v);
+            model.insert(k.clone(), v);
+        }
+        db.commit().unwrap();
+    }
+    stop.store(true, std::sync::atomic::Ordering::Relaxed);
+    assert!(reads.join().unwrap() > 0, "the handle read");
+    assert_eq!(
+        db.puts_in_place(),
+        before,
+        "no overwrite beside a handle on another thread"
+    );
+    check(&db, &model, "after the handle's thread");
+    // The handle dropped with its thread: the puts overwrite again.
+    let before = db.puts_in_place();
+    for k in &keys {
+        let v = fill(7, 24);
+        db.put(k, &v);
+        model.insert(k.clone(), v);
+    }
+    db.commit().unwrap();
+    assert!(
+        db.puts_in_place() > before,
+        "the puts overwrite once the handle is gone"
+    );
+    check(&db, &model, "after the handle");
+    db.flush().unwrap();
+    check(&db, &model, "flushed");
+    db.close().unwrap();
+    let db = Db::open(&d, opts()).unwrap();
+    check(&db, &model, "reopened");
 }
