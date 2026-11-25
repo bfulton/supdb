@@ -1133,6 +1133,62 @@ the threaded writers' mixes read 1.04-1.21x for it in both sittings, RMW
 on one thread 1.21x, the single-threaded mixes within the lean of E, which
 makes no point read, at 1.06x and 1.12x the other way.
 
+#### A live table every writer writes
+
+The threaded writers' mixes are FASTER's for two reasons, and the lock the
+threads take turns behind is not the larger one.
+- **Reads over pieces.** Each thread writes as many keys as the store holds,
+  three hundred thousand operations a thread. The live table seals at a tenth
+  of the store, so a mix seals seven to twenty-seven times. Its puts append,
+  since a handle is live. Fourteen to forty-six pieces stand under every read.
+  Profiled at 7b286c3 (`SUPDB_LAG_MARK=1 perf record -e cpu-clock -c 500000
+  -k CLOCK_MONOTONIC` over `bench ab --arms supdb-heldinplace,faster --size
+  300000 --passes load,mixes-threaded --reps 1`, cut to each mix by its marks
+  and to each thread), the read path is two thirds of a writer thread's time.
+  A merge thread takes a third to two thirds of a core beside it.
+- **The lock.** At three threads each writer is on its core under two thirds
+  of the mix, waiting the rest.
+
+A scratch build at that commit let a put overwrite beside a live handle and
+took the seal's share cap off. It read the one-thread RMW at 2.1M operations
+a second where the arm reads 1.1-1.3M, with 0-3 seals a mix. Three threads
+stayed at 2.8x of it in FASTER's favour. A spin lock in place of the mutex
+resolved nothing in two sittings, so the writers' turns themselves are the
+cost, not the lock's wake.
+
+The probe `proto::Shared` (arm `proto-shared`, at `5be4c26`) is the hashed
+memtable in the shape the engine keeps it:
+- an index of tagged entry numbers, never grown;
+- entries of twenty-four bytes;
+- keys in an arena and values in chunks of the engine's format.
+
+Every thread writes it at once, with no lock, over a read-only base standing
+for the partitions:
+- **A get** copies the head's value between two equal, even readings of the
+  entry's version.
+- **A put of a key the table holds** takes the version odd by a
+  compare-and-swap. It overwrites a value of its length as
+  `Options::put_in_place` does, and appends otherwise.
+- **A put of a new key** publishes its entry by a compare-and-swap of the
+  probe's vacant slot.
+- **A read-modify-write** is one probe under one hold of the version, as
+  FASTER's arm's is one operation.
+
+Each writer claims the arena and the entries in strides of its own. Paired
+with FASTER in both orders (`bench ab --arms proto-shared,faster --size 300000
+--passes load,mixes-threaded --reps 3`, and with `--arms faster,proto-shared`),
+by the geometric mean of the two orders, ours over FASTER's:
+- **A:** 1.02-1.10x scrambled and 0.98-1.40x uniform, at one to three threads.
+- **RMW with its own operation:** 0.87x, 1.07x and 0.99x at one, two and three
+  threads; the uniform RMW 0.83x, 1.07x and 1.00x.
+- **RMW made of a get and a put** (`PROTO_NO_RMW=1`): 0.72-0.79x scrambled
+  and 0.87-0.96x uniform.
+
+The one probe is what the RMW lacked: a get, and a put a hundred operations
+later, probe a line twice that FASTER's operation probes once. The first
+order read every cell of the arm listed second slower by up to a fifth, which
+is why both orders are in the means.
+
 #### Beside FASTER out of core
 
 A store larger than memory is what FASTER's log is made for, and the
