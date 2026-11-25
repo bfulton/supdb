@@ -7047,17 +7047,31 @@ work, every reader of it is listed and each that runs on every operation is
 given a reading that does none, and a test holds the cheap path to doing
 none of it.
 
-**A prefetch the core had already issued.** A read that falls below the
-shared table is three dependent misses where FASTER's is two, so a handle
-whose last read had fallen through asked for its next key's partition slot
-before probing the live table. It fired on every such read and moved
-nothing, one thread or three: the partition slot's address is the key's
-alone, the branch that follows the live table's empty slot is predicted, and
-the core runs ahead into the partition's read and issues the load itself. The
-rule: an ask for a load whose address the core can compute past a predictable
-branch is the core's own work done twice, so a lever on an overlap is priced
-by the time with and without it before it is kept, and a lever that fired and
-moved nothing comes out.
+**A prefetch refuted in a store that had no miss for it.** A read that
+falls below the shared table waits on three lines in turn, the table's
+slot, the partition's slot and its record, where FASTER's waits on two, so
+a handle whose last read had fallen through was made to ask for its next
+key's partition slot before it probed the table. It was priced in the
+probe's store where every key is a first touch (`SHARED_OPS_FRESH=1`), read
+level, was taken out, and this file then said why: the core runs ahead past
+the predicted branch and issues the partition's load itself. Nothing had
+measured that. The store's live table held no key, so its index, eight
+megabytes mapped and advised for huge pages, had never been written, and a
+read of an untouched anonymous mapping maps the kernel's zero page
+(`use_zero_page` is on here): every slot the probe read was one cached
+page, the table's probe never missed, and the ask had no wait to stand
+beside. In a store whose table holds half the keys and whose reads are of
+the other half (`SHARED_OPS_SPLIT=1`), the same reads took 112-220 ns with
+the ask and 144-262 without it over four sittings of both orders
+(`Options::shared_fall_ahead`, `docs/engine.md`, past FASTER). The rules: a
+probe's store is checked for the misses the suite's store has before a
+lever on a miss is priced in it, and memory nobody has written reads as
+one cached page; and the reason a refutation is given is a claim to
+measure, since the refutation measured only that the lever moved nothing
+in the store it ran in. Beside it, the same day's pairings at ten reps
+read the asymmetric pin 3-11% ahead in one and level in the next two, and
+the shared arm had been given it between the first and the second: a
+verdict is the second sitting's, so the first is not built on.
 
 ## Standing limitations
 

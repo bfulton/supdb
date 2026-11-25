@@ -1415,7 +1415,7 @@ three sittings, nanoseconds an operation on one thread:
 - **The pin's fence**, priced and not taken: `supdb-heldsharedbigasym`
   pins with a plain store the sweep fences for (`Options::asym_pins`), and
   read the probe's puts 8% faster on one thread and nothing either way on
-  three.
+  three; the suite at ten reps, below, resolves it no better.
 
 The suite's cell that still went to FASTER was A at two threads, in both
 orders. A runs first, on the store the load and its sync leave, so its
@@ -1446,19 +1446,13 @@ inserted in 133-194 ns an operation, the eager arm in 229-395 and FASTER in
 161-190.
 
 What is left of a first touch is the read that falls through: 887
-instructions to FASTER's 372 on a fresh store, the partition placed by a
-search whose every step calls `memcmp`, the key's FNV, the partition's
-filter and the layered read's own steps, then the partition's slot and
-record on a file mapping of small pages. A read the lean probe found absent
-is not probed in the live table again, 43 instructions of it. Asking for the
-partition's slot before the live table's probe, where the handle's last read
-had fallen through, moved nothing and is not kept: the core runs ahead
-through a branch it predicts absent and issues the partition's loads
-itself.
-
-Paired at `c75da23` (`bench/scripts/pair.sh supdb-heldsharedbig faster
-300000 --passes load,mixes-threaded --reps 3`), FASTER's rate over ours by
-the mean of the two orders, under one ours:
+instructions to FASTER's 372 on a fresh store at `c75da23`, the partition
+placed by a search whose every step called `memcmp`, the key's FNV, the
+partition's fences and filter, and the layered read's own steps, then the
+partition's slot and record. Paired at `c75da23`
+(`bench/scripts/pair.sh supdb-heldsharedbig faster 300000 --passes
+load,mixes-threaded --reps 3`), FASTER's rate over ours by the mean of the
+two orders, under one ours:
 
 | | one thread | two | three |
 |---|---|---|---|
@@ -1468,10 +1462,74 @@ the mean of the two orders, under one ours:
 | read-modify-write, uniform | 0.85 | 0.81 | 0.76 |
 
 The two cells over one read 1.27 and 0.87, and 1.05 and 0.98, in the two
-sittings, as the order effect leaves a tie; the eager length against the
-default (`pair.sh supdb-heldsharedbig supdb-heldsharedbigeagerlen 300000`,
-the same passes) read A at two and three threads 0.94x and 0.95x and the
-uniform A 0.91x and 0.89x, the read-modify-writes level.
+sittings. Three changes to that read, each an option with an arm:
+
+- **The read of a store that is a partition and the live table**
+  (`Options::point_lone_absent`; `supdb-heldsharedbignolone` takes the
+  placed read). A store just loaded has no piece and no frozen table, and
+  `Reader::read_lone` reads such a store as its partition and the live
+  table alone, but refused any table that rewrites in place, since such a
+  table is read through a copy. A key the lean probe found no record of
+  has nothing in the table to copy, and takes that read now.
+- **The fences as words** (`Options::point_fence_words`,
+  `State::fence_words`; `supdb-heldsharedbignowords` searches the bytes).
+  Each partition's upper fence is held as its bytes big-endian in a `u128`,
+  zero-padded, beside its length, which orders against a key's first
+  sixteen bytes taken the same way as the bytes do, so a step of the search
+  is two integer compares; and the placed partition's fences are not
+  compared again, the partitions tiling the key space.
+- **The partition asked for ahead** (`Options::shared_fall_ahead`;
+  `supdb-heldsharedbignofall` asks nothing). The read waits on three lines
+  in turn, the table's slot, the partition's slot and its record, where
+  FASTER's waits on two, and the partition's slot is a function of the key
+  alone: a handle whose last read fell below the table asks for its next
+  key's partition slot before it probes the table, and hands the key's word
+  and partition to the read below. At `c75da23` this read level on the
+  fresh store and was taken out, on the reading that the core issued the
+  partition's load itself past the predicted branch, which nothing had
+  measured. The fresh store's table holds no key, so its index had never
+  been written, and a read of an untouched mapping maps the kernel's zero
+  page (`use_zero_page` is on here): every slot the probe read was one
+  cached page, the table's probe never missed, and the ask had no wait to
+  stand beside.
+
+`SHARED_OPS_SPLIT=1` gives the probe the store the ask is for: the odd
+keys put, the phases' keys drawn from the even ones, so a first touch meets
+a table that holds half the store. Counted there at `9fb49d9` (callgrind
+toggled on `shared_ops::phase_gets`, `SHARED_OPS_SPLIT=1
+SHARED_OPS_ONLY=gets shared_ops ARM 300000 1 zipf`), a read that falls
+through executes 696 instructions, 789 with the fences' bytes and 978 by
+the placed read, which does not take the partition the ask found and finds
+it again; FASTER's executes 371. Timed there (`... shared_ops
+supdb-heldsharedbig,supdb-heldsharedbignofall,supdb-heldsharedbigfallalways,faster
+300000 6 zipf` and the arms the other way round, four sittings of each),
+the read took 112-220 ns, 144-262 without the ask, and FASTER's 122-205.
+
+Paired at `9fb49d9` at ten reps (`pair.sh supdb-heldsharedbig faster 300000
+--passes load,mixes-threaded --reps 10`), every cell is ours in both
+orders, FASTER's rate over ours:
+
+| | one thread | two | three |
+|---|---|---|---|
+| A | 0.83 | 0.97 | 0.96 |
+| A, uniform | 0.71 | 0.88 | 0.79 |
+| read-modify-write | 0.88 | 0.86 | 0.79 |
+| read-modify-write, uniform | 0.77 | 0.68 | 0.73 |
+
+and a pairing of the same engine an hour before it, the tree uncommitted,
+read every cell ours as well (A 0.84, 0.87 and 0.86). The three changes
+priced one at a time against the default at ten reps (`pair.sh
+supdb-heldsharedbig supdb-heldsharedbignofall 300000 --passes
+load,mixes-threaded --reps 10`, and `...nolone`, `...nowords`) resolve
+little alone: without the ask the read-modify-write cells read 0.88-0.98 in
+two pairings of three and level in the third, with the uniform ones
+slowest; without either of the other two the cells lean their way in one
+or two pairings of three and sit level in the rest, and the counts above
+are their verdict, each a strict removal of work. The pin's fence came back the same way: the
+arm with asymmetric pins (`supdb-heldsharedbigasym`) read 3-11% ahead in one
+ten-rep pairing and level, 0.95-1.08, in the next two, so it stays an arm.
+And the A cell at two threads, the weakest, read 0.87 in one pairing and
+0.97 in the other.
 
 #### Beside FASTER out of core
 
