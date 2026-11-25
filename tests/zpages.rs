@@ -14324,6 +14324,17 @@ fn recode_store_with(
     budget: u64,
     extra: impl FnOnce(&mut Options),
 ) -> (PathBuf, Db, Model, std::sync::Arc<supdb::ZInject>) {
+    recode_store_before_settle(name, budget, extra, |_| {})
+}
+
+/// `recode_store_with`, with `before` called on the loaded store ahead of
+/// its settle.
+fn recode_store_before_settle(
+    name: &str,
+    budget: u64,
+    extra: impl FnOnce(&mut Options),
+    before: impl FnOnce(&Db),
+) -> (PathBuf, Db, Model, std::sync::Arc<supdb::ZInject>) {
     let dir = scratch(name);
     let inject = std::sync::Arc::new(supdb::ZInject::new());
     inject.set_budget(budget);
@@ -14350,6 +14361,7 @@ fn recode_store_with(
     )
     .unwrap();
     let model = ordered_load(&mut db, 20_000, 0x2EC0);
+    before(&db);
     db.zpages_settle().unwrap();
     // A look over the settled form files, whose decode time the next look
     // differences against: the looks during the load saw none of them.
@@ -14548,12 +14560,41 @@ fn a_spare_started_as_a_settle_ends_is_not_the_settles_to_sweep() {
     // counted `spare_failed` and never given its spare, which the test
     // below waited a minute for. The seam stands the spare there every
     // time: the builds after the answer held before their renames, and the
-    // settle returning only once one is parked.
-    let (_dir, db, _model, _inject) = recode_store_with("sparesweep", 1 << 40, |o| {
-        o.zpages_recode_keep = true;
-        o.zpages_both = true;
-        o.zpages_hold_after_settle = true;
-    });
+    // settle returning only once one is parked. A spare starts whenever no
+    // settle runs, and the forced store's served form files are built
+    // during its load, so on a runner that gave the segment work the time
+    // before the test's settle every spare was built and none was left to
+    // park (once on a hosted x86 runner, every run with the settle half a
+    // second late): the seam starts none until a settle has answered, and
+    // the store is held to that before its settle -- its served files in,
+    // the segment work given the time, and no spare started.
+    let (_dir, db, _model, _inject) = recode_store_before_settle(
+        "sparesweep",
+        1 << 40,
+        |o| {
+            o.zpages_recode_keep = true;
+            o.zpages_both = true;
+            o.zpages_hold_after_settle = true;
+        },
+        |db| {
+            let t = std::time::Instant::now();
+            while db.zpage_counts().form_files < db.zpage_counts().partitions {
+                assert!(
+                    t.elapsed() < JOB_WALL,
+                    "the served form files built during the load: {:?}",
+                    db.zpage_counts()
+                );
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+            std::thread::sleep(std::time::Duration::from_millis(200));
+            let c = db.zpage_counts();
+            assert_eq!(
+                (c.spare_builds, c.spare_files),
+                (0, 0),
+                "no spare before the settle under the seam: {c:?}"
+            );
+        },
+    );
     assert!(
         db.zpage_build_waiting(),
         "a spare parked at its rename as the settle ended: {:?}",

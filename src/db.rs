@@ -1761,7 +1761,9 @@ pub struct Options {
     /// A test's: a settle of the form, once its segment work has answered,
     /// holds the builds after it before their renames and returns only
     /// once the next has parked there (`Db::hold_zpage_after_settle`), so a
-    /// test can stand a build in flight at the instant a settle ends.
+    /// test can stand a build in flight at the instant a settle ends; and no
+    /// spare (`zpages_both`) starts before the first such settle has
+    /// answered, so the build that parks is a spare started as it ended.
     #[doc(hidden)]
     pub zpages_hold_after_settle: bool,
     /// Under `ZPages::Always`, a partition's form file is built as soon as
@@ -49283,6 +49285,14 @@ struct Maint {
     /// Inside a `ZSettle` answer: every kind of build is due, where the
     /// loop's own turns start only the builds of partitions with none.
     z_settling: bool,
+    /// A test's seam (`Options::zpages_hold_after_settle`): no spare is
+    /// started (`Options::zpages_both`) until a settle of the form has
+    /// answered, so that the first spare is the one that starts as a settle
+    /// ends. Spares start whenever no settle runs, and a store whose
+    /// served form files were built during its load had every spare built
+    /// before the test's settle, on a runner that gave the segment work
+    /// the time first, and nothing was left to stand at the rename.
+    z_spares_after_settle: bool,
     /// The controller (`ZPages::Auto`): the selector, whether it runs under
     /// these options, whether its decisions are traced
     /// (`SUPDB_ZPAGES_TRACE`), the epoch its clock counts from, when it
@@ -49746,6 +49756,7 @@ impl Maint {
                 if self.shared.zsettle_hold.load(AtomicOrdering::Acquire) {
                     Db::set_zhold(&self.shared.zbuild_hold, ZHOLD_RENAME, true);
                 }
+                self.z_spares_after_settle = false;
                 self.z_settling = false;
                 swept?;
                 self.sync_owed_slot()
@@ -50056,6 +50067,7 @@ impl Maint {
             .manifest_seq
             .store(manifest_seq, AtomicOrdering::Release);
         let z_auto = r.opts.zpages == ZPages::Auto && !z_auto_inert(&r.opts);
+        let z_spares_after_settle = r.opts.zpages_hold_after_settle;
         let z_eager = r.opts.zpages_build_eager;
         let z_attach_eager = r.opts.zpages_attach_eager;
         let z_suspect_crossing = r.opts.zpages_suspect_at_crossing;
@@ -50088,6 +50100,7 @@ impl Maint {
             zahead: None,
             z_last_d: None,
             z_settling: false,
+            z_spares_after_settle,
             zsel: {
                 let mut sel = zselect::ZSelect::default();
                 sel.set_eager(z_eager);
@@ -52000,7 +52013,7 @@ impl Maint {
         self.z_convert_asked();
         if self.opts.zpages_recode && !self.z_settling {
             self.z_recode_tick();
-            if self.zbuild.is_none() && self.opts.zpages_both {
+            if self.zbuild.is_none() && self.opts.zpages_both && !self.z_spares_after_settle {
                 let next = {
                     let _op = self.op();
                     self.z_next_spare()
