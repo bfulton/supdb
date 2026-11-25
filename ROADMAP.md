@@ -690,39 +690,32 @@ What an engine picker would hit, roughly in order.
     could not take back was 1,228-1,251 MiB of the 1,280, so that bound
     has some forty mebibytes in hand.
   - What is written unannounced: a seal's output, whose size is its
-    table's; an ordered run's file, which grows a commit at a time; and
-    a form file built at a merge's finish. Each reaches the room a
-    reading late, as a merge's output did. A merge's own arrays, and a
-    seal's sort and its writer's, are the engine's mappings since the
-    merge of upstream's `59454e0` (`Options::jobs_mapped`, on), which the
-    room counts while they are mapped and not yet touched
-    (`zfile::unreclaimable_slack`, `blocks::mapped_bytes`): they reach it
-    as they are mapped, ahead of their writes. Whether that takes the
-    rise of the process's own memory between two readings, below, out of
-    the loads' peaks is not measured. A lever
-    for one of them waits for a peak that names it, read on the group's
-    memory by kind through the pass, kill or none. One came at ten
-    million keys under 1.25 GiB at `b7a1177`, `supdb-cipherauto` in the
-    shuffled load of a pairing's first rep (the item on the pass after a
-    full rewrite has the command): the kernel's record of the kill put
-    1,053 MB of shared memory in the group where the process mapped 850,
-    so some 200 MB of memory files no view had taken, beside 266 MB of
-    the process's own. The loads alone, three reps of the arm against
-    itself with the cache's trace and the group sampled
+    table's, and an ordered run's file, which grows a commit at a time;
+    each reaches the room a reading late, as a merge's output did. A
+    form file's build says what its file is to hold where it makes it
+    (`vault::expect` in `zfile::write_pages` and `write_stride`, at
+    `153a623`): at ten million keys under 1.25 GiB two form files built
+    ahead at the ordered load's end had grown shared memory by 99 MiB in
+    86 ms beside a cache at its budget, and the same three loads a side
     (`SUPDB_PAGER_TRACE=1 SUPDB_LAG_MARK=1 bench ab --arms
     supdb-cipherauto,supdb-cipherauto --size 10000000 --bound 1342177280
-    --passes load --reps 3 --ops-div 10` beside `scripts/groupmem.py
-    sample`, at `5c2f645`), none killed: each pass's most the kernel could
-    not take back was 1,189-1,247 MiB of the 1,280, the process's own
-    memory 62-351 of it, and the cache's reading of its slack at that
-    instant -33 to 28 MiB. The files being written there were 20-151 MB:
-    a seal's pieces, some thirty of a few megabytes each, written before
-    any has its envelope; a merge's output, announced; a form file built
-    at a merge's finish; an ordered run's file. Announced where each is
-    made, a seal's piece would move the room by its few megabytes, since
-    the pieces at the peak are written already and in the readings; the
-    peak is the cache at its budget when the process's own memory rises
-    by a hundred megabytes and more between two of its readings.
+    --passes load --reps 3 --ops-div 10` beside `GROUPMEM_INTERVAL_MS=20
+    scripts/groupmem.py sample`) read the most the kernel could not take
+    back at 1,214-1,253 MiB of the 1,280 at `781e2b8` and at 1,195-1,226
+    with the announcement, none killed either way. A merge's own arrays,
+    and a seal's sort and its writer's, are the engine's mappings
+    (`Options::jobs_mapped`), which the room counts as they are mapped:
+    with the cache full the process's own memory rose by 58 MiB at most
+    within a tenth of a second, the rest of each fast rise being memory
+    files, and the rises of a hundred megabytes and more are each pass's
+    start, the harness priming fresh pages with the cache empty. What the
+    peaks are now: five loads of six at 1,195-1,201 MiB in the ordered
+    load, the cache at its budget beside the run's file of 23-41 MB and
+    the room read at 7-36 MiB of slack; and one at 1,226, the shuffled
+    load's end, the process at 106 MiB of its own and a form file built at
+    a merge's finish announced. A lever for the run's file or a seal's
+    piece waits for a peak that names it, read on the group's memory by
+    kind through the pass, kill or none.
   - The evictor's waits, of which the long ones were a merge's. A merge
     wrote each output's envelope under its hold of the cache, and writes
     it unheld now (`CLAUDE.md`, the trace that named the close;

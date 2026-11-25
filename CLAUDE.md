@@ -2941,14 +2941,23 @@ killed in five reps of five, and the most the kernel could not take back
 581-595 MiB of the 640 in every pass of the ten, where the run before it
 had 621-636 in four passes of five, the killed one among them (`rss`,
 `shmem` and the kernel's own, sampled from the group every ten
-milliseconds). What is still written unannounced is a seal's output, an
-ordered run's file, a form file built at a merge's finish and the
-merge's own arrays (`ROADMAP.md`). The rules:
+milliseconds). A form file's build came next, two of them built ahead at
+the ordered load's end beside a cache at its budget, 99 MiB of shared
+memory in 86 ms and the group within 27 MiB of its limit; it says what
+its file is to hold where it makes it now, the stride form's length to the
+byte and the block form's records, and the same loads' peaks fell from
+1,214-1,253 MiB of the 1,280 to 1,195-1,226. What is still written
+unannounced is a seal's output and an ordered run's file (`ROADMAP.md`).
+The rules:
 a budget steered by a reading is late by what is written between two
 readings, so a writer that knows the size of what it is about to write
-says so before the first byte; and a kill one rep in three is a peak
+says so before the first byte; a kill one rep in three is a peak
 every rep comes near, so the fix is read on each pass's peak, by the
-group's own count, and not on the kills alone.
+group's own count, and not on the kills alone; and the writer to announce
+next is read off the cache's trace at the instants its slack was short,
+by kind of file in flight, against the ones that are announced or have a
+view, since a sampler of the group's memory says how much and not whose,
+and a quarter of a second between its samples misses a peak of a tenth.
 
 **A level made late for the open, read a head an ask where the first
 seek fell.** A store under a cipher reads an ordered index's top level
