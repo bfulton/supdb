@@ -75,10 +75,12 @@ floors.
 Arms: `supdb`, `supdb-forms`, `supdb-settle`, `supdb-nosnap`,
 `supdb-noadvice`, `supdb-nocache`, `supdb-cache256`, `lmdb`, `rocksdb-tuned`
 (durable per batch); `supdb-ingest`, `lmdb-nosync`, `rocksdb-tuned-nosync`
-(buffered); `faster` (in memory until a checkpoint; Linux x86-64). Every
-comparison is within a guarantee, and a comparator differs between the first
-two groups in the sync alone; `faster` is alone in the third and compared
-with nothing (`DESIGN.md`, Arms).
+(buffered); `supdb-heldnoframes`, `faster` (in memory until a checkpoint; both
+where `faster` is built, Linux x86-64). Every comparison is within a
+guarantee, and a comparator differs between the first two groups in the
+sync alone; in the third, `faster` has no ordered scan and reopens no
+store, so the pair is compared over the workloads both run (`DESIGN.md`,
+Arms).
 
 ## Checks
 

@@ -1164,6 +1164,21 @@ pairings before one is built: it was designed for the ordered load's
 double write and the two chunks a form page lies across, and the reads
 turned on neither.
 
+- [ ] **The log's sealing under the door.** Under a cipher the log
+  seals its own writes (`Wal::enc`, `Wal::write_sealed`, a header of
+  its own length), so every change main makes to the log's write path is
+  a conflict here, and a mechanism main adds to it -- the log held in
+  the process (`SyncPolicy::Explicit`) was the last -- has to be taught
+  the sealing by hand. The reads are below the engine already: sources
+  read by the piece, every file call through the door. Done when the log
+  writes to an append file the vault hands it, which seals what it is
+  given and cuts back what a failed write left, the log's own code being
+  main's, and a store under a cipher passes the log's tests and the
+  crash oracle without a branch on the cipher in `Wal`. The cache's
+  give-back is the other place the cipher reaches into the engine's
+  code (holds, rests, `unlent`), and is narrowed after: a long reader
+  that says where it holds nothing is the price of reading in place
+  from a cache that decrypts.
 - [ ] **Every mechanism held to acting under a cipher.** The seal bars
   a whole borrow at the sites it lists, and a new walk over a section
   borrowed whole inside a reader's own module, or a new caller of a

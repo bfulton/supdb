@@ -355,3 +355,15 @@ Db::job_pool_takes	-	a test seam or a counter: reads or sets the store's bookkee
 Db::snapshot_lean_builds	-	a test seam or a counter: reads or sets the store's bookkeeping, at no key, entry, block or step of an operation
 Db::snapshots_kept	-	a test seam or a counter: reads or sets the store's bookkeeping, at no key, entry, block or step of an operation
 Db::zpage_hot_asks_in	-	a test seam or a counter: reads or sets the store's bookkeeping, at no key, entry, block or step of an operation
+Blob::read_all_fixed_hashed	-	the engine's reader of a segment: reached through Reader::read_all and Reader::scan, whose probes count what the engine inlines of it
+Blob::slot_table	-	the key index's slot table for a point read that asks for its slots' lines ahead (upstream dbc2a2a): reached through Reader::read_all, whose probes count what the engine inlines of it
+Db::block_pool_counts	-	a test seam that reads the memtables' block pool's counts, read by tests, at no key, entry, block or step of an operation
+Db::block_pool_misses	-	a test seam that reads the block pool's misses, read by tests, at no key, entry, block or step of an operation
+Db::block_pool_on	-	a test seam that reads whether the block pool is on, read by tests, at no key, entry, block or step of an operation
+Db::put_batch	-	a batch of puts pinned once for all of them (upstream dbc2a2a): each is Db::put's path less its pin, which work and land count through Db::put; no probe writes a batch of puts
+Db::puts_in_place	-	a test seam that counts the puts that overwrote in place, read by tests, at no key, entry, block or step of an operation
+Db::reader	-	makes a handle, once a handle, the writer's refusal under Options::put_in_place before it
+Db::wal_held	-	a test seam that reads what a log that holds its commits dropped, spilled and holds, read by tests, at no key, entry, block or step of an operation
+Reader::point_lean_reads	-	a test seam that counts the point reads the lean reads answered, read by tests, at no key, entry, block or step of an operation
+Reader::point_live_ended_reads	-	a test seam that counts the point reads the live table ended, read by tests, at no key, entry, block or step of an operation
+Reader::point_placed_reads	-	a test seam that counts the point reads whose record was placed by the fixed read, read by tests, at no key, entry, block or step of an operation

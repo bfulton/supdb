@@ -243,13 +243,16 @@ static void log_cb(Status result, uint64_t) { g_log_done.store(result == Status:
 extern "C" {
 
 /// A store at `dir` (created if it is not there), with `table_size` hash
-/// buckets (a power of two) and `log_bytes` of the hybrid log in memory (a
-/// multiple of the log's page size). Null on failure.
-void* fkv_open(const char* dir, uint64_t table_size, uint64_t log_bytes) {
+/// buckets (a power of two), `log_bytes` of the hybrid log in memory (a
+/// multiple of the log's page size) and `mutable_fraction` of those pages
+/// updated in place, the rest read-only and copied to the tail on update.
+/// Null on failure.
+void* fkv_open(const char* dir, uint64_t table_size, uint64_t log_bytes,
+               double mutable_fraction) {
   try {
     std::string path{ dir };
     if (path.empty() || path.back() != '/') path.push_back('/');
-    return new store_t{ table_size, log_bytes, path };
+    return new store_t{ table_size, log_bytes, path, mutable_fraction };
   } catch (...) {
     return nullptr;
   }

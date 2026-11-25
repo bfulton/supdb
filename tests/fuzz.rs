@@ -62,7 +62,18 @@
 //!   under a small budget (`Options::zpages_promote_copies`).
 //! - `ZFUZZ_OPTVARY`: set, a seed turns compaction, promotion, the trusted
 //!   page views of the compact form or its block cursor off, or its
-//!   memo-first ask on, each with a chance of 15%.
+//!   memo-first ask on, each with a chance of 15%; and holds its log in
+//!   the process in a quarter of the seeds (`SyncPolicy::Explicit`,
+//!   `Cfg::hold_small`), dropped at half its reopens and closed at the
+//!   rest; and in half of those builds no frames (`Cfg::held_frames`),
+//!   closed at every reopen; and in a quarter of the seeds reads a
+//!   record as it reaches it, no line asked ahead of its header
+//!   (`Cfg::record_ahead`), and in a quarter asks the live table before
+//!   a point read finds its partition (`Cfg::live_first`), and in
+//!   a quarter hashes a memtable's keys by FNV alone (`Cfg::mem_fold`);
+//!   and in a quarter of the seeds that hold their log overwrites a put's
+//!   value of the put's length where it lies on the `z` store, its handles
+//!   claimed only with nothing staged (`Cfg::in_place`).
 //! - `ZFUZZ_SHAPES`: the key shapes a seed may draw from, as indexes from 0
 //!   to 7 separated by commas.
 //! - `ZFUZZ_SETTLEBUILDS=1`: the `z` store's commits near reads file their
@@ -391,6 +402,58 @@ struct Cfg {
     /// compact form is installed (`Options::merge_quiet_any_gate`): in half
     /// the seeds that draw the third merge.
     merge_quiet_any: bool,
+    /// A point read takes the common record where it lies
+    /// (`Options::point_fixed`) and reads a store's sources in their
+    /// common shape by the two-source and the layered read
+    /// (`Options::point_lone`): each off in a quarter of the seeds under
+    /// `ZFUZZ_OPTVARY`, the side generator's next two draws, and on
+    /// otherwise, as the engine has them, so the general read is held to
+    /// the model beside the reads that stand in for it.
+    point_fixed: bool,
+    point_lone: bool,
+    /// The layered read that places its sources first
+    /// (`Options::point_layers_lean`): off in a quarter of the seeds under
+    /// `ZFUZZ_OPTVARY`, so both layered reads meet the fuzz's stores, with
+    /// their pieces, their seals in flight and their chains of appends.
+    point_layers_lean: bool,
+    /// The log held in the process (`SyncPolicy::Explicit`, which `sync`
+    /// then is) in a quarter of the seeds under `ZFUZZ_OPTVARY`, and in
+    /// half of those to a cap of two kibibytes (`Options::wal_hold_bytes`),
+    /// so that it spills between its seals: the side generator's next two
+    /// draws. Such a seed's store is dropped at half its reopens and
+    /// closed at the rest, so the open replays what the drop wrote over
+    /// the gaps the dropped frames left.
+    hold_small: bool,
+    /// The held log with no frames (`Options::held_frames` off), in half
+    /// the seeds that hold their log: the side generator's draw after the
+    /// layered read's. Such a seed's store is closed at every reopen, since
+    /// a drop keeps nothing a drain has not covered.
+    held_frames: bool,
+    /// A point read asks for its record's lines past the first as the slot
+    /// names it (`Options::point_record_ahead`): off in a quarter of the
+    /// seeds under `ZFUZZ_OPTVARY`, the side generator's draw after the
+    /// frames', and on otherwise, as the engine has it.
+    record_ahead: bool,
+    /// The read that places its sources asks the live table before it
+    /// finds the partition (`Options::point_live_first`): on in a quarter
+    /// of the seeds under `ZFUZZ_OPTVARY`, the side generator's draw after
+    /// the record ask's, and off otherwise, as the engine has it.
+    live_first: bool,
+    /// A memtable hashes a sixteen-byte key by the fold of its words
+    /// (`Options::mem_hash_fold`): off in a quarter of the seeds under
+    /// `ZFUZZ_OPTVARY`, the side generator's draw after the live table's,
+    /// and on otherwise, as the engine has it.
+    mem_fold: bool,
+    /// The `z` store's puts overwrite a value of their length where it lies
+    /// (`Options::put_in_place`): in a quarter of the seeds that hold their
+    /// log, the side generator's draw after the memtable hash's, with the
+    /// cache off and the upkeep inline on `z` alone, since the engine
+    /// refuses the overwrite beside them, and a handle claimed on `z` only
+    /// where nothing is staged, as the store asks (`claim`), after which
+    /// `z` appends beside it; `r` appends every put over the same writes.
+    /// Such a seed makes a fifth of its writes puts of eight-byte values,
+    /// out of the appends' share.
+    in_place: bool,
     /// Under `ZFUZZ_STRIDE`, the stride form's steer; `None` without it.
     stride: Option<StrideSteer>,
 }
@@ -683,6 +746,15 @@ fn pick_cfg(rng: &mut Rng, want_cache: bool) -> Cfg {
     let (heads_on, land_on) = (side.chance(50), side.chance(50));
     let quiet_on = side.chance(50);
     let quiet_any = side.chance(50);
+    let (fixed_off, lone_off) = (side.chance(25), side.chance(25));
+    let (explicit_on, hold_small) = (side.chance(25), side.chance(50));
+    // After every draw before it, so that it moves none of them.
+    let layers_as_one = side.chance(25);
+    let no_frames = side.chance(50);
+    let ask_off = side.chance(25);
+    let live_first = side.chance(25);
+    let mem_fnv = side.chance(25);
+    let in_place = side.chance(25);
     // A generator of its own, as `side` is, so that the switch moves none
     // of the draws below.
     let stride =
@@ -705,15 +777,24 @@ fn pick_cfg(rng: &mut Rng, want_cache: bool) -> Cfg {
             _ => Upkeep::Background(1),
         },
         bg: rng.chance(75),
-        sync: match (rng.chance(50), env_flag("ZFUZZ_SYNCVARY")) {
-            (_, true) => [
-                SyncPolicy::Always,
-                SyncPolicy::EveryN(1),
-                SyncPolicy::EveryN(8),
-                SyncPolicy::EveryN(u32::MAX),
-            ][rng.below(4)],
-            (true, false) => SyncPolicy::Always,
-            (false, false) => SyncPolicy::EveryN(8),
+        sync: {
+            // Drawn as it always was, so that the draws after it stand,
+            // and replaced where the seed holds its log.
+            let drawn = match (rng.chance(50), env_flag("ZFUZZ_SYNCVARY")) {
+                (_, true) => [
+                    SyncPolicy::Always,
+                    SyncPolicy::EveryN(1),
+                    SyncPolicy::EveryN(8),
+                    SyncPolicy::EveryN(u32::MAX),
+                ][rng.below(4)],
+                (true, false) => SyncPolicy::Always,
+                (false, false) => SyncPolicy::EveryN(8),
+            };
+            if vary && explicit_on {
+                SyncPolicy::Explicit
+            } else {
+                drawn
+            }
         },
         ops: 600 + rng.below(1800),
         keys: 40 + rng.below(500),
@@ -744,6 +825,15 @@ fn pick_cfg(rng: &mut Rng, want_cache: bool) -> Cfg {
         land_bounds: !(vary && land_on),
         merge_quiet: !(vary && quiet_on),
         merge_quiet_any: vary && !quiet_on && quiet_any,
+        point_fixed: !(vary && fixed_off),
+        point_lone: !(vary && lone_off),
+        point_layers_lean: !(vary && layers_as_one),
+        hold_small: vary && explicit_on && hold_small,
+        held_frames: !(vary && explicit_on && no_frames),
+        record_ahead: !(vary && ask_off),
+        live_first: vary && live_first,
+        mem_fold: !(vary && mem_fnv),
+        in_place: vary && explicit_on && in_place,
         stride,
     }
 }
@@ -776,6 +866,18 @@ fn opts(c: &Cfg) -> Options {
         land_bounds_read: c.land_bounds,
         merge_parallel_quiet: if c.merge_quiet { 3 } else { 0 },
         merge_quiet_any_gate: c.merge_quiet_any,
+        point_fixed: c.point_fixed,
+        point_lone: c.point_lone,
+        point_layers_lean: c.point_layers_lean,
+        held_frames: c.held_frames,
+        point_record_ahead: c.record_ahead,
+        point_live_first: c.live_first,
+        mem_hash_fold: c.mem_fold,
+        wal_hold_bytes: if c.hold_small {
+            2 << 10
+        } else {
+            Options::default().wal_hold_bytes
+        },
         promote_starts: c.hot_starts,
         zpages_store_all: c.store_all,
         scan_start_cache: if c.start_cache { 4096 } else { 0 },
@@ -914,6 +1016,14 @@ fn opts_z(c: &Cfg) -> Options {
         o.scan_cache_bytes = 32 << 10;
         o.forms_to_fit = true;
     }
+    // Last, over whatever the flags set: the overwrite and what it needs.
+    if c.in_place {
+        o.put_in_place = true;
+        o.scan_block_cache = false;
+        o.upkeep = Upkeep::Inline;
+        o.snapshot_keeper = false;
+        o.forms_off_snapshot_kept = false;
+    }
     o
 }
 
@@ -938,6 +1048,17 @@ fn cipher_cache() -> Option<u64> {
     match CIPHER_CACHE.get() {
         0 => env_u64("ZFUZZ_CIPHERCACHE"),
         n => Some(n),
+    }
+}
+
+/// A handle on `z`, or none where the store refuses it as a store that
+/// overwrites its puts refuses a claim with a put staged (`Db::reader`,
+/// `Cfg::in_place`); any other refusal is the seed's failure.
+fn claim(z: &Db, cfg: &Cfg) -> Result<Option<Reader>, String> {
+    match z.reader() {
+        Ok(h) => Ok(Some(h)),
+        Err(e) if cfg.in_place && e.to_string().contains("nothing staged") => Ok(None),
+        Err(e) => Err(format!("reader: {e}")),
     }
 }
 
@@ -1775,6 +1896,17 @@ struct Stats {
     /// gave back (`Options::heads_owned`), summed as `abandons` is: what
     /// says a run under `ZFUZZ_CENSUS` or `ZFUZZ_ZPAGES` reached them.
     heads: [u64; 2],
+    /// The bytes of frames either store's log dropped unwritten behind a
+    /// durable seal, and wrote out at a spill (`SyncPolicy::Explicit`),
+    /// summed as `abandons` is: what says a run under `ZFUZZ_OPTVARY`
+    /// reached each.
+    held: [u64; 2],
+    /// The point reads either store's writer answered by the two-source
+    /// read, by a layered read, and of those by the one that places its
+    /// sources first (`Options::point_lone`, `point_layers_lean`), summed
+    /// as `abandons` is: what says a range reached each, since the general
+    /// read answers every key they decline and the model cannot tell.
+    reads: [u64; 3],
     /// Through either store's form files: groups a point read decoded in
     /// part, groups the memo took at a second touch, reads the key table
     /// sent to their record, groups a walk decoded into its own buffer and
@@ -1795,6 +1927,10 @@ struct Stats {
     /// past `merge_parallel` in a stretch of writes nobody read
     /// (`Options::merge_parallel_quiet`).
     point: [u64; 12],
+    /// The puts the `z` store overwrote where the value lay
+    /// (`Options::put_in_place`), summed over its opens as `kept` is: what
+    /// says a run under `ZFUZZ_OPTVARY` reached the overwrite.
+    in_place: u64,
     /// The `z` store's stride form under `ZFUZZ_STRIDE`.
     stride: StrideStats,
 }
@@ -1944,6 +2080,13 @@ fn count_heads(st: &mut Stats, db: &Db) {
     let (made, given, _) = db.heads_owned_counts();
     st.heads[0] += made;
     st.heads[1] += given;
+    let h = db.wal_held();
+    st.held[0] += h.dropped;
+    st.held[1] += h.spilled;
+    let (lone, layered) = db.point_lean_reads();
+    st.reads[0] += lone;
+    st.reads[1] += layered;
+    st.reads[2] += db.point_placed_reads();
 }
 
 fn panic_text(p: &(dyn std::any::Any + Send)) -> String {
@@ -2016,7 +2159,7 @@ fn run_seed(seed: u64, want_cache: bool, verbose: bool) -> Result<Stats, String>
 
 fn cfg_line(c: &Cfg) -> String {
     format!(
-        "seal={} part={:?} l0={} inline={:?} cache={} upkeep={:?} bg={} sync={:?} big={}",
+        "seal={} part={:?} l0={} inline={:?} cache={} upkeep={:?} bg={} sync={:?} frames={} big={}",
         c.seal_bytes,
         c.partition_bytes,
         c.l0_trigger,
@@ -2025,6 +2168,7 @@ fn cfg_line(c: &Cfg) -> String {
         c.upkeep,
         c.bg,
         c.sync,
+        c.held_frames,
         c.big
     )
 }
@@ -2108,8 +2252,11 @@ fn run_seed_inner(seed: u64, want_cache: bool, verbose: bool) -> Result<Stats, S
         zreads: 0,
         switches: 0,
         kept: 0,
+        in_place: 0,
         recuts: 0,
         heads: [0; 2],
+        held: [0; 2],
+        reads: [0; 3],
         point: [0; 12],
         stride: StrideStats::default(),
     };
@@ -2149,6 +2296,13 @@ fn run_seed_inner(seed: u64, want_cache: bool, verbose: bool) -> Result<Stats, S
             }
         } else {
             match rng.below(100) {
+                // A seed whose `z` overwrites its puts makes a fifth of its
+                // writes puts of one length, out of the appends' share, so
+                // that a put meets a put's value it can overwrite.
+                0..=19 if cfg.in_place => {
+                    let v = format!("{:08}", rng.below(100_000_000)).into_bytes();
+                    write(Op::Put(k.clone(), v), &mut staged, &mut z, &mut r);
+                }
                 0..=44 => {
                     let v = value(&mut rng, step, cfg.big);
                     write(Op::Append(k.clone(), v), &mut staged, &mut z, &mut r);
@@ -2283,11 +2437,10 @@ fn run_seed_inner(seed: u64, want_cache: bool, verbose: bool) -> Result<Stats, S
                 }
                 105..=119 => {
                     if handles.len() < 4 {
-                        handles.push(Handle {
-                            r: z.reader().map_err(|e| format!("reader: {e}"))?,
-                            snap: None,
-                        });
-                        note_event("claim z", &z, &r);
+                        if let Some(h) = claim(&z, &cfg)? {
+                            handles.push(Handle { r: h, snap: None });
+                            note_event("claim z", &z, &r);
+                        }
                     }
                 }
                 120..=139 => {
@@ -2320,14 +2473,15 @@ fn run_seed_inner(seed: u64, want_cache: bool, verbose: bool) -> Result<Stats, S
                     st.zreads += z.zpage_counts().reads + z.zpage_counts().scans;
                     st.switches += z.forms_off_counts()[..2].iter().sum::<u64>();
                     st.kept += z.snapshots_kept();
+                    st.in_place += z.puts_in_place();
                     st.recuts += z.forms_recut().0 + r.forms_recut().0;
                     count_point(&mut st, &z);
                     count_point(&mut st, &r);
                     count_heads(&mut st, &z);
                     count_heads(&mut st, &r);
                     st.stride.add(&z.zpage_counts());
-                    let always = matches!(cfg.sync, SyncPolicy::Always);
-                    let synced = !always && env_flag("ZFUZZ_SYNCVARY") && rng.chance(50);
+                    let every = matches!(cfg.sync, SyncPolicy::EveryN(_));
+                    let synced = every && env_flag("ZFUZZ_SYNCVARY") && rng.chance(50);
                     if synced {
                         // What the sync promises: every commit before it,
                         // a run's held tail among them, kept by the crash.
@@ -2338,7 +2492,11 @@ fn run_seed_inner(seed: u64, want_cache: bool, verbose: bool) -> Result<Stats, S
                             apply(&mut model, &op);
                         }
                     }
-                    let clean = rng.chance(50) || !(always || synced);
+                    // A store that holds its log is dropped too: what it
+                    // held goes to the file as it drops, every commit of
+                    // it, and the open replays them; one that syncs every
+                    // few commits only once a sync has covered them.
+                    let clean = rng.chance(50) || (every && !synced) || !cfg.held_frames;
                     if clean {
                         for op in staged.drain(..) {
                             // close commits the staged batch.
@@ -2406,8 +2564,9 @@ fn run_seed_inner(seed: u64, want_cache: bool, verbose: bool) -> Result<Stats, S
             let probe = all_probe(&pool, &absent);
             check_keys("z writer", &z, &model, &probe, &mut fails);
             check_keys("r writer", &r, &model, &probe, &mut fails);
-            let hz = z.reader().map_err(|e| format!("reader: {e}"))?;
-            check_keys("z fresh handle", &hz, &model, &probe, &mut fails);
+            if let Some(hz) = claim(&z, &cfg)? {
+                check_keys("z fresh handle", &hz, &model, &probe, &mut fails);
+            }
             for (i, h) in handles.iter().enumerate() {
                 match &h.snap {
                     Some(snap) => check_keys(
@@ -2475,8 +2634,9 @@ fn run_seed_inner(seed: u64, want_cache: bool, verbose: bool) -> Result<Stats, S
         let probe = all_probe(&pool, &absent);
         check_keys("final z writer", &z, &model, &probe, &mut fails);
         check_keys("final r writer", &r, &model, &probe, &mut fails);
-        let hz = z.reader().map_err(|e| format!("reader: {e}"))?;
-        check_keys("final z fresh handle", &hz, &model, &probe, &mut fails);
+        if let Some(hz) = claim(&z, &cfg)? {
+            check_keys("final z fresh handle", &hz, &model, &probe, &mut fails);
+        }
         for (i, h) in handles.iter().enumerate() {
             match &h.snap {
                 Some(snap) => check_keys(
@@ -2495,9 +2655,10 @@ fn run_seed_inner(seed: u64, want_cache: bool, verbose: bool) -> Result<Stats, S
                 ),
             }
         }
-        let sn = z.reader().map_err(|e| format!("reader: {e}"))?;
-        sn.snapshot();
-        check_keys("final z snapshot", &sn, &model, &probe, &mut fails);
+        if let Some(sn) = claim(&z, &cfg)? {
+            sn.snapshot();
+            check_keys("final z snapshot", &sn, &model, &probe, &mut fails);
+        }
     }
     let mut ok = fails.is_empty();
     drop(handles);
@@ -2511,6 +2672,7 @@ fn run_seed_inner(seed: u64, want_cache: bool, verbose: bool) -> Result<Stats, S
     st.zreads += z.zpage_counts().reads + z.zpage_counts().scans;
     st.switches += z.forms_off_counts()[..2].iter().sum::<u64>();
     st.kept += z.snapshots_kept();
+    st.in_place += z.puts_in_place();
     st.recuts += z.forms_recut().0 + r.forms_recut().0;
     count_point(&mut st, &z);
     count_point(&mut st, &r);
@@ -2615,10 +2777,34 @@ fn run_range() {
     let mut kept = 0u64;
     let mut point = [0u64; 12];
     let mut heads = [0u64; 2];
+    let mut held = [0u64; 2];
+    let mut reads = [0u64; 3];
+    let mut frameless = 0u64;
+    let mut unasked = 0u64;
+    let mut live_first = 0u64;
+    let mut mem_fnv = 0u64;
+    let mut in_place = [0u64; 2];
     let mut stride = StrideStats::default();
     let ran = seeds.len();
     let (mut evicted, mut fills, mut zreads) = (0u64, 0u64, 0u64);
     for seed in seeds {
+        // The seeds whose held log builds no frames, from the draws alone.
+        let drawn = seed_draws(seed, want_cache).0;
+        if !drawn.held_frames {
+            frameless += 1;
+        }
+        if !drawn.record_ahead {
+            unasked += 1;
+        }
+        if drawn.live_first {
+            live_first += 1;
+        }
+        if !drawn.mem_fold {
+            mem_fnv += 1;
+        }
+        if drawn.in_place {
+            in_place[0] += 1;
+        }
         match run_seed(seed, want_cache, verbose) {
             Ok(s) => {
                 if verbose && stride_on() {
@@ -2635,17 +2821,23 @@ fn run_range() {
                 switches += s.switches;
                 recuts += s.recuts;
                 kept += s.kept;
+                in_place[1] += s.in_place;
                 for (a, b) in point.iter_mut().zip(s.point) {
                     *a += b;
                 }
                 heads[0] += s.heads[0];
                 heads[1] += s.heads[1];
+                held[0] += s.held[0];
+                held[1] += s.held[1];
+                for (a, b) in reads.iter_mut().zip(s.reads) {
+                    *a += b;
+                }
             }
             Err(e) => bad.push(format!("seed {seed}: {e}")),
         }
     }
     eprintln!(
-        "seeds {from}..{to}: reopens {reopens}, abandons {abandons}, bindings {bindings}, merges beside {beside}, cache units given back {evicted}, chunks decrypted {fills}, reads through a form {zreads}, forms-off switches {switches}, sparse forms recut {recuts}, heads owned {} given back {}, point parts {} admits {} key hits {} walk owned {} walk parts {} hot starts {} copy starts {} stale exits {} cursor steps {} bounds by head {} landings left {} quiet merges {}, snapshots kept {kept}, FAILURES {}",
+        "seeds {from}..{to}: reopens {reopens}, abandons {abandons}, bindings {bindings}, merges beside {beside}, cache units given back {evicted}, chunks decrypted {fills}, reads through a form {zreads}, forms-off switches {switches}, sparse forms recut {recuts}, heads owned {} given back {}, point parts {} admits {} key hits {} walk owned {} walk parts {} hot starts {} copy starts {} stale exits {} cursor steps {} bounds by head {} landings left {} quiet merges {}, snapshots kept {kept}, log frames dropped {} spilled {}, held logs with no frames {frameless}, reads with no record asked {unasked}, live table asked first {live_first}, memtables hashed by FNV {mem_fnv}, overwriting puts {} overwrites {}, point reads two-source {} layered {} placed {}, FAILURES {}",
         heads[0],
         heads[1],
         point[0],
@@ -2660,6 +2852,13 @@ fn run_range() {
         point[9],
         point[10],
         point[11],
+        held[0],
+        held[1],
+        in_place[0],
+        in_place[1],
+        reads[0],
+        reads[1],
+        reads[2],
         bad.len()
     );
     if stride_on() {

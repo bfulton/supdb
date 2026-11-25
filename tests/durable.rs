@@ -13170,6 +13170,7 @@ fn a_runs_due_commit_over_a_log_that_owes_nothing_syncs_no_log() {
             let every = match sync {
                 SyncPolicy::EveryN(n) => n,
                 SyncPolicy::Always => 1,
+                SyncPolicy::Explicit => unreachable!("{p}: a policy with no due commit"),
             };
             assert_eq!(
                 dl_until_due(&mut db, &mut next, p),

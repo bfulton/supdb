@@ -1547,6 +1547,14 @@ fn a_second_merge_runs_beside_the_first_over_ranges_it_does_not_hold() {
             // No third merge in a write-only stretch: the room is the
             // test's (`Options::merge_parallel_quiet`).
             merge_parallel_quiet: 0,
+            // The in-core shape: under the forced form the gate is away
+            // from the raw form from the start, and a landing there chains
+            // without a scan (`Options::merge_chains_writes`). Where the
+            // segment work's loop landed the released merge before the
+            // settle asked for it, the chain planned the ranges the test
+            // counts as left, and three merges landed where it counts one;
+            // where the settle landed it, nothing chained.
+            merge_chains_writes: false,
             ..common::options()
         };
         let mut db = Db::create(&d, opts()).unwrap();

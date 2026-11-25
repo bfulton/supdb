@@ -314,7 +314,9 @@ engine, interleaved in one process where the comparison allows:
   actually lives on a barrier-bound device is fewer barriers per record:
   larger batches, or a bounded-loss sync policy. **Built and measured:**
   `SyncPolicy::EveryN` syncs every Nth commit and writes the WAL on every
-  one. Every-16 ingests **1.634x** every-batch (p=0.0022, commit phase
+  one (`SyncPolicy::Explicit`, which writes nothing at a commit and
+  promises nothing until a `sync`, came later and for another reason:
+  "A log held in the process", below). Every-16 ingests **1.634x** every-batch (p=0.0022, commit phase
   0.84s to 0.28s, device bytes unchanged), every-64 adds only 1.087x over
   that, and a torn unsynced tail is lost whole and never in part. That is
   the same 1.6x sharding would buy, for a policy bit instead of N writers;
@@ -355,6 +357,808 @@ defaults; tuned as deployed (a 256 MB block cache, a Bloom filter, four
 background threads) its read moved 1.19x and its scan 1.09x at 1M keys,
 so the pair reads **6.45x** and scans **4.70x** either way; the load stays
 at 0.688x, the shuffled load a tie.
+
+### Point gets and puts beside FASTER
+
+FASTER is the store the suite sets beside the buffered group for point
+operations alone (`bench/DESIGN.md`, the arms): a hash index over a log
+updated in place, with no write-ahead log, no ordered scan and a write that
+is in the process's memory until a checkpoint. In the first row that
+carried it, it led every point-read and write-mix cell and trailed only the
+loads. `bench ab --arms supdb-ingest,faster` reproduces the row's cells in
+one process, and under `SUPDB_MIX_KINDS=1` splits each mix into its gets
+and its commits; `bench/examples/point_ops.rs` runs the operations a mix is
+made of with the key generator out of the loop, one function a phase, which
+callgrind toggles on:
+
+    valgrind --tool=callgrind --collect-atstart=no \
+      --toggle-collect='point_ops::phase_reads_clean' \
+      bench/target/release/examples/point_ops supdb-ingest 100000 1 zipf 1
+
+and the same with `faster` for the arm, and `phase_updates`,
+`phase_reads_dirty` and `phase_half` for the phase. Counted so at a hundred
+thousand keys, a get over a store just loaded was 959 instructions against
+FASTER's 415, a get after a sixth of the store was rewritten 1,476 against
+417, and an update 1,213 against 555: two to three and a half times the
+instructions, over the same two dependent misses a get takes in either
+store (the slot and the record; the bucket and the record). No one function
+held them. The read was written for a key in any number of sources, each in
+any record shape, and with one source in the common shape it still set
+every layer up:
+
+- the record's extent rebuilt from its header, handed up and its run walked
+  by it, where the scan's walk had read the common record in place since
+  `compact_fixed_at`: 354 instructions. A point read takes the common
+  record's values where they lie (`Options::point_fixed`,
+  `FlatIndex::find_fixed_hashed`).
+- the multi-source machinery around one source: the tombstone pass and its
+  record of what it probed, the pieces over the range found by two
+  searches of an empty list, the frozen tables' loop set up, the
+  partition's read through a closure of six captures. A store whose
+  sources are its partition and the live table is read by those two alone
+  (`Options::point_lone`, `Reader::read_lone`), and one with pieces or
+  frozen tables in one newest-first pass that keeps what it finds on its
+  own frame (`Reader::read_layers`), where the general read asked each
+  source twice or carried the answers in a structure a single-source read
+  built too, and allocated a vector for a chain of one value.
+- bookkeeping at every read's edges: the read-mode note copied out of its
+  cell and back for one count, the advice asked through a call, the
+  sweeps' frames inlined into every unpin, a sixteen-byte key hashed by a
+  loop over a slice's length and compared through the library's compare.
+
+A put was the same shape on the write side: a pin and an unpin a record
+where a batch needs one (`Db::put_batch`), its two log frames grown seven
+`Vec` extensions each (`wal_record`), a tombstone and a value reserved and
+written by five calls where one reservation holds both
+(`MemTable::push_tomb_chunk`), and three or four locked adds a put to
+counters only the writer writes.
+
+With those, the same counts read 539 for the clean get and 979 for the
+update. Paired in the suite at a hundred thousand keys, the binary before
+and the binary after alternated three times, each against FASTER in both
+orders (`bench/scripts/pair.sh supdb-ingest faster 100000 --reps 6 --passes
+load,read,read-threaded,mixes,mixes-scrambled`, at `ab8a754` and at
+`ca2306e`), the buffered arm's rate over FASTER's read, at the median of
+the six sittings: the read pass 0.97x before and 1.11x after, on two
+reader threads 0.95x and 1.07x, on three 0.86x and 1.00x; the read-only
+mix 0.79x and 0.93x; B, A and D 0.67-0.71x and 0.74-0.79x; F 0.48x and
+0.55x; and the scrambled family, read on the store the first family
+leaves, a piece standing and unsealed keys over it, 0.47-0.69x and
+0.51-0.78x. So the read cells are level or ours, the read-only mix is
+nearly level, and every mix that writes is FASTER's by a quarter to a
+half. `supdb-pointexts` and `supdb-pointsources`, and their `supdb-ingest`
+siblings, are the reads before.
+
+The pairing is read with the environment clean. Under `SUPDB_MIX_KINDS`
+every arm reads the clock twice an operation, a fixed fifty nanoseconds on
+both sides of a ratio of operations that take a hundred: the first
+sittings of this work ran under it for the split by kind and read the
+read-only mix level with FASTER where the clean pairing reads 0.93x. The
+split is what the variable is for; a ratio is taken without it.
+
+Two readings on the way were wrong and are kept here so they are not made
+again. The pin is a locked store on every read, a full fence FASTER's reads
+do not have, and it was taken for what kept consecutive reads' misses from
+overlapping; the arm without the fence (`supdb-asympin`) read level with
+the default at 959 instructions and again at 530, in both sittings each.
+And a count taken under callgrind is of the store valgrind's threads
+make. The phase after the updates moved by a fifth between builds with
+nothing changed in its path, and was read as an idle seal that fired
+under the slowed clock and put a piece under gets that natively have
+none. Neither half of that was so, and a count by path said it later
+(`POINT_OPS_SHAPE=1`, the reads by the read that answered them): the
+updates cross the seal cap, a tenth of the store, in both runs, and no
+idle seal fires in either; natively the seal lands a few milliseconds
+into the phase and its gets are over a piece, and under valgrind, which
+runs one thread at a time, it stays in flight for the phase and they are
+over a frozen table. The shape line of the time counted pieces and not
+frozen tables, and read "none" off a seal in flight. The section below
+is that phase's.
+
+What is left is the write path and the gets beside it. A get of a key the
+live table holds reads the table's slot, its entry, its key and its chunk,
+four places where FASTER reads two, and a key in no table pays a slot and
+a filter line before the partition; a put appends to a log the kernel
+holds, a hundred nanoseconds of the kernel's a put in the profile of the A
+mix where FASTER makes no call, and first-touches fresh arena pages where
+FASTER rewrites a record in place. Those are the structures to change
+next, and none of them is a path to shorten.
+
+#### A log held in the process
+
+FASTER promises nothing of a write until a checkpoint, and the buffered
+arm it was read beside promises more: its every commit is in the kernel.
+`SyncPolicy::Explicit` is the engine's policy of FASTER's promise. A
+commit's frames stay in the buffer they were built in, behind the batch
+being staged, and reach the log's file at a `sync`, which syncs them, at a
+rotation, past a cap (`Options::wal_hold_bytes`) or where the store is
+dropped; and the frames whose records a seal has made durable meanwhile
+are dropped and never written, which leaves the file with a gap below
+every later open's start, where a replay checks nothing. `CLAUDE.md` has
+the three rules that hold it to the crash discipline, and `tests/runlog.rs`
+the states: a held commit in no file, a covered gap reopened over, a seal
+between its phases with its segment torn, a run begun over held frames,
+and twelve rounds of the kill oracle. `supdb-held` is `supdb-ingest` under
+it, in FASTER's row (`bench/DESIGN.md`).
+
+What it was worth was priced before it was built, by a scratch build
+whose log write returned at once: an update of `bench/examples/point_ops.rs`
+at a hundred thousand keys read 311 ns with the write and 242 without, and
+the half-and-half phase 269 and 236, beside FASTER's 166 and 142. The arm
+reads what the scratch build did, 313 and 242 (`point_ops supdb-held 100000
+4 zipf` beside `supdb-ingest` and `faster`, alternated five times, the
+medians of the last three reps).
+
+In the suite it reads level. Paired with the buffered arm at ten thousand,
+a hundred thousand and three hundred thousand keys (`bench/scripts/pair.sh
+supdb-held supdb-ingest SIZE --reps 6 --passes
+load,read,read-threaded,mixes,mixes-scrambled`, at `03a59d7`), no cell is
+further from level than 0.84x or 1.13x in either sitting, and the ones
+that lean furthest in both are the read passes on two and three threads,
+1.03-1.13x at the two larger rungs, over a drained store the policy cannot
+reach: the pairing resolves an eighth, and nothing in it is the policy's.
+Timed by kind (`SUPDB_MIX_KINDS=1 bench ab --arms
+supdb-held,supdb-ingest --size 100000 --reps 4 --passes
+load,read,mixes,mixes-scrambled`), a commit of a hundred updates is 22 to
+30 µs under either policy and 8 to 10% shorter held, in the A and F mixes,
+which is two or three percent of the mix: the probe's phase is updates
+alone over a scrambled Zipfian, and a mix's commits are a third of its
+time beside its gets and the harness. The cap moves nothing either: a
+mebibyte against the engine's sixty-four read level in both sittings at
+both rungs (`pair.sh supdb-held1m supdb-held`).
+
+The first shape of the buffer was a vector left to grow, and it copied
+everything it held each time it doubled: with eight megabytes and more
+held by the scrambled A mix, that mix's commits read 63 µs against 49 and
+the arm
+0.82x and 0.84x of the buffered one in both orders, in a pairing whose
+other cells were level. The buffer is reserved whole at the cap now, which
+is address space until it is written into, and a batch dropped with much
+still held behind it stays where it lay (`Wal::set_hold`,
+`Wal::drop_covered`); the same pairing reads that mix 0.99x twice.
+
+Beside FASTER under one guarantee (`pair.sh supdb-held faster SIZE`, the
+same passes; the held arm's rate over FASTER's, both sittings):
+
+| | 10,000 | 100,000 | 300,000 |
+|---|---|---|---|
+| ordered load | 31, 25 | 5.0, 6.6 | 4.4, 4.7 |
+| shuffled load | 12, 16 | 2.2, 2.3 | 1.9, 1.7 |
+| read pass | 1.46, 1.40 | 1.08, 1.25 | 1.01, 1.09 |
+| on two and three threads | 0.81-1.32 | 1.01-1.17 | 1.03-1.16 |
+| C | 1.32, 1.03 | 1.09, 0.80 | 0.96, 0.96 |
+| B, A, D | 0.74-1.14 | 0.76-0.92 | 0.75-0.84 |
+| F | 0.54, 0.87 | 0.65, 0.71 | 0.60, 0.60 |
+| scrambled B and C | 0.74-1.17 | 0.75-0.84 | 0.75-0.81 |
+| scrambled A, D and F | 0.51-0.96 | 0.55-0.68 | 0.52-0.65 |
+
+The smallest rung is a pass of a millisecond or two and its sittings
+disagree by more than the cells differ. From a hundred thousand keys the
+loads and the read passes are ours, the read-only mix is level or a
+twentieth behind, and every mix that writes is FASTER's by what it was
+beside the buffered arm. The
+update bursts of the lag sweep are the widest of it: at three hundred
+thousand keys (`pair.sh supdb-held faster 300000 --reps 4 --passes
+load,lag`, and the same with `supdb-ingest`) the held arm's bursts run at
+0.41-0.42x, 0.34-0.36x and 0.24-0.25x of FASTER's at one, ten and a
+hundred percent of the store, and the buffered arm's at 0.34-0.39x,
+0.32-0.33x and 0.23-0.25x.
+
+So the log's write was never what separated the two, and matching the
+guarantee moves the comparison by a few percent of a commit. What is left
+is what the paragraph above this section names. The bursts, where an
+update of ours costs a microsecond and a half against the quarter to half
+of one a mix's does, have not been taken apart beside FASTER's yet, and
+are the next thing to count.
+
+#### Gets over a written store
+
+A store that has been written is not the store a load leaves. The table
+seals at a tenth of the store (`Options::seal_max_pct`), so after a sixth
+of the keys are rewritten a get meets a partition, a piece that waits for
+its merge and a live table, and for the milliseconds of each seal a
+frozen table beside them. Every get there took the layered read: counted
+by path (`POINT_OPS_SHAPE=1 point_ops supdb-ingest 100000 1 zipf`), all of
+the phase's gets after the updates and all of the half-and-half phase's.
+The scrambled mix family runs wholly on such a store, and F, which
+follows A's updates, from its start.
+
+Counted with the seal landed (`POINT_OPS_LAND=1` and callgrind toggled on
+`point_ops::phase_reads_dirty`, as above, at `95d2404`), a get there was
+1,052 instructions, against 497 for a get of the store just loaded and
+417 for FASTER's, and no line of it held three in a hundred: the same
+shape the clean read had had, a layer set up for every case the store
+was not in. `Reader::read_placed` (`Options::point_layers_lean`) reads
+the same sources in the order of what each costs: the partition and its
+pieces placed by the state, which took the placement once at its publish
+(`State::placing`); the live table asked first, a tombstone there ending
+the read, which is three gets in ten under the scrambled Zipfian; the
+frozen tables the same way; then the pieces and the partition. It counts
+838, and `supdb-layersasone` and `supdb-ingestlayersasone` keep the read
+before. The first version left a store with a frozen table to the old
+read, on the reasoning that a seal is in flight for milliseconds, and
+the counter of its own reads said a third of the half-and-half phase's
+gets and two fifths of the phase after the updates, at one round a
+phase, had gone there: at this size a seal's milliseconds are a large
+share of the time between two seals.
+
+The count is not the whole of it. Timed by the source that answers
+(`POINT_OPS_LAND=1 POINT_OPS_CLASSES=1 point_ops ARM 100000 2 zipf`), each
+class of key read over and over so that every line is in the cache and
+every branch learned, a get costs, in nanoseconds:
+
+| the key is answered by | `supdb-ingest` | `supdb-ingestlayersasone` | `faster` |
+|---|---|---|---|
+| the live table | 60 | 80-85 | 47-49 |
+| the piece | 72 | 80-84 | 47-50 |
+| the partition | 90-96 | 105-140 | 62-66 |
+
+In the phase itself, where the keys are a sixth of the store drawn in no
+order, the same gets cost 177 ns under the scrambled Zipfian and 203
+under uniform keys, against 214 and 244 for the read before and 109 and
+118 for FASTER (`point_ops ARM 100000 4 DIST`, the three arms alternated
+six times, the median of the eighteen reps after each run's first; the
+phases the change cannot reach read 166 and 164, 111 and 112, 310 and
+316). Warm, the layered get is within a third of FASTER's; over keys the
+cache does not hold it is two thirds behind, where the clean get is
+level. The difference is how far two gets overlap. A get waits on two
+lines of the partition, its slot and then its record, and in a loop of
+gets the next one's waits begin while this one's are outstanding, as
+far as the core's window reaches. The layered get is longer, and the
+live table's probe ahead of the partition's is a branch no predictor
+learns, three in ten one way. Sampled by phase (`POINT_OPS_LAND=1 perf
+record -e cpu-clock -F 10000 --call-graph dwarf` over `point_ops ARM
+100000 1 uniform 40`, the samples laid to the phase function on each
+stack, twice an arm, at `95d2404`), the read before spent 341 and 384
+samples at the load of a partition's slot in the phase after the
+updates and 110 and 131 in the phase before them, and 526 and 589 at
+the record's against 418 and 424, for five sixths as many reads of the
+partition. So `read_placed` asks for the partition's slot as soon as
+the key is hashed, ahead of the tables and the filters, and the same
+sampling reads its slot at 127 and 169 against 115 and 120, the clean
+read's again, with the record's at 530 and 557 against 385 and 390,
+still two fifths more for fewer reads. A scratch build that left the
+ask out, alternated with one that made it, read the phase 240 ns and
+212 under uniform keys and 196 and 174 under the Zipfian, with the
+other phases level. The record's wait cannot be asked for ahead, its
+line being what the slot says; what shortens it is the next get
+starting sooner. FASTER, our clean get and our layered get each run at
+about the same instructions a cycle, 1.7 to 2.0, over 417, 497 and 838
+instructions, and the 838 has in it the generality the clean read's
+497 still has: the pin's two calls at sixty, the read's shell at a
+hundred, the partition's read at a hundred and ten.
+
+In the suite (`bench/scripts/pair.sh supdb-ingest supdb-ingestlayersasone
+300000 --reps 6 --passes load,read,read-threaded,mixes,mixes-scrambled`,
+at `95d2404`, the default's rate over the arm's in the two sittings):
+the scrambled B 1.10x and 1.15x, C 1.05x and 1.15x, D 1.11x and 1.21x, F
+1.08x and 1.13x, A 0.98x and 1.08x; the first family's D 1.00x and 1.14x
+and F 0.98x and 1.09x; and the loads, the read passes and the mixes that
+run before a seal within 0.94x and 1.03x. At a hundred thousand keys the
+same pairing's sittings disagree by more than its cells differ, the
+read-only mix that no layered read is in among them at 1.21x and 1.05x.
+The durable arm's pairing at that rung (`pair.sh supdb supdb-layersasone
+100000`, the same passes) resolves nothing either way, 0.86x to 1.35x
+with the sittings on opposite sides.
+
+Beside FASTER (`pair.sh supdb-held faster 300000`, the same passes, at
+`95d2404`, both sittings): the scrambled B 0.91x and 0.86x and C 0.87x
+and 0.84x, where the table above reads 0.75-0.81x; the scrambled D 0.70x
+and 0.73x, A 0.68x and 0.63x and F 0.57x and 0.58x; and the first family
+as it was, C 0.90x and 0.94x, B 0.86x and 0.82x, D 0.83x and 0.88x, A
+0.74x and 0.70x, F 0.60x in both. The mixes that mostly read have closed
+a third of their distance, and the mixes that write have not moved: by
+kind (`SUPDB_MIX_KINDS=1 bench ab --arms supdb-held,faster --size 100000
+--reps 3 --passes load,read,mixes,mixes-scrambled`) an update of ours is
+230 to 500 ns in A and F and their scrambled twins against FASTER's 66
+to 184, and half of those mixes' operations are updates. The write path
+is the larger distance now, and the gets' is the path length the clean
+read shares.
+
+#### Updates beside FASTER's
+
+Counted the same way (`point_ops ARM 100000 1 zipf 1` under callgrind
+toggled on `point_ops::phase_updates`, at `33d6e8c`), an update of the held
+arm is 978 instructions and FASTER's 555. FASTER's is not lean everywhere:
+104 of its instructions hash the key a byte at a time and 76 are its
+thread-local and thread-id checks. Ours is 904 inside `Db::put_batch`:
+the key's entry in a table that does not hold it yet, 191, which is
+seven updates in ten after a seal has emptied the table; the two log
+frames a put is, a delete and an append, 120 with their CRC at the
+commit; the value's chunk, 110; the index's insert, 74, and the probe
+before it, 69; the hash, 62; and the table's write log, 32. A key the
+table did not hold took the long way through all of them: its entry was
+made with a tombstone (`new_entry`) and the value laid down over it
+after (`push_chunk`), two reservations and five lookups of a block where
+`push_tomb_chunk` takes one of each, and its insert walked the index's
+slots again from the top to the vacant slot the probe had just found.
+`MemTable::put` takes the one reservation (`new_put_entry`) and the slot
+the probe found (`probe_or_vacant`, `index_insert_at`), and a chunk's
+header and value go in with one lookup of the block (`push_chunk`,
+`push_tomb`): the same bytes in the same places. It counts 801.
+
+The time moved a little: alternated, the held arm's updates read 296 ns
+and 286 under the scrambled Zipfian, the buffered arm's 327 and 313, and
+uniform keys level. An update was waiting on something other than its
+instructions, at 1.3 of them a cycle, and the kernel says what: the
+writer took 0.087-0.094 minor faults an update in the held arm, 0.046-0.053
+in the buffered one and none in FASTER's (`POINT_OPS_FAULTS=1`, the
+writer thread's own count around the phase), and sampled by phase (`perf
+record -e cpu-clock --call-graph dwarf`, the stacks with
+`point_ops::phase_updates` on them), 49% of the held arm's phase was the
+kernel's fault path against FASTER's 0.3%. What is left of the user's
+half is 1.34 times FASTER's whole phase. So the fresh pages are most of
+the distance in an update, at about 1.6 µs a page here, and the
+instructions are the rest.
+
+Two things first-touch them. A held log's buffer took every frame into
+pages nobody had touched: it closed the gap its dropped batches leave
+only where under 64 KB was held behind them, and a seal's landing leaves
+behind it whatever was committed while the seal ran, so new frames went
+on into the buffer's untouched reservation for the whole of a run, a
+page every two dozen updates of the suite's. It closes the gap now
+whenever the gap is at least what is held behind it
+(`Options::wal_hold_reuses`; `supdb-heldmarch` is the rule before).
+And every table's blocks are mapped fresh from the kernel and unmapped
+when it lands (`Options::blocks_mapped`), which is the buffered arm's
+whole count and the held arm's other half. Counted by mix in the suite's
+own shape (`SUPDB_MIX_COUNTERS=1 bench run --scale quick --top 300000
+--bottom 300000 --reps 2 --arms supdb-held,supdb-heldmarch,supdb-ingest,faster
+--passes load,read,mixes,mixes-scrambled`), writer faults a mix:
+
+| mix | `supdb-held` | `supdb-heldmarch` | `supdb-ingest` | `faster` |
+|---|---|---|---|---|
+| A | 2,093 | 2,093-2,108 | 1,069-1,084 | 0 |
+| F | 1,649-1,741 | 2,117-2,125 | 1,087-1,091 | 0 |
+| scrambled A | 1,527-1,821 | 2,431-2,434 | 1,410-1,412 | 0 |
+| scrambled F | 1,274-1,281 | 2,305-2,313 | 1,274-1,282 | 0 |
+
+A mix there is 25,000 updates. The held log's faults go once its buffer
+has lapped, by the third write mix, and what stays is the tables'
+blocks: a fault every twenty updates in every arm, two milliseconds or so
+of a mix of twenty to thirty-five. The mixes' times are a different
+matter: the held arm's scrambled F is 32-37 ms where FASTER's is 17-22,
+its scrambled A 28-32 against 17-22 and its F 23-25 against 12-17, so in
+the suite's mixes the faults are under a fifth of the distance, and the
+rest is the update's instructions and the gets beside them.
+
+Timed by kind at that rung (`SUPDB_MIX_KINDS=1 bench ab --arms
+supdb-held,faster --size 300000 --reps 4 --passes
+load,read,mixes,mixes-scrambled`), the read-mostly mixes are level with
+FASTER's, gets and commits, and the distance is the write mixes': their
+commits, 6.2 ms against 3.9 in A and 12.9 against 6.8 in the scrambled A,
+11.0 against 2.3 in the scrambled F, where FASTER's read-modify-write
+updates the record it has just read in place; and their gets once the
+table holds writes, 273 ns against 217 in A and 315 against 228 in the
+scrambled D.
+
+The tables' blocks are a lever with a ceiling the tree already had: the
+arm whose blocks come from the heap (`supdb-ingestheapblocks`), which
+keeps a freed block for the next allocation of its size, read the write
+mixes ahead of the buffered arm in both orders, A 1.09x and 1.08x, F
+1.02x and 1.07x, the scrambled A 1.15x and 1.26x, D 1.09x and 1.10x and F
+1.11x and 1.18x, and the read-only mixes level (`pair.sh
+supdb-ingestheapblocks supdb-ingest 300000 --reps 6 --passes
+load,read,read-threaded,mixes,mixes-scrambled`). That arm is the shape the
+mapped blocks replaced for holding hundreds of megabytes at ten million
+keys, so the store keeps a pool of its own (`blocks::BlockPool`,
+`Options::blocks_pool_bytes`): the blocks its tables give back, by exact
+length, up to a cap of 64 MiB or a sixty-fourth of the memory limit the
+store opens under, kept only while the controller's gate is at the raw
+form and given back to the kernel as it leaves it. The live table made at
+a freeze maps its blocks while the frozen one is in flight, so the first
+two tables after a load are fresh and the third takes the first's. Writer
+faults a mix at 300,000 keys, the same run as above with the arm that has
+none (`supdb-ingestnopool`):
+
+| mix | `supdb-ingest` | `supdb-ingestnopool` |
+|---|---|---|
+| A | 1,069-1,084 | 1,069-1,084 |
+| F | 924-1,003 | 1,087-1,089 |
+| scrambled A | 413-569 | 1,410 |
+| scrambled F | 96-97 | 1,274-1,281 |
+| scrambled D | 0-7 | 223-231 |
+
+The first family's A is the first two tables'. The rates resolve less
+than the count at this rung: the arm against itself reads 0.79x to 1.08x
+by position in the same shape (`pair.sh supdb-ingest supdb-ingest
+300000`). At the commit that made the pool the default (`pair.sh supdb
+supdb-nopool 300000 --reps 6 --passes
+load,read,read-threaded,mixes,mixes-scrambled`, at `1ef6f05`) the durable
+arm with it read the scrambled A 1.11x and 1.33x, the only cell past that
+floor in both orders, and the rest 0.93x to 1.17x either way. Under a
+bound it holds nothing where it matters: three million keys under 1 GiB,
+the lag sweep's every point, the pool's bytes in the census nil and no
+pass killed (`SUPDB_LAG_COUNTERS=1 bench ab --arms supdb,supdb-nopool
+--size 3000000 --bound 1073741824 --reps 1 --ops-div 10 --passes
+load,lag`).
+
+Beside FASTER after both (`pair.sh supdb-held faster 300000`, the same
+passes, at `1ef6f05`, both sittings): the scrambled F 0.77x and 0.77x where
+it read 0.55x and 0.59x at `88705d0`, the scrambled A 0.76x and 0.84x for
+0.59x and 0.64x, the scrambled D 0.85x and 0.75x for 0.73x and 0.70x; the
+first family's A at 0.77x and 0.80x and F at 0.61x and 0.66x, where its
+first two tables are fresh and they read as before; and the read passes,
+C and B level or a tenth either way. What separates the write mixes now
+is an update's instructions, 801 against 555, and FASTER's
+read-modify-write, which updates the record its read found in place
+where ours adds a tombstone and a value to the key's chain.
+
+#### A held log with no frames
+
+What was left of an update's instructions at `f0f01e6`, counted by
+function (`point_ops supdb-held 100000 1 zipf 1` under callgrind toggled on
+`point_ops::phase_updates`), was 808, and the largest single part was the
+log: 120 building a put's two frames into the held buffer and 30 the
+batch's CRC at the commit, for frames the drain that covers them drops
+unwritten -- the suite's `sync` for the arm is its drain. With the log
+building no frames (`Options::held_frames` off, `supdb-heldnoframes`) an
+update counts 597, against FASTER's 555, and the reads count what they did
+to the instruction.
+
+Paired at three hundred thousand keys against the held arm (`pair.sh
+supdb-heldnoframes supdb-held 300000 --reps 4 --passes
+load,read,read-threaded,mixes,mixes-scrambled,lag`, at `f0f01e6`; ours over
+the held arm's, both sittings): A 1.13x and 1.12x, F 1.20x and 1.12x, the
+scrambled A, D and F 1.07-1.31x, D 1.06x and 1.10x, and the update bursts
+1.12-1.14x by the sittings' geometric mean. The read-only mix and the
+threaded reads read 0.90-0.94x in both orders over code that counts the
+same to the instruction, the arms differing in the held log's buffer of 64
+MiB reserved at the open and nothing else before those passes: placement,
+unresolved, and the writes' gain is read against it.
+
+Beside FASTER in the same sitting (`pair.sh supdb-heldnoframes faster
+300000`, the same passes; the geometric mean of the two sittings, ours
+over FASTER's, since the read-only mix C, which no write reaches, read
+0.82x with the arm listed first and 1.25x with it second): A 1.08x, B 0.99x,
+C 1.01x, D 1.06x, F 0.82x; the scrambled A, B and C 1.00-1.02x, D 0.81x and
+F 0.81x; the read pass 1.07x, 1.15x on two threads and 1.14x on three; the
+loads 4.0x and 2.1x; and the update bursts 0.48x, 0.38x and 0.30x at one,
+ten and a hundred percent of the store. What FASTER keeps is the update
+beside a get of the same keys -- F and the scrambled D and F -- and the
+bursts, which update the whole store at the rate its log appends.
+
+#### A record asked for at its slot
+
+The segment read is three loads, each waiting on the one before: the hash
+slot, the record's header, and the value, whose place is the header's
+arithmetic on the key's length. Sampled over the scrambled D and F mixes
+and F at three hundred thousand keys (`SUPDB_LAG_MARK=1 perf record -e
+cpu-clock -F 4999 -k CLOCK_MONOTONIC` over `bench ab --arms
+supdb-heldnoframes,faster --size 300000 --reps 1 --passes
+load,read,mixes,mixes-scrambled`, at `2ce2ccf`, the samples of the mix
+thread inside the mixes' marks laid on `read_all_fixed_hashed`'s
+instructions), the slot's load took 34 of the read's 225 samples, the
+header's 107 and the first load from the value -- its last four bytes,
+two lines past the header for the suite's record of 124 bytes -- 61, and
+nothing else in the read took more than five. A record's lines past its
+first are asked for now as soon as the slot names it, out to the
+section's mean record length (`Options::point_record_ahead`,
+`FlatIndex::ask_record`), so the value's lines are fetched beside the
+header's. It costs 14 instructions a clean get and 9 over a written
+store (`point_ops supdb-heldnoframes 100000 1 zipf 1` against
+`supdb-heldnorecordahead`, callgrind on `phase_reads_clean` and
+`phase_reads_dirty`: 523 against 509, 812 against 803). Paired at
+`2c110bf` (`pair.sh supdb supdb-norecordahead 300000 --passes
+load,read,scan,mixes,mixes-scrambled --reps 8`; the ask over the arm
+without it, the two sittings), the read pass read 1.18x and 1.31x, eight
+pairs of eight in the sitting whose scan pass, which the ask cannot
+reach, read level, and the mixes 1.04-1.44x but A, 0.88x and 0.95x and
+unresolved; under the held log (`supdb-heldnoframes` against
+`supdb-heldnorecordahead`, the same passes at four reps) the read pass
+read 1.27x and 1.34x and the scrambled B, C and F 1.20-1.69x. At ten
+thousand keys, where the records are in the core's cache and the ask can
+only cost, nothing resolved either way.
+
+#### What the scans leave the writes
+
+Paired against FASTER over the row's whole order, the held arm lost cells
+it had held level in the pairing above, which ran no scan pass. Ours over
+FASTER's at three hundred thousand keys, the geometric mean of two
+sittings (`pair.sh supdb-heldnoframes faster 300000 --reps 6 --passes
+load,read,read-threaded,mixes,mixes-scrambled`, and the same with
+`scan,scan-threaded` before the mixes, at `2c110bf`):
+
+| | no scan pass | scan passes first |
+|---|---|---|
+| A | 0.99x | 0.72x |
+| B | 0.92x | 0.85x |
+| C | 0.95x | 0.81x |
+| D | 1.03x | 1.00x |
+| F | 0.76x | 0.64x |
+| scrambled A, D, F | 0.94x, 0.88x, 0.87x | 0.84x, 0.81x, 0.80x |
+
+Our rates fell between the two and FASTER's did not: A from 3.4M a second
+to 2.5M, F from 2.75M to 2.33M, C from 5.75M to 5.0M, in both orders. The
+same arm without the block cache, after the same scan passes
+(`supdb-heldnfnocache`), read A 0.99x, C 1.03x and the scrambled A 1.19x,
+so what the scans leave is the block cache and its upkeep, which files
+every write into the blocks' forms for the scans to come. Natively a
+probe of the shape puts the cost on the writes (`POINT_OPS_SCAN=1
+point_ops ARM 300000 2 zipf-plain 6`, eight reps alternated, medians):
+an update costs 258 ns with the cache live after a scan pass, 165 ns
+before any scan, 156 ns with the cache off and 158 ns in FASTER. Counted
+under callgrind the filing adds 23 instructions to an update
+(`phase_updates`, 620 against 597), so the 93 ns is waiting and not
+work: the upkeep thread, alert while reads are around
+(`Options::upkeep_alert`), files each batch within a fraction of a
+millisecond, reading the entries, the log and the values the writer is
+about to write again, and every line it reads is one the writer's next
+store to it has to take back. Backed off as before the alert
+(`supdb-heldnoalert`) an update reads 166 ns; with the filing on the
+writer (`supdb-heldinline`) 1,174, since the work itself is about 8,200
+instructions an update -- 4,400 of them the fill, a form for every block
+a write overlays that has none, and 2,500 the settle. The shipping arm,
+whose commits sync, pays the same tax inside an fdatasync and reads
+level for the back-off over the row's order (`pair.sh supdb
+supdb-noalert 300000 --reps 6`): A 1.08x, E 0.96x and the scrambled E
+0.91x, the ones the alert is for. The read-only C falling after the
+scans is not this: its gets count the same instructions either way and
+make no syscall, and in the probe a get read 104 ns with the scan pass
+and without it, so that cell is open.
+
+The lines were the guess, and the first cause counted was the index's
+pages. A memtable's hash index is a zeroed block mapped fresh at each
+doubling, and an insert probes its slot with a load before it stores: the
+load is the page's first touch and maps the kernel's shared zero page
+read-only, and the store after it is a copy-on-write fault that replaces a
+mapping already present, which flushes the TLB of every CPU the process
+runs on -- an IPI and its answer through the hypervisor for each CPU a
+thread of ours keeps busy, the alert upkeep thread's among them. The probe
+prints the machine's shootdowns over its updates beside the writer's faults
+(`POINT_OPS_FAULTS=1 POINT_OPS_SCAN=1 point_ops ARM 300000 1 zipf-plain
+6`, from `/proc/interrupts`): 157-165 in every run with the pages left to
+fault (`supdb-heldindexzeropage`), and 0-4 with each index populated for
+writing as it is mapped (`Options::index_populated`, `MADV_POPULATE_WRITE`),
+an update 182-246 ns against 186-337, five pairs of six run in both orders.
+The suite resolves nothing for it: at three hundred thousand keys under the
+held log and under the durable arm, and at ten thousand under the durable,
+each cell that moved by a tenth moved with the arms' order and not with the
+option (`pair.sh supdb-heldnoframes supdb-heldindexzeropage 300000 --reps
+6`, and `supdb supdb-indexzeropage` at 300000 and 10000). The suite's mixes take
+them too, counted over each mix beside its time by kind
+(`SUPDB_MIX_KINDS=1 bench ab --arms supdb-heldnoframes,supdb-heldindexzeropage
+--size 300000 --reps 2 --passes load,read,scan,scan-threaded,mixes`, at
+`b89b1ff`): A 41-64 a mix and F 45-87 unpopulated, 0-6 and 20-28
+populated, the other mixes none -- at the probe's price a tenth of those
+mixes' commits, under what a pairing resolves; the twenty or so left in F
+are not yet laid to a cause. It is on by the count, since it replaces a
+fault on the zero page, a copy-on-write fault and its flush with one
+population of pages every index touches at its first fill anyway. The rest of the tax is not known. Filing in batches of
+a hundredth of the store (`supdb-heldbatch1`, `Options::upkeep_batch_pct`)
+read E 1.13x and 1.12x for whichever arm was listed second, the rest by
+order too (`pair.sh supdb-heldnoframes supdb-heldbatch1 300000 --reps 6`).
+
+What the probe's reads over a written store say beside it is a second
+gap, of instructions. Read class by class over a few thousand keys, every
+line cached (`POINT_OPS_CLASSES=1 POINT_OPS_LAND=1 point_ops ARM 100000 1
+zipf-plain 1` under callgrind toggled on `phase_class_live`, `_piece` and
+`_partition`), a get the live table answers counts 785 instructions, one
+a piece answers 918 and one the partition answers under the live table and
+a piece 888, where FASTER counts 416 for each and the clean store's get
+523. The live table's hit is `MemTable::probe` 126, the arena's slices 108
+(two bounds checks and two assertions a slice, four or five slices a
+get), the FNV hash about 90, the partition's slot and the pieces' filters
+asked ahead about 95 -- for a read the live table ends -- and the pin and
+its release 76. The packed-record prototype's get counts 175
+(`supdb_bench::proto::Logged`), harness included.
+
+Four of those layers were work done twice or found again at every read,
+and went without changing what a read does: the probe hands back the
+entry its key compare decoded, where the read decoded it again
+(`MemTable::probe_entry`); a chunk's header and value come from one
+lookup of the arena's block, where each was a slice of its own
+(`ByteArena::chunk`); the slice is inlined; and a segment keeps its slot
+table's address from its open, so the ask for the partition's slot is an
+add and a mask where finding the section through the blob took
+thirty-two instructions (`Seg::slot_ask`). Counted the same way at the
+three classes (`POINT_OPS_CLASSES=1 POINT_OPS_LAND=1 point_ops
+supdb-heldnoframes 100000 1 zipf-plain 1` under callgrind toggled on
+`phase_class_live`, `_piece` and `_partition`), a get the live table
+answers went from 758.7 instructions at `b89b1ff` to 675.7, one a piece
+answers from 886.1 to 844.1 and one the partition answers from 849.3 to
+808.2.
+
+The live table's share of the mixes' gets is counted now beside the
+paths (`SUPDB_MIX_COUNTERS=1`, `gets ... live` on the `mixcounters`
+line, `Reader::point_live_ended_reads`): of the held arm's gets at three
+hundred thousand keys a tombstone in the live chain ended 60% of A's, 58%
+of F's and 39% of B's, 21-32% of the scrambled A, B and F, and 1-3% of D
+and the scrambled C and D (`bench ab --arms supdb-heldnoframes,supdb-held
+--size 300000 --reps 1 --passes
+load,read,read-threaded,scan,scan-threaded,mixes,mixes-scrambled`). A
+put leaves a tombstone under its value, so a read of a key written since
+the table's last seal ends there, whatever the store below holds. A and
+B, with no piece standing, take the two-source read, which asks the live
+table first already; F and the scrambled mixes, with pieces, took the
+placed read, which found the partition and asked for its slot and the
+pieces' filters before it probed the live table. Asked first
+(`Options::point_live_first`), the live table ends the read before any
+of that: 598.7 instructions a get it answers, against 676.7 in the same
+binary with the partition placed first, the order before, and 862.1
+and 826.2 a get a piece or the partition answers against 851.1 and
+815.2, the asks for those reads following the live probe instead of
+preceding it. The rates said nothing at six pairs a sitting -- every
+cell leaned a fifth toward the arm listed second, the load among them,
+which reads nothing -- and the gets timed apart from the commits said
+which way it went (`pair.sh SUPDB_MIX_KINDS=1 supdb-heldnoframes
+supdb-heldlivelast 300000 --reps 12 --passes
+load,read,scan,scan-threaded,mixes,mixes-scrambled`, at `636f613`, the
+arms named as they were then): F's gets read 0.99x and 0.95x of the order
+before, three in five of them ended in the live table, and the scrambled
+mixes' 1.04-1.16x slower in both sittings, a third of theirs or fewer.
+For a read the table does not end, the live probe had been the asks'
+lead, and moving the asks behind it cost more than the instructions it
+saved the others. So the option is off, and its arm is `supdb-livefirst`
+(`supdb-heldlivefirst` under the held log).
+
+The memtable's own hash was the next fixed cost of a read the table
+ends: the key's FNV word, a multiply a byte, and a finish over it, which
+the segments' indexes and filters need and the live table does not. A
+memtable is rebuilt from the log at every open, so its hash is nobody
+else's, and a sixteen-byte key now takes the fold of its two words'
+128-bit product (`Options::mem_hash_fold`, `fold_hash16`), the FNV word
+only where a source below the tables needs it. Linear probing at the
+half load the index grows at reads 1.49-1.50 slots a lookup either way
+over numbered keys, ids and numbered keys a thousand apart. In one build,
+by class as above, a get the live table ends counts 556.5 instructions
+against 609.7 with FNV (`supdb-heldmemfnv`), one answered below the
+tables 6 more, and an update 488.1 against 543.7 (`phase_updates`).
+Paired by kind (`pair.sh SUPDB_MIX_KINDS=1 supdb-heldnoframes
+supdb-heldmemfnv 300000 --reps 12`, same passes), the gets of A, B and F
+read 1.06-1.13x faster with the fold in both sittings bar one at 1.01,
+D's 0.97x in both, and the commits of A, B and F 5-25% faster; by both
+orders' mean the rates of A, B and F read 0.90-0.93x for FNV, the load
+0.93x, D 1.02x, and the scan passes, which hash nothing, 0.99-1.01x.
+
+#### Updates in place
+
+An update under the held log lays a tombstone and the new value at the
+end of the live table's arena and chains them over the key's old value,
+so every update is fresh bytes, and the seal comes sooner by their size;
+FASTER writes an update over the record where it lies, in its log's
+mutable region. Under the held log, which promises nothing of isolation,
+a put to a key whose live chain is one value over a put's tombstone, and
+whose new value has that value's length, now writes the bytes where they
+lie (`Options::put_in_place`, `MemTable::overwrite`, `supdb-heldinplace`,
+the held log with no frames, the block cache off and the upkeep inline;
+`supdb-heldnfinline` is the same arm appending). What a put leaves is the
+same either way, one value over a tombstone. The write is still logged:
+the scan snapshot's copy of a key's run (`Options::snapshot_runs`) is
+read again only where the log says the key was written since, and a test
+that drops the entry reads the copy after an overwrite over a store of
+partitions. The bytes change under nobody but the writer. A put
+overwrites only while no handle the caller made is live: a handle is made
+by the writer or by a live handle, so a count of none means none exists
+and none can appear before the put returns, and the count's decrement at a
+drop is a release the put's load acquires. A handle is claimed only with
+nothing staged, since a staged put may have overwritten a committed
+value, so what it reads was committed and stays as it read it, under
+`Latest` and `Snapshot` alike. The option refuses the engine's threads
+that read a live table's values beside the writer -- the block cache with
+its upkeep thread, and the keepers -- and the seal thread reads frozen
+tables and handed ones, which the writer writes nothing into. The store
+test holds each: no overwrite while a handle lives, on the writer's thread
+or another, a claim refused with a put staged, and, with the count ignored
+and its assertions taken out, a handle on another thread reads a value
+torn between two of the writer's puts.
+
+Counted under callgrind (`point_ops ARM 100000 1 zipf-plain 1`, toggled
+on `phase_updates` and `phase_half`, at `d83c220`), an update is 444.0
+instructions against 490.5 appending, and the phase of half gets and half
+updates 540.7 against 621.3. Timed natively, three rounds alternated
+(`point_ops ARM 300000 1 zipf-plain 6`, each round the overwriting arm,
+the appending arm twice, the overwriting arm and FASTER): an update
+103-147 ns, 111 the median of six, against 129-162 appending, 139, and
+FASTER's 155-180, 157; a get over the written store 109-121 ns against
+127-145 appending and FASTER's 82 in two runs of three.
+
+Paired against the arm that appends (`pair.sh SUPDB_MIX_KINDS=1
+supdb-heldinplace supdb-heldnfinline 300000 --reps 12 --passes
+load,read,scan,mixes,mixes-scrambled`, at `d83c220`; ours over the appending
+arm's, by both orders' mean), A read 1.09x, F 1.11x, E 1.22x and the
+scrambled D and E 1.06x and 1.10x, and D 0.97x, with the rest within 2%.
+Timed by kind, A's and F's gets are 7-8% faster in both sittings and
+their commits 1.3x and 1.5x. The scrambled mixes' commits are the other
+way, 1.15-1.6x slower in place in every rep of both sittings -- the
+scrambled E's 38 µs a commit against 24.
+
+The overwrite is not what costs them. An overwrite grows the table by its
+log's entry alone and is charged that toward the seal, so through the
+Zipfian mixes the table seals rarely, and the scrambled mixes, whose puts
+are mostly of keys the table does not hold, meet a table two and a half
+to three times the appending arm's. At their ends the in-place table held
+43,497 unsealed keys after the scrambled A against 12,858 and 31,532
+after the scrambled E against 12,544, with 0-2 pieces standing against 2-6
+(`SUPDB_MIX_COUNTERS=1 bench ab --arms supdb-heldinplace,supdb-heldnfinline
+--size 300000 --reps 2 --passes load,read,scan,mixes,mixes-scrambled`, the
+`pieces` and `unsealed` fields). A put of a new key into the larger table
+costs more: by every fault recorded with its instruction and cut to the
+writer's thread in the mixes' windows (`SUPDB_LAG_MARK=1 perf record -e
+minor-faults -c 1 -k CLOCK_MONOTONIC --call-graph dwarf,8192` over the same
+`bench ab`, one rep), the scrambled A and F took 1,404 faults against 508,
+812 against 170 of them in the copy of a put's value into the arena, with
+blocks the table's pool held none of the length of mapped fresh in the
+scrambled A (the census's `block_pool_misses_n`, `SUPDB_MIX_CENSUS=1`).
+The scrambled E's commits are a hundred such inserts each, 370 ns an
+insert against 240, and freeze nothing in either arm (`seals` and `freeze`
+on the `mixkinds` line). A build that charges an overwrite as a put,
+the one line in `Db::put_pinned` at `d83c220`, gives the in-place table the
+appending arm's sizes and pieces from the scrambled B on, and its
+scrambled commits read level with the appending arm's -- the scrambled E
+24-26 µs against 25-28 -- while A's and F's stay 1.2-1.5x faster: the cost
+is the longer-lived table, and the fewer pieces that are its other side
+are what the scrambled D's and E's gains are.
+
+Beside FASTER (`pair.sh SUPDB_MIX_KINDS=1 supdb-heldinplace faster
+300000`, the same passes and reps; ours over FASTER's): A 1.07x, B 1.04x,
+C 1.12x, D 1.02x, the scrambled A and B 1.09x and 1.01x, and the loads
+3.5x and 1.6x. FASTER keeps F at 0.96x and the scrambled C, D and F at
+0.96x, 0.93x and 0.93x. By kind, what it keeps is the gets of a store
+with pieces standing -- the scrambled mixes' gets 4-14% faster than ours
+in both sittings -- and F's writes, 7.3 µs a commit of a hundred
+read-modify-writes against our 8.7.
+
+With the handles beside it the arm runs every pass FASTER has, and
+beside FASTER over all of them (`pair.sh supdb-heldinplace faster 300000
+--reps 6 --passes load,read,read-threaded,mixes,mixes-scrambled,lag`, at
+`77ae295`; ours over FASTER's, the two sittings) the read pass read 1.22x and 1.13x, on two threads 1.35x and
+1.15x and on three 1.47x and 1.12x, and the update bursts at one, ten and
+a hundred percent of the store 2.55x and 2.61x, 2.09x and 2.05x, 1.44x
+and 1.79x. The threaded writers' mixes were in every row and in no
+pairing: `bench ab` paired a list of each pass's quantities that left
+them out (`OnePass::flat`), and a test now holds the list to the row's
+(`a_pairing_carries_every_quantity_a_row_carries`). Paired, they are
+FASTER's (`pair.sh supdb-heldinplace faster 300000 --reps 6 --passes
+load,mixes-threaded`, at `77ae295`; FASTER's over ours): A 0.85x and 0.82x
+on one thread, 1.39x and 1.38x on two, 2.21x and 2.36x on three; RMW
+2.59x and 2.52x, 3.31x and 3.11x, 5.17x and 4.78x; the uniform A
+1.15-1.19x, 1.58-1.70x and 2.40-2.64x and the uniform RMW 2.75x, 3.5-3.6x
+and 5.5-5.7x.
+FASTER's writers scale with its threads, and the store's one writer is
+lent to the threads behind a lock, so ours read flat from two threads on.
+
+On one thread the RMW mix was the read's as well. A thread's handle is
+live beside the writer, so its puts append, the store seals faster than
+its merges fold, and ten to thirty pieces stood over a partition through
+the mixes, where the placed read declined every range under more than
+eight: not one of the RMW mix's reads was a lean one, by each handle's
+counts at its drop. The placed read is bounded now by the records it
+keeps above the newest tombstone, one or two under puts, and not by the
+pieces it walks (`Options::point_placed_runs`; `supdb-heldinplacepieces`
+is the bound before), and paired at `5c739c8` (`pair.sh supdb-heldinplace
+supdb-heldinplacepieces 300000 --reps 6
+--passes load,read,read-threaded,mixes,mixes-scrambled,mixes-threaded`)
+the threaded writers' mixes read 1.04-1.21x for it in both sittings, RMW
+on one thread 1.21x, the single-threaded mixes within the lean of E, which
+makes no point read, at 1.06x and 1.12x the other way.
+
+#### Beside FASTER out of core
+
+A store larger than memory is what FASTER's log is made for, and the
+bounded roster runs it beside `supdb-heldpart`, `supdb` under the held
+log, with its index and the in-memory tail of its log divided from the
+bound (`bench/DESIGN.md`). At ten million keys under 1 GiB FASTER holds a
+256 MiB index and a 448 MiB tail of 1.36 GB of records, and reads the rest
+from the device past the page cache (`bench ab --arms supdb-heldpart,faster
+--size 10000000 --bound 1073741824 --ops-div 10 --reps 2 --passes
+load,read,read-threaded,mixes,mixes-scrambled,lag`, at `49db8b5`; FASTER's
+rate over ours, both pairs):
+
+| | FASTER over supdb-heldpart |
+|---|---|
+| ordered load | 0.40x |
+| shuffled load | 2.6x |
+| read pass, one, two and three threads | 0.27x, 0.07x, 0.06x |
+| A, B, C, D, F | 0.09x, 0.02x, 0.02x, 0.09x, 0.07x |
+| scrambled A, B, C, D, F | 0.17x, 0.09x, 0.06x, 0.47x, 0.19x |
+| update bursts at 1, 10 and 100% | 1.15x, 1.96x, 1.48x |
+
+Every read of FASTER's that misses its tail is a synchronous read of the
+device, 450 bytes an operation, where the compact form keeps the store's
+point-read population in the page cache. What FASTER keeps is the blind
+write: an upsert appends at the tail of its log and reads nothing, where
+ours seals and merges what the bound will not hold.
 
 ### The seal wait
 

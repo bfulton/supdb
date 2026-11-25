@@ -24,7 +24,8 @@ pub enum Guarantee {
     /// In the process's memory when the call returns, and on the device at
     /// the engine's next checkpoint: a process that is killed loses what it
     /// wrote since. FASTER's, which has no stronger promise to configure
-    /// and so no place in the two groups above.
+    /// and so no place in the two groups above, and the engine's where its
+    /// log is held in the process (`supdb::SyncPolicy::Explicit`).
     Memory,
 }
 

@@ -44,14 +44,16 @@ const BOTTOM: f64 = 48.0;
 /// the second dashed.
 fn style(arm: &str) -> (&'static str, &'static str) {
     match arm {
-        "supdb" | "supdb-ingest" => (INK, ""),
+        "supdb" | "supdb-ingest" | "supdb-held" | "supdb-heldnoframes" | "supdb-heldpart" => {
+            (INK, "")
+        }
         "supdb-noadvice" => (ACCENT, ""),
         "supdb-nocache" => (ACCENT, "7,4"),
         "supdb-forms" => (ACCENT, "4,2"),
         "supdb-nosnap" => (ACCENT, "6,2"),
         "supdb-settle" => (ACCENT, "8,2"),
         "supdb-cache256" => (ACCENT, "2,3"),
-        "lmdb" | "lmdb-nosync" => (GREY, ""),
+        "lmdb" | "lmdb-nosync" | "faster" => (GREY, ""),
         "lmdb-nordahead" => (GREY, "4,2"),
         "rocksdb-tuned" | "rocksdb-tuned-nosync" | "rocksdb-nosync" => (GREY, "7,4"),
         "rocksdb-tuned-lz4" => (GREY, "1,3"),
@@ -72,6 +74,9 @@ fn pretty(arm: &str) -> &'static str {
         "supdb-cache256" => "supdb (256 MB block cache)",
         "supdb-cache256tofit" => "supdb (256 MB cache, fitted)",
         "supdb-ingest" => "supdb (buffered)",
+        "supdb-held" => "supdb (log held in memory)",
+        "supdb-heldpart" => "supdb (log held in memory)",
+        "supdb-heldnoframes" => "supdb (in memory until a sync)",
         "lmdb" => "LMDB",
         "lmdb-nordahead" => "LMDB (no readahead)",
         "lmdb-nosync" => "LMDB (nosync)",
@@ -79,8 +84,6 @@ fn pretty(arm: &str) -> &'static str {
         "rocksdb-tuned-nosync" => "RocksDB (nosync)",
         "rocksdb-tuned-lz4" => "RocksDB (LZ4)",
         "rocksdb-nosync" => "RocksDB (untuned, nosync)",
-        // Named for a legend it is not yet in: its guarantee holds it alone
-        // and no figure is drawn of one arm (`render_row`).
         "faster" => "FASTER",
         _ => "?",
     }
@@ -310,11 +313,14 @@ fn render_row(row: &Row, out: &Path) -> io::Result<Vec<Rendered>> {
         let g = match guarantee {
             Guarantee::Durable => "durable",
             Guarantee::Buffered => "buffered",
-            // A figure is a comparison within a guarantee, and this one
-            // holds FASTER alone (`engines::ARMS`): nothing to draw it
-            // against. Its cells are the row's, for a reader who sets
-            // them beside another group's and says what differs.
-            Guarantee::Memory => continue,
+            // A figure is a comparison within a guarantee, and this one's
+            // two arms do not run the same workloads: FASTER has no scan
+            // and reopens no store (`engines::ALLOWED_GAPS`), so the held
+            // arm's scans, its E and its recoveries have nothing beside
+            // them, and a row from before the held arm holds FASTER
+            // alone. Those are cells of the row and no figure.
+            Guarantee::Memory if curves.len() < 2 => continue,
+            Guarantee::Memory => "memory",
         };
         let name = format!("{}-{workload}-{quantity}-{g}.svg", row.scale.as_str());
         let (svg, title) = figure(row, &workload, &quantity, &unit, guarantee, &curves, floors);
@@ -608,7 +614,13 @@ fn message(
             .and_then(|c| c.points.iter().find(|p| p.size == top))
             .map(|p| p.median)
     };
-    let mine = at("supdb").or_else(|| at("supdb-ingest"));
+    // The group's own engine arm: the default where it is durable, and
+    // the one arm the engine has in each of the other two.
+    let mine = at("supdb")
+        .or_else(|| at("supdb-ingest"))
+        .or_else(|| at("supdb-heldnoframes"))
+        .or_else(|| at("supdb-held"))
+        .or_else(|| at("supdb-heldpart"));
     let noun = workload_noun(workload);
     let what = match quantity {
         "ops_per_s" | "reads_per_s" | "entries_per_s" => "throughput".to_string(),
@@ -640,6 +652,7 @@ fn message(
         "rocksdb-tuned-lz4",
         "rocksdb-tuned-nosync",
         "rocksdb-nosync",
+        "faster",
     ] {
         if let (Some(m), Some(c)) = (mine, at(comp)) {
             if c > 0.0 && m > 0.0 {
@@ -922,6 +935,102 @@ mod tests {
             );
         }
         assert!(!names(&only_out.join(LATEST)).is_empty());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// The memory guarantee's figures are the pair's: drawn where the held
+    /// arm and FASTER both have the cell, with the engine's arm as "supdb"
+    /// in the headline and FASTER named, and not drawn where one of them
+    /// stands alone -- the held arm's scans, and every cell of a row from
+    /// before the held arm.
+    #[test]
+    fn the_memory_groups_figures_are_the_pairs_and_no_arms_alone() {
+        let root =
+            std::env::temp_dir().join(format!("supdb-next-figmemory-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let m = |workload: &str, quantity: &str, arm: &str, g: Guarantee, v: f64| {
+            crate::row::Measurement {
+                workload: workload.to_string(),
+                arm: arm.to_string(),
+                guarantee: g,
+                size: Some(10_000),
+                quantity: quantity.to_string(),
+                unit: "x/s".to_string(),
+                samples: vec![v, v * 1.1, v * 0.9],
+            }
+        };
+        let row = |measurements| {
+            let mut machine = crate::env::capture();
+            machine.mem_limit_bytes = None;
+            Row {
+                utc: "20260101T000000Z".to_string(),
+                sha: "0123456".to_string(),
+                rustc: "test".to_string(),
+                scale: Scale::Quick,
+                machine,
+                killed: vec![],
+                resumptions: vec![],
+                keys: Default::default(),
+                build: String::new(),
+                measurements,
+            }
+        };
+        let mem = Guarantee::Memory;
+        let both = row(vec![
+            m("read", "reads_per_s", "supdb-held", mem, 3.0e6),
+            m("read", "reads_per_s", "faster", mem, 2.0e6),
+            m("ycsb-F", "ops_per_s", "supdb-held", mem, 1.0e6),
+            m("ycsb-F", "ops_per_s", "faster", mem, 2.0e6),
+            m("scan", "entries_per_s", "supdb-held", mem, 5.0e7),
+            m("read", "reads_per_s", "supdb", Guarantee::Durable, 2.0e6),
+            m("read", "reads_per_s", "lmdb", Guarantee::Durable, 1.0e6),
+        ]);
+        let out = root.join("both");
+        std::fs::create_dir_all(&out).unwrap();
+        let drawn = render_row(&both, &out).unwrap();
+        let title = |name: &str| {
+            drawn
+                .iter()
+                .find(|r| r.path.file_name().unwrap().to_string_lossy() == name)
+                .map(|r| r.title.clone())
+        };
+        assert_eq!(
+            title("quick-read-reads_per_s-memory.svg").as_deref(),
+            Some("At 10⁴ keys supdb is 1.5× ahead of FASTER"),
+            "{drawn:?}"
+        );
+        assert_eq!(
+            title("quick-ycsb-F-ops_per_s-memory.svg").as_deref(),
+            Some("At 10⁴ keys supdb is 2.0× behind FASTER"),
+            "{drawn:?}"
+        );
+        assert_eq!(title("quick-scan-entries_per_s-memory.svg"), None);
+        assert_eq!(
+            title("quick-read-reads_per_s-durable.svg").as_deref(),
+            Some("At 10⁴ keys supdb is 2.0× ahead of LMDB")
+        );
+        assert_eq!(drawn.len(), 3, "{drawn:?}");
+        let svg = std::fs::read_to_string(out.join("quick-read-reads_per_s-memory.svg")).unwrap();
+        for text in [
+            "in memory until a checkpoint",
+            "FASTER",
+            "supdb (log held in memory)",
+        ] {
+            assert!(svg.contains(text), "the pair's figure says {text:?}");
+        }
+        // FASTER alone, as every row before the held arm has it.
+        let alone = row(vec![
+            m("read", "reads_per_s", "faster", mem, 2.0e6),
+            m("read", "reads_per_s", "supdb", Guarantee::Durable, 2.0e6),
+            m("read", "reads_per_s", "lmdb", Guarantee::Durable, 1.0e6),
+        ]);
+        let out = root.join("alone");
+        std::fs::create_dir_all(&out).unwrap();
+        let drawn = render_row(&alone, &out).unwrap();
+        assert_eq!(drawn.len(), 1, "{drawn:?}");
+        assert!(drawn[0]
+            .path
+            .ends_with("quick-read-reads_per_s-durable.svg"));
         let _ = std::fs::remove_dir_all(&root);
     }
 

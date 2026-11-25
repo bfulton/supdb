@@ -1002,6 +1002,560 @@ fn a_sync_after_a_reopen_covers_what_the_open_replayed() {
     let _ = std::fs::remove_dir_all(&d);
 }
 
+/// A store that writes nothing at a commit and holds its log in the
+/// process (`SyncPolicy::Explicit`), sealing every megabyte or so.
+fn explicit() -> Options {
+    Options {
+        sync: SyncPolicy::Explicit,
+        seal_bytes: 1 << 20,
+        ..common::options()
+    }
+}
+
+/// Whether `logged_batch(_, b)` is in the store, whole or not at all.
+fn logged(db: &Db, b: u64) -> bool {
+    holds(db, 1_000 - b)
+}
+
+/// The bytes of the store's log files past their headers: the frames a
+/// file holds.
+fn log_frames(d: &Path) -> u64 {
+    names(d, "wal-")
+        .iter()
+        .map(|n| {
+            std::fs::metadata(d.join(n))
+                .unwrap()
+                .len()
+                .saturating_sub(8)
+        })
+        .sum()
+}
+
+/// Under `SyncPolicy::Explicit` a commit is in no file: the store reads
+/// it, a process's death takes it, whole, and the store that reopens is
+/// the one the last sync left. A `sync` writes what was held and syncs
+/// it, and what is committed after it is held again.
+#[test]
+fn a_held_commit_is_in_no_file_until_a_sync() {
+    let d = dir("held");
+    let mut db = Db::create(&d, inline(explicit())).unwrap();
+    for b in 0..3 {
+        logged_batch(&mut db, b);
+    }
+    assert_eq!(db.runs_unsynced(), (None, 0), "the batches went to a run");
+    let h = db.wal_held();
+    assert!(h.held > 300_000, "three batches of frames are held: {h:?}");
+    assert_eq!((h.dropped, h.spilled, h.spills), (0, 0, 0), "{h:?}");
+    // And the census of what the process holds names them, by the
+    // buffer's capacity.
+    let census = db.memory_census();
+    let buffer = census.iter().find(|(k, _)| k == "wal_buffer").map(|x| x.1);
+    assert!(
+        buffer.is_some_and(|b| b >= h.held),
+        "the census counts the log's buffer at {buffer:?} with {} held",
+        h.held
+    );
+    assert_eq!(log_frames(&d), 0, "a held commit reached the log's file");
+    for b in 0..3 {
+        assert!(logged(&db, b), "the store does not read its own batch {b}");
+    }
+    db.crash();
+
+    let mut db = Db::open(&d, inline(explicit())).unwrap();
+    for b in 0..3 {
+        assert!(
+            !logged(&db, b),
+            "batch {b} outlived the process that held it"
+        );
+    }
+    // Again, and synced: on the file, behind a barrier, and nothing held.
+    for b in 0..3 {
+        logged_batch(&mut db, b);
+    }
+    let held = db.wal_held().held;
+    db.sync().unwrap();
+    let h = db.wal_held();
+    assert_eq!((h.held, h.spilled, h.spills), (0, held, 1), "{h:?}");
+    let (_, synced, written) = db.wal_durable();
+    assert!(synced == written && written > held, "{synced} of {written}");
+    assert_eq!(log_frames(&d), held);
+    // And what follows the sync is held as what preceded it was.
+    logged_batch(&mut db, 3);
+    logged_batch(&mut db, 4);
+    assert_eq!(log_frames(&d), held, "a commit after the sync was written");
+    db.crash();
+
+    let db = Db::open(&d, inline(explicit())).unwrap();
+    for b in 0..3 {
+        assert!(logged(&db, b), "batch {b}, synced, is gone");
+    }
+    for b in 3..5 {
+        assert!(!logged(&db, b), "batch {b} was never synced and is there");
+    }
+    db.crash();
+    let _ = std::fs::remove_dir_all(&d);
+}
+
+/// A held log with no frames (`Options::held_frames` off): a commit builds
+/// none, so nothing reaches the log's file and nothing is held; the store
+/// reads its commits; a process's death takes everything no drain covered,
+/// whole; a `sync` is a drain, and the store reopens with everything before
+/// it. A run of ordered ingest begun over a commit no drain covered does not
+/// say everything before it was synced: a crash takes the commit and the
+/// run, and the store opens, where a note that said so would have the open
+/// refuse a store with a record lost before the run. Under any other policy
+/// the option is refused, since their promise is the log.
+#[test]
+fn a_log_with_no_frames_writes_nothing_and_its_sync_drains() {
+    for sync in [SyncPolicy::Always, SyncPolicy::EveryN(4)] {
+        let d = dir("frameless-refused");
+        let o = Options {
+            held_frames: false,
+            sync,
+            ..common::options()
+        };
+        assert!(
+            Db::create(&d, o).is_err(),
+            "{sync:?} took a log with no frames"
+        );
+        let _ = std::fs::remove_dir_all(&d);
+    }
+    let opts = || Options {
+        held_frames: false,
+        ..inline(explicit())
+    };
+    let d = dir("frameless");
+    let mut db = Db::create(&d, opts()).unwrap();
+    for b in 0..3 {
+        logged_batch(&mut db, b);
+    }
+    let h = db.wal_held();
+    assert_eq!(
+        (h.held, h.dropped, h.spilled, h.spills),
+        (0, 0, 0, 0),
+        "{h:?}"
+    );
+    assert_eq!(log_frames(&d), 0, "a commit reached the log's file");
+    for b in 0..3 {
+        assert!(logged(&db, b), "the store does not read its own batch {b}");
+    }
+    db.crash();
+
+    let mut db = Db::open(&d, opts()).unwrap();
+    for b in 0..3 {
+        assert!(
+            !logged(&db, b),
+            "batch {b} outlived the process that held it"
+        );
+    }
+    for b in 0..3 {
+        logged_batch(&mut db, b);
+    }
+    db.sync().unwrap();
+    logged_batch(&mut db, 3);
+    assert_eq!(log_frames(&d), 0, "a sync or a commit wrote the log");
+    db.crash();
+
+    let db = Db::open(&d, opts()).unwrap();
+    for b in 0..3 {
+        assert!(logged(&db, b), "batch {b}, drained by the sync, is gone");
+    }
+    assert!(!logged(&db, 3), "batch 3 was never synced and is there");
+    db.close().unwrap();
+    let _ = std::fs::remove_dir_all(&d);
+
+    // A run of ordered ingest over a commit no drain covers, on a fresh
+    // store, where nothing else makes a sync owed: a reopened store's
+    // older log files wait for one (`Db::owes_sync`), and a run begun after
+    // a reopen says nothing of what is before it whatever the log holds.
+    // The seal held before its landing empties the table, so the batch
+    // above every key opens a run, and leaves batch 4 under no manifest.
+    let d = dir("frameless-run");
+    let mut db = Db::create(&d, opts()).unwrap();
+    logged_batch(&mut db, 4);
+    db.hold_seal_landing(true);
+    db.seal().unwrap();
+    ordered_batch(&mut db, 2_000);
+    assert!(db.runs_unsynced().0.is_some(), "the batch opened no run");
+    assert!(holds(&db, 2_000), "the store does not read its run");
+    db.crash();
+    let db = Db::open(&d, opts()).unwrap_or_else(|e| {
+        panic!("a run begun over a commit no drain covered was taken for one behind a sync: {e}")
+    });
+    assert!(
+        !logged(&db, 4),
+        "a commit no drain covered outlived the process"
+    );
+    assert!(
+        !holds(&db, 2_000),
+        "a run over a lost commit is there without it"
+    );
+    db.close().unwrap();
+    let _ = std::fs::remove_dir_all(&d);
+
+    // And behind a drain the run says so, and stands.
+    let d = dir("frameless-chained");
+    let mut db = Db::create(&d, opts()).unwrap();
+    logged_batch(&mut db, 4);
+    db.sync().unwrap();
+    ordered_batch(&mut db, 2_000);
+    assert!(db.runs_unsynced().0.is_some(), "the batch opened no run");
+    db.crash();
+    let db = Db::open(&d, opts()).unwrap();
+    assert!(logged(&db, 4), "a drained commit is gone");
+    assert!(holds(&db, 2_000), "a run behind a drain is gone");
+    db.close().unwrap();
+    let _ = std::fs::remove_dir_all(&d);
+}
+
+/// The frames a seal has made durable are dropped from what the log holds
+/// and never written, and the log's file is left with a gap where they
+/// would have stood: frames a sync wrote before them, and frames a sync
+/// wrote after. The store reopens over the gap, since its manifest covers
+/// it, with everything a sync or a flush promised and nothing held after
+/// the last of them. Then the same with a seal that covers only the
+/// oldest of what is held, the rest held on.
+#[test]
+fn frames_a_durable_seal_covers_are_never_written() {
+    // Under the manifest in two slots and under the one renamed into
+    // place (`Options::manifest_slots`): each tells the log what it covers
+    // once it is on the device.
+    for slots in [true, false] {
+        let opts = || Options {
+            manifest_slots: slots,
+            ..explicit()
+        };
+        let d = dir(&format!("covered-{slots}"));
+        let mut db = Db::create(&d, opts()).unwrap();
+        logged_batch(&mut db, 0);
+        logged_batch(&mut db, 1);
+        db.sync().unwrap();
+        let first = db.wal_held();
+        assert!(first.spilled > 0 && first.dropped == 0, "{first:?}");
+        logged_batch(&mut db, 2);
+        let held = db.wal_held().held;
+        assert!(held > 0);
+        // The drain: every batch so far in a segment the manifest names,
+        // on the device before the flush returns, since the log could not
+        // have covered the window. A sync straight after it has nothing
+        // to write: what the log held is covered, and is dropped.
+        db.flush().unwrap();
+        db.sync().unwrap();
+        let h = db.wal_held();
+        assert_eq!(
+            (h.held, h.dropped, h.spilled),
+            (0, held, first.spilled),
+            "slots {slots}: the frames the flush covered: {h:?}"
+        );
+        assert_eq!(log_frames(&d), first.spilled, "a covered frame was written");
+        logged_batch(&mut db, 3);
+        db.sync().unwrap();
+        assert!(db.wal_held().spilled > first.spilled);
+        logged_batch(&mut db, 4);
+        db.crash();
+
+        let db = Db::open(&d, opts()).unwrap_or_else(|e| {
+            panic!("slots {slots}: a log with a covered gap in it does not open: {e}");
+        });
+        for b in 0..4 {
+            assert!(logged(&db, b), "slots {slots}: batch {b} is gone");
+        }
+        assert!(!logged(&db, 4), "a batch held at the crash is there");
+        db.close().unwrap();
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    // A seal of the first table alone, durable while the second table's
+    // batch is held: the first's frames go, the second's stay and are
+    // what a sync then writes, at the head of a file that begins above
+    // sequence zero.
+    let d = dir("covered-part");
+    let mut db = Db::create(&d, explicit()).unwrap();
+    logged_batch(&mut db, 0);
+    let a = db.wal_held().held;
+    db.seal().unwrap();
+    logged_batch(&mut db, 1);
+    let ab = db.wal_held().held;
+    db.settle().unwrap();
+    db.commit().unwrap();
+    let h = db.wal_held();
+    assert_eq!(
+        (h.dropped, h.held),
+        (a, ab - a),
+        "the sealed table's frames and no others: {h:?}"
+    );
+    db.sync().unwrap();
+    assert_eq!(log_frames(&d), ab - a);
+    db.crash();
+    let db = Db::open(&d, explicit()).unwrap_or_else(|e| {
+        panic!("a log that begins above its covered frames does not open: {e}");
+    });
+    assert!(logged(&db, 0) && logged(&db, 1));
+    db.close().unwrap();
+    let _ = std::fs::remove_dir_all(&d);
+
+    // Where a seal's slot names its segments pending at its readable
+    // landing (`Options::manifest_pending`), that slot covers the seal's
+    // records only if the segments read back whole, and the slot before
+    // otherwise: what is covered whichever an open takes is the seal
+    // before. So the first table's frames go at the second seal's
+    // landing and the second's stay, durable as its segments are.
+    let d = dir("covered-pending");
+    let opts = || Options {
+        manifest_pending: true,
+        ..explicit()
+    };
+    let mut db = Db::create(&d, opts()).unwrap();
+    logged_batch(&mut db, 0);
+    let a = db.wal_held().held;
+    db.seal().unwrap();
+    db.settle().unwrap();
+    db.commit().unwrap();
+    assert_eq!(
+        db.wal_held().dropped,
+        0,
+        "dropped behind a slot that says pending"
+    );
+    logged_batch(&mut db, 1);
+    let ab = db.wal_held().held;
+    db.seal().unwrap();
+    db.settle().unwrap();
+    db.commit().unwrap();
+    let h = db.wal_held();
+    assert_eq!(
+        (h.dropped, h.held),
+        (a, ab - a),
+        "the seal before the pending one, and no more: {h:?}"
+    );
+    db.crash();
+    let db = Db::open(&d, opts()).unwrap();
+    assert!(logged(&db, 0) && logged(&db, 1));
+    db.close().unwrap();
+    let _ = std::fs::remove_dir_all(&d);
+}
+
+/// A seal's readable landing covers nothing a crash keeps: its segments
+/// are published and their fsyncs and the manifest are still to come.
+/// The frames it will cover stay held until that manifest is on the
+/// device, so a sync in the window writes them with what followed, and
+/// the store a crash leaves there opens with all of it from the log. Had
+/// they been dropped at the landing, the file would begin past a gap the
+/// open's manifest does not cover, which it refuses as a record lost.
+#[test]
+fn held_frames_wait_for_the_manifest_that_covers_them() {
+    // And where the landing writes a slot that names the segments pending
+    // (`Options::manifest_pending`), which a crash keeps: it covers the
+    // seal's records only if the segments read back whole, and here they
+    // do not -- the crash is given the segment's second half -- so the
+    // open takes the slot before, and the log.
+    for pending in [false, true] {
+        held_frames_wait(pending);
+    }
+}
+
+fn held_frames_wait(pending: bool) {
+    let d = dir(&format!("readable-{pending}"));
+    let opts = || Options {
+        manifest_pending: pending,
+        ..inline(explicit())
+    };
+    let mut db = Db::create(&d, opts()).unwrap();
+    db.hold_seal_durable(true);
+    logged_batch(&mut db, 0);
+    logged_batch(&mut db, 1);
+    db.seal().unwrap();
+    // The landing is the writer's own, the segment work being inline: at
+    // a commit, once the seal's thread has its segments in place.
+    let t = std::time::Instant::now();
+    while db.levels() == (0, 0) {
+        assert!(
+            t.elapsed().as_secs() < 120,
+            "the seal never landed readable"
+        );
+        std::thread::sleep(std::time::Duration::from_micros(200));
+        db.commit().unwrap();
+    }
+    assert!(
+        db.in_flight().0,
+        "the seal is durable; the window was not reached"
+    );
+    logged_batch(&mut db, 2);
+    let h = db.wal_held();
+    assert_eq!(
+        h.dropped, 0,
+        "frames dropped behind a landing no manifest names: {h:?}"
+    );
+    db.sync().unwrap();
+    assert_eq!(db.wal_held().dropped, 0);
+    db.crash();
+    // What the seal's fsync had not been asked for, a crash may take.
+    let mut torn = 0;
+    for e in std::fs::read_dir(&d).unwrap() {
+        let p = e.unwrap().path();
+        if p.extension().is_some_and(|x| x == "sup") {
+            let len = std::fs::metadata(&p).unwrap().len();
+            let f = std::fs::OpenOptions::new().write(true).open(&p).unwrap();
+            f.set_len(len / 2).unwrap();
+            torn += 1;
+        }
+    }
+    assert!(torn > 0, "the seal left no segment to tear");
+
+    let db = Db::open(&d, opts()).unwrap_or_else(|e| {
+        panic!(
+            "pending {pending}: the store a crash left between a seal's phases does not open: {e}"
+        );
+    });
+    for b in 0..3 {
+        assert!(
+            logged(&db, b),
+            "pending {pending}: batch {b}, synced, is gone"
+        );
+    }
+    db.crash();
+    let _ = std::fs::remove_dir_all(&d);
+}
+
+/// Past its cap the log writes what it holds, unsynced, in one write at
+/// the commit that crossed it: those commits outlive the process as a
+/// commit under `EveryN` does, the ones held after them do not, and what
+/// reopens is a prefix either way.
+#[test]
+fn a_log_over_its_cap_writes_what_it_holds() {
+    let d = dir("cap");
+    let opts = || Options {
+        wal_hold_bytes: 400 << 10,
+        ..inline(explicit())
+    };
+    let mut db = Db::create(&d, opts()).unwrap();
+    logged_batch(&mut db, 0);
+    logged_batch(&mut db, 1);
+    let h = db.wal_held();
+    assert!(
+        h.spills == 0 && h.held <= 400 << 10,
+        "two batches are under the cap: {h:?}"
+    );
+    logged_batch(&mut db, 2);
+    let h = db.wal_held();
+    assert_eq!((h.spills, h.held), (1, 0), "the third crossed it: {h:?}");
+    assert_eq!(log_frames(&d), h.spilled);
+    let (_, synced, written) = db.wal_durable();
+    assert!(
+        synced < written,
+        "a spill is no sync: {synced} of {written}"
+    );
+    logged_batch(&mut db, 3);
+    assert!(db.wal_held().held > 0);
+    db.crash();
+
+    let db = Db::open(&d, opts()).unwrap();
+    for b in 0..3 {
+        assert!(logged(&db, b), "batch {b}, written at the cap, is gone");
+    }
+    assert!(!logged(&db, 3), "the batch held past the spill is there");
+    db.crash();
+    let _ = std::fs::remove_dir_all(&d);
+}
+
+/// A run of ordered ingest that closes with frames held before it: the
+/// frames to come stand past the run in a new file, and the held ones go
+/// to the file they committed under first -- its seed is in their CRCs,
+/// and the next file's would refuse them. A process's death then keeps
+/// the held frames' file, the run and nothing after; and a sync keeps the
+/// frames after the run as well.
+#[test]
+fn frames_held_before_a_run_go_to_their_own_file() {
+    for synced in [false, true] {
+        let d = dir(&format!("held-run-{synced}"));
+        let mut db = Db::create(&d, explicit()).unwrap();
+        db.hold_seal_landing(true);
+        logged_batch(&mut db, 0);
+        // Its table frozen, the seal held: nothing covers the batch, and
+        // the live table is empty, so keys above every key open a run.
+        db.seal().unwrap();
+        for b in 1_001..1_004 {
+            ordered_batch(&mut db, b);
+        }
+        assert_eq!(names(&d, "direct-").len(), 1, "no run opened");
+        assert_eq!(log_frames(&d), 0, "the first batch is held");
+        let files = names(&d, "wal-").len();
+        // A key under the run's greatest: the run closes, loose, and the
+        // write goes to the log.
+        logged_batch(&mut db, 1);
+        assert_eq!(
+            names(&d, "wal-").len(),
+            files + 1,
+            "the log did not begin a file behind the run"
+        );
+        let h = db.wal_held();
+        assert!(
+            h.spills == 1 && h.held > 0,
+            "the first batch written, the last held: {h:?}"
+        );
+        assert_eq!(log_frames(&d), h.spilled);
+        if synced {
+            db.sync().unwrap();
+        }
+        db.crash();
+
+        let db = Db::open(&d, explicit()).unwrap_or_else(|e| {
+            panic!("synced {synced}: the store does not open: {e}");
+        });
+        assert!(
+            logged(&db, 0),
+            "synced {synced}: the batch held before the run"
+        );
+        for b in 1_001..1_004 {
+            assert!(holds(&db, b), "synced {synced}: the run's batch {b}");
+        }
+        assert_eq!(
+            logged(&db, 1),
+            synced,
+            "the batch behind the run, held at the crash unless a sync wrote it"
+        );
+        db.close().unwrap();
+        let _ = std::fs::remove_dir_all(&d);
+    }
+}
+
+/// A store dropped without its close is not a store that crashed: what
+/// its log held goes to the file as it drops, unsynced, and the store that
+/// reopens has it. And a close writes none of it: the flush it is makes
+/// every commit durable in a segment, the frames it covers are dropped,
+/// and the log's files end as their headers.
+#[test]
+fn a_dropped_store_writes_what_it_held_and_a_closed_one_nothing() {
+    let d = dir("dropped");
+    let mut db = Db::create(&d, explicit()).unwrap();
+    logged_batch(&mut db, 0);
+    assert_eq!(log_frames(&d), 0);
+    let held = db.wal_held().held;
+    drop(db);
+    assert_eq!(log_frames(&d), held, "the drop wrote what the log held");
+    let db = Db::open(&d, explicit()).unwrap();
+    assert!(
+        logged(&db, 0),
+        "a store dropped without its close lost what it held"
+    );
+    db.close().unwrap();
+    let _ = std::fs::remove_dir_all(&d);
+
+    let d = dir("closed");
+    let mut db = Db::create(&d, explicit()).unwrap();
+    logged_batch(&mut db, 0);
+    logged_batch(&mut db, 1);
+    db.close().unwrap();
+    assert_eq!(
+        log_frames(&d),
+        0,
+        "a close wrote frames its flush had covered"
+    );
+    let db = Db::open(&d, explicit()).unwrap();
+    assert!(logged(&db, 0) && logged(&db, 1));
+    db.close().unwrap();
+    let _ = std::fs::remove_dir_all(&d);
+}
+
 /// A run that began with everything before it behind a sync says so, and
 /// an open that finds the history ending before such a run has found a
 /// record lost: it refuses, and removes nothing. The same run after one
@@ -1559,6 +2113,22 @@ fn oracle_options(sync: SyncPolicy) -> Options {
     }
 }
 
+/// The oracle's policy by its name in a child's spec: `explicit` holds the
+/// log in the process to the engine's cap, and `explicit-small` to a
+/// quarter of a seal's bytes, so that it spills between its seals.
+#[cfg(target_os = "linux")]
+fn oracle_policy(name: &str) -> Options {
+    match name {
+        "always" => oracle_options(SyncPolicy::Always),
+        "explicit" => oracle_options(SyncPolicy::Explicit),
+        "explicit-small" => Options {
+            wal_hold_bytes: 24 << 10,
+            ..oracle_options(SyncPolicy::Explicit)
+        },
+        _ => oracle_options(SyncPolicy::EveryN(u32::MAX)),
+    }
+}
+
 /// The oracle's writer: the stream committed without end, each commit
 /// acknowledged on stdout. Killed from outside; never returns.
 #[cfg(target_os = "linux")]
@@ -1566,12 +2136,13 @@ fn oracle_child(spec: &str) -> ! {
     use std::io::Write;
     let (seed, rest) = spec.split_once(':').unwrap();
     let (sync, d) = rest.split_once(':').unwrap();
-    let sync = match sync {
-        "always" => SyncPolicy::Always,
-        _ => SyncPolicy::EveryN(u32::MAX),
-    };
-    let mut db = Db::create(Path::new(d), oracle_options(sync)).unwrap();
+    let opts = oracle_policy(sync);
+    let sync = opts.sync;
+    let mut db = Db::create(Path::new(d), opts).unwrap();
     let mut s = Stream::new(seed.parse().unwrap());
+    // A generator of its own for the syncs a holding policy is given, so
+    // that the stream is the one the parent makes again.
+    let mut promise = Stream::new(seed.parse::<u64>().unwrap() ^ 0x5CA1_AB1E);
     let out = std::io::stdout();
     for i in 0.. {
         let (ops, seal) = s.commit(i);
@@ -1608,6 +2179,25 @@ fn oracle_child(spec: &str) -> ! {
         drop(o);
         if seal {
             db.seal().unwrap();
+        }
+        if matches!(sync, SyncPolicy::Explicit) {
+            // Nothing is promised at a commit under this policy, and
+            // everything so far at a sync or a flush: one commit in six
+            // or so, acknowledged once it has returned.
+            let asked = match promise.draw(12) {
+                0 => Some(db.sync()),
+                1 => Some(db.flush()),
+                _ => None,
+            };
+            if let Some(r) = asked {
+                r.unwrap();
+                // With what the log's holding has come to, for the parent
+                // to hold the rounds to having dropped and spilled.
+                let h = db.wal_held();
+                let mut o = out.lock();
+                writeln!(o, "promised {i} {} {}", h.dropped, h.spilled).unwrap();
+                o.flush().unwrap();
+            }
         }
     }
     unreachable!()
@@ -1666,14 +2256,28 @@ fn a_torn_store_is_a_prefix_of_what_was_committed() {
     }
     let exe = std::env::current_exe().unwrap();
     let mut pick = Stream::new(0x0BAD_5EED);
-    for round in 0..24u64 {
+    // Over the rounds that hold their log: the most a writer said it had
+    // dropped unwritten and written at a spill, the rounds whose store
+    // reopened short of the last commit, and the rounds with a promise.
+    let (mut dropped, mut spilled, mut short, mut promises) = (0u64, 0u64, 0, 0);
+    for round in 0..36u64 {
         let seed = 1000 + round;
         // One round in four under a policy that syncs every commit, and
         // one in four of the others with nothing torn: those lose nothing.
-        let always = round % 4 == 3;
-        let torn = !always && round % 4 != 0;
+        // Then twelve under the policy that holds its log in the process
+        // (`SyncPolicy::Explicit`), killed and not torn: what a kill takes
+        // there is what a machine's crash takes, the commits no sync or
+        // flush had promised, and what was promised is on the device.
+        let explicit = round >= 24;
+        let always = !explicit && round % 4 == 3;
+        let torn = !explicit && !always && round % 4 != 0;
         let d = dir(&format!("oracle-{round}"));
-        let sync = if always { "always" } else { "never" };
+        let sync = match (explicit, always) {
+            (true, _) if round % 2 == 0 => "explicit",
+            (true, _) => "explicit-small",
+            (_, true) => "always",
+            _ => "never",
+        };
         // Spawned beside the other tests' open stores. A child holds a copy
         // of each one's `LOCK` from its fork to its exec, which a store's
         // close gives up for every copy (`tests/lock.rs`); the tests here
@@ -1689,13 +2293,29 @@ fn a_torn_store_is_a_prefix_of_what_was_committed() {
         let mut lines = BufReader::new(c.stdout.take().unwrap()).lines();
         let want = 20 + pick.draw(if always { 60 } else { 400 });
         let mut last: Option<u64> = None;
+        let mut promised: Option<u64> = None;
         let mut acked = 0;
         let mut said = String::new();
+        let mut heard = |l: &str, last: &mut Option<u64>| {
+            if let Ok(n) = l.trim().parse::<u64>() {
+                *last = Some(n);
+                true
+            } else {
+                if let Some(rest) = l.strip_prefix("promised ") {
+                    let n: Vec<u64> = rest.split(' ').filter_map(|w| w.parse().ok()).collect();
+                    if let [at, d, sp] = n[..] {
+                        promised = Some(at);
+                        dropped = dropped.max(d);
+                        spilled = spilled.max(sp);
+                    }
+                }
+                false
+            }
+        };
         while acked < want {
             match lines.next() {
                 Some(Ok(l)) => {
-                    if let Ok(n) = l.trim().parse::<u64>() {
-                        last = Some(n);
+                    if heard(&l, &mut last) {
                         acked += 1;
                     } else if l.starts_with("commit ") {
                         said = l;
@@ -1707,9 +2327,7 @@ fn a_torn_store_is_a_prefix_of_what_was_committed() {
         c.kill().unwrap();
         let _ = c.wait();
         for l in lines.map_while(Result::ok) {
-            if let Ok(n) = l.trim().parse::<u64>() {
-                last = Some(n);
-            }
+            heard(&l, &mut last);
         }
         let last = last.expect("no commit acknowledged");
         let did = if torn {
@@ -1718,11 +2336,13 @@ fn a_torn_store_is_a_prefix_of_what_was_committed() {
             Vec::new()
         };
         let what = format!(
-            "round {round}, seed {seed}, {sync}, last acknowledged {last}, torn: {did:?}, store {}",
+            "round {round}, seed {seed}, {sync}, last acknowledged {last}, promised \
+             {promised:?}, torn: {did:?}, store {}",
             d.display()
         );
 
-        let db = match Db::open(&d, oracle_options(SyncPolicy::EveryN(u32::MAX))) {
+        let reopened = if explicit { sync } else { "never" };
+        let db = match Db::open(&d, oracle_policy(reopened)) {
             Ok(db) => db,
             Err(e) => panic!("{what}: the store does not open: {e}"),
         };
@@ -1752,7 +2372,17 @@ fn a_torn_store_is_a_prefix_of_what_was_committed() {
                 got.len()
             );
         };
-        if !torn {
+        if explicit {
+            // A prefix that holds every commit a sync or a flush promised;
+            // of the commits after the last of those it may hold any
+            // number, the ones a spill wrote or a seal made durable.
+            assert!(
+                promised.is_none_or(|s| p > s),
+                "{what}: the store is the first {p} commits, short of what was promised"
+            );
+            short += usize::from(p <= last);
+            promises += usize::from(promised.is_some());
+        } else if !torn {
             assert!(
                 p > last,
                 "{what}: nothing was torn and the store is the first {p} commits"
@@ -1769,4 +2399,13 @@ fn a_torn_store_is_a_prefix_of_what_was_committed() {
         drop(db);
         let _ = std::fs::remove_dir_all(&d);
     }
+    // The rounds that held their log did what they are here for: frames
+    // dropped behind a seal and frames written at a spill, promises made,
+    // and at least one store that a kill left short of its last commit,
+    // which under the other policies none is.
+    assert!(
+        dropped > 0 && spilled > 0 && promises >= 6 && short > 0,
+        "the holding rounds: {dropped} bytes dropped, {spilled} spilled, {promises} rounds \
+         with a promise, {short} short of their last commit"
+    );
 }

@@ -99,5 +99,7 @@ cfgout	src/db/zfile.rs	read_budget	1	not Linux: no budget
 cfgout	src/db/zfile.rs	swap_ahead	1	not Linux: nothing swapped
 cfgout	src/db/zfile.rs	written_back_range	1	not Linux: a sync of the handle's data
 cfgout	src/db/zlz4.rs	fast_turn	1	not x86_64: the wide decodes' arm falls to the flat loop
+cfgout	src/flatindex.rs	FlatIndex::ask_record	1	not x86_64: no prefetch
 cfgout	src/flatindex.rs	prefetch_slot	1	not x86_64: no prefetch
+cfgout	src/flatindex.rs	records_asked	1	not debug_assertions: no count
 cfgout	src/lib.rs	mod wasmapi	1	wasm: the browser's C ABI, a file the door's build does not compile (its text is held whole)
