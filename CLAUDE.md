@@ -2231,6 +2231,59 @@ whole now, and a partial drop leaves its edges, which the crossing's
 test under a cipher allows for and nothing has looked at for a plain
 store's drops of a record region.
 
+And the forwarding stopped at the kernel's cache. `Paging::forget`
+dropped the envelope's pages for the range given up and left the
+chunks present in the store's cache, "to be given back as the cache
+gives anything back", so a drop under a cipher took the ciphertext a
+miss is read from and kept the plaintext nothing would read: the raw
+records of every partition its form file serves, which the plain
+store's drop (`Options::zpages_drop_raw`) takes out of memory at the
+install, and every range a build drops behind it. At ten million keys
+under 1.25 GiB the cache came to the pass after the lag sweep's full
+rewrite holding 412 MB of partitions' records the pass never read and 53
+MB of the form files it read, which came in a 4 KiB fault at a time,
+9,800 major faults on form files and 12,300 on pieces on the scanning
+thread, and the cache's trace said so in one line, what the cache holds
+present of each kind of file by the first field of its name
+(`SUPDB_PAGER_TRACE=1`, `present par .. pcs .. ord .. zpg ..`), with
+every major fault laid to its file beside it (`perf
+record -a -e major-faults -c 1 -d -k CLOCK_MONOTONIC`, each address
+through the mapping events, cut to the pass's `lagmark` lines). A drop
+gives back the units wholly inside its range now, at the evictor's next
+turn and whatever the budget, as a plain store's drop gives back its
+pages: each unit's chunks marked unread, so that a read after the drop
+keeps its unit, and the units marked with the pass's own under one wait
+for the readers (`Paged::drop_units`, `Pager::mark_dropped`;
+`StoreCipher::drops_keep_plaintext` is the shape before,
+`supdb-cipherautodropskeep` its arm). Paired at `95c4f1b`
+(`SUPDB_LAG_COUNTERS=1 SUPDB_SCAN_OPS=1 bench/scripts/pair.sh
+supdb-cipherauto supdb-cipherautodropskeep 10000000 --bound 1342177280
+--passes load,lag --reps 2 --ops-div 10`): the pass after the
+ten-percent burst at 270-330 ms in four reps of four where the shape
+before read 1.3-1.6 s in three, the clean store's pass faster in four
+pairs of four, the bursts and the loads level; over the row's passes
+(`--passes load,read,read-threaded,scan,scan-threaded,mixes`, and the
+mixes again at four reps an order) the one-thread read pass after the
+load 1.2-1.6x in eleven pairs of twelve and C 1.09-1.14x in eight of
+eight, nothing resolved against. The pass after the full rewrite leans
+its way in three pairs of four and still reads near three seconds, the
+plain store's 0.36 (`ROADMAP.md`). The evictor now makes a pass wherever
+a drop comes and not only past its budget, and waits for the readers in
+each: 7.7-8.4 s over a sweep against 2.1-3.4, on its own thread, with the
+reads that waited for a crowded cache fewer, 118-171 breaths against
+191-507. And a second lever came from the same trace and moved nothing:
+a form file built at a merge's finish taken whole into the cache whatever
+its room, on the reading that the room had refused the files the pass
+then faulted on, read the full rewrite's pass at 3.3-4.0 s against
+2.6-3.7 in a scratch build, and the trace had shown the cache with room
+through most of the burst; what takes those files out is the next
+reading. The rules: an advice forwarded to a second cache is forwarded
+to every cache its meaning covers -- a drop says the bytes are not
+wanted, wherever they are held -- and a comment that says what a step leaves ("the chunks
+present here stay") is a decision, read again on the day what it leaves
+is counted; and a lever built on why a cache refused a file is held to
+the count of what it refused before it is paired.
+
 Every test of it passed at its first run, the fuzz's among them, so none
 was believed until its mutant failed it. Twenty-four mutants; four
 outlived the first tests. An envelope written in place passed everything,
@@ -4852,7 +4905,17 @@ pinned beside the rounds, its thread off its core on a loaded runner
 for as long as the reads -- the last round's forms waiting for that pin,
 rightly, once on a hosted macOS runner and one run in a hundred beside
 five others; the pins in the table at the failure named the slot, and
-the test's segment work runs inside the writer's operations now. The
+the test's segment work runs inside the writer's operations now. And
+as builds ahead: the test of the crossing's ask for a cold partition's
+raw pages waited for two of a store's builds ahead and then held the
+builder's start, on the bet that a third was still to start, and in one
+run of the whole binary the builder had built every partition meanwhile,
+no build ever stood at the hold, and the test sat out its five minutes;
+with half a second after the two, every run. It walks the builds by hand
+now, each parked at its rename while the start behind it is held, so
+that two land and the third stands at its start whatever the load
+(`Db::zpage_build_held`, a hold still set beside its waiting bit, tells
+the two places apart where one hold is set at a time). The
 rule: a test that
 needs a state holds it, and a bet on timing loses the first time the
 thing it bets against gets faster; a state the test needs only to have

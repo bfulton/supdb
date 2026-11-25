@@ -1052,7 +1052,25 @@ until the run is its own log). What it loses:
   of that pairing lost `supdb-cipherauto` to the bound in the shuffled
   load, 1,053 MB of shared memory charged where the process mapped 850:
   the writes no reading of the room sees ("A store under a cipher under
-  a bound").
+  a bound"). With a drop giving the plaintext it covers back
+  (`StoreCipher::drops_keep_plaintext` off, at `95c4f1b`, `CLAUDE.md`)
+  the cache meets the pass holding the pieces and the form files and
+  almost none of the partitions' records, and the pass still reads
+  near three seconds: the scanning thread's major faults are 8,300 on
+  form files the burst's merges built in the ten seconds before the
+  pass and 900 on pieces, with the cache 130-440 MB under its budget
+  through the pass, and the merges in flight read 960 MB and write 640
+  inside it. What took those form files out of the cache is not
+  counted: by the code, the cache's clock passes once over a unit a
+  merge read and takes a unit nothing has read since the cache took the
+  file whole at its envelope, which a form file built at a merge's
+  finish is, so the next reading is the evictor's gives by kind of file
+  through the burst. The levers it would point at are the clock's order
+  for a file taken whole and never read, against a merge's inputs, which
+  go with the merge, and `StoreCipher::merges_beside_cache` again,
+  priced the first time against a cache that kept the merges' outputs
+  whole and now against one that gives a served partition's records
+  back.
 - [ ] **The builds ahead's last cold partition under a cipher.** At five
   million keys under 640 MiB with the builds ahead started at a quarter
   of the store's cache, one or two partitions are still found cold in
