@@ -8889,6 +8889,92 @@ fn the_controller_leaves_a_store_under_a_cipher_raw_unless_it_is_asked() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// Under a cipher a form file is a memory file until it has its envelope,
+/// memory the kernel cannot take back and no count of the store's cache
+/// has, which the cache's room learns of a page at a time as it is
+/// written: so a build says what its file is to hold where it makes it
+/// (`vault::expect`), as a merge says what its outputs are to. A store
+/// of numbered keys, loaded and settled with the form off and opened again
+/// with it forced, so that its builds are the only files written, has every
+/// byte its
+/// builds wrote announced: the stride form's to the byte, its length known
+/// before its first page, and the block form's as the partition's records,
+/// which its groups compress where the values do, and outgrow by a few in a
+/// hundred where they do not.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_form_build_under_a_cipher_says_what_its_file_is_to_hold() {
+    let cipher = || {
+        supdb::Encryption::Cipher(supdb::StoreCipher::new(
+            common::Gcm::new(&[0x5d; 32]),
+            common::Gcm::new,
+        ))
+    };
+    for stride in [ZStride::Forced, ZStride::Off] {
+        let what = format!("{stride:?}");
+        let dir = scratch(&format!("zexpect-cipher-{stride:?}"));
+        let model = {
+            let mut db = Db::create(
+                &dir,
+                Options {
+                    encryption: cipher(),
+                    partition_bytes: Some(400 << 10),
+                    ..Options::default()
+                },
+            )
+            .unwrap();
+            let model = numbered_load(&mut db, 40_000, 100, 0x4AB);
+            db.settle().unwrap();
+            db.close().unwrap();
+            model
+        };
+        let mut db = Db::open(
+            &dir,
+            forced(|o| {
+                o.encryption = cipher();
+                o.zpages_stride = stride;
+                o.partition_bytes = Some(400 << 10);
+            }),
+        )
+        .unwrap();
+        let said = db.cipher_counts().unwrap().expected;
+        db.zpages_settle().unwrap();
+        let c = db.zpage_counts();
+        let said = db.cipher_counts().unwrap().expected - said;
+        assert!(
+            c.builds >= 2 && c.form_files == c.partitions,
+            "{what}: every partition built: {c:?}"
+        );
+        assert_eq!(
+            c.stride_builds > 0,
+            stride == ZStride::Forced,
+            "{what}: the form asked for: {c:?}"
+        );
+        if stride == ZStride::Forced {
+            assert_eq!(
+                said, c.build_bytes,
+                "{what}: a stride file's length said to the byte: {c:?}"
+            );
+        } else {
+            // The values are random bytes, so the groups do not compress
+            // and the file outgrows its records by its pages' headers and
+            // directories and its filter, a few in a hundred: the rest a
+            // reading's to see.
+            assert!(
+                said * 10 >= c.build_bytes * 9 && said < 2 * c.build_bytes,
+                "{what}: the block form's records said, {said} bytes, for {} written: {c:?}",
+                c.build_bytes
+            );
+        }
+        let keys: Vec<Vec<u8>> = model.keys().step_by(97).cloned().collect();
+        let r = db.reader().unwrap();
+        check(&r, &model, &keys, &what);
+        drop(r);
+        db.close().unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
 /// The same under a cipher (`Encryption::Cipher`), where a form file an
 /// earlier open left is an envelope beside its segment's that this open's
 /// table of names does not hold until something asks for it: the

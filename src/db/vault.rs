@@ -2119,8 +2119,8 @@ pub struct CipherCounts {
     /// while its writer was on its way to seal it.
     pub late: u64,
     /// The bytes the store's writers announced before they wrote them: a
-    /// merge's outputs, each said where it was opened, for the cache to
-    /// give way ahead of.
+    /// merge's outputs and a form file's build, each said where its file
+    /// was opened, for the cache to give way ahead of.
     pub expected: u64,
     /// The cache the store reads through: what it may hold and holds, and
     /// what it has decrypted and given back.

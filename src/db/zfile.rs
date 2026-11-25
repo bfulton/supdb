@@ -8570,6 +8570,15 @@ fn write_pages<I: Images, W: Walked>(
     plan: &BuildPlan,
 ) -> Result<Outcome> {
     let out = super::vault::create(tmp)?;
+    // What the file is to hold, said where it is made: under a cipher it is
+    // a memory file until its envelope, which no count of the store's cache
+    // has and the room learns of a page at a time, and two of them built
+    // ahead at a load's end with the cache at its budget put the group within
+    // thirty mebibytes of its limit. The partition's records, which the
+    // groups compress: about the most the file holds where they compress,
+    // and a little less than it where they do not, the rest a reading's to
+    // see. Nothing for a plain store.
+    super::vault::expect(tmp, facts.recs_len);
     let mut w = Pieces::new(FileSink::new(&out, plan.drop_output), plan.piece);
     let mut scratch = FillScratch::new();
     scratch.group_bytes = plan.group_bytes;
@@ -8962,6 +8971,9 @@ fn write_stride<I: Images, W: StrideWalked>(
 ) -> Result<Outcome> {
     let recs_len = by.recs_len();
     let out = super::vault::create(tmp)?;
+    // What the file is to hold, to the byte, said where it is made, as a
+    // block body's is (`write_pages`).
+    super::vault::expect(tmp, sf.layout.file_len);
     let mut w = Pieces::new(FileSink::new(&out, plan.drop_output), plan.piece);
     let lay = sf.layout;
     let codec = sf.codec;

@@ -382,6 +382,8 @@ src/db/zfile.rs	name_built	vault::persist_form	code	1	S6	a form file's envelope,
 src/db/zfile.rs	open_seg	held build	code	1	R4	vault::kept picks the held build (design 6 renames it vault::paged at S3; R0 bars that too)
 src/db/zfile.rs	open_seg	vault::kept	code	1	R4	vault::kept picks the held build (design 6 renames it vault::paged at S3; R0 bars that too)
 src/db/zfile.rs	write_pages	held build	code	1	R4	W: Walked
+src/db/zfile.rs	write_pages	vault::expect	code	1	stays	a form file's build says what its file is to hold where it makes it, the partition's records: under a cipher a memory file the store's cache gives way to ahead of its writes (vault::Coming)
+src/db/zfile.rs	write_stride	vault::expect	code	1	stays	the same for a stride file, its length to the byte
 src/lib.rs	<item>	cipher	code	4	stays	the crate root re-exports the encryption side's API; a re-export is an alias, so the root is counted
 src/lib.rs	<item>	crate-root alias of an encryption item	code	1	stays	the crate root re-exports the encryption side's API; a re-export is an alias, so the root is counted
 src/lib.rs	<item>	crypt	code	1	stays	the crate root re-exports the encryption side's API; a re-export is an alias, so the root is counted
