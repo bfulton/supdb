@@ -72,8 +72,8 @@
 //!   a point read finds its partition (`Cfg::live_first`), and in
 //!   a quarter hashes a memtable's keys by FNV alone (`Cfg::mem_fold`);
 //!   and in a quarter of the seeds that hold their log overwrites a put's
-//!   value of the put's length where it lies on the `z` store, with no
-//!   handle claimed on it (`Cfg::in_place`).
+//!   value of the put's length where it lies on the `z` store, its handles
+//!   claimed only with nothing staged (`Cfg::in_place`).
 //! - `ZFUZZ_SHAPES`: the key shapes a seed may draw from, as indexes from 0
 //!   to 7 separated by commas.
 //! - `ZFUZZ_SETTLEBUILDS=1`: the `z` store's commits near reads file their
@@ -406,8 +406,9 @@ struct Cfg {
     /// (`Options::put_in_place`): in a quarter of the seeds that hold their
     /// log, the side generator's draw after the memtable hash's, with the
     /// cache off and the upkeep inline on `z` alone, since the engine
-    /// refuses the overwrite beside them, and no handle claimed on `z`,
-    /// which it refuses too; `r` appends every put over the same writes.
+    /// refuses the overwrite beside them, and a handle claimed on `z` only
+    /// where nothing is staged, as the store asks (`claim`), after which
+    /// `z` appends beside it; `r` appends every put over the same writes.
     /// Such a seed makes a fifth of its writes puts of eight-byte values,
     /// out of the appends' share.
     in_place: bool,
@@ -968,6 +969,17 @@ fn opts_z(c: &Cfg) -> Options {
         o.forms_off_snapshot_kept = false;
     }
     o
+}
+
+/// A handle on `z`, or none where the store refuses it as a store that
+/// overwrites its puts refuses a claim with a put staged (`Db::reader`,
+/// `Cfg::in_place`); any other refusal is the seed's failure.
+fn claim(z: &Db, cfg: &Cfg) -> Result<Option<Reader>, String> {
+    match z.reader() {
+        Ok(h) => Ok(Some(h)),
+        Err(e) if cfg.in_place && e.to_string().contains("nothing staged") => Ok(None),
+        Err(e) => Err(format!("reader: {e}")),
+    }
 }
 
 fn key_pool(rng: &mut Rng, n: usize) -> Vec<Vec<u8>> {
@@ -2321,12 +2333,11 @@ fn run_seed_inner(seed: u64, want_cache: bool, verbose: bool) -> Result<Stats, S
                     absent = absent_around(&pool, &mut rng);
                 }
                 105..=119 => {
-                    if handles.len() < 4 && !cfg.in_place {
-                        handles.push(Handle {
-                            r: z.reader().map_err(|e| format!("reader: {e}"))?,
-                            snap: None,
-                        });
-                        note_event("claim z", &z, &r);
+                    if handles.len() < 4 {
+                        if let Some(h) = claim(&z, &cfg)? {
+                            handles.push(Handle { r: h, snap: None });
+                            note_event("claim z", &z, &r);
+                        }
                     }
                 }
                 120..=139 => {
@@ -2434,8 +2445,7 @@ fn run_seed_inner(seed: u64, want_cache: bool, verbose: bool) -> Result<Stats, S
             let probe = all_probe(&pool, &absent);
             check_keys("z writer", &z, &model, &probe, &mut fails);
             check_keys("r writer", &r, &model, &probe, &mut fails);
-            if !cfg.in_place {
-                let hz = z.reader().map_err(|e| format!("reader: {e}"))?;
+            if let Some(hz) = claim(&z, &cfg)? {
                 check_keys("z fresh handle", &hz, &model, &probe, &mut fails);
             }
             for (i, h) in handles.iter().enumerate() {
@@ -2505,8 +2515,7 @@ fn run_seed_inner(seed: u64, want_cache: bool, verbose: bool) -> Result<Stats, S
         let probe = all_probe(&pool, &absent);
         check_keys("final z writer", &z, &model, &probe, &mut fails);
         check_keys("final r writer", &r, &model, &probe, &mut fails);
-        if !cfg.in_place {
-            let hz = z.reader().map_err(|e| format!("reader: {e}"))?;
+        if let Some(hz) = claim(&z, &cfg)? {
             check_keys("final z fresh handle", &hz, &model, &probe, &mut fails);
         }
         for (i, h) in handles.iter().enumerate() {
@@ -2527,8 +2536,7 @@ fn run_seed_inner(seed: u64, want_cache: bool, verbose: bool) -> Result<Stats, S
                 ),
             }
         }
-        if !cfg.in_place {
-            let sn = z.reader().map_err(|e| format!("reader: {e}"))?;
+        if let Some(sn) = claim(&z, &cfg)? {
             sn.snapshot();
             check_keys("final z snapshot", &sn, &model, &probe, &mut fails);
         }

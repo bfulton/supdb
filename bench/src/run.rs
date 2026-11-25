@@ -2131,6 +2131,15 @@ impl OnePass {
         for (t, x) in &self.scan_mixed_threaded {
             v.push((format!("scan-mixed entries_per_s_{t}t"), *x));
         }
+        // The threaded writers' mixes, named as their row's quantities are
+        // (`pass_measurements`), which a pairing left out while every row
+        // carried them.
+        for (name, t, x) in &self.mix_threaded {
+            v.push((
+                format!("threads-{name} {}", threaded_quantity("ops_per_s", *t)),
+                *x,
+            ));
+        }
         for (c, x) in &self.ycsb_ops_s {
             v.push((format!("ycsb-{c} ops_per_s"), *x));
         }
@@ -7111,6 +7120,36 @@ mod tests {
                 "a scan from {k} with {committed_then} keys committed"
             );
         }
+    }
+
+    /// A pairing reads what a row carries: every quantity a pass puts in a
+    /// row (`pass_measurements`) is in the list `ab` pairs (`OnePass::flat`)
+    /// under the row's workload and quantity, where the threaded writers'
+    /// mixes had been in every row and in no pairing.
+    #[test]
+    fn a_pairing_carries_every_quantity_a_row_carries() {
+        let _pass = TRIM.read().unwrap_or_else(|e| e.into_inner());
+        let root = std::env::temp_dir().join(format!("supdb-bench-flat-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let mut plan = Plan::new(Scale::Quick, vec![], 30_000, 4);
+        let payload = Payload::new(plan.value_size, plan.compress, 0xE1);
+        plan.passes = Passes::parse(
+            "load,read,read-threaded,scan,scan-threaded,mixes,scan-mixed,mixes-scrambled,lag,mixes-threaded",
+        )
+        .unwrap();
+        let one = one_pass("supdb", &root.join("one"), 2_000, 1, &plan, &payload, None).unwrap();
+        let flat: std::collections::BTreeSet<String> =
+            one.flat().into_iter().map(|(n, _)| n).collect();
+        let row = pass_measurements(2_000, "supdb", Guarantee::Durable, &one);
+        assert!(
+            row.iter().any(|m| m.workload.starts_with("threads-")),
+            "the pass ran the threaded writers' mixes"
+        );
+        for m in &row {
+            let name = format!("{} {}", m.workload, m.quantity);
+            assert!(flat.contains(&name), "the pairing leaves out {name}");
+        }
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     /// The second family runs in a pass after the threaded scans on the

@@ -22592,10 +22592,12 @@ fn a_landing_leaves_its_pieces_bounds_where_no_table_stands_to_read_them() {
 /// A store whose puts overwrite in place (`Options::put_in_place`) answers
 /// the last put of every key, by point read and by scan, while its puts
 /// overwrite and append in turn, across the seals its writes make and a
-/// close and reopen; and it is refused where another thread could read a
-/// live value as the writer overwrites it -- a policy that promises
-/// isolation, the block cache, an upkeep thread -- and a handle is refused
-/// on an open store.
+/// close and reopen; it is refused where one of the engine's threads would
+/// read a live value as the writer overwrites it -- a policy that promises
+/// isolation, the block cache, an upkeep thread; and a handle is claimed
+/// only with nothing staged, reads what was committed, and is never beside
+/// an overwrite: the puts append while one lives, on its thread or another,
+/// and overwrite again once it is dropped.
 #[test]
 fn a_store_that_overwrites_its_puts_answers_the_last_put() {
     // The scan snapshot copies a key's chain under `snapshot_runs`, and the
@@ -22637,10 +22639,6 @@ fn overwriting_store_answers_the_last_put(runs: bool) {
     }
     let d = dir("put-in-place");
     let mut db = Db::open(&d, opts()).unwrap();
-    assert!(
-        db.reader().is_err(),
-        "no handle beside an overwriting writer"
-    );
     let mut model: BTreeMap<Vec<u8>, Vec<u8>> = BTreeMap::new();
     let check = |db: &Db, model: &BTreeMap<Vec<u8>, Vec<u8>>, when: &str| {
         for (k, want) in model {
@@ -22723,6 +22721,103 @@ fn overwriting_store_answers_the_last_put(runs: bool) {
         4 * (0..400).step_by(7).count() as u64,
         "every put of the turns overwrote"
     );
+    // A handle: refused with a put staged, claimed after the commit, and
+    // the puts beside it append.
+    let k7 = b"0000000000000007".to_vec();
+    let len7 = model[&k7].len();
+    let mut staged = b"staged".to_vec();
+    staged.resize(len7, b'.');
+    db.put(&k7, &staged);
+    assert!(db.reader().is_err(), "a handle refused with a put staged");
+    db.commit().unwrap();
+    model.insert(k7.clone(), staged);
+    let h = db.reader().unwrap();
+    let before = db.puts_in_place();
+    for i in (0..400u32).step_by(7) {
+        let k = format!("{:016}", i).into_bytes();
+        let mut v = format!("h-{i:05}").into_bytes();
+        v.resize(model[&k].len(), b'.');
+        db.put(&k, &v);
+        model.insert(k, v);
+    }
+    db.commit().unwrap();
+    assert_eq!(
+        db.puts_in_place(),
+        before,
+        "no overwrite while a handle lives"
+    );
+    check(&db, &model, "beside a handle");
+    for (k, want) in &model {
+        let mut got = Vec::new();
+        h.read_all(k, vf(&mut |v| got.push(v.to_vec()))).unwrap();
+        assert_eq!(got, vec![want.clone()], "the handle reads the last commit");
+    }
+    // On another thread, reading as the writer puts values of one length
+    // into the keys it reads: every value it reads is one of them whole.
+    let keys: Vec<Vec<u8>> = (0..64u32)
+        .map(|i| format!("{:016}", i).into_bytes())
+        .collect();
+    let fill = |n: u32, len: usize| {
+        let mut v = vec![b'a' + (n % 26) as u8; len];
+        v[0] = b'#';
+        v
+    };
+    for k in &keys {
+        let v = fill(0, 24);
+        db.put(k, &v);
+        model.insert(k.clone(), v);
+    }
+    db.commit().unwrap();
+    let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let (keys2, stop2) = (keys.clone(), stop.clone());
+    let reads = std::thread::spawn(move || {
+        let mut n = 0u64;
+        while !stop2.load(std::sync::atomic::Ordering::Relaxed) {
+            for k in &keys2 {
+                h.read_all(
+                    k,
+                    vf(&mut |v| {
+                        assert_eq!(v.len(), 24, "a value of the length written");
+                        assert_eq!(v[0], b'#', "a value whole");
+                        assert!(v[1..].iter().all(|&b| b == v[1]), "a value torn: {v:?}");
+                    }),
+                )
+                .unwrap();
+                n += 1;
+            }
+        }
+        n
+    });
+    let before = db.puts_in_place();
+    for round in 1..200u32 {
+        for k in &keys {
+            let v = fill(round, 24);
+            db.put(k, &v);
+            model.insert(k.clone(), v);
+        }
+        db.commit().unwrap();
+    }
+    stop.store(true, std::sync::atomic::Ordering::Relaxed);
+    assert!(reads.join().unwrap() > 0, "the handle read");
+    assert_eq!(
+        db.puts_in_place(),
+        before,
+        "no overwrite beside a handle on another thread"
+    );
+    check(&db, &model, "after the handle's thread");
+    // The handle dropped with its thread: the puts overwrite again.
+    let before = db.puts_in_place();
+    for k in &keys {
+        let v = fill(7, 24);
+        db.put(k, &v);
+        model.insert(k.clone(), v);
+    }
+    db.commit().unwrap();
+    assert!(
+        db.puts_in_place() > before,
+        "the puts overwrite once the handle is gone"
+    );
+    check(&db, &model, "after the handle");
     db.flush().unwrap();
     check(&db, &model, "flushed");
     db.close().unwrap();

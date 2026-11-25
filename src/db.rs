@@ -4928,11 +4928,15 @@ pub struct Options {
     /// logged, so whatever keeps a copy of the key's values reads its chain
     /// again, and it is charged to the seal's count as the log's entry, the
     /// one thing it grows. The writer's own reads are the only ones that
-    /// may see the bytes while it writes them, so this shape refuses
-    /// whatever reads a live table's values on another thread: a reader
-    /// handle (`Db::reader`), the block cache and its upkeep thread
-    /// (`scan_block_cache`, `Upkeep::Inline` alone), the run keeper and the
-    /// kept merge snapshot. Off: `supdb-held`'s shape, a put appending.
+    /// may see the bytes while it writes them. So a put overwrites only
+    /// while no handle the caller made is live (`Db::put_pinned`), and
+    /// appends beside one; a handle is claimed only with nothing staged
+    /// (`Db::reader`), so what it reads was committed and stays as it read
+    /// it; and the shape refuses the engine's threads that read a live
+    /// table's values beside the writer: the block cache and its upkeep
+    /// thread (`scan_block_cache`, `Upkeep::Inline` alone), the run keeper
+    /// and the kept merge snapshot. Off: `supdb-held`'s shape, a put
+    /// appending.
     pub put_in_place: bool,
     /// A job's large per-key arrays -- a seal's sort of its
     /// table, a segment writer's copy of every key with its span, its
@@ -7276,7 +7280,6 @@ impl Options {
             prefault: self.prefault,
             index_populated: self.index_populated,
             fold_hash: self.mem_hash_fold,
-            in_place: self.put_in_place,
             mapped: self.blocks_mapped,
             pool: pool.clone(),
         }
@@ -13880,9 +13883,6 @@ struct BlockShape {
     /// Sixteen-byte keys hashed by a fold of their words
     /// (`Options::mem_hash_fold`).
     fold_hash: bool,
-    /// A put of a value of the length it replaces overwrites it
-    /// (`Options::put_in_place`).
-    in_place: bool,
     mapped: bool,
     /// The store's pool of blocks its tables gave back
     /// (`Options::blocks_pool_bytes`); none where it keeps none.
@@ -13898,9 +13898,6 @@ struct MemTable {
     /// words (`Options::mem_hash_fold`, `MemTable::hash`), fixed for the
     /// table's life: every hash handed to it is the table's own.
     fold_hash: bool,
-    /// Whether a put overwrites a value of its length in place
-    /// (`Options::put_in_place`, `MemTable::overwrite`).
-    in_place: bool,
     /// Every entry in the order it was made -- key order, when
     /// `ordered`, since ordered ingest pushes each key above the last and
     /// a lookup there is a binary search, never a probe.
@@ -15581,7 +15578,6 @@ impl MemTable {
             prefault,
             index_populated,
             fold_hash,
-            in_place,
             mapped,
             pool,
         } = shape;
@@ -15589,7 +15585,6 @@ impl MemTable {
         MemTable {
             mapped,
             fold_hash,
-            in_place,
             entries: Slab::new(src()),
             index: AtomicPtr::new(Box::into_raw(Box::new(Index::with_slots(
                 1024,
@@ -15642,7 +15637,6 @@ impl MemTable {
             prefault,
             index_populated: _,
             fold_hash: _,
-            in_place: _,
             mapped,
             pool,
         } = shape;
@@ -15651,7 +15645,6 @@ impl MemTable {
         MemTable {
             mapped,
             fold_hash: false,
-            in_place: false,
             entries: Slab::new(src()),
             index: AtomicPtr::new(std::ptr::null_mut()),
             ordered: true,
@@ -16018,16 +16011,17 @@ impl MemTable {
     /// where the probe for it found none (`index_insert_at`), where the
     /// insert walked the probe's slots again.
     ///
-    /// Whether the put overwrote the key's value where it lies
-    /// (`Options::put_in_place`, `overwrite`), growing the table by its
+    /// Whether the put overwrote the key's value where it lies, which it
+    /// tries where `overwrite` says it may (`Options::put_in_place`,
+    /// `MemTable::overwrite`, `Db::put_pinned`), growing the table by its
     /// log's entry alone.
-    fn put(&self, hash: u64, key: &[u8], value: &[u8], rd: &Readers) -> bool {
+    fn put(&self, hash: u64, key: &[u8], value: &[u8], rd: &Readers, overwrite: bool) -> bool {
         assert!(!self.ordered, "a put never reaches an ordered memtable");
         let vacant = match self.probe_or_vacant(hash, key) {
             Ok(id) => {
                 let e = self.fat(id);
                 let head = e.chain_head();
-                if self.in_place && self.overwrite(head, value) {
+                if overwrite && self.overwrite(head, value) {
                     self.log_write(id, false);
                     return true;
                 }
@@ -16052,7 +16046,8 @@ impl MemTable {
     /// `value`'s length; false, with nothing written, otherwise. What a put
     /// leaves is the same either way: the chain's one value, the new one,
     /// over a tombstone. Sound only while no other thread reads the table's
-    /// values (`Options::put_in_place`, `check_options`, `Db::reader`).
+    /// values: no handle live (`Db::put_pinned`), and none of the engine's
+    /// threads that read a live table's values (`check_options`).
     fn overwrite(&self, head: u64, value: &[u8]) -> bool {
         if head == NO_CHUNK || head < CHUNK_HDR as u64 {
             return false;
@@ -23697,9 +23692,12 @@ impl Drop for Reader {
         }
         if let Some(slot) = self.slot {
             if self.counted {
+                // A release: a writer that overwrites in place once the
+                // count reads nothing does so after this handle's reads
+                // (`Options::put_in_place`, `Db::put_pinned`).
                 self.shared
                     .live_handles
-                    .fetch_sub(1, AtomicOrdering::Relaxed);
+                    .fetch_sub(1, AtomicOrdering::Release);
             }
             self.shared.readers.release(slot);
         }
@@ -38825,9 +38823,19 @@ impl Db {
         let hash = self.mem().prefetch(key);
         self.wal.delete(key);
         self.wal.append(key, value);
-        // An overwrite grows the table by its log's entry alone, which is
-        // what it is charged toward the seal (`Options::put_in_place`).
-        if self.mem().put(hash, key, value, &self.shared.readers) {
+        // A put overwrites only while no handle the caller made is live
+        // (`Options::put_in_place`): a handle is made by the writer or by
+        // a live handle, so at a count of nothing none exists and none can
+        // appear before this put returns, and the acquire orders the put
+        // after the last read of whichever handle dropped last. An
+        // overwrite grows the table by its log's entry alone, which is
+        // what it is charged toward the seal.
+        let overwrite =
+            self.opts.put_in_place && self.shared.live_handles.load(AtomicOrdering::Acquire) == 0;
+        if self
+            .mem()
+            .put(hash, key, value, &self.shared.readers, overwrite)
+        {
             self.mem_bytes += std::mem::size_of::<u32>();
             self.puts_in_place += 1;
         } else {
@@ -40910,6 +40918,27 @@ impl Db {
         self.puts_in_place
     }
 
+    /// `Reader::reader`, the writer's: under `Options::put_in_place`
+    /// refused while the live table holds a write no commit has covered,
+    /// since a put may have overwritten a committed value there, and a
+    /// handle under `Latest` or `Snapshot` would read the overwrite as
+    /// committed. A put overwrites nothing while a handle is live
+    /// (`Db::put_pinned`), so what a handle claimed after a commit reads
+    /// was committed, and stays as it read it.
+    pub fn reader(&self) -> Result<Reader> {
+        if self.opts.put_in_place {
+            let _e = self.enter();
+            let mem = self.mem();
+            if !mem.ordered && mem.log_len() > mem.committed_at().0 {
+                return Err(err(
+                    "put_in_place: a handle is claimed with nothing staged, since a \
+                     staged put may have overwritten a committed value; commit first",
+                ));
+            }
+        }
+        self.r.reader()
+    }
+
     /// EXPERIMENT: scan snapshots built over this store's life. Sharing
     /// one is meant to hold this at one per state however many handles
     /// read it, which is what a test asks.
@@ -41237,12 +41266,6 @@ impl Reader {
     /// thread reads through it at a time, and a thread that wants its
     /// own asks for its own. Fails when every slot is taken.
     pub fn reader(&self) -> Result<Reader> {
-        if self.opts.put_in_place {
-            return Err(err(
-                "put_in_place overwrites the live table's values under the writer \
-                 alone: no handle may read them from another thread",
-            ));
-        }
         let _e = self.enter();
         self.new_reader(true)
     }
@@ -58091,7 +58114,6 @@ mod streaming_writes {
                     prefault: false,
                     index_populated: true,
                     fold_hash: false,
-                    in_place: false,
                     mapped: true,
                     pool: None,
                 },
@@ -58462,7 +58484,6 @@ mod threading {
             prefault: false,
             index_populated: true,
             fold_hash: false,
-            in_place: false,
             mapped: true,
             pool: None,
         });
@@ -58477,7 +58498,6 @@ mod threading {
             prefault: false,
             index_populated: true,
             fold_hash: false,
-            in_place: false,
             mapped: true,
             pool: None,
         });
@@ -58516,7 +58536,6 @@ mod put_index {
             prefault: false,
             index_populated: true,
             fold_hash: false,
-            in_place: false,
             mapped: true,
             pool: None,
         })
@@ -58547,7 +58566,7 @@ mod put_index {
             let first = m.index().unwrap().slots.len();
             for i in 0..4_000u32 {
                 let k = format!("pop-{i:08}").into_bytes();
-                m.put(mem_hash(&k), &k, b"v", &rd);
+                m.put(mem_hash(&k), &k, b"v", &rd, false);
             }
             let ix = m.index().unwrap();
             assert!(ix.slots.len() > first, "the index grew");
@@ -58569,7 +58588,6 @@ mod put_index {
                 prefault: false,
                 index_populated: true,
                 fold_hash: fold,
-                in_place: false,
                 mapped: true,
                 pool: None,
             });
@@ -58593,7 +58611,7 @@ mod put_index {
                 } else {
                     assert_eq!(m.hash(k), mem_hash(k));
                 }
-                m.put(m.hash(k), k, b"v", &rd);
+                m.put(m.hash(k), k, b"v", &rd, false);
             }
             for k in &keys {
                 let fnv = crate::flatindex::key_hash(k);
@@ -58620,12 +58638,11 @@ mod put_index {
                 prefault: false,
                 index_populated: true,
                 fold_hash: true,
-                in_place,
                 mapped: true,
                 pool: None,
             });
             let k = b"overwritten-key".to_vec();
-            let wrote = |m: &MemTable, v: &[u8]| m.put(m.hash(&k), &k, v, &rd);
+            let wrote = |m: &MemTable, v: &[u8]| m.put(m.hash(&k), &k, v, &rd, in_place);
             assert!(!wrote(&m, b"first"), "a new key's put appends");
             let used = m.vals.used();
             assert_eq!(wrote(&m, b"secnd"), in_place, "a put of the same length");
@@ -58652,7 +58669,7 @@ mod put_index {
             m.append(m.hash(&j), &j, b"", &rd);
             m.append(m.hash(&j), &j, b"abc", &rd);
             assert!(
-                !m.put(m.hash(&j), &j, b"xyz", &rd),
+                !m.put(m.hash(&j), &j, b"xyz", &rd, in_place),
                 "no tombstone under the head"
             );
             assert_eq!(values(&m, &j), Some((vec![b"xyz".to_vec()], true)));
@@ -58663,7 +58680,7 @@ mod put_index {
             let a = b"appended-first".to_vec();
             m.append(m.hash(&a), &a, b"abcd", &rd);
             assert!(
-                !m.put(m.hash(&a), &a, b"wxyz", &rd),
+                !m.put(m.hash(&a), &a, b"wxyz", &rd, in_place),
                 "a value that links to nothing"
             );
             assert_eq!(values(&m, &a), Some((vec![b"wxyz".to_vec()], true)));
@@ -58694,7 +58711,7 @@ mod put_index {
         let mut slots = m.index().unwrap().slots.len();
         for i in 0..20_000u32 {
             let k = key(i);
-            m.put(mem_hash(&k), &k, format!("v{i}").as_bytes(), &rd);
+            m.put(mem_hash(&k), &k, format!("v{i}").as_bytes(), &rd, false);
             let now = m.index().unwrap().slots.len();
             if now != slots {
                 grew += 1;
@@ -58717,7 +58734,7 @@ mod put_index {
         // Again over every key: the put of a key the table holds.
         for i in (0..20_000u32).step_by(3) {
             let k = key(i);
-            m.put(mem_hash(&k), &k, format!("w{i}").as_bytes(), &rd);
+            m.put(mem_hash(&k), &k, format!("w{i}").as_bytes(), &rd, false);
         }
         for i in 0..20_000u32 {
             let want = if i % 3 == 0 { "w" } else { "v" };
@@ -58750,8 +58767,8 @@ mod put_index {
         assert_eq!(mem_hash(&ka) >> 32, mem_hash(&kb) >> 32, "one tag");
         let rd = Readers::new(false, true);
         let m = table();
-        m.put(mem_hash(&ka), &ka, b"a1", &rd);
-        m.put(mem_hash(&kb), &kb, b"b1", &rd);
+        m.put(mem_hash(&ka), &ka, b"a1", &rd, false);
+        m.put(mem_hash(&kb), &kb, b"b1", &rd, false);
         assert_eq!(m.len(), 2, "two keys, two entries");
         assert_eq!(values(&m, &ka), Some((vec![b"a1".to_vec()], true)));
         assert_eq!(values(&m, &kb), Some((vec![b"b1".to_vec()], true)));
@@ -58761,8 +58778,8 @@ mod put_index {
         );
         assert!(ia.is_ok() && ib.is_ok() && ia != ib, "{ia:?} {ib:?}");
         // A second put of each lands on its own chain.
-        m.put(mem_hash(&kb), &kb, b"b2", &rd);
-        m.put(mem_hash(&ka), &ka, b"a2", &rd);
+        m.put(mem_hash(&kb), &kb, b"b2", &rd, false);
+        m.put(mem_hash(&ka), &ka, b"a2", &rd, false);
         assert_eq!(m.len(), 2);
         assert_eq!(values(&m, &ka), Some((vec![b"a2".to_vec()], true)));
         assert_eq!(values(&m, &kb), Some((vec![b"b2".to_vec()], true)));
