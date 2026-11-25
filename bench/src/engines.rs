@@ -1108,6 +1108,16 @@ pub struct Supdb {
     /// for the engine's default: `supdb-closeseal` and
     /// `supdb-ingestcloseseal` leave it to the seal thread.
     closereadable: Option<bool>,
+    /// A seal's Bloom composed only where it may be named a piece
+    /// (`Options::bloom_pieces_only`), `None` for the engine's default:
+    /// `supdb-bloomalways` and `supdb-ingestbloomalways` compose it for
+    /// every seal.
+    bloompieces: Option<bool>,
+    /// A landing's empty live table made only where the table it retires
+    /// is still live (`Options::land_fresh_lazy`), `None` for the
+    /// engine's default: `supdb-landfresh` and `supdb-ingestlandfresh`
+    /// make it at every landing that retires a table.
+    landfresh: Option<bool>,
     /// A scan that starts in a block the writer holds a form for counted
     /// as a reuse by the forms-off rule
     /// (`Options::scan_forms_off_counts_built`), `None` for the engine's
@@ -2583,6 +2593,16 @@ struct Policy {
     /// for the engine's default: `supdb-closeseal` and
     /// `supdb-ingestcloseseal` leave it to the seal thread.
     closereadable: Option<bool>,
+    /// A seal's Bloom composed only where it may be named a piece
+    /// (`Options::bloom_pieces_only`), `None` for the engine's default:
+    /// `supdb-bloomalways` and `supdb-ingestbloomalways` compose it for
+    /// every seal.
+    bloompieces: Option<bool>,
+    /// A landing's empty live table made only where the table it retires
+    /// is still live (`Options::land_fresh_lazy`), `None` for the
+    /// engine's default: `supdb-landfresh` and `supdb-ingestlandfresh`
+    /// make it at every landing that retires a table.
+    landfresh: Option<bool>,
     /// A scan that starts in a block the writer holds a form for counted
     /// as a reuse by the forms-off rule
     /// (`Options::scan_forms_off_counts_built`), `None` for the engine's
@@ -3442,6 +3462,8 @@ impl Default for Policy {
             syncbeside: None,
             directlean: None,
             closereadable: None,
+            bloompieces: None,
+            landfresh: None,
             formsoffbuilt: None,
             formson: false,
             formsoffkept: false,
@@ -8192,6 +8214,58 @@ impl Supdb {
         )
     }
 
+    /// `supdb` whose every seal composes the Bloom a piece's open takes
+    /// (`Options::bloom_pieces_only` off), the shape before.
+    /// `supdb-bloomalways`.
+    pub fn create_bloomalways(path: &Path) -> Res<Supdb> {
+        Supdb::with_policy(
+            path,
+            Policy {
+                bloompieces: Some(false),
+                ..Policy::default()
+            },
+        )
+    }
+
+    /// `supdb-ingest` as `supdb-bloomalways`. `supdb-ingestbloomalways`.
+    pub fn create_ingest_bloomalways(path: &Path) -> Res<Supdb> {
+        Supdb::with_policy(
+            path,
+            Policy {
+                partition: false,
+                durable: false,
+                bloompieces: Some(false),
+                ..Policy::default()
+            },
+        )
+    }
+
+    /// `supdb` whose every landing that retires a table makes an empty
+    /// live one, installed or not (`Options::land_fresh_lazy` off), the
+    /// shape before. `supdb-landfresh`.
+    pub fn create_landfresh(path: &Path) -> Res<Supdb> {
+        Supdb::with_policy(
+            path,
+            Policy {
+                landfresh: Some(false),
+                ..Policy::default()
+            },
+        )
+    }
+
+    /// `supdb-ingest` as `supdb-landfresh`. `supdb-ingestlandfresh`.
+    pub fn create_ingest_landfresh(path: &Path) -> Res<Supdb> {
+        Supdb::with_policy(
+            path,
+            Policy {
+                partition: false,
+                durable: false,
+                landfresh: Some(false),
+                ..Policy::default()
+            },
+        )
+    }
+
     /// `supdb-ingest` as `supdb-directfull`. `supdb-ingestdirectfull`.
     pub fn create_ingest_directfull(path: &Path) -> Res<Supdb> {
         Supdb::with_policy(
@@ -10279,6 +10353,8 @@ impl Supdb {
             syncbeside,
             directlean,
             closereadable,
+            bloompieces,
+            landfresh,
             formsoffbuilt,
             formson,
             formsoffkept,
@@ -10822,6 +10898,8 @@ impl Supdb {
             direct_lean_append: directlean.unwrap_or(supdb::Options::default().direct_lean_append),
             close_readable_inline: closereadable
                 .unwrap_or(supdb::Options::default().close_readable_inline),
+            bloom_pieces_only: bloompieces.unwrap_or(supdb::Options::default().bloom_pieces_only),
+            land_fresh_lazy: landfresh.unwrap_or(supdb::Options::default().land_fresh_lazy),
             scan_forms_off_counts_built: formsoffbuilt
                 .unwrap_or(supdb::Options::default().scan_forms_off_counts_built),
             scan_forms_off_unreused: !formson,
@@ -11328,6 +11406,8 @@ impl Supdb {
             syncbeside,
             directlean,
             closereadable,
+            bloompieces,
+            landfresh,
             formsoffbuilt,
             formson,
             formsoffkept,
@@ -13143,6 +13223,20 @@ impl Engine for Supdb {
                 "supdb-closeseal"
             } else {
                 "supdb-ingestcloseseal"
+            };
+        }
+        if self.bloompieces == Some(false) {
+            return if self.partition {
+                "supdb-bloomalways"
+            } else {
+                "supdb-ingestbloomalways"
+            };
+        }
+        if self.landfresh == Some(false) {
+            return if self.partition {
+                "supdb-landfresh"
+            } else {
+                "supdb-ingestlandfresh"
             };
         }
         match (
@@ -15569,6 +15663,8 @@ pub fn guarantee(arm: &str) -> Option<Guarantee> {
         | "supdb-syncafter"
         | "supdb-directfull"
         | "supdb-closeseal"
+        | "supdb-bloomalways"
+        | "supdb-landfresh"
         | "supdb-jobspooled"
         | "supdb-zslabjobs"
         | "supdb-zstrideallslabjobs"
@@ -15672,6 +15768,8 @@ pub fn guarantee(arm: &str) -> Option<Guarantee> {
         | "supdb-ingestsyncafter"
         | "supdb-ingestdirectfull"
         | "supdb-ingestcloseseal"
+        | "supdb-ingestbloomalways"
+        | "supdb-ingestlandfresh"
         | "supdb-ingestsettlefar"
         | "supdb-ingesttofit"
         | "supdb-ingestprefetch1k"
@@ -17006,6 +17104,10 @@ pub fn open(arm: &str, dir: &Path, map_gb: usize) -> Res<Box<dyn Engine>> {
         "supdb-directfull" => supdb_arm(Supdb::create_directfull, dir)?,
         "supdb-closeseal" => supdb_arm(Supdb::create_closeseal, dir)?,
         "supdb-ingestcloseseal" => supdb_arm(Supdb::create_ingest_closeseal, dir)?,
+        "supdb-bloomalways" => supdb_arm(Supdb::create_bloomalways, dir)?,
+        "supdb-ingestbloomalways" => supdb_arm(Supdb::create_ingest_bloomalways, dir)?,
+        "supdb-landfresh" => supdb_arm(Supdb::create_landfresh, dir)?,
+        "supdb-ingestlandfresh" => supdb_arm(Supdb::create_ingest_landfresh, dir)?,
         "supdb-ingestdirectfull" => supdb_arm(Supdb::create_ingest_directfull, dir)?,
         "supdb-jobspooled" => supdb_arm(Supdb::create_jobspooled, dir)?,
         "supdb-zslabjobs" => supdb_arm(Supdb::create_zslabjobs, dir)?,
@@ -20699,6 +20801,55 @@ mod tests {
                             so.direct_slim_entries
                         ),
                         "{arm}"
+                    );
+                    assert_eq!(
+                        open(arm, &dir(&format!("{arm}-open")), 1).unwrap().name(),
+                        arm
+                    );
+                    assert_eq!(guarantee(arm), guarantee(s.name()), "{arm}");
+                }
+                for (z, s, arm, bloom, fresh) in [
+                    (
+                        Supdb::create_bloomalways(&dir("bloomalways")).unwrap(),
+                        &base,
+                        "supdb-bloomalways",
+                        false,
+                        true,
+                    ),
+                    (
+                        Supdb::create_ingest_bloomalways(&dir("ingestbloomalways")).unwrap(),
+                        &sib,
+                        "supdb-ingestbloomalways",
+                        false,
+                        true,
+                    ),
+                    (
+                        Supdb::create_landfresh(&dir("landfresh")).unwrap(),
+                        &base,
+                        "supdb-landfresh",
+                        true,
+                        false,
+                    ),
+                    (
+                        Supdb::create_ingest_landfresh(&dir("ingestlandfresh")).unwrap(),
+                        &sib,
+                        "supdb-ingestlandfresh",
+                        true,
+                        false,
+                    ),
+                ] {
+                    assert_eq!(z.name(), arm);
+                    assert_eq!(z.features(), s.features(), "{arm}");
+                    let o = z.db.as_ref().unwrap().options();
+                    let so = s.db.as_ref().unwrap().options();
+                    assert_eq!(
+                        (o.bloom_pieces_only, o.land_fresh_lazy),
+                        (bloom, fresh),
+                        "{arm}"
+                    );
+                    assert!(
+                        so.bloom_pieces_only && so.land_fresh_lazy,
+                        "the engine's defaults"
                     );
                     assert_eq!(
                         open(arm, &dir(&format!("{arm}-open")), 1).unwrap().name(),

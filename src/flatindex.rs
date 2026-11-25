@@ -1198,14 +1198,46 @@ impl TrailerBuf for Vec<u8> {
     }
 }
 
+/// The length of the section `stream_trailer_in` composes for `n` keys
+/// over `recs_len` bytes of records, the keys it samples into the fence
+/// coming to `fence_blob` bytes (`fence_blob_len`): the header, the
+/// records, the fence, the directory and the hash slots with the padding
+/// between them, as the composer lays them out, which holds itself to
+/// this answer. For a caller that has to know a finished segment's length
+/// before it composes the trailer (`SegmentWriter::finished_len_bound`).
+pub fn stream_section_len(n: usize, recs_len: usize, fence_blob: usize) -> Option<usize> {
+    if recs_len > MAX_RECS {
+        return None;
+    }
+    let cap = hash_cap_for(n)?;
+    let mut at = align_up(HEADER + recs_len, 4);
+    let fence_n = n.div_ceil(fence_stride(n));
+    if fence_n > 0 {
+        at = at.checked_add((fence_n + 1) * 4)?.checked_add(fence_blob)?;
+    }
+    at = align_up(align_up(at, 4).checked_add(n.checked_mul(4)?)?, 8);
+    at.checked_add(cap.checked_mul(SLOT)?)
+}
+
+/// The bytes of the keys a section of `n` keys samples into its fence,
+/// every `fence_stride(n)`th from the first, `key_len` answering a key's
+/// length by its rank: what `stream_section_len` is told of them.
+pub fn fence_blob_len(n: usize, key_len: impl Fn(usize) -> usize) -> usize {
+    let stride = fence_stride(n);
+    (0..n.div_ceil(stride)).map(|i| key_len(i * stride)).sum()
+}
+
 /// `stream_trailer` into the caller's buffer `t`, handed over empty and
 /// handed back holding the trailer: the same bytes whatever the buffer.
+///
+/// Generic over the two callbacks, so a finish's pass over its keys is one
+/// loop with the source's reads in it, not a call through a pointer a key.
 pub fn stream_trailer_in<'a, B: TrailerBuf>(
     mut t: B,
     n: usize,
     recs_len: usize,
-    key_at: &dyn Fn(usize) -> &'a [u8],
-    each: &mut dyn FnMut(usize) -> (u32, u64),
+    key_at: impl Fn(usize) -> &'a [u8],
+    mut each: impl FnMut(usize) -> (u32, u64),
     generation: u64,
     lookahead: bool,
 ) -> Option<(Vec<u8>, B, usize)> {
@@ -1228,6 +1260,7 @@ pub fn stream_trailer_in<'a, B: TrailerBuf>(
     let stride = fence_stride(n);
     let fence_n = n.div_ceil(stride);
     let fence_offs_off = at;
+    let mut fence_blob = 0usize;
     if fence_n > 0 {
         let offs_len = (fence_n + 1) * 4;
         let mut blob: Vec<u8> = Vec::new();
@@ -1240,6 +1273,7 @@ pub fn stream_trailer_in<'a, B: TrailerBuf>(
         t.extend_from_slice(&offs);
         t.extend_from_slice(&blob);
         at += offs_len + blob.len();
+        fence_blob = blob.len();
     }
     // Directory, then the hash slots, 8-aligned: both regions laid out
     // first and filled in one pass, each key's offset into its directory
@@ -1270,6 +1304,11 @@ pub fn stream_trailer_in<'a, B: TrailerBuf>(
     }
     at += cap * SLOT;
     let total = at;
+    debug_assert_eq!(
+        Some(total),
+        stream_section_len(n, recs_len, fence_blob),
+        "the section is the length `stream_section_len` says"
+    );
 
     let mut h = vec![0u8; HEADER];
     h[0..4].copy_from_slice(&MAGIC.to_ne_bytes());
@@ -2795,6 +2834,42 @@ mod fill_tests {
                 outs.push(r);
             }
             assert_eq!(outs[0], outs[1], "{n} keys");
+        }
+    }
+
+    /// `stream_section_len` is the length of the section the composer
+    /// lays out, told only the key count, the records' bytes and the
+    /// fence keys' bytes: at the counts where the fence stride, the
+    /// hash's capacity and the padding change, with keys of every
+    /// length from none to forty bytes and records that leave every
+    /// alignment.
+    #[test]
+    fn the_sections_length_is_the_composers() {
+        for n in [
+            0usize, 1, 2, 3, 15, 16, 17, 47, 48, 49, 255, 256, 257, 4097, 20_000,
+        ] {
+            for (spread, recs_pad) in [(1usize, 0usize), (41, 1), (13, 3), (7, 6)] {
+                let keys: Vec<Vec<u8>> = (0..n)
+                    .map(|i| (0..(i * 7 + n) % spread).map(|b| b as u8).collect())
+                    .collect();
+                let recs_len = n * 20 + recs_pad;
+                let (_, trailer, total) = stream_trailer(
+                    n,
+                    recs_len,
+                    &|i| &keys[i][..],
+                    &mut |i| ((i * 20) as u32, key_hash(&keys[i])),
+                    1,
+                    false,
+                )
+                .expect("a section within the limits");
+                let fence = fence_blob_len(n, |i| keys[i].len());
+                assert_eq!(
+                    stream_section_len(n, recs_len, fence),
+                    Some(total),
+                    "{n} keys over {recs_len} bytes of records, fence keys of {fence} bytes"
+                );
+                assert_eq!(total, HEADER + recs_len + trailer.len(), "{n} keys");
+            }
         }
     }
 }

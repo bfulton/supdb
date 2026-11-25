@@ -5328,6 +5328,33 @@ pub struct Options {
     /// `supdb-closeseal` and `supdb-ingestcloseseal`, the seal thread's.
     #[doc(hidden)]
     pub close_readable_inline: bool,
+    /// A seal composes the Bloom a landing's open takes only where it may
+    /// be named a piece: a seal its close can name the store's first
+    /// partition before the finish, by an upper bound on the finished
+    /// file's length (`SegmentWriter::finished_len_bound`), composes none,
+    /// since a partition's open takes no Bloom, and is named as before.
+    /// Every drain of a fresh store's load is such a seal, and its finish
+    /// had added every key to a filter the landing dropped: 56 of the
+    /// finish's 502 instructions a key at ten thousand keys, and the
+    /// durable ordered load's drain reads 1.03-1.05 ms against 1.09-1.12
+    /// for the arm in both orders. On; off, `supdb-bloomalways` and
+    /// `supdb-ingestbloomalways`, the Bloom for every seal.
+    #[doc(hidden)]
+    pub bloom_pieces_only: bool,
+    /// A landing makes the empty live table it installs only where the
+    /// table it retires is still the live one, the one branch that
+    /// installs it; a landing that retires the oldest frozen table, which
+    /// is a drain's after the writer's freeze, makes none. The table had
+    /// been made for every landing that retired one and dropped unused by
+    /// all of those, on the landing's path: its three slabs' and three
+    /// arenas' tables of blocks, a quarter megabyte zeroed and freed, 394
+    /// thousand of a drain's landing's 451 thousand instructions at ten
+    /// thousand keys, and the durable ordered load's drain reads 1.05-1.06
+    /// ms against 1.13-1.15 for the arm in both orders. On; off,
+    /// `supdb-landfresh` and `supdb-ingestlandfresh`, the table for every
+    /// landing.
+    #[doc(hidden)]
+    pub land_fresh_lazy: bool,
     /// EXPERIMENT, refuted and kept as an arm: a drain's seal copies the
     /// frozen table's chains into a snapshot for the scans over the
     /// store while the seal runs, as any seal does (`seal_snapshot`),
@@ -7696,6 +7723,8 @@ impl Default for Options {
             drain_syncs_wal: false,
             close_finish_inline: false,
             close_readable_inline: true,
+            bloom_pieces_only: true,
+            land_fresh_lazy: true,
             drain_snapshot: true,
             seal_snapshot_far: false,
             land_ranks_far: false,
@@ -11205,9 +11234,18 @@ pub(crate) trait KeySource {
     fn at(&self, i: usize) -> (&[u8], u32, u64);
 }
 
-/// A finish's walk over deferred keys: their source, and the caller's
-/// hook told each key in order as the pass takes it.
-type KeyWalk<'s, 'k> = (&'s dyn KeySource, &'k mut dyn FnMut(&[u8]));
+/// What a finish's composition of the trailer makes: the section's header,
+/// the trailer, the section's length and the Bloom where one was asked for.
+type Composed = (Vec<u8>, blocks::BigVec<u8>, usize, Option<BlockedBloom>);
+
+/// The composition a finish asks for where its writer's keys were
+/// deferred (`SegmentWriter::finish_unsynced_from`).
+type ComposeFn<'a> = dyn FnMut(&SegmentWriter) -> Result<Composed> + 'a;
+
+/// What a piece writer's finish from a key source hands back: the
+/// segment's file, the ordered index's bytes and the landing's facts where
+/// they were composed (`PieceWriter::finish_unsynced_from`).
+type PieceFinished = (File, Vec<u8>, Option<(BlockedBloom, bool)>);
 
 /// What the file of a run of ordered ingest holds up to its last good
 /// commit marker (`SegmentWriter::walk_run`): where each committed record
@@ -12673,34 +12711,133 @@ impl SegmentWriter {
         self.finish_unsynced_with(generation, None).map(|(f, _)| f)
     }
 
+    /// The buffer a finish composes its trailer in, for `n` keys whose
+    /// fence keys come to `fence` bytes: room for the whole trailer from
+    /// the start (`flatindex::stream_section_len`), a mapping where it is
+    /// large, so the composer's steps -- the fence, the directory, the hash
+    /// slots -- grow nothing. Grown a step at a time, the buffer went from
+    /// the heap to a mapping partway and copied what it held, the pages
+    /// of both first touched for one trailer.
+    fn trailer_buf(&self, n: usize, fence: usize) -> blocks::BigVec<u8> {
+        let len = flatindex::stream_section_len(n, self.recs_len, fence)
+            .map_or(0, |total| total - flatindex::HEADER - self.recs_len);
+        blocks::BigVec::with_capacity(len, blocks::Site::Trailer, self.buffers_mapped)
+    }
+
+    /// An upper bound on the file's length once the finish has run, for a
+    /// writer of inline records alone: the section the trailer completes
+    /// (`flatindex::stream_section_len`), its checksum row, and the block
+    /// table at the file's end, where the finish may put it in the head's
+    /// reserve instead. The fence's keys are `src`'s where the keys were
+    /// deferred and the writer's own copies otherwise. `None` for a writer
+    /// with value blocks, which the finish writes after the row, and for
+    /// one whose keys it cannot see. For a caller that decides by the
+    /// finished length before the finish (`Options::bloom_pieces_only`).
+    pub(crate) fn finished_len_bound(&self, src: Option<&dyn KeySource>) -> Option<u64> {
+        if self.mode != Some(Layout::RecordsFirst)
+            || self.open_key.is_some()
+            || !self.builder.is_empty()
+            || !self.blocks.is_empty()
+            || !self.pending_blocks.is_empty()
+        {
+            return None;
+        }
+        let (n, fence) = match (self.deferred, src) {
+            (Some(n), Some(s)) if s.len() == n => {
+                (n, flatindex::fence_blob_len(n, |i| s.key_at(i).len()))
+            }
+            (None, _) => {
+                let n = self.spans.len();
+                (n, flatindex::fence_blob_len(n, |i| self.spans[i].1))
+            }
+            _ => return None,
+        };
+        let key_off = self.key_start();
+        let total = flatindex::stream_section_len(n, self.recs_len, fence)?;
+        let row = flatindex::checksum_row_len(total, flatindex::PIECE_SHIFT, key_off);
+        let table = flatindex::encode_blocks(&self.blocks, &self.chunk_rows).len();
+        Some(key_off + (total + row + 8 + table) as u64)
+    }
+
     /// `finish_unsynced` for a writer whose keys were deferred
     /// (`set_deferred_keys`): `src` answers the keys in order, and the
     /// Bloom a landing would build from them is composed in the same pass
     /// that fills the hash slots, so the keys are hashed once. The record
     /// offsets the source answers are the section's -- the stream the
     /// writer was fed is the record section byte for byte.
-    pub(crate) fn finish_unsynced_from(
+    ///
+    /// `bloom` false composes none, for a segment whose open takes none.
+    /// Generic over the source and the hook, so the pass is one loop with
+    /// both in it (`compose_from`): through a pointer a key, the source's
+    /// answer and the hook were three calls a key, and the finish at ten
+    /// thousand keys took 335 instructions a key where it takes 297 with
+    /// this, its trailer's buffer made whole (`trailer_buf`) and the
+    /// ordered index's push inlined.
+    pub(crate) fn finish_unsynced_from<S: KeySource + ?Sized>(
         self,
         generation: u64,
-        src: &dyn KeySource,
-        on_key: &mut dyn FnMut(&[u8]),
-    ) -> Result<(File, BlockedBloom)> {
-        let (file, bloom) = self.finish_unsynced_with(generation, Some((src, on_key)))?;
-        Ok((
-            file,
-            bloom.expect("a finish from a source composes the Bloom"),
-        ))
+        src: &S,
+        on_key: &mut impl FnMut(&[u8]),
+        bloom: bool,
+    ) -> Result<(File, Option<BlockedBloom>)> {
+        let mut compose = |w: &SegmentWriter| w.compose_from(src, on_key, generation, bloom);
+        let (file, made) = self.finish_unsynced_with(generation, Some(&mut compose))?;
+        debug_assert_eq!(made.is_some(), bloom, "a Bloom where one was asked for");
+        Ok((file, made))
     }
 
+    /// The trailer of a writer whose keys were deferred, composed from
+    /// `src` in one pass: each key read once for its offset and hash, the
+    /// Bloom where `want_bloom` asks for one and `on_key` told of the key
+    /// as it goes. The header, the trailer, the section's length and the
+    /// Bloom.
+    fn compose_from<S: KeySource + ?Sized>(
+        &self,
+        src: &S,
+        on_key: &mut impl FnMut(&[u8]),
+        generation: u64,
+        want_bloom: bool,
+    ) -> Result<Composed> {
+        let n = src.len();
+        if self.deferred != Some(n) {
+            return Err(err(
+                "segment writer: the key source holds a different count of keys than were written",
+            ));
+        }
+        let mut b =
+            want_bloom.then(|| BloomFill::new(BlockedBloom::with_capacity(n), self.lookahead));
+        let fence = flatindex::fence_blob_len(n, |i| src.key_at(i).len());
+        let (header, trailer, total) = flatindex::stream_trailer_in(
+            self.trailer_buf(n, fence),
+            n,
+            self.recs_len,
+            |i| src.key_at(i),
+            |i| {
+                let (key, off, h) = src.at(i);
+                if let Some(b) = b.as_mut() {
+                    b.add(h);
+                }
+                on_key(key);
+                (off, h)
+            },
+            generation,
+            self.lookahead,
+        )
+        .ok_or_else(|| err("segment writer: key section exceeds the flat index's limits"))?;
+        Ok((header, trailer, total, b.map(BloomFill::finish)))
+    }
+
+    /// The finish, with `compose` making the trailer of a writer whose
+    /// keys were deferred and the writer's own copies making it otherwise.
     fn finish_unsynced_with(
         mut self,
         generation: u64,
-        src: Option<KeyWalk<'_, '_>>,
+        compose: Option<&mut ComposeFn<'_>>,
     ) -> Result<(File, Option<BlockedBloom>)> {
         if self.open_key.is_some() {
             return Err(err("segment writer: finish with a key still open"));
         }
-        if src.is_none() && self.deferred.is_some() {
+        if compose.is_none() && self.deferred.is_some() {
             return Err(err(
                 "segment writer: deferred keys need their source at the finish",
             ));
@@ -12726,35 +12863,11 @@ impl SegmentWriter {
             Layout::RecordsFirst => {
                 let key_off = self.key_start();
                 let limits = || err("segment writer: key section exceeds the flat index's limits");
-                let (header, trailer, total) = match src {
-                    Some((src, on_key)) => {
-                        let n = src.len();
-                        if self.deferred != Some(n) {
-                            return Err(err(
-                                "segment writer: the key source holds a different count of keys than were written",
-                            ));
-                        }
-                        // One pass over the source: each key read once
-                        // for its offset and hash, the Bloom and the
-                        // caller's own composition told of it as it goes.
-                        let mut b = BloomFill::new(BlockedBloom::with_capacity(n), self.lookahead);
-                        let r = flatindex::stream_trailer_in(
-                            blocks::BigVec::new(blocks::Site::Trailer, self.buffers_mapped),
-                            n,
-                            self.recs_len,
-                            &|i| src.key_at(i),
-                            &mut |i| {
-                                let (key, off, h) = src.at(i);
-                                b.add(h);
-                                on_key(key);
-                                (off, h)
-                            },
-                            generation,
-                            self.lookahead,
-                        )
-                        .ok_or_else(limits)?;
-                        bloom = Some(b.finish());
-                        r
+                let (header, trailer, total) = match compose {
+                    Some(compose) => {
+                        let (header, trailer, total, made) = compose(&self)?;
+                        bloom = made;
+                        (header, trailer, total)
                     }
                     None => {
                         let arena = &self.key_arena;
@@ -12764,12 +12877,13 @@ impl SegmentWriter {
                             let (s, l) = spans[i];
                             &arena[s..s + l]
                         };
+                        let fence = flatindex::fence_blob_len(spans.len(), |i| spans[i].1);
                         flatindex::stream_trailer_in(
-                            blocks::BigVec::new(blocks::Site::Trailer, self.buffers_mapped),
+                            self.trailer_buf(spans.len(), fence),
                             spans.len(),
                             self.recs_len,
-                            &key_at,
-                            &mut |i| (rec_offs[i], hashes[i]),
+                            key_at,
+                            |i| (rec_offs[i], hashes[i]),
                             generation,
                             self.lookahead,
                         )
@@ -13400,11 +13514,13 @@ impl PieceWriter {
     /// `finish_unsynced` for deferred keys (`set_deferred_keys`): the
     /// segment's file, the ordered index composed from `src`'s keys, and
     /// the landing's facts -- the Bloom the finish composed in its pass
-    /// over the keys, and the tombstone flag.
-    fn finish_unsynced_from(
+    /// over the keys, and the tombstone flag -- where `bloom` asks for
+    /// them, for a segment whose open takes a Bloom.
+    fn finish_unsynced_from<S: KeySource + ?Sized>(
         self,
-        src: &dyn KeySource,
-    ) -> Result<(File, Vec<u8>, (BlockedBloom, bool))> {
+        src: &S,
+        bloom: bool,
+    ) -> Result<PieceFinished> {
         debug_assert!(self.3, "a finish from a source is for deferred keys");
         let tombs = self.2;
         let n = src.len();
@@ -13415,8 +13531,14 @@ impl PieceWriter {
         } else {
             crate::ordindex::Composer::new(n, src.key_at(0), src.key_at(n - 1))
         };
-        let (file, bloom) = (*self.0).finish_unsynced_from(1, src, &mut |k| ord.push(k))?;
-        Ok((file, ord.finish(), (bloom, tombs)))
+        let (file, made) = (*self.0).finish_unsynced_from(1, src, &mut |k| ord.push(k), bloom)?;
+        Ok((file, ord.finish(), made.map(|b| (b, tombs))))
+    }
+
+    /// `SegmentWriter::finished_len_bound`, the fence's keys from `src`
+    /// where the keys were deferred.
+    fn finished_len_bound(&self, src: Option<&dyn KeySource>) -> Option<u64> {
+        self.0.finished_len_bound(src)
     }
 }
 
@@ -16754,6 +16876,39 @@ impl MemTable {
         self.stream_rec_off_of(i, self.entry(i))
     }
 
+    /// `stream` only: entry `i`'s key and where its record starts, what a
+    /// finish's pass asks of every key (`StreamKeys`). A slim word that is
+    /// no fat entry's (`Options::direct_slim_entries`) holds both, the
+    /// record's offset and the key's length, the key being at
+    /// `RECORD_KEY_AT` in its record, so they are read off the word: the
+    /// entry's view decoded the value's head and its place in the record
+    /// as well, for a pass that reads neither: the source's answer for a
+    /// key, its hash among it, took 204 instructions and takes 140. Every
+    /// other entry goes the view's way.
+    #[inline]
+    fn stream_key_rec(&self, i: usize) -> (&[u8], usize) {
+        debug_assert!(self.stream);
+        if self.slim_entries && self.keys_in_stream {
+            let w = *self.slim.get(i);
+            if w & SLIM_FAT == 0 {
+                let rec = (w >> SLIM_REC_SHIFT) as usize;
+                let klen = ((w >> SLIM_KLEN_SHIFT) & 0xffff) as usize;
+                let key = self.stream_bytes(rec + flatindex::RECORD_KEY_AT, klen);
+                #[cfg(debug_assertions)]
+                {
+                    let e = self.entry(i);
+                    debug_assert!(
+                        key == self.key_of(e) && rec == self.stream_rec_off_of(i, e),
+                        "a slim word's key and record are its entry's"
+                    );
+                }
+                return (key, rec);
+            }
+        }
+        let e = self.entry(i);
+        (self.key_of(e), self.stream_rec_off_of(i, e))
+    }
+
     /// `stream_rec_off` with entry `i` in hand.
     fn stream_rec_off_of(&self, i: usize, e: Entry<'_>) -> usize {
         debug_assert!(self.stream);
@@ -17357,10 +17512,8 @@ impl KeySource for StreamKeys<'_> {
     }
 
     fn at(&self, i: usize) -> (&[u8], u32, u64) {
-        let e = self.0.entry(i);
-        let key = self.0.key_of(e);
-        let off = u32::try_from(self.0.stream_rec_off_of(i, e))
-            .expect("a record section the flat index addresses");
+        let (key, rec) = self.0.stream_key_rec(i);
+        let off = u32::try_from(rec).expect("a record section the flat index addresses");
         (key, off, flatindex::key_hash(key))
     }
 }
@@ -19539,9 +19692,11 @@ struct DrainSteps {
 }
 
 /// What a direct run's finish hands the rest of its close: whether the
-/// run holds a tombstone, the segment's file, the ordered index's bytes
-/// and the landing's facts where the finish took them.
-type DirectFinished = (bool, File, Vec<u8>, Option<(BlockedBloom, bool)>);
+/// run holds a tombstone, whether the close named it the store's first
+/// partition before the finish (`Options::bloom_pieces_only`), the
+/// segment's file, the ordered index's bytes and the landing's facts
+/// where the finish took them.
+type DirectFinished = (bool, bool, File, Vec<u8>, Option<(BlockedBloom, bool)>);
 
 const DRAIN_STEP_NAMES: [&str; 19] = [
     "flush",
@@ -19661,6 +19816,12 @@ struct SealCounts {
     /// Drains whose direct run closed on the writer up to its readable
     /// signal (`Options::close_readable_inline`).
     closes_inline: AtomicU64,
+    /// Seals named the store's first partition before their finish,
+    /// which composed no Bloom (`Options::bloom_pieces_only`).
+    blooms_left: AtomicU64,
+    /// Empty live tables a landing made, for the table it retired where
+    /// that one was still live (`Options::land_fresh_lazy`).
+    landing_tables: AtomicU64,
     /// The directory fsyncs such a drain's readable landing left to the
     /// seal's durable landing, paid there ahead of the slot.
     dir_owed_syncs: AtomicU64,
@@ -19707,6 +19868,8 @@ impl SealCounts {
             drains_early: get(&self.drains_early),
             drains_beside: get(&self.drains_beside),
             closes_inline: get(&self.closes_inline),
+            blooms_left: get(&self.blooms_left),
+            landing_tables: get(&self.landing_tables),
             dir_owed_syncs: get(&self.dir_owed_syncs),
             wal_rotations: get(&self.wal_rotations),
             rotated_unsynced: get(&self.rotated_unsynced),
@@ -19773,6 +19936,12 @@ pub struct SealWaits {
     /// Drains whose direct run closed on the writer up to its readable
     /// signal (`Options::close_readable_inline`).
     pub closes_inline: u64,
+    /// Seals named the store's first partition before their finish,
+    /// which composed no Bloom (`Options::bloom_pieces_only`).
+    pub blooms_left: u64,
+    /// Empty live tables a landing made, for the table it retired
+    /// (`Options::land_fresh_lazy`).
+    pub landing_tables: u64,
     /// The directory fsyncs their readable landings left owed, paid at
     /// the durable landing.
     pub dir_owed_syncs: u64,
@@ -38959,7 +39128,9 @@ impl Db {
             None => Db::seg_name(id, sealed),
         };
         let w = PieceWriter::resume_run(tmp, &Db::segment_opts(opts), run, run_start)?;
-        let (seg, ord, fact) = w.finish_unsynced_from(run)?;
+        // A piece, whose open takes the Bloom the finish composes.
+        let (seg, ord, fact) = w.finish_unsynced_from(run, true)?;
+        let fact = fact.expect("a Bloom asked for");
         seg.sync_all()?;
         drop(seg);
         write_ord(dir, &name, &ord, true)?;
@@ -39789,6 +39960,21 @@ impl Db {
             .then(|| w.file_clone().ok())
             .flatten();
         let limit = self.partition_limit();
+        // A seal the close can name the store's first partition before
+        // its finish, by an upper bound on the finished file's length,
+        // composes no Bloom: a partition's open takes none
+        // (`Options::bloom_pieces_only`). Any other is named after the
+        // finish as before, with its Bloom.
+        // The bound is taken in every checked build as well, and the
+        // finished file held to it.
+        let bloom_pieces_only = self.opts.bloom_pieces_only;
+        let partition_ahead = move |w: &PieceWriter, src: Option<&dyn KeySource>, tombs: bool| {
+            let wanted = bloom_pieces_only && first_partition && !tombs;
+            let bound = (wanted || cfg!(debug_assertions))
+                .then(|| w.finished_len_bound(src))
+                .flatten();
+            (wanted && bound.is_some_and(|b| b <= limit), bound)
+        };
         let (id, seq) = (d.id, end_seq);
         let retiring = tmp.clone();
         let shared = self.shared.clone();
@@ -39833,11 +40019,26 @@ impl Db {
                 seal_hold_wait(&shared, SEAL_HOLD_LANDING);
                 shared.drain_steps.stamp(2);
                 let tombs = w.tombs();
+                let src = StreamKeys(&keys);
+                let (ahead, bound) = partition_ahead(&w, Some(&src as &dyn KeySource), tombs);
                 let (seg, ord, fact) = w
-                    .finish_unsynced_from(&StreamKeys(&keys))
+                    .finish_unsynced_from(&src, !ahead)
                     .map_err(|e| err(&format!("direct finish: {e}")))?;
                 shared.drain_steps.stamp(3);
-                let name = if first_partition && !tombs && std::fs::metadata(&tmp)?.len() <= limit {
+                debug_assert!(
+                    bound.is_none_or(|b| std::fs::metadata(&tmp).is_ok_and(|m| m.len() <= b)),
+                    "a finished file within its bound"
+                );
+                if ahead {
+                    SealCounts::add(&shared.seal_counts.blooms_left, 1);
+                }
+                let name = if ahead
+                    || (first_partition && !tombs && std::fs::metadata(&tmp)?.len() <= limit)
+                {
+                    debug_assert!(
+                        !ahead || std::fs::metadata(&tmp).is_ok_and(|m| m.len() <= limit),
+                        "a seal named ahead is within the partition's limit"
+                    );
                     Db::first_partition_name(id, seq)
                 } else {
                     name
@@ -39847,7 +40048,7 @@ impl Db {
                 std::fs::hard_link(&tmp, dir.join(&name))?;
                 shared.drain_steps.stamp(5);
                 let names = vec![name];
-                let _ = readable.facts.set(vec![Some(fact)]);
+                let _ = readable.facts.set(vec![fact]);
                 let _ = readable.names.set(names.clone());
                 if let Some(t) = &readable.wake {
                     t.unpark();
@@ -39871,20 +40072,28 @@ impl Db {
             move |w: PieceWriter, keys: &MemTable| {
                 shared.drain_steps.stamp(2);
                 let tombs = w.tombs();
+                let src = StreamKeys(keys);
+                let (ahead, bound) =
+                    partition_ahead(&w, w.3.then_some(&src as &dyn KeySource), tombs);
                 let (seg, ord, fact) = if w.3 {
-                    let (seg, ord, fact) = w
-                        .finish_unsynced_from(&StreamKeys(keys))
-                        .map_err(|e| err(&format!("direct finish: {e}")))?;
-                    (seg, ord, Some(fact))
+                    w.finish_unsynced_from(&src, !ahead)
+                        .map_err(|e| err(&format!("direct finish: {e}")))?
                 } else {
-                    let fact = w.landing_facts();
+                    let fact = if ahead { None } else { w.landing_facts() };
                     let (seg, ord) = w
                         .finish_unsynced()
                         .map_err(|e| err(&format!("direct finish: {e}")))?;
                     (seg, ord, fact)
                 };
                 shared.drain_steps.stamp(3);
-                Ok::<_, std::io::Error>((tombs, seg, ord, fact))
+                debug_assert!(
+                    bound.is_none_or(|b| seg.metadata().is_ok_and(|m| m.len() <= b)),
+                    "a finished file within its bound"
+                );
+                if ahead {
+                    SealCounts::add(&shared.seal_counts.blooms_left, 1);
+                }
+                Ok::<_, std::io::Error>((tombs, ahead, seg, ord, fact))
             }
         };
         // The rest, on the seal thread: the ordered index, the link, the
@@ -39896,8 +40105,14 @@ impl Db {
                   done: Result<DirectFinished>,
                   presynced: Option<std::thread::JoinHandle<std::io::Result<()>>>|
                   -> Result<Vec<String>> {
-                let (tombs, seg, ord, fact) = done?;
-                let name = if first_partition && !tombs && std::fs::metadata(&tmp)?.len() <= limit {
+                let (tombs, ahead, seg, ord, fact) = done?;
+                let name = if ahead
+                    || (first_partition && !tombs && std::fs::metadata(&tmp)?.len() <= limit)
+                {
+                    debug_assert!(
+                        !ahead || std::fs::metadata(&tmp).is_ok_and(|m| m.len() <= limit),
+                        "a seal named ahead is within the partition's limit"
+                    );
                     Db::first_partition_name(id, seq)
                 } else {
                     name
@@ -40191,6 +40406,7 @@ impl Db {
             near || self.opts.seal_snapshot_far
         };
         let put_one = self.opts.seal_put_one;
+        let bloom_pieces_only = self.opts.bloom_pieces_only;
         // As the seal's writer has them (`Shared::job_buffers`, above).
         let jobs_mapped = opts.maps();
         let job = move |readable: &SealReadable| -> Result<Vec<String>> {
@@ -40365,10 +40581,12 @@ impl Db {
                 let id = first_id + ri as u64;
                 let tmp = dir.join(format!("seal-{id:08}.tmp"));
                 let _ = std::fs::remove_file(&tmp);
+                let whole = ranges.len() == 1 && lo.is_empty() && hi.is_none();
                 let ord;
                 let seg;
                 let tombs;
                 let fact;
+                let ahead;
                 {
                     let mut w = PieceWriter::create(&tmp, &opts, sync_every, inline_max)
                         .map_err(|e| err(&format!("seal create: {e}")))?;
@@ -40446,18 +40664,38 @@ impl Db {
                     }
                     SealCounts::add(&counts.seal_records_ns, t_recs.elapsed().as_nanos() as u64);
                     tombs = w.tombs();
-                    fact = w.landing_facts();
+                    // Named the store's first partition before the finish,
+                    // by an upper bound on the finished file's length, a
+                    // seal composes no Bloom, which a partition's open
+                    // takes none of (`Options::bloom_pieces_only`).
+                    let wanted = bloom_pieces_only && whole && first_partition && !tombs;
+                    let bound = (wanted || cfg!(debug_assertions))
+                        .then(|| w.finished_len_bound(None))
+                        .flatten();
+                    ahead = wanted && bound.is_some_and(|b| b <= limit);
+                    fact = if ahead { None } else { w.landing_facts() };
+                    if ahead {
+                        SealCounts::add(&counts.blooms_left, 1);
+                    }
                     (seg, ord) = w
                         .finish_unsynced()
                         .map_err(|e| err(&format!("seal finish: {e}")))?;
+                    debug_assert!(
+                        bound.is_none_or(|b| seg.metadata().is_ok_and(|m| m.len() <= b)),
+                        "a finished file within its bound"
+                    );
                 }
                 shared.drain_steps.stamp(3);
-                let whole = ranges.len() == 1 && lo.is_empty() && hi.is_none();
-                let name = if whole
-                    && first_partition
-                    && !tombs
-                    && std::fs::metadata(&tmp)?.len() <= limit
+                let name = if ahead
+                    || (whole
+                        && first_partition
+                        && !tombs
+                        && std::fs::metadata(&tmp)?.len() <= limit)
                 {
+                    debug_assert!(
+                        !ahead || std::fs::metadata(&tmp).is_ok_and(|m| m.len() <= limit),
+                        "a seal named ahead is within the partition's limit"
+                    );
                     Db::first_partition_name(id, end_seq)
                 } else if whole {
                     Db::seg_name(id, end_seq)
@@ -51272,12 +51510,18 @@ impl Maint {
         let l0_aligned = sort_segs(&mut segs);
         let (parts, piece_runs) = State::placing(&segs, l0_aligned);
         // One fresh table for every attempt: a landing that lost the swap
-        // installs the same empty table on its retry.
-        let fresh = landed.map(|_| {
-            std::sync::Arc::new(MemTable::new(
-                self.opts.block_shape(&self.shared.block_pool),
-            ))
-        });
+        // installs the same empty table on its retry. Made where an attempt
+        // finds the table it retires still live, the one branch that
+        // installs it (`Options::land_fresh_lazy`): a landing that retires
+        // the oldest frozen table installs none, and the table made for it
+        // anyway was built and dropped on the landing's path, which is a
+        // drain's.
+        let shape = self.opts.block_shape(&self.shared.block_pool);
+        let mut fresh: Option<std::sync::Arc<MemTable>> = None;
+        if landed.is_some() && !self.opts.land_fresh_lazy {
+            fresh = Some(std::sync::Arc::new(MemTable::new(shape.clone())));
+            SealCounts::add(&self.shared.seal_counts.landing_tables, 1);
+        }
         debug_assert!(
             Self::partitions_tile(&segs),
             "a segment publish left partitions that do not tile the key space: {:?}",
@@ -51323,10 +51567,11 @@ impl Maint {
                     );
                     swapped_live = true;
                     retired_table = true;
-                    (
-                        fresh.clone().expect("made for a landing"),
-                        cur.frozen.clone(),
-                    )
+                    let made = fresh.get_or_insert_with(|| {
+                        SealCounts::add(&self.shared.seal_counts.landing_tables, 1);
+                        std::sync::Arc::new(MemTable::new(shape.clone()))
+                    });
+                    (made.clone(), cur.frozen.clone())
                 }
                 Some(t)
                     if cur

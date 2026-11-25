@@ -17368,16 +17368,22 @@ fn tail_readers(
 /// once mid-load, leaving a tail live beside a seal in flight or a
 /// partition: the shape a durable-only `sync` used to leave for good.
 fn load_ordered_with_tail(d: &std::path::Path, n: u32) -> Db {
-    let mut db = Db::create(
-        d,
-        Options {
-            adaptive_shape: true,
-            seal_bytes: 1 << 20,
-            partition_bytes: Some(8 << 20),
-            ..common::options()
-        },
-    )
-    .unwrap();
+    load_ordered_with_tail_opts(d, n, load_ordered_with_tail_options())
+}
+
+/// The options `load_ordered_with_tail` opens its store with.
+fn load_ordered_with_tail_options() -> Options {
+    Options {
+        adaptive_shape: true,
+        seal_bytes: 1 << 20,
+        partition_bytes: Some(8 << 20),
+        ..common::options()
+    }
+}
+
+/// `load_ordered_with_tail` with the store opened under `opts`.
+fn load_ordered_with_tail_opts(d: &std::path::Path, n: u32, opts: Options) -> Db {
+    let mut db = Db::create(d, opts).unwrap();
     for i in 0..n {
         db.append(&tail_key(i), &tail_val(1));
         if i % 500 == 499 {
@@ -20387,6 +20393,198 @@ fn a_synced_runs_drain_closes_on_the_writer_and_defers_its_directory_sync() {
         drop(db);
         let db = Db::open(&d, opts).unwrap();
         drain_check(&db, &keys, &format!("{name}, reopened"));
+    }
+}
+
+/// A seal its close can name the store's first partition before the
+/// finish composes no Bloom (`Options::bloom_pieces_only`): a fresh
+/// store's drain, ordered and shuffled, closed on the writer, on the seal
+/// thread, from the writer's key copies, and sealed from a hashed table.
+/// A seal that may be a piece composes it -- one over a partition limit
+/// its finished file passes, and a hashed table's with a tombstone in it
+/// -- and so does every seal with the option off. Every key reads back
+/// through a handle and after a reopen, and each finished file is held to
+/// its bound in a checked build.
+#[test]
+fn a_seal_named_the_first_partition_ahead_composes_no_bloom() {
+    for ordered in [true, false] {
+        let keys = drain_keys(ordered, 3000);
+        for (case, opts, left) in [
+            ("writer", common::options(), 1),
+            (
+                "seal-thread",
+                Options {
+                    close_readable_inline: false,
+                    ..common::options()
+                },
+                1,
+            ),
+            (
+                "key-copies",
+                Options {
+                    direct_derive_keys: false,
+                    ..common::options()
+                },
+                1,
+            ),
+            (
+                "off",
+                Options {
+                    bloom_pieces_only: false,
+                    ..common::options()
+                },
+                0,
+            ),
+            (
+                "over-limit",
+                Options {
+                    partition_bytes: Some(64 << 10),
+                    ..common::options()
+                },
+                0,
+            ),
+        ] {
+            let d = dir(&format!("bloomahead-{case}-{ordered}"));
+            let mut db = Db::create(&d, opts.clone()).unwrap();
+            drain_load(&mut db, &keys);
+            db.flush().unwrap();
+            db.settle().unwrap();
+            let w = db.seal_waits();
+            assert_eq!(w.blooms_left, left, "{case}, ordered {ordered}: {w:?}");
+            let r = db.reader().unwrap();
+            drain_check(&r, &keys, case);
+            drop(r);
+            drop(db);
+            let db = Db::open(&d, opts).unwrap();
+            drain_check(&db, &keys, &format!("{case}, reopened"));
+        }
+        // The bound held to the finished length a byte at a time: the same
+        // keys finish to the same file, so under a limit a byte short of it
+        // the seal may be a piece and composes its Bloom, and under one a
+        // page past it the bound names the partition ahead.
+        let len = {
+            let d = dir(&format!("bloomahead-len-{ordered}"));
+            let mut db = Db::create(&d, common::options()).unwrap();
+            drain_load(&mut db, &keys);
+            db.flush().unwrap();
+            db.settle().unwrap();
+            let parts: Vec<u64> = std::fs::read_dir(&d)
+                .unwrap()
+                .flatten()
+                .filter(|e| e.file_name().to_string_lossy().starts_with("par-"))
+                .map(|e| e.metadata().unwrap().len())
+                .collect();
+            assert_eq!(parts.len(), 1, "one partition");
+            parts[0]
+        };
+        for (limit, left) in [(len - 1, 0u64), (len + 4096, 1)] {
+            let d = dir(&format!("bloomahead-at-{limit}-{ordered}"));
+            let opts = Options {
+                partition_bytes: Some(limit as usize),
+                ..common::options()
+            };
+            let mut db = Db::create(&d, opts).unwrap();
+            drain_load(&mut db, &keys);
+            db.flush().unwrap();
+            db.settle().unwrap();
+            assert_eq!(
+                db.seal_waits().blooms_left,
+                left,
+                "ordered {ordered}, a file of {len} bytes under a limit of {limit}"
+            );
+            drain_check(&db, &keys, "at the limit");
+        }
+    }
+    // A tombstone in a hashed table's seal: no partition, the Bloom made.
+    let keys = drain_keys(false, 3000);
+    let d = dir("bloomahead-tomb");
+    let opts = common::options();
+    let mut db = Db::create(&d, opts.clone()).unwrap();
+    drain_load(&mut db, &keys);
+    db.delete(&keys[7]);
+    db.commit().unwrap();
+    db.flush().unwrap();
+    db.settle().unwrap();
+    assert_eq!(db.seal_waits().blooms_left, 0, "{:?}", db.seal_waits());
+    let r = db.reader().unwrap();
+    assert!(read_vec(&r, &keys[7]).is_empty(), "the deleted key");
+    drain_check(&r, &keys[8..], "after the delete");
+    drop(r);
+    drop(db);
+    let db = Db::open(&d, opts).unwrap();
+    assert!(
+        read_vec(&db, &keys[7]).is_empty(),
+        "the deleted key, reopened"
+    );
+    drain_check(&db, &keys[8..], "after the delete, reopened");
+}
+
+/// A landing makes an empty live table only for a table it retires that
+/// is still the live one (`Options::land_fresh_lazy`): a drain, whose
+/// writer froze its table, makes none, and a `sync` that hands the live
+/// table and lands before the writer writes again makes the one it
+/// installs; with the option off every landing that retires a table
+/// makes one. The writes after read back either way.
+#[test]
+fn a_landing_makes_a_fresh_table_only_where_it_installs_one() {
+    for (lazy, drained) in [(true, 0u64), (false, 1)] {
+        let keys = drain_keys(true, 3000);
+        let d = dir(&format!("landfresh-drain-{lazy}"));
+        let opts = Options {
+            land_fresh_lazy: lazy,
+            ..common::options()
+        };
+        let mut db = Db::create(&d, opts).unwrap();
+        drain_load(&mut db, &keys);
+        db.flush().unwrap();
+        db.settle().unwrap();
+        assert_eq!(
+            db.seal_waits().landing_tables,
+            drained,
+            "lazy {lazy}: {:?}",
+            db.seal_waits()
+        );
+        drain_check(&db, &keys, "after the drain");
+    }
+    for lazy in [true, false] {
+        let d = dir(&format!("landfresh-handed-{lazy}"));
+        let n = 14_000u32;
+        let mut db = load_ordered_with_tail_opts(
+            &d,
+            n,
+            Options {
+                land_fresh_lazy: lazy,
+                ..load_ordered_with_tail_options()
+            },
+        );
+        // The run's mid-load seal landed first, so the count read here is
+        // every landing's but the sync's.
+        wait_for("the mid-load seal's landing", || !db.in_flight().0);
+        let before = db.seal_waits().landing_tables;
+        db.sync().unwrap();
+        let t = std::time::Instant::now();
+        while db.unsealed_keys() > 0 {
+            assert!(
+                t.elapsed() < std::time::Duration::from_secs(20),
+                "the tail did not land"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        assert_eq!(db.tail_swaps(), (0, 1), "the landing replaced the table");
+        assert_eq!(
+            db.seal_waits().landing_tables - before,
+            1,
+            "lazy {lazy}: the table it installed"
+        );
+        for k in (0..n).step_by(7) {
+            db.put(&tail_key(k), &tail_val(2));
+        }
+        db.commit().unwrap();
+        let r = db.reader().unwrap();
+        for k in 0..n {
+            let want = if k % 7 == 0 { 2 } else { 1 };
+            assert_eq!(read_vec(&r, &tail_key(k)), vec![tail_val(want)], "key {k}");
+        }
     }
 }
 

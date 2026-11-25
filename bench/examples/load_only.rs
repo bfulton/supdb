@@ -2,7 +2,8 @@
 //! through `Batch` flushes of a thousand, ending in the `sync` the suite's
 //! load ends in, on one arm; `reps` stores in turn. Prints ops/s a store.
 //! With `shuffled` the keys come in the shuffled load's order instead, the
-//! suite's permutation and seed (`run::shuffled_load`).
+//! suite's permutation and seed (`run::shuffled_load`). `LOAD_TRIM=1`
+//! trims the allocator after each store, as the suite does.
 //!
 //!     load_only <arm> <size> <reps> [shuffled]
 use std::time::Instant;
@@ -86,5 +87,16 @@ fn main() {
         );
         drop(e);
         let _ = std::fs::remove_dir_all(&dir);
+        // `LOAD_TRIM=1`: the allocator trimmed after each store, as the
+        // suite trims after every store it drops (`run::release_freed_memory`),
+        // so a store meets the fresh pages the suite's stores meet.
+        if std::env::var_os("LOAD_TRIM").is_some() {
+            #[cfg(all(target_os = "linux", target_env = "gnu"))]
+            // SAFETY: plain integers in and out; returning free pages is
+            // what it is for.
+            unsafe {
+                libc::malloc_trim(0);
+            }
+        }
     }
 }

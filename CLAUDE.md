@@ -7044,6 +7044,31 @@ started it, or the hand-off moves to the next step; and where two events
 race to a decision, the one decided first is told what the later one
 would have said.
 
+**Work made ahead of the branch that used it.** The landing that retires
+a table made the empty live table an install would need before it asked
+whether the retired table was the live one, and a drain's is the oldest
+frozen one, the writer having frozen it: every drain's landing zeroed a
+quarter megabyte of slab and arena tables and freed them unused, 394
+thousand of its 451 thousand instructions at ten thousand keys
+(`Options::land_fresh_lazy`). The finish composed a Bloom for every seal
+before the seal had a name, and a partition's open takes none: 56 of the
+finish's 502 instructions a key, for a filter the landing dropped; the
+name is decided ahead of the finish now where an upper bound on the
+finished file's length settles it (`Options::bloom_pieces_only`,
+`SegmentWriter::finished_len_bound`). And the ordered index's head copied
+the key's bytes past the prefix by a length known only at run time, a
+call into `memcpy` a key, for the suite's sixteen digits whose head is
+their last eight bytes shifted. With these, a key source read off the
+slim word and a pass made generic over its source, the finish took 297
+instructions a key where it took 502, and the durable ordered load's
+drain read 0.88 ms under the harness where it read 1.14-1.17. The
+rules: work one branch of a decision needs is done in that branch, since
+work done ahead of the decision is paid by every branch; a decision taken
+after the work it governs moves ahead of the work wherever a bound can
+take it, the bound held to the finished result in every checked build;
+and a copy of a length the compiler cannot see is a call, so the common
+length gets a load of its own.
+
 ## Open targets, and the one standing limitation
 
 A cell a comparator wins is a target, never a limit to be written down
