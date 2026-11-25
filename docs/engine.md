@@ -1027,10 +1027,21 @@ same either way, one value over a tombstone. The write is still logged:
 the scan snapshot's copy of a key's run (`Options::snapshot_runs`) is
 read again only where the log says the key was written since, and a test
 that drops the entry reads the copy after an overwrite over a store of
-partitions. The bytes change under nobody but the writer, so the option
-refuses a reader handle, the block cache with its upkeep thread, and the
-keepers; the seal thread reads frozen tables and handed ones, which the
-writer writes nothing into.
+partitions. The bytes change under nobody but the writer. A put
+overwrites only while no handle the caller made is live: a handle is made
+by the writer or by a live handle, so a count of none means none exists
+and none can appear before the put returns, and the count's decrement at a
+drop is a release the put's load acquires. A handle is claimed only with
+nothing staged, since a staged put may have overwritten a committed
+value, so what it reads was committed and stays as it read it, under
+`Latest` and `Snapshot` alike. The option refuses the engine's threads
+that read a live table's values beside the writer -- the block cache with
+its upkeep thread, and the keepers -- and the seal thread reads frozen
+tables and handed ones, which the writer writes nothing into. The store
+test holds each: no overwrite while a handle lives, on the writer's thread
+or another, a claim refused with a put staged, and, with the count ignored
+and its assertions taken out, a handle on another thread reads a value
+torn between two of the writer's puts.
 
 Counted under callgrind (`point_ops ARM 100000 1 zipf-plain 1`, toggled
 on `phase_updates` and `phase_half`, at `d83c220`), an update is 444.0
@@ -1087,6 +1098,40 @@ C 1.12x, D 1.02x, the scrambled A and B 1.09x and 1.01x, and the loads
 with pieces standing -- the scrambled mixes' gets 4-14% faster than ours
 in both sittings -- and F's writes, 7.3 µs a commit of a hundred
 read-modify-writes against our 8.7.
+
+With the handles beside it the arm runs every pass FASTER has, and
+beside FASTER over all of them (`pair.sh supdb-heldinplace faster 300000
+--reps 6 --passes load,read,read-threaded,mixes,mixes-scrambled,lag`, at
+`77ae295`; ours over FASTER's, the two sittings) the read pass read 1.22x and 1.13x, on two threads 1.35x and
+1.15x and on three 1.47x and 1.12x, and the update bursts at one, ten and
+a hundred percent of the store 2.55x and 2.61x, 2.09x and 2.05x, 1.44x
+and 1.79x. The threaded writers' mixes were in every row and in no
+pairing: `bench ab` paired a list of each pass's quantities that left
+them out (`OnePass::flat`), and a test now holds the list to the row's
+(`a_pairing_carries_every_quantity_a_row_carries`). Paired, they are
+FASTER's (`pair.sh supdb-heldinplace faster 300000 --reps 6 --passes
+load,mixes-threaded`, at `77ae295`; FASTER's over ours): A 0.85x and 0.82x
+on one thread, 1.39x and 1.38x on two, 2.21x and 2.36x on three; RMW
+2.59x and 2.52x, 3.31x and 3.11x, 5.17x and 4.78x; the uniform A
+1.15-1.19x, 1.58-1.70x and 2.40-2.64x and the uniform RMW 2.75x, 3.5-3.6x
+and 5.5-5.7x.
+FASTER's writers scale with its threads, and the store's one writer is
+lent to the threads behind a lock, so ours read flat from two threads on.
+
+On one thread the RMW mix was the read's as well. A thread's handle is
+live beside the writer, so its puts append, the store seals faster than
+its merges fold, and ten to thirty pieces stood over a partition through
+the mixes, where the placed read declined every range under more than
+eight: not one of the RMW mix's reads was a lean one, by each handle's
+counts at its drop. The placed read is bounded now by the records it
+keeps above the newest tombstone, one or two under puts, and not by the
+pieces it walks (`Options::point_placed_runs`; `supdb-heldinplacepieces`
+is the bound before), and paired at `5c739c8` (`pair.sh supdb-heldinplace
+supdb-heldinplacepieces 300000 --reps 6
+--passes load,read,read-threaded,mixes,mixes-scrambled,mixes-threaded`)
+the threaded writers' mixes read 1.04-1.21x for it in both sittings, RMW
+on one thread 1.21x, the single-threaded mixes within the lean of E, which
+makes no point read, at 1.06x and 1.12x the other way.
 
 #### Beside FASTER out of core
 
