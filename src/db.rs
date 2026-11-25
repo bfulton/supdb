@@ -4951,6 +4951,24 @@ pub struct Options {
     /// and the kept merge snapshot. Off: `supdb-held`'s shape, a put
     /// appending.
     pub put_in_place: bool,
+    /// EXPERIMENT: the live table takes writes from handles on any thread
+    /// at once, beside the writer's and with no lock between them
+    /// (`Reader::put`, `Reader::append`, `Reader::delete`; `SharedTable`).
+    /// A write lays its chunks down where nothing reads them and swaps them
+    /// in at the head of its key's chain, and a new key's entry is
+    /// published by a compare-and-swap of its index slot, so a reader reads
+    /// the table as it reads the one writer's; no read is isolated from the
+    /// writers, and a handle reads every write as it lands. A table that
+    /// fills answers a handle's write with `false` and is frozen by the
+    /// writer's next commit, which waits out the handles still writing it
+    /// before its seal reads it. It needs the held log with no frames,
+    /// since nothing logs a handle's write, and nothing that reads a live
+    /// table's values beside the writer or keeps a copy of them:
+    /// `Upkeep::Inline`, and `scan_block_cache`, `snapshot_keeper`,
+    /// `forms_off_snapshot_kept`, `snapshot_runs`, `direct_ingest` and
+    /// `put_in_place` off. Off: the one writer's table, and a handle that
+    /// writes is refused.
+    pub shared_writers: bool,
     /// A job's large per-key arrays -- a seal's sort of its
     /// table, a segment writer's copy of every key with its span, its
     /// record's offset and its hash, the ordered index builder's keys, a
@@ -7285,6 +7303,17 @@ impl Options {
 }
 
 impl Options {
+    /// A fresh live table: shared by the handles' writes where
+    /// `shared_writers` says, its value arena capped at `cap` bytes, the
+    /// seal's threshold when it is made, and the one writer's otherwise.
+    fn live_table(&self, pool: &Option<std::sync::Arc<blocks::BlockPool>>, cap: usize) -> MemTable {
+        if self.shared_writers {
+            MemTable::new_shared(self.block_shape(pool), cap.max(4 * SHARED_STRIDE))
+        } else {
+            MemTable::new(self.block_shape(pool))
+        }
+    }
+
     /// How a table's blocks are made, for `MemTable::new`.
     /// How the store's tables make their blocks, from `pool`, the store's
     /// (`Options::blocks_pool_bytes`).
@@ -7582,6 +7611,7 @@ impl Default for Options {
             index_populated: true,
             mem_hash_fold: true,
             put_in_place: false,
+            shared_writers: false,
             jobs_mapped: true,
             jobs_mapped_when_short: false,
             jobs_pooled: false,
@@ -14010,6 +14040,78 @@ struct MemTable {
     /// The table's own sorted snapshots, once it is frozen; see
     /// `FrozenSnaps`.
     snaps: FrozenSnaps,
+    /// A table writers on several threads write at once
+    /// (`Options::shared_writers`); `None` for the one writer's.
+    shared: Option<Box<SharedTable>>,
+}
+
+/// What a writer claims of a shared table's arena at a time
+/// (`ByteArena::reserve_shared`): the writers lay their bytes in strides of
+/// their own, so the one word of an arena they share is its end, touched a
+/// stride at a time.
+const SHARED_STRIDE: usize = 64 << 10;
+/// A shared table's write locks, a stripe an entry number.
+const SHARED_STRIPES: usize = 4096;
+/// The bytes a shared table's index is sized for an entry at: an entry with
+/// a key of sixteen bytes and no value lays down about this much.
+const SHARED_ENTRY_BYTES: usize = 64;
+/// The low half of an index word a writer has claimed for a key it is still
+/// laying down: no entry is numbered this high, the slab addressing 2^28.
+const SLOT_TENTATIVE: u64 = 0xffff_ffff;
+
+/// What a shared table keeps for its writers (`Options::shared_writers`).
+///
+/// A put of a key the table holds lays a tombstone and the value down where
+/// its writer's stride has room and swaps them in at the head of the key's
+/// chain, under the entry's stripe of `vers`, which writers alone take.
+/// Published bytes never change, so a reader reads the table as it reads
+/// the one writer's. A put of a key the table does not hold first claims the
+/// vacant slot its probe ended at with a tentative word, so that no other
+/// writer makes a second entry for the key -- one that meets the word waits
+/// for it to resolve, and a reader reads past it -- then lays the key and
+/// both chunks down, claims an entry number, writes the entry, and
+/// publishes the slot. Entry numbers are claimed in order and written in
+/// any, and the slab's length moves only over entries written, whichever
+/// writer moves it, so a walk of the entries by number meets none half
+/// made. The index is sized when the table is made and never grows.
+struct SharedTable {
+    /// The value arena's bytes past which a put finds the table full.
+    cap_bytes: usize,
+    /// Entry numbers claimed, at or past the slab's length.
+    claimed: AtomicUsize,
+    /// A put found the table full: set once, by whichever writer met the
+    /// cap, and read by every put after it and by the owner, which freezes
+    /// the table.
+    full: std::sync::atomic::AtomicBool,
+    /// Odd while a writer changes the chain of a key in the stripe.
+    vers: Box<[AtomicU32]>,
+}
+
+/// A writer's strides of one shared table's arenas; reset when the table it
+/// names is not the one written.
+#[derive(Default)]
+pub(crate) struct TableLocal {
+    table: usize,
+    keys: (usize, usize),
+    vals: (usize, usize),
+}
+
+/// A write to a shared table (`MemTable::write_shared`): a put, a tombstone
+/// and the value over it; an append, the value at the chain's head; a
+/// delete, a tombstone.
+#[derive(Clone, Copy)]
+enum SharedWrite<'a> {
+    Put(&'a [u8]),
+    Append(&'a [u8]),
+    Delete,
+}
+
+/// What a shared insert at a vacant slot came to.
+enum SharedInsert {
+    Done,
+    /// Another writer took the slot first: the probe reads it again.
+    Lost,
+    Full,
 }
 
 /// A value set at most once and never replaced, read without a lock: the
@@ -14425,6 +14527,10 @@ struct ByteArena {
     /// (`Options::blocks_mapped`), and the store's pool
     /// (`Options::blocks_pool_bytes`).
     src: blocks::Source,
+    /// A shared table's (`Options::shared_writers`): the arena's end, which
+    /// every writer claims its strides from (`reserve_shared`), where a
+    /// single writer's tail is `tail`.
+    shared_tail: AtomicUsize,
 }
 
 #[derive(Default)]
@@ -14460,7 +14566,103 @@ impl ByteArena {
             retired: UnsafeCell::new(Vec::new()),
             free: UnsafeCell::new(Vec::new()),
             src,
+            shared_tail: AtomicUsize::new(0),
         }
+    }
+
+    /// Shared: `n` contiguous bytes in one block, from the stride the
+    /// writer `stride` holds, a fresh stride of `SHARED_STRIDE` claimed from
+    /// the arena's end where it has no room; `None`, with nothing claimed,
+    /// where the arena's end is at `cap` or past it. A stride never runs
+    /// across a block: one that would is left unused and the next claimed.
+    /// A range of over half a block takes block-aligned blocks of its own.
+    fn reserve_shared(&self, stride: &mut (usize, usize), n: usize, cap: usize) -> Option<usize> {
+        if stride.0 + n <= stride.1 && stride.1 > 0 {
+            let off = stride.0;
+            stride.0 += n;
+            return Some(off);
+        }
+        if self.shared_tail.load(AtomicOrdering::Relaxed) >= cap {
+            return None;
+        }
+        let block = self.block_len();
+        if n > block / 2 {
+            return Some(self.reserve_shared_large(n));
+        }
+        let len = SHARED_STRIDE.max(n.next_multiple_of(64));
+        loop {
+            let at = self.shared_tail.fetch_add(len, AtomicOrdering::Relaxed);
+            let b = at >> self.shift;
+            if (at + len - 1) >> self.shift != b {
+                continue;
+            }
+            assert!(
+                b < ARENA_BLOCKS,
+                "memtable arena: more bytes than it addresses"
+            );
+            self.install_shared(b, block);
+            *stride = (at + n, at + len);
+            return Some(at);
+        }
+    }
+
+    /// Shared: `n` bytes over block-aligned blocks of their own, the first
+    /// block's allocation holding them all as `reserve` makes a block for a
+    /// value larger than one.
+    fn reserve_shared_large(&self, n: usize) -> usize {
+        let block = self.block_len();
+        let len = n.div_ceil(block) * block;
+        let mut cur = self.shared_tail.load(AtomicOrdering::Relaxed);
+        loop {
+            let start = cur.div_ceil(block) * block;
+            match self.shared_tail.compare_exchange_weak(
+                cur,
+                start + len,
+                AtomicOrdering::Relaxed,
+                AtomicOrdering::Relaxed,
+            ) {
+                Ok(_) => {
+                    let b = start >> self.shift;
+                    assert!(
+                        b + len / block <= ARENA_BLOCKS,
+                        "memtable arena: more bytes than it addresses"
+                    );
+                    self.install_shared(b, len);
+                    return start;
+                }
+                Err(now) => cur = now,
+            }
+        }
+    }
+
+    /// Shared: block `b` made with `cap` bytes where no writer has made it,
+    /// the first writer's installed by compare-and-swap and a loser's given
+    /// back. Every writer of a block asks for the same `cap`: a stride's
+    /// block is a block, and a large range's blocks are its claimant's.
+    fn install_shared(&self, b: usize, cap: usize) {
+        if !self.blocks[b].load(AtomicOrdering::Acquire).is_null() {
+            return;
+        }
+        let p = self.src.alloc(cap, false);
+        self.caps[b].store(cap, AtomicOrdering::Release);
+        if self.blocks[b]
+            .compare_exchange(
+                std::ptr::null_mut(),
+                p,
+                AtomicOrdering::AcqRel,
+                AtomicOrdering::Acquire,
+            )
+            .is_err()
+        {
+            // SAFETY: ours, just allocated with this length and published
+            // nowhere.
+            unsafe { self.src.free(p, cap) };
+        }
+    }
+
+    /// Shared: the bytes the arena's end has reached.
+    fn shared_used(&self) -> usize {
+        self.shared_tail.load(AtomicOrdering::Relaxed)
     }
 
     /// A block's bytes.
@@ -14479,7 +14681,7 @@ impl ByteArena {
             .filter(|(p, _)| !p.load(AtomicOrdering::Relaxed).is_null())
             .map(|(_, c)| c.load(AtomicOrdering::Relaxed))
             .sum();
-        (self.used.load(AtomicOrdering::Relaxed) as u64, cap as u64)
+        (self.used() as u64, cap as u64)
     }
 
     /// Writer: every block whose bytes lie wholly below `off` taken out
@@ -14860,8 +15062,16 @@ impl ByteArena {
         }
     }
 
+    /// The bytes reserved: the one writer's count, or a shared table's end
+    /// (`reserve_shared`), whose writers move no count of the one writer's
+    /// -- every stride up to it, the unused tails of the strides included,
+    /// so a buffer sized by it (`Snapshot::from_frozen`) holds what was
+    /// laid down. Counted by the one writer's count alone, the seal's copy
+    /// of a shared table sized its buffer at nothing and wrote past it.
     fn used(&self) -> usize {
-        self.used.load(AtomicOrdering::Relaxed)
+        self.used
+            .load(AtomicOrdering::Relaxed)
+            .max(self.shared_used())
     }
 }
 
@@ -14925,6 +15135,11 @@ struct Slab<T> {
     /// Where the blocks come from (`ByteArena::src`).
     src: blocks::Source,
     len: AtomicUsize,
+    /// A shared table's (`Options::shared_writers`): its blocks zeroed and
+    /// installed by whichever writer reaches one first, its entries
+    /// written in any order by their claimants, and a number read through
+    /// the index before the length covers it.
+    shared: bool,
     /// The most entries ever published, which a truncation leaves where
     /// it was: a reader that loaded the length before a truncation may
     /// still read any entry below it (`truncate`), so that is what `get`
@@ -14935,15 +15150,71 @@ struct Slab<T> {
 
 impl<T> Slab<T> {
     fn new(src: blocks::Source) -> Slab<T> {
+        Slab::new_with(src, false)
+    }
+
+    /// A shared table's slab (`Slab::shared`).
+    fn new_shared(src: blocks::Source) -> Slab<T> {
+        Slab::new_with(src, true)
+    }
+
+    fn new_with(src: blocks::Source, shared: bool) -> Slab<T> {
         Slab {
             blocks: (0..SLAB_BLOCKS)
                 .map(|_| AtomicPtr::new(std::ptr::null_mut()))
                 .collect(),
             src,
             len: AtomicUsize::new(0),
+            shared,
             #[cfg(debug_assertions)]
             pushed: AtomicUsize::new(0),
         }
+    }
+
+    /// Shared: the address of entry `id`, in a block made zeroed by the
+    /// first writer to reach it and installed by compare-and-swap, a loser
+    /// giving its own back. The entry's claimant alone writes it.
+    fn slot_shared(&self, id: usize) -> *mut T {
+        debug_assert!(self.shared, "a shared slab's");
+        let (b, w) = (id >> SLAB_SHIFT, id & (SLAB_BLOCK - 1));
+        assert!(
+            b < SLAB_BLOCKS,
+            "memtable: more entries than the slab addresses"
+        );
+        let mut p = self.blocks[b].load(AtomicOrdering::Acquire);
+        if p.is_null() {
+            let fresh = self.src.alloc(Self::block_bytes(), true) as *mut T;
+            p = match self.blocks[b].compare_exchange(
+                std::ptr::null_mut(),
+                fresh,
+                AtomicOrdering::AcqRel,
+                AtomicOrdering::Acquire,
+            ) {
+                Ok(_) => fresh,
+                Err(won) => {
+                    // SAFETY: ours, just allocated with this length and
+                    // published nowhere.
+                    unsafe { self.src.free(fresh as *mut u8, Self::block_bytes()) };
+                    won
+                }
+            };
+        }
+        // SAFETY: inside the block.
+        unsafe { p.add(w) }
+    }
+
+    /// Shared: entry `id` where its block is made, for a look at whether
+    /// its claimant has written it yet; `None` where no writer has reached
+    /// the block.
+    fn peek_shared(&self, id: usize) -> Option<&T> {
+        let b = id >> SLAB_SHIFT;
+        if b >= SLAB_BLOCKS {
+            return None;
+        }
+        let p = self.blocks[b].load(AtomicOrdering::Acquire);
+        // SAFETY: a zeroed block that lives as long as the slab; the
+        // caller reads only the atomic that says the entry is written.
+        (!p.is_null()).then(|| unsafe { &*p.add(id & (SLAB_BLOCK - 1)) })
     }
 
     fn len(&self) -> usize {
@@ -15008,7 +15279,7 @@ impl<T> Slab<T> {
     fn get(&self, id: usize) -> &T {
         #[cfg(debug_assertions)]
         assert!(
-            id < self.pushed.load(AtomicOrdering::Acquire),
+            self.shared || id < self.pushed.load(AtomicOrdering::Acquire),
             "memtable: an entry number past anything published"
         );
         let p = self.blocks[id >> SLAB_SHIFT].load(AtomicOrdering::Acquire);
@@ -15594,6 +15865,12 @@ impl MemTable {
     }
 
     fn new(shape: BlockShape) -> MemTable {
+        MemTable::new_with(shape, None)
+    }
+
+    /// A hashed table, shared by several writers where `shared` gives the
+    /// cap of its value arena (`MemTable::new_shared`).
+    fn new_with(shape: BlockShape, shared: Option<usize>) -> MemTable {
         let BlockShape {
             prefault,
             index_populated,
@@ -15602,12 +15879,19 @@ impl MemTable {
             pool,
         } = shape;
         let src = || blocks::Source::new(mapped, pool.clone());
+        let slots = shared.map_or(1024, |cap| {
+            (2 * cap / SHARED_ENTRY_BYTES).max(1024).next_power_of_two()
+        });
         MemTable {
             mapped,
             fold_hash,
-            entries: Slab::new(src()),
+            entries: if shared.is_some() {
+                Slab::new_shared(src())
+            } else {
+                Slab::new(src())
+            },
             index: AtomicPtr::new(Box::into_raw(Box::new(Index::with_slots(
-                1024,
+                slots,
                 src().populated(index_populated),
             )))),
             ordered: false,
@@ -15634,7 +15918,22 @@ impl MemTable {
             retired: UnsafeCell::new(Vec::new()),
             log: Slab::new(src()),
             snaps: FrozenSnaps::new(),
+            shared: shared.map(|cap_bytes| {
+                Box::new(SharedTable {
+                    cap_bytes,
+                    claimed: AtomicUsize::new(0),
+                    full: std::sync::atomic::AtomicBool::new(false),
+                    vers: (0..SHARED_STRIPES).map(|_| AtomicU32::new(0)).collect(),
+                })
+            }),
         }
+    }
+
+    /// A hashed table writers on several threads write at once
+    /// (`SharedTable`): its index sized for `cap_bytes` of values at
+    /// `SHARED_ENTRY_BYTES` an entry, at half load, and never grown.
+    fn new_shared(shape: BlockShape, cap_bytes: usize) -> MemTable {
+        MemTable::new_with(shape, Some(cap_bytes))
     }
 
     /// A table for keys that arrive in order: each above the last; with
@@ -15695,13 +15994,14 @@ impl MemTable {
             retired: UnsafeCell::new(Vec::new()),
             log: Slab::new(src()),
             snaps: FrozenSnaps::new(),
+            shared: None,
         }
     }
 
     /// The writes so far, for a handle's `log_at`: the entry count where
     /// the log is the entries' range (`log_range`).
     fn log_len(&self) -> usize {
-        if self.log_range {
+        if self.log_range || self.shared.is_some() {
             self.len()
         } else {
             self.log.len()
@@ -15710,7 +16010,12 @@ impl MemTable {
 
     /// The `i`th write: the entry it wrote and whether it made it.
     fn log_at(&self, i: usize) -> (usize, bool) {
-        if self.log_range {
+        // A shared table logs nothing: its writes are its entries' range,
+        // the new keys, as an ordered table's are, and a write to a key it
+        // holds leaves nothing a log would carry -- a shared store keeps no
+        // copied runs (`check_options`), and its readers read chains as
+        // they stand.
+        if self.log_range || self.shared.is_some() {
             // Write `i` made entry `i`: an ordered table takes each key
             // above its last and nothing else.
             return (i, true);
@@ -15746,8 +16051,18 @@ impl MemTable {
         }
     }
 
+    /// Whether the table holds nothing a read could find: no entry, or for
+    /// a shared table none claimed. A shared table's length waits at the
+    /// first entry claimed and not yet written (`advance_shared`), so it
+    /// reads zero while entries above that one are written and named by the
+    /// index; a read that took it for empty skipped the table and missed a
+    /// writer's own put, and a flush that did would leave a write out of
+    /// what it made durable.
     fn is_empty(&self) -> bool {
-        self.len() == 0
+        match self.shared.as_deref() {
+            Some(st) => st.claimed.load(AtomicOrdering::Acquire) == 0,
+            None => self.len() == 0,
+        }
     }
 
     /// Entry `id`, whichever shape it is kept in.
@@ -15920,6 +16235,10 @@ impl MemTable {
     /// mark the last commit did not write, and only then does `mark` name
     /// it.
     fn commit(&self) {
+        // A shared table's every write is visible as it lands: no mark.
+        if self.shared.is_some() {
+            return;
+        }
         let n = self.mark.load(AtomicOrdering::Relaxed) + 1;
         let m = &self.marks[(n & 1) as usize];
         m.log.store(self.log_len(), AtomicOrdering::Release);
@@ -15950,6 +16269,18 @@ impl MemTable {
     /// A reader never waits on the writer; it goes round again only when
     /// two commits landed inside its three loads.
     fn committed_at(&self) -> (usize, usize, u64) {
+        // Writers on every thread, each its own commit: a shared table
+        // promises its readers no isolation (`Options::shared_writers`), and
+        // every entry written and chunk published is a commit's. The count
+        // a lookup is bounded by is no count at all: the index names an
+        // entry only once it is written, and the slab's length, which a
+        // walk takes (`Reader::mem_len`), waits at the first entry claimed
+        // and not yet written -- as a lookup's bound it hid a writer's own
+        // put from its next read for as long as another writer held an
+        // entry below it open.
+        if self.shared.is_some() {
+            return (self.len(), usize::MAX, SEE_ALL);
+        }
         loop {
             let n = self.mark.load(AtomicOrdering::Acquire);
             let m = &self.marks[(n & 1) as usize];
@@ -15967,9 +16298,10 @@ impl MemTable {
         self.committed_at().0
     }
 
-    /// The entry count at the last commit.
+    /// The entry count at the last commit: at most the table's length,
+    /// which a shared table's commit count is unbounded by.
     fn committed_len(&self) -> usize {
-        self.committed_at().1
+        self.committed_at().1.min(self.len())
     }
 
     /// Writer: the entry for `key`, made if the table lacks it -- its key
@@ -17039,7 +17371,7 @@ impl MemTable {
             if s == 0 {
                 return Err(i);
             }
-            if s >> 32 == hash >> 32 {
+            if s >> 32 == hash >> 32 && s & 0xffff_ffff != SLOT_TENTATIVE {
                 let id = ((s & 0xffff_ffff) - 1) as usize;
                 let e = self.entry(id);
                 if crate::flatindex::key_eq(self.key_of(e), key) {
@@ -17066,8 +17398,11 @@ impl MemTable {
             if s == 0 {
                 return None;
             }
-            // The tag is the half the entry keeps, so the key decides.
-            if s >> 32 == hash >> 32 {
+            // The tag is the half the entry keeps, so the key decides. A
+            // tentative word (`SLOT_TENTATIVE`) is a shared table's insert
+            // still being laid down, which a read reads past: the put has
+            // not happened yet.
+            if s >> 32 == hash >> 32 && s & 0xffff_ffff != SLOT_TENTATIVE {
                 let id = ((s & 0xffff_ffff) - 1) as usize;
                 let e = self.entry(id);
                 if crate::flatindex::key_eq(self.key_of(e), key) {
@@ -17076,6 +17411,281 @@ impl MemTable {
             }
             i = (i + 1) & idx.mask;
         }
+    }
+}
+
+impl MemTable {
+    /// Whether the table is shared (`SharedTable`) and a put found it full:
+    /// the owner's cue to freeze it.
+    fn shared_full(&self) -> bool {
+        self.shared
+            .as_deref()
+            .is_some_and(|st| st.full.load(AtomicOrdering::Relaxed))
+    }
+
+    /// Shared: `w` to `key` from the writer whose strides `l` holds, beside
+    /// every other writer; false, and nothing written, where the table is
+    /// full and is the owner's to freeze. See `SharedTable`.
+    fn write_shared(&self, l: &mut TableLocal, hash: u64, key: &[u8], w: SharedWrite<'_>) -> bool {
+        let st = self.shared.as_deref().expect("a shared table's");
+        let me = self as *const MemTable as usize;
+        if l.table != me {
+            *l = TableLocal {
+                table: me,
+                ..TableLocal::default()
+            };
+        }
+        assert!(
+            key.len() <= usize::from(u16::MAX),
+            "a key fits a record's length word"
+        );
+        let idx = self.index().expect("a hashed table has an index");
+        let tag = hash & !0xffff_ffff;
+        let mut i = slot_of(hash, idx.mask);
+        loop {
+            let s = idx.slots[i].load(AtomicOrdering::Acquire);
+            if s == 0 {
+                match self.insert_shared(st, l, idx, i, hash, key, w) {
+                    SharedInsert::Done => return true,
+                    SharedInsert::Full => return false,
+                    // The slot again: it holds a key now.
+                    SharedInsert::Lost => continue,
+                }
+            }
+            if s & !0xffff_ffff == tag {
+                if s & 0xffff_ffff == SLOT_TENTATIVE {
+                    // An insert in flight with this tag may be of this key:
+                    // a second entry for it is what the word is against, so
+                    // the slot is read again until the insert publishes.
+                    std::hint::spin_loop();
+                    continue;
+                }
+                let id = ((s & 0xffff_ffff) - 1) as usize;
+                if crate::flatindex::key_eq(self.key_of(self.entry(id)), key) {
+                    return self.chain_shared(st, l, id, w);
+                }
+            }
+            i = (i + 1) & idx.mask;
+        }
+    }
+
+    /// Shared: `w` at the head of entry `id`'s chain under the entry's
+    /// stripe, its count kept as the one writer keeps it: one value after a
+    /// put, none after a delete, one more after an append.
+    fn chain_shared(
+        &self,
+        st: &SharedTable,
+        l: &mut TableLocal,
+        id: usize,
+        w: SharedWrite<'_>,
+    ) -> bool {
+        let lock = &st.vers[id & (SHARED_STRIPES - 1)];
+        let v = shared_lock(lock);
+        let e = self.fat(id);
+        let head = e.chain_head();
+        let Some(chunk) = self.chunks_shared(st, l, head, w) else {
+            lock.store(v, AtomicOrdering::Release);
+            return false;
+        };
+        e.head.store(chunk + 1, AtomicOrdering::Release);
+        let count = match w {
+            SharedWrite::Put(_) => 1,
+            SharedWrite::Delete => 0,
+            SharedWrite::Append(_) => e.count.load(AtomicOrdering::Relaxed) + 1,
+        };
+        e.count.store(count, AtomicOrdering::Relaxed);
+        lock.store(v + 2, AtomicOrdering::Release);
+        true
+    }
+
+    /// Shared: the chunks `w` lays over `prev` in one reservation of the
+    /// writer's stride -- a put's tombstone and its value over it, an
+    /// append's value, a delete's tombstone -- and the one a head names;
+    /// `None` where the arena is at its cap, the table marked full.
+    fn chunks_shared(
+        &self,
+        st: &SharedTable,
+        l: &mut TableLocal,
+        prev: u64,
+        w: SharedWrite<'_>,
+    ) -> Option<u64> {
+        let len = match w {
+            SharedWrite::Put(v) => 2 * CHUNK_HDR + v.len(),
+            SharedWrite::Append(v) => CHUNK_HDR + v.len(),
+            SharedWrite::Delete => CHUNK_HDR,
+        };
+        let Some(off) = self.vals.reserve_shared(&mut l.vals, len, st.cap_bytes) else {
+            st.full.store(true, AtomicOrdering::Relaxed);
+            return None;
+        };
+        self.vals.fill(off, len, |b| {
+            b[..8].copy_from_slice(&prev.to_le_bytes());
+            match w {
+                SharedWrite::Put(v) => {
+                    b[8..CHUNK_HDR].copy_from_slice(&TOMB_LEN.to_le_bytes());
+                    b[CHUNK_HDR..CHUNK_HDR + 8].copy_from_slice(&(off as u64).to_le_bytes());
+                    b[CHUNK_HDR + 8..2 * CHUNK_HDR]
+                        .copy_from_slice(&(v.len() as u32).to_le_bytes());
+                    b[2 * CHUNK_HDR..].copy_from_slice(v);
+                }
+                SharedWrite::Append(v) => {
+                    b[8..CHUNK_HDR].copy_from_slice(&(v.len() as u32).to_le_bytes());
+                    b[CHUNK_HDR..].copy_from_slice(v);
+                }
+                SharedWrite::Delete => {
+                    b[8..CHUNK_HDR].copy_from_slice(&TOMB_LEN.to_le_bytes());
+                }
+            }
+        });
+        if !matches!(w, SharedWrite::Append(_)) {
+            // The count says only that there is a tombstone (`tombs`), and
+            // a word every put stores to is a line every writer's core
+            // takes.
+            if self.tombs.load(AtomicOrdering::Relaxed) == 0 {
+                self.tombs.fetch_add(1, AtomicOrdering::Relaxed);
+            }
+        }
+        Some(match w {
+            SharedWrite::Put(_) => (off + CHUNK_HDR) as u64,
+            SharedWrite::Append(_) | SharedWrite::Delete => off as u64,
+        })
+    }
+
+    /// Shared: a new entry for `key` at the vacant slot `i`, the slot
+    /// claimed with a tentative word before anything is laid down.
+    #[allow(clippy::too_many_arguments)]
+    fn insert_shared(
+        &self,
+        st: &SharedTable,
+        l: &mut TableLocal,
+        idx: &Index,
+        i: usize,
+        hash: u64,
+        key: &[u8],
+        w: SharedWrite<'_>,
+    ) -> SharedInsert {
+        if st.full.load(AtomicOrdering::Relaxed) {
+            return SharedInsert::Full;
+        }
+        // Half load, as the one writer's index keeps, checked before the
+        // slot is claimed: a number once claimed is always written, since
+        // the slab's length waits at a number nobody writes. Writers that
+        // pass together take the load a few entries past half.
+        if (st.claimed.load(AtomicOrdering::Relaxed) + 1) * 2 > idx.slots.len() {
+            st.full.store(true, AtomicOrdering::Relaxed);
+            return SharedInsert::Full;
+        }
+        let tentative = (hash & !0xffff_ffff) | SLOT_TENTATIVE;
+        if idx.slots[i]
+            .compare_exchange(
+                0,
+                tentative,
+                AtomicOrdering::AcqRel,
+                AtomicOrdering::Acquire,
+            )
+            .is_err()
+        {
+            return SharedInsert::Lost;
+        }
+        let reserved = self
+            .keys
+            .reserve_shared(&mut l.keys, key.len(), st.cap_bytes)
+            .and_then(|k| self.chunks_shared(st, l, NO_CHUNK, w).map(|c| (k, c)));
+        let Some((key_off, chunk)) = reserved else {
+            // No number claimed yet, so the slot goes back: a writer that
+            // met the word reads it vacant, and a reader read past it.
+            st.full.store(true, AtomicOrdering::Relaxed);
+            idx.slots[i].store(0, AtomicOrdering::Release);
+            return SharedInsert::Full;
+        };
+        self.keys.write(key_off, key);
+        let id = st.claimed.fetch_add(1, AtomicOrdering::Relaxed);
+        #[cfg(test)]
+        shared_table::hold_after_claim();
+        let p = self.entries.slot_shared(id);
+        // SAFETY: entry `id` is this writer's alone, in a zeroed block, and
+        // read by nobody until its head is non-zero (`advance_shared`) or the
+        // slot names it, both stored after the fields with a release.
+        unsafe {
+            std::ptr::addr_of_mut!((*p).hash).write((hash >> 32) as u32);
+            std::ptr::addr_of_mut!((*p).key_off).write(
+                u32::try_from(key_off).expect("a memtable's keys stay under four gigabytes"),
+            );
+            std::ptr::addr_of_mut!((*p).klen).write(key.len() as u16);
+            (*p).count.store(
+                u32::from(!matches!(w, SharedWrite::Delete)),
+                AtomicOrdering::Relaxed,
+            );
+            (*p).head.store(chunk + 1, AtomicOrdering::Release);
+        }
+        idx.slots[i].store(Index::word(hash, id), AtomicOrdering::Release);
+        self.advance_shared(st);
+        SharedInsert::Done
+    }
+
+    /// Shared: the slab's length moved over every entry written below the
+    /// first one not yet written, by whichever writer gets there.
+    ///
+    /// The fence is what makes "whichever writer" true. Two writers that
+    /// each store their entry's head and then load the other's can each
+    /// miss the other's under release and acquire alone: the one below
+    /// sees nothing above its entry and stops, the one above sees the
+    /// entry below unwritten and stops, and the length waits under a
+    /// written entry until some later insert, which a freeze at quiet may
+    /// never have. Between the stores -- the claim, the entry's block, its
+    /// head -- and the loads here, a sequentially consistent fence orders
+    /// any two writers' fences one before the other, and the second's
+    /// loads see every store the first made before its own: so the writer
+    /// whose fence is last of those that wrote carries the length to the
+    /// claimed count. The freeze holds that in a checked build
+    /// (`shared_whole`).
+    fn advance_shared(&self, st: &SharedTable) {
+        std::sync::atomic::fence(AtomicOrdering::SeqCst);
+        loop {
+            let n = self.entries.len.load(AtomicOrdering::Acquire);
+            if n >= st.claimed.load(AtomicOrdering::Acquire) {
+                return;
+            }
+            match self.entries.peek_shared(n) {
+                Some(e) if e.head.load(AtomicOrdering::Acquire) != 0 => {
+                    let _ = self.entries.len.compare_exchange(
+                        n,
+                        n + 1,
+                        AtomicOrdering::AcqRel,
+                        AtomicOrdering::Relaxed,
+                    );
+                }
+                _ => return,
+            }
+        }
+    }
+}
+
+impl MemTable {
+    /// Shared: whether the slab's length has reached every entry claimed,
+    /// which it must have once every writer is out of the table; true of a
+    /// table no writer shares.
+    fn shared_whole(&self) -> bool {
+        self.shared
+            .as_deref()
+            .is_none_or(|st| self.entries.len() == st.claimed.load(AtomicOrdering::SeqCst))
+    }
+}
+
+/// A shared table's stripe taken from even to odd, waiting while another
+/// writer holds it; the even word it held, for the release.
+#[inline]
+fn shared_lock(lock: &AtomicU32) -> u32 {
+    loop {
+        let v = lock.load(AtomicOrdering::Relaxed);
+        if v & 1 == 0
+            && lock
+                .compare_exchange_weak(v, v + 1, AtomicOrdering::Acquire, AtomicOrdering::Relaxed)
+                .is_ok()
+        {
+            return v;
+        }
+        std::hint::spin_loop();
     }
 }
 
@@ -17227,6 +17837,24 @@ fn check_options(opts: &Options) -> Result<()> {
             "put_in_place overwrites a live table's values under the writer alone: \
              it needs SyncPolicy::Explicit, Upkeep::Inline, and scan_block_cache, \
              snapshot_keeper and forms_off_snapshot_kept off",
+        ));
+    }
+    if opts.shared_writers
+        && (!matches!(opts.sync, SyncPolicy::Explicit)
+            || opts.held_frames
+            || opts.scan_block_cache
+            || opts.snapshot_keeper
+            || opts.forms_off_snapshot_kept
+            || opts.snapshot_runs
+            || opts.direct_ingest
+            || opts.put_in_place
+            || opts.upkeep != Upkeep::Inline)
+    {
+        return Err(err(
+            "shared_writers writes the live table from every thread with nothing logged: \
+             it needs SyncPolicy::Explicit with held_frames off, Upkeep::Inline, and \
+             scan_block_cache, snapshot_keeper, forms_off_snapshot_kept, snapshot_runs, \
+             direct_ingest and put_in_place off",
         ));
     }
     if !opts.writer_pins && (opts.publish_in_background || opts.snapshot_keeper) {
@@ -21371,6 +21999,20 @@ struct Shared {
     /// Handles the caller made and still holds: who the forms are
     /// published for.
     live_handles: AtomicUsize,
+    /// The cap a fresh shared live table's values take
+    /// (`Options::shared_writers`): the seal's threshold at the writer's last
+    /// commit, which the segment work's landings make tables at too.
+    shared_cap: AtomicUsize,
+    /// The reader slots of the handles that have written a shared table,
+    /// which a freeze waits out (`Db::wait_shared_writers`).
+    writer_slots: std::sync::Mutex<Vec<usize>>,
+    /// A test's: how long a handle's shared write waits between taking the
+    /// state and writing its table, in microseconds (`Db::hold_shared_writes`).
+    shared_write_hold_us: AtomicU64,
+    /// A test's: a freeze's grace held between its read of the writers' list
+    /// and its reads of their slots, for as long as bit 0 stands
+    /// (`Db::hold_shared_grace`); bit 1 says the grace is waiting there.
+    shared_grace_hold: std::sync::atomic::AtomicU8,
     /// Whether the writer keeps no block forms just now
     /// (`Options::scan_forms_off_unreused`), mirrored where the segment
     /// work can read it: with no handle live, nothing makes a table, and
@@ -22593,6 +23235,12 @@ pub struct Reader {
     /// The commit is filing a burst's batch on the writer's own path
     /// (`Hand::File`); see `Options::forms_settle_builds_filed`.
     filing: std::cell::Cell<bool>,
+    /// The handle's strides of a shared live table, for its writes
+    /// (`Options::shared_writers`, `Reader::put`).
+    shared_local: std::cell::RefCell<TableLocal>,
+    /// Whether the handle has written a shared table, its slot among the
+    /// writers a freeze waits out (`Shared::writer_slots`).
+    wrote_shared: std::cell::Cell<bool>,
     /// The upkeep this handle keeps for its range reads: the block
     /// tables, the scan snapshot, and the log position both are
     /// current to. See `FormsState`.
@@ -23424,6 +24072,9 @@ pub struct Db {
     /// The store's greatest key, or empty for none: what a key has to be
     /// above to go direct.
     max_key: Vec<u8>,
+    /// The writer's own strides of a shared live table
+    /// (`Options::shared_writers`), as a handle that writes keeps its own.
+    shared_local: TableLocal,
     /// Scratch for the run a value would encode as, measured at `append`
     /// against the inline limit.
     /// EXPERIMENT: the memtable's entry count when the last builder was
@@ -23711,6 +24362,14 @@ impl Drop for Reader {
             self.shared.readers.release(slot);
         }
         if let Some(slot) = self.slot {
+            if self.wrote_shared.get() {
+                let mut w = self
+                    .shared
+                    .writer_slots
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner());
+                w.retain(|&s| s != slot);
+            }
             if self.counted {
                 // A release: a writer that overwrites in place once the
                 // count reads nothing does so after this handle's reads
@@ -23725,6 +24384,82 @@ impl Drop for Reader {
 }
 
 impl Reader {
+    /// EXPERIMENT (`Options::shared_writers`): `value` put to `key` from this
+    /// handle's thread, beside the writer and every other handle that
+    /// writes, with no lock between them. Every read takes it as it lands,
+    /// and nothing of it is promised until the store's `sync`, `flush` or
+    /// close, as with any write under the held log. `Ok(false)`, with
+    /// nothing written, where the live table is full: the writer's next
+    /// `commit` freezes it, and the write is made again after that.
+    pub fn put(&self, key: &[u8], value: &[u8]) -> Result<bool> {
+        self.write_shared(key, SharedWrite::Put(value))
+    }
+
+    /// `value` added to `key`'s values, as `put` writes: see there.
+    pub fn append(&self, key: &[u8], value: &[u8]) -> Result<bool> {
+        self.write_shared(key, SharedWrite::Append(value))
+    }
+
+    /// Every value of `key` ended, as `put` writes: see there.
+    pub fn delete(&self, key: &[u8]) -> Result<bool> {
+        self.write_shared(key, SharedWrite::Delete)
+    }
+
+    /// A test's: whether a freeze's grace waits at `Db::hold_shared_grace`.
+    #[doc(hidden)]
+    pub fn shared_grace_holding(&self) -> bool {
+        self.shared.shared_grace_hold.load(AtomicOrdering::Acquire) & 2 != 0
+    }
+
+    /// A test's: lets a grace held at `Db::hold_shared_grace` go on, from
+    /// the thread of a handle, since the freeze holds the writer.
+    #[doc(hidden)]
+    pub fn release_shared_grace(&self) {
+        self.shared
+            .shared_grace_hold
+            .fetch_and(!1, AtomicOrdering::AcqRel);
+    }
+
+    /// A handle's write to the shared live table: its slot among the
+    /// writers a freeze waits out before its first write pins (so that a
+    /// freeze that reads the list without it published its table first, and
+    /// this write takes the fresh one), then pinned as its reads are.
+    fn write_shared(&self, key: &[u8], w: SharedWrite<'_>) -> Result<bool> {
+        if !self.opts.shared_writers {
+            return Err(err(
+                "a handle writes only to a store opened with Options::shared_writers",
+            ));
+        }
+        let Some(slot) = self.slot else {
+            return Err(err("the engine's own handles do not write"));
+        };
+        // A handle holding a snapshot is pinned for as long as it holds it,
+        // and a freeze waits for every writer's pin to move on.
+        if self.isolation.get() == Isolation::Snapshot {
+            return Err(err(
+                "a handle holding a snapshot does not write: a freeze would wait for it",
+            ));
+        }
+        if !self.wrote_shared.replace(true) {
+            self.shared
+                .writer_slots
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .push(slot);
+        }
+        let _e = self.enter();
+        let mem = &self.state().mem;
+        let hold = self
+            .shared
+            .shared_write_hold_us
+            .load(AtomicOrdering::Relaxed);
+        if hold > 0 {
+            std::thread::sleep(std::time::Duration::from_micros(hold));
+        }
+        let mut l = self.shared_local.borrow_mut();
+        Ok(mem.write_shared(&mut l, mem.hash(key), key, w))
+    }
+
     /// The clock for a scan phase, read only under `Options::scan_timers`.
     #[inline]
     fn tick_start(&self) -> Option<std::time::Instant> {
@@ -37351,7 +38086,7 @@ impl Db {
             scans: AtomicU64::new(0),
             forms_bytes: AtomicUsize::new(0),
             segs,
-            mem: std::sync::Arc::new(MemTable::new(opts.block_shape(&block_pool))),
+            mem: std::sync::Arc::new(opts.live_table(&block_pool, opts.seal_bytes)),
             frozen: Vec::new(),
             gen: 1,
             lives: 0,
@@ -37438,6 +38173,10 @@ impl Db {
             mode_scans: AtomicU64::new(0),
             mode_points: AtomicU64::new(0),
             live_handles: AtomicUsize::new(0),
+            shared_cap: AtomicUsize::new(opts.seal_bytes),
+            writer_slots: std::sync::Mutex::new(Vec::new()),
+            shared_write_hold_us: AtomicU64::new(0),
+            shared_grace_hold: std::sync::atomic::AtomicU8::new(0),
             writer_forms_off: std::sync::atomic::AtomicBool::new(false),
             write_quiet: std::sync::atomic::AtomicBool::new(false),
             blk_reader: AtomicU64::new(0),
@@ -37551,6 +38290,8 @@ impl Db {
             len_bound: std::cell::Cell::new(usize::MAX),
             force_due: std::cell::Cell::new(false),
             filing: std::cell::Cell::new(false),
+            shared_local: std::cell::RefCell::new(TableLocal::default()),
+            wrote_shared: std::cell::Cell::new(false),
         }
         .tallied();
         let maint = MaintHome::Here(Box::new(Maint::new(
@@ -37576,6 +38317,7 @@ impl Db {
             mem_handed: None,
             read_mode: (0, 0, true),
             max_key: Vec::new(),
+            shared_local: TableLocal::default(),
             built_ahead_len: 0,
             built_ahead_gen: 0,
             pending_err: None,
@@ -38040,7 +38782,7 @@ impl Db {
         }
         wal_ids.sort_unstable();
         let block_pool = opts.block_pool();
-        let mem = MemTable::new(opts.block_shape(&block_pool));
+        let mem = opts.live_table(&block_pool, opts.seal_bytes);
         // Replay's own table, for the index resizes a replayed delete
         // frees through; nothing reads beside it.
         let readers = Readers::new(false, true);
@@ -38263,6 +39005,10 @@ impl Db {
             mode_scans: AtomicU64::new(0),
             mode_points: AtomicU64::new(0),
             live_handles: AtomicUsize::new(0),
+            shared_cap: AtomicUsize::new(opts.seal_bytes),
+            writer_slots: std::sync::Mutex::new(Vec::new()),
+            shared_write_hold_us: AtomicU64::new(0),
+            shared_grace_hold: std::sync::atomic::AtomicU8::new(0),
             writer_forms_off: std::sync::atomic::AtomicBool::new(false),
             write_quiet: std::sync::atomic::AtomicBool::new(false),
             blk_reader: AtomicU64::new(0),
@@ -38376,6 +39122,8 @@ impl Db {
             len_bound: std::cell::Cell::new(usize::MAX),
             force_due: std::cell::Cell::new(false),
             filing: std::cell::Cell::new(false),
+            shared_local: std::cell::RefCell::new(TableLocal::default()),
+            wrote_shared: std::cell::Cell::new(false),
         }
         .tallied();
         let maint = MaintHome::Here(Box::new(Maint::new(
@@ -38405,6 +39153,7 @@ impl Db {
             mem_handed: None,
             read_mode: (0, 0, true),
             max_key,
+            shared_local: TableLocal::default(),
             built_ahead_len: 0,
             built_ahead_gen: 0,
             pending_err: None,
@@ -38467,6 +39216,9 @@ impl Db {
     fn append_pinned(&mut self, key: &[u8], value: &[u8]) {
         if !self.writes_go() {
             return;
+        }
+        if self.opts.shared_writers {
+            return self.write_shared_own(key, SharedWrite::Append(value));
         }
         if self.mem().ordered || self.direct_can_open() {
             if self.goes_direct(key, value) {
@@ -38840,6 +39592,9 @@ impl Db {
         if !self.writes_go() {
             return;
         }
+        if self.opts.shared_writers {
+            return self.write_shared_own(key, SharedWrite::Put(value));
+        }
         if self.mem().ordered {
             self.leave_direct();
         }
@@ -38878,6 +39633,9 @@ impl Db {
         if !self.writes_go() {
             return;
         }
+        if self.opts.shared_writers {
+            return self.write_shared_own(key, SharedWrite::Delete);
+        }
         if self.mem().ordered {
             self.leave_direct();
         }
@@ -38885,6 +39643,34 @@ impl Db {
         self.wal.delete(key);
         self.mem().delete(hash, key, &self.shared.readers);
         self.mem_bytes += key.len() + 16;
+    }
+
+    /// The writer's own write to a shared live table, beside the handles'
+    /// (`Options::shared_writers`): a table it finds full sealed on the spot
+    /// and the write made into the fresh one. Nothing is logged -- the
+    /// option holds the log with no frames -- and nothing counted toward
+    /// the seal, which a shared table's cap decides.
+    fn write_shared_own(&mut self, key: &[u8], w: SharedWrite<'_>) {
+        let mut l = std::mem::take(&mut self.shared_local);
+        // A fresh table takes any write a full one refused; one that
+        // refuses the write too is a write larger than a table.
+        for _ in 0..3 {
+            let done = {
+                let mem = self.mem();
+                mem.write_shared(&mut l, mem.hash(key), key, w)
+            };
+            if done {
+                self.shared_local = l;
+                return;
+            }
+            if let Err(e) = self.seal() {
+                self.pending_err.get_or_insert(e);
+                return;
+            }
+        }
+        self.pending_err.get_or_insert(err(
+            "a write larger than a shared live table takes (Options::shared_writers)",
+        ));
     }
 
     /// The start of every write: the live table a `sync` handed to a seal
@@ -39012,7 +39798,15 @@ impl Db {
         // seal's piece does by promotion, so the two paths leave one shape.
         self.note_read_mode();
         let threshold = self.threshold_for(self.opts.seal_idle && self.read_mode.2);
-        let due = self.mem_bytes >= threshold && self.seal_now(threshold);
+        // A shared table counts nothing toward the threshold, which is its
+        // cap: it seals where a write found it full.
+        let due =
+            (self.mem_bytes >= threshold && self.seal_now(threshold)) || self.mem().shared_full();
+        if self.opts.shared_writers {
+            self.shared
+                .shared_cap
+                .store(threshold, AtomicOrdering::Relaxed);
+        }
         if due || self.seal_while_idle() {
             if !due {
                 SealCounts::add(&self.shared.seal_counts.idle_seals, 1);
@@ -39360,8 +40154,9 @@ impl Db {
         self.mem_bytes = 0;
         let Some(d) = self.direct.take() else {
             // A run forming with nothing committed: no file, nothing to close.
-            self.set_mem(std::sync::Arc::new(MemTable::new(
-                self.opts.block_shape(&self.shared.block_pool),
+            self.set_mem(std::sync::Arc::new(self.opts.live_table(
+                &self.shared.block_pool,
+                self.shared.shared_cap.load(AtomicOrdering::Relaxed),
             )));
             return Ok(());
         };
@@ -40544,8 +41339,9 @@ impl Db {
         let settled_at = self.state() as *const State;
         let from = Db::replaced_from(&self.opts, &self.shared);
         let complete = self.fs().tables_complete.get();
-        let fresh = std::sync::Arc::new(MemTable::new(
-            self.opts.block_shape(&self.shared.block_pool),
+        let fresh = std::sync::Arc::new(self.opts.live_table(
+            &self.shared.block_pool,
+            self.shared.shared_cap.load(AtomicOrdering::Relaxed),
         ));
         let carried = std::cell::Cell::new(false);
         let pieces_only = self.opts.forms_pieces_only;
@@ -40566,6 +41362,7 @@ impl Db {
         }) else {
             return false;
         };
+        self.wait_shared_writers(table);
         Db::ask_abandon(&self.opts, &self.shared, self.state(), from);
         // SAFETY: retired by `published` below, and the writer is pinned.
         let cur = unsafe { &*old };
@@ -40595,8 +41392,9 @@ impl Db {
     /// vouch for nothing until a publish into it says otherwise -- so a
     /// handle at it builds its own blocks until the upkeep has looked.
     fn freeze_swap(&mut self, table: &std::sync::Arc<MemTable>) -> bool {
-        let fresh = std::sync::Arc::new(MemTable::new(
-            self.opts.block_shape(&self.shared.block_pool),
+        let fresh = std::sync::Arc::new(self.opts.live_table(
+            &self.shared.block_pool,
+            self.shared.shared_cap.load(AtomicOrdering::Relaxed),
         ));
         let from = Db::replaced_from(&self.opts, &self.shared);
         let Some(old) = self.try_publish_writer_away(|cur| {
@@ -40607,9 +41405,73 @@ impl Db {
         }) else {
             return false;
         };
+        self.wait_shared_writers(table);
         self.published_away(old);
         Db::ask_abandon(&self.opts, &self.shared, self.state(), from);
         true
+    }
+
+    /// Shared: the handles that have written a shared table waited out of
+    /// the table a freeze just replaced (`Options::shared_writers`). An
+    /// epoch is bumped after the publish, and each writer's slot read until
+    /// it holds that epoch or none: a handle's write pins before it takes
+    /// the state, so one pinned below the epoch may hold the old table, and
+    /// one at or past it took the fresh one. So every write the frozen table
+    /// will get has landed before its seal reads it, and its length has
+    /// reached every entry they claimed (`advance_shared`), which a checked
+    /// build holds it to.
+    fn wait_shared_writers(&self, table: &MemTable) {
+        if !self.opts.shared_writers {
+            return;
+        }
+        self.wait_shared_writers_out();
+        debug_assert!(
+            table.shared_whole(),
+            "a frozen shared table's length short of its claimed entries"
+        );
+    }
+
+    fn wait_shared_writers_out(&self) {
+        let slots = self
+            .shared
+            .writer_slots
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        if slots.is_empty() {
+            return;
+        }
+        let hold = &self.shared.shared_grace_hold;
+        if hold.load(AtomicOrdering::Acquire) & 1 != 0 {
+            hold.fetch_or(2, AtomicOrdering::AcqRel);
+            while hold.load(AtomicOrdering::Acquire) & 1 != 0 {
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+            hold.fetch_and(!2, AtomicOrdering::AcqRel);
+        }
+        let rd = &self.shared.readers;
+        let tag = rd.bump();
+        rd.sync_pins();
+        for slot in slots {
+            let mut spins = 0u32;
+            // Zero is a slot given back (`Readers::release`), whose handle
+            // dropped after the list was read: the epochs start at one, so
+            // no pin is ever zero. A wait on it as a pin below the epoch
+            // waited for ever, the freeze holding the writer's lock that the
+            // other writers queued on.
+            loop {
+                let e = rd.slots[slot].epoch.load(AtomicOrdering::SeqCst);
+                if e == 0 || e >= tag {
+                    break;
+                }
+                spins += 1;
+                if spins < 64 {
+                    std::hint::spin_loop();
+                } else {
+                    std::thread::yield_now();
+                }
+            }
+        }
     }
 
     /// The state `cur` makes with its live table frozen, at the frozen
@@ -41337,6 +42199,8 @@ impl Reader {
             len_bound: std::cell::Cell::new(usize::MAX),
             force_due: std::cell::Cell::new(false),
             filing: std::cell::Cell::new(false),
+            shared_local: std::cell::RefCell::new(TableLocal::default()),
+            wrote_shared: std::cell::Cell::new(false),
         }
         .tallied())
     }
@@ -41381,6 +42245,8 @@ impl Reader {
                 len_bound: std::cell::Cell::new(usize::MAX),
                 force_due: std::cell::Cell::new(false),
                 filing: std::cell::Cell::new(false),
+                shared_local: std::cell::RefCell::new(TableLocal::default()),
+                wrote_shared: std::cell::Cell::new(false),
             }
             .tallied(),
         )
@@ -41432,6 +42298,8 @@ impl Reader {
             len_bound: std::cell::Cell::new(usize::MAX),
             force_due: std::cell::Cell::new(false),
             filing: std::cell::Cell::new(false),
+            shared_local: std::cell::RefCell::new(TableLocal::default()),
+            wrote_shared: std::cell::Cell::new(false),
         }
         .tallied())
     }
@@ -42225,6 +43093,26 @@ impl Db {
         self.shared
             .forms_position_hold
             .store(on, AtomicOrdering::Release);
+    }
+
+    /// A test's: every handle's shared write waits `micros` between taking
+    /// the state and writing the live table it holds
+    /// (`Options::shared_writers`), so that a freeze lands inside the write.
+    #[doc(hidden)]
+    pub fn hold_shared_writes(&self, micros: u64) {
+        self.shared
+            .shared_write_hold_us
+            .store(micros, AtomicOrdering::Relaxed);
+    }
+
+    /// A test's: while `on`, a freeze's grace (`Db::wait_shared_writers`)
+    /// waits between its read of the writers' list and its reads of their
+    /// slots, so a handle on the list can be dropped inside it. The freeze
+    /// is the writer's, so the hold is let go through a handle
+    /// (`Reader::release_shared_grace`).
+    #[doc(hidden)]
+    pub fn hold_shared_grace(&self, on: bool) {
+        Db::set_hold_bit(&self.shared.shared_grace_hold, 1, on);
     }
 
     /// A test's: while `on`, a merge's thread waits before it returns its
@@ -44671,6 +45559,8 @@ impl Reader {
             len_bound: std::cell::Cell::new(usize::MAX),
             force_due: std::cell::Cell::new(false),
             filing: std::cell::Cell::new(false),
+            shared_local: std::cell::RefCell::new(TableLocal::default()),
+            wrote_shared: std::cell::Cell::new(false),
             fs: FormsCell::empty(),
         }
         .tallied()
@@ -50684,8 +51574,9 @@ impl Maint {
         // One fresh table for every attempt: a landing that lost the swap
         // installs the same empty table on its retry.
         let fresh = landed.map(|_| {
-            std::sync::Arc::new(MemTable::new(
-                self.opts.block_shape(&self.shared.block_pool),
+            std::sync::Arc::new(self.opts.live_table(
+                &self.shared.block_pool,
+                self.shared.shared_cap.load(AtomicOrdering::Relaxed),
             ))
         });
         debug_assert!(
@@ -58551,6 +59442,328 @@ mod threading {
             let reads = reader.join().unwrap();
             assert!(reads > 1000, "the reader read beside the writer: {reads}");
         });
+    }
+}
+
+#[cfg(test)]
+mod shared_table {
+    use super::{BlockShape, MemTable, SharedWrite, TableLocal, NO_CHUNK};
+    use std::sync::atomic::Ordering::{Acquire, Relaxed};
+
+    thread_local! {
+        /// A test's: how long this thread's shared inserts wait between
+        /// claiming an entry's number and writing the entry, the window in
+        /// which the slab's length must not pass the number.
+        static HOLD_AFTER_CLAIM: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    }
+
+    /// A test's seam in `insert_shared`; see `HOLD_AFTER_CLAIM`.
+    pub(super) fn hold_after_claim() {
+        let us = HOLD_AFTER_CLAIM.with(|h| h.get());
+        if us > 0 {
+            std::thread::sleep(std::time::Duration::from_micros(us));
+        }
+    }
+
+    fn table(cap: usize) -> MemTable {
+        MemTable::new_shared(
+            BlockShape {
+                prefault: false,
+                index_populated: false,
+                fold_hash: true,
+                mapped: true,
+                pool: None,
+            },
+            cap,
+        )
+    }
+
+    fn key(i: u64) -> [u8; 16] {
+        let mut k = [0u8; 16];
+        k[..8].copy_from_slice(&i.to_be_bytes());
+        k[8..].copy_from_slice(b"sharedkk");
+        k
+    }
+
+    /// The key's head value, `None` for a key the table does not hold and
+    /// `Some(None)` for one a tombstone ends.
+    fn head_value(m: &MemTable, k: &[u8]) -> Option<Option<Vec<u8>>> {
+        let (_, e) = m.probe_entry(m.hash(k), k)?;
+        let head = MemTable::head(e);
+        if m.is_tomb(head) {
+            return Some(None);
+        }
+        Some(Some(m.value_at(head as usize).to_vec()))
+    }
+
+    /// The chunks of the key's chain, tombstones and values both.
+    fn chain_len(m: &MemTable, k: &[u8]) -> usize {
+        let (_, e) = m.probe_entry(m.hash(k), k).expect("the key is there");
+        let (mut at, mut n) = (MemTable::head(e), 0);
+        while at != NO_CHUNK {
+            n += 1;
+            at = m.chunk_prev(at);
+        }
+        n
+    }
+
+    /// Four writers released together put one set of keys over and over --
+    /// each first round a race to make the keys' entries -- and delete some
+    /// of them, while two threads read: no read sees a value that is not
+    /// one write's whole (each value a run of one byte), every key ends with
+    /// one entry, found once by a walk of the entries and once in the
+    /// index, the slab's length reaches every entry claimed, and each key's
+    /// chain holds a tombstone and a value for every put of it and a
+    /// tombstone for every delete -- no write lost to another's.
+    #[test]
+    fn writers_on_threads_make_one_entry_a_key_and_lose_no_write() {
+        const KEYS: u64 = 2000;
+        const ROUNDS: u64 = 12;
+        const WRITERS: u64 = 4;
+        let m = table(256 << 20);
+        let stop = std::sync::atomic::AtomicBool::new(false);
+        let go = std::sync::Barrier::new(WRITERS as usize);
+        let uniform = |v: &[u8]| v.iter().all(|&b| b == v[0]);
+        std::thread::scope(|s| {
+            let readers: Vec<_> = (0..2)
+                .map(|_| {
+                    let (m, stop) = (&m, &stop);
+                    s.spawn(move || {
+                        let mut seen = 0u64;
+                        while !stop.load(Relaxed) {
+                            for i in 0..KEYS {
+                                if let Some(Some(v)) = head_value(m, &key(i)) {
+                                    assert!(uniform(&v), "a value torn between two writes");
+                                    seen += 1;
+                                }
+                            }
+                        }
+                        seen
+                    })
+                })
+                .chain(std::iter::once({
+                    // A walk of the entries by number, as a snapshot's sort
+                    // and a seal take them: every entry under the length is
+                    // written whole.
+                    let (m, stop) = (&m, &stop);
+                    s.spawn(move || {
+                        let mut seen = 0u64;
+                        while !stop.load(Relaxed) {
+                            for id in 0..m.len() {
+                                let e = m.entry(id);
+                                assert_ne!(MemTable::head(e), NO_CHUNK, "entry {id} unwritten");
+                                assert_eq!(m.key_of(e).len(), 16, "entry {id} half made");
+                                seen += 1;
+                            }
+                        }
+                        seen
+                    })
+                }))
+                .collect();
+            let writers: Vec<_> = (0..WRITERS)
+                .map(|w| {
+                    let (m, go) = (&m, &go);
+                    s.spawn(move || {
+                        let mut l = TableLocal::default();
+                        // One writer's inserts held open between the claim
+                        // and the write, so that the walk meets numbers
+                        // claimed and not written while the others write
+                        // past them.
+                        if w == 0 {
+                            HOLD_AFTER_CLAIM.with(|h| h.set(200));
+                        }
+                        go.wait();
+                        for round in 0..ROUNDS {
+                            let v = vec![(1 + w * ROUNDS + round) as u8; 100];
+                            for i in 0..KEYS {
+                                let k = key(i);
+                                let del = i % 7 == 0 && round % 3 == 2;
+                                let w = if del {
+                                    SharedWrite::Delete
+                                } else {
+                                    SharedWrite::Put(&v)
+                                };
+                                assert!(
+                                    m.write_shared(&mut l, m.hash(&k), &k, w),
+                                    "the table filled"
+                                );
+                            }
+                        }
+                    })
+                })
+                .collect();
+            let done: Vec<_> = writers.into_iter().map(|h| h.join()).collect();
+            stop.store(true, Relaxed);
+            let reads: Vec<_> = readers.into_iter().map(|h| h.join()).collect();
+            for d in done {
+                if let Err(p) = d {
+                    std::panic::resume_unwind(p);
+                }
+            }
+            for r in reads {
+                match r {
+                    Ok(n) => assert!(n > 0, "a reader read nothing"),
+                    Err(p) => std::panic::resume_unwind(p),
+                }
+            }
+        });
+        let st = m.shared.as_deref().unwrap();
+        assert_eq!(st.claimed.load(Acquire), KEYS as usize, "one entry a key");
+        assert_eq!(
+            m.len(),
+            KEYS as usize,
+            "the length reaches every entry claimed"
+        );
+        let mut walked = std::collections::HashSet::new();
+        for id in 0..m.len() {
+            assert!(
+                walked.insert(m.key_of(m.entry(id)).to_vec()),
+                "a key walked twice"
+            );
+        }
+        let idx = m.index().unwrap();
+        let indexed = (0..idx.slots.len())
+            .filter(|&i| idx.slots[i].load(Relaxed) != 0)
+            .count();
+        assert_eq!(indexed, KEYS as usize, "one index word a key");
+        let deletes = (ROUNDS / 3) * WRITERS;
+        for i in 0..KEYS {
+            let k = key(i);
+            let (puts, dels) = if i % 7 == 0 {
+                (ROUNDS * WRITERS - deletes, deletes)
+            } else {
+                (ROUNDS * WRITERS, 0)
+            };
+            assert_eq!(
+                chain_len(&m, &k) as u64,
+                2 * puts + dels,
+                "key {i}: a write lost"
+            );
+            if let Some(Some(v)) = head_value(&m, &k) {
+                assert!(uniform(&v) && v.len() == 100, "key {i}");
+            }
+        }
+        assert!(!m.shared_full());
+    }
+
+    /// Two writers released together, round after round, each making one
+    /// entry: once both are through, the length has reached both entries,
+    /// in every round. Each stores its entry's head and then loads the
+    /// other's to move the length; without the fence in `advance_shared`
+    /// each may load the other's head unwritten and stop, the length one
+    /// short with both written, and the next round's inserts carry it on,
+    /// so it is read at every round's end.
+    #[test]
+    fn two_writers_inserting_at_once_leave_the_length_past_both() {
+        const ROUNDS: usize = 200_000;
+        let m = table(64 << 20);
+        let started = std::sync::atomic::AtomicUsize::new(0);
+        let done = std::sync::atomic::AtomicUsize::new(0);
+        let short = std::sync::atomic::AtomicUsize::new(0);
+        let wait = |c: &std::sync::atomic::AtomicUsize, n: usize| {
+            while c.load(Acquire) < n {
+                std::hint::spin_loop();
+            }
+        };
+        std::thread::scope(|s| {
+            for t in 0..2usize {
+                let (m, started, done, short) = (&m, &started, &done, &short);
+                s.spawn(move || {
+                    let mut l = TableLocal::default();
+                    for r in 0..ROUNDS {
+                        started.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+                        wait(started, 2 * (r + 1));
+                        let k = key((2 * r + t) as u64);
+                        assert!(m.write_shared(&mut l, m.hash(&k), &k, SharedWrite::Put(b"v")));
+                        done.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+                        wait(done, 2 * (r + 1));
+                        if t == 0 && m.len() != 2 * (r + 1) {
+                            short.fetch_add(1, Relaxed);
+                        }
+                    }
+                });
+            }
+        });
+        assert_eq!(
+            short.load(Relaxed),
+            0,
+            "rounds that left the length under both writers' entries"
+        );
+        assert_eq!(m.len(), 2 * ROUNDS);
+    }
+
+    /// The slab's length waits at an entry claimed and not yet written,
+    /// whatever is written past it: one writer held between its claim and
+    /// its write while another makes the next entry, the length stays at
+    /// the held number, and reaches both once the held writer is through.
+    #[test]
+    fn the_length_waits_at_an_entry_claimed_and_not_written() {
+        let m = table(64 << 20);
+        let st = m.shared.as_deref().unwrap();
+        std::thread::scope(|s| {
+            let held = s.spawn(|| {
+                HOLD_AFTER_CLAIM.with(|h| h.set(300_000));
+                let mut l = TableLocal::default();
+                assert!(m.write_shared(
+                    &mut l,
+                    m.hash(&key(1)),
+                    &key(1),
+                    SharedWrite::Put(b"held")
+                ));
+            });
+            let t = std::time::Instant::now();
+            while st.claimed.load(Acquire) == 0 {
+                assert!(t.elapsed().as_secs() < 60, "the held writer never claimed");
+                std::thread::yield_now();
+            }
+            let mut l = TableLocal::default();
+            assert!(m.write_shared(&mut l, m.hash(&key(2)), &key(2), SharedWrite::Put(b"free")));
+            assert_eq!(head_value(&m, &key(2)), Some(Some(b"free".to_vec())));
+            assert_eq!(
+                m.len(),
+                0,
+                "the length passed an entry claimed and not written"
+            );
+            held.join().unwrap();
+        });
+        assert_eq!(m.len(), 2);
+        assert_eq!(head_value(&m, &key(1)), Some(Some(b"held".to_vec())));
+    }
+
+    /// A table that fills says so and refuses the put that found it full,
+    /// writing nothing of it: the key a refused put was to make is absent,
+    /// and a key a refused put was to rewrite keeps the value it had; the
+    /// slab's length reaches every entry claimed.
+    #[test]
+    fn a_full_shared_table_refuses_a_put_and_writes_nothing_of_it() {
+        let m = table(1 << 20);
+        let mut l = TableLocal::default();
+        let v = [7u8; 200];
+        let mut made = 0u64;
+        while m.write_shared(&mut l, m.hash(&key(made)), &key(made), SharedWrite::Put(&v)) {
+            made += 1;
+            assert!(made < 1 << 20, "the table never filled");
+        }
+        assert!(m.shared_full());
+        assert_eq!(
+            head_value(&m, &key(made)),
+            None,
+            "the refused key is absent"
+        );
+        // Refused again, and promptly: the slot the refused insert claimed
+        // went back, where a word left tentative would hold a writer of the
+        // key for ever.
+        assert!(!m.write_shared(&mut l, m.hash(&key(made)), &key(made), SharedWrite::Put(&v)));
+        let w = [9u8; 200];
+        assert!(!m.write_shared(&mut l, m.hash(&key(0)), &key(0), SharedWrite::Put(&w)));
+        assert_eq!(
+            head_value(&m, &key(0)),
+            Some(Some(v.to_vec())),
+            "the old value stands"
+        );
+        let st = m.shared.as_deref().unwrap();
+        assert_eq!(st.claimed.load(Acquire), made as usize);
+        assert_eq!(m.len(), made as usize);
     }
 }
 

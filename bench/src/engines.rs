@@ -1968,6 +1968,14 @@ pub struct Supdb {
     /// store's keys (`Options::upkeep_batch_pct`) under the held log with
     /// no frames: `supdb-heldbatch1`.
     upkeepbatch: Option<usize>,
+    /// EXPERIMENT: the live table written by every thread's handle at once
+    /// (`Options::shared_writers`), under the held log with no frames, the
+    /// block cache off, the upkeep the writer's and ordered ingest off,
+    /// which the option needs: `supdb-heldshared`, beside
+    /// `supdb-heldnfinline`, which differs in the sharing and the ordered
+    /// ingest. Its writer threads write through their own handles and
+    /// take the one writer only to freeze a table they found full.
+    shared: bool,
     /// What the reader handles this store gave its threads answered
     /// through the ordered index, summed as each is dropped
     /// (`OrdTally`); only the arm that reads that way hands out handles
@@ -3238,6 +3246,9 @@ struct Policy {
     /// The upkeep's passes batched (`Options::upkeep_batch_pct`):
     /// `supdb-heldbatch1`.
     upkeepbatch: Option<usize>,
+    /// Every thread's handle writing the live table
+    /// (`Options::shared_writers`): `supdb-heldshared`.
+    shared: bool,
 }
 
 /// The conversions a fill makes at most in `supdb-convertcap`: the first
@@ -3577,6 +3588,7 @@ impl Default for Policy {
             inplace: false,
             placedpieces: false,
             upkeepbatch: None,
+            shared: false,
             defer: false,
             firstfloor: false,
             aheadmin: None,
@@ -10289,6 +10301,7 @@ impl Supdb {
             inplace,
             placedpieces,
             upkeepbatch,
+            shared,
         } = policy;
         // What the engine ships, so an arm that pins nothing inherits it
         // rather than restating it and drifting from it.
@@ -10966,6 +10979,10 @@ impl Supdb {
             mem_hash_fold: !memfnv,
             put_in_place: inplace,
             point_placed_runs: !placedpieces,
+            shared_writers: shared,
+            // A run of ordered ingest is the one writer's table, which the
+            // shared mode has none of.
+            direct_ingest: !shared,
             ..Default::default()
         };
         let opts = match advice {
@@ -11328,6 +11345,7 @@ impl Supdb {
             inplace,
             placedpieces,
             upkeepbatch,
+            shared,
             ord_threads: Default::default(),
         })
     }
@@ -11478,6 +11496,36 @@ impl ThreadWriter for SupdbWriter<'_> {
     }
 }
 
+/// A writer thread's supdb under the shared live table
+/// (`Options::shared_writers`): its `Reader` reads and writes, and the
+/// store's one writer, behind a mutex, is taken only to freeze a table the
+/// handle found full -- the commit that freezes it, after which the write
+/// goes to the fresh table. A batch is its puts: what one put of it
+/// writes, every handle's next read sees, as a commit of the one writer's
+/// shows.
+struct SupdbSharedWriter<'a> {
+    db: std::sync::Arc<std::sync::Mutex<&'a mut supdb::Db>>,
+    r: supdb::Reader,
+}
+
+impl ThreadWriter for SupdbSharedWriter<'_> {
+    fn get(&mut self, key: &[u8]) -> Res<usize> {
+        supdb_get(&self.r, key)
+    }
+    fn update_batch(&mut self, items: &[(&[u8], &[u8])]) -> Res<()> {
+        for (k, v) in items {
+            while !self.r.put(k, v).map_err(|e| e.to_string())? {
+                self.db
+                    .lock()
+                    .map_err(|_| "a writer thread panicked holding the store".to_string())?
+                    .commit()
+                    .map_err(|e| e.to_string())?;
+            }
+        }
+        Ok(())
+    }
+}
+
 impl ThreadReader for TallyReader {
     fn get(&mut self, key: &[u8]) -> Res<usize> {
         supdb_get(&self.r, key)
@@ -11501,7 +11549,9 @@ impl Engine for Supdb {
                 return "supdb-heldmarch";
             }
             if self.noframes {
-                return if self.inplace && self.placedpieces {
+                return if self.shared {
+                    "supdb-heldshared"
+                } else if self.inplace && self.placedpieces {
                     "supdb-heldinplacepieces"
                 } else if self.inplace {
                     "supdb-heldinplace"
@@ -13838,12 +13888,18 @@ impl Engine for Supdb {
             readers.push(db.reader().map_err(|e| e.to_string())?);
         }
         let db = std::sync::Arc::new(std::sync::Mutex::new(db));
+        let shared = self.shared;
         Ok(readers
             .into_iter()
             .map(|r| {
                 let db = db.clone();
-                Box::new(move || Ok(Box::new(SupdbWriter { db, r }) as Box<dyn ThreadWriter + '_>))
-                    as WriterOpener<'_>
+                Box::new(move || {
+                    Ok(if shared {
+                        Box::new(SupdbSharedWriter { db, r }) as Box<dyn ThreadWriter + '_>
+                    } else {
+                        Box::new(SupdbWriter { db, r }) as Box<dyn ThreadWriter + '_>
+                    })
+                }) as WriterOpener<'_>
             })
             .collect())
     }
@@ -15463,6 +15519,7 @@ pub fn guarantee(arm: &str) -> Option<Guarantee> {
         | "supdb-heldinplace"
         | "supdb-heldinplacepieces"
         | "supdb-heldnfinline"
+        | "supdb-heldshared"
         | "supdb-heldbatch1"
         | "proto-shared"
         | "faster" => Guarantee::Memory,
@@ -16044,6 +16101,24 @@ pub fn open(arm: &str, dir: &Path, map_gb: usize) -> Res<Box<dyn Engine>> {
                         noframes: true,
                         block_cache: false,
                         upkeep: Some(supdb::Upkeep::Inline),
+                        ..Policy::default()
+                    },
+                )
+            },
+            dir,
+        )?,
+        "supdb-heldshared" => supdb_arm(
+            |d| {
+                Supdb::with_policy(
+                    d,
+                    Policy {
+                        partition: false,
+                        durable: false,
+                        held: true,
+                        noframes: true,
+                        block_cache: false,
+                        upkeep: Some(supdb::Upkeep::Inline),
+                        shared: true,
                         ..Policy::default()
                     },
                 )
@@ -18069,6 +18144,57 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
+    /// The shared arm is `supdb-heldnfinline` with the live table shared
+    /// by every handle's writes, and ordered ingest off, which the sharing
+    /// needs: named, in FASTER's row, and opened with those two options
+    /// set against that arm's and the held log's shape the same.
+    #[test]
+    fn the_shared_arm_is_the_inline_held_arm_with_its_table_shared() {
+        let root =
+            std::env::temp_dir().join(format!("supdb-bench-sharedarm-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let e = open("supdb-heldshared", &root.join("shared"), 1).unwrap();
+        assert_eq!(e.name(), "supdb-heldshared");
+        assert_eq!(guarantee("supdb-heldshared"), Some(Guarantee::Memory));
+        let base = open("supdb-heldnfinline", &root.join("inline"), 1).unwrap();
+        assert_eq!(e.features(), base.features());
+        drop((e, base));
+        let made = |name: &str, shared: bool| {
+            Supdb::with_policy(
+                &root.join(name),
+                Policy {
+                    partition: false,
+                    durable: false,
+                    held: true,
+                    noframes: true,
+                    block_cache: false,
+                    upkeep: Some(supdb::Upkeep::Inline),
+                    shared,
+                    ..Policy::default()
+                },
+            )
+            .unwrap()
+        };
+        let (s, b) = (made("shared-policy", true), made("inline-policy", false));
+        assert_eq!(
+            (s.name(), b.name()),
+            ("supdb-heldshared", "supdb-heldnfinline")
+        );
+        let (so, bo) = (
+            s.db.as_ref().unwrap().options().clone(),
+            b.db.as_ref().unwrap().options().clone(),
+        );
+        assert!(so.shared_writers && !bo.shared_writers);
+        assert!(!so.direct_ingest && bo.direct_ingest);
+        for o in [&so, &bo] {
+            assert!(matches!(o.sync, supdb::SyncPolicy::Explicit));
+            assert!(!o.held_frames && !o.scan_block_cache && !o.put_in_place);
+            assert_eq!(o.upkeep, supdb::Upkeep::Inline);
+        }
+        drop((s, b));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
     /// The handles a threaded mix gives its threads write the store the
     /// arm opened, and read what they wrote: three threads at once, each
     /// over keys of its own, read every key at the length the load gave it,
@@ -18086,7 +18212,12 @@ mod tests {
             .map(|i| format!("{i:016}").into_bytes())
             .collect();
         let (was, now) = (vec![7u8; 100], vec![9u8; 60]);
-        for arm in ["supdb-ingest", "lmdb-nosync", "rocksdb-tuned-nosync"] {
+        for arm in [
+            "supdb-ingest",
+            "supdb-heldshared",
+            "lmdb-nosync",
+            "rocksdb-tuned-nosync",
+        ] {
             let mut e = open(arm, &root.join(arm), 1).unwrap();
             let pairs: Vec<(&[u8], &[u8])> = keys
                 .iter()

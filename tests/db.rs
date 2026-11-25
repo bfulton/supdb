@@ -12,7 +12,7 @@ use supdb::{Db, Isolation, Options, ReadAdvice, Reader};
 mod common;
 #[cfg(target_os = "linux")]
 use common::cached_pages;
-use common::{kv, vf, without_the_clock};
+use common::{kv, vf, watchdog_exit, without_the_clock, Watchdog};
 
 fn dir(name: &str) -> PathBuf {
     let d = std::env::temp_dir().join(format!("supdb-next-{name}-{}", std::process::id()));
@@ -17582,65 +17582,6 @@ fn a_write_after_a_handed_seal_takes_a_fresh_table_from_whichever_side_swapped()
         for k in 0..n {
             let want = if k % 11 == 0 || k == 3 { 2 } else { 1 };
             assert_eq!(read_vec(&r, &tail_key(k)), vec![tail_val(want)], "key {k}");
-        }
-    }
-}
-
-/// A watchdog's exit: the message on the process's own stderr, past the
-/// harness's capture, then the exit. The harness captures what a test's
-/// threads print, a watchdog's thread among them, so a watchdog that
-/// printed through `eprintln!` and exited left the whole binary ending with
-/// code 101 after a hundred and sixty-six tests, no failure named and no
-/// summary -- the dev binary under the whole file's load, where a window
-/// a minute holds in the checked profile runs several times longer.
-fn watchdog_exit(what: &str) -> ! {
-    use std::io::Write;
-    let said = std::fs::OpenOptions::new()
-        .write(true)
-        .open("/dev/stderr")
-        .and_then(|mut e| writeln!(e, "watchdog: {what}"));
-    if said.is_err() {
-        eprintln!("watchdog: {what}");
-    }
-    std::process::exit(101);
-}
-
-/// Exits the process unless dropped within a minute: for a test whose
-/// failure is a wait that never returns, so it reports itself rather
-/// than hanging. Dropped as the waits end, or by the unwind of a failure
-/// in them, so an assertion reports itself and not the watchdog.
-struct Watchdog {
-    done: std::sync::Arc<std::sync::atomic::AtomicBool>,
-    watch: Option<std::thread::JoinHandle<()>>,
-}
-
-impl Watchdog {
-    fn arm(what: &'static str) -> Watchdog {
-        let done = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let watch = {
-            let done = done.clone();
-            std::thread::spawn(move || {
-                let t = std::time::Instant::now();
-                while !done.load(std::sync::atomic::Ordering::Relaxed) {
-                    if t.elapsed() > std::time::Duration::from_secs(60) {
-                        watchdog_exit(what);
-                    }
-                    std::thread::sleep(std::time::Duration::from_millis(20));
-                }
-            })
-        };
-        Watchdog {
-            done,
-            watch: Some(watch),
-        }
-    }
-}
-
-impl Drop for Watchdog {
-    fn drop(&mut self) {
-        self.done.store(true, std::sync::atomic::Ordering::Relaxed);
-        if let Some(w) = self.watch.take() {
-            let _ = w.join();
         }
     }
 }
