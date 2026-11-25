@@ -2393,7 +2393,17 @@ either store, against none of 240 with the fix under the same load. A scratch li
 walks' call sites named the two, and holding the upkeep's pass across
 the landing (`hold_upkeep_pass`) gave the gate's exact numbers every
 run. The test settles the store before the seal now, so the pass is done
-in both stores before anything races it. The
+in both stores before anything races it. And as a freeze: the test that a
+freeze settles a shared table only once an overwrite in flight is through
+spawned the overwrite and flushed at once, on the bet that the put would
+be inside its record's lock before the freeze closed the table to
+overwrites. A put started late found the table closed, laid its value
+down and was never held, and the thread waiting for the hold waited for
+ever: under the gate's load once, every run with a sleep of 50 ms ahead
+of the put. The flush waits for the hold now, and its sibling, which
+slept 50 ms on the reading that a held write would be inside its hold by
+then, waits for the count of writes the hold has taken
+(`Db::shared_writes_held`). The
 rule: a test that
 needs a state holds it, and a bet on timing loses the first time the
 thing it bets against gets faster; a state the test needs only to have
@@ -7001,6 +7011,53 @@ the writer's side is moved first to shrink the set of states the protocol
 has to cover, since every reader of a state left in the set is a site to
 convert and to test; and an audit of the paths that read a structure is
 also an audit of the paths that hand it to someone else.
+
+**Equal instructions at two thirds the speed, and a sample on the first
+touch of a page.** The shared table's lean path brought a get, a put and a
+read-modify-write to within a sixth of FASTER's instruction counts (442,
+464 and 488 against 378, 416 and 483 at `c75da23`, the record's ask in),
+and before the ask FASTER still ran each in two thirds of the time. Laid
+on its instructions, 85% of a get's samples were two loads, the slot and the
+record's first word, the shape FASTER's operation has too: what differed was
+when the value's lines were asked for, since FASTER's record holds its value
+at a fixed offset and ours names it through its head, and the core could ask
+for them only once the first line had come. With the record's lines asked
+for at the slot, a sixth of the samples moved onto the ask's prefetch
+instruction: the first instruction to touch the record's page, charged for
+the walk the page's translation took, where a table of 81 MB over 4 KiB
+pages is many times what the TLB maps. On huge pages each operation took a
+tenth less, and FASTER's are on small ones. The rules: an operation level
+with a comparator in instructions and behind it in time is laid on its loads
+and asked, of each, which earlier load its address waited for; and a sample
+on the first instruction to touch a page is read as that page's translation
+before it is read as the instruction's.
+
+**A quantity that became work to read, read on every operation.** The
+shared table's inserts carried the slab's length -- a fence and the loads of
+two words every inserting writer writes -- a third of an insert, and three
+threads inserted no faster than one. Left to whoever reads it, the length
+is carried as it is read (`MemTable::len`), and two readers had been reading
+it on every operation: a handle's operation took the table's commit bounds,
+which a shared table's reads have no use for, and its note of the read
+compared the log's position, so every get carried the length the inserts no
+longer did, and the inserts' saving would have been every read's cost. The
+test written to hold a handle's gets and puts to leaving the length alone
+found the second on its first run. The rule: when reading a quantity becomes
+work, every reader of it is listed and each that runs on every operation is
+given a reading that does none, and a test holds the cheap path to doing
+none of it.
+
+**A prefetch the core had already issued.** A read that falls below the
+shared table is three dependent misses where FASTER's is two, so a handle
+whose last read had fallen through asked for its next key's partition slot
+before probing the live table. It fired on every such read and moved
+nothing, one thread or three: the partition slot's address is the key's
+alone, the branch that follows the live table's empty slot is predicted, and
+the core runs ahead into the partition's read and issues the load itself. The
+rule: an ask for a load whose address the core can compute past a predictable
+branch is the core's own work done twice, so a lever on an overlap is priced
+by the time with and without it before it is kept, and a lever that fired and
+moved nothing comes out.
 
 ## Standing limitations
 

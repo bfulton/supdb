@@ -1346,6 +1346,133 @@ Paired and profiled at `80bf367`, with the same passes and reps:
 - **The index's size** resolved nothing in its pairing, cells moving both
   ways between the orders.
 
+#### Past FASTER: what an operation costs
+
+Counted at `ef97fef`, an operation of the threaded mixes took up to three
+times FASTER's instructions, inside each arm's own call with the harness
+left out (`valgrind --tool=callgrind --collect-atstart=no`, toggled on each
+arm's `ThreadWriter::get`, `update_batch` and `rmw`, around `bench ab
+--arms supdb-heldsharedbig,faster --size 300000 --passes
+load,mixes-threaded --reps 1`):
+
+| instructions | ours | FASTER |
+|---|---|---|
+| get | 1,338 | 365 |
+| read-modify-write | 887 | 462 |
+| put | 692 | 434 |
+
+A get spent 317 of them copying the key's chain into two vectors it then
+freed, 188 in the probe and 133 placing the partition and hashing the key,
+for a read the live table answered three times in four. The writes were
+layers, each looking the record's block up again. The probe
+`bench/examples/shared_ops.rs` takes the harness out of the loop: every
+arm's store loaded in one process, every key put once through a thread
+writer, then gets, puts and read-modify-writes over keys drawn before the
+clock, the arms by turns phase by phase, since on this host one process's
+memory reads a factor apart from the next one's. At `c75da23`, `shared_ops
+ARMS 300000 15 zipf` with `ARMS` the four arms named below and `faster`,
+three sittings, nanoseconds an operation on one thread:
+
+| | get | put | read-modify-write |
+|---|---|---|---|
+| `supdb-heldsharedbig` | 184-191 | 204-209 | 200-271 |
+| `supdb-heldsharedbignoahead` | 210-216 | 235-242 | 212-227 |
+| `supdb-heldsharedbignolean` | 334-340 | 266-269 | 285-296 |
+| `faster` | 210-217 | 224-233 | 228-240 |
+
+- **The lean path** (`Options::shared_lean`; `supdb-heldsharedbignolean`
+  is the layered one). A get, put or read-modify-write of a key whose live
+  chain is one put's goes from the slot to the record by one lookup of its
+  block and reads the key, the lock, the head and the value through that
+  address, the value copied to the stack between two readings of the lock
+  where the table rewrites. Every other shape takes the layers. Counted in
+  the probe's phases at `c75da23` (callgrind toggled on
+  `shared_ops::phase_gets`, `phase_puts` and `phase_rmws`, one round): 442,
+  464 and 488 instructions, the layered path's 1,521, 729 and 912, FASTER's
+  378, 416 and 483. With the counts level, FASTER first ran each operation
+  in two thirds of the lean path's time.
+- **The record's lines asked for at the slot.** Laid on its instructions,
+  85% of a get's samples were two loads: the slot, and the record's first
+  word. FASTER's record holds its value at a fixed offset, so the core asks
+  for every line of it at once; ours names its value through its head, and
+  the value's lines were asked for only once the first had come. The lean
+  probe asks for the record's next lines as the key compare loads the first
+  (`MemTable::ask_record`, under `Options::shared_chunk_ahead`;
+  `supdb-heldsharedbignoahead` asks nothing).
+- **Huge pages** (`Options::shared_huge`; `supdb-heldsharedbignohuge`).
+  With the ask in, a sixth of a three-thread read-modify-write's samples sat
+  on the ask's prefetch instruction: the first to touch the record's page,
+  charged for its walk. The table's value arena and index, 81 MB and 8 MB at
+  three hundred thousand keys, are many times what the TLB maps at 4 KiB;
+  mapped 2 MiB-aligned and advised `MADV_HUGEPAGE` (`blocks::map_huge`),
+  84 MB of the probe's 112 MB of anonymous memory read as huge pages in its
+  `smaps_rollup`. On three threads at `c75da23` (`SHARED_OPS_THREADS=3
+  shared_ops supdb-heldsharedbig,supdb-heldsharedbignohuge,faster 300000 15
+  zipf`, and `uniform`, three sittings of each), the small pages read A in
+  1.01-1.17x the huge pages' time and the read-modify-write in 1.02-1.21x;
+  FASTER read them in 1.03-1.10x and 1.06-1.23x. FASTER's log and index are
+  on small pages under the kernel's `madvise` policy.
+- **The pin's fence**, priced and not taken: `supdb-heldsharedbigasym`
+  pins with a plain store the sweep fences for (`Options::asym_pins`), and
+  read the probe's puts 8% faster on one thread and nothing either way on
+  three.
+
+The suite's cell that still went to FASTER was A at two threads, in both
+orders. A runs first, on the store the load and its sync leave, so its
+cells are where a key is first touched: a get falls below the live table to
+the partition, and a put inserts the key's record. The probe on such a
+store (`SHARED_OPS_FRESH=1`, one round, the arms both ways round, three
+sittings of each, at `c75da23`) separates the two: on one thread a read
+that falls through takes 303-500 ns to FASTER's 195-317
+(`SHARED_OPS_THREADS=1 SHARED_OPS_ONLY=gets`), and an insert as the eager
+arm makes it 193-254 to FASTER's 293-418 (`SHARED_OPS_ONLY=puts`); on three
+threads the eager insert takes 229-395, three threads inserting slower than
+one. A quarter of an insert was two words every writer writes:
+the claimed count, and the slab's length, which each insert carried over
+the entries written below the first one not yet written, behind a
+sequentially consistent fence. The length is the walks' -- a scan's, the
+seal's -- and no point read or write reads it, so an insert leaves it now
+and whoever reads it carries it (`Options::shared_len_lazy`,
+`MemTable::len`; `supdb-heldsharedbigeagerlen` carries it at every
+insert): the freeze once its writers are out, a scan as it walks, the
+upkeep. Two readers had been reading it on every operation, and the test
+that holds a handle's gets and puts to leaving it alone found the second:
+an operation took the table's commit bounds, which a shared table's reads
+have no use for, and its note of the read compared the log's position. At
+`c75da23` (`SHARED_OPS_FRESH=1 SHARED_OPS_THREADS=3 SHARED_OPS_ONLY=puts
+shared_ops supdb-heldsharedbig,supdb-heldsharedbigeagerlen,faster 300000 1
+zipf`, and the arms the other way round, three of each), three threads
+inserted in 133-194 ns an operation, the eager arm in 229-395 and FASTER in
+161-190.
+
+What is left of a first touch is the read that falls through: 887
+instructions to FASTER's 372 on a fresh store, the partition placed by a
+search whose every step calls `memcmp`, the key's FNV, the partition's
+filter and the layered read's own steps, then the partition's slot and
+record on a file mapping of small pages. A read the lean probe found absent
+is not probed in the live table again, 43 instructions of it. Asking for the
+partition's slot before the live table's probe, where the handle's last read
+had fallen through, moved nothing and is not kept: the core runs ahead
+through a branch it predicts absent and issues the partition's loads
+itself.
+
+Paired at `c75da23` (`bench/scripts/pair.sh supdb-heldsharedbig faster
+300000 --passes load,mixes-threaded --reps 3`), FASTER's rate over ours by
+the mean of the two orders, under one ours:
+
+| | one thread | two | three |
+|---|---|---|---|
+| A | 1.05 | 0.97 | 0.91 |
+| A, uniform | 0.85 | 1.02 | 0.87 |
+| read-modify-write | 0.93 | 0.96 | 0.88 |
+| read-modify-write, uniform | 0.85 | 0.81 | 0.76 |
+
+The two cells over one read 1.27 and 0.87, and 1.05 and 0.98, in the two
+sittings, as the order effect leaves a tie; the eager length against the
+default (`pair.sh supdb-heldsharedbig supdb-heldsharedbigeagerlen 300000`,
+the same passes) read A at two and three threads 0.94x and 0.95x and the
+uniform A 0.91x and 0.89x, the read-modify-writes level.
+
 #### Beside FASTER out of core
 
 A store larger than memory is what FASTER's log is made for, and the
