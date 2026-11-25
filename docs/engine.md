@@ -1189,6 +1189,67 @@ later, probe a line twice that FASTER's operation probes once. The first
 order read every cell of the arm listed second slower by up to a fifth, which
 is why both orders are in the means.
 
+In the engine the shared table is `Options::shared_writers` (arm
+`supdb-heldshared`, `supdb-heldnfinline` with the table shared and ordered
+ingest off). A handle writes with `Reader::put`, `append` and `delete`, and
+gets `false` from a table that is full. The writer's next commit freezes the
+full table, and the freeze waits out every handle still writing it before
+its seal reads it: an epoch is bumped after the publish, and each writer's
+slot is read until it holds that epoch or none. Values are appended, never
+overwritten, so a reader reads the table as it reads the one writer's.
+Three things the threads found that no single-writer test could:
+- **The slab's length** waits at the first entry claimed and not yet
+  written, and is carried on by whichever writer gets there. Two writers
+  that each store their own entry's head and then load the other's can each
+  miss the other's under release and acquire alone, and the length stopped
+  one short with both entries written. A sequentially consistent fence
+  between the stores and the loads closes it (`MemTable::advance_shared`).
+  Without it, two writers inserting at once left the length short in 26
+  rounds of 200,000 on this machine.
+- **That length was also the count a handle's lookup is bounded by**, and
+  the table's emptiness. While another writer held an entry below its own
+  open, a thread's own put was hidden from its next read through its
+  handle. The index names an entry only once it is written, so a shared
+  table's lookup is unbounded, while a walk still takes the length
+  (`MemTable::committed_at`), and its emptiness is its claimed count
+  (`MemTable::is_empty`).
+- **The seal's copy** sized its buffer by the one writer's byte counts,
+  which a shared table's writers never move. It sizes it by the arena's end
+  now (`ByteArena::used`).
+
+Paired with FASTER at `7c90d45` (`bench/scripts/pair.sh supdb-heldshared
+faster 300000 --passes load,mixes-threaded --reps 3`), it does not scale.
+A reads 2.2-2.3M operations a second on one thread and 3.0-3.2M on three,
+where FASTER reads 6.5-7.1M. RMW, made of a get and a put, reads 1.2-1.7M
+at every thread count, about a fifth of FASTER's at three. The profile of
+the three-thread RMW, cut to its marks, says why:
+- **The writers are off their cores a third of the window.** A sampled
+  profile does not say what they wait on, and that was not traced. Where a
+  writer waits by design is the freeze: on the writer's mutex, and in the
+  grace. A freeze comes every few megabytes, since the seal cap is a tenth
+  of the store and every put grows the table by its value. The seal and
+  merge threads take most of the fourth core.
+- **More than half of `write_shared`'s samples, over the profile's mixes,
+  are an insert's two shared words**:
+  the claimed count's `lock xadd` and the length's compare-and-swap. Every
+  fresh table makes a new entry for every key written into it, so most puts
+  into a fresh table are inserts.
+- **A read of a key the live table does not hold** walks the frozen tables,
+  the pieces and the partition, where FASTER's read is one probe and one
+  record.
+
+The same arm with the seal cap off, a seal at `seal_bytes` alone, read RMW
+at three threads 1.6M to 2.2M operations a second in a scratch run, and A
+3.2M to 3.6M. The writers were then on their cores five sixths of the
+window, and the live table's probes and the read through the sources were
+what was left. The levers are in that order:
+- a put of a value of the length it replaces overwrites it in place under
+  the stripe's version, with readers copying between two equal readings, so
+  the table stops growing on overwrites;
+- a read-modify-write that probes once;
+- a shared table sized for the held log's promise and not by the seal's
+  share of the store.
+
 #### Beside FASTER out of core
 
 A store larger than memory is what FASTER's log is made for, and the

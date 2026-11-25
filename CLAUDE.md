@@ -6930,6 +6930,40 @@ holds, since a drop made in one state cannot reach the next; and an
 invariant a reader leans on is asserted where it is published, not only
 at a write that a stale form need never meet.
 
+**One number that meant three things while there was one writer.** A
+memtable's length was the prefix a walk may read, the count a handle's
+lookup is bounded by, and whether the table held anything, and with one
+writer the three are the same number. A table every handle writes at once
+(`Options::shared_writers`) claims an entry's number before it writes the
+entry. Its length waits at the first number claimed and not yet written,
+which is right for a walk and wrong for the other two. A handle's lookup
+bounded by it read past a thread's own put while another thread held an
+entry below it open. A read that took a length of zero for an empty table
+skipped the table while entries above an open entry 0 stood written. And
+the seal's copy, sized by the one writer's byte counts, which the shared
+writers never move, wrote past its buffer. None of it showed in the tests
+that read through the writer, which honours no bound, or in a watcher that
+checked only that a value was whole. The bench's test that each thread reads
+its own write back found the bound; the same check in the engine's test,
+once the bound was fixed, found the emptiness; the seal's panic found the
+buffer.
+The length itself was moved by whichever writer got there, and two writers
+that each stored their own entry's head and then loaded the other's could
+each miss the other's under release and acquire. The length stopped one
+short with both entries written: 26 rounds in 200,000 here, two writers
+released together a round. A sequentially consistent fence between the
+stores and the loads closes it, since whichever writer fences second sees
+everything the first stored (`MemTable::advance_shared`), and the freeze
+asserts the length whole once its writers are out. The rules: when a second
+writer comes to a structure, every quantity the one writer kept is read for
+each thing it is taken to mean, since the writer was what made them one; a
+test of a concurrent structure reads each thread's writes back through the
+reader that thread would use, at once and while the others write; and a
+handoff between writers that each publish and then read the other's
+publication is the store-buffering shape, which release and acquire do not
+order, so it gets a sequentially consistent fence and a litmus test that
+fails without it.
+
 ## Standing limitations
 
 These are the engine's, as opposed to refuted predictions. Each is a curve
