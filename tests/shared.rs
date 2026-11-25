@@ -669,6 +669,202 @@ fn a_handles_lean_path_answers_what_the_layered_one_does() {
     );
 }
 
+/// A store of several partitions with no piece and no frozen table, its
+/// keys of several lengths, some past a word, loaded and drained, for the
+/// reads below the shared table; the store, its keys, and keys it lacks
+/// that fall between and beyond them.
+fn partitioned(name: &str, o: Options) -> (PathBuf, Db, Vec<Vec<u8>>, Vec<Vec<u8>>) {
+    let d = scratch(name);
+    let mut db = Db::create(
+        &d,
+        Options {
+            partition_bytes: Some(1024),
+            ..o
+        },
+    )
+    .unwrap();
+    let mut keys: Vec<Vec<u8>> = Vec::new();
+    for i in 0..300 {
+        keys.push(format!("pk-{i:04}").into_bytes());
+        if i % 3 == 0 {
+            keys.push(format!("pk-{i:04}-and-a-tail-past-a-word").into_bytes());
+        }
+    }
+    keys.sort();
+    for k in &keys {
+        db.put(k, k);
+    }
+    db.commit().unwrap();
+    db.flush().unwrap();
+    db.settle().unwrap();
+    let absent: Vec<Vec<u8>> = (0..300)
+        .step_by(7)
+        .map(|i| format!("pk-{i:04}x").into_bytes())
+        .chain([
+            b"pk".to_vec(),
+            b"pk-9999".to_vec(),
+            b"zz".to_vec(),
+            Vec::new(),
+        ])
+        .collect();
+    (d, db, keys, absent)
+}
+
+/// A key the shared table's lean probe finds no record of is read from
+/// its partition alone where the store has no piece and no frozen table
+/// (`Options::point_lone_absent`), and the partition is placed by the
+/// fences' words (`Options::point_fence_words`): every answer is the one
+/// the placed read gives and the one the search by bytes gives, over keys
+/// at, between and past the fences, and the reads are counted by the
+/// read that answered them. A key the table holds is the lean probe's,
+/// and a store with a frozen table is the placed read's.
+#[test]
+fn a_key_the_live_table_lacks_is_read_from_its_partition_alone() {
+    let _w = Watchdog::arm("the lone read's test waited a minute");
+    let mut answers = Vec::new();
+    for (lone, words) in [(true, true), (false, true), (true, false)] {
+        let (d, mut db, keys, absent) = partitioned(
+            &format!("lone-{lone}-{words}"),
+            Options {
+                point_lone_absent: lone,
+                point_fence_words: words,
+                ..options(1 << 20)
+            },
+        );
+        assert!(db.segments() > 4, "partitions: {}", db.segments());
+        let r = db.reader().unwrap();
+        let mut got: Vec<Vec<Vec<u8>>> = Vec::new();
+        let (lone0, layer0) = r.point_lean_reads();
+        for k in keys.iter().chain(&absent) {
+            got.push(handle_values(&r, k));
+        }
+        let (lone1, layer1) = r.point_lean_reads();
+        // Under the stride switch a form file serves the partitions and
+        // the general read takes every key (`common::stride_switch`).
+        if !common::stride_switch() {
+            let n = (keys.len() + absent.len()) as u64;
+            assert_eq!(
+                (lone1 - lone0, layer1 - layer0),
+                if lone { (n, 0) } else { (0, n) },
+                "lone {lone}, words {words}: the reads by the read that answered"
+            );
+        }
+        // A key the table holds, and then a store with a frozen table.
+        assert!(r.put(&keys[5], b"live").unwrap());
+        let ops0 = r.shared_lean_ops();
+        got.push(handle_values(&r, &keys[5]));
+        assert_eq!(
+            r.shared_lean_ops() - ops0,
+            1,
+            "the table's key is the lean probe's"
+        );
+        assert!(r.put(&keys[7], b"frozen").unwrap());
+        db.hold_seal_landing(true);
+        db.seal().unwrap();
+        assert_eq!(db.frozen_tables(), 1, "the frozen table");
+        let (lone2, _) = r.point_lean_reads();
+        got.push(handle_values(&r, &keys[7]));
+        got.push(handle_values(&r, &keys[9]));
+        assert_eq!(
+            r.point_lean_reads().0,
+            lone2,
+            "a frozen table is the placed read's"
+        );
+        drop(r);
+        db.hold_seal_landing(false);
+        drop(db);
+        let _ = std::fs::remove_dir_all(&d);
+        answers.push(got);
+    }
+    assert_eq!(answers[0], answers[1], "the lone read and the placed one");
+    assert_eq!(answers[0], answers[2], "the search by words and by bytes");
+    let a = &answers[0];
+    assert!(
+        a.iter().filter(|v| v.is_empty()).count() >= 4,
+        "the keys the store lacks read absent"
+    );
+    let n = a.len();
+    assert_eq!(a[n - 3], vec![b"live".to_vec()], "the table's value");
+    assert_eq!(
+        a[n - 2],
+        vec![b"frozen".to_vec()],
+        "the frozen table's value"
+    );
+}
+
+/// A handle whose read fell below the shared table asks for its next key's
+/// partition slot before it probes the table, and hands the key's word
+/// and partition to the read below (`Options::shared_fall_ahead`): a run
+/// of reads below the table asks at every read after its first, a read
+/// the table ends stops the asks, and every key, in whichever partition,
+/// reads back. Under `shared_fall_always` every read asks; with the
+/// option off none does, and the answers are the same.
+#[test]
+fn a_handle_whose_read_fell_below_the_table_asks_for_the_next_partition_first() {
+    let _w = Watchdog::arm("the fall-ahead test waited a minute");
+    let mut answers = Vec::new();
+    for (fall, always) in [(true, false), (true, true), (false, false)] {
+        let (d, db, keys, absent) = partitioned(
+            &format!("fall-{fall}-{always}"),
+            Options {
+                shared_fall_ahead: fall,
+                shared_fall_always: always,
+                ..options(1 << 20)
+            },
+        );
+        let r = db.reader().unwrap();
+        assert!(r.put(b"hot", b"h").unwrap());
+        let mut got: Vec<Vec<Vec<u8>>> = Vec::new();
+        let asks = |want: u64, what: &str| {
+            // Under the stride switch a form file serves the partitions,
+            // whose slots the read does not ask for
+            // (`common::stride_switch`).
+            if !common::stride_switch() {
+                assert_eq!(
+                    r.shared_fall_asks(),
+                    want,
+                    "fall {fall}, always {always}: {what}"
+                );
+            }
+        };
+        got.push(handle_values(&r, b"hot"));
+        asks(
+            u64::from(always),
+            "a read the table ends asks nothing after it",
+        );
+        got.push(handle_values(&r, &keys[0]));
+        asks(2 * u64::from(always), "the first read below the table");
+        for k in keys.iter().chain(&absent) {
+            got.push(handle_values(&r, k));
+        }
+        let n = (keys.len() + absent.len()) as u64;
+        let after = if fall { n } else { 0 } + if always { 2 } else { 0 };
+        asks(after, "every read after one that fell");
+        got.push(handle_values(&r, b"hot"));
+        got.push(handle_values(&r, &keys[1]));
+        let after = after + if fall { 1 } else { 0 } + u64::from(always);
+        asks(after, "the read after the table's");
+        // A read the table's chain leaves to the read below -- an append
+        // over the partition's value -- found a record, and asks nothing
+        // after it.
+        assert!(r.append(&keys[3], b"more").unwrap());
+        got.push(handle_values(&r, &keys[2]));
+        got.push(handle_values(&r, &keys[3]));
+        got.push(handle_values(&r, &keys[4]));
+        let after = after + 2 * u64::from(fall) + u64::from(always);
+        asks(after, "the read after a chain the table does not end");
+        drop(r);
+        drop(db);
+        let _ = std::fs::remove_dir_all(&d);
+        answers.push(got);
+    }
+    assert_eq!(answers[0], answers[2], "the asks and none");
+    assert_eq!(answers[1], answers[2], "an ask at every read and none");
+    for (i, v) in answers[0][2..].iter().enumerate().take(5) {
+        assert!(!v.is_empty(), "key {i} reads back");
+    }
+}
+
 /// A handle's gets and puts read no length of the live table it shares,
 /// whose inserts leave the length to its readers
 /// (`Options::shared_len_lazy`): after a handle's inserts and its gets of

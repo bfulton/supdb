@@ -30,19 +30,28 @@
 //! `SHARED_OPS_FRESH=1` skips the put of every key, so the phases meet
 //! the store as its load and sync left it, every key's first touch among
 //! them; with one round, the threaded phases are a key's first touches as
-//! the threaded mixes' first cells meet them.
+//! the threaded mixes' first cells meet them. `SHARED_OPS_SPLIT=1` puts the
+//! odd keys alone and draws the phases' keys from the even ones, so a
+//! key's first touch meets a live table that holds half the store, its
+//! index written and not the kernel's zero page an untouched one reads.
 use std::time::Instant;
 use supdb_bench::engines::{self, Engine, ThreadWriter};
 use supdb_bench::workload::{db_key_into, KeyDist, KeyGen, Payload, Rng};
 
 const BATCH: usize = 100;
 
+fn split() -> bool {
+    std::env::var_os("SHARED_OPS_SPLIT").is_some()
+}
+
 fn keys(dist: KeyDist, size: u64, seed: u64, n: usize) -> Vec<[u8; 16]> {
     let mut g = KeyGen::new(dist, size, seed);
+    let even = split();
     (0..n)
         .map(|_| {
             let mut kb = [0u8; 16];
-            db_key_into(g.next(), &mut kb);
+            let k = g.next();
+            db_key_into(if even { k & !1 } else { k }, &mut kb);
             kb
         })
         .collect()
@@ -232,7 +241,12 @@ fn main() {
             // them where `SHARED_OPS_FRESH` is set, for what a key's first
             // touch costs.
             if std::env::var_os("SHARED_OPS_FRESH").is_none() {
-                let all = keys(KeyDist::Sequential, size, 0, size as usize);
+                let mut all = Vec::with_capacity(size as usize);
+                for i in (0..size).filter(|i| !split() || i % 2 == 1) {
+                    let mut kb = [0u8; 16];
+                    db_key_into(i, &mut kb);
+                    all.push(kb);
+                }
                 let v = vec![0x5Au8; payload.value_size()];
                 for chunk in all.chunks(BATCH) {
                     let pairs: Vec<(&[u8], &[u8])> =

@@ -2009,6 +2009,22 @@ pub struct Supdb {
     /// The big shared table's inserts each carrying the slab's length
     /// (`Options::shared_len_lazy` off): `supdb-heldsharedbigeagerlen`.
     sharedeagerlen: bool,
+    /// The big shared table's point reads placing their partition by the
+    /// fences' bytes (`Options::point_fence_words` off):
+    /// `supdb-heldsharedbignowords`.
+    sharednowords: bool,
+    /// The big shared table's reads the lean probe found absent from the
+    /// table taking the placed read (`Options::point_lone_absent` off):
+    /// `supdb-heldsharedbignolone`.
+    sharednolone: bool,
+    /// The big shared table's reads asking for their partition's slot only
+    /// once the live table has said it lacks the key
+    /// (`Options::shared_fall_ahead` off): `supdb-heldsharedbignofall`.
+    sharednofall: bool,
+    /// The big shared table's reads all asking for their partition's slot
+    /// ahead of the live table's probe (`Options::shared_fall_always`):
+    /// `supdb-heldsharedbigfallalways`.
+    sharedfallalways: bool,
     /// What the reader handles this store gave its threads answered
     /// through the ordered index, summed as each is dropped
     /// (`OrdTally`); only the arm that reads that way hands out handles
@@ -3312,6 +3328,22 @@ struct Policy {
     /// The big shared table's inserts each carrying the slab's length
     /// (`Options::shared_len_lazy` off): `supdb-heldsharedbigeagerlen`.
     sharedeagerlen: bool,
+    /// The big shared table's point reads placing their partition by the
+    /// fences' bytes (`Options::point_fence_words` off):
+    /// `supdb-heldsharedbignowords`.
+    sharednowords: bool,
+    /// The big shared table's reads the lean probe found absent from the
+    /// table taking the placed read (`Options::point_lone_absent` off):
+    /// `supdb-heldsharedbignolone`.
+    sharednolone: bool,
+    /// The big shared table's reads asking for their partition's slot only
+    /// once the live table has said it lacks the key
+    /// (`Options::shared_fall_ahead` off): `supdb-heldsharedbignofall`.
+    sharednofall: bool,
+    /// The big shared table's reads all asking for their partition's slot
+    /// ahead of the live table's probe (`Options::shared_fall_always`):
+    /// `supdb-heldsharedbigfallalways`.
+    sharedfallalways: bool,
 }
 
 /// The conversions a fill makes at most in `supdb-convertcap`: the first
@@ -3661,6 +3693,10 @@ impl Default for Policy {
             sharednolean: false,
             sharednohuge: false,
             sharedeagerlen: false,
+            sharednowords: false,
+            sharednolone: false,
+            sharednofall: false,
+            sharedfallalways: false,
             defer: false,
             firstfloor: false,
             aheadmin: None,
@@ -3881,6 +3917,10 @@ impl Supdb {
             asym,
             nohuge,
             eagerlen,
+            nowords,
+            nolone,
+            nofall,
+            fallalways,
         } = shape;
         Supdb::with_policy(
             path,
@@ -3901,6 +3941,10 @@ impl Supdb {
                 sharednolean: nolean,
                 sharednohuge: nohuge,
                 sharedeagerlen: eagerlen,
+                sharednowords: nowords,
+                sharednolone: nolone,
+                sharednofall: nofall,
+                sharedfallalways: fallalways,
                 asympin: asym,
                 ..Policy::default()
             },
@@ -10424,6 +10468,10 @@ impl Supdb {
             sharednolean,
             sharednohuge,
             sharedeagerlen,
+            sharednowords,
+            sharednolone,
+            sharednofall,
+            sharedfallalways,
         } = policy;
         // What the engine ships, so an arm that pins nothing inherits it
         // rather than restating it and drifting from it.
@@ -11110,6 +11158,10 @@ impl Supdb {
             shared_lean: !sharednolean,
             shared_huge: !sharednohuge,
             shared_len_lazy: !sharedeagerlen,
+            point_fence_words: !sharednowords,
+            point_lone_absent: !sharednolone,
+            shared_fall_ahead: !sharednofall,
+            shared_fall_always: sharedfallalways,
             shared_index_slots: if sharedbig && !sharedcapindex {
                 shared_index_slots()
             } else {
@@ -11490,6 +11542,10 @@ impl Supdb {
             sharednolean,
             sharednohuge,
             sharedeagerlen,
+            sharednowords,
+            sharednolone,
+            sharednofall,
+            sharedfallalways,
             ord_threads: Default::default(),
         })
     }
@@ -11736,6 +11792,14 @@ impl Engine for Supdb {
                     "supdb-heldsharedbignohuge"
                 } else if self.shared && self.sharedbig && self.sharedeagerlen {
                     "supdb-heldsharedbigeagerlen"
+                } else if self.shared && self.sharedbig && self.sharednowords {
+                    "supdb-heldsharedbignowords"
+                } else if self.shared && self.sharedbig && self.sharednolone {
+                    "supdb-heldsharedbignolone"
+                } else if self.shared && self.sharedbig && self.sharednofall {
+                    "supdb-heldsharedbignofall"
+                } else if self.shared && self.sharedbig && self.sharedfallalways {
+                    "supdb-heldsharedbigfallalways"
                 } else if self.shared && self.sharedbig {
                     "supdb-heldsharedbig"
                 } else if self.shared {
@@ -14759,7 +14823,13 @@ pub fn set_store_bound(bytes: Option<u64>) {
 /// pins plain stores the sweep fences for (`Options::asym_pins`),
 /// `supdb-heldsharedbigasym`, or its table on small pages,
 /// `supdb-heldsharedbignohuge`, or its inserts each carrying the slab's
-/// length, `supdb-heldsharedbigeagerlen`.
+/// length, `supdb-heldsharedbigeagerlen`, or its point reads placing their
+/// partition by the fences' bytes, `supdb-heldsharedbignowords`, or its
+/// reads the lean probe found absent from the table taking the placed
+/// read, `supdb-heldsharedbignolone`, or its reads asking for their
+/// partition's slot only once the live table lacks the key,
+/// `supdb-heldsharedbignofall`, or all of them asking for it ahead of the
+/// table's probe, `supdb-heldsharedbigfallalways`.
 #[derive(Clone, Copy, Default)]
 pub struct SharedShape {
     pub norecycle: bool,
@@ -14772,6 +14842,10 @@ pub struct SharedShape {
     pub asym: bool,
     pub nohuge: bool,
     pub eagerlen: bool,
+    pub nowords: bool,
+    pub nolone: bool,
+    pub nofall: bool,
+    pub fallalways: bool,
 }
 
 /// The slots `supdb-heldsharedbig`'s shared index takes
@@ -15780,6 +15854,10 @@ pub fn guarantee(arm: &str) -> Option<Guarantee> {
         | "supdb-heldsharedbigasym"
         | "supdb-heldsharedbignohuge"
         | "supdb-heldsharedbigeagerlen"
+        | "supdb-heldsharedbignowords"
+        | "supdb-heldsharedbignolone"
+        | "supdb-heldsharedbignofall"
+        | "supdb-heldsharedbigfallalways"
         | "supdb-heldbatch1"
         | "proto-shared"
         | "faster" => Guarantee::Memory,
@@ -16467,6 +16545,58 @@ pub fn open(arm: &str, dir: &Path, map_gb: usize) -> Res<Box<dyn Engine>> {
                     SharedShape {
                         big: true,
                         eagerlen: true,
+                        ..SharedShape::default()
+                    },
+                )
+            },
+            dir,
+        )?,
+        "supdb-heldsharedbignowords" => supdb_arm(
+            |d| {
+                Supdb::create_held_shared(
+                    d,
+                    SharedShape {
+                        big: true,
+                        nowords: true,
+                        ..SharedShape::default()
+                    },
+                )
+            },
+            dir,
+        )?,
+        "supdb-heldsharedbignolone" => supdb_arm(
+            |d| {
+                Supdb::create_held_shared(
+                    d,
+                    SharedShape {
+                        big: true,
+                        nolone: true,
+                        ..SharedShape::default()
+                    },
+                )
+            },
+            dir,
+        )?,
+        "supdb-heldsharedbignofall" => supdb_arm(
+            |d| {
+                Supdb::create_held_shared(
+                    d,
+                    SharedShape {
+                        big: true,
+                        nofall: true,
+                        ..SharedShape::default()
+                    },
+                )
+            },
+            dir,
+        )?,
+        "supdb-heldsharedbigfallalways" => supdb_arm(
+            |d| {
+                Supdb::create_held_shared(
+                    d,
+                    SharedShape {
+                        big: true,
+                        fallalways: true,
                         ..SharedShape::default()
                     },
                 )
@@ -18581,6 +18711,10 @@ mod tests {
             asym: false,
             nohuge: false,
             eagerlen: false,
+            nowords: false,
+            nolone: false,
+            nofall: false,
+            fallalways: false,
         };
         for (arm, s) in [
             (
@@ -18638,6 +18772,34 @@ mod tests {
                     ..shape(false, true, false, false, false)
                 },
             ),
+            (
+                "supdb-heldsharedbignowords",
+                SharedShape {
+                    nowords: true,
+                    ..shape(false, true, false, false, false)
+                },
+            ),
+            (
+                "supdb-heldsharedbignolone",
+                SharedShape {
+                    nolone: true,
+                    ..shape(false, true, false, false, false)
+                },
+            ),
+            (
+                "supdb-heldsharedbignofall",
+                SharedShape {
+                    nofall: true,
+                    ..shape(false, true, false, false, false)
+                },
+            ),
+            (
+                "supdb-heldsharedbigfallalways",
+                SharedShape {
+                    fallalways: true,
+                    ..shape(false, true, false, false, false)
+                },
+            ),
         ] {
             let e = open(arm, &root.join(arm), 1).unwrap();
             assert_eq!(e.name(), arm);
@@ -18657,6 +18819,10 @@ mod tests {
             assert_eq!(ao.asym_pins, s.asym, "{arm}");
             assert_eq!(ao.shared_huge, !s.nohuge, "{arm}");
             assert_eq!(ao.shared_len_lazy, !s.eagerlen, "{arm}");
+            assert_eq!(ao.point_fence_words, !s.nowords, "{arm}");
+            assert_eq!(ao.point_lone_absent, !s.nolone, "{arm}");
+            assert_eq!(ao.shared_fall_ahead, !s.nofall, "{arm}");
+            assert_eq!(ao.shared_fall_always, s.fallalways, "{arm}");
         }
         let _ = std::fs::remove_dir_all(&root);
     }
