@@ -1011,6 +1011,56 @@ D's 0.97x in both, and the commits of A, B and F 5-25% faster; by both
 orders' mean the rates of A, B and F read 0.90-0.93x for FNV, the load
 0.93x, D 1.02x, and the scan passes, which hash nothing, 0.99-1.01x.
 
+#### Updates in place
+
+An update under the held log lays a tombstone and the new value at the
+end of the live table's arena and chains them over the key's old value,
+so every update is fresh bytes, and the seal comes sooner by their size;
+FASTER writes an update over the record where it lies, in its log's
+mutable region. Under the held log, which promises nothing of isolation,
+a put to a key whose live chain is one value over a put's tombstone, and
+whose new value has that value's length, now writes the bytes where they
+lie (`Options::put_in_place`, `MemTable::overwrite`, `supdb-heldinplace`,
+the held log with no frames, the block cache off and the upkeep inline;
+`supdb-heldnfinline` is the same arm appending). What a put leaves is the
+same either way, one value over a tombstone. The write is still logged:
+the scan snapshot's copy of a key's run (`Options::snapshot_runs`) is
+read again only where the log says the key was written since, and a test
+that drops the entry reads the copy after an overwrite over a store of
+partitions. The bytes change under nobody but the writer, so the option
+refuses a reader handle, the block cache with its upkeep thread, and the
+keepers; the seal thread reads frozen tables and handed ones, which the
+writer writes nothing into.
+
+Counted under callgrind (`point_ops ARM 100000 1 zipf-plain 1`, toggled
+on `phase_updates` and `phase_half`, at `d83c220`), an update is 444.0
+instructions against 490.5 appending, and the phase of half gets and half
+updates 540.7 against 621.3. Timed natively, three rounds alternated
+(`point_ops ARM 300000 1 zipf-plain 6`, each round the overwriting arm,
+the appending arm twice, the overwriting arm and FASTER): an update
+103-147 ns, 111 the median of six, against 129-162 appending, 139, and
+FASTER's 155-180, 157; a get over the written store 109-121 ns against
+127-145 appending and FASTER's 82 in two runs of three.
+
+Paired against the arm that appends (`pair.sh SUPDB_MIX_KINDS=1
+supdb-heldinplace supdb-heldnfinline 300000 --reps 12 --passes
+load,read,scan,mixes,mixes-scrambled`, at `d83c220`; ours over the appending
+arm's, by both orders' mean), A read 1.09x, F 1.11x, E 1.22x and the
+scrambled D and E 1.06x and 1.10x, and D 0.97x, with the rest within 2%.
+Timed by kind, A's and F's gets are 7-8% faster in both sittings and
+their commits 1.3x and 1.5x. The scrambled mixes' commits are the other
+way, 1.15-1.6x slower in place in both sittings -- the scrambled E's 38
+µs a commit against 24 -- which is not yet laid to a cause.
+
+Beside FASTER (`pair.sh SUPDB_MIX_KINDS=1 supdb-heldinplace faster
+300000`, the same passes and reps; ours over FASTER's): A 1.07x, B 1.04x,
+C 1.12x, D 1.02x, the scrambled A and B 1.09x and 1.01x, and the loads
+3.5x and 1.6x. FASTER keeps F at 0.96x and the scrambled C, D and F at
+0.96x, 0.93x and 0.93x. By kind, what it keeps is the gets of a store
+with pieces standing -- the scrambled mixes' gets 4-14% faster than ours
+in both sittings -- and F's writes, 7.3 µs a commit of a hundred
+read-modify-writes against our 8.7.
+
 #### Beside FASTER out of core
 
 A store larger than memory is what FASTER's log is made for, and the
