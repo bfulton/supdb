@@ -5017,6 +5017,18 @@ pub struct Options {
     /// naming its record, for the walks by number. Off: an entry a key, its
     /// key and its chunks apart.
     pub shared_records: bool,
+    /// EXPERIMENT, under `shared_writers` with `shared_records`: a put of a
+    /// value of the length its key's value has overwrites the value where it
+    /// lies, under the record's lock, as FASTER updates a record in its
+    /// mutable region: no chunk laid down, no head swapped, and the value
+    /// beside its key on the record's lines for every read after. A read of
+    /// a table that rewrites copies a key's chain between two equal, even
+    /// readings of the record's lock (`MemTable::copy_chain`), as a sequence
+    /// lock's reader does, until the table's freeze has stopped the
+    /// overwrites and waited out the writers that may have been making one,
+    /// before it publishes the table frozen; a frozen table is read as the
+    /// one writer's is. Off: a put lays its value down and swaps the head.
+    pub shared_in_place: bool,
     /// A job's large per-key arrays -- a seal's sort of its
     /// table, a segment writer's copy of every key with its span, its
     /// record's offset and its hash, the ordered index builder's keys, a
@@ -7363,6 +7375,7 @@ impl Options {
                 self.shared_recycles,
                 self.shared_chunk_ahead,
                 self.shared_records,
+                self.shared_in_place,
             )
         } else {
             MemTable::new(self.block_shape(pool))
@@ -7682,6 +7695,7 @@ impl Default for Options {
             shared_chunk_ahead: true,
             shared_index_slots: 0,
             shared_records: true,
+            shared_in_place: true,
             jobs_mapped: true,
             jobs_mapped_when_short: false,
             jobs_pooled: false,
@@ -14118,6 +14132,19 @@ struct MemTable {
     /// which holds the chain's head beside the key and the key's first
     /// write after it, and an entry names the record for the walks.
     records: bool,
+    /// A table of records whose puts of a value of the length they replace
+    /// overwrite it where it lies, under the record's lock
+    /// (`Options::shared_in_place`); `closed` once its freeze has stopped
+    /// that, and `settled` once the writers that may have been overwriting
+    /// are out: every read of a table that rewrites and is not settled
+    /// copies a chain between two equal readings of its record's lock
+    /// (`copy_chain`).
+    rewrites: bool,
+    closed: std::sync::atomic::AtomicBool,
+    settled: std::sync::atomic::AtomicBool,
+    /// A test's: an overwrite in place waits inside the record's lock while
+    /// bit 0 stands (`Reader::hold_rewrites`); bit 1 says one is waiting there.
+    rewrite_hold: std::sync::atomic::AtomicU8,
 }
 
 /// What a writer claims of a shared table's arena at a time
@@ -14206,6 +14233,10 @@ pub(crate) struct TableLocal {
     /// The oldest pin when the writer last read the pins, `u64::MAX` where
     /// none was pinned.
     oldest: u64,
+    /// The puts this writer has overwritten in place, over every table it
+    /// has written (`MemTable::rewrite_in_place`), for a test that has to
+    /// know its writes took that path.
+    rewrites: u64,
 }
 
 /// Replaced ranges a writer gathers before it bumps the epoch over them and
@@ -14293,6 +14324,46 @@ fn shared_chunk_len(w: SharedWrite<'_>) -> usize {
         SharedWrite::Put(v) => 2 * CHUNK_HDR + v.len(),
         SharedWrite::Append(v) => CHUNK_HDR + v.len(),
         SharedWrite::Delete => CHUNK_HDR,
+    }
+}
+
+/// A key's live values copied out of a table that rewrites in place
+/// (`MemTable::copy_chain`): the bytes, each value's end, oldest first once
+/// the copy is whole.
+#[derive(Default)]
+struct ChainCopy {
+    bytes: Vec<u8>,
+    ends: Vec<usize>,
+}
+
+impl ChainCopy {
+    /// The values as `copy_chain` walked them, newest first, put oldest
+    /// first.
+    fn oldest_first(&mut self) {
+        if self.ends.len() < 2 {
+            return;
+        }
+        let mut bytes = Vec::with_capacity(self.bytes.len());
+        let mut ends = Vec::with_capacity(self.ends.len());
+        for i in (0..self.ends.len()).rev() {
+            let start = if i == 0 { 0 } else { self.ends[i - 1] };
+            bytes.extend_from_slice(&self.bytes[start..self.ends[i]]);
+            ends.push(bytes.len());
+        }
+        self.bytes = bytes;
+        self.ends = ends;
+    }
+
+    /// The values, oldest first.
+    fn values(&self) -> impl DoubleEndedIterator<Item = &[u8]> {
+        self.ends.iter().enumerate().map(|(i, &end)| {
+            let start = if i == 0 { 0 } else { self.ends[i - 1] };
+            &self.bytes[start..end]
+        })
+    }
+
+    fn len(&self) -> usize {
+        self.ends.len()
     }
 }
 
@@ -16134,6 +16205,10 @@ impl MemTable {
             log_range: false,
             slim_entries: false,
             records: false,
+            rewrites: false,
+            closed: std::sync::atomic::AtomicBool::new(false),
+            settled: std::sync::atomic::AtomicBool::new(false),
+            rewrite_hold: std::sync::atomic::AtomicU8::new(0),
             slim: Slab::new(src()),
             vals2: ByteArena::new(prefault, src()),
             staging: UnsafeCell::new(Staging::default()),
@@ -16169,6 +16244,7 @@ impl MemTable {
         recycles: bool,
         head_ahead: bool,
         records: bool,
+        in_place: bool,
     ) -> MemTable {
         let mut m = MemTable::new_with(shape, Some((cap_bytes, slots)));
         if let Some(st) = m.shared.as_deref_mut() {
@@ -16180,7 +16256,16 @@ impl MemTable {
             "a shared table's records name their keys by thirty-two-bit offsets"
         );
         m.records = records;
+        m.rewrites = records && in_place;
         m
+    }
+
+    /// Whether a read of this table's values may meet a value being
+    /// overwritten in place: a table that rewrites, its freeze not yet past
+    /// the writers that may be overwriting (`settled`).
+    #[inline]
+    fn rewrites_now(&self) -> bool {
+        self.rewrites && !self.settled.load(AtomicOrdering::Acquire)
     }
 
     /// Shared records: the atomic word of eight bytes at `at` in the value
@@ -16324,6 +16409,10 @@ impl MemTable {
             snaps: FrozenSnaps::new(),
             shared: None,
             records: false,
+            rewrites: false,
+            closed: std::sync::atomic::AtomicBool::new(false),
+            settled: std::sync::atomic::AtomicBool::new(false),
+            rewrite_hold: std::sync::atomic::AtomicU8::new(0),
         }
     }
 
@@ -17520,6 +17609,21 @@ impl MemTable {
         buf: &mut [std::mem::MaybeUninit<&'t [u8]>; LIVE_SMALL],
     ) -> Option<(usize, bool)> {
         debug_assert!(
+            !self.rewrites_now(),
+            "a value of a table that rewrites in place read without its record's lock"
+        );
+        self.live_small_locked(e, wm, buf)
+    }
+
+    /// `live_small_hashed` for a reader that holds the key's lock, or of a
+    /// table that does not rewrite: no write of the key can be in flight.
+    fn live_small_locked<'t>(
+        &'t self,
+        e: Entry<'t>,
+        wm: u64,
+        buf: &mut [std::mem::MaybeUninit<&'t [u8]>; LIVE_SMALL],
+    ) -> Option<(usize, bool)> {
+        debug_assert!(
             !self.ordered && !self.stream && !self.refs,
             "a hashed table's chunks are in its arena, under plain offsets"
         );
@@ -17555,6 +17659,10 @@ impl MemTable {
     }
 
     fn value_at(&self, off: usize) -> &[u8] {
+        debug_assert!(
+            !self.rewrites_now(),
+            "a value of a table that rewrites in place read without its record's lock"
+        );
         let len = self.chunk_len(off as u64);
         debug_assert_ne!(len, TOMB_LEN, "a tombstone has no value");
         if self.stream {
@@ -17778,6 +17886,7 @@ impl MemTable {
         if l.table != me {
             *l = TableLocal {
                 table: me,
+                rewrites: l.rewrites,
                 ..TableLocal::default()
             };
         }
@@ -17840,6 +17949,13 @@ impl MemTable {
             0 => NO_CHUNK,
             h => h - 1,
         };
+        if let SharedWrite::Put(value) = w {
+            if self.rewrite_in_place(head, value) {
+                c.lock.store(v + 2, AtomicOrdering::Release);
+                l.rewrites += 1;
+                return true;
+            }
+        }
         let drops = st.recycles && !matches!(w, SharedWrite::Append(_));
         let below = if drops { NO_CHUNK } else { head };
         let Some(chunk) = self.chunks_shared(st, l, rd, below, w) else {
@@ -17904,6 +18020,7 @@ impl MemTable {
         if l.table != me {
             *l = TableLocal {
                 table: me,
+                rewrites: l.rewrites,
                 ..TableLocal::default()
             };
         }
@@ -17921,10 +18038,28 @@ impl MemTable {
         };
         let head = MemTable::head(e);
         let mut live = [std::mem::MaybeUninit::<&[u8]>::uninit(); LIVE_SMALL];
-        let Some((n, true)) = self.live_small_hashed(e, SEE_ALL, &mut live) else {
+        // Under the key's lock no write of the key is in flight, so the
+        // chain's bytes are read as they lie.
+        let Some((mut n, true)) = self.live_small_locked(e, SEE_ALL, &mut live) else {
             c.lock.store(v, AtomicOrdering::Release);
             return SharedRmw::Spread;
         };
+        if self.rewrites && !self.closed.load(AtomicOrdering::SeqCst) {
+            // The old value read out first, under the lock no writer of
+            // this key can take, then overwritten where it lies.
+            for old in live[..n].iter().rev() {
+                // SAFETY: the first `n` are written.
+                f(unsafe { old.assume_init() });
+            }
+            if self.rewrite_in_place(head, value) {
+                c.lock.store(v + 2, AtomicOrdering::Release);
+                l.rewrites += 1;
+                return SharedRmw::Whole(true);
+            }
+            // Not a chain one put made, or another length: laid down as a
+            // put is, the values already given.
+            n = 0;
+        }
         let w = SharedWrite::Put(value);
         let drops = st.recycles;
         let below = if drops { NO_CHUNK } else { head };
@@ -17947,6 +18082,113 @@ impl MemTable {
             }
         }
         SharedRmw::Whole(true)
+    }
+
+    /// Shared, rewriting (`MemTable::rewrites`), under the key's lock: `value`
+    /// written over the chain's value where the chain is one put's -- its
+    /// value of `value`'s length over a tombstone over nothing -- and the
+    /// table is not closed to it (`closed`), as a sequence lock's writer
+    /// writes: the lock odd since the caller took it, a release fence, the
+    /// bytes, and the caller's even store after. False, nothing written,
+    /// where any of that does not hold.
+    fn rewrite_in_place(&self, head: u64, value: &[u8]) -> bool {
+        // The closed flag is read after the lock is taken, sequentially
+        // consistent beside the freeze's store of it and its bump: a writer
+        // that reads it open pinned before the freeze's bump, so the freeze
+        // waits for its write; one that pins after reads it closed.
+        if !self.rewrites || head == NO_CHUNK || self.closed.load(AtomicOrdering::SeqCst) {
+            return false;
+        }
+        let c = self.vals.chunk(head as usize);
+        if c.len == TOMB_LEN || c.len as usize != value.len() || c.prev == NO_CHUNK {
+            return false;
+        }
+        let t = self.vals.chunk(c.prev as usize);
+        if t.len != TOMB_LEN || t.prev != NO_CHUNK {
+            return false;
+        }
+        std::sync::atomic::fence(AtomicOrdering::Release);
+        if self.rewrite_hold.load(AtomicOrdering::Acquire) & 1 != 0 {
+            self.rewrite_hold.fetch_or(2, AtomicOrdering::AcqRel);
+            while self.rewrite_hold.load(AtomicOrdering::Acquire) & 1 != 0 {
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+            self.rewrite_hold.fetch_and(!2, AtomicOrdering::AcqRel);
+        }
+        self.vals.fill(head as usize + CHUNK_HDR, value.len(), |b| {
+            b.copy_from_slice(value)
+        });
+        true
+    }
+
+    /// Shared, rewriting: entry `e`'s chain, its record's current one,
+    /// copied into `out` oldest first between two equal, even readings of
+    /// the record's lock, as a sequence lock's reader reads: a writer that
+    /// overwrote a value or moved the head between them makes the copy
+    /// again. Whether a tombstone cut the chain. The bytes are copied while
+    /// a writer may be writing them and kept only where the lock says none
+    /// was, crossbeam's `AtomicCell` reads a value too large for an atomic
+    /// the same way.
+    fn copy_chain(&self, e: Entry<'_>, out: &mut ChainCopy) -> bool {
+        debug_assert!(self.records, "a table that rewrites keeps records");
+        let r = e.key_off as usize - REC_HDR;
+        let lock = self.rec_word32(r + REC_LOCK);
+        let head = self.rec_word64(r + REC_HEAD);
+        loop {
+            let v = lock.load(AtomicOrdering::Acquire);
+            if v & 1 == 1 {
+                std::hint::spin_loop();
+                continue;
+            }
+            out.bytes.clear();
+            out.ends.clear();
+            let mut at = match head.load(AtomicOrdering::Acquire) {
+                0 => NO_CHUNK,
+                h => h - 1,
+            };
+            let mut tomb = false;
+            while at != NO_CHUNK {
+                let c = self.vals.chunk(at as usize);
+                if c.len == TOMB_LEN {
+                    tomb = true;
+                    break;
+                }
+                out.bytes.extend_from_slice(c.value());
+                out.ends.push(out.bytes.len());
+                at = c.prev;
+            }
+            std::sync::atomic::fence(AtomicOrdering::Acquire);
+            if lock.load(AtomicOrdering::Relaxed) == v {
+                out.oldest_first();
+                return tomb;
+            }
+        }
+    }
+
+    /// Entry `e`'s live values, oldest first, to `f`, where a tombstone ends
+    /// them, as `live_offs_into` and `value_at` read them -- through a copy
+    /// under the record's lock where the table rewrites (`copy_chain`).
+    /// Whether a tombstone cut the chain.
+    fn live_values(
+        &self,
+        e: Entry<'_>,
+        wm: u64,
+        scratch: &mut Vec<usize>,
+        copy: &mut ChainCopy,
+        mut f: impl FnMut(&[u8]),
+    ) -> bool {
+        if self.rewrites_now() {
+            let tomb = self.copy_chain(e, copy);
+            for v in copy.values() {
+                f(v);
+            }
+            return tomb;
+        }
+        let tomb = self.live_offs_into(e, scratch, wm);
+        for &off in scratch.iter() {
+            f(self.value_at(off));
+        }
+        tomb
     }
 
     /// Shared: the bytes of a chain that is one put's -- a tombstone over
@@ -18412,13 +18654,14 @@ fn check_options(opts: &Options) -> Result<()> {
             || opts.snapshot_runs
             || opts.direct_ingest
             || opts.put_in_place
+            || opts.adaptive_shape
             || opts.upkeep != Upkeep::Inline)
     {
         return Err(err(
             "shared_writers writes the live table from every thread with nothing logged: \
              it needs SyncPolicy::Explicit with held_frames off, Upkeep::Inline, and \
              scan_block_cache, snapshot_keeper, forms_off_snapshot_kept, snapshot_runs, \
-             direct_ingest and put_in_place off",
+             direct_ingest, put_in_place and adaptive_shape off",
         ));
     }
     if !opts.writer_pins && (opts.publish_in_background || opts.snapshot_keeper) {
@@ -24969,6 +25212,53 @@ impl Reader {
         self.write_shared(key, SharedWrite::Delete)
     }
 
+    /// A test's: whether a freeze waits at `Db::hold_shared_closed`.
+    #[doc(hidden)]
+    pub fn shared_closed_holding(&self) -> bool {
+        self.shared.shared_grace_hold.load(AtomicOrdering::Acquire) & 8 != 0
+    }
+
+    /// A test's: lets a freeze held at `Db::hold_shared_closed` go on.
+    #[doc(hidden)]
+    pub fn release_shared_closed(&self) {
+        self.shared
+            .shared_grace_hold
+            .fetch_and(!4, AtomicOrdering::AcqRel);
+    }
+
+    /// A test's: whether an overwrite waits at `Reader::hold_rewrites` in the
+    /// live table this handle reads.
+    #[doc(hidden)]
+    pub fn rewrite_holding(&self) -> bool {
+        let _e = self.enter();
+        self.state().mem.rewrite_hold.load(AtomicOrdering::Acquire) & 2 != 0
+    }
+
+    /// A test's: while `on`, an overwrite in place of the live table this
+    /// handle reads waits inside the record's lock
+    /// (`MemTable::rewrite_in_place`); set through a handle, since the
+    /// writer reads its state only inside its own operations.
+    #[doc(hidden)]
+    pub fn hold_rewrites(&self, on: bool) {
+        let _e = self.enter();
+        Db::set_hold_bit(&self.state().mem.rewrite_hold, 1, on);
+    }
+
+    /// A test's: whether the live table this handle reads is settled, its
+    /// overwrites in place stopped and waited out (`MemTable::settled`).
+    #[doc(hidden)]
+    pub fn live_settled(&self) -> bool {
+        let _e = self.enter();
+        self.state().mem.settled.load(AtomicOrdering::Acquire)
+    }
+
+    /// A test's: the puts this handle has overwritten in place
+    /// (`Options::shared_in_place`), over every table it has written.
+    #[doc(hidden)]
+    pub fn rewrites_made(&self) -> u64 {
+        self.shared_local.borrow().rewrites
+    }
+
     /// A test's: whether a freeze's grace waits at `Db::hold_shared_grace`.
     #[doc(hidden)]
     pub fn shared_grace_holding(&self) -> bool {
@@ -29429,13 +29719,29 @@ impl Reader {
         // of a store is made with one shape, so the frozen tables below
         // take the live one's hash.
         let mh = mem.hash_with(key, fnv0);
+        // A table that rewrites in place is read through a copy of the
+        // chain under its record's lock, and its values are slices of the
+        // copy, which outlives them on this frame.
+        let mut live_copy = ChainCopy::default();
         let mut live = [std::mem::MaybeUninit::<&[u8]>::uninit(); LIVE_SMALL];
         let mut live_n = 0;
         let found = mem
             .probe_entry(mh, key)
             .filter(|&(i, _)| i < self.len_bound.get());
         if let Some((_, e)) = found {
-            let (n, tomb) = mem.live_small_hashed(e, self.wm(), &mut live)?;
+            let (n, tomb) = if mem.rewrites_now() {
+                let tomb = mem.copy_chain(e, &mut live_copy);
+                if live_copy.len() > LIVE_SMALL {
+                    return None;
+                }
+                // Newest first, as `live_small_hashed` gives them.
+                for (j, v) in live_copy.values().rev().enumerate() {
+                    live[j].write(v);
+                }
+                (live_copy.len(), tomb)
+            } else {
+                mem.live_small_hashed(e, self.wm(), &mut live)?
+            };
             if tomb {
                 // The tombstone masks every older source: the read is
                 // the chain's values after it.
@@ -29571,7 +29877,7 @@ impl Reader {
         }
         let (segs, mem) = (&st.segs, &*st.mem);
         let nf = st.frozen.len();
-        if mem.ordered || nf > FROZEN_CAP {
+        if mem.ordered || nf > FROZEN_CAP || mem.rewrites_now() {
             return None;
         }
         if self.opts.zpages != ZPages::Off && self.z_on() {
@@ -29689,6 +29995,11 @@ impl Reader {
         let segs = &st.segs;
         let mem = &*st.mem;
         if !segs.last().is_some_and(|s| s.level > 0) || !st.frozen.is_empty() || mem.ordered {
+            return None;
+        }
+        // A table that rewrites in place is read through a copy, which the
+        // general read takes (`MemTable::live_values`).
+        if mem.rewrites_now() {
             return None;
         }
         // A partition a form file may serve is dispatched by the general
@@ -29953,11 +30264,13 @@ impl Reader {
                 None => mem.get_with(hash, key, self.len_bound.get()),
             };
             if let Some(e) = got {
-                let (offs, _) = mem.live_chain(e, self.wm());
-                n += offs.len() as u64;
-                for off in offs {
-                    f(mem.value_at(off));
-                }
+                let (mut offs, mut copy) = (Vec::new(), ChainCopy::default());
+                let mut k = 0u64;
+                mem.live_values(e, self.wm(), &mut offs, &mut copy, |v| {
+                    k += 1;
+                    f(v)
+                });
+                n += k;
             }
         }
         Ok(n)
@@ -30545,9 +30858,9 @@ impl Reader {
                 }
                 if nc + self.frozen().len() >= start {
                     if let Some(e) = self.mem().get(key, self.len_bound.get()) {
-                        for off in self.mem().live_chain(e, self.wm()).0 {
-                            f(key, self.mem().value_at(off));
-                        }
+                        let (mut offs, mut copy) = (Vec::new(), ChainCopy::default());
+                        self.mem()
+                            .live_values(e, self.wm(), &mut offs, &mut copy, |v| f(key, v));
                     }
                 }
                 unsealed.advance(&mut mc);
@@ -37671,10 +37984,9 @@ impl Reader {
                 snap.run_values(uk.lrun, self.wm(), |v| f(key, v));
             } else {
                 let e = self.mem().entry(uk.mem as usize);
-                self.mem().live_offs_into(e, scratch, self.wm());
-                for &off in scratch.iter() {
-                    f(key, self.mem().value_at(off));
-                }
+                let mut copy = ChainCopy::default();
+                self.mem()
+                    .live_values(e, self.wm(), scratch, &mut copy, |v| f(key, v));
             }
         }
         Ok(())
@@ -37872,10 +38184,9 @@ impl Reader {
                 }
                 if sk.mem != u32::MAX && nc + 1 + nf >= start {
                     let e = self.mem().entry(sk.mem as usize);
-                    self.mem().live_offs_into(e, &mut scratch, self.wm());
-                    for &off in &scratch {
-                        f(key, self.mem().value_at(off));
-                    }
+                    let mut copy = ChainCopy::default();
+                    self.mem()
+                        .live_values(e, self.wm(), &mut scratch, &mut copy, |v| f(key, v));
                 }
                 unsealed.advance(&mut mc);
             }
@@ -41942,6 +42253,7 @@ impl Db {
         let carried = std::cell::Cell::new(false);
         let pieces_only = self.opts.forms_pieces_only;
         let by_capacity = self.opts.counts_capacity();
+        self.close_in_place(table);
         let Some(old) = self.try_publish_writer(|cur| {
             if !std::sync::Arc::ptr_eq(&cur.mem, table) || cur.frozen.len() >= FROZEN_CAP {
                 return None;
@@ -41993,6 +42305,7 @@ impl Db {
             self.shared.shared_cap.load(AtomicOrdering::Relaxed),
         ));
         let from = Db::replaced_from(&self.opts, &self.shared);
+        self.close_in_place(table);
         let Some(old) = self.try_publish_writer_away(|cur| {
             if !std::sync::Arc::ptr_eq(&cur.mem, table) || cur.frozen.len() >= FROZEN_CAP {
                 return None;
@@ -42005,6 +42318,30 @@ impl Db {
         self.published_away(old);
         Db::ask_abandon(&self.opts, &self.shared, self.state(), from);
         true
+    }
+
+    /// Shared, rewriting (`MemTable::rewrites`): the live `table` closed to
+    /// writes in place before its freeze publishes it frozen, the writers
+    /// that may be making one waited out, and the table marked settled, so
+    /// that no frozen table is ever read while a value of it is overwritten
+    /// and its readers read it as one that never rewrites. A freeze whose
+    /// publish then fails leaves the table live and closed: it takes no
+    /// more writes in place, and its reads need no copy.
+    fn close_in_place(&self, table: &MemTable) {
+        if !table.rewrites || table.settled.load(AtomicOrdering::Acquire) {
+            return;
+        }
+        table.closed.store(true, AtomicOrdering::SeqCst);
+        self.wait_shared_writers_out();
+        table.settled.store(true, AtomicOrdering::Release);
+        let hold = &self.shared.shared_grace_hold;
+        if hold.load(AtomicOrdering::Acquire) & 4 != 0 {
+            hold.fetch_or(8, AtomicOrdering::AcqRel);
+            while hold.load(AtomicOrdering::Acquire) & 4 != 0 {
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+            hold.fetch_and(!8, AtomicOrdering::AcqRel);
+        }
     }
 
     /// Shared: the handles that have written a shared table waited out of
@@ -43709,6 +44046,15 @@ impl Db {
     #[doc(hidden)]
     pub fn hold_shared_grace(&self, on: bool) {
         Db::set_hold_bit(&self.shared.shared_grace_hold, 1, on);
+    }
+
+    /// A test's: while `on`, a freeze of a table that rewrites in place
+    /// waits once it has closed and settled the table and before it
+    /// publishes it frozen (`Db::close_in_place`), let go through a handle
+    /// (`Reader::release_shared_closed`).
+    #[doc(hidden)]
+    pub fn hold_shared_closed(&self, on: bool) {
+        Db::set_hold_bit(&self.shared.shared_grace_hold, 4, on);
     }
 
     /// A test's: while `on`, a merge's thread waits before it returns its
@@ -48838,10 +49184,9 @@ impl<'s> BuildCtx<'s> {
                     ov.snap.run_values(sk.lrun, self.wm, |v| f(key, v));
                 } else {
                     let e = self.mem.entry(sk.mem as usize);
-                    self.mem.live_offs_into(e, &mut em.scratch, self.wm);
-                    for &off in em.scratch.iter() {
-                        f(key, self.mem.value_at(off));
-                    }
+                    let mut copy = ChainCopy::default();
+                    self.mem
+                        .live_values(e, self.wm, &mut em.scratch, &mut copy, |v| f(key, v));
                 }
             }
         }
@@ -60092,7 +60437,37 @@ mod shared_table {
             recycles,
             true,
             RECORDS.with(|r| r.get()),
+            false,
         )
+    }
+
+    /// A table of records whose puts overwrite in place, recycling what a
+    /// put of another length replaces.
+    fn rewriting(cap: usize) -> MemTable {
+        MemTable::new_shared(
+            BlockShape {
+                prefault: false,
+                index_populated: false,
+                fold_hash: true,
+                mapped: true,
+                pool: None,
+            },
+            cap,
+            0,
+            true,
+            true,
+            true,
+            true,
+        )
+    }
+
+    /// The key's values, oldest first, and whether a tombstone ends them,
+    /// copied under the record's lock (`MemTable::copy_chain`).
+    fn copied(m: &MemTable, k: &[u8]) -> Option<(Vec<Vec<u8>>, bool)> {
+        let (_, e) = m.probe_entry(m.hash(k), k)?;
+        let mut c = super::ChainCopy::default();
+        let tomb = m.copy_chain(e, &mut c);
+        Some((c.values().map(|v| v.to_vec()).collect(), tomb))
     }
 
     fn key(i: u64) -> [u8; 16] {
@@ -60289,9 +60664,9 @@ mod shared_table {
             mapped: true,
             pool: None,
         };
-        let asked = MemTable::new_shared(shape(), 64 << 20, 5000, false, true, false);
+        let asked = MemTable::new_shared(shape(), 64 << 20, 5000, false, true, false, false);
         assert_eq!(asked.index().unwrap().slots.len(), 8192);
-        let sized = MemTable::new_shared(shape(), 1 << 20, 0, false, true, false);
+        let sized = MemTable::new_shared(shape(), 1 << 20, 0, false, true, false, false);
         assert_eq!(sized.index().unwrap().slots.len(), (2 << 20) / 64);
         let mut l = TableLocal::default();
         let mut made = 0u64;
@@ -60621,6 +60996,132 @@ mod shared_table {
             }
         });
         m.vals.shared_used()
+    }
+
+    /// A put of a value of the length its key's value has, over a chain one
+    /// put made, overwrites the value where it lies: the arena grows by
+    /// nothing, the head stays, and the copy under the record's lock reads
+    /// the new value. A put of another length lays its value down; a put of
+    /// that length after it overwrites that one.
+    #[test]
+    fn a_put_of_its_length_overwrites_in_place_and_the_copy_reads_it() {
+        let m = rewriting(64 << 20);
+        let mut l = TableLocal::default();
+        let k = key(1);
+        let put = |l: &mut TableLocal, v: &[u8]| {
+            assert!(m.write_shared(l, None, m.hash(&k), &k, SharedWrite::Put(v)));
+        };
+        put(&mut l, &[1u8; 100]);
+        let (_, e) = m.probe_entry(m.hash(&k), &k).unwrap();
+        let (head, used) = (MemTable::head(e), m.vals.shared_used());
+        for b in 2..200u8 {
+            put(&mut l, &[b; 100]);
+        }
+        let (_, e) = m.probe_entry(m.hash(&k), &k).unwrap();
+        assert_eq!(MemTable::head(e), head, "an overwrite moved the head");
+        assert_eq!(m.vals.shared_used(), used, "an overwrite laid bytes down");
+        assert_eq!(copied(&m, &k), Some((vec![vec![199u8; 100]], true)));
+        put(&mut l, &[7u8; 60]);
+        let (_, e) = m.probe_entry(m.hash(&k), &k).unwrap();
+        let moved = MemTable::head(e);
+        assert_ne!(moved, head, "a put of another length laid its value down");
+        put(&mut l, &[8u8; 60]);
+        let (_, e) = m.probe_entry(m.hash(&k), &k).unwrap();
+        assert_eq!(
+            MemTable::head(e),
+            moved,
+            "the put of its length overwrote it"
+        );
+        assert_eq!(copied(&m, &k), Some((vec![vec![8u8; 60]], true)));
+    }
+
+    /// Writers on threads overwrite a few keys in place, over and over,
+    /// while readers copy them under their records' locks: no copy is a
+    /// value that is not one put's whole, each a run of one byte, which a
+    /// copy that kept bytes a writer was writing would show.
+    #[test]
+    fn readers_copy_values_writers_overwrite_and_no_copy_is_torn() {
+        const KEYS: u64 = 16;
+        const PUTS: u64 = 200_000;
+        let m = rewriting(64 << 20);
+        {
+            let mut l = TableLocal::default();
+            for i in 0..KEYS {
+                let k = key(i);
+                assert!(m.write_shared(
+                    &mut l,
+                    None,
+                    m.hash(&k),
+                    &k,
+                    SharedWrite::Put(&[1u8; 256])
+                ));
+            }
+        }
+        let stop = std::sync::atomic::AtomicBool::new(false);
+        std::thread::scope(|s| {
+            let readers: Vec<_> = (0..2)
+                .map(|_| {
+                    let (m, stop) = (&m, &stop);
+                    s.spawn(move || {
+                        let mut seen = 0u64;
+                        while !stop.load(Relaxed) {
+                            for i in 0..KEYS {
+                                let (vs, tomb) = copied(m, &key(i)).unwrap();
+                                assert!(tomb && vs.len() == 1, "key {i}: {} values", vs.len());
+                                let v = &vs[0];
+                                assert!(
+                                    v.len() == 256 && v.iter().all(|&b| b == v[0]),
+                                    "a value torn by an overwrite"
+                                );
+                                seen += 1;
+                            }
+                        }
+                        seen
+                    })
+                })
+                .collect();
+            let writers: Vec<_> = (0..2u64)
+                .map(|w| {
+                    let m = &m;
+                    s.spawn(move || {
+                        let mut l = TableLocal::default();
+                        for n in 0..PUTS {
+                            let k = key((n + w) % KEYS);
+                            let v = [(2 + (n * 2 + w) % 250) as u8; 256];
+                            assert!(m.write_shared(
+                                &mut l,
+                                None,
+                                m.hash(&k),
+                                &k,
+                                SharedWrite::Put(&v)
+                            ));
+                        }
+                    })
+                })
+                .collect();
+            for h in writers {
+                h.join().unwrap();
+            }
+            stop.store(true, Relaxed);
+            for h in readers {
+                assert!(h.join().unwrap() > 0, "a reader read nothing");
+            }
+        });
+    }
+
+    /// A read of a table that rewrites in place through the plain value
+    /// read, which hands out the bytes where they lie, is refused in a
+    /// checked build: only the copy under the record's lock may read them.
+    #[test]
+    #[cfg(debug_assertions)]
+    #[should_panic(expected = "read without its record's lock")]
+    fn a_plain_read_of_a_table_that_rewrites_is_refused() {
+        let m = rewriting(1 << 20);
+        let mut l = TableLocal::default();
+        let k = key(1);
+        assert!(m.write_shared(&mut l, None, m.hash(&k), &k, SharedWrite::Put(b"v")));
+        let (_, e) = m.probe_entry(m.hash(&k), &k).unwrap();
+        let _ = m.value_at(MemTable::head(e) as usize);
     }
 
     // Each test of a writer's path again over a table of records.

@@ -1995,6 +1995,10 @@ pub struct Supdb {
     /// The big shared table's keys as entries and chunks apart, not as
     /// records (`Options::shared_records` off): `supdb-heldsharedbignorecords`.
     sharednorecords: bool,
+    /// The big shared table's puts laying their values down where they
+    /// replace one of their length, nothing overwritten in place
+    /// (`Options::shared_in_place` off): `supdb-heldsharedbignoinplace`.
+    sharednoinplace: bool,
     /// What the reader handles this store gave its threads answered
     /// through the ordered index, summed as each is dropped
     /// (`OrdTally`); only the arm that reads that way hands out handles
@@ -3284,6 +3288,10 @@ struct Policy {
     /// The big shared table's keys as entries and chunks apart, not as
     /// records (`Options::shared_records` off): `supdb-heldsharedbignorecords`.
     sharednorecords: bool,
+    /// The big shared table's puts laying their values down where they
+    /// replace one of their length, nothing overwritten in place
+    /// (`Options::shared_in_place` off): `supdb-heldsharedbignoinplace`.
+    sharednoinplace: bool,
 }
 
 /// The conversions a fill makes at most in `supdb-convertcap`: the first
@@ -3629,6 +3637,7 @@ impl Default for Policy {
             sharednoahead: false,
             sharedcapindex: false,
             sharednorecords: false,
+            sharednoinplace: false,
             defer: false,
             firstfloor: false,
             aheadmin: None,
@@ -3844,6 +3853,7 @@ impl Supdb {
             noahead,
             capindex,
             norecords,
+            noinplace,
         } = shape;
         Supdb::with_policy(
             path,
@@ -3860,6 +3870,7 @@ impl Supdb {
                 sharednoahead: noahead,
                 sharedcapindex: capindex,
                 sharednorecords: norecords,
+                sharednoinplace: noinplace,
                 ..Policy::default()
             },
         )
@@ -10378,6 +10389,7 @@ impl Supdb {
             sharednoahead,
             sharedcapindex,
             sharednorecords,
+            sharednoinplace,
         } = policy;
         // What the engine ships, so an arm that pins nothing inherits it
         // rather than restating it and drifting from it.
@@ -11060,6 +11072,7 @@ impl Supdb {
             shared_table_bytes: if sharedbig { shared_table_bytes() } else { 0 },
             shared_chunk_ahead: !sharednoahead,
             shared_records: !sharednorecords,
+            shared_in_place: !sharednoinplace,
             shared_index_slots: if sharedbig && !sharedcapindex {
                 shared_index_slots()
             } else {
@@ -11436,6 +11449,7 @@ impl Supdb {
             sharednoahead,
             sharedcapindex,
             sharednorecords,
+            sharednoinplace,
             ord_threads: Default::default(),
         })
     }
@@ -11672,6 +11686,8 @@ impl Engine for Supdb {
                     "supdb-heldsharedbigcapindex"
                 } else if self.shared && self.sharedbig && self.sharednorecords {
                     "supdb-heldsharedbignorecords"
+                } else if self.shared && self.sharedbig && self.sharednoinplace {
+                    "supdb-heldsharedbignoinplace"
                 } else if self.shared && self.sharedbig {
                     "supdb-heldsharedbig"
                 } else if self.shared {
@@ -14689,7 +14705,8 @@ pub fn set_store_bound(bytes: Option<u64>) {
 /// `supdb-heldsharedbig`, and that with its probe asking nothing ahead,
 /// `supdb-heldsharedbignoahead`, or its index sized from its cap,
 /// `supdb-heldsharedbigcapindex`, or its keys apart from their chains,
-/// `supdb-heldsharedbignorecords`.
+/// `supdb-heldsharedbignorecords`, or its puts overwriting nothing in
+/// place, `supdb-heldsharedbignoinplace`.
 #[derive(Clone, Copy, Default)]
 pub struct SharedShape {
     pub norecycle: bool,
@@ -14697,6 +14714,7 @@ pub struct SharedShape {
     pub noahead: bool,
     pub capindex: bool,
     pub norecords: bool,
+    pub noinplace: bool,
 }
 
 /// The slots `supdb-heldsharedbig`'s shared index takes
@@ -15700,6 +15718,7 @@ pub fn guarantee(arm: &str) -> Option<Guarantee> {
         | "supdb-heldsharedbignoahead"
         | "supdb-heldsharedbigcapindex"
         | "supdb-heldsharedbignorecords"
+        | "supdb-heldsharedbignoinplace"
         | "supdb-heldbatch1"
         | "proto-shared"
         | "faster" => Guarantee::Memory,
@@ -16322,6 +16341,19 @@ pub fn open(arm: &str, dir: &Path, map_gb: usize) -> Res<Box<dyn Engine>> {
                     SharedShape {
                         big: true,
                         noahead: true,
+                        ..SharedShape::default()
+                    },
+                )
+            },
+            dir,
+        )?,
+        "supdb-heldsharedbignoinplace" => supdb_arm(
+            |d| {
+                Supdb::create_held_shared(
+                    d,
+                    SharedShape {
+                        big: true,
+                        noinplace: true,
                         ..SharedShape::default()
                     },
                 )
@@ -18430,6 +18462,7 @@ mod tests {
             noahead,
             capindex,
             norecords,
+            noinplace: false,
         };
         for (arm, s) in [
             (
@@ -18452,6 +18485,13 @@ mod tests {
                 "supdb-heldsharedbignorecords",
                 shape(false, true, false, false, true),
             ),
+            (
+                "supdb-heldsharedbignoinplace",
+                SharedShape {
+                    noinplace: true,
+                    ..shape(false, true, false, false, false)
+                },
+            ),
         ] {
             let e = open(arm, &root.join(arm), 1).unwrap();
             assert_eq!(e.name(), arm);
@@ -18466,6 +18506,7 @@ mod tests {
             assert_eq!(ao.shared_chunk_ahead, !s.noahead, "{arm}");
             assert_eq!(ao.shared_index_slots > 0, s.big && !s.capindex, "{arm}");
             assert_eq!(ao.shared_records, !s.norecords, "{arm}");
+            assert_eq!(ao.shared_in_place, !s.noinplace, "{arm}");
         }
         let _ = std::fs::remove_dir_all(&root);
     }

@@ -251,6 +251,205 @@ fn handles_on_threads_write_one_live_table_and_every_write_lands() {
     let _ = std::fs::remove_dir_all(&d);
 }
 
+/// Handles on three threads put values of one length over a set of keys in
+/// common, round after round -- each put after a key's first in a table
+/// overwriting its value where it lies (`Options::shared_in_place`) -- while
+/// a handle on a fourth reads every key and scans the store, under a table
+/// small enough to freeze about once a round. Every value a read or a scan
+/// meets is one put's whole, each a run of one byte, which a read of bytes a
+/// writer was overwriting would break; the writers made overwrites in the
+/// thousands; and each key reads one whole value after the flush and after
+/// a reopen.
+#[test]
+fn handles_overwrite_in_place_beside_reads_and_scans_and_every_value_is_whole() {
+    const THREADS: usize = 3;
+    const KEYS: usize = 2000;
+    const ROUNDS: usize = 30;
+    let _w = Watchdog::arm("the in-place test waited a minute: a freeze never let go");
+    let d = scratch("inplace");
+    let db = Db::create(&d, options(256 << 10)).unwrap();
+    let handles: Vec<supdb::Reader> = (0..THREADS + 1).map(|_| db.reader().unwrap()).collect();
+    let db = Arc::new(Mutex::new(db));
+    let stop = std::sync::atomic::AtomicBool::new(false);
+    let key = |i: usize| format!("inplace-{i:05}").into_bytes();
+    let whole = |v: &[u8]| v.len() == 64 && v.iter().all(|&b| b == v[0]);
+    let rewrites: u64 = std::thread::scope(|s| {
+        let mut handles = handles.into_iter();
+        let reader = handles.next().unwrap();
+        let watcher = {
+            let stop = &stop;
+            s.spawn(move || {
+                let mut seen = 0u64;
+                while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                    for i in 0..KEYS {
+                        reader
+                            .read_all(
+                                &key(i),
+                                vf(&mut |v| {
+                                    assert!(whole(v), "a read met a value torn: {v:?}");
+                                    seen += 1;
+                                }),
+                            )
+                            .unwrap();
+                    }
+                    reader
+                        .scan(
+                            b"",
+                            usize::MAX,
+                            kv(&mut |k, v| {
+                                assert!(
+                                    whole(v),
+                                    "a scan met {}'s value torn",
+                                    String::from_utf8_lossy(k)
+                                );
+                                seen += 1;
+                            }),
+                        )
+                        .unwrap();
+                }
+                seen
+            })
+        };
+        let writers: Vec<_> = handles
+            .enumerate()
+            .map(|(t, r)| {
+                let db = &db;
+                s.spawn(move || {
+                    for round in 0..ROUNDS {
+                        for i in 0..KEYS {
+                            let v = [(1 + (t * 31 + round * 7 + i) % 250) as u8; 64];
+                            write(db, || r.put(&key(i), &v));
+                        }
+                    }
+                    r.rewrites_made()
+                })
+            })
+            .collect();
+        let made: Vec<_> = writers.into_iter().map(|h| h.join()).collect();
+        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        let seen = watcher.join();
+        let made: u64 = made
+            .into_iter()
+            .map(|m| m.unwrap_or_else(|p| std::panic::resume_unwind(p)))
+            .sum();
+        match seen {
+            Ok(n) => assert!(n > 0, "the reader read nothing"),
+            Err(p) => std::panic::resume_unwind(p),
+        }
+        made
+    });
+    let puts = (THREADS * ROUNDS * KEYS) as u64;
+    assert!(
+        rewrites > puts / 2,
+        "{rewrites} of {puts} puts overwrote in place: the test did not take the path"
+    );
+    let mut db = Arc::try_unwrap(db).ok().unwrap().into_inner().unwrap();
+    let hold = |db: &Db, when: &str| {
+        for i in 0..KEYS {
+            let v = values(db, &key(i));
+            assert!(v.len() == 1 && whole(&v[0]), "{when}: key {i}: {v:?}");
+        }
+    };
+    hold(&db, "before the flush");
+    db.flush().unwrap();
+    hold(&db, "after the flush");
+    db.close().unwrap();
+    let db = Db::open(&d, options(256 << 10)).unwrap();
+    hold(&db, "after a reopen");
+    drop(db);
+    let _ = std::fs::remove_dir_all(&d);
+}
+
+/// A put into a table its freeze has closed lays its value down and does
+/// not overwrite in place: the freeze held once it has closed and settled
+/// the table and before it publishes it frozen, a handle's put of a value of
+/// the length its key's value has, and the handle's count of overwrites
+/// does not move. A write in place there would be one a reader of the
+/// frozen table, which reads it as a table that never rewrites, could meet.
+#[test]
+fn a_put_into_a_table_its_freeze_closed_lays_its_value_down() {
+    let _w = Watchdog::arm("the closed-table test waited a minute");
+    let d = scratch("closed");
+    let mut db = Db::create(&d, options(1 << 20)).unwrap();
+    let r = db.reader().unwrap();
+    assert!(r.put(b"k", &[1u8; 64]).unwrap());
+    assert!(r.put(b"k", &[2u8; 64]).unwrap());
+    assert_eq!(
+        r.rewrites_made(),
+        1,
+        "a put of its length overwrote in place"
+    );
+    db.hold_shared_closed(true);
+    let (before, after) = std::thread::scope(|s| {
+        let put = s.spawn(move || {
+            while !r.shared_closed_holding() {
+                std::thread::yield_now();
+            }
+            let before = r.rewrites_made();
+            let done = r.put(b"k", &[3u8; 64]).unwrap();
+            let after = r.rewrites_made();
+            r.release_shared_closed();
+            assert!(done);
+            (before, after)
+        });
+        db.flush().unwrap();
+        put.join().unwrap()
+    });
+    db.hold_shared_closed(false);
+    assert_eq!(
+        before, after,
+        "a put into a closed table overwrote in place"
+    );
+    assert_eq!(values(&db, b"k"), vec![vec![3u8; 64]]);
+    drop(db);
+    let _ = std::fs::remove_dir_all(&d);
+}
+
+/// A freeze settles its table only once an overwrite in flight is through:
+/// a handle's overwrite held inside its record's lock, the freeze held in
+/// the grace that waits it out, and the live table reads not settled there
+/// -- a table settled before its overwrites are through is read as one
+/// that never rewrites while a value of it is being written.
+#[test]
+fn a_freeze_settles_its_table_only_once_an_overwrite_in_flight_is_through() {
+    let _w = Watchdog::arm("the settling test waited a minute");
+    let d = scratch("settles");
+    let mut db = Db::create(&d, options(1 << 20)).unwrap();
+    let w = db.reader().unwrap();
+    let g = db.reader().unwrap();
+    assert!(w.put(b"k", &[1u8; 64]).unwrap());
+    g.hold_rewrites(true);
+    db.hold_shared_grace(true);
+    let settled_in_grace = std::thread::scope(|s| {
+        s.spawn(move || {
+            assert!(w.put(b"k", &[2u8; 64]).unwrap());
+            assert_eq!(w.rewrites_made(), 1, "the held put overwrote in place");
+        });
+        let gate = s.spawn(move || {
+            while !g.rewrite_holding() {
+                std::thread::yield_now();
+            }
+            while !g.shared_grace_holding() {
+                std::thread::yield_now();
+            }
+            let settled = g.live_settled();
+            g.release_shared_grace();
+            g.hold_rewrites(false);
+            settled
+        });
+        db.flush().unwrap();
+        gate.join().unwrap()
+    });
+    db.hold_shared_grace(false);
+    assert!(
+        !settled_in_grace,
+        "the table read settled with an overwrite in flight"
+    );
+    assert_eq!(values(&db, b"k"), vec![vec![2u8; 64]]);
+    drop(db);
+    let _ = std::fs::remove_dir_all(&d);
+}
+
 /// A freeze waits out the handle still writing the table it replaces: a
 /// handle's write held between taking the state and writing its table, a
 /// flush that freezes and seals the table meanwhile, and the write is in
