@@ -1065,12 +1065,18 @@ until the run is its own log). What it loses:
   merge read and takes a unit nothing has read since the cache took the
   file whole at its envelope, which a form file built at a merge's
   finish is, so the next reading is the evictor's gives by kind of file
-  through the burst. The levers it would point at are the clock's order
-  for a file taken whole and never read, against a merge's inputs, which
-  go with the merge, and `StoreCipher::merges_beside_cache` again,
-  priced the first time against a cache that kept the merges' outputs
-  whole and now against one that gives a served partition's records
-  back.
+  through the burst, and whether the rewarm of the form files the cache
+  let go, which waits for the merges in flight to land, fires inside
+  the pass at all (`SUPDB_ZPAGES_TRACE=1`, its `zrewarm` lines). The
+  lever it would point at is the clock's order for a file taken whole
+  and never read, against a merge's inputs, which go with the merge.
+  `StoreCipher::merges_beside_cache`, priced again against a cache that
+  gives a served partition's records back (`SUPDB_LAG_COUNTERS=1
+  SUPDB_SCAN_OPS=1 bench/scripts/pair.sh supdb-cipherautomergestream
+  supdb-cipherauto 10000000 --bound 1342177280 --passes load,lag --reps
+  2 --ops-div 10` at `068aca1`), still loses: the full rewrite's pass
+  0.84-0.93x of the shipped store and the ten-percent pass 0.80-0.82x
+  in both sittings, the loads level.
 - [ ] **The builds ahead's last cold partition under a cipher.** At five
   million keys under 640 MiB with the builds ahead started at a quarter
   of the store's cache, one or two partitions are still found cold in
