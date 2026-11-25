@@ -1064,12 +1064,24 @@ until the run is its own log). What it loses:
   counted: by the code, the cache's clock passes once over a unit a
   merge read and takes a unit nothing has read since the cache took the
   file whole at its envelope, which a form file built at a merge's
-  finish is, so the next reading is the evictor's gives by kind of file
-  through the burst, and whether the rewarm of the form files the cache
-  let go, which waits for the merges in flight to land, fires inside
-  the pass at all (`SUPDB_ZPAGES_TRACE=1`, its `zrewarm` lines). The
-  lever it would point at is the clock's order for a file taken whole
-  and never read, against a merge's inputs, which go with the merge.
+  finish is. Counted by kind (`SUPDB_PAGER_TRACE=1`'s `given` and
+  `pagerback`, `CLAUDE.md`): the burst gives back 1.4-1.6 GB of form
+  files and 550-690 MB of pieces against 13-76 MB of partitions'
+  records, and the pass's faults are 4,900-6,100 on form files and
+  4,200-7,200 on the segments, pieces most of them; leaving a merge's
+  reads cold for the clock moved the gives and not the pass, and was
+  taken out. Inside the pass the merges are still running, 787 MB read
+  and 632 MB written at the device in a pass of 2.7 s, and the rewarm of
+  the form files waits for them to land: in one sweep it fired 1.9 s
+  into the pass, as the last merge landed, and the pass's tenths after
+  the two ran at a fifth of the ones before. In the burst the cache's budget falls to 450 MB where the
+  merges' outputs are memory files while they are written (`writing`
+  and `coming`, 100-280 MB). The levers left are those three: the merge
+  debt paid before the pass, a merge under a cipher being twice the
+  plain store's wall; the rewarm under a cipher, whose asks are
+  ciphertext the kernel may take back, beside the merges; and a merge's
+  output sealed as it is written ("An envelope written beside its
+  segment"), so that it is not memory the cache gives way to.
   `StoreCipher::merges_beside_cache`, priced again against a cache that
   gives a served partition's records back (`SUPDB_LAG_COUNTERS=1
   SUPDB_SCAN_OPS=1 bench/scripts/pair.sh supdb-cipherautomergestream

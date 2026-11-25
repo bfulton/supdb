@@ -2284,6 +2284,41 @@ present here stay") is a decision, read again on the day what it leaves
 is counted; and a lever built on why a cache refused a file is held to
 the count of what it refused before it is paired.
 
+What took them out was read next, and the order it pointed at was not
+the lever. The cache's trace counts what the evictor gives back over
+its budget by the first field of each file's name, a drop's apart
+(`given` beside `present`), and names each envelope's file where a view
+is given it (`pagerback`), so a major fault laid to an envelope by its
+address is laid to what the envelope holds. Through the full rewrite's
+burst at ten million keys under 1.25 GiB the evictor gave back 1.4-1.6
+GB of form files and 550-690 MB of pieces against 13-76 MB of
+partitions' records, in two sweeps: a merge's inputs are read and so
+passed over once by the clock, where the files written since are taken
+whole and read by nobody until the pass. The pass's scanning thread
+took 4,900-6,100 major faults on form files and 4,200-7,200 on the
+segments, pieces most of them, where the plain store's took 363 in all
+(`SUPDB_PAGER_TRACE=1 SUPDB_ZPAGES_TRACE=1 SUPDB_LAG_MARK=1` and `perf
+record -a -e major-faults -c 1 -d -k CLOCK_MONOTONIC` over `bench run
+--scale ooc --bound 1342177280 --ops-div 10 --reps 1 --top 10000000
+--bottom 10000000 --arms supdb-cipherauto --passes load,lag`, at
+`eee60c4`). A scratch build of that commit left a merge's reads cold
+for the clock, the chunks it decrypted counted as asked for by nobody,
+with the shape before an arm: it fired, 1.3-1.4 million fills a sweep
+left cold, and the burst gave back 450 MB of partitions' records and
+1.1 GB of form files; paired against the shape before (`SUPDB_LAG_COUNTERS=1
+SUPDB_SCAN_OPS=1 bench/scripts/pair.sh` over `--passes load,lag --reps 2
+--ops-div 10` at that bound) the full rewrite's pass read 1.04x against
+it in one sitting and 1.07x for it in the other, with every lag pass of
+both sittings 4-23% to the arm listed second, and it was taken out. A
+pass reads more of what its burst gave back than the burst had to give
+back unwanted: the burst cycles its merges' inputs and outputs, their
+form files and the seals' pieces through a cache of 450-700 MB, and the
+last form files are built in the pass's first seconds by merges still in
+flight, which the plain store has finished a second before it. The rule:
+an order among what a cache gives back is a lever only where what it
+must give back is no more than what nobody will read again, which the
+count by kind says before the order is changed.
+
 Every test of it passed at its first run, the fuzz's among them, so none
 was believed until its mutant failed it. Twenty-four mutants; four
 outlived the first tests. An envelope written in place passed everything,

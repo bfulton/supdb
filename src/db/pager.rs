@@ -476,6 +476,10 @@ pub(crate) struct Pager {
     /// Units a drop has asked to be given back since the evictor last
     /// looked (`Paged::forget`), each flagged on its file.
     dropped: AtomicUsize,
+    /// What the evictor gave back of files since dropped, by the first
+    /// field of each one's name, bytes: the cache's trace adds it to the
+    /// files still viewed (`Paged::given_bytes`).
+    given_gone: Mutex<Vec<(String, u64)>>,
     files: Mutex<Vec<Weak<Paged>>>,
     /// The era the holds stand in (`Hold`), and the holds.
     era: AtomicU64,
@@ -532,6 +536,7 @@ impl Pager {
             beside: AtomicBool::new(false),
             drops_keep: AtomicBool::new(false),
             dropped: AtomicUsize::new(0),
+            given_gone: Mutex::new(Vec::new()),
             files: Mutex::new(Vec::new()),
             era: AtomicU64::new(1),
             holds: Mutex::new(Vec::new()),
@@ -722,6 +727,12 @@ impl Pager {
     /// (`StoreCipher::merges_beside_cache`).
     pub(crate) fn merge_beside(&self, on: bool) {
         self.beside.store(on, Ordering::Relaxed);
+    }
+
+    /// What the evictor gave back of files since dropped, by the first
+    /// field of each one's name (`given_gone`).
+    pub(crate) fn given_gone(&self) -> Vec<(String, u64)> {
+        lock(&self.given_gone).clone()
     }
 
     /// Whether a drop of a file's pages leaves its plaintext here
@@ -1053,6 +1064,8 @@ impl Pager {
                     self.counts
                         .dropped_bytes
                         .fetch_add(freed, Ordering::Relaxed);
+                } else {
+                    f.given.fetch_add(freed, Ordering::Relaxed);
                 }
             }
         }
@@ -1221,6 +1234,10 @@ pub(crate) struct Paged {
     /// Chunks present, for the drop's count; kept by the fills and the
     /// frees.
     present: AtomicUsize,
+    /// Plaintext the evictor has given back of this file over the budget,
+    /// a drop's apart, bytes: the cache's trace sums it by kind of file
+    /// (`SUPDB_PAGER_TRACE`).
+    given: AtomicU64,
     /// A test's hold on a reader between its taking a unit back and its
     /// saying a chunk of it is lent (`pause_after_rescue`): 1 asked, 2
     /// held.
@@ -1245,6 +1262,20 @@ static VIEWED: Mutex<std::collections::BTreeSet<u64>> =
 // that could hold a borrow (the module's docs).
 unsafe impl Send for Paged {}
 unsafe impl Sync for Paged {}
+
+/// `SUPDB_PAGER_TRACE=1`: a `pagerback` line on stderr where a view is
+/// given its envelope, the file's name beside the envelope's, so that a
+/// fault laid to an envelope by its address is laid to the file it holds.
+fn trace_back(label: &str, back: &Back) {
+    static ON: OnceLock<bool> = OnceLock::new();
+    if *ON.get_or_init(|| std::env::var_os("SUPDB_PAGER_TRACE").is_some()) {
+        let env = back
+            .path
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned());
+        eprintln!("pagerback {label} {}", env.unwrap_or_default());
+    }
+}
 
 /// A memory file: anonymous, the process's, gone with its last handle and
 /// its last mapping.
@@ -1351,6 +1382,7 @@ impl Paged {
             label: label.to_string(),
             regenerable: label.ends_with(".zpg") || label.ends_with(".z"),
             present: AtomicUsize::new(if first == EMPTY { 0 } else { chunks }),
+            given: AtomicU64::new(0),
             #[cfg(test)]
             pause: AtomicU8::new(0),
             #[cfg(debug_assertions)]
@@ -1424,6 +1456,7 @@ impl Paged {
             #[cfg(debug_assertions)]
             None,
         )?;
+        trace_back(label, &back);
         let _ = p.back.set(back);
         Ok(p)
     }
@@ -1442,6 +1475,7 @@ impl Paged {
                 ),
             ));
         }
+        trace_back(&self.label, &back);
         if self.back.set(back).is_ok() {
             self.pager.unbacked.fetch_sub(self.len, Ordering::Relaxed);
         }
@@ -1867,6 +1901,12 @@ impl Paged {
         }
     }
 
+    /// What the evictor has given back of this file over the budget,
+    /// bytes, a drop's apart.
+    pub(crate) fn given_bytes(&self) -> u64 {
+        self.given.load(Ordering::Relaxed)
+    }
+
     /// The plaintext this file holds present, bytes: its chunks' count,
     /// the last being short.
     pub(crate) fn present_bytes(&self) -> u64 {
@@ -1887,6 +1927,15 @@ impl Drop for Paged {
             lock(&VIEWED).remove(&ino);
         }
         self.pager.sub(self.present_bytes());
+        let given = self.given_bytes();
+        if given > 0 {
+            let field = self.label.split('-').next().unwrap_or(&self.label);
+            let mut gone = lock(&self.pager.given_gone);
+            match gone.iter_mut().find(|(f, _)| f == field) {
+                Some((_, g)) => *g += given,
+                None => gone.push((field.to_string(), given)),
+            }
+        }
         if !self.backed() {
             // Taken whole and gone before it had an envelope.
             self.pager.unbacked.fetch_sub(self.len, Ordering::Relaxed);
@@ -3528,7 +3577,16 @@ mod tests {
             c.peak < pager.budget() + 16 * unit,
             "the cache ran far past its budget: {c:?}"
         );
+        // What the budget took is the file's to say, for the trace, and a
+        // file that goes hands its count to the cache by the first field
+        // of its name.
+        let c = pager.counts();
+        assert_eq!(p.given_bytes(), c.evicted_bytes - c.dropped_bytes, "{c:?}");
+        assert!(p.given_bytes() > 0);
+        assert!(pager.given_gone().is_empty());
+        let given = p.given_bytes();
         drop(p);
+        assert_eq!(pager.given_gone(), vec![("test".to_string(), given)]);
         pager.stop();
         let _ = std::fs::remove_dir_all(&dir);
     }

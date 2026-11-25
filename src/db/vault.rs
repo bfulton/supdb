@@ -962,18 +962,33 @@ fn trace_room(slack: i64) {
         drop(files);
         // What the cache holds present by that field: whether the
         // plaintext held is what the reads ask for.
-        let mut by: Vec<(String, u64)> = Vec::new();
+        let mut by: Vec<(String, u64, u64)> = Vec::new();
         for (field, p) in &views {
-            let held = p.present_bytes();
-            match by.iter_mut().find(|(f, _)| f == field) {
-                Some((_, b)) => *b += held,
-                None => by.push((field.clone(), held)),
+            let (held, given) = (p.present_bytes(), p.given_bytes());
+            match by.iter_mut().find(|(f, _, _)| f == field) {
+                Some((_, b, g)) => {
+                    *b += held;
+                    *g += given;
+                }
+                None => by.push((field.clone(), held, given)),
+            }
+        }
+        for (field, given) in v.pager.given_gone() {
+            match by.iter_mut().find(|(f, _, _)| *f == field) {
+                Some((_, _, g)) => *g += given,
+                None => by.push((field, 0, given)),
             }
         }
         by.sort();
         line.push_str(" | present");
-        for (field, held) in &by {
+        for (field, held, _) in &by {
             line.push_str(&format!(" {field} {}", mib(*held)));
+        }
+        // And what the evictor has given back of each kind over the
+        // budget, the files since dropped among them: what the budget took.
+        line.push_str(" | given");
+        for (field, _, given) in &by {
+            line.push_str(&format!(" {field} {}", mib(*given)));
         }
     }
     eprintln!("{line}");
