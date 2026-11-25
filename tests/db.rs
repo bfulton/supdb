@@ -18425,6 +18425,12 @@ fn a_handed_tables_log_is_retired_at_its_landing_and_replays_before_it() {
         }
         db.commit().unwrap();
         db.flush().unwrap();
+        // The slot that names the partition written: a durable flush is
+        // answered at its seal's readable landing, before that slot, and
+        // the manifest saved below as the state after the flush was the
+        // empty store's once, beside the whole binary, which no log
+        // replays onto.
+        db.settle().unwrap();
         assert_eq!(db.levels(), (1, 0));
         for i in 0..2000u32 {
             let k = (i as u64 * 7919 % 2000) as u32;
@@ -23082,8 +23088,12 @@ fn a_durable_flush_is_answered_at_its_seals_readable_landing() {
 fn a_crash_after_a_flush_answered_at_readable_keeps_every_commit() {
     for ordered in [true, false] {
         let d = dir(&format!("drain-readable-crash-{ordered}"));
+        // No form files, which a builder this process still runs after
+        // the crash would read through the segment the test tears
+        // (`a_buffered_flush_syncs_its_log_beside_its_seal_and_answers_readable`).
         let opts = Options {
             drain_answers_readable: true,
+            zpages: supdb::ZPages::Off,
             ..common::options()
         };
         let keys = drain_keys(ordered, 3000);
@@ -23293,6 +23303,15 @@ fn a_buffered_flush_syncs_its_log_beside_its_seal_and_answers_readable() {
     drop(db);
 
     let d = dir("drain-beside-crash");
+    // No form files: the crash leaves this process's threads running, as
+    // `Db::crash` says, and a form file's build forced under the stride
+    // switch read the segment this test then tears, through its mapping:
+    // the binary died of SIGBUS, one run in four. A crashed process has no
+    // builder to read anything.
+    let opts = Options {
+        zpages: supdb::ZPages::Off,
+        ..opts
+    };
     let mut db = Db::create(&d, opts.clone()).unwrap();
     drain_load(&mut db, &keys);
     db.hold_seal_durable(true);
@@ -23378,14 +23397,31 @@ fn a_drain_the_beside_sync_cannot_answer_pays_nothing_beside() {
                 k
             })
             .collect();
-        if case == "piece" {
+        // A flush that can be answered early holds its seal between its
+        // phases, so that the seal cannot be landed whole before the ask
+        // comes: a seal that finished first leaves the drain nothing to
+        // answer early, and the count read 0 once beside the whole binary.
+        let held_flush = |db: &mut Db| {
+            db.hold_seal_durable(true);
+            let release = db.release_seal_durable_after(std::time::Duration::from_secs(30));
             db.flush().unwrap();
             let w = db.seal_waits();
+            db.hold_seal_durable(false);
+            drop(release);
+            wait_for("the seal's durable landing", || !db.in_flight().0);
+            w
+        };
+        if case == "piece" {
+            let w = held_flush(&mut db);
             assert_eq!((w.drains_early, w.drains_beside), (1, 1), "{case}: {w:?}");
             drain_load(&mut db, &more);
         }
-        db.flush().unwrap();
-        let w = db.seal_waits();
+        let w = if case == "durable" {
+            held_flush(&mut db)
+        } else {
+            db.flush().unwrap();
+            db.seal_waits()
+        };
         let early = u64::from(case == "durable" || case == "piece");
         assert_eq!(
             (w.drains_early, w.drains_beside),
