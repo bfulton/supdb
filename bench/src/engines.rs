@@ -1999,6 +1999,16 @@ pub struct Supdb {
     /// replace one of their length, nothing overwritten in place
     /// (`Options::shared_in_place` off): `supdb-heldsharedbignoinplace`.
     sharednoinplace: bool,
+    /// The big shared table's operations all through the layered path,
+    /// none through the record's address (`Options::shared_lean` off):
+    /// `supdb-heldsharedbignolean`.
+    sharednolean: bool,
+    /// The big shared table's value arena and index on small pages
+    /// (`Options::shared_huge` off): `supdb-heldsharedbignohuge`.
+    sharednohuge: bool,
+    /// The big shared table's inserts each carrying the slab's length
+    /// (`Options::shared_len_lazy` off): `supdb-heldsharedbigeagerlen`.
+    sharedeagerlen: bool,
     /// What the reader handles this store gave its threads answered
     /// through the ordered index, summed as each is dropped
     /// (`OrdTally`); only the arm that reads that way hands out handles
@@ -3292,6 +3302,16 @@ struct Policy {
     /// replace one of their length, nothing overwritten in place
     /// (`Options::shared_in_place` off): `supdb-heldsharedbignoinplace`.
     sharednoinplace: bool,
+    /// The big shared table's operations all through the layered path,
+    /// none through the record's address (`Options::shared_lean` off):
+    /// `supdb-heldsharedbignolean`.
+    sharednolean: bool,
+    /// The big shared table's value arena and index on small pages
+    /// (`Options::shared_huge` off): `supdb-heldsharedbignohuge`.
+    sharednohuge: bool,
+    /// The big shared table's inserts each carrying the slab's length
+    /// (`Options::shared_len_lazy` off): `supdb-heldsharedbigeagerlen`.
+    sharedeagerlen: bool,
 }
 
 /// The conversions a fill makes at most in `supdb-convertcap`: the first
@@ -3638,6 +3658,9 @@ impl Default for Policy {
             sharedcapindex: false,
             sharednorecords: false,
             sharednoinplace: false,
+            sharednolean: false,
+            sharednohuge: false,
+            sharedeagerlen: false,
             defer: false,
             firstfloor: false,
             aheadmin: None,
@@ -3854,6 +3877,10 @@ impl Supdb {
             capindex,
             norecords,
             noinplace,
+            nolean,
+            asym,
+            nohuge,
+            eagerlen,
         } = shape;
         Supdb::with_policy(
             path,
@@ -3871,6 +3898,10 @@ impl Supdb {
                 sharedcapindex: capindex,
                 sharednorecords: norecords,
                 sharednoinplace: noinplace,
+                sharednolean: nolean,
+                sharednohuge: nohuge,
+                sharedeagerlen: eagerlen,
+                asympin: asym,
                 ..Policy::default()
             },
         )
@@ -10390,6 +10421,9 @@ impl Supdb {
             sharedcapindex,
             sharednorecords,
             sharednoinplace,
+            sharednolean,
+            sharednohuge,
+            sharedeagerlen,
         } = policy;
         // What the engine ships, so an arm that pins nothing inherits it
         // rather than restating it and drifting from it.
@@ -11073,6 +11107,9 @@ impl Supdb {
             shared_chunk_ahead: !sharednoahead,
             shared_records: !sharednorecords,
             shared_in_place: !sharednoinplace,
+            shared_lean: !sharednolean,
+            shared_huge: !sharednohuge,
+            shared_len_lazy: !sharedeagerlen,
             shared_index_slots: if sharedbig && !sharedcapindex {
                 shared_index_slots()
             } else {
@@ -11450,6 +11487,9 @@ impl Supdb {
             sharedcapindex,
             sharednorecords,
             sharednoinplace,
+            sharednolean,
+            sharednohuge,
+            sharedeagerlen,
             ord_threads: Default::default(),
         })
     }
@@ -11688,6 +11728,14 @@ impl Engine for Supdb {
                     "supdb-heldsharedbignorecords"
                 } else if self.shared && self.sharedbig && self.sharednoinplace {
                     "supdb-heldsharedbignoinplace"
+                } else if self.shared && self.sharedbig && self.sharednolean {
+                    "supdb-heldsharedbignolean"
+                } else if self.shared && self.sharedbig && self.asympin {
+                    "supdb-heldsharedbigasym"
+                } else if self.shared && self.sharedbig && self.sharednohuge {
+                    "supdb-heldsharedbignohuge"
+                } else if self.shared && self.sharedbig && self.sharedeagerlen {
+                    "supdb-heldsharedbigeagerlen"
                 } else if self.shared && self.sharedbig {
                     "supdb-heldsharedbig"
                 } else if self.shared {
@@ -14706,7 +14754,12 @@ pub fn set_store_bound(bytes: Option<u64>) {
 /// `supdb-heldsharedbignoahead`, or its index sized from its cap,
 /// `supdb-heldsharedbigcapindex`, or its keys apart from their chains,
 /// `supdb-heldsharedbignorecords`, or its puts overwriting nothing in
-/// place, `supdb-heldsharedbignoinplace`.
+/// place, `supdb-heldsharedbignoinplace`, or its operations all through
+/// the layered path, `supdb-heldsharedbignolean`; and the big arm with its
+/// pins plain stores the sweep fences for (`Options::asym_pins`),
+/// `supdb-heldsharedbigasym`, or its table on small pages,
+/// `supdb-heldsharedbignohuge`, or its inserts each carrying the slab's
+/// length, `supdb-heldsharedbigeagerlen`.
 #[derive(Clone, Copy, Default)]
 pub struct SharedShape {
     pub norecycle: bool,
@@ -14715,6 +14768,10 @@ pub struct SharedShape {
     pub capindex: bool,
     pub norecords: bool,
     pub noinplace: bool,
+    pub nolean: bool,
+    pub asym: bool,
+    pub nohuge: bool,
+    pub eagerlen: bool,
 }
 
 /// The slots `supdb-heldsharedbig`'s shared index takes
@@ -15719,6 +15776,10 @@ pub fn guarantee(arm: &str) -> Option<Guarantee> {
         | "supdb-heldsharedbigcapindex"
         | "supdb-heldsharedbignorecords"
         | "supdb-heldsharedbignoinplace"
+        | "supdb-heldsharedbignolean"
+        | "supdb-heldsharedbigasym"
+        | "supdb-heldsharedbignohuge"
+        | "supdb-heldsharedbigeagerlen"
         | "supdb-heldbatch1"
         | "proto-shared"
         | "faster" => Guarantee::Memory,
@@ -16360,6 +16421,59 @@ pub fn open(arm: &str, dir: &Path, map_gb: usize) -> Res<Box<dyn Engine>> {
             },
             dir,
         )?,
+        "supdb-heldsharedbignolean" => supdb_arm(
+            |d| {
+                Supdb::create_held_shared(
+                    d,
+                    SharedShape {
+                        big: true,
+                        nolean: true,
+                        ..SharedShape::default()
+                    },
+                )
+            },
+            dir,
+        )?,
+        "supdb-heldsharedbigasym" => supdb_arm(
+            |d| {
+                Supdb::create_held_shared(
+                    d,
+                    SharedShape {
+                        big: true,
+                        asym: true,
+                        ..SharedShape::default()
+                    },
+                )
+            },
+            dir,
+        )?,
+        "supdb-heldsharedbignohuge" => supdb_arm(
+            |d| {
+                Supdb::create_held_shared(
+                    d,
+                    SharedShape {
+                        big: true,
+                        nohuge: true,
+                        ..SharedShape::default()
+                    },
+                )
+            },
+            dir,
+        )?,
+        "supdb-heldsharedbigeagerlen" => supdb_arm(
+            |d| {
+                Supdb::create_held_shared(
+                    d,
+                    SharedShape {
+                        big: true,
+                        eagerlen: true,
+                        ..SharedShape::default()
+                    },
+                )
+            },
+            dir,
+        )?,
+
         "supdb-heldsharedbignorecords" => supdb_arm(
             |d| {
                 Supdb::create_held_shared(
@@ -18463,6 +18577,10 @@ mod tests {
             capindex,
             norecords,
             noinplace: false,
+            nolean: false,
+            asym: false,
+            nohuge: false,
+            eagerlen: false,
         };
         for (arm, s) in [
             (
@@ -18492,6 +18610,34 @@ mod tests {
                     ..shape(false, true, false, false, false)
                 },
             ),
+            (
+                "supdb-heldsharedbignolean",
+                SharedShape {
+                    nolean: true,
+                    ..shape(false, true, false, false, false)
+                },
+            ),
+            (
+                "supdb-heldsharedbigasym",
+                SharedShape {
+                    asym: true,
+                    ..shape(false, true, false, false, false)
+                },
+            ),
+            (
+                "supdb-heldsharedbignohuge",
+                SharedShape {
+                    nohuge: true,
+                    ..shape(false, true, false, false, false)
+                },
+            ),
+            (
+                "supdb-heldsharedbigeagerlen",
+                SharedShape {
+                    eagerlen: true,
+                    ..shape(false, true, false, false, false)
+                },
+            ),
         ] {
             let e = open(arm, &root.join(arm), 1).unwrap();
             assert_eq!(e.name(), arm);
@@ -18507,6 +18653,10 @@ mod tests {
             assert_eq!(ao.shared_index_slots > 0, s.big && !s.capindex, "{arm}");
             assert_eq!(ao.shared_records, !s.norecords, "{arm}");
             assert_eq!(ao.shared_in_place, !s.noinplace, "{arm}");
+            assert_eq!(ao.shared_lean, !s.nolean, "{arm}");
+            assert_eq!(ao.asym_pins, s.asym, "{arm}");
+            assert_eq!(ao.shared_huge, !s.nohuge, "{arm}");
+            assert_eq!(ao.shared_len_lazy, !s.eagerlen, "{arm}");
         }
         let _ = std::fs::remove_dir_all(&root);
     }

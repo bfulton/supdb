@@ -4992,8 +4992,11 @@ pub struct Options {
     /// key compare, since the entry names both (`MemTable::ask_head`). A get
     /// or a read-modify-write of a key the table holds is four dependent
     /// misses otherwise -- the index slot, the entry, the key and the head
-    /// -- where FASTER's is two, the bucket and the record. Off: the head
-    /// read once the key has compared.
+    /// -- where FASTER's is two, the bucket and the record. The lean path
+    /// (`shared_lean`) asks for the record's lines past its first, where a
+    /// put's value lies, as its key compare loads the first
+    /// (`MemTable::ask_record`). Off: the head read once the key has
+    /// compared, and the value's lines once the head names them.
     pub shared_chunk_ahead: bool,
     /// EXPERIMENT, under `shared_writers`: the slots a shared table's index
     /// is made with, rounded up to a power of two; zero sizes it from the
@@ -5029,6 +5032,43 @@ pub struct Options {
     /// before it publishes the table frozen; a frozen table is read as the
     /// one writer's is. Off: a put lays its value down and swaps the head.
     pub shared_in_place: bool,
+    /// EXPERIMENT, under `shared_writers` with `shared_records`: a handle's
+    /// get, put and read-modify-write of a key the live table holds in one
+    /// put's shape -- one value over a lone tombstone, laid together -- go
+    /// from the index slot to the record by one lookup of its block and
+    /// read and write the key, the lock, the head and the value through
+    /// that one address (`MemTable::lean_find`, `Reader::read_live_lean`).
+    /// Every other key and shape takes the layered path. Off: every
+    /// operation goes through the layers, each of which looked the
+    /// record's block up again, 1,338 instructions a get, 887 a
+    /// read-modify-write and 692 a put of the threaded mixes at three
+    /// hundred thousand keys, where FASTER's are 365, 462 and 434.
+    pub shared_lean: bool,
+    /// EXPERIMENT, under `shared_writers`: the shared table's value arena
+    /// and its index are mapped at addresses a multiple of two megabytes and
+    /// advised onto the kernel's transparent huge pages (`MADV_HUGEPAGE`,
+    /// `blocks::map_huge`; `Options::blocks_mapped`), neither taken from the
+    /// block pool nor given to it. A get or a write of a key the table holds
+    /// loads an index slot and then the key's record, each on a page of its
+    /// own among the table's: over 4 KiB pages a table of a store's records
+    /// is many times what the TLB maps, and every operation walks twice for
+    /// the translations before either miss starts, the walk charged to
+    /// whichever instruction first touches each page. FASTER's log and index
+    /// are on small pages under the kernel's `madvise` policy. Where the
+    /// host backs the guest's memory on small pages the translations stay
+    /// as small as the host's. Off: blocks as every other table maps them.
+    pub shared_huge: bool,
+    /// EXPERIMENT, under `shared_writers`: an insert into the shared table
+    /// leaves the slab's length where it is, and whoever reads the length
+    /// carries it over the entries written -- a walk of the entries, the
+    /// upkeep, a freeze once its writers are out (`MemTable::len`) -- where
+    /// every insert carried it, a sequentially consistent fence and the
+    /// loads of two words and an entry every inserting writer writes, a
+    /// third of an insert on one thread and the reason three threads
+    /// inserted no faster than one. A handle's operation takes no bound
+    /// from a shared table, whose reads are unbounded already: a get or a
+    /// put reads no length. Off: every insert carries the length.
+    pub shared_len_lazy: bool,
     /// A job's large per-key arrays -- a seal's sort of its
     /// table, a segment writer's copy of every key with its span, its
     /// record's offset and its hash, the ordered index builder's keys, a
@@ -7376,6 +7416,8 @@ impl Options {
                 self.shared_chunk_ahead,
                 self.shared_records,
                 self.shared_in_place,
+                self.shared_huge,
+                self.shared_len_lazy,
             )
         } else {
             MemTable::new(self.block_shape(pool))
@@ -7696,6 +7738,9 @@ impl Default for Options {
             shared_index_slots: 0,
             shared_records: true,
             shared_in_place: true,
+            shared_lean: true,
+            shared_huge: true,
+            shared_len_lazy: true,
             jobs_mapped: true,
             jobs_mapped_when_short: false,
             jobs_pooled: false,
@@ -14206,6 +14251,9 @@ struct SharedTable {
     /// A probe asks for the chain's head as it reads the entry, before the
     /// key compare (`Options::shared_chunk_ahead`, `MemTable::ask_head`).
     head_ahead: bool,
+    /// An insert leaves the slab's length to whoever reads it
+    /// (`Options::shared_len_lazy`, `MemTable::len`).
+    lazy_len: bool,
 }
 
 /// A writer's strides of one shared table's arenas, and the ranges of its
@@ -14373,6 +14421,39 @@ struct KeyCells<'t> {
     head: &'t AtomicU64,
     count: &'t AtomicU32,
 }
+
+/// What a lean overwrite gives the value it replaces to
+/// (`MemTable::lean_overwrite`): a read-modify-write's reader.
+type GiveOld<'a> = &'a mut dyn FnMut(&[u8]);
+
+/// A shared record's chain as the lean path reads it (`MemTable::lean_chain`).
+enum LeanChain {
+    /// A value over a tombstone: its address and length, and whether the
+    /// tombstone lies over nothing, as one put's does.
+    One(*const u8, usize, bool),
+    /// A tombstone at the head: no value.
+    Deleted,
+    /// Anything else, which the layered path reads.
+    Other,
+}
+
+/// A lean read of the live table (`Reader::read_live_lean`).
+enum LeanRead {
+    /// The key's read, its values given: their count.
+    Done(u64),
+    /// No record of the key in the live table.
+    Absent,
+    /// A record the layered path reads.
+    General,
+}
+
+/// The bytes of a value a lean read copies out of a table that rewrites in
+/// place, on its frame; a longer value takes the layered path.
+const LEAN_COPY: usize = 256;
+
+/// The bytes of a record's first value whose lines the lean probe asks for
+/// ahead of its key compare (`MemTable::ask_record`).
+const LEAN_AHEAD: usize = 128;
 
 /// What a shared read-modify-write came to (`MemTable::rmw_shared`).
 enum SharedRmw {
@@ -16162,7 +16243,7 @@ impl MemTable {
     /// cap of its value arena (`MemTable::new_shared`).
     /// `shared`: the cap of a shared table's values and the slots its
     /// index is asked for, zero to size it from the cap.
-    fn new_with(shape: BlockShape, shared: Option<(usize, usize)>) -> MemTable {
+    fn new_with(shape: BlockShape, shared: Option<(usize, usize, bool)>) -> MemTable {
         let BlockShape {
             prefault,
             index_populated,
@@ -16171,7 +16252,10 @@ impl MemTable {
             pool,
         } = shape;
         let src = || blocks::Source::new(mapped, pool.clone());
-        let slots = shared.map_or(1024, |(cap, want)| {
+        // A shared table's value arena and index on huge pages, where it
+        // asks (`Options::shared_huge`): the two a probe loads from.
+        let huge = shared.is_some_and(|(_, _, h)| h);
+        let slots = shared.map_or(1024, |(cap, want, _)| {
             let slots = if want > 0 {
                 want
             } else {
@@ -16189,7 +16273,7 @@ impl MemTable {
             },
             index: AtomicPtr::new(Box::into_raw(Box::new(Index::with_slots(
                 slots,
-                src().populated(index_populated),
+                src().populated(index_populated).huge(huge),
             )))),
             ordered: false,
             refs: false,
@@ -16213,14 +16297,14 @@ impl MemTable {
             vals2: ByteArena::new(prefault, src()),
             staging: UnsafeCell::new(Staging::default()),
             keys: ByteArena::new(prefault, src()),
-            vals: ByteArena::new(prefault, src()),
+            vals: ByteArena::new(prefault, src().huge(huge)),
             tombs: AtomicUsize::new(0),
             marks: Default::default(),
             mark: AtomicU64::new(0),
             retired: UnsafeCell::new(Vec::new()),
             log: Slab::new(src()),
             snaps: FrozenSnaps::new(),
-            shared: shared.map(|(cap_bytes, _)| {
+            shared: shared.map(|(cap_bytes, _, _)| {
                 Box::new(SharedTable {
                     cap_bytes,
                     claimed: AtomicUsize::new(0),
@@ -16228,6 +16312,7 @@ impl MemTable {
                     vers: (0..SHARED_STRIPES).map(|_| AtomicU32::new(0)).collect(),
                     recycles: false,
                     head_ahead: false,
+                    lazy_len: false,
                 })
             }),
         }
@@ -16237,6 +16322,7 @@ impl MemTable {
     /// (`SharedTable`): its index of `slots`, or where that is zero sized
     /// for `cap_bytes` of values at `SHARED_ENTRY_BYTES` an entry, at half
     /// load, and never grown.
+    #[allow(clippy::too_many_arguments)]
     fn new_shared(
         shape: BlockShape,
         cap_bytes: usize,
@@ -16245,11 +16331,14 @@ impl MemTable {
         head_ahead: bool,
         records: bool,
         in_place: bool,
+        huge: bool,
+        lazy_len: bool,
     ) -> MemTable {
-        let mut m = MemTable::new_with(shape, Some((cap_bytes, slots)));
+        let mut m = MemTable::new_with(shape, Some((cap_bytes, slots, huge)));
         if let Some(st) = m.shared.as_deref_mut() {
             st.recycles = recycles;
             st.head_ahead = head_ahead;
+            st.lazy_len = lazy_len;
         }
         assert!(
             !records || cap_bytes < u32::MAX as usize,
@@ -16463,10 +16552,17 @@ impl MemTable {
 
     fn len(&self) -> usize {
         if self.slim_entries {
-            self.slim.len()
-        } else {
-            self.entries.len()
+            return self.slim.len();
         }
+        // A shared table whose inserts leave the length to its readers
+        // (`Options::shared_len_lazy`): carried over the entries written
+        // before it is read, so a walk meets every entry written below the
+        // first one claimed and not yet written, as an insert that carried
+        // it would have left it.
+        if let Some(st) = self.shared.as_deref().filter(|st| st.lazy_len) {
+            self.advance_shared(st);
+        }
+        self.entries.len()
     }
 
     /// Whether the table holds nothing a read could find: no entry, or for
@@ -16722,6 +16818,19 @@ impl MemTable {
     /// The write log's length at the last commit.
     fn committed_log(&self) -> usize {
         self.committed_at().0
+    }
+
+    /// `committed_log` for a note that compares the position and nothing
+    /// more (`Reader::note_read`): for a shared table whose length its
+    /// readers carry, the length as it was last carried, since carrying it
+    /// at every handle's read was a fence and the loads of two words every
+    /// inserting writer writes on every get (`Options::shared_len_lazy`).
+    fn log_mark(&self) -> usize {
+        if self.shared.as_deref().is_some_and(|st| st.lazy_len) {
+            self.entries.len()
+        } else {
+            self.committed_log()
+        }
     }
 
     /// The entry count at the last commit: at most the table's length,
@@ -18084,6 +18193,17 @@ impl MemTable {
         SharedRmw::Whole(true)
     }
 
+    /// A test's: an overwrite inside the record's lock waits while
+    /// `Reader::hold_rewrites` holds it.
+    #[cold]
+    fn hold_rewrite(&self) {
+        self.rewrite_hold.fetch_or(2, AtomicOrdering::AcqRel);
+        while self.rewrite_hold.load(AtomicOrdering::Acquire) & 1 != 0 {
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        self.rewrite_hold.fetch_and(!2, AtomicOrdering::AcqRel);
+    }
+
     /// Shared, rewriting (`MemTable::rewrites`), under the key's lock: `value`
     /// written over the chain's value where the chain is one put's -- its
     /// value of `value`'s length over a tombstone over nothing -- and the
@@ -18109,15 +18229,262 @@ impl MemTable {
         }
         std::sync::atomic::fence(AtomicOrdering::Release);
         if self.rewrite_hold.load(AtomicOrdering::Acquire) & 1 != 0 {
-            self.rewrite_hold.fetch_or(2, AtomicOrdering::AcqRel);
-            while self.rewrite_hold.load(AtomicOrdering::Acquire) & 1 != 0 {
-                std::thread::sleep(std::time::Duration::from_millis(1));
-            }
-            self.rewrite_hold.fetch_and(!2, AtomicOrdering::AcqRel);
+            self.hold_rewrite();
         }
         self.vals.fill(head as usize + CHUNK_HDR, value.len(), |b| {
             b.copy_from_slice(value)
         });
+        true
+    }
+
+    /// Shared records, the lean path (`Options::shared_lean`): the record
+    /// holding `key` in a table of records, as its offset in the value arena
+    /// and the address of its first byte, from the index slot and one lookup
+    /// of its block; `Ok(None)` where the table holds no record of the key.
+    /// A slot an insert is still laying down under this key's tag is read
+    /// past by a reader, for whom the insert has not happened, and is
+    /// `Err(())` to a writer, whose layered path waits it out: a second
+    /// record for the key is what the tentative word is against.
+    #[inline(always)]
+    fn lean_find(
+        &self,
+        hash: u64,
+        key: &[u8],
+        writing: bool,
+    ) -> std::result::Result<Option<(usize, *const u8)>, ()> {
+        debug_assert!(self.records, "a table of records'");
+        let Some(idx) = self.index() else {
+            return Ok(None);
+        };
+        let tag = hash >> 32;
+        let mut i = slot_of(hash, idx.mask);
+        loop {
+            let s = idx.slots[i].load(AtomicOrdering::Acquire);
+            if s == 0 {
+                return Ok(None);
+            }
+            if s >> 32 == tag {
+                let low = s & 0xffff_ffff;
+                if low == SLOT_TENTATIVE {
+                    if writing {
+                        return Err(());
+                    }
+                } else {
+                    let r = ((low - 1) * 8) as usize;
+                    // One reservation holds the header and the key, so the
+                    // block that holds the one holds the other.
+                    let (b, w) = self.vals.block(r, REC_HDR + key.len());
+                    // SAFETY: inside the block, as `block` checked for the
+                    // header and a key of this length; a record's header and
+                    // key are written before its slot names it.
+                    let p = unsafe { b.add(w) } as *const u8;
+                    self.ask_record(p, key.len());
+                    let klen = unsafe { std::ptr::read_unaligned(p.add(REC_KLEN) as *const u16) };
+                    if usize::from(klen) == key.len() {
+                        // SAFETY: as above, the key's `klen` bytes.
+                        let k = unsafe { std::slice::from_raw_parts(p.add(REC_HDR), key.len()) };
+                        if crate::flatindex::key_eq(k, key) {
+                            return Ok(Some((r, p)));
+                        }
+                    }
+                }
+            }
+            i = (i + 1) & idx.mask;
+        }
+    }
+
+    /// Shared records, lean: the lines of the record at `p` past its first,
+    /// where a put of a value of `LEAN_AHEAD` bytes or fewer lies, asked for
+    /// as the key compare loads the first (`Options::shared_chunk_ahead`): a
+    /// record names its value through its head, so the core can ask for the
+    /// value's lines only once the first line has come, where FASTER's
+    /// record has its value at a fixed offset and both are asked at once.
+    #[inline(always)]
+    fn ask_record(&self, p: *const u8, klen: usize) {
+        if !self.shared.as_deref().is_some_and(|st| st.head_ahead) {
+            return;
+        }
+        let end = REC_HDR + klen + 2 * CHUNK_HDR + LEAN_AHEAD;
+        let mut off = 64 - (p as usize & 63);
+        while off < end {
+            // SAFETY: a hint, which faults on no address.
+            #[cfg(target_arch = "x86_64")]
+            unsafe {
+                std::arch::x86_64::_mm_prefetch(
+                    p.add(off) as *const i8,
+                    std::arch::x86_64::_MM_HINT_T0,
+                );
+            }
+            off += 64;
+        }
+    }
+
+    /// Shared records, lean: the chain at head `at` where it is the whole
+    /// of the key's read -- a value over a tombstone, which masks everything
+    /// older, as the value's address and length and whether the tombstone
+    /// lies over nothing, as one put's does (`rewrite_in_place` overwrites
+    /// only that shape); `Deleted` for a tombstone, none; `Other` for any
+    /// other chain, which the layered path reads. Chunk headers are written
+    /// before the head that names them and never after, and the bytes a
+    /// pinned reader may hold are not reused under it (`TableLocal`), so the
+    /// headers read here are whole whatever a writer of the key is doing;
+    /// only a value's bytes are ever written in place, under the record's
+    /// lock.
+    #[inline(always)]
+    fn lean_chain(&self, at: u64) -> LeanChain {
+        if at == NO_CHUNK {
+            return LeanChain::Other;
+        }
+        let c = self.vals.chunk(at as usize);
+        if c.len == TOMB_LEN {
+            return LeanChain::Deleted;
+        }
+        if c.prev == NO_CHUNK {
+            return LeanChain::Other;
+        }
+        let len = c.len as usize;
+        assert!(len <= c.room, "memtable arena: a read past its block");
+        let t = self.vals.chunk(c.prev as usize);
+        if t.len != TOMB_LEN {
+            return LeanChain::Other;
+        }
+        LeanChain::One(c.value, len, t.prev == NO_CHUNK)
+    }
+
+    /// Shared records, lean: the lock and the head of the record at `p`, an
+    /// address `lean_find` gave.
+    #[inline(always)]
+    fn lean_words(&self, p: *const u8) -> (&AtomicU32, &AtomicU64) {
+        // SAFETY: a record's header, eight-aligned (`reserve_shared_aligned`),
+        // in a block that lives as long as the table.
+        unsafe {
+            (
+                &*(p.add(REC_LOCK) as *const AtomicU32),
+                &*(p.add(REC_HEAD) as *const AtomicU64),
+            )
+        }
+    }
+
+    /// Shared records, lean: `key`'s read from this table where it ends
+    /// there: its one value given to `f` where its chain is one put's, or
+    /// none where it is one delete's, either masking every older source. A
+    /// table that rewrites in place has the value copied onto this frame
+    /// between two equal, even readings of the record's lock, as a sequence
+    /// lock's reader reads it (`copy_chain`); one that does not, a frozen
+    /// table's way, gives it where it lies. `Absent` where the table holds
+    /// no record of the key; `General` for any other chain, and a value
+    /// longer than the frame's copy, which the layered read takes.
+    #[inline(always)]
+    fn lean_read<F: FnMut(&[u8])>(&self, hash: u64, key: &[u8], f: &mut F) -> LeanRead {
+        let p = match self.lean_find(hash, key, false) {
+            Ok(Some((_, p))) => p,
+            Ok(None) => return LeanRead::Absent,
+            Err(()) => return LeanRead::General,
+        };
+        let (lock, head) = self.lean_words(p);
+        let head_at = || match head.load(AtomicOrdering::Acquire) {
+            0 => NO_CHUNK,
+            h => h - 1,
+        };
+        if !self.rewrites_now() {
+            return match self.lean_chain(head_at()) {
+                LeanChain::One(v, len, _) => {
+                    // SAFETY: a value's bytes, which nothing writes again in
+                    // a table that does not rewrite.
+                    f(unsafe { std::slice::from_raw_parts(v, len) });
+                    LeanRead::Done(1)
+                }
+                LeanChain::Deleted => LeanRead::Done(0),
+                LeanChain::Other => LeanRead::General,
+            };
+        }
+        let mut buf = [std::mem::MaybeUninit::<u8>::uninit(); LEAN_COPY];
+        loop {
+            let v = lock.load(AtomicOrdering::Acquire);
+            if v & 1 == 1 {
+                std::hint::spin_loop();
+                continue;
+            }
+            let len = match self.lean_chain(head_at()) {
+                LeanChain::One(src, len, _) if len <= LEAN_COPY => {
+                    // SAFETY: the value's bytes in their block and the frame's
+                    // buffer, which holds them; bytes a writer may be writing,
+                    // kept only where the lock says none was.
+                    unsafe { std::ptr::copy_nonoverlapping(src, buf.as_mut_ptr() as *mut u8, len) };
+                    len
+                }
+                // A head is loaded once and the chunks it names never
+                // change, so a tombstone at the head ends the read however
+                // the lock reads.
+                LeanChain::Deleted => return LeanRead::Done(0),
+                _ => return LeanRead::General,
+            };
+            #[cfg(test)]
+            shared_table::lean_copied();
+            std::sync::atomic::fence(AtomicOrdering::Acquire);
+            if lock.load(AtomicOrdering::Relaxed) == v {
+                // SAFETY: the first `len` bytes of the buffer, copied above.
+                f(unsafe { std::slice::from_raw_parts(buf.as_ptr() as *const u8, len) });
+                return LeanRead::Done(1);
+            }
+        }
+    }
+
+    /// Shared records, lean: `value` written over `key`'s value where the
+    /// table rewrites and the key's chain is one put's of `value`'s length,
+    /// under the record's lock, with `f` given the value it replaces first:
+    /// the in-place put (`rewrite_in_place`) and read-modify-write
+    /// (`rmw_shared`) of the layered path, through the record's address.
+    /// False, nothing read or written, for any other key, shape or table,
+    /// whose write the layered path makes.
+    #[inline(always)]
+    fn lean_overwrite(
+        &self,
+        l: &mut TableLocal,
+        hash: u64,
+        key: &[u8],
+        value: &[u8],
+        f: Option<GiveOld<'_>>,
+    ) -> bool {
+        if !self.rewrites {
+            return false;
+        }
+        let Ok(Some((_, p))) = self.lean_find(hash, key, true) else {
+            return false;
+        };
+        let (lock, head) = self.lean_words(p);
+        let v = shared_lock(lock);
+        // Read after the lock is taken, as `rewrite_in_place` reads it.
+        if self.closed.load(AtomicOrdering::SeqCst) {
+            lock.store(v, AtomicOrdering::Release);
+            return false;
+        }
+        let at = match head.load(AtomicOrdering::Acquire) {
+            0 => NO_CHUNK,
+            h => h - 1,
+        };
+        let LeanChain::One(old, len, true) = self.lean_chain(at) else {
+            lock.store(v, AtomicOrdering::Release);
+            return false;
+        };
+        if len != value.len() {
+            lock.store(v, AtomicOrdering::Release);
+            return false;
+        }
+        if let Some(f) = f {
+            // SAFETY: the value's bytes, which no writer of the key can
+            // change while this one holds its lock.
+            f(unsafe { std::slice::from_raw_parts(old, len) });
+        }
+        std::sync::atomic::fence(AtomicOrdering::Release);
+        if self.rewrite_hold.load(AtomicOrdering::Acquire) & 1 != 0 {
+            self.hold_rewrite();
+        }
+        // SAFETY: the value's bytes in their block, this writer's under the
+        // record's lock; readers copy them between two readings of it.
+        unsafe { std::ptr::copy_nonoverlapping(value.as_ptr(), old as *mut u8, len) };
+        lock.store(v + 2, AtomicOrdering::Release);
+        l.rewrites += 1;
         true
     }
 
@@ -18362,7 +18729,9 @@ impl MemTable {
             (*p).head.store(chunk + 1, AtomicOrdering::Release);
         }
         idx.slots[i].store(Index::word(hash, id), AtomicOrdering::Release);
-        self.advance_shared(st);
+        if !st.lazy_len {
+            self.advance_shared(st);
+        }
         SharedInsert::Done
     }
 
@@ -18425,7 +18794,9 @@ impl MemTable {
             (*p).head.store(r as u64 + 1, AtomicOrdering::Release);
         }
         idx.slots[i].store((hash & !0xffff_ffff) | low as u64, AtomicOrdering::Release);
-        self.advance_shared(st);
+        if !st.lazy_len {
+            self.advance_shared(st);
+        }
         SharedInsert::Done
     }
 
@@ -22816,6 +23187,8 @@ struct Shared {
     /// A test's: how long a handle's shared write waits between taking the
     /// state and writing its table, in microseconds (`Db::hold_shared_writes`).
     shared_write_hold_us: AtomicU64,
+    /// A test's: the shared writes that have entered that wait.
+    shared_writes_held: AtomicU64,
     /// A test's: a freeze's grace held between its read of the writers' list
     /// and its reads of their slots, for as long as bit 0 stands
     /// (`Db::hold_shared_grace`); bit 1 says the grace is waiting there.
@@ -24064,6 +24437,12 @@ pub struct Reader {
     /// `Options::point_lone`), for a test that has to know which read its
     /// store took (`point_lean_reads`).
     lone_reads: std::cell::Cell<u64>,
+    /// The gets, puts and read-modify-writes the lean path answered
+    /// (`Options::shared_lean`).
+    lean_ops: std::cell::Cell<u64>,
+    /// The live table's probes the placed read made (`Reader::read_placed`),
+    /// which a read the lean probe found absent from it makes none of.
+    placed_live_probes: std::cell::Cell<u64>,
     layer_reads: std::cell::Cell<u64>,
     /// Of `layer_reads`, the ones `read_placed` answered
     /// (`Options::point_layers_lean`).
@@ -25287,10 +25666,23 @@ impl Reader {
             .shared_write_hold_us
             .load(AtomicOrdering::Relaxed);
         if hold > 0 {
+            self.shared
+                .shared_writes_held
+                .fetch_add(1, AtomicOrdering::AcqRel);
             std::thread::sleep(std::time::Duration::from_micros(hold));
         }
         let mut l = self.shared_local.borrow_mut();
-        Ok(mem.write_shared(&mut l, Some(&self.shared.readers), mem.hash(key), key, w))
+        let hash = mem.hash(key);
+        if let SharedWrite::Put(value) = w {
+            if self.opts.shared_lean
+                && mem.records
+                && mem.lean_overwrite(&mut l, hash, key, value, None)
+            {
+                self.lean_ops.set(self.lean_ops.get() + 1);
+                return Ok(true);
+            }
+        }
+        Ok(mem.write_shared(&mut l, Some(&self.shared.readers), hash, key, w))
     }
 
     /// EXPERIMENT (`Options::shared_writers`): `key`'s values given to `f`,
@@ -25308,8 +25700,16 @@ impl Reader {
             let _e = self.enter();
             let mem = &self.state().mem;
             let mut l = self.shared_local.borrow_mut();
+            let hash = mem.hash(key);
+            if self.opts.shared_lean
+                && mem.records
+                && mem.lean_overwrite(&mut l, hash, key, value, Some(&mut f))
+            {
+                self.lean_ops.set(self.lean_ops.get() + 1);
+                return Ok(true);
+            }
             let rd = Some(&self.shared.readers);
-            match mem.rmw_shared(&mut l, rd, mem.hash(key), key, value, &mut f) {
+            match mem.rmw_shared(&mut l, rd, hash, key, value, &mut f) {
                 SharedRmw::Whole(done) => return Ok(done),
                 SharedRmw::Spread => {}
             }
@@ -27011,8 +27411,17 @@ impl Reader {
                     // entry the read names, as the length bounds the log
                     // it reads: a snapshot over the table's raw length
                     // named the writer's staged keys, and a scan counted
-                    // them against its limit with nothing to emit.
-                    let (log, len, wm) = mem.committed_at();
+                    // them against its limit with nothing to emit. A
+                    // shared table whose length its readers carry
+                    // (`Options::shared_len_lazy`) bounds nothing: its
+                    // reads are unbounded, and a walk reads the length as
+                    // it walks (`MemTable::len`), so a get or a put reads
+                    // no length.
+                    let (log, len, wm) = if mem.shared.as_deref().is_some_and(|st| st.lazy_len) {
+                        (usize::MAX, usize::MAX, SEE_ALL)
+                    } else {
+                        mem.committed_at()
+                    };
                     self.log_bound.set(log);
                     self.len_bound.set(len);
                     self.wm.set(wm);
@@ -28044,7 +28453,7 @@ impl Reader {
             return;
         }
         let mut m = self.mode_note.get();
-        let now = (self.state().gen, self.mem().committed_log());
+        let now = (self.state().gen, self.mem().log_mark());
         let (at, shared) = if scan {
             (&mut m.scan_at, &self.shared.mode_scans)
         } else {
@@ -28615,6 +29024,28 @@ impl Reader {
     /// its common shape (`Options::point_lone`); both zero without the
     /// option, and a read counted in neither took the general read. A
     /// handle's own count, as `ord_point_reads` is.
+    /// A test's: the length of the live table this handle reads as it was
+    /// last carried, not carried here (`Options::shared_len_lazy`).
+    #[doc(hidden)]
+    pub fn shared_len_carried(&self) -> usize {
+        let _e = self.enter();
+        self.state().mem.entries.len()
+    }
+
+    /// A test's: the gets, puts and read-modify-writes this handle's lean
+    /// path answered (`Options::shared_lean`).
+    #[doc(hidden)]
+    pub fn shared_lean_ops(&self) -> u64 {
+        self.lean_ops.get()
+    }
+
+    /// A test's: the live table's probes this handle's placed reads made
+    /// (`Reader::read_placed`).
+    #[doc(hidden)]
+    pub fn placed_live_probes(&self) -> u64 {
+        self.placed_live_probes.get()
+    }
+
     pub fn point_lean_reads(&self) -> (u64, u64) {
         (self.lone_reads.get(), self.layer_reads.get())
     }
@@ -29646,16 +30077,40 @@ impl Reader {
         // an accessor at every step, thirty nanoseconds on a read of two
         // hundred at three hundred thousand keys.
         let st = self.state();
+        // A shared table of records first, through the record's address
+        // (`Options::shared_lean`): a shared table promises its readers no
+        // isolation, so its reads honour no mark. A key with no record
+        // there is read below with the live table known not to hold it.
+        let mut live_absent = false;
+        if self.opts.shared_lean && st.mem.records {
+            match self.read_live_lean(&st.mem, key, &mut f) {
+                LeanRead::Done(n) => return Ok(n),
+                LeanRead::Absent => live_absent = true,
+                LeanRead::General => {}
+            }
+        }
         if let Some(n) = self.read_lone(st, key, &mut f) {
             return n;
         }
-        if let Some(n) = self.read_placed(st, key, &mut f) {
+        if let Some(n) = self.read_placed(st, key, live_absent, &mut f) {
             return n;
         }
         if let Some(n) = self.read_layers(st, key, &mut f) {
             return n;
         }
         self.read_sources(st, key, f)
+    }
+
+    /// The live table's read of `key` where it is a shared table of
+    /// records, through the record's address (`Options::shared_lean`,
+    /// `MemTable::lean_read`), counted where it ends the read.
+    #[inline(always)]
+    fn read_live_lean<F: FnMut(&[u8])>(&self, mem: &MemTable, key: &[u8], f: &mut F) -> LeanRead {
+        let r = mem.lean_read(mem.hash(key), key, f);
+        if let LeanRead::Done(_) = r {
+            self.lean_ops.set(self.lean_ops.get() + 1);
+        }
+        r
     }
 
     /// `read_layers` with its sources asked in the order of what each
@@ -29681,6 +30136,7 @@ impl Reader {
         &self,
         st: &State,
         key: &[u8],
+        live_absent: bool,
         f: &mut F,
     ) -> Option<Result<u64>> {
         if !self.opts.point_layers_lean || !self.opts.point_lone_on() {
@@ -29725,9 +30181,16 @@ impl Reader {
         let mut live_copy = ChainCopy::default();
         let mut live = [std::mem::MaybeUninit::<&[u8]>::uninit(); LIVE_SMALL];
         let mut live_n = 0;
-        let found = mem
-            .probe_entry(mh, key)
-            .filter(|&(i, _)| i < self.len_bound.get());
+        // The lean read's probe found no record of the key there: forty
+        // instructions of such a read's nine hundred, its probe again.
+        let found = if live_absent {
+            None
+        } else {
+            self.placed_live_probes
+                .set(self.placed_live_probes.get() + 1);
+            mem.probe_entry(mh, key)
+                .filter(|&(i, _)| i < self.len_bound.get())
+        };
         if let Some((_, e)) = found {
             let (n, tomb) = if mem.rewrites_now() {
                 let tomb = mem.copy_chain(e, &mut live_copy);
@@ -39083,6 +39546,7 @@ impl Db {
             shared_cap: AtomicUsize::new(opts.shared_cap(opts.seal_bytes)),
             writer_slots: std::sync::Mutex::new(Vec::new()),
             shared_write_hold_us: AtomicU64::new(0),
+            shared_writes_held: AtomicU64::new(0),
             shared_grace_hold: std::sync::atomic::AtomicU8::new(0),
             writer_forms_off: std::sync::atomic::AtomicBool::new(false),
             write_quiet: std::sync::atomic::AtomicBool::new(false),
@@ -39172,6 +39636,8 @@ impl Db {
             forms_off_now: std::cell::Cell::new(false),
             ord_served: std::cell::Cell::new(0),
             lone_reads: std::cell::Cell::new(0),
+            lean_ops: std::cell::Cell::new(0),
+            placed_live_probes: std::cell::Cell::new(0),
             layer_reads: std::cell::Cell::new(0),
             placed_reads: std::cell::Cell::new(0),
             live_ended: std::cell::Cell::new(0),
@@ -39915,6 +40381,7 @@ impl Db {
             shared_cap: AtomicUsize::new(opts.shared_cap(opts.seal_bytes)),
             writer_slots: std::sync::Mutex::new(Vec::new()),
             shared_write_hold_us: AtomicU64::new(0),
+            shared_writes_held: AtomicU64::new(0),
             shared_grace_hold: std::sync::atomic::AtomicU8::new(0),
             writer_forms_off: std::sync::atomic::AtomicBool::new(false),
             write_quiet: std::sync::atomic::AtomicBool::new(false),
@@ -40004,6 +40471,8 @@ impl Db {
             forms_off_now: std::cell::Cell::new(false),
             ord_served: std::cell::Cell::new(0),
             lone_reads: std::cell::Cell::new(0),
+            lean_ops: std::cell::Cell::new(0),
+            placed_live_probes: std::cell::Cell::new(0),
             layer_reads: std::cell::Cell::new(0),
             placed_reads: std::cell::Cell::new(0),
             live_ended: std::cell::Cell::new(0),
@@ -42358,6 +42827,11 @@ impl Db {
             return;
         }
         self.wait_shared_writers_out();
+        // The length carried over every entry written: the writers are out,
+        // and their stores before the grace let them go are seen here.
+        if let Some(st) = table.shared.as_deref() {
+            table.advance_shared(st);
+        }
         debug_assert!(
             table.shared_whole(),
             "a frozen shared table's length short of its claimed entries"
@@ -43109,6 +43583,8 @@ impl Reader {
             forms_off_now: std::cell::Cell::new(false),
             ord_served: std::cell::Cell::new(0),
             lone_reads: std::cell::Cell::new(0),
+            lean_ops: std::cell::Cell::new(0),
+            placed_live_probes: std::cell::Cell::new(0),
             layer_reads: std::cell::Cell::new(0),
             placed_reads: std::cell::Cell::new(0),
             live_ended: std::cell::Cell::new(0),
@@ -43155,6 +43631,8 @@ impl Reader {
                 forms_off_now: std::cell::Cell::new(false),
                 ord_served: std::cell::Cell::new(0),
                 lone_reads: std::cell::Cell::new(0),
+                lean_ops: std::cell::Cell::new(0),
+                placed_live_probes: std::cell::Cell::new(0),
                 layer_reads: std::cell::Cell::new(0),
                 placed_reads: std::cell::Cell::new(0),
                 live_ended: std::cell::Cell::new(0),
@@ -43208,6 +43686,8 @@ impl Reader {
             forms_off_now: std::cell::Cell::new(false),
             ord_served: std::cell::Cell::new(0),
             lone_reads: std::cell::Cell::new(0),
+            lean_ops: std::cell::Cell::new(0),
+            placed_live_probes: std::cell::Cell::new(0),
             layer_reads: std::cell::Cell::new(0),
             placed_reads: std::cell::Cell::new(0),
             live_ended: std::cell::Cell::new(0),
@@ -44036,6 +44516,13 @@ impl Db {
         self.shared
             .shared_write_hold_us
             .store(micros, AtomicOrdering::Relaxed);
+    }
+
+    /// A test's: the shared writes that have entered the wait
+    /// `hold_shared_writes` sets, each counted as it begins to wait.
+    #[doc(hidden)]
+    pub fn shared_writes_held(&self) -> u64 {
+        self.shared.shared_writes_held.load(AtomicOrdering::Acquire)
     }
 
     /// A test's: while `on`, a freeze's grace (`Db::wait_shared_writers`)
@@ -46477,6 +46964,8 @@ impl Reader {
             forms_off_now: std::cell::Cell::new(false),
             ord_served: std::cell::Cell::new(0),
             lone_reads: std::cell::Cell::new(0),
+            lean_ops: std::cell::Cell::new(0),
+            placed_live_probes: std::cell::Cell::new(0),
             layer_reads: std::cell::Cell::new(0),
             placed_reads: std::cell::Cell::new(0),
             live_ended: std::cell::Cell::new(0),
@@ -60388,7 +60877,10 @@ mod threading {
 
 #[cfg(test)]
 mod shared_table {
-    use super::{BlockShape, MemTable, Readers, SharedWrite, TableLocal, NO_CHUNK, RECYCLE_BATCH};
+    use super::{
+        slot_of, BlockShape, LeanRead, MemTable, Readers, SharedWrite, TableLocal, LEAN_COPY,
+        NO_CHUNK, RECYCLE_BATCH, SLOT_TENTATIVE,
+    };
     use std::sync::atomic::Ordering::{Acquire, Relaxed};
 
     thread_local! {
@@ -60409,6 +60901,37 @@ mod shared_table {
     fn as_records(test: fn()) {
         RECORDS.with(|r| r.set(true));
         test();
+    }
+
+    thread_local! {
+        /// The tables this thread's test makes leave the slab's length to
+        /// its readers (`Options::shared_len_lazy`): each test of the
+        /// length runs once as inserts carry it and once as walks do
+        /// (`as_lazy`).
+        static LAZY: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    }
+
+    /// `test` with this thread's tables made as records whose length their
+    /// readers carry.
+    fn as_lazy(test: fn()) {
+        RECORDS.with(|r| r.set(true));
+        LAZY.with(|r| r.set(true));
+        test();
+    }
+
+    thread_local! {
+        /// A test's: run once between a lean read's copy of a value and its
+        /// second reading of the record's lock (`MemTable::lean_read`), the
+        /// window an overwrite must send the read round again from.
+        static LEAN_COPIED: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+            const { std::cell::RefCell::new(None) };
+    }
+
+    /// A test's seam in `MemTable::lean_read`; see `LEAN_COPIED`.
+    pub(super) fn lean_copied() {
+        if let Some(f) = LEAN_COPIED.with(|h| h.borrow_mut().take()) {
+            f();
+        }
     }
 
     /// A test's seam in `insert_shared`; see `HOLD_AFTER_CLAIM`.
@@ -60438,6 +60961,8 @@ mod shared_table {
             true,
             RECORDS.with(|r| r.get()),
             false,
+            false,
+            LAZY.with(|r| r.get()),
         )
     }
 
@@ -60454,6 +60979,8 @@ mod shared_table {
             },
             cap,
             0,
+            true,
+            true,
             true,
             true,
             true,
@@ -60664,9 +61191,20 @@ mod shared_table {
             mapped: true,
             pool: None,
         };
-        let asked = MemTable::new_shared(shape(), 64 << 20, 5000, false, true, false, false);
+        let asked = MemTable::new_shared(
+            shape(),
+            64 << 20,
+            5000,
+            false,
+            true,
+            false,
+            false,
+            false,
+            false,
+        );
         assert_eq!(asked.index().unwrap().slots.len(), 8192);
-        let sized = MemTable::new_shared(shape(), 1 << 20, 0, false, true, false, false);
+        let sized =
+            MemTable::new_shared(shape(), 1 << 20, 0, false, true, false, false, false, false);
         assert_eq!(sized.index().unwrap().slots.len(), (2 << 20) / 64);
         let mut l = TableLocal::default();
         let mut made = 0u64;
@@ -61109,6 +61647,344 @@ mod shared_table {
         });
     }
 
+    /// A table of records that does not rewrite, read as a frozen table is.
+    fn records_kept(cap: usize) -> MemTable {
+        MemTable::new_shared(
+            BlockShape {
+                prefault: false,
+                index_populated: false,
+                fold_hash: true,
+                mapped: true,
+                pool: None,
+            },
+            cap,
+            0,
+            true,
+            true,
+            true,
+            false,
+            false,
+            true,
+        )
+    }
+
+    /// The lean read of `k`: what it came to, and the values it gave.
+    fn lean(m: &MemTable, k: &[u8]) -> (&'static str, Vec<Vec<u8>>) {
+        let mut got = Vec::new();
+        let r = m.lean_read(m.hash(k), k, &mut |v: &[u8]| got.push(v.to_vec()));
+        let r = match r {
+            LeanRead::Done(n) => {
+                assert_eq!(n as usize, got.len(), "a count of the values it gave");
+                "done"
+            }
+            LeanRead::Absent => "absent",
+            LeanRead::General => "general",
+        };
+        (r, got)
+    }
+
+    /// The lock word of `k`'s record.
+    fn lock_of(m: &MemTable, k: &[u8]) -> u32 {
+        let (_, p) = m.lean_find(m.hash(k), k, false).unwrap().unwrap();
+        m.lean_words(p).0.load(Acquire)
+    }
+
+    /// The lean read ends a key's read where the live table's chain is one
+    /// put's -- its one value -- or one delete's -- none -- in a table that
+    /// rewrites and in one that does not, and leaves every other chain, and
+    /// every key it has no record of, to the layered read: values appended
+    /// with no tombstone under them, a put with an append over it, and in a
+    /// table that rewrites, a value longer than the frame's copy.
+    #[test]
+    fn a_lean_read_ends_a_read_of_one_put_or_one_delete_and_leaves_the_rest() {
+        for m in [rewriting(64 << 20), records_kept(64 << 20)] {
+            let rewrites = m.rewrites;
+            let mut l = TableLocal::default();
+            let w = |l: &mut TableLocal, i: u64, w: SharedWrite<'_>| {
+                let k = key(i);
+                assert!(m.write_shared(l, None, m.hash(&k), &k, w));
+            };
+            w(&mut l, 1, SharedWrite::Put(&[1u8; 100]));
+            w(&mut l, 2, SharedWrite::Put(&[2u8; 100]));
+            w(&mut l, 2, SharedWrite::Delete);
+            w(&mut l, 3, SharedWrite::Append(b"a"));
+            w(&mut l, 3, SharedWrite::Append(b"b"));
+            w(&mut l, 5, SharedWrite::Put(&[5u8; 100]));
+            w(&mut l, 5, SharedWrite::Put(&[6u8; 60]));
+            w(&mut l, 6, SharedWrite::Put(b"p"));
+            w(&mut l, 6, SharedWrite::Append(b"q"));
+            let long = vec![7u8; LEAN_COPY + 1];
+            w(&mut l, 7, SharedWrite::Put(&long));
+            w(&mut l, 8, SharedWrite::Append(b"alone"));
+            assert_eq!(lean(&m, &key(1)), ("done", vec![vec![1u8; 100]]));
+            assert_eq!(lean(&m, &key(2)), ("done", vec![]));
+            assert_eq!(lean(&m, &key(3)), ("general", vec![]));
+            assert_eq!(lean(&m, &key(4)), ("absent", vec![]));
+            assert_eq!(lean(&m, &key(5)), ("done", vec![vec![6u8; 60]]));
+            assert_eq!(lean(&m, &key(6)), ("general", vec![]));
+            assert_eq!(lean(&m, &key(8)), ("general", vec![]));
+            if rewrites {
+                assert_eq!(lean(&m, &key(7)), ("general", vec![]));
+            } else {
+                assert_eq!(lean(&m, &key(7)), ("done", vec![long.clone()]));
+            }
+        }
+    }
+
+    /// A lean read whose copy an overwrite lands beside -- between its copy
+    /// and its second reading of the record's lock -- reads again, and gives
+    /// the value the overwrite left, once: a read that kept its first copy
+    /// would give bytes a writer may have been writing.
+    #[test]
+    fn a_lean_read_whose_copy_meets_an_overwrite_reads_again() {
+        let m: &'static MemTable = Box::leak(Box::new(rewriting(1 << 20)));
+        let k = key(1);
+        let mut l = TableLocal::default();
+        assert!(m.write_shared(&mut l, None, m.hash(&k), &k, SharedWrite::Put(&[1u8; 100])));
+        LEAN_COPIED.with(|h| {
+            *h.borrow_mut() = Some(Box::new(move || {
+                let mut l = TableLocal::default();
+                assert!(m.lean_overwrite(&mut l, m.hash(&k), &k, &[2u8; 100], None));
+            }))
+        });
+        assert_eq!(lean(m, &k), ("done", vec![vec![2u8; 100]]));
+        assert!(
+            LEAN_COPIED.with(|h| h.borrow().is_none()),
+            "the overwrite ran"
+        );
+    }
+
+    /// A lean overwrite writes a value of its key's value's length where it
+    /// lies, under the record's lock, giving the value it replaces first:
+    /// no head moved, no byte laid down, the lock moved on by two. It
+    /// leaves to the layered path, with nothing written and the lock as it
+    /// found it, a value of another length, a deleted key, a chain of
+    /// appends, a key with no record, a table closed to overwrites and a
+    /// table that does not rewrite.
+    #[test]
+    fn a_lean_overwrite_writes_its_length_where_it_lies_and_leaves_the_rest() {
+        let m = rewriting(64 << 20);
+        let mut l = TableLocal::default();
+        let w = |l: &mut TableLocal, i: u64, w: SharedWrite<'_>| {
+            let k = key(i);
+            assert!(m.write_shared(l, None, m.hash(&k), &k, w));
+        };
+        w(&mut l, 1, SharedWrite::Put(&[1u8; 100]));
+        w(&mut l, 2, SharedWrite::Delete);
+        w(&mut l, 3, SharedWrite::Append(b"a"));
+        let (k1, k2, k3) = (key(1), key(2), key(3));
+        let head = |k: &[u8]| MemTable::head(m.probe_entry(m.hash(k), k).unwrap().1);
+        let (h1, used, lock1) = (head(&k1), m.vals.shared_used(), lock_of(&m, &k1));
+        let rewrites = l.rewrites;
+        let mut old = Vec::new();
+        let mut give = |v: &[u8]| old.push(v.to_vec());
+        assert!(m.lean_overwrite(&mut l, m.hash(&k1), &k1, &[2u8; 100], Some(&mut give)));
+        assert_eq!(
+            old,
+            vec![vec![1u8; 100]],
+            "the value it replaced, given once"
+        );
+        assert_eq!((head(&k1), m.vals.shared_used()), (h1, used));
+        assert_eq!(lock_of(&m, &k1), lock1 + 2);
+        assert_eq!(l.rewrites, rewrites + 1);
+        assert_eq!(lean(&m, &k1), ("done", vec![vec![2u8; 100]]));
+        // What it leaves: nothing written, the lock as it was.
+        let refused = |m: &MemTable, l: &mut TableLocal, k: &[u8], v: &[u8]| {
+            let lock = m
+                .lean_find(m.hash(k), k, false)
+                .unwrap()
+                .map(|_| lock_of(m, k));
+            let mut given = 0;
+            let mut count = |_: &[u8]| given += 1;
+            assert!(!m.lean_overwrite(l, m.hash(k), k, v, Some(&mut count)));
+            assert_eq!(given, 0, "nothing read");
+            if let Some(lock) = lock {
+                assert_eq!(lock_of(m, k), lock, "the lock as it was");
+            }
+        };
+        refused(&m, &mut l, &k1, &[3u8; 60]);
+        refused(&m, &mut l, &k2, &[3u8; 100]);
+        refused(&m, &mut l, &k3, b"b");
+        refused(&m, &mut l, &key(4), &[3u8; 100]);
+        assert_eq!(lean(&m, &k1), ("done", vec![vec![2u8; 100]]));
+        assert_eq!(lean(&m, &k2), ("done", vec![]));
+        m.closed.store(true, std::sync::atomic::Ordering::SeqCst);
+        refused(&m, &mut l, &k1, &[3u8; 100]);
+        assert_eq!(lean(&m, &k1), ("done", vec![vec![2u8; 100]]));
+        let kept = records_kept(1 << 20);
+        let mut lk = TableLocal::default();
+        assert!(kept.write_shared(
+            &mut lk,
+            None,
+            kept.hash(&k1),
+            &k1,
+            SharedWrite::Put(&[1u8; 100])
+        ));
+        refused(&kept, &mut lk, &k1, &[3u8; 100]);
+        assert_eq!(lean(&kept, &k1), ("done", vec![vec![1u8; 100]]));
+        // A table that recycles nothing lays a put of another length's
+        // tombstone over the chain it replaces: read whole by the lean read,
+        // since a tombstone masks what is under it, and overwritten by
+        // neither path, which overwrite one put's tombstone over nothing
+        // alone.
+        let piled = MemTable::new_shared(
+            BlockShape {
+                prefault: false,
+                index_populated: false,
+                fold_hash: true,
+                mapped: true,
+                pool: None,
+            },
+            1 << 20,
+            0,
+            false,
+            true,
+            true,
+            true,
+            false,
+            true,
+        );
+        let mut lp = TableLocal::default();
+        let put = |l: &mut TableLocal, v: &[u8]| {
+            assert!(piled.write_shared(l, None, piled.hash(&k1), &k1, SharedWrite::Put(v)));
+        };
+        put(&mut lp, &[1u8; 100]);
+        put(&mut lp, &[2u8; 60]);
+        assert_eq!(lean(&piled, &k1), ("done", vec![vec![2u8; 60]]));
+        refused(&piled, &mut lp, &k1, &[3u8; 60]);
+        put(&mut lp, &[4u8; 60]);
+        assert_eq!(lp.rewrites, 0, "the layered path overwrote nothing");
+        assert_eq!(lean(&piled, &k1), ("done", vec![vec![4u8; 60]]));
+    }
+
+    /// A slot an insert is still laying down under a key's tag is read past
+    /// by a lean reader, for whom the insert has not happened, and is left
+    /// by a lean writer to the layered path, which waits it out: a writer
+    /// that read past it would lay a second record for the key.
+    #[test]
+    fn a_lean_writer_leaves_a_tentative_slot_of_its_tag_to_the_layered_path() {
+        let m = rewriting(1 << 20);
+        let k = key(1);
+        let h = m.hash(&k);
+        let idx = m.index().unwrap();
+        idx.slots[slot_of(h, idx.mask)].store((h & !0xffff_ffff) | SLOT_TENTATIVE, Relaxed);
+        assert!(m.lean_find(h, &k, true).is_err());
+        assert_eq!(m.lean_find(h, &k, false).map(|p| p.is_none()), Ok(true));
+        let mut l = TableLocal::default();
+        assert!(!m.lean_overwrite(&mut l, h, &k, &[1u8; 100], None));
+    }
+
+    /// A lean probe takes only the record of its own key where a slot
+    /// under the key's tag names another key's record, as two keys that
+    /// share a tag leave: one whose key is this key and one byte more, and
+    /// one of this key's length with other bytes. A probe that compared no
+    /// length would read the longer key's first bytes as this key; one that
+    /// compared no key would take either.
+    #[test]
+    fn a_lean_probe_takes_only_the_record_of_its_key() {
+        let m = rewriting(1 << 20);
+        let mut l = TableLocal::default();
+        let a = b"lean-probe-key-a".to_vec();
+        let mut longer = a.clone();
+        longer.push(b'+');
+        let mut other = a.clone();
+        *other.last_mut().unwrap() ^= 1;
+        for k in [&longer, &other] {
+            assert!(m.write_shared(&mut l, None, m.hash(k), k, SharedWrite::Put(b"v")));
+            let idx = m.index().unwrap();
+            let named = (0..idx.slots.len())
+                .map(|i| idx.slots[i].load(Relaxed))
+                .find(|&s| {
+                    s != 0
+                        && m.lean_find(m.hash(k), k, false).unwrap().unwrap().0
+                            == ((s & 0xffff_ffff) - 1) as usize * 8
+                })
+                .expect("the record's slot");
+            // `a`'s first slot, under `a`'s tag, naming the other record.
+            let h = m.hash(&a);
+            let i = slot_of(h, idx.mask);
+            assert_eq!(idx.slots[i].load(Relaxed), 0, "a's first slot is vacant");
+            idx.slots[i].store((h & !0xffff_ffff) | (named & 0xffff_ffff), Relaxed);
+            assert_eq!(idx.slots[(i + 1) & idx.mask].load(Relaxed), 0);
+            assert_eq!(
+                m.lean_find(h, &a, false).map(|p| p.is_none()),
+                Ok(true),
+                "{k:?}"
+            );
+            assert_eq!(lean(&m, &a), ("absent", vec![]));
+            idx.slots[i].store(0, Relaxed);
+        }
+    }
+
+    /// Writers on threads overwrite a few keys through the lean path, over
+    /// and over, while readers read them through it: every read ends in
+    /// the live table with one value that is one put's whole, each a run of
+    /// one byte, which a read that kept bytes a writer was writing would
+    /// show.
+    #[test]
+    fn readers_read_lean_values_writers_overwrite_lean_and_no_read_is_torn() {
+        const KEYS: u64 = 16;
+        const PUTS: u64 = 200_000;
+        let m = rewriting(64 << 20);
+        {
+            let mut l = TableLocal::default();
+            for i in 0..KEYS {
+                let k = key(i);
+                assert!(m.write_shared(
+                    &mut l,
+                    None,
+                    m.hash(&k),
+                    &k,
+                    SharedWrite::Put(&[1u8; 256])
+                ));
+            }
+        }
+        let stop = std::sync::atomic::AtomicBool::new(false);
+        std::thread::scope(|s| {
+            let readers: Vec<_> = (0..2)
+                .map(|_| {
+                    let (m, stop) = (&m, &stop);
+                    s.spawn(move || {
+                        let mut seen = 0u64;
+                        while !stop.load(Relaxed) {
+                            for i in 0..KEYS {
+                                let (r, vs) = lean(m, &key(i));
+                                assert_eq!((r, vs.len()), ("done", 1), "key {i}");
+                                let v = &vs[0];
+                                assert!(
+                                    v.len() == 256 && v.iter().all(|&b| b == v[0]),
+                                    "a value torn by an overwrite"
+                                );
+                                seen += 1;
+                            }
+                        }
+                        seen
+                    })
+                })
+                .collect();
+            let writers: Vec<_> = (0..2u64)
+                .map(|w| {
+                    let m = &m;
+                    s.spawn(move || {
+                        let mut l = TableLocal::default();
+                        for n in 0..PUTS {
+                            let k = key((n + w) % KEYS);
+                            let v = [(2 + (n * 2 + w) % 250) as u8; 256];
+                            assert!(m.lean_overwrite(&mut l, m.hash(&k), &k, &v, None));
+                        }
+                    })
+                })
+                .collect();
+            for h in writers {
+                h.join().unwrap();
+            }
+            stop.store(true, Relaxed);
+            for h in readers {
+                assert!(h.join().unwrap() > 0, "a reader read nothing");
+            }
+        });
+    }
+
     /// A read of a table that rewrites in place through the plain value
     /// read, which hands out the bytes where they lie, is refused in a
     /// checked build: only the copy under the record's lock may read them.
@@ -61152,6 +62028,105 @@ mod shared_table {
     #[test]
     fn writers_on_threads_reuse_one_anothers_ranges_as_records() {
         as_records(writers_on_threads_reuse_one_anothers_ranges);
+    }
+
+    // And over a table of records whose length its readers carry.
+    #[test]
+    fn writers_on_threads_make_one_entry_a_key_and_lose_no_write_lazy() {
+        as_lazy(writers_on_threads_make_one_entry_a_key_and_lose_no_write);
+    }
+    #[test]
+    fn two_writers_inserting_at_once_leave_the_length_past_both_lazy() {
+        as_lazy(two_writers_inserting_at_once_leave_the_length_past_both);
+    }
+    #[test]
+    fn the_length_waits_at_an_entry_claimed_and_not_written_lazy() {
+        as_lazy(the_length_waits_at_an_entry_claimed_and_not_written);
+    }
+    #[test]
+    fn a_full_shared_table_refuses_a_put_and_writes_nothing_of_it_lazy() {
+        as_lazy(a_full_shared_table_refuses_a_put_and_writes_nothing_of_it);
+    }
+    #[test]
+    fn a_put_reuses_what_it_replaced_once_no_reader_can_hold_it_lazy() {
+        as_lazy(a_put_reuses_what_it_replaced_once_no_reader_can_hold_it);
+    }
+    #[test]
+    fn writers_reuse_beside_pinned_readers_and_no_read_is_torn_lazy() {
+        as_lazy(writers_reuse_beside_pinned_readers_and_no_read_is_torn);
+    }
+    #[test]
+    fn writers_on_threads_reuse_one_anothers_ranges_lazy() {
+        as_lazy(writers_on_threads_reuse_one_anothers_ranges);
+    }
+
+    /// A shared table that asks for huge pages (`Options::shared_huge`)
+    /// has its value arena, where its records lie, and its index mapped
+    /// advised onto them, and one that does not has neither: read off the
+    /// kernel's flags for the mapping that holds a record and the index.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_shared_table_on_huge_pages_maps_its_records_and_index_there() {
+        if !std::path::Path::new("/sys/kernel/mm/transparent_hugepage/enabled").exists() {
+            return;
+        }
+        let advised = |p: *const u8| {
+            super::blocks::vm_flags(p)
+                .split_whitespace()
+                .any(|f| f == "hg")
+        };
+        for huge in [true, false] {
+            let m = MemTable::new_shared(
+                BlockShape {
+                    prefault: false,
+                    index_populated: false,
+                    fold_hash: true,
+                    mapped: true,
+                    pool: None,
+                },
+                64 << 20,
+                1 << 20,
+                true,
+                true,
+                true,
+                true,
+                huge,
+                true,
+            );
+            let mut l = TableLocal::default();
+            let k = key(1);
+            assert!(m.write_shared(&mut l, None, m.hash(&k), &k, SharedWrite::Put(b"v")));
+            let (_, p) = m.lean_find(m.hash(&k), &k, false).unwrap().unwrap();
+            let idx = m.index().unwrap();
+            assert_eq!(advised(p), huge, "the record's mapping, huge {huge}");
+            assert_eq!(
+                advised(idx.slots.as_ptr() as *const u8),
+                huge,
+                "the index's mapping, huge {huge}"
+            );
+        }
+    }
+
+    /// A table whose length its readers carry leaves it where it is at
+    /// every insert, and the first read of it carries it over every entry
+    /// written; a table whose inserts carry it has it at every entry the
+    /// moment each insert returns.
+    #[test]
+    fn an_insert_leaves_the_length_to_its_readers_where_the_table_says() {
+        for lazy in [true, false] {
+            LAZY.with(|r| r.set(lazy));
+            RECORDS.with(|r| r.set(true));
+            let m = table(1 << 20);
+            let mut l = TableLocal::default();
+            for i in 0..100 {
+                let k = key(i);
+                assert!(m.write_shared(&mut l, None, m.hash(&k), &k, SharedWrite::Put(b"v")));
+            }
+            let carried = m.entries.len();
+            assert_eq!(carried, if lazy { 0 } else { 100 }, "lazy {lazy}");
+            assert_eq!(m.len(), 100, "lazy {lazy}: a read carries it");
+            assert_eq!(m.entries.len(), 100, "lazy {lazy}: and leaves it carried");
+        }
     }
 }
 

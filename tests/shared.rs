@@ -417,6 +417,7 @@ fn a_freeze_settles_its_table_only_once_an_overwrite_in_flight_is_through() {
     let mut db = Db::create(&d, options(1 << 20)).unwrap();
     let w = db.reader().unwrap();
     let g = db.reader().unwrap();
+    let h = db.reader().unwrap();
     assert!(w.put(b"k", &[1u8; 64]).unwrap());
     g.hold_rewrites(true);
     db.hold_shared_grace(true);
@@ -437,6 +438,13 @@ fn a_freeze_settles_its_table_only_once_an_overwrite_in_flight_is_through() {
             g.hold_rewrites(false);
             settled
         });
+        // The flush only once the put is held inside its record's lock: a
+        // freeze that closed the table first left the put nothing to
+        // overwrite and the gate waiting for a hold that never came, which a
+        // put started late under load did.
+        while !h.rewrite_holding() {
+            std::thread::yield_now();
+        }
         db.flush().unwrap();
         gate.join().unwrap()
     });
@@ -470,8 +478,12 @@ fn a_freeze_waits_out_a_write_holding_the_table_it_replaces() {
             assert!(r.put(b"held", b"landed").unwrap());
             drop(r);
         });
-        // The handle is inside its hold by the time the flush freezes.
-        std::thread::sleep(std::time::Duration::from_millis(50));
+        // The handle inside its hold before the flush freezes: a sleep
+        // that bet the handle would be there by its end lost to a thread
+        // started late under load.
+        while db.shared_writes_held() == 0 {
+            std::thread::yield_now();
+        }
         let t = std::time::Instant::now();
         db.flush().unwrap();
         assert!(
@@ -539,6 +551,173 @@ fn a_freeze_lets_go_of_a_writer_dropped_inside_its_grace() {
 /// over a key only the partition holds, over a key the live table ends
 /// with a put, and over one whose live chain is an append on the
 /// partition's value, which the read takes whole, oldest first.
+/// A handle's get, put and read-modify-write of a key the live table holds
+/// in one put's shape go through the record's address
+/// (`Options::shared_lean`), and every answer is the layered path's: the
+/// store with the option off answers each the same, overwrites as many in
+/// place, and counts none of them lean. A key the live table has no record
+/// of is read below it -- in the frozen table a held seal keeps, and in the
+/// partition -- as the layered read reads it, the lean probe having said
+/// the live table does not hold it.
+#[test]
+fn a_handles_lean_path_answers_what_the_layered_one_does() {
+    let _w = Watchdog::arm("the lean path's test waited a minute");
+    let mut answers = Vec::new();
+    for lean in [true, false] {
+        let d = scratch(if lean { "lean" } else { "nolean" });
+        let mut db = Db::create(
+            &d,
+            Options {
+                shared_lean: lean,
+                ..options(1 << 20)
+            },
+        )
+        .unwrap();
+        db.put(b"part", b"p1");
+        db.put(b"frozen", b"f0");
+        db.put(b"base", b"b0");
+        db.commit().unwrap();
+        db.flush().unwrap();
+        let r = db.reader().unwrap();
+        let rmw = |k: &[u8], v: &[u8]| {
+            let mut g = Vec::new();
+            assert!(r.rmw(k, v, |x| g.push(x.to_vec())).unwrap());
+            g
+        };
+        // A key in a frozen table, its seal's landing held.
+        assert!(r.put(b"frozen", &[9u8; 64]).unwrap());
+        db.hold_seal_landing(true);
+        db.seal().unwrap();
+        assert_eq!(db.frozen_tables(), 1, "the frozen table");
+        let mut got: Vec<Vec<Vec<u8>>> = Vec::new();
+        let ops0 = r.shared_lean_ops();
+        let probes0 = r.placed_live_probes();
+        got.push(handle_values(&r, b"frozen"));
+        got.push(handle_values(&r, b"part"));
+        assert_eq!(
+            r.shared_lean_ops(),
+            ops0,
+            "reads the live table does not end"
+        );
+        // The read below the table probes the table again only where the
+        // lean probe did not say it lacks the key. The placed read is the
+        // one that counts, and under the stride switch a form file serves
+        // the partition and the general read takes the key
+        // (`common::stride_switch`).
+        let layered = if common::stride_switch() { 0 } else { 2 };
+        assert_eq!(
+            r.placed_live_probes() - probes0,
+            if lean { 0 } else { layered },
+            "lean: {lean}: the live table probed again"
+        );
+        assert!(r.put(b"k", &[1u8; 64]).unwrap());
+        got.push(handle_values(&r, b"k"));
+        assert!(r.put(b"k", &[2u8; 64]).unwrap());
+        got.push(handle_values(&r, b"k"));
+        got.push(rmw(b"k", &[3u8; 64]));
+        got.push(handle_values(&r, b"k"));
+        got.push(rmw(b"part", b"p2"));
+        got.push(handle_values(&r, b"part"));
+        assert!(r.delete(b"k").unwrap());
+        got.push(handle_values(&r, b"k"));
+        // A chain the lean path leaves to the layered read -- an append
+        // over the partition's value, no tombstone under it -- read with
+        // the partition below it, not as a key the table lacks.
+        assert!(r.append(b"base", b"b1").unwrap());
+        got.push(handle_values(&r, b"base"));
+        // The reads of `k` and of `part` after its put, the put of `k`'s
+        // length and its read-modify-write.
+        assert_eq!(
+            r.shared_lean_ops() - ops0,
+            if lean { 7 } else { 0 },
+            "lean: {lean}"
+        );
+        got.push(vec![r.rewrites_made().to_be_bytes().to_vec()]);
+        drop(r);
+        db.hold_seal_landing(false);
+        db.flush().unwrap();
+        for k in [&b"frozen"[..], b"part", b"k"] {
+            got.push(values(&db, k));
+        }
+        answers.push(got);
+        drop(db);
+        let _ = std::fs::remove_dir_all(&d);
+    }
+    assert_eq!(
+        answers[0], answers[1],
+        "the lean path's answers and the layered one's"
+    );
+    let a = &answers[0];
+    assert_eq!(a[0], vec![vec![9u8; 64]], "the frozen table's value");
+    assert_eq!(a[1], vec![b"p1".to_vec()], "the partition's");
+    assert_eq!(a[4], vec![vec![2u8; 64]], "the value the rmw replaced");
+    assert_eq!(
+        a[6],
+        vec![b"p1".to_vec()],
+        "the rmw's read of the partition"
+    );
+    assert_eq!(a[8], Vec::<Vec<u8>>::new(), "a deleted key");
+    assert_eq!(
+        a[9],
+        vec![b"b0".to_vec(), b"b1".to_vec()],
+        "an append over the partition's value"
+    );
+    assert_eq!(
+        a[10],
+        vec![2u64.to_be_bytes().to_vec()],
+        "two overwrites in place"
+    );
+}
+
+/// A handle's gets and puts read no length of the live table it shares,
+/// whose inserts leave the length to its readers
+/// (`Options::shared_len_lazy`): after a handle's inserts and its gets of
+/// them, the length is where the inserts left it, and the handle's scan
+/// carries it over every entry written and lists every key. With the
+/// option off the inserts carry it themselves.
+#[test]
+fn a_handles_point_operations_leave_the_shared_length_and_a_scan_carries_it() {
+    for lazy in [true, false] {
+        let d = scratch(if lazy { "lazylen" } else { "eagerlen" });
+        let db = Db::create(
+            &d,
+            Options {
+                shared_len_lazy: lazy,
+                ..options(1 << 20)
+            },
+        )
+        .unwrap();
+        let r = db.reader().unwrap();
+        for i in 0..50 {
+            assert!(r.put(&common_key(i), b"v").unwrap());
+        }
+        for i in 0..50 {
+            assert_eq!(handle_values(&r, &common_key(i)), vec![b"v".to_vec()]);
+        }
+        assert_eq!(
+            r.shared_len_carried(),
+            if lazy { 0 } else { 50 },
+            "lazy {lazy}: the length after the inserts and the gets"
+        );
+        let mut keys = Vec::new();
+        r.scan(b"common-", 100, kv(&mut |k, _| keys.push(k.to_vec())))
+            .unwrap();
+        assert_eq!(
+            keys,
+            (0..50).map(common_key).collect::<Vec<_>>(),
+            "lazy {lazy}"
+        );
+        assert_eq!(
+            r.shared_len_carried(),
+            50,
+            "lazy {lazy}: carried by the scan"
+        );
+        drop(r);
+        drop(db);
+        let _ = std::fs::remove_dir_all(&d);
+    }
+}
+
 #[test]
 fn a_handles_rmw_reads_what_the_key_held_and_puts_its_value() {
     let d = scratch("rmw");
