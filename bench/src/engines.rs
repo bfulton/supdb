@@ -15464,6 +15464,7 @@ pub fn guarantee(arm: &str) -> Option<Guarantee> {
         | "supdb-heldinplacepieces"
         | "supdb-heldnfinline"
         | "supdb-heldbatch1"
+        | "proto-shared"
         | "faster" => Guarantee::Memory,
         _ => return None,
     })
@@ -17602,6 +17603,15 @@ pub fn open(arm: &str, dir: &Path, map_gb: usize) -> Res<Box<dyn Engine>> {
         "rocksdb-tuned-nosync" => Box::new(Rocks::create_tuned_nosync(dir)?),
         #[cfg(faster)]
         "faster" => Box::new(Faster::create(dir)?),
+        // The probe's live table shared by every writer thread, over a
+        // read-only base (`proto::Shared`): what a shared live table
+        // costs the threaded writers' mixes, beside FASTER's.
+        "proto-shared" => Box::new(crate::proto::Shared::create(
+            match STORE_KEYS.load(std::sync::atomic::Ordering::Relaxed) {
+                0 => 1 << 20,
+                n => n,
+            },
+        )),
         #[cfg(not(faster))]
         "faster" => return Err("faster: FASTER's C++ store is built on Linux x86-64 alone".into()),
         other => return Err(format!("no such arm: {other}")),
