@@ -525,6 +525,8 @@ pub struct Supdb {
     cipher_merge_apart: bool,
     /// `Policy::cipher_merge_stream`.
     cipher_merge_stream: bool,
+    /// `Policy::cipher_drops_keep`.
+    cipher_drops_keep: bool,
     /// False for the ingest-first arm: a flush stops partitioning what it
     /// sealed and leaves that to the background -- promotion at once, a
     /// merge for the rest (`Options::flush_schedules`). Both arms exist so
@@ -2019,6 +2021,12 @@ struct Policy {
     /// (`StoreCipher::merges_beside_cache`): `supdb-cipherautomergestream`,
     /// beside `supdb-cipherauto`, which reads them through it.
     cipher_merge_stream: bool,
+    /// The store under a cipher with the controller on and a drop of a
+    /// file's pages leaving the plaintext it covers in the store's cache
+    /// (`StoreCipher::drops_keep_plaintext`), where the store as shipped
+    /// gives the units it covers back: `supdb-cipherautodropskeep`, beside
+    /// `supdb-cipherauto`, the shape before.
+    cipher_drops_keep: bool,
     partition: bool,
     drain: bool,
     advice: Option<supdb::ReadAdvice>,
@@ -3230,6 +3238,7 @@ impl Default for Policy {
             cipher_land_model: false,
             cipher_merge_apart: false,
             cipher_merge_stream: false,
+            cipher_drops_keep: false,
             partition: true,
             drain: true,
             advice: None,
@@ -3688,6 +3697,16 @@ impl Policy {
     }
 }
 
+/// The shapes before a cipher arm keeps of the cipher's own knobs
+/// (`StoreCipher`), each the policy's field of the same name.
+#[derive(Clone, Copy, Default)]
+struct CipherShape {
+    apart: bool,
+    half: bool,
+    merge_stream: bool,
+    drops_keep: bool,
+}
+
 /// The encryption an arm's store is under: the kernel's key for the arm
 /// that asks for it, a cipher of the suite's for the cipher arms (with the
 /// cache the arm bounds it to), and none for the rest. One way or neither:
@@ -3696,17 +3715,16 @@ fn encryption_of(
     dir_key: bool,
     cipher: bool,
     cipher_cache: u64,
-    cipher_apart: bool,
-    cipher_half: bool,
-    cipher_merge_stream: bool,
+    shape: CipherShape,
 ) -> supdb::Encryption {
     match (dir_key, cipher) {
         (true, _) => supdb::Encryption::Kernel(supdb::DirKey::new([0x5a; 32])),
         (false, true) => {
             let c = supdb::StoreCipher::new(Gcm::new(), Gcm::of)
-                .chunks_apart(cipher_apart)
-                .cache_half_at_open(cipher_half)
-                .merges_beside_cache(cipher_merge_stream);
+                .chunks_apart(shape.apart)
+                .cache_half_at_open(shape.half)
+                .merges_beside_cache(shape.merge_stream)
+                .drops_keep_plaintext(shape.drops_keep);
             supdb::Encryption::Cipher(match cipher_cache {
                 0 => c,
                 bytes => c.cache_bytes(bytes),
@@ -3836,6 +3854,21 @@ impl Supdb {
                 cipher: true,
                 cipher_auto: true,
                 cipher_merge_stream: true,
+                ..Policy::default()
+            },
+        )
+    }
+
+    /// `supdb-cipherauto` with a drop of a file's pages leaving its
+    /// plaintext in the store's cache (`Policy::cipher_drops_keep`):
+    /// `supdb-cipherautodropskeep`.
+    pub fn create_cipherauto_dropskeep(path: &Path) -> Res<Supdb> {
+        Supdb::with_policy(
+            path,
+            Policy {
+                cipher: true,
+                cipher_auto: true,
+                cipher_drops_keep: true,
                 ..Policy::default()
             },
         )
@@ -10167,6 +10200,7 @@ impl Supdb {
             cipher_land_model,
             cipher_merge_apart,
             cipher_merge_stream,
+            cipher_drops_keep,
             partition,
             drain,
             advice,
@@ -11181,9 +11215,12 @@ impl Supdb {
             dir_key,
             cipher,
             cipher_cache,
-            cipher_apart,
-            cipher_half,
-            cipher_merge_stream,
+            CipherShape {
+                apart: cipher_apart,
+                half: cipher_half,
+                merge_stream: cipher_merge_stream,
+                drops_keep: cipher_drops_keep,
+            },
         );
         let db = if REOPEN.with(|r| r.get()) {
             supdb::Db::open(path, opts)
@@ -11204,6 +11241,7 @@ impl Supdb {
             cipher_land_model,
             cipher_merge_apart,
             cipher_merge_stream,
+            cipher_drops_keep,
             partition,
             drain,
             advice,
@@ -11654,6 +11692,7 @@ impl Engine for Supdb {
                 true if self.cipher_auto && self.cipher_merge_stream => {
                     "supdb-cipherautomergestream"
                 }
+                true if self.cipher_auto && self.cipher_drops_keep => "supdb-cipherautodropskeep",
                 true if self.cipher_auto => "supdb-cipherauto",
                 false if self.cipher_auto => "supdb-ingestcipherauto",
                 true if self.cipher_cache != 0 => "supdb-cipher64",
@@ -13365,6 +13404,8 @@ impl Engine for Supdb {
             ("cipher_gave_way", pc.gave_way as f64),
             ("cipher_spared_at_end", pc.spared as f64),
             ("cipher_evictor_passes", pc.passes as f64),
+            ("cipher_dropped_units", pc.dropped_units as f64),
+            ("cipher_dropped_bytes", pc.dropped_bytes as f64),
             ("lazy_scans_done", db.lazy_scans().0 as f64),
             ("lazy_scans_resumed", db.lazy_scans().1 as f64),
             ("seals", db.seal_waits().joins as f64),
@@ -15321,6 +15362,7 @@ pub fn guarantee(arm: &str) -> Option<Guarantee> {
         | "supdb-cipherautolandmodel"
         | "supdb-cipherautomergeapart"
         | "supdb-cipherautomergestream"
+        | "supdb-cipherautodropskeep"
         | "supdb-cipherzpages"
         | "supdb-cipherzstride"
         | "supdb-cipherzstrideapart"
@@ -15938,6 +15980,7 @@ pub fn open(arm: &str, dir: &Path, map_gb: usize) -> Res<Box<dyn Engine>> {
         "supdb-cipherautolandmodel" => supdb_arm(Supdb::create_cipherauto_landmodel, dir)?,
         "supdb-cipherautomergeapart" => supdb_arm(Supdb::create_cipherauto_mergeapart, dir)?,
         "supdb-cipherautomergestream" => supdb_arm(Supdb::create_cipherauto_mergestream, dir)?,
+        "supdb-cipherautodropskeep" => supdb_arm(Supdb::create_cipherauto_dropskeep, dir)?,
         "supdb-cipherzpages" => supdb_arm(Supdb::create_cipher_zpages, dir)?,
         "supdb-cipherzstride" => supdb_arm(Supdb::create_cipher_zstride, dir)?,
         "supdb-cipherzstrideapart" => supdb_arm(Supdb::create_cipher_zstride_apart, dir)?,
@@ -18108,6 +18151,23 @@ mod tests {
             guarantee("supdb-cipher")
         );
         drop(stream);
+        let keep = arm(
+            "supdb-cipherautodropskeep",
+            Supdb::create_cipherauto_dropskeep,
+        );
+        assert!(under(&keep), "supdb-cipherautodropskeep: under a cipher");
+        let k = o(&keep);
+        assert!(k.zpages_under_cipher, "supdb-cipherautodropskeep");
+        assert!(
+            !auto.cipher_drops_keep && keep.cipher_drops_keep,
+            "supdb-cipherautodropskeep leaves a drop's plaintext in the cache"
+        );
+        assert_eq!(k.zpages_drop_raw, z.zpages_drop_raw);
+        assert_eq!(
+            guarantee("supdb-cipherautodropskeep"),
+            guarantee("supdb-cipher")
+        );
+        drop(keep);
         drop((plain, cipher, log, auto, zblock, zstride));
         let _ = std::fs::remove_dir_all(&root);
     }
@@ -18120,23 +18180,23 @@ mod tests {
     fn the_dirkey_arm_asks_the_kernel_and_the_cipher_arms_a_cipher() {
         use supdb::Encryption;
         assert!(matches!(
-            encryption_of(true, false, 0, false, false, false),
+            encryption_of(true, false, 0, CipherShape::default()),
             Encryption::Kernel(_)
         ));
         assert!(matches!(
-            encryption_of(true, true, 0, false, false, false),
+            encryption_of(true, true, 0, CipherShape::default()),
             Encryption::Kernel(_)
         ));
         assert!(matches!(
-            encryption_of(false, true, 0, false, false, false),
+            encryption_of(false, true, 0, CipherShape::default()),
             Encryption::Cipher(_)
         ));
         assert!(matches!(
-            encryption_of(false, true, 64 << 20, false, false, false),
+            encryption_of(false, true, 64 << 20, CipherShape::default()),
             Encryption::Cipher(_)
         ));
         assert!(matches!(
-            encryption_of(false, false, 0, false, false, false),
+            encryption_of(false, false, 0, CipherShape::default()),
             Encryption::None
         ));
         // The merges' reads beside the cache are the cipher's knob.
@@ -18144,8 +18204,41 @@ mod tests {
             Encryption::Cipher(c) => c.merges_beside_cache_set(),
             _ => false,
         };
-        assert!(beside(encryption_of(false, true, 0, false, false, true)));
-        assert!(!beside(encryption_of(false, true, 0, false, false, false)));
+        assert!(beside(encryption_of(
+            false,
+            true,
+            0,
+            CipherShape {
+                merge_stream: true,
+                ..CipherShape::default()
+            }
+        )));
+        assert!(!beside(encryption_of(
+            false,
+            true,
+            0,
+            CipherShape::default()
+        )));
+        // And a drop's plaintext kept is the cipher's knob too.
+        let keeps = |e: Encryption| match e {
+            Encryption::Cipher(c) => c.drops_keep_plaintext_set(),
+            _ => false,
+        };
+        assert!(keeps(encryption_of(
+            false,
+            true,
+            0,
+            CipherShape {
+                drops_keep: true,
+                ..CipherShape::default()
+            }
+        )));
+        assert!(!keeps(encryption_of(
+            false,
+            true,
+            0,
+            CipherShape::default()
+        )));
         // And the bound reaches the store: `supdb-cipher64`'s cache is its
         // policy's sixty-four mebibytes, `supdb-cipher`'s the engine's own.
         let root =
@@ -18172,7 +18265,7 @@ mod tests {
         // in a gate's bench group, where the two were held within a
         // quarter of each other. A store keeps no cipher in its options
         // past its open, so the cipher is the policy's.
-        let size = |cache: u64| match encryption_of(false, true, cache, false, false, false) {
+        let size = |cache: u64| match encryption_of(false, true, cache, CipherShape::default()) {
             Encryption::Cipher(c) => c.cache_bytes_set(),
             _ => panic!("a cipher"),
         };

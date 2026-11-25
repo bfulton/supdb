@@ -199,6 +199,7 @@ pub struct StoreCipher {
     apart: bool,
     half: bool,
     beside: bool,
+    drops_keep: bool,
     room: Option<Arc<RoomFn>>,
 }
 
@@ -224,6 +225,7 @@ impl StoreCipher {
             apart: false,
             half: false,
             beside: false,
+            drops_keep: false,
             room: None,
         }
     }
@@ -313,6 +315,26 @@ impl StoreCipher {
     pub fn merges_beside_cache(mut self, on: bool) -> StoreCipher {
         self.beside = on;
         self
+    }
+
+    /// Whether a drop of a file's pages (`Bytes::advise_dontneed`, the
+    /// raw records of a partition its form file serves, a build's drop
+    /// behind it) leaves the plaintext it covers in the store's cache, to
+    /// be given back as the cache gives anything back, and drops the
+    /// kernel's cache of the envelope alone. As shipped, off: the units
+    /// wholly inside the range are given back at the evictor's next turn,
+    /// whatever the budget, as a plain store's drop gives back its pages.
+    /// On is the shape that is priced against.
+    #[doc(hidden)]
+    pub fn drops_keep_plaintext(mut self, keep: bool) -> StoreCipher {
+        self.drops_keep = keep;
+        self
+    }
+
+    /// Whether `drops_keep_plaintext` is set: a test's look at an arm.
+    #[doc(hidden)]
+    pub fn drops_keep_plaintext_set(&self) -> bool {
+        self.drops_keep
     }
 
     /// Whether `merges_beside_cache` is set: a test's look at an arm.
@@ -918,6 +940,15 @@ fn trace_room(slack: i64) {
             lock(&v.mapped).len(),
             mib(v.coming.bytes())
         ));
+        // The views, by the first field of the name each was met under,
+        // for what the cache holds present of each kind of file.
+        let views: Vec<(String, Arc<Paged>)> = files
+            .iter()
+            .filter_map(|(name, e)| {
+                let field = name.split('-').next().unwrap_or(name).to_string();
+                e.page.clone().map(|p| (field, p))
+            })
+            .collect();
         seen.sort_by_key(|s| std::cmp::Reverse(s.2));
         for (_, name, len, viewed) in seen.iter().take(6) {
             let short: String = name.chars().take(28).collect();
@@ -926,6 +957,23 @@ fn trace_room(slack: i64) {
                 if *viewed { "*" } else { "" },
                 mib(*len)
             ));
+        }
+        drop(seen);
+        drop(files);
+        // What the cache holds present by that field: whether the
+        // plaintext held is what the reads ask for.
+        let mut by: Vec<(String, u64)> = Vec::new();
+        for (field, p) in &views {
+            let held = p.present_bytes();
+            match by.iter_mut().find(|(f, _)| f == field) {
+                Some((_, b)) => *b += held,
+                None => by.push((field.clone(), held)),
+            }
+        }
+        by.sort();
+        line.push_str(" | present");
+        for (field, held) in &by {
+            line.push_str(&format!(" {field} {}", mib(*held)));
         }
     }
     eprintln!("{line}");
@@ -1088,6 +1136,7 @@ impl Vault {
                 };
                 pager.keep_apart(cipher.apart);
                 pager.merge_beside(cipher.beside);
+                pager.drops_keep(cipher.drops_keep);
                 pager
             },
             coming,

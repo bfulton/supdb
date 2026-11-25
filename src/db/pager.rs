@@ -308,6 +308,8 @@ struct Counts {
     gave_way: AtomicU64,
     spared: AtomicU64,
     streamed: AtomicU64,
+    dropped_units: AtomicU64,
+    dropped_bytes: AtomicU64,
 }
 
 /// The longest a reader waits for a crowded cache (`Pager::breathe`).
@@ -361,6 +363,10 @@ pub struct PagerCounts {
     /// Chunks decrypted by views read in order beside the cache (a merge's
     /// inputs, `Stream`), which the cache neither holds nor counts.
     pub streamed: u64,
+    /// Of `evicted_units` and `evicted_bytes`, the units a drop of their
+    /// file's pages gave back (`Paged::forget`), and their plaintext.
+    pub dropped_units: u64,
+    pub dropped_bytes: u64,
 }
 
 /// What a cache whose budget follows the room asks of the platform
@@ -465,6 +471,11 @@ pub(crate) struct Pager {
     apart: AtomicBool,
     /// `StoreCipher::merges_beside_cache`.
     beside: AtomicBool,
+    /// `StoreCipher::drops_keep_plaintext`.
+    drops_keep: AtomicBool,
+    /// Units a drop has asked to be given back since the evictor last
+    /// looked (`Paged::forget`), each flagged on its file.
+    dropped: AtomicUsize,
     files: Mutex<Vec<Weak<Paged>>>,
     /// The era the holds stand in (`Hold`), and the holds.
     era: AtomicU64,
@@ -519,6 +530,8 @@ impl Pager {
             peak: AtomicU64::new(0),
             apart: AtomicBool::new(false),
             beside: AtomicBool::new(false),
+            drops_keep: AtomicBool::new(false),
+            dropped: AtomicUsize::new(0),
             files: Mutex::new(Vec::new()),
             era: AtomicU64::new(1),
             holds: Mutex::new(Vec::new()),
@@ -711,6 +724,12 @@ impl Pager {
         self.beside.store(on, Ordering::Relaxed);
     }
 
+    /// Whether a drop of a file's pages leaves its plaintext here
+    /// (`StoreCipher::drops_keep_plaintext`).
+    pub(crate) fn drops_keep(&self, keep: bool) {
+        self.drops_keep.store(keep, Ordering::Relaxed);
+    }
+
     pub(crate) fn counts(&self) -> PagerCounts {
         let c = &self.counts;
         let r = |a: &AtomicU64| a.load(Ordering::Relaxed);
@@ -734,6 +753,8 @@ impl Pager {
             gave_way: r(&c.gave_way),
             spared: r(&c.spared),
             streamed: r(&c.streamed),
+            dropped_units: r(&c.dropped_units),
+            dropped_bytes: r(&c.dropped_bytes),
         }
     }
 
@@ -907,7 +928,7 @@ impl Pager {
             // what the look reads, and one after it tells again (`nudge`).
             p.told.store(false, Ordering::Release);
             p.follow_room();
-            let idle = p.over() == 0 || !p.pass();
+            let idle = !p.pass();
             if idle {
                 // Nothing to give back, or nothing that may be: wait to be
                 // told, and look again before long in case the telling was
@@ -926,26 +947,67 @@ impl Pager {
         }
     }
 
-    /// One pass: mark units until what they hold covers what the cache is
-    /// over by and a little more, wait out the readers, and give back
-    /// whichever were not taken back meanwhile. False when nothing could
-    /// be marked.
+    /// One pass: the units a drop asked for marked (`Paged::forget`), and
+    /// where the cache is over its budget, units from the hand until what
+    /// the marked hold covers what it is over by and a little more; the
+    /// readers waited out once for all of them, and whichever were not
+    /// taken back meanwhile given back. False when nothing was marked.
     fn pass(&self) -> bool {
-        Counts::bump(&self.counts.passes);
-        // Under the budget by a margin, so that the next fill does not
-        // start the next pass: a sixteenth of the budget, and a unit at
-        // least. The first margin was eight units at least, eight
-        // megabytes, which under a budget of two was every pass giving
-        // back everything the store held.
-        let budget = self.budget();
-        let goal = self
-            .over()
-            .saturating_add((budget / 16).max((unit_chunks() * CHUNK) as u64));
-        let marked = self.mark(goal);
-        if marked.is_empty() {
-            Counts::bump(&self.counts.stalls);
+        let (mut marked, dropped) = self.mark_dropped();
+        let over = self.over();
+        if over > 0 {
+            Counts::bump(&self.counts.passes);
+            // Under the budget by a margin, so that the next fill does not
+            // start the next pass: a sixteenth of the budget, and a unit
+            // at least. The first margin was eight units at least, eight
+            // megabytes, which under a budget of two was every pass giving
+            // back everything the store held.
+            let budget = self.budget();
+            let goal = over.saturating_add((budget / 16).max((unit_chunks() * CHUNK) as u64));
+            if dropped < goal {
+                marked.extend(self.mark(goal - dropped));
+            }
+            if marked.is_empty() {
+                Counts::bump(&self.counts.stalls);
+                return false;
+            }
+        } else if marked.is_empty() {
             return false;
         }
+        self.give(&marked);
+        true
+    }
+
+    /// The units a drop asked to be given back (`Paged::forget`), whatever
+    /// the budget, each marked unless a chunk of it was read since the
+    /// drop, and the plaintext they hold.
+    fn mark_dropped(&self) -> (Vec<(Arc<Paged>, usize)>, u64) {
+        let mut marked = Vec::new();
+        let mut bytes = 0u64;
+        if self.dropped.swap(0, Ordering::AcqRel) == 0 {
+            return (marked, bytes);
+        }
+        let files: Vec<Arc<Paged>> = lock(&self.files).iter().filter_map(Weak::upgrade).collect();
+        for f in &files {
+            for (u, asked) in f.drop_asked.iter().enumerate() {
+                if asked.swap(false, Ordering::AcqRel) {
+                    let got = f.mark(u);
+                    if got > 0 {
+                        bytes += got;
+                        f.dropping[u].store(true, Ordering::Relaxed);
+                        marked.push((f.clone(), u));
+                    }
+                }
+            }
+        }
+        (marked, bytes)
+    }
+
+    /// The marked units' pages given back once every reader that could
+    /// have been lent a byte of them has gone, unless a reader took a unit
+    /// back meanwhile, those a drop asked for counted apart. Nothing is
+    /// given back where the store is closing.
+    fn give(&self, marked: &[(Arc<Paged>, usize)]) {
         // Every reader that could have been lent a byte of a marked unit
         // pinned before now. The epoch and the era move after the marks,
         // and the pins are read after they move.
@@ -965,10 +1027,11 @@ impl Pager {
             if self.stop.load(Ordering::SeqCst) {
                 // The store is closing under readers still pinned: nothing
                 // is given back, and the marks are lifted.
-                for (f, u) in &marked {
+                for (f, u) in marked {
                     f.unmark(*u);
+                    f.dropping[*u].store(false, Ordering::Relaxed);
                 }
-                return true;
+                return;
             }
             std::thread::sleep(nap);
             nap = (nap * 2).min(Duration::from_millis(2));
@@ -978,16 +1041,21 @@ impl Pager {
         self.counts
             .longest_wait_us
             .fetch_max(waited, Ordering::Relaxed);
-        for (f, u) in &marked {
+        for (f, u) in marked {
             let freed = f.free(*u);
             if freed > 0 {
                 Counts::bump(&self.counts.evicted_units);
                 self.counts
                     .evicted_bytes
                     .fetch_add(freed, Ordering::Relaxed);
+                if f.dropping[*u].swap(false, Ordering::Relaxed) {
+                    Counts::bump(&self.counts.dropped_units);
+                    self.counts
+                        .dropped_bytes
+                        .fetch_add(freed, Ordering::Relaxed);
+                }
             }
         }
-        true
     }
 
     /// Mark units for a pass, from where the hand stands and at most twice
@@ -1134,6 +1202,12 @@ pub(crate) struct Paged {
     unit_chunks: usize,
     state: Box<[AtomicU8]>,
     unit: Box<[AtomicU8]>,
+    /// The units a drop of the file's pages has asked the evictor to give
+    /// back (`Paged::forget`, `Pager::mark_dropped`).
+    drop_asked: Box<[AtomicBool]>,
+    /// The units marked for a drop and not yet given back, for the count
+    /// of what drops gave back (`PagerCounts::dropped_units`).
+    dropping: Box<[AtomicBool]>,
     back: OnceLock<Back>,
     /// What the file is called, for an error.
     label: String,
@@ -1266,6 +1340,12 @@ impl Paged {
             state: (0..chunks).map(|_| AtomicU8::new(first)).collect(),
             unit: (0..chunks.div_ceil(unit_chunks))
                 .map(|_| AtomicU8::new(LIVE))
+                .collect(),
+            drop_asked: (0..chunks.div_ceil(unit_chunks))
+                .map(|_| AtomicBool::new(false))
+                .collect(),
+            dropping: (0..chunks.div_ceil(unit_chunks))
+                .map(|_| AtomicBool::new(false))
                 .collect(),
             back: OnceLock::new(),
             label: label.to_string(),
@@ -1739,9 +1819,57 @@ impl Paged {
         self.present.load(Ordering::Relaxed)
     }
 
+    /// The units wholly inside `len` bytes of plaintext from `off`, of a
+    /// file with its envelope, asked of the evictor to be given back at its
+    /// next turn whatever the budget, as a plain store's drop gives back
+    /// its pages (`StoreCipher::drops_keep_plaintext` leaves them): each
+    /// unit's chunks marked unread, so that a read after the drop, which
+    /// marks its chunk read again, keeps the unit, and the unit flagged for
+    /// the evictor (`Pager::mark_dropped`). A unit is a megabyte, so a
+    /// range under one asks for nothing, and a range's ends inside a unit
+    /// leave that unit, as the kernel's drop leaves a folio a range does
+    /// not cover whole.
+    fn drop_units(&self, off: u64, len: usize) {
+        if self.pager.drops_keep.load(Ordering::Relaxed)
+            || len == 0
+            || off >= self.len
+            || self.back.get().is_none()
+        {
+            return;
+        }
+        let ub = (self.unit_chunks * CHUNK) as u64;
+        let end = off.saturating_add(len as u64).min(self.len);
+        let mut asked = 0usize;
+        for u in off.div_ceil(ub) as usize..self.unit.len() {
+            if ((u as u64 + 1) * ub).min(self.len) > end {
+                break;
+            }
+            let lo = u * self.unit_chunks;
+            let hi = (lo + self.unit_chunks).min(self.state.len());
+            let mut present = false;
+            for s in &self.state[lo..hi] {
+                match s.load(Ordering::Relaxed) {
+                    HOT => {
+                        let _ = s.compare_exchange(HOT, COLD, Ordering::SeqCst, Ordering::SeqCst);
+                        present = true;
+                    }
+                    COLD => present = true,
+                    _ => {}
+                }
+            }
+            if present && !self.drop_asked[u].swap(true, Ordering::AcqRel) {
+                asked += 1;
+            }
+        }
+        if asked > 0 {
+            self.pager.dropped.fetch_add(asked, Ordering::AcqRel);
+            self.pager.nudge();
+        }
+    }
+
     /// The plaintext this file holds present, bytes: its chunks' count,
     /// the last being short.
-    fn present_bytes(&self) -> u64 {
+    pub(crate) fn present_bytes(&self) -> u64 {
         let mut bytes = 0u64;
         for (c, s) in self.state.iter().enumerate() {
             if matches!(s.load(Ordering::Relaxed), COLD | HOT | DYING) {
@@ -1924,12 +2052,13 @@ impl Paging for Paged {
         have as f64 / (b - a + 1) as f64
     }
 
-    /// The kernel's cache of the envelope's bytes for the range given up:
-    /// this process's entries for them dropped, then the file's clean
-    /// pages, which a drop skips while a mapping holds them. Whole pages
-    /// inside the range's ciphertext alone. The chunks present here stay,
-    /// to be given back as the cache gives anything back.
+    /// The range given up: the units wholly inside it asked of the
+    /// evictor (`drop_units`), and the kernel's cache of the envelope's
+    /// bytes for it, this process's entries for them dropped and then the
+    /// file's clean pages, which a drop skips while a mapping holds them,
+    /// whole pages inside the range's ciphertext alone.
     fn forget(&self, off: u64, len: usize) {
+        self.drop_units(off, len);
         let Some((back, mut from, mut to)) = self.stored_pages(off, len, true) else {
             return;
         };
@@ -3027,6 +3156,9 @@ mod tests {
         // Clean pages are what a drop takes.
         File::open(&path).unwrap().sync_all().unwrap();
         let pager = Pager::new(u64::MAX);
+        // The kernel's side of a drop: what a drop gives back of the
+        // plaintext held here is the next test's.
+        pager.drops_keep(true);
         let p = sparse(&pager, &path, 9);
         let len = bytes.len();
         assert_eq!(p.resident(0, 0), 0.0);
@@ -3081,6 +3213,82 @@ mod tests {
         m.advise_dontneed();
         assert_eq!(m.resident_at(100_000), Some(false), "the whole file");
         assert_eq!(m.resident_at(1_000_000), Some(true), "but the chunk here");
+    }
+
+    /// A drop of a range gives back the units wholly inside it, whatever
+    /// the budget, as a plain store's drop gives back its pages: a unit a
+    /// range covers in part stays, as does one read after the drop, and
+    /// the shape that leaves the plaintext (`StoreCipher::
+    /// drops_keep_plaintext`) gives nothing back. The evictor is stopped,
+    /// so that each give-back is the test's own call.
+    #[test]
+    fn a_drop_gives_back_the_units_it_covers_and_not_one_read_after_it() {
+        let dir = scratch("dropunits");
+        let bytes = plain(4 * 1024 * 1024, 4);
+        let path = dir.join("e");
+        envelope(&path, &bytes, 9);
+        let pager = Pager::new(u64::MAX);
+        pager.stop();
+        let p = sparse(&pager, &path, 9);
+        let len = bytes.len();
+        {
+            let _h = pager.hold();
+            assert_eq!(read(&p, 0, len).as_deref(), Some(&bytes[..]));
+        }
+        let ub = p.unit_chunks * CHUNK;
+        assert_eq!(p.unit.len(), len.div_ceil(ub), "five units, the last short");
+        let present = |u: usize| {
+            let lo = u * p.unit_chunks;
+            let hi = (lo + p.unit_chunks).min(p.state.len());
+            p.state[lo..hi]
+                .iter()
+                .filter(|s| matches!(s.load(Ordering::SeqCst), COLD | HOT))
+                .count()
+        };
+        let whole = |u: usize| ((u + 1) * p.unit_chunks).min(p.state.len()) - u * p.unit_chunks;
+        // Units 1 and 2 lie wholly inside; 0 and 3 in part.
+        let (off, n) = (ub as u64 - 10, 2 * ub + 20);
+        p.forget(off, n);
+        assert_eq!(pager.dropped.load(Ordering::SeqCst), 2, "two units asked");
+        // A read after the drop keeps its unit.
+        {
+            let _h = pager.hold();
+            let at = 2 * ub + 100;
+            assert_eq!(
+                read(&p, at as u64, 10).as_deref(),
+                Some(&bytes[at..at + 10])
+            );
+        }
+        pager.pass();
+        let c = pager.counts();
+        assert_eq!(c.dropped_units, 1, "{c:?}");
+        assert_eq!(c.dropped_bytes, ub as u64, "{c:?}");
+        assert_eq!(present(1), 0, "the unit dropped is given back");
+        for u in [0, 2, 3, 4] {
+            assert_eq!(present(u), whole(u), "unit {u} stays");
+        }
+        assert_eq!(pager.held(), (len - ub) as u64, "what is held is counted");
+        // Read back, the plaintext is the file's.
+        {
+            let _h = pager.hold();
+            assert_eq!(read(&p, 0, len).as_deref(), Some(&bytes[..]));
+        }
+        // The whole file: every unit.
+        p.forget(0, len);
+        assert_eq!(pager.dropped.load(Ordering::SeqCst), 5, "every unit asked");
+        pager.pass();
+        assert_eq!(pager.held(), 0, "the file given back whole");
+        assert_eq!(pager.counts().dropped_units, 6);
+        // The shape before: the drop leaves the plaintext here.
+        {
+            let _h = pager.hold();
+            assert_eq!(read(&p, 0, len).as_deref(), Some(&bytes[..]));
+        }
+        pager.drops_keep(true);
+        p.forget(0, len);
+        assert_eq!(pager.dropped.load(Ordering::SeqCst), 0, "nothing asked");
+        pager.pass();
+        assert_eq!(pager.held(), len as u64, "nothing given back");
     }
 
     /// A paged mapping and a mapped file over the same plaintext say alike
@@ -3192,6 +3400,8 @@ mod tests {
         envelope(&path, &bytes, 9);
         File::open(&path).unwrap().sync_all().unwrap();
         let pager = Pager::new(u64::MAX);
+        // The kernel's side of a drop, as the test before.
+        pager.drops_keep(true);
         let p = sparse(&pager, &path, 9);
         let len = bytes.len();
         // Out of the tables and the cache, then back into the cache alone.

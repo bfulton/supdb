@@ -436,7 +436,10 @@ well. `supdb-cipherautomergeapart` is `supdb-cipherauto` with
 its merges asking nothing ahead of their walks of their inputs
 (`Options::merge_read_ahead_cipher` at zero), the shape before, and
 `supdb-cipherautomergestream` the same with its merges reading their
-inputs beside the store's cache (`StoreCipher::merges_beside_cache`). And
+inputs beside the store's cache (`StoreCipher::merges_beside_cache`), and
+`supdb-cipherautodropskeep` the same with a drop of a file's pages leaving
+the plaintext it covers in the store's cache
+(`StoreCipher::drops_keep_plaintext`), the shape before. And
 two that force the compact form
 there, each coding priced by itself: `supdb-cipherzpages`, every
 partition's form file in the block coding, and `supdb-cipherzstride`,

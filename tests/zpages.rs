@@ -8975,6 +8975,97 @@ fn a_form_build_under_a_cipher_says_what_its_file_is_to_hold() {
     }
 }
 
+/// Under a cipher a partition's raw pages dropped once its form file serves
+/// it (`Options::zpages_drop_raw`) are the plaintext the store's cache holds
+/// of them as well as the kernel's cache of their envelope: the drop gives
+/// the cache's units back, as a plain store's drop gives back its pages,
+/// where it had dropped the envelope's pages alone and left the plaintext of
+/// every partition the form serves to stand in the cache beside the form
+/// files the reads want. The shape before (`StoreCipher::
+/// drops_keep_plaintext`) gives nothing back, and is run first, so that its
+/// evictor has had the whole of the other store's wait to turn in.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_drop_of_a_partitions_raw_pages_under_a_cipher_gives_its_plaintext_back() {
+    let mut kept = None;
+    for keep in [true, false] {
+        let what = format!("drops keep the plaintext: {keep}");
+        let cipher = supdb::StoreCipher::new(common::Gcm::new(&[0x5e; 32]), common::Gcm::new)
+            .cache_bytes(1 << 30)
+            .drops_keep_plaintext(keep);
+        let dir = scratch(&format!("zdrop-cipher-{keep}"));
+        let mut db = Db::create(
+            &dir,
+            forced(|o| {
+                o.encryption = supdb::Encryption::Cipher(cipher);
+                o.partition_bytes = Some(400 << 10);
+                o.zpages_drop_at_install = false;
+            }),
+        )
+        .unwrap();
+        let model = numbered_load(&mut db, 40_000, 100, 0x4AC);
+        db.zpages_settle().unwrap();
+        let c = db.zpage_counts();
+        assert!(
+            c.partitions >= 2 && c.form_files == c.partitions,
+            "{what}: every partition served: {c:?}"
+        );
+        assert!(
+            c.raw_dropped >= c.partitions,
+            "{what}: every partition's raw pages dropped: {c:?}"
+        );
+        // The segments' envelopes, by their names: an envelope of a
+        // segment carries no kind's suffix.
+        let raw: u64 = std::fs::read_dir(&dir)
+            .unwrap()
+            .flatten()
+            .filter(|e| {
+                e.file_name()
+                    .to_str()
+                    .is_some_and(|n| n.starts_with("x-") && !n.contains('.'))
+            })
+            .map(|e| e.metadata().unwrap().len())
+            .sum();
+        assert!(
+            raw > 2 << 20,
+            "{what}: the segments' envelopes: {raw} bytes"
+        );
+        let dropped = || db.cipher_counts().unwrap().cache.dropped_bytes;
+        if keep {
+            kept = Some((dir, db, model));
+            continue;
+        }
+        let t = std::time::Instant::now();
+        while dropped() < raw / 2 {
+            assert!(
+                t.elapsed() < std::time::Duration::from_secs(20),
+                "{what}: {} bytes given back of {raw}: {:?}",
+                dropped(),
+                db.cipher_counts().unwrap().cache
+            );
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        let keys: Vec<Vec<u8>> = model.keys().step_by(97).cloned().collect();
+        let r = db.reader().unwrap();
+        check(&r, &model, &keys, &what);
+        drop(r);
+        db.close().unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+    let (dir, db, model) = kept.unwrap();
+    let c = db.cipher_counts().unwrap().cache;
+    assert_eq!(
+        c.dropped_bytes, 0,
+        "the shape before gives nothing back: {c:?}"
+    );
+    let keys: Vec<Vec<u8>> = model.keys().step_by(97).cloned().collect();
+    let r = db.reader().unwrap();
+    check(&r, &model, &keys, "the shape before");
+    drop(r);
+    db.close().unwrap();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// The same under a cipher (`Encryption::Cipher`), where a form file an
 /// earlier open left is an envelope beside its segment's that this open's
 /// table of names does not hold until something asks for it: the
@@ -9385,21 +9476,46 @@ fn the_crossing_asks_for_the_raw_pages_of_a_cold_partition_with_no_form_file() {
             });
         if ahead {
             // Two partitions built ahead under the line, their files on
-            // disk, and the third's build held at its start.
+            // disk, and the third's build held at its start. The builds are
+            // walked through by hand: each parked at its rename, with only
+            // the rename held, while the start behind it is held, so that
+            // no build runs past the two whatever the load. Two built and
+            // then a hold set was a bet that the builder had not built the
+            // rest meanwhile, which one run of the whole binary lost.
+            let parked = |n: u64| {
+                let t = std::time::Instant::now();
+                while !(db.zpage_build_held() && db.zpage_counts().prebuilt >= n)
+                    && t.elapsed() < JOB_WALL
+                {
+                    wait_steps(&db, 1);
+                }
+                assert!(
+                    db.zpage_build_held(),
+                    "{what}: a build held with {n} built ahead: {:?}",
+                    db.zpage_counts()
+                );
+            };
+            db.hold_zpage_rename(true);
             inject.set_budget(raw * 3 / 2);
+            for n in 0..2 {
+                // The build after `n` stands at its rename.
+                parked(n);
+                db.hold_zpage_build(true);
+                db.hold_zpage_rename(false);
+                // It lands, and the next one stands at its start.
+                parked(n + 1);
+                if n + 1 < 2 {
+                    db.hold_zpage_rename(true);
+                    db.hold_zpage_build(false);
+                }
+            }
             assert!(
-                tick_until_built(&db, |c| c.prebuilt >= 2),
+                db.zpage_counts().prebuilt >= 2,
                 "{what}: built ahead: {:?}",
                 db.zpage_counts()
             );
-        }
-        db.hold_zpage_build(true);
-        if ahead {
-            let t = std::time::Instant::now();
-            while !db.zpage_build_waiting() && t.elapsed() < JOB_WALL {
-                wait_steps(&db, 1);
-            }
-            assert!(db.zpage_build_waiting(), "{what}: a build held");
+        } else {
+            db.hold_zpage_build(true);
         }
         let on_disk = named_form_files(&dir).len() as u64;
         let pars: Vec<PathBuf> = std::fs::read_dir(&dir)
