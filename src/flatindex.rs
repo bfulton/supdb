@@ -1074,6 +1074,71 @@ pub(crate) fn record_into(
     at
 }
 
+/// `record_into`, the same bytes, with each pad zeroed by one word laid
+/// before the bytes beside it -- a record pads its key and its tail to
+/// four, so a pad is at most three bytes and lies inside the word that
+/// ends where it does -- where `record_into` filled each pad with a call
+/// whatever its length, and a sixteen-byte key copied by a fixed move
+/// (`Options::direct_lean_append`, through `MemTable::push_record`).
+pub(crate) fn record_into_lean(
+    rec: &mut [u8],
+    key: &[u8],
+    exts: &[Ext],
+    tail: &[u8],
+    compact: bool,
+) -> usize {
+    let klen = key.len();
+    let at = align_up(4 + klen, REC_ALIGN);
+    let len = rec.len();
+    let one = compact && compacts(exts);
+    debug_assert_eq!(
+        len,
+        if one {
+            record_len_compact(klen, tail.len())
+        } else {
+            record_len_tail(klen, exts.len(), tail.len())
+        },
+        "a record's slice is its length"
+    );
+    // The pads first: every byte past them is written below, and a pad's
+    // word ends where the pad does. The tail's word may be the key's (no
+    // extent and no tail) or overlap the compact header (no tail), both
+    // written after it.
+    rec[len - 4..len].copy_from_slice(&[0; 4]);
+    rec[at - 4..at].copy_from_slice(&[0; 4]);
+    let count = if one { COMPACT } else { exts.len() as u16 };
+    let mut hdr = [0u8; 4];
+    hdr[0..2].copy_from_slice(&(klen as u16).to_le_bytes());
+    hdr[2..4].copy_from_slice(&count.to_le_bytes());
+    rec[0..4].copy_from_slice(&hdr);
+    if let Ok(k) = <&[u8; 16]>::try_from(key) {
+        rec[RECORD_KEY_AT..RECORD_KEY_AT + 16].copy_from_slice(k);
+    } else {
+        rec[RECORD_KEY_AT..RECORD_KEY_AT + klen].copy_from_slice(key);
+    }
+    if one {
+        debug_assert_eq!(
+            tail.len(),
+            exts[0].len as usize,
+            "a compact run is its tail"
+        );
+        rec[at..at + 4].copy_from_slice(&compact_header(&exts[0]));
+        rec[at + 4..at + 4 + tail.len()].copy_from_slice(tail);
+        return at + 4;
+    }
+    let mut at = at;
+    for e in exts {
+        rec[at..at + 4].copy_from_slice(&e.block.to_le_bytes());
+        rec[at + 4..at + 8].copy_from_slice(&e.off.to_le_bytes());
+        rec[at + 8..at + 12].copy_from_slice(&e.len.to_le_bytes());
+        rec[at + 12..at + 16].copy_from_slice(&e.last.to_le_bytes());
+        rec[at + 16..at + 20].copy_from_slice(&e.count.to_le_bytes());
+        at += EXT_BYTES;
+    }
+    rec[at..at + tail.len()].copy_from_slice(tail);
+    at
+}
+
 pub fn stream_record_tail_at(
     out: &mut Vec<u8>,
     key: &[u8],
@@ -2731,6 +2796,57 @@ mod fill_tests {
             }
             assert_eq!(outs[0], outs[1], "{n} keys");
         }
+    }
+}
+
+#[cfg(test)]
+mod record_tests {
+    use super::*;
+
+    /// The lean encoder writes `record_into`'s bytes over a slice of any
+    /// prior contents -- every key length either side of the four-byte
+    /// pad, every tail length either side of it, compact and full, no
+    /// extent, one and several -- and reports the same tail offset.
+    #[test]
+    fn the_lean_record_is_record_intos_bytes() {
+        let ext = |len: u32, block: u32, count: u32| Ext {
+            block,
+            off: 0,
+            len,
+            last: 0,
+            count,
+        };
+        let mut cases = 0;
+        for klen in [0usize, 1, 2, 3, 4, 5, 7, 8, 12, 15, 16, 17, 20, 31, 64] {
+            let key: Vec<u8> = (0..klen).map(|i| 0x41 + i as u8).collect();
+            for tlen in [0usize, 1, 2, 3, 4, 5, 99, 100, 101, 102, 103, 4096] {
+                let tail: Vec<u8> = (0..tlen).map(|i| (i * 7 + 3) as u8).collect();
+                let one = [ext(tlen as u32, Ext::INLINE, 1 | Ext::FIXED)];
+                let two = [ext(tlen as u32, Ext::INLINE, 1), ext(9, 4, 2)];
+                let exts: [&[Ext]; 3] = [&[], &one, &two];
+                for e in exts {
+                    for compact in [false, true] {
+                        let Some(len) = record_len_for(klen, e, tlen, compact) else {
+                            continue;
+                        };
+                        for junk in [0x00u8, 0xa5, 0xff] {
+                            let mut a = vec![junk; len];
+                            let mut b = vec![junk ^ 0x5a; len];
+                            let ta = record_into(&mut a, &key, e, &tail, compact);
+                            let tb = record_into_lean(&mut b, &key, e, &tail, compact);
+                            assert_eq!(
+                                (ta, &a),
+                                (tb, &b),
+                                "key {klen}, tail {tlen}, {} extents, compact {compact}",
+                                e.len()
+                            );
+                            cases += 1;
+                        }
+                    }
+                }
+            }
+        }
+        assert!(cases > 1000, "{cases} cases");
     }
 }
 

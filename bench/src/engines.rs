@@ -1098,6 +1098,16 @@ pub struct Supdb {
     /// `supdb-ingestsyncafter` is the buffered drain that waits for its
     /// slot, the shape before.
     syncbeside: Option<bool>,
+    /// A direct run's append and commit without the per-record work the
+    /// records no longer need (`Options::direct_lean_append`), `None` for
+    /// the engine's default: `supdb-directfull` and
+    /// `supdb-ingestdirectfull` are the walk, the shape before.
+    directlean: Option<bool>,
+    /// A drain's close of a synced direct run on the writer up to the
+    /// segment being readable (`Options::close_readable_inline`), `None`
+    /// for the engine's default: `supdb-closeseal` and
+    /// `supdb-ingestcloseseal` leave it to the seal thread.
+    closereadable: Option<bool>,
     /// A scan that starts in a block the writer holds a form for counted
     /// as a reuse by the forms-off rule
     /// (`Options::scan_forms_off_counts_built`), `None` for the engine's
@@ -2563,6 +2573,16 @@ struct Policy {
     /// `supdb-ingestsyncafter` is the buffered drain that waits for its
     /// slot, the shape before.
     syncbeside: Option<bool>,
+    /// A direct run's append and commit without the per-record work the
+    /// records no longer need (`Options::direct_lean_append`), `None` for
+    /// the engine's default: `supdb-directfull` and
+    /// `supdb-ingestdirectfull` are the walk, the shape before.
+    directlean: Option<bool>,
+    /// A drain's close of a synced direct run on the writer up to the
+    /// segment being readable (`Options::close_readable_inline`), `None`
+    /// for the engine's default: `supdb-closeseal` and
+    /// `supdb-ingestcloseseal` leave it to the seal thread.
+    closereadable: Option<bool>,
     /// A scan that starts in a block the writer holds a form for counted
     /// as a reuse by the forms-off rule
     /// (`Options::scan_forms_off_counts_built`), `None` for the engine's
@@ -3420,6 +3440,8 @@ impl Default for Policy {
             chainuncovered: None,
             drainreadable: None,
             syncbeside: None,
+            directlean: None,
+            closereadable: None,
             formsoffbuilt: None,
             formson: false,
             formsoffkept: false,
@@ -8130,6 +8152,59 @@ impl Supdb {
         )
     }
 
+    /// `supdb` whose direct runs walk every record of a batch at the
+    /// commit and take the memtable hash of every key
+    /// (`Options::direct_lean_append` off), the shape before.
+    /// `supdb-directfull`.
+    pub fn create_directfull(path: &Path) -> Res<Supdb> {
+        Supdb::with_policy(
+            path,
+            Policy {
+                directlean: Some(false),
+                ..Policy::default()
+            },
+        )
+    }
+
+    /// `supdb` whose drain leaves a direct run's close to the seal thread
+    /// (`Options::close_readable_inline` off), the shape before.
+    /// `supdb-closeseal`.
+    pub fn create_closeseal(path: &Path) -> Res<Supdb> {
+        Supdb::with_policy(
+            path,
+            Policy {
+                closereadable: Some(false),
+                ..Policy::default()
+            },
+        )
+    }
+
+    /// `supdb-ingest` as `supdb-closeseal`. `supdb-ingestcloseseal`.
+    pub fn create_ingest_closeseal(path: &Path) -> Res<Supdb> {
+        Supdb::with_policy(
+            path,
+            Policy {
+                partition: false,
+                durable: false,
+                closereadable: Some(false),
+                ..Policy::default()
+            },
+        )
+    }
+
+    /// `supdb-ingest` as `supdb-directfull`. `supdb-ingestdirectfull`.
+    pub fn create_ingest_directfull(path: &Path) -> Res<Supdb> {
+        Supdb::with_policy(
+            path,
+            Policy {
+                partition: false,
+                durable: false,
+                directlean: Some(false),
+                ..Policy::default()
+            },
+        )
+    }
+
     /// `supdb` whose every flush waits for its seal's fsyncs and slot
     /// (`Options::drain_answers_readable` off), the shape before.
     /// `supdb-drainstrict`.
@@ -10202,6 +10277,8 @@ impl Supdb {
             chainuncovered,
             drainreadable,
             syncbeside,
+            directlean,
+            closereadable,
             formsoffbuilt,
             formson,
             formsoffkept,
@@ -10742,6 +10819,9 @@ impl Supdb {
             drain_answers_readable: drainreadable
                 .unwrap_or(supdb::Options::default().drain_answers_readable),
             drain_syncs_beside: syncbeside.unwrap_or(supdb::Options::default().drain_syncs_beside),
+            direct_lean_append: directlean.unwrap_or(supdb::Options::default().direct_lean_append),
+            close_readable_inline: closereadable
+                .unwrap_or(supdb::Options::default().close_readable_inline),
             scan_forms_off_counts_built: formsoffbuilt
                 .unwrap_or(supdb::Options::default().scan_forms_off_counts_built),
             scan_forms_off_unreused: !formson,
@@ -11246,6 +11326,8 @@ impl Supdb {
             chainuncovered,
             drainreadable,
             syncbeside,
+            directlean,
+            closereadable,
             formsoffbuilt,
             formson,
             formsoffkept,
@@ -13047,6 +13129,20 @@ impl Engine for Supdb {
                 "supdb-syncafter"
             } else {
                 "supdb-ingestsyncafter"
+            };
+        }
+        if self.directlean == Some(false) {
+            return if self.partition {
+                "supdb-directfull"
+            } else {
+                "supdb-ingestdirectfull"
+            };
+        }
+        if self.closereadable == Some(false) {
+            return if self.partition {
+                "supdb-closeseal"
+            } else {
+                "supdb-ingestcloseseal"
             };
         }
         match (
@@ -15471,6 +15567,8 @@ pub fn guarantee(arm: &str) -> Option<Guarantee> {
         | "supdb-drainstrict"
         | "supdb-syncbeside"
         | "supdb-syncafter"
+        | "supdb-directfull"
+        | "supdb-closeseal"
         | "supdb-jobspooled"
         | "supdb-zslabjobs"
         | "supdb-zstrideallslabjobs"
@@ -15572,6 +15670,8 @@ pub fn guarantee(arm: &str) -> Option<Guarantee> {
         | "supdb-ingestdirplain"
         | "supdb-ingestsyncbeside"
         | "supdb-ingestsyncafter"
+        | "supdb-ingestdirectfull"
+        | "supdb-ingestcloseseal"
         | "supdb-ingestsettlefar"
         | "supdb-ingesttofit"
         | "supdb-ingestprefetch1k"
@@ -16903,6 +17003,10 @@ pub fn open(arm: &str, dir: &Path, map_gb: usize) -> Res<Box<dyn Engine>> {
         "supdb-ingestsyncbeside" => supdb_arm(Supdb::create_ingest_syncbeside, dir)?,
         "supdb-syncafter" => supdb_arm(Supdb::create_syncafter, dir)?,
         "supdb-ingestsyncafter" => supdb_arm(Supdb::create_ingest_syncafter, dir)?,
+        "supdb-directfull" => supdb_arm(Supdb::create_directfull, dir)?,
+        "supdb-closeseal" => supdb_arm(Supdb::create_closeseal, dir)?,
+        "supdb-ingestcloseseal" => supdb_arm(Supdb::create_ingest_closeseal, dir)?,
+        "supdb-ingestdirectfull" => supdb_arm(Supdb::create_ingest_directfull, dir)?,
         "supdb-jobspooled" => supdb_arm(Supdb::create_jobspooled, dir)?,
         "supdb-zslabjobs" => supdb_arm(Supdb::create_zslabjobs, dir)?,
         "supdb-zstrideallslabjobs" => supdb_arm(Supdb::create_zstride_all_slab_jobs, dir)?,
@@ -20532,6 +20636,67 @@ mod tests {
                             so.drain_answers_readable,
                             so.close_presync,
                             so.drain_syncs_wal
+                        ),
+                        "{arm}"
+                    );
+                    assert_eq!(
+                        open(arm, &dir(&format!("{arm}-open")), 1).unwrap().name(),
+                        arm
+                    );
+                    assert_eq!(guarantee(arm), guarantee(s.name()), "{arm}");
+                }
+                // A direct run that walks every record at the commit, the
+                // shape before, durable and buffered, each differing from its
+                // sibling by that alone.
+                for (z, s, arm, lean, inline) in [
+                    (
+                        Supdb::create_directfull(&dir("directfull")).unwrap(),
+                        &base,
+                        "supdb-directfull",
+                        false,
+                        true,
+                    ),
+                    (
+                        Supdb::create_ingest_directfull(&dir("ingestdirectfull")).unwrap(),
+                        &sib,
+                        "supdb-ingestdirectfull",
+                        false,
+                        true,
+                    ),
+                    (
+                        Supdb::create_closeseal(&dir("closeseal")).unwrap(),
+                        &base,
+                        "supdb-closeseal",
+                        true,
+                        false,
+                    ),
+                    (
+                        Supdb::create_ingest_closeseal(&dir("ingestcloseseal")).unwrap(),
+                        &sib,
+                        "supdb-ingestcloseseal",
+                        true,
+                        false,
+                    ),
+                ] {
+                    assert_eq!(z.name(), arm);
+                    assert_eq!(z.features(), s.features(), "{arm}");
+                    let o = z.db.as_ref().unwrap().options();
+                    let so = s.db.as_ref().unwrap().options();
+                    assert_eq!(
+                        (o.direct_lean_append, o.close_readable_inline),
+                        (lean, inline),
+                        "{arm}"
+                    );
+                    assert!(
+                        so.direct_lean_append && so.close_readable_inline,
+                        "the engine's defaults"
+                    );
+                    assert_eq!(
+                        (o.direct_stream, o.direct_derive_keys, o.direct_slim_entries),
+                        (
+                            so.direct_stream,
+                            so.direct_derive_keys,
+                            so.direct_slim_entries
                         ),
                         "{arm}"
                     );

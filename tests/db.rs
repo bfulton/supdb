@@ -20178,7 +20178,13 @@ fn a_run_whose_keys_the_table_keeps_leaves_the_segment_the_copies_leave() {
 #[test]
 fn a_failed_presync_is_the_flushs_answer() {
     let d = dir("presyncfail");
-    let opts = common::options();
+    // The close that syncs the records beside the trailer: a run whose
+    // commits are all synced closes on the writer by default and owes no
+    // such sync (`Options::close_readable_inline`, the test after this).
+    let opts = Options {
+        close_readable_inline: false,
+        ..common::options()
+    };
     let mut db = Db::create(&d, opts.clone()).unwrap();
     for c in 0u32..500 {
         db.append(format!("k{c:04}").as_bytes(), &c.to_le_bytes());
@@ -20204,6 +20210,176 @@ fn a_failed_presync_is_the_flushs_answer() {
         );
     }
     assert_eq!(read_vec(&db, b"k9999"), vec![b"z".to_vec()]);
+}
+
+/// A direct run's lean append (`Options::direct_lean_append`) and its close
+/// on the writer (`Options::close_readable_inline`) write the files the walk
+/// and the seal thread wrote, byte for byte but the second each segment was
+/// finished in: keys of every length either side of the records' four-byte
+/// pad, values empty, short, of every length either side of it, and over
+/// the sixty-four kilobytes a slim entry holds, so fat entries among slim
+/// ones, records across the stream's blocks, commits of one key and of
+/// hundreds, under a policy that syncs every commit and one that syncs none.
+#[test]
+fn the_lean_direct_run_writes_the_walks_bytes() {
+    let mut keys: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
+    for i in 0u32..4000 {
+        let klen = 1 + (i % 23) as usize;
+        let mut k = format!("{i:06}").into_bytes();
+        k.resize(6 + klen, b'k');
+        let vlen = match i % 97 {
+            0 => 0,
+            1 => 70_000,
+            n => (n as usize * 13) % 301,
+        };
+        let v: Vec<u8> = (0..vlen).map(|j| (j as u32 ^ i) as u8).collect();
+        keys.push((k, v));
+    }
+    for sync in [
+        supdb::SyncPolicy::Always,
+        supdb::SyncPolicy::EveryN(u32::MAX),
+    ] {
+        let shapes = [(true, true), (false, true), (true, false), (false, false)];
+        let mut files: Vec<Vec<(String, Vec<u8>)>> = Vec::new();
+        for (lean, inline) in shapes {
+            let d = dir(&format!("leanbytes-{sync:?}-{lean}-{inline}"));
+            // Every value inline, so every key is the one run's, the
+            // sixty-four-kilobyte ones among them.
+            let opts = Options {
+                sync,
+                direct_lean_append: lean,
+                close_readable_inline: inline,
+                inline_bytes: 128 << 10,
+                ..common::options()
+            };
+            let mut db = Db::create(&d, opts.clone()).unwrap();
+            let mut c = 0;
+            for (i, (k, v)) in keys.iter().enumerate() {
+                db.append(k, v);
+                if i % (1 + c % 300) == 0 {
+                    db.commit().unwrap();
+                    c += 1;
+                    assert!(
+                        db.runs_unsynced().0.is_some(),
+                        "lean {lean} inline {inline}: key {i} in the one run"
+                    );
+                }
+            }
+            db.commit().unwrap();
+            db.flush().unwrap();
+            db.settle().unwrap();
+            assert_eq!(db.segments(), 1, "lean {lean} inline {inline}");
+            for (k, v) in &keys {
+                assert_eq!(
+                    read_vec(&db, k),
+                    vec![v.clone()],
+                    "lean {lean} inline {inline}"
+                );
+            }
+            drop(db);
+            let mut f: Vec<(String, Vec<u8>)> = std::fs::read_dir(&d)
+                .unwrap()
+                .flatten()
+                .map(|e| e.file_name().to_string_lossy().into_owned())
+                .filter(|n| n.ends_with(".sup") || n.ends_with(".oidx"))
+                .map(|n| {
+                    let b = std::fs::read(d.join(&n)).unwrap();
+                    let b = if n.ends_with(".sup") {
+                        without_the_clock(&b)
+                    } else {
+                        b
+                    };
+                    (n, b)
+                })
+                .collect();
+            f.sort();
+            assert!(f.iter().any(|(n, _)| n.ends_with(".sup")), "{f:?}");
+            files.push(f);
+        }
+        for (i, f) in files.iter().enumerate().skip(1) {
+            assert_eq!(
+                f.iter().map(|(n, _)| n).collect::<Vec<_>>(),
+                files[0].iter().map(|(n, _)| n).collect::<Vec<_>>(),
+                "{sync:?} {:?}: the same files",
+                shapes[i]
+            );
+            for ((n, a), (_, b)) in f.iter().zip(&files[0]) {
+                assert!(a == b, "{sync:?} {:?}: {n} differs", shapes[i]);
+            }
+        }
+    }
+}
+
+/// A drain's close of a direct run whose every commit is synced runs on the
+/// writer up to the readable signal (`Options::close_readable_inline`): it
+/// makes no records' sync, since none is owed, so a sync set to fail is
+/// never asked and the flush answers; the drain is answered at the seal's
+/// readable landing, with the directory's fsync of its name left to the
+/// durable landing every time -- the readable signal comes before the
+/// flush's ask, and the loop leaves the landing to the ask
+/// (`SealJob::early_hint`), where landed first it paid that fsync there;
+/// and every key reads back through a handle and after a reopen. A store
+/// whose run closes with commits unsynced, and the option off, close on the
+/// seal thread as before.
+#[test]
+fn a_synced_runs_drain_closes_on_the_writer_and_defers_its_directory_sync() {
+    let keys = drain_keys(true, 3000);
+    for i in 0..12 {
+        let d = dir(&format!("closeinline-{i}"));
+        let opts = common::options();
+        assert!(opts.close_readable_inline, "the engine's default");
+        let mut db = Db::create(&d, opts.clone()).unwrap();
+        drain_load(&mut db, &keys);
+        db.fail_next_presync();
+        db.flush().unwrap();
+        let w = db.seal_waits();
+        assert_eq!(
+            (w.closes_inline, w.drains_early, w.drains_beside),
+            (1, 1, 0),
+            "store {i}: {w:?}"
+        );
+        let r = db.reader().unwrap();
+        drain_check(&r, &keys, "after the flush");
+        drop(r);
+        db.settle().unwrap();
+        let w = db.seal_waits();
+        assert_eq!(
+            w.dir_owed_syncs, 1,
+            "store {i}: the readable landing left the directory's fsync: {w:?}"
+        );
+        assert!(direct_temps(&d).is_empty(), "{:?}", direct_temps(&d));
+        drop(db);
+        let db = Db::open(&d, opts).unwrap();
+        assert_eq!((db.segments(), db.unsealed_keys()), (1, 0));
+        drain_check(&db, &keys, "after the reopen");
+    }
+    for (name, opts) in [
+        (
+            "closeinline-buffered",
+            Options {
+                sync: supdb::SyncPolicy::EveryN(u32::MAX),
+                ..common::options()
+            },
+        ),
+        (
+            "closeinline-off",
+            Options {
+                close_readable_inline: false,
+                ..common::options()
+            },
+        ),
+    ] {
+        let d = dir(name);
+        let mut db = Db::create(&d, opts.clone()).unwrap();
+        drain_load(&mut db, &keys);
+        db.flush().unwrap();
+        db.settle().unwrap();
+        assert_eq!(db.seal_waits().closes_inline, 0, "{name}");
+        drain_check(&db, &keys, name);
+        drop(db);
+        let db = Db::open(&d, opts).unwrap();
+        drain_check(&db, &keys, &format!("{name}, reopened"));
+    }
 }
 
 /// A scan's seek hints the directory lines of its stride window and the
@@ -23017,6 +23193,9 @@ fn a_durable_flush_is_answered_at_its_seals_readable_landing() {
         let w = db.seal_waits();
         assert_eq!(w.drains_early, 1, "ordered {ordered}: {w:?}");
         assert_eq!(w.drains_beside, 0, "a durable store owes no sync");
+        // Held there, and not by timing: a seal let through lands durable
+        // in a few milliseconds.
+        std::thread::sleep(std::time::Duration::from_millis(200));
         assert!(
             db.in_flight().0,
             "ordered {ordered}: the seal is between its phases"

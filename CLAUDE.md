@@ -6999,6 +6999,51 @@ it costs where the answer does not come is added to the strict path's
 price; and a barrier issued beside another thread's fsync is priced by
 that fsync's journal commit, not by what the barrier has to write.
 
+**A walk the table had done, done again at the commit.** A direct run's
+commit handed the segment writer every record of its batch one at a time
+-- the entry looked up, the record's shape computed again, the key
+compared with the last for an order the table had checked at the append,
+and copied as the last key -- and the append hashed every key for an
+ordered table whose slim entries keep no hash. The writer's commits
+counted 930 instructions a record at ten thousand keys under callgrind
+(`bench/examples/load_only.rs`, collection on inside the arm's
+`write_batch`); the batch accounted at once from the stream's own totals
+(`SegmentWriter::put_encoded_run`), the hash taken only for a fat entry,
+and a record's pads laid by one word each where each was a call into the
+C library, two a record with no pad at all, count 496
+(`Options::direct_lean_append`), the commits a seventh faster than
+RocksDB's where they had been level. Two levers beside it lost. The close's
+keys hashed eight at a time side by side, on the reading that the
+finish's FNV chains were serial, moved the trailer by nothing in thirty
+loads a side: the core had overlapped them already. And the stream's
+pages populated by a helper during the commit's fdatasync took the
+writer's faults from 425 a load to 149 and its CPU up by a third, the
+helper's zeroing leaving every line on its own core for the writer to
+pull across, where a page the writer faults is zeroed on the core that
+writes it; populated on the writer, the price of a page in bulk was what
+it saved. The rules: a structure that guarantees a property is not asked
+the question again a record at a time downstream, and a per-record path
+is counted in instructions before its pages are; a fresh page is priced
+on the core that will write it.
+
+**A hand-off that moved a cost and a landing that came first.** The
+close of a drain's run spawned the seal thread at the hand-over, its
+spawn and first turn 120 µs before the finish began, and the finish on
+the writer with the thread spawned after it moved the same cost to
+between the finish and the ordered index. A run whose commits are all
+synced owes no records' sync to work beside, so its close runs on the
+writer up to the readable signal and the thread, spawned first, takes the
+fsyncs alone (`Options::close_readable_inline`). The readable signal
+then reached the segment work before the flush's ask, and the loop's
+readable landing, coming first, fsynced the directory on the drain's path
+where the ask's landing defers it: 0.3 ms in a drain of 1.1, one drain in
+three. The seal carries the ask's early answer as a hint and the loop
+leaves its landing to the ask (`SealJob::early_hint`). The rules: work
+moved to the thread that waits anyway takes with it the hand-off that
+started it, or the hand-off moves to the next step; and where two events
+race to a decision, the one decided first is told what the later one
+would have said.
+
 ## Open targets, and the one standing limitation
 
 A cell a comparator wins is a target, never a limit to be written down

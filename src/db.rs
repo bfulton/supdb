@@ -5259,6 +5259,29 @@ pub struct Options {
     /// frameless drain writes to no file. On by default; off, a buffered
     /// drain waits for its slot as before, `supdb-ingestsyncafter`.
     pub drain_syncs_beside: bool,
+    /// A direct run's writer path without the work its records need no
+    /// longer: an ordered table's append takes no memtable hash for a key
+    /// whose entry is a slim word, which carries none -- the hash is
+    /// taken only for the fat entry that does -- and the commit accounts
+    /// for its batch's records in the segment writer in one call
+    /// (`SegmentWriter::put_encoded_run`), from the batch's first and last
+    /// entries and the stream's own byte counts, where it walked every
+    /// entry, rebuilt its record's shape and handed each key over for an
+    /// order check and a copy the table had made already. The file is the
+    /// same byte for byte: what the writer counts of a batch is the sum
+    /// of what it counted of each record, held to it entry by entry in a
+    /// checked build. And a record's pads are laid by one word each
+    /// (`flatindex::record_into_lean`), where a fill of each pad was a
+    /// call into the C library whatever its length, two a record of the
+    /// suite's shape with no pad at all. The commits' path counted 930
+    /// instructions a record at ten thousand keys and counts 496, the
+    /// writer's CPU over the commits a quarter lower, and the ordered load
+    /// reads 1.04-1.14x of the walk in both orders at ten and three
+    /// hundred thousand keys, buffered and durable, but for one sitting of
+    /// the durable load at ten thousand, level. On; off,
+    /// `supdb-directfull` and `supdb-ingestdirectfull`, the walk.
+    #[doc(hidden)]
+    pub direct_lean_append: bool,
     /// A flush's commit of what is staged fsyncs the WAL whatever the
     /// policy, before the seal is handed over: the buffered arm's drain
     /// at ten thousand keys began with a 2.4 ms fdatasync of a log the
@@ -5287,6 +5310,24 @@ pub struct Options {
     /// composes the trailer while the writer syncs the records. On,
     /// `supdb-closeinline` and `supdb-ingestcloseinline`.
     pub close_finish_inline: bool,
+    /// A drain's close of a direct run whose every commit is synced runs
+    /// on the writer up to the segment being readable -- the trailer, the
+    /// ordered index, the link, the readable signal -- with the seal's
+    /// thread spawned before it starts and left the fsyncs alone. The
+    /// writer waits for the drain anyway, the run owes no records' sync to
+    /// work beside, and the seal thread spawned at the hand-over cost the
+    /// close its spawn and its first turn ahead of the finish, 120 µs of a
+    /// 1.2 ms drain at ten thousand keys, where the finish inline with the
+    /// thread spawned after it (`close_finish_inline`) moved the same cost
+    /// to between the finish and the ordered index. Its readable signal
+    /// comes before the flush's ask for the drain, so the seal carries the
+    /// ask's early answer as a hint and the loop leaves its readable
+    /// landing to the ask (`SealJob::early_hint`). The drain is answered
+    /// 0.12 ms sooner at ten thousand keys, and the ordered load reads
+    /// 1.03-1.05x of the seal thread's in both orders. On; off,
+    /// `supdb-closeseal` and `supdb-ingestcloseseal`, the seal thread's.
+    #[doc(hidden)]
+    pub close_readable_inline: bool,
     /// EXPERIMENT, refuted and kept as an arm: a drain's seal copies the
     /// frozen table's chains into a snapshot for the scans over the
     /// store while the seal runs, as any seal does (`seal_snapshot`),
@@ -7651,8 +7692,10 @@ impl Default for Options {
             flush_waits_manifest: false,
             drain_answers_readable: true,
             drain_syncs_beside: true,
+            direct_lean_append: true,
             drain_syncs_wal: false,
             close_finish_inline: false,
+            close_readable_inline: true,
             drain_snapshot: true,
             seal_snapshot_far: false,
             land_ranks_far: false,
@@ -9052,6 +9095,10 @@ struct Direct {
     /// With `Options::direct_stream`, where the table's record stream is
     /// written to from here: its end at the last commit, marker included.
     stream_from: usize,
+    /// The table's stream payload (`MemTable::stream_payload`) at the last
+    /// commit, with `Options::direct_lean_append`: what the next batch
+    /// holds is the count less this.
+    payload_from: u64,
     /// Whether the file holds commits no sync has covered: every commit
     /// under a policy that did not sync it, until one that does. A run
     /// that closes so is loose (`Db::loose_runs`).
@@ -11757,6 +11804,77 @@ impl SegmentWriter {
         Ok(())
     }
 
+    /// `put_encoded` over a batch of `n` records laid one after another in
+    /// the caller's stream, accounted at once: `first` and `last` the
+    /// batch's first and last keys, `rec_bytes` and `payload` the sums of
+    /// its records' lengths and of their keys' and values' bytes, and
+    /// `last_rec` the last record's length, its tail's offset in it and
+    /// its value's length. What `put_encoded` counts of each record, the
+    /// count and the last key kept and nothing else of a key, summed: for
+    /// a writer whose keys are deferred (`set_deferred_keys`) alone, and a
+    /// caller whose batch holds its keys in increasing order -- the table
+    /// a direct run streams from, which takes each key above its last
+    /// (`Options::direct_lean_append`).
+    pub(crate) fn put_encoded_run(
+        &mut self,
+        first: &[u8],
+        last: &[u8],
+        n: usize,
+        rec_bytes: usize,
+        payload: u64,
+        last_rec: (usize, usize, u32),
+    ) -> Result<()> {
+        if n == 0 {
+            return Ok(());
+        }
+        if self.open_key.is_some() {
+            return Err(err("segment writer: begin while a key is open"));
+        }
+        let Some(had) = self.deferred else {
+            return Err(err(
+                "segment writer: a batch accounted at once needs its keys deferred",
+            ));
+        };
+        if first.len() > u16::MAX as usize || last.len() > u16::MAX as usize {
+            return Err(err("segment writer: key longer than 65,535 bytes"));
+        }
+        if (had > 0 && first <= self.last_key.as_slice())
+            || if n == 1 { first != last } else { first >= last }
+        {
+            return Err(err(
+                "segment writer: keys must arrive in strictly increasing order",
+            ));
+        }
+        if self.layout()? != Layout::RecordsFirst {
+            return Err(err(
+                "segment writer: a streamed record needs the records-first layout",
+            ));
+        }
+        let (last_len, last_tail_at, last_value_len) = last_rec;
+        if last_len > rec_bytes {
+            return Err(err(
+                "segment writer: a batch's last record longer than the batch",
+            ));
+        }
+        self.last = 0;
+        self.payload += payload;
+        self.last_value = (
+            self.pos + (rec_bytes - last_len) as u64 + last_tail_at as u64,
+            last_value_len,
+        );
+        self.pos += rec_bytes as u64;
+        self.last_key.clear();
+        self.last_key.extend_from_slice(last);
+        self.deferred = Some(had + n);
+        self.recs_len += rec_bytes;
+        if self.recs_len > flatindex::MAX_RECS {
+            return Err(err(
+                "segment writer: key section exceeds the flat index's limits",
+            ));
+        }
+        Ok(())
+    }
+
     /// Bytes `from..to` of the caller's record stream hashed into the
     /// marker's CRC as a batch of records is, and held for the file
     /// (`AlignedWriter::stream_hash`): the marker behind them writes what
@@ -13202,6 +13320,26 @@ impl PieceWriter {
         self.0.put_encoded(k, rec_len, tail_at, value_len)
     }
 
+    /// `SegmentWriter::put_encoded_run`, for a writer whose keys are
+    /// deferred: the ordered index takes them at the finish.
+    fn put_encoded_run(
+        &mut self,
+        first: &[u8],
+        last: &[u8],
+        n: usize,
+        rec_bytes: usize,
+        payload: u64,
+        last_rec: (usize, usize, u32),
+    ) -> Result<()> {
+        if !self.3 {
+            return Err(err(
+                "segment writer: a batch accounted at once needs its keys deferred",
+            ));
+        }
+        self.0
+            .put_encoded_run(first, last, n, rec_bytes, payload, last_rec)
+    }
+
     fn stream_out(&mut self, from: usize, to: usize) -> Result<()> {
         self.0.stream_out(from, to)
     }
@@ -13995,9 +14133,18 @@ struct MemTable {
     stream: bool,
     /// `SegmentOptions::compact_records` of the run the stream is for.
     stream_compact: bool,
+    /// `stream` with `Options::direct_lean_append`: a record laid in the
+    /// stream by `flatindex::record_into_lean`, the same bytes.
+    stream_lean: bool,
     /// The stream's end at the last commit, past its marker: where a
     /// truncation of the uncommitted tail rewinds the stream to.
     stream_committed: AtomicUsize,
+    /// Writer-only: the key and value bytes of every record laid in the
+    /// stream, and their sum at the last commit, where a truncation
+    /// rewinds it to: what a commit's batch holds is the difference
+    /// (`Options::direct_lean_append`).
+    stream_payload: AtomicU64,
+    stream_payload_committed: AtomicU64,
     /// The mapping of the run's segment the committed references read
     /// through, published by the writer once the run has a file and
     /// replaced by a larger one when the file outgrows it; the one
@@ -15669,7 +15816,10 @@ impl MemTable {
             refs: false,
             stream: false,
             stream_compact: false,
+            stream_lean: false,
             stream_committed: AtomicUsize::new(0),
+            stream_payload: AtomicU64::new(0),
+            stream_payload_committed: AtomicU64::new(0),
             run: AtomicPtr::new(std::ptr::null_mut()),
             run_flushed: AtomicU64::new(0),
             retired_runs: UnsafeCell::new(Vec::new()),
@@ -15726,7 +15876,10 @@ impl MemTable {
             refs,
             stream: stream.is_some(),
             stream_compact: stream.unwrap_or(false),
+            stream_lean: false,
             stream_committed: AtomicUsize::new(0),
+            stream_payload: AtomicU64::new(0),
+            stream_payload_committed: AtomicU64::new(0),
             run: AtomicPtr::new(std::ptr::null_mut()),
             run_flushed: AtomicU64::new(0),
             retired_runs: UnsafeCell::new(Vec::new()),
@@ -15751,6 +15904,15 @@ impl MemTable {
             log: Slab::new(src()),
             snaps: FrozenSnaps::new(),
         }
+    }
+
+    /// The table with a stream's records laid by
+    /// `flatindex::record_into_lean` where `on`
+    /// (`Options::direct_lean_append`): the same bytes. Before the table
+    /// is shared.
+    fn with_lean_records(mut self, on: bool) -> MemTable {
+        self.stream_lean = self.stream && on;
+        self
     }
 
     /// The writes so far, for a handle's `log_at`: the entry count where
@@ -15950,6 +16112,10 @@ impl MemTable {
             // back to the last commit's marker.
             self.vals
                 .rewind(self.stream_committed.load(AtomicOrdering::Acquire));
+            self.stream_payload.store(
+                self.stream_payload_committed.load(AtomicOrdering::Relaxed),
+                AtomicOrdering::Relaxed,
+            );
         }
         if self.refs {
             for i in n..self.len() {
@@ -16156,6 +16322,27 @@ impl MemTable {
     /// Writer: a new entry, its key and first chunk written, published by
     /// the slab's length; the index is the caller's.
     fn new_entry(&self, hash: u64, key: &[u8], value: Option<&[u8]>) -> usize {
+        self.new_entry_by(|| hash, key, value)
+    }
+
+    /// Writer: an ordered table's entry for `key` above its last, its
+    /// record laid in the stream, where the memtable's hash is taken only
+    /// for an entry that keeps it -- a fat one; a slim word carries none
+    /// (`Options::direct_lean_append`). The entry `write` makes of it,
+    /// hash and all.
+    fn append_ordered(&self, key: &[u8], value: &[u8]) {
+        debug_assert!(self.ordered, "an ordered table's append");
+        debug_assert!(
+            self.is_empty() || self.key_of(self.entry(self.len() - 1)) < key,
+            "an ordered memtable takes each key above its last"
+        );
+        let id = self.new_entry_by(|| self.hash(key), key, Some(value));
+        self.log_write(id, true);
+    }
+
+    /// `new_entry` with the hash asked for only where the entry keeps it.
+    #[inline(always)]
+    fn new_entry_by(&self, hash: impl FnOnce() -> u64, key: &[u8], value: Option<&[u8]>) -> usize {
         let copy = || self.copy_key(key);
         let (off, count, key_off) = match value {
             Some(v) if self.stream => {
@@ -16188,7 +16375,7 @@ impl MemTable {
                 return self.slim.push(w);
             }
             let fat = self.entries.push(MemEntry {
-                hash: (hash >> 32) as u32,
+                hash: (hash() >> 32) as u32,
                 key_off,
                 klen: key.len() as u16,
                 head: AtomicU64::new(off + 1),
@@ -16197,7 +16384,7 @@ impl MemTable {
             return self.slim.push(SLIM_FAT | fat as u64);
         }
         self.entries.push(MemEntry {
-            hash: (hash >> 32) as u32,
+            hash: (hash() >> 32) as u32,
             key_off,
             klen: key.len() as u16,
             head: AtomicU64::new(off + 1),
@@ -16394,6 +16581,11 @@ impl MemTable {
     /// the record starts in the stream.
     fn push_record(&self, key: &[u8], value: &[u8]) -> (u64, usize) {
         debug_assert!(self.stream);
+        // Writer-only, so a load and a store.
+        self.stream_payload.store(
+            self.stream_payload.load(AtomicOrdering::Relaxed) + (key.len() + value.len()) as u64,
+            AtomicOrdering::Relaxed,
+        );
         let (ext, tail_len) = MemTable::stream_ext(value.len());
         let rec_len = flatindex::record_len_for(key.len(), &[ext], tail_len, self.stream_compact)
             .expect("a direct run takes keys and values a record holds");
@@ -16407,9 +16599,15 @@ impl MemTable {
             at
         } else {
             let compact = self.stream_compact;
-            self.vals.write_with(off, rec_len, |rec| {
-                flatindex::record_into(rec, key, &[ext], tail, compact)
-            })
+            if self.stream_lean {
+                self.vals.write_with(off, rec_len, |rec| {
+                    flatindex::record_into_lean(rec, key, &[ext], tail, compact)
+                })
+            } else {
+                self.vals.write_with(off, rec_len, |rec| {
+                    flatindex::record_into(rec, key, &[ext], tail, compact)
+                })
+            }
         };
         let voff = off + tail_at;
         if value.is_empty() {
@@ -16597,6 +16795,16 @@ impl MemTable {
     /// included.
     fn set_stream_committed(&self, at: usize) {
         self.stream_committed.store(at, AtomicOrdering::Release);
+        self.stream_payload_committed.store(
+            self.stream_payload.load(AtomicOrdering::Relaxed),
+            AtomicOrdering::Relaxed,
+        );
+    }
+
+    /// `stream` only, writer: the key and value bytes of the records the
+    /// stream holds, committed or not.
+    fn stream_payload(&self) -> u64 {
+        self.stream_payload.load(AtomicOrdering::Relaxed)
     }
 
     fn push_tomb(&self, prev: u64) -> u64 {
@@ -19450,6 +19658,9 @@ struct SealCounts {
     /// Drains that paid the sync they owed beside their seal
     /// (`Options::drain_syncs_beside`).
     drains_beside: AtomicU64,
+    /// Drains whose direct run closed on the writer up to its readable
+    /// signal (`Options::close_readable_inline`).
+    closes_inline: AtomicU64,
     /// The directory fsyncs such a drain's readable landing left to the
     /// seal's durable landing, paid there ahead of the slot.
     dir_owed_syncs: AtomicU64,
@@ -19495,6 +19706,7 @@ impl SealCounts {
             idle_seals: get(&self.idle_seals),
             drains_early: get(&self.drains_early),
             drains_beside: get(&self.drains_beside),
+            closes_inline: get(&self.closes_inline),
             dir_owed_syncs: get(&self.dir_owed_syncs),
             wal_rotations: get(&self.wal_rotations),
             rotated_unsynced: get(&self.rotated_unsynced),
@@ -19558,6 +19770,9 @@ pub struct SealWaits {
     /// Drains that paid the sync they owed beside their seal
     /// (`Options::drain_syncs_beside`).
     pub drains_beside: u64,
+    /// Drains whose direct run closed on the writer up to its readable
+    /// signal (`Options::close_readable_inline`).
+    pub closes_inline: u64,
     /// The directory fsyncs their readable landings left owed, paid at
     /// the durable landing.
     pub dir_owed_syncs: u64,
@@ -23550,6 +23765,9 @@ pub struct Db {
     /// descriptors are one open file description, and an fsync error
     /// is reported once per description.
     presync_failed: Option<std::io::Error>,
+    /// The seal `hand_seal` hands next is a drain's whose answer will be
+    /// asked early (`SealJob::early_hint`), read and cleared by it.
+    hand_early: bool,
     /// The drain's own seal of a hashed table was named the store's first
     /// partition (`seals_first_partition`), so that nothing stands beside
     /// it once it lands -- no piece, no merge -- and the drain can be
@@ -37691,6 +37909,7 @@ impl Db {
             phase_ns: [0; 3],
             draining: false,
             presync_failed: None,
+            hand_early: false,
             drain_first: false,
             lock,
         };
@@ -38521,6 +38740,7 @@ impl Db {
             phase_ns: [0; 3],
             draining: false,
             presync_failed: None,
+            hand_early: false,
             drain_first: false,
             lock,
         };
@@ -38558,17 +38778,20 @@ impl Db {
                 if !self.mem().ordered {
                     let old = self.mem().clone();
                     self.set_mem_with(
-                        std::sync::Arc::new(MemTable::new_ordered(
-                            self.opts.direct_table_refs,
-                            self.opts.block_shape(&self.shared.block_pool),
-                            self.opts
-                                .direct_stream
-                                .then_some(self.opts.segment.compact_records),
-                            self.opts.direct_recycle,
-                            self.opts.direct_keys_in_stream,
-                            self.opts.direct_log_range,
-                            self.opts.direct_slim_entries,
-                        )),
+                        std::sync::Arc::new(
+                            MemTable::new_ordered(
+                                self.opts.direct_table_refs,
+                                self.opts.block_shape(&self.shared.block_pool),
+                                self.opts
+                                    .direct_stream
+                                    .then_some(self.opts.segment.compact_records),
+                                self.opts.direct_recycle,
+                                self.opts.direct_keys_in_stream,
+                                self.opts.direct_log_range,
+                                self.opts.direct_slim_entries,
+                            )
+                            .with_lean_records(self.opts.direct_lean_append),
+                        ),
                         true,
                     );
                     self.carry_switch(&old);
@@ -38576,7 +38799,11 @@ impl Db {
                 self.max_key.clear();
                 self.max_key.extend_from_slice(key);
                 let mem = self.mem();
-                mem.append(mem.hash(key), key, value, &self.shared.readers);
+                if self.opts.direct_lean_append {
+                    mem.append_ordered(key, value);
+                } else {
+                    mem.append(mem.hash(key), key, value, &self.shared.readers);
+                }
                 self.mem_bytes += key.len() + value.len();
                 return;
             }
@@ -39261,6 +39488,7 @@ impl Db {
                 committed: 0,
                 pending: std::collections::VecDeque::new(),
                 stream_from: 0,
+                payload_from: 0,
                 unsynced: false,
                 named: false,
             });
@@ -39272,6 +39500,7 @@ impl Db {
         };
         let shared = self.shared.clone();
         let put_one = self.opts.direct_put_one;
+        let lean = self.opts.direct_lean_append;
         let d = self.direct.as_mut().expect("opened above");
         let refs = mem.refs;
         if (refs || mem.recycle) && mem.run().is_none() {
@@ -39287,11 +39516,52 @@ impl Db {
             // batch goes to the file from the arena, its marker behind it.
             if d.committed == 0 && d.stream_from == 0 {
                 d.w.set_stream_source(mem.clone());
+                d.payload_from = 0;
             }
-            for i in d.committed..mem.len() {
-                let e = mem.entry(i);
-                let (rec_len, tail_at, vlen) = mem.stream_record_shape(e);
-                d.w.put_encoded(mem.key_of(e), rec_len, tail_at, vlen)?;
+            if lean && d.w.3 {
+                // The batch at once: its records lie one after another in
+                // the stream from where the last commit's marker ended,
+                // each key above the last (`Options::direct_lean_append`).
+                let (a, b) = (d.committed, mem.len());
+                let to = mem.stream_tail();
+                let payload = mem.stream_payload() - d.payload_from;
+                let first = mem.entry(a);
+                let last = mem.entry(b - 1);
+                let shape = mem.stream_record_shape(last);
+                #[cfg(debug_assertions)]
+                {
+                    let (mut bytes, mut pay) = (0usize, 0u64);
+                    for i in a..b {
+                        let e = mem.entry(i);
+                        let (rec_len, _, vlen) = mem.stream_record_shape(e);
+                        bytes += rec_len;
+                        pay += (e.key_len() + vlen) as u64;
+                        debug_assert!(
+                            i == a || mem.key_of(mem.entry(i - 1)) < mem.key_of(e),
+                            "a direct run's batch holds its keys in increasing order"
+                        );
+                    }
+                    debug_assert_eq!(
+                        (bytes, pay),
+                        (to - d.stream_from, payload),
+                        "a batch's records are the stream from the last marker, and their bytes"
+                    );
+                }
+                d.w.put_encoded_run(
+                    mem.key_of(first),
+                    mem.key_of(last),
+                    b - a,
+                    to - d.stream_from,
+                    payload,
+                    shape,
+                )?;
+                d.payload_from = mem.stream_payload();
+            } else {
+                for i in d.committed..mem.len() {
+                    let e = mem.entry(i);
+                    let (rec_len, tail_at, vlen) = mem.stream_record_shape(e);
+                    d.w.put_encoded(mem.key_of(e), rec_len, tail_at, vlen)?;
+                }
             }
             let to = mem.stream_tail();
             d.w.stream_out(d.stream_from, to)?;
@@ -39489,6 +39759,7 @@ impl Db {
         // run's durable landing; the run is kept aside for the one that
         // fails (`drain_run`).
         let owed = (d.unsynced || !d.named).then(|| (d.tmp.clone(), d.named));
+        let synced = owed.is_none();
         let loose = if self.draining {
             self.drain_run = owed;
             None
@@ -39513,7 +39784,8 @@ impl Db {
         let dir = self.dir.clone();
         let tmp = d.tmp;
         let w = d.w;
-        let presync = (self.draining && self.opts.close_presync)
+        let inline_readable = self.draining && self.opts.close_readable_inline && synced && w.3;
+        let presync = (self.draining && self.opts.close_presync && !inline_readable)
             .then(|| w.file_clone().ok())
             .flatten();
         let limit = self.partition_limit();
@@ -39522,6 +39794,73 @@ impl Db {
         let shared = self.shared.clone();
         let ord_durable = self.opts.ord_durable;
         let keys = table.clone();
+        if inline_readable {
+            // The seal registered and its thread spawned first, waiting
+            // for the files to sync; the close up to the readable signal on
+            // this thread, which waits for the drain anyway
+            // (`Options::close_readable_inline`). The run's commits are
+            // synced, so it owes no records' sync, and the seal's fsync
+            // covers the trailer. The holds a test sets are taken where
+            // the seal thread took them: the landing's before the finish,
+            // the durable one before the fsyncs.
+            let wals = std::mem::take(&mut self.closed_wals);
+            type Synced = Result<(File, File, Vec<String>)>;
+            let (tx, rx) = std::sync::mpsc::sync_channel::<Synced>(1);
+            let job = {
+                let shared = shared.clone();
+                move |_: &SealReadable| -> Result<Vec<String>> {
+                    let (seg, ordf, names) = rx
+                        .recv()
+                        .map_err(|_| err("the writer's close of the run went away"))??;
+                    seal_hold_wait(&shared, SEAL_HOLD_DURABLE);
+                    seg.sync_all()?;
+                    shared.drain_steps.stamp(7);
+                    if ord_durable {
+                        ordf.sync_all()?;
+                    }
+                    Ok(names)
+                }
+            };
+            // The early answer the flush will ask for, as it asks it: the
+            // run's own close owes nothing (`drain_run`, kept for a run
+            // owed a sync, is clear for this one).
+            self.hand_early = self.opts.drain_answers_readable
+                && matches!(self.maint, MaintHome::Away(_))
+                && !self.owes_sync();
+            let readable = self.hand_seal(job, table, wals, Some(retiring));
+            self.shared.drain_steps.stamp(1);
+            let closed = (|| -> Synced {
+                seal_hold_wait(&shared, SEAL_HOLD_LANDING);
+                shared.drain_steps.stamp(2);
+                let tombs = w.tombs();
+                let (seg, ord, fact) = w
+                    .finish_unsynced_from(&StreamKeys(&keys))
+                    .map_err(|e| err(&format!("direct finish: {e}")))?;
+                shared.drain_steps.stamp(3);
+                let name = if first_partition && !tombs && std::fs::metadata(&tmp)?.len() <= limit {
+                    Db::first_partition_name(id, seq)
+                } else {
+                    name
+                };
+                let ordf = write_ord_unsynced(&dir, &name, &ord)?;
+                shared.drain_steps.stamp(4);
+                std::fs::hard_link(&tmp, dir.join(&name))?;
+                shared.drain_steps.stamp(5);
+                let names = vec![name];
+                let _ = readable.facts.set(vec![Some(fact)]);
+                let _ = readable.names.set(names.clone());
+                if let Some(t) = &readable.wake {
+                    t.unpark();
+                }
+                shared.drain_steps.stamp(6);
+                SealCounts::add(&shared.seal_counts.closes_inline, 1);
+                Ok((seg, ordf, names))
+            })();
+            // The seal thread takes the error as its answer where the
+            // close failed, as it took the finish's own.
+            let _ = tx.send(closed);
+            return Ok(());
+        }
         // The finish: the trailer composed and written, the Bloom and the
         // ordered index with it, from the table where the writer kept no
         // key copies and from its own copies otherwise. Run on the writer's
@@ -41999,7 +42338,7 @@ impl Db {
         table: std::sync::Arc<MemTable>,
         wal: Vec<PathBuf>,
         tmp: Option<PathBuf>,
-    ) {
+    ) -> std::sync::Arc<SealReadable> {
         let draining = self.draining;
         let wake = match &self.maint {
             MaintHome::Away(a) => a.thread.clone(),
@@ -42011,6 +42350,7 @@ impl Db {
             wake: wake.clone(),
         });
         let signal = readable.clone();
+        let theirs = readable.clone();
         let handle = std::thread::spawn(move || {
             let out = job(&signal);
             if let Some(t) = wake {
@@ -42027,6 +42367,7 @@ impl Db {
             tmp,
             draining,
             early: false,
+            early_hint: std::mem::take(&mut self.hand_early),
             dir_owed: false,
             wal_unsynced: self.log_unsynced() || !self.loose_wals.is_empty(),
         };
@@ -42044,6 +42385,7 @@ impl Db {
                 }
             }
         }
+        theirs
     }
 
     /// `ask` answered by the segment work, inline or on its thread, and
@@ -48885,6 +49227,16 @@ struct SealJob {
     /// the loop: landed whole at the stop where the loop has not come to
     /// it (`Maint::stop`), as a strict drain's is before its answer.
     early: bool,
+    /// A drain's seal whose writer signals it readable before the drain's
+    /// request is sent (`Options::close_readable_inline`), with the
+    /// request to ask its answer at that landing: the loop leaves the
+    /// readable landing to the request (`Maint::drain_readable`), which
+    /// lands it with the directory's fsync deferred, where the loop's own
+    /// landing, coming first, paid that fsync on the drain's path -- 0.3
+    /// ms of a 1.1 ms drain at ten thousand keys, one drain in three. A
+    /// request that never comes leaves it to the seal's whole landing at
+    /// its thread's return, as a strict drain's is.
+    early_hint: bool,
     /// The readable landing left the directory's fsync of the segments'
     /// names to the durable landing, ahead of the slot that names them
     /// (`Maint::drain_readable`).
@@ -49863,7 +50215,7 @@ impl Maint {
                 self.land_front(draining)?;
                 continue;
             }
-            if readable {
+            if readable && !self.sealing.front().is_some_and(|j| j.early_hint) {
                 self.land_front_readable()?;
             }
             return Ok(());
@@ -58388,7 +58740,7 @@ mod streaming_writes {
     /// the head where the key is the copy.
     #[test]
     fn a_streamed_tables_keys_read_in_place_and_across_a_seam() {
-        for compact in [false, true] {
+        for (compact, lean) in [(false, false), (true, false), (false, true), (true, true)] {
             let rd = Readers::new(false, true);
             let mem = MemTable::new_ordered(
                 false,
@@ -58404,7 +58756,8 @@ mod streaming_writes {
                 true,
                 true,
                 true,
-            );
+            )
+            .with_lean_records(lean);
             let block = mem.vals.block_len();
             let value = vec![b'v'; 10];
             let (ext, tail) = MemTable::stream_ext(value.len());
