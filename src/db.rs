@@ -4995,6 +4995,28 @@ pub struct Options {
     /// -- where FASTER's is two, the bucket and the record. Off: the head
     /// read once the key has compared.
     pub shared_chunk_ahead: bool,
+    /// EXPERIMENT, under `shared_writers`: the slots a shared table's index
+    /// is made with, rounded up to a power of two; zero sizes it from the
+    /// table's cap, a slot for each thirty-two bytes of values, which is
+    /// what an entry of a sixteen-byte key and no value lays down. A table
+    /// whose cap holds a store of hundred-byte values had an index four
+    /// times what its keys need, 32 MiB at three hundred thousand keys
+    /// where FASTER's is 16, every probe on a page of its own. A table
+    /// finds itself full where its entries pass half its slots, as by the
+    /// cap.
+    pub shared_index_slots: usize,
+    /// EXPERIMENT, under `shared_writers`: a shared table lays each new key
+    /// as a record in its value arena -- the chain's head, its count and
+    /// the key's lock beside the key, and the key's first write just after
+    /// it -- and its index slots name the records (`MemTable::records`).
+    /// A probe goes from the slot to the record, which answers the key
+    /// compare and the head on the lines it starts on, and for a key one
+    /// put made, the value on the lines after: where a probe through the
+    /// entry was the slot, the entry, the key and the head, four misses in
+    /// a row, FASTER's is the bucket and the record. The entries stay, each
+    /// naming its record, for the walks by number. Off: an entry a key, its
+    /// key and its chunks apart.
+    pub shared_records: bool,
     /// A job's large per-key arrays -- a seal's sort of its
     /// table, a segment writer's copy of every key with its span, its
     /// record's offset and its hash, the ordered index builder's keys, a
@@ -7337,8 +7359,10 @@ impl Options {
             MemTable::new_shared(
                 self.block_shape(pool),
                 cap.max(4 * SHARED_STRIDE),
+                self.shared_index_slots,
                 self.shared_recycles,
                 self.shared_chunk_ahead,
+                self.shared_records,
             )
         } else {
             MemTable::new(self.block_shape(pool))
@@ -7656,6 +7680,8 @@ impl Default for Options {
             shared_recycles: true,
             shared_table_bytes: 0,
             shared_chunk_ahead: true,
+            shared_index_slots: 0,
+            shared_records: true,
             jobs_mapped: true,
             jobs_mapped_when_short: false,
             jobs_pooled: false,
@@ -14087,6 +14113,11 @@ struct MemTable {
     /// A table writers on several threads write at once
     /// (`Options::shared_writers`); `None` for the one writer's.
     shared: Option<Box<SharedTable>>,
+    /// A shared table whose keys are records in the value arena
+    /// (`Options::shared_records`): an index slot names the key's record,
+    /// which holds the chain's head beside the key and the key's first
+    /// write after it, and an entry names the record for the walks.
+    records: bool,
 }
 
 /// What a writer claims of a shared table's arena at a time
@@ -14096,6 +14127,18 @@ struct MemTable {
 const SHARED_STRIDE: usize = 64 << 10;
 /// A shared table's write locks, a stripe an entry number.
 const SHARED_STRIPES: usize = 4096;
+/// A shared table's key record (`Options::shared_records`), eight-aligned in
+/// the value arena: the chain's head, offset plus one as an entry keeps it;
+/// the chain's count; the key's lock, odd while a writer changes the chain;
+/// the entry's number; the key's length; then the key, at `REC_HDR`, and the
+/// key's first write just after it.
+const REC_HEAD: usize = 0;
+const REC_COUNT: usize = 8;
+const REC_LOCK: usize = 12;
+const REC_ID: usize = 16;
+const REC_KLEN: usize = 20;
+const REC_HDR: usize = 24;
+
 /// The bytes a shared table's index is sized for an entry at: an entry with
 /// a key of sixteen bytes and no value lays down about this much.
 const SHARED_ENTRY_BYTES: usize = 64;
@@ -14241,6 +14284,23 @@ enum SharedWrite<'a> {
     Put(&'a [u8]),
     Append(&'a [u8]),
     Delete,
+}
+
+/// The bytes a shared write lays down: a put's tombstone and value, an
+/// append's value, a delete's tombstone, each behind a chunk header.
+fn shared_chunk_len(w: SharedWrite<'_>) -> usize {
+    match w {
+        SharedWrite::Put(v) => 2 * CHUNK_HDR + v.len(),
+        SharedWrite::Append(v) => CHUNK_HDR + v.len(),
+        SharedWrite::Delete => CHUNK_HDR,
+    }
+}
+
+/// The words a writer changes one key's chain through (`MemTable::key_cells`).
+struct KeyCells<'t> {
+    lock: &'t AtomicU32,
+    head: &'t AtomicU64,
+    count: &'t AtomicU32,
 }
 
 /// What a shared read-modify-write came to (`MemTable::rmw_shared`).
@@ -14750,6 +14810,19 @@ impl ByteArena {
             *stride = (at + n, at + len);
             return Some(at);
         }
+    }
+
+    /// Shared: `reserve_shared` at an offset that is a multiple of eight, for
+    /// a record whose words are atomics. A stride starts on a line, so the
+    /// round up within one is all it takes.
+    fn reserve_shared_aligned(
+        &self,
+        stride: &mut (usize, usize),
+        n: usize,
+        cap: usize,
+    ) -> Option<usize> {
+        stride.0 = stride.0.next_multiple_of(8).min(stride.1);
+        self.reserve_shared(stride, n, cap)
     }
 
     /// Shared: `n` bytes over block-aligned blocks of their own, the first
@@ -16016,7 +16089,9 @@ impl MemTable {
 
     /// A hashed table, shared by several writers where `shared` gives the
     /// cap of its value arena (`MemTable::new_shared`).
-    fn new_with(shape: BlockShape, shared: Option<usize>) -> MemTable {
+    /// `shared`: the cap of a shared table's values and the slots its
+    /// index is asked for, zero to size it from the cap.
+    fn new_with(shape: BlockShape, shared: Option<(usize, usize)>) -> MemTable {
         let BlockShape {
             prefault,
             index_populated,
@@ -16025,8 +16100,13 @@ impl MemTable {
             pool,
         } = shape;
         let src = || blocks::Source::new(mapped, pool.clone());
-        let slots = shared.map_or(1024, |cap| {
-            (2 * cap / SHARED_ENTRY_BYTES).max(1024).next_power_of_two()
+        let slots = shared.map_or(1024, |(cap, want)| {
+            let slots = if want > 0 {
+                want
+            } else {
+                2 * cap / SHARED_ENTRY_BYTES
+            };
+            slots.max(1024).next_power_of_two()
         });
         MemTable {
             mapped,
@@ -16053,6 +16133,7 @@ impl MemTable {
             keys_in_stream: false,
             log_range: false,
             slim_entries: false,
+            records: false,
             slim: Slab::new(src()),
             vals2: ByteArena::new(prefault, src()),
             staging: UnsafeCell::new(Staging::default()),
@@ -16064,7 +16145,7 @@ impl MemTable {
             retired: UnsafeCell::new(Vec::new()),
             log: Slab::new(src()),
             snaps: FrozenSnaps::new(),
-            shared: shared.map(|cap_bytes| {
+            shared: shared.map(|(cap_bytes, _)| {
                 Box::new(SharedTable {
                     cap_bytes,
                     claimed: AtomicUsize::new(0),
@@ -16078,20 +16159,92 @@ impl MemTable {
     }
 
     /// A hashed table writers on several threads write at once
-    /// (`SharedTable`): its index sized for `cap_bytes` of values at
-    /// `SHARED_ENTRY_BYTES` an entry, at half load, and never grown.
+    /// (`SharedTable`): its index of `slots`, or where that is zero sized
+    /// for `cap_bytes` of values at `SHARED_ENTRY_BYTES` an entry, at half
+    /// load, and never grown.
     fn new_shared(
         shape: BlockShape,
         cap_bytes: usize,
+        slots: usize,
         recycles: bool,
         head_ahead: bool,
+        records: bool,
     ) -> MemTable {
-        let mut m = MemTable::new_with(shape, Some(cap_bytes));
+        let mut m = MemTable::new_with(shape, Some((cap_bytes, slots)));
         if let Some(st) = m.shared.as_deref_mut() {
             st.recycles = recycles;
             st.head_ahead = head_ahead;
         }
+        assert!(
+            !records || cap_bytes < u32::MAX as usize,
+            "a shared table's records name their keys by thirty-two-bit offsets"
+        );
+        m.records = records;
         m
+    }
+
+    /// Shared records: the atomic word of eight bytes at `at` in the value
+    /// arena, a record's chain head.
+    fn rec_word64(&self, at: usize) -> &AtomicU64 {
+        let b = self.vals.slice(at, 8);
+        debug_assert_eq!(b.as_ptr() as usize % 8, 0, "a record is eight-aligned");
+        // SAFETY: eight aligned bytes of a block that lives as long as the
+        // table, written as this atomic by every writer once the record is
+        // published and by its maker alone before.
+        unsafe { &*(b.as_ptr() as *const AtomicU64) }
+    }
+
+    /// Shared records: the atomic word of four bytes at `at`, a record's
+    /// count or lock.
+    fn rec_word32(&self, at: usize) -> &AtomicU32 {
+        let b = self.vals.slice(at, 4);
+        debug_assert_eq!(b.as_ptr() as usize % 4, 0, "a record's words are aligned");
+        // SAFETY: as `rec_word64`.
+        unsafe { &*(b.as_ptr() as *const AtomicU32) }
+    }
+
+    /// Shared records: the record at `r` as an entry: its chain's head and
+    /// count, and its key's span, which is in the value arena.
+    fn rec_entry(&self, r: usize) -> Entry<'_> {
+        let klen = u16::from_le_bytes(
+            self.vals
+                .slice(r + REC_KLEN, 2)
+                .try_into()
+                .expect("two bytes"),
+        );
+        Entry {
+            head: match self.rec_word64(r + REC_HEAD).load(AtomicOrdering::Acquire) {
+                0 => NO_CHUNK,
+                h => h - 1,
+            },
+            key_off: (r + REC_HDR) as u32,
+            klen,
+            count: self.rec_word32(r + REC_COUNT).load(AtomicOrdering::Relaxed),
+            _table: std::marker::PhantomData,
+        }
+    }
+
+    /// Shared records: the entry number the record at `r` was made with.
+    fn rec_id(&self, r: usize) -> usize {
+        u32::from_le_bytes(
+            self.vals
+                .slice(r + REC_ID, 4)
+                .try_into()
+                .expect("four bytes"),
+        ) as usize
+    }
+
+    /// The entry number and the entry an index slot's low word names: the
+    /// entry's number, or in a table of records the record's offset over
+    /// eight (`MemTable::records`), plus one.
+    #[inline]
+    fn slot_entry(&self, low: u64) -> (usize, Entry<'_>) {
+        if self.records {
+            let r = ((low - 1) * 8) as usize;
+            return (self.rec_id(r), self.rec_entry(r));
+        }
+        let id = (low - 1) as usize;
+        (id, self.entry(id))
     }
 
     /// Shared: the line of entry `e`'s chain head asked for, and the
@@ -16170,6 +16323,7 @@ impl MemTable {
             log: Slab::new(src()),
             snaps: FrozenSnaps::new(),
             shared: None,
+            records: false,
         }
     }
 
@@ -16242,6 +16396,11 @@ impl MemTable {
 
     /// Entry `id`, whichever shape it is kept in.
     fn entry(&self, id: usize) -> Entry<'_> {
+        if self.records {
+            // The entry's head is its record's offset, plus one.
+            let r = self.entries.get(id).head.load(AtomicOrdering::Acquire) - 1;
+            return self.rec_entry(r as usize);
+        }
         if !self.slim_entries {
             return Entry::fat(self.entries.get(id));
         }
@@ -16286,6 +16445,9 @@ impl MemTable {
     /// reads its keys in place, in the stream unless the span carries
     /// `KEYS_BIAS`.
     fn key_at(&self, off: u32, len: u32) -> &[u8] {
+        if self.records {
+            return self.vals.slice(off as usize, len as usize);
+        }
         if self.keys_in_stream {
             if off & KEYS_BIAS == 0 {
                 return self.stream_bytes(off as usize, len as usize);
@@ -17578,8 +17740,7 @@ impl MemTable {
             // still being laid down, which a read reads past: the put has
             // not happened yet.
             if s >> 32 == hash >> 32 && s & 0xffff_ffff != SLOT_TENTATIVE {
-                let id = ((s & 0xffff_ffff) - 1) as usize;
-                let e = self.entry(id);
+                let (id, e) = self.slot_entry(s & 0xffff_ffff);
                 self.ask_head(e);
                 if crate::flatindex::key_eq(self.key_of(e), key) {
                     return Some((id, e));
@@ -17645,11 +17806,10 @@ impl MemTable {
                     std::hint::spin_loop();
                     continue;
                 }
-                let id = ((s & 0xffff_ffff) - 1) as usize;
-                let e = self.entry(id);
+                let (id, e) = self.slot_entry(s & 0xffff_ffff);
                 self.ask_head(e);
                 if crate::flatindex::key_eq(self.key_of(e), key) {
-                    return self.chain_shared(st, l, rd, id, w);
+                    return self.chain_shared(st, l, rd, id, e, w);
                 }
             }
             i = (i + 1) & idx.mask;
@@ -17671,32 +17831,55 @@ impl MemTable {
         l: &mut TableLocal,
         rd: Option<&Readers>,
         id: usize,
+        e: Entry<'_>,
         w: SharedWrite<'_>,
     ) -> bool {
-        let lock = &st.vers[id & (SHARED_STRIPES - 1)];
-        let v = shared_lock(lock);
-        let e = self.fat(id);
-        let head = e.chain_head();
+        let c = self.key_cells(st, id, e);
+        let v = shared_lock(c.lock);
+        let head = match c.head.load(AtomicOrdering::Acquire) {
+            0 => NO_CHUNK,
+            h => h - 1,
+        };
         let drops = st.recycles && !matches!(w, SharedWrite::Append(_));
         let below = if drops { NO_CHUNK } else { head };
         let Some(chunk) = self.chunks_shared(st, l, rd, below, w) else {
-            lock.store(v, AtomicOrdering::Release);
+            c.lock.store(v, AtomicOrdering::Release);
             return false;
         };
-        e.head.store(chunk + 1, AtomicOrdering::Release);
+        c.head.store(chunk + 1, AtomicOrdering::Release);
         let count = match w {
             SharedWrite::Put(_) => 1,
             SharedWrite::Delete => 0,
-            SharedWrite::Append(_) => e.count.load(AtomicOrdering::Relaxed) + 1,
+            SharedWrite::Append(_) => c.count.load(AtomicOrdering::Relaxed) + 1,
         };
-        e.count.store(count, AtomicOrdering::Relaxed);
-        lock.store(v + 2, AtomicOrdering::Release);
+        c.count.store(count, AtomicOrdering::Relaxed);
+        c.lock.store(v + 2, AtomicOrdering::Release);
         if let (true, Some(rd)) = (drops, rd) {
             if let Some((off, len)) = self.lone_write(head) {
                 l.retire(off, len, rd);
             }
         }
         true
+    }
+
+    /// Shared: the words a writer changes key `id`'s chain through -- its
+    /// lock, its head and its count -- in the stripe table and the entry,
+    /// or in the key's record (`MemTable::records`).
+    fn key_cells<'t>(&'t self, st: &'t SharedTable, id: usize, e: Entry<'_>) -> KeyCells<'t> {
+        if self.records {
+            let r = e.key_off as usize - REC_HDR;
+            return KeyCells {
+                lock: self.rec_word32(r + REC_LOCK),
+                head: self.rec_word64(r + REC_HEAD),
+                count: self.rec_word32(r + REC_COUNT),
+            };
+        }
+        let f = self.fat(id);
+        KeyCells {
+            lock: &st.vers[id & (SHARED_STRIPES - 1)],
+            head: &f.head,
+            count: &f.count,
+        }
     }
 
     /// Shared: `key`'s values read and `value` put over them in one probe
@@ -17724,23 +17907,29 @@ impl MemTable {
                 ..TableLocal::default()
             };
         }
-        let Some((id, _)) = self.probe_entry(hash, key) else {
+        let Some((id, e)) = self.probe_entry(hash, key) else {
             return SharedRmw::Spread;
         };
-        let lock = &st.vers[id & (SHARED_STRIPES - 1)];
-        let v = shared_lock(lock);
-        let e = self.fat(id);
-        let head = e.chain_head();
+        let c = self.key_cells(st, id, e);
+        let v = shared_lock(c.lock);
+        // Read again under the lock: the probe's view of the chain may be a
+        // writer's older one.
+        let e = if self.records {
+            self.rec_entry(e.key_off as usize - REC_HDR)
+        } else {
+            self.entry(id)
+        };
+        let head = MemTable::head(e);
         let mut live = [std::mem::MaybeUninit::<&[u8]>::uninit(); LIVE_SMALL];
-        let Some((n, true)) = self.live_small_hashed(self.entry(id), SEE_ALL, &mut live) else {
-            lock.store(v, AtomicOrdering::Release);
+        let Some((n, true)) = self.live_small_hashed(e, SEE_ALL, &mut live) else {
+            c.lock.store(v, AtomicOrdering::Release);
             return SharedRmw::Spread;
         };
         let w = SharedWrite::Put(value);
         let drops = st.recycles;
         let below = if drops { NO_CHUNK } else { head };
         let Some(chunk) = self.chunks_shared(st, l, rd, below, w) else {
-            lock.store(v, AtomicOrdering::Release);
+            c.lock.store(v, AtomicOrdering::Release);
             return SharedRmw::Whole(false);
         };
         // The old values are read before the head moves off them; the
@@ -17749,9 +17938,9 @@ impl MemTable {
             // SAFETY: the first `n` are written.
             f(unsafe { old.assume_init() });
         }
-        e.head.store(chunk + 1, AtomicOrdering::Release);
-        e.count.store(1, AtomicOrdering::Relaxed);
-        lock.store(v + 2, AtomicOrdering::Release);
+        c.head.store(chunk + 1, AtomicOrdering::Release);
+        c.count.store(1, AtomicOrdering::Relaxed);
+        c.lock.store(v + 2, AtomicOrdering::Release);
         if let (true, Some(rd)) = (drops, rd) {
             if let Some((off, len)) = self.lone_write(head) {
                 l.retire(off, len, rd);
@@ -17768,6 +17957,11 @@ impl MemTable {
     /// lone tombstone reads as a put's, and the two are garbage together
     /// all the same; the block test keeps a range that two reservations
     /// made across a block's end from being handed out as one.
+    ///
+    /// A record's own first chunks are handed out like any others once the
+    /// head has moved off them: the range is the pair's bytes and starts
+    /// past the record's header and key. A guard that kept them back was
+    /// an equivalent mutant, no test able to tell it apart.
     fn lone_write(&self, head: u64) -> Option<(usize, usize)> {
         if head == NO_CHUNK {
             return None;
@@ -17804,11 +17998,7 @@ impl MemTable {
         prev: u64,
         w: SharedWrite<'_>,
     ) -> Option<u64> {
-        let len = match w {
-            SharedWrite::Put(v) => 2 * CHUNK_HDR + v.len(),
-            SharedWrite::Append(v) => CHUNK_HDR + v.len(),
-            SharedWrite::Delete => CHUNK_HDR,
-        };
+        let len = shared_chunk_len(w);
         let reused = match rd {
             Some(_) if st.recycles => l.reuse(len),
             _ => None,
@@ -17818,6 +18008,13 @@ impl MemTable {
             st.full.store(true, AtomicOrdering::Relaxed);
             return None;
         };
+        Some(self.fill_chunks(off, prev, w))
+    }
+
+    /// Shared: the bytes of a write laid at `off` over `prev`, which the
+    /// caller reserved: `shared_chunk_len` of them. The head they make.
+    fn fill_chunks(&self, off: usize, prev: u64, w: SharedWrite<'_>) -> u64 {
+        let len = shared_chunk_len(w);
         self.vals.fill(off, len, |b| {
             b[..8].copy_from_slice(&prev.to_le_bytes());
             match w {
@@ -17845,10 +18042,10 @@ impl MemTable {
                 self.tombs.fetch_add(1, AtomicOrdering::Relaxed);
             }
         }
-        Some(match w {
+        match w {
             SharedWrite::Put(_) => (off + CHUNK_HDR) as u64,
             SharedWrite::Append(_) | SharedWrite::Delete => off as u64,
-        })
+        }
     }
 
     /// Shared: a new entry for `key` at the vacant slot `i`, the slot
@@ -17888,6 +18085,9 @@ impl MemTable {
         {
             return SharedInsert::Lost;
         }
+        if self.records {
+            return self.insert_record(st, l, idx, i, hash, key, w);
+        }
         let reserved = self
             .keys
             .reserve_shared(&mut l.keys, key.len(), st.cap_bytes)
@@ -17920,6 +18120,69 @@ impl MemTable {
             (*p).head.store(chunk + 1, AtomicOrdering::Release);
         }
         idx.slots[i].store(Index::word(hash, id), AtomicOrdering::Release);
+        self.advance_shared(st);
+        SharedInsert::Done
+    }
+
+    /// Shared records: `insert_shared` past its claim of slot `i`, the key
+    /// laid as one record -- its header, the key, its first write -- in one
+    /// reservation of the value arena, its entry naming the record, and the
+    /// slot published naming the record, so that a probe goes from the slot
+    /// to the key, its chain's head and, for a put, its value, on the lines
+    /// the record starts on.
+    #[allow(clippy::too_many_arguments)]
+    fn insert_record(
+        &self,
+        st: &SharedTable,
+        l: &mut TableLocal,
+        idx: &Index,
+        i: usize,
+        hash: u64,
+        key: &[u8],
+        w: SharedWrite<'_>,
+    ) -> SharedInsert {
+        let at = REC_HDR + key.len();
+        let Some(r) =
+            self.vals
+                .reserve_shared_aligned(&mut l.vals, at + shared_chunk_len(w), st.cap_bytes)
+        else {
+            // No number claimed yet, so the slot goes back.
+            st.full.store(true, AtomicOrdering::Relaxed);
+            idx.slots[i].store(0, AtomicOrdering::Release);
+            return SharedInsert::Full;
+        };
+        let low = r / 8 + 1;
+        assert!(
+            (low as u64) < SLOT_TENTATIVE && r + REC_HDR < u32::MAX as usize,
+            "a shared table's records stay where a slot and an entry can name them"
+        );
+        let count = u32::from(!matches!(w, SharedWrite::Delete));
+        self.vals.fill(r, at, |b| {
+            b[..REC_HDR].fill(0);
+            b[REC_COUNT..REC_COUNT + 4].copy_from_slice(&count.to_le_bytes());
+            b[REC_KLEN..REC_KLEN + 2].copy_from_slice(&(key.len() as u16).to_le_bytes());
+            b[REC_HDR..].copy_from_slice(key);
+        });
+        let head = self.fill_chunks(r + at, NO_CHUNK, w);
+        let id = st.claimed.fetch_add(1, AtomicOrdering::Relaxed);
+        #[cfg(test)]
+        shared_table::hold_after_claim();
+        self.vals.fill(r + REC_ID, 4, |b| {
+            b.copy_from_slice(&(id as u32).to_le_bytes())
+        });
+        self.rec_word64(r + REC_HEAD)
+            .store(head + 1, AtomicOrdering::Release);
+        let p = self.entries.slot_shared(id);
+        // SAFETY: as in `insert_shared`: entry `id` is this writer's alone,
+        // read by nobody until its head is non-zero or the slot names the
+        // record, both stored after its fields with a release.
+        unsafe {
+            std::ptr::addr_of_mut!((*p).hash).write((hash >> 32) as u32);
+            std::ptr::addr_of_mut!((*p).key_off).write((r + REC_HDR) as u32);
+            std::ptr::addr_of_mut!((*p).klen).write(key.len() as u16);
+            (*p).head.store(r as u64 + 1, AtomicOrdering::Release);
+        }
+        idx.slots[i].store((hash & !0xffff_ffff) | low as u64, AtomicOrdering::Release);
         self.advance_shared(st);
         SharedInsert::Done
     }
@@ -59790,6 +60053,19 @@ mod shared_table {
         static HOLD_AFTER_CLAIM: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
     }
 
+    thread_local! {
+        /// The tables this thread's test makes lay their keys as records
+        /// (`MemTable::records`): each test of a writer's path runs once as
+        /// entries and once as records (`as_records`).
+        static RECORDS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    }
+
+    /// `test` with this thread's tables made as records.
+    fn as_records(test: fn()) {
+        RECORDS.with(|r| r.set(true));
+        test();
+    }
+
     /// A test's seam in `insert_shared`; see `HOLD_AFTER_CLAIM`.
     pub(super) fn hold_after_claim() {
         let us = HOLD_AFTER_CLAIM.with(|h| h.get());
@@ -59812,8 +60088,10 @@ mod shared_table {
                 pool: None,
             },
             cap,
+            0,
             recycles,
             true,
+            RECORDS.with(|r| r.get()),
         )
     }
 
@@ -59890,8 +60168,15 @@ mod shared_table {
                         while !stop.load(Relaxed) {
                             for id in 0..m.len() {
                                 let e = m.entry(id);
-                                assert_ne!(MemTable::head(e), NO_CHUNK, "entry {id} unwritten");
+                                let head = MemTable::head(e);
+                                assert_ne!(head, NO_CHUNK, "entry {id} unwritten");
                                 assert_eq!(m.key_of(e).len(), 16, "entry {id} half made");
+                                // The head an entry gives is a chain's: a
+                                // tombstone or one put's whole value.
+                                if !m.is_tomb(head) {
+                                    let v = m.value_at(head as usize);
+                                    assert!(uniform(v) && v.len() == 100, "entry {id}'s head");
+                                }
                                 seen += 1;
                             }
                         }
@@ -59955,10 +60240,16 @@ mod shared_table {
         );
         let mut walked = std::collections::HashSet::new();
         for id in 0..m.len() {
-            assert!(
-                walked.insert(m.key_of(m.entry(id)).to_vec()),
-                "a key walked twice"
+            let k = m.key_of(m.entry(id)).to_vec();
+            // The probe gives the number the walk finds the key at: a table
+            // of records names it in each record, and a scan that reads the
+            // live table by a probe's number reads that entry's values.
+            assert_eq!(
+                m.probe(m.hash(&k), &k),
+                Some(id),
+                "entry {id}'s key probes elsewhere"
             );
+            assert!(walked.insert(k), "a key walked twice");
         }
         let idx = m.index().unwrap();
         let indexed = (0..idx.slots.len())
@@ -59983,6 +60274,39 @@ mod shared_table {
             }
         }
         assert!(!m.shared_full());
+    }
+
+    /// A shared table's index has the slots it was asked for, rounded up
+    /// to a power of two, or where none were asked a slot for each
+    /// thirty-two bytes of its cap; and the table finds itself full as its
+    /// entries pass half the slots, the put that would pass it refused.
+    #[test]
+    fn a_shared_index_has_the_slots_it_was_asked_for_and_fills_at_half() {
+        let shape = || BlockShape {
+            prefault: false,
+            index_populated: false,
+            fold_hash: true,
+            mapped: true,
+            pool: None,
+        };
+        let asked = MemTable::new_shared(shape(), 64 << 20, 5000, false, true, false);
+        assert_eq!(asked.index().unwrap().slots.len(), 8192);
+        let sized = MemTable::new_shared(shape(), 1 << 20, 0, false, true, false);
+        assert_eq!(sized.index().unwrap().slots.len(), (2 << 20) / 64);
+        let mut l = TableLocal::default();
+        let mut made = 0u64;
+        while asked.write_shared(
+            &mut l,
+            None,
+            asked.hash(&key(made)),
+            &key(made),
+            SharedWrite::Put(b"v"),
+        ) {
+            made += 1;
+            assert!(made <= 8192, "the index took more entries than its slots");
+        }
+        assert_eq!(made, 4096, "the entries the index held before it was full");
+        assert!(asked.shared_full());
     }
 
     /// Two writers released together, round after round, each making one
@@ -60297,6 +60621,36 @@ mod shared_table {
             }
         });
         m.vals.shared_used()
+    }
+
+    // Each test of a writer's path again over a table of records.
+    #[test]
+    fn writers_on_threads_make_one_entry_a_key_and_lose_no_write_as_records() {
+        as_records(writers_on_threads_make_one_entry_a_key_and_lose_no_write);
+    }
+    #[test]
+    fn two_writers_inserting_at_once_leave_the_length_past_both_as_records() {
+        as_records(two_writers_inserting_at_once_leave_the_length_past_both);
+    }
+    #[test]
+    fn the_length_waits_at_an_entry_claimed_and_not_written_as_records() {
+        as_records(the_length_waits_at_an_entry_claimed_and_not_written);
+    }
+    #[test]
+    fn a_full_shared_table_refuses_a_put_and_writes_nothing_of_it_as_records() {
+        as_records(a_full_shared_table_refuses_a_put_and_writes_nothing_of_it);
+    }
+    #[test]
+    fn a_put_reuses_what_it_replaced_once_no_reader_can_hold_it_as_records() {
+        as_records(a_put_reuses_what_it_replaced_once_no_reader_can_hold_it);
+    }
+    #[test]
+    fn writers_reuse_beside_pinned_readers_and_no_read_is_torn_as_records() {
+        as_records(writers_reuse_beside_pinned_readers_and_no_read_is_torn);
+    }
+    #[test]
+    fn writers_on_threads_reuse_one_anothers_ranges_as_records() {
+        as_records(writers_on_threads_reuse_one_anothers_ranges);
     }
 }
 

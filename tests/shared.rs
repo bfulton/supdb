@@ -206,9 +206,19 @@ fn handles_on_threads_write_one_live_table_and_every_write_lands() {
             assert_eq!(v.len(), 1, "{when}: common key {i}: {v:?}");
             assert!(v[0].starts_with(b"common-"), "{when}: common key {i}");
         }
-        let mut keys = Vec::new();
-        db.scan(b"", usize::MAX, kv(&mut |k, _| keys.push(k.to_vec())))
-            .unwrap();
+        // A scan lists every live key once, each with the values its point
+        // read gives: a scan reads the live table by entry number, which a
+        // table of records names in each record.
+        let mut scanned: Vec<(Vec<u8>, Vec<Vec<u8>>)> = Vec::new();
+        db.scan(
+            b"",
+            usize::MAX,
+            kv(&mut |k, v| match scanned.last_mut() {
+                Some((last, vs)) if last.as_slice() == k => vs.push(v.to_vec()),
+                _ => scanned.push((k.to_vec(), vec![v.to_vec()])),
+            }),
+        )
+        .unwrap();
         let mut want: Vec<Vec<u8>> = (0..THREADS)
             .flat_map(|t| {
                 (0..OWN)
@@ -218,9 +228,17 @@ fn handles_on_threads_write_one_live_table_and_every_write_lands() {
             .chain((0..COMMON).map(common_key))
             .collect();
         want.sort();
-        keys.dedup();
+        let keys: Vec<Vec<u8>> = scanned.iter().map(|(k, _)| k.clone()).collect();
         assert_eq!(keys.len(), want.len(), "{when}: the scan's keys");
         assert_eq!(keys, want, "{when}: the scan's keys");
+        for (k, vs) in &scanned {
+            assert_eq!(
+                vs,
+                &values(db, k),
+                "{when}: the scan's values of {}",
+                String::from_utf8_lossy(k)
+            );
+        }
     };
     hold(&db, "before the flush");
     db.flush().unwrap();
