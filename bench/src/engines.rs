@@ -1984,6 +1984,10 @@ pub struct Supdb {
     /// records, where the engine's own cap is the seal's share of the
     /// store: `supdb-heldsharedbig`.
     sharedbig: bool,
+    /// The big shared table's probe reading the chain's head only once the
+    /// key has compared (`Options::shared_chunk_ahead` off):
+    /// `supdb-heldsharedbignoahead`.
+    sharednoahead: bool,
     /// What the reader handles this store gave its threads answered
     /// through the ordered index, summed as each is dropped
     /// (`OrdTally`); only the arm that reads that way hands out handles
@@ -3263,6 +3267,9 @@ struct Policy {
     /// Its table sized as FASTER's log (`Options::shared_table_bytes`):
     /// `supdb-heldsharedbig`.
     sharedbig: bool,
+    /// Its probe asking nothing ahead (`Options::shared_chunk_ahead` off):
+    /// `supdb-heldsharedbignoahead`.
+    sharednoahead: bool,
 }
 
 /// The conversions a fill makes at most in `supdb-convertcap`: the first
@@ -3605,6 +3612,7 @@ impl Default for Policy {
             shared: false,
             sharednorecycle: false,
             sharedbig: false,
+            sharednoahead: false,
             defer: false,
             firstfloor: false,
             aheadmin: None,
@@ -3813,8 +3821,14 @@ impl Supdb {
     /// `supdb-heldnfinline` with its live table written by every thread's
     /// handle (`Options::shared_writers`): `supdb-heldshared`, and with
     /// its puts appending, `supdb-heldsharednorecycle`, or its table sized
-    /// as FASTER's log, `supdb-heldsharedbig`.
-    pub fn create_held_shared(path: &Path, norecycle: bool, big: bool) -> Res<Supdb> {
+    /// as FASTER's log, `supdb-heldsharedbig`, and that with its probe
+    /// asking nothing ahead, `supdb-heldsharedbignoahead`.
+    pub fn create_held_shared(
+        path: &Path,
+        norecycle: bool,
+        big: bool,
+        noahead: bool,
+    ) -> Res<Supdb> {
         Supdb::with_policy(
             path,
             Policy {
@@ -3827,6 +3841,7 @@ impl Supdb {
                 shared: true,
                 sharednorecycle: norecycle,
                 sharedbig: big,
+                sharednoahead: noahead,
                 ..Policy::default()
             },
         )
@@ -10342,6 +10357,7 @@ impl Supdb {
             shared,
             sharednorecycle,
             sharedbig,
+            sharednoahead,
         } = policy;
         // What the engine ships, so an arm that pins nothing inherits it
         // rather than restating it and drifting from it.
@@ -11022,6 +11038,7 @@ impl Supdb {
             shared_writers: shared,
             shared_recycles: !sharednorecycle,
             shared_table_bytes: if sharedbig { shared_table_bytes() } else { 0 },
+            shared_chunk_ahead: !sharednoahead,
             // A run of ordered ingest is the one writer's table, which the
             // shared mode has none of.
             direct_ingest: !shared,
@@ -11390,6 +11407,7 @@ impl Supdb {
             shared,
             sharednorecycle,
             sharedbig,
+            sharednoahead,
             ord_threads: Default::default(),
         })
     }
@@ -11620,6 +11638,8 @@ impl Engine for Supdb {
             if self.noframes {
                 return if self.shared && self.sharednorecycle {
                     "supdb-heldsharednorecycle"
+                } else if self.shared && self.sharedbig && self.sharednoahead {
+                    "supdb-heldsharedbignoahead"
                 } else if self.shared && self.sharedbig {
                     "supdb-heldsharedbig"
                 } else if self.shared {
@@ -15615,6 +15635,7 @@ pub fn guarantee(arm: &str) -> Option<Guarantee> {
         | "supdb-heldshared"
         | "supdb-heldsharednorecycle"
         | "supdb-heldsharedbig"
+        | "supdb-heldsharedbignoahead"
         | "supdb-heldbatch1"
         | "proto-shared"
         | "faster" => Guarantee::Memory,
@@ -16202,11 +16223,18 @@ pub fn open(arm: &str, dir: &Path, map_gb: usize) -> Res<Box<dyn Engine>> {
             },
             dir,
         )?,
-        "supdb-heldshared" => supdb_arm(|d| Supdb::create_held_shared(d, false, false), dir)?,
-        "supdb-heldsharednorecycle" => {
-            supdb_arm(|d| Supdb::create_held_shared(d, true, false), dir)?
+        "supdb-heldshared" => {
+            supdb_arm(|d| Supdb::create_held_shared(d, false, false, false), dir)?
         }
-        "supdb-heldsharedbig" => supdb_arm(|d| Supdb::create_held_shared(d, false, true), dir)?,
+        "supdb-heldsharednorecycle" => {
+            supdb_arm(|d| Supdb::create_held_shared(d, true, false, false), dir)?
+        }
+        "supdb-heldsharedbig" => {
+            supdb_arm(|d| Supdb::create_held_shared(d, false, true, false), dir)?
+        }
+        "supdb-heldsharedbignoahead" => {
+            supdb_arm(|d| Supdb::create_held_shared(d, false, true, true), dir)?
+        }
         "supdb-heldnfnocache" => supdb_arm(
             |d| {
                 Supdb::with_policy(
@@ -18276,21 +18304,28 @@ mod tests {
         assert!(so.shared_recycles && so.shared_table_bytes == 0);
         drop((s, b));
         // And its two siblings, each the arm but for one option.
-        for (arm, norecycle, big) in [
-            ("supdb-heldsharednorecycle", true, false),
-            ("supdb-heldsharedbig", false, true),
+        for (arm, norecycle, big, noahead) in [
+            ("supdb-heldsharednorecycle", true, false, false),
+            ("supdb-heldsharedbig", false, true, false),
+            ("supdb-heldsharedbignoahead", false, true, true),
         ] {
             let e = open(arm, &root.join(arm), 1).unwrap();
             assert_eq!(e.name(), arm);
             assert_eq!(guarantee(arm), Some(Guarantee::Memory), "{arm}");
             drop(e);
-            let a = Supdb::create_held_shared(&root.join(format!("{arm}-policy")), norecycle, big)
-                .unwrap();
+            let a = Supdb::create_held_shared(
+                &root.join(format!("{arm}-policy")),
+                norecycle,
+                big,
+                noahead,
+            )
+            .unwrap();
             assert_eq!(a.name(), arm);
             let ao = a.db.as_ref().unwrap().options().clone();
             assert!(ao.shared_writers && !ao.direct_ingest, "{arm}");
             assert_eq!(ao.shared_recycles, !norecycle, "{arm}");
             assert_eq!(ao.shared_table_bytes > 0, big, "{arm}");
+            assert_eq!(ao.shared_chunk_ahead, !noahead, "{arm}");
         }
         let _ = std::fs::remove_dir_all(&root);
     }

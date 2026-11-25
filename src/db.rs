@@ -4987,6 +4987,14 @@ pub struct Options {
     /// shared live table takes before a write finds it full; zero takes
     /// the seal's threshold, a share of the store (`seal_max_pct`).
     pub shared_table_bytes: usize,
+    /// EXPERIMENT, under `shared_writers`: a probe of the shared table asks
+    /// for the line of the chain's head as it reads the entry, before the
+    /// key compare, since the entry names both (`MemTable::ask_head`). A get
+    /// or a read-modify-write of a key the table holds is four dependent
+    /// misses otherwise -- the index slot, the entry, the key and the head
+    /// -- where FASTER's is two, the bucket and the record. Off: the head
+    /// read once the key has compared.
+    pub shared_chunk_ahead: bool,
     /// A job's large per-key arrays -- a seal's sort of its
     /// table, a segment writer's copy of every key with its span, its
     /// record's offset and its hash, the ordered index builder's keys, a
@@ -7330,6 +7338,7 @@ impl Options {
                 self.block_shape(pool),
                 cap.max(4 * SHARED_STRIDE),
                 self.shared_recycles,
+                self.shared_chunk_ahead,
             )
         } else {
             MemTable::new(self.block_shape(pool))
@@ -7646,6 +7655,7 @@ impl Default for Options {
             shared_writers: false,
             shared_recycles: true,
             shared_table_bytes: 0,
+            shared_chunk_ahead: true,
             jobs_mapped: true,
             jobs_mapped_when_short: false,
             jobs_pooled: false,
@@ -14123,6 +14133,9 @@ struct SharedTable {
     /// writer reuses once no reader can be reading them
     /// (`Options::shared_recycles`, `TableLocal::retire`).
     recycles: bool,
+    /// A probe asks for the chain's head as it reads the entry, before the
+    /// key compare (`Options::shared_chunk_ahead`, `MemTable::ask_head`).
+    head_ahead: bool,
 }
 
 /// A writer's strides of one shared table's arenas, and the ranges of its
@@ -16058,6 +16071,7 @@ impl MemTable {
                     full: std::sync::atomic::AtomicBool::new(false),
                     vers: (0..SHARED_STRIPES).map(|_| AtomicU32::new(0)).collect(),
                     recycles: false,
+                    head_ahead: false,
                 })
             }),
         }
@@ -16066,12 +16080,35 @@ impl MemTable {
     /// A hashed table writers on several threads write at once
     /// (`SharedTable`): its index sized for `cap_bytes` of values at
     /// `SHARED_ENTRY_BYTES` an entry, at half load, and never grown.
-    fn new_shared(shape: BlockShape, cap_bytes: usize, recycles: bool) -> MemTable {
+    fn new_shared(
+        shape: BlockShape,
+        cap_bytes: usize,
+        recycles: bool,
+        head_ahead: bool,
+    ) -> MemTable {
         let mut m = MemTable::new_with(shape, Some(cap_bytes));
         if let Some(st) = m.shared.as_deref_mut() {
             st.recycles = recycles;
+            st.head_ahead = head_ahead;
         }
         m
+    }
+
+    /// Shared: the line of entry `e`'s chain head asked for, and the
+    /// twelve bytes below it where a put's tombstone sits, where the table
+    /// asks (`Options::shared_chunk_ahead`): the entry names both the key
+    /// and the head, so the head's line comes while the key compare waits
+    /// on the key's, where it was the fourth miss in a row of a get or a
+    /// read-modify-write -- the slot, the entry, the key, the head.
+    #[inline]
+    fn ask_head(&self, e: Entry<'_>) {
+        if self.shared.as_deref().is_some_and(|st| st.head_ahead) {
+            let h = MemTable::head(e);
+            if h != NO_CHUNK {
+                let at = (h as usize).saturating_sub(CHUNK_HDR);
+                self.vals.prefetch(at, 2 * CHUNK_HDR + 64);
+            }
+        }
     }
 
     /// A table for keys that arrive in order: each above the last; with
@@ -17543,6 +17580,7 @@ impl MemTable {
             if s >> 32 == hash >> 32 && s & 0xffff_ffff != SLOT_TENTATIVE {
                 let id = ((s & 0xffff_ffff) - 1) as usize;
                 let e = self.entry(id);
+                self.ask_head(e);
                 if crate::flatindex::key_eq(self.key_of(e), key) {
                     return Some((id, e));
                 }
@@ -17608,7 +17646,9 @@ impl MemTable {
                     continue;
                 }
                 let id = ((s & 0xffff_ffff) - 1) as usize;
-                if crate::flatindex::key_eq(self.key_of(self.entry(id)), key) {
+                let e = self.entry(id);
+                self.ask_head(e);
+                if crate::flatindex::key_eq(self.key_of(e), key) {
                     return self.chain_shared(st, l, rd, id, w);
                 }
             }
@@ -59773,6 +59813,7 @@ mod shared_table {
             },
             cap,
             recycles,
+            true,
         )
     }
 
