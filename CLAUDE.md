@@ -6922,10 +6922,19 @@ holds, since a drop made in one state cannot reach the next; and an
 invariant a reader leans on is asserted where it is published, not only
 at a write that a stale form need never meet.
 
-## Standing limitations
+## Open targets, and the one standing limitation
 
-These are the engine's, as opposed to refuted predictions. Each is a curve
-in the suite's figures, at `full` scale where it says so:
+A cell a comparator wins is a target, never a limit to be written down
+and lived with: each entry below is one still open, with what its
+decomposition has found and the levers it names, and it leaves this list
+when its cells are won. The one standing limitation is the bytes on disk:
+a segment holds its key section, its ordered index and its filter beside
+the records, so the store's files are larger per byte stored than the
+comparators' (`bytes_on_disk_per_byte` in the load's figures), and that is
+the price of the reads those structures serve.
+
+The open targets, each a curve in the suite's figures, at `full` scale
+where it says so:
 
 - The scan pass after a burst pays its first scan for the burst's end:
   the wait for the upkeep thread's pass in flight, the log read, the
