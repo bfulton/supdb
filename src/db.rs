@@ -4919,6 +4919,21 @@ pub struct Options {
     /// `supdb-memfnv`, and `supdb-heldmemfnv` under the held log with no
     /// frames.
     pub mem_hash_fold: bool,
+    /// PROTOTYPE: under the held log (`SyncPolicy::Explicit`), which
+    /// promises nothing of isolation, a put to a key whose live-table chain
+    /// is one value over the tombstone a put lays down, and whose new value
+    /// has that value's length, overwrites the value's bytes where they lie
+    /// instead of laying down a tombstone and a value after them, as
+    /// FASTER updates a record in its mutable region. The write is still
+    /// logged, so whatever keeps a copy of the key's values reads its chain
+    /// again, and it is charged to the seal's count as the log's entry, the
+    /// one thing it grows. The writer's own reads are the only ones that
+    /// may see the bytes while it writes them, so this shape refuses
+    /// whatever reads a live table's values on another thread: a reader
+    /// handle (`Db::reader`), the block cache and its upkeep thread
+    /// (`scan_block_cache`, `Upkeep::Inline` alone), the run keeper and the
+    /// kept merge snapshot. Off: `supdb-held`'s shape, a put appending.
+    pub put_in_place: bool,
     /// A job's large per-key arrays -- a seal's sort of its
     /// table, a segment writer's copy of every key with its span, its
     /// record's offset and its hash, the ordered index builder's keys, a
@@ -7261,6 +7276,7 @@ impl Options {
             prefault: self.prefault,
             index_populated: self.index_populated,
             fold_hash: self.mem_hash_fold,
+            in_place: self.put_in_place,
             mapped: self.blocks_mapped,
             pool: pool.clone(),
         }
@@ -7548,6 +7564,7 @@ impl Default for Options {
             blocks_pool_bytes: 64 << 20,
             index_populated: true,
             mem_hash_fold: true,
+            put_in_place: false,
             jobs_mapped: true,
             jobs_mapped_when_short: false,
             jobs_pooled: false,
@@ -13863,6 +13880,9 @@ struct BlockShape {
     /// Sixteen-byte keys hashed by a fold of their words
     /// (`Options::mem_hash_fold`).
     fold_hash: bool,
+    /// A put of a value of the length it replaces overwrites it
+    /// (`Options::put_in_place`).
+    in_place: bool,
     mapped: bool,
     /// The store's pool of blocks its tables gave back
     /// (`Options::blocks_pool_bytes`); none where it keeps none.
@@ -13878,6 +13898,9 @@ struct MemTable {
     /// words (`Options::mem_hash_fold`, `MemTable::hash`), fixed for the
     /// table's life: every hash handed to it is the table's own.
     fold_hash: bool,
+    /// Whether a put overwrites a value of its length in place
+    /// (`Options::put_in_place`, `MemTable::overwrite`).
+    in_place: bool,
     /// Every entry in the order it was made -- key order, when
     /// `ordered`, since ordered ingest pushes each key above the last and
     /// a lookup there is a binary search, never a probe.
@@ -15558,6 +15581,7 @@ impl MemTable {
             prefault,
             index_populated,
             fold_hash,
+            in_place,
             mapped,
             pool,
         } = shape;
@@ -15565,6 +15589,7 @@ impl MemTable {
         MemTable {
             mapped,
             fold_hash,
+            in_place,
             entries: Slab::new(src()),
             index: AtomicPtr::new(Box::into_raw(Box::new(Index::with_slots(
                 1024,
@@ -15617,6 +15642,7 @@ impl MemTable {
             prefault,
             index_populated: _,
             fold_hash: _,
+            in_place: _,
             mapped,
             pool,
         } = shape;
@@ -15625,6 +15651,7 @@ impl MemTable {
         MemTable {
             mapped,
             fold_hash: false,
+            in_place: false,
             entries: Slab::new(src()),
             index: AtomicPtr::new(std::ptr::null_mut()),
             ordered: true,
@@ -15990,22 +16017,58 @@ impl MemTable {
     /// and five lookups of a block, and goes into the index at the slot
     /// where the probe for it found none (`index_insert_at`), where the
     /// insert walked the probe's slots again.
-    fn put(&self, hash: u64, key: &[u8], value: &[u8], rd: &Readers) {
+    ///
+    /// Whether the put overwrote the key's value where it lies
+    /// (`Options::put_in_place`, `overwrite`), growing the table by its
+    /// log's entry alone.
+    fn put(&self, hash: u64, key: &[u8], value: &[u8], rd: &Readers) -> bool {
         assert!(!self.ordered, "a put never reaches an ordered memtable");
         let vacant = match self.probe_or_vacant(hash, key) {
             Ok(id) => {
                 let e = self.fat(id);
-                let off = self.push_tomb_chunk(e.chain_head(), value);
+                let head = e.chain_head();
+                if self.in_place && self.overwrite(head, value) {
+                    self.log_write(id, false);
+                    return true;
+                }
+                let off = self.push_tomb_chunk(head, value);
                 e.head.store(off + 1, AtomicOrdering::Release);
                 e.count.store(1, AtomicOrdering::Relaxed);
                 self.log_write(id, false);
-                return;
+                return false;
             }
             Err(slot) => slot,
         };
         let id = self.new_put_entry(hash, key, value);
         self.index_insert_at(hash, id, vacant, rd);
         self.log_write(id, true);
+        false
+    }
+
+    /// Writer: `value` over the bytes of the chain's head at `head`, where
+    /// the head is a put's -- a value laid down in one reservation right
+    /// after the tombstone it is chained to (`push_tomb_chunk`), so that it
+    /// is the key's one live value and masks everything older -- and is
+    /// `value`'s length; false, with nothing written, otherwise. What a put
+    /// leaves is the same either way: the chain's one value, the new one,
+    /// over a tombstone. Sound only while no other thread reads the table's
+    /// values (`Options::put_in_place`, `check_options`, `Db::reader`).
+    fn overwrite(&self, head: u64, value: &[u8]) -> bool {
+        if head == NO_CHUNK || head < CHUNK_HDR as u64 {
+            return false;
+        }
+        // By the head's offset less the header, never the link's plus it:
+        // a key whose first write in the table was an append links to
+        // nothing (`NO_CHUNK`), and the sum overflows.
+        let c = self.vals.chunk(head as usize);
+        if c.len as usize != value.len() || head - CHUNK_HDR as u64 != c.prev {
+            return false;
+        }
+        if self.vals.chunk(c.prev as usize).len != TOMB_LEN {
+            return false;
+        }
+        self.vals.write(head as usize + CHUNK_HDR, value);
+        true
     }
 
     /// End every value of `key` before this point: a tombstone chunk at the
@@ -17136,6 +17199,19 @@ fn check_options(opts: &Options) -> Result<()> {
     if opts.direct_stream && opts.direct_table_refs {
         return Err(err(
             "direct_stream and direct_table_refs are two shapes of one table",
+        ));
+    }
+    if opts.put_in_place
+        && (!matches!(opts.sync, SyncPolicy::Explicit)
+            || opts.scan_block_cache
+            || opts.snapshot_keeper
+            || opts.forms_off_snapshot_kept
+            || opts.upkeep != Upkeep::Inline)
+    {
+        return Err(err(
+            "put_in_place overwrites a live table's values under the writer alone: \
+             it needs SyncPolicy::Explicit, Upkeep::Inline, and scan_block_cache, \
+             snapshot_keeper and forms_off_snapshot_kept off",
         ));
     }
     if !opts.writer_pins && (opts.publish_in_background || opts.snapshot_keeper) {
@@ -23311,6 +23387,9 @@ pub struct Db {
     /// a loose run if it fails (`flush`).
     drain_run: Option<(PathBuf, bool)>,
     mem_bytes: usize,
+    /// The puts that overwrote a value where it lay
+    /// (`Options::put_in_place`, `Db::puts_in_place`).
+    puts_in_place: u64,
     /// The segment ordered ingest streams into, while one is open. The
     /// memtable is ordered exactly while a run is forming or open.
     direct: Option<Direct>,
@@ -37467,6 +37546,7 @@ impl Db {
             loose_runs: Vec::new(),
             drain_run: None,
             mem_bytes: 0,
+            puts_in_place: 0,
             direct: None,
             mem_handed: None,
             read_mode: (0, 0, true),
@@ -38295,6 +38375,7 @@ impl Db {
             loose_runs: Vec::new(),
             drain_run: None,
             mem_bytes,
+            puts_in_place: 0,
             direct: None,
             mem_handed: None,
             read_mode: (0, 0, true),
@@ -38744,8 +38825,14 @@ impl Db {
         let hash = self.mem().prefetch(key);
         self.wal.delete(key);
         self.wal.append(key, value);
-        self.mem().put(hash, key, value, &self.shared.readers);
-        self.mem_bytes += key.len() + 16 + key.len() + value.len();
+        // An overwrite grows the table by its log's entry alone, which is
+        // what it is charged toward the seal (`Options::put_in_place`).
+        if self.mem().put(hash, key, value, &self.shared.readers) {
+            self.mem_bytes += std::mem::size_of::<u32>();
+            self.puts_in_place += 1;
+        } else {
+            self.mem_bytes += key.len() + 16 + key.len() + value.len();
+        }
     }
 
     /// End every value of `key` written before this point; later appends
@@ -40817,6 +40904,12 @@ impl Db {
         self.shared.frozen_sorts.load(AtomicOrdering::Relaxed)
     }
 
+    /// PROTOTYPE: the puts this store's writer has made over the value a
+    /// put left where it lay, since the open (`Options::put_in_place`).
+    pub fn puts_in_place(&self) -> u64 {
+        self.puts_in_place
+    }
+
     /// EXPERIMENT: scan snapshots built over this store's life. Sharing
     /// one is meant to hold this at one per state however many handles
     /// read it, which is what a test asks.
@@ -41144,6 +41237,12 @@ impl Reader {
     /// thread reads through it at a time, and a thread that wants its
     /// own asks for its own. Fails when every slot is taken.
     pub fn reader(&self) -> Result<Reader> {
+        if self.opts.put_in_place {
+            return Err(err(
+                "put_in_place overwrites the live table's values under the writer \
+                 alone: no handle may read them from another thread",
+            ));
+        }
         let _e = self.enter();
         self.new_reader(true)
     }
@@ -57973,6 +58072,7 @@ mod streaming_writes {
                     prefault: false,
                     index_populated: true,
                     fold_hash: false,
+                    in_place: false,
                     mapped: true,
                     pool: None,
                 },
@@ -58343,6 +58443,7 @@ mod threading {
             prefault: false,
             index_populated: true,
             fold_hash: false,
+            in_place: false,
             mapped: true,
             pool: None,
         });
@@ -58357,6 +58458,7 @@ mod threading {
             prefault: false,
             index_populated: true,
             fold_hash: false,
+            in_place: false,
             mapped: true,
             pool: None,
         });
@@ -58395,6 +58497,7 @@ mod put_index {
             prefault: false,
             index_populated: true,
             fold_hash: false,
+            in_place: false,
             mapped: true,
             pool: None,
         })
@@ -58447,6 +58550,7 @@ mod put_index {
                 prefault: false,
                 index_populated: true,
                 fold_hash: fold,
+                in_place: false,
                 mapped: true,
                 pool: None,
             });
@@ -58480,6 +58584,70 @@ mod put_index {
                     "found by the reader's"
                 );
             }
+        }
+    }
+
+    /// A table that overwrites (`Options::put_in_place`) writes a put over
+    /// the value a put left, where the lengths agree, and grows its arena
+    /// by nothing; a value of another length, and a chain an append has
+    /// grown past one value, take a tombstone and a value as before. Every
+    /// read answers the last put either way, and a table that does not
+    /// overwrite appends every put.
+    #[test]
+    fn a_put_overwrites_a_put_of_its_length_and_appends_anything_else() {
+        let rd = Readers::new(false, true);
+        for in_place in [true, false] {
+            let m = MemTable::new(BlockShape {
+                prefault: false,
+                index_populated: true,
+                fold_hash: true,
+                in_place,
+                mapped: true,
+                pool: None,
+            });
+            let k = b"overwritten-key".to_vec();
+            let wrote = |m: &MemTable, v: &[u8]| m.put(m.hash(&k), &k, v, &rd);
+            assert!(!wrote(&m, b"first"), "a new key's put appends");
+            let used = m.vals.used();
+            assert_eq!(wrote(&m, b"secnd"), in_place, "a put of the same length");
+            assert_eq!(m.vals.used() == used, in_place, "the arena is where it was");
+            assert_eq!(values(&m, &k), Some((vec![b"secnd".to_vec()], true)));
+            assert!(
+                !wrote(&m, b"longer value"),
+                "a put of another length appends"
+            );
+            assert_eq!(values(&m, &k), Some((vec![b"longer value".to_vec()], true)));
+            assert_eq!(wrote(&m, b"longer VALUE"), in_place, "and is a put's again");
+            assert_eq!(values(&m, &k), Some((vec![b"longer VALUE".to_vec()], true)));
+            // An append makes the chain two values: the head's predecessor
+            // is a value, not the tombstone, so the next put appends.
+            m.append(m.hash(&k), &k, b"extra value!", &rd);
+            assert!(!wrote(&m, b"after append"), "a chain of two values");
+            assert_eq!(values(&m, &k), Some((vec![b"after append".to_vec()], true)));
+            // The writes are logged as writes either way.
+            assert_eq!(m.log_len(), 6);
+            // An empty value's chunk is a header alone, as long as a
+            // tombstone's, so a head appended right after one sits where a
+            // put's would: only the tombstone check tells them apart.
+            let j = b"empty-then-more".to_vec();
+            m.append(m.hash(&j), &j, b"", &rd);
+            m.append(m.hash(&j), &j, b"abc", &rd);
+            assert!(
+                !m.put(m.hash(&j), &j, b"xyz", &rd),
+                "no tombstone under the head"
+            );
+            assert_eq!(values(&m, &j), Some((vec![b"xyz".to_vec()], true)));
+            // A key whose first write in the table is an append: its one
+            // value links to nothing and stands over no tombstone, so an
+            // older source's values below it are live, and a put of its
+            // length appends the tombstone that masks them.
+            let a = b"appended-first".to_vec();
+            m.append(m.hash(&a), &a, b"abcd", &rd);
+            assert!(
+                !m.put(m.hash(&a), &a, b"wxyz", &rd),
+                "a value that links to nothing"
+            );
+            assert_eq!(values(&m, &a), Some((vec![b"wxyz".to_vec()], true)));
         }
     }
 

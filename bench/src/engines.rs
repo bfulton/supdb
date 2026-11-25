@@ -1955,6 +1955,11 @@ pub struct Supdb {
     /// bytes or not (`Options::mem_hash_fold` off): `supdb-memfnv`, and
     /// `supdb-heldmemfnv` under the held log with no frames.
     memfnv: bool,
+    /// A put of a value of the length it replaces overwritten in place
+    /// (`Options::put_in_place`), under the held log with no frames, the
+    /// block cache off and the upkeep the writer's: `supdb-heldinplace`,
+    /// beside `supdb-heldnfinline`, which differs in the overwrite alone.
+    inplace: bool,
     /// The upkeep thread's passes batched to this percentage of the
     /// store's keys (`Options::upkeep_batch_pct`) under the held log with
     /// no frames: `supdb-heldbatch1`.
@@ -3220,6 +3225,9 @@ struct Policy {
     /// The memtable's hash taken from FNV for every key
     /// (`Options::mem_hash_fold` off): `supdb-memfnv`, `supdb-heldmemfnv`.
     memfnv: bool,
+    /// Puts overwritten in place (`Options::put_in_place`):
+    /// `supdb-heldinplace`.
+    inplace: bool,
     /// The upkeep's passes batched (`Options::upkeep_batch_pct`):
     /// `supdb-heldbatch1`.
     upkeepbatch: Option<usize>,
@@ -3559,6 +3567,7 @@ impl Default for Policy {
             indexzeropage: false,
             livefirst: false,
             memfnv: false,
+            inplace: false,
             upkeepbatch: None,
             defer: false,
             firstfloor: false,
@@ -10269,6 +10278,7 @@ impl Supdb {
             indexzeropage,
             livefirst,
             memfnv,
+            inplace,
             upkeepbatch,
         } = policy;
         // What the engine ships, so an arm that pins nothing inherits it
@@ -10945,6 +10955,7 @@ impl Supdb {
             index_populated: !indexzeropage,
             point_live_first: livefirst,
             mem_hash_fold: !memfnv,
+            put_in_place: inplace,
             ..Default::default()
         };
         let opts = match advice {
@@ -11304,6 +11315,7 @@ impl Supdb {
             indexzeropage,
             livefirst,
             memfnv,
+            inplace,
             upkeepbatch,
             ord_threads: Default::default(),
         })
@@ -11478,7 +11490,11 @@ impl Engine for Supdb {
                 return "supdb-heldmarch";
             }
             if self.noframes {
-                return if !self.block_cache {
+                return if self.inplace {
+                    "supdb-heldinplace"
+                } else if !self.block_cache && self.upkeep == Some(supdb::Upkeep::Inline) {
+                    "supdb-heldnfinline"
+                } else if !self.block_cache {
                     "supdb-heldnfnocache"
                 } else if self.norecordahead {
                     "supdb-heldnorecordahead"
@@ -15431,6 +15447,8 @@ pub fn guarantee(arm: &str) -> Option<Guarantee> {
         | "supdb-heldindexzeropage"
         | "supdb-heldlivefirst"
         | "supdb-heldmemfnv"
+        | "supdb-heldinplace"
+        | "supdb-heldnfinline"
         | "supdb-heldbatch1"
         | "faster" => Guarantee::Memory,
         _ => return None,
@@ -15957,6 +15975,41 @@ pub fn open(arm: &str, dir: &Path, map_gb: usize) -> Res<Box<dyn Engine>> {
                         noframes: true,
                         upkeep: None,
                         noalert: true,
+                        ..Policy::default()
+                    },
+                )
+            },
+            dir,
+        )?,
+        "supdb-heldinplace" => supdb_arm(
+            |d| {
+                Supdb::with_policy(
+                    d,
+                    Policy {
+                        partition: false,
+                        durable: false,
+                        held: true,
+                        noframes: true,
+                        block_cache: false,
+                        upkeep: Some(supdb::Upkeep::Inline),
+                        inplace: true,
+                        ..Policy::default()
+                    },
+                )
+            },
+            dir,
+        )?,
+        "supdb-heldnfinline" => supdb_arm(
+            |d| {
+                Supdb::with_policy(
+                    d,
+                    Policy {
+                        partition: false,
+                        durable: false,
+                        held: true,
+                        noframes: true,
+                        block_cache: false,
+                        upkeep: Some(supdb::Upkeep::Inline),
                         ..Policy::default()
                     },
                 )

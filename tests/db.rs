@@ -22588,3 +22588,144 @@ fn a_landing_leaves_its_pieces_bounds_where_no_table_stands_to_read_them() {
         let _ = std::fs::remove_dir_all(&d);
     }
 }
+
+/// A store whose puts overwrite in place (`Options::put_in_place`) answers
+/// the last put of every key, by point read and by scan, while its puts
+/// overwrite and append in turn, across the seals its writes make and a
+/// close and reopen; and it is refused where another thread could read a
+/// live value as the writer overwrites it -- a policy that promises
+/// isolation, the block cache, an upkeep thread -- and a handle is refused
+/// on an open store.
+#[test]
+fn a_store_that_overwrites_its_puts_answers_the_last_put() {
+    // The scan snapshot copies a key's chain under `snapshot_runs`, and the
+    // copy is read again only where the log says the key was written since.
+    for runs in [false, true] {
+        overwriting_store_answers_the_last_put(runs);
+    }
+}
+
+fn overwriting_store_answers_the_last_put(runs: bool) {
+    let opts = || Options {
+        sync: supdb::SyncPolicy::Explicit,
+        put_in_place: true,
+        upkeep: supdb::Upkeep::Inline,
+        scan_block_cache: false,
+        snapshot_runs: runs,
+        seal_bytes: 64 << 10,
+        ..common::options()
+    };
+    for (i, bad) in [
+        Options {
+            sync: supdb::SyncPolicy::Always,
+            ..opts()
+        },
+        Options {
+            scan_block_cache: true,
+            ..opts()
+        },
+        Options {
+            upkeep: supdb::Upkeep::Background(1),
+            ..opts()
+        },
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let d = dir(&format!("put-in-place-refused-{runs}-{i}"));
+        assert!(Db::open(&d, bad).is_err(), "combination {i} is refused");
+    }
+    let d = dir("put-in-place");
+    let mut db = Db::open(&d, opts()).unwrap();
+    assert!(
+        db.reader().is_err(),
+        "no handle beside an overwriting writer"
+    );
+    let mut model: BTreeMap<Vec<u8>, Vec<u8>> = BTreeMap::new();
+    let check = |db: &Db, model: &BTreeMap<Vec<u8>, Vec<u8>>, when: &str| {
+        for (k, want) in model {
+            let mut got = Vec::new();
+            db.read_all(k, vf(&mut |v| got.push(v.to_vec()))).unwrap();
+            assert_eq!(
+                got,
+                vec![want.clone()],
+                "{when}: {}",
+                String::from_utf8_lossy(k)
+            );
+        }
+        let mut seen = Vec::new();
+        db.scan(
+            b"",
+            usize::MAX,
+            kv(&mut |k, v| seen.push((k.to_vec(), v.to_vec()))),
+        )
+        .unwrap();
+        let want: Vec<(Vec<u8>, Vec<u8>)> =
+            model.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
+        assert_eq!(seen, want, "{when}: the scan");
+    };
+    for round in 0..40u32 {
+        for i in 0..400u32 {
+            let k = format!("{:016}", (i * 7919) % 400).into_bytes();
+            // Mostly the length the last put had, so the put overwrites;
+            // every fifth round a longer one, so it appends.
+            let pad = if round % 5 == 4 { "-longer" } else { "" };
+            let v = format!("r{round:04}-i{i:05}{pad}").into_bytes();
+            db.put(&k, &v);
+            model.insert(k, v);
+        }
+        if round % 3 == 0 {
+            db.append(b"0000000000000007", b"appended");
+            model
+                .get_mut(b"0000000000000007".as_slice())
+                .unwrap()
+                .clear();
+            db.put(b"0000000000000007", b"after-the-append");
+            model.insert(b"0000000000000007".to_vec(), b"after-the-append".to_vec());
+        }
+        db.commit().unwrap();
+        if round % 10 == 9 {
+            check(&db, &model, &format!("round {round}"));
+        }
+    }
+    // A store of partitions alone, whose scans emit the live table's keys
+    // from the snapshot's copies of their runs (`snapshot_runs`) where the
+    // log says nothing has written them since: every key put once into a
+    // fresh table, then a scan, then overwrites of values the snapshot
+    // copied, with no seal between, then a scan. An overwrite is a write
+    // the log says so of, or the scan reads the copy.
+    db.flush().unwrap();
+    for i in 0..400u32 {
+        let k = format!("{:016}", i).into_bytes();
+        let v = format!("fresh-{i:05}").into_bytes();
+        db.put(&k, &v);
+        model.insert(k, v);
+    }
+    db.commit().unwrap();
+    let before = db.puts_in_place();
+    for turn in 0..4u32 {
+        check(&db, &model, &format!("before overwrites {turn}"));
+        for i in (0..400u32).step_by(7) {
+            let k = format!("{:016}", i).into_bytes();
+            let len = model[&k].len();
+            let mut v = format!("o{turn}-{i:05}").into_bytes();
+            v.resize(len, b'.');
+            db.put(&k, &v);
+            model.insert(k, v);
+        }
+        db.commit().unwrap();
+    }
+    check(&db, &model, "after overwrites");
+    // Every key a turn writes holds the one value the fresh put left, of
+    // the length the turn writes, so each of its puts overwrote.
+    assert_eq!(
+        db.puts_in_place() - before,
+        4 * (0..400).step_by(7).count() as u64,
+        "every put of the turns overwrote"
+    );
+    db.flush().unwrap();
+    check(&db, &model, "flushed");
+    db.close().unwrap();
+    let db = Db::open(&d, opts()).unwrap();
+    check(&db, &model, "reopened");
+}
