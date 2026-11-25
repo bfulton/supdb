@@ -1272,7 +1272,11 @@ mod tests {
     /// a mapping is, so a probe's load maps the zero page; and a block not
     /// asked zeroed, or under `MAP_FROM`, is no business of the population.
     /// Read off `mincore`, which counts a page the mapping has a page for.
-    #[cfg(target_os = "linux")]
+    /// Not under qemu-user (`supdb_emulated`), which answers
+    /// `madvise(MADV_POPULATE_WRITE)` with success and passes nothing to
+    /// the kernel: a populated block of 512 KiB read every page resident
+    /// natively and none emulated. The native ARM leg runs it.
+    #[cfg(all(target_os = "linux", not(supdb_emulated)))]
     #[test]
     fn a_populating_source_maps_a_zeroed_block_written_and_no_other() {
         let len = 4 * MAP_FROM;
