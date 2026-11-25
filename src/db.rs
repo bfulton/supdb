@@ -28063,16 +28063,6 @@ impl Reader {
     /// The answer goes through here and comes back: asked for a verdict
     /// alone and left to replace the answer itself, the read's end cost a
     /// plain store's read three instructions for a branch it never takes.
-    /// A read's answer in a store under a cipher: the failure a file of
-    /// the store has met, if one has (`pager::Pager::check`), in its place.
-    #[inline(always)]
-    fn paged_answer<T>(&self, r: Result<T>) -> Result<T> {
-        match self.shared.pager.as_ref() {
-            Some(p) => p.check().and(r),
-            None => r,
-        }
-    }
-
     #[inline(never)]
     fn end_slow<T>(&self, r: Result<T>) -> Result<T> {
         if self.depth.get() == 1
@@ -30852,15 +30842,15 @@ impl Reader {
     }
 
     /// `read_all` for a store under a cipher, from the census's test at the
-    /// read's start on: the start's slow half, the read, and its answer
-    /// replaced with the failure a file of the store met while it was read
-    /// (`Reader::paged_answer`); the read's end is the guard's, as a
-    /// plain read's is, whose test the cipher's bit is in (`leave`).
+    /// read's start on: the start's slow half, the read, and the end's slow
+    /// half with the answer in hand, which replaces it with the failure a
+    /// file of the store met while it was read (`Reader::end_slow`); the
+    /// rest of the end is the guard's, as a plain read's is.
     #[inline(never)]
     fn read_all_paged<F: FnMut(&[u8])>(&self, key: &[u8], f: F) -> Result<u64> {
         self.begin_slow(false);
         let r = self.read_all_in::<F, true>(key, f);
-        self.paged_answer(r)
+        self.end_slow(r)
     }
 
     #[inline(always)]
