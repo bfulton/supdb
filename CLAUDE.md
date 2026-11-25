@@ -761,6 +761,14 @@ instructions, so past the first prefetch the lever on a cold get is its
 length. Price a read path warm
 by class and cold in the mix, both, before its count is read as its
 cost.
+It came again as an order: a read that asked the live table before
+finding the partition saved 78 instructions on every read the table
+ends and cost the rest 11, and the gets timed apart from the commits read
+the scrambled mixes 4-16% slower with it in both sittings -- for a read
+the table does not end, the live probe had been the lead of the asks
+behind it. An ask's lead is part of a read's price, so a reordering is
+timed by kind on the mixes whose reads go past the step it moves, never
+judged by its count.
 
 A decoder timed on one input is timed on an input it has learned. The
 form's LZ4 decode read 1.1 µs a page decoding one page over and over

@@ -1553,9 +1553,15 @@ pub struct Options {
     /// seal ends there, three in five of the mixes A and F at three
     /// hundred thousand keys under the held log and a fifth to a third of
     /// the scrambled A, B and F (`SUPDB_MIX_COUNTERS`, `gets ... live`).
-    /// Off, the partition and the asks come first for every read, the
-    /// asks' lead the live probe: `supdb-livelast`, and
-    /// `supdb-heldlivelast` under the held log with no frames.
+    /// It saves 78 instructions of a read the live table ends and costs
+    /// the others their asks' lead, the live probe: timed by kind in two
+    /// sittings of twelve pairs (`pair.sh SUPDB_MIX_KINDS=1
+    /// supdb-heldnoframes supdb-heldlivelast 300000 --reps 12`, at
+    /// `636f613`, where the order before was the arm), F's gets read 0.99x and 0.95x of the order before and
+    /// the scrambled mixes' 1.04-1.16x slower in both, where a third of
+    /// their gets or fewer end in the live table. Off: the partition and
+    /// its asks first, as before. On: `supdb-livefirst`, and
+    /// `supdb-heldlivefirst` under the held log with no frames.
     pub point_live_first: bool,
     /// A point read or a count over a store with tombstones reads each
     /// source once: the pass that finds the newest tombstone, newest source
@@ -4900,6 +4906,19 @@ pub struct Options {
     /// `supdb-indexzeropage`, and `supdb-heldindexzeropage` under the held
     /// log with no frames.
     pub index_populated: bool,
+    /// A memtable hashes a sixteen-byte key by a folded multiply of its two
+    /// words, seven instructions, where it took the key's FNV word, a
+    /// multiply a byte, and a finish over it: fifty instructions of every
+    /// put and of every read the live table ends, which need no other
+    /// source's hash. A memtable is the process's own, rebuilt from the
+    /// log at an open, so its hash is nobody else's; the segments' indexes
+    /// and filters keep FNV, and a read that goes on past the live table
+    /// takes that word as well. Linear probing at the half load the index
+    /// grows at reads 1.49 slots a lookup over the suite's numbered keys
+    /// and over random ids either way. Off, every key's hash is FNV's:
+    /// `supdb-memfnv`, and `supdb-heldmemfnv` under the held log with no
+    /// frames.
+    pub mem_hash_fold: bool,
     /// A job's large per-key arrays -- a seal's sort of its
     /// table, a segment writer's copy of every key with its span, its
     /// record's offset and its hash, the ordered index builder's keys, a
@@ -7241,6 +7260,7 @@ impl Options {
         BlockShape {
             prefault: self.prefault,
             index_populated: self.index_populated,
+            fold_hash: self.mem_hash_fold,
             mapped: self.blocks_mapped,
             pool: pool.clone(),
         }
@@ -7322,7 +7342,7 @@ impl Default for Options {
             point_lone: true,
             point_layers_lean: true,
             read_lines_ahead: true,
-            point_live_first: true,
+            point_live_first: false,
             read_probes_once: true,
             point_via_ord: false,
             zpages: ZPages::Auto,
@@ -7527,6 +7547,7 @@ impl Default for Options {
             blocks_mapped: true,
             blocks_pool_bytes: 64 << 20,
             index_populated: true,
+            mem_hash_fold: true,
             jobs_mapped: true,
             jobs_mapped_when_short: false,
             jobs_pooled: false,
@@ -13839,6 +13860,9 @@ struct BlockShape {
     /// The hash index populated for writing as it is mapped
     /// (`Options::index_populated`).
     index_populated: bool,
+    /// Sixteen-byte keys hashed by a fold of their words
+    /// (`Options::mem_hash_fold`).
+    fold_hash: bool,
     mapped: bool,
     /// The store's pool of blocks its tables gave back
     /// (`Options::blocks_pool_bytes`); none where it keeps none.
@@ -13850,6 +13874,10 @@ struct MemTable {
     /// -- are mapped from the kernel (`Options::blocks_mapped`); the seal's
     /// snapshot copy of the table follows it.
     mapped: bool,
+    /// Whether the index hashes a sixteen-byte key by the fold of its
+    /// words (`Options::mem_hash_fold`, `MemTable::hash`), fixed for the
+    /// table's life: every hash handed to it is the table's own.
+    fold_hash: bool,
     /// Every entry in the order it was made -- key order, when
     /// `ordered`, since ordered ingest pushes each key above the last and
     /// a lookup there is a binary search, never a probe.
@@ -14171,6 +14199,18 @@ fn mem_hash(key: &[u8]) -> u64 {
     // FNV-1a, then a splitmix finish; the std SipHash was part of what the
     // memtable's decomposition priced.
     mem_hash_of(crate::flatindex::key_hash(key))
+}
+
+/// A sixteen-byte key's memtable hash under `Options::mem_hash_fold`: the
+/// two words' folded 128-bit product, each word moved off zero by a
+/// constant first, the halves of the product exclusive-or'd. Two loads, a
+/// multiply and a few operations, where FNV takes a multiply a byte.
+#[inline(always)]
+fn fold_hash16(key: &[u8; 16]) -> u64 {
+    let a = u64::from_le_bytes(key[..8].try_into().expect("eight bytes"));
+    let b = u64::from_le_bytes(key[8..].try_into().expect("eight bytes"));
+    let m = u128::from(a ^ 0x9E37_79B9_7F4A_7C15) * u128::from(b ^ 0xD6E8_FEB8_6659_FD93);
+    ((m as u64) ^ ((m >> 64) as u64)) | 1 // 0 marks a vacant slot
 }
 
 /// The memtable's hash from the key's FNV word (`flatindex::key_hash`), the
@@ -15517,12 +15557,14 @@ impl MemTable {
         let BlockShape {
             prefault,
             index_populated,
+            fold_hash,
             mapped,
             pool,
         } = shape;
         let src = || blocks::Source::new(mapped, pool.clone());
         MemTable {
             mapped,
+            fold_hash,
             entries: Slab::new(src()),
             index: AtomicPtr::new(Box::into_raw(Box::new(Index::with_slots(
                 1024,
@@ -15570,10 +15612,11 @@ impl MemTable {
         slim_entries: bool,
     ) -> MemTable {
         // An ordered table keeps no hash index, the one block a shape's
-        // population is for.
+        // population and its hash are for.
         let BlockShape {
             prefault,
             index_populated: _,
+            fold_hash: _,
             mapped,
             pool,
         } = shape;
@@ -15581,6 +15624,7 @@ impl MemTable {
         debug_assert!(!(refs && stream.is_some()), "two shapes of one table");
         MemTable {
             mapped,
+            fold_hash: false,
             entries: Slab::new(src()),
             index: AtomicPtr::new(std::ptr::null_mut()),
             ordered: true,
@@ -16855,7 +16899,7 @@ impl MemTable {
             }
             return None;
         }
-        self.probe(mem_hash(key), key).filter(|&i| i < upto)
+        self.probe(self.hash(key), key).filter(|&i| i < upto)
     }
 
     /// A hint to fetch the slot line `key` probes first, and its hash for
@@ -16864,7 +16908,7 @@ impl MemTable {
     /// while the line comes in. At thirty million keys the slot and the
     /// entry behind it are both misses, and this hides the first.
     fn prefetch(&self, key: &[u8]) -> u64 {
-        self.prefetch_hashed(mem_hash(key))
+        self.prefetch_hashed(self.hash(key))
     }
 
     /// `prefetch` for a key whose hash (`mem_hash`) the caller has.
@@ -16878,6 +16922,37 @@ impl MemTable {
 
     /// `probe` for the writer's put: the entry holding `key`, or the vacant
     /// slot its probe ended at, for `index_insert_at`.
+    /// This table's hash of `key`: the fold of its words where the table
+    /// folds and the key is sixteen bytes (`Options::mem_hash_fold`), and
+    /// otherwise the hash of its FNV word.
+    #[inline(always)]
+    fn hash(&self, key: &[u8]) -> u64 {
+        if self.fold_hash {
+            if let Ok(k) = <&[u8; 16]>::try_from(key) {
+                return fold_hash16(k);
+            }
+        }
+        mem_hash(key)
+    }
+
+    /// `hash` for a key whose FNV word `fnv` the caller has taken.
+    #[inline(always)]
+    fn hash_with(&self, key: &[u8], fnv: u64) -> u64 {
+        if self.fold_hash {
+            if let Ok(k) = <&[u8; 16]>::try_from(key) {
+                return fold_hash16(k);
+            }
+        }
+        mem_hash_of(fnv)
+    }
+
+    /// Whether `hash` takes no FNV word for `key`, so that a read the
+    /// table ends need not take one.
+    #[inline(always)]
+    fn folds(&self, key: &[u8]) -> bool {
+        self.fold_hash && key.len() == 16
+    }
+
     fn probe_or_vacant(&self, hash: u64, key: &[u8]) -> std::result::Result<usize, usize> {
         let idx = self.index().expect("a hashed table has an index");
         let mut i = slot_of(hash, idx.mask);
@@ -27901,7 +27976,16 @@ impl Reader {
         if self.opts.zpages != ZPages::Off && self.z_on() {
             return None;
         }
-        let fnv = crate::flatindex::key_hash(key);
+        // The key's FNV word, which every source below the tables takes,
+        // after the live table where the table is asked first and its
+        // hash is not made from the word (`Options::mem_hash_fold`), so a
+        // read the table ends takes none.
+        let late = self.opts.point_live_first && mem.folds(key);
+        let fnv0 = if late {
+            0
+        } else {
+            crate::flatindex::key_hash(key)
+        };
         // The key's partition and the pieces over it, and the asks for
         // the lines their probes will load first: before the live table's
         // probe, or after it where the live table is asked first and its
@@ -27909,12 +27993,14 @@ impl Reader {
         let placed = if self.opts.point_live_first {
             None
         } else {
-            Some(Reader::place(&self.opts, st, key, fnv)?)
+            Some(Reader::place(&self.opts, st, key, fnv0)?)
         };
         // The live table first: the values of the key's chain newest
         // first, the first `live_n` of `live`. They are slices of the
-        // table's arena, which the state holds for the read.
-        let mh = mem_hash_of(fnv);
+        // table's arena, which the state holds for the read. Every table
+        // of a store is made with one shape, so the frozen tables below
+        // take the live one's hash.
+        let mh = mem.hash_with(key, fnv0);
         let mut live = [std::mem::MaybeUninit::<&[u8]>::uninit(); LIVE_SMALL];
         let mut live_n = 0;
         let found = mem
@@ -27936,6 +28022,11 @@ impl Reader {
             }
             live_n = n;
         }
+        let fnv = if late {
+            crate::flatindex::key_hash(key)
+        } else {
+            fnv0
+        };
         let (at, l0) = match placed {
             Some(p) => p,
             None => Reader::place(&self.opts, st, key, fnv)?,
@@ -28064,7 +28155,7 @@ impl Reader {
             return None;
         }
         let fnv = crate::flatindex::key_hash(key);
-        let mh = mem_hash_of(fnv);
+        let mh = mem.hash_with(key, fnv);
         if self.opts.read_lines_ahead {
             for seg in l0 {
                 seg.prefetch_probe(fnv);
@@ -28171,7 +28262,15 @@ impl Reader {
         if self.opts.zpages != ZPages::Off && self.z_on() {
             return None;
         }
-        let fnv = crate::flatindex::key_hash(key);
+        // The key's FNV word, which the partition's read takes, before the
+        // live table only where the table's hash is made from it
+        // (`Options::mem_hash_fold`), so a read the table ends takes none.
+        let folds = mem.folds(key);
+        let fnv0 = if folds {
+            0
+        } else {
+            crate::flatindex::key_hash(key)
+        };
         // The live table over the partition: the key's chain there read
         // once, newest first to its newest tombstone, which masks the
         // partition; then the partition where none does, and the chain's
@@ -28180,13 +28279,18 @@ impl Reader {
         let (n, tomb) = if mem.is_empty() {
             (0, false)
         } else {
-            match mem.get_with(mem_hash_of(fnv), key, self.len_bound.get()) {
+            match mem.get_with(mem.hash_with(key, fnv0), key, self.len_bound.get()) {
                 Some(e) => mem.live_offs_small(e, self.wm(), &mut offs)?,
                 None => (0, false),
             }
         };
         let mut below = 0;
         if !tomb {
+            let fnv = if folds {
+                crate::flatindex::key_hash(key)
+            } else {
+                fnv0
+            };
             let at = if segs.len() == 1 {
                 0
             } else {
@@ -28269,7 +28373,13 @@ impl Reader {
         } else {
             0
         };
-        let mem_h = |k: &[u8]| if once { mem_hash_of(fnv) } else { mem_hash(k) };
+        let mem_h = |k: &[u8]| {
+            if once {
+                mem.hash_with(k, fnv)
+            } else {
+                mem.hash(k)
+            }
+        };
         let hash = if mem_empty {
             0
         } else {
@@ -36362,7 +36472,13 @@ impl Reader {
         } else {
             0
         };
-        let mem_h = |k: &[u8]| if once { mem_hash_of(fnv) } else { mem_hash(k) };
+        let mem_h = |k: &[u8]| {
+            if once {
+                mem.hash_with(k, fnv)
+            } else {
+                mem.hash(k)
+            }
+        };
         let hash = if mem_empty {
             0
         } else {
@@ -37859,10 +37975,10 @@ impl Db {
                         replay_max.extend_from_slice(k);
                     }
                     if kind == WAL_DEL {
-                        mem.delete(mem_hash(k), k, &readers);
+                        mem.delete(mem.hash(k), k, &readers);
                         mem_bytes += k.len() + 16;
                     } else {
-                        mem.append(mem_hash(k), k, v, &readers);
+                        mem.append(mem.hash(k), k, v, &readers);
                         mem_bytes += k.len() + v.len();
                     }
                 },
@@ -38268,8 +38384,8 @@ impl Db {
                 }
                 self.max_key.clear();
                 self.max_key.extend_from_slice(key);
-                self.mem()
-                    .append(mem_hash(key), key, value, &self.shared.readers);
+                let mem = self.mem();
+                mem.append(mem.hash(key), key, value, &self.shared.readers);
                 self.mem_bytes += key.len() + value.len();
                 return;
             }
@@ -38554,8 +38670,8 @@ impl Db {
         }
         for (k, v) in tail {
             self.wal.append(&k, &v);
-            self.mem()
-                .append(mem_hash(&k), &k, &v, &self.shared.readers);
+            let mem = self.mem();
+            mem.append(mem.hash(&k), &k, &v, &self.shared.readers);
             self.mem_bytes += k.len() + v.len();
         }
     }
@@ -57856,6 +57972,7 @@ mod streaming_writes {
                 BlockShape {
                     prefault: false,
                     index_populated: true,
+                    fold_hash: false,
                     mapped: true,
                     pool: None,
                 },
@@ -58225,6 +58342,7 @@ mod threading {
         let dry = super::MemTable::new(super::BlockShape {
             prefault: false,
             index_populated: true,
+            fold_hash: false,
             mapped: true,
             pool: None,
         });
@@ -58238,6 +58356,7 @@ mod threading {
         let mem = super::MemTable::new(super::BlockShape {
             prefault: false,
             index_populated: true,
+            fold_hash: false,
             mapped: true,
             pool: None,
         });
@@ -58275,6 +58394,7 @@ mod put_index {
         MemTable::new(BlockShape {
             prefault: false,
             index_populated: true,
+            fold_hash: false,
             mapped: true,
             pool: None,
         })
@@ -58310,6 +58430,56 @@ mod put_index {
             let ix = m.index().unwrap();
             assert!(ix.slots.len() > first, "the index grew");
             assert_eq!(ix.slots.src.populates(), on, "a grown index");
+        }
+    }
+
+    /// A table that folds (`Options::mem_hash_fold`) hashes a sixteen-byte
+    /// key by the fold and every other key by its FNV word, the same way
+    /// at the writer's entry (`MemTable::hash`) as at a reader's that has
+    /// the word already (`hash_with`), and finds every key it was handed
+    /// both ways, sixteen bytes and not, in one table; one that does not
+    /// fold hashes every key by FNV.
+    #[test]
+    fn a_folding_table_hashes_one_way_at_both_ends() {
+        let rd = Readers::new(false, true);
+        for fold in [true, false] {
+            let m = MemTable::new(BlockShape {
+                prefault: false,
+                index_populated: true,
+                fold_hash: fold,
+                mapped: true,
+                pool: None,
+            });
+            let keys: Vec<Vec<u8>> = (0..3_000u64)
+                .map(|i| {
+                    if i % 3 == 0 {
+                        format!("k{i:06}").into_bytes()
+                    } else {
+                        format!("{i:016}").into_bytes()
+                    }
+                })
+                .collect();
+            for k in &keys {
+                let fnv = crate::flatindex::key_hash(k);
+                assert_eq!(m.hash(k), m.hash_with(k, fnv), "both ends");
+                let folded = fold && k.len() == 16;
+                assert_eq!(m.folds(k), folded);
+                if folded {
+                    assert_eq!(m.hash(k), fold_hash16(k.as_slice().try_into().unwrap()));
+                    assert_ne!(m.hash(k), mem_hash(k), "the fold is not FNV's");
+                } else {
+                    assert_eq!(m.hash(k), mem_hash(k));
+                }
+                m.put(m.hash(k), k, b"v", &rd);
+            }
+            for k in &keys {
+                let fnv = crate::flatindex::key_hash(k);
+                assert!(m.get(k, MemTable::ALL).is_some(), "found by its own hash");
+                assert!(
+                    m.get_with(m.hash_with(k, fnv), k, MemTable::ALL).is_some(),
+                    "found by the reader's"
+                );
+            }
         }
     }
 

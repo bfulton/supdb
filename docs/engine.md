@@ -975,10 +975,41 @@ placed read, which found the partition and asked for its slot and the
 pieces' filters before it probed the live table. Asked first
 (`Options::point_live_first`), the live table ends the read before any
 of that: 598.7 instructions a get it answers, against 676.7 in the same
-binary with the partition placed first (`supdb-heldlivelast`), and 862.1
+binary with the partition placed first, the order before, and 862.1
 and 826.2 a get a piece or the partition answers against 851.1 and
 815.2, the asks for those reads following the live probe instead of
-preceding it.
+preceding it. The rates said nothing at six pairs a sitting -- every
+cell leaned a fifth toward the arm listed second, the load among them,
+which reads nothing -- and the gets timed apart from the commits said
+which way it went (`pair.sh SUPDB_MIX_KINDS=1 supdb-heldnoframes
+supdb-heldlivelast 300000 --reps 12 --passes
+load,read,scan,scan-threaded,mixes,mixes-scrambled`, at `636f613`, the
+arms named as they were then): F's gets read 0.99x and 0.95x of the order
+before, three in five of them ended in the live table, and the scrambled
+mixes' 1.04-1.16x slower in both sittings, a third of theirs or fewer.
+For a read the table does not end, the live probe had been the asks'
+lead, and moving the asks behind it cost more than the instructions it
+saved the others. So the option is off, and its arm is `supdb-livefirst`
+(`supdb-heldlivefirst` under the held log).
+
+The memtable's own hash was the next fixed cost of a read the table
+ends: the key's FNV word, a multiply a byte, and a finish over it, which
+the segments' indexes and filters need and the live table does not. A
+memtable is rebuilt from the log at every open, so its hash is nobody
+else's, and a sixteen-byte key now takes the fold of its two words'
+128-bit product (`Options::mem_hash_fold`, `fold_hash16`), the FNV word
+only where a source below the tables needs it. Linear probing at the
+half load the index grows at reads 1.49-1.50 slots a lookup either way
+over numbered keys, ids and numbered keys a thousand apart. In one build,
+by class as above, a get the live table ends counts 556.5 instructions
+against 609.7 with FNV (`supdb-heldmemfnv`), one answered below the
+tables 6 more, and an update 488.1 against 543.7 (`phase_updates`).
+Paired by kind (`pair.sh SUPDB_MIX_KINDS=1 supdb-heldnoframes
+supdb-heldmemfnv 300000 --reps 12`, same passes), the gets of A, B and F
+read 1.06-1.13x faster with the fold in both sittings bar one at 1.01,
+D's 0.97x in both, and the commits of A, B and F 5-25% faster; by both
+orders' mean the rates of A, B and F read 0.90-0.93x for FNV, the load
+0.93x, D 1.02x, and the scan passes, which hash nothing, 0.99-1.01x.
 
 #### Beside FASTER out of core
 

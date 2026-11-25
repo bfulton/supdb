@@ -1946,11 +1946,15 @@ pub struct Supdb {
     /// off): `supdb-indexzeropage`, and `supdb-heldindexzeropage` under
     /// the held log with no frames.
     indexzeropage: bool,
-    /// The placed read's partition and asks taken before the live
-    /// table's probe, for every read (`Options::point_live_first` off):
-    /// `supdb-livelast`, and `supdb-heldlivelast` under the held log with
-    /// no frames.
-    livelast: bool,
+    /// The placed read's live table asked before its partition is found
+    /// and its lines asked for (`Options::point_live_first` on):
+    /// `supdb-livefirst`, and `supdb-heldlivefirst` under the held log
+    /// with no frames.
+    livefirst: bool,
+    /// Every memtable key hashed by its FNV word and a finish, sixteen
+    /// bytes or not (`Options::mem_hash_fold` off): `supdb-memfnv`, and
+    /// `supdb-heldmemfnv` under the held log with no frames.
+    memfnv: bool,
     /// The upkeep thread's passes batched to this percentage of the
     /// store's keys (`Options::upkeep_batch_pct`) under the held log with
     /// no frames: `supdb-heldbatch1`.
@@ -3209,10 +3213,13 @@ struct Policy {
     /// (`Options::index_populated` off): `supdb-indexzeropage`,
     /// `supdb-heldindexzeropage`.
     indexzeropage: bool,
-    /// The partition before the live table in the placed read
-    /// (`Options::point_live_first` off): `supdb-livelast`,
-    /// `supdb-heldlivelast`.
-    livelast: bool,
+    /// The live table before the partition in the placed read
+    /// (`Options::point_live_first` on): `supdb-livefirst`,
+    /// `supdb-heldlivefirst`.
+    livefirst: bool,
+    /// The memtable's hash taken from FNV for every key
+    /// (`Options::mem_hash_fold` off): `supdb-memfnv`, `supdb-heldmemfnv`.
+    memfnv: bool,
     /// The upkeep's passes batched (`Options::upkeep_batch_pct`):
     /// `supdb-heldbatch1`.
     upkeepbatch: Option<usize>,
@@ -3550,7 +3557,8 @@ impl Default for Policy {
             noframes: false,
             norecordahead: false,
             indexzeropage: false,
-            livelast: false,
+            livefirst: false,
+            memfnv: false,
             upkeepbatch: None,
             defer: false,
             firstfloor: false,
@@ -10259,7 +10267,8 @@ impl Supdb {
             noframes,
             norecordahead,
             indexzeropage,
-            livelast,
+            livefirst,
+            memfnv,
             upkeepbatch,
         } = policy;
         // What the engine ships, so an arm that pins nothing inherits it
@@ -10934,7 +10943,8 @@ impl Supdb {
             held_frames: !noframes,
             point_record_ahead: !norecordahead,
             index_populated: !indexzeropage,
-            point_live_first: !livelast,
+            point_live_first: livefirst,
+            mem_hash_fold: !memfnv,
             ..Default::default()
         };
         let opts = match advice {
@@ -11292,7 +11302,8 @@ impl Supdb {
             noframes,
             norecordahead,
             indexzeropage,
-            livelast,
+            livefirst,
+            memfnv,
             upkeepbatch,
             ord_threads: Default::default(),
         })
@@ -11473,8 +11484,10 @@ impl Engine for Supdb {
                     "supdb-heldnorecordahead"
                 } else if self.indexzeropage {
                     "supdb-heldindexzeropage"
-                } else if self.livelast {
-                    "supdb-heldlivelast"
+                } else if self.livefirst {
+                    "supdb-heldlivefirst"
+                } else if self.memfnv {
+                    "supdb-heldmemfnv"
                 } else if self.upkeepbatch.is_some() {
                     "supdb-heldbatch1"
                 } else if self.noalert {
@@ -11500,8 +11513,11 @@ impl Engine for Supdb {
         if self.indexzeropage {
             return "supdb-indexzeropage";
         }
-        if self.livelast {
-            return "supdb-livelast";
+        if self.livefirst {
+            return "supdb-livefirst";
+        }
+        if self.memfnv {
+            return "supdb-memfnv";
         }
         // The probe's combinations first, which the single fields below
         // would name by one of their parts.
@@ -14899,7 +14915,8 @@ pub fn guarantee(arm: &str) -> Option<Guarantee> {
         | "supdb-advicerandom"
         | "supdb-norecordahead"
         | "supdb-indexzeropage"
-        | "supdb-livelast"
+        | "supdb-livefirst"
+        | "supdb-memfnv"
         | "supdb-nocache"
         | "supdb-nocacheordread"
         | "supdb-nocachezpages"
@@ -15412,7 +15429,8 @@ pub fn guarantee(arm: &str) -> Option<Guarantee> {
         | "supdb-heldnoalert"
         | "supdb-heldinline"
         | "supdb-heldindexzeropage"
-        | "supdb-heldlivelast"
+        | "supdb-heldlivefirst"
+        | "supdb-heldmemfnv"
         | "supdb-heldbatch1"
         | "faster" => Guarantee::Memory,
         _ => return None,
@@ -15843,7 +15861,7 @@ pub fn open(arm: &str, dir: &Path, map_gb: usize) -> Res<Box<dyn Engine>> {
             },
             dir,
         )?,
-        "supdb-heldlivelast" => supdb_arm(
+        "supdb-heldlivefirst" => supdb_arm(
             |d| {
                 Supdb::with_policy(
                     d,
@@ -15852,19 +15870,47 @@ pub fn open(arm: &str, dir: &Path, map_gb: usize) -> Res<Box<dyn Engine>> {
                         durable: false,
                         held: true,
                         noframes: true,
-                        livelast: true,
+                        livefirst: true,
                         ..Policy::default()
                     },
                 )
             },
             dir,
         )?,
-        "supdb-livelast" => supdb_arm(
+        "supdb-heldmemfnv" => supdb_arm(
             |d| {
                 Supdb::with_policy(
                     d,
                     Policy {
-                        livelast: true,
+                        partition: false,
+                        durable: false,
+                        held: true,
+                        noframes: true,
+                        memfnv: true,
+                        ..Policy::default()
+                    },
+                )
+            },
+            dir,
+        )?,
+        "supdb-memfnv" => supdb_arm(
+            |d| {
+                Supdb::with_policy(
+                    d,
+                    Policy {
+                        memfnv: true,
+                        ..Policy::default()
+                    },
+                )
+            },
+            dir,
+        )?,
+        "supdb-livefirst" => supdb_arm(
+            |d| {
+                Supdb::with_policy(
+                    d,
+                    Policy {
+                        livefirst: true,
                         ..Policy::default()
                     },
                 )
@@ -17820,7 +17866,8 @@ mod tests {
             ("supdb-heldnoalert", |a| !a.upkeep_alert),
             ("supdb-heldinline", |a| a.upkeep == supdb::Upkeep::Inline),
             ("supdb-heldindexzeropage", |a| !a.index_populated),
-            ("supdb-heldlivelast", |a| !a.point_live_first),
+            ("supdb-heldlivefirst", |a| a.point_live_first),
+            ("supdb-heldmemfnv", |a| !a.mem_hash_fold),
             ("supdb-heldbatch1", |a| a.upkeep_batch_pct == 1),
         ] {
             let e = open(arm, &root.join(arm), 1).unwrap();
@@ -17845,8 +17892,12 @@ mod tests {
                     indexzeropage: true,
                     ..Policy::default()
                 },
-                "supdb-heldlivelast" => Policy {
-                    livelast: true,
+                "supdb-heldlivefirst" => Policy {
+                    livefirst: true,
+                    ..Policy::default()
+                },
+                "supdb-heldmemfnv" => Policy {
+                    memfnv: true,
                     ..Policy::default()
                 },
                 "supdb-heldbatch1" => Policy {
@@ -17886,21 +17937,32 @@ mod tests {
         assert_eq!(e.name(), "supdb-indexzeropage");
         assert_eq!(guarantee("supdb-indexzeropage"), guarantee("supdb"));
         drop(e);
-        let e = open("supdb-livelast", &root.join("livelast"), 1).unwrap();
-        assert_eq!(e.name(), "supdb-livelast");
-        assert_eq!(guarantee("supdb-livelast"), guarantee("supdb"));
+        let e = open("supdb-livefirst", &root.join("livefirst"), 1).unwrap();
+        assert_eq!(e.name(), "supdb-livefirst");
+        assert_eq!(guarantee("supdb-livefirst"), guarantee("supdb"));
         drop(e);
         let ll = Supdb::with_policy(
-            &root.join("livelast-policy"),
+            &root.join("livefirst-policy"),
             Policy {
-                livelast: true,
+                livefirst: true,
                 ..Policy::default()
             },
         )
         .unwrap();
-        assert_eq!(ll.name(), "supdb-livelast");
-        assert!(!ll.db.as_ref().unwrap().options().point_live_first);
+        assert_eq!(ll.name(), "supdb-livefirst");
+        assert!(ll.db.as_ref().unwrap().options().point_live_first);
         drop(ll);
+        let mf = Supdb::with_policy(
+            &root.join("memfnv-policy"),
+            Policy {
+                memfnv: true,
+                ..Policy::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(mf.name(), "supdb-memfnv");
+        assert!(!mf.db.as_ref().unwrap().options().mem_hash_fold);
+        drop(mf);
         let e = open("supdb", &root.join("livefirst"), 1).unwrap();
         drop((e, nof));
         assert!(
