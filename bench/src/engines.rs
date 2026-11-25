@@ -1409,6 +1409,10 @@ pub struct Supdb {
     /// The rewarm made beside merges in flight, the shape before
     /// (`Options::zpages_rewarm_beside_merges` on): `supdb-zrewarmbeside`.
     zrewarmbeside: bool,
+    /// A merge's asks ahead in one window for every input and over its
+    /// records alone, the shape before (`Options::merge_ahead_shares`
+    /// off): `supdb-cipherautoaheadflat`.
+    aheadflat: bool,
     /// The controller's install makes a rewarm due
     /// (`Options::zpages_rewarm_at_install`): `supdb-zrewarminstall`.
     zrewarminstall: bool,
@@ -2918,6 +2922,9 @@ struct Policy {
     zrewarmwait: bool,
     /// The rewarm beside merges: `supdb-zrewarmbeside`.
     zrewarmbeside: bool,
+    /// A merge's asks in one window, records alone:
+    /// `supdb-cipherautoaheadflat`.
+    aheadflat: bool,
     /// A rewarm at the install: `supdb-zrewarminstall`.
     zrewarminstall: bool,
     /// The fill's resident records first: `supdb-zhotresident`.
@@ -3567,6 +3574,7 @@ impl Default for Policy {
             zhotskewroomhyst: false,
             zrewarmwait: false,
             zrewarmbeside: false,
+            aheadflat: false,
             zrewarminstall: false,
             zhotresident: false,
             settlegated: false,
@@ -4034,6 +4042,36 @@ impl Supdb {
                 cipher: true,
                 cipher_auto: true,
                 cipher_drops_keep: true,
+                ..Policy::default()
+            },
+        )
+    }
+
+    /// `supdb-cipherauto` whose rewarm is made beside merges in flight
+    /// (`Options::zpages_rewarm_beside_merges` on, `Policy::zrewarmbeside`):
+    /// `supdb-cipherautorewarmbeside`.
+    pub fn create_cipherauto_rewarmbeside(path: &Path) -> Res<Supdb> {
+        Supdb::with_policy(
+            path,
+            Policy {
+                cipher: true,
+                cipher_auto: true,
+                zrewarmbeside: true,
+                ..Policy::default()
+            },
+        )
+    }
+
+    /// `supdb-cipherauto` with its merges asking ahead in one window for
+    /// every input and over their records alone (`Policy::aheadflat`,
+    /// `Options::merge_ahead_shares` off): `supdb-cipherautoaheadflat`.
+    pub fn create_cipherauto_aheadflat(path: &Path) -> Res<Supdb> {
+        Supdb::with_policy(
+            path,
+            Policy {
+                cipher: true,
+                cipher_auto: true,
+                aheadflat: true,
                 ..Policy::default()
             },
         )
@@ -10605,6 +10643,7 @@ impl Supdb {
             zhotskewroomhyst,
             zrewarmwait,
             zrewarmbeside,
+            aheadflat,
             zrewarminstall,
             zhotresident,
             settlegated,
@@ -11247,6 +11286,7 @@ impl Supdb {
             zpages_hot_skew_room: zhotskewroom || zhotskewroomhyst,
             zpages_hot_room_margin_pct: if zhotskewroomhyst { 5 } else { 0 },
             zpages_rewarm_beside_merges: zrewarmbeside,
+            merge_ahead_shares: !aheadflat,
             zpages_rewarm_at_install: zrewarminstall,
             zpages_hot_fill_resident_first: zhotresident,
             forms_settle_past_llc: settlegated,
@@ -11686,6 +11726,7 @@ impl Supdb {
             zhotskewroomhyst,
             zrewarmwait,
             zrewarmbeside,
+            aheadflat,
             zrewarminstall,
             zhotresident,
             settlegated,
@@ -11998,6 +12039,8 @@ impl Engine for Supdb {
                     "supdb-cipherautomergestream"
                 }
                 true if self.cipher_auto && self.cipher_drops_keep => "supdb-cipherautodropskeep",
+                true if self.cipher_auto && self.zrewarmbeside => "supdb-cipherautorewarmbeside",
+                true if self.cipher_auto && self.aheadflat => "supdb-cipherautoaheadflat",
                 true if self.cipher_auto => "supdb-cipherauto",
                 false if self.cipher_auto => "supdb-ingestcipherauto",
                 true if self.cipher_cache != 0 => "supdb-cipher64",
@@ -15869,6 +15912,8 @@ pub fn guarantee(arm: &str) -> Option<Guarantee> {
         | "supdb-cipherautomergeapart"
         | "supdb-cipherautomergestream"
         | "supdb-cipherautodropskeep"
+        | "supdb-cipherautorewarmbeside"
+        | "supdb-cipherautoaheadflat"
         | "supdb-cipherzpages"
         | "supdb-cipherzstride"
         | "supdb-cipherzstrideapart"
@@ -16514,6 +16559,8 @@ pub fn open(arm: &str, dir: &Path, map_gb: usize) -> Res<Box<dyn Engine>> {
         "supdb-cipherautomergeapart" => supdb_arm(Supdb::create_cipherauto_mergeapart, dir)?,
         "supdb-cipherautomergestream" => supdb_arm(Supdb::create_cipherauto_mergestream, dir)?,
         "supdb-cipherautodropskeep" => supdb_arm(Supdb::create_cipherauto_dropskeep, dir)?,
+        "supdb-cipherautorewarmbeside" => supdb_arm(Supdb::create_cipherauto_rewarmbeside, dir)?,
+        "supdb-cipherautoaheadflat" => supdb_arm(Supdb::create_cipherauto_aheadflat, dir)?,
         "supdb-cipherzpages" => supdb_arm(Supdb::create_cipher_zpages, dir)?,
         "supdb-cipherzstride" => supdb_arm(Supdb::create_cipher_zstride, dir)?,
         "supdb-cipherzstrideapart" => supdb_arm(Supdb::create_cipher_zstride_apart, dir)?,
@@ -19647,6 +19694,42 @@ mod tests {
             guarantee("supdb-cipher")
         );
         drop(keep);
+        let beside = arm(
+            "supdb-cipherautorewarmbeside",
+            Supdb::create_cipherauto_rewarmbeside,
+        );
+        assert!(
+            under(&beside),
+            "supdb-cipherautorewarmbeside: under a cipher"
+        );
+        let b = o(&beside);
+        assert!(b.zpages_under_cipher, "supdb-cipherautorewarmbeside");
+        assert!(
+            !z.zpages_rewarm_beside_merges && b.zpages_rewarm_beside_merges,
+            "supdb-cipherautorewarmbeside rewarms beside merges in flight"
+        );
+        assert_eq!(b.zpages_rewarm_quiet_ms, z.zpages_rewarm_quiet_ms);
+        assert_eq!(
+            guarantee("supdb-cipherautorewarmbeside"),
+            guarantee("supdb-cipher")
+        );
+        drop(beside);
+        let flat = arm(
+            "supdb-cipherautoaheadflat",
+            Supdb::create_cipherauto_aheadflat,
+        );
+        assert!(under(&flat), "supdb-cipherautoaheadflat: under a cipher");
+        let f = o(&flat);
+        assert!(
+            z.merge_ahead_shares && !f.merge_ahead_shares,
+            "supdb-cipherautoaheadflat asks its merges' windows whole"
+        );
+        assert_eq!(f.merge_read_ahead_cipher, z.merge_read_ahead_cipher);
+        assert_eq!(
+            guarantee("supdb-cipherautoaheadflat"),
+            guarantee("supdb-cipher")
+        );
+        drop(flat);
         drop((plain, cipher, log, auto, zblock, zstride));
         let _ = std::fs::remove_dir_all(&root);
     }

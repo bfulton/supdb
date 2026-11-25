@@ -1089,6 +1089,30 @@ until the run is its own log). What it loses:
   2 --ops-div 10` at `068aca1`), still loses: the full rewrite's pass
   0.84-0.93x of the shipped store and the ten-percent pass 0.80-0.82x
   in both sittings, the loads level.
+  Against encrypted RocksDB at `9e7ae54` (the command in the item above,
+  `--passes load,read,scan,lag --reps 2`, four pairs) the pass read
+  0.87-0.96x, every other cell of the pairing ahead or level: the reads
+  4-4.9x, the scans 13-14x, the three lighter lag passes 1.9-2.8x, every
+  burst 1.3-1.4x. Its scans waited 2.3-2.5 ms a read against RocksDB's
+  62-66 µs, behind the burst's merges still writing at the device. The
+  rewarm beside those merges (`supdb-cipherautorewarmbeside`) read the pass
+  level or behind in four pairs, asking for the form files of partitions
+  the merges then replaced and nothing for their outputs: refuted. The
+  merges' asks laid to their inputs' regions (`CLAUDE.md`, a merge's asks)
+  took the faults from 36,000 a burst to 530 and the pass to twice
+  RocksDB's in four reps of six; in the other two the burst landed fewer
+  merges and left the debt to the pass. Two things hold the merges now,
+  by their threads' kernel stacks sampled every 5 ms through the burst: a
+  merge's thread runs three fifths of its wall and waits for the device a
+  fifth, on the reads its asks have in flight; and the segment work's
+  thread spends 3.9 s of a 25 s burst in the filesystem's discard of the
+  inputs a landing retires (`ext4_free_blocks` under `evict`), landing and
+  planning nothing meanwhile. The levers left: the retired inputs' unlink
+  taken off the thread every landing goes through, as a retired form
+  file's is (renamed to a dead name, `Maint::spares`), which the plain
+  store's segment work pays too and so is priced on both; and a merge's
+  CPU under a cipher, 342 ms against the plain store's 196 for the same
+  input. The pass is then to be paired against encrypted RocksDB again.
 - [ ] **The builds ahead's last cold partition under a cipher.** At five
   million keys under 640 MiB with the builds ahead started at a quarter
   of the store's cache, one or two partitions are still found cold in

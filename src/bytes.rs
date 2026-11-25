@@ -205,6 +205,14 @@ pub trait Bytes {
     /// no-op wherever `advise_random` is one.
     fn advise_normal(&self) {}
 
+    /// The kernel's default advice for a source just opened, where the
+    /// source's own default is another: nothing for a mapped file, whose
+    /// mapping has the default already, and `advise_normal` for a paged
+    /// mapping, whose envelope opens advised for reads far apart. What a
+    /// reader that advises random only in a phase of point reads gives a
+    /// source it opens in any other phase.
+    fn advise_default(&self) {}
+
     /// Whether the page holding `off` is in the page cache now (`mincore`),
     /// `None` where the source cannot say: a mapping with no page cache
     /// behind it, or no mapping at all. The one question a reader asks
@@ -752,6 +760,11 @@ impl Bytes for MmapBytes {
                 let _ = m.advise(memmap2::Advice::Normal);
             }
             Own::Paged(p) => p.advise(false),
+        }
+    }
+    fn advise_default(&self) {
+        if let Own::Paged(p) = &self.own {
+            p.advise(false);
         }
     }
     #[cfg(target_os = "linux")]

@@ -473,7 +473,12 @@ its merges asking nothing ahead of their walks of their inputs
 inputs beside the store's cache (`StoreCipher::merges_beside_cache`), and
 `supdb-cipherautodropskeep` the same with a drop of a file's pages leaving
 the plaintext it covers in the store's cache
-(`StoreCipher::drops_keep_plaintext`), the shape before. And
+(`StoreCipher::drops_keep_plaintext`), the shape before, and
+`supdb-cipherautorewarmbeside` the same with its rewarm made beside the
+merges in flight (`Options::zpages_rewarm_beside_merges`), and
+`supdb-cipherautoaheadflat` the same with its merges asking ahead in one
+window for every input and over their records alone
+(`Options::merge_ahead_shares` off), the shape before. And
 two that force the compact form
 there, each coding priced by itself: `supdb-cipherzpages`, every
 partition's form file in the block coding, and `supdb-cipherzstride`,

@@ -1655,6 +1655,22 @@ pub struct Options {
     /// 39 pieces. Zero asks nothing; `supdb-cipherautomergeapart` is the
     /// shape before.
     pub merge_read_ahead_cipher: usize,
+    /// A merge's asks ahead (`merge_read_ahead`, `merge_read_ahead_cipher`)
+    /// by each input's share of the walk and over its directory as well as
+    /// its records (`MergeAhead`). The walk takes the inputs in key order,
+    /// so each moves at its share of the merge's pace, and one window for
+    /// every input asked a piece of a twentieth of the merge whole at its
+    /// first rank, read over the whole merge: under a bound its pages were
+    /// reclaimed before the walk came to them. And the directory the walk
+    /// places each record by was asked by nobody, which over a store under
+    /// a cipher, whose envelopes are advised for reads far apart, was a
+    /// fault a page: at ten million keys under 1.25 GiB the full rewrite's
+    /// merges took 23,000 major faults on their partitions' directories
+    /// and 14,000 on their pieces' records, against 530 in all with both
+    /// asked. False is the shape before, one window for every input and
+    /// the records alone: `supdb-cipherautoaheadflat`.
+    #[doc(hidden)]
+    pub merge_ahead_shares: bool,
     /// A merge's writer syncs its output behind it every this many bytes
     /// (`SegmentOptions::sync_ahead` for the merge's writers alone), zero
     /// for the segment's own. The writer's hint moves a piece to the
@@ -7678,6 +7694,7 @@ impl Default for Options {
             merge_drop_chunk: 2 << 20,
             merge_read_ahead: 0,
             merge_read_ahead_cipher: MERGE_AHEAD_WINDOW,
+            merge_ahead_shares: true,
             merge_sync_ahead: 0,
             background_io: BackgroundIo::Normal,
             seal_sync_every: 0,
@@ -15136,6 +15153,19 @@ impl Seg {
         .map_err(|e| err(&format!("segment {name}: {e}")))?;
         if random {
             blob.advise_random();
+        } else {
+            // A plain segment opened outside a phase of point reads keeps
+            // the kernel's default advice, which reads around a fault; a
+            // paged mapping's envelope is opened advised for reads far
+            // apart (`pager::Back::open`), so it is given the default here
+            // (`Bytes::advise_default`, nothing for a mapped file), as
+            // `Db::advise` gives it every segment at a switch, and kept for
+            // the envelope where a seal's segment lands readable before it
+            // has one (`pager::Paged::advise`). Left random, a segment
+            // landed in a phase of long scans was read a page a fault where
+            // the plain store's was read a window a fault, until the next
+            // switch.
+            blob.advise_default();
         }
         let data = blob
             .payload_bytes()
@@ -20072,6 +20102,9 @@ struct MergePlan {
     /// The window the second pass asks ahead of its walk of each input
     /// (`Options::merge_read_ahead`); zero asks nothing.
     read_ahead: usize,
+    /// The window split by the inputs' shares and the directories asked
+    /// (`Options::merge_ahead_shares`).
+    ahead_shares: bool,
     /// Each input's key kept across the steps it does not advance in
     /// (`Options::merge_walk_cached`).
     walk_cached: bool,
@@ -20095,34 +20128,80 @@ struct MergePlan {
 const AHEAD_EVERY: usize = 64;
 
 struct MergeAhead {
-    window: u64,
-    asked_to: Vec<u64>,
-    end: Vec<u64>,
+    /// Each input's two regions the walk reads in rank order, the records
+    /// and the directory that places them, by their frontier of asked
+    /// bytes, where the region ends and the window it is asked by.
+    recs: Vec<AheadRegion>,
+    dirs: Vec<AheadRegion>,
+    /// Each input's ranks, for the place in its directory a rank stands at.
+    ranks: Vec<u64>,
     asks: u64,
     bytes: u64,
     counts: Option<std::sync::Arc<Shared>>,
+}
+
+/// One region of one input a merge's walk reads in order
+/// (`MergeAhead`): from where its asks have reached to its end, a window
+/// at a time.
+#[derive(Clone, Copy)]
+struct AheadRegion {
+    at: u64,
+    asked_to: u64,
+    end: u64,
+    window: u64,
 }
 
 impl MergeAhead {
     fn new(
         blobs: &[&Blob<MmapBytes>],
         window: usize,
+        shares: bool,
         counts: Option<std::sync::Arc<Shared>>,
     ) -> Option<MergeAhead> {
         if window == 0 {
             return None;
         }
-        let spans: Vec<(u64, u64)> = blobs
+        let place = |p: Option<(u64, usize)>| p.map_or((0, 0), |(at, len)| (at, len as u64));
+        let recs: Vec<(u64, u64)> = blobs
+            .iter()
+            .map(|b| place(b.record_region_place()))
+            .collect();
+        // The shape before: one window for every input, and no directory.
+        let dirs: Vec<(u64, u64)> = blobs
             .iter()
             .map(|b| {
-                b.record_region_place()
-                    .map_or((0, 0), |(at, len)| (at, at.saturating_add(len as u64)))
+                if shares {
+                    place(b.record_dir_place())
+                } else {
+                    (0, 0)
+                }
             })
             .collect();
+        // A window in proportion to the input's share of the records the
+        // walk reads: the walk takes the inputs in key order, so each moves
+        // at its share of the merge's pace, and a window of the same bytes
+        // for every input asked a piece of a twentieth of the merge whole at
+        // its first rank, to be read over the merge's whole length; under a
+        // bound its pages were reclaimed before the walk came to them. Never
+        // under the piece the kernel reads whole at an ask.
+        let total = recs.iter().map(|r| r.1).sum::<u64>().max(1);
+        let floor = crate::bytes::WILLNEED_PIECE as u64;
+        let share = |len: u64| {
+            if !shares {
+                return window as u64;
+            }
+            ((window as u128 * len as u128 / total as u128) as u64).max(floor)
+        };
+        let region = |(at, len): (u64, u64)| AheadRegion {
+            at,
+            asked_to: at,
+            end: at.saturating_add(len),
+            window: share(len),
+        };
         Some(MergeAhead {
-            window: window as u64,
-            asked_to: spans.iter().map(|s| s.0).collect(),
-            end: spans.iter().map(|s| s.1).collect(),
+            recs: recs.iter().copied().map(region).collect(),
+            dirs: dirs.iter().copied().map(region).collect(),
+            ranks: blobs.iter().map(|b| b.keys() as u64).collect(),
             asks: 0,
             bytes: 0,
             counts,
@@ -20134,20 +20213,34 @@ impl MergeAhead {
     /// turn, the next window is asked half a window before the frontier,
     /// and a record's offset is a look into the input's directory, which
     /// under a cipher is an ask by the piece -- made at every step, it was
-    /// a twenty-eighth of a merge's CPU there.
+    /// a twenty-eighth of a merge's CPU there. The directory is read in
+    /// rank order beside the records, its place for a rank its share of
+    /// the directory's bytes.
     fn at(&mut self, blobs: &[&Blob<MmapBytes>], i: usize, rank: usize) {
         if !rank.is_multiple_of(AHEAD_EVERY) {
             return;
         }
-        let Some(off) = blobs[i].record_offset(rank) else {
+        let d = self.dirs[i];
+        if d.end > d.at {
+            let n = self.ranks[i].max(1);
+            let off = d.at + ((d.end - d.at) as u128 * rank as u128 / n as u128) as u64;
+            self.ask(blobs, i, false, off);
+        }
+        if let Some(off) = blobs[i].record_offset(rank) {
+            self.ask(blobs, i, true, off);
+        }
+    }
+
+    fn ask(&mut self, blobs: &[&Blob<MmapBytes>], i: usize, recs: bool, off: u64) {
+        let r = if recs {
+            &mut self.recs[i]
+        } else {
+            &mut self.dirs[i]
+        };
+        let Some((from, to)) = crate::blob::ahead_span(r.asked_to, r.end, off, r.window) else {
             return;
         };
-        let Some((from, to)) =
-            crate::blob::ahead_span(self.asked_to[i], self.end[i], off, self.window)
-        else {
-            return;
-        };
-        self.asked_to[i] = to;
+        r.asked_to = to;
         let n = blobs[i].willneed_at(from, (to - from) as usize);
         if n > 0 {
             self.asks += 1;
@@ -20873,9 +20966,15 @@ impl<R: MergeRest> Emitter<'_, R> {
             self.rest.unheld(|| vault::persist_one(dir, name))?;
             self.out.push(p.name.clone());
             // Its form file, from the pages just written, while the merge
-            // goes on to the next output.
+            // goes on to the next output. The wait for a builder's slot is
+            // a wait that reads none of the merge's inputs, as the write
+            // above is: the builds it waits for read through the cache and
+            // breathe at their rests until the evictor gives back, and the
+            // evictor waits for every hold, so under the merge's hold the
+            // three waited on each other and the cache filled to the bound.
             if let Some(z) = &self.zfinish {
-                z.build(&p.name);
+                let name = p.name.as_str();
+                self.rest.unheld(|| z.build(name));
             }
             self.pi += 1;
         }
@@ -20942,6 +21041,7 @@ fn compact_run<R: MergeRest>(plan: MergePlan, rest: R) -> Result<Vec<String>> {
         drop_chunk,
         walk_cached,
         read_ahead,
+        ahead_shares,
         verify_inputs,
         zfinish,
     } = plan;
@@ -21120,7 +21220,7 @@ fn compact_run<R: MergeRest>(plan: MergePlan, rest: R) -> Result<Vec<String>> {
         dropped_bytes += to - dropped_to[i];
         dropped_to[i] = to;
     };
-    let mut ahead = MergeAhead::new(&blobs, read_ahead, counts.clone());
+    let mut ahead = MergeAhead::new(&blobs, read_ahead, ahead_shares, counts.clone());
     if cursors {
         merge_ranks(&blobs, walk_cached, rest, |k, tied| {
             let mut start = 0usize;
@@ -21237,6 +21337,9 @@ struct TierPlan {
     /// The window the second pass asks ahead of its walk
     /// (`Options::merge_read_ahead`), and where its asks are counted.
     read_ahead: usize,
+    /// The window split by the inputs' shares and the directories asked
+    /// (`Options::merge_ahead_shares`).
+    ahead_shares: bool,
     counts: Option<std::sync::Arc<Shared>>,
     /// The builds at each output's finish (`Options::zpages_build_at_finish`).
     zfinish: Option<std::sync::Arc<ZFinish>>,
@@ -21324,6 +21427,7 @@ fn tier_walk<R: MergeRest>(plan: TierPlan, rest: R) -> Result<Vec<String>> {
         walk_cached,
         verify_inputs,
         read_ahead,
+        ahead_shares,
         counts,
         zfinish,
     } = plan;
@@ -21379,7 +21483,7 @@ fn tier_walk<R: MergeRest>(plan: TierPlan, rest: R) -> Result<Vec<String>> {
         syncs: 0,
         helpers: 0,
     };
-    let mut ahead = MergeAhead::new(&blobs, read_ahead, counts.clone());
+    let mut ahead = MergeAhead::new(&blobs, read_ahead, ahead_shares, counts.clone());
     merge_ranks(&blobs, walk_cached, rest, |k, tied| {
         let mut start = 0usize;
         let mut live = 0u64;
@@ -21472,15 +21576,30 @@ fn thread_majflt() -> u64 {
         .unwrap_or(0)
 }
 
+/// The thread's wait for a core so far, nanoseconds, the second field of
+/// `/proc/thread-self/schedstat`; for the merge trace's `mergejob` line
+/// alone, where a merge's wall less its CPU and this wait is the time it
+/// was blocked.
+// The door (tests/data/door.txt): a /proc read for a trace (G3: Memory).
+#[allow(clippy::disallowed_methods)]
+fn thread_runq() -> u64 {
+    std::fs::read_to_string("/proc/thread-self/schedstat")
+        .ok()
+        .and_then(|s| s.split_whitespace().nth(1)?.parse().ok())
+        .unwrap_or(0)
+}
+
 /// A merge job's own account under `SUPDB_MERGE_TRACE`: at each step the
 /// wall since the job began, the thread's CPU and its major faults, so a
-/// merge's time is read as its work or its waits on the device. Off, a
-/// branch a step.
+/// merge's time is read as its work or its waits on the device, and at its
+/// end the thread's wait for a core, which tells a merge short of a core
+/// from one blocked on something. Off, a branch a step.
 struct MergeSteps {
     on: bool,
     t0: std::time::Instant,
     cpu0: u64,
     flt0: u64,
+    runq0: u64,
     out: String,
 }
 
@@ -21493,6 +21612,7 @@ impl MergeSteps {
             t0: std::time::Instant::now(),
             cpu0: if on { thread_cpu_ns() } else { 0 },
             flt0: if on { thread_majflt() } else { 0 },
+            runq0: if on { thread_runq() } else { 0 },
             out: String::new(),
         }
     }
@@ -21514,10 +21634,11 @@ impl MergeSteps {
     fn print(&self, what: &str, keys: usize, bytes_in: u64) {
         if self.on {
             eprintln!(
-                "mergejob t={:.6} {what} keys {keys} mb_in {:.1} wall/cpu/majflt{}",
+                "mergejob t={:.6} {what} keys {keys} mb_in {:.1} wall/cpu/majflt{} runq_ms {:.1}",
                 mono_secs(),
                 bytes_in as f64 / (1u64 << 20) as f64,
-                self.out
+                self.out,
+                thread_runq().saturating_sub(self.runq0) as f64 / 1e6
             );
         }
     }
@@ -31963,7 +32084,11 @@ impl Reader {
         let mut last: Vec<u8> = Vec::new();
         loop {
             let want = (limit - seen).min(SCAN_REST);
-            let n = self.scan_body(&next, want, |k, v| {
+            // Each walk advised by the scan's whole span, as the scan in
+            // one walk is: by its own, a walk of `SCAN_REST` keys, a scan of
+            // the whole store read random under a cipher where the plain
+            // store's read ahead.
+            let n = self.scan_body(&next, want, limit, |k, v| {
                 if last.as_slice() != k {
                     last.clear();
                     last.extend_from_slice(k);
@@ -31993,18 +32118,20 @@ impl Reader {
         if self.zcensus_begin(true) && limit > SCAN_REST {
             return self.scan_rested(from, limit, f);
         }
-        self.scan_body(from, limit, f)
+        self.scan_body(from, limit, limit, f)
     }
 
-    /// A scan's walk, inside the operation `scan` entered.
+    /// A scan's walk, inside the operation `scan` entered: `limit` keys of
+    /// a scan of `span`, by which the mappings are advised.
     #[inline(always)]
     fn scan_body<F: FnMut(&[u8], &[u8])>(
         &self,
         from: &[u8],
         limit: usize,
+        span: usize,
         mut f: F,
     ) -> Result<usize> {
-        self.advise(!self.scan_wants_readahead(limit));
+        self.advise(!self.scan_wants_readahead(span));
         // `Prefetch` never changes mode, so `advise` above is a no-op for it.
         // Instead the segments are told exactly which value bytes this scan
         // will walk, before it walks them. Errors are dropped: a plan that
@@ -56695,6 +56822,7 @@ impl Maint {
             walk_cached: self.opts.merge_walk_cached,
             verify_inputs: self.opts.merge_verifies_inputs,
             read_ahead: self.merge_window(),
+            ahead_shares: self.opts.merge_ahead_shares,
             counts: Some(self.shared.clone()),
             zfinish: self.z_finish_plan_repicked(),
         };
@@ -63740,6 +63868,7 @@ impl Maint {
         let walk_cached = self.opts.merge_walk_cached;
         let verify_inputs = self.opts.merge_verifies_inputs;
         let read_ahead = self.merge_window();
+        let ahead_shares = self.opts.merge_ahead_shares;
         let zfinish = self.z_finish_plan_repicked();
         let job_inputs = inputs.clone();
         let kept_fences = fences.clone();
@@ -63772,6 +63901,7 @@ impl Maint {
                 drop_chunk,
                 walk_cached,
                 read_ahead,
+                ahead_shares,
                 verify_inputs,
                 zfinish,
             });

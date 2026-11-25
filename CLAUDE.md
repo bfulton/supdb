@@ -3109,6 +3109,37 @@ again over the next sitting's lines before the figure it explains is
 left as the machine's; and a guard that protects a reader for a window
 its test cannot open is held where the guard is, by its own state.
 
+It came again one line after that write. Where an output is
+finished a merge starts its form file's build as well (`ZFinish::build`),
+and where every builder's slot was taken it parked for one under its
+hold: the builds it waited for read through the cache and breathe at
+their rests until the evictor gives back, and the evictor waited for the
+merge's hold, so each breath ended into the next and the cache filled
+behind them. At ten million keys under 1.25 GiB it killed the lag
+sweep's full rewrite in four sweeps of five once the merges' asks covered
+their directories (`Options::merge_ahead_shares`) and they finished
+outputs with the slot still taken: the cache's trace went silent three
+seconds before the kill, the group's shared memory rising from 838 to
+994 MB beside 271 of the process's own, and every thread's stacks at the
+limit (`scripts/stallwatch.py` at `--within 200`; at 60 it never fired,
+the unreclaimable memory crossing that line a tenth of a second before
+the kill) had the evictor in `Pager::give`, two merges and both builders
+breathing at their rests and one merge parked in `ZFinish::build` under
+`Emitter::leave`. The slot's wait runs unheld now, with the envelope's
+write; `a_merge_waiting_for_a_build_slot_holds_nothing_of_a_ciphers_cache`
+holds a build at its start under one builder, so that a merge of more
+outputs than one waits at its second for the slot, and reads every key
+of the store through a handle several times the cache over: with the
+wait under the hold the cache gives back nothing and stands at fourteen
+times its budget. Its first version read the store by scans, which a
+block copy in the process's memory answers without the cache, and in
+four runs of thirteen read too little to be a test. The rule is the one
+above at its next site: a wait added beside a wait already unheld is
+held to the same rule in the same change, since the two are one place in
+the walk; and a kill whose cache trace goes silent is read for its
+threads' stacks with a threshold the memory crosses early, not one the
+kill crosses first.
+
 It came again as a read, over keys the roster had not run under a
 cipher. At five million ids under 640 MiB (`bench ab --arms
 supdb-cipherauto,supdb-cipher --size 5000000 --bound 671088640 --keys ids
@@ -3366,6 +3397,48 @@ the cache holds when they begin; a structure's count of its own work is
 held to the distinct work it was asked for before its rate is read; and
 a knob one mode reads lives in that mode's builder, since a field of
 `Options` is in every store's layout and the count reads the layout.
+
+**A merge's asks, laid to the regions its walk reads.** With the drop
+and the stream settled, the pass after the full rewrite at ten million
+keys under 1.25 GiB read 0.87-0.96x of encrypted RocksDB's in four pairs
+of four, every other cell of the pairing ahead, and what was left of it
+was the burst's merges still running inside it, their device traffic
+2.3 ms a read on the scanning thread against RocksDB's 62 µs. Every major
+fault of the burst laid to its file and its offset, beside each input's
+regions printed at the merge's open (a scratch line, taken out), put
+23,000 of the merges' 36,000 on their partitions' directories, every page
+of every directory once, and most of the rest on their pieces' records
+past the first megabyte. A plain merge maps each input afresh, at the
+kernel's default, and reads around every fault in any phase; a merge
+under a cipher reads through the one view every reader of the file
+shares, advised random, so it had only its own asks, and those covered
+the records alone, in one window for every input: a piece of a twentieth
+of the merge was asked whole at its first rank and read over the whole
+merge, its pages reclaimed meanwhile. A sweep of the window's size, one,
+four and sixteen mebibytes, moved the faults by less than two runs of one
+size apart, which is what said neither in-flight asks nor eviction alone
+was it. The asks follow each input's share of the walk now and cover its
+directory, placed by the rank's share of it (`Options::merge_ahead_shares`,
+`MergeAhead`; `supdb-cipherautoaheadflat` is the shape before), by two
+pairings (`BIN=$PWD/target-enc/release/bench sh scripts/pair.sh
+SUPDB_LAG_COUNTERS=1 SUPDB_MERGE_TRACE=1 SUPDB_LAG_MARK=1 supdb-cipherauto
+supdb-cipherautoaheadflat 10000000 --bound 1342177280 --passes load,lag
+--reps 3 --ops-div 10`, in `bench/`, at `MERGEAHEAD_COMMIT`): 530 major
+faults over the burst, 70-80 merges landed in it where 55-69 had, 31-50
+pieces at the pass where 61-75 stood, and the pass 520-842 thousand
+entries a second in four reps of six, about twice RocksDB's; in the other
+two the burst landed 60-62 merges and the pass read 258-298 thousand.
+The clean store's pass leaned a tenth the other way in nine pairs of
+twelve, and the same arm paired against itself read that pass up to a
+fifth apart in five pairs of six, so it is unresolved. The first faster
+merges also met the wait the entry on a hold's waits names next, a merge
+parked for a build's slot under its hold, which killed four sweeps of five
+until it was unheld. The rules: a merge's faults are laid to its inputs'
+regions before its asks are tuned, since a window that is too small or too
+early reads the same in a total; an ask is sized by the input's share of
+the walk it serves, and covers every region the walk reads in order; and
+where a mode puts a shared view in place of a reader's own mapping, the
+reader's read-ahead is the mode's to supply.
 
 The rules: a second way to hold the same bytes is priced on the first
 operation of every pass as well as on its rate, since a mapping's first
@@ -10381,6 +10454,40 @@ in a later state checks every claim it finds there against what it
 holds, since a drop made in one state cannot reach the next; and an
 invariant a reader leans on is asserted where it is published, not only
 at a write that a stale form need never meet.
+
+**A default the plain store has by its mapping, which a mode's shared
+view had by nobody.** The plain store's segments are advised random in a
+phase of point reads and short scans and keep the kernel's default
+otherwise (`ReadAdvice::Adaptive`), and a segment opened mid-phase is
+advised random where the phase is and left alone where it is not, the
+default being what a plain mapping has. An envelope opens advised random
+(`pager::Back::open`), so under a cipher a segment opened in a phase of
+long scans stayed random until the next switch, and a seal's segment,
+which lands readable before it has an envelope, had none for the switch
+to reach; and a long scan under a cipher is walked a thousand keys at a
+time so that it can rest (`Reader::scan_rested`), each walk advised by
+its own span, so a scan of the whole store was advised random. The
+segment's open gives a paged view the default (`Seg::open_full`), the
+view keeps an advice for an envelope it has not yet (`pager::Paged::advise`),
+and each walk of a rested scan is advised by the scan's span
+(`Reader::scan_body`); a test reads the kernel's flag on the envelopes
+across a point read, a long scan, a seal and a point read again, and the
+pager's unit test holds the advice kept for an envelope to come, which
+the store test reached only by a race. None of the suite's scans reaches
+any of it, at a hundred entries a scan. It was first written down as the
+cause of the merges' faults in the lag sweep's full rewrite, and a trace
+of that sweep then showed the store advised random throughout in both
+stores: a plain merge maps each input afresh, at the kernel's default,
+where a merge under a cipher reads through the one view every reader of
+the file shares, so the plain merge reads around its faults in any phase
+and the one under a cipher has only its own asks, which did not cover the
+directory it places its records by (`Options::merge_ahead_shares`). The
+rules: where a mode replaces mappings each reader makes for itself by one
+view all of them share, each reader's default is read for what the shared
+view gives it, since the view has the advice of whoever set it last; a
+decision by an operation's length is made on the operation and not on the
+piece a mode walks it in; and a fix written on a reading is held to a
+trace of the state it is for before its comment names what it fixed.
 
 ## Standing limitations
 

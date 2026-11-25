@@ -1222,6 +1222,12 @@ pub(crate) struct Paged {
     /// of what drops gave back (`PagerCounts::dropped_units`).
     dropping: Box<[AtomicBool]>,
     back: OnceLock<Back>,
+    /// The view advised for reads in order (`Paging::advise` with `random`
+    /// false), which its envelope is given where it has one and when it
+    /// comes where it has not: an envelope opens advised for reads far
+    /// apart (`Back::open`), and a segment a seal lands readable is a
+    /// memory file when its open advises it (`db::Seg::open_full`).
+    around: AtomicBool,
     /// What the file is called, for an error.
     label: String,
     /// A file the store can make again, a form file (`zpg-<..>.zpg`, kept as
@@ -1379,6 +1385,7 @@ impl Paged {
                 .map(|_| AtomicBool::new(false))
                 .collect(),
             back: OnceLock::new(),
+            around: AtomicBool::new(false),
             label: label.to_string(),
             regenerable: label.ends_with(".zpg") || label.ends_with(".z"),
             present: AtomicUsize::new(if first == EMPTY { 0 } else { chunks }),
@@ -1479,12 +1486,31 @@ impl Paged {
         if self.back.set(back).is_ok() {
             self.pager.unbacked.fetch_sub(self.len, Ordering::Relaxed);
         }
+        // The advice the view was given before it had an envelope. Read
+        // after the set, as `advise` writes the word before it reads the
+        // envelope, so one of the two applies it.
+        if self.around.load(Ordering::SeqCst) {
+            self.advise_back(false);
+        }
         self.pager.nudge();
         Ok(())
     }
 
     pub(crate) fn backed(&self) -> bool {
         self.back.get().is_some()
+    }
+
+    /// The kernel told how the envelope is read, where the file has one:
+    /// far apart, or in order, when the kernel's own read-ahead brings the
+    /// next chunks' ciphertext in beside the one asked for.
+    fn advise_back(&self, random: bool) {
+        if let Some(b) = self.back.get() {
+            let _ = b.map.advise(if random {
+                memmap2::Advice::Random
+            } else {
+                memmap2::Advice::Normal
+            });
+        }
     }
 
     fn chunk_len(&self, c: usize) -> usize {
@@ -2033,17 +2059,11 @@ impl Paging for Paged {
     }
 
     /// The kernel told how the envelope is read, which is where a chunk
-    /// that is not present comes from: far apart, or in order, when the
-    /// kernel's own read-ahead brings the next chunks' ciphertext in
-    /// beside the one asked for.
+    /// that is not present comes from (`Paged::advise_back`), and the
+    /// advice kept for an envelope the file has not yet.
     fn advise(&self, random: bool) {
-        if let Some(b) = self.back.get() {
-            let _ = b.map.advise(if random {
-                memmap2::Advice::Random
-            } else {
-                memmap2::Advice::Normal
-            });
-        }
+        self.around.store(!random, Ordering::SeqCst);
+        self.advise_back(random);
     }
 
     /// The chunks of the range a read would not wait on the device for:
@@ -3857,6 +3877,64 @@ mod tests {
         fixed.stop();
         drop(p);
         pager.stop();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Whether the live mapping of `path` this process holds is advised
+    /// for reads far apart, by the kernel's own word (`rr` in its
+    /// `VmFlags`); `None` where nothing maps it.
+    #[cfg(target_os = "linux")]
+    fn mapped_random(path: &std::path::Path) -> Option<bool> {
+        let want = path.to_string_lossy().into_owned();
+        let smaps = std::fs::read_to_string("/proc/self/smaps").unwrap();
+        let mut ours = false;
+        for line in smaps.lines() {
+            if let Some(flags) = line.strip_prefix("VmFlags:") {
+                if ours {
+                    return Some(flags.split_whitespace().any(|f| f == "rr"));
+                }
+            } else if line.split_whitespace().nth(5) == Some(want.as_str()) {
+                ours = true;
+            }
+        }
+        None
+    }
+
+    /// An advice given a view before it has its envelope is the
+    /// envelope's when it comes (`Paged::advise`, `Paged::back`): an
+    /// envelope opens advised for reads far apart (`Back::open`), and a
+    /// segment a seal lands readable as a memory file is advised to be
+    /// read in order wherever its store is in a scan's phase, before the
+    /// seal has written its envelope -- left random, the plain store's
+    /// default being to read around a fault. And an advice given after the
+    /// envelope is the envelope's at once, both ways.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn an_advice_given_before_the_envelope_is_the_envelopes_when_it_comes() {
+        let dir = scratch("advice-before");
+        let bytes = plain(8 * CHUNK, 5);
+        let pager = Pager::new(u64::MAX);
+        for (before, random) in [(Some(false), false), (Some(true), true), (None, true)] {
+            let path = dir.join(format!("e-{before:?}"));
+            let mut mem = memfile().unwrap();
+            mem.write_all(&bytes).unwrap();
+            let p = Paged::adopt(&pager, &mem, bytes.len() as u64, "file").unwrap();
+            drop(mem);
+            if let Some(r) = before {
+                p.advise(r);
+            }
+            envelope(&path, &bytes, 31);
+            p.back(Back::open(&path, Box::new(Toy(31))).unwrap())
+                .unwrap();
+            assert_eq!(
+                mapped_random(&path),
+                Some(random),
+                "advised {before:?} before the envelope"
+            );
+            p.advise(!random);
+            assert_eq!(mapped_random(&path), Some(!random), "advised after it");
+            drop(p);
+        }
         let _ = std::fs::remove_dir_all(&dir);
     }
 

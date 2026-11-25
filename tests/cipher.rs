@@ -2827,6 +2827,83 @@ fn a_merge_under_a_cipher_asks_ahead_for_its_cold_inputs() {
     );
 }
 
+/// The envelopes of a store's segments advised as a plain store's mappings
+/// are, by the kernel's own word (`rr` in `VmFlags`): random after a point
+/// read, read around a fault after a scan long enough to read ahead for
+/// (`Options::scan_readahead_bytes`), and so for a segment that lands after
+/// such a scan. An envelope opens advised random (`pager::Back::open`), so a
+/// segment landed in that phase was read a page a fault until the next
+/// switch where the plain store's was read a window a fault; and a long
+/// scan under a cipher is walked a thousand keys at a time
+/// (`Reader::scan_rested`), each walk advised by its own span, which left a
+/// scan of the whole store advised random.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_segment_landed_after_a_scan_has_its_envelope_advised_as_a_plain_ones() {
+    let dir = scratch("advice-landed");
+    let mut db = Db::create(&dir, under(14)).unwrap();
+    fill(&mut db, 20_000);
+    // The segments' envelopes mapped now, each with the kernel's advice:
+    // `x-` and a token, the ordered indexes' and the form files' carrying
+    // a suffix beside it.
+    let envelopes = || -> Vec<(String, bool)> {
+        common::mappings_advised_random(&dir.to_string_lossy())
+            .into_iter()
+            .filter(|(p, _)| {
+                let n = p.rsplit('/').next().unwrap_or("");
+                n.starts_with("x-") && n.len() == 34
+            })
+            .collect()
+    };
+    db.read_all(&k(1), vf(&mut |_| {})).unwrap();
+    let read = envelopes();
+    assert!(
+        !read.is_empty() && read.iter().all(|(_, rr)| *rr),
+        "after a point read, every envelope random: {read:?}"
+    );
+    // A scan whose span is past the line at which the store reads ahead
+    // (`Options::scan_readahead_bytes`): a short one leaves the advice
+    // random, as a point read does.
+    db.scan(b"", usize::MAX, kv(&mut |_k, _v| {})).unwrap();
+    let scanned = envelopes();
+    assert!(
+        scanned.iter().all(|(_, rr)| !*rr),
+        "after a scan, every envelope read around a fault: {scanned:?}"
+    );
+    let before: std::collections::BTreeSet<String> =
+        scanned.iter().map(|(p, _)| p.clone()).collect();
+    // Keys written again, which a seal takes, and its segment lands
+    // readable as a memory file before its envelope is written: keys above
+    // every key would go to an ordered run, whose envelope is written as
+    // the run closes, before it lands.
+    for i in (0..20_000).step_by(2) {
+        db.put(&k(i), &v(i, 2));
+        if i % 1000 == 998 {
+            db.commit().unwrap();
+        }
+    }
+    db.commit().unwrap();
+    db.flush().unwrap();
+    db.settle().unwrap();
+    let landed = envelopes();
+    assert!(
+        landed.iter().any(|(p, _)| !before.contains(p)),
+        "no segment's envelope came after the scan: {landed:?}"
+    );
+    assert!(
+        landed.iter().all(|(_, rr)| !*rr),
+        "a segment landed after the scan is read as the others are: {landed:?}"
+    );
+    db.read_all(&k(2), vf(&mut |_| {})).unwrap();
+    let again = envelopes();
+    assert!(
+        again.iter().all(|(_, rr)| *rr),
+        "after a point read again, every envelope random: {again:?}"
+    );
+    drop(db);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// An open refused beside a live store writes nothing in its directory:
 /// the marker's temp name, which a creation's crash or a rewrap leaves, is
 /// removed by an open that holds the store, at its sweep, and not by one

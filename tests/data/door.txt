@@ -44,6 +44,7 @@ allow	src/db.rs	fadvise_dontneed	1	advice on a door handle (S1, R3)
 # The engine: memory and the machine, read (G3: Memory).
 allow	src/db.rs	thread_minflt	1	/proc/thread-self/stat for a trace (G3: Memory)
 allow	src/db.rs	thread_majflt	1	/proc/thread-self/stat for a trace (G3: Memory)
+allow	src/db.rs	thread_runq	1	/proc/thread-self/schedstat for a trace (G3: Memory)
 allow	src/db.rs	llc_bytes	1	the last-level cache's size from /sys (G3: Memory)
 allow	src/db.rs	mallinfo2	1	dlsym of glibc's allocator count (G3: Memory)
 allow	src/db.rs	resident_beyond_use	1	/proc/self/status for the trim (G3: Memory)
@@ -72,6 +73,7 @@ literal	src/db.rs	reopen	1	/proc/self/fd, a second description of a door handle 
 literal	src/db.rs	resident_beyond_use	1	/proc/self/status (G3: Memory)
 literal	src/db.rs	thread_majflt	1	/proc/thread-self/stat (G3: Memory)
 literal	src/db.rs	thread_minflt	1	/proc/thread-self/stat (G3: Memory)
+literal	src/db.rs	thread_runq	1	/proc/thread-self/schedstat (G3: Memory)
 literal	src/db/zfile.rs	budget_from	4	/proc meminfo, cgroup, mounts and status, read through read_budget's closure (G3: Memory)
 # Threads, until S1.
 thread	src/crypt.rs	*	1	a reader yields while another thread decrypts its chunk (S1: pin::)

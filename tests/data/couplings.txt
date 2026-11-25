@@ -27,6 +27,7 @@ src/bytes.rs	Bytes::<item>	piecewise/ASK_PIECES	code	1	stays	the seam: Paging, p
 src/bytes.rs	Bytes::lend_at	piecewise/ASK_PIECES	code	1	stays	the seam: Paging, piecewise and the paged mapping are R0's allowed vocabulary
 src/bytes.rs	Bytes::piecewise	piecewise/ASK_PIECES	code	1	stays	the seam: Paging, piecewise and the paged mapping are R0's allowed vocabulary
 src/bytes.rs	MmapBytes::<item>	piecewise/ASK_PIECES	code	1	stays	the seam: Paging, piecewise and the paged mapping are R0's allowed vocabulary
+src/bytes.rs	MmapBytes::advise_default	paged	code	1	stays	the seam: Paging, piecewise and the paged mapping are R0's allowed vocabulary
 src/bytes.rs	MmapBytes::advise_dontneed	paged	code	1	stays	the seam: Paging, piecewise and the paged mapping are R0's allowed vocabulary
 src/bytes.rs	MmapBytes::advise_dontneed_range	paged	code	1	stays	the seam: Paging, piecewise and the paged mapping are R0's allowed vocabulary
 src/bytes.rs	MmapBytes::advise_normal	paged	code	1	stays	the seam: Paging, piecewise and the paged mapping are R0's allowed vocabulary

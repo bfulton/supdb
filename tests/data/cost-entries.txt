@@ -300,6 +300,7 @@ Blob::version	-	the format version, read once an open
 Blob::payload_bytes	-	a size read once an open
 Blob::advise_random	-	advice, once a mode change
 Blob::advise_normal	-	advice, once a mode change
+Blob::advise_default	-	advice, once a segment's open
 Blob::advise_dontneed	-	advice, once a drop
 Blob::zero_copy	-	whether the source lends, read once an open
 Blob::lookup	-	the engine's reader of a segment: reached through Reader::read_all and Reader::scan, whose probes count what the engine inlines of it

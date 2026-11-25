@@ -1311,6 +1311,13 @@ impl<B: Bytes> Blob<B> {
         self.src.advise_normal();
     }
 
+    /// The kernel's default advice, where the source's own default is
+    /// another (`Bytes::advise_default`): for a source opened outside a
+    /// phase of point reads.
+    pub fn advise_default(&self) {
+        self.src.advise_default();
+    }
+
     /// This source's pages unmapped from the process
     /// (`Bytes::advise_dontneed`).
     pub fn advise_dontneed(&self) {

@@ -239,6 +239,38 @@ pub fn dead_arena(bytes: usize) -> Vec<u8> {
     .unwrap()
 }
 
+/// Whether each live mapping of this process whose path contains `needle` is
+/// advised `MADV_RANDOM`, as the kernel says it (`rr` in `VmFlags`): the
+/// mapping is the only thing that can be asked, and a store's own record of
+/// what it last asked of it is a claim the kernel does not have to share. A
+/// mapping of a file that was unlinked (`(deleted)`) is a retired segment's,
+/// held until the last reader that could have it leaves, and is nobody's to
+/// advise any more.
+#[cfg(target_os = "linux")]
+pub fn mappings_advised_random(needle: &str) -> Vec<(String, bool)> {
+    let smaps = std::fs::read_to_string("/proc/self/smaps").unwrap();
+    let mut out = Vec::new();
+    let mut path: Option<String> = None;
+    for line in smaps.lines() {
+        let first = line.split_whitespace().next().unwrap_or("");
+        if let Some(flags) = line.strip_prefix("VmFlags:") {
+            if let Some(p) = path.take() {
+                out.push((p, flags.split_whitespace().any(|f| f == "rr")));
+            }
+        } else if first.contains('-') && first.bytes().all(|b| b.is_ascii_hexdigit() || b == b'-') {
+            // A mapping's first line: range, permissions, offset, device,
+            // inode and the path, if it has one.
+            let mut f = line.split_whitespace().skip(5);
+            let deleted = line.ends_with("(deleted)");
+            path = f
+                .next()
+                .filter(|p| p.contains(needle) && !deleted)
+                .map(str::to_string);
+        }
+    }
+    out
+}
+
 /// How many pages of `[off, off + len)` of the file at `path` the page cache
 /// holds: `mincore` over a mapping of the file's own that touches nothing.
 #[cfg(target_os = "linux")]

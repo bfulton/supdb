@@ -4703,43 +4703,11 @@ fn a_merge_takes_the_form_file_of_the_segment_it_retires() {
 
 // ---- advice, sweeping, and the counters the pairing is read by ---------------------
 
-/// Whether each live mapping of this process whose path contains `needle` is
-/// advised `MADV_RANDOM`, as the kernel says it (`rr` in `VmFlags`): the
-/// mapping is the only thing that can be asked, and a store's own record of
-/// what it last asked of it is a claim the kernel does not have to share. A
-/// mapping of a file that was unlinked (`(deleted)`) is a retired segment's,
-/// held until the last reader that could have it leaves, and is nobody's to
-/// advise any more.
-#[cfg(target_os = "linux")]
-fn mappings_advised_random(needle: &str) -> Vec<(String, bool)> {
-    let smaps = std::fs::read_to_string("/proc/self/smaps").unwrap();
-    let mut out = Vec::new();
-    let mut path: Option<String> = None;
-    for line in smaps.lines() {
-        let first = line.split_whitespace().next().unwrap_or("");
-        if let Some(flags) = line.strip_prefix("VmFlags:") {
-            if let Some(p) = path.take() {
-                out.push((p, flags.split_whitespace().any(|f| f == "rr")));
-            }
-        } else if first.contains('-') && first.bytes().all(|b| b.is_ascii_hexdigit() || b == b'-') {
-            // A mapping's first line: range, permissions, offset, device,
-            // inode and the path, if it has one.
-            let mut f = line.split_whitespace().skip(5);
-            let deleted = line.ends_with("(deleted)");
-            path = f
-                .next()
-                .filter(|p| p.contains(needle) && !deleted)
-                .map(str::to_string);
-        }
-    }
-    out
-}
-
 /// The live mappings under `dir` whose names end in `suffix`, each as the
 /// kernel has it advised.
 #[cfg(target_os = "linux")]
 fn advised(dir: &Path, suffix: &str) -> Vec<bool> {
-    mappings_advised_random(&dir.to_string_lossy())
+    common::mappings_advised_random(&dir.to_string_lossy())
         .into_iter()
         .filter(|(p, _)| p.ends_with(suffix))
         .map(|(_, rr)| rr)
@@ -10265,6 +10233,118 @@ fn a_merges_outputs_have_their_form_files_when_it_lands() {
         db.close().unwrap();
         let _ = std::fs::remove_dir_all(&dir);
     }
+}
+
+/// A merge that waits for a slot to build its finished output's form file
+/// in (`Options::zpages_build_at_finish`) holds nothing of the store's
+/// cache while it waits (`MergeRest::unheld`), as it holds nothing while
+/// it writes the output's envelope just before: the builds it waits for
+/// read through the cache and breathe at their rests until the evictor
+/// gives back, and the evictor waits for every hold. Under the merge's
+/// hold the three waited on each other, the cache stopped giving back,
+/// and at ten million keys under 1.25 GiB the full rewrite's merges were
+/// killed under the bound in four sweeps of five once their asks covered
+/// their directories and they finished their outputs faster.
+///
+/// One builder and its build held at its start, so that a merge of more
+/// outputs than one finishes its first, starts that build in the one slot
+/// and waits at the next for it; a handle then reads several times the
+/// cache, which has to give back what the handle read past its budget
+/// while the merge waits. Its hold left standing, it gives back nothing.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_merge_waiting_for_a_build_slot_holds_nothing_of_a_ciphers_cache() {
+    let cache: u64 = 256 << 10;
+    let (dir, mut db, mut model, inject, raw) =
+        land_store_with("auto-finish-slot-cipher", 50, |o| {
+            o.encryption = supdb::Encryption::Cipher(
+                supdb::StoreCipher::new(common::Gcm::new(&[0x6b; 32]), common::Gcm::new)
+                    .cache_bytes(cache),
+            );
+            o.zpages_under_cipher = true;
+            o.zpages_build_at_finish = true;
+            o.zpages_ahead_builders = 1;
+            o.partition_bytes = Some(1 << 20);
+            o.l0_trigger = 1;
+            // The builds ahead at landing by the controller's budget alone:
+            // a cache this small is past their line under a cipher from the
+            // load on (`Options::zpages_land_cache_pct`).
+            o.zpages_land_cache_pct = 0;
+        });
+    let mut seen = 0usize;
+    db.scan(b"", 10, kv(&mut |_, _| seen += 1)).unwrap();
+    assert_eq!(seen, 10);
+    inject.set_decode_cost(std::time::Duration::from_micros(1));
+    inject.set_budget(raw / 2);
+    wait_steps(&db, 2);
+    assert!(db.zpage_counts().partitions >= 3, "{:?}", db.zpage_counts());
+    db.hold_zpage_build(true);
+    let mut rng = Rng(0x51D7);
+    let keys: Vec<Vec<u8>> = model.keys().cloned().collect();
+    for chunk in keys.chunks(250) {
+        for k in chunk {
+            let v = suite_value(&mut rng);
+            db.put(k, &v);
+            model.insert(k.clone(), vec![v]);
+        }
+        db.commit().unwrap();
+    }
+    let before = db.seal_waits().merges;
+    db.seal().unwrap();
+    wait_for_merge(&db, before);
+    wait_for(
+        "a build at its hold and a merge waiting for the slot",
+        || {
+            let c = db.zpage_counts();
+            db.zpage_build_waiting() && c.finish_live == 1 && c.finish_waits >= 1
+        },
+    );
+    let pager = |db: &Db| db.cipher_counts().expect("a store under a cipher").cache;
+    let first = pager(&db);
+    // A handle reads the store through the cache, a few times over: by its
+    // keys, which a point read takes to the segments' files, where a scan
+    // may be answered by the block copies in the process's memory.
+    let r = db.reader().unwrap();
+    let keys: Vec<Vec<u8>> = model.keys().cloned().collect();
+    let mut passes = 0;
+    while (pager(&db).fills - first.fills) * 4080 < 6 * cache && passes < 8 {
+        for k in &keys {
+            r.read_all(k, vf(&mut |_| {})).unwrap();
+        }
+        passes += 1;
+    }
+    // A few times the cache at the least: a cache that gives nothing back
+    // fills each chunk once and no more, which stops the loop above short
+    // of its six and is the failure the assertion after this one names.
+    let read = (pager(&db).fills - first.fills) * 4080;
+    assert!(
+        read >= 3 * cache,
+        "the handle read {read} bytes through the cache, which is no test of it"
+    );
+    // The merge waits still, and the cache has given back what the handle
+    // read past the budget, or does so now.
+    let gave = |db: &Db| pager(db).evicted_bytes - first.evicted_bytes;
+    let t = std::time::Instant::now();
+    while gave(&db) < read - 2 * cache && t.elapsed() < std::time::Duration::from_secs(10) {
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+    let (gave, c, z) = (gave(&db), pager(&db), db.zpage_counts());
+    let waiting = z.finish_live == 1 && db.merges_in_flight() >= 1;
+    db.hold_zpage_build(false);
+    assert!(waiting, "the merge stopped waiting for its slot: {z:?}");
+    assert!(
+        gave >= read - 2 * cache,
+        "the cache gave back {gave} bytes of the {read} a handle read while a merge waited for \
+         a build's slot: {c:?}"
+    );
+    wait_for("the builds at the outputs' finish to end", || {
+        db.zpage_counts().finish_live == 0 && db.merges_in_flight() == 0
+    });
+    db.settle().unwrap();
+    check(&r, &model, &keys, "after the merge waited for its slot");
+    drop(r);
+    db.close().unwrap();
+    let _ = std::fs::remove_dir_all(&dir);
 }
 
 /// An output being built at its merge's finish is a build in flight
