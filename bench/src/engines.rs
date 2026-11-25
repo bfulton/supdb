@@ -1960,6 +1960,10 @@ pub struct Supdb {
     /// block cache off and the upkeep the writer's: `supdb-heldinplace`,
     /// beside `supdb-heldnfinline`, which differs in the overwrite alone.
     inplace: bool,
+    /// The placed read bounded by the pieces over a range and not by the
+    /// records it keeps (`Options::point_placed_runs` off), the in-place
+    /// arm's shape otherwise: `supdb-heldinplacepieces`.
+    placedpieces: bool,
     /// The upkeep thread's passes batched to this percentage of the
     /// store's keys (`Options::upkeep_batch_pct`) under the held log with
     /// no frames: `supdb-heldbatch1`.
@@ -3228,6 +3232,9 @@ struct Policy {
     /// Puts overwritten in place (`Options::put_in_place`):
     /// `supdb-heldinplace`.
     inplace: bool,
+    /// The placed read bounded by the pieces (`Options::point_placed_runs`
+    /// off): `supdb-heldinplacepieces`.
+    placedpieces: bool,
     /// The upkeep's passes batched (`Options::upkeep_batch_pct`):
     /// `supdb-heldbatch1`.
     upkeepbatch: Option<usize>,
@@ -3568,6 +3575,7 @@ impl Default for Policy {
             livefirst: false,
             memfnv: false,
             inplace: false,
+            placedpieces: false,
             upkeepbatch: None,
             defer: false,
             firstfloor: false,
@@ -10279,6 +10287,7 @@ impl Supdb {
             livefirst,
             memfnv,
             inplace,
+            placedpieces,
             upkeepbatch,
         } = policy;
         // What the engine ships, so an arm that pins nothing inherits it
@@ -10956,6 +10965,7 @@ impl Supdb {
             point_live_first: livefirst,
             mem_hash_fold: !memfnv,
             put_in_place: inplace,
+            point_placed_runs: !placedpieces,
             ..Default::default()
         };
         let opts = match advice {
@@ -11316,6 +11326,7 @@ impl Supdb {
             livefirst,
             memfnv,
             inplace,
+            placedpieces,
             upkeepbatch,
             ord_threads: Default::default(),
         })
@@ -11490,7 +11501,9 @@ impl Engine for Supdb {
                 return "supdb-heldmarch";
             }
             if self.noframes {
-                return if self.inplace {
+                return if self.inplace && self.placedpieces {
+                    "supdb-heldinplacepieces"
+                } else if self.inplace {
                     "supdb-heldinplace"
                 } else if !self.block_cache && self.upkeep == Some(supdb::Upkeep::Inline) {
                     "supdb-heldnfinline"
@@ -15448,6 +15461,7 @@ pub fn guarantee(arm: &str) -> Option<Guarantee> {
         | "supdb-heldlivefirst"
         | "supdb-heldmemfnv"
         | "supdb-heldinplace"
+        | "supdb-heldinplacepieces"
         | "supdb-heldnfinline"
         | "supdb-heldbatch1"
         | "faster" => Guarantee::Memory,
@@ -15993,6 +16007,25 @@ pub fn open(arm: &str, dir: &Path, map_gb: usize) -> Res<Box<dyn Engine>> {
                         block_cache: false,
                         upkeep: Some(supdb::Upkeep::Inline),
                         inplace: true,
+                        ..Policy::default()
+                    },
+                )
+            },
+            dir,
+        )?,
+        "supdb-heldinplacepieces" => supdb_arm(
+            |d| {
+                Supdb::with_policy(
+                    d,
+                    Policy {
+                        partition: false,
+                        durable: false,
+                        held: true,
+                        noframes: true,
+                        block_cache: false,
+                        upkeep: Some(supdb::Upkeep::Inline),
+                        inplace: true,
+                        placedpieces: true,
                         ..Policy::default()
                     },
                 )

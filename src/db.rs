@@ -1688,6 +1688,19 @@ pub struct Options {
     /// Needs `point_lone`. Off: `supdb-layersasone`, and
     /// `supdb-ingestlayersasone` buffered.
     pub point_layers_lean: bool,
+    /// The placed read (`point_layers_lean`) takes a range under any
+    /// number of pieces, and leaves to the general read only a key with
+    /// more records than its frame keeps (`LAYERS_PIECES`) above the newest
+    /// tombstone, where it had left every range under more than that many
+    /// pieces. A put's tombstone ends the walk at the newest piece that
+    /// holds the key, so under puts a read keeps one or two. It asks for
+    /// the newest pieces' filters, at most `PLACED_ASKS` of them, as it did
+    /// for all of them. Beside a writer that appends faster than its merges
+    /// fold -- a live handle beside the overwriting arm's writer, the
+    /// threaded writers' mixes -- ten to thirty pieces stood over a
+    /// partition and every read took the general path. Off: the bound by
+    /// the pieces, `supdb-heldinplacepieces`.
+    pub point_placed_runs: bool,
     /// EXPERIMENT: a point read of a partition whose ordered index holds
     /// whole keys (`OrdIndex::uniform`: every key one length, no longer
     /// than the common prefix and eight bytes) finds its rank through the
@@ -7360,6 +7373,7 @@ impl Default for Options {
             point_record_ahead: true,
             point_lone: true,
             point_layers_lean: true,
+            point_placed_runs: true,
             read_lines_ahead: true,
             point_live_first: false,
             read_probes_once: true,
@@ -14209,8 +14223,14 @@ const LIVE_SMALL: usize = 8;
 
 /// The pieces over a range a point read keeps the records of on its own
 /// frame (`Reader::read_layers`); a range under more takes the general
-/// read.
+/// read. The placed read keeps the records of the pieces that hold the key
+/// down to the newest tombstone, and with `Options::point_placed_runs` it
+/// is that count it bounds (`Reader::read_placed`).
 const LAYERS_PIECES: usize = 8;
+
+/// The most pieces' filters a placed read asks for ahead of its probes, the
+/// newest (`Reader::place`, `Options::point_placed_runs`).
+const PLACED_ASKS: usize = 4 * LAYERS_PIECES;
 
 /// No watermark: every chunk in a chain is visible, committed or not.
 const SEE_ALL: u64 = u64::MAX;
@@ -28143,6 +28163,12 @@ impl Reader {
                     seg.raw()
                         .find_fixed_hashed(key, fnv, self.opts.point_record_ahead)?
                 {
+                    // More records above the newest tombstone than the
+                    // frame keeps: the general read's
+                    // (`Options::point_placed_runs`).
+                    if held == LAYERS_PIECES {
+                        return None;
+                    }
                     runs[held].write((c.run, c.records));
                     held += 1;
                     if c.tomb {
@@ -28416,17 +28442,18 @@ impl Reader {
             std::ptr::eq(l0, st.pieces_over(np, at)),
             "the pieces a publish placed over a partition are the ones a search finds"
         );
-        if l0.len() > LAYERS_PIECES {
+        if !opts.point_placed_runs && l0.len() > LAYERS_PIECES {
             return None;
         }
         if opts.read_lines_ahead {
             // The partition's slot first: it is the read's longest wait
             // where no tombstone masks the partition, and the tables'
-            // probes and the pieces' filters are the lead for it.
+            // probes and the pieces' filters are the lead for it. The
+            // newest pieces' filters, which the walk asks first.
             if let Some(seg) = segs[..np].get(at) {
                 seg.prefetch_slot(fnv);
             }
-            for seg in l0 {
+            for seg in l0.iter().rev().take(PLACED_ASKS) {
                 seg.prefetch_probe(fnv);
             }
         }

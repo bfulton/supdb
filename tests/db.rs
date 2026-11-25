@@ -2592,6 +2592,87 @@ fn a_store_takes_back_the_blocks_its_tables_gave() {
     let _ = std::fs::remove_dir_all(&d);
 }
 
+/// The placed read takes a range under more pieces than its frame keeps the
+/// records of (`Options::point_placed_runs`): twelve pieces of puts stand
+/// over the partition, kept by a merge trigger above them and no promotion,
+/// and every key's read is
+/// the placed one, through the writer and through a handle, and answers as
+/// the model does; a key appended to in every piece has more records above
+/// its newest tombstone than the frame keeps and is the general read's, as
+/// it answers right too; and with the option off no read over the range is
+/// placed. Under the stride switch, whose forced form sends a partition's
+/// reads to the general read, the answers alone are held.
+#[test]
+fn a_placed_read_takes_a_range_under_more_pieces_than_its_frame_keeps() {
+    for runs in [true, false] {
+        let d = dir(&format!("placed-runs-{runs}"));
+        let opts = Options {
+            point_placed_runs: runs,
+            l0_trigger: 1000,
+            promote: false,
+            ..common::options()
+        };
+        let mut db = Db::open(&d, opts).unwrap();
+        let key = |i: u32| format!("{i:016}").into_bytes();
+        let mut model: BTreeMap<Vec<u8>, Vec<Vec<u8>>> = BTreeMap::new();
+        for i in 0..2000u32 {
+            let v = format!("base-{i}").into_bytes();
+            db.put(&key(i), &v);
+            model.insert(key(i), vec![v]);
+        }
+        db.commit().unwrap();
+        db.flush().unwrap();
+        db.settle().unwrap();
+        let many = key(1999);
+        for p in 0..12u32 {
+            for i in (p * 7..1990).step_by(97) {
+                let v = format!("p{p}-{i}").into_bytes();
+                db.put(&key(i), &v);
+                model.insert(key(i), vec![v]);
+            }
+            let v = format!("appended-{p}").into_bytes();
+            db.append(&many, &v);
+            model.get_mut(&many).unwrap().push(v);
+            db.commit().unwrap();
+            db.seal().unwrap();
+            db.settle().unwrap();
+        }
+        assert!(
+            db.levels().1 >= 12,
+            "twelve pieces stand: {:?}",
+            db.levels()
+        );
+        let h = db.reader().unwrap();
+        let placed = (db.point_placed_reads(), h.point_placed_reads());
+        for (k, want) in &model {
+            assert_eq!(&read_vec(&db, k), want, "runs {runs}: the writer");
+            assert_eq!(&read_vec(&h, k), want, "runs {runs}: a handle");
+        }
+        let n = model.len() as u64;
+        let placed = (
+            db.point_placed_reads() - placed.0,
+            h.point_placed_reads() - placed.1,
+        );
+        // A partition a form file may serve is the general read's, as the
+        // stride switch forces it (`common::stride_switch`): there the reads
+        // are held to the model alone.
+        if common::stride_switch() {
+            assert_eq!(placed, (0, 0), "the forced form's reads are general");
+        } else if runs {
+            assert_eq!(
+                placed,
+                (n - 1, n - 1),
+                "every read placed but the appended key's"
+            );
+        } else {
+            assert_eq!(placed, (0, 0), "no read placed over twelve pieces");
+        }
+        drop(h);
+        db.close().unwrap();
+        let _ = std::fs::remove_dir_all(&d);
+    }
+}
+
 /// `Options::point_fixed` and `Options::point_lone` change the path a point
 /// read takes and nothing it returns: the fixture's store -- a partition, a
 /// piece with tombstones and a live table over both -- read with each of
