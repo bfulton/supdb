@@ -1275,12 +1275,21 @@ follows on the segment work's thread with the WAL's and temp names'
 retirement behind it (`Options::flush_waits_manifest` is the shape that
 waited, `supdb-waitmanifest`): the round trip was a tenth of a
 ten-thousand-key drain, and a crash inside it is a torn newest slot, the
-case the slots were made for. A buffered store's flush commits what is
-staged under its policy, with no sync (`Options::drain_syncs_wal` is the
-shape that fsynced the whole log first, `supdb-ingestwalsync`), so its
-drain is answered behind the slot's fdatasync instead: the log's
-durability was what covered that window, and without it the slot's own
-does. The flush's close of a direct run
+case the slots were made for. A flush whose writes were all durable
+before it -- every commit synced, nothing owed a sync, the drain's own
+run synced and named -- is answered sooner still, once its seal's
+segments are published, where the seal is the one in flight and leaves
+no piece and no merge, and the directory's fsync of their names, the
+seal's fsyncs and the slot follow in the loop
+(`Options::drain_answers_readable`; `supdb-drainstrict` waits): nothing
+it covers rested on them, the run's temp name and the log being what an
+open recovers from until a slot names the segment, and a store dropped
+with such a seal in flight lands it whole at its stop. A buffered
+store's flush commits what is staged under its policy, with no sync
+(`Options::drain_syncs_wal` is the shape that fsynced the whole log
+first, `supdb-ingestwalsync`), so its drain is answered behind the
+slot's fdatasync instead: the log's durability was what covered that
+window, and without it the slot's own does. The flush's close of a direct run
 fdatasyncs the run's records on the writer's thread, which waits for
 the drain anyway, while the seal thread composes the trailer, so the
 seal's fsync flushes the trailer alone (`Options::close_presync`;
@@ -6921,6 +6930,44 @@ in a later state checks every claim it finds there against what it
 holds, since a drop made in one state cannot reach the next; and an
 invariant a reader leans on is asserted where it is published, not only
 at a write that a stale form need never meet.
+
+**A stamp read as the end of the step it begins.** The drain's stamps
+name `readable` where the seal thread hands its segments over, and the
+first decomposition of the durable shuffled load at ten thousand keys
+read the 1.9 ms from there to `fsynced` as the seal's fsync, and an
+answer at the readable landing was built to skip it. It saved a
+fortieth of a millisecond on the ordered load and half of one on the
+shuffled: the readable landing ran from `landstart` to `landed`, 0.55 ms
+and 1.3 to 1.8, with the fsync ending inside it. After its publish
+(`readers`) the landing was the directory's fsync of the seal's names,
+which waits on the journal commit the seal thread's own fsync forces.
+Answered at the publish, with that fsync owed to the durable landing
+ahead of its slot (`Options::drain_answers_readable`), the drains read
+1.4 ms against 1.95 and 4.1 against 5.6, in both orders. The rules: a
+stamp is read for where in its step it is taken, the stamps on either
+side of a wait are listed before the wait is named, and an fsync two
+threads issue against one journal commit costs whichever waits for it
+first. Beside it, the price of answering before the store is at rest:
+the load's bytes on disk and device bytes are read at the answer, a
+page short at ten thousand keys, the slot's, which the gate reads as
+better than its window there.
+
+**An ask that undid the drop of a step it did not know was running.** A
+form file's build reads its partition's records once and drops them
+behind it, and a settle's ask for the raw form's files
+(`Options::zpages_rewarm_raw`) passes over the partitions a form file
+serves and asks the rest back where the cache holds under nine tenths of
+them. A partition whose build was in flight had no form file yet, so a
+settle that came while the loop built the partition a drain had just
+landed asked every record back beside the file the build then attached:
+the test of the drop failed three runs in forty once a durable flush was
+answered at its seal's readable landing, and none before, the build
+having started after the settle while the flush waited. The ask leaves
+the records of a partition with a build in flight now, and a test holds
+the build before its rename and settles beside it. The rule: a step that
+puts back what another step gives away asks whether that step is in
+flight, not only whether it has finished, and a change that moves when a
+caller returns is read for the background work it now runs beside.
 
 ## Open targets, and the one standing limitation
 

@@ -1934,6 +1934,63 @@ fn the_build_drops_the_raw_records_it_passed_when_asked_to_and_not_otherwise() {
 
 #[cfg(target_os = "linux")]
 #[test]
+fn a_settle_asks_nothing_back_of_a_partition_its_build_has_in_flight() {
+    // A build drops its partition's records behind it, and a settle's ask
+    // for the raw form's files (`Options::zpages_rewarm_raw`) passes over the
+    // partitions a form file serves; a partition whose build is in flight is
+    // the build's, and the ask leaves its records where the drop left them.
+    // Built: the build held before its rename, past its drop, with the room
+    // the ask is made in given by the seam so that it is made on any host,
+    // and a settle beside it, where the race had a settle come by chance.
+    let dir = scratch("settle-beside-build");
+    let inject = std::sync::Arc::new(supdb::ZInject::new());
+    inject.set_budget(1 << 30);
+    inject.set_slack(1 << 30);
+    let mut db = Db::create(
+        &dir,
+        forced(|o| {
+            o.zpages_drop_behind = true;
+            o.zpages_drop_raw = false;
+            o.zpages_rewarm_raw = true;
+            o.zpages_inject = Some(inject.clone());
+        }),
+    )
+    .unwrap();
+    db.hold_zpage_rename(true);
+    let model = ordered_load(&mut db, 8000, 0xD21);
+    let seg = partition_file(&dir);
+    let r = regions_of(&seg);
+    let pages = r.rec.1.div_ceil(4096);
+    assert!(pages > 150, "{pages} pages of records");
+    let t = std::time::Instant::now();
+    while !db.zpage_build_waiting() {
+        assert!(
+            t.elapsed() < std::time::Duration::from_secs(120),
+            "no build reached its rename"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    }
+    let dropped = cached_pages(&seg, r.rec.0, r.rec.1);
+    assert!(
+        dropped * 4 < pages,
+        "the build held at its rename left {dropped} of {pages} pages: the case was not reached"
+    );
+    db.settle().unwrap();
+    let kept = cached_pages(&seg, r.rec.0, r.rec.1);
+    assert!(
+        kept * 4 < pages,
+        "a settle beside the build asked back {kept} of {pages} pages of its partition's records"
+    );
+    db.hold_zpage_rename(false);
+    db.zpages_settle().unwrap();
+    assert_eq!(db.zpage_counts().form_files, 1);
+    let keys: Vec<Vec<u8>> = model.keys().step_by(13).cloned().collect();
+    check(&db, &model, &keys, "after the build");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[cfg(target_os = "linux")]
+#[test]
 fn a_point_read_from_the_form_file_touches_no_page_of_the_raw_records() {
     // What the form is for: a covered partition's read is answered from the
     // form file's page, so the raw records and their directory, which are the

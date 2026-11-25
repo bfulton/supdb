@@ -10815,6 +10815,9 @@ fn a_reader_under_latest_sees_the_commit_of_a_key_it_settled_uncommitted() {
 /// direct segment an ordered run takes and through the memtable a
 /// shuffled one takes. A piece with a tombstone cannot be a partition as
 /// it is, so that flush publishes twice and still leaves one partition.
+/// The publishes are counted once the segment work is settled: a durable
+/// flush is answered at its seal's readable landing, and the seal's slot
+/// follows (`Options::drain_answers_readable`).
 #[test]
 fn a_first_flush_seals_the_partition_in_one_publish() {
     let key = |k: u32| format!("key-{k:05}").into_bytes();
@@ -10852,6 +10855,7 @@ fn a_first_flush_seals_the_partition_in_one_publish() {
         let before = db.seal_waits().publishes;
         db.flush().unwrap();
         assert_eq!(db.levels(), (1, 0), "{name}: one partition, no piece");
+        db.settle().unwrap();
         assert_eq!(
             db.seal_waits().publishes - before,
             1,
@@ -10878,6 +10882,7 @@ fn a_first_flush_seals_the_partition_in_one_publish() {
     let before = db.seal_waits().publishes;
     db.flush().unwrap();
     assert_eq!(db.levels(), (1, 0));
+    db.settle().unwrap();
     assert!(
         db.seal_waits().publishes - before >= 2,
         "a piece with a tombstone is not a partition as it is"
@@ -19545,15 +19550,19 @@ fn a_closed_wal_outlives_a_seal_between_its_phases_and_a_crash_there() {
 /// published to a handle while the flush still waits for the fsyncs.
 /// Joined whole, the flush published nothing until the hold lifted. On
 /// both arms of the segment work, and with every key read back after.
+/// A strict flush waits out the hold (`Options::drain_answers_readable`
+/// off); one whose writes were durable before it returns without, where
+/// the segment work has a thread of its own to land the rest.
 #[test]
 fn a_flush_publishes_its_seal_before_the_seal_is_durable() {
-    for background in [true, false] {
-        let d = dir(&format!("flush-readable-{background}"));
+    for (background, early) in [(true, false), (true, true), (false, true)] {
+        let d = dir(&format!("flush-readable-{background}-{early}"));
         let mut db = Db::create(
             &d,
             Options {
                 publish_in_background: background,
                 direct_ingest: false,
+                drain_answers_readable: early,
                 ..common::options()
             },
         )
@@ -19586,10 +19595,20 @@ fn a_flush_publishes_its_seal_before_the_seal_is_durable() {
             .join()
             .unwrap()
             .expect("the seal's table was never retired");
-        assert!(
-            waited >= hold,
-            "background {background}: the flush waited for the held fsyncs ({waited:?})"
-        );
+        if background && early {
+            assert!(
+                waited < hold,
+                "background {background}: the flush waited for the held fsyncs ({waited:?})"
+            );
+            assert_eq!(db.seal_waits().drains_early, 1);
+        } else {
+            assert!(
+                waited >= hold,
+                "background {background}, early {early}: the flush did not wait for the \
+                 held fsyncs ({waited:?})"
+            );
+            assert_eq!(db.seal_waits().drains_early, 0);
+        }
         assert!(
             seen < hold / 2,
             "background {background}: the segment was published at {seen:?}, \
@@ -22904,4 +22923,314 @@ fn overwriting_store_answers_the_last_put(runs: bool) {
     db.close().unwrap();
     let db = Db::open(&d, opts()).unwrap();
     check(&db, &model, "reopened");
+}
+
+/// The keys of a drain's tests: `n` of them in key order, or in a
+/// permutation of it (the stride coprime to `n`).
+fn drain_keys(ordered: bool, n: u32) -> Vec<Vec<u8>> {
+    (0..n)
+        .map(|i| if ordered { i } else { (i * 7919) % n })
+        .map(|k| format!("key-{k:06}").into_bytes())
+        .collect()
+}
+
+fn drain_value(k: &[u8]) -> Vec<u8> {
+    let mut v = b"v-".to_vec();
+    v.extend_from_slice(k);
+    v
+}
+
+/// `keys` appended and committed in batches of five hundred.
+fn drain_load(db: &mut Db, keys: &[Vec<u8>]) {
+    for (i, k) in keys.iter().enumerate() {
+        db.append(k, &drain_value(k));
+        if i % 500 == 499 {
+            db.commit().unwrap();
+        }
+    }
+    db.commit().unwrap();
+}
+
+fn drain_check(r: &Reader, keys: &[Vec<u8>], what: &str) {
+    for k in keys {
+        assert_eq!(
+            read_vec(r, k),
+            vec![drain_value(k)],
+            "{what}: key {}",
+            String::from_utf8_lossy(k)
+        );
+    }
+}
+
+/// The run of ordered ingest's temp names a store's directory holds.
+fn direct_temps(d: &std::path::Path) -> Vec<PathBuf> {
+    let mut v: Vec<PathBuf> = std::fs::read_dir(d)
+        .unwrap()
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| {
+            p.file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(|n| n.starts_with("direct-") && n.ends_with(".tmp"))
+        })
+        .collect();
+    v.sort();
+    v
+}
+
+/// A flush whose writes were all durable before it -- every commit synced
+/// -- is answered once its seal is readable (`Options::drain_answers_readable`):
+/// with the seal held between its phases (`Db::hold_seal_durable`), where a
+/// strict flush waits for the release, the flush returns, a handle reads
+/// every key, and the seal is still in flight. The store's drop then lands
+/// that seal whole, as a strict flush had before its answer: the run's
+/// temp name retired behind the slot that names its segment, and the
+/// reopen finds the partition and nothing to replay. Both a load's shapes:
+/// the ordered one's direct run and the shuffled one's memtable.
+#[test]
+fn a_durable_flush_is_answered_at_its_seals_readable_landing() {
+    for ordered in [true, false] {
+        let d = dir(&format!("drain-readable-{ordered}"));
+        let opts = Options {
+            drain_answers_readable: true,
+            ..common::options()
+        };
+        let keys = drain_keys(ordered, 3000);
+        let mut db = Db::create(&d, opts.clone()).unwrap();
+        drain_load(&mut db, &keys);
+        db.hold_seal_durable(true);
+        // The release a strict flush would wait for, late enough to tell.
+        let _release = db.release_seal_durable_after(std::time::Duration::from_secs(30));
+        let t = std::time::Instant::now();
+        db.flush().unwrap();
+        assert!(
+            t.elapsed() < std::time::Duration::from_secs(15),
+            "ordered {ordered}: the flush waited for its seal's fsync ({:?})",
+            t.elapsed()
+        );
+        let w = db.seal_waits();
+        assert_eq!(w.drains_early, 1, "ordered {ordered}: {w:?}");
+        assert!(
+            db.in_flight().0,
+            "ordered {ordered}: the seal is between its phases"
+        );
+        let r = db.reader().unwrap();
+        drain_check(&r, &keys, "after the flush");
+        drop(r);
+        drop(db);
+        assert!(
+            direct_temps(&d).is_empty(),
+            "ordered {ordered}: the drop left the run's temp name: {:?}",
+            direct_temps(&d)
+        );
+        let db = Db::open(&d, opts.clone()).unwrap();
+        assert_eq!(
+            (db.segments(), db.unsealed_keys()),
+            (1, 0),
+            "ordered {ordered}: the reopen recovered what the drop should have landed"
+        );
+        drain_check(&db, &keys, "after the drop and the reopen");
+        let w = db.seal_waits();
+        assert_eq!(w.drains_early, 0, "a fresh store's count");
+        drop(db);
+
+        // Landed by the loop, with nothing held between the phases: the
+        // slot that names the seal written behind the directory's fsync
+        // the readable landing owed. The seal is held before it writes for
+        // a second, so that the flush's ask is at the segment work before
+        // the seal is readable and the loop cannot land it readable first,
+        // which syncs the directory there.
+        let d2 = dir(&format!("drain-readable-loop-{ordered}"));
+        let mut db = Db::create(&d2, opts.clone()).unwrap();
+        drain_load(&mut db, &keys);
+        db.hold_seal_landing(true);
+        let _release = db.release_seal_landing_after(std::time::Duration::from_secs(1));
+        db.flush().unwrap();
+        // Landed as no flush's: its slot synced where it was written and
+        // the run's temp name retired behind it, with no ask to pay a
+        // slot left owed.
+        wait_for("the seal's durable landing", || !db.in_flight().0);
+        assert!(
+            direct_temps(&d2).is_empty(),
+            "ordered {ordered}: the durable landing left the temp name: {:?}",
+            direct_temps(&d2)
+        );
+        db.settle().unwrap();
+        let w = db.seal_waits();
+        assert_eq!(
+            (w.drains_early, w.dir_owed_syncs),
+            (1, 1),
+            "ordered {ordered}: {w:?}"
+        );
+        assert!(direct_temps(&d2).is_empty());
+        drop(db);
+        let db = Db::open(&d2, opts).unwrap();
+        assert_eq!((db.segments(), db.unsealed_keys()), (1, 0));
+        drain_check(&db, &keys, "after the settle and the reopen");
+    }
+}
+
+/// A machine's crash after a flush answered at its seal's readable landing
+/// may take whatever that seal had not made durable -- its trailer, its
+/// names, its segment's pages -- and nothing the flush covers: every commit
+/// was synced before it. Built: the seal held between its phases, the
+/// store crashed, and what the seal wrote taken back -- a direct run's file
+/// cut to the length its last synced commit left, a memtable's segment torn
+/// in half. The reopen finds every key.
+#[test]
+fn a_crash_after_a_flush_answered_at_readable_keeps_every_commit() {
+    for ordered in [true, false] {
+        let d = dir(&format!("drain-readable-crash-{ordered}"));
+        let opts = Options {
+            drain_answers_readable: true,
+            ..common::options()
+        };
+        let keys = drain_keys(ordered, 3000);
+        let mut db = Db::create(&d, opts.clone()).unwrap();
+        drain_load(&mut db, &keys);
+        let synced: Vec<(PathBuf, u64)> = direct_temps(&d)
+            .into_iter()
+            .map(|p| {
+                let n = std::fs::metadata(&p).unwrap().len();
+                (p, n)
+            })
+            .collect();
+        assert_eq!(
+            synced.len(),
+            usize::from(ordered),
+            "a run is the ordered load's"
+        );
+        db.hold_seal_durable(true);
+        db.flush().unwrap();
+        assert_eq!(db.seal_waits().drains_early, 1);
+        assert!(db.in_flight().0);
+        // Held for good: the crashed store's seal thread never syncs.
+        db.crash();
+        if ordered {
+            for (p, n) in &synced {
+                let f = std::fs::OpenOptions::new().write(true).open(p).unwrap();
+                f.set_len(*n).unwrap();
+            }
+        } else {
+            let mut torn = 0;
+            for name in common::seg_names(&d) {
+                let p = d.join(&name);
+                let n = std::fs::metadata(&p).unwrap().len();
+                let f = std::fs::OpenOptions::new().write(true).open(&p).unwrap();
+                f.set_len(n / 2).unwrap();
+                torn += 1;
+            }
+            assert!(torn > 0, "the seal left no segment to tear");
+        }
+        let db = Db::open(&d, opts).unwrap();
+        drain_check(&db, &keys, "after the crash");
+    }
+}
+
+/// A flush with anything behind no sync waits for its seal's fsync, the
+/// slot behind it: a buffered store's, whose log frames and whose run of
+/// ordered ingest no commit synced; a store whose segment work is inline,
+/// where nothing would land the seal until the writer's next operation;
+/// and a drain that leaves a level-0 piece to merge.
+#[test]
+fn a_flush_owed_anything_waits_for_its_seals_fsync() {
+    for ordered in [true, false] {
+        let keys = drain_keys(ordered, 3000);
+        for case in ["buffered", "inline"] {
+            let d = dir(&format!("drain-strict-{case}-{ordered}"));
+            let opts = Options {
+                drain_answers_readable: true,
+                sync: if case == "buffered" {
+                    supdb::SyncPolicy::EveryN(u32::MAX)
+                } else {
+                    Options::default().sync
+                },
+                publish_in_background: case != "inline",
+                ..common::options()
+            };
+            let mut db = Db::create(&d, opts.clone()).unwrap();
+            drain_load(&mut db, &keys);
+            db.flush().unwrap();
+            assert_eq!(
+                db.seal_waits().drains_early,
+                0,
+                "{case}, ordered {ordered}: answered early"
+            );
+            drain_check(&db, &keys, case);
+            drop(db);
+            let db = Db::open(&d, opts).unwrap();
+            drain_check(&db, &keys, case);
+        }
+        // A seal handed before the drain's and held between its phases:
+        // the drain lands it whole first, as a strict one does, and its
+        // own seal after it. Shaped (`adaptive_shape`), the held seal is
+        // the store's first partition, so that a drain that took it for
+        // its own would find no piece standing and answer.
+        let d = dir(&format!("drain-strict-behind-{ordered}"));
+        let opts = Options {
+            drain_answers_readable: true,
+            adaptive_shape: true,
+            ..common::options()
+        };
+        let mut db = Db::create(&d, opts.clone()).unwrap();
+        let (first, second) = keys.split_at(keys.len() / 2);
+        drain_load(&mut db, first);
+        db.hold_seal_durable(true);
+        db.seal().unwrap();
+        // The published segments, which `segments` also counts frozen
+        // tables among.
+        wait_for("the first seal's readable landing", || {
+            db.levels() != (0, 0)
+        });
+        assert!(db.in_flight().0, "the held seal is between its phases");
+        assert_eq!(db.levels(), (1, 0), "the held seal is the first partition");
+        drain_load(&mut db, second);
+        let _release = db.release_seal_durable_after(std::time::Duration::from_secs(1));
+        db.flush().unwrap();
+        assert_eq!(
+            db.seal_waits().drains_early,
+            0,
+            "ordered {ordered}: answered with a seal before the drain's in flight"
+        );
+        assert!(
+            !db.in_flight().0,
+            "ordered {ordered}: a seal left in flight"
+        );
+        drain_check(&db, &keys, "behind a held seal");
+        drop(db);
+        let db = Db::open(&d, opts).unwrap();
+        assert_eq!(db.unsealed_keys(), 0);
+        drain_check(&db, &keys, "behind a held seal, reopened");
+        drop(db);
+        // A partitioned store's flush over keys inside its range: the seal
+        // leaves a piece over the partition, and the drain merges it.
+        let d = dir(&format!("drain-strict-piece-{ordered}"));
+        let opts = Options {
+            drain_answers_readable: true,
+            ..common::options()
+        };
+        let mut db = Db::create(&d, opts.clone()).unwrap();
+        drain_load(&mut db, &keys);
+        db.flush().unwrap();
+        assert_eq!(db.seal_waits().drains_early, 1);
+        let more: Vec<Vec<u8>> = keys
+            .iter()
+            .step_by(7)
+            .map(|k| {
+                let mut k = k.clone();
+                k.push(b'x');
+                k
+            })
+            .collect();
+        drain_load(&mut db, &more);
+        db.flush().unwrap();
+        assert_eq!(
+            db.seal_waits().drains_early,
+            1,
+            "ordered {ordered}: a drain with a piece to merge answered early"
+        );
+        assert_eq!(db.levels().1, 0, "the drain left a piece");
+        drain_check(&db, &keys, "the first load");
+        drain_check(&db, &more, "the second");
+    }
 }

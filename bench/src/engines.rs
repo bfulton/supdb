@@ -1085,6 +1085,12 @@ pub struct Supdb {
     /// default. `supdb-chaincovered` chains through a covered burst, and
     /// `supdb-nocopiesfitchain` is both shapes before.
     chainuncovered: Option<bool>,
+    /// A flush whose writes were all durable before it answered once its
+    /// seal is readable, the seal's fsync and its manifest left to the
+    /// segment work's loop (`Options::drain_answers_readable`), `None` for
+    /// the engine's default: `supdb-drainreadable` answers so and
+    /// `supdb-drainstrict` waits for the seal's fsync.
+    drainreadable: Option<bool>,
     /// A scan that starts in a block the writer holds a form for counted
     /// as a reuse by the forms-off rule
     /// (`Options::scan_forms_off_counts_built`), `None` for the engine's
@@ -2537,6 +2543,12 @@ struct Policy {
     /// default. `supdb-chaincovered` chains through a covered burst, and
     /// `supdb-nocopiesfitchain` is both shapes before.
     chainuncovered: Option<bool>,
+    /// A flush whose writes were all durable before it answered once its
+    /// seal is readable, the seal's fsync and its manifest left to the
+    /// segment work's loop (`Options::drain_answers_readable`), `None` for
+    /// the engine's default: `supdb-drainreadable` answers so and
+    /// `supdb-drainstrict` waits for the seal's fsync.
+    drainreadable: Option<bool>,
     /// A scan that starts in a block the writer holds a form for counted
     /// as a reuse by the forms-off rule
     /// (`Options::scan_forms_off_counts_built`), `None` for the engine's
@@ -3392,6 +3404,7 @@ impl Default for Policy {
             zbuycross: None,
             copiesfit: None,
             chainuncovered: None,
+            drainreadable: None,
             formsoffbuilt: None,
             formson: false,
             formsoffkept: false,
@@ -8026,6 +8039,35 @@ impl Supdb {
         )
     }
 
+    /// `supdb` answering a flush whose writes were all durable before it
+    /// once its seal's segments are published, the option pinned on
+    /// (`Options::drain_answers_readable`, the engine's default): the
+    /// directory's fsync, the seal's fsyncs and its manifest slot follow in
+    /// the segment work's loop. `supdb-drainreadable`, the arm it was
+    /// priced as.
+    pub fn create_drainreadable(path: &Path) -> Res<Supdb> {
+        Supdb::with_policy(
+            path,
+            Policy {
+                drainreadable: Some(true),
+                ..Policy::default()
+            },
+        )
+    }
+
+    /// `supdb` whose every flush waits for its seal's fsyncs and slot
+    /// (`Options::drain_answers_readable` off), the shape before.
+    /// `supdb-drainstrict`.
+    pub fn create_drainstrict(path: &Path) -> Res<Supdb> {
+        Supdb::with_policy(
+            path,
+            Policy {
+                drainreadable: Some(false),
+                ..Policy::default()
+            },
+        )
+    }
+
     /// `supdb-nocopiesfit` and `supdb-chaincovered` together, the shape
     /// before both: the budget that binds beside the raw form, and the
     /// chain through a burst the forms cover.
@@ -10083,6 +10125,7 @@ impl Supdb {
             zbuycross,
             copiesfit,
             chainuncovered,
+            drainreadable,
             formsoffbuilt,
             formson,
             formsoffkept,
@@ -10620,6 +10663,8 @@ impl Supdb {
                 .unwrap_or(supdb::Options::default().scan_cache_copies_fit),
             merge_chains_writes_uncovered: chainuncovered
                 .unwrap_or(supdb::Options::default().merge_chains_writes_uncovered),
+            drain_answers_readable: drainreadable
+                .unwrap_or(supdb::Options::default().drain_answers_readable),
             scan_forms_off_counts_built: formsoffbuilt
                 .unwrap_or(supdb::Options::default().scan_forms_off_counts_built),
             scan_forms_off_unreused: !formson,
@@ -11122,6 +11167,7 @@ impl Supdb {
             zbuycross,
             copiesfit,
             chainuncovered,
+            drainreadable,
             formsoffbuilt,
             formson,
             formsoffkept,
@@ -12905,6 +12951,12 @@ impl Engine for Supdb {
         if self.zbuycross == Some(false) {
             return "supdb-nobuycross";
         }
+        if self.drainreadable == Some(true) {
+            return "supdb-drainreadable";
+        }
+        if self.drainreadable == Some(false) {
+            return "supdb-drainstrict";
+        }
         match (
             self.copiesfit == Some(false),
             self.chainuncovered == Some(false),
@@ -13265,6 +13317,9 @@ impl Engine for Supdb {
             ("publishes", db.seal_waits().publishes as f64),
             ("seals_deferred", db.seal_waits().deferred as f64),
             ("seals_idle", db.seal_waits().idle_seals as f64),
+            // Flushes answered at their seal's readable landing
+            // (`Options::drain_answers_readable`).
+            ("drains_early", db.seal_waits().drains_early as f64),
             ("wal_rotations", db.seal_waits().wal_rotations as f64),
             ("freeze_ms", db.seal_waits().freeze_ns as f64 / 1e6),
             ("join_wait_ms", db.seal_waits().join_wait_ns as f64 / 1e6),
@@ -15317,6 +15372,8 @@ pub fn guarantee(arm: &str) -> Option<Guarantee> {
         | "supdb-jobsshort"
         | "supdb-jobsheap"
         | "supdb-nobuycross"
+        | "supdb-drainreadable"
+        | "supdb-drainstrict"
         | "supdb-jobspooled"
         | "supdb-zslabjobs"
         | "supdb-zstrideallslabjobs"
@@ -16741,6 +16798,8 @@ pub fn open(arm: &str, dir: &Path, map_gb: usize) -> Res<Box<dyn Engine>> {
         "supdb-jobsshort" => supdb_arm(Supdb::create_jobsshort, dir)?,
         "supdb-jobsheap" => supdb_arm(Supdb::create_jobsheap, dir)?,
         "supdb-nobuycross" => supdb_arm(Supdb::create_nobuycross, dir)?,
+        "supdb-drainreadable" => supdb_arm(Supdb::create_drainreadable, dir)?,
+        "supdb-drainstrict" => supdb_arm(Supdb::create_drainstrict, dir)?,
         "supdb-jobspooled" => supdb_arm(Supdb::create_jobspooled, dir)?,
         "supdb-zslabjobs" => supdb_arm(Supdb::create_zslabjobs, dir)?,
         "supdb-zstrideallslabjobs" => supdb_arm(Supdb::create_zstride_all_slab_jobs, dir)?,
@@ -20286,6 +20345,48 @@ mod tests {
                 assert_eq!(z.features(), base.features());
                 let o = z.db.as_ref().unwrap().options();
                 assert!(!o.zpages_buy_crosses && o.jobs_mapped && !o.jobs_pooled);
+                // A flush answered at its seal's readable landing, and the
+                // strict one, each differing from the default by that alone.
+                for (z, on) in [
+                    (
+                        Supdb::create_drainreadable(&dir("drainreadable")).unwrap(),
+                        true,
+                    ),
+                    (
+                        Supdb::create_drainstrict(&dir("drainstrict")).unwrap(),
+                        false,
+                    ),
+                ] {
+                    assert_eq!(
+                        z.name(),
+                        if on {
+                            "supdb-drainreadable"
+                        } else {
+                            "supdb-drainstrict"
+                        }
+                    );
+                    assert_eq!(z.features(), base.features());
+                    let o = z.db.as_ref().unwrap().options();
+                    assert_eq!(o.drain_answers_readable, on);
+                    let drain = |o: &supdb::Options| {
+                        (
+                            o.flush_waits_manifest,
+                            o.close_presync,
+                            o.drain_syncs_wal,
+                            o.manifest_slots,
+                            o.drain_names_partition,
+                            o.zpages_buy_crosses,
+                            o.jobs_mapped,
+                        )
+                    };
+                    assert_eq!(drain(o), drain(b));
+                    let arm = z.name();
+                    assert_eq!(
+                        open(arm, &dir(&format!("{arm}-open")), 1).unwrap().name(),
+                        arm
+                    );
+                    assert_eq!(guarantee(arm), guarantee("supdb"), "{arm}");
+                }
                 let z = Supdb::create_jobsheap(&dir("jobsheap")).unwrap();
                 assert_eq!(z.name(), "supdb-jobsheap");
                 assert_eq!(z.features(), base.features());

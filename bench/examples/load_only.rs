@@ -1,17 +1,21 @@
 //! The suite's ordered load alone, for a profile: `size` keys in key order
 //! through `Batch` flushes of a thousand, ending in the `sync` the suite's
 //! load ends in, on one arm; `reps` stores in turn. Prints ops/s a store.
+//! With `shuffled` the keys come in the shuffled load's order instead, the
+//! suite's permutation and seed (`run::shuffled_load`).
 //!
-//!     load_only <arm> <size> <reps>
+//!     load_only <arm> <size> <reps> [shuffled]
 use std::time::Instant;
 use supdb_bench::engines::{self, Batch};
-use supdb_bench::workload::{db_key_into, Payload, Rng};
+use supdb_bench::workload::{db_key_into, Payload, Permutation, Rng};
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     let arm = args.get(1).cloned().unwrap_or("supdb-ingest".into());
     let size: u64 = args.get(2).and_then(|s| s.parse().ok()).unwrap_or(300_000);
     let reps: usize = args.get(3).and_then(|s| s.parse().ok()).unwrap_or(3);
+    let shuffled = args.get(4).is_some_and(|s| s == "shuffled");
+    let perm = Permutation::new(size, 0x5EED);
     let payload = Payload::new(100, 0.5, 0xE1);
     let root = std::env::temp_dir().join(format!("supdb-loadonly-{}", std::process::id()));
     let mut kb = [0u8; 16];
@@ -28,7 +32,7 @@ fn main() {
         let mut batches: Vec<f64> = Vec::new();
         let t = Instant::now();
         for i in 0..size {
-            db_key_into(i, &mut kb);
+            db_key_into(if shuffled { perm.at(i) } else { i }, &mut kb);
             buf.push(&kb, payload.get(&mut vrng));
             if buf.len() == 1000 {
                 let tb = Instant::now();

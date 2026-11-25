@@ -5206,6 +5206,33 @@ pub struct Options {
     /// the owed slot first. Kept for pricing as `supdb-waitmanifest` and
     /// `supdb-ingestwaitmanifest`. Only with `manifest_slots`.
     pub flush_waits_manifest: bool,
+    /// A flush whose writes were all durable before it -- every commit
+    /// synced, by `SyncPolicy::Always`, so that nothing is owed a sync
+    /// (`Db::owes_sync`) and the drain's own run of ordered ingest, if it
+    /// closed one, has every commit synced and its name behind a barrier
+    /// -- is answered once its seal's segments are published, and the
+    /// rest of the seal's landing follows in the segment work's loop: the
+    /// directory's fsync of the segments' names, the seal's fsyncs, its
+    /// manifest slot and the retirement of the log and the temp name it
+    /// covers. Its durability never rested on them: a run of ordered
+    /// ingest synced its records and markers at every commit and keeps its
+    /// temp name until a slot names its segment, so an open after a crash
+    /// finishes the run again from it, and a memtable's frames were synced
+    /// in the log, which retires only behind that slot and replays where it
+    /// was not. What the strict drain waited for after the publish was the
+    /// directory's fsync at the readable landing, which waits on the
+    /// journal commit the seal's own fsync forces, and then the join: at
+    /// ten thousand keys 1.1 to 1.8 ms of the shuffled load's drain of 5.6
+    /// and 0.5 of the ordered load's 1.9, with the fsync done inside it.
+    /// Only where the segment work has a thread of its own (inline, nothing
+    /// would land the seal until the writer's next operation), where the
+    /// drain's seal is the one in flight and leaves no level-0 piece and no
+    /// merge to join -- a load's own drain, whose seal is named the
+    /// partition -- and for a flush alone: a checkpoint, a settle and a
+    /// close land every seal whole, and a store dropped with such a seal in
+    /// flight lands it whole at its stop. Off, every flush waits for its
+    /// seal's fsync and slot, as before: `supdb-drainstrict`.
+    pub drain_answers_readable: bool,
     /// A flush's commit of what is staged fsyncs the WAL whatever the
     /// policy, before the seal is handed over: the buffered arm's drain
     /// at ten thousand keys began with a 2.4 ms fdatasync of a log the
@@ -7596,6 +7623,7 @@ impl Default for Options {
             manifest_slots: true,
             manifest_pending: false,
             flush_waits_manifest: false,
+            drain_answers_readable: true,
             drain_syncs_wal: false,
             close_finish_inline: false,
             drain_snapshot: true,
@@ -19387,6 +19415,13 @@ struct SealCounts {
     /// Seals a commit under the threshold started because no seal was
     /// writing (`Options::seal_idle`).
     idle_seals: AtomicU64,
+    /// Drains answered once their seal was readable, with its fsync and
+    /// its manifest left to the segment work's loop
+    /// (`Options::drain_answers_readable`).
+    drains_early: AtomicU64,
+    /// The directory fsyncs such a drain's readable landing left to the
+    /// seal's durable landing, paid there ahead of the slot.
+    dir_owed_syncs: AtomicU64,
     /// WAL rotations, at seals or by size; the bytes a rotation left
     /// unsynced in the file it closed, none under a policy that syncs
     /// every commit, which a test holds it to, and the file's tail under
@@ -19427,6 +19462,8 @@ impl SealCounts {
             seal_sorts: get(&self.seal_sorts),
             deferred: get(&self.deferred),
             idle_seals: get(&self.idle_seals),
+            drains_early: get(&self.drains_early),
+            dir_owed_syncs: get(&self.dir_owed_syncs),
             wal_rotations: get(&self.wal_rotations),
             rotated_unsynced: get(&self.rotated_unsynced),
             loose_synced: get(&self.loose_synced),
@@ -19483,6 +19520,12 @@ pub struct SealWaits {
     /// Seals started by a commit under the threshold because no seal was
     /// writing (`Options::seal_idle`).
     pub idle_seals: u64,
+    /// Drains answered once their seal was readable
+    /// (`Options::drain_answers_readable`).
+    pub drains_early: u64,
+    /// The directory fsyncs their readable landings left owed, paid at
+    /// the durable landing.
+    pub dir_owed_syncs: u64,
     pub wal_rotations: u64,
     pub rotated_unsynced: u64,
     pub loose_synced: u64,
@@ -40337,7 +40380,17 @@ impl Db {
         self.shared.reads_near.store(true, AtomicOrdering::Release);
         let sealed = self.seal().and_then(|_| {
             self.shared.drain_steps.stamp(1);
-            self.maint_request(MaintAsk::Drain)
+            // Asked once the seal is handed: a drain owed nothing here --
+            // no frame, file or run behind no sync (`owes_sync`), and the
+            // drain's own run, which its close keeps aside rather than
+            // loose (`drain_run`), with every commit synced and its name
+            // behind a barrier -- covers writes that were all durable
+            // before it.
+            let early = self.opts.drain_answers_readable
+                && matches!(self.maint, MaintHome::Away(_))
+                && !self.owes_sync()
+                && self.drain_run.is_none();
+            self.maint_request(MaintAsk::Drain { early })
         });
         self.draining = false;
         self.shared.drain_steps.stamp(13);
@@ -40361,8 +40414,11 @@ impl Db {
         }
         if sealed.is_ok() {
             // Every seal handed before the drain has landed with its
-            // fsyncs done: no run is loose, and a handle kept on one would
-            // keep its file's blocks past the merge that retires it.
+            // fsyncs done, or the drain was answered at its seal's readable
+            // landing with nothing owed a sync, no run loose among it
+            // (`Options::drain_answers_readable`): no run is loose, and a
+            // handle kept on one would keep its file's blocks past the
+            // merge that retires it.
             self.loose_runs.clear();
         }
         sealed
@@ -41907,6 +41963,8 @@ impl Db {
             wal,
             tmp,
             draining,
+            early: false,
+            dir_owed: false,
             wal_unsynced: self.log_unsynced() || !self.loose_wals.is_empty(),
         };
         // Counted before it is sent, so the count never reads zero with a
@@ -48759,6 +48817,15 @@ struct SealJob {
     wal: Vec<PathBuf>,
     tmp: Option<PathBuf>,
     draining: bool,
+    /// A drain answered at this seal's readable landing
+    /// (`Options::drain_answers_readable`), its durable landing left to
+    /// the loop: landed whole at the stop where the loop has not come to
+    /// it (`Maint::stop`), as a strict drain's is before its answer.
+    early: bool,
+    /// The readable landing left the directory's fsync of the segments'
+    /// names to the durable landing, ahead of the slot that names them
+    /// (`Maint::drain_readable`).
+    dir_owed: bool,
     /// The log held frames not yet synced when the seal was handed over:
     /// a drain of such a seal is answered only behind a durable slot,
     /// since nothing else covers them (`Options::drain_syncs_wal`).
@@ -48768,8 +48835,10 @@ struct SealJob {
 /// What the writer waits for.
 enum MaintAsk {
     /// A flush's: the seal landed, then the store left partitioned or its
-    /// partitioning scheduled (`Maint::drain`).
-    Drain,
+    /// partitioning scheduled (`Maint::drain`). `early` where the flush
+    /// may be answered once its seal is readable
+    /// (`Options::drain_answers_readable`, `Maint::drain_readable`).
+    Drain { early: bool },
     /// A settle's: the seal and every merge in flight landed.
     Settle,
     /// A settle of the second form's (`Db::zpages_settle`): every live
@@ -49545,7 +49614,12 @@ impl Maint {
     /// What the writer waits for; see `MaintAsk`.
     fn answer(&mut self, ask: MaintAsk) -> Result<()> {
         match ask {
-            MaintAsk::Drain => {
+            MaintAsk::Drain { early } => {
+                if early && self.drain_readable()? {
+                    self.shared.drain_steps.stamp(12);
+                    SealCounts::add(&self.shared.seal_counts.drains_early, 1);
+                    return Ok(());
+                }
                 self.join_seal(true)?;
                 let out = self.drain();
                 self.shared.drain_steps.stamp(12);
@@ -49728,6 +49802,13 @@ impl Maint {
     /// published for readers and its table retired (`land_readable`); the
     /// seal is between its phases from here until its thread returns.
     fn land_front_readable(&mut self) -> Result<()> {
+        self.land_front_readable_as(false)
+    }
+
+    /// `land_front_readable`, with the directory's fsync of the segments'
+    /// names left to the durable landing where `defer_dir` asks
+    /// (`land_readable`).
+    fn land_front_readable_as(&mut self, defer_dir: bool) -> Result<()> {
         let Some(front) = self.sealing.front() else {
             return Ok(());
         };
@@ -49736,11 +49817,12 @@ impl Maint {
         let table = front.table.clone();
         let t = std::time::Instant::now();
         self.shared.drain_steps.stamp(8);
-        match self.land_readable(&names, &facts, &table) {
-            Ok(()) => {
+        match self.land_readable(&names, &facts, &table, defer_dir) {
+            Ok(owed) => {
                 self.shared.drain_steps.stamp(9);
                 if let Some(s) = self.sealing.front_mut() {
                     s.landed = true;
+                    s.dir_owed = owed;
                 }
                 SealCounts::add(
                     &self.shared.seal_counts.seal_ns,
@@ -49865,6 +49947,20 @@ impl Maint {
         z_finish_wait(&self.shared);
         if let Some(s) = self.z_sampling.take() {
             let _ = s.handle.join();
+        }
+        // A drain answered at its seal's readable landing left the rest of
+        // that landing to the loop (`Options::drain_answers_readable`): a
+        // store dropped before the loop came to it lands it here, so that
+        // a flush followed by a drop leaves what a strict flush's did, the
+        // segments named by a synced slot and nothing for the open to
+        // recover. The seals handed after it are joined and left, as every
+        // seal in flight at a drop is.
+        if self.sealing.front().is_some_and(|j| j.early) {
+            let op = self.op();
+            if let Err(e) = self.land_front(false) {
+                self.shared.put_maint_err(e);
+            }
+            drop(op);
         }
         for job in self.sealing.drain(..) {
             let _ = job.handle.join();
@@ -50143,6 +50239,53 @@ impl Maint {
         Ok(())
     }
 
+    /// A drain answered at its seal's readable landing
+    /// (`Options::drain_answers_readable`): the drain's own seal, the one
+    /// seal in flight, landed readable with the directory's fsync of its
+    /// names left to its durable landing (`land_readable`), and true where
+    /// that leaves the drain nothing to do -- no level-0 piece and no merge
+    /// in flight -- so that the seal's fsyncs and its durable landing
+    /// follow in the loop (`collect_seal`), which lands it as no flush's:
+    /// the slot it writes is synced there, since nobody waits for it to
+    /// be. False, and the drain goes on as a strict one from where this
+    /// left the queue, where the drain still has work, where the seal's
+    /// thread returned before it was readable, and where a seal handed
+    /// before the drain's is still in flight. The work is what `drain`
+    /// does, named as it names it: a merge or a piece merge to join, and a
+    /// level-0 piece to partition. Either merge holds a level-0 input
+    /// while it runs, so the piece is what a store reaching here shows,
+    /// and the two are asked apart all the same, as the joins they are.
+    fn drain_readable(&mut self) -> Result<bool> {
+        if self.sealing.len() != 1 || self.shared.seal_wedged.load(AtomicOrdering::Acquire) {
+            return Ok(false);
+        }
+        if self.sealing.front().is_some_and(|f| !f.landed) {
+            loop {
+                let (readable, sealed) = self.seal_phases_due();
+                if sealed || self.shared.seal_wedged.load(AtomicOrdering::Acquire) {
+                    break;
+                }
+                if readable {
+                    self.land_front_readable_as(true)?;
+                    break;
+                }
+                std::thread::park_timeout(MAINT_LAND_POLL);
+            }
+        }
+        if !self.sealing.front().is_some_and(|f| f.landed)
+            || !self.compacting.is_empty()
+            || self.tiering.is_some()
+            || self.segs().iter().any(|s| s.level == 0)
+        {
+            return Ok(false);
+        }
+        if let Some(front) = self.sealing.front_mut() {
+            front.draining = false;
+            front.early = true;
+        }
+        Ok(true)
+    }
+
     /// The oldest seal in flight landed whole: its thread joined first if
     /// it is still writing, its segments published for readers if the
     /// poll has not done that (`land_readable`), then the durable landing
@@ -50165,6 +50308,7 @@ impl Maint {
             tmp,
             readable,
             wal_unsynced,
+            dir_owed,
             ..
         } = job;
         let t = std::time::Instant::now();
@@ -50200,11 +50344,23 @@ impl Maint {
         };
         if !landed {
             let facts = readable.facts.get().cloned().unwrap_or_default();
-            if let Err(e) = self.land_readable(&names, &facts, &table) {
+            if let Err(e) = self.land_readable(&names, &facts, &table, false) {
                 self.shared.in_seal.fetch_sub(1, AtomicOrdering::AcqRel);
                 self.shared.seal_wedged.store(true, AtomicOrdering::Release);
                 return Err(e);
             }
+        }
+        // The directory's fsync the readable landing left owed, before the
+        // slot that names the segments: a failure is the readable
+        // landing's, the segments published and unnamed, and wedges the
+        // queue as one there does.
+        if dir_owed {
+            if let Err(e) = File::open(&self.dir).and_then(|d| d.sync_all()) {
+                self.shared.in_seal.fetch_sub(1, AtomicOrdering::AcqRel);
+                self.shared.seal_wedged.store(true, AtomicOrdering::Release);
+                return Err(e);
+            }
+            SealCounts::add(&self.shared.seal_counts.dir_owed_syncs, 1);
         }
         let defer =
             draining && !self.opts.flush_waits_manifest && !self.pending_on() && !wal_unsynced;
@@ -50232,7 +50388,8 @@ impl Maint {
         names: &[String],
         facts: &[Option<(BlockedBloom, bool)>],
         table: &std::sync::Arc<MemTable>,
-    ) -> Result<()> {
+        defer_dir: bool,
+    ) -> Result<bool> {
         if self.shared.fail_landing.swap(false, AtomicOrdering::AcqRel) {
             return Err(err("a test failed this landing"));
         }
@@ -50328,10 +50485,17 @@ impl Maint {
             // own directory fsync does this. An fsync that fails here
             // leaves the segments published and unnamed, which is the
             // state a crash before the publish leaves: the WAL holds the
-            // writes, and the seal is wedged by the caller.
+            // writes, and the seal is wedged by the caller. Left to the
+            // durable landing where the caller asks (`defer_dir`): a drain
+            // answered here, whose writes no name of the seal's covers,
+            // returns without waiting on that journal commit, and the
+            // landing that writes the slot syncs the directory first.
+            if defer_dir {
+                return Ok(true);
+            }
             File::open(&self.dir)?.sync_all()?;
         }
-        Ok(())
+        Ok(false)
     }
 
     /// Whether a seal's manifest rides its fsync (`Options::manifest_pending`
@@ -53931,6 +54095,20 @@ impl Maint {
     fn raw_rewarm_files(&self, merging: bool) -> Vec<PathBuf> {
         let raw_gate = self.shared.zgate.load() == zselect::GATE_RAW;
         let _op = self.op();
+        // A partition with its form file's build in flight is the build's:
+        // the build reads its records once and drops them behind it
+        // (`Options::zpages_drop_behind`), and asked back before the build
+        // was collected they stood whole beside the form file it then
+        // attached -- a settle that came while the loop built the partition
+        // a drain had just landed asked every page of the records back, in
+        // a test of the drop three runs in forty once a durable flush was
+        // answered at its seal's readable landing, and none before.
+        let building: Vec<&str> = [self.zbuild.as_ref(), self.zahead.as_ref()]
+            .into_iter()
+            .flatten()
+            .filter(|b| matches!(b.job, ZJob::Build(_)))
+            .map(|b| b.seg.name.as_str())
+            .collect();
         let (mut files, mut parts, mut pieces) = (Vec::new(), Vec::new(), Vec::new());
         for s in self.segs().iter() {
             if merging && self.in_flight_input(&s.name) {
@@ -53941,6 +54119,9 @@ impl Maint {
             }
             if let Some(n) = Db::ord_name_for(&s.name) {
                 files.push(self.dir.join(n));
+            }
+            if s.level > 0 && building.contains(&s.name.as_str()) {
+                continue;
             }
             if s.level > 0 {
                 parts.push(self.dir.join(&s.name));
