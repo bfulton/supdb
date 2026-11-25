@@ -4996,10 +4996,22 @@ struct MixKinds {
     scans: (u64, f64),
     commits: (u64, f64),
     irq0: [u64; 2],
+    /// The engine's seals and the milliseconds its commits spent freezing
+    /// at the mix's start (`seals`, `freeze_ms`; zeros for an engine that
+    /// counts neither), so the commits' time is read beside the freezes
+    /// inside it.
+    seals0: [f64; 2],
+}
+
+/// The engine's seals and freeze milliseconds as its counters have them.
+fn seal_counts(e: &dyn Engine) -> [f64; 2] {
+    let c = e.counters();
+    let get = |k: &str| c.iter().find(|(n, _)| *n == k).map_or(0.0, |(_, v)| *v);
+    [get("seals"), get("freeze_ms")]
 }
 
 impl MixKinds {
-    fn new() -> MixKinds {
+    fn new(e: &dyn Engine) -> MixKinds {
         let on = std::env::var_os("SUPDB_MIX_KINDS").is_some();
         MixKinds {
             on,
@@ -5007,6 +5019,7 @@ impl MixKinds {
             scans: (0, 0.0),
             commits: (0, 0.0),
             irq0: if on { irq_counts() } else { [0; 2] },
+            seals0: if on { seal_counts(e) } else { [0.0; 2] },
         }
     }
 
@@ -5021,11 +5034,12 @@ impl MixKinds {
         }
     }
 
-    fn report(&self, arm: &str, mix: &str, size: u64, ops: u64, total: f64) {
+    fn report(&self, e: &dyn Engine, arm: &str, mix: &str, size: u64, ops: u64, total: f64) {
         if self.on {
             let irq = irq_counts();
+            let seals = seal_counts(e);
             eprintln!(
-                "mixkinds {arm} {mix} size {size} ops {ops} gets {} {:.3} scans {} {:.3} commits {} {:.3} total {:.3} tlb {} cal {}",
+                "mixkinds {arm} {mix} size {size} ops {ops} gets {} {:.3} scans {} {:.3} commits {} {:.3} total {:.3} tlb {} cal {} seals {} freeze {:.3}",
                 self.gets.0,
                 self.gets.1 * 1e3,
                 self.scans.0,
@@ -5034,7 +5048,9 @@ impl MixKinds {
                 self.commits.1 * 1e3,
                 total * 1e3,
                 irq[0] - self.irq0[0],
-                irq[1] - self.irq0[1]
+                irq[1] - self.irq0[1],
+                seals[0] - self.seals0[0],
+                seals[1] - self.seals0[1]
             );
         }
     }
@@ -5178,7 +5194,7 @@ fn ycsb(
     let mut kb = [0u8; KEY_SIZE];
     let mut wbuf = Batch::with_capacity(YCSB_BATCH, payload.value_size());
     let mut wbuf_is_insert = false;
-    let mut kinds = MixKinds::new();
+    let mut kinds = MixKinds::new(&*e);
     // A key that exists: a draw at or above the committed keys is drawn
     // again, which only the scrambled family's fixed space can produce.
     let existing = |keys: &mut KeyGen, committed: u64| loop {
@@ -5234,7 +5250,7 @@ fn ycsb(
     flush_ycsb(&mut wbuf, e, wbuf_is_insert)?;
     MixKinds::add(&mut kinds.commits, t0);
     let total = t.elapsed().as_secs_f64();
-    kinds.report(arm, mix, size, ops, total);
+    kinds.report(&*e, arm, mix, size, ops, total);
     Ok(total)
 }
 

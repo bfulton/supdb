@@ -871,7 +871,8 @@ entries the writer is rewriting are the cost, each an ownership the
 next update pays for, and three cache-line separations guessed at
 before the bisect moved nothing and were taken out. The mixes have a
 timer by kind (`SUPDB_MIX_KINDS=1`, a `mixkinds` line per mix on
-stderr for every arm, its reads, scans and commits apart), which read
+stderr for every arm, its reads, scans and commits apart, and the seals
+and the freezes' time inside the commits), which read
 the E gap as the scans' alone and the tax as the commits' and the
 gets'; `SUPDB_MIX_EVENTS=1` prints each mix's form events, upkeep
 passes and snapshot builds beside its counters; `SUPDB_MIX_CENSUS=1`

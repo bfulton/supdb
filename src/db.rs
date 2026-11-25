@@ -42304,6 +42304,16 @@ impl Db {
             .map_or((0, 0, 0), |p| p.counts())
     }
 
+    /// The blocks the store's tables asked of its pool that it held none
+    /// of the length of, so mapped fresh, and their bytes, over its life
+    /// (`Options::blocks_pool_bytes`). Zeros where it keeps none.
+    pub fn block_pool_misses(&self) -> (usize, usize) {
+        self.shared
+            .block_pool
+            .as_ref()
+            .map_or((0, 0), |p| p.misses())
+    }
+
     /// Whether the store's pool of given-back blocks keeps blocks now
     /// (`Options::blocks_pool_bytes`); false where it has none.
     pub fn block_pool_on(&self) -> bool {
@@ -45509,8 +45519,17 @@ impl Db {
             self.wal.pending.capacity()
         };
         c.push(("wal_buffer".to_string(), wal as u64));
-        // The blocks the store's pool holds for its next tables.
-        c.push(("block_pool".to_string(), self.block_pool_counts().0 as u64));
+        // The blocks the store's pool holds for its next tables, and over
+        // its life the blocks it gave out, took back and held none of the
+        // length of, with the kibibytes mapped fresh for those: counts, and
+        // not bytes the process holds.
+        let (held, takes, gives) = self.block_pool_counts();
+        let (misses, missed) = self.block_pool_misses();
+        c.push(("block_pool".to_string(), held as u64));
+        c.push(("block_pool_takes_n".to_string(), takes as u64));
+        c.push(("block_pool_gives_n".to_string(), gives as u64));
+        c.push(("block_pool_misses_n".to_string(), misses as u64));
+        c.push(("block_pool_missed_kib_n".to_string(), (missed >> 10) as u64));
         c
     }
 

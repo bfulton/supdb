@@ -1049,8 +1049,35 @@ arm's, by both orders' mean), A read 1.09x, F 1.11x, E 1.22x and the
 scrambled D and E 1.06x and 1.10x, and D 0.97x, with the rest within 2%.
 Timed by kind, A's and F's gets are 7-8% faster in both sittings and
 their commits 1.3x and 1.5x. The scrambled mixes' commits are the other
-way, 1.15-1.6x slower in place in both sittings -- the scrambled E's 38
-µs a commit against 24 -- which is not yet laid to a cause.
+way, 1.15-1.6x slower in place in every rep of both sittings -- the
+scrambled E's 38 µs a commit against 24.
+
+The overwrite is not what costs them. An overwrite grows the table by its
+log's entry alone and is charged that toward the seal, so through the
+Zipfian mixes the table seals rarely, and the scrambled mixes, whose puts
+are mostly of keys the table does not hold, meet a table two and a half
+to three times the appending arm's. At their ends the in-place table held
+43,497 unsealed keys after the scrambled A against 12,858 and 31,532
+after the scrambled E against 12,544, with 0-2 pieces standing against 2-6
+(`SUPDB_MIX_COUNTERS=1 bench ab --arms supdb-heldinplace,supdb-heldnfinline
+--size 300000 --reps 2 --passes load,read,scan,mixes,mixes-scrambled`, the
+`pieces` and `unsealed` fields). A put of a new key into the larger table
+costs more: by every fault recorded with its instruction and cut to the
+writer's thread in the mixes' windows (`SUPDB_LAG_MARK=1 perf record -e
+minor-faults -c 1 -k CLOCK_MONOTONIC --call-graph dwarf,8192` over the same
+`bench ab`, one rep), the scrambled A and F took 1,404 faults against 508,
+812 against 170 of them in the copy of a put's value into the arena, with
+blocks the table's pool held none of the length of mapped fresh in the
+scrambled A (the census's `block_pool_misses_n`, `SUPDB_MIX_CENSUS=1`).
+The scrambled E's commits are a hundred such inserts each, 370 ns an
+insert against 240, and freeze nothing in either arm (`seals` and `freeze`
+on the `mixkinds` line). A build that charges an overwrite as a put,
+the one line in `Db::put_pinned` at `d83c220`, gives the in-place table the
+appending arm's sizes and pieces from the scrambled B on, and its
+scrambled commits read level with the appending arm's -- the scrambled E
+24-26 µs against 25-28 -- while A's and F's stay 1.2-1.5x faster: the cost
+is the longer-lived table, and the fewer pieces that are its other side
+are what the scrambled D's and E's gains are.
 
 Beside FASTER (`pair.sh SUPDB_MIX_KINDS=1 supdb-heldinplace faster
 300000`, the same passes and reps; ours over FASTER's): A 1.07x, B 1.04x,

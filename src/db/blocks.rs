@@ -280,13 +280,16 @@ impl Source {
     /// pooled block holds what its last table wrote.
     pub(crate) fn alloc(&self, len: usize, zeroed: bool) -> *mut u8 {
         if maps(len, self.mapped) {
-            if let Some(p) = self.pool.as_ref().and_then(|pool| pool.take(len)) {
-                if zeroed {
-                    // SAFETY: a block of `len` bytes the pool held, no
-                    // reader's since it was given back.
-                    unsafe { std::ptr::write_bytes(p, 0, len) };
+            if let Some(pool) = &self.pool {
+                if let Some(p) = pool.take(len) {
+                    if zeroed {
+                        // SAFETY: a block of `len` bytes the pool held, no
+                        // reader's since it was given back.
+                        unsafe { std::ptr::write_bytes(p, 0, len) };
+                    }
+                    return p;
                 }
-                return p;
+                pool.missed(len);
             }
             let p = alloc(len, zeroed, true);
             if zeroed && self.populate {
@@ -338,6 +341,11 @@ pub(crate) struct BlockPool {
     /// Blocks given out of the pool, and given to it, over its life.
     takes: AtomicUsize,
     gives: AtomicUsize,
+    /// Blocks its tables asked for that it held none of the length of, so
+    /// mapped fresh, and their bytes, over its life: the blocks whose
+    /// pages are each a fault at the first touch.
+    misses: AtomicUsize,
+    missed_bytes: AtomicUsize,
 }
 
 impl BlockPool {
@@ -349,7 +357,24 @@ impl BlockPool {
             on: std::sync::atomic::AtomicBool::new(on),
             takes: AtomicUsize::new(0),
             gives: AtomicUsize::new(0),
+            misses: AtomicUsize::new(0),
+            missed_bytes: AtomicUsize::new(0),
         }
+    }
+
+    /// A block of `len` bytes asked for and not held, mapped fresh.
+    fn missed(&self, len: usize) {
+        self.misses.fetch_add(1, Ordering::Relaxed);
+        self.missed_bytes.fetch_add(len, Ordering::Relaxed);
+    }
+
+    /// The blocks asked for that the pool held none of the length of, and
+    /// their bytes, over its life.
+    pub(crate) fn misses(&self) -> (usize, usize) {
+        (
+            self.misses.load(Ordering::Relaxed),
+            self.missed_bytes.load(Ordering::Relaxed),
+        )
     }
 
     fn held(&self) -> std::sync::MutexGuard<'_, Vec<(usize, usize)>> {
@@ -1606,6 +1631,11 @@ mod tests {
             c.write(9);
         }
         assert_eq!(pool.counts(), (0, 0, 0), "nothing given yet");
+        assert_eq!(
+            pool.misses(),
+            (3, 2 * LEN + MAP_FROM),
+            "an empty pool's three blocks mapped fresh"
+        );
         // SAFETY: from this source with these lengths, read no more here.
         unsafe {
             src.free(a, LEN);
@@ -1616,6 +1646,7 @@ mod tests {
         // A fourth over the cap: unmapped, not held.
         let d = src.alloc(MAP_FROM, false);
         assert_eq!(pool.counts().1, 1, "the third block given back out");
+        assert_eq!(pool.misses().0, 3, "a block taken is no miss");
         assert_eq!(d, c, "the same block");
         // SAFETY: as above.
         assert_eq!(unsafe { d.read() }, 9, "what its last owner wrote");
@@ -1647,6 +1678,11 @@ mod tests {
         assert_eq!(pool.counts().2, 5, "the short block held at its own length");
         let again = src.alloc(2 * MAP_FROM, false);
         assert_eq!(again, short, "and given back at it");
+        assert_eq!(
+            pool.misses(),
+            (5, 2 * LEN + MAP_FROM + 2 * LEN + 2 * MAP_FROM),
+            "the lengths it held none of, mapped fresh, and none it held"
+        );
         // SAFETY: as above.
         unsafe { src.free(again, 2 * MAP_FROM) };
         // A block too small to map, and a source that does not map.
@@ -1654,6 +1690,7 @@ mod tests {
         let h = small.alloc(64, false);
         let unmapped = Source::new(false, Some(pool.clone()));
         let i = unmapped.alloc(LEN, false);
+        assert_eq!(pool.misses().0, 5, "a block the pool never sees is no miss");
         let held = pool.counts();
         // SAFETY: as above.
         unsafe {
