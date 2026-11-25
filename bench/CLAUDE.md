@@ -264,7 +264,9 @@ resident to 2.1 GB. The runner now releases freed memory after every
 store a pass drops, and the pass line prints what the process holds as
 the next pass opens, so a climb shows while it is happening.
 `a_dropped_stores_freed_memory_is_returned_before_the_next_pass`
-reproduces the shape and released 0 of its 300 MB without the release.
+reproduces the shape and released 0 of its 300 MB without the release;
+it has a binary of its own (`tests/trim.rs`), since the release is the
+process's and any test beside it that runs a pass trims its blocks first.
 It came back inside one store's life: the shuffled load's merges at ten
 million keys left 742 MB of freed memory in the arenas with the engine
 holding 11, and under a bound of 1 GiB the lag sweep's full rewrite put

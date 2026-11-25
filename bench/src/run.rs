@@ -5870,7 +5870,7 @@ pub fn lmdb_map_gb(size: u64, value_size: usize) -> usize {
 /// was left, and from its third rep the rung read at a tenth to a twentieth
 /// of the reps before, faulting on every page. `malloc_trim(0)` took that
 /// process from 12.9 GB resident to 2.1 GB.
-fn release_freed_memory() {
+pub fn release_freed_memory() {
     #[cfg(all(target_os = "linux", target_env = "gnu"))]
     // SAFETY: takes and returns plain integers; releasing free pages is
     // what it is for, and it takes the allocator's own locks.
@@ -6000,58 +6000,6 @@ mod tests {
         assert_eq!(stop_after("10000"), None);
         assert_eq!(stop_after("ten-1"), None);
         assert_eq!(stop_after(""), None);
-    }
-
-    /// Held between the one test that counts what `release_freed_memory`
-    /// returns and the tests that run a pass, which call it: the release is
-    /// the process's, so a pass's `malloc_trim` in another test's thread
-    /// takes the freed blocks the first is about to count, and the test
-    /// failed -- on blocks that "were not resident to begin with", or on a
-    /// release that returned less than most of them -- in runs of the whole
-    /// binary at the default thread count once a test that runs a pass was
-    /// beside it. A pass takes this shared, and the measurement
-    /// exclusively. The guard is taken through `into_inner`, so a test that
-    /// fails holding it fails nobody else.
-    static TRIM: std::sync::RwLock<()> = std::sync::RwLock::new(());
-
-    /// The shape that filled the full run's memory: a thread allocates
-    /// small blocks in its own arena, frees them, and exits, with one block
-    /// allocated last still live so the arena cannot give its heap back from
-    /// the top. The freed memory stays resident until the runner releases
-    /// it -- the first assertion is that the test reached that case at all,
-    /// the second that the release returns most of it.
-    #[cfg(all(target_os = "linux", target_env = "gnu"))]
-    #[test]
-    fn a_dropped_stores_freed_memory_is_returned_before_the_next_pass() {
-        let _alone = TRIM.write().unwrap_or_else(|e| e.into_inner());
-        const BLOCKS: usize = 3_000_000;
-        const SIZE: usize = 100;
-        let held = BLOCKS * SIZE;
-        let pin = std::thread::spawn(|| {
-            let mut v: Vec<Box<[u8; SIZE]>> = Vec::with_capacity(BLOCKS);
-            for i in 0..BLOCKS {
-                v.push(Box::new([i as u8; SIZE]));
-            }
-            let pin = Box::new([1u8; SIZE]);
-            std::hint::black_box(&v);
-            drop(v);
-            pin
-        })
-        .join()
-        .unwrap();
-        let before = resident_bytes().unwrap();
-        release_freed_memory();
-        let after = resident_bytes().unwrap();
-        assert!(
-            before >= held as u64,
-            "the freed blocks were not resident to begin with: {before} bytes, {held} allocated"
-        );
-        assert!(
-            before - after >= held as u64 / 2,
-            "released {} of the {held} bytes freed ({before} -> {after})",
-            before.saturating_sub(after)
-        );
-        drop(pin);
     }
 
     /// Holm's step-down against hand-worked cases: it stops at the first
@@ -7128,7 +7076,6 @@ mod tests {
     /// mixes had been in every row and in no pairing.
     #[test]
     fn a_pairing_carries_every_quantity_a_row_carries() {
-        let _pass = TRIM.read().unwrap_or_else(|e| e.into_inner());
         let root = std::env::temp_dir().join(format!("supdb-bench-flat-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
         let mut plan = Plan::new(Scale::Quick, vec![], 30_000, 4);
@@ -7157,7 +7104,6 @@ mod tests {
     /// under its own pass name: a pass without it reports none.
     #[test]
     fn the_second_mix_family_reports_six_rates_under_its_pass() {
-        let _pass = TRIM.read().unwrap_or_else(|e| e.into_inner());
         let root = std::env::temp_dir().join(format!("supdb-bench-ycsbs-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
         let mut plan = Plan::new(Scale::Quick, vec![], 30_000, 4);
@@ -7199,7 +7145,6 @@ mod tests {
     fn the_pass_refuses_a_forced_arm_that_covers_nothing_and_runs_one_that_does() {
         // A pass releases freed memory to the system: not while the test that
         // counts what the release returns is counting.
-        let _pass = TRIM.read().unwrap_or_else(|e| e.into_inner());
         let root = std::env::temp_dir().join(format!("supdb-bench-zpass-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
         let mut plan = Plan::new(Scale::Quick, vec![], 30_000, 4);

@@ -3195,10 +3195,18 @@ it just as well.
 `release_freed_memory` is `malloc_trim` of every arena, and the first library
 test to run a pass trimmed under the test that measures what a trim returns:
 two of twenty-five whole-binary runs failed, with 148.6 of 300 MB released.
-A lock now, taken for write by the measurement and for read by every test
-that reaches a pass, through `into_inner` so that a failure holds nobody. The
-rule: a test that counts a process-wide effect excludes every test that can
-cause it. A lock excludes the tests that trim and not the ones that
+A lock held them apart for a while, taken for write by the measurement and
+for read by every test that runs a pass -- every test that remembered to:
+one written later ran a pass without it (`a_bounded_passes_start_enters_the_row`),
+and the measurement failed once in a run of the suite's library tests on
+blocks that "were not resident to begin with". Every `malloc_trim` logged
+with its backtrace by a preloaded shim named that test's pass as the only
+trim near the window, and the pass started inside the window on purpose
+took the blocks from 349 MB resident to 27 before the read, every run. The
+measurement has a binary of its own now (`bench/tests/trim.rs`) and the lock
+is gone. The rule: a test that counts a process-wide effect excludes every
+test that can cause it, by a process boundary where the tests that can are
+any test that might be written next. A lock excludes the tests that trim and not the ones that
 allocate, and the count of anonymous bytes resident beyond the allocator's
 use is lowered by any allocation from a free chunk already resident: a
 dead arena of thirty-two megabytes read as nine in one run of the whole
