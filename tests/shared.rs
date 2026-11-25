@@ -318,6 +318,118 @@ fn a_freeze_lets_go_of_a_writer_dropped_inside_its_grace() {
     let _ = std::fs::remove_dir_all(&d);
 }
 
+/// A handle's read-modify-write reads what the key held and puts its value:
+/// over a key only the partition holds, over a key the live table ends
+/// with a put, and over one whose live chain is an append on the
+/// partition's value, which the read takes whole, oldest first.
+#[test]
+fn a_handles_rmw_reads_what_the_key_held_and_puts_its_value() {
+    let d = scratch("rmw");
+    let mut db = Db::create(&d, options(1 << 20)).unwrap();
+    db.put(b"loaded", b"base");
+    db.put(b"appended", b"base");
+    db.commit().unwrap();
+    db.flush().unwrap();
+    let r = db.reader().unwrap();
+    let rmw = |k: &[u8], v: &[u8]| {
+        let mut got = Vec::new();
+        assert!(r.rmw(k, v, |x| got.push(x.to_vec())).unwrap());
+        got
+    };
+    assert_eq!(
+        rmw(b"loaded", b"one"),
+        vec![b"base".to_vec()],
+        "the partition's value"
+    );
+    assert_eq!(
+        rmw(b"loaded", b"two"),
+        vec![b"one".to_vec()],
+        "the live table's"
+    );
+    assert_eq!(handle_values(&r, b"loaded"), vec![b"two".to_vec()]);
+    assert!(r.append(b"appended", b"more").unwrap());
+    assert_eq!(
+        rmw(b"appended", b"replaced"),
+        vec![b"base".to_vec(), b"more".to_vec()],
+        "an append's chain reads the partition's value under it"
+    );
+    assert_eq!(handle_values(&r, b"appended"), vec![b"replaced".to_vec()]);
+    assert_eq!(rmw(b"absent", b"first"), Vec::<Vec<u8>>::new());
+    assert_eq!(handle_values(&r, b"absent"), vec![b"first".to_vec()]);
+    drop(r);
+    db.flush().unwrap();
+    assert_eq!(values(&db, b"loaded"), vec![b"two".to_vec()]);
+    assert_eq!(values(&db, b"appended"), vec![b"replaced".to_vec()]);
+    drop(db);
+    let _ = std::fs::remove_dir_all(&d);
+}
+
+/// Handles on threads read-modify-write one key the live table holds,
+/// each putting a value of its own: every value but the last is read by
+/// exactly one of them, and the last by none -- each read is of the value
+/// its put replaced, which is what the one probe under the key's stripe
+/// buys and a read and a put made apart do not.
+#[test]
+fn rmws_on_threads_each_replace_the_value_they_read() {
+    const THREADS: usize = 3;
+    const EACH: usize = 20_000;
+    let _w = Watchdog::arm("the rmw test waited a minute");
+    let d = scratch("rmwrace");
+    let mut db = Db::create(&d, options(64 << 20)).unwrap();
+    let handles: Vec<supdb::Reader> = (0..THREADS).map(|_| db.reader().unwrap()).collect();
+    assert!(handles[0].put(b"hot", b"start").unwrap());
+    let go = std::sync::Barrier::new(THREADS);
+    let go = &go;
+    let seen: Vec<Vec<(Vec<u8>, Vec<u8>)>> = std::thread::scope(|s| {
+        let threads: Vec<_> = handles
+            .into_iter()
+            .enumerate()
+            .map(|(t, r)| {
+                s.spawn(move || {
+                    go.wait();
+                    let mut mine = Vec::with_capacity(EACH);
+                    for i in 0..EACH {
+                        let v = format!("{t}-{i}").into_bytes();
+                        let mut read = Vec::new();
+                        assert!(
+                            r.rmw(b"hot", &v, |x| read.push(x.to_vec())).unwrap(),
+                            "the table filled"
+                        );
+                        assert_eq!(read.len(), 1, "one value read: {read:?}");
+                        mine.push((read.pop().unwrap(), v));
+                    }
+                    mine
+                })
+            })
+            .collect();
+        threads.into_iter().map(|h| h.join().unwrap()).collect()
+    });
+    let mut read = std::collections::HashMap::<Vec<u8>, usize>::new();
+    let mut written = std::collections::HashSet::new();
+    for (r, w) in seen.into_iter().flatten() {
+        *read.entry(r).or_default() += 1;
+        written.insert(w);
+    }
+    let last = values(&db, b"hot");
+    assert_eq!(last.len(), 1);
+    assert_eq!(
+        read.get(b"start".as_slice()),
+        Some(&1),
+        "the first value read once"
+    );
+    for w in &written {
+        let n = read.get(w).copied().unwrap_or(0);
+        if *w == last[0] {
+            assert_eq!(n, 0, "the last value read by an rmw");
+        } else {
+            assert_eq!(n, 1, "{}: read by {n} rmws", String::from_utf8_lossy(w));
+        }
+    }
+    db.flush().unwrap();
+    drop(db);
+    let _ = std::fs::remove_dir_all(&d);
+}
+
 /// A store opened without the option refuses a handle's write, and one
 /// with it refuses a handle that holds a snapshot, whose pin a freeze would
 /// wait on for as long as the snapshot is held.
