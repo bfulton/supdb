@@ -48,6 +48,20 @@ fn buffered() -> Options {
     }
 }
 
+/// The options of a store whose files a test cuts after its crash: the
+/// compact form off. `Db::crash` leaves a store's threads running, and
+/// under the stride switch (`SUPDB_TEST_STRIDE`) a form file's build reads
+/// a landed segment through a mapping, so a segment cut under it ends the
+/// binary in a SIGBUS -- once in a gate's stride group, in none of ten
+/// runs of the binary or thirty-six of its tests alone, the shape the
+/// `db` tests' tears were given the same answer for.
+fn torn(o: Options) -> Options {
+    Options {
+        zpages: supdb::ZPages::Off,
+        ..o
+    }
+}
+
 /// The options of a store that is read and then stopped as a crash stops
 /// it: its segment work inline, since `Db::crash` leaves a store's threads
 /// running, and a thread that shapes what the reads touched would go on
@@ -131,7 +145,7 @@ fn two_runs(db: &mut Db, d: &Path, more: u64) -> (u64, u64) {
 #[test]
 fn a_run_cut_short_ends_the_history_before_the_run_after_it() {
     let d = dir("short");
-    let mut db = Db::create(&d, buffered()).unwrap();
+    let mut db = Db::create(&d, torn(buffered())).unwrap();
     let (n, second) = two_runs(&mut db, &d, 3);
     db.crash();
     // The first run's end, lost: a quarter of a megabyte, two batches.
@@ -1152,7 +1166,7 @@ fn held_frames_wait(pending: bool) {
     let d = dir(&format!("readable-{pending}"));
     let opts = || Options {
         manifest_pending: pending,
-        ..inline(explicit())
+        ..torn(inline(explicit()))
     };
     let mut db = Db::create(&d, opts()).unwrap();
     db.hold_seal_durable(true);

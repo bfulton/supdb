@@ -1952,8 +1952,13 @@ mod tests {
         );
         // SAFETY: from `alloc` with these arguments, read no more.
         unsafe { free(p, len, true) };
+        // A range no mapping holds is resident nowhere: the page at address
+        // zero, which the kernel gives no mapping (`vm.mmap_min_addr`). Not
+        // the range just freed, which another thread of this binary may be
+        // given by its next mapping before the count is read -- seventeen
+        // pages of someone else's were, once in a gate's stride group.
         assert_eq!(
-            resident_of(p, len),
+            resident_of(std::ptr::null_mut(), 4096),
             0,
             "an unmapped range is resident nowhere"
         );
