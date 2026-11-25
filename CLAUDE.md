@@ -1848,9 +1848,12 @@ form's census; the cipher's bit is in both (`ATTN_PAGED`, set where the
 handle is made), so a store under none makes the tests it made, and what
 a read under one does there -- the wait for a cache far past its budget,
 a snapshot's word, the failure its answer is replaced by (`paged_begin`,
-`end_slow`) -- is behind them and out of line. The end's look is made
-with the answer in hand (`Entered::finish`), and `leave` with no look in
-it is where the read came out ahead. Whether an operation is the
+`end_slow`) -- is behind them and out of line. A scan's and a count's
+end look is made with the answer in hand (`Entered::finish`), and
+`leave` with no look in it is where the read came out ahead; a point
+read under a cipher is sent at the start's test to a read of its own
+(`read_all_paged`), since its paths' answers met at that end cost a
+plain point read four instructions (the merge of #29, below). Whether an operation is the
 writer's own is its depth (`WRITER_OP`), where it was a counter; a
 merge's rests are a type (`MergeRest`, `NoRest` for a plain store, which
 compiles to no step counted); the forms' word for "nobody has asked"
@@ -2528,7 +2531,8 @@ second way to fetch a block, and though no record of a form file's
 partition has a run in a block, the walk's loop kept a register less for
 it, two spills an entry. Out of line for the form's reads
 (`Blob::read_exts_inline`), the scan through a form counts 986
-instructions under the main line's and the point read through one nine;
+instructions under the main line's and the point read through one nine
+(the point read has `read_exts` back since the merge of #29, below);
 kept out of line for every caller, the raw scan read 150 over. The same
 count read the point read through a form 1.8 over at first, one helper
 (`ZFile::view_of`) left a call where the main line's build had it in the
@@ -9985,6 +9989,40 @@ is the caller. A change to the build definition is a change of
 compiler: the count is taken again under it, every function's gain read
 against the count before, and a base built without the head's
 definition counts the flags.
+
+It came a third time at the merge of #29, in three places. The point
+read carried its answer to an end that may replace it
+(`Entered::finish`), so every path's answer met there as one value in
+registers, its variant tested again after `leave` to be stored and the
+count `supdb_get` drops computed for it: four instructions a read, where
+main's build gives the single-source read an exit of its own. Four shapes
+of the end -- the answer replaced in place, the slow end returning, a
+verdict alone, the general path's end inside it -- each counted the same
+or worse; main's text built in the tree counted main's, and the change
+added back a step at a time named the step: an answer handed to an end
+that may change it. A store under a cipher is sent to a read of its own
+at the start's test now (`read_all_paged`), its bit in the same two
+bytes, and the plain read returns through the guard: `supdb_get` and
+`leave` count main's to the instruction. The form's point read had its
+values read by `read_exts_inline`, given to the form's reads for the
+scan's loop, inlined into `part_read_z` at 116 instructions a read where
+main's `read_exts`, a call, is 101; it reads through `read_exts` again,
+in which `Ext::fixed_width` divided twice in this build and once in
+main's, of the same text -- the remainder's test and the quotient never
+paired, written in `u32` and in one block alike -- and divides once now,
+the remainder tested by the product, a multiply over the pair at its
+best in every build. And the seal probe's loop held main's instructions
+with a spill a key more, in a function that also inlines
+`SegmentWriter::create`, whose open goes through the door beside the
+tests' seams; `create` is out of line, and the loop counts two a key
+under main's. The rules: an answer is handed to a step that may replace
+it only on the path that needs the step, since the merge it forces is
+paid on every path that does not; where several shapes of a change all
+miss, the base's own text is built in the tree and the change added back
+a step at a time, before a fifth shape is guessed; a divide written once
+that a build makes twice is written so that no pass can make it twice;
+and code that runs once a segment stays out of the function that holds
+a loop a key.
 
 **One handle's setup, written into the step every handle's constructor
 ends in.** The settle's rest under a cipher wanted a caller's handle to

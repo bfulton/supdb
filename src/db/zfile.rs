@@ -4840,7 +4840,7 @@ impl ZFile {
                 decoded,
             } => match parse_record(opened.bytes(), off) {
                 Some((_, exts, tail, _)) => raw
-                    .read_exts_inline(&exts, tail, &mut *f)
+                    .read_exts(&exts, tail, &mut *f)
                     .map(|n| ZRead::Served { n, decoded }),
                 None => {
                     // The first decode walked every record whole: a group

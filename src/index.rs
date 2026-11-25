@@ -54,16 +54,25 @@ impl Ext {
 
     /// The width of a fixed run's values; `None` for a prefixed run or an
     /// empty or inconsistent one.
+    ///
+    /// One divide, and the quotient's product with the count for whether
+    /// it was exact: a remainder taken beside the quotient is a divide the
+    /// compiler pairs with the quotient's in some builds and makes again in
+    /// others, of the same source, in every reader of a fixed run.
     #[inline]
     pub fn fixed_width(&self) -> Option<usize> {
         if !self.is_fixed() {
             return None;
         }
-        let n = self.records() as usize;
-        if n == 0 || !(self.len as usize).is_multiple_of(n) {
+        let n = self.records();
+        if n == 0 {
             return None;
         }
-        Some(self.len as usize / n)
+        let w = self.len / n;
+        if w * n != self.len {
+            return None;
+        }
+        Some(w as usize)
     }
 
     /// A `block` of this value means the run is INLINE: its bytes sit in the

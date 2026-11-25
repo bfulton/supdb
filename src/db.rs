@@ -12757,6 +12757,12 @@ impl SegmentWriter {
     /// Open `path` for a fresh segment. `opts` supplies the block size, the
     /// checksum switch and whether the index build may use threads; the
     /// rest of `SegmentOptions` describes machinery this writer does not have.
+    ///
+    /// Never inlined: once a segment, and inlined into a caller that writes
+    /// its keys in the same function its open with the door's call and the
+    /// tests' seams beside them took registers from that caller's loop, a
+    /// spill a key of the seal probe's.
+    #[inline(never)]
     pub fn create(path: &Path, opts: &SegmentOptions) -> Result<SegmentWriter> {
         // The checksum switch is process-wide and `Store::create` sets it
         // from the same option; a writer that recorded none while readers
@@ -26181,15 +26187,19 @@ struct Entered<'a> {
 }
 
 impl Entered<'_> {
-    /// The read's end with its answer in hand, for a read that ran to its
-    /// end: the look `leave` makes at the handle's two bytes made here,
-    /// inline, and the rest of `leave` after it. The look is the census's
-    /// and, in a store under a cipher, the one that turns the answer into
-    /// the failure a file of the store met while it was read
+    /// The read's end with its answer in hand, for a scan or a count that
+    /// ran to its end: the look `leave` makes at the handle's two bytes
+    /// made here, inline, and the rest of `leave` after it. The look is
+    /// the census's and, in a store under a cipher, the one that turns the
+    /// answer into the failure a file of the store met while it was read
     /// (`Reader::end_slow`); made inside `leave`, it could not reach the
     /// answer, and a test of its own for the cipher was a test on every
     /// read of a store without one. A read that leaves early, by an
-    /// error, is ended by the guard as it always was.
+    /// error, is ended by the guard as it always was. A point read does not
+    /// end here: its paths' answers met at this end, merged into one value
+    /// and its variant tested again after it, four instructions a read of
+    /// a store in the clear, so a store under a cipher is sent to a read of
+    /// its own at the start (`Reader::read_all_paged`).
     #[inline(always)]
     fn finish<T>(self, r: Result<T>) -> Result<T> {
         let rd = self.r;
@@ -28053,6 +28063,16 @@ impl Reader {
     /// The answer goes through here and comes back: asked for a verdict
     /// alone and left to replace the answer itself, the read's end cost a
     /// plain store's read three instructions for a branch it never takes.
+    /// A read's answer in a store under a cipher: the failure a file of
+    /// the store has met, if one has (`pager::Pager::check`), in its place.
+    #[inline(always)]
+    fn paged_answer<T>(&self, r: Result<T>) -> Result<T> {
+        match self.shared.pager.as_ref() {
+            Some(p) => p.check().and(r),
+            None => r,
+        }
+    }
+
     #[inline(never)]
     fn end_slow<T>(&self, r: Result<T>) -> Result<T> {
         if self.depth.get() == 1
@@ -30827,16 +30847,43 @@ impl Reader {
     }
 
     pub fn read_all<F: FnMut(&[u8])>(&self, key: &[u8], f: F) -> Result<u64> {
-        let entered = self.enter();
-        let r = self.read_all_in(key, f);
-        entered.finish(r)
+        let _entered = self.enter();
+        self.read_all_in::<F, false>(key, f)
+    }
+
+    /// `read_all` for a store under a cipher, from the census's test at the
+    /// read's start on: the start's slow half, the read, and its answer
+    /// replaced with the failure a file of the store met while it was read
+    /// (`Reader::paged_answer`); the read's end is the guard's, as a
+    /// plain read's is, whose test the cipher's bit is in (`leave`).
+    #[inline(never)]
+    fn read_all_paged<F: FnMut(&[u8])>(&self, key: &[u8], f: F) -> Result<u64> {
+        self.begin_slow(false);
+        let r = self.read_all_in::<F, true>(key, f);
+        self.paged_answer(r)
     }
 
     #[inline(always)]
-    fn read_all_in<F: FnMut(&[u8])>(&self, key: &[u8], mut f: F) -> Result<u64> {
-        self.advise(true);
-        self.note_read(false);
-        self.zcensus_begin(false);
+    fn read_all_in<F: FnMut(&[u8]), const PAGED: bool>(&self, key: &[u8], mut f: F) -> Result<u64> {
+        // The census's test at the read's start (`zcensus_begin`), written
+        // out so that a store under a cipher, whose bit is in the same two
+        // bytes, takes a read of its own from here (`read_all_paged`). A
+        // store in the clear reads on and returns through the guard:
+        // carried to an end that could replace it, the answer was a value
+        // merged from every path and tested again after the end to be
+        // stored, four instructions a read (`Entered::finish`).
+        if !PAGED {
+            self.advise(true);
+            self.note_read(false);
+            if self.attn != 0
+                && (self.attn_open.get() != 0 || self.shared.zgate.load() != zselect::GATE_RAW)
+            {
+                if self.attn & ATTN_PAGED != 0 {
+                    return self.read_all_paged(key, f);
+                }
+                self.begin_slow(false);
+            }
+        }
         // The state once, and the memtable's hash and slot line only when
         // it has entries: a read over a store just flushed hashed the key
         // and fetched a line of an empty table, and took the state through
