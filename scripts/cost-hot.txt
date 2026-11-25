@@ -124,6 +124,8 @@ supdb::db::Db::op
 supdb::db::WriterOp
 supdb::db::Wal::write
 supdb::db::Wal::frame
+supdb::db::Wal::put_out
+supdb::db::Db::log_commit
 supdb::db::MemTable::
 supdb::db::ByteArena::
 supdb::db::SnapArena::
