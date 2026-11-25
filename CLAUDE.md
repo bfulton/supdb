@@ -3423,7 +3423,7 @@ directory, placed by the rank's share of it (`Options::merge_ahead_shares`,
 pairings (`BIN=$PWD/target-enc/release/bench sh scripts/pair.sh
 SUPDB_LAG_COUNTERS=1 SUPDB_MERGE_TRACE=1 SUPDB_LAG_MARK=1 supdb-cipherauto
 supdb-cipherautoaheadflat 10000000 --bound 1342177280 --passes load,lag
---reps 3 --ops-div 10`, in `bench/`, at `MERGEAHEAD_COMMIT`): 530 major
+--reps 3 --ops-div 10`, in `bench/`, at `b63c2de`): 530 major
 faults over the burst, 70-80 merges landed in it where 55-69 had, 31-50
 pieces at the pass where 61-75 stood, and the pass 520-842 thousand
 entries a second in four reps of six, about twice RocksDB's; in the other
