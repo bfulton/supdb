@@ -5233,6 +5233,30 @@ pub struct Options {
     /// flight lands it whole at its stop. Off, every flush waits for its
     /// seal's fsync and slot, as before: `supdb-drainstrict`.
     pub drain_answers_readable: bool,
+    /// A flush over writes no sync has covered pays the sync it owes on
+    /// the writer's thread while the seal thread writes the segment --
+    /// the frames of the log, the files and runs left loose before it and
+    /// the directory's barrier, by `sync_wal` -- and is then answered as
+    /// `drain_answers_readable` answers a flush whose writes were durable
+    /// before it. Without it a buffered store's drain is answered behind
+    /// its slot's fdatasync, since nothing before that makes its writes
+    /// durable, and at ten thousand keys the shuffled load's drain read
+    /// 6.5 ms, its seal 3.8 of it, where RocksDB's sync is an fdatasync of
+    /// its log alone; the writer waits for the drain anyway, so the sync
+    /// it pays runs beside the seal's work. Not where the drain closed a
+    /// run of ordered ingest the policy left unsynced: the close presyncs
+    /// the run's records already (`close_presync`), and its temp name
+    /// wants a barrier of the directory, which waits on the journal commit
+    /// the seal thread's own fsync forces and ended with the strict drain
+    /// it was to cut short. Nor where the drain's seal is not the store's
+    /// first partition: the pieces and merges beside it keep the drain
+    /// strict whatever is synced, and at three hundred thousand keys,
+    /// where the shuffled load seals before its drain, the sync paid beside
+    /// such a seal was a fsync of the whole log for nothing. Nor under
+    /// `SyncPolicy::Explicit`, whose log is held in the process and a
+    /// frameless drain writes to no file. On by default; off, a buffered
+    /// drain waits for its slot as before, `supdb-ingestsyncafter`.
+    pub drain_syncs_beside: bool,
     /// A flush's commit of what is staged fsyncs the WAL whatever the
     /// policy, before the seal is handed over: the buffered arm's drain
     /// at ten thousand keys began with a 2.4 ms fdatasync of a log the
@@ -7624,6 +7648,7 @@ impl Default for Options {
             manifest_pending: false,
             flush_waits_manifest: false,
             drain_answers_readable: true,
+            drain_syncs_beside: true,
             drain_syncs_wal: false,
             close_finish_inline: false,
             drain_snapshot: true,
@@ -19308,7 +19333,7 @@ struct DrainSteps {
 /// and the landing's facts where the finish took them.
 type DirectFinished = (bool, File, Vec<u8>, Option<(BlockedBloom, bool)>);
 
-const DRAIN_STEP_NAMES: [&str; 18] = [
+const DRAIN_STEP_NAMES: [&str; 19] = [
     "flush",
     "handed",
     "jobstart",
@@ -19327,6 +19352,7 @@ const DRAIN_STEP_NAMES: [&str; 18] = [
     "sorted",
     "snapped",
     "readers",
+    "beside",
 ];
 
 impl DrainSteps {
@@ -19419,6 +19445,9 @@ struct SealCounts {
     /// its manifest left to the segment work's loop
     /// (`Options::drain_answers_readable`).
     drains_early: AtomicU64,
+    /// Drains that paid the sync they owed beside their seal
+    /// (`Options::drain_syncs_beside`).
+    drains_beside: AtomicU64,
     /// The directory fsyncs such a drain's readable landing left to the
     /// seal's durable landing, paid there ahead of the slot.
     dir_owed_syncs: AtomicU64,
@@ -19463,6 +19492,7 @@ impl SealCounts {
             deferred: get(&self.deferred),
             idle_seals: get(&self.idle_seals),
             drains_early: get(&self.drains_early),
+            drains_beside: get(&self.drains_beside),
             dir_owed_syncs: get(&self.dir_owed_syncs),
             wal_rotations: get(&self.wal_rotations),
             rotated_unsynced: get(&self.rotated_unsynced),
@@ -19523,6 +19553,9 @@ pub struct SealWaits {
     /// Drains answered once their seal was readable
     /// (`Options::drain_answers_readable`).
     pub drains_early: u64,
+    /// Drains that paid the sync they owed beside their seal
+    /// (`Options::drain_syncs_beside`).
+    pub drains_beside: u64,
     /// The directory fsyncs their readable landings left owed, paid at
     /// the durable landing.
     pub dir_owed_syncs: u64,
@@ -23515,6 +23548,11 @@ pub struct Db {
     /// descriptors are one open file description, and an fsync error
     /// is reported once per description.
     presync_failed: Option<std::io::Error>,
+    /// The drain's own seal of a hashed table was named the store's first
+    /// partition (`seals_first_partition`), so that nothing stands beside
+    /// it once it lands -- no piece, no merge -- and the drain can be
+    /// answered at its readable landing (`Options::drain_syncs_beside`).
+    drain_first: bool,
     /// PROTOTYPE: the run keeper, once the first commit has started it.
     keeper: Option<Keeper>,
     /// EXPERIMENT: the upkeep thread, once a commit has had something
@@ -37651,6 +37689,7 @@ impl Db {
             phase_ns: [0; 3],
             draining: false,
             presync_failed: None,
+            drain_first: false,
             lock,
         };
         db.go_away()?;
@@ -38480,6 +38519,7 @@ impl Db {
             phase_ns: [0; 3],
             draining: false,
             presync_failed: None,
+            drain_first: false,
             lock,
         };
         db.go_away()?;
@@ -39727,6 +39767,7 @@ impl Db {
         // First, since it moves the held state to the latest, and the
         // fences below are taken from the same state.
         let first_partition = self.seals_first_partition();
+        self.drain_first = self.draining && first_partition;
         // The live partition fences, if any. A seal splits the memtable at
         // them and writes one piece per range, so every piece overlaps only
         // its own range and a later merge touches one partition instead of
@@ -40373,6 +40414,7 @@ impl Db {
         self.commit_staged()?;
         self.unsynced = 0;
         self.draining = true;
+        self.drain_first = false;
         // Reads come after a drain: its landings, and whatever lands
         // before the next seal says otherwise, take their pieces' ranks
         // (`Options::land_ranks_far`), whichever path the drain's own
@@ -40386,8 +40428,27 @@ impl Db {
             // loose (`drain_run`), with every commit synced and its name
             // behind a barrier -- covers writes that were all durable
             // before it.
+            let away = matches!(self.maint, MaintHome::Away(_));
+            // What the drain owes a sync, paid here beside the seal where
+            // that is all that keeps it from the early answer
+            // (`Options::drain_syncs_beside`): the log and what was left
+            // loose before it, where the drain's seal is the store's first
+            // partition and nothing will stand beside it to merge. That
+            // seal is a hashed table's, so the drain closed no run of its
+            // own, which the answer below asks after as well.
+            if self.opts.drain_syncs_beside
+                && self.opts.drain_answers_readable
+                && away
+                && self.drain_first
+                && !matches!(self.opts.sync, SyncPolicy::Explicit)
+                && self.owes_sync()
+            {
+                self.sync_wal()?;
+                SealCounts::add(&self.shared.seal_counts.drains_beside, 1);
+                self.shared.drain_steps.stamp(18);
+            }
             let early = self.opts.drain_answers_readable
-                && matches!(self.maint, MaintHome::Away(_))
+                && away
                 && !self.owes_sync()
                 && self.drain_run.is_none();
             self.maint_request(MaintAsk::Drain { early })

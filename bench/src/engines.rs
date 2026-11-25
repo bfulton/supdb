@@ -1091,6 +1091,13 @@ pub struct Supdb {
     /// the engine's default: `supdb-drainreadable` answers so and
     /// `supdb-drainstrict` waits for the seal's fsync.
     drainreadable: Option<bool>,
+    /// A flush over writes no sync has covered pays the sync it owes
+    /// beside its seal and is answered at the seal's readable landing
+    /// (`Options::drain_syncs_beside`), `None` for the engine's default:
+    /// `supdb-ingestsyncbeside` and `supdb-syncbeside` pin it on, and
+    /// `supdb-ingestsyncafter` is the buffered drain that waits for its
+    /// slot, the shape before.
+    syncbeside: Option<bool>,
     /// A scan that starts in a block the writer holds a form for counted
     /// as a reuse by the forms-off rule
     /// (`Options::scan_forms_off_counts_built`), `None` for the engine's
@@ -2549,6 +2556,13 @@ struct Policy {
     /// the engine's default: `supdb-drainreadable` answers so and
     /// `supdb-drainstrict` waits for the seal's fsync.
     drainreadable: Option<bool>,
+    /// A flush over writes no sync has covered pays the sync it owes
+    /// beside its seal and is answered at the seal's readable landing
+    /// (`Options::drain_syncs_beside`), `None` for the engine's default:
+    /// `supdb-ingestsyncbeside` and `supdb-syncbeside` pin it on, and
+    /// `supdb-ingestsyncafter` is the buffered drain that waits for its
+    /// slot, the shape before.
+    syncbeside: Option<bool>,
     /// A scan that starts in a block the writer holds a form for counted
     /// as a reuse by the forms-off rule
     /// (`Options::scan_forms_off_counts_built`), `None` for the engine's
@@ -3405,6 +3419,7 @@ impl Default for Policy {
             copiesfit: None,
             chainuncovered: None,
             drainreadable: None,
+            syncbeside: None,
             formsoffbuilt: None,
             formson: false,
             formsoffkept: false,
@@ -8055,6 +8070,66 @@ impl Supdb {
         )
     }
 
+    /// `supdb` whose flush pays the sync it owes beside its seal and is
+    /// answered at the seal's readable landing, the option pinned on
+    /// (`Options::drain_syncs_beside`, the engine's default): a durable
+    /// store owes nothing, so against `supdb-syncafter` it prices the
+    /// option's cost where it does nothing. `supdb-syncbeside`.
+    pub fn create_syncbeside(path: &Path) -> Res<Supdb> {
+        Supdb::with_policy(
+            path,
+            Policy {
+                syncbeside: Some(true),
+                ..Policy::default()
+            },
+        )
+    }
+
+    /// `supdb-ingest` as `supdb-syncbeside`: the buffered drain, whose
+    /// writes no sync has covered, pays its log's sync beside its seal
+    /// and is answered at the readable landing, where it waited for its
+    /// slot's fdatasync. `supdb-ingestsyncbeside`, the arm it was priced
+    /// as.
+    pub fn create_ingest_syncbeside(path: &Path) -> Res<Supdb> {
+        Supdb::with_policy(
+            path,
+            Policy {
+                partition: false,
+                durable: false,
+                syncbeside: Some(true),
+                ..Policy::default()
+            },
+        )
+    }
+
+    /// `supdb` whose drain never pays a sync beside its seal
+    /// (`Options::drain_syncs_beside` off), the shape before.
+    /// `supdb-syncafter`.
+    pub fn create_syncafter(path: &Path) -> Res<Supdb> {
+        Supdb::with_policy(
+            path,
+            Policy {
+                syncbeside: Some(false),
+                ..Policy::default()
+            },
+        )
+    }
+
+    /// `supdb-ingest` whose buffered drain waits for its slot's fdatasync
+    /// (`Options::drain_syncs_beside` off), the shape before.
+    /// `supdb-ingestsyncafter`.
+    pub fn create_ingest_syncafter(path: &Path) -> Res<Supdb> {
+        Supdb::with_policy(
+            path,
+            Policy {
+                partition: false,
+                durable: false,
+                syncbeside: Some(false),
+                ..Policy::default()
+            },
+        )
+    }
+
     /// `supdb` whose every flush waits for its seal's fsyncs and slot
     /// (`Options::drain_answers_readable` off), the shape before.
     /// `supdb-drainstrict`.
@@ -10126,6 +10201,7 @@ impl Supdb {
             copiesfit,
             chainuncovered,
             drainreadable,
+            syncbeside,
             formsoffbuilt,
             formson,
             formsoffkept,
@@ -10665,6 +10741,7 @@ impl Supdb {
                 .unwrap_or(supdb::Options::default().merge_chains_writes_uncovered),
             drain_answers_readable: drainreadable
                 .unwrap_or(supdb::Options::default().drain_answers_readable),
+            drain_syncs_beside: syncbeside.unwrap_or(supdb::Options::default().drain_syncs_beside),
             scan_forms_off_counts_built: formsoffbuilt
                 .unwrap_or(supdb::Options::default().scan_forms_off_counts_built),
             scan_forms_off_unreused: !formson,
@@ -11168,6 +11245,7 @@ impl Supdb {
             copiesfit,
             chainuncovered,
             drainreadable,
+            syncbeside,
             formsoffbuilt,
             formson,
             formsoffkept,
@@ -12957,6 +13035,20 @@ impl Engine for Supdb {
         if self.drainreadable == Some(false) {
             return "supdb-drainstrict";
         }
+        if self.syncbeside == Some(true) {
+            return if self.partition {
+                "supdb-syncbeside"
+            } else {
+                "supdb-ingestsyncbeside"
+            };
+        }
+        if self.syncbeside == Some(false) {
+            return if self.partition {
+                "supdb-syncafter"
+            } else {
+                "supdb-ingestsyncafter"
+            };
+        }
         match (
             self.copiesfit == Some(false),
             self.chainuncovered == Some(false),
@@ -13320,6 +13412,9 @@ impl Engine for Supdb {
             // Flushes answered at their seal's readable landing
             // (`Options::drain_answers_readable`).
             ("drains_early", db.seal_waits().drains_early as f64),
+            // Of them, the drains that paid the sync they owed beside their
+            // seal (`Options::drain_syncs_beside`).
+            ("drains_beside", db.seal_waits().drains_beside as f64),
             ("wal_rotations", db.seal_waits().wal_rotations as f64),
             ("freeze_ms", db.seal_waits().freeze_ns as f64 / 1e6),
             ("join_wait_ms", db.seal_waits().join_wait_ns as f64 / 1e6),
@@ -15374,6 +15469,8 @@ pub fn guarantee(arm: &str) -> Option<Guarantee> {
         | "supdb-nobuycross"
         | "supdb-drainreadable"
         | "supdb-drainstrict"
+        | "supdb-syncbeside"
+        | "supdb-syncafter"
         | "supdb-jobspooled"
         | "supdb-zslabjobs"
         | "supdb-zstrideallslabjobs"
@@ -15473,6 +15570,8 @@ pub fn guarantee(arm: &str) -> Option<Guarantee> {
         | "supdb-ingestwake"
         | "supdb-ingestnoprefetch"
         | "supdb-ingestdirplain"
+        | "supdb-ingestsyncbeside"
+        | "supdb-ingestsyncafter"
         | "supdb-ingestsettlefar"
         | "supdb-ingesttofit"
         | "supdb-ingestprefetch1k"
@@ -16800,6 +16899,10 @@ pub fn open(arm: &str, dir: &Path, map_gb: usize) -> Res<Box<dyn Engine>> {
         "supdb-nobuycross" => supdb_arm(Supdb::create_nobuycross, dir)?,
         "supdb-drainreadable" => supdb_arm(Supdb::create_drainreadable, dir)?,
         "supdb-drainstrict" => supdb_arm(Supdb::create_drainstrict, dir)?,
+        "supdb-syncbeside" => supdb_arm(Supdb::create_syncbeside, dir)?,
+        "supdb-ingestsyncbeside" => supdb_arm(Supdb::create_ingest_syncbeside, dir)?,
+        "supdb-syncafter" => supdb_arm(Supdb::create_syncafter, dir)?,
+        "supdb-ingestsyncafter" => supdb_arm(Supdb::create_ingest_syncafter, dir)?,
         "supdb-jobspooled" => supdb_arm(Supdb::create_jobspooled, dir)?,
         "supdb-zslabjobs" => supdb_arm(Supdb::create_zslabjobs, dir)?,
         "supdb-zstrideallslabjobs" => supdb_arm(Supdb::create_zstride_all_slab_jobs, dir)?,
@@ -20386,6 +20489,57 @@ mod tests {
                         arm
                     );
                     assert_eq!(guarantee(arm), guarantee("supdb"), "{arm}");
+                }
+                // A drain that pays the sync it owes beside its seal, pinned
+                // on, and the shape before, durable and buffered, each
+                // differing from its sibling by that alone.
+                let sib = Supdb::create_ingest(&dir("ingestsib")).unwrap();
+                for (z, s, arm, on) in [
+                    (
+                        Supdb::create_syncbeside(&dir("syncbeside")).unwrap(),
+                        &base,
+                        "supdb-syncbeside",
+                        true,
+                    ),
+                    (
+                        Supdb::create_ingest_syncbeside(&dir("ingestsyncbeside")).unwrap(),
+                        &sib,
+                        "supdb-ingestsyncbeside",
+                        true,
+                    ),
+                    (
+                        Supdb::create_syncafter(&dir("syncafter")).unwrap(),
+                        &base,
+                        "supdb-syncafter",
+                        false,
+                    ),
+                    (
+                        Supdb::create_ingest_syncafter(&dir("ingestsyncafter")).unwrap(),
+                        &sib,
+                        "supdb-ingestsyncafter",
+                        false,
+                    ),
+                ] {
+                    assert_eq!(z.name(), arm);
+                    assert_eq!(z.features(), s.features(), "{arm}");
+                    let o = z.db.as_ref().unwrap().options();
+                    let so = s.db.as_ref().unwrap().options();
+                    assert_eq!(o.drain_syncs_beside, on, "{arm}");
+                    assert!(so.drain_syncs_beside, "the engine's default pays beside");
+                    assert_eq!(
+                        (o.drain_answers_readable, o.close_presync, o.drain_syncs_wal),
+                        (
+                            so.drain_answers_readable,
+                            so.close_presync,
+                            so.drain_syncs_wal
+                        ),
+                        "{arm}"
+                    );
+                    assert_eq!(
+                        open(arm, &dir(&format!("{arm}-open")), 1).unwrap().name(),
+                        arm
+                    );
+                    assert_eq!(guarantee(arm), guarantee(s.name()), "{arm}");
                 }
                 let z = Supdb::create_jobsheap(&dir("jobsheap")).unwrap();
                 assert_eq!(z.name(), "supdb-jobsheap");

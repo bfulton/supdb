@@ -23010,6 +23010,7 @@ fn a_durable_flush_is_answered_at_its_seals_readable_landing() {
         );
         let w = db.seal_waits();
         assert_eq!(w.drains_early, 1, "ordered {ordered}: {w:?}");
+        assert_eq!(w.drains_beside, 0, "a durable store owes no sync");
         assert!(
             db.in_flight().0,
             "ordered {ordered}: the seal is between its phases"
@@ -23129,7 +23130,8 @@ fn a_crash_after_a_flush_answered_at_readable_keeps_every_commit() {
 
 /// A flush with anything behind no sync waits for its seal's fsync, the
 /// slot behind it: a buffered store's, whose log frames and whose run of
-/// ordered ingest no commit synced; a store whose segment work is inline,
+/// ordered ingest no commit synced, where the drain does not pay the sync
+/// beside its seal (`Options::drain_syncs_beside` off); a store whose segment work is inline,
 /// where nothing would land the seal until the writer's next operation;
 /// and a drain that leaves a level-0 piece to merge.
 #[test]
@@ -23140,6 +23142,7 @@ fn a_flush_owed_anything_waits_for_its_seals_fsync() {
             let d = dir(&format!("drain-strict-{case}-{ordered}"));
             let opts = Options {
                 drain_answers_readable: true,
+                drain_syncs_beside: false,
                 sync: if case == "buffered" {
                     supdb::SyncPolicy::EveryN(u32::MAX)
                 } else {
@@ -23232,5 +23235,176 @@ fn a_flush_owed_anything_waits_for_its_seals_fsync() {
         assert_eq!(db.levels().1, 0, "the drain left a piece");
         drain_check(&db, &keys, "the first load");
         drain_check(&db, &more, "the second");
+    }
+}
+
+/// A buffered flush -- its commits synced by no policy -- pays the log's
+/// sync beside its seal and is answered at the seal's readable landing
+/// (`Options::drain_syncs_beside`): with the seal held between its phases,
+/// where the strict drain waits for the release and its slot, the flush
+/// returns, the log is synced to its end and a handle reads every key. The
+/// drop then lands the seal whole, and the reopen finds the partition and
+/// nothing to replay. And a machine's crash in the window takes what the
+/// seal wrote and the log past its sync, which is nothing: built, the store
+/// crashed with the seal held for good, the log cut to its synced length
+/// and the segment torn, and the reopen replays every key from the log.
+#[test]
+fn a_buffered_flush_syncs_its_log_beside_its_seal_and_answers_readable() {
+    let keys = drain_keys(false, 3000);
+    let opts = Options {
+        drain_answers_readable: true,
+        drain_syncs_beside: true,
+        sync: supdb::SyncPolicy::EveryN(u32::MAX),
+        ..common::options()
+    };
+    let d = dir("drain-beside");
+    let mut db = Db::create(&d, opts.clone()).unwrap();
+    drain_load(&mut db, &keys);
+    let (_, synced, written) = db.wal_durable();
+    assert!(
+        synced < written,
+        "the load left its frames unsynced: {synced} of {written}"
+    );
+    db.hold_seal_durable(true);
+    let _release = db.release_seal_durable_after(std::time::Duration::from_secs(30));
+    let t = std::time::Instant::now();
+    db.flush().unwrap();
+    assert!(
+        t.elapsed() < std::time::Duration::from_secs(15),
+        "the flush waited for its seal's fsync ({:?})",
+        t.elapsed()
+    );
+    let w = db.seal_waits();
+    assert_eq!((w.drains_early, w.drains_beside), (1, 1), "{w:?}");
+    assert!(db.in_flight().0, "the seal is between its phases");
+    let (_, synced, written) = db.wal_durable();
+    assert_eq!(synced, written, "the log synced to its end");
+    let r = db.reader().unwrap();
+    drain_check(&r, &keys, "after the flush");
+    drop(r);
+    drop(db);
+    let db = Db::open(&d, opts.clone()).unwrap();
+    assert_eq!(
+        (db.segments(), db.unsealed_keys()),
+        (1, 0),
+        "the reopen recovered what the drop should have landed"
+    );
+    drain_check(&db, &keys, "after the drop and the reopen");
+    drop(db);
+
+    let d = dir("drain-beside-crash");
+    let mut db = Db::create(&d, opts.clone()).unwrap();
+    drain_load(&mut db, &keys);
+    db.hold_seal_durable(true);
+    db.flush().unwrap();
+    assert_eq!(db.seal_waits().drains_early, 1);
+    assert!(db.in_flight().0);
+    let (wal, synced, _) = db.wal_durable();
+    // Held for good: the crashed store's seal thread never syncs.
+    db.crash();
+    let f = std::fs::OpenOptions::new().write(true).open(&wal).unwrap();
+    f.set_len(synced).unwrap();
+    let mut torn = 0;
+    for name in common::seg_names(&d) {
+        let p = d.join(&name);
+        let n = std::fs::metadata(&p).unwrap().len();
+        let f = std::fs::OpenOptions::new().write(true).open(&p).unwrap();
+        f.set_len(n / 2).unwrap();
+        torn += 1;
+    }
+    assert!(torn > 0, "the seal left no segment to tear");
+    let db = Db::open(&d, opts).unwrap();
+    drain_check(&db, &keys, "after the crash");
+}
+
+/// The drains `Options::drain_syncs_beside` leaves to wait for their slot,
+/// each with the option on: one that closed a run of ordered ingest the
+/// policy left unsynced, whose name wants a barrier the seal's own fsync
+/// holds up -- over a log with nothing unsynced, and over one whose frames
+/// from before the run are, so the drain owes the log as well; a log held
+/// in the process (`SyncPolicy::Explicit`); a store whose segment work is
+/// inline; and one whose flush answers only behind its slot
+/// (`drain_answers_readable` off); and a drain whose seal is a piece over
+/// a partition the store holds, which the drain merges. None pays a sync
+/// beside its seal, none is answered early, and each reopens with every
+/// key. A durable store owes nothing and is answered early with nothing
+/// paid beside.
+#[test]
+fn a_drain_the_beside_sync_cannot_answer_pays_nothing_beside() {
+    for case in [
+        "ordered", "owed-run", "held", "inline", "strict", "durable", "piece",
+    ] {
+        let keys = drain_keys(case == "ordered", 3000);
+        let d = dir(&format!("drain-beside-not-{case}"));
+        let opts = Options {
+            drain_answers_readable: case != "strict",
+            drain_syncs_beside: true,
+            sync: match case {
+                "held" => supdb::SyncPolicy::Explicit,
+                "durable" => Options::default().sync,
+                _ => supdb::SyncPolicy::EveryN(u32::MAX),
+            },
+            publish_in_background: case != "inline",
+            ..common::options()
+        };
+        let mut db = Db::create(&d, opts.clone()).unwrap();
+        drain_load(&mut db, &keys);
+        // Keys above every one the log holds frames for, in order, over an
+        // empty live table: a run of ordered ingest the drain closes, with
+        // the frames from before it unsynced in the log.
+        let above: Vec<Vec<u8>> = (0..1000u32)
+            .map(|k| format!("lay-{k:06}").into_bytes())
+            .collect();
+        if case == "owed-run" {
+            db.seal().unwrap();
+            wait_for("the seal's landing", || !db.in_flight().0);
+            drain_load(&mut db, &above);
+            let (_, synced, written) = db.wal_durable();
+            assert!(
+                synced < written,
+                "the log's frames are unsynced: {synced} of {written}"
+            );
+        }
+        // A store's second flush, over keys inside the partition its first
+        // made: the drain's seal is a piece the drain merges, and its first
+        // flush, answered early with the log synced beside its seal, is
+        // the one count.
+        let more: Vec<Vec<u8>> = keys
+            .iter()
+            .step_by(7)
+            .map(|k| {
+                let mut k = k.clone();
+                k.push(b'x');
+                k
+            })
+            .collect();
+        if case == "piece" {
+            db.flush().unwrap();
+            let w = db.seal_waits();
+            assert_eq!((w.drains_early, w.drains_beside), (1, 1), "{case}: {w:?}");
+            drain_load(&mut db, &more);
+        }
+        db.flush().unwrap();
+        let w = db.seal_waits();
+        let early = u64::from(case == "durable" || case == "piece");
+        assert_eq!(
+            (w.drains_early, w.drains_beside),
+            (early, u64::from(case == "piece")),
+            "{case}: {w:?}"
+        );
+        if case == "piece" {
+            assert_eq!(db.levels().1, 0, "the drain left a piece");
+            drain_check(&db, &more, case);
+        }
+        drain_check(&db, &keys, case);
+        if case == "owed-run" {
+            drain_check(&db, &above, case);
+        }
+        drop(db);
+        let db = Db::open(&d, opts).unwrap();
+        drain_check(&db, &keys, case);
+        if case == "owed-run" {
+            drain_check(&db, &above, case);
+        }
     }
 }

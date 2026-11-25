@@ -1287,9 +1287,15 @@ open recovers from until a slot names the segment, and a store dropped
 with such a seal in flight lands it whole at its stop. A buffered
 store's flush commits what is staged under its policy, with no sync
 (`Options::drain_syncs_wal` is the shape that fsynced the whole log
-first, `supdb-ingestwalsync`), so its drain is answered behind the
-slot's fdatasync instead: the log's durability was what covered that
-window, and without it the slot's own does. The flush's close of a direct run
+first, `supdb-ingestwalsync`), and where its seal is the store's first
+partition -- a load's own drain -- the writer then fdatasyncs the log
+beside the seal and the drain is answered at the readable landing as a
+durable one is (`Options::drain_syncs_beside`; `supdb-ingestsyncafter`
+waits): the log's durability covers the window the slot's otherwise
+would. Elsewhere its drain is answered behind the slot's fdatasync: the
+pieces and merges beside a later drain's seal keep it strict whatever is
+synced, and a drain that closed a run the policy left unsynced would owe
+its temp name a barrier that waits on the seal's own fsync. The flush's close of a direct run
 fdatasyncs the run's records on the writer's thread, which waits for
 the drain anyway, while the seal thread composes the trailer, so the
 seal's fsync flushes the trailer alone (`Options::close_presync`;
@@ -6968,6 +6974,30 @@ the build before its rename and settles beside it. The rule: a step that
 puts back what another step gives away asks whether that step is in
 flight, not only whether it has finished, and a change that moves when a
 caller returns is read for the background work it now runs beside.
+
+**A sync bought for an answer the drain could not give.** A buffered
+store's drain was answered behind its slot's fdatasync, since nothing
+before that made its writes durable, and a writer that fdatasyncs the
+log beside the seal lets the drain be answered at the readable landing
+as a durable one is (`Options::drain_syncs_beside`): the shuffled load at
+ten thousand keys read 1.21x of `rocksdb-tuned-nosync` in both orders,
+where the drain alone had lost the cell (`bench/scripts/pair.sh
+supdb-ingestsyncbeside rocksdb-tuned-nosync 10000 --passes load --reps
+24`). The first version paid the sync at every buffered drain. At three
+hundred thousand keys the shuffled load seals before its drain, the
+pieces and merges beside the drain's seal keep it strict whatever is
+synced, and the sync was an fsync of the whole log for nothing, 19 ms of
+one sitting's drain, with no early answer counted in either arm. And a
+drain that closed a run of ordered ingest paid a barrier of the directory
+for the run's temp name, which waited on the journal commit the seal
+thread's own fsync forces and ended two microseconds before the strict
+drain it was to cut short. The sync is paid only where the drain's seal
+is the store's first partition now, which leaves nothing beside it. The
+rules: a step that buys an earlier answer is paid only where the answer
+can follow, judged on the conditions the answer is judged on, since what
+it costs where the answer does not come is added to the strict path's
+price; and a barrier issued beside another thread's fsync is priced by
+that fsync's journal commit, not by what the barrier has to write.
 
 ## Open targets, and the one standing limitation
 
