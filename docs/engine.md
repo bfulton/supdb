@@ -1283,6 +1283,32 @@ Paired at `7b895b9`, with the same passes and reps as above:
   keys the distinct keys alone fill a table of a tenth of the store, so it
   freezes whatever its puts reuse.
 
+What each operation costs is now the gap. One thread's RMW, profiled at the
+same commit and laid on its loads, is four misses in a row:
+- the index slot, three fifths of the probe's samples;
+- the entry, nine tenths of the entry's decode;
+- the key, in its own arena, for the compare, two fifths of the probe;
+- the value chunk's header, half the RMW's body.
+
+FASTER's is two, the bucket and the record that holds the key and the
+value. The entry names both the key and the chain's head, so the head can
+be asked for while the key compare waits (`Options::shared_chunk_ahead`, on
+in the shared mode; `supdb-heldsharedbignoahead` asks nothing). Profiled arm
+against arm at `eee91bb`, the RMW body lost a seventh to a fifth of its
+samples, as aimed, about a fiftieth of the thread's. The pairing
+(`pair.sh supdb-heldsharedbig supdb-heldsharedbignoahead 300000`) resolved
+nothing either way, its cells moving by up to a third in both directions
+between the orders.
+
+The waits left are the slot, the entry and the key. The levers on them:
+- An index sized by the keys and not by the table's cap: 4M slots for
+  300,000 keys at the big arm's cap, 32 MiB beside FASTER's 16, which this
+  host's L3 holds and its TLB, on 4 KiB pages, does not.
+- A key record that holds the chain's head, so a probe goes from the slot
+  to the key record and then to the value, the entry read only by walks.
+- A value overwritten in place in that record, under the stripe's version,
+  which would make the probe FASTER's two misses.
+
 #### Beside FASTER out of core
 
 A store larger than memory is what FASTER's log is made for, and the
