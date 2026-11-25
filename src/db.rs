@@ -30871,14 +30871,21 @@ impl Reader {
         // store in the clear reads on and returns through the guard:
         // carried to an end that could replace it, the answer was a value
         // merged from every path and tested again after the end to be
-        // stored, four instructions a read (`Entered::finish`).
+        // stored, four instructions a read (`Entered::finish`). The bit is
+        // read by a load of its own: tested on the byte the census's test
+        // loaded, the byte was kept in a register for it, an instruction a
+        // read where the census's slow half runs, and the same question
+        // asked by a call of its own laid the read out around it otherwise,
+        // two a read of a store at rest.
         if !PAGED {
             self.advise(true);
             self.note_read(false);
             if self.attn != 0
                 && (self.attn_open.get() != 0 || self.shared.zgate.load() != zselect::GATE_RAW)
             {
-                if self.attn & ATTN_PAGED != 0 {
+                // SAFETY: a read of a field of `self`, which is borrowed;
+                // volatile only so that it is a load of its own (above).
+                if unsafe { std::ptr::read_volatile(&self.attn) } & ATTN_PAGED != 0 {
                     return self.read_all_paged(key, f);
                 }
                 self.begin_slow(false);
@@ -40833,6 +40840,11 @@ impl Db {
         s
     }
 
+    /// Never inlined: once a store, and inlined into a caller that also
+    /// runs a loop an operation, the store's making -- the door, the lock,
+    /// the log, the reader table and the run's spare -- took registers from
+    /// that caller's loop, two moves an operation of the merge probe's.
+    #[inline(never)]
     pub fn create(dir: &Path, mut opts: Options) -> Result<Db> {
         check_options(&opts)?;
         let starts_random = opts.read_advice.starts_random();
