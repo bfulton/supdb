@@ -1194,9 +1194,13 @@ In the engine the shared table is `Options::shared_writers` (arm
 ingest off). A handle writes with `Reader::put`, `append` and `delete`, and
 gets `false` from a table that is full. The writer's next commit freezes the
 full table, and the freeze waits out every handle still writing it before
-its seal reads it: an epoch is bumped after the publish, and each writer's
-slot is read until it holds that epoch or none. Values are appended, never
-overwritten, so a reader reads the table as it reads the one writer's.
+it publishes the table frozen: the table is closed, an epoch is bumped, and
+each writer's slot is read until it holds that epoch or none, a write that
+finds the table closed being answered as a full table's is
+(`Db::close_shared`; the wait came after the publish until a scan made
+inside it was found to have sorted a table still being written). Values are
+appended, never overwritten, so a reader reads the table as it reads the
+one writer's.
 Three things the threads found that no single-writer test could:
 - **The slab's length** waits at the first entry claimed and not yet
   written, and is carried on by whichever writer gets there. Two writers

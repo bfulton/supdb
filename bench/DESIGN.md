@@ -21,7 +21,7 @@ The workloads below, plus four floors. Each yields one or more quantities.
 | `ycsb` | core A–F on the loaded store, a Zipfian over the key space itself (the hot keys the lowest, contiguous) and D's reads uniform, a sixth of the keys in operations per mix | ops/s per mix |
 | `scan-mixed` | the threaded `scan` passes again on the store the six mixes leave | entries/s per thread count |
 | `ycsbs` | core A–F again, on the store `scan-mixed` leaves, with YCSB's own key distributions: its scrambled Zipfian for A, B, C, E and F, and the latest distribution for D | ops/s per mix |
-| `threads` | `threads-A`, `threads-A-uniform`, `threads-RMW` and `threads-RMW-uniform`, on a store of their own, loaded in key order: point reads and updates from several threads at once, half reads and half updates (`A`) or every operation a read-modify-write (`RMW`), under YCSB's scrambled Zipfian or uniform keys; on one thread and then on each of the class's reader-thread counts, a store's worth of operations a thread, each thread's updates committed a hundred at a time. In no row of the series: `bench run --passes mixes-threaded` runs them, and writes its row under `runs/passes/` | ops/s per thread count |
+| `threads` | `threads-A`, `threads-A-uniform`, `threads-RMW` and `threads-RMW-uniform`, on a store of their own, loaded in key order: point reads and updates from several threads at once, half reads and half updates (`A`) or every operation a read-modify-write (`RMW`), under YCSB's scrambled Zipfian or uniform keys; on one thread and then on each of the class's reader-thread counts, a store's worth of operations a thread, each thread's updates committed a hundred at a time. In a row in core for the arms of the guarantee FASTER's is, whose comparator's own benchmark they are; `--passes mixes-threaded` runs them for every arm, a row of which is written under `runs/passes/` | ops/s per thread count |
 | `scan-lag` | on the store the shuffled load leaves, the keys updated in slices to 0, 1, 10 and 100% of the store, each slice a burst of batches followed by the `scan` workload's scans with nothing merged between | entries/s of each point's scans; updates/s of each point's burst |
 | `recover` | a fresh store given the `load` workload's batches by a process of its own, each committed under the arm's guarantee with no sync behind the last, and one batch more staged and never committed; the process killed there, and the store it left opened in the run's process | open ms, first read µs; for a buffered arm, acknowledged batches not recovered |
 | `recover-shuffled` | the same after the `load-shuffled` workload's batches | the same |
@@ -336,6 +336,19 @@ where `faster` is and in no other, the pair being what it is measured for.
 that covers them drops unwritten: the roster's arm of the guarantee until
 the frames were priced at a quarter of an update's instructions, and kept
 for pricing.
+
+Its live table follows who writes it (`Options::share_on_write`, the
+engine's under this log): the one writer's, with the block cache, the
+upkeep thread and ordered ingest, until a thread's handle writes, and
+then one every handle writes at once with no lock between them, sized
+from the store's keys as FASTER's log is, until the handles have gone and
+the writer has left it. So in the `threads` workloads its threads write
+through their own handles, as FASTER's sessions do, and in every other
+workload it is the arm it was. `supdb-heldnoshare` is that arm with the
+table the one writer's whoever writes, its threads taking the writer in
+turn, and `supdb-heldsharedbig` the arm whose every table is shared, with
+what a shared table refuses turned off for the store's life; both are for
+pricing.
 
 The two differ on the ordered scan and the reopen, which `faster` has not
 got and has no setting for. The check that holds a guarantee's arms to one

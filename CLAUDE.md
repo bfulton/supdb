@@ -1511,6 +1511,25 @@ flushed at its end writes its log to no file at all. `Db::crash` forgets
 the store without dropping it, so a test's crash takes what the log held,
 and a store dropped without its close writes it.
 
+**A frozen table is one nothing writes, whoever wrote it live.** The one
+writer's table is frozen by the thread that wrote it, so it was never
+said. A shared table (`Options::shared_writers`, and under
+`Options::share_on_write` whenever a handle writes) is written by handles
+that took it before its freeze and are still inside their write: the
+freeze closes it first, each handle's write reading the flag after it has
+pinned and before it writes, waits out the writes that read it open, and
+only then publishes it frozen (`Db::close_shared`); a write that finds it
+closed is answered as a full table's is and made again in the next table.
+Everything that reads a frozen table -- the seal, a scan's sort left on
+the table for the next reader, a block built over it -- takes its length
+once. And while a state holds a shared table, live or frozen, nothing is
+built, kept or lent that a handle's write could not reach: no block form,
+no table for the upkeep's look, no loan to the upkeep thread, no builder,
+no run of ordered ingest in the live table's place (`Reader::sharing`).
+Each of those was an option the shared table refused at the open; they
+are stood down by the state, so a store has them back when the shared
+tables have landed.
+
 **A file a store names never changes.** A segment, its ordered index
 and its form file are each written under a temp name and renamed or
 linked into place, and nothing writes one after that: no patch in place,
@@ -7090,6 +7109,62 @@ read the asymmetric pin 3-11% ahead in one and level in the next two, and
 the shared arm had been given it between the first and the second: a
 verdict is the second sitting's, so the first is not built on.
 
+**An arm that won the cells it was built for, never paired with the arm
+it would replace.** The table every handle writes was paired with FASTER
+on the threaded mixes at every step of its making, twelve cells of twelve
+by the end, and with nothing else: it sat in no roster, the roster's arm
+of FASTER's guarantee was another, and asked which of the two was the
+faster the notes had no answer. Paired over every pass a row runs, it was
+a trade either way -- the threaded mixes at 1.3x to 10x and the bursts at
+2.3x to 3.9x for it, and the ordered load at half, ycsb-E at a sixth and
+the scans after a full rewrite at a tenth against it, with its ordered
+load's recovery gone (`docs/engine.md`, past FASTER). Each loss was an
+option it refuses at the open: the block cache, the upkeep thread,
+ordered ingest. And each refusal was written of the option where the
+hazard is of a table: a form is unsafe over a shared table, not in a
+store that may make one, so the three stand down while a shared table is
+in the state a reader holds and come back when it has landed
+(`Options::share_on_write`, `Reader::sharing`), and one store is each arm
+while the workload is that arm's. The rules: an arm is paired over every
+pass against the arm it would displace before it is called faster, on
+the day it first wins the cells it was built for; and a refusal of one
+option beside another is read for the state it guards against, since
+what is refused for a store's life may need standing down only while the
+state lasts. Beside it: the threaded mixes were in no row, so nothing
+banked said what any arm did in them.
+
+**What the one writer kept without being asked.** Three things held in
+the engine because every write went through one thread, and no line of it
+said so. The store's sequence moved at every write, so no two seals
+ended at one number; the store's greatest key moved at every key, so a
+run of ordered ingest opened only above every key; and a frozen table
+was written by nobody, its writer being the thread that froze it. A
+shared table's writes go through none of the three. Two tables sealed
+with no logged write between them carried one sequence, their pieces
+ordered by name, and a reopened store read the older piece's values over
+a newer put; a run opened under keys the handles had written, the
+partitions promoted from it did not tile, and a merge refused its own
+key and stopped the segment work; and a handle that had taken a table
+before its freeze wrote it after the freeze's publish, inside the wait
+for it, where a scan had already sorted the table and left the order on
+it, short of the write, for the seal and every scan after. The table
+that shared for a store's life had the first and the third and reached
+neither in its tests, and refuses the option the second needs. The
+differential fuzz had no write through a handle in it at all, the shared
+table having been held by threaded tests of its own: given one
+(`ZFUZZ_SHARE`), six seeds of fourteen hundred failed on the first two,
+and a test that held the freeze's wait open for a third of a second
+found the third, as a checked build's assertion in the seal. A shared
+table takes a number of the sequence at its freeze, the greatest key is
+brought up to the shared tables' keys before a run is judged against it
+(`Db::refresh_max_key`), and a table is closed to writes before it is
+published frozen. The rules: when a second path writes a structure, what
+the first path maintained by being the only one -- a counter that moved,
+a maximum, a point past which nothing changes -- is listed and given to
+the second, since nothing names it an invariant; and a mode that only
+its own arm could reach is put under the fuzz the day the default can
+reach it, with the fuzz making the writes the mode exists for.
+
 ## Standing limitations
 
 These are the engine's, as opposed to refuted predictions. Each is a curve
@@ -7156,6 +7231,15 @@ in the suite's figures, at `full` scale where it says so:
   rate in the long shape. The lever is the crossing's asks made off that
   thread, so the buy and the install are not held behind them, and is not
   built.
+- A shared table is left only at one of the writer's own commits or
+  seals (`Options::share_on_write`, `Db::share_look`): a store whose
+  handles stop writing and whose writer then only reads keeps the shared
+  form, and its scans merge their sources, a sixth of the block cache's
+  rate on ycsb-E, until the writer commits. And a scan beside handles
+  that write always merges. The levers: the segment work's thread
+  leaving the table for a writer that is idle, which needs the freeze
+  made safe from a second thread; and a form kept current from the
+  shared table's own writes, which needs them logged.
 - The frozen tables are held to a count (`FROZEN_CAP`, three) and not to
   bytes. A table freezes at the seal's threshold, 109 MB of memtable at
   ten million keys, and near reads its seal makes a snapshot copy of it,
