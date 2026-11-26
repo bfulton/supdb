@@ -1115,44 +1115,46 @@ behind an atomic would let one in unasked.
 its block tables and scan snapshot -- to a thread of the store's own and
 returns without waiting for it; at level 2 (`supdb-hold`) a commit that
 would leave its batch to the next scan returns only once the thread has
-filed it. A commit with no fsync to work beside files a burst's first
-batch after a scan itself (`Options::upkeep_inline_bursts`): the
-thread's window is the barrier, and a buffered burst of one commit left
-it none, so the burst's whole filing fell to the first scan after it --
-the buffered lag cells read 0.2-0.6x of LMDB with the scans themselves
-at the drained store's rate. The batches after that one, each at most
-a hundredth of the store's keys, it lends paced
-(`Options::upkeep_pace_pct`, `Hand::Pace`): the commit returns once the
-thread trails by at most that hundredth, so the thread's core files
-behind the writer's commits, the writer waits only where the thread has
-fallen that far behind, and the first scan after the burst meets at most
-the share -- filing every batch inline had put the whole fill on the
-writer, a third to half of a buffered burst from a hundred thousand keys
-up, and lending every batch had left the scans after a burst 1.8-3.5x
-slower. The share is the first scan's wait for the pass in flight
-against the pass over the store: at ten thousand keys a batch of a
-thousand is a tenth of the store and its fill several passes, and paced
-there the burst gained a third while its scans after lost two thirds.
-It is the pipeline's depth too: paced a batch deep, every batch was a
-pass of the thread's, whose fixed part doubled the thread's cost a batch
-at three million keys, and the sweep's weighted sum read a third worse
-than lending at a million; and a thread gathering half the share before
-a pass, for longer passes while the writer ran ahead, read level, since
-the trailing thread took several batches a pass already and the share
-bounds the trail that lending's long passes amortise, so a lever on a
-pass's length is read against the passes counted before it is built.
-And the share is the first scan's to pay: a paced batch is held now
-until the thread has filed it (`Options::upkeep_pace_holds`;
-`supdb-ingestpacelends` lends it within the share), since the trail is
-a linear trade -- each write of it saves the burst its filing at every
-batch and costs the first scan after the burst its filing once -- that a
-sum over the burst and the pass reads lending's way at any depth, while
-the cells read it the other way: at a hundred thousand keys the share is
-one batch, the first scan after the full rewrite paid the pass in flight
-and the batch after it, and the pass read 0.9x of `lmdb-nosync` with the
-burst at 2x; held, 1.2-1.3x and 1.5-1.6x.
-`supdb-ingestlendbursts` is the arm that lends every batch and
-`supdb-ingestnopace` the one that files every batch. A syncing commit
+filed it. A commit with no fsync to work beside files a burst's batches
+itself (`Options::upkeep_inline_bursts`, `Options::upkeep_pace_pct` at
+zero): the thread's window is the barrier, and a buffered burst lent to
+it left its filing to the first scan after -- the buffered lag cells read
+0.2-0.6x of LMDB with the scans themselves at the drained store's rate.
+Two shapes stood between that and this, and their order is the lesson.
+The batches after a burst's first, each at most a hundredth of the
+store's keys, were lent paced (`Hand::Pace`), the commit returning once
+the thread trailed by at most the share, so the thread's core filed
+behind the writer's commits: the sweep's weighted sum read 0.64-0.85x of
+the inline fill's from three hundred thousand keys up, and the pass after
+a full rewrite at a hundred thousand 0.9x of `lmdb-nosync`, the first scan
+paying the pass in flight and the batch after it. Then each paced batch
+was held until the thread had filed it (`Options::upkeep_pace_holds`),
+which won that pass back, and was paired with the trail it replaced and
+never with the inline fill it had turned back into: a batch held for is
+the commit's own filing with a hand-over to another core in front of it,
+the writer waiting for all of it. Paired at last, the inline fill read
+the bursts of more than one batch 1.1-1.4x of the hold's and the passes
+after them level or better from a hundred thousand keys to three million
+(`docs/engine.md`, what a burst costs under the held log).
+`supdb-ingestpaced` is the hold, `supdb-ingestpacelends` the trail within
+the share and `supdb-ingestlendbursts` every batch lent. Under the held
+log (`SyncPolicy::Explicit`) a burst's batches are lent and never filed
+by a commit or waited for (`Options::held_bursts_lend`; `supdb-heldfiles`
+files them): filing a write into its block's form costs two to three
+times the write on whichever thread pays, so one thread files at half the
+writer's rate and a store has the burst at the writer's rate or the pass
+after it at the filed store's, not both. The comparator of that policy
+files nothing and scans nothing, so its row reads the burst: lent, 1.2-2.2x
+of FASTER's at three hundred thousand keys where filed it read 0.3-0.6x,
+and the scan pass straight after a burst pays, a tenth to a fifth of the
+filed store's after a full rewrite. The share of a lent pace is the first
+scan's wait for the pass in flight against the pass over the store, and
+the pipeline's depth: paced a batch deep, every batch was a pass of the
+thread's, whose fixed part doubled the thread's cost a batch at three
+million keys; and a thread gathering half the share before a pass read
+level, the trailing thread taking several batches a pass already, so a
+lever on a pass's length is read against the passes counted before it is
+built. A syncing commit
 lends every batch, since its thread files through the fsync, and in core
 it is paced too, within a quarter of a percent of the store's keys
 (`Options::upkeep_pace_syncs_bp`; `supdb-nopacesyncs` lends unpaced):
@@ -7283,6 +7285,24 @@ done inside that pass.
 These are the engine's, as opposed to refuted predictions. Each is a curve
 in the suite's figures, at `full` scale where it says so:
 
+- Under the held log the scan pass straight after a burst pays for the
+  filing the burst was not held for (`Options::held_bursts_lend`): 0.7x
+  to 0.9x of the pass behind a filed burst after one percent rewritten,
+  0.3x to 0.6x after ten and 0.09x to 0.18x after a hundred, at a hundred
+  and three hundred thousand keys (`docs/engine.md`, what a burst costs
+  under the held log). The first scan waits out the upkeep thread's pass
+  in flight and settles its trail, and the walks then meet sparse forms
+  where the filed store has copies. Filing a write costs two to three
+  times the write and no part of it is most of it, so one thread cannot
+  keep beside the writer, and the pass is ten milliseconds against a debt
+  of a hundred. The levers, none built: a filing that amortises with a
+  batch's density -- the sorted batch resolved by one walk of the heads
+  and a block made once where most of it was rewritten, which is what a
+  bulk load pays a key -- so that a thread that trails catches up by
+  trailing; the first scan after a long trail taking the cheaper of the
+  settle and the merge of its sources, with the thread left to file
+  beside the scans; and the thread's fill converting what a burst left
+  sparse once the store is only read.
 - The scan pass after a burst pays its first scan for the burst's end:
   the wait for the upkeep thread's pass in flight, the log read, the
   settle of what the thread trailed by and the snapshot's extension,

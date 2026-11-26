@@ -1739,50 +1739,145 @@ The differential fuzz found the first two once it wrote through handles
 (`ZFUZZ_SHARE=all`, six seeds of fourteen hundred over four configurations),
 and a test that held the freeze's wait open found the third.
 
-#### The one writer's writes at FASTER's one level
+#### What a burst costs under the held log
 
 FASTER has one isolation level: each read, upsert and read-modify-write is
 atomic on its record and visible to every session as it is made, with no
 batch and no commit (`bench/vendor/faster/shim.cc`, `GetAtomic` and
-`PutAtomic`). Every supdb arm stages a batch that a commit publishes whole
-(`Features::transactions`), the arm of FASTER's guarantee among them, so
-that arm's single-threaded update mixes and bursts are a batch isolated
-beside none. `supdb-heldhandle` prices the difference: the roster's arm
-with its own updates made a write at a time through a handle claimed to
-write (`Db::writer`), and its reads through that handle, which is the
-shared table's lean path. Paired at `f7d565c` (`pair.sh supdb-heldhandle
-faster SIZE --passes load,read,mixes,mixes-scrambled,lag --reps 5`, and
-against `supdb-heldnoframes`, at three hundred and a hundred thousand
-keys), our rate over FASTER's in the two orders, beside the roster's arm's
-in its own pairing with FASTER at `2c0a1b1` above:
+`PutAtomic`), and it has no scan. Every supdb arm stages a batch that a
+commit publishes whole (`Features::transactions`) and keeps block forms
+for its scans, and a burst of updates pays for the second: the lag
+sweep's bursts were the cells of FASTER's row the roster's arm lost by the
+most, 0.29 to 0.63 of FASTER's rate at `2c0a1b1`.
 
-| | 300,000 keys | 100,000 keys | the roster's arm, both rungs |
+What they lost by is not the write. The writer's own CPU over a burst is
+the same whatever the live table is and whoever writes it, and level with
+FASTER's whole burst; the rest was the commit waiting for its batch to be
+filed into the block forms the scans after it walk. The sweep's full
+rewrite at three hundred thousand keys, in milliseconds, with the lag
+counters on (`SUPDB_LAG_COUNTERS=1 bench ab --arms A,B --size 300000
+--passes load,lag --reps 4`, at `3f413cd`, medians of the four):
+
+| arm | a burst's batches | burst | writer's CPU | held for | upkeep thread, its passes | scan pass after |
+|---|---|---|---|---|---|---|
+| `supdb-heldpaced` | lent, each commit held until the thread has filed its batch | 380 | 103 | 273 | 241, 278 | 11.5 |
+| `supdb-heldpacelends` | lent, the thread a hundredth of the store behind at most | 288 | 125 | 139 | 285, 142 | 13.0 |
+| `supdb-heldfiles` | filed by the commit | 297 | 278 | | 18, 7 | 9.4 |
+| `supdb-heldnoframes` | lent and never waited for | 100 | 96 | | 113, 6 | 84 |
+| `supdb-heldnfnocache` | no block cache, so nothing filed | 89 | 75 | | | 97 |
+| `supdb-heldhandle` | through a handle on the shared table, which files nothing | 83 | 83 | | | 113 |
+
+FASTER's burst there is 130 ms. At a hundred thousand keys the bursts read
+106, 84, 85, 40, 32 and 28 ms in that order and the passes 3.2, 3.7, 2.9,
+19, 32 and 31.
+
+Filing a write into its block's form costs two to three times what the
+write does, on whichever thread pays, and no part of it is most of it:
+the upkeep thread over the held full rewrite is 46% the settle, of which
+the patches themselves are a tenth of the thread and the rest the batch's
+sort, the resolves and the bookkeeping, 27% the fill's conversions of
+sparse forms to copies and 15% the snapshot (`perf record -e cpu-clock -c
+100000 -k CLOCK_MONOTONIC --call-graph dwarf,8192` over `bench ab --arms
+supdb-heldnoframes,supdb-heldnoframes --size 300000 --passes load,lag
+--reps 3` under `SUPDB_LAG_MARK=1` at `ccf6455`, whose roster arm held;
+the samples between a ten-percent pass's end and the full rewrite's
+pass's start, by thread). So one thread files at half the
+writer's rate or less, and a store with one such thread has the burst at
+the writer's rate or the pass after it at the filed store's, not both:
+the table's rows are that trade, and the shapes in between -- the trail
+bounded, the forms holding the pieces' fold alone -- sit on it and escape
+nothing (`supdb-heldpiecesonly` and `supdb-heldpiecesonlylend` at
+`ccf6455`, under the table's command).
+
+Two things follow, and both are the engine's now.
+
+A batch held for its filing is the commit's own filing with a hand-over to
+another core in front of it: the writer waits for all of it, nothing runs
+beside it, and the batch's lines are read from the other core. The hold
+had been added to the pace to win a pass back and was never paired with
+the inline fill the pace had replaced. A buffered burst's batches are
+filed by their commits (`Options::upkeep_pace_pct` at zero). In the
+buffered arm, our rate over the paced and held arm's in the two orders
+(`bench/scripts/pair.sh supdb-ingest supdb-ingestpaced SIZE --passes
+load,read,mixes,mixes-scrambled,lag --reps 5`, at `3f413cd`):
+
+| | 1,000,000 keys | 300,000 | 100,000 |
 |---|---|---|---|
-| burst, the full rewrite | 1.70, 1.63 | 1.71, 1.45 | 0.29-0.48 |
-| burst, ten percent | 1.57, 1.75 | 1.45, 1.68 | 0.35-0.63 |
-| ycsb-A | 1.17, 0.95 | 0.87, 0.89 | 0.81-0.97 |
-| ycsb-F | 0.98, 0.88 | 0.85, 0.81 | 0.55-0.77 |
-| scrambled A | 1.26, 1.31 | 0.95, 0.92 | 0.72-1.15 |
-| scrambled F | 1.01, 1.01 | 0.83, 0.94 | 0.68-0.85 |
+| burst, the full rewrite | 1.14, 1.17 | 1.44, 1.20 | 1.18, 1.27 |
+| burst, ten percent | 1.21, 1.28 | 1.13, 1.14 | 1.15, 1.29 |
+| burst, one percent | 1.16, 1.02 | 1.13, 1.34 | 0.91, 0.92 |
+| pass after the full rewrite | 1.16, 1.01 | 0.94, 1.17 | 1.12, 1.11 |
+| pass after ten percent | 0.98, 1.08 | 1.33, 1.30 | 1.07, 1.09 |
+| pass after one percent | 1.00, 1.12 | 1.03, 1.24 | 0.72, 0.94 |
+| the sweep's weighted time | 0.88, 0.86 | 0.73, 0.81 | 0.96, 0.80 |
 
-The arm claims its handle at its first update, so the table's install and
-its population land in the cell that update is in: B, and the one-percent
-burst, read 0.2 to 0.35 and 0.1 for it, which is the install and not the
-path. And the arm never leaves the shared table, its handle living as long
-as the store, so every scan merges its sources: against the roster's arm E
-reads 0.15 to 0.19 and the scrambled E 0.23 to 0.31, and the passes after
-the bursts 0.09 to 0.10 after the full rewrite, 0.26 to 0.38 after ten
-percent and 0.54 to 0.87 after one, with the bursts themselves 2.1x to
-5.1x. By the sweep's weighted sum of a burst and its pass the two arms
-trade: the handle's arm 0.67 to 0.90 of the other's time at the full
-rewrite and 0.99 to 1.32 at ten percent.
+and at three million keys the bursts 1.00x to 1.22x and the passes 1.00x
+to 1.07x (`pair.sh supdb-ingestnopace supdb-ingest 3000000 --passes
+load,lag --reps 3`, at `ccf6455`, where the arms were named so). Against
+`lmdb-nosync` at `3f413cd` every lag cell is ours at three hundred and a
+hundred thousand keys, the bursts 1.9x to 3.3x and the passes 1.4x to
+2.6x. Under the held log the same pairing (`supdb-heldfiles
+supdb-heldpaced`) reads the bursts 0.98x to 1.50x at three hundred
+thousand keys, and at a hundred thousand whichever arm is listed first.
 
-So the batch is what the bursts lose to FASTER by, and half of what F
-does. It is not built into the store: a store that took the shared form
-for its own writer's point writes and left it for its scans would need
-the install off its first write, with the table's memory kept across a
-leave and the next install, and a pass after a burst that does not pay
-for forms nobody filed.
+And under the held log a burst's batches are lent to the upkeep thread
+and never filed by a commit or waited for (`Options::held_bursts_lend`):
+the burst at the writer's rate, the thread filing behind it in passes as
+long as its trail, and what it has not filed when a scan comes that
+scan's to wait out and settle. Against `faster` in the row's order
+(`pair.sh supdb-heldnoframes faster SIZE --passes
+load,read,mixes,mixes-scrambled,lag --reps 5`, at `3f413cd`), our rate
+over FASTER's in the two orders:
+
+| | 300,000 keys | 100,000 | 10,000 |
+|---|---|---|---|
+| burst, the full rewrite | 1.49, 1.24 | 0.63, 0.97 | 1.30, 0.85 |
+| burst, ten percent | 2.08, 1.35 | 1.47, 1.42 | 2.41, 1.89 |
+| burst, one percent | 2.21, 1.98 | 1.89, 2.07 | 1.06, 0.85 |
+| ycsb-A | 0.97, 0.99 | 0.96, 0.77 | 0.89, 0.99 |
+| ycsb-B | 1.00, 1.07 | 1.01, 1.22 | 1.17, 1.15 |
+| ycsb-C | 1.19, 1.18 | 0.99, 1.45 | 1.17, 1.24 |
+| ycsb-D | 1.18, 1.13 | 1.23, 1.09 | 1.07, 1.22 |
+| ycsb-F | 0.80, 0.79 | 0.70, 0.58 | 0.87, 0.75 |
+| scrambled A | 0.97, 0.99 | 0.85, 0.83 | 0.97, 0.82 |
+| scrambled B | 1.09, 1.13 | 1.10, 1.08 | 1.03, 0.85 |
+| scrambled C | 1.09, 1.07 | 1.03, 0.98 | 0.94, 1.00 |
+| scrambled D | 0.91, 0.85 | 0.71, 0.90 | 0.74, 0.62 |
+| scrambled F | 0.90, 0.81 | 0.69, 0.74 | 0.63, 0.48 |
+
+The scan pass straight after a burst pays for what the burst did not
+file. Against the bursts filed by their commits (`pair.sh
+supdb-heldnoframes supdb-heldfiles`, at `3f413cd`, three hundred and a
+hundred thousand keys) the bursts read 1.9x to 3.6x and the passes after
+them 0.70x to 0.92x after one percent rewritten, 0.31x to 0.58x after ten
+and 0.09x to 0.18x after a hundred, the first scan waiting out the
+thread's pass in flight and settling its trail and the walks then meeting
+sparse forms where the filed store has copies; the sweep's weighted time,
+a burst and twice its pass, reads 0.78x to 0.92x. FASTER has no cell for
+those passes. The mixes' batches are too small to be a burst's and are
+handed as before.
+
+The handle's path is not what the bursts were short of. `supdb-heldhandle`
+makes the arm's own updates a write at a time through a handle claimed to
+write (`Db::writer`), with no batch behind a commit, which is FASTER's one
+level; a shared table stands the block cache and the upkeep thread down,
+and the arm with no block cache and the one writer's table has the same
+bursts. Against that arm (`pair.sh supdb-heldhandle supdb-heldnfnocache`,
+at `3f413cd`) the handle reads F 0.89x to 1.31x and the scrambled F 1.11x
+to 1.29x, a read-modify-write being one operation through it, A within a
+tenth either way, D 0.85x to 1.01x, and its bursts no faster. Nor does leaving the
+shared form at a scan pay: the arm that gave its handle up at its first
+scan and sealed the table there (`supdb-heldhandleleaves`, `pair.sh` with
+`supdb-heldnoframes`, at `ccf6455`) read the passes after the bursts at
+0.09x to 0.11x of the roster's arm's of that commit after the full
+rewrite, as the arm that never leaves does, the seal landing inside no
+pass, with E 0.74x to 0.88x and the scrambled E 0.43x to 0.59x for the
+leave they hold. Neither is built into the store.
+
+What FASTER still has of the row's single-threaded cells is F and the
+scrambled F, the scrambled D, the scrambled A below three hundred
+thousand keys, and the full rewrite's burst at a hundred thousand, where
+the burst's seals and the thread share four cores with the writer.
 
 #### Beside FASTER out of core
 
@@ -5383,6 +5478,12 @@ are lent as before, and A and F read level arm against arm. Level 2 of
 the upkeep (`supdb-ingesthold`) holds the bursts too, and also files the
 mixes' small batches in the commit, which took a third off A's and F's
 margins: the hold is a burst's decision, not the upkeep's level.
+
+Neither the pace nor the hold is the engine's now: held, a paced batch is
+the commit's own filing behind a hand-over, and the inline fill reads the
+bursts and the passes at or ahead of it at every rung (what a burst costs
+under the held log, above). `supdb-ingestpaced` is the hold and
+`supdb-ingestpacelends` the trail within the share.
 
 #### The buffered load's write path: six copies of a value, and the pages they touch
 
