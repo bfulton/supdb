@@ -920,6 +920,17 @@ impl Live {
                         }
                     };
                     let word = (hash >> 32) << 32 | (n as u64 + 1);
+                    // A test's: the writer off its core between finding
+                    // the slot vacant and taking it, for as many inserts
+                    // as the test asked, so that another writer of the
+                    // key takes it first whatever the scheduler does.
+                    #[cfg(test)]
+                    if tests::WIDE_INSERTS
+                        .try_update(Relaxed, Relaxed, |n| n.checked_sub(1))
+                        .is_ok()
+                    {
+                        std::thread::yield_now();
+                    }
                     if self
                         .slot(i)
                         .compare_exchange(0, word, Release, Acquire)
@@ -1140,6 +1151,14 @@ impl Engine for Shared {
 
 #[cfg(test)]
 mod tests {
+    /// Set by the test of the insert race: the inserts, of whichever
+    /// writers make them, that yield between finding a key's slot vacant
+    /// and taking it. A count and not a switch, since a yield on a machine
+    /// with every core busy is a round of the scheduler, and the race wants
+    /// the first few keys' inserts and not all of them. Another test's
+    /// writers may spend some of it, which changes no answer.
+    pub(super) static WIDE_INSERTS: std::sync::atomic::AtomicU32 =
+        std::sync::atomic::AtomicU32::new(0);
     use super::*;
 
     #[test]
@@ -1264,18 +1283,19 @@ mod tests {
     /// write a run of one byte, so a copy torn between two shows two --
     /// every key has one entry in the index and one insert counted whatever
     /// the races, and each key ends with a value some writer wrote last of
-    /// its own. The insert race is a matter of timing, so the store is made
-    /// again until one has been run with a race in it, ten at most.
+    /// its own. The insert race is a window of tens of nanoseconds that
+    /// four writers on a loaded machine may never meet in, each running its
+    /// first round alone in a slice of its own: ten stores made in a row
+    /// once held no race among them. So the first inserts yield their core
+    /// inside the window (`WIDE_INSERTS`), the writers released together
+    /// each find the first key's slot vacant before any takes it, and the
+    /// store races.
     #[test]
     fn writers_on_threads_make_one_entry_a_key_and_nobody_reads_a_torn_value() {
-        let mut raced = false;
-        for _ in 0..10 {
-            raced |= shared_writers_round() > 0;
-            if raced {
-                break;
-            }
-        }
-        assert!(raced, "no store of ten raced two writers to a key's entry");
+        WIDE_INSERTS.store(256, Relaxed);
+        let races = shared_writers_round();
+        WIDE_INSERTS.store(0, Relaxed);
+        assert!(races > 0, "no two writers raced to a key's entry");
     }
 
     /// One store of `writers_on_threads_make_one_entry_a_key_...`: its
