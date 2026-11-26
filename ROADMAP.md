@@ -195,6 +195,50 @@ What an engine picker would hit, roughly in order.
   anything (`tests/runlog.rs`). A run that was the last thing written is
   gone with nothing said, as a log's last synced record would be: nothing
   on disk stands after it to say so.
+- [ ] **A scan's limit counts the keys it answers, and a page says where
+  the next one starts.** `scan(from, limit, f)` counts every key it
+  visits, a deleted key among them for as long as any part of the store
+  still records the delete. With eight of a store's first sixteen keys
+  deleted and unsealed, a scan of ten answers ten and hands over the
+  values of five; with those merged away and four of the keys after them
+  deleted, of six, unsealed or sealed in a piece; and of ten once a
+  flush's merge has dropped the deletes (sixty keys put, the deletes,
+  `seal`, `flush`, with partitions and without, at `e577753`). So
+  what a limit buys depends on what the store has merged: a page comes
+  back short, or empty, with keys still ahead of it, a caller that reads
+  "fewer than the limit" as the end stops early, and a page of exactly the
+  limit says nothing of whether another follows. The limit is to count the
+  keys that hold a value, a key deleted and not written again passed over
+  whichever part of the store records the delete, so a scan answers
+  `limit` keys wherever that many stand at or above `from` and fewer only
+  at the store's end. And a paged call, `scan_page(from, limit, f)`,
+  answers where the next page starts, the first key after the page that
+  holds a value, and nothing at the store's end, which a store whose keys
+  are a whole number of pages needs as much as one with deletes; it is a
+  scan of one key more than the page, whose values are read and not handed
+  over. Three things the change has to carry. The merge paths and the
+  overlay's walks count a key where a value of it is handed over. The
+  block path gives each source a window of keys as long as the limit
+  (`overlay_window`, `overlay_mem_window`, and a wide block's under
+  `Options::scan_wide_capped`), and once a deleted key counts for nothing a
+  walk can spend its whole window under the limit: it stops there and the
+  scan goes on from the key after the window's last. And a partition may
+  hold a record with no value: a merge that writes the bottom level drops
+  the deletes, a promotion links a piece as it stands (`Seg::tombs`;
+  `promote_ranges`, `promote_unpartitioned`), and the walks that take a
+  partition's records in bulk count records without asking whether one
+  holds a value. Done when a scan and a page hold to
+  the model in every state of the store, the scan model and the
+  differential fuzz counting keys with values and the fuzz paging a store
+  from end to end, with the deletes unsealed, in a piece, and in a
+  partition a promotion made; when the README shows the paged call; and
+  when the scan pass and ycsb-E are priced against the count before in
+  both orders, since the count is in the scan's innermost loops. Open for
+  the design: whether no partition may hold a record without a value, a
+  promotion leaving such a piece to the merge and a store from before
+  checked or rewritten once at its first open under a new store format
+  version, or whether every record walk says which records hold none and
+  the bulk walks stop for them, with no format change.
 - [ ] **A buffered burst of one commit pays the filing in that commit.** A
   commit near reads files its batch (`Options::forms_settle_every`), and
   where a burst is one commit the filing is in the burst: the buffered
