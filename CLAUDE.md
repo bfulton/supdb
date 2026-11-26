@@ -159,6 +159,14 @@ owner's:
   the gate passes with it on, and the count level with it off. What is
   built of it and what its pairings leave open is one item of
   `ROADMAP.md` ("The store in one file: what is built, and what leans").
+  Asked what the path to a pull request was, with the log's move into the
+  file and the defaults offered as work for after one, the owner: "Do
+  all. Don't open a pr which is complete and will lead to a bunch of
+  other PRs." Every stage is this branch's, the defaults among them, and
+  the pull request is the one that needs no other behind it; and, the
+  same hour, "Try to stay focused and efficient though": a stage is
+  built in the least form that its cells call for, and a form the plan
+  drew larger waits for the pairing that asks for it.
 - **`scratch/` is this branch's working records, and comes off before a
   merge or a pull request**, as it came off PR #6. The layer's design
   (`scratch/seam/design.md`, its decisions and the forms' contract

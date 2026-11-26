@@ -202,6 +202,11 @@ file a store that mobile wants) after them.
     page as its writes make it (`onefile::Head`). The pairings above are
     of the tree before it; at ten million keys it is a page for each of
     the builds ahead a load makes, two dozen.
+  - **The row under 1.25 GiB at the stage's commit** (`b22446f`, the
+    command above with the row's passes, three reps): the shuffled load
+    1.06x and 1.03x in six pairs of six, and no other cell on one side in
+    both orders; the scrambled F, behind in six pairs of six before each
+    mapping had an open of its own, 0.94x and 1.15x.
 - **O3 -- one file.** The log as extents (rotation, retirement, the first
   extent's pre-write), the slots at the head, ordered ingest's run as an
   extent with its marker in the log, `copy_to` and the old name's fate.

@@ -1282,9 +1282,6 @@ turned on neither.
   - The clean store's scan pass under 1.25 GiB, 0.79x in no pair of
     three in one sitting, with half again the major faults, and level in
     the next.
-  - The scrambled F mix under 1.25 GiB, 0.81x and 0.96x, behind in six
-    pairs of six, read before each mapping had an open of its own and
-    not since.
   - A file's sync is an fdatasync of the data file, so it pays for
     whatever else of the store is dirty there: a seal's sync beside a
     merge's output in flight, or a form file's build. A sync of the
@@ -1294,8 +1291,14 @@ turned on neither.
   - Writes into room reserved and never written convert the extent at
     each writeback's end on ext4 (the kernel's log counted them); not
     priced in the loads' sync phases.
-  - The row's passes under 1.25 GiB have not been paired since each
-    mapping had an open of its own.
+  The row's passes under 1.25 GiB, paired at `b22446f` with each mapping
+  on an open of its own (`pair.sh supdb-onefile supdb 10000000 --bound
+  1342177280 --passes
+  load,read,read-threaded,scan,scan-threaded,mixes,scan-mixed,mixes-scrambled
+  --reps 3 --ops-div 10`): no cell on one side in both orders but the
+  shuffled load, 1.06x and 1.03x ahead in six pairs of six; the scrambled
+  F mix, 0.81x and 0.96x before the mappings' own opens, read 0.94x in
+  one order and 1.15x in the other.
   Then the stages left, in the order agreed: the sealing over extents,
   for a store under a cipher in one file; a run its own log under a
   cipher, with the controller on; the log, the slots and the run into
