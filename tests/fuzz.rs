@@ -441,7 +441,7 @@ struct Cfg {
     /// A copy of fixed-size records held as one stream
     /// (`Options::copy_packed`): on in half the seeds under
     /// `ZFUZZ_OPTVARY`, the side generator's draw after the claim's, and
-    /// off otherwise, as the engine has it. The stride steer's keys and
+    /// on otherwise, as the engine has it. The stride steer's keys and
     /// values are of one length each for most of a seed's writes, so
     /// `ZFUZZ_STRIDE` with the cache on is where the copies pack, and its
     /// deletes, runs and odd widths are what unpack them.
@@ -832,7 +832,7 @@ fn pick_cfg(rng: &mut Rng, want_cache: bool) -> Cfg {
         settle_lone: !(vary && lone_chain_off),
         copy_span: vary && copy_span,
         identity_keys: !(vary && identity_blob),
-        copy_packed: vary && copy_packed,
+        copy_packed: !vary || copy_packed,
         stride,
     }
 }

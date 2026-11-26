@@ -7212,6 +7212,84 @@ explains a cost by a mechanism is read again for the lever on the
 mechanism before the lever on its frequency is built; and a counter's
 name is read for what increments it before a test leans on it.
 
+**A protection that rode on another mechanism's side effect, lost to a
+saving.** The copy of fixed-size records as one stream
+(`Options::copy_packed`) took a fifth off the block cache, 435 MB to 346
+after a full rewrite at three million keys, and under 1.25 GiB the pass
+after that rewrite then ran two to four times as long in seven sweeps of
+twelve, 40 to 370 major faults on its scans' start seeks, with the walk
+itself faster in the other five. The larger process had come to its
+group's limit a second before the burst's end, its refaults had taken
+the controller to the census, and at the census a raw partition's heads
+are copied into the process's memory (`heads_owned`); the smaller one
+came to the limit as the burst ended, the store never left the raw gate,
+where the model says the pages a read touches fit and no head is copied,
+and the kernel took the pages written once and never read first, the
+ordered indexes of the partitions the burst's merges had just landed.
+Nobody had decided the heads were to be held through a burst: the census
+had been doing it by being tripped. Three triggers for a copy under the
+raw gate were then built, and the first two read the kernel. The group's
+unused memory less the margin, at the model's reading once a second, saw
+the limit in six sweeps of twelve. The kernel's own count of the limit's
+hits (`memory.failcnt`), latched on its growth since the store opened,
+read as the surer signal and was built with its reader, its seam and its
+tests before one `cat` of the file beside a sweep: zero until the
+burst's last second, and the copies made in four sweeps of twelve. A
+signal that says the kernel is taking pages fires as the pages go. What
+the store knows ahead is what it has written: the model's populations
+are the partitions' two regions, and the burst had put a store's worth
+of level-0 pieces in the cache beside them, which a model of reads does
+not count. The heads are copied under the raw gate once the store's
+files whole, the pieces' with the partitions', have stood past the fill
+share of the budget (`Options::heads_owned_past_fill`,
+`zselect::FORM_FILL`, the line the cache's other tenants are left their
+room by already), which a full rewrite crosses in its middle: the heads
+copied in twelve sweeps of twelve, no pass over 15 ms (`docs/engine.md`
+has the pairings). The rules: when a saving of memory or of time lands,
+the protections the old cost had been triggering are listed -- a census
+tripped by refaults, a budget that bound, a wait that covered a race --
+since the saving takes the trigger away and the protection with it, and
+the cell that then loses is nowhere near the change; a signal for "the
+kernel will take these pages" that reads the kernel is reactive by
+construction, so the one that leads is drawn from what the store itself
+has put in the cache; a counter a trigger is to be built on is read live
+beside the run it is for before its reader is written, a minute against
+an afternoon; and a model's "fits" is a statement about the tenants it
+counts, so a rule that leans on it names the tenants it leaves out.
+Beside it, the pairings' own floor: the pass after the one-percent burst
+read against the arm in six sittings of six, twenty-four pairs of
+thirty-six, with no packed copy built and no head copied by that point
+in any sweep -- the arms had run the same instructions to it -- and the
+five pairings after read it level under one bound and a seventh ahead
+under the other; and at ten million keys the
+first arm listed took the hot-raw policy's releases in both sittings,
+whichever arm it was. A lean with the mechanism's count at zero is the
+floor however many sittings agree, and the count is what says so.
+
+**An arm committed without the gate, and a test that had never run in
+the gate's second mode.** The packed copy went in as an arm, off, with
+its tests green in the binary they live in, and the full gate was left
+for the commit that would make it the default: an arm that is off
+changes no default, and the rule is about defaults. The gate runs every
+test twice, the second time with a form file serving the store
+(`SUPDB_TEST_STRIDE=1`, the `stride` group), and under it the arm's own
+test failed every run: its store wrote three keys of four again, the
+last partition's twenty keys made fifteen deltas, one under the dense
+bound, and a block that light is converted to a copy only on its walks
+and only under the raw gate -- a copy in the mode the test was written
+in and a sparse form in the other, so "a patch a partition, each at its
+rank" counted one short. Two commits stood on the branch with a red
+gate group and nothing had said so. The store writes seven keys of
+eight again now and asserts that every partition is dense with them, a
+premise checked where it is made. The rules: the gate is of the tree
+and not of the default, so a commit that adds a test runs the groups
+that run it, an arm's commit as much as a default's; a test's premise
+about the engine's state -- every block a copy -- is asserted at the
+fixture, where a mode that breaks it fails on the premise and not three
+assertions later on a count; and a fixture that sits one under a
+threshold of the engine's is a fixture on the threshold, so the count
+is drawn clear of it.
+
 ## Open targets, and the one standing limitation
 
 A cell a comparator wins is a target, never a limit to be written down

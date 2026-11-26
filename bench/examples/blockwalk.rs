@@ -1,12 +1,12 @@
 //! What a scan's walk of a copied block costs by the block's layout, with no
-//! engine in it: the block cache holds a block dense with unsealed keys as
+//! engine in it: the block cache held a block dense with unsealed keys as
 //! one merged copy in three buffers -- sixteen bytes of entry a record,
 //! the keys, and the values each behind a length -- and a scan of fifty
-//! from a key somewhere in the store starts three streams in a block it
-//! has not touched lately and three more in the next. This walks the same
+//! from a key somewhere in the store started three streams in a block it
+//! had not touched lately and three more in the next. This walks the same
 //! records laid out that way and as one buffer of fixed-size records, key
-//! and value side by side, which a block can be where its keys are of one
-//! length and each has one value of one length.
+//! and value side by side, which a block is now where its keys are of one
+//! length and each has one value of one length (`Options::copy_packed`).
 //!
 //! The walk is the engine's in shape and no more: a table of blocks, a
 //! start at a random entry of a random block, `len` records to a callback

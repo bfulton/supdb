@@ -2427,8 +2427,23 @@ fn copies_of_fixed_records(
         .collect();
     assert!(by_part.iter().all(|p| (12..=64).contains(&p.len())));
     let _ = scan_model(&db);
+    // Seven keys of eight written again: every partition's block is dense
+    // with them, sixteen keys or more, and so a copy whatever serves the
+    // store. A block with fewer is a light form, converted only on its
+    // walks and only under the raw gate: with three keys of four the last
+    // partition, of twenty keys, stood sparse wherever a form file served
+    // (`common::options` under the stride switch) and was a copy elsewhere.
+    let written = |i: usize| !i.is_multiple_of(8);
+    assert!(
+        by_part.iter().all(|p| p
+            .iter()
+            .filter(|k| written(keys.iter().position(|x| x == *k).unwrap()))
+            .count()
+            >= 16),
+        "every partition dense with the keys written again"
+    );
     for (i, k) in keys.iter().enumerate() {
-        if i % 4 != 0 {
+        if written(i) {
             db.put(k, &[b'u'; 100]);
             want.insert(k.clone(), vec![vec![b'u'; 100]]);
         }
@@ -2466,7 +2481,7 @@ fn a_copy_of_fixed_size_records_is_one_stream_until_a_write_it_cannot_take() {
             by_part[parts - 1][2].clone(),
         ];
         let (p0, n0) = db.block_cache_packed();
-        assert!(n0 >= 6, "copies: {n0}");
+        assert_eq!(n0, parts, "every partition's block a copy");
         assert_eq!(
             p0,
             if packed { n0 } else { 0 },

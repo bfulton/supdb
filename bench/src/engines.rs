@@ -1454,16 +1454,13 @@ pub struct Supdb {
     /// and lost at every merge of its partition (`Options::identity_by_keys`
     /// off): `supdb-identityblob` and `supdb-ingestidentityblob`.
     identityblob: bool,
-    /// A copy of fixed-size records held as one stream
-    /// (`Options::copy_packed`): `supdb-copypacked` and
-    /// `supdb-ingestcopypacked`.
-    copypacked: bool,
-    /// A raw partition's heads copied under the raw gate once the store's
-    /// files whole are past the fill share of its budget
-    /// (`Options::heads_owned_past_fill`):
-    /// `supdb-headspastfill`, and with the packed copy
-    /// `supdb-copypackedheads`.
-    headspastfill: bool,
+    /// Every copy held as its three buffers (`Options::copy_packed`
+    /// off): `supdb-copythree` and `supdb-ingestcopythree`.
+    copythree: bool,
+    /// The raw gate's heads left to the page cache whatever the store's
+    /// files have outgrown (`Options::heads_owned_past_fill` off):
+    /// `supdb-headsgate`.
+    headsgate: bool,
     /// A settle's patch searches a copy for a key above its last entry
     /// (`Options::settle_append_last` off): `supdb-settlesearch` and
     /// `supdb-ingestsettlesearch`.
@@ -2936,11 +2933,10 @@ struct Policy {
     copyspan: bool,
     /// A copy's identity by its file: `...identityblob`.
     identityblob: bool,
-    /// A copy of fixed-size records as one stream: `...copypacked`.
-    copypacked: bool,
-    /// Heads copied under the raw gate past the fill line:
-    /// `...headspastfill`.
-    headspastfill: bool,
+    /// Every copy as its three buffers: `...copythree`.
+    copythree: bool,
+    /// The raw gate's heads left to the page cache: `...headsgate`.
+    headsgate: bool,
     /// The patch's search for an appended key: `...settlesearch`.
     settlesearch: bool,
     /// The patch's walk of the sources for a lone key: `...settlesources`.
@@ -3583,8 +3579,8 @@ impl Default for Policy {
             runsheld: false,
             copyspan: false,
             identityblob: false,
-            copypacked: false,
-            headspastfill: false,
+            copythree: false,
+            headsgate: false,
             settlesearch: false,
             settlesources: false,
             scanlevers: false,
@@ -10530,8 +10526,8 @@ impl Supdb {
             runsheld,
             copyspan,
             identityblob,
-            copypacked,
-            headspastfill,
+            copythree,
+            headsgate,
             settlesearch,
             settlesources,
             scanlevers,
@@ -11186,8 +11182,8 @@ impl Supdb {
             scan_runs_held: runsheld || scanlevers,
             copy_prefetch_span: copyspan,
             identity_by_keys: !identityblob,
-            copy_packed: copypacked,
-            heads_owned_past_fill: headspastfill,
+            copy_packed: !copythree,
+            heads_owned_past_fill: !headsgate,
             settle_append_last: !settlesearch,
             settle_lone_chain: !settlesources,
             forms_convert_from: if densefrom > 0 {
@@ -11597,8 +11593,8 @@ impl Supdb {
             runsheld,
             copyspan,
             identityblob,
-            copypacked,
-            headspastfill,
+            copythree,
+            headsgate,
             settlesearch,
             settlesources,
             scanlevers,
@@ -12758,17 +12754,14 @@ impl Engine for Supdb {
                 "supdb-ingestcopyspan"
             };
         }
-        if self.copypacked && self.headspastfill {
-            return "supdb-copypackedheads";
+        if self.headsgate {
+            return "supdb-headsgate";
         }
-        if self.headspastfill {
-            return "supdb-headspastfill";
-        }
-        if self.copypacked {
+        if self.copythree {
             return if self.partition {
-                "supdb-copypacked"
+                "supdb-copythree"
             } else {
-                "supdb-ingestcopypacked"
+                "supdb-ingestcopythree"
             };
         }
         if self.identityblob {
@@ -15753,10 +15746,9 @@ pub fn guarantee(arm: &str) -> Option<Guarantee> {
         | "supdb-ingestcopyspan"
         | "supdb-identityblob"
         | "supdb-ingestidentityblob"
-        | "supdb-copypacked"
-        | "supdb-ingestcopypacked"
-        | "supdb-copypackedheads"
-        | "supdb-headspastfill"
+        | "supdb-copythree"
+        | "supdb-ingestcopythree"
+        | "supdb-headsgate"
         | "supdb-settlesearch"
         | "supdb-ingestsettlesearch"
         | "supdb-settlesources"
@@ -17091,51 +17083,38 @@ pub fn open(arm: &str, dir: &Path, map_gb: usize) -> Res<Box<dyn Engine>> {
             },
             dir,
         )?,
-        "supdb-copypacked" => supdb_arm(
+        "supdb-copythree" => supdb_arm(
             |d| {
                 Supdb::with_policy(
                     d,
                     Policy {
-                        copypacked: true,
+                        copythree: true,
                         ..Policy::default()
                     },
                 )
             },
             dir,
         )?,
-        "supdb-copypackedheads" => supdb_arm(
+        "supdb-headsgate" => supdb_arm(
             |d| {
                 Supdb::with_policy(
                     d,
                     Policy {
-                        copypacked: true,
-                        headspastfill: true,
+                        headsgate: true,
                         ..Policy::default()
                     },
                 )
             },
             dir,
         )?,
-        "supdb-headspastfill" => supdb_arm(
-            |d| {
-                Supdb::with_policy(
-                    d,
-                    Policy {
-                        headspastfill: true,
-                        ..Policy::default()
-                    },
-                )
-            },
-            dir,
-        )?,
-        "supdb-ingestcopypacked" => supdb_arm(
+        "supdb-ingestcopythree" => supdb_arm(
             |d| {
                 Supdb::with_policy(
                     d,
                     Policy {
                         partition: false,
                         durable: false,
-                        copypacked: true,
+                        copythree: true,
                         ..Policy::default()
                     },
                 )
@@ -20631,48 +20610,33 @@ mod tests {
             }
             {
                 let z = Supdb::with_policy(
-                    &dir("copypacked"),
+                    &dir("copythree"),
                     Policy {
-                        copypacked: true,
+                        copythree: true,
                         ..Policy::default()
                     },
                 )
                 .unwrap();
-                assert_eq!(z.name(), "supdb-copypacked");
+                assert_eq!(z.name(), "supdb-copythree");
                 assert_eq!(z.features(), base.features());
                 let o = z.db.as_ref().unwrap().options();
-                assert!(o.copy_packed && !b.copy_packed);
-                assert!(!o.heads_owned_past_fill);
+                assert!(!o.copy_packed && b.copy_packed);
+                assert!(o.heads_owned_past_fill);
             }
             {
                 let z = Supdb::with_policy(
-                    &dir("copypackedheads"),
+                    &dir("headsgate"),
                     Policy {
-                        copypacked: true,
-                        headspastfill: true,
+                        headsgate: true,
                         ..Policy::default()
                     },
                 )
                 .unwrap();
-                assert_eq!(z.name(), "supdb-copypackedheads");
+                assert_eq!(z.name(), "supdb-headsgate");
                 assert_eq!(z.features(), base.features());
                 let o = z.db.as_ref().unwrap().options();
-                assert!(o.copy_packed && o.heads_owned_past_fill);
-            }
-            {
-                let z = Supdb::with_policy(
-                    &dir("headspastfill"),
-                    Policy {
-                        headspastfill: true,
-                        ..Policy::default()
-                    },
-                )
-                .unwrap();
-                assert_eq!(z.name(), "supdb-headspastfill");
-                assert_eq!(z.features(), base.features());
-                let o = z.db.as_ref().unwrap().options();
-                assert!(o.heads_owned_past_fill && !b.heads_owned_past_fill);
-                assert!(!o.copy_packed);
+                assert!(!o.heads_owned_past_fill && b.heads_owned_past_fill);
+                assert!(o.copy_packed);
             }
             {
                 let z = Supdb::with_policy(

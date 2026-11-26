@@ -1887,8 +1887,8 @@ pub struct Options {
     /// writes it in place; any other -- an insert, a delete, a second
     /// value, another length -- makes the block the three buffers again
     /// first (`CachedBlock::unpack`), and it stays so until it is built
-    /// again. Off is the three buffers for every copy;
-    /// `supdb-copypacked` and `supdb-ingestcopypacked` are the arms.
+    /// again. On; off is the three buffers for every copy,
+    /// `supdb-copythree` and `supdb-ingestcopythree`.
     #[doc(hidden)]
     pub copy_packed: bool,
     /// A settle's patch takes a key's run from the key's own chain where
@@ -6758,11 +6758,9 @@ pub struct Options {
     /// middle of the burst, seconds ahead of the limit: read as the
     /// group's unused memory less the margin, once a second, the limit
     /// was seen in half the sweeps, and read as the kernel's count of the
-    /// times the limit was met (`memory.failcnt`) it was seen in none
-    /// before the pass, the group first meeting its limit as the burst
-    /// ends. Off leaves the raw gate's heads the page cache's;
-    /// `supdb-headspastfill` is the arm, and `supdb-copypackedheads` with
-    /// the packed copy.
+    /// times the limit was met (`memory.failcnt`) in a third, the group
+    /// first meeting its limit as the burst ends. On; off leaves the raw
+    /// gate's heads the page cache's, `supdb-headsgate`.
     #[doc(hidden)]
     pub heads_owned_past_fill: bool,
     /// The hot-raw policy's skew bar read against the room
@@ -7655,7 +7653,7 @@ impl Default for Options {
             settle_lazy_raw: false,
             settle_append_last: true,
             identity_by_keys: true,
-            copy_packed: false,
+            copy_packed: true,
             settle_lone_chain: true,
             settle_covered_samples: true,
             zpages_trusted_views: true,
@@ -7951,7 +7949,7 @@ impl Default for Options {
             heads_look_ms: 0,
             heads_owned: true,
             heads_owned_beside_copies: true,
-            heads_owned_past_fill: false,
+            heads_owned_past_fill: true,
             zpages_hot_skew_room: false,
             zpages_hot_room_margin_pct: 0,
             zpages_walk_owns_decodes: false,

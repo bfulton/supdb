@@ -15769,6 +15769,11 @@ fn a_replacing_write_patches_a_copy_in_place() {
         // commit a pass files is the thread's timing, and a count read
         // before the pass began counts a table nothing has been filed into.
         upkeep: supdb::Upkeep::Inline,
+        // The three buffers' patch, which this is about: a copy held as
+        // one stream of fixed-size records takes a value of its own length
+        // in place and is made the three buffers by any other, a shorter
+        // run among them (`tests/settle.rs` holds that).
+        copy_packed: false,
         ..common::options()
     };
     let mut db = Db::create(&d, opts).unwrap();
