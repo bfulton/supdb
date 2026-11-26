@@ -139,6 +139,24 @@ owner's:
   `sh scripts/cost.sh <its head>`, every probe at or under
   that head by its total and no function's gain new (it exits red by
   function there, on moves: `ROADMAP.md`); and the whole gate.
+- **The store in one file is built on this branch.** The owner, the day
+  a third tier for freeing retired files was built, priced and refuted
+  ("A cost moved off the threads that paid it", below): "I wonder if
+  there's an opportunity to make our own filesystem abstraction that
+  uses only a single real file, and gives us more control over the
+  performance of fs operations. Using a single file would give us an
+  advantage on mobile", and then "Let's build all this here because we
+  think this helps us clear the perf bar." The decisions made with the
+  owner are in `scratch/onefile/design.md` -- one file a store, the
+  manifest's slots at its head, the log and every segment extents of it,
+  space reused and never freed in steady state, growth reserved and not
+  written, a checkpoint a full copy (`copy_to`; "Okay, let's go with full
+  copy checkpoints") -- with the probe behind each in
+  `scratch/onefile/notes.md`, and the stages in `scratch/plan/onefile.md`,
+  which says what of the layer's design (`scratch/seam/design.md`) it
+  keeps and what it replaces. It is held to the same two bars: every
+  stage behind an option and an arm until the suite reads it better and
+  the gate passes with it on, and the count level with it off.
 - **`scratch/` is this branch's working records, and comes off before a
   merge or a pull request**, as it came off PR #6. The layer's design
   (`scratch/seam/design.md`, its decisions and the forms' contract
@@ -661,7 +679,22 @@ before reading a sync phase as the device's, time its steps -- the buffered
 load's sync at three hundred thousand keys stayed level after the
 fsync inside it fell from 25 ms to under one, because the phase was a
 segment close whose checksum row re-read the section (`docs/engine.md`,
-the streaming write). The suite's device-bytes quantity is
+the streaming write). And the flush is the device's, not the file's: it
+pays for every byte anyone sent the device since the last one. A commit
+of 16.8 KB into a pre-written file takes 0.13 ms alone and 180 ms beside
+a writer that hints megabyte pieces to the device, in another file or in
+the commit's own, and 0.15 where that writer's bytes are still in the
+page cache (`python3 scratch/onefile/prims.py DIR`, at `3ca9014`). Traced
+over the lag sweep's full rewrite at ten million keys under 1.25 GiB
+(`scratch/onefile/inv.sh`, an `strace -f -T` of `supdb` laid to phase,
+thread and purpose by `inv.py`), the writer spent 18.1 s of 26.6 in the
+log's fdatasync, 9,000 commits at 2.0 ms where a quiet one is under
+half, while 9.6 GB went to the device for 1.3 GB of updates: log 1.5,
+merge outputs 5.7, form files 2.3. That is what a durable commit waits
+on beside the merges, which the entry on the scrambled E's commits left
+open: the lever on a durable write phase is the bytes everything beside
+it sends the device, and the class or the order of the requests moves
+none of it. The suite's device-bytes quantity is
 `/proc/self/io`'s `write_bytes`, which the kernel counts at dirtying
 time per folio: a one-megabyte write makes a one-megabyte folio, and a
 patch of a hundred bytes made in place after the folio was written
@@ -10488,6 +10521,44 @@ view gives it, since the view has the advice of whoever set it last; a
 decision by an operation's length is made on the operation and not on the
 piece a mode walks it in; and a fix written on a reading is held to a
 trace of the state it is for before its comment names what it fixed.
+
+**A cost moved off the threads that paid it, and paid by the passes
+after.** An inode freed on this fleet's disk (ext4 with no journal,
+mounted `discard`) is a synchronous discard of every block, 0.43 ms a
+megabyte, and it is paid wherever the file's last reference goes: every
+thread of a pass sampled in the kernel's free path
+(`scratch/reap/discards.py`) put 6.0 s of the full rewrite's 22 on the
+segment work in the clear and 5.4 of 25 under a cipher, the writer a
+quarter to two thirds of a second, and the load's drain one to two
+seconds on the writer, four fifths of it at a mapping's last drop and
+not at an unlink. The owner's lever was a third tier of background
+work: a retired segment, its index and its form file renamed to a dead
+name, which keeps the inode whoever unmaps it, and freed once nothing
+holds the segment by a thread of the lowest class
+(`Options::retired_reaped`, in `scratch/reap/reaper-v1.patch` against
+`dcdd042`, five tests and twelve mutants). It did what it was built to
+do, the segment work's time in frees under a second and the writer's
+near nothing, and lost the cells after the load in every pairing
+(`SUPDB_LAG_COUNTERS=1 SUPDB_SCAN_OPS=1 sh scripts/pair.sh supdb-reap
+supdb 10000000 --bound 1342177280 --passes load,lag --reps 2 --ops-div
+10`, and `supdb-cipherautoreap supdb-cipherauto`): 2.3-2.9 GB of dead
+files waited at the load's end, their discards landed in the clean
+store's pass and the durable burst behind it, 0.36-0.75x and 0.14-0.23x
+in the clear. Freed in cuts of four megabytes at the device's idle
+class, by the segment work itself one file a turn, or written over by
+the next segment's writer in a crude pool, the same cells lost. A
+discard in flight is ahead of a commit's flush at the host whatever
+class the guest gave it, so on a device that charges for a free the
+choices are to pay it where it falls or not to free: the space written
+over, which a probe put at 60 ms for 64 MB against 103 written fresh
+with the old file freed, and which is the store in one file this branch
+builds. One of the variants truncated a file a promotion's link still
+named and died of SIGBUS in a pairing; a cut of a retired file is held
+to the inode's link count. The rules: a cost taken off a thread is
+priced at the device and in the cells after the phase, not on the
+thread; a deferred cost is a backlog, read as a peak (2.9 GB here)
+before it is read as a saving; and where every way of moving a cost
+loses, the lever is the cost's cause.
 
 ## Standing limitations
 

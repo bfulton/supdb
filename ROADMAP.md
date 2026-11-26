@@ -1107,12 +1107,14 @@ until the run is its own log). What it loses:
   fifth, on the reads its asks have in flight; and the segment work's
   thread spends 3.9 s of a 25 s burst in the filesystem's discard of the
   inputs a landing retires (`ext4_free_blocks` under `evict`), landing and
-  planning nothing meanwhile. The levers left: the retired inputs' unlink
-  taken off the thread every landing goes through, as a retired form
-  file's is (renamed to a dead name, `Maint::spares`), which the plain
-  store's segment work pays too and so is priced on both; and a merge's
+  planning nothing meanwhile. The retired inputs' unlink taken off that
+  thread was built three ways and refuted (`CLAUDE.md`, a cost moved off
+  the threads that paid it): the frees' discards land in the passes after
+  the load whoever issues them, so the lever is not to free, which is the
+  store in one file ("The page layer", below). Left beside it: a merge's
   CPU under a cipher, 342 ms against the plain store's 196 for the same
-  input. The pass is then to be paired against encrypted RocksDB again.
+  input; and the pass paired against encrypted RocksDB again with the
+  merges' asks, which has been read only against the shape before them.
 - [ ] **The builds ahead's last cold partition under a cipher.** At five
   million keys under 640 MiB with the builds ahead started at a quarter
   of the store's cache, one or two partitions are still found cold in
@@ -1242,6 +1244,17 @@ turned on neither.
   read's. Each stage ends on the gate, the count and the pairings its
   predictions name. Done when `supdb-cipher` is that shape and the
   envelope is left to `supdb::crypt`, a published file's.
+  The layer's lower half is a store in one file, by the owner's word
+  (`CLAUDE.md`, the encryption work on this branch): the manifest's slots
+  at the file's head, the log and every segment extents of it, space
+  reused and never freed, a checkpoint a full copy. It is built first and
+  for the plain store, as an arm, since what it takes back is the plain
+  store's too -- every free, 8 s of the full rewrite's traced 26.6 at ten
+  million keys under 1.25 GiB, every directory sync, open and close, and
+  by a probe 44% of a segment's write and sync -- and the sealing then
+  sits on extents where the design had a stored file a logical file, with
+  no sealed names. `scratch/plan/onefile.md` has the stages and what each
+  is held to; `scratch/onefile/design.md` the decisions.
 
 ### Before a pull request
 
