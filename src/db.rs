@@ -52662,9 +52662,11 @@ impl Life {
         })
     }
 
-    /// One more thread that may change the directory, counted here, on
-    /// the thread that spawns it: counted on the thread itself, a crash
-    /// could read nothing between the spawn and the count.
+    /// One more thread of the store's that touches its files, counted
+    /// here, on the thread that spawns it: counted on the thread itself, a
+    /// crash could read nothing between the spawn and the count. Whoever
+    /// spawns one is counted itself or is the writer, the thread a crash
+    /// is called on, so the count a crash reads as nothing stays nothing.
     fn job(self: &std::sync::Arc<Life>) -> LifeJob {
         self.jobs.fetch_add(1, AtomicOrdering::SeqCst);
         LifeJob(self.clone())
