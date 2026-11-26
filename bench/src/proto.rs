@@ -613,6 +613,10 @@ struct Live {
     inplace: AtomicU64,
     appends: AtomicU64,
     races: AtomicU64,
+    /// A test's: the inserts into this table, of whichever writers make
+    /// them, that wait between finding a key's slot vacant and taking it.
+    #[cfg(test)]
+    wide_inserts: std::sync::atomic::AtomicU32,
 }
 
 // Shared by the writers and the readers under the slots' publication and
@@ -702,6 +706,8 @@ impl Live {
             inplace: AtomicU64::new(0),
             appends: AtomicU64::new(0),
             races: AtomicU64::new(0),
+            #[cfg(test)]
+            wide_inserts: std::sync::atomic::AtomicU32::new(0),
         }
     }
 
@@ -920,16 +926,18 @@ impl Live {
                         }
                     };
                     let word = (hash >> 32) << 32 | (n as u64 + 1);
-                    // A test's: the writer off its core between finding
-                    // the slot vacant and taking it, for as many inserts
-                    // as the test asked, so that another writer of the
-                    // key takes it first whatever the scheduler does.
+                    // A test's: the writer waits between finding the slot
+                    // vacant and taking it, for as many of this table's
+                    // inserts as the test asked, so that another writer
+                    // of the key finds it vacant too whatever the
+                    // scheduler does.
                     #[cfg(test)]
-                    if tests::WIDE_INSERTS
+                    if self
+                        .wide_inserts
                         .try_update(Relaxed, Relaxed, |n| n.checked_sub(1))
                         .is_ok()
                     {
-                        std::thread::yield_now();
+                        std::thread::sleep(std::time::Duration::from_micros(tests::WIDE_WAIT_US));
                     }
                     if self
                         .slot(i)
@@ -1151,14 +1159,11 @@ impl Engine for Shared {
 
 #[cfg(test)]
 mod tests {
-    /// Set by the test of the insert race: the inserts, of whichever
-    /// writers make them, that yield between finding a key's slot vacant
-    /// and taking it. A count and not a switch, since a yield on a machine
-    /// with every core busy is a round of the scheduler, and the race wants
-    /// the first few keys' inserts and not all of them. Another test's
-    /// writers may spend some of it, which changes no answer.
-    pub(super) static WIDE_INSERTS: std::sync::atomic::AtomicU32 =
-        std::sync::atomic::AtomicU32::new(0);
+    /// How long an insert the test of the insert race widened waits
+    /// between finding its key's slot vacant and taking it
+    /// (`Live::wide_inserts`): long enough that a writer released a
+    /// scheduler's slice late reaches the key while the first still waits.
+    pub(super) const WIDE_WAIT_US: u64 = 200;
     use super::*;
 
     #[test]
@@ -1286,21 +1291,22 @@ mod tests {
     /// its own. The insert race is a window of tens of nanoseconds that
     /// four writers on a loaded machine may never meet in, each running its
     /// first round alone in a slice of its own: ten stores made in a row
-    /// once held no race among them. So the first inserts yield their core
-    /// inside the window (`WIDE_INSERTS`), the writers released together
-    /// each find the first key's slot vacant before any takes it, and the
-    /// store races.
+    /// once held no race among them. So the table's first inserts wait
+    /// inside the window (`Live::wide_inserts`): the writers work the keys
+    /// in one order, a writer that waits on a key is caught there by the
+    /// next to reach it, and the store races. The count is the table's:
+    /// kept for the process, the test beside this one spent it, its own
+    /// inserts running first in the gate's run of the whole binary, and
+    /// this store raced nowhere.
     #[test]
     fn writers_on_threads_make_one_entry_a_key_and_nobody_reads_a_torn_value() {
-        WIDE_INSERTS.store(256, Relaxed);
-        let races = shared_writers_round();
-        WIDE_INSERTS.store(0, Relaxed);
+        let races = shared_writers_round(64);
         assert!(races > 0, "no two writers raced to a key's entry");
     }
 
     /// One store of `writers_on_threads_make_one_entry_a_key_...`: its
     /// checks, and the insert races its writers counted.
-    fn shared_writers_round() -> u64 {
+    fn shared_writers_round(wide: u32) -> u64 {
         const KEYS: u64 = 4096;
         const ROUNDS: u64 = 20;
         const WRITERS: usize = 4;
@@ -1316,6 +1322,8 @@ mod tests {
         let go = std::sync::Barrier::new(WRITERS);
         let uniform = |v: &[u8]| v.iter().all(|&b| b == v[0]);
         let openers = t.thread_writers(WRITERS).unwrap();
+        // After the load, whose inserts are one writer's and race nobody.
+        live.wide_inserts.store(wide, Relaxed);
         std::thread::scope(|s| {
             let readers: Vec<_> = (0..2)
                 .map(|_| {

@@ -73,7 +73,9 @@
 //!   a quarter hashes a memtable's keys by FNV alone (`Cfg::mem_fold`);
 //!   and in a quarter of the seeds that hold their log overwrites a put's
 //!   value of the put's length where it lies on the `z` store, its handles
-//!   claimed only with nothing staged (`Cfg::in_place`).
+//!   claimed only with nothing staged (`Cfg::in_place`); and in a quarter
+//!   each takes one of the settle's four shapes before (`Cfg::settle_loads`
+//!   and the three beside it).
 //! - `ZFUZZ_SHARE`: `1`, handles write in the seeds whose log is held
 //!   with no frames, where both stores share their live table on demand
 //!   (`Options::share_on_write`, the engine's); `all`, every seed holds
@@ -456,6 +458,17 @@ struct Cfg {
     /// (`Options::held_bursts_lend` off): in a quarter of the seeds under
     /// `ZFUZZ_OPTVARY`, the side generator's next draw.
     held_files: bool,
+    /// The settle's four shapes before, each in a quarter of the seeds
+    /// under `ZFUZZ_OPTVARY` and each the side generator's next draw: its
+    /// resolve reading the pending list and the table by index
+    /// (`Options::settle_gathers` off), its batch sorted twice
+    /// (`Options::settle_sorts_once` off), every patch staged
+    /// (`Options::settle_patch_in_place` off) and the dense forms left to
+    /// the fill (`Options::settle_converts` off).
+    settle_loads: bool,
+    settle_twice: bool,
+    settle_staged: bool,
+    settle_noconvert: bool,
     /// Under `ZFUZZ_STRIDE`, the stride form's steer; `None` without it.
     stride: Option<StrideSteer>,
 }
@@ -758,6 +771,8 @@ fn pick_cfg(rng: &mut Rng, want_cache: bool) -> Cfg {
     let mem_fnv = side.chance(25);
     let in_place = side.chance(25);
     let (bursts_all, held_files) = (side.chance(25), side.chance(25));
+    let (settle_loads, settle_twice) = (side.chance(25), side.chance(25));
+    let (settle_staged, settle_noconvert) = (side.chance(25), side.chance(25));
     // A generator of its own, as `side` is, so that the switch moves none
     // of the draws below.
     let stride =
@@ -834,6 +849,10 @@ fn pick_cfg(rng: &mut Rng, want_cache: bool) -> Cfg {
         in_place: vary && explicit_on && in_place,
         bursts_all: vary && bursts_all,
         held_files: vary && held_files,
+        settle_loads: vary && settle_loads,
+        settle_twice: vary && settle_twice,
+        settle_staged: vary && settle_staged,
+        settle_noconvert: vary && settle_noconvert,
         stride,
     }
 }
@@ -1011,6 +1030,10 @@ fn opts_z(c: &Cfg) -> Options {
         o.upkeep_inline_min = 1;
     }
     o.held_bursts_lend = !c.held_files;
+    o.settle_gathers = !c.settle_loads;
+    o.settle_sorts_once = !c.settle_twice;
+    o.settle_patch_in_place = !c.settle_staged;
+    o.settle_converts = !c.settle_noconvert;
     // Last, over whatever the flags set: the overwrite and what it needs.
     if c.in_place {
         o.put_in_place = true;

@@ -12085,9 +12085,13 @@ fn a_held_logs_burst_is_lent_and_never_waited_for() {
     // the burst, after its first commit and after its third, and whether
     // the small batch's commit moved the count. The count is the writer's
     // own and stands where no commit lends: the load's one commit, with
-    // no scan before it, is lent under every policy and its report never
-    // read, so a burst that lends nothing leaves the count where it was,
-    // and one that lends starts it over at its first batch.
+    // no scan before it, is lent under every policy, and whether the scan
+    // before the burst found the thread's report of it is the thread's
+    // timing -- the count before the burst is the load's twenty thousand
+    // or nothing. So a burst that lends nothing leaves the count where it
+    // was, whichever that is, and one that lends starts it over at its
+    // first batch: the first version held the first count under the one
+    // before the burst, which under the gate's load was nothing.
     let run = |name: &str, sync: supdb::SyncPolicy, lend: Option<bool>| -> [u64; 4] {
         let d = dir(name);
         let mut opts = Options {
@@ -12187,10 +12191,10 @@ fn a_held_logs_burst_is_lent_and_never_waited_for() {
         [before, first, third, small]
     };
     let [before, first, third, small] = run("held-burst-lent", supdb::SyncPolicy::Explicit, None);
-    assert!(
-        (300..before).contains(&first) && third == 3 * first,
-        "every commit of the burst lent its batch, the first among them: \
-         {first} then {third}, from {before}"
+    assert_eq!(
+        (first, third),
+        (300, 900),
+        "every commit of the burst lent its batch, the first among them, from {before}"
     );
     assert_eq!(small, 0, "a small batch a scan preceded is the commit's");
     let [before, first, third, small] =
