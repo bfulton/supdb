@@ -6680,7 +6680,7 @@ The frozen tables are a list, oldest first and in the order their seals
 were handed, of up to three (`FROZEN_CAP`): the writer freezes into room
 at a seal, at a commit past the threshold and at its first write after a
 `sync`'s hand-off, and waits for the oldest's readable landing only when
-the list is full. A landing retires the front, and a table a `sync`
+the list is full, by its count or by its tables' bytes (below). A landing retires the front, and a table a `sync`
 handed without a freeze joins the back when the writer freezes it. Every
 read folds the frozen tables by age, each through its own snapshot as a
 base of the live one.
@@ -6700,6 +6700,64 @@ sittings, puts the 1% point at 0.29x and 0.52x of the one-table binary
 summed (faster in every pair of both), the 10% point at 0.84x and 0.91x
 (4 and 5 of 6), the 0% point at 0.88x and 0.91x (4 of 6 each), the 100%
 point level, and nothing at 100k on one side.
+
+#### The frozen tables' bytes
+
+The list is held to bytes as well as to a count (`Options::frozen_bytes`):
+a commit whose seal would freeze the live table past them waits for the
+oldest frozen table's readable landing first, as it waits at three, and
+one table is frozen whatever it holds. A table counts as one kept for the
+upkeep's look counts (`upkeep_keep_bytes`), at twice its capacity, the
+table and the snapshot copy a seal near reads makes of it, and the bound
+is an eighth of the memory available where none is given. The count had
+bounded them alone from when a table froze at `seal_bytes`. The seal's
+threshold grows with the store since (`seal_grows`), a hundred megabytes
+at ten million keys, and a writer whose commits wait for no sync fills
+one in half a second where its seal takes longer. The bounded roster's
+buffered arm, `supdb-heldpart`, was killed under 1 GiB in the lag sweep's
+full rewrite: the engine's mapped blocks counted by length at each new
+peak, from a scratch build, read 618 MB two seconds into the burst, 101
+arena blocks of four megabytes among them, the live table and three
+frozen ones.
+
+Paired against the count alone at ten million keys
+(`SUPDB_LAG_COUNTERS=1 bench/scripts/pair.sh supdb-heldpart
+supdb-heldpartfrozencount 10000000 --bound 1073741824 --reps 3 --ops-div
+10 --passes load,lag`, twice, and `pair.sh supdb-heldpart supdb-heldpart`
+in the same shape, at `a22f7eb`): the count alone was killed in three
+sweeps of twelve and the bound in none of twenty-four. The process's
+anonymous memory at the full rewrite's end read 334-550 MB against
+478-884 in the sweeps that lived, and 26-35 freezes a sweep waited,
+1.6-1.9 s between them. The passes after the bursts read level or ahead
+in both sittings of both runs: the clean store's 1.02-2.1x, after the
+one-percent burst 1.16-3.3x, after the full rewrite 1.0-1.48x. The full
+rewrite's burst read 0.92x and 1.43x in one run and 1.15x and 0.78x in
+the other: 5.2-6.8 s with the bound in every sweep, against 4.6-5.0 s by
+the count alone in the sweeps that began as the bound's did.
+
+The sweeps did not begin alike. With the bound the compact form was
+serving as the sweep began in seventeen sweeps of eighteen, and by the
+count alone in one of six, by the form's scans in the lag counters of the
+clean store's pass. Where it was not, the one- and ten-percent bursts ran
+0.4-0.6 s and 3.3-4.5 s against 33-43 ms and 0.4-0.6 s, the writer held
+behind an upkeep thread that resolves its keys through raw records the
+bound has pushed out. Under 1.25 GiB (`--bound 1342177280`) neither arm
+was killed, the count alone ended the full rewrite at 641-961 MB against
+346-682, and the form was serving at the sweep's start in three of the
+bound's six sweeps and in none of the other's. Why the purchase comes
+late there has not been read off the controller's trace.
+
+The durable arm does not meet the bound. Its commits wait for their
+syncs, a table is seconds filling, and the list seldom holds two
+(`pair.sh supdb supdb-frozencount 10000000 --bound 1073741824 --reps 2
+--ops-div 10 --passes load,lag`, and `3000000` at three reps): no wait or
+one a sweep, 21-134 ms, and no cell that holds a side across the
+sittings. At three million keys the buffered arm waits three to five
+times a sweep, 70-130 ms, and two pairings there disagree
+(`pair.sh supdb-heldpart supdb-heldpartfrozencount 3000000 ...`, and
+again with `SUPDB_SCAN_OPS=1`): the passes move by the host's two speeds,
+a median scan of 2.8-3.0 µs or 3.6-3.8 with the thread's CPU at its
+wall, whichever arm.
 
 #### Seals whenever the sealer is idle
 

@@ -7293,6 +7293,58 @@ assertions later on a count; and a fixture that sits one under a
 threshold of the engine's is a fixture on the threshold, so the count
 is drawn clear of it.
 
+**A cap by count on things whose size had been made to grow, and the
+one arm whose pace hid it.** The frozen tables were capped at three
+(`FROZEN_CAP`) when a table froze at `seal_bytes`, thirty-two megabytes.
+The seal's threshold was made to grow with the store later
+(`seal_grows`), a hundred megabytes at ten million keys, and nothing
+went back to the cap; an open target here said the count was no bound in
+bytes and named the lever. No row showed it, because every arm of the
+bounded roster synced its commits, and a writer that waits for its syncs
+seldom has two tables frozen: a freeze found one ahead of it once in the
+medians of eight sittings. The roster's first buffered arm,
+`supdb-heldpart` in FASTER's row, rewrites the store in five seconds, a
+table every half second, and under 1 GiB the group killed it in the lag
+sweep's full rewrite, one sweep in four. Three readings came before the
+count, each true and none the owner: the allocator's free bytes after
+the pass, 240-360 MB, which is what is left and not the peak; the held
+log's buffer, sixty-four megabytes at every point; and the day's new
+defaults, whose counts were nothing in the killed shape. What named it
+was the process's anonymous memory by mapping, sampled from outside it
+through the burst (`/proc/<pid>/smaps` beside the group's `memory.stat`):
+eight hundred megabytes of nine hundred in mappings that were not the
+allocator's; and then the engine's own mapped blocks by length at each
+new peak, a scratch counter in `blocks::alloc`: 101 arena blocks of four
+megabytes, four tables. The kernel merges adjacent anonymous mappings,
+so a mapping's size in `smaps` says allocator or not and no more. The
+writer's wait for room is by the tables' bytes as well now
+(`Options::frozen_bytes`; `docs/engine.md`, the frozen tables' bytes):
+no kill in twenty-four sweeps where the count alone had three in twelve.
+The pairings showed two things the fix was not built for. The bound
+decided which store a sweep began on: with it the compact form was
+serving at the sweep's start in seventeen sweeps of eighteen, by the
+count alone in one of six, and the small bursts ran ten times faster
+where it was, which a cell read at its median would have given to the
+bound's own speed. And the buffered arm's passes at three million keys
+read behind in six pairs of six with every counter level, and the same
+pairing run again with each scan timed read the other arm behind: the
+host's two speeds, a pass at a time. Beside them, the session's own: two
+pairings that differed in `--bound` alone were queued under one output
+name, the second overwrote the first's files, and the first was run
+again before a sentence could cite it. The rules: a limit kept as a
+count is a limit in bytes only while the things counted keep their size,
+so when a size is made to grow, every count that bounded it is read
+again that day; a limit one arm's pace keeps a store under is a limit
+nothing enforces, and a bound is tested by the writer that waits for
+nothing; memory at a kill is read during the burst and from outside the
+process, by mapping first, since that says allocator or engine before
+any owner is guessed, and what a census reads after the pass is what is
+left; a lever on memory moves every decision that reads the process's
+size, so a pairing of one is read for the state each sweep began in
+before its medians; six pairs of six with the counters level is one
+sitting's coin until the pairing is run again; and two runs whose
+commands differ are filed under names that differ.
+
 ## Open targets, and the one standing limitation
 
 A cell a comparator wins is a target, never a limit to be written down
@@ -7368,17 +7420,19 @@ where it says so:
   rate in the long shape. The lever is the crossing's asks made off that
   thread, so the buy and the install are not held behind them, and is not
   built.
-- The frozen tables are held to a count (`FROZEN_CAP`, three) and not to
-  bytes. A table freezes at the seal's threshold, 109 MB of memtable at
-  ten million keys, and near reads its seal makes a snapshot copy of it,
-  123 MB more: three behind a landing that does not come, with the live
-  table past them, are a gigabyte, and under a bound of that the group
-  kills the process before the writer's wait at a full list holds it.
-  The one landing known to stall so was the bounds walk over keys whose
-  heads are not whole keys, which the heads place now
-  (`Options::bounds_by_heads`, `land_bounds_read`). The lever for any
-  other is the writer's wait drawn from what the bound can spare, and is
-  not built.
+- A store past its budget that is only scanned after its load is bought
+  late or not at all. At ten million keys the buffered arm's lag sweep
+  began with the compact form serving in seventeen sweeps of eighteen
+  under 1 GiB and in three of six under 1.25 GiB (`docs/engine.md`, the
+  frozen tables' bytes; by the count alone, in one of twelve), and where
+  it began raw the one- and ten-percent bursts ran ten times longer, the
+  writer held behind an upkeep thread that resolves its keys through raw
+  records the bound has pushed out. The cells are in FASTER's row, the
+  held arm's small bursts. The controller buys on its point reads'
+  faults and the sweep has none; what decides the purchase before it,
+  the load's builds ahead or the budget as the load ends, has not been
+  read off the controller's trace (`SUPDB_ZPAGES_TRACE=1` over the
+  pairing).
 - The scrambled E in core is the scans at LMDB's rate and two costs of
   ours beside them (`docs/engine.md`, timed by kind): a commit of a
   hundred inserts at twice LMDB's, 2,500 instructions an insert of the
