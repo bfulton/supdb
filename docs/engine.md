@@ -1531,6 +1531,30 @@ ten-rep pairing and level, 0.95-1.08, in the next two, so it stays an arm.
 And the A cell at two threads, the weakest, read 0.87 in one pairing and
 0.97 in the other.
 
+A read-modify-write of a key the table lacks, which the uniform mix's are
+nearly all, probed the table three times before it read below it -- in the
+lean probe, in the layered read-modify-write (`MemTable::rmw_shared`) and
+in the read -- and twice more in the put after it, its lean probe and its
+insert, and asked for the partition only after the table's miss. It reads
+below in the pin and the state of its lean probe now, asks for the
+partition ahead where the last read fell through, and inserts with the hash
+it took (`Options::shared_rmw_absent`; `supdb-heldsharedbigrmwprobes`
+probes again). Counted on the split store at `8e235df`
+(`SHARED_OPS_SPLIT=1 SHARED_OPS_ONLY=rmws shared_ops ARM 300000 1 DIST`
+under callgrind toggled on `shared_ops::phase_rmws`): 1,086 instructions an
+operation uniform and 943 zipf, against 1,424 and 1,168, and FASTER's 631
+and 590. Timed on one thread, one round a process since the rounds after
+the first are second touches, four processes of each order: 434-552 ns
+uniform against 481-574 and FASTER's 351-483, and 355-539 zipf against
+402-488 and FASTER's 284-332. A key's first read-modify-write is the one
+operation FASTER still runs faster here. Paired at ten reps (`pair.sh
+supdb-heldsharedbig supdb-heldsharedbigrmwprobes 300000 --passes
+load,mixes-threaded --reps 10`), the read-modify-write cells read 0.90-1.00
+without it in five of six while the A cells, which make none, lean to 1.11,
+so the count is its verdict; and against FASTER the same day every cell was
+ours a third time, A 0.85, 0.91 and 0.91, the uniform read-modify-write
+0.82, 0.71 and 0.69.
+
 #### Beside FASTER out of core
 
 A store larger than memory is what FASTER's log is made for, and the
