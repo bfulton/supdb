@@ -1341,8 +1341,10 @@ one's are durable; the frozen tables are a list in the queue's order,
 up to `FROZEN_CAP`, and a landing retires its front; a table `sync`
 hands without a freeze is a seal in flight beside theirs that joins the
 list's back only when the writer freezes it; the writer freezes into
-room and waits only when the list is full, for the oldest's readable
-landing; and the count of seals
+room, which is the list's count and its tables' bytes against a share
+of the memory available (`Options::frozen_bytes`), one table frozen
+whatever it holds, and waits only where there is none, for the oldest's
+readable landing; and the count of seals
 (`in_seal`) is read before the state whoever decides against it, so a
 count of zero is one whose landings the state shows. A store is held by one open at a time, under an exclusive `flock` of
 its `LOCK` taken before the open reads its directory -- an open sweeps the

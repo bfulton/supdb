@@ -1461,6 +1461,10 @@ pub struct Supdb {
     /// files have outgrown (`Options::heads_owned_past_fill` off):
     /// `supdb-headsgate`.
     headsgate: bool,
+    /// The frozen tables bounded by their count alone
+    /// (`Options::frozen_bytes` at `usize::MAX`): `supdb-frozencount`, and
+    /// `supdb-heldpartfrozencount` under the held log.
+    frozencount: bool,
     /// A settle's patch searches a copy for a key above its last entry
     /// (`Options::settle_append_last` off): `supdb-settlesearch` and
     /// `supdb-ingestsettlesearch`.
@@ -2937,6 +2941,8 @@ struct Policy {
     copythree: bool,
     /// The raw gate's heads left to the page cache: `...headsgate`.
     headsgate: bool,
+    /// The frozen tables bounded by their count alone: `...frozencount`.
+    frozencount: bool,
     /// The patch's search for an appended key: `...settlesearch`.
     settlesearch: bool,
     /// The patch's walk of the sources for a lone key: `...settlesources`.
@@ -3581,6 +3587,7 @@ impl Default for Policy {
             identityblob: false,
             copythree: false,
             headsgate: false,
+            frozencount: false,
             settlesearch: false,
             settlesources: false,
             scanlevers: false,
@@ -10528,6 +10535,7 @@ impl Supdb {
             identityblob,
             copythree,
             headsgate,
+            frozencount,
             settlesearch,
             settlesources,
             scanlevers,
@@ -11184,6 +11192,7 @@ impl Supdb {
             identity_by_keys: !identityblob,
             copy_packed: !copythree,
             heads_owned_past_fill: !headsgate,
+            frozen_bytes: if frozencount { usize::MAX } else { 0 },
             settle_append_last: !settlesearch,
             settle_lone_chain: !settlesources,
             forms_convert_from: if densefrom > 0 {
@@ -11595,6 +11604,7 @@ impl Supdb {
             identityblob,
             copythree,
             headsgate,
+            frozencount,
             settlesearch,
             settlesources,
             scanlevers,
@@ -11915,7 +11925,11 @@ impl Engine for Supdb {
                 };
             }
             if self.partition {
-                return "supdb-heldpart";
+                return if self.frozencount {
+                    "supdb-heldpartfrozencount"
+                } else {
+                    "supdb-heldpart"
+                };
             }
             return match self.holdcap {
                 None => "supdb-held",
@@ -12756,6 +12770,9 @@ impl Engine for Supdb {
         }
         if self.headsgate {
             return "supdb-headsgate";
+        }
+        if self.frozencount {
+            return "supdb-frozencount";
         }
         if self.copythree {
             return if self.partition {
@@ -13754,6 +13771,19 @@ impl Engine for Supdb {
             ("wal_rotations", db.seal_waits().wal_rotations as f64),
             ("freeze_ms", db.seal_waits().freeze_ns as f64 / 1e6),
             ("join_wait_ms", db.seal_waits().join_wait_ns as f64 / 1e6),
+            // Freezes by the tables frozen ahead of them, and the waits for
+            // room the frozen tables' bytes made (`Options::frozen_bytes`).
+            ("frozen_ahead0", db.seal_waits().frozen_ahead[0] as f64),
+            ("frozen_ahead1", db.seal_waits().frozen_ahead[1] as f64),
+            ("frozen_ahead2", db.seal_waits().frozen_ahead[2] as f64),
+            (
+                "frozen_byte_waits",
+                db.seal_waits().frozen_byte_waits as f64,
+            ),
+            (
+                "frozen_byte_wait_ms",
+                db.seal_waits().frozen_byte_wait_ns as f64 / 1e6,
+            ),
             // The manifest publishes' time on the segment work's thread:
             // the slot's write and fdatasync, a device round trip each.
             ("publish_ms", db.seal_waits().publish_ns as f64 / 1e6),
@@ -15749,6 +15779,7 @@ pub fn guarantee(arm: &str) -> Option<Guarantee> {
         | "supdb-copythree"
         | "supdb-ingestcopythree"
         | "supdb-headsgate"
+        | "supdb-frozencount"
         | "supdb-settlesearch"
         | "supdb-ingestsettlesearch"
         | "supdb-settlesources"
@@ -15971,6 +16002,7 @@ pub fn guarantee(arm: &str) -> Option<Guarantee> {
         | "supdb-held8m"
         | "supdb-heldmarch"
         | "supdb-heldpart"
+        | "supdb-heldpartfrozencount"
         | "supdb-heldnoframes"
         | "supdb-heldnfnocache"
         | "supdb-heldnorecordahead"
@@ -17101,6 +17133,32 @@ pub fn open(arm: &str, dir: &Path, map_gb: usize) -> Res<Box<dyn Engine>> {
                     d,
                     Policy {
                         headsgate: true,
+                        ..Policy::default()
+                    },
+                )
+            },
+            dir,
+        )?,
+        "supdb-frozencount" => supdb_arm(
+            |d| {
+                Supdb::with_policy(
+                    d,
+                    Policy {
+                        frozencount: true,
+                        ..Policy::default()
+                    },
+                )
+            },
+            dir,
+        )?,
+        "supdb-heldpartfrozencount" => supdb_arm(
+            |d| {
+                Supdb::with_policy(
+                    d,
+                    Policy {
+                        durable: false,
+                        held: true,
+                        frozencount: true,
                         ..Policy::default()
                     },
                 )
@@ -20637,6 +20695,32 @@ mod tests {
                 let o = z.db.as_ref().unwrap().options();
                 assert!(!o.heads_owned_past_fill && b.heads_owned_past_fill);
                 assert!(o.copy_packed);
+            }
+            {
+                let z = Supdb::with_policy(
+                    &dir("frozencount"),
+                    Policy {
+                        frozencount: true,
+                        ..Policy::default()
+                    },
+                )
+                .unwrap();
+                assert_eq!(z.name(), "supdb-frozencount");
+                assert_eq!(z.features(), base.features());
+                let o = z.db.as_ref().unwrap().options();
+                assert!(o.frozen_bytes == usize::MAX && b.frozen_bytes == 0);
+                let z = Supdb::with_policy(
+                    &dir("heldpartfrozencount"),
+                    Policy {
+                        durable: false,
+                        held: true,
+                        frozencount: true,
+                        ..Policy::default()
+                    },
+                )
+                .unwrap();
+                assert_eq!(z.name(), "supdb-heldpartfrozencount");
+                assert_eq!(z.db.as_ref().unwrap().options().frozen_bytes, usize::MAX);
             }
             {
                 let z = Supdb::with_policy(

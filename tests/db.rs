@@ -17864,6 +17864,11 @@ fn a_fourth_freeze_waits_for_the_front_to_land() {
     );
     assert!(w.join_wait_ns > w0.join_wait_ns, "{w:?}");
     assert_eq!(
+        (w.frozen_byte_waits, w.frozen_byte_wait_ns),
+        (w0.frozen_byte_waits, w0.frozen_byte_wait_ns),
+        "for the count, which the bytes' wait is told apart from: {w:?}"
+    );
+    assert_eq!(
         db.frozen_tables(),
         3,
         "the fourth table frozen into the front's room"
@@ -17881,6 +17886,210 @@ fn a_fourth_freeze_waits_for_the_front_to_land() {
         vec![b"c".to_vec()],
         "the fourth table's value over the third's tombstone"
     );
+}
+
+/// The frozen tables are held to bytes as well as to a count
+/// (`Options::frozen_bytes`). One store's shape three times, a table
+/// frozen behind a held seal and a second one committed: bounded by the
+/// count alone the second freezes beside the first and waits for
+/// nothing; bounded at exactly what the two hold it does the same; a byte
+/// under that it waits for the front's landing, freezes with none ahead,
+/// and the wait is counted once, as the bytes'. The first table froze
+/// under every bound, since one is frozen whatever it holds.
+#[test]
+fn a_freeze_past_the_frozen_tables_bytes_waits_for_the_front_to_land() {
+    let key = |k: u32| format!("key-{k:05}");
+    // What the second freeze holds, and whether it waited.
+    let run = |name: &str, bound: usize, waits: bool| -> u64 {
+        let (mut db, mut m, _) = partitions_under_a_piece(
+            name,
+            Options {
+                frozen_bytes: bound,
+                ..common::options()
+            },
+        );
+        let watch = Watchdog::arm("a freeze within the frozen tables' bytes waited, or one past them outlasted the release");
+        db.hold_seal_landing(true);
+        // The durable phase held too, so the front's readable landing
+        // is the one landing the release lets through.
+        db.hold_seal_durable(true);
+        freeze_one_of_three(&mut db, &mut m, 0);
+        assert_eq!(db.frozen_tables(), 1, "{name}: one table frozen");
+        for k in (0..3000u32).step_by(4) {
+            m.append(&mut db, &key(k), "f1");
+        }
+        m.append(&mut db, "key-cross-b", "b");
+        db.commit().unwrap();
+        let (held, resolved) = db.frozen_bytes_held();
+        assert_eq!(resolved, bound as u64, "{name}: the bound as given");
+        // Each table at twice its capacity, the live one with the frozen,
+        // by the census's own count of what the tables hold.
+        let census: BTreeMap<String, u64> = db.memory_census().into_iter().collect();
+        let cap = |k: &str| census.get(k).copied().unwrap_or(0);
+        assert!(
+            cap("mem_live_cap") > 0 && cap("mem_frozen_cap") > 0,
+            "{name}: {census:?}"
+        );
+        assert_eq!(
+            held,
+            2 * (cap("mem_live_cap") + cap("mem_frozen_cap")),
+            "{name}: {census:?}"
+        );
+        let w0 = db.seal_waits();
+        let release =
+            waits.then(|| db.release_seal_landing_after(std::time::Duration::from_millis(500)));
+        db.seal().unwrap();
+        let frozen = db.frozen_tables();
+        let w = db.seal_waits();
+        if let Some(r) = release {
+            r.join().unwrap();
+        }
+        drop(watch);
+        let ahead = |i: usize| w.frozen_ahead[i] - w0.frozen_ahead[i];
+        if waits {
+            assert_eq!(
+                (
+                    w.frozen_byte_waits - w0.frozen_byte_waits,
+                    w.blocked_joins - w0.blocked_joins
+                ),
+                (1, 1),
+                "{name}: the freeze waited once, for the bytes: {w:?}"
+            );
+            assert!(
+                w.frozen_byte_wait_ns > w0.frozen_byte_wait_ns && w.join_wait_ns > w0.join_wait_ns,
+                "{name}: {w:?}"
+            );
+            assert_eq!(frozen, 1, "{name}: frozen once the front had landed");
+            assert_eq!((ahead(0), ahead(1)), (1, 0), "{name}: with none ahead");
+        } else {
+            assert_eq!(
+                (
+                    w.frozen_byte_waits - w0.frozen_byte_waits,
+                    w.blocked_joins - w0.blocked_joins,
+                    w.join_wait_ns - w0.join_wait_ns
+                ),
+                (0, 0, 0),
+                "{name}: the freeze waited for nothing: {w:?}"
+            );
+            assert_eq!(frozen, 2, "{name}: frozen beside the first");
+            assert_eq!((ahead(0), ahead(1)), (0, 1), "{name}: with one ahead");
+        }
+        m.check(&db, &format!("{name}: the writer over the frozen tables"));
+        let r = db.reader().unwrap();
+        m.check(&r, &format!("{name}: a handle over the frozen tables"));
+        db.hold_seal_landing(false);
+        db.hold_seal_durable(false);
+        db.settle().unwrap();
+        assert_eq!(db.frozen_tables(), 0, "{name}: every seal landed");
+        m.check(&db, &format!("{name}: the writer after the landings"));
+        m.check(&r, &format!("{name}: a handle after the landings"));
+        held
+    };
+    let held = run("frozen-bytes-count", usize::MAX, false);
+    assert!(held > 0);
+    let at = run("frozen-bytes-at", held as usize, false);
+    assert_eq!(at, held, "the same writes hold the same bytes");
+    let under = run("frozen-bytes-under", held as usize - 1, true);
+    assert_eq!(under, held, "the same writes hold the same bytes");
+}
+
+/// A store opened with no bound given takes one from the memory
+/// available to the process (`Options::frozen_bytes` at zero): where the
+/// platform says what that is, an eighth of it at most of the machine's,
+/// and no bound where it does not.
+#[test]
+fn the_frozen_tables_bound_is_taken_from_the_memory_available() {
+    let d = dir("frozen-bytes-auto");
+    let db = Db::create(&d, common::options()).unwrap();
+    let (_, bound) = db.frozen_bytes_held();
+    let total = std::fs::read_to_string("/proc/meminfo").ok().and_then(|m| {
+        let line = m.lines().find(|l| l.starts_with("MemTotal:"))?;
+        let kb: u64 = line.split_whitespace().nth(1)?.parse().ok()?;
+        Some(kb * 1024)
+    });
+    match total {
+        Some(total) => assert!(
+            bound > 0 && bound <= total / 8,
+            "an eighth of at most the machine's {total} bytes: {bound}"
+        ),
+        None => assert_eq!(bound, u64::MAX, "no memory to read, no bound"),
+    }
+}
+
+/// A table `sync` handed to a seal is frozen at the writer's next write
+/// once the list has room, and room is the bytes' too: beside one frozen
+/// table whose seal is held, past the bytes, the write waits for the
+/// front's landing and then freezes the handed table with none ahead;
+/// bounded by the count alone it freezes it beside the first at once.
+#[test]
+fn a_handed_tail_past_the_frozen_tables_bytes_waits_for_the_front() {
+    for (name, bound, waits) in [
+        ("handed-bytes", 1usize, true),
+        ("handed-bytes-count", usize::MAX, false),
+    ] {
+        let (mut db, mut m, _) = partitions_under_a_piece(
+            name,
+            Options {
+                adaptive_shape: true,
+                frozen_bytes: bound,
+                ..common::options()
+            },
+        );
+        let watch = Watchdog::arm(
+            "the write after a hand-off waited within the bytes, or past them outlasted the release",
+        );
+        db.hold_seal_landing(true);
+        db.hold_seal_durable(true);
+        freeze_one_of_three(&mut db, &mut m, 0);
+        assert_eq!(db.frozen_tables(), 1, "{name}");
+        // Shuffled, so the tail is hashed and goes to a seal.
+        for i in 0..500u32 {
+            m.append(&mut db, &format!("key-{:05}t", i * 7919 % 500), "t");
+        }
+        db.commit().unwrap();
+        db.sync().unwrap();
+        assert_eq!(db.tail_swaps(), (0, 0), "{name}: handed, not yet replaced");
+        let w0 = db.seal_waits();
+        let release =
+            waits.then(|| db.release_seal_landing_after(std::time::Duration::from_millis(500)));
+        m.append(&mut db, "key-00001", "w");
+        db.commit().unwrap();
+        let frozen = db.frozen_tables();
+        let w = db.seal_waits();
+        if let Some(r) = release {
+            r.join().unwrap();
+        }
+        drop(watch);
+        assert_eq!(
+            db.tail_swaps(),
+            (1, 0),
+            "{name}: the write froze the handed table"
+        );
+        assert_eq!(
+            (
+                w.frozen_byte_waits - w0.frozen_byte_waits,
+                w.blocked_joins - w0.blocked_joins,
+                frozen
+            ),
+            if waits { (1, 1, 1) } else { (0, 0, 2) },
+            "{name}: {w:?}"
+        );
+        let r = db.reader().unwrap();
+        m.check(
+            &r,
+            &format!("{name}: a handle over the handed table frozen"),
+        );
+        m.check(
+            &db,
+            &format!("{name}: the writer over the handed table frozen"),
+        );
+        db.hold_seal_landing(false);
+        db.hold_seal_durable(false);
+        db.settle().unwrap();
+        assert_eq!(db.frozen_tables(), 0, "{name}");
+        m.check(&r, &format!("{name}: a handle after the landings"));
+        m.check(&db, &format!("{name}: the writer after the landings"));
+    }
 }
 
 /// A table `sync` hands to a seal beside two frozen tables whose seals
@@ -19236,10 +19445,27 @@ fn a_rotated_wal_torn_in_its_new_file_reopens_to_a_prefix() {
 /// commit seals what grew, and every key reads right.
 #[test]
 fn a_commit_past_the_threshold_keeps_writing_while_the_frozen_list_is_full() {
-    let d = dir("seal-defers");
+    commits_defer_past_room("seal-defers", usize::MAX, 3);
+}
+
+/// The same past the frozen tables' bytes (`Options::frozen_bytes`): with
+/// a bound any second table passes, the first crossing freezes, since one
+/// table is frozen whatever it holds, and the crossing after it finds no
+/// room with one table frozen and defers as at a full list.
+#[test]
+fn a_commit_past_the_frozen_tables_bytes_keeps_writing_too() {
+    commits_defer_past_room("seal-defers-bytes", 1, 1);
+}
+
+/// `seal_defers` with the frozen tables bounded at `bound` bytes: `room`
+/// crossings freeze into room, and the commits past the threshold after
+/// them defer.
+fn commits_defer_past_room(name: &str, bound: usize, room: u32) {
+    let d = dir(name);
     let opts = Options {
         seal_rotates_wal: false,
         seal_defers: true,
+        frozen_bytes: bound,
         seal_bytes: 256 << 10,
         seal_max_pct: 0,
         sync: supdb::SyncPolicy::EveryN(u32::MAX),
@@ -19274,11 +19500,11 @@ fn a_commit_past_the_threshold_keeps_writing_while_the_frozen_list_is_full() {
     };
     db.hold_seal_landing(true);
     let mut want: BTreeMap<Vec<u8>, Vec<Vec<u8>>> = BTreeMap::new();
-    // Past the threshold three times, each sealing into room and held,
+    // Past the threshold `room` times, each sealing into room and held,
     // then past it again and under the ceiling of twice the threshold.
     let per = tail_key(0).len() + tail_val(1).len();
     let crossing = (256 << 10) / per as u32 + 100;
-    let full = 3 * crossing;
+    let full = room * crossing;
     let n = full + (350 << 10) / per as u32;
     for i in 0..n {
         db.append(&tail_key(i), &tail_val(1));
@@ -19288,8 +19514,12 @@ fn a_commit_past_the_threshold_keeps_writing_while_the_frozen_list_is_full() {
         }
         if i + 1 == full {
             db.commit().unwrap();
-            assert_eq!(db.frozen_tables(), 3, "three crossings froze into room");
-            assert_eq!(db.seal_waits().deferred, 0, "and deferred nothing");
+            assert_eq!(
+                db.frozen_tables(),
+                room as usize,
+                "{name}: the crossings froze into room"
+            );
+            assert_eq!(db.seal_waits().deferred, 0, "{name}: and deferred nothing");
         }
     }
     db.commit().unwrap();
@@ -19297,11 +19527,17 @@ fn a_commit_past_the_threshold_keeps_writing_while_the_frozen_list_is_full() {
     watch.join().unwrap();
     let w = db.seal_waits();
     assert!(db.in_flight().0, "the seals are in flight, held");
+    assert_eq!(
+        db.frozen_tables(),
+        room as usize,
+        "{name}: nothing froze past the room"
+    );
     assert!(
         w.deferred > 0,
-        "the commits past the threshold deferred: {w:?}"
+        "{name}: the commits past the threshold deferred: {w:?}"
     );
     assert_eq!(w.join_wait_ns, 0, "and none waited for the slot");
+    assert_eq!(w.frozen_byte_waits, 0, "nor for the bytes: {w:?}");
     holds_all(&db, &want, "beside the held seal");
     db.hold_seal_landing(false);
     // The seals land; the table that grew meanwhile seals at the first

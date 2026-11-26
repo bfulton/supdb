@@ -4826,6 +4826,26 @@ pub struct Options {
     /// bounds them. A look further behind than the tables kept drops the
     /// writer's tables, as it does past the count.
     pub upkeep_keep_bytes: usize,
+    /// The bytes the frozen tables may take, each counted as
+    /// `upkeep_keep_bytes` counts a kept one, at twice its capacity, the
+    /// table and the snapshot copy a seal near reads makes of it: a
+    /// commit whose seal would freeze the live table past them waits for
+    /// the oldest frozen table's readable landing first, as it waits
+    /// where `FROZEN_CAP` tables are frozen, and one table is frozen
+    /// whatever it holds. Zero, the default, is an eighth of the memory
+    /// available to the process (`zfile::read_budget`'s limit), and where
+    /// that cannot be read the count alone bounds them; `usize::MAX` is
+    /// the count alone. A table freezes at the seal's threshold, which
+    /// grows with the store, a hundred megabytes at ten million keys, and
+    /// a writer whose commits wait for no sync fills one in half a
+    /// second where its seal takes longer: under 1 GiB the live table and
+    /// three frozen ones stood at 140 MB each with the seals' sorts and
+    /// copies beside them, 620 MB of mapped blocks two seconds into a
+    /// full rewrite, and the group killed the process in one sweep of
+    /// four. `supdb-frozencount` and `supdb-heldpartfrozencount` are the
+    /// arms bounded by the count alone.
+    #[doc(hidden)]
+    pub frozen_bytes: usize,
     /// Whether the upkeep thread gives its forms up when the writes have
     /// outrun it: it drops its tables wherever it is in its pass, and
     /// nothing is filed into forms, no seal makes a snapshot copy for
@@ -7833,6 +7853,7 @@ impl Default for Options {
             ahead_converts: false,
             ahead_sends_bounds: true,
             upkeep_keep_bytes: 0,
+            frozen_bytes: 0,
             upkeep_abandons: true,
             upkeep_files_bursts: true,
             upkeep_yields: false,
@@ -20063,6 +20084,12 @@ struct SealCounts {
     /// Time the writer spent in the seals its commits started: the wait
     /// for room, the freeze, and the seal's writer half.
     freeze_ns: AtomicU64,
+    /// Freezes by the tables frozen ahead of them, and of the waits for
+    /// room the ones the frozen tables' bytes made where their count had
+    /// room (`Options::frozen_bytes`), with their time.
+    frozen_ahead: [AtomicU64; FROZEN_CAP],
+    frozen_byte_waits: AtomicU64,
+    frozen_byte_wait_ns: AtomicU64,
 }
 
 impl SealCounts {
@@ -20101,6 +20128,9 @@ impl SealCounts {
             run_spares_made: get(&self.run_spares_made),
             keyseqs_kept: get(&self.keyseqs_kept),
             freeze_ns: get(&self.freeze_ns),
+            frozen_ahead: std::array::from_fn(|i| get(&self.frozen_ahead[i])),
+            frozen_byte_waits: get(&self.frozen_byte_waits),
+            frozen_byte_wait_ns: get(&self.frozen_byte_wait_ns),
         }
     }
 
@@ -20184,6 +20214,13 @@ pub struct SealWaits {
     /// (`Options::identity_by_keys`).
     pub keyseqs_kept: u64,
     pub freeze_ns: u64,
+    /// Freezes by the tables frozen ahead of them, none to
+    /// `FROZEN_CAP - 1`, and the waits for room the frozen tables' bytes
+    /// made where their count had room (`Options::frozen_bytes`), with
+    /// their time.
+    pub frozen_ahead: [u64; FROZEN_CAP],
+    pub frozen_byte_waits: u64,
+    pub frozen_byte_wait_ns: u64,
 }
 
 /// PROTOTYPE: records of one partition block a scan reads over unsealed
@@ -22576,6 +22613,10 @@ struct Shared {
     /// tables kept for the upkeep's look may take, `u64::MAX` where
     /// nothing bounds them but the count.
     keep_bytes: u64,
+    /// `Options::frozen_bytes` as resolved at open: the bytes the frozen
+    /// tables may take before a freeze waits for a landing, more than any
+    /// tables hold where nothing bounds them but the count.
+    frozen_bytes: u64,
     /// The block cache's automatic budget as resolved at open
     /// (`Options::scan_cache_auto`), zero for none.
     auto_cache_bytes: usize,
@@ -38248,9 +38289,7 @@ impl Db {
         // segment work published meanwhile may have made room. A stale
         // full list only defers, so no order against the count.
         self.rehold();
-        if self.state().frozen.len() < FROZEN_CAP
-            || self.shared.seal_wedged.load(AtomicOrdering::Acquire)
-        {
+        if self.frozen_room().1 || self.shared.seal_wedged.load(AtomicOrdering::Acquire) {
             return true;
         }
         if self.mem_bytes >= threshold.saturating_mul(2) {
@@ -38737,6 +38776,7 @@ impl Db {
             upkeep: Lend::default(),
             upkeep_lives: AtomicU64::new(u64::MAX),
             keep_bytes: Db::resolve_keep_bytes(&opts),
+            frozen_bytes: Db::resolve_frozen_bytes(&opts),
             auto_cache_bytes: Db::resolve_auto_cache(&opts),
             cache_bindings: AtomicU64::new(0),
             cache_growths: AtomicU64::new(0),
@@ -39583,6 +39623,7 @@ impl Db {
             upkeep: Lend::default(),
             upkeep_lives: AtomicU64::new(u64::MAX),
             keep_bytes: Db::resolve_keep_bytes(&opts),
+            frozen_bytes: Db::resolve_frozen_bytes(&opts),
             auto_cache_bytes: Db::resolve_auto_cache(&opts),
             cache_bindings: AtomicU64::new(0),
             cache_growths: AtomicU64::new(0),
@@ -41774,22 +41815,19 @@ impl Db {
         }
         let t = std::time::Instant::now();
         let mut waited = false;
+        let mut by_bytes = false;
         loop {
             // The count before the state: a count of zero read after the
             // landing's publish sees that publish, so a table still live
             // beside a count of zero has a seal that failed to land.
             let seals = self.shared.in_seal.load(AtomicOrdering::Acquire);
             self.rehold();
-            let (replaced, room) = {
-                let st = self.state();
-                (
-                    !std::sync::Arc::ptr_eq(&st.mem, &handed),
-                    st.frozen.len() < FROZEN_CAP,
-                )
-            };
+            let replaced = !std::sync::Arc::ptr_eq(&self.state().mem, &handed);
             if replaced {
                 break;
             }
+            let (ahead, room) = self.frozen_room();
+            by_bytes |= !room && ahead < FROZEN_CAP;
             // Before the freeze, not only before the wait: frozen under a
             // fresh table with its seal failed, the handed table would sit
             // in the list for no landing to retire, and every later seal
@@ -41815,8 +41853,13 @@ impl Db {
         self.mem_handed = None;
         if waited {
             let c = &self.shared.seal_counts;
-            SealCounts::add(&c.join_wait_ns, t.elapsed().as_nanos() as u64);
+            let ns = t.elapsed().as_nanos() as u64;
+            SealCounts::add(&c.join_wait_ns, ns);
             SealCounts::add(&c.blocked_joins, 1);
+            if by_bytes {
+                SealCounts::add(&c.frozen_byte_waits, 1);
+                SealCounts::add(&c.frozen_byte_wait_ns, ns);
+            }
         }
         Ok(())
     }
@@ -42257,6 +42300,23 @@ impl Db {
             return opts.upkeep_keep_bytes as u64;
         }
         zfile::read_budget().map_or(u64::MAX, |b| b.limit / 8)
+    }
+
+    /// `Options::frozen_bytes` resolved against the memory available.
+    fn resolve_frozen_bytes(opts: &Options) -> u64 {
+        Db::frozen_bytes_of(opts.frozen_bytes, zfile::read_budget().map(|b| b.limit))
+    }
+
+    /// `Options::frozen_bytes` as `given`, with `limit` the memory
+    /// available to the process where it can be read: the bytes given, or
+    /// for zero an eighth of the limit, and no bound where zero finds no
+    /// limit. `usize::MAX` given is more than any tables hold, which is
+    /// the count alone.
+    fn frozen_bytes_of(given: usize, limit: Option<u64>) -> u64 {
+        match given {
+            0 => limit.map_or(u64::MAX, |l| l / 8),
+            n => n as u64,
+        }
     }
 
     /// After a publish that kept tables for the upkeep's look: where it
@@ -43397,13 +43457,17 @@ impl Db {
         }
         let t = std::time::Instant::now();
         let mut waited = false;
+        let mut by_bytes = false;
         loop {
             // The count before the state, as in `take_fresh_mem`.
             let seals = self.shared.in_seal.load(AtomicOrdering::Acquire);
             self.rehold();
-            if self.state().frozen.len() < FROZEN_CAP {
+            let (ahead, room) = self.frozen_room();
+            if room {
+                SealCounts::add(&self.shared.seal_counts.frozen_ahead[ahead], 1);
                 break;
             }
+            by_bytes |= ahead < FROZEN_CAP;
             if let Some(e) = self.shared.take_maint_err() {
                 return Err(e);
             }
@@ -43425,9 +43489,40 @@ impl Db {
                 SealCounts::add(&c.join_wait_ns, ns);
                 SealCounts::add(&c.blocked_joins, 1);
             }
+            if by_bytes {
+                SealCounts::add(&c.frozen_byte_waits, 1);
+                SealCounts::add(&c.frozen_byte_wait_ns, ns);
+            }
         }
         self.rehold();
         Ok(())
+    }
+
+    /// The tables frozen in the state the writer holds, and whether the
+    /// list has room for the live one: fewer than `FROZEN_CAP` frozen,
+    /// and either none, or their bytes with the live table's within
+    /// `Options::frozen_bytes`, each table at what keeping it costs
+    /// (`MemTable::kept_bytes`). The one definition of room for the
+    /// writer's waits and its deferral; the publish that freezes holds
+    /// the count alone, since the list only shrinks between this and it.
+    fn frozen_room(&self) -> (usize, bool) {
+        let st = self.state();
+        let ahead = st.frozen.len();
+        if ahead >= FROZEN_CAP {
+            return (ahead, false);
+        }
+        if ahead == 0 {
+            return (ahead, true);
+        }
+        (ahead, Db::frozen_held(st) <= self.shared.frozen_bytes)
+    }
+
+    /// What `Options::frozen_bytes` is held against: the frozen tables'
+    /// bytes with the live table's, each at what keeping it costs.
+    fn frozen_held(st: &State) -> u64 {
+        st.frozen
+            .iter()
+            .fold(st.mem.kept_bytes(), |b, t| b.saturating_add(t.kept_bytes()))
     }
 
     /// A seal's work started on a thread of its own and handed to the
@@ -43576,6 +43671,15 @@ impl Db {
     pub fn frozen_tables(&self) -> usize {
         let _op = self.op();
         self.state().frozen.len()
+    }
+
+    /// A test's: the bytes `Options::frozen_bytes` is held against as the
+    /// store stands, the frozen tables' with the live table's, and the
+    /// bound as the open resolved it.
+    #[doc(hidden)]
+    pub fn frozen_bytes_held(&self) -> (u64, u64) {
+        let _op = self.op();
+        (Db::frozen_held(self.state()), self.shared.frozen_bytes)
     }
 
     /// A test's: `hold_seal_landing(false)` after `after`, from a thread
@@ -45992,6 +46096,28 @@ impl PaceRuns {
     fn hold_pays(&self) -> bool {
         let (ended, reached) = self.ends_here();
         PACE_READ_WEIGHT * ended > reached
+    }
+}
+
+#[cfg(test)]
+mod frozen_bytes_tests {
+    use super::Db;
+
+    /// `Options::frozen_bytes` resolved: zero is an eighth of the memory
+    /// available and no bound where that cannot be read, and anything
+    /// else is itself whatever the memory, `usize::MAX` among them.
+    #[test]
+    fn the_frozen_tables_bound_is_an_eighth_of_the_memory_available() {
+        assert_eq!(Db::frozen_bytes_of(0, Some(1 << 30)), 128 << 20);
+        assert_eq!(Db::frozen_bytes_of(0, Some(1342177280)), 167772160);
+        assert_eq!(Db::frozen_bytes_of(0, None), u64::MAX);
+        assert_eq!(
+            Db::frozen_bytes_of(usize::MAX, Some(1 << 30)),
+            usize::MAX as u64
+        );
+        assert_eq!(Db::frozen_bytes_of(usize::MAX, None), usize::MAX as u64);
+        assert_eq!(Db::frozen_bytes_of(1, Some(1 << 30)), 1);
+        assert_eq!(Db::frozen_bytes_of(7 << 20, None), 7 << 20);
     }
 }
 
