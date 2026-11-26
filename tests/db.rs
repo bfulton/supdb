@@ -22489,15 +22489,17 @@ fn a_seal_in_flight_at_a_crash_is_through_before_the_crash_returns() {
 /// And a merge: one held before it reads anything is in flight for as long
 /// as the test says, and let go as the crash is called it has written its
 /// outputs when the crash returns, with nobody to land them, whether or
-/// not a hold stands before its landing; held at its start, it writes
-/// none, and the crash does not wait for it.
+/// not a hold stands before its landing, and whether or not the planner
+/// is waiting to join it there (`Db::plan_joins_merge`); held at its
+/// start, it writes none, and the crash does not wait for it.
 #[test]
 fn a_merge_in_flight_at_a_crash_is_through_before_the_crash_returns() {
     let n = 3000u32;
-    for (name, held, landing) in [
-        ("crash-merge", false, false),
-        ("crash-merge-held", true, false),
-        ("crash-merge-landing", false, true),
+    for (name, held, landing, joined) in [
+        ("crash-merge", false, false, false),
+        ("crash-merge-held", true, false, false),
+        ("crash-merge-landing", false, true, false),
+        ("crash-merge-joined", false, true, true),
     ] {
         let d = dir(name);
         let mut db = Db::create(&d, crash_opts()).unwrap();
@@ -22517,6 +22519,14 @@ fn a_merge_in_flight_at_a_crash_is_through_before_the_crash_returns() {
         if !held {
             db.hold_merge_start(false);
         }
+        // A third piece, whose landing plans a merge beside the one held
+        // at its landing and waits to join it first.
+        if joined {
+            crash_batch(&mut db, n, "c");
+            db.plan_joins_merge(true);
+            db.seal().unwrap();
+            wait_for("the planner's join", || db.merge_plan_joining());
+        }
         db.crash();
         let left = stands_still(&d, name);
         assert_eq!(
@@ -22525,7 +22535,7 @@ fn a_merge_in_flight_at_a_crash_is_through_before_the_crash_returns() {
             "{name}: the merge's outputs, {:?}",
             left.keys().collect::<Vec<_>>()
         );
-        crash_reopens(&d, n, "b");
+        crash_reopens(&d, n, if joined { "c" } else { "b" });
     }
 }
 

@@ -52693,10 +52693,9 @@ impl Life {
 
     /// `Db::crash`'s: the store marked dead, its threads that park
     /// between turns woken to find it so, and every counted thread waited
-    /// out. A thread that never ends is one stuck, or one waiting on a
-    /// thread a hold has parked for good -- the planner's join of a merge
-    /// held at its landing (`Db::plan_joins_merge`) -- and is named rather
-    /// than waited for without end.
+    /// out. One that never ends is stuck, or waits on something only the
+    /// store's writer would have given it, and is named rather than
+    /// waited for without end.
     fn end(&self, wake: [Option<&std::thread::Thread>; 3]) {
         self.dead.store(true, AtomicOrdering::SeqCst);
         for t in wake.into_iter().flatten() {
@@ -61649,6 +61648,15 @@ impl Maint {
                 self.shared
                     .merge_hold
                     .fetch_or(MERGE_HOLD_JOINING, AtomicOrdering::AcqRel);
+                // The join waits out a merge the test may hold at its
+                // landing, and in a store the tests' crash has ended that
+                // merge is parked for good: so is this wait (`Life::held`),
+                // which blocked in the join had the crash wait for a
+                // thread that could not end.
+                while self.compacting.iter().any(|m| !m.handle.is_finished()) {
+                    self.shared.life.held();
+                    std::thread::park_timeout(MAINT_LAND_POLL);
+                }
                 let joined = self.join_compact();
                 self.shared
                     .merge_hold
