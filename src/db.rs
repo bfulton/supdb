@@ -5099,7 +5099,9 @@ pub struct Options {
     /// table, as a key's first touch is -- asks for the line of its next
     /// key's partition slot before it probes the live table
     /// (`Seg::prefetch_slot`), and hands the key's FNV word and partition
-    /// to the read below (`Reader::read_lone`): such a read waits on three
+    /// to the read below (`Reader::read_lone`, `Reader::read_placed`), as
+    /// a read-modify-write of a key the table lacks does
+    /// (`shared_rmw_absent`): such a read waits on three
     /// lines one after another, the table's slot, the partition's slot and
     /// its record, where FASTER's waits on two, and the partition's slot
     /// is a function of the key alone, so its wait can stand beside the
@@ -5110,6 +5112,17 @@ pub struct Options {
     /// partition's slot ahead of the live table's probe, whatever the last
     /// read found.
     pub shared_fall_always: bool,
+    /// Under `shared_lean`, a handle's read-modify-write of a key the live
+    /// table has no record of -- a key's first touch, which the uniform
+    /// mix's are nearly all -- reads the key below the table in the pin
+    /// and the state its lean probe was made in, and asks for the key's
+    /// partition slot ahead of that probe where the handle's last read
+    /// fell below the table (`shared_fall_ahead`), then puts. It probed
+    /// the table three times before it read below it, in the lean probe,
+    /// in the layered read-modify-write (`MemTable::rmw_shared`) and in
+    /// the read, and asked for the partition after the table's miss. Off:
+    /// those three probes, `supdb-heldsharedbigrmwprobes`.
+    pub shared_rmw_absent: bool,
     /// A job's large per-key arrays -- a seal's sort of its
     /// table, a segment writer's copy of every key with its span, its
     /// record's offset and its hash, the ordered index builder's keys, a
@@ -7786,6 +7799,7 @@ impl Default for Options {
             shared_len_lazy: true,
             shared_fall_ahead: true,
             shared_fall_always: false,
+            shared_rmw_absent: true,
             jobs_mapped: true,
             jobs_mapped_when_short: false,
             jobs_pooled: false,
@@ -14691,6 +14705,18 @@ enum LeanRead {
     General,
 }
 
+/// What a lean overwrite made of a key (`MemTable::lean_overwrite`).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum LeanWrite {
+    /// The value written over the key's, the old one given.
+    Done,
+    /// No record of the key in the live table, nothing read or written.
+    Absent,
+    /// A record, a shape or a table the layered path writes, nothing read
+    /// or written.
+    Other,
+}
+
 /// The bytes of a value a lean read copies out of a table that rewrites in
 /// place, on its frame; a longer value takes the layered path.
 const LEAN_COPY: usize = 256;
@@ -18678,8 +18704,9 @@ impl MemTable {
     /// under the record's lock, with `f` given the value it replaces first:
     /// the in-place put (`rewrite_in_place`) and read-modify-write
     /// (`rmw_shared`) of the layered path, through the record's address.
-    /// False, nothing read or written, for any other key, shape or table,
-    /// whose write the layered path makes.
+    /// `Absent`, nothing read or written, where the table has no record of
+    /// the key, and `Other` for any other key, shape or table, whose write
+    /// the layered path makes.
     #[inline(always)]
     fn lean_overwrite(
         &self,
@@ -18688,19 +18715,21 @@ impl MemTable {
         key: &[u8],
         value: &[u8],
         f: Option<GiveOld<'_>>,
-    ) -> bool {
+    ) -> LeanWrite {
         if !self.rewrites {
-            return false;
+            return LeanWrite::Other;
         }
-        let Ok(Some((_, p))) = self.lean_find(hash, key, true) else {
-            return false;
+        let p = match self.lean_find(hash, key, true) {
+            Ok(Some((_, p))) => p,
+            Ok(None) => return LeanWrite::Absent,
+            Err(()) => return LeanWrite::Other,
         };
         let (lock, head) = self.lean_words(p);
         let v = shared_lock(lock);
         // Read after the lock is taken, as `rewrite_in_place` reads it.
         if self.closed.load(AtomicOrdering::SeqCst) {
             lock.store(v, AtomicOrdering::Release);
-            return false;
+            return LeanWrite::Other;
         }
         let at = match head.load(AtomicOrdering::Acquire) {
             0 => NO_CHUNK,
@@ -18708,11 +18737,11 @@ impl MemTable {
         };
         let LeanChain::One(old, len, true) = self.lean_chain(at) else {
             lock.store(v, AtomicOrdering::Release);
-            return false;
+            return LeanWrite::Other;
         };
         if len != value.len() {
             lock.store(v, AtomicOrdering::Release);
-            return false;
+            return LeanWrite::Other;
         }
         if let Some(f) = f {
             // SAFETY: the value's bytes, which no writer of the key can
@@ -18728,7 +18757,7 @@ impl MemTable {
         unsafe { std::ptr::copy_nonoverlapping(value.as_ptr(), old as *mut u8, len) };
         lock.store(v + 2, AtomicOrdering::Release);
         l.rewrites += 1;
-        true
+        LeanWrite::Done
     }
 
     /// Shared, rewriting: entry `e`'s chain, its record's current one,
@@ -24695,6 +24724,9 @@ pub struct Reader {
     /// The reads that asked for their partition's slot ahead of the live
     /// table's probe (`Options::shared_fall_ahead`).
     fall_asks: std::cell::Cell<u64>,
+    /// The read-modify-writes that read a key the live table lacks below
+    /// it in their own pin (`Options::shared_rmw_absent`).
+    rmw_below: std::cell::Cell<u64>,
     /// The live table's probes the placed read made (`Reader::read_placed`),
     /// which a read the lean probe found absent from it makes none of.
     placed_live_probes: std::cell::Cell<u64>,
@@ -25931,7 +25963,7 @@ impl Reader {
         if let SharedWrite::Put(value) = w {
             if self.opts.shared_lean
                 && mem.records
-                && mem.lean_overwrite(&mut l, hash, key, value, None)
+                && mem.lean_overwrite(&mut l, hash, key, value, None) == LeanWrite::Done
             {
                 self.lean_ops.set(self.lean_ops.get() + 1);
                 return Ok(true);
@@ -25953,15 +25985,50 @@ impl Reader {
         self.may_write_shared()?;
         {
             let _e = self.enter();
-            let mem = &self.state().mem;
+            let st = self.state();
+            let mem = &st.mem;
             let mut l = self.shared_local.borrow_mut();
             let hash = mem.hash(key);
-            if self.opts.shared_lean
-                && mem.records
-                && mem.lean_overwrite(&mut l, hash, key, value, Some(&mut f))
-            {
-                self.lean_ops.set(self.lean_ops.get() + 1);
-                return Ok(true);
+            if self.opts.shared_lean && mem.records {
+                // A key the table lacks is read below it in this pin, from
+                // the state the probe was made in, with its partition's
+                // slot asked for ahead of the probe where the last read
+                // fell below the table (`Options::shared_rmw_absent`).
+                let absent_below = self.opts.shared_rmw_absent;
+                let pre = if absent_below {
+                    self.fall_ask(st, key)
+                } else {
+                    None
+                };
+                match mem.lean_overwrite(&mut l, hash, key, value, Some(&mut f)) {
+                    LeanWrite::Done => {
+                        self.lean_ops.set(self.lean_ops.get() + 1);
+                        if absent_below {
+                            self.lean_fell.set(false);
+                        }
+                        return Ok(true);
+                    }
+                    LeanWrite::Absent if absent_below => {
+                        drop(l);
+                        self.lean_fell.set(true);
+                        self.rmw_below.set(self.rmw_below.get() + 1);
+                        self.read_begin();
+                        self.read_below(st, key, true, pre, &mut f)?;
+                        // The put into the table the probe found the key
+                        // absent from, with the hash taken for it, as a
+                        // handle's put lays it down past its lean probe.
+                        let mut l = self.shared_local.borrow_mut();
+                        let rd = Some(&self.shared.readers);
+                        return Ok(mem.write_shared(
+                            &mut l,
+                            rd,
+                            hash,
+                            key,
+                            SharedWrite::Put(value),
+                        ));
+                    }
+                    _ => {}
+                }
             }
             let rd = Some(&self.shared.readers);
             match mem.rmw_shared(&mut l, rd, hash, key, value, &mut f) {
@@ -29315,6 +29382,14 @@ impl Reader {
         self.lean_ops.get()
     }
 
+    /// A test's: the read-modify-writes this handle made of a key the
+    /// live table lacked, read below it in their own pin
+    /// (`Options::shared_rmw_absent`).
+    #[doc(hidden)]
+    pub fn shared_rmw_below(&self) -> u64 {
+        self.rmw_below.get()
+    }
+
     /// A test's: the reads this handle asked for their partition's slot
     /// ahead of the live table's probe (`Options::shared_fall_ahead`).
     #[doc(hidden)]
@@ -30351,9 +30426,7 @@ impl Reader {
 
     pub fn read_all<F: FnMut(&[u8])>(&self, key: &[u8], mut f: F) -> Result<u64> {
         let _entered = self.enter();
-        self.advise(true);
-        self.note_read(false);
-        self.zcensus_begin(false);
+        self.read_begin();
         // The state once, and the memtable's hash and slot line only when
         // it has entries: a read over a store just flushed hashed the key
         // and fetched a line of an empty table, and took the state through
@@ -30367,23 +30440,7 @@ impl Reader {
         let mut live_absent = false;
         let mut pre = None;
         if self.opts.shared_lean && st.mem.records {
-            // The partition's slot asked for ahead of the table's probe
-            // where the last read fell below the table
-            // (`Options::shared_fall_ahead`), and the key's word and
-            // partition kept for the read below it.
-            if self.opts.shared_fall_ahead
-                && (self.lean_fell.get() || self.opts.shared_fall_always)
-                && st.parts > 0
-                && !(self.opts.zpages != ZPages::Off && self.z_on())
-            {
-                let fnv = crate::flatindex::key_hash(key);
-                let at = st.part_of(key, self.opts.point_fence_words);
-                if let Some(seg) = st.segs[..st.parts].get(at) {
-                    seg.prefetch_slot(fnv);
-                }
-                pre = Some((fnv, at));
-                self.fall_asks.set(self.fall_asks.get() + 1);
-            }
+            pre = self.fall_ask(st, key);
             match self.read_live_lean(&st.mem, key, &mut f) {
                 LeanRead::Done(n) => {
                     self.lean_fell.set(false);
@@ -30396,10 +30453,57 @@ impl Reader {
                 LeanRead::General => self.lean_fell.set(false),
             }
         }
+        self.read_below(st, key, live_absent, pre, f)
+    }
+
+    /// A point read's bookkeeping at its start: the advice, the note of a
+    /// point read and the census's hook.
+    #[inline(always)]
+    fn read_begin(&self) {
+        self.advise(true);
+        self.note_read(false);
+        self.zcensus_begin(false);
+    }
+
+    /// The partition's slot asked for ahead of the live table's probe
+    /// where the last read fell below the table
+    /// (`Options::shared_fall_ahead`): the key's FNV word and partition,
+    /// for the read below it, where the ask was made.
+    #[inline(always)]
+    fn fall_ask(&self, st: &State, key: &[u8]) -> Option<(u64, usize)> {
+        if !(self.opts.shared_fall_ahead
+            && (self.lean_fell.get() || self.opts.shared_fall_always)
+            && st.parts > 0
+            && !(self.opts.zpages != ZPages::Off && self.z_on()))
+        {
+            return None;
+        }
+        let fnv = crate::flatindex::key_hash(key);
+        let at = st.part_of(key, self.opts.point_fence_words);
+        if let Some(seg) = st.segs[..st.parts].get(at) {
+            seg.prefetch_slot(fnv);
+        }
+        self.fall_asks.set(self.fall_asks.get() + 1);
+        Some((fnv, at))
+    }
+
+    /// The point read of `key` below the lean probe of a shared table:
+    /// with `live_absent`, the probe found no record of the key there, and
+    /// `pre` is its word and partition where they were taken ahead
+    /// (`fall_ask`).
+    #[inline(always)]
+    fn read_below<F: FnMut(&[u8])>(
+        &self,
+        st: &State,
+        key: &[u8],
+        live_absent: bool,
+        pre: Option<(u64, usize)>,
+        mut f: F,
+    ) -> Result<u64> {
         if let Some(n) = self.read_lone(st, key, live_absent, pre, &mut f) {
             return n;
         }
-        if let Some(n) = self.read_placed(st, key, live_absent, &mut f) {
+        if let Some(n) = self.read_placed(st, key, live_absent, pre, &mut f) {
             return n;
         }
         if let Some(n) = self.read_layers(st, key, &mut f) {
@@ -30459,6 +30563,7 @@ impl Reader {
         st: &State,
         key: &[u8],
         live_absent: bool,
+        pre: Option<(u64, usize)>,
         f: &mut F,
     ) -> Option<Result<u64>> {
         if !self.opts.point_layers_lean || !self.opts.point_lone_on() {
@@ -30476,20 +30581,22 @@ impl Reader {
         // after the live table where the table is asked first and its
         // hash is not made from the word (`Options::mem_hash_fold`), so a
         // read the table ends takes none.
-        let late = self.opts.point_live_first && mem.folds(key);
-        let fnv0 = if late {
-            0
-        } else {
-            crate::flatindex::key_hash(key)
+        // Both taken already where the read asked for its partition ahead
+        // of the live table (`pre`, `Options::shared_fall_ahead`).
+        let late = pre.is_none() && self.opts.point_live_first && mem.folds(key);
+        let fnv0 = match pre {
+            Some((fnv, _)) => fnv,
+            None if late => 0,
+            None => crate::flatindex::key_hash(key),
         };
         // The key's partition and the pieces over it, and the asks for
         // the lines their probes will load first: before the live table's
         // probe, or after it where the live table is asked first and its
         // chain did not end the read (`Options::point_live_first`).
-        let placed = if self.opts.point_live_first {
-            None
-        } else {
-            Some(Reader::place(&self.opts, st, key, fnv0)?)
+        let placed = match pre {
+            Some((fnv, at)) => Some(Reader::place_at(&self.opts, st, at, fnv, false)?),
+            None if self.opts.point_live_first => None,
+            None => Some(Reader::place(&self.opts, st, key, fnv0)?),
         };
         // The live table first: the values of the key's chain newest
         // first, the first `live_n` of `live`. They are slices of the
@@ -30874,8 +30981,21 @@ impl Reader {
         key: &[u8],
         fnv: u64,
     ) -> Option<(usize, &'s [std::sync::Arc<Seg>])> {
-        let (segs, np) = (&st.segs, st.parts);
         let at = st.part_of(key, opts.point_fence_words);
+        Reader::place_at(opts, st, at, fnv, true)
+    }
+
+    /// `place` for a key whose partition `at` the read has, its slot
+    /// asked for already where `ask_slot` is false.
+    #[inline(always)]
+    fn place_at<'s>(
+        opts: &Options,
+        st: &'s State,
+        at: usize,
+        fnv: u64,
+        ask_slot: bool,
+    ) -> Option<(usize, &'s [std::sync::Arc<Seg>])> {
+        let (segs, np) = (&st.segs, st.parts);
         let l0 = st.pieces_placed(at);
         debug_assert!(
             std::ptr::eq(l0, st.pieces_over(np, at)),
@@ -30889,7 +31009,7 @@ impl Reader {
             // where no tombstone masks the partition, and the tables'
             // probes and the pieces' filters are the lead for it. The
             // newest pieces' filters, which the walk asks first.
-            if let Some(seg) = segs[..np].get(at) {
+            if let Some(seg) = segs[..np].get(at).filter(|_| ask_slot) {
                 seg.prefetch_slot(fnv);
             }
             for seg in l0.iter().rev().take(PLACED_ASKS) {
@@ -39974,6 +40094,7 @@ impl Db {
             lean_ops: std::cell::Cell::new(0),
             lean_fell: std::cell::Cell::new(false),
             fall_asks: std::cell::Cell::new(0),
+            rmw_below: std::cell::Cell::new(0),
             placed_live_probes: std::cell::Cell::new(0),
             layer_reads: std::cell::Cell::new(0),
             placed_reads: std::cell::Cell::new(0),
@@ -40812,6 +40933,7 @@ impl Db {
             lean_ops: std::cell::Cell::new(0),
             lean_fell: std::cell::Cell::new(false),
             fall_asks: std::cell::Cell::new(0),
+            rmw_below: std::cell::Cell::new(0),
             placed_live_probes: std::cell::Cell::new(0),
             layer_reads: std::cell::Cell::new(0),
             placed_reads: std::cell::Cell::new(0),
@@ -43928,6 +44050,7 @@ impl Reader {
             lean_ops: std::cell::Cell::new(0),
             lean_fell: std::cell::Cell::new(false),
             fall_asks: std::cell::Cell::new(0),
+            rmw_below: std::cell::Cell::new(0),
             placed_live_probes: std::cell::Cell::new(0),
             layer_reads: std::cell::Cell::new(0),
             placed_reads: std::cell::Cell::new(0),
@@ -43978,6 +44101,7 @@ impl Reader {
                 lean_ops: std::cell::Cell::new(0),
                 lean_fell: std::cell::Cell::new(false),
                 fall_asks: std::cell::Cell::new(0),
+                rmw_below: std::cell::Cell::new(0),
                 placed_live_probes: std::cell::Cell::new(0),
                 layer_reads: std::cell::Cell::new(0),
                 placed_reads: std::cell::Cell::new(0),
@@ -44035,6 +44159,7 @@ impl Reader {
             lean_ops: std::cell::Cell::new(0),
             lean_fell: std::cell::Cell::new(false),
             fall_asks: std::cell::Cell::new(0),
+            rmw_below: std::cell::Cell::new(0),
             placed_live_probes: std::cell::Cell::new(0),
             layer_reads: std::cell::Cell::new(0),
             placed_reads: std::cell::Cell::new(0),
@@ -47315,6 +47440,7 @@ impl Reader {
             lean_ops: std::cell::Cell::new(0),
             lean_fell: std::cell::Cell::new(false),
             fall_asks: std::cell::Cell::new(0),
+            rmw_below: std::cell::Cell::new(0),
             placed_live_probes: std::cell::Cell::new(0),
             layer_reads: std::cell::Cell::new(0),
             placed_reads: std::cell::Cell::new(0),
@@ -61229,8 +61355,8 @@ mod threading {
 #[cfg(test)]
 mod shared_table {
     use super::{
-        slot_of, BlockShape, LeanRead, MemTable, Readers, SharedWrite, TableLocal, LEAN_COPY,
-        NO_CHUNK, RECYCLE_BATCH, SLOT_TENTATIVE,
+        slot_of, BlockShape, LeanRead, LeanWrite, MemTable, Readers, SharedWrite, TableLocal,
+        LEAN_COPY, NO_CHUNK, RECYCLE_BATCH, SLOT_TENTATIVE,
     };
     use std::sync::atomic::Ordering::{Acquire, Relaxed};
 
@@ -62142,7 +62268,10 @@ mod shared_table {
         LEAN_COPIED.with(|h| {
             *h.borrow_mut() = Some(Box::new(move || {
                 let mut l = TableLocal::default();
-                assert!(m.lean_overwrite(&mut l, m.hash(&k), &k, &[2u8; 100], None));
+                assert_eq!(
+                    m.lean_overwrite(&mut l, m.hash(&k), &k, &[2u8; 100], None),
+                    LeanWrite::Done
+                );
             }))
         });
         assert_eq!(lean(m, &k), ("done", vec![vec![2u8; 100]]));
@@ -62176,7 +62305,10 @@ mod shared_table {
         let rewrites = l.rewrites;
         let mut old = Vec::new();
         let mut give = |v: &[u8]| old.push(v.to_vec());
-        assert!(m.lean_overwrite(&mut l, m.hash(&k1), &k1, &[2u8; 100], Some(&mut give)));
+        assert_eq!(
+            m.lean_overwrite(&mut l, m.hash(&k1), &k1, &[2u8; 100], Some(&mut give)),
+            LeanWrite::Done
+        );
         assert_eq!(
             old,
             vec![vec![1u8; 100]],
@@ -62194,7 +62326,10 @@ mod shared_table {
                 .map(|_| lock_of(m, k));
             let mut given = 0;
             let mut count = |_: &[u8]| given += 1;
-            assert!(!m.lean_overwrite(l, m.hash(k), k, v, Some(&mut count)));
+            assert_ne!(
+                m.lean_overwrite(l, m.hash(k), k, v, Some(&mut count)),
+                LeanWrite::Done
+            );
             assert_eq!(given, 0, "nothing read");
             if let Some(lock) = lock {
                 assert_eq!(lock_of(m, k), lock, "the lock as it was");
@@ -62269,7 +62404,10 @@ mod shared_table {
         assert!(m.lean_find(h, &k, true).is_err());
         assert_eq!(m.lean_find(h, &k, false).map(|p| p.is_none()), Ok(true));
         let mut l = TableLocal::default();
-        assert!(!m.lean_overwrite(&mut l, h, &k, &[1u8; 100], None));
+        assert_eq!(
+            m.lean_overwrite(&mut l, h, &k, &[1u8; 100], None),
+            LeanWrite::Other
+        );
     }
 
     /// A lean probe takes only the record of its own key where a slot
@@ -62368,7 +62506,10 @@ mod shared_table {
                         for n in 0..PUTS {
                             let k = key((n + w) % KEYS);
                             let v = [(2 + (n * 2 + w) % 250) as u8; 256];
-                            assert!(m.lean_overwrite(&mut l, m.hash(&k), &k, &v, None));
+                            assert_eq!(
+                                m.lean_overwrite(&mut l, m.hash(&k), &k, &v, None),
+                                LeanWrite::Done
+                            );
                         }
                     })
                 })

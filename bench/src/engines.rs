@@ -2025,6 +2025,10 @@ pub struct Supdb {
     /// ahead of the live table's probe (`Options::shared_fall_always`):
     /// `supdb-heldsharedbigfallalways`.
     sharedfallalways: bool,
+    /// The big shared table's read-modify-writes of a key the table lacks
+    /// probing it again before they read below it
+    /// (`Options::shared_rmw_absent` off): `supdb-heldsharedbigrmwprobes`.
+    sharedrmwprobes: bool,
     /// What the reader handles this store gave its threads answered
     /// through the ordered index, summed as each is dropped
     /// (`OrdTally`); only the arm that reads that way hands out handles
@@ -3344,6 +3348,10 @@ struct Policy {
     /// ahead of the live table's probe (`Options::shared_fall_always`):
     /// `supdb-heldsharedbigfallalways`.
     sharedfallalways: bool,
+    /// The big shared table's read-modify-writes of a key the table lacks
+    /// probing it again before they read below it
+    /// (`Options::shared_rmw_absent` off): `supdb-heldsharedbigrmwprobes`.
+    sharedrmwprobes: bool,
 }
 
 /// The conversions a fill makes at most in `supdb-convertcap`: the first
@@ -3697,6 +3705,7 @@ impl Default for Policy {
             sharednolone: false,
             sharednofall: false,
             sharedfallalways: false,
+            sharedrmwprobes: false,
             defer: false,
             firstfloor: false,
             aheadmin: None,
@@ -3921,6 +3930,7 @@ impl Supdb {
             nolone,
             nofall,
             fallalways,
+            rmwprobes,
         } = shape;
         Supdb::with_policy(
             path,
@@ -3945,6 +3955,7 @@ impl Supdb {
                 sharednolone: nolone,
                 sharednofall: nofall,
                 sharedfallalways: fallalways,
+                sharedrmwprobes: rmwprobes,
                 asympin: asym,
                 ..Policy::default()
             },
@@ -10472,6 +10483,7 @@ impl Supdb {
             sharednolone,
             sharednofall,
             sharedfallalways,
+            sharedrmwprobes,
         } = policy;
         // What the engine ships, so an arm that pins nothing inherits it
         // rather than restating it and drifting from it.
@@ -11162,6 +11174,7 @@ impl Supdb {
             point_lone_absent: !sharednolone,
             shared_fall_ahead: !sharednofall,
             shared_fall_always: sharedfallalways,
+            shared_rmw_absent: !sharedrmwprobes,
             shared_index_slots: if sharedbig && !sharedcapindex {
                 shared_index_slots()
             } else {
@@ -11546,6 +11559,7 @@ impl Supdb {
             sharednolone,
             sharednofall,
             sharedfallalways,
+            sharedrmwprobes,
             ord_threads: Default::default(),
         })
     }
@@ -11800,6 +11814,8 @@ impl Engine for Supdb {
                     "supdb-heldsharedbignofall"
                 } else if self.shared && self.sharedbig && self.sharedfallalways {
                     "supdb-heldsharedbigfallalways"
+                } else if self.shared && self.sharedbig && self.sharedrmwprobes {
+                    "supdb-heldsharedbigrmwprobes"
                 } else if self.shared && self.sharedbig {
                     "supdb-heldsharedbig"
                 } else if self.shared {
@@ -14829,7 +14845,9 @@ pub fn set_store_bound(bytes: Option<u64>) {
 /// read, `supdb-heldsharedbignolone`, or its reads asking for their
 /// partition's slot only once the live table lacks the key,
 /// `supdb-heldsharedbignofall`, or all of them asking for it ahead of the
-/// table's probe, `supdb-heldsharedbigfallalways`.
+/// table's probe, `supdb-heldsharedbigfallalways`, or its read-modify-writes
+/// of a key the table lacks probing it again before they read below it,
+/// `supdb-heldsharedbigrmwprobes`.
 #[derive(Clone, Copy, Default)]
 pub struct SharedShape {
     pub norecycle: bool,
@@ -14846,6 +14864,7 @@ pub struct SharedShape {
     pub nolone: bool,
     pub nofall: bool,
     pub fallalways: bool,
+    pub rmwprobes: bool,
 }
 
 /// The slots `supdb-heldsharedbig`'s shared index takes
@@ -15858,6 +15877,7 @@ pub fn guarantee(arm: &str) -> Option<Guarantee> {
         | "supdb-heldsharedbignolone"
         | "supdb-heldsharedbignofall"
         | "supdb-heldsharedbigfallalways"
+        | "supdb-heldsharedbigrmwprobes"
         | "supdb-heldbatch1"
         | "proto-shared"
         | "faster" => Guarantee::Memory,
@@ -16597,6 +16617,19 @@ pub fn open(arm: &str, dir: &Path, map_gb: usize) -> Res<Box<dyn Engine>> {
                     SharedShape {
                         big: true,
                         fallalways: true,
+                        ..SharedShape::default()
+                    },
+                )
+            },
+            dir,
+        )?,
+        "supdb-heldsharedbigrmwprobes" => supdb_arm(
+            |d| {
+                Supdb::create_held_shared(
+                    d,
+                    SharedShape {
+                        big: true,
+                        rmwprobes: true,
                         ..SharedShape::default()
                     },
                 )
@@ -18715,6 +18748,7 @@ mod tests {
             nolone: false,
             nofall: false,
             fallalways: false,
+            rmwprobes: false,
         };
         for (arm, s) in [
             (
@@ -18800,6 +18834,13 @@ mod tests {
                     ..shape(false, true, false, false, false)
                 },
             ),
+            (
+                "supdb-heldsharedbigrmwprobes",
+                SharedShape {
+                    rmwprobes: true,
+                    ..shape(false, true, false, false, false)
+                },
+            ),
         ] {
             let e = open(arm, &root.join(arm), 1).unwrap();
             assert_eq!(e.name(), arm);
@@ -18823,6 +18864,7 @@ mod tests {
             assert_eq!(ao.point_lone_absent, !s.nolone, "{arm}");
             assert_eq!(ao.shared_fall_ahead, !s.nofall, "{arm}");
             assert_eq!(ao.shared_fall_always, s.fallalways, "{arm}");
+            assert_eq!(ao.shared_rmw_absent, !s.rmwprobes, "{arm}");
         }
         let _ = std::fs::remove_dir_all(&root);
     }

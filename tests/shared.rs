@@ -885,6 +885,102 @@ fn a_handle_whose_read_fell_below_the_table_asks_for_the_next_partition_first() 
     }
 }
 
+/// A handle's read-modify-write of a key the shared table has no record of
+/// reads the key below the table in the pin its lean probe was made in,
+/// with the key's partition asked for ahead of that probe where the last
+/// read fell below (`Options::shared_rmw_absent`): over keys at, between
+/// and past the fences, each first touch is given the partition's value
+/// and puts its own, a second touch is the lean overwrite's, and after one
+/// the next first touch asks for nothing ahead. The answers are the ones
+/// the read-modify-write that probes the table again gives.
+#[test]
+fn a_handles_rmw_of_a_key_the_table_lacks_reads_it_below_in_one_pin() {
+    let _w = Watchdog::arm("the rmw-below test waited a minute");
+    let mut answers = Vec::new();
+    for absent in [true, false] {
+        let (d, db, keys, missing) = partitioned(
+            &format!("rmwbelow-{absent}"),
+            Options {
+                shared_rmw_absent: absent,
+                ..options(1 << 20)
+            },
+        );
+        let r = db.reader().unwrap();
+        let rmw = |k: &[u8], v: &[u8]| {
+            let mut g = Vec::new();
+            assert!(r.rmw(k, v, |x| g.push(x.to_vec())).unwrap());
+            g
+        };
+        // Under the stride switch a form file serves the partitions, whose
+        // slots the read does not ask for (`common::stride_switch`).
+        let asks = |want: u64, what: &str| {
+            if !common::stride_switch() {
+                assert_eq!(r.shared_fall_asks(), want, "absent {absent}: {what}");
+            }
+        };
+        let mut got: Vec<Vec<Vec<u8>>> = Vec::new();
+        let (lone0, _) = r.point_lean_reads();
+        for k in keys.iter().chain(&missing) {
+            got.push(rmw(k, &[7u8; 16]));
+        }
+        let n = (keys.len() + missing.len()) as u64;
+        // Each first touch read the partition alone, the table known not to
+        // hold the key (`Options::point_lone_absent`), in either shape.
+        if !common::stride_switch() {
+            assert_eq!(
+                r.point_lean_reads().0 - lone0,
+                n,
+                "absent {absent}: the reads below"
+            );
+        }
+        assert_eq!(
+            r.shared_rmw_below(),
+            if absent { n } else { 0 },
+            "absent {absent}: the first touches read below in their pin"
+        );
+        // Every first touch but the first asks, after one that fell, both
+        // where the read-modify-write asks and where its read does.
+        asks(n - 1, "the first touches after the first");
+        // A second touch is the lean overwrite's. Where the read-modify-write
+        // asks ahead itself, the first second touch after a first touch
+        // asks, and its overwrite ends the run of reads below: the get after
+        // it asks nothing. Where it does not, the get asks, the mark left by
+        // the read before the overwrite.
+        let ops0 = r.shared_lean_ops();
+        got.push(rmw(&keys[0], &[8u8; 16]));
+        asks(n - 1 + u64::from(absent), "a second touch after a first");
+        let mut fresh = b"pk-0000".to_vec();
+        fresh.extend_from_slice(b"-new");
+        got.push(handle_values(&r, &fresh));
+        asks(n, "the get after a second touch");
+        for k in keys.iter().skip(1).take(19) {
+            got.push(rmw(k, &[8u8; 16]));
+        }
+        assert_eq!(
+            r.shared_lean_ops() - ops0,
+            20,
+            "a second touch is the lean overwrite's"
+        );
+        got.push(rmw(&fresh, &[9u8; 16]));
+        for k in keys.iter().chain(&missing).chain([&fresh]) {
+            got.push(handle_values(&r, k));
+        }
+        if absent {
+            for (k, g) in keys.iter().zip(&got) {
+                assert_eq!(g, &vec![k.clone()], "the partition's value of {k:?}");
+            }
+            for g in &got[keys.len()..keys.len() + missing.len()] {
+                assert!(g.is_empty(), "a key the store lacks");
+            }
+        }
+        drop(r);
+        drop(db);
+        let _ = std::fs::remove_dir_all(&d);
+        answers.push(got);
+    }
+    assert_eq!(answers[0], answers[1], "one pin and three probes");
+}
+
 /// A handle's gets and puts read no length of the live table it shares,
 /// whose inserts leave the length to its readers
 /// (`Options::shared_len_lazy`): after a handle's inserts and its gets of
