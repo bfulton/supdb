@@ -152,11 +152,20 @@ pub struct Passes {
     #[serde(default)]
     pub recover: bool,
     /// The threaded mixes, `threads-A` and its kin (`THREADED`): gets and
-    /// puts from several threads at once, on a store of their own. In no
-    /// row of the series: off in `all`, and run where `--passes` names
-    /// them, for what they cost every arm (`DESIGN.md`).
+    /// puts from several threads at once, on a store of their own, for
+    /// every arm. In no row of the series: off in `all`, and run where
+    /// `--passes` names them, for what they cost every arm (`DESIGN.md`).
     #[serde(default)]
     pub mixes_threaded: bool,
+    /// The threaded mixes for the arms of the guarantee FASTER's is
+    /// (`Guarantee::Memory`) alone, whose comparator's own benchmark they
+    /// are and whose commits reach no device, so that they cost a row a
+    /// minute where every arm's cost it as much again as the row
+    /// (`threaded_runs`). A row's in core: on in `all`, off in a pairing,
+    /// which runs them where they are named, and off in a list of passes.
+    /// Absent from a plan written before it, where it reads as off.
+    #[serde(default)]
+    pub threads_held: bool,
 }
 
 impl Passes {
@@ -187,17 +196,27 @@ impl Passes {
             lag: true,
             recover: true,
             mixes_threaded: false,
+            threads_held: true,
         }
     }
 
     /// What a pairing runs where it names no passes (`bench ab`): every
     /// pass but the recovery workloads, which load two stores more an arm
-    /// a rep and are run by the pairing that asks for them.
+    /// a rep and are run by the pairing that asks for them, and the
+    /// threaded mixes, which a pairing names.
     pub fn paired() -> Passes {
         Passes {
             recover: false,
+            threads_held: false,
             ..Passes::all()
         }
+    }
+
+    /// Whether `arm`'s pass runs the threaded mixes: named for every arm,
+    /// or a row's for an arm of FASTER's guarantee (`threads_held`).
+    pub fn threaded_runs(&self, arm: &str) -> bool {
+        self.mixes_threaded
+            || (self.threads_held && engines::guarantee(arm) == Some(Guarantee::Memory))
     }
 
     /// A comma-separated list of `NAMES`; a name not among them is an
@@ -215,6 +234,7 @@ impl Passes {
             lag: false,
             recover: false,
             mixes_threaded: false,
+            threads_held: false,
         };
         let mut any = false;
         for name in list.split(',').map(str::trim).filter(|s| !s.is_empty()) {
@@ -3368,7 +3388,7 @@ fn one_pass(
     // reads' must. In memory only: no count is read around them, so a
     // bounded row carries none.
     let mut mix_threaded = Vec::new();
-    if passes.mixes_threaded && plan.bound.is_none() {
+    if passes.threaded_runs(arm) && plan.bound.is_none() {
         prime_fresh_pool(prime_bytes_for(size, plan.bound_bytes()))?;
         // The lag store's files are still here where that store was built.
         let _ = std::fs::remove_dir_all(dir);
@@ -7302,11 +7322,35 @@ mod tests {
             all,
             Passes {
                 mixes_threaded: true,
+                threads_held: false,
                 ..Passes::all()
             }
         );
         assert!(!Passes::all().mixes_threaded && !Passes::paired().mixes_threaded);
         assert!(Passes::parse("mixes-threaded").unwrap().mixes_threaded);
+        // A row runs them for the arms of FASTER's guarantee alone, a
+        // pairing and a list of passes for none unless they are named, and
+        // named they run for every arm.
+        assert!(Passes::all().threads_held && !Passes::paired().threads_held);
+        for (arm, in_a_row) in [
+            ("supdb-heldnoframes", true),
+            ("supdb-heldnoshare", true),
+            ("supdb", false),
+            ("supdb-ingest", false),
+            ("lmdb", false),
+            ("rocksdb-tuned-nosync", false),
+        ] {
+            assert_eq!(Passes::all().threaded_runs(arm), in_a_row, "{arm}, a row");
+            assert!(!Passes::paired().threaded_runs(arm), "{arm}, a pairing");
+            assert!(
+                !Passes::parse("load,mixes").unwrap().threaded_runs(arm),
+                "{arm}"
+            );
+            assert!(
+                Passes::parse("mixes-threaded").unwrap().threaded_runs(arm),
+                "{arm}"
+            );
+        }
         let some = Passes::parse("read, scan-threaded,lag").unwrap();
         assert!(some.read && some.scan_threaded && some.lag);
         assert!(!some.load && !some.read_threaded && !some.scan && !some.mixes);
@@ -7329,6 +7373,7 @@ mod tests {
         assert_eq!(
             Passes {
                 recover: true,
+                threads_held: true,
                 ..Passes::paired()
             },
             Passes::all()
@@ -7336,6 +7381,7 @@ mod tests {
         assert!(Passes::parse("recover").unwrap().recover);
         let mut old = serde_json::to_value(Passes::all()).unwrap();
         old.as_object_mut().unwrap().remove("recover").unwrap();
+        old.as_object_mut().unwrap().remove("threads_held").unwrap();
         let old: Passes = serde_json::from_value(old).unwrap();
         assert_eq!(old, Passes::paired());
     }

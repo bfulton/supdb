@@ -74,6 +74,19 @@
 //!   and in a quarter of the seeds that hold their log overwrites a put's
 //!   value of the put's length where it lies on the `z` store, its handles
 //!   claimed only with nothing staged (`Cfg::in_place`).
+//! - `ZFUZZ_SHARE`: `1`, handles write in the seeds whose log is held
+//!   with no frames, where both stores share their live table on demand
+//!   (`Options::share_on_write`, the engine's); `all`, every seed holds
+//!   its log so, a flag over its draws. In those seeds a handle on each
+//!   store is claimed
+//!   and dropped again by a generator of the knob's own, and while one is
+//!   held some steps write through it -- a put of one length, which
+//!   overwrites where it lies, a put, an append or a delete -- each
+//!   committed as it is made, asking the writer's commit wherever the
+//!   table refuses it. So the stores go to the shared table and back many
+//!   times a seed, under everything else the seed does. No snapshot is
+//!   taken over a shared live table, which isolates no read from a write.
+//!   No draw of the seed's own moves.
 //! - `ZFUZZ_SHAPES`: the key shapes a seed may draw from, as indexes from 0
 //!   to 7 separated by commas.
 //! - `ZFUZZ_SETTLEBUILDS=1`: the `z` store's commits near reads file their
@@ -196,6 +209,27 @@ fn env_u64(name: &str) -> Option<u64> {
 
 fn env_flag(name: &str) -> bool {
     std::env::var(name).is_ok_and(|v| v == "1")
+}
+
+/// `ZFUZZ_SHARE`: 0 unset, 1 where the seed's own draws hold its log with
+/// no frames, 2 with every seed made to.
+fn share_mode() -> u8 {
+    match std::env::var("ZFUZZ_SHARE").as_deref() {
+        Ok("1") => 1,
+        Ok("all") => 2,
+        _ => 0,
+    }
+}
+
+/// Whether the seed writes through handles: the knob, and a configuration
+/// in which the stores share their live table on demand
+/// (`Options::shares`).
+fn shares(c: &Cfg) -> bool {
+    share_mode() > 0
+        && matches!(c.sync, SyncPolicy::Explicit)
+        && !c.held_frames
+        && !c.in_place
+        && !env_flag("ZFUZZ_SNAPKEPT")
 }
 
 fn trace_on() -> bool {
@@ -1178,6 +1212,36 @@ fn note_event(what: impl Into<String>, z: &Db, r: &Db) {
     });
 }
 
+/// Both stores' shared tables installed and left, into the seed's counts
+/// (`Stats::share`).
+fn count_share(st: &mut Stats, z: &Db, r: &Db) {
+    for d in [z, r] {
+        for (a, b) in st.share.iter_mut().zip(d.share_counts()) {
+            *a += b;
+        }
+    }
+}
+
+/// One write through the handle `h` of the store `d`: asked of the
+/// writer's commit wherever the table refuses it, the one writer's table
+/// to ask for a shared one and a shared one that is full to be frozen.
+fn handle_write(d: &mut Db, h: &Reader, op: &Op) -> std::io::Result<()> {
+    for _ in 0..16 {
+        let done = match op {
+            Op::Append(k, v) => h.append(k, v)?,
+            Op::Delete(k) => h.delete(k)?,
+            Op::Put(k, v) => h.put(k, v)?,
+        };
+        if done {
+            return Ok(());
+        }
+        d.commit()?;
+    }
+    Err(std::io::Error::other(
+        "a handle's write refused past every commit",
+    ))
+}
+
 /// Both stores' commits, and the staged writes taken into the model.
 fn commit_both(
     z: &mut Db,
@@ -1842,6 +1906,11 @@ struct Stats {
     /// (`Options::put_in_place`), summed over its opens as `kept` is: what
     /// says a run under `ZFUZZ_OPTVARY` reached the overwrite.
     in_place: u64,
+    /// Under `ZFUZZ_SHARE`, both stores' shared tables installed, left at
+    /// a commit and left at a seal (`Db::share_counts`), summed over their
+    /// opens as `kept` is, and the writes the seed made through handles:
+    /// what says a run reached the flips it is for.
+    share: [u64; 4],
     /// The `z` store's stride form under `ZFUZZ_STRIDE`.
     stride: StrideStats,
 }
@@ -2028,10 +2097,17 @@ fn pin_note() -> String {
 fn seed_draws(seed: u64, want_cache: bool) -> (Cfg, Rng) {
     let mut rng = Rng::new(seed);
     let own = pick_cfg(&mut rng, want_cache);
-    let cfg = match pinned() {
+    let mut cfg = match pinned() {
         Some(p) => pick_cfg(&mut Rng::new(p), want_cache),
         None => own,
     };
+    // `ZFUZZ_SHARE=all`: every seed holds its log with no frames, over
+    // whatever it drew, so that every seed's stores can share.
+    if share_mode() == 2 {
+        cfg.sync = SyncPolicy::Explicit;
+        cfg.held_frames = false;
+        cfg.in_place = false;
+    }
     (cfg, rng)
 }
 
@@ -2150,6 +2226,7 @@ fn run_seed_inner(seed: u64, want_cache: bool, verbose: bool) -> Result<Stats, S
         switches: 0,
         kept: 0,
         in_place: 0,
+        share: [0; 4],
         recuts: 0,
         heads: [0; 2],
         held: [0; 2],
@@ -2167,6 +2244,12 @@ fn run_seed_inner(seed: u64, want_cache: bool, verbose: bool) -> Result<Stats, S
     let scan_every = env_flag("ZFUZZ_SCANEVERY");
     let heads_flip = env_flag("ZFUZZ_HEADSFLIP") && env_flag("ZFUZZ_ZPAGES");
     let convert = convert_on();
+    // `ZFUZZ_SHARE`: the handles the seed writes through, one a store, and
+    // the generator that claims them, drops them and draws their writes,
+    // apart from the seed's own so that none of its draws moves.
+    let sharing = shares(&cfg);
+    let mut share_rng = Rng::new(seed ^ 0x5AA2_E0D3_0000_0001);
+    let mut writers: Option<(Reader, Reader)> = None;
     for step in 0..cfg.ops as u64 {
         STEP.set(step as i64);
         // By the step and not by a draw: every seed's stream stays as it
@@ -2221,6 +2304,59 @@ fn run_seed_inner(seed: u64, want_cache: bool, verbose: bool) -> Result<Stats, S
                     write(Op::Put(k.clone(), v), &mut staged, &mut z, &mut r);
                 }
                 _ => {}
+            }
+        }
+        if sharing {
+            if share_rng.chance(4) {
+                match writers.take() {
+                    Some(_) => note_event("writers dropped", &z, &r),
+                    None => {
+                        let (wz, wr) = (
+                            z.reader().map_err(|e| format!("reader: {e}"))?,
+                            r.reader().map_err(|e| format!("reader: {e}"))?,
+                        );
+                        writers = Some((wz, wr));
+                        note_event("writers claimed", &z, &r);
+                    }
+                }
+            }
+            // The draw only beside a handle, as the claim's is every step.
+            let write = writers.is_some() && share_rng.chance(40);
+            if let (true, Some((wz, wr))) = (write, writers.as_ref()) {
+                let k = pool[share_rng.below(pool.len())].clone();
+                let op = match share_rng.below(10) {
+                    // Of one length, so that a put meets a put's value it
+                    // overwrites where it lies.
+                    0..=3 => Op::Put(
+                        k,
+                        format!("{:08}", share_rng.below(100_000_000)).into_bytes(),
+                    ),
+                    4..=5 => Op::Put(k, value(&mut share_rng, step, cfg.big)),
+                    6..=7 => Op::Append(k, value(&mut share_rng, step, cfg.big)),
+                    _ => Op::Delete(k),
+                };
+                // A handle's write is no part of a batch: what is staged
+                // commits first, and the write is in the model as it lands.
+                commit_both(&mut z, &mut r, &mut model, &mut staged)?;
+                handle_write(&mut z, wz, &op).map_err(|e| format!("z handle write: {e}"))?;
+                handle_write(&mut r, wr, &op).map_err(|e| format!("r handle write: {e}"))?;
+                note(Rec::Write {
+                    step: STEP.get(),
+                    op: op.clone(),
+                });
+                apply(&mut model, &op);
+                note_commit("commit", &z, &r);
+                st.share[3] += 1;
+                if share_rng.chance(15) {
+                    let sample: Vec<Vec<u8>> = (0..6)
+                        .map(|_| pool[share_rng.below(pool.len())].clone())
+                        .chain(std::iter::once(op_key(&op).to_vec()))
+                        .collect();
+                    check_keys("z writing handle", wz, &model, &sample, &mut fails);
+                    check_keys("r writing handle", wr, &model, &sample, &mut fails);
+                    check_keys("z writer, shared", &z, &model, &sample, &mut fails);
+                    check_keys("r writer, shared", &r, &model, &sample, &mut fails);
+                }
             }
         }
         // The writer's own reads see the staged batch.
@@ -2344,7 +2480,11 @@ fn run_seed_inner(seed: u64, want_cache: bool, verbose: bool) -> Result<Stats, S
                     // A snapshot of the committed store, held while the store
                     // changes under it.
                     commit_both(&mut z, &mut r, &mut model, &mut staged)?;
-                    if let Some(h) = handles.iter_mut().find(|h| h.snap.is_none()) {
+                    // Not over a shared live table, which isolates no
+                    // read from a write made after it (`ZFUZZ_SHARE`).
+                    if z.live_shared() {
+                        note_event("no snapshot of a shared table", &z, &r);
+                    } else if let Some(h) = handles.iter_mut().find(|h| h.snap.is_none()) {
                         h.r.snapshot();
                         h.snap = Some(model.clone());
                         note_event("snapshot z", &z, &r);
@@ -2360,6 +2500,8 @@ fn run_seed_inner(seed: u64, want_cache: bool, verbose: bool) -> Result<Stats, S
                 160..=169 => {
                     // A crash or a clean close, then the reopen.
                     handles.clear();
+                    writers = None;
+                    count_share(&mut st, &z, &r);
                     st.abandons += z.upkeep_abandons() + r.upkeep_abandons();
                     st.bindings += z.cache_bindings() + r.cache_bindings();
                     st.beside += z.seal_waits().merges_beside + r.seal_waits().merges_beside;
@@ -2543,6 +2685,8 @@ fn run_seed_inner(seed: u64, want_cache: bool, verbose: bool) -> Result<Stats, S
     }
     let mut ok = fails.is_empty();
     drop(handles);
+    drop(writers);
+    count_share(&mut st, &z, &r);
     st.abandons += z.upkeep_abandons() + r.upkeep_abandons();
     st.bindings += z.cache_bindings() + r.cache_bindings();
     st.beside += z.seal_waits().merges_beside + r.seal_waits().merges_beside;
@@ -2618,6 +2762,8 @@ fn fuzz_range() {
     let mut live_first = 0u64;
     let mut mem_fnv = 0u64;
     let mut in_place = [0u64; 2];
+    let mut share = [0u64; 4];
+    let mut sharing_seeds = 0u64;
     let mut stride = StrideStats::default();
     let ran = seeds.len();
     for seed in seeds {
@@ -2638,6 +2784,9 @@ fn fuzz_range() {
         if drawn.in_place {
             in_place[0] += 1;
         }
+        if shares(&drawn) {
+            sharing_seeds += 1;
+        }
         match run_seed(seed, want_cache, verbose) {
             Ok(s) => {
                 if verbose && stride_on() {
@@ -2652,6 +2801,9 @@ fn fuzz_range() {
                 recuts += s.recuts;
                 kept += s.kept;
                 in_place[1] += s.in_place;
+                for (a, b) in share.iter_mut().zip(s.share) {
+                    *a += b;
+                }
                 for (a, b) in point.iter_mut().zip(s.point) {
                     *a += b;
                 }
@@ -2691,6 +2843,19 @@ fn fuzz_range() {
         reads[2],
         bad.len()
     );
+    if share_mode() > 0 {
+        eprintln!(
+            "seeds {from}..{to}: {sharing_seeds} sharing, shared tables installed {} left at a commit {} left at a seal {}, writes through handles {}",
+            share[0], share[1], share[2], share[3]
+        );
+        // Asked to share, a range whose stores never went to the shared
+        // table and back tested nothing of it.
+        if sharing_seeds > 0 && (share[0] == 0 || share[1] + share[2] == 0 || share[3] == 0) {
+            bad.push(format!(
+                "ZFUZZ_SHARE reached no flip in {sharing_seeds} sharing seeds: {share:?}"
+            ));
+        }
+    }
     if stride_on() {
         // Summed over the seeds, the files as each seed's most at once.
         eprintln!("seeds {from}..{to}: {stride}");

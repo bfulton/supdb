@@ -2036,6 +2036,9 @@ pub struct Supdb {
     /// probing it again before they read below it
     /// (`Options::shared_rmw_absent` off): `supdb-heldsharedbigrmwprobes`.
     sharedrmwprobes: bool,
+    /// The live table never shared with a handle's writes
+    /// (`Options::share_on_write` off): `supdb-heldnoshare`.
+    noshare: bool,
     /// What the reader handles this store gave its threads answered
     /// through the ordered index, summed as each is dropped
     /// (`OrdTally`); only the arm that reads that way hands out handles
@@ -3359,6 +3362,15 @@ struct Policy {
     /// probing it again before they read below it
     /// (`Options::shared_rmw_absent` off): `supdb-heldsharedbigrmwprobes`.
     sharedrmwprobes: bool,
+    /// The live table the one writer's whoever writes, a handle's write
+    /// refused (`Options::share_on_write` off), under the held log with no
+    /// frames: `supdb-heldnoshare`, `supdb-heldnoframes` as it was before
+    /// its table followed its writers, whose threads take the one writer
+    /// in turn. The engine shares on demand, and `supdb-heldnoframes` with
+    /// it: that arm is itself until a thread's handle writes and
+    /// `supdb-heldsharedbig` while one does, its shared table sized from
+    /// the store's keys as that arm's is.
+    noshare: bool,
 }
 
 /// The conversions a fill makes at most in `supdb-convertcap`: the first
@@ -3713,6 +3725,7 @@ impl Default for Policy {
             sharednofall: false,
             sharedfallalways: false,
             sharedrmwprobes: false,
+            noshare: false,
             defer: false,
             firstfloor: false,
             aheadmin: None,
@@ -10491,7 +10504,13 @@ impl Supdb {
             sharednofall,
             sharedfallalways,
             sharedrmwprobes,
+            noshare,
         } = policy;
+        // The table a held store with no frames makes for its handles'
+        // writes (`Options::share_on_write`) is sized as the big shared
+        // arm's is, from the store's keys, so that it holds the store as
+        // FASTER's log does.
+        let shares_big = held && noframes && !shared && !noshare && !inplace;
         // What the engine ships, so an arm that pins nothing inherits it
         // rather than restating it and drifting from it.
         let base_seal_max_pct = supdb::Options::default().seal_max_pct;
@@ -11169,8 +11188,16 @@ impl Supdb {
             put_in_place: inplace,
             point_placed_runs: !placedpieces,
             shared_writers: shared,
+            share_on_write: !noshare,
             shared_recycles: !sharednorecycle,
-            shared_table_bytes: if sharedbig { shared_table_bytes() } else { 0 },
+            // The big table's sizing for the table a held store with no
+            // frames shares on demand too, which holds the store as
+            // FASTER's log does: `shares_big`.
+            shared_table_bytes: if sharedbig || shares_big {
+                shared_table_bytes()
+            } else {
+                0
+            },
             shared_chunk_ahead: !sharednoahead,
             shared_records: !sharednorecords,
             shared_in_place: !sharednoinplace,
@@ -11182,7 +11209,7 @@ impl Supdb {
             shared_fall_ahead: !sharednofall,
             shared_fall_always: sharedfallalways,
             shared_rmw_absent: !sharedrmwprobes,
-            shared_index_slots: if sharedbig && !sharedcapindex {
+            shared_index_slots: if (sharedbig && !sharedcapindex) || shares_big {
                 shared_index_slots()
             } else {
                 0
@@ -11567,6 +11594,7 @@ impl Supdb {
             sharednofall,
             sharedfallalways,
             sharedrmwprobes,
+            noshare,
             ord_threads: Default::default(),
         })
     }
@@ -11820,7 +11848,9 @@ impl Engine for Supdb {
                 return "supdb-heldmarch";
             }
             if self.noframes {
-                return if self.shared && self.sharednorecycle {
+                return if self.noshare {
+                    "supdb-heldnoshare"
+                } else if self.shared && self.sharednorecycle {
                     "supdb-heldsharednorecycle"
                 } else if self.shared && self.sharedbig && self.sharednoahead {
                     "supdb-heldsharedbignoahead"
@@ -13678,6 +13708,13 @@ impl Engine for Supdb {
             ("merges_beside", db.seal_waits().merges_beside as f64),
             ("merges_quiet", db.seal_waits().merges_quiet as f64),
             ("pieces_aligned", db.pieces_aligned() as u8 as f64),
+            // The shared tables installed for handles' writes and left
+            // again, at a commit and at a seal (`Db::share_counts`).
+            ("share_installs", db.share_counts()[0] as f64),
+            (
+                "share_leaves",
+                (db.share_counts()[1] + db.share_counts()[2]) as f64,
+            ),
             // What the forms' upkeep did: see `Db::forms_events`.
             ("blk_by_upkeep", ev[0] as f64),
             ("table_drops", ev[1] as f64),
@@ -14188,8 +14225,12 @@ impl Engine for Supdb {
         for _ in 0..n {
             readers.push(db.reader().map_err(|e| e.to_string())?);
         }
+        // A store that shares on demand takes a thread's writes through
+        // its handle as a shared one does: the first of them is refused by
+        // the one writer's table, and the commit a refused write makes
+        // installs a shared one (`Options::share_on_write`).
+        let shared = self.shared || db.shares();
         let db = std::sync::Arc::new(std::sync::Mutex::new(db));
-        let shared = self.shared;
         Ok(readers
             .into_iter()
             .map(|r| {
@@ -15914,6 +15955,7 @@ pub fn guarantee(arm: &str) -> Option<Guarantee> {
         | "supdb-heldsharedbignofall"
         | "supdb-heldsharedbigfallalways"
         | "supdb-heldsharedbigrmwprobes"
+        | "supdb-heldnoshare"
         | "supdb-heldbatch1"
         | "proto-shared"
         | "faster" => Guarantee::Memory,
@@ -16512,6 +16554,22 @@ pub fn open(arm: &str, dir: &Path, map_gb: usize) -> Res<Box<dyn Engine>> {
                     SharedShape {
                         norecycle: true,
                         ..SharedShape::default()
+                    },
+                )
+            },
+            dir,
+        )?,
+        "supdb-heldnoshare" => supdb_arm(
+            |d| {
+                Supdb::with_policy(
+                    d,
+                    Policy {
+                        partition: false,
+                        durable: false,
+                        held: true,
+                        noframes: true,
+                        noshare: true,
+                        ..Policy::default()
                     },
                 )
             },
@@ -18602,6 +18660,10 @@ mod tests {
         assert!(
             fo.point_record_ahead && fo.scan_block_cache && fo.upkeep_alert && fo.index_populated
         );
+        assert!(
+            fo.share_on_write && fo.shared_table_bytes > 0 && fo.shared_index_slots > 0,
+            "the roster's arm shares its table on demand, sized as the big shared arm's"
+        );
         for (arm, differs) in [
             (
                 "supdb-heldnorecordahead",
@@ -18614,6 +18676,7 @@ mod tests {
             ("supdb-heldlivefirst", |a| a.point_live_first),
             ("supdb-heldmemfnv", |a| !a.mem_hash_fold),
             ("supdb-heldbatch1", |a| a.upkeep_batch_pct == 1),
+            ("supdb-heldnoshare", |a| !a.share_on_write),
         ] {
             let e = open(arm, &root.join(arm), 1).unwrap();
             assert_eq!(e.name(), arm);
@@ -18647,6 +18710,10 @@ mod tests {
                 },
                 "supdb-heldbatch1" => Policy {
                     upkeepbatch: Some(1),
+                    ..Policy::default()
+                },
+                "supdb-heldnoshare" => Policy {
+                    noshare: true,
                     ..Policy::default()
                 },
                 _ => Policy {
@@ -18926,6 +18993,12 @@ mod tests {
             "supdb-ingest",
             "supdb-heldshared",
             "supdb-heldsharednorecycle",
+            // The table shared on demand: the threads' first writes are
+            // refused by the one writer's table, the commit one of them
+            // makes installs a shared one, and each write is made again.
+            "supdb-heldnoframes",
+            // And the same store with its table the one writer's.
+            "supdb-heldnoshare",
             "lmdb-nosync",
             "rocksdb-tuned-nosync",
         ] {

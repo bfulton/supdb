@@ -4985,8 +4985,9 @@ pub struct Options {
     /// the table as it reads the one writer's; no read is isolated from the
     /// writers, and a handle reads every write as it lands. A table that
     /// fills answers a handle's write with `false` and is frozen by the
-    /// writer's next commit, which waits out the handles still writing it
-    /// before its seal reads it. It needs the held log with no frames,
+    /// writer's next commit, which closes it to writes and waits out the
+    /// handles still writing it before it publishes it frozen
+    /// (`Db::close_shared`). It needs the held log with no frames,
     /// since nothing logs a handle's write, and nothing that reads a live
     /// table's values beside the writer or keeps a copy of them:
     /// `Upkeep::Inline`, and `scan_block_cache`, `snapshot_keeper`,
@@ -5123,6 +5124,38 @@ pub struct Options {
     /// the read, and asked for the partition after the table's miss. Off:
     /// those three probes, `supdb-heldsharedbigrmwprobes`.
     pub shared_rmw_absent: bool,
+    /// The live table shared by the handles' writes while handles write,
+    /// and the one writer's otherwise: the form of the table follows who
+    /// writes it. A store opens with the one writer's table, its block
+    /// cache, its upkeep thread and its ordered ingest as its other
+    /// options say. A handle's write to such a table is answered `false`,
+    /// as a full shared table's is, and the writer's next commit, finding
+    /// a handle that writes, installs a shared one: the live table frozen
+    /// under it (an empty one replaced, a run of ordered ingest closed
+    /// first). A shared table isolates no read from a write, the writer's
+    /// own included, which lands in it as it is made and not at a commit.
+    /// While a state holds a shared table, live or frozen, it is read and
+    /// written as a store opened with `shared_writers` is: no block cache
+    /// over it, nothing lent to the upkeep thread, no run of ordered
+    /// ingest opened, since each of those reads a live table's values
+    /// beside its one writer or keeps what a handle's write would have to
+    /// reach. The way back is the writer's too: a seal that finds no
+    /// handle that writes makes the next table the one writer's, and a
+    /// commit that finds none, once the writer's own writes and scans
+    /// since the last one left have come to the table's entries, freezes
+    /// the shared table under one -- the seal that leaving costs paid for
+    /// by as much work in the form that suits it less. The store reads as
+    /// it did once the shared tables have landed.
+    ///
+    /// It acts only where a handle's write may go unlogged and nothing
+    /// else keeps a copy of a live table's values (`Options::shares`):
+    /// `SyncPolicy::Explicit` with `held_frames` off, and
+    /// `snapshot_keeper`, `forms_off_snapshot_kept`, `snapshot_runs`,
+    /// `put_in_place` and `adaptive_shape` off. Elsewhere, and off, a
+    /// handle that writes is refused, as it was: on, the option changes
+    /// nothing of a store no handle writes. Off:
+    /// `supdb-heldnoshare`, whose threads take the one writer in turn.
+    pub share_on_write: bool,
     /// A job's large per-key arrays -- a seal's sort of its
     /// table, a segment writer's copy of every key with its span, its
     /// record's offset and its hash, the ordered index builder's keys, a
@@ -7461,7 +7494,20 @@ impl Options {
     /// `shared_writers` says, its value arena capped at `cap` bytes, the
     /// seal's threshold when it is made, and the one writer's otherwise.
     fn live_table(&self, pool: &Option<std::sync::Arc<blocks::BlockPool>>, cap: usize) -> MemTable {
-        if self.shared_writers {
+        self.table_of(self.shared_writers, pool, cap)
+    }
+
+    /// A fresh live table of the kind asked for: `shared`, the handles'
+    /// (`SharedTable`), or the one writer's. `live_table` asks for what
+    /// `shared_writers` says, and a store that shares on demand
+    /// (`share_on_write`) for what its writer last chose (`Db::fresh_table`).
+    fn table_of(
+        &self,
+        shared: bool,
+        pool: &Option<std::sync::Arc<blocks::BlockPool>>,
+        cap: usize,
+    ) -> MemTable {
+        if shared {
             MemTable::new_shared(
                 self.block_shape(pool),
                 cap.max(4 * SHARED_STRIDE),
@@ -7476,6 +7522,26 @@ impl Options {
         } else {
             MemTable::new(self.block_shape(pool))
         }
+    }
+
+    /// Whether the store shares its live table on demand
+    /// (`share_on_write`): the option, where a handle's write may go
+    /// unlogged -- the held log with no frames, which the open refuses
+    /// under any policy but `SyncPolicy::Explicit` -- and nothing keeps a
+    /// copy of a live table's values that such a write would have to
+    /// reach. The three things a shared table
+    /// stands down while it stands -- the block cache, the upkeep thread
+    /// and ordered ingest -- are no part of this: they are stood down by
+    /// the state (`Reader::sharing`), not refused at the open.
+    fn shares(&self) -> bool {
+        self.share_on_write
+            && !self.shared_writers
+            && !self.held_frames
+            && !self.snapshot_keeper
+            && !self.forms_off_snapshot_kept
+            && !self.snapshot_runs
+            && !self.put_in_place
+            && !self.adaptive_shape
     }
 
     /// How a table's blocks are made, for `MemTable::new`.
@@ -7800,6 +7866,7 @@ impl Default for Options {
             shared_fall_ahead: true,
             shared_fall_always: false,
             shared_rmw_absent: true,
+            share_on_write: true,
             jobs_mapped: true,
             jobs_mapped_when_short: false,
             jobs_pooled: false,
@@ -23460,8 +23527,16 @@ struct Shared {
     /// commit, which the segment work's landings make tables at too.
     shared_cap: AtomicUsize,
     /// The reader slots of the handles that have written a shared table,
-    /// which a freeze waits out (`Db::wait_shared_writers`).
+    /// which a freeze waits out (`Db::close_shared`).
     writer_slots: std::sync::Mutex<Vec<usize>>,
+    /// Whether the store shares its live table on demand
+    /// (`Options::shares`), resolved at the open.
+    shares: bool,
+    /// The tables the writer has installed for the handles and the shared
+    /// tables it has retired for its own (`Db::share`, `Db::unshare`), and
+    /// the seals that chose the one writer's table for the next
+    /// (`Db::seal`): `Db::share_counts`.
+    share_counts: [AtomicU64; 3],
     /// A test's: how long a handle's shared write waits between taking the
     /// state and writing its table, in microseconds (`Db::hold_shared_writes`).
     shared_write_hold_us: AtomicU64,
@@ -24690,6 +24765,10 @@ pub struct Reader {
     /// The upkeep thread's pass files everything whatever the commit's
     /// own rules say; see `Upkeep::Background`.
     force_due: std::cell::Cell<bool>,
+    /// Sharing on demand: the entries this handle's scans asked for over
+    /// states a shared table stood in, which the writer adds to the rent
+    /// of the shared form from its own handle (`Db::share_look`).
+    share_scanned: std::cell::Cell<u64>,
     /// The commit is filing a burst's batch on the writer's own path
     /// (`Hand::File`); see `Options::forms_settle_builds_filed`.
     filing: std::cell::Cell<bool>,
@@ -25548,6 +25627,29 @@ pub struct Db {
     /// The writer's own strides of a shared live table
     /// (`Options::shared_writers`), as a handle that writes keeps its own.
     shared_local: TableLocal,
+    /// Sharing on demand (`Options::share_on_write`): whether the next
+    /// live table the writer makes is a shared one (`fresh_table`), chosen
+    /// where a handle asked for one (`share`) and taken back where none
+    /// writes (`unshare`, `seal`).
+    share_next: bool,
+    /// The writer's own writes to a shared live table since its last look
+    /// (`share_look`), and the rent of the shared form while no handle
+    /// writes it: those writes and the entries the writer's own scans
+    /// asked for since the last writing handle left, which come to the
+    /// table's entries before the writer pays a seal to leave it.
+    share_own: u64,
+    share_rent: u64,
+    /// A shared table has been frozen since `max_key` was last brought up
+    /// to the store (`refresh_max_key`): a handle's write, and the
+    /// writer's own into a shared table, moves no `max_key`, so the keys
+    /// such a table took are counted into it before the next run of
+    /// ordered ingest is judged against it.
+    max_key_stale: bool,
+    /// Whether the writer's last look found a shared table and no handle
+    /// that writes, so that the work since it was done beside none
+    /// (`share_look`): the rent is counted from the look that first finds
+    /// so, which starts it at nothing.
+    share_quiet: bool,
     /// Scratch for the run a value would encode as, measured at `append`
     /// against the inline limit.
     /// EXPERIMENT: the memtable's entry count when the last builder was
@@ -25878,6 +25980,27 @@ impl Reader {
         self.write_shared(key, SharedWrite::Delete)
     }
 
+    /// A test's: `Db::shared_writes_held`, through a handle, for a test
+    /// whose writer is inside the commit the held write is to land in.
+    #[doc(hidden)]
+    pub fn shared_writes_held(&self) -> u64 {
+        self.shared.shared_writes_held.load(AtomicOrdering::Acquire)
+    }
+
+    /// A test's: whether the writer waits at `Db::hold_unshare`.
+    #[doc(hidden)]
+    pub fn unshare_holding(&self) -> bool {
+        self.shared.shared_grace_hold.load(AtomicOrdering::Acquire) & 32 != 0
+    }
+
+    /// A test's: lets a writer held at `Db::hold_unshare` go on.
+    #[doc(hidden)]
+    pub fn release_unshare(&self) {
+        self.shared
+            .shared_grace_hold
+            .fetch_and(!16, AtomicOrdering::AcqRel);
+    }
+
     /// A test's: whether a freeze waits at `Db::hold_shared_closed`.
     #[doc(hidden)]
     pub fn shared_closed_holding(&self) -> bool {
@@ -25948,6 +26071,21 @@ impl Reader {
         self.may_write_shared()?;
         let _e = self.enter();
         let mem = &self.state().mem;
+        if mem.shared.is_none() {
+            // The one writer's table, in a store that shares on demand
+            // (`Options::share_on_write`): `false`, as a full shared table
+            // answers, so the caller's remedy is the one it has for that
+            // -- commit, and write again -- and the commit finds this
+            // handle among the writers and installs a shared table
+            // (`Db::share_look`).
+            return Ok(false);
+        }
+        // A table its freeze has closed takes no write (`Db::close_shared`):
+        // read after the pin, so that a write that reads it open is one the
+        // freeze waits for.
+        if mem.closed.load(AtomicOrdering::SeqCst) {
+            return Ok(false);
+        }
         let hold = self
             .shared
             .shared_write_hold_us
@@ -25987,6 +26125,15 @@ impl Reader {
             let _e = self.enter();
             let st = self.state();
             let mem = &st.mem;
+            if mem.shared.is_none() {
+                // As a put to the one writer's table is answered
+                // (`write_shared`).
+                return Ok(false);
+            }
+            // And as a put to a table its freeze has closed is.
+            if mem.closed.load(AtomicOrdering::SeqCst) {
+                return Ok(false);
+            }
             let mut l = self.shared_local.borrow_mut();
             let hash = mem.hash(key);
             if self.opts.shared_lean && mem.records {
@@ -26043,9 +26190,10 @@ impl Reader {
     /// Whether this handle may write the shared live table, its slot among
     /// the writers a freeze waits out before its first write pins.
     fn may_write_shared(&self) -> Result<()> {
-        if !self.opts.shared_writers {
+        if !self.opts.shared_writers && !self.shared.shares {
             return Err(err(
-                "a handle writes only to a store opened with Options::shared_writers",
+                "a handle writes only to a store opened with Options::shared_writers, \
+                 or one that shares its live table on demand (Options::share_on_write)",
             ));
         }
         let Some(slot) = self.slot else {
@@ -28177,6 +28325,33 @@ impl Reader {
         &self.state().mem
     }
 
+    /// Whether the state this operation holds is one a shared table
+    /// stands in, in a store that shares on demand
+    /// (`Options::share_on_write`, `State::sharing`): it is then read and
+    /// written as a store opened with `Options::shared_writers` is, with
+    /// what that option refuses stood down -- the block cache (`cache_on`),
+    /// the upkeep's loan (`Db::commit`) and ordered ingest
+    /// (`Db::append_pinned`). Every change of it is a publish, so
+    /// whatever a handle keeps across its operations meets it as a new
+    /// generation, where a handle drops its tables; the writer's own went
+    /// at its flip (`Db::share`), and it makes none while this holds, so
+    /// it has none to carry out of the stretch.
+    #[inline]
+    fn sharing(&self) -> bool {
+        self.shared.shares && self.state().sharing()
+    }
+
+    /// Whether the block cache serves the operation in progress:
+    /// `Options::scan_block_cache`, and no shared table in the state it
+    /// holds (`sharing`). A form is a copy of a block's values kept
+    /// current from the one writer's log, and a handle's write is in no
+    /// log, so over a shared table no form is built, kept, published or
+    /// carried, and a scan merges its sources.
+    #[inline]
+    fn cache_on(&self) -> bool {
+        self.opts.scan_block_cache && !self.sharing()
+    }
+
     /// The frozen tables, oldest first.
     fn frozen(&self) -> &[std::sync::Arc<MemTable>] {
         &self.state().frozen
@@ -28288,6 +28463,14 @@ impl Reader {
 }
 
 impl State {
+    /// Whether a shared table stands in this state, live or frozen
+    /// (`SharedTable`): asked of the tables themselves, so that no publish
+    /// can make a state that says otherwise of what it holds. At most
+    /// `FROZEN_CAP` tables beside the live one.
+    fn sharing(&self) -> bool {
+        self.mem.shared.is_some() || self.frozen.iter().any(|t| t.shared.is_some())
+    }
+
     fn has_tombstones(&self) -> bool {
         self.segs_tombs || self.mem.tombs() > 0 || self.frozen.iter().any(|f| f.tombs() > 0)
     }
@@ -31542,8 +31725,15 @@ impl Reader {
         // million unsealed keys. The cache wants partitions to hang blocks
         // on: before the first partitioning it stands aside.
         let partitioned = self.segs().first().is_some_and(|s| s.level > 0);
-        let forms_off = self.opts.scan_block_cache && partitioned && self.forms_off_scan(from);
-        let use_cache = self.opts.scan_block_cache && partitioned && !forms_off;
+        let cache_on = self.cache_on();
+        if !cache_on && self.opts.scan_block_cache {
+            // A scan the shared form serves by a merge (`sharing`), toward
+            // what leaving that form has to have cost first.
+            self.share_scanned
+                .set(self.share_scanned.get().saturating_add(limit as u64));
+        }
+        let forms_off = cache_on && partitioned && self.forms_off_scan(from);
+        let use_cache = cache_on && partitioned && !forms_off;
         if forms_off {
             self.signal_scan();
             self.shared
@@ -33626,7 +33816,7 @@ impl Reader {
     /// scans settle staged writes into its tables, and a handle must not
     /// find those -- and otherwise at the next commit.
     fn publish_for_handle(&self) {
-        if self.slot.is_some() || !self.opts.scan_block_cache {
+        if self.slot.is_some() || !self.cache_on() {
             return;
         }
         let st = self.state();
@@ -34339,7 +34529,7 @@ impl Reader {
     /// the maintenance that acts on it does: the upkeep's hand-over asks
     /// the same question without acting.
     fn settle_due(&self, consume: bool) -> Option<bool> {
-        if !(self.opts.commit_forms && self.opts.scan_block_cache) {
+        if !(self.opts.commit_forms && self.cache_on()) {
             return None;
         }
         // No forms kept while this handle's scans take the merge path
@@ -37912,7 +38102,11 @@ impl Reader {
                 "partition {p} blob {} block {b} cut {cut}: ",
                 seg.blob.id()
             );
-            match fs.tables.borrow()[p].borrow().as_ref() {
+            // No cell at all where the handle has made no table yet, or a
+            // shared table has stood since it dropped them (`sharing`).
+            let tables = fs.tables.borrow();
+            let table = tables.get(p).map(|t| t.borrow());
+            match table.as_ref().and_then(|t| t.as_ref()) {
                 None => {
                     let _ = write!(out, "no table; ");
                 }
@@ -40000,6 +40194,8 @@ impl Db {
             live_handles: AtomicUsize::new(0),
             shared_cap: AtomicUsize::new(opts.shared_cap(opts.seal_bytes)),
             writer_slots: std::sync::Mutex::new(Vec::new()),
+            shares: opts.shares(),
+            share_counts: Default::default(),
             shared_write_hold_us: AtomicU64::new(0),
             shared_writes_held: AtomicU64::new(0),
             shared_grace_hold: std::sync::atomic::AtomicU8::new(0),
@@ -40120,6 +40316,7 @@ impl Db {
             log_bound: std::cell::Cell::new(usize::MAX),
             len_bound: std::cell::Cell::new(usize::MAX),
             force_due: std::cell::Cell::new(false),
+            share_scanned: std::cell::Cell::new(0),
             filing: std::cell::Cell::new(false),
             shared_local: std::cell::RefCell::new(TableLocal::default()),
             wrote_shared: std::cell::Cell::new(false),
@@ -40149,6 +40346,11 @@ impl Db {
             read_mode: (0, 0, true),
             max_key: Vec::new(),
             shared_local: TableLocal::default(),
+            share_next: false,
+            share_own: 0,
+            share_rent: 0,
+            max_key_stale: false,
+            share_quiet: false,
             built_ahead_len: 0,
             built_ahead_gen: 0,
             pending_err: None,
@@ -40839,6 +41041,8 @@ impl Db {
             live_handles: AtomicUsize::new(0),
             shared_cap: AtomicUsize::new(opts.shared_cap(opts.seal_bytes)),
             writer_slots: std::sync::Mutex::new(Vec::new()),
+            shares: opts.shares(),
+            share_counts: Default::default(),
             shared_write_hold_us: AtomicU64::new(0),
             shared_writes_held: AtomicU64::new(0),
             shared_grace_hold: std::sync::atomic::AtomicU8::new(0),
@@ -40959,6 +41163,7 @@ impl Db {
             log_bound: std::cell::Cell::new(usize::MAX),
             len_bound: std::cell::Cell::new(usize::MAX),
             force_due: std::cell::Cell::new(false),
+            share_scanned: std::cell::Cell::new(0),
             filing: std::cell::Cell::new(false),
             shared_local: std::cell::RefCell::new(TableLocal::default()),
             wrote_shared: std::cell::Cell::new(false),
@@ -40992,6 +41197,11 @@ impl Db {
             read_mode: (0, 0, true),
             max_key,
             shared_local: TableLocal::default(),
+            share_next: false,
+            share_own: 0,
+            share_rent: 0,
+            max_key_stale: false,
+            share_quiet: false,
             built_ahead_len: 0,
             built_ahead_gen: 0,
             pending_err: None,
@@ -41055,10 +41265,13 @@ impl Db {
         if !self.writes_go() {
             return;
         }
-        if self.opts.shared_writers {
+        if self.mem().shared.is_some() {
             return self.write_shared_own(key, SharedWrite::Append(value));
         }
         if self.mem().ordered || self.direct_can_open() {
+            if self.max_key_stale {
+                self.refresh_max_key();
+            }
             if self.goes_direct(key, value) {
                 if !self.mem().ordered {
                     let old = self.mem().clone();
@@ -41322,6 +41535,34 @@ impl Db {
         Ok(next)
     }
 
+    /// `max_key` brought up to the keys the shared tables frozen since it
+    /// was last current took (`max_key_stale`): each is a segment's by
+    /// now, whose last key is its greatest, or still on the frozen list,
+    /// its writers waited out at its freeze, where every entry is read.
+    /// A run of ordered ingest is of keys above the store's greatest, and
+    /// one opened under a key a handle wrote made a piece open above over
+    /// keys the shared table's pieces held beside it: partitions promoted
+    /// from them did not tile, and a merge refused its own key.
+    fn refresh_max_key(&mut self) {
+        self.max_key_stale = false;
+        let st = self.state();
+        let mut best = Db::max_seg_key(&st.segs);
+        for t in st.frozen.iter().filter(|t| t.shared.is_some()) {
+            for e in (0..t.len()).map(|i| t.entry(i)) {
+                let k = t.key_of(e);
+                if k > best.as_slice() {
+                    best = k.to_vec();
+                }
+            }
+        }
+        if best > self.max_key {
+            self.max_key = best;
+        }
+    }
+
+    /// Never asked over a shared live table, whose writes go to it before
+    /// this is reached (`append_pinned`): a run's ordered table takes the
+    /// live one's place, and a handle may be writing the shared one.
     fn direct_can_open(&self) -> bool {
         self.opts.direct_ingest && self.mem().is_empty() && !self.wal.staged()
     }
@@ -41430,7 +41671,7 @@ impl Db {
         if !self.writes_go() {
             return;
         }
-        if self.opts.shared_writers {
+        if self.mem().shared.is_some() {
             return self.write_shared_own(key, SharedWrite::Put(value));
         }
         if self.mem().ordered {
@@ -41471,7 +41712,7 @@ impl Db {
         if !self.writes_go() {
             return;
         }
-        if self.opts.shared_writers {
+        if self.mem().shared.is_some() {
             return self.write_shared_own(key, SharedWrite::Delete);
         }
         if self.mem().ordered {
@@ -41489,12 +41730,25 @@ impl Db {
     /// option holds the log with no frames -- and nothing counted toward
     /// the seal, which a shared table's cap decides.
     fn write_shared_own(&mut self, key: &[u8], w: SharedWrite<'_>) {
+        self.share_own += 1;
         let mut l = std::mem::take(&mut self.shared_local);
         // A fresh table takes any write a full one refused; one that
         // refuses the write too is a write larger than a table.
         for _ in 0..3 {
             let done = {
                 let mem = self.mem();
+                if mem.shared.is_none() {
+                    // The seal that made room made the next table the one
+                    // writer's, for want of a handle that writes
+                    // (`seal_live`): the write goes as the writer's own
+                    // goes, into that.
+                    self.shared_local = l;
+                    return match w {
+                        SharedWrite::Put(v) => self.put_pinned(key, v),
+                        SharedWrite::Append(v) => self.append_pinned(key, v),
+                        SharedWrite::Delete => self.delete(key),
+                    };
+                }
                 mem.write_shared(&mut l, Some(&self.shared.readers), mem.hash(key), key, w)
             };
             if done {
@@ -41559,8 +41813,12 @@ impl Db {
         if self.mem_handed.is_some() {
             return Ok(());
         }
+        self.share_look()?;
         let t = std::time::Instant::now();
-        let background = matches!(self.opts.upkeep, Upkeep::Background(_));
+        // Nothing lent while a shared table stands (`Reader::sharing`):
+        // the thread's pass reads the live table's values beside its
+        // writer, and a shared table has as many as write through handles.
+        let background = matches!(self.opts.upkeep, Upkeep::Background(_)) && !self.r.sharing();
         self.forms_off_stale();
         if self.mem().ordered {
             self.commit_direct()?;
@@ -41640,7 +41898,11 @@ impl Db {
         // cap: it seals where a write found it full.
         let due =
             (self.mem_bytes >= threshold && self.seal_now(threshold)) || self.mem().shared_full();
-        if self.opts.shared_writers {
+        // For a store that shares on demand as for one that always does:
+        // a shared table made after this commit takes the threshold this
+        // commit found. No test tells the two apart where the threshold is
+        // the option's, which is every store a test makes.
+        if self.opts.shared_writers || self.shared.shares {
             self.shared
                 .shared_cap
                 .store(self.opts.shared_cap(threshold), AtomicOrdering::Relaxed);
@@ -41992,10 +42254,7 @@ impl Db {
         self.mem_bytes = 0;
         let Some(d) = self.direct.take() else {
             // A run forming with nothing committed: no file, nothing to close.
-            self.set_mem(std::sync::Arc::new(self.opts.live_table(
-                &self.shared.block_pool,
-                self.shared.shared_cap.load(AtomicOrdering::Relaxed),
-            )));
+            self.set_mem(std::sync::Arc::new(self.fresh_table()));
             return Ok(());
         };
         self.land_seal()?;
@@ -42246,9 +42505,25 @@ impl Db {
     /// (`hand_tail`) is a seal in flight beside them, holding no place in
     /// the list, and the seals land in the order they were handed.
     pub fn seal(&mut self) -> Result<()> {
+        self.seal_live(false)
+    }
+
+    /// `seal`, and with `force` of a live table that reads empty too: a
+    /// shared table the writer is leaving (`unshare`) is frozen whatever
+    /// it holds, since only a freeze waits its writers out, and one found
+    /// empty once they are out is taken off the frozen list again
+    /// (`unfreeze`), no seal handed for it.
+    fn seal_live(&mut self, force: bool) -> Result<()> {
         let _op = self.op();
         if let Some(e) = self.pending_err.take() {
             return Err(e);
+        }
+        // Sharing on demand: a seal makes the next table, so it is where
+        // leaving the shared form costs nothing, and with no handle that
+        // writes the next table is the one writer's.
+        if self.share_next && !self.writers_any() {
+            self.share_next = false;
+            self.shared.share_counts[2].fetch_add(1, AtomicOrdering::Relaxed);
         }
         // A table a sync handed to a seal is already going: what is live
         // after this is a fresh table, and empty.
@@ -42282,13 +42557,203 @@ impl Db {
                 self.sync_wal()?;
             }
         }
-        if self.mem().is_empty() {
+        if self.mem().is_empty() && !force {
             return Ok(());
         }
         self.land_seal()?;
         let frozen = self.freeze();
         self.mem_bytes = 0;
+        if frozen.is_empty() {
+            self.unfreeze(&frozen);
+            return Ok(());
+        }
+        if frozen.shared.is_some() {
+            self.max_key_stale = true;
+            // A shared table's writes are in no log and took no number of
+            // the store's sequence as they were made, so the table takes
+            // one at its freeze: its seal then ends past every seal before
+            // it, which is the order the pieces are read in (`age_order`),
+            // and a run of ordered ingest begun after it starts past what
+            // no manifest covers yet and says so (`owes_sync`). Without it
+            // two tables sealed with no logged write between them carried
+            // one sequence, their pieces ordered by name, and a reopened
+            // store read the older piece's values over the newer one's put.
+            self.wal.seq += 1;
+            self.unframed_to = self.wal.seq;
+        }
         self.seal_table(frozen)
+    }
+
+    /// Sharing on demand (`Options::share_on_write`), looked at where a
+    /// commit begins, the one place the writer changes the kind of its
+    /// live table for want of one.
+    ///
+    /// Over the one writer's table: a handle that writes is alive
+    /// (`writers_any`), which is a handle whose write the table refused or
+    /// is about to, since the writer leaves the shared form only where
+    /// none is, and a shared table is installed for it. Over a shared
+    /// table: with a handle that writes, nothing, and the rent starts
+    /// over. With none, the writer's
+    /// own writes into the table and the entries its own scans asked for
+    /// since its last look are added to the rent, from the first look that
+    /// found none, and once the rent has come to the table's entries the
+    /// writer leaves it (`unshare`): leaving costs a seal of those entries
+    /// and a merge of its piece, so the store has done about that much
+    /// work in the form that suits its work less before it pays to leave,
+    /// and a store whose handles come and go pays for a leave only after
+    /// as much work without them. An empty table is left at the second
+    /// look to find no handle, since leaving it costs no seal.
+    fn share_look(&mut self) -> Result<()> {
+        if !self.shared.shares {
+            return Ok(());
+        }
+        // A scan of everything asks for more entries than a count holds.
+        let work = std::mem::take(&mut self.share_own).saturating_add(self.r.share_scanned.take());
+        if self.mem().shared.is_none() {
+            self.share_quiet = false;
+            if self.writers_any() {
+                self.share()?;
+            }
+            return Ok(());
+        }
+        if self.writers_any() {
+            self.share_quiet = false;
+            return Ok(());
+        }
+        // The first look to find none: the work since the look before may
+        // have been done beside a handle that wrote, so the rent starts
+        // here, at nothing.
+        if !std::mem::replace(&mut self.share_quiet, true) {
+            self.share_rent = 0;
+            return Ok(());
+        }
+        self.share_rent = self.share_rent.saturating_add(work);
+        if self.share_rent >= self.mem().len() as u64 {
+            self.unshare()?;
+        }
+        Ok(())
+    }
+
+    /// Whether a handle that has written a shared table is alive
+    /// (`Shared::writer_slots`): a handle joins the list before its first
+    /// write pins, shared table or not, and leaves it at its drop.
+    fn writers_any(&self) -> bool {
+        !self
+            .shared
+            .writer_slots
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .is_empty()
+    }
+
+    /// The live table made a shared one for the handles that asked
+    /// (`share_look`): a run of ordered ingest closed and a table with
+    /// writes frozen under it, as a seal does both, and an empty one
+    /// replaced.
+    ///
+    /// The writer's tables go, the upkeep taken home for it, with what
+    /// the state publishes of them: from here until the shared tables have
+    /// landed no form is kept (`Reader::cache_on`), so they would stand
+    /// for the whole stretch as memory nothing reads. The states of the
+    /// stretch carry no form and keep no table for a look
+    /// (`replaced_from_in`), so nothing is carried out of it either: the
+    /// first state after it starts as a store just opened does.
+    fn share(&mut self) -> Result<()> {
+        self.drop_blocks_for(6);
+        self.share_next = true;
+        self.seal()?;
+        if self.share_next && self.mem().shared.is_none() {
+            self.set_mem(std::sync::Arc::new(self.fresh_table()));
+        }
+        if self.mem().shared.is_some() {
+            self.shared.share_counts[0].fetch_add(1, AtomicOrdering::Relaxed);
+        }
+        Ok(())
+    }
+
+    /// The shared live table left for the one writer's (`share_look`):
+    /// frozen under one whatever it holds, its writers waited out by the
+    /// freeze, and sealed, or taken off the frozen list where they left it
+    /// empty. The store reads as a shared one until the shared tables
+    /// frozen have landed (`State::sharing`).
+    fn unshare(&mut self) -> Result<()> {
+        // A test's hold (`Db::hold_unshare`): the look has found no handle
+        // that writes, and the table is not closed yet.
+        let hold = &self.shared.shared_grace_hold;
+        if hold.load(AtomicOrdering::Acquire) & 16 != 0 {
+            hold.fetch_or(32, AtomicOrdering::AcqRel);
+            while hold.load(AtomicOrdering::Acquire) & 16 != 0 {
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+            hold.fetch_and(!32, AtomicOrdering::AcqRel);
+        }
+        self.share_next = false;
+        self.shared.share_counts[1].fetch_add(1, AtomicOrdering::Relaxed);
+        self.seal_live(true)
+    }
+
+    /// `table`, the empty table this call's freeze put at the back of the
+    /// frozen list, taken off it: no seal was handed for it, so no landing
+    /// will, and its writers are out (`close_shared`), so nothing
+    /// is lost with it. The landings retire the list's front and only the
+    /// writer freezes, so nothing has joined the list behind it.
+    fn unfreeze(&mut self, table: &std::sync::Arc<MemTable>) {
+        debug_assert!(
+            table.is_empty(),
+            "only a table with nothing in it is unfrozen"
+        );
+        let old = self.publish_writer(|cur| State {
+            forms: Reader::forms_for(&cur.segs),
+            forms_moved: std::sync::atomic::AtomicBool::new(false),
+            snap: AtomicPtr::new(std::ptr::null_mut()),
+            reader_scans: AtomicU64::new(cur.reader_scans.load(AtomicOrdering::Relaxed)),
+            forms_at: AtomicUsize::new(usize::MAX),
+            forms_complete: std::sync::atomic::AtomicBool::new(false),
+            scans: AtomicU64::new(0),
+            forms_bytes: AtomicUsize::new(0),
+            segs: cur.segs.clone(),
+            mem: cur.mem.clone(),
+            frozen: cur
+                .frozen
+                .iter()
+                .filter(|t| !std::sync::Arc::ptr_eq(t, table))
+                .cloned()
+                .collect(),
+            gen: cur.gen + 1,
+            lives: cur.lives,
+            replaced: std::sync::Mutex::new(Vec::new()),
+            mean_key_bytes: cur.mean_key_bytes,
+            store_bytes: cur.store_bytes,
+            data_bytes: cur.data_bytes,
+            l0_aligned: cur.l0_aligned,
+            parts: cur.parts,
+            piece_runs: cur.piece_runs.clone(),
+            fence_words: cur.fence_words.clone(),
+            segs_tombs: cur.segs_tombs,
+            layout: cur.layout.clone(),
+        });
+        self.published(old);
+    }
+
+    /// A fresh live table of the kind the writer last chose: a shared one
+    /// where the option says every table is (`Options::shared_writers`) or
+    /// a handle asked and one still writes (`share_next`), and the one
+    /// writer's otherwise.
+    fn fresh_table(&self) -> MemTable {
+        self.opts.table_of(
+            self.opts.shared_writers || self.share_next,
+            &self.shared.block_pool,
+            self.shared.shared_cap.load(AtomicOrdering::Relaxed),
+        )
+    }
+
+    /// Where the state a publish of `fresh` as the live table makes keeps
+    /// tables from, for the upkeep's look (`replaced_from_in`): nowhere
+    /// where `fresh` is a shared table or one stands in the state the
+    /// writer holds.
+    fn kept_from(&self, fresh: &MemTable) -> Option<Keep> {
+        let sharing = self.shared.shares && (fresh.shared.is_some() || self.state().sharing());
+        Db::replaced_from_in(&self.opts, &self.shared, sharing)
     }
 
     /// `table`, a hashed memtable whose every write is committed and
@@ -42718,7 +43183,7 @@ impl Db {
     fn build_ahead_if_due(&mut self) {
         let due = self.opts.build_ahead_on_commit;
         let on_publish = self.opts.build_ahead_on_publish;
-        if (due == 0 && !on_publish) || !self.opts.scan_block_cache {
+        if (due == 0 && !on_publish) || !self.cache_on() {
             return;
         }
         // Nor one whose forms wait for the maintenance that installs them,
@@ -43175,16 +43640,13 @@ impl Db {
         }
         let settled = self.freeze_prepare();
         let settled_at = self.state() as *const State;
-        let from = Db::replaced_from(&self.opts, &self.shared);
+        let fresh = std::sync::Arc::new(self.fresh_table());
+        let from = self.kept_from(&fresh);
         let complete = self.fs().tables_complete.get();
-        let fresh = std::sync::Arc::new(self.opts.live_table(
-            &self.shared.block_pool,
-            self.shared.shared_cap.load(AtomicOrdering::Relaxed),
-        ));
         let carried = std::cell::Cell::new(false);
         let pieces_only = self.opts.forms_pieces_only;
         let by_capacity = self.opts.counts_capacity();
-        self.close_in_place(table);
+        self.close_shared(table);
         let Some(old) = self.try_publish_writer(|cur| {
             if !std::sync::Arc::ptr_eq(&cur.mem, table) || cur.frozen.len() >= FROZEN_CAP {
                 return None;
@@ -43201,7 +43663,6 @@ impl Db {
         }) else {
             return false;
         };
-        self.wait_shared_writers(table);
         Db::ask_abandon(&self.opts, &self.shared, self.state(), from);
         // SAFETY: retired by `published` below, and the writer is pinned.
         let cur = unsafe { &*old };
@@ -43231,12 +43692,9 @@ impl Db {
     /// vouch for nothing until a publish into it says otherwise -- so a
     /// handle at it builds its own blocks until the upkeep has looked.
     fn freeze_swap(&mut self, table: &std::sync::Arc<MemTable>) -> bool {
-        let fresh = std::sync::Arc::new(self.opts.live_table(
-            &self.shared.block_pool,
-            self.shared.shared_cap.load(AtomicOrdering::Relaxed),
-        ));
-        let from = Db::replaced_from(&self.opts, &self.shared);
-        self.close_in_place(table);
+        let fresh = std::sync::Arc::new(self.fresh_table());
+        let from = self.kept_from(&fresh);
+        self.close_shared(table);
         let Some(old) = self.try_publish_writer_away(|cur| {
             if !std::sync::Arc::ptr_eq(&cur.mem, table) || cur.frozen.len() >= FROZEN_CAP {
                 return None;
@@ -43245,25 +43703,55 @@ impl Db {
         }) else {
             return false;
         };
-        self.wait_shared_writers(table);
         self.published_away(old);
         Db::ask_abandon(&self.opts, &self.shared, self.state(), from);
         true
     }
 
-    /// Shared, rewriting (`MemTable::rewrites`): the live `table` closed to
-    /// writes in place before its freeze publishes it frozen, the writers
-    /// that may be making one waited out, and the table marked settled, so
-    /// that no frozen table is ever read while a value of it is overwritten
-    /// and its readers read it as one that never rewrites. A freeze whose
-    /// publish then fails leaves the table live and closed: it takes no
-    /// more writes in place, and its reads need no copy.
-    fn close_in_place(&self, table: &MemTable) {
-        if !table.rewrites || table.settled.load(AtomicOrdering::Acquire) {
+    /// Shared: the live `table` closed to its handles' writes before its
+    /// freeze publishes it frozen, and the writes in flight waited out, so
+    /// that a frozen table is one nothing writes, as the one writer's is.
+    ///
+    /// A handle's write reads the table's `closed` after it has pinned and
+    /// before it writes anything (`Reader::write_shared`, `Reader::rmw`),
+    /// sequentially consistent beside the store of it here and the bump of
+    /// the wait after it: a write that read it open pinned before the bump,
+    /// so the wait is for it and it lands in the table before the publish;
+    /// one that pins after reads it closed, is answered `false` as a full
+    /// table's is, and is made again once the writer's commit has installed
+    /// the next table. Then the table's length is carried over every entry
+    /// claimed (`advance_shared`), which a checked build holds it to, and
+    /// the table is marked settled: no value of it is overwritten from here
+    /// (`MemTable::rewrites`), and its readers read it as a table that
+    /// never rewrites.
+    ///
+    /// A frozen table took writes once, from the handles that had pinned
+    /// before the publish, and the freeze waited them out after it. A scan
+    /// made in that wait sorted the table as it stood and left the order on
+    /// it for whoever read it next (`FrozenSnaps`), short of an entry a
+    /// handle then claimed: the seal met a snapshot short of its table, and
+    /// a scan after the write had returned did not read it until the table
+    /// landed. Nothing that reads a frozen table asks whether it is whole,
+    /// since for the one writer's it always was.
+    ///
+    /// A freeze whose publish then declines leaves the table live and
+    /// closed: it takes no handle's write until the writer freezes it.
+    fn close_shared(&self, table: &MemTable) {
+        let Some(st) = table.shared.as_deref() else {
+            return;
+        };
+        if table.settled.load(AtomicOrdering::Acquire) {
             return;
         }
         table.closed.store(true, AtomicOrdering::SeqCst);
         self.wait_shared_writers_out();
+        // The writers are out, and their stores before the wait let them
+        // go are seen here.
+        table.advance_shared(st);
+        debug_assert!(
+            table.shared_whole(),
+            "a closed shared table's length short of its claimed entries"
+        );
         table.settled.store(true, AtomicOrdering::Release);
         let hold = &self.shared.shared_grace_hold;
         if hold.load(AtomicOrdering::Acquire) & 4 != 0 {
@@ -43276,30 +43764,11 @@ impl Db {
     }
 
     /// Shared: the handles that have written a shared table waited out of
-    /// the table a freeze just replaced (`Options::shared_writers`). An
-    /// epoch is bumped after the publish, and each writer's slot read until
-    /// it holds that epoch or none: a handle's write pins before it takes
-    /// the state, so one pinned below the epoch may hold the old table, and
-    /// one at or past it took the fresh one. So every write the frozen table
-    /// will get has landed before its seal reads it, and its length has
-    /// reached every entry they claimed (`advance_shared`), which a checked
-    /// build holds it to.
-    fn wait_shared_writers(&self, table: &MemTable) {
-        if !self.opts.shared_writers {
-            return;
-        }
-        self.wait_shared_writers_out();
-        // The length carried over every entry written: the writers are out,
-        // and their stores before the grace let them go are seen here.
-        if let Some(st) = table.shared.as_deref() {
-            table.advance_shared(st);
-        }
-        debug_assert!(
-            table.shared_whole(),
-            "a frozen shared table's length short of its claimed entries"
-        );
-    }
-
+    /// the table a freeze has closed (`close_shared`). An epoch is bumped
+    /// after the table is closed, and each writer's slot read until it
+    /// holds that epoch or none: a handle's write pins before it reads
+    /// whether the table is closed, so one pinned below the epoch may be
+    /// writing it, and one at or past it read it closed.
     fn wait_shared_writers_out(&self) {
         let slots = self
             .shared
@@ -43384,7 +43853,20 @@ impl Db {
     /// last look, or nowhere when nothing looks across a change of the
     /// live table (`Reader::rebase_tables`).
     fn replaced_from(opts: &Options, shared: &Shared) -> Option<Keep> {
-        (opts.forms_carry && opts.commit_forms && opts.scan_block_cache && !opts.freeze_settles)
+        Db::replaced_from_in(opts, shared, false)
+    }
+
+    /// `replaced_from` for a publish out of or into a state a shared table
+    /// stands in (`sharing`; `State::sharing`, or the table the publish
+    /// installs): nowhere, since no table is carried over one
+    /// (`Reader::cache_on`) and a list kept for a look that is not coming
+    /// held every table frozen meanwhile.
+    fn replaced_from_in(opts: &Options, shared: &Shared, sharing: bool) -> Option<Keep> {
+        (!sharing
+            && opts.forms_carry
+            && opts.commit_forms
+            && opts.scan_block_cache
+            && !opts.freeze_settles)
             .then(|| Keep {
                 from: shared.upkeep_lives.load(AtomicOrdering::SeqCst),
                 bytes: shared.keep_bytes,
@@ -43606,7 +44088,7 @@ impl Db {
     /// what they were: for the table an empty one is replaced by at a
     /// direct run's start, whose log starts where the empty one's ended.
     fn set_mem_with(&mut self, mem: std::sync::Arc<MemTable>, carry: bool) {
-        let from = Db::replaced_from(&self.opts, &self.shared);
+        let from = self.kept_from(&mem);
         let pieces_only = self.opts.forms_pieces_only;
         let by_capacity = self.opts.counts_capacity();
         let old = self.publish_writer(|cur| {
@@ -44074,6 +44556,7 @@ impl Reader {
             log_bound: std::cell::Cell::new(usize::MAX),
             len_bound: std::cell::Cell::new(usize::MAX),
             force_due: std::cell::Cell::new(false),
+            share_scanned: std::cell::Cell::new(0),
             filing: std::cell::Cell::new(false),
             shared_local: std::cell::RefCell::new(TableLocal::default()),
             wrote_shared: std::cell::Cell::new(false),
@@ -44125,6 +44608,7 @@ impl Reader {
                 log_bound: std::cell::Cell::new(usize::MAX),
                 len_bound: std::cell::Cell::new(usize::MAX),
                 force_due: std::cell::Cell::new(false),
+                share_scanned: std::cell::Cell::new(0),
                 filing: std::cell::Cell::new(false),
                 shared_local: std::cell::RefCell::new(TableLocal::default()),
                 wrote_shared: std::cell::Cell::new(false),
@@ -44183,6 +44667,7 @@ impl Reader {
             log_bound: std::cell::Cell::new(usize::MAX),
             len_bound: std::cell::Cell::new(usize::MAX),
             force_due: std::cell::Cell::new(false),
+            share_scanned: std::cell::Cell::new(0),
             filing: std::cell::Cell::new(false),
             shared_local: std::cell::RefCell::new(TableLocal::default()),
             wrote_shared: std::cell::Cell::new(false),
@@ -44991,6 +45476,45 @@ impl Db {
             .store(micros, AtomicOrdering::Relaxed);
     }
 
+    /// Sharing on demand (`Options::share_on_write`), over the store's
+    /// life: the shared tables the writer installed for handles that asked
+    /// (`share`), the shared tables it left at the price of a freeze once
+    /// their rent was paid (`unshare`), and the seals that made the next
+    /// table the one writer's for want of a handle that writes.
+    pub fn share_counts(&self) -> [u64; 3] {
+        let c = &self.shared.share_counts;
+        [
+            c[0].load(AtomicOrdering::Relaxed),
+            c[1].load(AtomicOrdering::Relaxed),
+            c[2].load(AtomicOrdering::Relaxed),
+        ]
+    }
+
+    /// Whether the store takes a handle's write by sharing its live table
+    /// on demand (`Options::share_on_write`, where it acts): a handle's
+    /// write is then answered `false` by the one writer's table, and made
+    /// again after a commit it lands in a shared one.
+    pub fn shares(&self) -> bool {
+        self.shared.shares
+    }
+
+    /// Whether a shared table stands in the store's state, live or
+    /// frozen (`State::sharing`): the store is then read as one opened
+    /// with `Options::shared_writers` is, its block cache standing down.
+    pub fn sharing(&self) -> bool {
+        let _op = self.op();
+        self.r.sharing()
+    }
+
+    /// Whether the live table is a shared one, which a handle's write
+    /// goes into: where a store that shares on demand has left it, the
+    /// state may hold shared tables still on their way to the segments
+    /// (`sharing`), and a handle's write asks again.
+    pub fn live_shared(&self) -> bool {
+        let _op = self.op();
+        self.mem().shared.is_some()
+    }
+
     /// A test's: the shared writes that have entered the wait
     /// `hold_shared_writes` sets, each counted as it begins to wait.
     #[doc(hidden)]
@@ -44998,7 +45522,7 @@ impl Db {
         self.shared.shared_writes_held.load(AtomicOrdering::Acquire)
     }
 
-    /// A test's: while `on`, a freeze's grace (`Db::wait_shared_writers`)
+    /// A test's: while `on`, a freeze's grace (`Db::close_shared`)
     /// waits between its read of the writers' list and its reads of their
     /// slots, so a handle on the list can be dropped inside it. The freeze
     /// is the writer's, so the hold is let go through a handle
@@ -45008,9 +45532,19 @@ impl Db {
         Db::set_hold_bit(&self.shared.shared_grace_hold, 1, on);
     }
 
+    /// A test's: while `on`, the writer's leaving of a shared table
+    /// (`Db::unshare`) waits where its look has found no handle that
+    /// writes and before it closes the table, let go through a handle
+    /// (`Reader::release_unshare`): for a handle's write that takes the
+    /// table in between.
+    #[doc(hidden)]
+    pub fn hold_unshare(&self, on: bool) {
+        Db::set_hold_bit(&self.shared.shared_grace_hold, 16, on);
+    }
+
     /// A test's: while `on`, a freeze of a table that rewrites in place
     /// waits once it has closed and settled the table and before it
-    /// publishes it frozen (`Db::close_in_place`), let go through a handle
+    /// publishes it frozen (`Db::close_shared`), let go through a handle
     /// (`Reader::release_shared_closed`).
     #[doc(hidden)]
     pub fn hold_shared_closed(&self, on: bool) {
@@ -47465,6 +47999,7 @@ impl Reader {
             log_bound: std::cell::Cell::new(usize::MAX),
             len_bound: std::cell::Cell::new(usize::MAX),
             force_due: std::cell::Cell::new(false),
+            share_scanned: std::cell::Cell::new(0),
             filing: std::cell::Cell::new(false),
             shared_local: std::cell::RefCell::new(TableLocal::default()),
             wrote_shared: std::cell::Cell::new(false),
@@ -53153,7 +53688,7 @@ impl Maint {
         // Far from reads the pieces go without, and a reader that comes
         // takes them (`Options::land_ranks_far`).
         let near = self.opts.land_ranks_far || self.shared.reads_near.load(AtomicOrdering::Acquire);
-        if self.opts.scan_block_cache && near {
+        if self.cache_on() && near {
             // The ranks only under the arm (`Options::piece_ranks_whole`);
             // the bounds are a table's, and every table over the pair
             // would walk them otherwise.
@@ -53337,7 +53872,7 @@ impl Maint {
     /// keeper counts them for it (`Reader::signal_scan`), which is the one
     /// way the second term is reached.
     fn forms_uncovered(&self) -> bool {
-        !self.opts.scan_block_cache
+        !self.cache_on()
             || !self.opts.commit_forms
             || self.opts.scan_cache_bytes > 0
             || self.shared.cache_bound_any.load(AtomicOrdering::Acquire)

@@ -380,47 +380,80 @@ fn handles_overwrite_in_place_beside_reads_and_scans_and_every_value_is_whole() 
     let _ = std::fs::remove_dir_all(&d);
 }
 
-/// A put into a table its freeze has closed lays its value down and does
-/// not overwrite in place: the freeze held once it has closed and settled
-/// the table and before it publishes it frozen, a handle's put of a value of
-/// the length its key's value has, and the handle's count of overwrites
-/// does not move. A write in place there would be one a reader of the
-/// frozen table, which reads it as a table that never rewrites, could meet.
+/// A table its freeze has closed takes no write: a handle's put started
+/// once the freeze has closed and settled the table, and before it has
+/// published it frozen, is answered as a full table's is, with nothing
+/// written and nothing overwritten, and made again after the flush it
+/// lands in the next table. A frozen table is then one nothing writes, as
+/// the one writer's is: a write that landed in it after its publish was
+/// one a scan made before it had sorted the table without.
 #[test]
-fn a_put_into_a_table_its_freeze_closed_lays_its_value_down() {
+fn a_put_into_a_table_its_freeze_closed_is_refused() {
+    // A table that overwrites its puts where they lie, and one that lays
+    // every write down: each is closed to every write.
+    for in_place in [true, false] {
+        a_closed_table_refuses(in_place);
+    }
+}
+
+fn a_closed_table_refuses(in_place: bool) {
     let _w = Watchdog::arm("the closed-table test waited a minute");
-    let d = scratch("closed");
-    let mut db = Db::create(&d, options(1 << 20)).unwrap();
+    let d = scratch(if in_place { "closed" } else { "closed-laid" });
+    let mut db = Db::create(
+        &d,
+        Options {
+            shared_in_place: in_place,
+            ..options(1 << 20)
+        },
+    )
+    .unwrap();
     let r = db.reader().unwrap();
     assert!(r.put(b"k", &[1u8; 64]).unwrap());
     assert!(r.put(b"k", &[2u8; 64]).unwrap());
     assert_eq!(
         r.rewrites_made(),
-        1,
-        "a put of its length overwrote in place"
+        u64::from(in_place),
+        "a put of its length overwrote in place where the table does"
     );
     db.hold_shared_closed(true);
-    let (before, after) = std::thread::scope(|s| {
+    let r = std::thread::scope(|s| {
         let put = s.spawn(move || {
             while !r.shared_closed_holding() {
                 std::thread::yield_now();
             }
             let before = r.rewrites_made();
-            let done = r.put(b"k", &[3u8; 64]).unwrap();
-            let after = r.rewrites_made();
+            // Every kind of write, each refused.
+            let mut read = 0;
+            let refused = [
+                r.put(b"k", &[3u8; 64]).unwrap(),
+                r.put(b"new", b"v").unwrap(),
+                r.append(b"k", b"more").unwrap(),
+                r.delete(b"k").unwrap(),
+                r.rmw(b"k", &[4u8; 64], vf(&mut |_| read += 1)).unwrap(),
+            ];
+            assert_eq!(refused, [false; 5], "a closed table took a write");
+            assert_eq!(read, 0, "a refused read-modify-write read its key");
+            assert_eq!(r.rewrites_made(), before, "a closed table was overwritten");
+            assert_eq!(handle_values(&r, b"k"), vec![vec![2u8; 64]]);
             r.release_shared_closed();
-            assert!(done);
-            (before, after)
+            r
         });
         db.flush().unwrap();
         put.join().unwrap()
     });
     db.hold_shared_closed(false);
     assert_eq!(
-        before, after,
-        "a put into a closed table overwrote in place"
+        values(&db, b"k"),
+        vec![vec![2u8; 64]],
+        "a refused write landed"
+    );
+    assert!(values(&db, b"new").is_empty());
+    assert!(
+        r.put(b"k", &[3u8; 64]).unwrap(),
+        "the next table took no write"
     );
     assert_eq!(values(&db, b"k"), vec![vec![3u8; 64]]);
+    drop(r);
     drop(db);
     let _ = std::fs::remove_dir_all(&d);
 }
