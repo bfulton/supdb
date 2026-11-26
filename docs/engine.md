@@ -1879,6 +1879,141 @@ scrambled F, the scrambled D, the scrambled A below three hundred
 thousand keys, and the full rewrite's burst at a hundred thousand, where
 the burst's seals and the thread share four cores with the writer.
 
+#### What filing a write costs
+
+Filing a write into its block's form is the cost behind both halves of
+that trade: the commit pays it where it files its own batch, and the first
+scan after a burst waits it out where the batch was lent. Counted over the
+lag sweep at a hundred thousand keys, the buffered arm, whose commits file
+(`valgrind --tool=callgrind --collect-atstart=no
+--toggle-collect='<supdb::db::Reader>::maintain_forms'
+bench/target/release/examples/lag_only ARM 100000 1`, 111,000 writes, at
+`3f4f23f`), in millions of instructions:
+
+| step | `supdb-ingestsettlefat`, the settle before | `supdb-ingest` |
+|---|---|---|
+| the whole | 431, 3,900 a write | 374, 3,400 a write |
+| the patches staged through `patch_block` | 107 | 66 |
+| conversions of dense forms | 31, in the fill | 33, in the settle |
+| the fill beyond them | 29 | 18 |
+| the batch's sort by key offset | 17 | none |
+| its sort by prefix | 27 | 25 |
+| the snapshot's refresh | 57 | 50 |
+| the log read | 19 | 20 |
+
+It was not one cost. A patch over a copy's own record took a few hundred
+instructions and a patch of a sparse form two thousand: a search of its
+deltas, an insert into them, its three buffers grown. Which a write met
+turned on a rule written for something else. The fill is what rebuilds a
+sparse form of sixteen deltas as a copy, and it is left for a later pass
+while the writer has a commit posted (`Options::upkeep_fill_skips_posted`),
+which was priced on the syncing pace. Under a lent burst a commit is
+always posted, so no form became a copy for the length of a burst, every
+patch of it was the sparse kind, and the scans after it walked forms of
+up to sixty-four deltas (`LAG_ALL=1 lag_only supdb-heldsettlefat 300000
+1`: `walk_sparse` 7,616 over the pass after the full rewrite and
+`walk_copy` none).
+
+And on the upkeep thread two loads were a tenth of its time. The settle
+sorts its batch by the keys' first sixteen bytes and carried each write's
+place in the pending list through the sort; the resolve then read the
+write by that index and the key's bytes from the table's arena, in key
+order from two structures laid out in arrival order, inside iterations too
+long for the core to overlap. Sampled over a lent full rewrite at three
+hundred thousand keys and laid on source lines (`perf record -e cpu-clock
+-F 20000 -k CLOCK_MONOTONIC` over `SUPDB_LAG_MARK=1 lag_only
+supdb-heldnoframes 300000 4`, the thread's samples between the ten-percent
+pass's end and the full rewrite's, each address through `llvm-addr2line
+-i`, at `3e4605c`), the load of the write held 6.4% of the thread and the
+first reads of the key's bytes 5.9%.
+
+Four options, each the engine's, each with the shape before as an arm for
+the durable, the buffered and the held log's (`supdb-settle...`,
+`supdb-ingestsettle...`, `supdb-heldsettle...`; `...settlefat` is all four
+off):
+
+- `Options::settle_gathers`: the writes are gathered once into key order,
+  and a key of sixteen bytes or fewer is rebuilt from the prefix words the
+  batch was sorted by, so the resolve reads neither the list nor the arena
+  in key order. It adds a million instructions to the count above and
+  takes the two loads away.
+- `Options::settle_sorts_once`: the comparison sort by key offset ahead of
+  the prefix sort is gone. It was there so that the stable prefix sort
+  would leave a key's writes together; the prefix sort does that by itself
+  unless two keys share sixteen bytes, and a run of equal prefix words
+  holding more than one key is grouped by key afterwards.
+- `Options::settle_patch_in_place`: a put over a copy whose entries are
+  its block's records, one value above a tombstone and no longer than the
+  run the entry holds, is copied over that run from the key's chain.
+  Everything else is the staged patch's.
+- `Options::settle_converts`: a sparse form the batch takes to the dense
+  count is converted before the batch's keys are spliced into it, so they
+  patch the copy; within the cache's budget, which it asks what the fill
+  asks, and with nothing withdrawn from the state, since the copy holds
+  what the form held.
+
+Each alone, by the same count: the batch sorted twice reads 396 million,
+every patch staged 404, the conversions left to the fill 389, the resolve
+without its gather 372.
+
+Against the settle before (`pair.sh A B SIZE --passes
+load,read,mixes,mixes-scrambled,lag --reps 5`, at `3f4f23f`; the first
+arm's rate over the second's, the sitting that lists it first and then
+the other):
+
+| | `supdb-heldnoframes` over `supdb-heldsettlefat` | `supdb-ingest` over `supdb-ingestsettlefat` |
+|---|---|---|
+| pass after the full rewrite, 10k | 1.19, 1.76 | 0.86, 1.26 |
+| 100k | 2.67, 2.40 | 1.16, 0.94 |
+| 300k | 2.40, 1.54 | 0.99, 0.89 |
+| the full rewrite's burst, 10k | 1.29, 1.54 | 1.07, 1.07 |
+| 100k | 1.02, 1.11 | 1.29, 1.02 |
+| 300k | 0.87, 1.11 | 1.18, 1.00 |
+| the sweep's weighted time, 10k | 0.86, 0.76 | 0.99, 0.92 |
+| 100k | 0.81, 0.71 | 0.88, 1.01 |
+| 300k | 0.71, 0.74 | 0.89, 1.02 |
+
+What resolves is the held log's pass after a full rewrite and its weighted
+time, in every sitting at every rung. A cell the options cannot reach
+moved as far as the buffered arm's cells did: the read-only mix, which
+runs before any settle, read 0.75 to 1.43 between the two arms over the
+same sittings, and the arm paired with itself (`pair.sh supdb-ingest
+supdb-ingest 300000 --passes load,read,mixes --reps 15`) read its mixes
+0.85 to 1.04. At three million keys the buffered arm's bursts read 1.19,
+1.19 after a hundred percent, 1.16, 1.11 after ten and 1.28, 1.31 after
+one, and the sweep's weighted time 0.82, 0.85 (`pair.sh supdb-ingest
+supdb-ingestsettlefat 3000000 --passes load,lag --reps 3`), beside a
+clean-store pass, which no settle precedes, at 1.28, 1.34: the count is
+the verdict for that arm and the rates are not. The mixes are not
+reached at all: their write mixes file nothing far from a scan, and E
+makes the same walks and builds under either (`SUPDB_MIX_COUNTERS=1
+SUPDB_MIX_KINDS=1 bench ab --arms supdb-ingest,supdb-ingestsettlefat
+--size 100000 --passes load,read,mixes --reps 7`: 18,139, 6,230 and 541
+walks by form in both, 21.4 ms against 21.5). Under a bound nothing
+resolved and nothing was killed (`pair.sh supdb supdb-settlenoconvert
+3000000 --bound 1073741824 --reps 3 --ops-div 10 --passes load,lag`).
+
+The trade stands, narrower. The thread does not file faster than it did:
+over a lent full rewrite at three hundred thousand keys its CPU reads 127
+ms against 133 and at a hundred thousand 44 against 43 (`lag_only`, the
+two arms alternated, medians of eight), because what the lean patches save
+it spends on the conversions the fill used to skip, four thousand of them
+at about ten microseconds. What that buys is the pass: copies to walk, 198
+thousand of the burst's 270 thousand patches in place, and a first scan
+that waits 64 ms where it waited 79. Behind a burst filed by its commits
+the whole pass is about ten. Filing a write is still several times a
+write, and three things are left in it, by the same count: the settle's
+asks ahead are half of its own instructions (its callees apart, 59
+million in `supdb-settlenoahead` against 122 in `supdb`, each ask having
+been priced as a win at three million keys under a bound, where a miss is
+memory's and not a cache's); a conversion is twenty thousand instructions,
+most of them the partition's records read through the general scan; and
+the snapshot's refresh sorts the keys the settle has just sorted. None of
+them is the factor the trade needs. That would take the scan after a burst
+going on without the whole trail filed -- the blocks it walks settled as
+it reaches them, the thread filing the rest beside it -- which nothing
+here builds.
+
 #### Beside FASTER out of core
 
 A store larger than memory is what FASTER's log is made for, and the

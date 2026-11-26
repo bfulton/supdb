@@ -1146,8 +1146,10 @@ writer's rate and a store has the burst at the writer's rate or the pass
 after it at the filed store's, not both. The comparator of that policy
 files nothing and scans nothing, so its row reads the burst: lent, 1.2-2.2x
 of FASTER's at three hundred thousand keys where filed it read 0.3-0.6x,
-and the scan pass straight after a burst pays, a tenth to a fifth of the
-filed store's after a full rewrite. The share of a lent pace is the first
+and the scan pass straight after a burst pays, a sixth to a third of the
+filed store's after a full rewrite once the settle converts the forms a
+burst makes dense (`Options::settle_converts`; a tenth to a fifth before
+it). The share of a lent pace is the first
 scan's wait for the pass in flight against the pass over the store, and
 the pipeline's depth: paced a batch deep, every batch was a pass of the
 thread's, whose fixed part doubled the thread's cost a batch at three
@@ -2461,7 +2463,22 @@ their core inside the window now, by a count the test sets
 (`proto::tests::WIDE_INSERTS`), and the first store races on one CPU as
 on four. The base rate was first read off a stale binary of another
 build layout, none of a hundred and thirty runs failing where the
-current one fails half its single stores. The
+current one fails half its single stores. That count was the process's,
+and the gate that followed found the test at one run in two: the test
+beside it in the binary makes five hundred inserts of its own and spent
+the count before this one's writers reached theirs, where the test run
+alone, which is how the fix had been held, kept all of it. The whole
+library binary passed four runs of eight with the count the process's
+and eight of eight with the count the table's
+(`Live::wide_inserts`) and the window a wait of two hundred
+microseconds, which a writer released a slice late still reaches. And
+as a baseline: the test of a held log's lent burst held its first count
+of writes lent under the count before the burst, which is the load's
+twenty thousand where the scan before the burst has not found the
+thread's report of them and nothing where it has; under the gate's load
+it was nothing, the range empty, and a burst that had lent three
+hundred and then nine hundred, as it should, failed. It holds the
+counts themselves now. The
 rule: a test that
 needs a state holds it, and a bet on timing loses the first time the
 thing it bets against gets faster; a state the test needs only to have
@@ -7280,6 +7297,73 @@ turned back into, not only against the shape it was added to; and a move
 between forms is priced on the pass it lands in, by whether its work is
 done inside that pass.
 
+**A cost read as one step's, that was three shapes of the step, and
+the rule of another regime that had picked the dearest.** Filing a write
+into its block's form was 3,900 instructions a write and the one thing a
+lent burst's first scan waited on, and the first plan was a lean path for
+"the patch". Counted by the form each patch met, with a scratch counter
+at the splice, a patch over a copy's own record was 340 instructions and
+a patch of a sparse form 2,100 to 2,300, and under a held log's lent
+bursts all but a hundredth of a full rewrite's patches were the second
+kind: the
+fill is what rebuilds a form of sixteen deltas as a copy, the fill is
+left for a later pass while the writer has a commit posted
+(`Options::upkeep_fill_skips_posted`, priced on the syncing pace, where a
+pass a batch paid the fill's walk at every batch), and under a lent burst
+a commit is always posted. Nothing was wrong and nothing raised; the
+forms stayed sparse for the length of the burst, each patch an insert
+into up to sixty-four sorted deltas, and the scans after it walked them.
+The settle converts the form its batch takes to the dense count now, and
+writes a put over a copy's own run where it lies
+(`Options::settle_converts`, `settle_patch_in_place`). Beside it, on the
+thread's samples laid to source lines, two loads held a tenth of its
+time: the batch is sorted by its keys' prefix words with each write's
+place in the pending list carried through the sort, and the resolve read
+the write by that place and the key's bytes from the arena, in key order
+from two structures in arrival order, inside iterations too long for the
+core to overlap (`Options::settle_gathers`). What the change bought is
+written where it is measured (`docs/engine.md`, what filing a write
+costs), and it is not what it was begun for: the thread files no faster,
+since the conversions it now makes cost what the lean patches save, and
+the trade between a burst and the pass after it is narrower and stands.
+The rules: a per-operation cost is laid by the state each operation
+meets before a path is built for the average, and the count that does
+it is a counter at the branch, an hour's work; a step left out under one
+regime's rule is listed for everything else it did and who relied on it,
+since the rule that skipped the fill's walk skipped its conversions with
+it; a sort that carries an index leaves a gather for every reader after
+it, to be made once in a loop the core can overlap, and what the sort's
+own key holds is not read again; and when the levers found are worth a
+quarter where a factor was wanted, that is said, with the lever that
+would be the factor named beside it, before a fifth lever of the same
+kind is built.
+
+Five things the validation of that change found, each a rule this file
+already had. The settle's conversion reused the fill's routine, which
+withdraws the block from the state with a published mark, and a writer
+nobody reads through a handle began publishing a mark a conversion: the
+gate's test of that regime caught it, and the conversion withdraws
+nothing, the form a state publishes being as current as it was to the
+position it was published at -- a routine taken for a new caller is read
+for what it does to the state beside what it returns. It also grew the
+cache without asking its budget, which the fill asks at every block, and
+no test said so; it was found by reading for the first, and the two ask
+through one function now -- when one side effect of a borrowed routine
+turns up, the rest are listed the same hour. A mark the in-place patch
+set for the next publish survived its mutant, and reading for a state
+that reaches it found none: a form the writer alone holds is dirty from
+its build, from the staged patch that cloned it out of a form a reader
+shared, or from the look that found the state publishing another, so the
+mark was dead and is an assertion of that invariant in checked builds --
+an unkillable guard is read for the invariant that makes it dead, and
+the invariant is what gets written down. The dedupe of a key's writes
+survived four mutants of the sort that keeps them together, a key
+resolved twice reading back right in every test, and is an assertion
+too. And one mutant survived a run beside three fuzz processes and died
+alone: the test that would kill it reaches its state by holds that the
+load stretched, so a mutant's verdict is taken with nothing else on the
+machine and a survivor is run again by itself before it is read.
+
 ## Standing limitations
 
 These are the engine's, as opposed to refuted predictions. Each is a curve
@@ -7288,21 +7372,25 @@ in the suite's figures, at `full` scale where it says so:
 - Under the held log the scan pass straight after a burst pays for the
   filing the burst was not held for (`Options::held_bursts_lend`): 0.7x
   to 0.9x of the pass behind a filed burst after one percent rewritten,
-  0.3x to 0.6x after ten and 0.09x to 0.18x after a hundred, at a hundred
-  and three hundred thousand keys (`docs/engine.md`, what a burst costs
-  under the held log). The first scan waits out the upkeep thread's pass
-  in flight and settles its trail, and the walks then meet sparse forms
-  where the filed store has copies. Filing a write costs two to three
-  times the write and no part of it is most of it, so one thread cannot
-  keep beside the writer, and the pass is ten milliseconds against a debt
-  of a hundred. The levers, none built: a filing that amortises with a
-  batch's density -- the sorted batch resolved by one walk of the heads
-  and a block made once where most of it was rewritten, which is what a
-  bulk load pays a key -- so that a thread that trails catches up by
-  trailing; the first scan after a long trail taking the cheaper of the
-  settle and the merge of its sources, with the thread left to file
-  beside the scans; and the thread's fill converting what a burst left
-  sparse once the store is only read.
+  0.3x to 0.45x after ten and 0.15x to 0.35x after a hundred, at a hundred
+  and three hundred thousand keys, for bursts 1.7x to 3.4x and a weighted
+  time, the burst and twice its pass, a quarter to a third lower
+  (`pair.sh supdb-heldnoframes supdb-heldfiles SIZE --passes
+  load,read,mixes,mixes-scrambled,lag --reps 5`, at `3f4f23f`). The first
+  scan waits out the upkeep thread's pass in flight and settles its
+  trail, 64 ms of a pass of 74 at three hundred thousand keys where the
+  filed store's whole pass is ten. Filing a write is still several times
+  the write: 3,400 instructions by callgrind, and the thread spends on
+  the conversions it now makes what the lean patches save it
+  (`docs/engine.md`, what filing a write costs). What is left in the
+  filing is a flat tail -- the settle's asks ahead, half of its own
+  instructions, the conversion's read of the partition's records, the
+  snapshot's second sort of the same keys -- and none of it is the
+  factor. The lever is the scan, not built: the first scan after a long
+  trail going on without the whole of it filed, the blocks it walks
+  settled as it reaches them from the batch sorted once, and the thread
+  filing the rest beside the scans, which needs the forms' state shared
+  between the two where it is lent whole to one today.
 - The scan pass after a burst pays its first scan for the burst's end:
   the wait for the upkeep thread's pass in flight, the log read, the
   settle of what the thread trailed by and the snapshot's extension,
