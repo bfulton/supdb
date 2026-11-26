@@ -4552,10 +4552,12 @@ exists to warm. After a burst of updates every copy's entries are the
 block's records and nothing else -- an update patches an entry in place
 and inserts none -- and the copy knows it (`CachedBlock::identity`,
 set by the build over updates at known cuts, cleared by an insert for
-good, and held of the partition the build read: a table carried across
-a merge that rewrites its partition over the same blocks keeps copies
-whose entries are the old partition's records, so they are searched
-there, `CachedBlock::identity_for`), so the walk starts at the seek's
+good, and held of the partition's keys: a table carried across a merge
+that rewrites its partition over the same blocks keeps its copies, and
+a copy's entries are the rewritten partition's records only where the
+merge wrote the old one's keys and no others, so any other is searched
+there, `CachedBlock::identity_for` and the claim's own paragraph
+below), so the walk starts at the seek's
 rank less the block's first (`Options::copy_start_at_rank`;
 `supdb-copysearch` searches). On the
 probe, eighteen passes a shape over nine rotated rounds, the start at
@@ -4647,6 +4649,35 @@ p=0.006), the scan mix 1.05x (10/12, p=0.039), the thread's time 0.96x
 on the durable arm (10/12, p=0.039), and the buffered rewritten point
 1.3-1.4x by median at both sizes in nine pairs of twelve, which its
 bimodality keeps from significance. Nothing read against either.
+
+A third is the claim itself. A copy's entries are its partition's
+records by the keys the partition holds, and the claim was kept by the
+file: once a copy carried across a rewrite was stopped from claiming
+ranks that a key dropped and a key folded into its block had moved,
+every copy carried across any merge of its partition searched, for the
+copy's life. A merge knows which it was. It counts, for each output,
+the keys it writes that no partition among its inputs held; an output
+with none, at the fences of the partition it rewrote and with as many
+keys, holds that partition's keys at the ranks they had, and takes its
+key sequence (`Seg::keyseq`), which is what a copy's claim is held to
+(`Options::identity_by_keys`; `supdb-identityblob` and
+`supdb-ingestidentityblob` hold it to the file). The lag sweep's full
+rewrite folds updates alone, so every merge inside it keeps its
+partition's keys: at three million keys every patch of the burst and
+every start of the pass after it is at a rank, where a quarter to a
+third of the patches and a third of the starts searched, the upkeep
+thread's settle is a sixth to a fifth shorter on its own clock, and the
+burst is faster in both orders in core and under both bounds
+(`bench/scripts/pair.sh SUPDB_LAG_COUNTERS=1 supdb supdb-identityblob
+3000000 --reps 3 --passes load,lag`, and with `--bound 1073741824
+--reps 4 --ops-div 10` and `--bound 1342177280 --reps 4 --ops-div 10`,
+at `d317c79`; `patches`, `starts`, `keyseqs` and the pass's `steps
+settle` on the counters lines). The pass after the burst does not
+resolve, and at three hundred thousand keys, where the rewrite has one
+merge, nothing does. The mixes are out of its reach at the sizes paired:
+no merge inside them keeps a key sequence (`keyseqs_kept` in the
+pairing's counts), their update mixes sealing nothing and the pieces
+their merges fold holding inserts.
 
 Refuted, and kept as an arm: dropping a block from six keys of it in a
 batch and building it once (`forms_settle_rebuild_from`,

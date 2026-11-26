@@ -7162,6 +7162,56 @@ count, the phase is at the machine's rate for both and the lever is what
 only one of them does -- here a first scan and a commit -- never the
 shared loop.
 
+**A claim held to the file, where it was a claim about the keys; and
+the cost of the fix that held it there, which nobody counted.** A copy
+of a block whose entries are its partition's records starts a scan and
+takes a patch at a rank (`CachedBlock::identity`), and the entry on a
+rank kept across the rewrite that moved it records the fix: a copy
+carried across a merge that dropped a key and folded one into its block
+claimed ranks the merge had moved, so the claim was held to the blob the
+copy's build read. That was right, and it took the rank from every copy
+carried across any merge, for the copy's life, since a merge's output is
+a new blob whatever it holds. Nothing raised and no row moved by more
+than the hosts do. Two things already written down said it: the lag
+counters of the pass after a full rewrite at three hundred thousand
+keys, `starts 0/3000`, every start a search, and this file's own note
+that the upkeep thread's settle ran 5.9 s of a burst against 3.6 with
+twice the merges landed, "every landing leaves its partition's copies
+without their identity", read there as a reason to land fewer merges.
+The claim is about the keys. A merge that folds updates alone writes
+the keys its partition held at the ranks they had, and the merge is the
+one place that knows: it counts, for each output, the keys it writes
+that no partition among its inputs held, and an output with none, at the
+fences of the partition it rewrote and with as many keys, takes that
+partition's key sequence (`Seg::keyseq`, `Options::identity_by_keys`),
+which is what a copy's claim is held to now. Over a full rewrite at
+three million keys every patch and every start is at a rank again, the
+thread's settle a sixth to a fifth shorter, the burst faster in six
+sittings of six (`docs/engine.md` has the pairings). Three things came
+with it. The old-shape arm of the new test passed at first for nothing:
+it read the copies' claims after the merges had landed and before the
+writer had looked across them, tables the carry had not reached, and
+the count it leaned on (`forms_rebased`) is of the forms a landing's
+publish carries, not of the writer's tables; the test scans first now,
+and both shapes are told apart by the copies, the starts, the patches
+and the asks ahead, each counted. The pairings of the mixes read the
+arms apart by up to a quarter, one cell at p .031, in stores where no
+merge kept a key sequence and the two arms ran the same code: the count
+of the mechanism in the cell (`keyseqs_kept`, nothing) is what said
+those cells were the floor's. And two guards written beside the carry
+were taken out as unreachable before a mutant had to say so, the
+output's level and the input's name, the partitions tiling the keys.
+The rules: a fix for a wrong answer that narrows a fast path is
+followed, the same day, by a count of how often the fast path still
+fires in the suite's own passes, since the fix is right either way and
+only the count says what it cost; a derived structure is keyed by the
+identity of the property it depends on, and where whoever makes the next
+object can prove the property carried, it says so there, by counting,
+rather than leave every reader to assume it did not; a note that
+explains a cost by a mechanism is read again for the lever on the
+mechanism before the lever on its frequency is built; and a counter's
+name is read for what increments it before a test leans on it.
+
 ## Open targets, and the one standing limitation
 
 A cell a comparator wins is a target, never a limit to be written down
@@ -7263,7 +7313,17 @@ where it says so:
   and a scan that takes its upkeep back from a pass in its fill by a
   short spin where it parks, fifteen microseconds a hand-off. Neither is
   built. The cells from thirty to three hundred thousand keys read 0.94x
-  to 1.2x by row and are not resolved by anything priced so far.
+  to 1.2x by row and are not resolved by anything priced so far. A third
+  lever is the copy's layout: a block is three buffers, entries, keys and
+  values, three streams a walk and three more in the block after, where
+  a block whose keys are of one length with one value each of one length
+  could be one stream of fixed-size records. With no engine in it
+  (`bench/examples/blockwalk.rs`) the one stream, asked for over the
+  lines its walk reads, walks 1.4-1.7x faster at every working set, which
+  by the engine's own time an entry is a tenth to a fifth of a scan. Not
+  built; the span ask alone, which the same probe reads ahead, moved
+  nothing in the engine (`Options::copy_prefetch_span`), so the probe is
+  a ceiling and the form is priced in the engine before it is believed.
 - Scans on a store with unsealed keys spread through it pay for the path.
   A few unsealed keys in a partition take every scan of it off the bulk
   walk and through the block loop and the form file's cursor, a fifth to
