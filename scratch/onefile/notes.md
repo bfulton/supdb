@@ -66,3 +66,8 @@ bound in both, 32-37 hinted in both. One shape stands apart: direct
 synchronous commits in the data file read 0.13-0.16 ms beside any writer
 and the writer fell from 1.3 GB/s to 30-90 MB/s, the commits holding the
 file's lock across their flush.
+
+`copy.py DIR` -- a checkpoint by copy: a gibibyte copied into a new file
+(`copy_file_range`) and synced, 1.14-1.19 s with the source in the page
+cache and 1.19-1.39 s with it out. No clone on this ext4 (`cp
+--reflink=always`: Operation not supported).
