@@ -7216,9 +7216,10 @@ name is read for what increments it before a test leans on it.
 saving.** The copy of fixed-size records as one stream
 (`Options::copy_packed`) took a fifth off the block cache, 435 MB to 346
 after a full rewrite at three million keys, and under 1.25 GiB the pass
-after that rewrite then ran two to four times as long in seven sweeps of
-twelve, 40 to 370 major faults on its scans' start seeks, with the walk
-itself faster in the other five. The larger process had come to its
+after that rewrite then ran two to four times as long in four to seven
+sweeps of twelve by sitting, 40 to 370 major faults on its scans' start
+seeks, with the walk itself faster in the others. The larger process had
+come to its
 group's limit a second before the burst's end, its refaults had taken
 the controller to the census, and at the census a raw partition's heads
 are copied into the process's memory (`heads_owned`); the smaller one
@@ -7390,18 +7391,14 @@ where it says so:
   duplicates, the key read four times a write, a patch's allocations --
   and a scan that takes its upkeep back from a pass in its fill by a
   short spin where it parks, fifteen microseconds a hand-off. Neither is
-  built. The cells from thirty to three hundred thousand keys read 0.94x
-  to 1.2x by row and are not resolved by anything priced so far. A third
-  lever is the copy's layout: a block is three buffers, entries, keys and
-  values, three streams a walk and three more in the block after, where
-  a block whose keys are of one length with one value each of one length
-  could be one stream of fixed-size records. With no engine in it
-  (`bench/examples/blockwalk.rs`) the one stream, asked for over the
-  lines its walk reads, walks 1.4-1.7x faster at every working set, which
-  by the engine's own time an entry is a tenth to a fifth of a scan. Not
-  built; the span ask alone, which the same probe reads ahead, moved
-  nothing in the engine (`Options::copy_prefetch_span`), so the probe is
-  a ceiling and the form is priced in the engine before it is believed.
+  built. The third lever was the copy's layout and is the engine's now,
+  a copy of fixed-size records as one stream (`Options::copy_packed`,
+  `docs/engine.md`): the scans' own time an entry fell, the mix read
+  1.10-1.31x of the three buffers' at ten and thirty thousand keys, and
+  the row at `001781d` is the first to read the cell ahead at every
+  rung, 1.03x to 1.34x. At ten and thirty thousand keys that is a cell
+  won by a twentieth with the two costs above standing in it, so it is
+  open until they are gone.
 - Scans on a store with unsealed keys spread through it pay for the path.
   A few unsealed keys in a partition take every scan of it off the bulk
   walk and through the block loop and the form file's cursor, a fifth to
