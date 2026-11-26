@@ -132,20 +132,22 @@ The suite has to be fair before any of its numbers are quoted.
   store is under a cgroup bound, where free memory is page cache the
   store does not have (`Options::forms_to_fit`'s trim, priced in core
   before it is the default under a bound); and 1 GiB.
-- [ ] **An arm at FASTER's promise.** `faster` is in the roster with a
-  guarantee of its own, in memory until a checkpoint, and nothing to be
-  compared with there: the buffered arms hand every commit to the kernel
-  and FASTER hands it to nobody. A supdb arm whose log stays in the
-  process's memory between checkpoints would be the matched one, and is
-  an arm for that comparison and not a default. Done when the group has a
-  supdb arm in it and the figures draw it.
-- [ ] **The threaded mixes in a row, or not.** `threads-A` and `threads-RMW`
+- [x] **An arm at FASTER's promise.** `faster` is in the roster with a
+  guarantee of its own, in memory until a checkpoint, and had nothing to
+  be compared with there: the buffered arms hand every commit to the
+  kernel and FASTER hands it to nobody. `supdb-heldnoframes` is the
+  matched arm, opened under the one policy of the engine's that promises
+  what FASTER does (`SyncPolicy::Explicit`): a commit is in the process
+  until a sync. It is an arm for that comparison and not a default. It
+  sits in FASTER's group in the roster, `supdb-heldpart` in the bounded
+  one, and the figures draw the group (`bench/DESIGN.md`, Arms).
+- [x] **The threaded mixes in a row, or not.** `threads-A` and `threads-RMW`
   are the workloads FASTER is picked for, gets and puts from several
-  threads at once, and they run only where `--passes mixes-threaded` asks:
-  a store's worth of operations a thread, on one thread and each thread
-  count, for every arm, is hours more a full row. Done when a row carries
-  them for the arms and at the operation count somebody chose, or the
-  suite says why it does not.
+  threads at once. A row in core carries them for the arms of FASTER's
+  guarantee, a store's worth of operations a thread, on one thread and
+  each thread count; for every arm that is hours more a full row, so the
+  rest run them only where `--passes mixes-threaded` asks
+  (`bench/DESIGN.md`).
 - [ ] **Match the checksum work, or state it.** RocksDB reads with
   `verify_checksums(false)`, under which it verifies no data block it
   reads, from the file or into its cache. supdb verifies a segment's key
@@ -208,6 +210,97 @@ What an engine picker would hit, roughly in order.
   `5df99d6`, is unresolved by it now and sits level with LMDB's without
   sync in the rows. What the filing costs a burst of one commit is not
   decomposed.
+- [ ] **The forms shared between the writer's scans and its upkeep
+  thread.** The writer's block tables and scan snapshot are lent whole to
+  one thread at a time (`CLAUDE.md`, the writer's upkeep is lent, never
+  shared), and a scan through the writer takes them home: it waits out the
+  thread's pass in flight and files everything the thread trails by before
+  it walks its first block. Filing a write into its block's form costs
+  several times the write on whichever thread pays (`docs/engine.md`, what
+  filing a write costs), so one thread files at about half the writer's
+  rate, and a store has a burst at the writer's rate or the scan pass after
+  it at the filed store's, not both. The engine picks by policy today: a
+  buffered commit files its burst itself, a syncing one lends it under a
+  pace, and only the held log lends it outright
+  (`Options::held_bursts_lend`). There the bursts run 1.7x to 3.4x of the
+  filed store's and the scan pass straight after a full rewrite at 0.15x
+  to 0.35x of it, the first scan's wait and settle 64 ms of a pass of 74
+  at three hundred thousand keys (`bench/scripts/pair.sh
+  supdb-heldnoframes supdb-heldfiles 300000 --passes
+  load,read,mixes,mixes-scrambled,lag --reps 5` at `3f4f23f`). What is
+  left in the filing itself is a flat tail, none of it the factor. The
+  lever is the scan: going on without the whole trail filed, settling the
+  blocks it walks as it reaches them, from the batch sorted once, while
+  the thread files the rest beside it. Done when the pass after a lent
+  burst reads level with the pass behind a filed one in both orders of
+  that pairing with the bursts still at the lent rate; the buffered
+  commit's own filing and the syncing commit's pace, which both exist to
+  bound what the first scan meets, are each priced against lending beside
+  it; the shape before is an arm; and the reader-thread tests and the
+  differential fuzz hold it at every upkeep level. Open for the design:
+  what the two threads share and in what unit it changes hands, a block
+  or a partition's table, where one word hands the whole of it over today
+  and nothing in it is `Sync`; what a scan must have filed before it may
+  walk a block, the keys created since its snapshot among it; and what a
+  pass may publish to reader handles while the writer is walking.
+- [ ] **The forms stood down through a stretch of point operations.**
+  Under the held log the roster's arm trails FASTER on the point mixes
+  one thread runs, 0.6x to 0.85x on A, B and F at a hundred thousand keys
+  and 0.7x to 0.8x on A and F at three hundred thousand, timed by kind in
+  the row's order (`docs/engine.md`, the point mixes on one thread, by
+  what is taken away; `bench/scripts/pair.sh SUPDB_MIX_KINDS=1
+  supdb-heldnoframes faster 100000 --passes
+  load,read,read-threaded,scan,scan-threaded,mixes,scan-mixed,mixes-scrambled
+  --reps 12` at `02bab06`, and beside it `supdb-heldnfnocache` and
+  `supdb-heldinplace`). Two of its three causes are one constraint. Once
+  a scan has come the forms the scans run on are kept current beside
+  every commit, and the writer waits for the lines the upkeep thread
+  read: with no block cache A is within a tenth of FASTER and F has two
+  fifths of its gap back. And a put appends where FASTER overwrites,
+  because the thread reads the values an overwrite would change
+  (`Options::put_in_place` refuses the block cache): with both gone A is
+  ahead of FASTER at both rungs and F at 0.9x. The forms are what E, the
+  scan passes and the lag passes run on, so they cannot be off for a
+  store's life; they can be stood down while the workload is point
+  operations, as they are while a shared table stands
+  (`Reader::sharing`), and brought back when scans come. What that costs
+  is the first scans after, which is why it waits on the item above. Done
+  when the roster's arm reads A, B and F level with `supdb-heldinplace`
+  in the row's order, in both orders at both rungs, with E, the scan
+  passes and the lag passes no slower than the roster's arm has them now;
+  and the differential fuzz and the handle tests hold an overwrite beside
+  the stand-down and the way back. Open for the design: what says a
+  stretch is point operations, where two stores' worth of writes since a
+  scan says it today (`reads_around`), and what a handle claimed inside
+  the stretch finds.
+- [ ] **The upkeep thread's alertness beside point writes.** The thread
+  stays alert while reads are around, so that a mix's small batches are
+  filed before the scans that follow (`Options::upkeep_alert`). Under the
+  held log, backed off, A read 1.17x to 1.24x in three sittings of four,
+  the scrambled A 1.11x to 1.20x in all four and E, which the alert is
+  for, 0.95x to 1.24x, unresolved; F did not move
+  (`bench/scripts/pair.sh supdb-heldnoalert supdb-heldnoframes 100000
+  --passes
+  load,read,read-threaded,scan,scan-threaded,mixes,scan-mixed,mixes-scrambled
+  --reps 30`, and `300000 --reps 12`, at `02bab06`). It is the part of the
+  item above that needs nothing built. Done when E's price is read by
+  count, its walks, its builds and its first scans, at ten, a hundred and
+  three hundred thousand keys, and the alert is kept with that price
+  stated or keyed on what E needs; and when what the block cache costs
+  F's writes beside the alert, 229 ns against 158 without the cache, is
+  laid to a cause.
+- [ ] **The one writer's get, as short as the shared table's.** With the
+  two above gone a get is what is left: on the clean store C reads it
+  costs 164 ns against FASTER's 142 at a hundred thousand keys, in every
+  arm, and at three hundred thousand, where C is level, F's gets are 250
+  ns against 227 and F stays at 0.9x (`docs/engine.md`, the same
+  section). The one writer's get is longer than FASTER's by its
+  instructions, counted class by class (`docs/engine.md`, what the scans
+  leave the writes), and the shared table's lean path, one record address
+  a get, came within a sixth of FASTER's count (`CLAUDE.md`, equal
+  instructions at two thirds the speed). Done when C at a hundred
+  thousand keys reads level with FASTER in both orders of the row's
+  order, and F's gets do, timed by kind, in `supdb-heldinplace`.
 - [x] **Order ordered ingest's runs across a machine's crash.** Under a
   policy that does not sync at every commit (`SyncPolicy::EveryN`), a
   machine's crash could keep a later run, or frames in the log, and take
