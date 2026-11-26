@@ -9068,21 +9068,48 @@ fn the_crossing_asks_for_the_raw_pages_of_a_cold_partition_with_no_form_file() {
             });
         if ahead {
             // Two partitions built ahead under the line, their files on
-            // disk, and the third's build held at its start.
+            // disk, and the third's build held at its start. The builds
+            // are let through one at a time, each from its start to its
+            // rename with the next one's start held behind it: the hold
+            // set once two had been counted built was set behind builds
+            // that follow one another in milliseconds, and where the
+            // test's thread was a few of them late every partition had
+            // its file and no build was left to hold -- once on a hosted
+            // ARM runner, and every run with the thread kept 300 ms
+            // before the hold, seven built of seven.
+            db.hold_zpage_build(true);
+            db.hold_zpage_rename(true);
             inject.set_budget(raw * 3 / 2);
-            assert!(
-                tick_until_built(&db, |c| c.prebuilt >= 2),
-                "{what}: built ahead: {:?}",
-                db.zpage_counts()
-            );
-        }
-        db.hold_zpage_build(true);
-        if ahead {
-            let t = std::time::Instant::now();
-            while !db.zpage_build_waiting() && t.elapsed() < JOB_WALL {
-                wait_steps(&db, 1);
+            let held_at = |what: &str, at: &str| {
+                let t = std::time::Instant::now();
+                while !db.zpage_build_held() && t.elapsed() < JOB_WALL {
+                    wait_steps(&db, 1);
+                }
+                assert!(db.zpage_build_held(), "{what}: a build held at its {at}");
+            };
+            for built in 1..=2u64 {
+                held_at(what, "start");
+                db.hold_zpage_build(false);
+                held_at(what, "rename");
+                db.hold_zpage_build(true);
+                db.hold_zpage_rename(false);
+                assert!(
+                    tick_until_built(&db, |c| c.prebuilt >= built),
+                    "{what}: built ahead: {:?}",
+                    db.zpage_counts()
+                );
+                db.hold_zpage_rename(true);
             }
-            assert!(db.zpage_build_waiting(), "{what}: a build held");
+            db.hold_zpage_rename(false);
+            held_at(what, "start");
+            let c = db.zpage_counts();
+            assert_eq!(
+                (c.prebuilt, c.build_starts),
+                (2, 3),
+                "{what}: two built ahead and the third held: {c:?}"
+            );
+        } else {
+            db.hold_zpage_build(true);
         }
         let on_disk = named_form_files(&dir).len() as u64;
         let pars: Vec<PathBuf> = std::fs::read_dir(&dir)

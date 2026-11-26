@@ -2500,7 +2500,19 @@ twenty thousand where the scan before the burst has not found the
 thread's report of them and nothing where it has; under the gate's load
 it was nothing, the range empty, and a burst that had lent three
 hundred and then nine hundred, as it should, failed. It holds the
-counts themselves now. The
+counts themselves now. And as a hold set behind the builds it was for:
+the test of the crossing's ask for raw pages wants two partitions built
+ahead and the third's build held at its start, and set the hold once it
+had counted two built. The builds ahead follow one another in
+milliseconds, each started at the turn the one before wakes
+(`Options::zpages_drive_at_job_end`), so a test thread a few of them
+late found every partition built and waited out its five minutes for a
+build to hold: once on a hosted ARM runner, in the pull request after
+the one that had passed there, and every run with the thread kept 300 ms
+before the hold, seven built of seven by the counts printed at the
+assertion. Both holds are set before the builds are due now, and each
+build is let from its start to its rename with the next one's start held
+behind it, which passes with 300 ms slept at every step. The
 rule: a test that
 needs a state holds it, and a bet on timing loses the first time the
 thing it bets against gets faster; a state the test needs only to have
