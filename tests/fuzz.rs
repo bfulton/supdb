@@ -438,6 +438,14 @@ struct Cfg {
     /// claim by the partition's keys is held to the model beside a claim
     /// by its file.
     identity_keys: bool,
+    /// A copy of fixed-size records held as one stream
+    /// (`Options::copy_packed`): on in half the seeds under
+    /// `ZFUZZ_OPTVARY`, the side generator's draw after the claim's, and
+    /// off otherwise, as the engine has it. The stride steer's keys and
+    /// values are of one length each for most of a seed's writes, so
+    /// `ZFUZZ_STRIDE` with the cache on is where the copies pack, and its
+    /// deletes, runs and odd widths are what unpack them.
+    copy_packed: bool,
     /// Under `ZFUZZ_STRIDE`, the stride form's steer; `None` without it.
     stride: Option<StrideSteer>,
 }
@@ -744,6 +752,7 @@ fn pick_cfg(rng: &mut Rng, want_cache: bool) -> Cfg {
     let lone_chain_off = side.chance(25);
     let copy_span = side.chance(25);
     let identity_blob = side.chance(25);
+    let copy_packed = side.chance(50);
     // A generator of its own, as `side` is, so that the switch moves none
     // of the draws below.
     let stride =
@@ -823,6 +832,7 @@ fn pick_cfg(rng: &mut Rng, want_cache: bool) -> Cfg {
         settle_lone: !(vary && lone_chain_off),
         copy_span: vary && copy_span,
         identity_keys: !(vary && identity_blob),
+        copy_packed: vary && copy_packed,
         stride,
     }
 }
@@ -852,6 +862,7 @@ fn opts(c: &Cfg) -> Options {
         settle_lone_chain: c.settle_lone,
         copy_prefetch_span: c.copy_span,
         identity_by_keys: c.identity_keys,
+        copy_packed: c.copy_packed,
         zpages_scan_admit: c.scan_admit,
         zpages_walk_part: c.walk_part,
         zpages_cursor_steps: c.cursor_steps,
@@ -1881,8 +1892,10 @@ struct Stats {
     /// the key sequence of the partition they rewrote, and the patches and
     /// the scans' starts a copy took at a rank
     /// (`Options::identity_by_keys`), what says a run with the cache on
-    /// carried a copy's claim across a merge and used it.
-    point: [u64; 15],
+    /// carried a copy's claim across a merge and used it; then the copies
+    /// packed into one stream of fixed-size records at their build and
+    /// the packed copies a patch unpacked (`Options::copy_packed`).
+    point: [u64; 17],
     /// The puts the `z` store overwrote where the value lay
     /// (`Options::put_in_place`), summed over its opens as `kept` is: what
     /// says a run under `ZFUZZ_OPTVARY` reached the overwrite.
@@ -2026,6 +2039,11 @@ fn count_point(st: &mut Stats, db: &Db) {
     st.point[12] += db.seal_waits().keyseqs_kept;
     st.point[13] += db.copy_patches()[0];
     st.point[14] += db.copy_starts()[0];
+    // The copies packed into one stream at their build and the packed
+    // copies a patch unpacked (`Options::copy_packed`).
+    let packs = db.copy_packs();
+    st.point[15] += packs[0];
+    st.point[16] += packs[1];
 }
 
 /// Under `ZFUZZ_CENSUS`, the store read as out of core: the census gate,
@@ -2204,7 +2222,7 @@ fn run_seed_inner(seed: u64, want_cache: bool, verbose: bool) -> Result<Stats, S
         heads: [0; 2],
         held: [0; 2],
         reads: [0; 3],
-        point: [0; 15],
+        point: [0; 17],
         stride: StrideStats::default(),
     };
     let mut fails: Vec<String> = Vec::new();
@@ -2659,7 +2677,7 @@ fn fuzz_range() {
         (Vec::new(), 0u64, 0u64, 0u64, 0u64, 0u64);
     let mut recuts = 0u64;
     let mut kept = 0u64;
-    let mut point = [0u64; 15];
+    let mut point = [0u64; 17];
     let mut heads = [0u64; 2];
     let mut held = [0u64; 2];
     let mut reads = [0u64; 3];
@@ -2717,7 +2735,7 @@ fn fuzz_range() {
         }
     }
     eprintln!(
-        "seeds {from}..{to}: reopens {reopens}, abandons {abandons}, bindings {bindings}, merges beside {beside}, forms-off switches {switches}, sparse forms recut {recuts}, heads owned {} given back {}, point parts {} admits {} key hits {} walk owned {} walk parts {} hot starts {} copy starts {} stale exits {} cursor steps {} bounds by head {} landings left {} quiet merges {} key sequences kept {} rank patches {} rank starts {}, snapshots kept {kept}, log frames dropped {} spilled {}, held logs with no frames {frameless}, reads with no record asked {unasked}, live table asked first {live_first}, memtables hashed by FNV {mem_fnv}, overwriting puts {} overwrites {}, point reads two-source {} layered {} placed {}, FAILURES {}",
+        "seeds {from}..{to}: reopens {reopens}, abandons {abandons}, bindings {bindings}, merges beside {beside}, forms-off switches {switches}, sparse forms recut {recuts}, heads owned {} given back {}, point parts {} admits {} key hits {} walk owned {} walk parts {} hot starts {} copy starts {} stale exits {} cursor steps {} bounds by head {} landings left {} quiet merges {} key sequences kept {} rank patches {} rank starts {} copies packed {} unpacked {}, snapshots kept {kept}, log frames dropped {} spilled {}, held logs with no frames {frameless}, reads with no record asked {unasked}, live table asked first {live_first}, memtables hashed by FNV {mem_fnv}, overwriting puts {} overwrites {}, point reads two-source {} layered {} placed {}, FAILURES {}",
         heads[0],
         heads[1],
         point[0],
@@ -2735,6 +2753,8 @@ fn fuzz_range() {
         point[12],
         point[13],
         point[14],
+        point[15],
+        point[16],
         held[0],
         held[1],
         in_place[0],

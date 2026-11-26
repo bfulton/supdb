@@ -1454,6 +1454,10 @@ pub struct Supdb {
     /// and lost at every merge of its partition (`Options::identity_by_keys`
     /// off): `supdb-identityblob` and `supdb-ingestidentityblob`.
     identityblob: bool,
+    /// A copy of fixed-size records held as one stream
+    /// (`Options::copy_packed`): `supdb-copypacked` and
+    /// `supdb-ingestcopypacked`.
+    copypacked: bool,
     /// A settle's patch searches a copy for a key above its last entry
     /// (`Options::settle_append_last` off): `supdb-settlesearch` and
     /// `supdb-ingestsettlesearch`.
@@ -2926,6 +2930,8 @@ struct Policy {
     copyspan: bool,
     /// A copy's identity by its file: `...identityblob`.
     identityblob: bool,
+    /// A copy of fixed-size records as one stream: `...copypacked`.
+    copypacked: bool,
     /// The patch's search for an appended key: `...settlesearch`.
     settlesearch: bool,
     /// The patch's walk of the sources for a lone key: `...settlesources`.
@@ -3568,6 +3574,7 @@ impl Default for Policy {
             runsheld: false,
             copyspan: false,
             identityblob: false,
+            copypacked: false,
             settlesearch: false,
             settlesources: false,
             scanlevers: false,
@@ -10513,6 +10520,7 @@ impl Supdb {
             runsheld,
             copyspan,
             identityblob,
+            copypacked,
             settlesearch,
             settlesources,
             scanlevers,
@@ -11167,6 +11175,7 @@ impl Supdb {
             scan_runs_held: runsheld || scanlevers,
             copy_prefetch_span: copyspan,
             identity_by_keys: !identityblob,
+            copy_packed: copypacked,
             settle_append_last: !settlesearch,
             settle_lone_chain: !settlesources,
             forms_convert_from: if densefrom > 0 {
@@ -11576,6 +11585,7 @@ impl Supdb {
             runsheld,
             copyspan,
             identityblob,
+            copypacked,
             settlesearch,
             settlesources,
             scanlevers,
@@ -12735,6 +12745,13 @@ impl Engine for Supdb {
                 "supdb-ingestcopyspan"
             };
         }
+        if self.copypacked {
+            return if self.partition {
+                "supdb-copypacked"
+            } else {
+                "supdb-ingestcopypacked"
+            };
+        }
         if self.identityblob {
             return if self.partition {
                 "supdb-identityblob"
@@ -13806,6 +13823,8 @@ impl Engine for Supdb {
             ("start_search", cs[1] as f64),
             ("patch_at_rank", db.copy_patches()[0] as f64),
             ("patch_search", db.copy_patches()[1] as f64),
+            ("copies_packed", db.copy_packs()[0] as f64),
+            ("copies_unpacked", db.copy_packs()[1] as f64),
             // The writer's scans whose start seek seeded the partition's
             // reader with its cursor (`Options::zpages_seek_seeds`).
             ("seek_seeds", ss as f64),
@@ -15714,6 +15733,8 @@ pub fn guarantee(arm: &str) -> Option<Guarantee> {
         | "supdb-ingestcopyspan"
         | "supdb-identityblob"
         | "supdb-ingestidentityblob"
+        | "supdb-copypacked"
+        | "supdb-ingestcopypacked"
         | "supdb-settlesearch"
         | "supdb-ingestsettlesearch"
         | "supdb-settlesources"
@@ -17042,6 +17063,32 @@ pub fn open(arm: &str, dir: &Path, map_gb: usize) -> Res<Box<dyn Engine>> {
                         partition: false,
                         durable: false,
                         copyspan: true,
+                        ..Policy::default()
+                    },
+                )
+            },
+            dir,
+        )?,
+        "supdb-copypacked" => supdb_arm(
+            |d| {
+                Supdb::with_policy(
+                    d,
+                    Policy {
+                        copypacked: true,
+                        ..Policy::default()
+                    },
+                )
+            },
+            dir,
+        )?,
+        "supdb-ingestcopypacked" => supdb_arm(
+            |d| {
+                Supdb::with_policy(
+                    d,
+                    Policy {
+                        partition: false,
+                        durable: false,
+                        copypacked: true,
                         ..Policy::default()
                     },
                 )
@@ -20534,6 +20581,20 @@ mod tests {
                 assert_eq!(z.features(), base.features());
                 let o = z.db.as_ref().unwrap().options();
                 assert!(o.copy_prefetch_span && !b.copy_prefetch_span);
+            }
+            {
+                let z = Supdb::with_policy(
+                    &dir("copypacked"),
+                    Policy {
+                        copypacked: true,
+                        ..Policy::default()
+                    },
+                )
+                .unwrap();
+                assert_eq!(z.name(), "supdb-copypacked");
+                assert_eq!(z.features(), base.features());
+                let o = z.db.as_ref().unwrap().options();
+                assert!(o.copy_packed && !b.copy_packed);
             }
             {
                 let z = Supdb::with_policy(

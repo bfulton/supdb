@@ -1873,6 +1873,21 @@ pub struct Options {
     /// `supdb-ingestidentityblob` are the arms.
     #[doc(hidden)]
     pub identity_by_keys: bool,
+    /// A copy of a block whose keys are of one length, each with one value
+    /// of one length, is held as one stream of fixed-size records, key then
+    /// value (`CachedBlock::fixed`), where it is three buffers: sixteen
+    /// bytes of entry a record, the keys, and the values each behind a
+    /// length word. A walk of the three reads three streams in each block
+    /// it crosses and 136 bytes an entry of the suite's shape; of the one,
+    /// one stream and 116, with no entry to decode and no length to read.
+    /// A patch that writes a value of the block's length over its key's
+    /// writes it in place; any other -- an insert, a delete, a second
+    /// value, another length -- makes the block the three buffers again
+    /// first (`CachedBlock::unpack`), and it stays so until it is built
+    /// again. Off is the three buffers for every copy;
+    /// `supdb-copypacked` and `supdb-ingestcopypacked` are the arms.
+    #[doc(hidden)]
+    pub copy_packed: bool,
     /// A settle's patch takes a key's run from the key's own chain where
     /// no older source can hold the key (`Reader::patch_block`): the write
     /// is the live table's, the partition has no record of the key at its
@@ -7607,6 +7622,7 @@ impl Default for Options {
             settle_lazy_raw: false,
             settle_append_last: true,
             identity_by_keys: true,
+            copy_packed: false,
             settle_lone_chain: true,
             settle_covered_samples: true,
             zpages_trusted_views: true,
@@ -20184,9 +20200,243 @@ struct CachedBlock {
     /// where it summed every entry's run at every patch -- a copy kept past
     /// the wide bound holds thousands, and each insert into it paid the sum.
     dead: usize,
+    /// The copy as one stream of fixed-size records
+    /// (`Options::copy_packed`): the key's length and the value's, with
+    /// `vals` every entry's key and then its value, in the entries' order
+    /// and nothing between them, and `ents` and `keys` empty. Whatever
+    /// reads the three buffers reads the entries through `len`, `key_i`
+    /// and `values_i`, which answer for either shape, or has the block
+    /// unpacked first.
+    fixed: Option<(u32, u32)>,
+}
+
+/// A copy as its build fills it: every key once, then its values
+/// (`begin`, `push`, `end`), into one stream of fixed-size records for as
+/// long as every entry is one key of the first's length with one value of
+/// the first's length (`Options::copy_packed`), and into the three buffers
+/// from the first entry that is not -- the entries before it moved there,
+/// in their order. A block of the suite's shape never leaves the stream,
+/// and its build writes each record once where it wrote the three buffers
+/// and then the stream from them.
+struct CopyBuild {
+    blk: CachedBlock,
+    /// Still one stream: `blk.vals` holds the records, and `blk.keys` and
+    /// `blk.ents` nothing.
+    packing: bool,
+    klen: u32,
+    vlen: u32,
+    /// Entries begun, and the values the last of them holds so far.
+    n: u32,
+    open: u32,
+    /// What the three buffers' keys and entries are sized for where the
+    /// build falls back to them.
+    caps: (usize, usize),
+}
+
+impl CopyBuild {
+    /// A build of a copy of the key sequence `identity_of`, its buffers
+    /// sized `caps` -- keys, values, entries -- and packed where `packed`.
+    fn new(identity_of: u64, caps: (usize, usize, usize), packed: bool) -> CopyBuild {
+        let (keys, vals, ents) = caps;
+        CopyBuild {
+            blk: CachedBlock {
+                keys: if packed {
+                    Vec::new()
+                } else {
+                    Vec::with_capacity(keys)
+                },
+                vals: Vec::with_capacity(vals),
+                ents: if packed {
+                    Vec::new()
+                } else {
+                    Vec::with_capacity(ents)
+                },
+                identity: false,
+                identity_of,
+                wide: false,
+                dead: 0,
+                fixed: None,
+            },
+            packing: packed,
+            klen: 0,
+            vlen: 0,
+            n: 0,
+            open: 0,
+            caps: (keys, ents),
+        }
+    }
+    fn begin(&mut self, key: &[u8]) {
+        if self.packing {
+            // The first key sets the length; a later one follows an entry
+            // of one value and is of that length.
+            if self.n == 0 || (self.open == 1 && key.len() as u32 == self.klen) {
+                if self.n == 0 {
+                    self.klen = key.len() as u32;
+                }
+                self.blk.vals.extend_from_slice(key);
+                self.n += 1;
+                self.open = 0;
+                return;
+            }
+            self.unpack();
+        }
+        self.blk.begin(key);
+    }
+    fn push(&mut self, v: &[u8]) {
+        if self.packing {
+            // The first entry's value sets the length; a later entry's one
+            // value is of that length, and a second value is no record.
+            let first = self.n == 1;
+            if self.n > 0 && self.open == 0 && (first || v.len() as u32 == self.vlen) {
+                if first {
+                    self.vlen = v.len() as u32;
+                }
+                self.blk.vals.extend_from_slice(v);
+                self.open = 1;
+                return;
+            }
+            self.unpack();
+        }
+        self.blk.push(v);
+    }
+    fn end(&mut self) {
+        if !self.packing {
+            self.blk.end();
+        }
+    }
+    /// The entries so far moved into the three buffers, the last left as
+    /// open as it is: its key and no value yet, or its one value with the
+    /// next still to come.
+    fn unpack(&mut self) {
+        self.packing = false;
+        let recs = std::mem::take(&mut self.blk.vals);
+        let (k, v, n) = (self.klen as usize, self.vlen as usize, self.n as usize);
+        let whole = if self.open == 1 {
+            n
+        } else {
+            n.saturating_sub(1)
+        };
+        self.blk.keys.reserve(self.caps.0.max(n * k));
+        self.blk.ents.reserve(self.caps.1.max(n));
+        self.blk.vals.reserve(recs.capacity() + 4 * n);
+        let mut at = 0;
+        for _ in 0..whole {
+            self.blk.begin(&recs[at..at + k]);
+            self.blk.push(&recs[at + k..at + k + v]);
+            self.blk.end();
+            at += k + v;
+        }
+        if whole < n {
+            self.blk.begin(&recs[at..]);
+        }
+    }
+    /// The copy: one stream where every entry was a record of the first's
+    /// shape and a record has a byte to it, the three buffers otherwise.
+    fn finish(mut self) -> CachedBlock {
+        if self.packing {
+            // The last entry holds its one value -- and so there is an
+            // entry -- and a record has a byte to it.
+            if self.open == 1 && self.klen + self.vlen > 0 {
+                self.blk.fixed = Some((self.klen, self.vlen));
+            } else {
+                self.unpack();
+            }
+        }
+        self.blk
+    }
 }
 
 impl CachedBlock {
+    /// The entries the copy holds.
+    #[inline]
+    fn len(&self) -> usize {
+        match self.fixed {
+            Some((k, v)) => self.vals.len() / (k + v) as usize,
+            None => self.ents.len(),
+        }
+    }
+    /// Entry `i`'s key.
+    #[inline]
+    fn key_i(&self, i: usize) -> &[u8] {
+        match self.fixed {
+            Some((k, v)) => {
+                let at = i * (k + v) as usize;
+                &self.vals[at..at + k as usize]
+            }
+            None => self.key(&self.ents[i]),
+        }
+    }
+    /// Entry `i`'s values, in order.
+    #[inline]
+    fn values_i(&self, i: usize, mut f: impl FnMut(&[u8])) {
+        match self.fixed {
+            Some((k, v)) => {
+                let at = i * (k + v) as usize + k as usize;
+                f(&self.vals[at..at + v as usize])
+            }
+            None => self.each_value(&self.ents[i], f),
+        }
+    }
+    /// The one stream made the three buffers again, for a write the
+    /// stream cannot take in place.
+    fn unpack(&mut self) {
+        let Some((k, v)) = self.fixed.take() else {
+            return;
+        };
+        let (k, v) = (k as usize, v as usize);
+        let n = self.vals.len() / (k + v);
+        let mut keys = Vec::with_capacity(n * k);
+        let mut vals = Vec::with_capacity(n * (4 + v));
+        let mut ents = Vec::with_capacity(n);
+        for r in self.vals.chunks_exact(k + v) {
+            ents.push([
+                keys.len() as u32,
+                k as u32,
+                vals.len() as u32,
+                (4 + v) as u32,
+            ]);
+            keys.extend_from_slice(&r[..k]);
+            vals.extend_from_slice(&(v as u32).to_le_bytes());
+            vals.extend_from_slice(&r[k..]);
+        }
+        self.keys = keys;
+        self.vals = vals;
+        self.ents = ents;
+        self.dead = 0;
+    }
+    /// This copy as the three buffers, whichever shape it is held in: what
+    /// the checks that compare two copies entry for entry read.
+    #[cfg(debug_assertions)]
+    fn unpacked(&self) -> std::borrow::Cow<'_, CachedBlock> {
+        if self.fixed.is_none() {
+            return std::borrow::Cow::Borrowed(self);
+        }
+        let mut c = self.clone();
+        c.unpack();
+        std::borrow::Cow::Owned(c)
+    }
+    /// Entry `j`'s line, ahead of a patch that finds it by its rank.
+    fn prefetch_entry(&self, j: usize) {
+        match self.fixed {
+            Some((k, v)) => prefetch_lines(self.vals[j * (k + v) as usize..].as_ptr(), 16),
+            None => prefetch_lines(self.ents[j..].as_ptr() as *const u8, 16),
+        }
+    }
+    /// The run entry `j` names, ahead of the patch that writes it.
+    fn prefetch_run(&self, j: usize) {
+        match self.fixed {
+            Some((k, v)) => {
+                let at = j * (k + v) as usize + k as usize;
+                prefetch_lines(self.vals[at..].as_ptr(), v as usize);
+            }
+            None => {
+                let e = self.ents[j];
+                let from = (e[2] as usize).min(self.vals.len());
+                let len = (e[3] as usize + 63).min(self.vals.len() - from);
+                prefetch_lines(self.vals[from..].as_ptr(), len);
+            }
+        }
+    }
     /// Whether entry `i` is record `lo + i` of a partition of the key
     /// sequence `keyseq`: the identity holds, and of those keys.
     #[inline]
@@ -20228,10 +20478,11 @@ impl CachedBlock {
     /// in the checked profile (`Options::convert_from_form`).
     #[cfg(debug_assertions)]
     fn agrees(&self, other: &CachedBlock) -> bool {
-        self.keys == other.keys
-            && self.vals == other.vals
-            && self.ents == other.ents
-            && (self.identity || !other.identity)
+        let (this, other) = (self.unpacked(), other.unpacked());
+        this.keys == other.keys
+            && this.vals == other.vals
+            && this.ents == other.ents
+            && (this.identity || !other.identity)
     }
     /// Whether a walk of this copy emits what a walk of `other` emits:
     /// the keys that hold a value, each with its run, an entry of no
@@ -20245,12 +20496,16 @@ impl CachedBlock {
                 .filter(|e| e[3] != 0)
                 .map(|e| (c.key(e), &c.vals[e[2] as usize..(e[2] + e[3]) as usize]))
         }
-        live(self).eq(live(other))
+        let (this, other) = (self.unpacked(), other.unpacked());
+        live(&this).eq(live(&other))
     }
     /// Where this copy and `other` first part: the entry, its keys and
     /// its values' lengths on each side, for the check above to name.
     #[cfg(debug_assertions)]
     fn disagreement(&self, other: &CachedBlock) -> String {
+        if self.fixed.is_some() || other.fixed.is_some() {
+            return self.unpacked().disagreement(&other.unpacked());
+        }
         let n = self.ents.len().min(other.ents.len());
         for i in 0..n {
             let (a, b) = (&self.ents[i], &other.ents[i]);
@@ -20283,8 +20538,8 @@ impl CachedBlock {
     }
     /// First entry whose key is not below `from`.
     fn lower_bound(&self, from: &[u8]) -> usize {
-        select_lower_bound(self.ents.len(), |i| {
-            key_cmp(self.key(&self.ents[i]), from) == Ordering::Less
+        select_lower_bound(self.len(), |i| {
+            key_cmp(self.key_i(i), from) == Ordering::Less
         })
     }
     /// PROTOTYPE: pull the entries and the keys toward the core, and the
@@ -20302,6 +20557,18 @@ impl CachedBlock {
             self.prefetch_from(0);
             return;
         }
+        // One stream: as many lines of it as the three buffers' asks came
+        // to, from its first, and the whole of it where the values' whole
+        // is asked for.
+        if self.fixed.is_some() {
+            let n = if whole {
+                self.vals.len()
+            } else {
+                self.vals.len().min(48 * 64)
+            };
+            prefetch_lines(self.vals.as_ptr(), n);
+            return;
+        }
         prefetch_lines(self.ents.as_ptr() as *const u8, self.ents.len() * 16);
         prefetch_lines(self.keys.as_ptr(), self.keys.len());
         // The whole of the values (`Options::copy_prefetch_whole`), or
@@ -20317,6 +20584,11 @@ impl CachedBlock {
     /// that starts there and streams on (`Options::copy_prefetch_from_start`):
     /// two lines of entries, two of keys and four of values.
     fn prefetch_from(&self, i: usize) {
+        if let Some((k, v)) = self.fixed {
+            let at = (i * (k + v) as usize).min(self.vals.len());
+            prefetch_lines(self.vals[at..].as_ptr(), (self.vals.len() - at).min(512));
+            return;
+        }
         let Some(e) = self.ents.get(i) else {
             return;
         };
@@ -20339,7 +20611,7 @@ impl CachedBlock {
     /// is a load the asks would wait for. Each buffer is asked for from
     /// the line its first byte is on.
     fn prefetch_span(&self, i: usize, n: usize) {
-        let len = self.ents.len();
+        let len = self.len();
         if i >= len || n == 0 {
             return;
         }
@@ -20348,6 +20620,16 @@ impl CachedBlock {
             let lead = ptr as usize & 63;
             prefetch_lines(ptr.wrapping_sub(lead), bytes + lead);
         };
+        // One stream: the head of the records the walk reads, the rest
+        // the hardware's once the stream is running.
+        if let Some((k, v)) = self.fixed {
+            let stride = (k + v) as usize;
+            lines(
+                self.vals[i * stride..].as_ptr(),
+                (m * stride).min(PACKED_ASK),
+            );
+            return;
+        }
         lines(self.ents[i..].as_ptr() as *const u8, m * 16);
         let part = |total: usize, at: usize| (total as u64 * at as u64 / len as u64) as usize;
         let (k0, k1) = (part(self.keys.len(), i), part(self.keys.len(), i + m));
@@ -20483,7 +20765,7 @@ fn copy_entry_at(table: &BlockTable, b: u32, cut: u32) -> Option<(&CachedBlock, 
         return None;
     };
     let j = ((cut >> 1) as usize).checked_sub(b as usize * CACHE_BLOCK)?;
-    (blk.identity_for(table.keyseq) && j < blk.ents.len()).then_some((blk, j))
+    (blk.identity_for(table.keyseq) && j < blk.len()).then_some((blk, j))
 }
 
 /// The lines a walk of `form` over the partition's ranks `from` to `n`
@@ -20502,6 +20784,11 @@ struct Pace {
     at: usize,
 }
 
+/// What a walk asks for of a packed copy from the entry it starts at
+/// (`CachedBlock::prefetch_span`): a kilobyte and a half, a dozen records
+/// of the suite's shape, behind which the stream runs on its own.
+const PACKED_ASK: usize = 1536;
+
 /// Four lines of each buffer a step.
 const PACE_BYTES: usize = 256;
 /// Entries of the walk between steps: a block's sixty-four entries take
@@ -20510,6 +20797,16 @@ const PACE_STEP: usize = 16;
 
 impl Pace {
     fn of(blk: &CachedBlock) -> Pace {
+        if blk.fixed.is_some() {
+            return Pace {
+                spans: [
+                    (blk.vals.as_ptr(), blk.vals.len().min(48 * 64)),
+                    (std::ptr::null(), 0),
+                    (std::ptr::null(), 0),
+                ],
+                at: 0,
+            };
+        }
         Pace {
             spans: [
                 (blk.ents.as_ptr() as *const u8, blk.ents.len() * 16),
@@ -20554,6 +20851,7 @@ fn prefetch_block(
     whole: bool,
     sparse_span: bool,
     copy_span: Option<bool>,
+    packed_at: Option<(usize, bool)>,
 ) {
     // The partition's records are asked for only where the walk will read
     // them raw: under the form file the walk's pages are the form's, which
@@ -20575,6 +20873,14 @@ fn prefetch_block(
         // its entry without a search: by rank in an identity copy, or at
         // the block's first where it walks in from the block before
         // (`copy_span` says which).
+        // A packed copy by the span from the entry its walk starts at
+        // (`packed_at`, and whether the walk takes that entry only where
+        // the copy's entries are its block's records): one stream, so the
+        // lines the walk reads first are the whole of the ask.
+        Cached::Block(blk) if blk.fixed.is_some() => match packed_at {
+            Some((i, by_rank)) if blk.identity || !by_rank => blk.prefetch_span(i, n),
+            _ => blk.prefetch(whole),
+        },
         Cached::Block(blk) => match (at, copy_span) {
             (Some(i), Some(enters)) if (blk.identity || enters) && !blk.wide => {
                 blk.prefetch_span(i, n)
@@ -23824,6 +24130,9 @@ struct FormsState {
     /// The settle's patches of a copy by how each found its entry: at the
     /// key's rank, and by a search of the copy (`Db::copy_patches`).
     copy_patches: Counts<2>,
+    /// Copies packed at their build (`Options::copy_packed`), and packed
+    /// copies a patch made the three buffers again.
+    copy_packs: Counts<2>,
     /// Scans whose start seek seeded the partition's reader with its cursor
     /// (`Options::zpages_seek_seeds`).
     seek_seeds: std::cell::Cell<u64>,
@@ -24030,6 +24339,7 @@ impl FormsState {
             dir_prefetches: std::cell::Cell::new(0),
             copy_starts: Counts::new(),
             copy_patches: Counts::new(),
+            copy_packs: Counts::new(),
             seek_seeds: std::cell::Cell::new(0),
             hot_starts: Counts::new(),
             prefetch_paces: std::cell::Cell::new(0),
@@ -34310,17 +34620,14 @@ impl Reader {
                 if let Some(&(at2, b2, cut2, ..)) = resolved.get(i + 3) {
                     if at2 == at as u32 {
                         if let Some((blk, j)) = copy_entry_at(table, b2, cut2) {
-                            prefetch_lines(blk.ents[j..].as_ptr() as *const u8, 16);
+                            blk.prefetch_entry(j);
                         }
                     }
                 }
                 if let Some(&(at1, b1, cut1, ..)) = resolved.get(i + 1) {
                     if at1 == at as u32 {
                         if let Some((blk, j)) = copy_entry_at(table, b1, cut1) {
-                            let e = blk.ents[j];
-                            let from = (e[2] as usize).min(blk.vals.len());
-                            let len = (e[3] as usize + 63).min(blk.vals.len() - from);
-                            prefetch_lines(blk.vals[from..].as_ptr(), len);
+                            blk.prefetch_run(j);
                             asked += 1;
                         }
                     }
@@ -34684,11 +34991,11 @@ impl Reader {
                     && blk.identity_for(table.keyseq)
                     && same
                     && c >= lo
-                    && c - lo < blk.ents.len();
+                    && c - lo < blk.len();
                 self.fs().copy_patches.add(usize::from(!at_rank), 1);
                 let (i, found) = if at_rank {
                     debug_assert!(
-                        key_cmp(blk.key(&blk.ents[c - lo]), key) == Ordering::Equal,
+                        key_cmp(blk.key_i(c - lo), key) == Ordering::Equal,
                         "a copy's identity entry disagrees with its search"
                     );
                     (c - lo, true)
@@ -34696,27 +35003,44 @@ impl Reader {
                     // A key above the copy's last entry goes after it:
                     // one compare, where the search made ten to say so
                     // (`Options::settle_append_last`).
+                    let n = blk.len();
                     let past = self.opts.settle_append_last
-                        && blk
-                            .ents
-                            .last()
-                            .is_some_and(|e| key_cmp(blk.key(e), key) == Ordering::Less);
+                        && n > 0
+                        && key_cmp(blk.key_i(n - 1), key) == Ordering::Less;
                     if past {
                         debug_assert_eq!(
                             blk.lower_bound(key),
-                            blk.ents.len(),
+                            n,
                             "a key above a copy's last entry is searched to another place"
                         );
                         self.fs().settle_short.add(1, 1);
-                        (blk.ents.len(), false)
+                        (n, false)
                     } else {
                         let i = blk.lower_bound(key);
-                        (
-                            i,
-                            i < blk.ents.len()
-                                && key_cmp(blk.key(&blk.ents[i]), key) == Ordering::Equal,
-                        )
+                        (i, i < n && key_cmp(blk.key_i(i), key) == Ordering::Equal)
                     }
+                };
+                // A packed copy takes one value of its records' length over
+                // its key's in place, and nothing else: any other write --
+                // a key it does not hold, a run of no value or of two, a
+                // value of another length -- finds the three buffers, made
+                // again first (`Options::copy_packed`).
+                let in_place = match blk.fixed {
+                    Some((kl, vl))
+                        if found
+                            && run.len() == 4 + vl as usize
+                            && run[..4] == vl.to_le_bytes() =>
+                    {
+                        let at = i * (kl + vl) as usize + kl as usize;
+                        blk.vals[at..at + vl as usize].copy_from_slice(&run[4..]);
+                        true
+                    }
+                    Some(_) => {
+                        blk.unpack();
+                        self.fs().copy_packs.add(1, 1);
+                        false
+                    }
+                    None => false,
                 };
                 // A run no longer than the one it replaces is written
                 // over it: the values stay where a build laid them and
@@ -34726,7 +35050,8 @@ impl Reader {
                 // build makes 13, and the blocks past twice their live
                 // bytes unlisted and built again in the pass that
                 // followed, half of them in one round.
-                if found && run.len() <= blk.ents[i][3] as usize {
+                if in_place {
+                } else if found && run.len() <= blk.ents[i][3] as usize {
                     let at = blk.ents[i][2] as usize;
                     blk.vals[at..at + run.len()].copy_from_slice(run);
                     blk.dead += blk.ents[i][3] as usize - run.len();
@@ -34756,7 +35081,8 @@ impl Reader {
                 }
                 // Bloated only past twice the floor: below that the sum
                 // over the entries, a load an entry a write, cannot say so.
-                if blk.vals.len() > 2 * 4096 {
+                // A packed copy holds no dead byte.
+                if !in_place && blk.vals.len() > 2 * 4096 {
                     let live = blk.vals.len() - blk.dead;
                     debug_assert_eq!(
                         live,
@@ -34955,6 +35281,9 @@ impl Reader {
                         })
                     }
                     Some(Cached::Block(blk)) => {
+                        // No copy is packed under `pieces_only`, the one
+                        // shape that folds a piece into a form.
+                        debug_assert!(blk.fixed.is_none());
                         let i = blk.lower_bound(key);
                         (i < blk.ents.len() && blk.key(&blk.ents[i]) == key).then(|| {
                             let e = &blk.ents[i];
@@ -35704,6 +36033,15 @@ impl Reader {
                     && rank != usize::MAX)
                     .then(|| start - lo);
                 let copy_span = self.opts.copy_prefetch_span;
+                // The entry a packed copy's walk starts at: the first of a
+                // block after the scan's first, and in the first the
+                // seek's rank less the block's, taken only by a copy whose
+                // entries are the block's records.
+                let packed_at = if !first {
+                    Some((0, false))
+                } else {
+                    (self.opts.copy_start_at_rank && rank != usize::MAX).then(|| (start - lo, true))
+                };
                 let mut pace: Option<Pace> = None;
                 if !fetched && self.opts.scan_prefetch {
                     prefetch_block(
@@ -35719,6 +36057,7 @@ impl Reader {
                         // A block after the scan's first is walked from
                         // its first entry, whatever its copy holds.
                         copy_span.then_some(!first),
+                        packed_at,
                     );
                 }
                 fetched = false;
@@ -35749,6 +36088,7 @@ impl Reader {
                                 self.opts.copy_prefetch_whole,
                                 self.opts.scan_prefetch_sparse_span,
                                 copy_span.then_some(true),
+                                Some((0, false)),
                             ),
                         }
                         fetched = true;
@@ -35872,7 +36212,7 @@ impl Reader {
                         let i = if !first {
                             0
                         } else if at_rank {
-                            let i = (start - lo).min(blk.ents.len());
+                            let i = (start - lo).min(blk.len());
                             debug_assert_eq!(
                                 i,
                                 blk.lower_bound(cursor),
@@ -35889,18 +36229,37 @@ impl Reader {
                                 fs.span_starts.set(fs.span_starts.get() + 1);
                             }
                         }
-                        for (n, e) in blk.ents[i..].iter().enumerate() {
-                            if seen >= limit {
-                                break;
-                            }
-                            if let Some(p) = pace.as_mut() {
-                                if n.is_multiple_of(PACE_STEP) {
-                                    p.step();
+                        if let Some((kl, vl)) = blk.fixed {
+                            // One stream of records, key then value: no
+                            // entry to decode and no length to read.
+                            let (kl, stride) = (kl as usize, (kl + vl) as usize);
+                            let recs = blk.vals[i * stride..].chunks_exact(stride);
+                            for (n, r) in recs.enumerate() {
+                                if seen >= limit {
+                                    break;
                                 }
+                                if let Some(p) = pace.as_mut() {
+                                    if n.is_multiple_of(PACE_STEP) {
+                                        p.step();
+                                    }
+                                }
+                                f(&r[..kl], &r[kl..]);
+                                seen += 1;
                             }
-                            let k = blk.key(e);
-                            blk.each_value(e, |v| f(k, v));
-                            seen += 1;
+                        } else {
+                            for (n, e) in blk.ents[i..].iter().enumerate() {
+                                if seen >= limit {
+                                    break;
+                                }
+                                if let Some(p) = pace.as_mut() {
+                                    if n.is_multiple_of(PACE_STEP) {
+                                        p.step();
+                                    }
+                                }
+                                let k = blk.key(e);
+                                blk.each_value(e, |v| f(k, v));
+                                seen += 1;
+                            }
                         }
                         if pace.is_some() {
                             let fs = self.fs();
@@ -36248,6 +36607,23 @@ impl Reader {
     /// A test's: the writer's copies that claim their entries are their
     /// partition's records, and of those the ones whose claim is of the
     /// partition their table now stands over (`CachedBlock::identity_for`).
+    /// A test's: the writer's copies held as one stream of fixed-size
+    /// records, and its copies (`Options::copy_packed`).
+    #[doc(hidden)]
+    pub fn block_cache_packed(&self) -> (usize, usize) {
+        let _e = self.enter();
+        let (mut packed, mut copies) = (0usize, 0usize);
+        for t in self.fs().tables.borrow().iter() {
+            for c in t.borrow().iter().flat_map(|t| t.slots.iter()).flatten() {
+                if let Cached::Block(b) = &**c {
+                    copies += 1;
+                    packed += b.fixed.is_some() as usize;
+                }
+            }
+        }
+        (packed, copies)
+    }
+
     #[doc(hidden)]
     pub fn block_cache_identity(&self) -> (usize, usize) {
         let _e = self.enter();
@@ -36276,6 +36652,12 @@ impl Reader {
         for t in self.fs().tables.borrow().iter() {
             for c in t.borrow().iter().flat_map(|t| t.slots.iter()).flatten() {
                 if let Cached::Block(b) = &**c {
+                    // A packed copy is its entries in order and no dead
+                    // byte.
+                    if b.fixed.is_some() {
+                        ents += b.len();
+                        continue;
+                    }
                     let live: usize = b.ents.iter().map(|e| e[3] as usize).sum();
                     dead += b.vals.len() - live;
                     ents += b.ents.len();
@@ -42214,6 +42596,14 @@ impl Db {
         self.r.fs().copy_patches.get()
     }
 
+    /// The writer's own copies packed into one stream of fixed-size
+    /// records at their build, and the packed copies a patch made the
+    /// three buffers again (`Options::copy_packed`).
+    pub fn copy_packs(&self) -> [u64; 2] {
+        self.take_back_upkeep();
+        self.r.fs().copy_packs.get()
+    }
+
     /// The writer's scans whose start seek seeded the partition's reader
     /// with its cursor (`Options::zpages_seek_seeds`).
     pub fn seek_seeds(&self) -> u64 {
@@ -45563,6 +45953,131 @@ impl PaceRuns {
 }
 
 #[cfg(test)]
+mod copy_build_tests {
+    use super::{CachedBlock, CopyBuild};
+
+    /// A build fed `entries`, each a key with its values, as the builders
+    /// feed one: an entry opened at a key, its values pushed, and closed at
+    /// the next key or the end.
+    fn build(entries: &[(&[u8], &[&[u8]])], packed: bool) -> CachedBlock {
+        let mut b = CopyBuild::new(7, (64, 256, 8), packed);
+        let mut open = false;
+        for (k, vals) in entries {
+            if open {
+                b.end();
+            }
+            b.begin(k);
+            open = true;
+            for v in vals.iter() {
+                b.push(v);
+            }
+        }
+        if open {
+            b.end();
+        }
+        b.finish()
+    }
+
+    /// What a copy holds, read through the accessors either shape answers.
+    fn read(c: &CachedBlock) -> Vec<(Vec<u8>, Vec<Vec<u8>>)> {
+        (0..c.len())
+            .map(|i| {
+                let mut vals = Vec::new();
+                c.values_i(i, |v| vals.push(v.to_vec()));
+                (c.key_i(i).to_vec(), vals)
+            })
+            .collect()
+    }
+
+    fn held(entries: &[(&[u8], &[&[u8]])], packs: bool) {
+        let want: Vec<(Vec<u8>, Vec<Vec<u8>>)> = entries
+            .iter()
+            .map(|(k, vs)| (k.to_vec(), vs.iter().map(|v| v.to_vec()).collect()))
+            .collect();
+        let plain = build(entries, false);
+        assert!(plain.fixed.is_none());
+        assert_eq!(read(&plain), want, "the three buffers");
+        let packed = build(entries, true);
+        assert_eq!(packed.fixed.is_some(), packs, "packed: {entries:?}");
+        assert_eq!(read(&packed), want, "the build under the stream");
+        if packs {
+            assert!(packed.keys.is_empty() && packed.ents.is_empty());
+            let stride: usize = entries[0].0.len() + entries[0].1[0].len();
+            assert_eq!(packed.vals.len(), entries.len() * stride);
+        }
+        // Unpacked, the stream is the three buffers the plain build made,
+        // byte for byte; and a search answers alike in either shape.
+        let mut un = packed.clone();
+        un.unpack();
+        assert!(un.fixed.is_none());
+        assert_eq!(
+            (&un.keys, &un.vals, &un.ents),
+            (&plain.keys, &plain.vals, &plain.ents)
+        );
+        for (k, _) in entries {
+            assert_eq!(packed.lower_bound(k), plain.lower_bound(k));
+            let mut past = k.to_vec();
+            past.push(0);
+            assert_eq!(packed.lower_bound(&past), plain.lower_bound(&past));
+        }
+        assert_eq!(packed.lower_bound(b""), 0);
+    }
+
+    #[test]
+    fn records_of_one_shape_are_one_stream() {
+        held(
+            &[
+                (b"k01", &[b"aaaa"]),
+                (b"k02", &[b"bbbb"]),
+                (b"k03", &[b"cccc"]),
+            ],
+            true,
+        );
+        held(&[(b"k01", &[b"aaaa"])], true);
+        // A key of no bytes with a value, and keys with a value of none.
+        held(&[(b"", &[b"aaaa"])], true);
+        held(&[(b"k1", &[b""]), (b"k2", &[b""])], true);
+    }
+
+    #[test]
+    fn an_entry_of_another_shape_makes_the_three_buffers() {
+        let a: &[u8] = b"aaaa";
+        // A key of another length: the first, one inside, the last.
+        held(&[(b"k1", &[a]), (b"k02", &[a]), (b"k03", &[a])], false);
+        held(&[(b"k01", &[a]), (b"k2", &[a]), (b"k03", &[a])], false);
+        held(&[(b"k01", &[a]), (b"k02", &[a]), (b"k3", &[a])], false);
+        // A value of another length.
+        held(
+            &[(b"k01", &[b"aaa"]), (b"k02", &[a]), (b"k03", &[a])],
+            false,
+        );
+        held(
+            &[(b"k01", &[a]), (b"k02", &[b"aaaaa"]), (b"k03", &[a])],
+            false,
+        );
+        held(&[(b"k01", &[a]), (b"k02", &[a]), (b"k03", &[b""])], false);
+        // Two values, of the records' length and of half of it each less
+        // the length word, which is as many bytes of run as one value's.
+        held(&[(b"k01", &[a, a]), (b"k02", &[a]), (b"k03", &[a])], false);
+        held(&[(b"k01", &[a]), (b"k02", &[a, a]), (b"k03", &[a])], false);
+        held(&[(b"k01", &[a]), (b"k02", &[a]), (b"k03", &[a, a])], false);
+        held(
+            &[(b"k01", &[b"12345678"]), (b"k02", &[b"12", b"34"])],
+            false,
+        );
+        // A key with no value: the first, one inside, the last, the only.
+        held(&[(b"k01", &[]), (b"k02", &[a]), (b"k03", &[a])], false);
+        held(&[(b"k01", &[a]), (b"k02", &[]), (b"k03", &[a])], false);
+        held(&[(b"k01", &[a]), (b"k02", &[a]), (b"k03", &[])], false);
+        held(&[(b"k01", &[])], false);
+        // A record of no bytes has no stride to count the entries by.
+        held(&[(b"", &[b""])], false);
+        // And no entry at all.
+        held(&[], false);
+    }
+}
+
+#[cfg(test)]
 mod pace_runs_tests {
     use super::*;
 
@@ -47446,6 +47961,21 @@ struct BuildCtx<'s> {
 }
 
 impl<'s> BuildCtx<'s> {
+    /// Whether a copy this context builds is one stream of fixed-size
+    /// records where its entries allow it (`Options::copy_packed`). Not
+    /// under `pieces_only`, whose forms take a landed piece's runs folded
+    /// in, which reads the three buffers.
+    fn packs(&self) -> bool {
+        self.rd.opts.copy_packed && !self.pieces_only
+    }
+    /// A copy as its build finished it, counted where it came out packed.
+    fn built(&self, build: CopyBuild) -> CachedBlock {
+        let blk = build.finish();
+        if blk.fixed.is_some() {
+            self.rd.fs().copy_packs.add(0, 1);
+        }
+        blk
+    }
     /// PROTOTYPE: where a partition's block boundaries fall in every
     /// level-0 piece meeting its range, and in the snapshot of unsealed
     /// keys: the two source maps a table starts from.
@@ -49094,18 +49624,18 @@ impl<'s> BuildCtx<'s> {
             tombs: self.tombs,
             scratch: self.take_offs(),
         };
+        let n = blk.len();
         while seen < limit {
-            let order = match (blk.ents.get(i), ov.over.get(oi)) {
-                (None, None) => break,
-                (Some(_), None) => Ordering::Less,
-                (None, Some(_)) => Ordering::Greater,
-                (Some(e), Some(o)) => blk.key(e).cmp(o.key),
+            let order = match (i < n, ov.over.get(oi)) {
+                (false, None) => break,
+                (true, None) => Ordering::Less,
+                (false, Some(_)) => Ordering::Greater,
+                (true, Some(o)) => blk.key_i(i).cmp(o.key),
             };
             match order {
                 Ordering::Less => {
-                    let e = &blk.ents[i];
-                    let k = blk.key(e);
-                    blk.each_value(e, |v| f(k, v));
+                    let k = blk.key_i(i);
+                    blk.values_i(i, |v| f(k, v));
                     i += 1;
                 }
                 Ordering::Greater => {
@@ -49113,9 +49643,8 @@ impl<'s> BuildCtx<'s> {
                     oi += 1;
                 }
                 Ordering::Equal => {
-                    let e = &blk.ents[i];
                     self.emit_both(&mut f, &mut em, ov, oi, src, |f| {
-                        blk.each_value(e, |v| f(blk.key(e), v))
+                        blk.values_i(i, |v| f(blk.key_i(i), v))
                     })?;
                     i += 1;
                     oi += 1;
@@ -49250,15 +49779,11 @@ impl<'s> BuildCtx<'s> {
         self.prefetch_overlay(ov);
         let n = ranks.len() + ov.over.len();
         let (lo, hi) = (ranks.start, ranks.end);
-        let blk = std::cell::RefCell::new(CachedBlock {
-            keys: Vec::with_capacity(n * 16),
-            vals: Vec::with_capacity(n * 128),
-            ents: Vec::with_capacity(n),
-            identity: false,
-            identity_of: src.seg.keyseq,
-            wide: false,
-            dead: 0,
-        });
+        let blk = std::cell::RefCell::new(CopyBuild::new(
+            src.seg.keyseq,
+            (n * 16, n * 128, n),
+            self.packs(),
+        ));
         let mut current: Vec<u8> = Vec::with_capacity(32);
         let mut open = false;
         let (_, all_same) = self.walk_block(
@@ -49281,10 +49806,11 @@ impl<'s> BuildCtx<'s> {
             },
             |_k, v| blk.borrow_mut().push(v),
         )?;
-        let mut blk = blk.into_inner();
+        let mut build = blk.into_inner();
         if open {
-            blk.end();
+            build.end();
         }
+        let mut blk = self.built(build);
         // Every overlay key an update of a record at its cut, and a key
         // emitted per record: a tombstone that took a record out leaves the
         // copy searched. The walk answers each key's cut exactly, carried or
@@ -49292,7 +49818,7 @@ impl<'s> BuildCtx<'s> {
         // off) also left a copy searched where a cut had to be searched for.
         let updates = all_same
             && (self.rd.opts.zpages_block_cursor || ov.over.iter().all(|o| o.cut != u32::MAX));
-        blk.identity = updates && blk.ents.len() == hi - lo;
+        blk.identity = updates && blk.len() == hi - lo;
         if self.fit {
             blk.fit();
         }
@@ -49320,15 +49846,15 @@ impl<'s> BuildCtx<'s> {
         } else {
             hi - lo
         };
-        let mut blk = CachedBlock {
-            keys: Vec::with_capacity(sb.keys.len() + kept * 16),
-            vals: Vec::with_capacity(sb.vals.len() + kept * 128),
-            ents: Vec::with_capacity(sb.ents.len() + kept),
-            identity: false,
-            identity_of: seg.keyseq,
-            wide: false,
-            dead: 0,
-        };
+        let mut blk = CopyBuild::new(
+            seg.keyseq,
+            (
+                sb.keys.len() + kept * 16,
+                sb.vals.len() + kept * 128,
+                sb.ents.len() + kept,
+            ),
+            self.packs(),
+        );
         // Every key once, then its values, as `copy_block` opens them: an
         // entry opens on a key change, and a key without values -- a
         // record a delta deleted -- still gets one.
@@ -49337,7 +49863,7 @@ impl<'s> BuildCtx<'s> {
         let mut rank = lo;
         let mut updates = true;
         let mut pr = PartReader::new(self.rd, seg);
-        let mut stream = |blk: &mut CachedBlock,
+        let mut stream = |blk: &mut CopyBuild,
                           current: &mut Vec<u8>,
                           open: &mut bool,
                           from: usize,
@@ -49387,9 +49913,10 @@ impl<'s> BuildCtx<'s> {
         if open {
             blk.end();
         }
+        let mut blk = self.built(blk);
         // Every delta an update of a record, and a key emitted per record:
         // `copy_block`'s rule, which the form's cuts answer exactly.
-        blk.identity = updates && blk.ents.len() == hi - lo;
+        blk.identity = updates && blk.len() == hi - lo;
         if self.fit {
             blk.fit();
         }

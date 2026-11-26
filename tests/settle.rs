@@ -1579,14 +1579,18 @@ fn appended(dir: &std::path::Path, n: usize, background: bool, o: Options) -> (D
 /// place.
 #[test]
 fn a_key_past_a_copys_last_entry_is_appended_without_a_search() {
-    for on in [true, false] {
-        let dir = scratch(&format!("append-last-{on}"));
+    // And under the copy as one stream of fixed-size records
+    // (`Options::copy_packed`), which this store's blocks are: a key
+    // appended finds the three buffers.
+    for (on, packed) in [(true, false), (false, false), (true, true)] {
+        let dir = scratch(&format!("append-last-{on}-{packed}"));
         let (mut db, keys) = appended(
             &dir,
             1000,
             false,
             Options {
                 settle_append_last: on,
+                copy_packed: packed,
                 ..common::options()
             },
         );
@@ -2283,4 +2287,487 @@ fn a_key_folded_in_is_its_own_outputs_and_no_other_outputs() {
         drop(db);
         let _ = std::fs::remove_dir_all(&dir);
     }
+}
+
+/// Every answer a store gives, held to the model: the whole scan in its
+/// order, scans from inside a block for a few entries, across a block's
+/// end and through several blocks, a handle's scan, and every point read.
+/// A scan's limit counts a deleted key for as long as its tombstone
+/// stands in a table or a piece, on every path, so a limited scan is held
+/// to the model's entries in their order, as many keys as the limit less
+/// the `ghosts` -- the keys deleted and not known merged away -- it may
+/// have passed.
+fn answers(
+    db: &Db,
+    want: &std::collections::BTreeMap<Vec<u8>, Vec<Vec<u8>>>,
+    from: &[Vec<u8>],
+    what: &str,
+) {
+    answers_past(db, want, from, &[], what)
+}
+
+fn answers_past(
+    db: &Db,
+    want: &std::collections::BTreeMap<Vec<u8>, Vec<Vec<u8>>>,
+    from: &[Vec<u8>],
+    ghosts: &[Vec<u8>],
+    what: &str,
+) {
+    let listed: Vec<(Vec<u8>, Vec<Vec<u8>>)> =
+        want.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
+    assert!(scan_list(db) == listed, "{what}: the writer's scan");
+    for start in from {
+        for limit in [1usize, 5, 70, 200] {
+            let mut got: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
+            db.scan(
+                start,
+                limit,
+                kv(&mut |k, v| got.push((k.to_vec(), v.to_vec()))),
+            )
+            .unwrap();
+            // The keys the scan answered, and the model's from the same
+            // start: the same entries in the same order for as many keys
+            // as the scan took, which is the limit less the deleted keys
+            // it may have counted.
+            let mut keys_got = 0usize;
+            let mut last: Option<&[u8]> = None;
+            for (k, _) in &got {
+                if last != Some(k.as_slice()) {
+                    keys_got += 1;
+                    last = Some(k.as_slice());
+                }
+            }
+            let model: Vec<(Vec<u8>, Vec<u8>)> = want
+                .range(start.clone()..)
+                .take(keys_got)
+                .flat_map(|(k, vs)| vs.iter().map(move |v| (k.clone(), v.clone())))
+                .collect();
+            let live = want.range(start.clone()..).take(limit).count();
+            let passed = ghosts.iter().filter(|g| *g >= start).count();
+            assert!(
+                got == model && keys_got <= live && keys_got + passed >= live,
+                "{what}: a scan of {limit} from {:?}: {keys_got} keys, {} entries, against the model's {live} keys past {passed} deleted",
+                String::from_utf8_lossy(start),
+                got.len(),
+            );
+        }
+    }
+    let r = db.reader().unwrap();
+    let mut via_handle: Vec<(Vec<u8>, Vec<Vec<u8>>)> = Vec::new();
+    r.scan(
+        b"",
+        usize::MAX,
+        kv(&mut |k, v| match via_handle.last_mut() {
+            Some((last, vals)) if last.as_slice() == k => vals.push(v.to_vec()),
+            _ => via_handle.push((k.to_vec(), vec![v.to_vec()])),
+        }),
+    )
+    .unwrap();
+    assert!(via_handle == listed, "{what}: the handle's scan");
+    drop(r);
+    for (k, v) in want {
+        let mut got = Vec::new();
+        db.read_all(k, vf(&mut |x| got.push(x.to_vec()))).unwrap();
+        assert!(
+            &got == v,
+            "{what}: the point read of {:?}",
+            String::from_utf8_lossy(k)
+        );
+    }
+}
+
+/// A store of partitions a block each, every block held as a copy of
+/// fixed-size records: keys of one length, each with one value of a
+/// hundred bytes, three quarters of them written again at that length.
+#[allow(clippy::type_complexity)]
+fn copies_of_fixed_records(
+    dir: &std::path::Path,
+    o: Options,
+) -> (
+    Db,
+    Vec<Vec<u8>>,
+    std::collections::BTreeMap<Vec<u8>, Vec<Vec<u8>>>,
+    Vec<Vec<Vec<u8>>>,
+) {
+    let mut db = Db::create(
+        dir,
+        Options {
+            seal_bytes: 1 << 20,
+            partition_bytes: Some(4096),
+            partition_on_flush: true,
+            publish_in_background: true,
+            upkeep: Upkeep::Background(1),
+            upkeep_pace_syncs_bp: 0,
+            scan_block_cache: true,
+            l0_trigger: 2,
+            ..o
+        },
+    )
+    .unwrap();
+    let keys: Vec<Vec<u8>> = (0..300).map(|i| format!("k{i:05}").into_bytes()).collect();
+    let mut want = std::collections::BTreeMap::new();
+    for k in &keys {
+        db.put(k, &[b'v'; 100]);
+        want.insert(k.clone(), vec![vec![b'v'; 100]]);
+    }
+    db.commit().unwrap();
+    db.flush().unwrap();
+    db.settle().unwrap();
+    let fences = partition_fences(dir);
+    assert!(fences.len() >= 6, "partitions: {}", fences.len());
+    // The keys by the partition that holds them.
+    let by_part: Vec<Vec<Vec<u8>>> = fences
+        .iter()
+        .map(|(lo, hi)| {
+            keys.iter()
+                .filter(|k| **k >= *lo && hi.as_ref().is_none_or(|h| **k < *h))
+                .cloned()
+                .collect()
+        })
+        .collect();
+    assert!(by_part.iter().all(|p| (12..=64).contains(&p.len())));
+    let _ = scan_model(&db);
+    for (i, k) in keys.iter().enumerate() {
+        if i % 4 != 0 {
+            db.put(k, &[b'u'; 100]);
+            want.insert(k.clone(), vec![vec![b'u'; 100]]);
+        }
+    }
+    db.commit().unwrap();
+    db.settle().unwrap();
+    assert!(scan_model(&db) == want);
+    (db, keys, want, by_part)
+}
+
+/// A copy of a block whose keys are of one length, each with one value of
+/// one length, is one stream of fixed-size records
+/// (`Options::copy_packed`), and answers as the three buffers do: a walk
+/// from its first entry, from a rank inside it and across its end, a
+/// handle's walk of the copy as published, a value of its records' length
+/// written over a key's in place, and across a merge that kept its
+/// partition's keys. A write it cannot take in place -- a value of
+/// another length, a key it does not hold, a delete, a second value --
+/// finds the three buffers, made again first, in that block and no other.
+#[test]
+fn a_copy_of_fixed_size_records_is_one_stream_until_a_write_it_cannot_take() {
+    for packed in [true, false] {
+        let dir = scratch(&format!("copy-packed-{packed}"));
+        let (mut db, keys, mut want, by_part) = copies_of_fixed_records(
+            &dir,
+            Options {
+                copy_packed: packed,
+                ..common::options()
+            },
+        );
+        let parts = by_part.len();
+        let from: Vec<Vec<u8>> = vec![
+            by_part[parts / 2][4].clone(),
+            by_part[1][0].clone(),
+            by_part[parts - 1][2].clone(),
+        ];
+        let (p0, n0) = db.block_cache_packed();
+        assert!(n0 >= 6, "copies: {n0}");
+        assert_eq!(
+            p0,
+            if packed { n0 } else { 0 },
+            "{packed}: the copies packed"
+        );
+        // Counted as they were built, by the writer or the thread it lends
+        // its tables to.
+        let built = db.copy_packs()[0];
+        assert!(
+            if packed {
+                built >= p0 as u64
+            } else {
+                built == 0
+            },
+            "{packed}: {built} copies counted packed at their build, {p0} held"
+        );
+        let (claimed, holds) = db.block_cache_identity();
+        assert!(claimed == n0 && holds == n0, "{packed}: copies of records");
+        answers(&db, &want, &from, "as built");
+        // A scan that starts inside a copy takes its entry by the rank.
+        let before = db.copy_starts();
+        let mut n = 0;
+        db.scan(&from[0], 5, kv(&mut |_, _| n += 1)).unwrap();
+        let after = db.copy_starts();
+        assert_eq!(n, 5);
+        assert_eq!([after[0] - before[0], after[1] - before[1]], [1, 0]);
+
+        // A value of the records' length over a key's, in every block:
+        // written where it lies.
+        let unpacked = db.copy_packs()[1];
+        let patches = db.copy_patches();
+        let asks = db.patch_asks();
+        for part in &by_part {
+            db.put(&part[3], &[b'p'; 100]);
+            want.insert(part[3].clone(), vec![vec![b'p'; 100]]);
+        }
+        // And a second key of one partition, whose lines the patch before
+        // it asks for by its rank.
+        db.put(&by_part[parts / 2][9], &[b'p'; 100]);
+        want.insert(by_part[parts / 2][9].clone(), vec![vec![b'p'; 100]]);
+        db.commit().unwrap();
+        db.settle().unwrap();
+        answers(&db, &want, &from, "after values written in place");
+        assert_eq!(db.copy_packs()[1], unpacked, "{packed}: no copy unpacked");
+        assert_eq!(db.block_cache_packed(), (p0, n0));
+        let now = db.copy_patches();
+        assert_eq!(
+            [now[0] - patches[0], now[1] - patches[1]],
+            [parts as u64 + 1, 0],
+            "{packed}: each patch at its rank"
+        );
+        assert_eq!(
+            db.patch_asks() - asks,
+            1,
+            "{packed}: the ask ahead of a patch"
+        );
+
+        // Across a merge that kept every partition's keys: the copies
+        // carried, packed as they were, their ranks with them.
+        let merges_before = db.seal_waits().merges;
+        db.hold_seal_durable(true);
+        for round in 0..2u8 {
+            for k in keys.iter().step_by(5) {
+                db.put(k, &[b'a' + round; 100]);
+                want.insert(k.clone(), vec![vec![b'a' + round; 100]]);
+            }
+            db.commit().unwrap();
+            db.seal().unwrap();
+        }
+        db.hold_seal_durable(false);
+        merged_past(&mut db, merges_before);
+        answers(&db, &want, &from, "across the merges");
+        assert_eq!(
+            db.block_cache_packed(),
+            (p0, n0),
+            "{packed}: carried as they were"
+        );
+        let (claimed, holds) = db.block_cache_identity();
+        assert!(claimed == n0 && holds == n0, "{packed}: and their ranks");
+        assert_eq!(db.copy_packs()[1], unpacked);
+
+        // The writes a stream cannot take in place, each in a block of
+        // its own: that block the three buffers again, and no other.
+        let mut gone = 0;
+        let deleted = vec![by_part[2][5].clone()];
+        let mut step =
+            |db: &mut Db, want: &std::collections::BTreeMap<Vec<u8>, Vec<Vec<u8>>>, what: &str| {
+                db.commit().unwrap();
+                db.settle().unwrap();
+                gone += 1;
+                // The deleted key's tombstone stands from its step on.
+                let ghosts: &[Vec<u8>] = if gone >= 3 { &deleted } else { &[] };
+                answers_past(db, want, &from, ghosts, what);
+                if packed {
+                    assert_eq!(db.copy_packs()[1], unpacked + gone, "{what}: unpacked");
+                    assert_eq!(
+                        db.block_cache_packed(),
+                        (p0 - gone as usize, n0),
+                        "{what}: one block more as three buffers"
+                    );
+                } else {
+                    assert_eq!(db.copy_packs(), [0, 0]);
+                }
+            };
+        let _ = built;
+        // A value of another length.
+        db.put(&by_part[0][5], b"short");
+        want.insert(by_part[0][5].clone(), vec![b"short".to_vec()]);
+        step(&mut db, &want, "a value of another length");
+        // A key the block does not hold, between two it does.
+        let folded = {
+            let mut k = by_part[1][5].clone();
+            k.push(b'x');
+            k
+        };
+        db.put(&folded, &[b'f'; 100]);
+        want.insert(folded.clone(), vec![vec![b'f'; 100]]);
+        step(&mut db, &want, "a key folded in");
+        // A delete.
+        db.delete(&by_part[2][5]);
+        want.remove(&by_part[2][5]);
+        step(&mut db, &want, "a key deleted");
+        // A second value.
+        db.append(&by_part[3][5], &[b's'; 100]);
+        want.get_mut(&by_part[3][5]).unwrap().push(vec![b's'; 100]);
+        step(&mut db, &want, "a second value");
+        // A value of no bytes.
+        db.put(&by_part[4][5], b"");
+        want.insert(by_part[4][5].clone(), vec![Vec::new()]);
+        step(&mut db, &want, "a value of no bytes");
+        // Two values whose run is as many bytes as one value's: forty-eight
+        // bytes each behind their length words, a hundred and four.
+        db.put(&by_part[5][5], &[b'1'; 48]);
+        db.append(&by_part[5][5], &[b'2'; 48]);
+        want.insert(by_part[5][5].clone(), vec![vec![b'1'; 48], vec![b'2'; 48]]);
+        step(&mut db, &want, "two values in one value's bytes");
+        // And a block already the three buffers takes a write as it did.
+        db.put(&by_part[0][6], &[b'q'; 100]);
+        want.insert(by_part[0][6].clone(), vec![vec![b'q'; 100]]);
+        db.commit().unwrap();
+        db.settle().unwrap();
+        answers_past(
+            &db,
+            &want,
+            &from,
+            &deleted,
+            "a write into an unpacked block",
+        );
+        if packed {
+            assert_eq!(db.copy_packs()[1], unpacked + 6);
+        }
+        db.flush().unwrap();
+        db.settle().unwrap();
+        answers_past(&db, &want, &from, &deleted, "after the flush");
+        drop(db);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+/// A packed copy that makes no claim to its ranks -- built over keys the
+/// partition did not hold -- is searched by its records' keys: a scan's
+/// start inside it and a patch of a key it holds find their entry by the
+/// search, the patch written in place, and the answers are the model's.
+#[test]
+fn a_packed_copy_with_no_claim_to_its_ranks_is_searched_by_its_keys() {
+    for packed in [true, false] {
+        let dir = scratch(&format!("copy-packed-searched-{packed}"));
+        let mut db = Db::create(
+            &dir,
+            Options {
+                seal_bytes: 1 << 20,
+                partition_bytes: Some(4096),
+                partition_on_flush: true,
+                publish_in_background: true,
+                upkeep: Upkeep::Background(1),
+                upkeep_pace_syncs_bp: 0,
+                scan_block_cache: true,
+                l0_trigger: 64,
+                copy_packed: packed,
+                ..common::options()
+            },
+        )
+        .unwrap();
+        // The even keys sealed, the odd ones written over them: every
+        // block's copy is built over inserts.
+        let key = |i: usize| format!("k{i:05}").into_bytes();
+        let mut want = std::collections::BTreeMap::new();
+        for i in (0..300).step_by(2) {
+            db.put(&key(i), &[b'v'; 100]);
+            want.insert(key(i), vec![vec![b'v'; 100]]);
+        }
+        db.commit().unwrap();
+        db.flush().unwrap();
+        db.settle().unwrap();
+        let _ = scan_model(&db);
+        for i in (1..300).step_by(2) {
+            db.put(&key(i), &[b'o'; 100]);
+            want.insert(key(i), vec![vec![b'o'; 100]]);
+        }
+        db.commit().unwrap();
+        db.settle().unwrap();
+        let from = vec![key(41), key(150), key(297)];
+        answers(&db, &want, &from, "as built");
+        let (p0, n0) = db.block_cache_packed();
+        assert!(n0 >= 3, "copies: {n0}");
+        assert_eq!(p0, if packed { n0 } else { 0 });
+        let (claimed, _) = db.block_cache_identity();
+        assert_eq!(claimed, 0, "no copy built over inserts claims its ranks");
+        // A scan's start inside a copy, by the search.
+        let before = db.copy_starts();
+        let mut got = Vec::new();
+        db.scan(&key(151), 3, kv(&mut |k, _| got.push(k.to_vec())))
+            .unwrap();
+        let after = db.copy_starts();
+        assert_eq!(got, vec![key(151), key(152), key(153)]);
+        assert_eq!([after[0] - before[0], after[1] - before[1]], [0, 1]);
+        // Patches of keys the copies hold, an old key and a new one, by
+        // the search and in place.
+        let unpacked = db.copy_packs()[1];
+        let patches = db.copy_patches();
+        for i in [40usize, 41, 150, 299] {
+            db.put(&key(i), &[b'p'; 100]);
+            want.insert(key(i), vec![vec![b'p'; 100]]);
+        }
+        db.commit().unwrap();
+        db.settle().unwrap();
+        answers(&db, &want, &from, "after the patches");
+        let now = db.copy_patches();
+        assert_eq!([now[0] - patches[0], now[1] - patches[1]], [0, 4]);
+        assert_eq!(db.copy_packs()[1], unpacked, "in place");
+        assert_eq!(db.block_cache_packed(), (p0, n0));
+        drop(db);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+/// Under `forms_pieces_only` a form takes a landed piece's runs folded
+/// in, which reads a copy's three buffers: no copy is packed there, a
+/// block whose every record is of one shape among them.
+#[test]
+fn no_copy_is_packed_where_pieces_are_folded_into_forms() {
+    let dir = scratch("copy-packed-pieces-only");
+    let mut db = Db::create(
+        &dir,
+        Options {
+            seal_bytes: 1 << 20,
+            partition_bytes: Some(4096),
+            partition_on_flush: true,
+            publish_in_background: true,
+            upkeep: Upkeep::Background(1),
+            upkeep_pace_syncs_bp: 0,
+            scan_block_cache: true,
+            l0_trigger: 64,
+            copy_packed: true,
+            forms_pieces_only: true,
+            ..common::options()
+        },
+    )
+    .unwrap();
+    let keys: Vec<Vec<u8>> = (0..300).map(|i| format!("k{i:05}").into_bytes()).collect();
+    let mut want = std::collections::BTreeMap::new();
+    for k in &keys {
+        db.put(k, &[b'v'; 100]);
+        want.insert(k.clone(), vec![vec![b'v'; 100]]);
+    }
+    db.commit().unwrap();
+    db.flush().unwrap();
+    db.settle().unwrap();
+    let _ = scan_model(&db);
+    // A piece over most of every block, and the forms built again over
+    // it: a form is the pieces' fold here, and a block dense with a
+    // piece's keys a copy.
+    let from = vec![keys[40].clone(), keys[150].clone()];
+    let land =
+        |db: &mut Db, want: &mut std::collections::BTreeMap<Vec<u8>, Vec<Vec<u8>>>, round: u8| {
+            for (i, k) in keys.iter().enumerate() {
+                if i % 4 != round as usize {
+                    db.put(k, &[b'a' + round; 100]);
+                    want.insert(k.clone(), vec![vec![b'a' + round; 100]]);
+                }
+            }
+            db.commit().unwrap();
+            db.seal().unwrap();
+            db.settle().unwrap();
+        };
+    land(&mut db, &mut want, 0);
+    db.drop_forms();
+    answers(&db, &want, &from, "the forms built over a piece");
+    let (packed, copies) = db.block_cache_packed();
+    assert!(
+        copies >= 3,
+        "copies of the pieces' fold: {copies}, kinds {:?}",
+        db.block_cache_kinds()
+    );
+    assert_eq!(packed, 0);
+    assert_eq!(db.copy_packs(), [0, 0]);
+    // A second piece, folded into the copies the first left.
+    land(&mut db, &mut want, 1);
+    answers(&db, &want, &from, "a piece folded into the copies");
+    assert_eq!(db.block_cache_packed().0, 0);
+    assert_eq!(db.copy_packs(), [0, 0]);
+    drop(db);
+    let _ = std::fs::remove_dir_all(&dir);
 }
