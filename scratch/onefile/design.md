@@ -43,6 +43,11 @@ or shipped by ordinary tools); a ring format for the log.
 
 ## Open
 
+- The name of the copy. "Checkpoint" came with the links (RocksDB's name
+  for a directory of them) and elsewhere means a durability point, FASTER's
+  in this suite among them; "snapshot" is taken by the read view
+  (`Reader::snapshot`). A full copy of a live single-file store is LMDB's
+  `mdb_env_copy` and SQLite's backup. Candidates: `copy_to`, `backup_to`.
 - Whether this is built on the encryption branch or as the line after it.
 - Ordered ingest: a run appends into an extent and its commits put their
   marker in the log; today the run's file is its own log.
