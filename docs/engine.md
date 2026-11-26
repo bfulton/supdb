@@ -1739,6 +1739,50 @@ The differential fuzz found the first two once it wrote through handles
 (`ZFUZZ_SHARE=all`, six seeds of fourteen hundred over four configurations),
 and a test that held the freeze's wait open found the third.
 
+#### The one writer's writes at FASTER's one level
+
+FASTER has one isolation level: each read, upsert and read-modify-write is
+atomic on its record and visible to every session as it is made, with no
+batch and no commit (`bench/vendor/faster/shim.cc`, `GetAtomic` and
+`PutAtomic`). Every supdb arm stages a batch that a commit publishes whole
+(`Features::transactions`), the arm of FASTER's guarantee among them, so
+that arm's single-threaded update mixes and bursts are a batch isolated
+beside none. `supdb-heldhandle` prices the difference: the roster's arm
+with its own updates made a write at a time through a handle claimed to
+write (`Db::writer`), and its reads through that handle, which is the
+shared table's lean path. Paired at `f7d565c` (`pair.sh supdb-heldhandle
+faster SIZE --passes load,read,mixes,mixes-scrambled,lag --reps 5`, and
+against `supdb-heldnoframes`, at three hundred and a hundred thousand
+keys), our rate over FASTER's in the two orders:
+
+| | 300,000 keys | 100,000 keys | the roster's arm, both rungs |
+|---|---|---|---|
+| burst, the full rewrite | 1.70, 1.63 | 1.71, 1.45 | 0.29-0.48 |
+| burst, ten percent | 1.57, 1.75 | 1.45, 1.68 | 0.36-0.63 |
+| ycsb-A | 1.17, 0.95 | 0.87, 0.89 | 0.81-0.97 |
+| ycsb-F | 0.98, 0.88 | 0.85, 0.81 | 0.55-0.77 |
+| scrambled A | 1.26, 1.31 | 0.95, 0.92 | 0.72-1.15 |
+| scrambled F | 1.01, 1.01 | 0.83, 0.94 | 0.68-0.85 |
+
+The arm claims its handle at its first update, so the table's install and
+its population land in the cell that update is in: B, and the one-percent
+burst, read 0.2 to 0.35 and 0.1 for it, which is the install and not the
+path. And the arm never leaves the shared table, its handle living as long
+as the store, so every scan merges its sources: against the roster's arm E
+reads 0.15 to 0.19 and the scrambled E 0.23 to 0.31, and the passes after
+the bursts 0.09 to 0.10 after the full rewrite, 0.26 to 0.38 after ten
+percent and 0.54 to 0.87 after one, with the bursts themselves 2.1x to
+5.1x. By the sweep's weighted sum of a burst and its pass the two arms
+trade: the handle's arm 0.67 to 0.90 of the other's time at the full
+rewrite and 0.99 to 1.32 at ten percent.
+
+So the batch is what the bursts lose to FASTER by, and half of what F
+does. It is not built into the store: a store that took the shared form
+for its own writer's point writes and left it for its scans would need
+the install off its first write, with the table's memory kept across a
+leave and the next install, and a pass after a burst that does not pay
+for forms nobody filed.
+
 #### Beside FASTER out of core
 
 A store larger than memory is what FASTER's log is made for, and the

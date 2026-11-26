@@ -354,8 +354,10 @@ that arm with the table the one writer's whoever writes, its threads
 taking the writer in turn; `supdb-heldnopopulate` installs the table at the
 claim and leaves its memory to the writes that reach it; and
 `supdb-heldsharedbig` is the arm whose every table is shared, with what a
-shared table refuses turned off for the store's life. All three are for
-pricing.
+shared table refuses turned off for the store's life. `supdb-heldhandle`
+makes the arm's own updates a write at a time through such a handle, with
+no batch behind a commit, which is the one isolation level FASTER has, and
+never leaves the shared table. All four are for pricing.
 
 The two differ on the ordered scan and the reopen, which `faster` has not
 got and has no setting for. The check that holds a guarantee's arms to one
