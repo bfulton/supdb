@@ -14,7 +14,10 @@ C06 | src/db.rs | if let Some(places) = &places {\n                out.extend_fr
 C07 | src/db.rs | Some(_) => STORE_FORMAT_ONE,\n                None => STORE_FORMAT, | Some(_) => STORE_FORMAT,\n                None => STORE_FORMAT, | a store in one file that says it is a store of files
 C08 | src/db/vault.rs | let Some(one) = self.one() else {\n            return Ok(None);\n        }; | let Some(one) = self.one().filter(\|_\| false) else {\n            return Ok(None);\n        }; | places never listed
 C09 | src/db/vault.rs | let with: Vec<String> = files.iter().flat_map(\|(t, _)\| riders(t)).collect(); | let with: Vec<String> = Vec::new(); | a manifest that lists no index and no form file
-C10 | src/db.rs | if let Some(one) = vault::one_of(dir) {\n                one.durable(seq);\n            } | if let Some(one) = vault::one_under(dir) {\n                one.durable(seq);\n            } | the vault's table never told a manifest is on the device
+# C10 was the open's own publish telling the vault's table (vault::one_of in
+# SlotChoice::write_shape): it survived, no open under a cipher publishing
+# over a table with room waiting, and the line went back to the plain
+# store's lookup. C05 survives as written: a directory fsync more.
 C11 | src/db.rs | let one = vault::one_of(dir);\n        if one.is_some() { | let one = vault::one_under(dir);\n        if one.is_some() { | the segment work without the vault's table: nothing listed after a landing
 C12 | src/db.rs | Some(v) => v.beside(self.segs().iter().map(\|s\| s.name.as_str())), | Some(_) => Vec::new(), | a form file's envelope built since the last landing is in no manifest
 C13 | src/db/vault.rs | Some(one) => one.on_device(&d.name()).unwrap_or(false), | Some(_) => true, | a place written over read as the envelope a slot named

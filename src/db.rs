@@ -5345,8 +5345,12 @@ pub struct Options {
     /// The store's, chosen where it is made: a store opens the way its
     /// manifest says it is kept, whatever this says, and a store of files
     /// is not rewritten. A checkpoint of a store kept so is a store of
-    /// files, each copied out. Nothing under `Encryption::Cipher`, whose
-    /// files are the vault's. Refused beside the manifest's shapes that
+    /// files, each copied out. Under `Encryption::Cipher` the files kept
+    /// there are the store's envelopes, a segment's, its ordered index's
+    /// and its form file's, each an extent under the name it had in the
+    /// directory, and the manifest that lists their places is sealed as a
+    /// slot is (`vault::Vault::one`); `supdb-cipheronefile` and
+    /// `supdb-cipherautoonefile` are those arms. Refused beside the manifest's shapes that
     /// tell no slot durable (`manifest_slots` off) or name a segment before
     /// its sync (`manifest_pending`), each of which the room's reuse rests
     /// on. Off; `supdb-onefile` is the arm.
@@ -19336,8 +19340,13 @@ impl SlotChoice {
         if opts.manifest_slots {
             self.landed(slot);
             // On the device: what no manifest from this one on lists is
-            // room a store in one file may write over.
-            if let Some(one) = vault::one_of(dir) {
+            // room a store in one file may write over. A plain store's
+            // table, which an open that names a recovered run's piece
+            // tells here; under a cipher a run is no file an open
+            // recovers, so its open publishes over a table nothing waits
+            // in, and the segment work tells the vault's
+            // (`Maint::slot_told`).
+            if let Some(one) = vault::one_under(dir) {
                 one.durable(seq);
             }
         }

@@ -73,6 +73,18 @@
 //! - `spare-<id>`: a log file retired and kept to be written again in
 //!   place (`Options::recycle_wal`): its last life's records, or zeroes,
 //!   under a key its next life does not have.
+//! - `store.one`, in a store kept in one file (`Options::one_file`): the
+//!   data file the envelopes are extents of, each under the name above
+//!   that it would have had in the directory, in a table the vault holds
+//!   (`Vault::one`, `onefile`). The sealed manifest lists each one's
+//!   place behind the segments' names, tokens and keys, and an ordered
+//!   index's and a form file's where a sync has covered them, which is
+//!   how an open finds the two beside a segment there. An envelope is the
+//!   bytes it is as a file, read through the same cache; what differs is
+//!   that a retired one's room is written over and not freed, that a
+//!   segment's sync is a sync of the data file and covers its index's
+//!   envelope written ahead of it, and that no envelope has a name for
+//!   the directory to make durable.
 //!
 //! # Keys and nonces
 //!

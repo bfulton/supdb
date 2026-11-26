@@ -9167,7 +9167,7 @@ fn reads_device(tmp: &Path, map: &MmapBytes, plan: &BuildPlan, asks: bool) -> bo
     }
     for looks in 1..=3 {
         match read_back_residency(map, plan) {
-            Some(share) if share == 0.0 => return true,
+            Some(0.0) => return true,
             Some(_) if plan.drop_output && !asks && looks < 3 => {
                 let Ok(f) = super::vault::open(tmp) else {
                     return false;

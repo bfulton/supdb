@@ -44,7 +44,11 @@
 //!   written before.
 //!
 //! No cipher is in it and no format of a segment: it holds bytes at
-//! offsets under names.
+//! offsets under names. A store under a cipher (`Encryption::Cipher`)
+//! kept this way has a table of its own, its vault's (`vault::Vault::one`),
+//! and the files in it are the store's envelopes, each under the name it
+//! had in the directory: the rules above are kept for them as for a
+//! segment, and nothing here knows which it holds.
 
 // The door (scripts/door/clippy.toml, tests/data/door.txt): the files of a
 // store kept in one, opened, written, synced and mapped here.
