@@ -1854,6 +1854,25 @@ pub struct Options {
     /// `supdb-settlesearch` and `supdb-ingestsettlesearch` are the arms.
     #[doc(hidden)]
     pub settle_append_last: bool,
+    /// A copy's claim that its entries are its partition's records
+    /// (`CachedBlock::identity`) is of the partition's keys and not of its
+    /// file: a merge that rewrites a partition over the same keys -- every
+    /// key it wrote there one the partition held, and as many of them --
+    /// gives its output the partition's key sequence (`Seg::keyseq`), and
+    /// a copy carried across it (`Db::same_blocks`) starts a scan and takes
+    /// a patch at a rank as it did before the merge. The claim was of the
+    /// blob the copy's build read, since a carry over the same block
+    /// boundaries can move the keys between them (a delete and an insert
+    /// in one block), so every copy carried across any merge searched its
+    /// entries for a scan's start and for every patch from then on: after
+    /// the lag sweep's full rewrite at three hundred thousand keys, whose
+    /// merges fold updates alone, all three thousand of the pass's starts
+    /// were searches, and each landing of a burst's merges left the
+    /// settle's patches searching where they had indexed. Off is the claim
+    /// by blob, the shape before; `supdb-identityblob` and
+    /// `supdb-ingestidentityblob` are the arms.
+    #[doc(hidden)]
+    pub identity_by_keys: bool,
     /// A settle's patch takes a key's run from the key's own chain where
     /// no older source can hold the key (`Reader::patch_block`): the write
     /// is the live table's, the partition has no record of the key at its
@@ -7587,6 +7606,7 @@ impl Default for Options {
             zpages_settle_span: true,
             settle_lazy_raw: false,
             settle_append_last: true,
+            identity_by_keys: true,
             settle_lone_chain: true,
             settle_covered_samples: true,
             zpages_trusted_views: true,
@@ -9556,7 +9576,7 @@ type Compaction = (Vec<String>, std::thread::JoinHandle<Result<Vec<String>>>);
 struct Merging {
     inputs: Vec<String>,
     fences: Option<Vec<Fence>>,
-    handle: std::thread::JoinHandle<Result<Vec<String>>>,
+    handle: std::thread::JoinHandle<Result<MergeOut>>,
     why: (usize, bool),
     began: Option<std::time::Instant>,
 }
@@ -10029,6 +10049,15 @@ impl SegBlob {
 /// from a partitioning merge, are disjoint, and are gated by their fence.
 struct Seg {
     blob: SegBlob,
+    /// The identity of this partition's key sequence: its own blob's id,
+    /// or the key sequence of the partition a merge rewrote it from where
+    /// the merge wrote that partition's keys and no others
+    /// (`Options::identity_by_keys`, `Maint::join_merge`). Two partitions
+    /// of one key sequence hold the same key at every rank, which is what
+    /// a copy's claim to its entries' ranks is of
+    /// (`CachedBlock::identity_for`). In memory alone: a store opened
+    /// again holds no copy to claim anything.
+    keyseq: u64,
     /// Touches of the raw form through `Seg::raw` while a form file is
     /// installed, under debug assertions; `Reader::raw_touches` sums it.
     raw_touches: AtomicU64,
@@ -13955,6 +13984,7 @@ impl Seg {
                 None => Seg::bloom_and_tombs(&blob)?,
             };
             return Ok(Seg {
+                keyseq: blob.id(),
                 blob: SegBlob(blob),
                 raw_touches: AtomicU64::new(0),
                 name: name.to_string(),
@@ -14004,6 +14034,7 @@ impl Seg {
                 Some(unhex(f[3]).ok_or_else(|| err("segment fence is malformed"))?)
             };
             return Ok(Seg {
+                keyseq: blob.id(),
                 blob: SegBlob(blob),
                 raw_touches: AtomicU64::new(0),
                 name: name.to_string(),
@@ -14045,6 +14076,7 @@ impl Seg {
             None => Seg::bloom_and_tombs(&blob)?,
         };
         Ok(Seg {
+            keyseq: blob.id(),
             blob: SegBlob(blob),
             raw_touches: AtomicU64::new(0),
             name: name.to_string(),
@@ -18604,7 +18636,7 @@ impl Drop for MergeAhead {
     }
 }
 
-fn compact_job(plan: MergePlan) -> Result<Vec<String>> {
+fn compact_job(plan: MergePlan) -> Result<MergeOut> {
     compact_run(plan)
 }
 
@@ -19065,6 +19097,12 @@ struct Emitter<'a> {
     r: usize,
     w: Option<PieceWriter>,
     out: Vec<String>,
+    /// Keys written to the output in hand that no partition among the
+    /// inputs held (`Emitter::fresh`), and the outputs finished with none:
+    /// with a partition's fences and its key count, such an output holds
+    /// that partition's keys and no others (`Options::identity_by_keys`).
+    fresh: u64,
+    kept_keys: Vec<String>,
     /// Each output's form file built as it is finished
     /// (`Options::zpages_build_at_finish`).
     zfinish: Option<std::sync::Arc<ZFinish>>,
@@ -19154,6 +19192,9 @@ impl Emitter<'_> {
             write_ord(self.dir, &p.name, &ord, self.ord_durable)?;
             std::fs::rename(&p.tmp, self.dir.join(&p.name))?;
             self.out.push(p.name.clone());
+            if std::mem::take(&mut self.fresh) == 0 {
+                self.kept_keys.push(p.name.clone());
+            }
             // Its form file, from the pages just written, while the merge
             // goes on to the next output.
             if let Some(z) = &self.zfinish {
@@ -19194,15 +19235,33 @@ impl Emitter<'_> {
         self.leave(to)
     }
 
-    fn finish(self, total: usize) -> Result<Vec<String>> {
+    /// The key about to be written is one no partition among the inputs
+    /// held: the output it goes to holds a key its range's partition did
+    /// not.
+    fn fresh(&mut self) {
+        self.fresh += 1;
+    }
+
+    fn finish(self, total: usize) -> Result<MergeOut> {
         if self.r != total || self.pi != self.pieces.len() {
             return Err(err("merge ended with a piece still open"));
         }
-        Ok(self.out)
+        Ok(MergeOut {
+            names: self.out,
+            kept_keys: self.kept_keys,
+        })
     }
 }
 
-fn compact_run(plan: MergePlan) -> Result<Vec<String>> {
+/// A merge's outputs, and those of them it wrote no key into but keys a
+/// partition among its inputs held (`Emitter::fresh`).
+#[derive(Default)]
+struct MergeOut {
+    names: Vec<String>,
+    kept_keys: Vec<String>,
+}
+
+fn compact_run(plan: MergePlan) -> Result<MergeOut> {
     let MergePlan {
         dir,
         inputs,
@@ -19295,7 +19354,7 @@ fn compact_run(plan: MergePlan) -> Result<Vec<String>> {
         all
     };
     let Some((slices, given, total)) = slicer.finish() else {
-        return Ok(Vec::new());
+        return Ok(MergeOut::default());
     };
     steps.step("keys");
 
@@ -19347,6 +19406,8 @@ fn compact_run(plan: MergePlan) -> Result<Vec<String>> {
         r: 0,
         w: None,
         out: Vec::new(),
+        fresh: 0,
+        kept_keys: Vec::new(),
         zfinish: zfinish.clone(),
         syncs: 0,
         helpers: 0,
@@ -19399,6 +19460,9 @@ fn compact_run(plan: MergePlan) -> Result<Vec<String>> {
         dropped_to[i] = to;
     };
     let mut ahead = MergeAhead::new(&blobs, read_ahead, counts.clone());
+    // The inputs that are partitions: a key none of them holds is one the
+    // output's range did not have (`Emitter::fresh`).
+    let from_partition: Vec<bool> = inputs.iter().map(|n| n.starts_with("par-")).collect();
     if cursors {
         merge_ranks(&blobs, walk_cached, |k, tied| {
             let mut start = 0usize;
@@ -19419,6 +19483,9 @@ fn compact_run(plan: MergePlan) -> Result<Vec<String>> {
             }
             if live == 0 {
                 return em.skip();
+            }
+            if !tied.iter().any(|&(i, _)| from_partition[i]) {
+                em.fresh();
             }
             em.key(k, |w| {
                 for &(i, rank) in &tied[start..] {
@@ -19450,6 +19517,9 @@ fn compact_run(plan: MergePlan) -> Result<Vec<String>> {
                 em.skip()?;
                 continue;
             }
+            if !found.iter().any(|&(i, ..)| from_partition[i]) {
+                em.fresh();
+            }
             em.key(k, |w| {
                 for &(i, exts, tail) in &found[start..] {
                     blobs[i]
@@ -19471,7 +19541,7 @@ fn compact_run(plan: MergePlan) -> Result<Vec<String>> {
             .fetch_add(em.helpers, AtomicOrdering::Relaxed);
     }
     let mut out = em.finish(total)?;
-    out.extend(empties);
+    out.names.extend(empties);
     File::open(&dir)?.sync_all()?;
     steps.step("finish");
     if steps.on {
@@ -19632,6 +19702,8 @@ fn tier_run(plan: TierPlan) -> Result<Vec<String>> {
         r: 0,
         w: None,
         out: Vec::new(),
+        fresh: 0,
+        kept_keys: Vec::new(),
         zfinish: zfinish.clone(),
         syncs: 0,
         helpers: 0,
@@ -19672,7 +19744,7 @@ fn tier_run(plan: TierPlan) -> Result<Vec<String>> {
         c.merge_helpers
             .fetch_add(em.helpers, AtomicOrdering::Relaxed);
     }
-    let out = em.finish(total)?;
+    let out = em.finish(total)?.names;
     File::open(&dir)?.sync_all()?;
     Ok(out)
 }
@@ -19937,6 +20009,9 @@ struct SealCounts {
     /// first, by the segment work.
     run_spares: AtomicU64,
     run_spares_made: AtomicU64,
+    /// Merge outputs given the key sequence of the partition they rewrote
+    /// (`Options::identity_by_keys`).
+    keyseqs_kept: AtomicU64,
     /// Time the writer spent in the seals its commits started: the wait
     /// for room, the freeze, and the seal's writer half.
     freeze_ns: AtomicU64,
@@ -19976,6 +20051,7 @@ impl SealCounts {
             run_names: get(&self.run_names),
             run_spares: get(&self.run_spares),
             run_spares_made: get(&self.run_spares_made),
+            keyseqs_kept: get(&self.keyseqs_kept),
             freeze_ns: get(&self.freeze_ns),
         }
     }
@@ -20056,6 +20132,9 @@ pub struct SealWaits {
     /// segment work made so (`Options::run_spare`).
     pub run_spares: u64,
     pub run_spares_made: u64,
+    /// Merge outputs given the key sequence of the partition they rewrote
+    /// (`Options::identity_by_keys`).
+    pub keyseqs_kept: u64,
     pub freeze_ns: u64,
 }
 
@@ -20078,8 +20157,10 @@ struct CachedBlock {
     /// holds. True only of the partition `identity_of` names
     /// (`CachedBlock::identity_for`).
     identity: bool,
-    /// The blob id of the partition whose records the entries are where
-    /// `identity` holds. A table is carried across a merge that rewrites
+    /// The key sequence (`Seg::keyseq`) of the partition whose records the
+    /// entries are where `identity` holds: that partition's blob id, which
+    /// a partition a merge rewrote over the same keys carries on
+    /// (`Options::identity_by_keys`). A table is carried across a merge that rewrites
     /// its partition over the same block boundaries (`Db::same_blocks`:
     /// the same key count and the same key at every block's first rank),
     /// and its copies with it; a delete and an insert in one block that a
@@ -20106,11 +20187,11 @@ struct CachedBlock {
 }
 
 impl CachedBlock {
-    /// Whether entry `i` is record `lo + i` of the partition `blob` names:
-    /// the identity holds, and of that partition.
+    /// Whether entry `i` is record `lo + i` of a partition of the key
+    /// sequence `keyseq`: the identity holds, and of those keys.
     #[inline]
-    fn identity_for(&self, blob: u64) -> bool {
-        self.identity && self.identity_of == blob
+    fn identity_for(&self, keyseq: u64) -> bool {
+        self.identity && self.identity_of == keyseq
     }
     /// The three buffers shrunk to what they hold, where a build asked
     /// for more than it filled (`Options::forms_to_fit`).
@@ -20402,7 +20483,7 @@ fn copy_entry_at(table: &BlockTable, b: u32, cut: u32) -> Option<(&CachedBlock, 
         return None;
     };
     let j = ((cut >> 1) as usize).checked_sub(b as usize * CACHE_BLOCK)?;
-    (blk.identity_for(table.blob) && j < blk.ents.len()).then_some((blk, j))
+    (blk.identity_for(table.keyseq) && j < blk.ents.len()).then_some((blk, j))
 }
 
 /// The lines a walk of `form` over the partition's ranks `from` to `n`
@@ -21025,6 +21106,11 @@ struct BlockTable {
     /// it was built against.
     layout: u64,
     blob: u64,
+    /// The key sequence of the partition the table stands over
+    /// (`Seg::keyseq`): what a copy's claim to its entries' ranks is held
+    /// to (`CachedBlock::identity_for`). The blob's own id unless a merge
+    /// rewrote the partition over its keys (`Options::identity_by_keys`).
+    keyseq: u64,
 }
 
 impl BlockTable {
@@ -23735,6 +23821,9 @@ struct FormsState {
     /// Scans that started a copy walk at the seek's rank, and that
     /// searched the copy (`Options::copy_start_at_rank`).
     copy_starts: Counts<2>,
+    /// The settle's patches of a copy by how each found its entry: at the
+    /// key's rank, and by a search of the copy (`Db::copy_patches`).
+    copy_patches: Counts<2>,
     /// Scans whose start seek seeded the partition's reader with its cursor
     /// (`Options::zpages_seek_seeds`).
     seek_seeds: std::cell::Cell<u64>,
@@ -23940,6 +24029,7 @@ impl FormsState {
             sheds: std::cell::Cell::new(0),
             dir_prefetches: std::cell::Cell::new(0),
             copy_starts: Counts::new(),
+            copy_patches: Counts::new(),
             seek_seeds: std::cell::Cell::new(0),
             hot_starts: Counts::new(),
             prefetch_paces: std::cell::Cell::new(0),
@@ -30469,6 +30559,7 @@ impl Reader {
             t.piece_ranks = piece_ranks;
             if rebased {
                 t.blob = seg.blob.id();
+                t.keyseq = seg.keyseq;
                 // The keys filed since the snapshot carry the cut each
                 // resolved to -- its rank in the partition -- and the
                 // rewrite the carry crosses keeps the block boundaries
@@ -34590,10 +34681,11 @@ impl Reader {
                 // answered (`Options::copy_start_at_rank`).
                 let lo = b * CACHE_BLOCK;
                 let at_rank = self.opts.copy_start_at_rank
-                    && blk.identity_for(table.blob)
+                    && blk.identity_for(table.keyseq)
                     && same
                     && c >= lo
                     && c - lo < blk.ents.len();
+                self.fs().copy_patches.add(usize::from(!at_rank), 1);
                 let (i, found) = if at_rank {
                     debug_assert!(
                         key_cmp(blk.key(&blk.ents[c - lo]), key) == Ordering::Equal,
@@ -34973,6 +35065,7 @@ impl Reader {
             dirty: vec![false; nblocks],
             layout: self.layout_of_seg(seg),
             blob: seg.blob.id(),
+            keyseq: seg.keyseq,
         })
     }
 
@@ -35774,7 +35867,7 @@ impl Reader {
                         // above record `start - 1` and not above `start`,
                         // so no entry between them is skipped.
                         let at_rank = self.opts.copy_start_at_rank
-                            && blk.identity_for(src.seg.blob.id())
+                            && blk.identity_for(src.seg.keyseq)
                             && rank != usize::MAX;
                         let i = if !first {
                             0
@@ -36164,7 +36257,7 @@ impl Reader {
                 for c in t.slots.iter().flatten() {
                     if let Cached::Block(b) = &**c {
                         claimed += b.identity as usize;
-                        holds += b.identity_for(t.blob) as usize;
+                        holds += b.identity_for(t.keyseq) as usize;
                     }
                 }
             }
@@ -42112,6 +42205,15 @@ impl Db {
         self.r.fs().copy_starts.get()
     }
 
+    /// The writer's own settles' patches of a copy by how each found its
+    /// entry: at the key's rank, where the copy's entries are its
+    /// partition's records, and by a search of the copy
+    /// (`Options::copy_start_at_rank`, `Options::identity_by_keys`).
+    pub fn copy_patches(&self) -> [u64; 2] {
+        self.take_back_upkeep();
+        self.r.fs().copy_patches.get()
+    }
+
     /// The writer's scans whose start seek seeded the partition's reader
     /// with its cursor (`Options::zpages_seek_seeds`).
     pub fn seek_seeds(&self) -> u64 {
@@ -44713,6 +44815,7 @@ impl Reader {
                 dirty: vec![false; nblocks],
                 layout: 0,
                 blob: seg.blob.id(),
+                keyseq: seg.keyseq,
             };
             if table.clean_throughout() {
                 continue;
@@ -49152,7 +49255,7 @@ impl<'s> BuildCtx<'s> {
             vals: Vec::with_capacity(n * 128),
             ents: Vec::with_capacity(n),
             identity: false,
-            identity_of: src.seg.blob.id(),
+            identity_of: src.seg.keyseq,
             wide: false,
             dead: 0,
         });
@@ -49222,7 +49325,7 @@ impl<'s> BuildCtx<'s> {
             vals: Vec::with_capacity(sb.vals.len() + kept * 128),
             ents: Vec::with_capacity(sb.ents.len() + kept),
             identity: false,
-            identity_of: seg.blob.id(),
+            identity_of: seg.keyseq,
             wide: false,
             dead: 0,
         };
@@ -59203,7 +59306,10 @@ impl Maint {
             self.flush_merge = false;
         }
         let t = std::time::Instant::now();
-        let outputs = handle
+        let MergeOut {
+            names: outputs,
+            kept_keys,
+        } = handle
             .join()
             .map_err(|_| err("compaction thread panicked"))??;
         if self.merge_trace {
@@ -59230,15 +59336,40 @@ impl Maint {
             .cloned()
             .collect();
         let mut merged = Vec::with_capacity(outputs.len() + kept.len());
+        let mut kept_seqs = 0u64;
         for name in &outputs {
-            merged.push(std::sync::Arc::new(Seg::open(
+            let mut out = Seg::open(
                 &self.dir,
                 name,
                 self.advice_random(),
                 self.opts.read_advice != ReadAdvice::Normal,
                 self.opts.segment.checksums,
                 true,
-            )?));
+            )?;
+            // The key sequence of the partition this output rewrote, where
+            // the merge wrote it no key that partition did not hold and it
+            // holds as many: within one partition's fences every key a
+            // partition held was that partition's, so the output's keys are
+            // among its keys, and as many of them are all of them
+            // (`Options::identity_by_keys`). The partition at the output's
+            // fences is the one it rewrote, the partitions tiling the keys;
+            // a piece cut at the same fences is not a partition.
+            if self.opts.identity_by_keys && kept_keys.contains(name) {
+                let rewrote = self.segs().iter().find(|a| {
+                    a.level > 0
+                        && a.lo == out.lo
+                        && a.hi == out.hi
+                        && a.blob.keys() == out.blob.keys()
+                });
+                if let Some(a) = rewrote {
+                    out.keyseq = a.keyseq;
+                    kept_seqs += 1;
+                }
+            }
+            merged.push(std::sync::Arc::new(out));
+        }
+        if kept_seqs > 0 {
+            SealCounts::add(&self.shared.seal_counts.keyseqs_kept, kept_seqs);
         }
         // Partitions first (older, disjoint), then whatever L0 arrived
         // while the merge ran, oldest to newest.

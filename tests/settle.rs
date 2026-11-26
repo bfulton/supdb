@@ -346,6 +346,7 @@ fn a_copys_identity_is_its_partitions_and_not_the_one_a_rewrite_left() {
     };
     let rebased_before = db.forms_rebased();
     let merges_before = db.seal_waits().merges;
+    let kept_before = db.seal_waits().keyseqs_kept;
     db.hold_upkeep_pass(true);
     db.hold_seal_durable(true);
     for _ in 0..2 {
@@ -368,6 +369,14 @@ fn a_copys_identity_is_its_partitions_and_not_the_one_a_rewrite_left() {
         "the rewrite kept the partition's layout: {} before, {} after",
         rebased_before,
         db.forms_rebased()
+    );
+    // The output holds a key its partition did not, as many keys as it
+    // and between the same fences: not that partition's key sequence
+    // (`Options::identity_by_keys`).
+    assert_eq!(
+        db.seal_waits().keyseqs_kept,
+        kept_before,
+        "an output with a key folded in took the key sequence of the partition it rewrote"
     );
     let mut want = std::collections::BTreeMap::new();
     for k in &keys {
@@ -1850,6 +1859,427 @@ fn a_key_only_its_chain_holds_takes_its_run_from_the_chain() {
             scan_model(&db) == want,
             "{on}: and once the seal has landed"
         );
+        drop(db);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+/// A store of partitions a block each, every block held as a copy built
+/// over updates alone, so each copy's entries are its partition's records
+/// (`CachedBlock::identity`): the keys, what a scan answers, and the keys
+/// inside the middle partition.
+#[allow(clippy::type_complexity)]
+fn copies_of_records(
+    dir: &std::path::Path,
+    o: Options,
+) -> (
+    Db,
+    Vec<Vec<u8>>,
+    std::collections::BTreeMap<Vec<u8>, Vec<Vec<u8>>>,
+    Vec<Vec<u8>>,
+) {
+    let mut db = Db::create(
+        dir,
+        Options {
+            seal_bytes: 1 << 20,
+            partition_bytes: Some(4096),
+            partition_on_flush: true,
+            publish_in_background: true,
+            upkeep: Upkeep::Background(1),
+            upkeep_pace_syncs_bp: 0,
+            scan_block_cache: true,
+            l0_trigger: 2,
+            ..o
+        },
+    )
+    .unwrap();
+    let value = [b'v'; 100];
+    let keys: Vec<Vec<u8>> = (0..300).map(|i| format!("k{i:05}").into_bytes()).collect();
+    let mut want = std::collections::BTreeMap::new();
+    for k in &keys {
+        db.put(k, &value);
+        want.insert(k.clone(), vec![value.to_vec()]);
+    }
+    db.commit().unwrap();
+    db.flush().unwrap();
+    db.settle().unwrap();
+    let fences = partition_fences(dir);
+    assert!(fences.len() >= 4, "partitions: {}", fences.len());
+    let (lo, hi) = {
+        let (lo, hi) = &fences[fences.len() / 2];
+        (lo.clone(), hi.clone().expect("a closed partition"))
+    };
+    let inside: Vec<Vec<u8>> = keys
+        .iter()
+        .filter(|k| **k >= lo && **k < hi)
+        .cloned()
+        .collect();
+    assert!(
+        (26..=64).contains(&inside.len()),
+        "keys inside the range: {}",
+        inside.len()
+    );
+    let _ = scan_model(&db);
+    for (i, k) in keys.iter().enumerate() {
+        if i % 4 != 0 {
+            db.put(k, b"updated");
+            want.insert(k.clone(), vec![b"updated".to_vec()]);
+        }
+    }
+    db.commit().unwrap();
+    db.settle().unwrap();
+    assert_eq!(scan_model(&db), want);
+    let (claimed, holds) = db.block_cache_identity();
+    assert!(
+        claimed >= 4 && holds == claimed,
+        "copies of their partitions' records: {claimed} claimed, {holds} of their partitions"
+    );
+    (db, keys, want, inside)
+}
+
+/// The store's merges landed past `before`, and the writer's look across
+/// them made.
+fn merged_past(db: &mut Db, before: u64) {
+    let t = std::time::Instant::now();
+    while db.seal_waits().merges == before {
+        assert!(t.elapsed().as_secs() < 60, "the merge never landed");
+        std::thread::sleep(std::time::Duration::from_millis(2));
+    }
+    db.settle().unwrap();
+    db.settle().unwrap();
+}
+
+/// A copy's claim that its entries are its partition's records is of the
+/// partition's keys, and a merge that folds updates alone into a
+/// partition writes those keys at the ranks they had: the copy carried
+/// across it starts a scan and takes a patch at a rank as before. Held to
+/// the file its build read, the claim was lost at every merge of the
+/// partition for the copy's life, and every scan's start in the block and
+/// every patch of it searched from then on (`Options::identity_by_keys`;
+/// off is that shape, and reads the same answers by the search). Under
+/// either way a merge finds its keys (`Options::cursor_merge`).
+#[test]
+fn a_copys_identity_outlives_a_merge_that_kept_its_partitions_keys() {
+    for (by_keys, cursors) in [(true, true), (true, false), (false, true)] {
+        let dir = scratch(&format!("copy-identity-kept-{by_keys}-{cursors}"));
+        let (mut db, keys, mut want, inside) = copies_of_records(
+            &dir,
+            Options {
+                identity_by_keys: by_keys,
+                cursor_merge: cursors,
+                ..common::options()
+            },
+        );
+        let partitions = partition_fences(&dir).len();
+        // Updates alone in every partition, sealed twice: every range is
+        // due, and each merge writes its partition's keys and no others.
+        let rebased_before = db.forms_rebased();
+        let merges_before = db.seal_waits().merges;
+        let kept_before = db.seal_waits().keyseqs_kept;
+        db.hold_seal_durable(true);
+        for round in 0..2u8 {
+            let v = [b'a' + round; 100];
+            for k in keys.iter().step_by(5) {
+                db.put(k, &v);
+                want.insert(k.clone(), vec![v.to_vec()]);
+            }
+            db.commit().unwrap();
+            db.seal().unwrap();
+        }
+        db.hold_seal_durable(false);
+        merged_past(&mut db, merges_before);
+        // The writer's look across the landings, which carries its tables
+        // to the partitions as they stand, is its next read of the log: a
+        // scan.
+        assert_eq!(scan_model(&db), want, "the writer's scan across the merges");
+        assert!(
+            db.forms_rebased() > rebased_before,
+            "the rewrites kept the partitions' layouts: {} before, {} after",
+            rebased_before,
+            db.forms_rebased()
+        );
+        let kept = db.seal_waits().keyseqs_kept - kept_before;
+        let (claimed, holds) = db.block_cache_identity();
+        if by_keys {
+            assert_eq!(
+                kept, partitions as u64,
+                "every output is of its partition's keys"
+            );
+            assert!(
+                claimed >= 4 && holds == claimed,
+                "the copies carried across: {claimed} claimed, {holds} of their partitions"
+            );
+        } else {
+            assert_eq!(kept, 0, "a claim by the file carries no key sequence");
+            assert!(
+                claimed >= 4 && holds == 0,
+                "the copies carried across: {claimed} claimed, {holds} of their partitions"
+            );
+        }
+        // A write after the rewrites, patched into the carried copy, and
+        // a scan that starts inside it: at the key's rank where the claim
+        // stands, by a search of the copy where it does not, and the same
+        // answer either way.
+        let patches_before = db.copy_patches();
+        let asks_before = db.patch_asks();
+        for k in [&inside[7], &inside[9]] {
+            db.put(k, b"after");
+            want.insert(k.clone(), vec![b"after".to_vec()]);
+        }
+        db.commit().unwrap();
+        db.settle().unwrap();
+        let before = db.copy_starts();
+        let mut got = Vec::new();
+        db.scan(
+            &inside[4],
+            5,
+            kv(&mut |k, v| got.push((k.to_vec(), v.to_vec()))),
+        )
+        .unwrap();
+        let after = db.copy_starts();
+        let patches = db.copy_patches();
+        let from_model: Vec<(Vec<u8>, Vec<u8>)> = want
+            .range(inside[4].clone()..)
+            .take(5)
+            .map(|(k, v)| (k.clone(), v[0].clone()))
+            .collect();
+        assert_eq!(got, from_model, "the scan from inside the copy");
+        assert_eq!(
+            [after[0] - before[0], after[1] - before[1]],
+            if by_keys { [1, 0] } else { [0, 1] },
+            "the scan's start in the copy, at its rank and by a search"
+        );
+        assert_eq!(
+            [
+                patches[0] - patches_before[0],
+                patches[1] - patches_before[1]
+            ],
+            if by_keys { [2, 0] } else { [0, 2] },
+            "the patches of the copy, at their ranks and by a search"
+        );
+        // And the lines a patch by its rank asks for ahead of it, the
+        // second key's while the first is patched.
+        assert_eq!(
+            db.patch_asks() - asks_before,
+            u64::from(by_keys),
+            "the asks ahead of a patch by its rank"
+        );
+        let listed: Vec<(Vec<u8>, Vec<Vec<u8>>)> =
+            want.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
+        assert_eq!(scan_list(&db), listed, "the writer's scan");
+        let r = db.reader().unwrap();
+        let mut via_handle = std::collections::BTreeMap::new();
+        r.scan(
+            b"",
+            usize::MAX,
+            kv(&mut |k, v| {
+                via_handle
+                    .entry(k.to_vec())
+                    .or_insert_with(Vec::new)
+                    .push(v.to_vec());
+            }),
+        )
+        .unwrap();
+        assert_eq!(via_handle, want, "the handle's scan");
+        drop(r);
+        // The tables made again over the partitions as the merges left
+        // them, and their copies built again: a table and the copies it
+        // holds name one key sequence, the partition's, inherited or not.
+        db.drop_forms();
+        let _ = scan_model(&db);
+        for (i, k) in keys.iter().enumerate() {
+            if i % 4 != 0 {
+                db.put(k, b"again");
+                want.insert(k.clone(), vec![b"again".to_vec()]);
+            }
+        }
+        db.commit().unwrap();
+        db.settle().unwrap();
+        assert_eq!(
+            scan_model(&db),
+            want,
+            "the writer's scan over the forms made again"
+        );
+        let (claimed, holds) = db.block_cache_identity();
+        assert!(
+            claimed >= 4 && holds == claimed,
+            "the copies built again: {claimed} claimed, {holds} of their partitions"
+        );
+        let before = db.copy_starts();
+        let mut n = 0;
+        db.scan(&inside[4], 5, kv(&mut |_, _| n += 1)).unwrap();
+        let after = db.copy_starts();
+        assert_eq!(n, 5);
+        assert_eq!(
+            [after[0] - before[0], after[1] - before[1]],
+            [1, 0],
+            "the scan's start in a copy built over the partition as it stands"
+        );
+        for (k, v) in &want {
+            let mut got = Vec::new();
+            db.read_all(k, vf(&mut |x| got.push(x.to_vec()))).unwrap();
+            assert_eq!(
+                &got,
+                v,
+                "the point read of {:?}",
+                String::from_utf8_lossy(k)
+            );
+        }
+        drop(db);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+/// An output a key short of the partition it rewrote holds only keys that
+/// partition held, and is not its key sequence: every rank past the key
+/// the merge dropped is another key's. The count is what says so, where
+/// the keys folded in say nothing; and the partition's is the count that
+/// is asked, not that of a piece over its range, which here holds as many
+/// keys as the output does.
+#[test]
+fn a_merge_that_drops_a_key_writes_a_key_sequence_of_its_own() {
+    let dir = scratch("copy-identity-dropped-key");
+    let (mut db, _, mut want, inside) = copies_of_records(&dir, common::options());
+    let merges_before = db.seal_waits().merges;
+    let kept_before = db.seal_waits().keyseqs_kept;
+    db.hold_seal_durable(true);
+    // The first piece drops the key; the second holds every other key of
+    // the range, as many records as the output will.
+    db.delete(&inside[2]);
+    db.put(&inside[3], &[b'a'; 100]);
+    want.remove(&inside[2]);
+    want.insert(inside[3].clone(), vec![vec![b'a'; 100]]);
+    db.commit().unwrap();
+    db.seal().unwrap();
+    for (i, k) in inside.iter().enumerate() {
+        if i != 2 {
+            db.put(k, &[b'b'; 100]);
+            want.insert(k.clone(), vec![vec![b'b'; 100]]);
+        }
+    }
+    db.commit().unwrap();
+    db.seal().unwrap();
+    db.hold_seal_durable(false);
+    merged_past(&mut db, merges_before);
+    assert_eq!(
+        db.seal_waits().keyseqs_kept,
+        kept_before,
+        "an output a key short took a key sequence that is not its own"
+    );
+    db.put(&inside[7], b"after");
+    want.insert(inside[7].clone(), vec![b"after".to_vec()]);
+    db.commit().unwrap();
+    db.settle().unwrap();
+    let listed: Vec<(Vec<u8>, Vec<Vec<u8>>)> =
+        want.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
+    assert_eq!(scan_list(&db), listed, "the writer's scan");
+    let mut got = Vec::new();
+    db.scan(
+        &inside[4],
+        5,
+        kv(&mut |k, v| got.push((k.to_vec(), v.to_vec()))),
+    )
+    .unwrap();
+    let from_model: Vec<(Vec<u8>, Vec<u8>)> = want
+        .range(inside[4].clone()..)
+        .take(5)
+        .map(|(k, v)| (k.clone(), v[0].clone()))
+        .collect();
+    assert_eq!(got, from_model, "the scan from inside the block");
+    drop(db);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A key no partition held is counted against the output it is written
+/// to and no other: one merge over every range, with a key dropped and a
+/// key folded in -- as many keys as before -- in the first partition and
+/// in the last, the last's folded key the store's greatest, the last the
+/// merge writes. Those two outputs are key sequences of their own and
+/// every output between them is its partition's. Under either way a merge
+/// finds its keys (`Options::cursor_merge`).
+#[test]
+fn a_key_folded_in_is_its_own_outputs_and_no_other_outputs() {
+    for cursors in [true, false] {
+        let dir = scratch(&format!("copy-identity-folded-{cursors}"));
+        let (mut db, keys, mut want, _) = copies_of_records(
+            &dir,
+            Options {
+                cursor_merge: cursors,
+                ..common::options()
+            },
+        );
+        let partitions = partition_fences(&dir).len() as u64;
+        let merges_before = db.seal_waits().merges;
+        let kept_before = db.seal_waits().keyseqs_kept;
+        let folded_low = {
+            let mut k = keys[1].clone();
+            k.push(b'x');
+            k
+        };
+        let folded_high = {
+            let mut k = keys[keys.len() - 1].clone();
+            k.push(b'x');
+            k
+        };
+        let (dropped_low, dropped_high) = (keys[3].clone(), keys[keys.len() - 4].clone());
+        db.hold_seal_durable(true);
+        for round in 0..2u8 {
+            let v = [b'a' + round; 100];
+            for k in keys.iter().step_by(5) {
+                db.put(k, &v);
+                want.insert(k.clone(), vec![v.to_vec()]);
+            }
+            db.delete(&dropped_low);
+            db.delete(&dropped_high);
+            db.put(&folded_low, b"folded");
+            db.put(&folded_high, b"folded");
+            want.remove(&dropped_low);
+            want.remove(&dropped_high);
+            want.insert(folded_low.clone(), vec![b"folded".to_vec()]);
+            want.insert(folded_high.clone(), vec![b"folded".to_vec()]);
+            db.commit().unwrap();
+            db.seal().unwrap();
+        }
+        db.hold_seal_durable(false);
+        merged_past(&mut db, merges_before);
+        assert_eq!(
+            db.seal_waits().merges,
+            merges_before + 1,
+            "one merge over every range"
+        );
+        assert_eq!(
+            db.seal_waits().keyseqs_kept - kept_before,
+            partitions - 2,
+            "the outputs of their partitions' keys, of {partitions}"
+        );
+        let listed: Vec<(Vec<u8>, Vec<Vec<u8>>)> =
+            want.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
+        assert_eq!(scan_list(&db), listed, "the writer's scan across the merge");
+        // Patches into the first and the last blocks, between the key each
+        // lost and the key each gained, where every rank moved.
+        db.put(&keys[2], b"after");
+        db.put(&keys[keys.len() - 2], b"after");
+        want.insert(keys[2].clone(), vec![b"after".to_vec()]);
+        want.insert(keys[keys.len() - 2].clone(), vec![b"after".to_vec()]);
+        db.commit().unwrap();
+        db.settle().unwrap();
+        let listed: Vec<(Vec<u8>, Vec<Vec<u8>>)> =
+            want.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
+        assert_eq!(
+            scan_list(&db),
+            listed,
+            "the writer's scan after the patches"
+        );
+        for (k, v) in &want {
+            let mut got = Vec::new();
+            db.read_all(k, vf(&mut |x| got.push(x.to_vec()))).unwrap();
+            assert_eq!(
+                &got,
+                v,
+                "the point read of {:?}",
+                String::from_utf8_lossy(k)
+            );
+        }
         drop(db);
         let _ = std::fs::remove_dir_all(&dir);
     }

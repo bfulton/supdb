@@ -1450,6 +1450,10 @@ pub struct Supdb {
     /// (`Options::copy_prefetch_span`): `supdb-copyspan` and
     /// `supdb-ingestcopyspan`.
     copyspan: bool,
+    /// A copy's claim to its entries' ranks is of the file its build read
+    /// and lost at every merge of its partition (`Options::identity_by_keys`
+    /// off): `supdb-identityblob` and `supdb-ingestidentityblob`.
+    identityblob: bool,
     /// A settle's patch searches a copy for a key above its last entry
     /// (`Options::settle_append_last` off): `supdb-settlesearch` and
     /// `supdb-ingestsettlesearch`.
@@ -2920,6 +2924,8 @@ struct Policy {
     runsheld: bool,
     /// A copy's ask over its walk's entries: `...copyspan`.
     copyspan: bool,
+    /// A copy's identity by its file: `...identityblob`.
+    identityblob: bool,
     /// The patch's search for an appended key: `...settlesearch`.
     settlesearch: bool,
     /// The patch's walk of the sources for a lone key: `...settlesources`.
@@ -3561,6 +3567,7 @@ impl Default for Policy {
             sparsespan: false,
             runsheld: false,
             copyspan: false,
+            identityblob: false,
             settlesearch: false,
             settlesources: false,
             scanlevers: false,
@@ -10505,6 +10512,7 @@ impl Supdb {
             sparsespan,
             runsheld,
             copyspan,
+            identityblob,
             settlesearch,
             settlesources,
             scanlevers,
@@ -11158,6 +11166,7 @@ impl Supdb {
             scan_prefetch_sparse_span: sparsespan || scanlevers,
             scan_runs_held: runsheld || scanlevers,
             copy_prefetch_span: copyspan,
+            identity_by_keys: !identityblob,
             settle_append_last: !settlesearch,
             settle_lone_chain: !settlesources,
             forms_convert_from: if densefrom > 0 {
@@ -11566,6 +11575,7 @@ impl Supdb {
             sparsespan,
             runsheld,
             copyspan,
+            identityblob,
             settlesearch,
             settlesources,
             scanlevers,
@@ -12725,6 +12735,13 @@ impl Engine for Supdb {
                 "supdb-ingestcopyspan"
             };
         }
+        if self.identityblob {
+            return if self.partition {
+                "supdb-identityblob"
+            } else {
+                "supdb-ingestidentityblob"
+            };
+        }
         if self.settlesearch {
             return if self.partition {
                 "supdb-settlesearch"
@@ -13766,6 +13783,7 @@ impl Engine for Supdb {
             ("merge_plans", db.seal_waits().plans as f64),
             ("merges_beside", db.seal_waits().merges_beside as f64),
             ("merges_quiet", db.seal_waits().merges_quiet as f64),
+            ("keyseqs_kept", db.seal_waits().keyseqs_kept as f64),
             ("pieces_aligned", db.pieces_aligned() as u8 as f64),
             // What the forms' upkeep did: see `Db::forms_events`.
             ("blk_by_upkeep", ev[0] as f64),
@@ -13786,6 +13804,8 @@ impl Engine for Supdb {
             ("walk_copy", wk[0] as f64),
             ("start_at_rank", cs[0] as f64),
             ("start_search", cs[1] as f64),
+            ("patch_at_rank", db.copy_patches()[0] as f64),
+            ("patch_search", db.copy_patches()[1] as f64),
             // The writer's scans whose start seek seeded the partition's
             // reader with its cursor (`Options::zpages_seek_seeds`).
             ("seek_seeds", ss as f64),
@@ -15692,6 +15712,8 @@ pub fn guarantee(arm: &str) -> Option<Guarantee> {
         | "supdb-ingestrunsheld"
         | "supdb-copyspan"
         | "supdb-ingestcopyspan"
+        | "supdb-identityblob"
+        | "supdb-ingestidentityblob"
         | "supdb-settlesearch"
         | "supdb-ingestsettlesearch"
         | "supdb-settlesources"
@@ -17020,6 +17042,32 @@ pub fn open(arm: &str, dir: &Path, map_gb: usize) -> Res<Box<dyn Engine>> {
                         partition: false,
                         durable: false,
                         copyspan: true,
+                        ..Policy::default()
+                    },
+                )
+            },
+            dir,
+        )?,
+        "supdb-identityblob" => supdb_arm(
+            |d| {
+                Supdb::with_policy(
+                    d,
+                    Policy {
+                        identityblob: true,
+                        ..Policy::default()
+                    },
+                )
+            },
+            dir,
+        )?,
+        "supdb-ingestidentityblob" => supdb_arm(
+            |d| {
+                Supdb::with_policy(
+                    d,
+                    Policy {
+                        partition: false,
+                        durable: false,
+                        identityblob: true,
                         ..Policy::default()
                     },
                 )
@@ -20486,6 +20534,21 @@ mod tests {
                 assert_eq!(z.features(), base.features());
                 let o = z.db.as_ref().unwrap().options();
                 assert!(o.copy_prefetch_span && !b.copy_prefetch_span);
+            }
+            {
+                let z = Supdb::with_policy(
+                    &dir("identityblob"),
+                    Policy {
+                        identityblob: true,
+                        ..Policy::default()
+                    },
+                )
+                .unwrap();
+                assert_eq!(z.name(), "supdb-identityblob");
+                assert_eq!(z.features(), base.features());
+                let o = z.db.as_ref().unwrap().options();
+                assert!(!o.identity_by_keys && b.identity_by_keys);
+                assert!(o.settle_append_last);
             }
             {
                 let z = Supdb::with_policy(
