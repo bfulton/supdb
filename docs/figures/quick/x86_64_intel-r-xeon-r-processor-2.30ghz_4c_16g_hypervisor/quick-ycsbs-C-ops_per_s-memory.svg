@@ -2,7 +2,7 @@
 <rect width="760" height="420" fill="white"/>
 <text x="72" y="28" font-size="15" font-weight="600">At 3×10⁵ keys supdb is 1.1× behind FASTER</text>
 <text x="72" y="47" font-size="12">YCSB-C, read-only (scrambled zipfian), throughput, in memory until a checkpoint, to 3×10⁵ keys</text>
-<text x="72" y="64" font-size="11" fill="#6b6b6b">x86_64/intel-r-xeon-r-processor-2.30ghz/4c/16g/hypervisor · f0ea1c7 · 2026-11-26 · median with 95% CI over 5 reps</text>
+<text x="72" y="64" font-size="11" fill="#6b6b6b">x86_64/intel-r-xeon-r-processor-2.30ghz/4c/16g/hypervisor · 001781d · 2026-11-26 · median with 95% CI over 5 reps</text>
 <line x1="72" y1="372" x2="610" y2="372" stroke="#c8c8c8" stroke-width="1"/>
 <line x1="72" y1="88" x2="72" y2="372" stroke="#c8c8c8" stroke-width="1"/>
 <line x1="98.3" y1="372" x2="98.3" y2="378" stroke="#c8c8c8" stroke-width="1"/>
@@ -15,18 +15,19 @@
 <line x1="67" y1="372.0" x2="72" y2="372.0" stroke="#c8c8c8" stroke-width="1"/>
 <text x="63" y="376.0" font-size="11" text-anchor="end" fill="#6b6b6b">0</text>
 <line x1="67" y1="301.0" x2="72" y2="301.0" stroke="#c8c8c8" stroke-width="1"/>
-<text x="63" y="305.0" font-size="11" text-anchor="end" fill="#6b6b6b">2.5M</text>
+<text x="63" y="305.0" font-size="11" text-anchor="end" fill="#6b6b6b">2M</text>
 <line x1="67" y1="230.0" x2="72" y2="230.0" stroke="#c8c8c8" stroke-width="1"/>
-<text x="63" y="234.0" font-size="11" text-anchor="end" fill="#6b6b6b">5M</text>
+<text x="63" y="234.0" font-size="11" text-anchor="end" fill="#6b6b6b">4M</text>
 <line x1="67" y1="159.0" x2="72" y2="159.0" stroke="#c8c8c8" stroke-width="1"/>
-<text x="63" y="163.0" font-size="11" text-anchor="end" fill="#6b6b6b">7.5M</text>
+<text x="63" y="163.0" font-size="11" text-anchor="end" fill="#6b6b6b">6M</text>
 <line x1="67" y1="88.0" x2="72" y2="88.0" stroke="#c8c8c8" stroke-width="1"/>
-<text x="63" y="92.0" font-size="11" text-anchor="end" fill="#6b6b6b">10M</text>
+<text x="63" y="92.0" font-size="11" text-anchor="end" fill="#6b6b6b">8M</text>
 <text x="10" y="80" font-size="11" text-anchor="start" fill="#6b6b6b">ops/s</text>
-<path d="M98.3,113.7 L255.1,151.3 L426.9,170.0 L583.7,246.0 L583.7,286.8 L426.9,243.8 L255.1,256.7 L98.3,259.7 Z" fill="#8c8c8c" fill-opacity="0.10"/>
-<path d="M98.3,190.4 L255.1,211.3 L426.9,234.7 L583.7,265.8 L583.7,285.1 L426.9,289.1 L255.1,294.6 L98.3,249.8 Z" fill="#1b1b1b" fill-opacity="0.10"/>
-<path d="M98.3,246.4 L255.1,212.2 L426.9,236.4 L583.7,260.3 " fill="none" stroke="#8c8c8c" stroke-width="1.6" stroke-linejoin="round" stroke-linecap="round"/>
-<path d="M98.3,224.0 L255.1,254.9 L426.9,267.6 L583.7,267.7 " fill="none" stroke="#1b1b1b" stroke-width="2" stroke-linejoin="round" stroke-linecap="round"/>
-<text x="618.0" y="264.3" font-size="11" fill="#8c8c8c">FASTER</text>
-<text x="618.0" y="277.3" font-size="11" fill="#1b1b1b">supdb (in memory until a sync)</text>
+<path d="M98.3,125.4 L255.1,119.0 L426.9,126.0 L583.7,183.4 L583.7,271.2 L426.9,216.6 L255.1,253.4 L98.3,205.5 Z" fill="#8c8c8c" fill-opacity="0.10"/>
+<path d="M98.3,125.1 L255.1,120.9 L426.9,196.1 L583.7,217.9 L583.7,264.9 L426.9,275.0 L255.1,232.4 L98.3,186.8 Z" fill="#1b1b1b" fill-opacity="0.10"/>
+<path d="M98.3,143.0 L255.1,190.4 L426.9,153.8 L583.7,248.3 " fill="none" stroke="#8c8c8c" stroke-width="1.6" stroke-linejoin="round" stroke-linecap="round"/>
+<path d="M98.3,164.9 L255.1,224.8 L426.9,245.3 L583.7,255.1 " fill="none" stroke="#1b1b1b" stroke-width="2" stroke-linejoin="round" stroke-linecap="round"/>
+<text x="618.0" y="252.3" font-size="11" fill="#8c8c8c">FASTER</text>
+<line x1="612.0" y1="255.1" x2="616.0" y2="261.3" stroke="#1b1b1b" stroke-width="0.75"/>
+<text x="618.0" y="265.3" font-size="11" fill="#1b1b1b">supdb (in memory until a sync)</text>
 </svg>
