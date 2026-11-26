@@ -877,8 +877,9 @@ entries the writer is rewriting are the cost, each an ownership the
 next update pays for, and three cache-line separations guessed at
 before the bisect moved nothing and were taken out. The mixes have a
 timer by kind (`SUPDB_MIX_KINDS=1`, a `mixkinds` line per mix on
-stderr for every arm, its reads, scans and commits apart, and the seals
-and the freezes' time inside the commits), which read
+stderr for every arm, its reads, scans and commits apart, its first four
+scans and its longest, and the seals and the freezes' time inside the
+commits), which read
 the E gap as the scans' alone and the tax as the commits' and the
 gets'; `SUPDB_MIX_EVENTS=1` prints each mix's form events, upkeep
 passes and snapshot builds beside its counters; `SUPDB_MIX_CENSUS=1`
@@ -7098,8 +7099,8 @@ directory for the next file ran beside them and the two wait on one
 journal. The phase column named it, the rate could not. The next file is
 made now where the directory is synced anyway, at a landing, and the
 load reads 9-10% faster at ten thousand keys in both orders
-(`SUPDB_LOAD_PHASES=1 bench/scripts/pair.sh supdb supdb-runcreate 10000
---passes load --reps 24`, at the commit that made the option). The rule this file had for it: a sync handed
+(`bench/scripts/pair.sh SUPDB_LOAD_PHASES=1 supdb supdb-runcreate 10000
+--passes load --reps 24`, at `11f03c7`). The rule this file had for it: a sync handed
 to a helper is hidden only while nothing needs the device beside it, and
 a saving made by doing a thing early is priced where the early thing is
 done, the phase after the one it leaves. Three things about the tests
@@ -7119,6 +7120,47 @@ the file's own notes say so of every store it crashes with that work on
 a thread. A test that crashes a store runs its segment work inline or
 holds it, and one written beside a new mechanism is read against the
 file's helpers before its failure is read as the mechanism's.
+
+**A mix a millisecond long, read by its rate for eight rows; and a
+probe whose store was not the suite's.** The buffered scrambled E at ten
+thousand keys read 0.91-0.97x of LMDB's in eight rows of eight, the one
+cell the quick ladder lost every time, and stood in the notes as "the
+scan path". The mix there is 1,585 scans and one commit in 1.1 ms. Timed
+by kind with its first scans apart (`SUPDB_MIX_KINDS`, which had the
+kinds and not the first operation), the scans after the first were
+LMDB's to a twentieth, the one commit was 95 µs to its 27, and the first
+scan was 100-140 µs to its 2.4: the upkeep thread, a commit or four
+behind the write mixes that end a few hundred microseconds earlier, and
+the scan waiting out its pass or settling what it had not filed
+(`docs/engine.md`). Two things went wrong on the way to that. The probe
+that exists for callgrind (`bench/examples/e_scrambled.rs`) was sampled
+over a hundred rounds of the phase and put a sixth of the thread in a
+copy's prefetch, and a span-shaped prefetch was built on it before one
+count was read: the suite's phase is the first round, the rounds after it
+are the store the rounds make, and at ten thousand keys the suite walks
+sparse forms where the profile was of copies. And the probe's first
+round is not the suite's either: it skips the read and threaded passes,
+its upkeep thread stands elsewhere, and its store at thirty thousand
+keys is copies in every run where the harness's is copies in most reps
+and half sparse in others. The profile that stood was the harness's own
+run under `perf record -k CLOCK_MONOTONIC`, cut to the mix's windows by
+its phase marks (`SUPDB_LAG_MARK`) and to the thread, beside the walk
+counts of the same shape (`SUPDB_MIX_COUNTERS`, `walks`). And three
+levers that take instructions off the scans or the commit -- the runs a
+sparse walk makes held by one walker, 5-9% of the phase by callgrind; a
+copy asked for over its walk's span; two searches the settle made for a
+key above the store's end, a fifth of an insert's settle -- moved no
+time a pairing resolved, the first two left as arms and the third
+shipped on its count as work strictly removed. The rules: a pass under a
+few milliseconds is timed by kind and by its first operation before its
+rate is given a cause, and the instrument that times the kinds times the
+first of each; a probe is held to the harness's counts -- the walks by
+form, the passes of the background thread -- before a profile of it is
+read, and a phase repeated for samples is the store the repeats make; and
+where two engines run a phase in the same time over the same instruction
+count, the phase is at the machine's rate for both and the lever is what
+only one of them does -- here a first scan and a commit -- never the
+shared loop.
 
 ## Open targets, and the one standing limitation
 
@@ -7206,6 +7248,22 @@ where it says so:
   (`Options::bounds_by_heads`, `land_bounds_read`). The lever for any
   other is the writer's wait drawn from what the bound can spare, and is
   not built.
+- The scrambled E in core is the scans at LMDB's rate and two costs of
+  ours beside them (`docs/engine.md`, timed by kind): a commit of a
+  hundred inserts at twice LMDB's, 2,500 instructions an insert of the
+  settle the commit makes for the scans behind it, and at ten thousand
+  keys a first scan of 100-140 µs in a mix of 1.1 ms, the upkeep thread's
+  trail behind the write mixes before it. The thread is on a core nine
+  tenths of the write mixes and files a key in 0.55 µs, most of it lines
+  the writer wrote a moment before fetched from the writer's core, in a
+  profile with nothing over a tenth. The levers: the settle's cost a key,
+  which is the thread's trail, the first scan's residue and the commit
+  at once, and wants its loop made again and not trimmed -- its sort for
+  duplicates, the key read four times a write, a patch's allocations --
+  and a scan that takes its upkeep back from a pass in its fill by a
+  short spin where it parks, fifteen microseconds a hand-off. Neither is
+  built. The cells from thirty to three hundred thousand keys read 0.94x
+  to 1.2x by row and are not resolved by anything priced so far.
 - Scans on a store with unsealed keys spread through it pay for the path.
   A few unsealed keys in a partition take every scan of it off the bulk
   walk and through the block loop and the form file's cursor, a fifth to
