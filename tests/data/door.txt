@@ -26,21 +26,15 @@ allow	src/db/vault.rs	<file>	1	the door itself
 allow	src/db.rs	idle_io_priority	1	syscall(SYS_ioprio_set): a thread's I/O class, not a file
 allow	src/db.rs	with_idle_io	1	syscall(SYS_ioprio_get/set): a thread's I/O class, not a file
 allow	src/db.rs	io_priority_class	1	syscall(SYS_ioprio_get): a thread's I/O class, not a file
-allow	src/db.rs	same_description	1	syscall(SYS_kcmp): compares two descriptors the door gave
 allow	src/db.rs	populate_ahead	1	madvise(POPULATE_WRITE) on the writer's anonymous buffer
 allow	src/db.rs	register_membarrier	1	syscall(SYS_membarrier): not a file
 allow	src/db.rs	membarrier_all_threads	1	syscall(SYS_membarrier): not a file
 # The engine: on a handle the door gave (S1: the typed handle's methods).
 allow	src/db.rs	Wal::replay	1	maps the log through a handle vault::open gave (S1: as_os)
-allow	src/db.rs	pwritev_at	1	pwritev on a handle the door gave (S1: the handle's write)
-allow	src/db.rs	start_writeback	1	sync_file_range on a handle the door gave (S1: writeback)
 allow	src/db.rs	RunWalk::<item>	1	a raw mapping of a run's file, made by walk_run from a door handle
 allow	src/db.rs	SegmentWriter::walk_run	1	maps a run's file through a handle vault::open gave (S1: as_os)
-allow	src/db.rs	reopen	1	a second description of a door handle, by /proc/self/fd (S1: the handle's reopen)
 allow	src/db.rs	RunMap::<item>	1	the run's mapping, of the file vault::open_mapped gave
 allow	src/db.rs	RunMap::open	1	maps the run's file through vault::open_mapped's handle (S1: as_os)
-allow	src/db.rs	fadvise_dontneed_range	1	advice on a door handle (S1, R3)
-allow	src/db.rs	fadvise_dontneed	1	advice on a door handle (S1, R3)
 # The engine: memory and the machine, read (G3: Memory).
 allow	src/db.rs	thread_minflt	1	/proc/thread-self/stat for a trace (G3: Memory)
 allow	src/db.rs	thread_majflt	1	/proc/thread-self/stat for a trace (G3: Memory)
@@ -56,11 +50,6 @@ allow	src/db.rs	Maint::checkpoint_into	1	the caller's destination, made and remo
 allow	src/db.rs	Maint::z_files_cover	1	is_file of a form file by path: under a cipher the decoy answers no (S5 prices the controller there)
 allow	src/db.rs	Maint::z_cross	1	is_file of a form file by path: under a cipher the decoy answers no (S5 prices the controller there)
 # The compact form's builder and reader.
-allow	src/db/zfile.rs	drop_written_range	1	writeback and drop on the build's own output, a door handle
-allow	src/db/zfile.rs	written_back_range	1	writeback on the build's own output, a door handle
-allow	src/db/zfile.rs	swap_ahead	1	advice on a door handle
-allow	src/db/zfile.rs	ask_file	1	advice on a door handle (S1)
-allow	src/db/zfile.rs	drop_behind	1	the descriptor half of the plain build's drop, on a door handle (S1)
 allow	src/db/zfile.rs	build_file_seen	1	Mmap::map of a plain segment's door handle (SegSrc::File)
 allow	src/db/zfile.rs	PlacedWalk::map_out	1	maps a plain store's stride build's own output by path, for its read-back; a kept file's is mapped through the door (StrideWalked for Held)
 allow	src/db/zfile.rs	thread_major_faults	1	getrusage (G3: Memory)
@@ -69,7 +58,6 @@ allow	src/db/zfile.rs	time_file_decodes	1	maps a form file by path: as file_fact
 allow	src/db/zfile.rs	read_budget	1	/proc and cgroup reads (G3: Memory)
 # Paths written outside the door's modules.
 literal	src/db.rs	llc_bytes	1	/sys/devices/system/cpu (G3: Memory)
-literal	src/db.rs	reopen	1	/proc/self/fd, a second description of a door handle (S1)
 literal	src/db.rs	resident_beyond_use	1	/proc/self/status (G3: Memory)
 literal	src/db.rs	thread_majflt	1	/proc/thread-self/stat (G3: Memory)
 literal	src/db.rs	thread_minflt	1	/proc/thread-self/stat (G3: Memory)
@@ -84,22 +72,17 @@ thread	src/flatindex.rs	*	3	the writer's helper thread (S1: pin::)
 cfgout	src/blob.rs	Blob::scan_at_in	1	wasm: a lead nobody reads
 cfgout	src/block.rs	crc32_from	1	aarch64: the CRC instructions' dispatch
 cfgout	src/block.rs	crc32c_hw	1	aarch64: the CRC instructions
-cfgout	src/db.rs	<file>	2	not Linux: fadvise_dontneed_range and fadvise_dontneed do nothing
 cfgout	src/db.rs	Reader::convert_walked	1	not debug_assertions: a binding the check below uses
 cfgout	src/db.rs	io_priority_class	1	not Linux: no I/O class
 cfgout	src/db.rs	mod heap	1	not glibc: no allocator counts
 cfgout	src/db.rs	populate_ahead	1	not Linux: nothing populated
 cfgout	src/db.rs	prefetch_lines	1	not x86_64: no prefetch
-cfgout	src/db.rs	reopen	1	not Linux: a clone of the handle
-cfgout	src/db.rs	same_description	1	not Linux: descriptors compared by number
-cfgout	src/db.rs	start_writeback	1	not Linux: no writeback hint
 cfgout	src/db.rs	with_idle_io	1	not Linux: the call as it is
 cfgout	src/db/zfile.rs	<file>	2	not Linux: drop_behind and ask_ahead do nothing
 cfgout	src/db/zfile.rs	ask_file	1	not Linux: nothing asked
 cfgout	src/db/zfile.rs	drop_written_range	1	not Linux: nothing dropped
 cfgout	src/db/zfile.rs	read_budget	1	not Linux: no budget
 cfgout	src/db/zfile.rs	swap_ahead	1	not Linux: nothing swapped
-cfgout	src/db/zfile.rs	written_back_range	1	not Linux: a sync of the handle's data
 cfgout	src/db/zlz4.rs	fast_turn	1	not x86_64: the wide decodes' arm falls to the flat loop
 cfgout	src/flatindex.rs	FlatIndex::ask_record	1	not x86_64: no prefetch
 cfgout	src/flatindex.rs	prefetch_slot	1	not x86_64: no prefetch

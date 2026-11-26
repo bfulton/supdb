@@ -148,7 +148,7 @@
 use crate::bytes::MmapBytes;
 use crate::crypt::{self, Aead, EncryptOptions, NONCE, TAG};
 use std::collections::HashMap;
-use std::fs::{File, OpenOptions};
+use std::fs::{File as OsFile, OpenOptions};
 use std::io::{Error, ErrorKind, Read, Result, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, AtomicU8, AtomicUsize, Ordering};
@@ -405,7 +405,7 @@ fn random(buf: &mut [u8]) -> Result<()> {
     }
     #[cfg(not(target_os = "linux"))]
     {
-        File::open("/dev/urandom")?.read_exact(buf)
+        OsFile::open("/dev/urandom")?.read_exact(buf)
     }
 }
 
@@ -548,12 +548,12 @@ fn write_marker(dir: &Path, cipher: &StoreCipher, store_id: &[u8; 16], key: &Key
     bytes.extend_from_slice(&seal(&*cipher.master, nonce, &head, &key.0));
     let tmp = dir.join(format!("{MARKER}.tmp"));
     {
-        let mut f = File::create(&tmp)?;
+        let mut f = OsFile::create(&tmp)?;
         f.write_all(&bytes)?;
         f.sync_all()?;
     }
     std::fs::rename(&tmp, dir.join(MARKER))?;
-    File::open(dir)?.sync_all()
+    OsFile::open(dir)?.sync_all()
 }
 
 /// A store opened with no cipher: refused where the directory is under
@@ -656,7 +656,7 @@ fn disk_parse(name: &str) -> Option<(Token, Kind)> {
 /// memory file: its plaintext is the cache's, to hold and to give back.
 #[derive(Clone, Default)]
 struct Entry {
-    mem: Option<Arc<File>>,
+    mem: Option<Arc<OsFile>>,
     page: Option<Arc<Paged>>,
     disk: Option<Disk>,
 }
@@ -724,7 +724,7 @@ pub(crate) struct Vault {
 struct MappedFile {
     /// The memory file, kept open: its identity for as long as it is
     /// mapped.
-    mem: Arc<File>,
+    mem: Arc<OsFile>,
     /// The mappings over it.
     maps: usize,
     /// The view of it that waits for its envelope behind it, and the
@@ -739,7 +739,7 @@ struct MappedFile {
 /// once the file has its envelope and give back by the megabyte, out of
 /// the memory this mapping reads; dropped with the mapping, this is what
 /// says the mapping has gone.
-pub(crate) struct Mapped(Option<(Arc<Vault>, Arc<File>)>);
+pub(crate) struct Mapped(Option<(Arc<Vault>, Arc<OsFile>)>);
 
 impl Drop for Mapped {
     fn drop(&mut self) {
@@ -761,14 +761,14 @@ impl Drop for Mapped {
 /// cache gives way ahead of them.
 #[derive(Default)]
 struct Coming {
-    files: Mutex<Vec<(std::sync::Weak<File>, u64)>>,
+    files: Mutex<Vec<(std::sync::Weak<OsFile>, u64)>>,
     /// Every byte announced, ever: what the cache gives way to at once,
     /// between two readings of its room (`Room::claimed`).
     said: AtomicU64,
 }
 
 impl Coming {
-    fn expect(&self, mem: &Arc<File>, bytes: u64) {
+    fn expect(&self, mem: &Arc<OsFile>, bytes: u64) {
         lock(&self.files).push((Arc::downgrade(mem), bytes));
         self.said.fetch_add(bytes, Ordering::Relaxed);
     }
@@ -916,7 +916,7 @@ fn trace_room(slack: i64) {
             c.waited_us / 1000
         ));
         // Each memory file once, by the name it was first met under.
-        let mut seen: Vec<(*const File, &str, u64, bool)> = Vec::new();
+        let mut seen: Vec<(*const OsFile, &str, u64, bool)> = Vec::new();
         let files = lock(&v.files);
         for (name, e) in files.iter() {
             let Some(mem) = &e.mem else { continue };
@@ -1069,7 +1069,7 @@ use pager::memfile;
 /// Another handle on a memory file with a position of its own, as a second
 /// open of a file has: through the process's descriptor table, and where
 /// that cannot be read, a duplicate, which shares the position.
-fn reopen(mem: &File, write: bool, append: bool) -> Result<File> {
+fn reopen(mem: &OsFile, write: bool, append: bool) -> Result<OsFile> {
     use std::os::fd::AsRawFd;
     let path = format!("/proc/self/fd/{}", mem.as_raw_fd());
     let mut o = OpenOptions::new();
@@ -1094,7 +1094,7 @@ fn reopen(mem: &File, write: bool, append: bool) -> Result<File> {
 /// the whole file's device time after the whole file's cipher time, end to
 /// end.
 struct Ahead {
-    file: File,
+    file: OsFile,
     at: u64,
     hint: bool,
 }
@@ -1264,7 +1264,7 @@ impl Vault {
 
     // -- the door's kept side ------------------------------------------
 
-    fn make(&self, name: &str) -> Result<File> {
+    fn make(&self, name: &str) -> Result<OsFile> {
         let mem = memfile()?;
         let handle = mem.try_clone()?;
         // Over a name that exists, as a create truncates: the entry before
@@ -1380,7 +1380,7 @@ impl Vault {
         // From the envelope's header, which says how much plaintext it
         // holds: a length asked of a file nothing has read yet.
         let mut head = [0u8; crypt::Header::LEN];
-        File::open(self.real.join(disk.name()))?.read_exact(&mut head)?;
+        OsFile::open(self.real.join(disk.name()))?.read_exact(&mut head)?;
         Ok(crypt::Header::parse(&head)?.plain_len())
     }
 
@@ -1442,7 +1442,7 @@ impl Vault {
     /// (`open_mapped`), and the memory file the mapping is counted
     /// against. One that has its envelope is refused, as `reopen_written`
     /// refuses it: it is read through the cache's view.
-    fn map_written(&self, name: &str) -> Result<(File, Arc<File>)> {
+    fn map_written(&self, name: &str) -> Result<(OsFile, Arc<OsFile>)> {
         let files = lock(&self.files);
         let mem = files
             .get(name)
@@ -1473,7 +1473,7 @@ impl Vault {
     /// view that waited for its envelope gets it, and the file is the
     /// cache's to give back. A view that cannot be given its envelope
     /// stays whole in memory, which is what it was.
-    fn unmapped(&self, mem: &Arc<File>) {
+    fn unmapped(&self, mem: &Arc<OsFile>) {
         let _files = lock(&self.files);
         let mut mapped = lock(&self.mapped);
         let Some(i) = mapped.iter().position(|m| Arc::ptr_eq(&m.mem, mem)) else {
@@ -1493,7 +1493,7 @@ impl Vault {
     /// A kept file opened to be written again. One that has an envelope is
     /// refused: the envelope would no longer be the file, and nothing
     /// would say so.
-    fn rewrite(&self, name: &str, append: bool) -> Result<File> {
+    fn rewrite(&self, name: &str, append: bool) -> Result<OsFile> {
         let mem = {
             let files = lock(&self.files);
             let e = files
@@ -1516,7 +1516,7 @@ impl Vault {
     /// A kept file opened to be read as a file: one still in its writer's
     /// memory file. A file with its envelope is read through its mapping
     /// (`map`) and has no descriptor to hand out.
-    fn reopen_written(&self, name: &str) -> Result<File> {
+    fn reopen_written(&self, name: &str) -> Result<OsFile> {
         let mem = lock(&self.files)
             .get(name)
             .ok_or_else(|| Error::from(ErrorKind::NotFound))?
@@ -1560,18 +1560,18 @@ impl Vault {
     /// past the cache instead (`O_DIRECT`, a megabyte at a time), the same
     /// envelope took half as long again: each piece waits for the device
     /// where the cached pieces go to it together.
-    fn write_envelope(&self, mem: &File, disk: &Disk, key: &Key, sync: bool) -> Result<u64> {
+    fn write_envelope(&self, mem: &OsFile, disk: &Disk, key: &Key, sync: bool) -> Result<u64> {
         self.write_envelope_at(mem, &self.real.join(disk.name()), key, sync)
     }
 
     /// `write_envelope` to a path of the caller's choosing.
-    fn write_envelope_at(&self, mem: &File, path: &Path, key: &Key, sync: bool) -> Result<u64> {
+    fn write_envelope_at(&self, mem: &OsFile, path: &Path, key: &Key, sync: bool) -> Result<u64> {
         let aead = (self.data)(&key.0);
         let len = mem.metadata()?.len();
         // Under a key of the file's own, which has no name of the caller's.
         let opts = EncryptOptions::default();
         let mut out = Ahead {
-            file: File::create(path)?,
+            file: OsFile::create(path)?,
             at: 0,
             hint: sync,
         };
@@ -1599,7 +1599,7 @@ impl Vault {
     /// its cache therefore reads what it wrote without decrypting it, and
     /// one that does not leaves a merge's output to be read from its
     /// envelope, by the chunk, when something wants it.
-    fn keeps(&self, mem: &Arc<File>) -> bool {
+    fn keeps(&self, mem: &Arc<OsFile>) -> bool {
         let viewed = lock(&self.files)
             .values()
             .any(|e| e.page.is_some() && e.mem.as_ref().is_some_and(|m| Arc::ptr_eq(m, mem)));
@@ -1627,7 +1627,7 @@ impl Vault {
         &self,
         files: &mut HashMap<String, Entry>,
         name: &str,
-        mem: &Arc<File>,
+        mem: &Arc<OsFile>,
         disk: &Disk,
         keep: bool,
     ) -> Result<()> {
@@ -1798,7 +1798,7 @@ impl Vault {
             out.push((disk.token, disk.wrapped));
         }
         if made && dir_sync {
-            File::open(&self.real)?.sync_all()?;
+            OsFile::open(&self.real)?.sync_all()?;
         }
         Ok(out)
     }
@@ -1864,7 +1864,7 @@ impl Vault {
         let tmp = self.real.join(format!("{}{ENVELOPE_TMP}", zdisk.name()));
         self.write_envelope_at(&mem, &tmp, &key, sync)?;
         if cold {
-            if let Ok(f) = File::open(&tmp) {
+            if let Ok(f) = OsFile::open(&tmp) {
                 drop_cached(&f);
             }
         }
@@ -2303,14 +2303,428 @@ impl LogCipher {
 
 // ------------------------------------------------------------- the door --
 
+/// A file as the door hands it to the engine: every open and create below
+/// answers one, and what the engine does with a file it does through this
+/// type's methods, each the standard library's call or the system call the
+/// engine made on the descriptor itself before the type stood here
+/// (`pwritev`, `sync_file_range`, `posix_fadvise`, a second description by
+/// `/proc/self/fd`, `kcmp`). So the engine names no descriptor, and a file
+/// that is not a file of the directory's own has one place to be told from
+/// one that is. A plain store's file and a memory file of a store under a
+/// cipher are both the standard library's file under it.
+pub(crate) struct File(OsFile);
+
+impl File {
+    /// The standard library's file under this one, for the callers that
+    /// hand it to something that takes one: a mapping made of it
+    /// (`memmap2`), a lock on it, a test's look at its descriptor. Each is
+    /// of a file the directory holds under its own name.
+    #[inline]
+    pub(crate) fn as_os(&self) -> &OsFile {
+        &self.0
+    }
+
+    /// `File::sync_data`.
+    #[inline]
+    pub(crate) fn sync_data(&self) -> Result<()> {
+        self.0.sync_data()
+    }
+
+    /// `File::sync_all`.
+    #[inline]
+    pub(crate) fn sync_all(&self) -> Result<()> {
+        self.0.sync_all()
+    }
+
+    /// `File::set_len`.
+    #[inline]
+    pub(crate) fn set_len(&self, len: u64) -> Result<()> {
+        self.0.set_len(len)
+    }
+
+    /// The file's length: `File::metadata`'s.
+    #[inline]
+    pub(crate) fn len(&self) -> Result<u64> {
+        Ok(self.0.metadata()?.len())
+    }
+
+    /// `File::try_clone`: a second handle on the same open file
+    /// description, its position shared.
+    #[inline]
+    pub(crate) fn try_clone(&self) -> Result<File> {
+        self.0.try_clone().map(File)
+    }
+
+    /// `FileExt::read_exact_at`.
+    #[inline]
+    pub(crate) fn read_exact_at(&self, buf: &mut [u8], at: u64) -> Result<()> {
+        std::os::unix::fs::FileExt::read_exact_at(&self.0, buf, at)
+    }
+
+    /// `FileExt::write_all_at`.
+    #[inline]
+    pub(crate) fn write_all_at(&self, buf: &[u8], at: u64) -> Result<()> {
+        std::os::unix::fs::FileExt::write_all_at(&self.0, buf, at)
+    }
+
+    /// One `pwritev` of `iov` at `at`: what the call returned, the bytes
+    /// written or a negative with the error in `errno`. The loop over a
+    /// short count is the caller's (`db::pwritev_loop`).
+    #[inline(always)]
+    pub(crate) fn pwritev(&self, iov: &[std::io::IoSlice<'_>], at: u64) -> isize {
+        use std::os::fd::AsRawFd;
+        // SAFETY: `IoSlice` is ABI-compatible with `iovec` on unix, and
+        // every slice it names is borrowed for the call.
+        unsafe {
+            libc::pwritev(
+                self.0.as_raw_fd(),
+                iov.as_ptr() as *const libc::iovec,
+                iov.len().min(1024) as libc::c_int,
+                at as libc::off_t,
+            )
+        }
+    }
+
+    /// The pages of `len` bytes at `at` handed to the device, waiting for
+    /// nothing: `sync_file_range` with the write flag on Linux, where it
+    /// is a hint the later fsync is shorter for; nothing on another
+    /// platform, and nothing on an error, since the fsync that follows
+    /// writes whatever this did not.
+    #[inline]
+    pub(crate) fn start_writeback(&self, at: u64, len: u64) {
+        #[cfg(target_os = "linux")]
+        {
+            use std::os::fd::AsRawFd;
+            // SAFETY: a hint over a range of an open file; the call reads
+            // and writes no memory of ours.
+            let _ = unsafe {
+                libc::sync_file_range(
+                    self.0.as_raw_fd(),
+                    at as libc::off64_t,
+                    len as libc::off64_t,
+                    libc::SYNC_FILE_RANGE_WRITE,
+                )
+            };
+        }
+        #[cfg(not(target_os = "linux"))]
+        let _ = (at, len);
+    }
+
+    /// `sync_file_range` over `len` bytes at `at` with `flags`, a length
+    /// of nothing reaching the file's end: what the call returned. Linux's
+    /// alone.
+    #[cfg(target_os = "linux")]
+    #[inline]
+    pub(crate) fn sync_range(&self, at: u64, len: u64, flags: libc::c_uint) -> libc::c_int {
+        use std::os::fd::AsRawFd;
+        // SAFETY: a writeback over a range of an open file; the call
+        // reads and writes no memory of ours.
+        unsafe {
+            libc::sync_file_range(
+                self.0.as_raw_fd(),
+                at as libc::off64_t,
+                len as libc::off64_t,
+                flags,
+            )
+        }
+    }
+
+    /// `posix_fadvise` over `len` bytes at `at`, a length of nothing
+    /// reaching the file's end: what the call returned, an error's number
+    /// and not `errno`. Linux's alone.
+    #[cfg(target_os = "linux")]
+    #[inline]
+    pub(crate) fn advise(&self, at: u64, len: u64, advice: libc::c_int) -> libc::c_int {
+        use std::os::fd::AsRawFd;
+        let (Ok(at), Ok(len)) = (libc::off_t::try_from(at), libc::off_t::try_from(len)) else {
+            return libc::EINVAL;
+        };
+        // SAFETY: an advice over a range of an open file; nothing is
+        // written.
+        unsafe { libc::posix_fadvise(self.0.as_raw_fd(), at, len, advice) }
+    }
+
+    /// `POSIX_FADV_DONTNEED` over `len` bytes at `at`, a length of nothing
+    /// reaching the file's end: the clean pages of that range dropped from
+    /// the page cache, a mapped page skipped, which is why
+    /// `Bytes::advise_dontneed_range` goes first, and a dirty one written
+    /// back first and dropped by a later reclaim. Nothing off Linux.
+    #[inline]
+    pub(crate) fn drop_range(&self, at: u64, len: u64) {
+        #[cfg(target_os = "linux")]
+        let _ = self.advise(at, len, libc::POSIX_FADV_DONTNEED);
+        #[cfg(not(target_os = "linux"))]
+        let _ = (at, len);
+    }
+
+    /// `drop_range` over the whole file.
+    #[inline]
+    pub(crate) fn drop_all(&self) {
+        self.drop_range(0, 0)
+    }
+
+    /// `POSIX_FADV_WILLNEED` over `len` bytes at `at`: the reads started
+    /// and none waited for, a page the cache holds already not read again.
+    /// Linux's alone, as its one caller is (`zfile::ask_file`).
+    #[cfg(target_os = "linux")]
+    #[inline]
+    pub(crate) fn ask_range(&self, at: u64, len: u64) {
+        let _ = self.advise(at, len, libc::POSIX_FADV_WILLNEED);
+    }
+
+    /// `[at, at + len)` written back and waited for, a length of nothing
+    /// reaching the file's end, and the writeback's error read:
+    /// `sync_file_range` with both waits, which reports a writeback error
+    /// the descriptor has not yet seen as an fsync does, once, and asks
+    /// the filesystem for no journal commit and the device for no flush,
+    /// as an fsync would. Off Linux, where nothing waits for a range, the
+    /// file's sync.
+    pub(crate) fn written_back(&self, at: u64, len: u64) -> Result<()> {
+        #[cfg(target_os = "linux")]
+        {
+            let rc = self.sync_range(
+                at,
+                len,
+                libc::SYNC_FILE_RANGE_WAIT_BEFORE
+                    | libc::SYNC_FILE_RANGE_WRITE
+                    | libc::SYNC_FILE_RANGE_WAIT_AFTER,
+            );
+            if rc != 0 {
+                return Err(Error::last_os_error());
+            }
+            Ok(())
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = (at, len);
+            self.0.sync_data()
+        }
+    }
+
+    /// Another open file description of the same file, for a thread that
+    /// syncs it beside this one's holder and has to be told of a failure
+    /// of its own (`db::HelperShared`): through `/proc/self/fd/<fd>` on
+    /// Linux, a path built on the stack; a duplicate of the descriptor
+    /// elsewhere.
+    pub(crate) fn reopen(&self) -> Result<File> {
+        #[cfg(target_os = "linux")]
+        {
+            use std::os::fd::{AsRawFd, FromRawFd};
+            let mut path = *b"/proc/self/fd/\0\0\0\0\0\0\0\0\0\0\0\0";
+            let mut digits = [0u8; 10];
+            let (mut fd, mut n) = (self.0.as_raw_fd() as u32, 0);
+            loop {
+                digits[n] = b'0' + (fd % 10) as u8;
+                n += 1;
+                fd /= 10;
+                if fd == 0 {
+                    break;
+                }
+            }
+            for i in 0..n {
+                path[14 + i] = digits[n - 1 - i];
+            }
+            // SAFETY: `path` is a NUL-terminated string on the stack; the
+            // descriptor returned is ours alone.
+            let fd = unsafe {
+                libc::open(
+                    path.as_ptr() as *const libc::c_char,
+                    libc::O_RDONLY | libc::O_CLOEXEC,
+                )
+            };
+            if fd < 0 {
+                return Err(Error::last_os_error());
+            }
+            // SAFETY: a descriptor just opened, owned by nothing else.
+            Ok(File(unsafe { OsFile::from_raw_fd(fd) }))
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            self.try_clone()
+        }
+    }
+
+    /// Whether this and `other` are one open file description (`kcmp`'s
+    /// `KCMP_FILE`).
+    pub(crate) fn same_description(&self, other: &File) -> bool {
+        use std::os::fd::AsRawFd;
+        #[cfg(target_os = "linux")]
+        {
+            const KCMP_FILE: libc::c_int = 0;
+            let pid = std::process::id() as libc::pid_t;
+            // SAFETY: compares two of this process's descriptors; no
+            // memory.
+            let r = unsafe {
+                libc::syscall(
+                    libc::SYS_kcmp,
+                    pid,
+                    pid,
+                    KCMP_FILE,
+                    self.0.as_raw_fd() as libc::c_ulong,
+                    other.0.as_raw_fd() as libc::c_ulong,
+                )
+            };
+            assert!(r >= 0, "kcmp: {}", Error::last_os_error());
+            r == 0
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            self.0.as_raw_fd() == other.0.as_raw_fd()
+        }
+    }
+
+    /// The file's inode number, for a test's seam that names which file a
+    /// failure was made for.
+    pub(crate) fn ino(&self) -> Result<u64> {
+        use std::os::unix::fs::MetadataExt;
+        Ok(self.0.metadata()?.ino())
+    }
+
+    /// `File::try_lock`: an exclusive `flock`, taken or refused at once. A
+    /// store's `LOCK` alone (`open_lock`).
+    #[inline]
+    pub(crate) fn try_lock(&self) -> std::result::Result<(), std::fs::TryLockError> {
+        self.0.try_lock()
+    }
+
+    /// `File::unlock`.
+    #[inline]
+    pub(crate) fn unlock(&self) -> Result<()> {
+        self.0.unlock()
+    }
+}
+
+// The standard library's file answers `read_to_end` and its kin with the
+// file's length in hand, where a default built on `read` grows a buffer by
+// guesses: each is handed on as it is, so a read through the door makes
+// the calls a read of the file made.
+impl Read for File {
+    #[inline]
+    fn read(&mut self, buf: &mut [u8]) -> Result<usize> {
+        self.0.read(buf)
+    }
+
+    #[inline]
+    fn read_vectored(&mut self, bufs: &mut [std::io::IoSliceMut<'_>]) -> Result<usize> {
+        self.0.read_vectored(bufs)
+    }
+
+    #[inline]
+    fn read_to_end(&mut self, buf: &mut Vec<u8>) -> Result<usize> {
+        self.0.read_to_end(buf)
+    }
+
+    #[inline]
+    fn read_to_string(&mut self, buf: &mut String) -> Result<usize> {
+        self.0.read_to_string(buf)
+    }
+
+    #[inline]
+    fn read_exact(&mut self, buf: &mut [u8]) -> Result<()> {
+        self.0.read_exact(buf)
+    }
+}
+
+impl Read for &File {
+    #[inline]
+    fn read(&mut self, buf: &mut [u8]) -> Result<usize> {
+        (&self.0).read(buf)
+    }
+
+    #[inline]
+    fn read_vectored(&mut self, bufs: &mut [std::io::IoSliceMut<'_>]) -> Result<usize> {
+        (&self.0).read_vectored(bufs)
+    }
+
+    #[inline]
+    fn read_to_end(&mut self, buf: &mut Vec<u8>) -> Result<usize> {
+        (&self.0).read_to_end(buf)
+    }
+
+    #[inline]
+    fn read_to_string(&mut self, buf: &mut String) -> Result<usize> {
+        (&self.0).read_to_string(buf)
+    }
+
+    #[inline]
+    fn read_exact(&mut self, buf: &mut [u8]) -> Result<()> {
+        (&self.0).read_exact(buf)
+    }
+}
+
+impl Write for File {
+    #[inline]
+    fn write(&mut self, buf: &[u8]) -> Result<usize> {
+        self.0.write(buf)
+    }
+
+    #[inline]
+    fn write_vectored(&mut self, bufs: &[std::io::IoSlice<'_>]) -> Result<usize> {
+        self.0.write_vectored(bufs)
+    }
+
+    #[inline]
+    fn write_all(&mut self, buf: &[u8]) -> Result<()> {
+        self.0.write_all(buf)
+    }
+
+    #[inline]
+    fn flush(&mut self) -> Result<()> {
+        self.0.flush()
+    }
+}
+
+impl Write for &File {
+    #[inline]
+    fn write(&mut self, buf: &[u8]) -> Result<usize> {
+        (&self.0).write(buf)
+    }
+
+    #[inline]
+    fn write_vectored(&mut self, bufs: &[std::io::IoSlice<'_>]) -> Result<usize> {
+        (&self.0).write_vectored(bufs)
+    }
+
+    #[inline]
+    fn write_all(&mut self, buf: &[u8]) -> Result<()> {
+        (&self.0).write_all(buf)
+    }
+
+    #[inline]
+    fn flush(&mut self) -> Result<()> {
+        (&self.0).flush()
+    }
+}
+
+impl std::io::Seek for File {
+    #[inline]
+    fn seek(&mut self, pos: std::io::SeekFrom) -> Result<u64> {
+        self.0.seek(pos)
+    }
+}
+
+impl std::io::Seek for &File {
+    #[inline]
+    fn seek(&mut self, pos: std::io::SeekFrom) -> Result<u64> {
+        (&self.0).seek(pos)
+    }
+}
+
+impl std::fmt::Debug for File {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.0.fmt(f)
+    }
+}
+
 /// `File::create`: the file made, or cut to nothing, and open for writing.
 pub(crate) fn create(path: impl AsRef<Path>) -> Result<File> {
     let path = path.as_ref();
-    match locate(path) {
-        None => File::create(path),
-        Some((v, name)) if passes(&name) => File::create(v.real.join(name)),
+    let f = match locate(path) {
+        None => OsFile::create(path),
+        Some((v, name)) if passes(&name) => OsFile::create(v.real.join(name)),
         Some((v, name)) => v.make(&name),
-    }
+    };
+    f.map(File)
 }
 
 /// The file at `path`, just made, is to hold `bytes`: said to the store's
@@ -2337,21 +2751,23 @@ pub(crate) fn create_rw(path: impl AsRef<Path>) -> Result<File> {
             .truncate(true)
             .open(p)
     };
-    match locate(path) {
+    let f = match locate(path) {
         None => plain(path),
         Some((v, name)) if passes(&name) => plain(&v.real.join(name)),
         Some((v, name)) => v.make(&name),
-    }
+    };
+    f.map(File)
 }
 
 /// `File::open`: a file that exists, for reading.
 pub(crate) fn open(path: impl AsRef<Path>) -> Result<File> {
     let path = path.as_ref();
-    match locate(path) {
-        None => File::open(path),
-        Some((v, name)) if passes(&name) => File::open(v.real.join(name)),
+    let f = match locate(path) {
+        None => OsFile::open(path),
+        Some((v, name)) if passes(&name) => OsFile::open(v.real.join(name)),
         Some((v, name)) => v.reopen_written(&name),
-    }
+    };
+    f.map(File)
 }
 
 /// A file that exists, opened for writing where the caller says, cut
@@ -2359,11 +2775,12 @@ pub(crate) fn open(path: impl AsRef<Path>) -> Result<File> {
 pub(crate) fn open_write(path: impl AsRef<Path>) -> Result<File> {
     let path = path.as_ref();
     let plain = |p: &Path| OpenOptions::new().write(true).open(p);
-    match locate(path) {
+    let f = match locate(path) {
         None => plain(path),
         Some((v, name)) if passes(&name) => plain(&v.real.join(name)),
         Some((v, name)) => v.rewrite(&name, false),
-    }
+    };
+    f.map(File)
 }
 
 /// A file that exists, opened to be read and written where the caller
@@ -2371,11 +2788,12 @@ pub(crate) fn open_write(path: impl AsRef<Path>) -> Result<File> {
 pub(crate) fn open_rw(path: impl AsRef<Path>) -> Result<File> {
     let path = path.as_ref();
     let plain = |p: &Path| OpenOptions::new().read(true).write(true).open(p);
-    match locate(path) {
+    let f = match locate(path) {
         None => plain(path),
         Some((v, name)) if passes(&name) => plain(&v.real.join(name)),
         Some((v, name)) => v.rewrite(&name, false),
-    }
+    };
+    f.map(File)
 }
 
 /// A file opened to be read and written at the offset its caller seeks
@@ -2392,14 +2810,15 @@ pub(crate) fn open_append(path: impl AsRef<Path>) -> Result<File> {
             .truncate(false)
             .open(p)
     };
-    match locate(path) {
+    let f = match locate(path) {
         None => plain(path),
         Some((v, name)) if passes(&name) => plain(&v.real.join(name)),
         Some((v, name)) => match v.rewrite(&name, true) {
             Err(e) if e.kind() == ErrorKind::NotFound => v.make(&name),
             r => r,
         },
-    }
+    };
+    f.map(File)
 }
 
 /// A store's lock file (`db::StoreLock`), made if it is not there and cut
@@ -2413,6 +2832,7 @@ pub(crate) fn open_lock(path: impl AsRef<Path>) -> Result<File> {
         .create(true)
         .truncate(false)
         .open(path)
+        .map(File)
 }
 
 /// A file opened to be written in place, made if it is not there and cut
@@ -2429,14 +2849,15 @@ pub(crate) fn open_slot(path: impl AsRef<Path>) -> Result<File> {
             .truncate(false)
             .open(p)
     };
-    match locate(path) {
+    let f = match locate(path) {
         None => plain(path),
         Some((v, name)) if passes(&name) => plain(&v.real.join(name)),
         Some((v, name)) => match v.rewrite(&name, false) {
             Err(e) if e.kind() == ErrorKind::NotFound => v.make(&name),
             r => r,
         },
-    }
+    };
+    f.map(File)
 }
 
 /// A manifest slot's bytes made durable as the page cache holds them: an
@@ -2622,11 +3043,13 @@ pub(crate) fn rename(from: impl AsRef<Path>, to: impl AsRef<Path>) -> Result<()>
 pub(crate) fn open_mapped(path: impl AsRef<Path>) -> Result<(File, Mapped)> {
     let path = path.as_ref();
     match locate(path) {
-        None => Ok((File::open(path)?, Mapped(None))),
-        Some((v, name)) if passes(&name) => Ok((File::open(v.real.join(name))?, Mapped(None))),
+        None => Ok((File(OsFile::open(path)?), Mapped(None))),
+        Some((v, name)) if passes(&name) => {
+            Ok((File(OsFile::open(v.real.join(name))?), Mapped(None)))
+        }
         Some((v, name)) => {
             let (file, mem) = v.map_written(&name)?;
-            Ok((file, Mapped(Some((v, mem)))))
+            Ok((File(file), Mapped(Some((v, mem)))))
         }
     }
 }
@@ -2762,8 +3185,8 @@ pub(crate) fn sync_dir_as(dir: impl AsRef<Path>, kind: DirSync) -> Result<()> {
         return sync_dir_seamed(dir, kind, seams);
     }
     match under(dir) {
-        Some(v) => File::open(&v.real)?.sync_all()?,
-        None => File::open(dir)?.sync_all()?,
+        Some(v) => OsFile::open(&v.real)?.sync_all()?,
+        None => OsFile::open(dir)?.sync_all()?,
     }
     Ok(())
 }
@@ -2795,8 +3218,8 @@ fn sync_dir_seamed(dir: &Path, kind: DirSync, seams: u8) -> Result<()> {
         }
     }
     match under(dir) {
-        Some(v) => File::open(&v.real)?.sync_all()?,
-        None => File::open(dir)?.sync_all()?,
+        Some(v) => OsFile::open(&v.real)?.sync_all()?,
+        None => OsFile::open(dir)?.sync_all()?,
     }
     if seams & SEAM_TRACE != 0 {
         io_trace("sync_dir", dir);
@@ -2952,7 +3375,7 @@ pub(crate) fn note_file(what: &'static str, path: impl AsRef<Path>, f: &File) {
         use std::io::Seek;
         use std::os::fd::AsRawFd;
         let path = real(path);
-        let at = (&mut &*f).stream_position().unwrap_or(u64::MAX);
+        let at = (&mut &f.0).stream_position().unwrap_or(u64::MAX);
         io_trace(what, &path);
         for r in IO_TRACE
             .lock()
@@ -2960,7 +3383,7 @@ pub(crate) fn note_file(what: &'static str, path: impl AsRef<Path>, f: &File) {
             .iter_mut()
             .filter(|r| path.starts_with(&r.0))
         {
-            r.2.push((what, path.clone(), f.as_raw_fd(), at));
+            r.2.push((what, path.clone(), f.0.as_raw_fd(), at));
         }
     }
 }
@@ -3034,10 +3457,11 @@ pub(crate) fn real(path: impl AsRef<Path>) -> PathBuf {
 /// A directory's own handle, for a caller that syncs it later.
 pub(crate) fn open_dir(dir: impl AsRef<Path>) -> Result<File> {
     let dir = dir.as_ref();
-    match under(dir) {
-        Some(v) => File::open(&v.real),
-        None => File::open(dir),
-    }
+    let f = match under(dir) {
+        Some(v) => OsFile::open(&v.real),
+        None => OsFile::open(dir),
+    };
+    f.map(File)
 }
 
 /// The segments in `pairs`, each with its ordered index's name, made
@@ -3093,7 +3517,7 @@ pub(crate) fn persist_form(
 /// A file's pages written back and dropped from the kernel's cache: the
 /// writeback waited for by range, which asks for no flush of the device,
 /// then the clean pages dropped.
-fn drop_cached(file: &File) {
+fn drop_cached(file: &OsFile) {
     #[cfg(target_os = "linux")]
     {
         use std::os::fd::AsRawFd;
@@ -3672,7 +4096,7 @@ pub(crate) mod tests {
         let real = dir("decoy");
         let held = Vault::create(&real, &cipher(1)).unwrap();
         let d = held.dir();
-        assert!(File::create(d.join("seg-1.sup")).is_err());
+        assert!(OsFile::create(d.join("seg-1.sup")).is_err());
         assert!(std::fs::write(d.join("seg-1.sup"), b"plaintext").is_err());
         assert!(std::fs::read_dir(&d).is_err());
         assert_eq!(on_disk(&real).len(), 1, "the marker alone");

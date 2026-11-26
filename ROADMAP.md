@@ -1298,7 +1298,16 @@ turned on neither.
   Done for that when the count is taken by instruction and a function's
   sum leaves its padding out, with a red input in which a gain of
   padding alone reads green beside a gain of one instruction that reads
-  red. And the count is a function of the compiler: against one
+  red. And a library function's monomorph whose argument a change
+  renames to a type of the engine's reads as two functions: the seal's
+  list of a segment's file and its index's was a `Vec` of the standard
+  library's files and is one of the door's since `vault::File`, so the
+  landing probe reads `RawVec::grow_one` 58,176 instructions under the
+  commit before and `RawVec::grow_one (over the engine)` the same 58,176
+  over, red, each of the function's three source rows the same count on
+  both sides (`sh scripts/cost.sh f24e380 land` at the commit of the
+  door's file type). The declared group above is what answers it. And
+  the count is a function of the compiler: against one
   line's head it moved four probes from under to over with a toolchain
   and no commit (`CLAUDE.md`, "A count held under one compiler"), and
   what stands over upstream by function since is the block form's open

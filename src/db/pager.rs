@@ -3599,7 +3599,13 @@ mod tests {
         );
         // What the budget took is the file's to say, for the trace, and a
         // file that goes hands its count to the cache by the first field
-        // of its name.
+        // of its name. Read with the evictor stopped: a pass goes on past
+        // the budget to its margin and holds every file for its length
+        // (`Pager::mark`), so beside one the file's count was a unit short
+        // of what its drop handed over, fourteen runs of a hundred and
+        // fifty with six at once, and the drop itself was the evictor's to
+        // finish, the count not there when it was read, once in a gate.
+        pager.stop();
         let c = pager.counts();
         assert_eq!(p.given_bytes(), c.evicted_bytes - c.dropped_bytes, "{c:?}");
         assert!(p.given_bytes() > 0);
@@ -3607,7 +3613,6 @@ mod tests {
         let given = p.given_bytes();
         drop(p);
         assert_eq!(pager.given_gone(), vec![("test".to_string(), given)]);
-        pager.stop();
         let _ = std::fs::remove_dir_all(&dir);
     }
 

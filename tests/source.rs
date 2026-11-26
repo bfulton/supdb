@@ -88,8 +88,11 @@ const FORM: &[&str] = &[
 /// guards and fsync counters, and the I/O trace the tests read. Any other
 /// `vault::name` a form writes is counted under its own name. `vault::real`
 /// is not one: it is the log's name passed through to the directory under a
-/// cipher.
+/// cipher. `File` is the type every one of those opens and creates answers,
+/// a plain store's file under it: what the engine does with a file it does
+/// through that type's methods, so a form names it wherever it holds one.
 const DOOR: &[&str] = &[
+    "File",
     "create",
     "create_rw",
     "open",
@@ -3408,21 +3411,21 @@ fn a_new_allow_of_the_door_fails_in_each_spelling() {
 #[test]
 fn an_allow_moved_or_taken_away_fails_until_the_list_follows() {
     let listed = door_listed(&root());
-    // `drop_behind`'s allow moved onto `drop_written`.
+    // `file_facts`'s allow moved onto `drop_written`.
     let src = edited("src/db/zfile.rs", |t| {
         let t = t.replacen(
             "fn drop_written(",
             "#[allow(clippy::disallowed_methods)]\nfn drop_written(",
             1,
         );
-        let at = t.find("\nfn drop_behind(").expect("drop_behind");
-        let allow = t[..at].rfind("#[allow(").expect("drop_behind's allow");
+        let at = t.find("\npub(super) fn file_facts(").expect("file_facts");
+        let allow = t[..at].rfind("#[allow(").expect("file_facts's allow");
         let end = allow + t[allow..].find('\n').unwrap() + 1;
         format!("{}{}", &t[..allow], &t[end..])
     });
     let e = door_check(&src, &listed).expect_err("a move");
     assert!(e.contains("drop_written: 1 > 0"), "{e}");
-    assert!(e.contains("drop_behind: 0 < 1 listed: lower"), "{e}");
+    assert!(e.contains("file_facts: 0 < 1 listed: lower"), "{e}");
 }
 
 #[test]

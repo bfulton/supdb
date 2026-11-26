@@ -181,7 +181,7 @@ owner's:
 | `src/db/zpages.rs` | the compact form's layout: the page, the directory of the groups it holds, the group, the fill that cuts records into groups and packs them into pages, the fence, the trailer and the identity a form file is bound by, with no file, thread or clock in it -- the module's own docs, and `bench/examples/zsize.rs` for what it makes of the engine's bytes |
 | `src/db/zfile.rs` | the compact form's file on the engine's side: the builder that writes a partition's form file from the partition's own bytes, the attach that binds it to its segment by content, the cell a segment holds it in, the point read, the count, the scan walk and the cursor through it, behind `Options::zpages`, and the controller's platform side, the cache budget read from the cgroup and the test's seam for it; the block cache's reads of a covered partition go through it too (`Options::zpages_block_cache`); and the stride form (`Options::zpages_stride`; `zpages_stride_room` keeps it to the builds made while the store in it fits, `zpages_stride_convert` moves a served partition between it and the block form, and `zpages_stride_below`, an arm's, keeps it to the partitions under a key), a partition's values alone at their stride where its keys are one run of numbers -- the module's own docs, and `docs/engine.md` for where it wins and where it does not fit |
 | `src/db/dirkey.rs` | a live store's directory under a key, encrypted by the kernel (`Encryption::Kernel`): the requests of Linux's file encryption, what `create` and `open` hold a directory to, and `lock`, with no cipher and no byte of a read path in it -- the module's own docs, and `scripts/fscrypt.sh` for a filesystem to test it on |
-| `src/db/vault.rs` | a live store under a cipher the caller supplies (`Encryption::Cipher`): the door every file operation of the engine goes through, which is the standard library's call for a plain store; a file as a memory file while it is written and as its envelope in the directory after; the marker and the keys, the caller's wrapping the store's and the store's wrapping a key a file; the manifest's slot and the log's record sealed, with no cipher in the crate -- the module's own docs, `tests/cipher.rs`, and `ZFUZZ_CIPHER=1` for the differential fuzz |
+| `src/db/vault.rs` | a live store under a cipher the caller supplies (`Encryption::Cipher`): the door every file operation of the engine goes through, which is the standard library's call for a plain store, and the file it hands out (`vault::File`), whose methods are the calls the engine made on a descriptor; a file as a memory file while it is written and as its envelope in the directory after; the marker and the keys, the caller's wrapping the store's and the store's wrapping a key a file; the manifest's slot and the log's record sealed, with no cipher in the crate -- the module's own docs, `tests/cipher.rs`, and `ZFUZZ_CIPHER=1` for the differential fuzz |
 | `src/db/pager.rs` | the cache a store under a cipher reads its files through: a file as address space its plaintext's length, a chunk of it decrypted where it is first asked for and a megabyte given back at a time once the cache is past its budget and no reader could hold it; the holds and rests of the threads that read with no slot of the reader table, the two lines past the budget at which the store's own work and then a caller's read wait, the failure a read remembers, and the view a merge reads its inputs through beside the cache (`Stream`), with no cipher in it and no reader of the format -- the module's own docs, and `tests/cipher.rs` for a store several times its cache |
 | `src/db/zselect.rs` | the compact form's selector: `ZSelect::step`, a function of its state and an explicit `Input` (no clock, thread or file), the one definition of the transitions between FITS, SUSPECT, building, COMPACT and the trial, the replays that hold it, the model of a cache's faults over populations of pages (`model_populations`), and what the reads of a store in two forms cost with the moves between the forms that pay (`forms_cost`, `conversions`) -- the module's own docs |
 | `src/format.rs` | the on-disk format's fixed quantities, owned by no writer |
@@ -5233,7 +5233,27 @@ with half a second after the two, every run. It walks the builds by hand
 now, each parked at its rename while the start behind it is held, so
 that two land and the third stands at its start whatever the load
 (`Db::zpage_build_held`, a hold still set beside its waiting bit, tells
-the two places apart where one hold is set at a time). The
+the two places apart where one hold is set at a time). And as a form
+file being built under a count: the test of the raw seek's directory
+hint counts a hint a scan and a hint a partition crossed, and with the
+compact form forced (the stride group's `SUPDB_TEST_STRIDE`) a
+partition's form file is built as it lands and serves the scans from
+there, a seek that reads no directory, so the counts were whichever side
+of that build the scans fell on: no hint for the first scan in one run
+of sixty, three hints for four partitions once in a gate's stride group,
+and no hint in every run with the scans held four hundred milliseconds
+behind the flush. It names the raw form, the form whose seek it counts.
+And as an evictor's pass: the pager's test of a cache over its budget
+waited for the cache to come back under the budget and then read what
+the evictor had given back, and a pass goes on past the budget to its
+margin, holding every file it looks at for its length (`Pager::mark`).
+Read beside one, the file's count was a unit short of what the file's
+drop handed over, and the drop itself was the evictor's to finish, the
+count not there when the test read it, once in a gate. The first fix
+waited for the count to appear and failed fourteen runs of a hundred and
+fifty with six at once, on the unit: a wait for one of two things a pass
+in flight leaves is a wait for the pass, so the test stops the evictor
+(`Pager::stop`, which joins it) before it reads either. The
 rule: a test that
 needs a state holds it, and a bet on timing loses the first time the
 thing it bets against gets faster; a state the test needs only to have

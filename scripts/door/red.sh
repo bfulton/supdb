@@ -66,7 +66,7 @@ EOF
 
 # The anchor: a function compiled on every target.
 file="$copy/src/db/zfile.rs"
-anchor='fn drop_written(file: &File) -> Result<()> {'
+anchor='fn drop_written(file: &super::vault::File) -> Result<()> {'
 n=$(grep -cF "$anchor" "$file")
 [ "$n" = 1 ] || fail "the anchor \`$anchor\` is in src/db/zfile.rs $n times, not once"
 at=$(grep -nF "$anchor" "$file" | cut -d: -f1)

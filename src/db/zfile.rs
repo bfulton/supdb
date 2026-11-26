@@ -54,7 +54,6 @@ use crate::flatindex::{
 use crate::index::Ext;
 use std::cell::{Cell, RefCell};
 use std::cmp::Ordering as KeyOrder;
-use std::fs::File;
 use std::io::{ErrorKind, Result, Write};
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicU64, AtomicU8, Ordering};
@@ -3512,7 +3511,7 @@ pub(super) struct ZFile {
     /// cache once its name is gone (`ZFile::drop_cache`), since a mapping's
     /// own advice reaches only the pages it maps. `None` where it did not
     /// open.
-    file: Option<std::fs::File>,
+    file: Option<super::vault::File>,
     /// The mapping was advised random (`ZFile::advised`).
     advised: bool,
     /// Heap copies of the resident part's tables, never evicted.
@@ -3698,7 +3697,7 @@ struct Assembly {
     /// Whether the mapping lends nothing whole (`ZFile::asks`).
     asks: bool,
     map: MmapBytes,
-    file: Option<std::fs::File>,
+    file: Option<super::vault::File>,
     advise: bool,
     fence: ZFence,
     filter: Option<super::BlockedBloom>,
@@ -5892,7 +5891,7 @@ impl ZFile {
     pub(super) fn drop_cache(&self) {
         self.map.advise_dontneed();
         if let Some(f) = &self.file {
-            super::fadvise_dontneed(f);
+            f.drop_all();
         }
     }
 
@@ -7314,13 +7313,13 @@ trait PieceSink {
 /// dirty pages pushed the raw form's out until the file was dropped whole
 /// at its end, and the raw form's refaults read as the group's pressure.
 struct FileSink<'a> {
-    file: &'a File,
+    file: &'a super::vault::File,
     drop: bool,
     prev: Option<(u64, u64)>,
 }
 
 impl<'a> FileSink<'a> {
-    fn new(file: &'a File, drop: bool) -> FileSink<'a> {
+    fn new(file: &'a super::vault::File, drop: bool) -> FileSink<'a> {
         FileSink {
             file,
             drop,
@@ -7333,7 +7332,7 @@ impl PieceSink for FileSink<'_> {
     fn put(&mut self, at: u64, piece: &[u8]) -> Result<()> {
         let mut f = self.file;
         f.write_all(piece)?;
-        super::start_writeback(self.file, at, piece.len() as u64);
+        self.file.start_writeback(at, piece.len() as u64);
         if self.drop {
             if let Some((a, n)) = self.prev {
                 drop_written_range(self.file, a, n)?;
@@ -7395,7 +7394,7 @@ impl<S: PieceSink> Pieces<S> {
 
 /// A file's own pages written back and dropped from the page cache, the
 /// whole of it (`drop_written_range`).
-fn drop_written(file: &File) -> Result<()> {
+fn drop_written(file: &super::vault::File) -> Result<()> {
     drop_written_range(file, 0, 0)
 }
 
@@ -7406,27 +7405,15 @@ fn drop_written(file: &File) -> Result<()> {
 /// so no later wait or sync of the file sees it, and a page whose writeback
 /// failed and that the drop skipped -- one a mapping holds -- reads right
 /// from the cache and wrong from the device.
-// The door (tests/data/door.txt): writeback and drop on the build's own output, a door handle.
-#[allow(clippy::disallowed_methods)]
 #[cfg(target_os = "linux")]
-fn drop_written_range(file: &File, at: u64, n: u64) -> Result<()> {
-    use std::os::unix::io::AsRawFd;
+fn drop_written_range(file: &super::vault::File, at: u64, n: u64) -> Result<()> {
     written_back_range(file, at, n)?;
-    // SAFETY: an advice over a descriptor this call holds open; it changes
-    // no byte of the file.
-    unsafe {
-        libc::posix_fadvise(
-            file.as_raw_fd(),
-            at as libc::off64_t,
-            n as libc::off64_t,
-            libc::POSIX_FADV_DONTNEED,
-        );
-    }
+    file.drop_range(at, n);
     Ok(())
 }
 
 #[cfg(not(target_os = "linux"))]
-fn drop_written_range(_file: &File, _at: u64, _n: u64) -> Result<()> {
+fn drop_written_range(_file: &super::vault::File, _at: u64, _n: u64) -> Result<()> {
     Ok(())
 }
 
@@ -7453,40 +7440,14 @@ fn fail_next_writeback(on: bool) {
 /// commit and the device for no flush, as an fsync would. Off Linux, where
 /// nothing waits for a range, the file's sync. A test's seam answers an
 /// error once (`fail_next_writeback`).
-// The door (tests/data/door.txt): writeback on the build's own output, a door handle.
-#[allow(clippy::disallowed_methods)]
-fn written_back_range(file: &File, at: u64, n: u64) -> Result<()> {
+fn written_back_range(file: &super::vault::File, at: u64, n: u64) -> Result<()> {
     #[cfg(test)]
     if WRITEBACK_FAILS.with(|f| f.replace(false)) {
         return Err(std::io::Error::other(
             "the form file's writeback was made to fail",
         ));
     }
-    #[cfg(target_os = "linux")]
-    {
-        use std::os::unix::io::AsRawFd;
-        // SAFETY: a writeback over a descriptor this call holds open; it
-        // reads and writes no memory of ours.
-        let rc = unsafe {
-            libc::sync_file_range(
-                file.as_raw_fd(),
-                at as libc::off64_t,
-                n as libc::off64_t,
-                libc::SYNC_FILE_RANGE_WAIT_BEFORE
-                    | libc::SYNC_FILE_RANGE_WRITE
-                    | libc::SYNC_FILE_RANGE_WAIT_AFTER,
-            )
-        };
-        if rc != 0 {
-            return Err(std::io::Error::last_os_error());
-        }
-        Ok(())
-    }
-    #[cfg(not(target_os = "linux"))]
-    {
-        let _ = (at, n);
-        file.sync_data()
-    }
+    file.written_back(at, n)
 }
 
 /// A stride file's writeback waited for and its error read before its
@@ -7499,7 +7460,7 @@ fn written_back_range(file: &File, at: u64, n: u64) -> Result<()> {
 /// copy wrong under a check of the right one. A build that drops its
 /// output reads the error of each piece's writeback but the last's as it
 /// drops the piece (`drop_written_range`), and this wait reads the last's.
-fn read_writeback(file: &File) -> Result<()> {
+fn read_writeback(file: &super::vault::File) -> Result<()> {
     written_back_range(file, 0, 0)
 }
 
@@ -7512,30 +7473,18 @@ fn read_writeback(file: &File) -> Result<()> {
 /// this machine's 4 MiB requests, a device of 256 KiB requests read 64 pages
 /// of each. The bytes asked for; an error opening the form file asks for
 /// none.
-// The door (tests/data/door.txt): advice on a handle the door gave.
-#[allow(clippy::disallowed_methods)]
 #[cfg(target_os = "linux")]
-pub(super) fn swap_ahead(seg: &File, at: u64, len: u64, form: &Path) -> u64 {
-    use std::os::unix::io::AsRawFd;
+pub(super) fn swap_ahead(seg: &super::vault::File, at: u64, len: u64, form: &Path) -> u64 {
     let page = ZPAGE as u64;
     let (a, b) = (at.next_multiple_of(page), (at + len) & !(page - 1));
-    // SAFETY: advices over file descriptors this call holds open; neither
-    // changes a byte of either file.
-    unsafe {
-        if a < b {
-            libc::posix_fadvise(
-                seg.as_raw_fd(),
-                a as libc::off_t,
-                (b - a) as libc::off_t,
-                libc::POSIX_FADV_DONTNEED,
-            );
-        }
+    if a < b {
+        seg.drop_range(a, b - a);
     }
     ask_file(form)
 }
 
 #[cfg(not(target_os = "linux"))]
-pub(super) fn swap_ahead(_seg: &File, _at: u64, _len: u64, _form: &Path) -> u64 {
+pub(super) fn swap_ahead(_seg: &super::vault::File, _at: u64, _len: u64, _form: &Path) -> u64 {
     0
 }
 
@@ -7545,28 +7494,16 @@ pub(super) fn swap_ahead(_seg: &File, _at: u64, _len: u64, _form: &Path) -> u64 
 /// (`vault::open`, which opens no form file of a store under a cipher once
 /// it has its envelope). The ask starts the reads and waits for none of
 /// them, and a page the cache holds already is not read again.
-// The door (tests/data/door.txt): advice on a handle the door gave.
-#[allow(clippy::disallowed_methods)]
 #[cfg(target_os = "linux")]
 pub(super) fn ask_file(form: &Path) -> u64 {
-    use std::os::unix::io::AsRawFd;
     let Ok(f) = super::vault::open(form) else {
         return 0;
     };
-    let n = f.metadata().map_or(0, |m| m.len());
+    let n = f.len().unwrap_or(0);
     let mut off = 0u64;
     while off < n {
         let w = (n - off).min(crate::bytes::WILLNEED_PIECE as u64);
-        // SAFETY: an advice over a file descriptor this call holds open;
-        // it changes no byte of the file.
-        unsafe {
-            libc::posix_fadvise(
-                f.as_raw_fd(),
-                off as libc::off_t,
-                w as libc::off_t,
-                libc::POSIX_FADV_WILLNEED,
-            );
-        }
+        f.ask_range(off, w);
         off += w;
     }
     n
@@ -7583,31 +7520,19 @@ pub(super) fn ask_file(_form: &Path) -> u64 {
 /// a page a mapping still holds. The window is trimmed to whole pages
 /// inside it, and the pages another mapping holds -- the readers' hot raw
 /// pages -- survive the second call by design.
-// The door (tests/data/door.txt): the descriptor half of the plain build's drop (Walked::Mapped).
-#[allow(clippy::disallowed_methods)]
 #[cfg(target_os = "linux")]
-fn drop_behind(map: &MmapBytes, file: &File, from: usize, to: usize) {
-    use std::os::unix::io::AsRawFd;
+fn drop_behind(map: &MmapBytes, file: &super::vault::File, from: usize, to: usize) {
     let a = from.next_multiple_of(ZPAGE);
     let b = to & !(ZPAGE - 1);
     if a >= b {
         return;
     }
     map.advise_dontneed_range(a as u64, b - a);
-    // SAFETY: an advice over a file descriptor the build holds open; it
-    // changes no byte of the file.
-    unsafe {
-        libc::posix_fadvise(
-            file.as_raw_fd(),
-            a as libc::off_t,
-            (b - a) as libc::off_t,
-            libc::POSIX_FADV_DONTNEED,
-        );
-    }
+    file.drop_range(a as u64, (b - a) as u64);
 }
 
 #[cfg(not(target_os = "linux"))]
-fn drop_behind(_map: &MmapBytes, _file: &File, _from: usize, _to: usize) {}
+fn drop_behind(_map: &MmapBytes, _file: &super::vault::File, _from: usize, _to: usize) {}
 
 /// Ask for `[from, to)` of the segment's mapping, offsets in its file,
 /// ahead of a walk (`Bytes::advise_willneed`): the reads are issued at
@@ -7850,7 +7775,7 @@ pub(super) fn build(
 /// mapped whole; or a file a store under a cipher keeps, as the store's
 /// cache maps it, read by the piece.
 pub(super) enum SegSrc {
-    File(File),
+    File(super::vault::File),
     Kept(MmapBytes),
 }
 
@@ -7919,7 +7844,7 @@ fn build_file_seen(
             // segment is never truncated under a mapping.
             // The door (tests/data/door.txt): a plain segment's door handle mapped (SegSrc::File).
             #[allow(clippy::disallowed_methods, clippy::disallowed_types)]
-            let map = MmapBytes::from_map(unsafe { memmap2::Mmap::map(&file)? });
+            let map = MmapBytes::from_map(unsafe { memmap2::Mmap::map(file.as_os())? });
             let blob = Blob::open_with(map, opts)?;
             blob.advise_normal();
             let facts = blob.z_source_facts().ok_or_else(|| {
@@ -8276,7 +8201,7 @@ struct Placed<'a> {
 /// `map` is the segment's mapping and `file` its descriptor; `recs_at` and
 /// `dir_at` are where the two regions start in the file, from the header.
 struct Mapped<'a> {
-    file: &'a File,
+    file: &'a super::vault::File,
     map: &'a MmapBytes,
     recs: &'a [u8],
     dir: &'a [u8],
@@ -8464,7 +8389,7 @@ trait StrideWalked {
 /// whole and placed in the file (`Placed`), the segment's descriptor for
 /// the drop behind the walk, and the build's count of what it dropped.
 struct PlacedWalk<'a> {
-    file: &'a File,
+    file: &'a super::vault::File,
     at: Placed<'a>,
     seen: &'a mut dyn FnMut(usize, usize),
 }
@@ -14424,7 +14349,7 @@ mod tests {
     #[cfg(target_os = "linux")]
     fn evict(p: &Path) {
         use std::os::unix::io::AsRawFd;
-        let f = File::open(p).unwrap();
+        let f = std::fs::File::open(p).unwrap();
         f.sync_all().unwrap();
         // SAFETY: a hint on an open descriptor.
         let rc = unsafe { libc::posix_fadvise(f.as_raw_fd(), 0, 0, libc::POSIX_FADV_DONTNEED) };
@@ -14496,10 +14421,10 @@ mod tests {
         let p = fx.dir.join("window");
         let n = 64usize;
         std::fs::write(&p, vec![7u8; n * ZPAGE]).unwrap();
-        let file = File::open(&p).unwrap();
+        let file = super::super::vault::open(&p).unwrap();
         let map = MmapBytes::open(&p).unwrap();
         let base = map.addr();
-        let mut pm = File::open("/proc/self/pagemap").unwrap();
+        let mut pm = std::fs::File::open("/proc/self/pagemap").unwrap();
         let mut mapped = || -> Vec<bool> {
             (0..n)
                 .map(|i| {
@@ -14565,7 +14490,7 @@ mod tests {
             use std::io::Read;
             use std::os::unix::io::AsRawFd;
             evict(&fx.out);
-            let mut f = File::open(&fx.out).unwrap();
+            let mut f = std::fs::File::open(&fx.out).unwrap();
             // SAFETY: a hint on an open descriptor.
             unsafe { libc::posix_fadvise(f.as_raw_fd(), 0, 0, libc::POSIX_FADV_RANDOM) };
             let part = all * 3 / 4 * page;

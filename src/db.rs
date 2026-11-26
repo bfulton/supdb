@@ -28,7 +28,6 @@
 
 use std::cell::UnsafeCell;
 use std::cmp::Ordering;
-use std::fs::File;
 use std::io::{Read, Result, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicPtr, AtomicU32, AtomicU64, AtomicUsize, Ordering as AtomicOrdering};
@@ -118,7 +117,7 @@ fn write_ord(dir: &Path, seg_name: &str, bytes: &[u8], durable: bool) -> Result<
 /// name, which is why nothing names the segment durably -- the manifest --
 /// until the caller has synced both, and why a segment the manifest does
 /// not name is swept at open with its index.
-fn write_ord_unsynced(dir: &Path, seg_name: &str, bytes: &[u8]) -> Result<File> {
+fn write_ord_unsynced(dir: &Path, seg_name: &str, bytes: &[u8]) -> Result<vault::File> {
     let (f, tmp, name) = write_ord_tmp(dir, seg_name, bytes)?;
     vault::rename(&tmp, dir.join(&name))?;
     Ok(f)
@@ -126,7 +125,11 @@ fn write_ord_unsynced(dir: &Path, seg_name: &str, bytes: &[u8]) -> Result<File> 
 
 /// The index written to its temp name: the file, the temp path, and the
 /// final name for the caller to rename it to.
-fn write_ord_tmp(dir: &Path, seg_name: &str, bytes: &[u8]) -> Result<(File, PathBuf, String)> {
+fn write_ord_tmp(
+    dir: &Path,
+    seg_name: &str,
+    bytes: &[u8],
+) -> Result<(vault::File, PathBuf, String)> {
     let name = Db::ord_name_for(seg_name).ok_or_else(|| err("segment name is malformed"))?;
     let tmp = dir.join(format!("{name}.tmp"));
     let mut f = vault::create(&tmp)?;
@@ -8122,7 +8125,7 @@ fn run_note_start(head: &[u8]) -> Option<(u64, bool)> {
 }
 
 struct Wal {
-    file: File,
+    file: vault::File,
     path: PathBuf,
     /// Sequence of the next record to be written.
     seq: u64,
@@ -8730,7 +8733,8 @@ impl Wal {
         self.extent = bytes.max(self.written);
         self.pads = pads;
         if pads && self.extent > zselect::PAGE {
-            fadvise_dontneed_range(&self.file, zselect::PAGE, self.extent - zselect::PAGE);
+            self.file
+                .drop_range(zselect::PAGE, self.extent - zselect::PAGE);
         }
         Ok(())
     }
@@ -8800,7 +8804,7 @@ impl Wal {
         }
         vault::rename(spare, path)?;
         let mut file = vault::open_write(path)?;
-        let extent = file.metadata()?.len();
+        let extent = file.len()?;
         file.seek(SeekFrom::Start(0))?;
         file.write_all(&wal_header(kind))?;
         let wal = Wal {
@@ -8869,7 +8873,6 @@ impl Wal {
     /// them with its frames, and pays the one journal commit the file's
     /// growth needs there.
     fn extend_to(&mut self, end: u64, to: u64) -> Result<()> {
-        use std::os::unix::fs::FileExt;
         let page_end = (end + zselect::PAGE - 1) & !(zselect::PAGE - 1);
         let mut at = self.extent.max(page_end);
         let zeros = [0u8; 4096];
@@ -8902,7 +8905,7 @@ impl Wal {
         // (`Wal::put_back`): an append-mode write goes to the file's end
         // whatever the cursor says.
         let mut file = vault::open_append(path)?;
-        let mut written = file.metadata()?.len();
+        let mut written = file.len()?;
         let loose;
         let after_run;
         let mut head = WAL_MAGIC.len() as u64;
@@ -9430,7 +9433,6 @@ impl Wal {
         let spawned = std::thread::Builder::new()
             .name("supdb-walzero".into())
             .spawn(move || -> std::io::Result<u64> {
-                use std::os::unix::fs::FileExt;
                 let zeros = [0u8; 4096];
                 let mut at = from;
                 while at < to {
@@ -9481,7 +9483,7 @@ impl Wal {
         }
         let floor = self.synced & !(zselect::PAGE - 1);
         if floor >= self.dropped.saturating_add(stride) {
-            fadvise_dontneed_range(&self.file, self.dropped, floor - self.dropped);
+            self.file.drop_range(self.dropped, floor - self.dropped);
             self.dropped = floor;
         }
     }
@@ -9613,7 +9615,7 @@ impl Wal {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok((from, 0, false)),
             Err(e) => return Err(e),
         };
-        if file.metadata()?.len() == 0 {
+        if file.len()? == 0 {
             return Ok((from, 0, false));
         }
         // Read through a mapping and not into a buffer. The frames are
@@ -9627,7 +9629,7 @@ impl Wal {
         // lock over; nothing in this process writes it while the view
         // stands, and the view is dropped before the caller truncates or
         // appends to the file.
-        let mapped = unsafe { memmap2::Mmap::map(&file)? };
+        let mapped = unsafe { memmap2::Mmap::map(file.as_os())? };
         #[cfg(unix)]
         let _ = mapped.advise(memmap2::Advice::Sequential);
         let buf: &[u8] = &mapped;
@@ -9852,7 +9854,7 @@ struct Direct {
 /// whose temp name is gone landed durable and needs nothing.
 struct LooseRun {
     tmp: PathBuf,
-    file: File,
+    file: vault::File,
     named: bool,
 }
 
@@ -11057,7 +11059,7 @@ const STUCK_PIECE: u64 = 1 << 62;
 /// the other side, a folio sized by a write far larger than the commits
 /// after it (`CLAUDE.md`).
 struct AlignedWriter {
-    file: File,
+    file: vault::File,
     buf: Vec<u8>,
     /// `SegmentOptions::prefault`: the buffer's pages populated a window
     /// ahead of the fill, and how far they are.
@@ -11162,7 +11164,13 @@ struct HelperRow {
 }
 
 impl AlignedWriter {
-    fn new(file: File, piece: usize, writeback: bool, ahead: u64, prefault: bool) -> AlignedWriter {
+    fn new(
+        file: vault::File,
+        piece: usize,
+        writeback: bool,
+        ahead: u64,
+        prefault: bool,
+    ) -> AlignedWriter {
         let piece = piece.max(4096);
         AlignedWriter {
             file,
@@ -11210,7 +11218,6 @@ impl AlignedWriter {
     /// head is still there, and on the file where a write piece no longer
     /// than the head has carried it there already.
     fn patch_head(&mut self, off: usize, bytes: &[u8]) -> std::io::Result<()> {
-        use std::os::unix::fs::FileExt;
         let end = off + bytes.len();
         if self.written == 0 && self.buf.len() >= end {
             self.buf[off..end].copy_from_slice(bytes);
@@ -11394,7 +11401,7 @@ impl AlignedWriter {
             self.written = stop;
             self.held_from = to;
             if self.writeback && stop % piece == 0 {
-                start_writeback(&self.file, stop - piece, piece);
+                self.file.start_writeback(stop - piece, piece);
             }
         }
         if self.ahead > 0 {
@@ -11468,7 +11475,7 @@ impl AlignedWriter {
         })
     }
 
-    fn get_ref(&self) -> &File {
+    fn get_ref(&self) -> &vault::File {
         &self.file
     }
 
@@ -11480,7 +11487,7 @@ impl AlignedWriter {
     /// trusted for: every write of such a file fails (`run_write_fault`),
     /// and a finish has its trailer at least to write, which no write
     /// before this one can have taken from the buffer.
-    fn into_inner(mut self) -> std::io::Result<File> {
+    fn into_inner(mut self) -> std::io::Result<vault::File> {
         std::io::Write::flush(&mut self)?;
         self.join_helper()?;
         Ok(self.file)
@@ -11508,7 +11515,6 @@ impl AlignedWriter {
     /// `dst.len()` bytes of the output from `off`: from the file where
     /// they have landed, from the buffer where they have not.
     fn read_section(&self, off: u64, dst: &mut [u8]) -> std::io::Result<()> {
-        use std::os::unix::fs::FileExt;
         let on_file = (self.written.saturating_sub(off) as usize).min(dst.len());
         if on_file > 0 {
             self.file.read_exact_at(&mut dst[..on_file], off)?;
@@ -11626,11 +11632,11 @@ impl AlignedWriter {
     /// writer's, returning first, answer `Ok` before the helper had stored
     /// it. One open where the helper is spawned; its syncs and reads go
     /// through it, and it is closed with the thread.
-    fn helper_description(&self) -> std::io::Result<File> {
+    fn helper_description(&self) -> std::io::Result<vault::File> {
         if self.helper_fault.as_ref().is_some_and(|f| f.refuses()) {
             return Err(std::io::Error::from_raw_os_error(libc::ENOENT));
         }
-        reopen(&self.file)
+        self.file.reopen()
     }
 
     /// The writer synced the file itself, to its end: nothing on it is the
@@ -11859,7 +11865,6 @@ impl AlignedWriter {
             pwritev_all(&self.file, at, &parts, &mut self.fault)?;
             self.held_from = self.held_to;
         } else {
-            use std::os::unix::fs::FileExt;
             let split = (self.prefix as usize).min(self.buf.len());
             if self.fault >= RUN_FAULT_WRITE {
                 pwritev_all(&self.file, at, &[&self.buf], &mut self.fault)?;
@@ -11873,7 +11878,7 @@ impl AlignedWriter {
         let total = (held + self.buf.len()) as u64;
         self.written += total;
         if self.writeback && hint {
-            start_writeback(&self.file, at, total);
+            self.file.start_writeback(at, total);
         }
         self.buf.clear();
         if self.ahead > 0 {
@@ -11896,31 +11901,23 @@ impl AlignedWriter {
 /// one that writes half of its first part and then fails, as a short
 /// write followed by an error does; and a writer's state after a failure
 /// (`RUN_ATTN_*`) is asked in the same compare (`run_write_fault`).
-fn pwritev_all(file: &File, at: u64, parts: &[&[u8]], fault: &mut u8) -> std::io::Result<()> {
+fn pwritev_all(
+    file: &vault::File,
+    at: u64,
+    parts: &[&[u8]],
+    fault: &mut u8,
+) -> std::io::Result<()> {
     if *fault >= RUN_FAULT_WRITE {
         return run_write_fault(file, at, parts, fault);
     }
     pwritev_at(file, at, parts)
 }
 
-/// `pwritev_all`'s write.
-// The door (tests/data/door.txt): pwritev on a handle the door gave.
-#[allow(clippy::disallowed_methods)]
+/// `pwritev_all`'s write: the loop over `File::pwritev`.
 #[inline(always)]
-fn pwritev_at(file: &File, at: u64, parts: &[&[u8]]) -> std::io::Result<()> {
-    use std::os::unix::io::AsRawFd;
-    let fd = file.as_raw_fd();
+fn pwritev_at(file: &vault::File, at: u64, parts: &[&[u8]]) -> std::io::Result<()> {
     pwritev_loop(at, parts, |iov: &[std::io::IoSlice<'_>], at: u64| {
-        // SAFETY: `IoSlice` is ABI-compatible with `iovec` on unix, and
-        // every slice it names is borrowed for the call.
-        unsafe {
-            libc::pwritev(
-                fd,
-                iov.as_ptr() as *const libc::iovec,
-                iov.len().min(1024) as libc::c_int,
-                at as libc::off_t,
-            )
-        }
+        file.pwritev(iov, at)
     })
 }
 
@@ -11969,8 +11966,12 @@ fn pwritev_loop(
 /// write, as `pwritev_all` makes it.
 #[cold]
 #[inline(never)]
-fn run_write_fault(file: &File, at: u64, parts: &[&[u8]], fault: &mut u8) -> std::io::Result<()> {
-    use std::os::unix::fs::FileExt;
+fn run_write_fault(
+    file: &vault::File,
+    at: u64,
+    parts: &[&[u8]],
+    fault: &mut u8,
+) -> std::io::Result<()> {
     if *fault & RUN_ATTN_LOST != 0 {
         return Err(std::io::Error::other(
             "an fdatasync of the run's file failed, and no write to it after is trusted",
@@ -12024,32 +12025,6 @@ fn run_write_fault(file: &File, at: u64, parts: &[&[u8]], fault: &mut u8) -> std
     }))
 }
 
-/// Ask the kernel to start writing `len` bytes of `file` from `at` to the
-/// device, waiting for nothing: `sync_file_range` with the write flag on
-/// Linux, where it is a hint the later fsync is shorter for; nothing on
-/// another platform, and nothing on an error, since the fsync that follows
-/// writes whatever this did not.
-// The door (tests/data/door.txt): sync_file_range on a handle the door gave.
-#[allow(clippy::disallowed_methods)]
-fn start_writeback(file: &File, at: u64, len: u64) {
-    #[cfg(target_os = "linux")]
-    {
-        use std::os::unix::io::AsRawFd;
-        // SAFETY: a hint over a range of an open file; the call reads and
-        // writes no memory of ours.
-        let _ = unsafe {
-            libc::sync_file_range(
-                file.as_raw_fd(),
-                at as libc::off64_t,
-                len as libc::off64_t,
-                libc::SYNC_FILE_RANGE_WRITE,
-            )
-        };
-    }
-    #[cfg(not(target_os = "linux"))]
-    let _ = (file, at, len);
-}
-
 /// The thread behind a segment's writer (`SegmentOptions::sync_ahead`):
 /// it syncs the file whenever `ahead` bytes are on it past what is synced,
 /// an fdatasync on an open file description of its own
@@ -12059,7 +12034,7 @@ fn start_writeback(file: &File, at: u64, len: u64) {
 /// back from the page cache, so the finish takes its row from the thread
 /// and reads nothing.
 ///
-/// The writeback hint (`start_writeback`) moves a piece from this guest's
+/// The writeback hint (`vault::File::start_writeback`) moves a piece from this guest's
 /// page cache to the device's, and the fsync that closed a 40 MB segment
 /// still paid 24 ms after every piece's writeback had finished: the device
 /// flushing its own cache to what is behind it, which nothing but an fsync
@@ -12118,7 +12093,7 @@ struct HelperSeams {
 impl HelperSeams {
     #[cold]
     #[inline(never)]
-    fn sync(&self, dup: &File) -> std::io::Result<()> {
+    fn sync(&self, dup: &vault::File) -> std::io::Result<()> {
         if self.fail.is_some() {
             return Err(std::io::Error::from_raw_os_error(libc::EIO));
         }
@@ -12164,7 +12139,7 @@ impl WriterHelper {
     /// The thread, with a test's `seams` where `SEAMED` (`HelperSeams::start`
     /// before its loop) and with none otherwise.
     fn spawn<const SEAMED: bool>(
-        dup: File,
+        dup: vault::File,
         ahead: u64,
         synced: u64,
         section: Option<u64>,
@@ -12204,8 +12179,7 @@ impl WriterHelper {
         })
     }
 
-    fn run(s: &HelperShared, dup: &File, ahead: u64, seams: Option<&HelperSeams>) {
-        use std::os::unix::fs::FileExt;
+    fn run(s: &HelperShared, dup: &vault::File, ahead: u64, seams: Option<&HelperSeams>) {
         let piece = 1u64 << flatindex::PIECE_SHIFT;
         let mut buf = vec![0u8; 1 << 20];
         loop {
@@ -13274,7 +13248,7 @@ impl SegmentWriter {
     pub(crate) fn walk_run(path: &Path) -> Result<RunWalk> {
         let base = RunWalk::BASE;
         let file = vault::open(path)?;
-        if file.metadata()?.len() <= base as u64 {
+        if file.len()? <= base as u64 {
             return Ok(RunWalk {
                 map: None,
                 offs: Vec::new(),
@@ -13287,7 +13261,7 @@ impl SegmentWriter {
         // (`resume_run`), past the last good marker and in its head, and
         // the walk's readers take only the records between
         // (`RunWalk::bytes_at`).
-        let map = memmap2::MmapOptions::new().map_raw_read_only(&file)?;
+        let map = memmap2::MmapOptions::new().map_raw_read_only(file.as_os())?;
         #[cfg(unix)]
         let _ = map.advise(memmap2::Advice::Sequential);
         // SAFETY: the mapping's own bytes, read-only, of a file this open
@@ -13372,7 +13346,7 @@ impl SegmentWriter {
         // What stands past the last good marker is a batch nobody was
         // told was durable, or the index an earlier finish wrote here
         // before a crash took the open that made it.
-        if file.metadata()?.len() != run.end {
+        if file.len()? != run.end {
             file.set_len(run.end)?;
         }
         file.seek(SeekFrom::Start(run.end))?;
@@ -13931,7 +13905,7 @@ impl SegmentWriter {
     /// The seal publishes its segment to readers off this and pays the
     /// fsync afterwards; a caller that wants the segment durable syncs the
     /// file it is handed.
-    pub(crate) fn finish_unsynced(self, generation: u64) -> Result<File> {
+    pub(crate) fn finish_unsynced(self, generation: u64) -> Result<vault::File> {
         self.finish_unsynced_with(generation, None).map(|(f, _)| f)
     }
 
@@ -13946,7 +13920,7 @@ impl SegmentWriter {
         generation: u64,
         src: &dyn KeySource,
         on_key: &mut dyn FnMut(&[u8]),
-    ) -> Result<(File, BlockedBloom)> {
+    ) -> Result<(vault::File, BlockedBloom)> {
         let (file, bloom) = self.finish_unsynced_with(generation, Some((src, on_key)))?;
         Ok((
             file,
@@ -13958,7 +13932,7 @@ impl SegmentWriter {
         mut self,
         generation: u64,
         src: Option<KeyWalk<'_, '_>>,
-    ) -> Result<(File, Option<BlockedBloom>)> {
+    ) -> Result<(vault::File, Option<BlockedBloom>)> {
         if self.open_key.is_some() {
             return Err(err("segment writer: finish with a key still open"));
         }
@@ -14144,7 +14118,6 @@ impl SegmentWriter {
 
         t_marks[3] = t_finish.elapsed().as_micros();
         let file = self.out.into_inner()?;
-        use std::os::unix::fs::FileExt;
         if let Some(h) = &header {
             file.write_all_at(h, key_off)?;
         }
@@ -14459,7 +14432,7 @@ pub struct HelperFault {
     after_stop: std::sync::atomic::AtomicBool,
     /// A duplicate of the description the error was reported to, the
     /// helper's.
-    met: std::sync::Mutex<Option<File>>,
+    met: std::sync::Mutex<Option<vault::File>>,
 }
 
 impl HelperFault {
@@ -14518,7 +14491,7 @@ impl HelperFault {
 
     /// The helper's fdatasync over `dup`, failed while armed: the error is
     /// reported to `dup`'s description, and the thread waits where held.
-    fn helper_sync(&self, dup: &File) -> std::io::Result<()> {
+    fn helper_sync(&self, dup: &vault::File) -> std::io::Result<()> {
         if !self.armed() {
             return dup.sync_data();
         }
@@ -14535,82 +14508,9 @@ impl HelperFault {
 
     /// Whether the writer's fdatasync of `file` is answered the error: a
     /// helper met one on a description that is not `file`'s.
-    fn reaches(&self, file: &File) -> bool {
+    fn reaches(&self, file: &vault::File) -> bool {
         let met = self.met.lock().unwrap_or_else(|e| e.into_inner());
-        met.as_ref().is_some_and(|m| !same_description(file, m))
-    }
-}
-
-/// `file` opened again, read-only, as a new open file description of the
-/// same file: through `/proc/self/fd/<fd>` on Linux, a path built on the
-/// stack; a duplicate of the descriptor elsewhere.
-// The door (tests/data/door.txt): a second description of a door handle, by /proc/self/fd.
-#[allow(clippy::disallowed_methods)]
-fn reopen(file: &File) -> std::io::Result<File> {
-    #[cfg(target_os = "linux")]
-    {
-        use std::os::unix::io::{AsRawFd, FromRawFd};
-        let mut path = *b"/proc/self/fd/\0\0\0\0\0\0\0\0\0\0\0\0";
-        let mut digits = [0u8; 10];
-        let (mut fd, mut n) = (file.as_raw_fd() as u32, 0);
-        loop {
-            digits[n] = b'0' + (fd % 10) as u8;
-            n += 1;
-            fd /= 10;
-            if fd == 0 {
-                break;
-            }
-        }
-        for i in 0..n {
-            path[14 + i] = digits[n - 1 - i];
-        }
-        // SAFETY: `path` is a NUL-terminated string on the stack; the
-        // descriptor returned is ours alone.
-        let fd = unsafe {
-            libc::open(
-                path.as_ptr() as *const libc::c_char,
-                libc::O_RDONLY | libc::O_CLOEXEC,
-            )
-        };
-        if fd < 0 {
-            return Err(std::io::Error::last_os_error());
-        }
-        // SAFETY: a descriptor just opened, owned by nothing else.
-        Ok(unsafe { File::from_raw_fd(fd) })
-    }
-    #[cfg(not(target_os = "linux"))]
-    {
-        file.try_clone()
-    }
-}
-
-/// Whether two files are one open file description (`kcmp`'s
-/// `KCMP_FILE`).
-// The door (tests/data/door.txt): kcmp of two descriptors the door gave.
-#[allow(clippy::disallowed_methods)]
-fn same_description(a: &File, b: &File) -> bool {
-    use std::os::unix::io::AsRawFd;
-    #[cfg(target_os = "linux")]
-    {
-        const KCMP_FILE: libc::c_int = 0;
-        let pid = std::process::id() as libc::pid_t;
-        // SAFETY: compares two of this process's descriptors; no memory.
-        let r = unsafe {
-            libc::syscall(
-                libc::SYS_kcmp,
-                pid,
-                pid,
-                KCMP_FILE,
-                a.as_raw_fd() as libc::c_ulong,
-                b.as_raw_fd() as libc::c_ulong,
-            )
-        };
-        assert!(r >= 0, "kcmp: {}", std::io::Error::last_os_error());
-        r == 0
-    }
-    #[cfg(not(target_os = "linux"))]
-    {
-        a.as_raw_fd() == b.as_raw_fd()
+        met.as_ref().is_some_and(|m| !file.same_description(m))
     }
 }
 
@@ -14708,7 +14608,7 @@ impl PieceWriter {
 
     /// A second handle on the segment's file, for a sync from another
     /// thread (`Options::close_presync`).
-    fn file_clone(&self) -> std::io::Result<File> {
+    fn file_clone(&self) -> std::io::Result<vault::File> {
         self.0.out.get_ref().try_clone()
     }
 
@@ -14826,7 +14726,7 @@ impl PieceWriter {
 
     /// `finish` with the segment's fsync left to the caller: the segment's
     /// file, complete and unsynced, and the ordered index's bytes.
-    fn finish_unsynced(self) -> Result<(File, Vec<u8>)> {
+    fn finish_unsynced(self) -> Result<(vault::File, Vec<u8>)> {
         let file = (*self.0).finish_unsynced(1)?;
         Ok((file, self.1.finish()))
     }
@@ -14838,7 +14738,7 @@ impl PieceWriter {
     fn finish_unsynced_from(
         self,
         src: &dyn KeySource,
-    ) -> Result<(File, Vec<u8>, (BlockedBloom, bool))> {
+    ) -> Result<(vault::File, Vec<u8>, (BlockedBloom, bool))> {
         debug_assert!(self.3, "a finish from a source is for deferred keys");
         let tombs = self.2;
         let n = src.len();
@@ -14926,7 +14826,7 @@ impl Seg {
         let names = [Some(self.name.clone()), Db::ord_name_for(&self.name)];
         for name in names.into_iter().flatten() {
             if let Ok(f) = vault::open(dir.join(&name)) {
-                fadvise_dontneed(&f);
+                f.drop_all();
             }
         }
         self.z_drop_noted.store(true, AtomicOrdering::Release);
@@ -14946,7 +14846,7 @@ impl Seg {
         let before = held(self);
         if let Some(name) = Db::ord_name_for(&self.name) {
             if let Ok(f) = vault::open(dir.join(&name)) {
-                fadvise_dontneed(&f);
+                f.drop_all();
             }
         }
         (before, held(self))
@@ -18956,7 +18856,7 @@ impl RunMap {
         // stays below `run_flushed`. Under a cipher the file is the run's
         // memory file, and `held` keeps the store's cache from giving its
         // pages back for as long as this maps them.
-        let map = unsafe { memmap2::MmapOptions::new().len(cap).map(&file)? };
+        let map = unsafe { memmap2::MmapOptions::new().len(cap).map(file.as_os())? };
         Ok(RunMap { map, _held: held })
     }
 
@@ -19492,8 +19392,7 @@ fn manifest_write_slot_unsynced(
     names: &[String],
     pending: &[String],
     tear: bool,
-) -> Result<File> {
-    use std::os::unix::fs::FileExt;
+) -> Result<vault::File> {
     let out = manifest_image(dir, seq, covered_seq, needs_log, names, pending)?;
     let f = vault::open_slot(dir.join(MANIFEST_SLOTS[slot]))?;
     if tear {
@@ -19740,10 +19639,10 @@ fn manifest_parse(buf: &[u8]) -> Result<Manifest> {
 /// slot file found, by its index, as it was opened to be read: the open
 /// makes the slot files durable through these descriptors, whatever they
 /// read as.
-fn manifest_read_all(dir: &Path) -> Result<(Vec<Manifest>, [Option<File>; 2])> {
+fn manifest_read_all(dir: &Path) -> Result<(Vec<Manifest>, [Option<vault::File>; 2])> {
     let mut valid: Vec<Manifest> = Vec::new();
     let mut torn: Option<std::io::Error> = None;
-    let mut files: [Option<File>; 2] = [None, None];
+    let mut files: [Option<vault::File>; 2] = [None, None];
     for (i, slot) in MANIFEST_SLOTS.iter().enumerate() {
         let mut buf = Vec::new();
         match vault::open(dir.join(slot)) {
@@ -21186,7 +21085,7 @@ fn compact_run<R: MergeRest>(plan: MergePlan, rest: R) -> Result<Vec<String>> {
     let drops: Vec<bool> = (0..inputs.len())
         .map(|i| drop_behind || drop_covered.get(i).copied().unwrap_or(false))
         .collect();
-    let files: Vec<Option<std::fs::File>> = inputs
+    let files: Vec<Option<vault::File>> = inputs
         .iter()
         .zip(&drops)
         .map(|(name, &d)| {
@@ -21215,7 +21114,7 @@ fn compact_run<R: MergeRest>(plan: MergePlan, rest: R) -> Result<Vec<String>> {
         }
         blobs[i].drop_records(dropped_to[i], to);
         if let Some(f) = files.get(i).and_then(|f| f.as_ref()) {
-            fadvise_dontneed_range(f, dropped_to[i], to - dropped_to[i]);
+            f.drop_range(dropped_to[i], to - dropped_to[i]);
         }
         dropped_bytes += to - dropped_to[i];
         dropped_to[i] = to;
@@ -21660,7 +21559,7 @@ struct DrainSteps {
 /// What a direct run's finish hands the rest of its close: whether the
 /// run holds a tombstone, the segment's file, the ordered index's bytes
 /// and the landing's facts where the finish took them.
-type DirectFinished = (bool, File, Vec<u8>, Option<(BlockedBloom, bool)>);
+type DirectFinished = (bool, vault::File, Vec<u8>, Option<(BlockedBloom, bool)>);
 
 const DRAIN_STEP_NAMES: [&str; 18] = [
     "flush",
@@ -24196,43 +24095,6 @@ struct Shared {
     fit_skips: std::sync::atomic::AtomicU32,
 }
 
-/// `POSIX_FADV_DONTNEED` over `len` bytes at `off` of `file`: the clean
-/// pages of that range dropped from the page cache, a mapped page skipped,
-/// which is why `Bytes::advise_dontneed_range` goes first.
-// The door (tests/data/door.txt): advice on a handle the door gave.
-#[allow(clippy::disallowed_methods)]
-#[cfg(target_os = "linux")]
-fn fadvise_dontneed_range(file: &std::fs::File, off: u64, len: u64) {
-    use std::os::unix::io::AsRawFd;
-    let (Ok(off), Ok(len)) = (libc::off_t::try_from(off), libc::off_t::try_from(len)) else {
-        return;
-    };
-    // SAFETY: an advice over a range of an open file; nothing is written.
-    unsafe {
-        libc::posix_fadvise(file.as_raw_fd(), off, len, libc::POSIX_FADV_DONTNEED);
-    }
-}
-#[cfg(not(target_os = "linux"))]
-fn fadvise_dontneed_range(_file: &std::fs::File, _off: u64, _len: u64) {}
-
-/// The clean pages of `file` that nothing maps dropped from the page cache,
-/// the whole file (`POSIX_FADV_DONTNEED`); a dirty page is written back
-/// first and dropped by a later reclaim. Nothing elsewhere.
-// The door (tests/data/door.txt): advice on a handle the door gave.
-#[allow(clippy::disallowed_methods)]
-#[cfg(target_os = "linux")]
-fn fadvise_dontneed(file: &std::fs::File) {
-    use std::os::unix::io::AsRawFd;
-    // SAFETY: an advice over a file descriptor this call holds open; it
-    // changes no byte of the file.
-    unsafe {
-        libc::posix_fadvise(file.as_raw_fd(), 0, 0, libc::POSIX_FADV_DONTNEED);
-    }
-}
-
-#[cfg(not(target_os = "linux"))]
-fn fadvise_dontneed(_file: &std::fs::File) {}
-
 /// A mapping's length, a paged one's included, whose slice is empty.
 fn map_len(map: &MmapBytes) -> usize {
     crate::bytes::Bytes::len(map) as usize
@@ -26182,7 +26044,7 @@ pub struct Db {
 /// would otherwise give up its parent's lock with the parent's store
 /// still open.
 struct StoreLock {
-    file: File,
+    file: vault::File,
     /// The process that took the lock.
     pid: u32,
 }
@@ -40194,7 +40056,7 @@ impl Db {
             };
             seg.blob.advise_dontneed();
             if let Ok(f) = vault::open(self.dir.join(&seg.name)) {
-                fadvise_dontneed_range(&f, 0, 0);
+                f.drop_range(0, 0);
             }
             dropped += len as u64;
         }
@@ -41576,10 +41438,9 @@ impl Db {
                 // was for named by its inode, so a test can tell the slot
                 // taken from the other.
                 let failed = if fail {
-                    use std::os::unix::fs::MetadataExt;
                     Some(err(&format!(
                         "a test failed the open's fdatasync of {what} (inode {})",
-                        f.metadata()?.ino()
+                        f.ino()?
                     )))
                 } else {
                     None
@@ -44877,7 +44738,7 @@ impl Db {
             let mut names = Vec::new();
             let mut facts = Vec::new();
             // The files of every piece, unsynced until phase D.
-            let mut files: Vec<(File, File)> = Vec::new();
+            let mut files: Vec<(vault::File, vault::File)> = Vec::new();
             let mut at = 0usize;
             for (ri, (lo, hi)) in ranges.iter().enumerate() {
                 let start = at;
@@ -47334,7 +47195,12 @@ impl Db {
     /// presyncs sync.
     #[cold]
     #[inline(never)]
-    fn seamed_presync(shared: &Shared, f: &File, upto: u64, holds: bool) -> std::io::Result<()> {
+    fn seamed_presync(
+        shared: &Shared,
+        f: &vault::File,
+        upto: u64,
+        holds: bool,
+    ) -> std::io::Result<()> {
         if holds && shared.presync_seam.load(AtomicOrdering::Acquire) & PRESYNC_HOLD != 0 {
             shared
                 .presync_seam
@@ -47362,9 +47228,8 @@ impl Db {
     /// recorded (`failed_presync_extent`), and the error a failed
     /// fdatasync would answer.
     #[cold]
-    fn injected_presync(shared: &Shared, f: &File, upto: u64) -> std::io::Result<()> {
-        use std::os::unix::fs::MetadataExt;
-        let ino = f.metadata().map(|m| m.ino()).unwrap_or(0);
+    fn injected_presync(shared: &Shared, f: &vault::File, upto: u64) -> std::io::Result<()> {
+        let ino = f.ino().unwrap_or(0);
         *shared
             .failed_presync
             .lock()
@@ -48041,7 +47906,7 @@ impl Db {
     #[doc(hidden)]
     pub fn wal_join_ahead(&mut self) -> Result<u64> {
         self.wal.join_zeroing()?;
-        Ok(self.wal.file.metadata()?.len())
+        self.wal.file.len()
     }
 
     /// A test's: the log's next pre-write beside fails after its zeros are
@@ -54747,14 +54612,14 @@ fn stands_in(have: u64, of: u64) -> bool {
 /// the seal's fsync it was to overlap, where a wake takes tens of
 /// microseconds.
 struct SyncHelper {
-    jobs: Option<std::sync::mpsc::Sender<(File, File, bool)>>,
+    jobs: Option<std::sync::mpsc::Sender<(vault::File, vault::File, bool)>>,
     done: std::sync::mpsc::Receiver<std::io::Result<()>>,
     thread: Option<std::thread::JoinHandle<()>>,
 }
 
 impl SyncHelper {
     fn spawn() -> std::io::Result<SyncHelper> {
-        let (jobs, rx) = std::sync::mpsc::channel::<(File, File, bool)>();
+        let (jobs, rx) = std::sync::mpsc::channel::<(vault::File, vault::File, bool)>();
         let (tx, done) = std::sync::mpsc::channel();
         let thread = std::thread::Builder::new()
             .name("supdb-manifest".into())
@@ -54780,7 +54645,7 @@ impl SyncHelper {
     /// `slot` fdatasynced and `dir` fsynced, in that order, on the thread;
     /// with `fail`, a test's (`Db::fail_next_slot_sync`), neither, and the
     /// outcome is the failure a device would answer.
-    fn start(&self, slot: File, dir: File, fail: bool) -> std::io::Result<()> {
+    fn start(&self, slot: vault::File, dir: vault::File, fail: bool) -> std::io::Result<()> {
         self.jobs
             .as_ref()
             .and_then(|j| j.send((slot, dir, fail)).ok())
@@ -54889,7 +54754,7 @@ struct Maint {
     /// every write of a slot or bump of the sequence takes it first
     /// (`write_slot`) and every move of `slot` follows such a write; a
     /// publish before that sync writes the same slot, over it.
-    slot_sync_due: Option<File>,
+    slot_sync_due: Option<vault::File>,
     /// The partition merges in flight, oldest first, at most
     /// `Options::merge_parallel` of them and over disjoint inputs and
     /// ranges. Each one's inputs stay live and readable until the manifest
@@ -57459,7 +57324,7 @@ impl Maint {
         covered: u64,
         names: &[String],
         pending: &[String],
-    ) -> Result<(File, bool)> {
+    ) -> Result<(vault::File, bool)> {
         let tear = self.shared.tear_slot.load(AtomicOrdering::Relaxed)
             && self.slot_sync_due.is_some()
             && self.shared.tear_slot.swap(false, AtomicOrdering::AcqRel);
@@ -57500,7 +57365,7 @@ impl Maint {
 
     /// A slot's file fdatasynced: what a publish's own sync and a drain's
     /// owed one call, so a test can fail either (`Db::fail_next_slot_sync`).
-    fn sync_slot(&self, f: &File) -> Result<()> {
+    fn sync_slot(&self, f: &vault::File) -> Result<()> {
         if self.shared.fail_slot_sync.load(AtomicOrdering::Relaxed)
             && self
                 .shared
@@ -57783,7 +57648,7 @@ impl Maint {
                 seg.ord.advise_dontneed();
                 if let Some(name) = Db::ord_name_for(&seg.name) {
                     if let Ok(f) = vault::open(self.dir.join(&name)) {
-                        fadvise_dontneed(&f);
+                        f.drop_all();
                     }
                 }
             }

@@ -20312,9 +20312,20 @@ fn a_scans_answers_are_the_same_with_the_directory_hint_and_without() {
 /// burst the thread filed.
 #[test]
 fn a_seek_counts_its_directory_hint_once_a_scan_and_the_threads_pass_none() {
-    // A drained store, one partition: every scan of ten is one seek.
+    // A drained store, one partition: every scan of ten is one seek. The
+    // hint is the raw form's seek's, so the store is kept in it: with the
+    // compact form forced (the stride group's `SUPDB_TEST_STRIDE`) a
+    // partition's form file is built as it lands and serves the scans from
+    // there, a seek that reads no directory, and the counts below were
+    // whichever side of that build the scans fell on -- one run in sixty
+    // read no hint for the first scan, and a gate's read three hints for
+    // four partitions.
+    let raw = || Options {
+        zpages: supdb::ZPages::Off,
+        ..common::options()
+    };
     let d = dir("dirhint-count");
-    let mut db = Db::create(&d, common::options()).unwrap();
+    let mut db = Db::create(&d, raw()).unwrap();
     let key = |k: u32| format!("key-{k:06}").into_bytes();
     for k in 0..5_000u32 {
         db.append(&key(k), b"0");
@@ -20365,7 +20376,7 @@ fn a_seek_counts_its_directory_hint_once_a_scan_and_the_threads_pass_none() {
         upkeep_inline_bursts: true,
         partition_bytes: Some(256 << 10),
         seal_max_pct: 0,
-        ..common::options()
+        ..raw()
     };
     let mut db = Db::create(&d, opts).unwrap();
     let keys = 20_000u32;
