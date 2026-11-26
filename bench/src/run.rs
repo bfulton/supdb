@@ -2,7 +2,9 @@
 //! into a row.
 //!
 //! Every arm in one process, interleaved one round at a time, so a machine
-//! that drifts drifts across all of them rather than into one. A rep is one
+//! that drifts drifts across all of them rather than into one, and each
+//! round in an order of its own (`rep_order`), so that no arm's pass
+//! follows the same arm's in every rep. A rep is one
 //! complete pass of every workload for one arm; rep zero is a warmup and is
 //! discarded, because the first touch of a fresh file pays for allocation
 //! and first-fault costs that no steady state repeats -- and a run whose
@@ -1218,6 +1220,44 @@ pub struct Resume {
     pub passes_only: bool,
 }
 
+/// The order a rep runs its arms in, as indices into the plan's arms: a
+/// different one each rep, so that no arm keeps one predecessor.
+///
+/// What a pass leaves is a variable of the pass after it, and in the
+/// plan's order every rep an arm's pass followed the same arm's: `supdb`,
+/// first in the roster, followed the last, which since FASTER joined is
+/// FASTER's, and a load of ten thousand keys straight after FASTER's pass
+/// reads a seventh slower than the same load after any other arm's --
+/// the same code, 9.8 ms against 8.1 to 8.7 with four arms of one load
+/// path set after LMDB's, FASTER's, RocksDB's and each other's passes in
+/// one run, whichever of the four stood where (`bench/CLAUDE.md`, a
+/// predecessor every rep). So a row compared `supdb` after FASTER with
+/// `rocksdb-tuned` after LMDB, in every rep of every rung.
+///
+/// Rep `r` starts at arm `r - 1` and steps by the `r - 1`th of the strides
+/// that share no factor with the arm count, each a permutation: with
+/// distinct strides an arm's predecessor within the rep is a different arm
+/// in each, for as many reps as there are such strides (eight for fifteen
+/// arms), and two arms alternate. The warmup and the first rep run in the
+/// plan's order. A function of the count and the rep alone, so a run
+/// taken up from its ledger orders a rep as the run that was cut did.
+pub fn rep_order(arms: usize, rep: usize) -> Vec<usize> {
+    if arms < 2 || rep == 0 {
+        return (0..arms).collect();
+    }
+    fn gcd(a: usize, b: usize) -> usize {
+        if b == 0 {
+            a
+        } else {
+            gcd(b, a % b)
+        }
+    }
+    let k = rep - 1;
+    let strides: Vec<usize> = (1..arms).filter(|s| gcd(*s, arms) == 1).collect();
+    let stride = strides[k % strides.len()];
+    (0..arms).map(|i| (k + i * stride) % arms).collect()
+}
+
 /// The seam a test cuts a run at: `SUPDB_BENCH_STOP_AFTER=<size>-<rep>`
 /// ends the run, its ledger left as it stands, once that rep's file is
 /// written, and `<size>-<rep>-<arm>` once that arm's pass is: the state
@@ -1732,7 +1772,8 @@ pub fn run(
                 s.extend(&frag);
                 continue;
             };
-            for arm in &plan.arms {
+            for ai in rep_order(plan.arms.len(), rep) {
+                let arm = &plan.arms[ai];
                 if !arms_to_run.contains(arm) {
                     let l = ledger.as_ref().expect("a pass is kept only in a ledger");
                     replay_arm(l, size, rep, arm, &mut s, &mut killed)?;
@@ -7077,6 +7118,52 @@ mod tests {
         assert!(asked_after
             .iter()
             .any(|&(k, _)| k >= size && k < size + committed));
+    }
+
+    /// A rep runs every arm once, the warmup and the first rep in the
+    /// plan's order; over as many reps as an arm count has strides, no arm
+    /// follows the same arm twice within its reps, and no two reps start
+    /// with one arm; and two arms alternate.
+    #[test]
+    fn a_reps_order_gives_no_arm_one_predecessor() {
+        for arms in 0..=24usize {
+            for rep in 0..=12 {
+                let mut o = rep_order(arms, rep);
+                o.sort_unstable();
+                assert_eq!(o, (0..arms).collect::<Vec<_>>(), "{arms} arms, rep {rep}");
+            }
+            assert_eq!(rep_order(arms, 0), (0..arms).collect::<Vec<_>>());
+            assert_eq!(rep_order(arms, 1), (0..arms).collect::<Vec<_>>());
+        }
+        assert_eq!(rep_order(2, 2), [1, 0]);
+        assert_eq!(rep_order(2, 3), [0, 1]);
+        // Fifteen arms, the quick roster's count, have eight strides; the
+        // full scale takes seven reps.
+        for (arms, reps) in [(15usize, 8usize), (14, 6), (13, 12), (7, 6), (5, 4), (3, 2)] {
+            let mut before: Vec<Vec<usize>> = vec![Vec::new(); arms];
+            let mut firsts = Vec::new();
+            for rep in 1..=reps {
+                let o = rep_order(arms, rep);
+                firsts.push(o[0]);
+                for w in o.windows(2) {
+                    assert!(
+                        !before[w[1]].contains(&w[0]),
+                        "{arms} arms: arm {} follows arm {} again at rep {rep}",
+                        w[1],
+                        w[0]
+                    );
+                    before[w[1]].push(w[0]);
+                }
+            }
+            let n = firsts.len();
+            firsts.sort_unstable();
+            firsts.dedup();
+            assert_eq!(
+                firsts.len(),
+                n,
+                "{arms} arms: a rep starts where another did"
+            );
+        }
     }
 
     /// The scrambled mixes read keys that exist and spread their hot keys:
