@@ -139,7 +139,7 @@ pub(crate) fn mapped_resident_bytes() -> usize {
 /// The bytes of the `len` at `p` that are resident, in whole pages, by
 /// `mincore`; none where the range is not a mapping any more.
 #[cfg(target_os = "linux")]
-fn resident_of(p: *mut u8, len: usize) -> usize {
+pub(crate) fn resident_of(p: *mut u8, len: usize) -> usize {
     // SAFETY: a constant's read.
     let page = unsafe { libc::sysconf(libc::_SC_PAGESIZE) }.max(1) as usize;
     let pages = len.div_ceil(page);
@@ -198,7 +198,7 @@ pub(crate) fn alloc(len: usize, zeroed: bool, mapped: bool) -> *mut u8 {
 /// # Safety
 /// `[p, p + len)` is a writable mapping of zeroed bytes nobody else reads
 /// or writes yet.
-unsafe fn populate_write(p: *mut u8, len: usize) {
+pub(crate) unsafe fn populate_write(p: *mut u8, len: usize) {
     #[cfg(target_os = "linux")]
     {
         // SAFETY: the caller's range; the advice changes no byte's value.

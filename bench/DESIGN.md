@@ -344,10 +344,17 @@ then one every handle writes at once with no lock between them, sized
 from the store's keys as FASTER's log is, until the handles have gone and
 the writer has left it. So in the `threads` workloads its threads write
 through their own handles, as FASTER's sessions do, and in every other
-workload it is the arm it was. `supdb-heldnoshare` is that arm with the
-table the one writer's whoever writes, its threads taking the writer in
-turn, and `supdb-heldsharedbig` the arm whose every table is shared, with
-what a shared table refuses turned off for the store's life; both are for
+workload it is the arm it was. The handles are claimed as handles that
+write, where the threads are given them and outside every clock
+(`Db::writer`, `Engine::thread_writers`): the claim installs the shared
+table and makes it whole, its index and its arena populated, as FASTER's
+log and index stand from its open, so that a cell times its operations and
+not the first touches of a table made inside it. `supdb-heldnoshare` is
+that arm with the table the one writer's whoever writes, its threads
+taking the writer in turn; `supdb-heldnopopulate` installs the table at the
+claim and leaves its memory to the writes that reach it; and
+`supdb-heldsharedbig` is the arm whose every table is shared, with what a
+shared table refuses turned off for the store's life. All three are for
 pricing.
 
 The two differ on the ordered scan and the reopen, which `faster` has not

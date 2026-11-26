@@ -2311,10 +2311,26 @@ fn run_seed_inner(seed: u64, want_cache: bool, verbose: bool) -> Result<Stats, S
                 match writers.take() {
                     Some(_) => note_event("writers dropped", &z, &r),
                     None => {
-                        let (wz, wr) = (
-                            z.reader().map_err(|e| format!("reader: {e}"))?,
-                            r.reader().map_err(|e| format!("reader: {e}"))?,
-                        );
+                        // Half as handles claimed to write (`Db::writer`),
+                        // whose claim commits what is staged and installs
+                        // the shared table there; half as handles whose
+                        // first write asks for it.
+                        let (wz, wr) = if share_rng.chance(50) {
+                            let w = (
+                                z.writer().map_err(|e| format!("writer: {e}"))?,
+                                r.writer().map_err(|e| format!("writer: {e}"))?,
+                            );
+                            for op in staged.drain(..) {
+                                apply(&mut model, &op);
+                            }
+                            note_commit("writer claim", &z, &r);
+                            w
+                        } else {
+                            (
+                                z.reader().map_err(|e| format!("reader: {e}"))?,
+                                r.reader().map_err(|e| format!("reader: {e}"))?,
+                            )
+                        };
                         writers = Some((wz, wr));
                         note_event("writers claimed", &z, &r);
                     }

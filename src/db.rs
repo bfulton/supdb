@@ -5156,6 +5156,26 @@ pub struct Options {
     /// nothing of a store no handle writes. Off:
     /// `supdb-heldnoshare`, whose threads take the one writer in turn.
     pub share_on_write: bool,
+    /// Under `share_on_write`: the shared table the writer installs for
+    /// its handles is made whole before it is published -- every block of
+    /// its value arena up to its cap and the entry slab's blocks for the
+    /// entries its index takes, populated for writing
+    /// (`MemTable::populate_shared`) -- at the commit that installs it,
+    /// which a claim of a handle that writes makes (`Db::writer`). A table
+    /// installed in the middle of a workload is memory nothing has
+    /// touched, and its handles' first writes zeroed it a page at a time
+    /// on their own path, on huge pages two megabytes a fault: at the
+    /// host's price, which where the guest's balloon has reported the free
+    /// blocks to its host is milliseconds a huge page, and the first
+    /// threaded mix after a load read at half its rate for it. The price
+    /// is paid at the install, once, as FASTER pays for its log and index
+    /// at its open; the table's cap is memory the store was given for a
+    /// live table already. A value of over half an arena block is laid past
+    /// the blocks made ahead, and ends the table's room. A table a freeze
+    /// makes for the handles is not made ahead: its writers are waiting
+    /// for the commit that makes it. Off: the table's blocks made as its
+    /// writers reach them, `supdb-heldnopopulate`.
+    pub shared_populates: bool,
     /// A job's large per-key arrays -- a seal's sort of its
     /// table, a segment writer's copy of every key with its span, its
     /// record's offset and its hash, the ordered index builder's keys, a
@@ -7867,6 +7887,7 @@ impl Default for Options {
             shared_fall_always: false,
             shared_rmw_absent: true,
             share_on_write: true,
+            shared_populates: true,
             jobs_mapped: true,
             jobs_mapped_when_short: false,
             jobs_pooled: false,
@@ -15226,6 +15247,11 @@ struct ByteArena {
     /// every writer claims its strides from (`reserve_shared`), where a
     /// single writer's tail is `tail`.
     shared_tail: AtomicUsize,
+    /// Shared: the leading blocks made before any writer reserved
+    /// (`MemTable::populate_shared`), each a block's bytes. A range of
+    /// over half a block starts past them: it takes one allocation over
+    /// block-aligned blocks of its own, which a block made ahead is not.
+    made_ahead: AtomicUsize,
 }
 
 #[derive(Default)]
@@ -15262,6 +15288,7 @@ impl ByteArena {
             free: UnsafeCell::new(Vec::new()),
             src,
             shared_tail: AtomicUsize::new(0),
+            made_ahead: AtomicUsize::new(0),
         }
     }
 
@@ -15320,9 +15347,11 @@ impl ByteArena {
     fn reserve_shared_large(&self, n: usize) -> usize {
         let block = self.block_len();
         let len = n.div_ceil(block) * block;
+        let ahead = self.made_ahead.load(AtomicOrdering::Acquire);
         let mut cur = self.shared_tail.load(AtomicOrdering::Relaxed);
         loop {
-            let start = cur.div_ceil(block) * block;
+            // Past the blocks made ahead, which are a block each.
+            let start = cur.div_ceil(block).max(ahead) * block;
             match self.shared_tail.compare_exchange_weak(
                 cur,
                 start + len,
@@ -16685,6 +16714,45 @@ impl MemTable {
         m.records = records;
         m.rewrites = records && in_place;
         m
+    }
+
+    /// Shared, before the table is published: every block of the value
+    /// arena up to the table's cap, and the entry slab's blocks for the
+    /// entries its index takes at half load, made and populated for
+    /// writing (`Options::shared_populates`), so that the handles' first
+    /// writes into the table find their pages and take no fault for them.
+    /// The bytes made. A range of over half a block is laid past the
+    /// blocks made here (`ByteArena::made_ahead`), each of which is a
+    /// block's bytes and no more.
+    fn populate_shared(&self) -> usize {
+        let Some(st) = self.shared.as_deref() else {
+            return 0;
+        };
+        let block = self.vals.block_len();
+        let n = st.cap_bytes.div_ceil(block).min(ARENA_BLOCKS);
+        self.vals.made_ahead.store(n, AtomicOrdering::Release);
+        let mut bytes = 0;
+        for b in 0..n {
+            self.vals.install_shared(b, block);
+            let p = self.vals.blocks[b].load(AtomicOrdering::Acquire);
+            // SAFETY: block `b`, just made with `block` bytes, in a table
+            // nobody else has yet.
+            unsafe { blocks::populate_write(p, block) };
+            bytes += block;
+        }
+        // SAFETY: the index is this table's own, and nobody else's yet.
+        let slots = unsafe { &*self.index.load(AtomicOrdering::Acquire) }
+            .slots
+            .len();
+        let slab = Slab::<MemEntry>::block_bytes();
+        for id in (0..slots / 2).step_by(SLAB_BLOCK) {
+            let p = self.entries.slot_shared(id);
+            // SAFETY: the slab block entry `id` starts, zeroed and nobody
+            // else's yet.
+            unsafe { blocks::populate_write(p as *mut u8, slab) };
+            bytes += slab;
+        }
+        bytes
     }
 
     /// Whether a read of this table's values may meet a value being
@@ -23537,6 +23605,9 @@ struct Shared {
     /// the seals that chose the one writer's table for the next
     /// (`Db::seal`): `Db::share_counts`.
     share_counts: [AtomicU64; 3],
+    /// The bytes of the shared tables made whole at their install
+    /// (`Options::shared_populates`): `Db::share_populated`.
+    share_populated: AtomicU64,
     /// A test's: how long a handle's shared write waits between taking the
     /// state and writing its table, in microseconds (`Db::hold_shared_writes`).
     shared_write_hold_us: AtomicU64,
@@ -25650,6 +25721,10 @@ pub struct Db {
     /// (`share_look`): the rent is counted from the look that first finds
     /// so, which starts it at nothing.
     share_quiet: bool,
+    /// The next shared table made is the one the writer installs for its
+    /// handles (`share`), which is made whole before it is published
+    /// (`Options::shared_populates`, `fresh_table`).
+    share_flip: std::cell::Cell<bool>,
     /// Scratch for the run a value would encode as, measured at `append`
     /// against the inline limit.
     /// EXPERIMENT: the memtable's entry count when the last builder was
@@ -40196,6 +40271,7 @@ impl Db {
             writer_slots: std::sync::Mutex::new(Vec::new()),
             shares: opts.shares(),
             share_counts: Default::default(),
+            share_populated: AtomicU64::new(0),
             shared_write_hold_us: AtomicU64::new(0),
             shared_writes_held: AtomicU64::new(0),
             shared_grace_hold: std::sync::atomic::AtomicU8::new(0),
@@ -40351,6 +40427,7 @@ impl Db {
             share_rent: 0,
             max_key_stale: false,
             share_quiet: false,
+            share_flip: std::cell::Cell::new(false),
             built_ahead_len: 0,
             built_ahead_gen: 0,
             pending_err: None,
@@ -41043,6 +41120,7 @@ impl Db {
             writer_slots: std::sync::Mutex::new(Vec::new()),
             shares: opts.shares(),
             share_counts: Default::default(),
+            share_populated: AtomicU64::new(0),
             shared_write_hold_us: AtomicU64::new(0),
             shared_writes_held: AtomicU64::new(0),
             shared_grace_hold: std::sync::atomic::AtomicU8::new(0),
@@ -41202,6 +41280,7 @@ impl Db {
             share_rent: 0,
             max_key_stale: false,
             share_quiet: false,
+            share_flip: std::cell::Cell::new(false),
             built_ahead_len: 0,
             built_ahead_gen: 0,
             pending_err: None,
@@ -42661,6 +42740,11 @@ impl Db {
     fn share(&mut self) -> Result<()> {
         self.drop_blocks_for(6);
         self.share_next = true;
+        // The mark the table this installs is made whole by, taken by
+        // whichever of the seal and the line after it makes the table
+        // (`fresh_table`). A seal that makes none leaves it for the next
+        // of these, which sets it again.
+        self.share_flip.set(true);
         self.seal()?;
         if self.share_next && self.mem().shared.is_none() {
             self.set_mem(std::sync::Arc::new(self.fresh_table()));
@@ -42740,11 +42824,20 @@ impl Db {
     /// a handle asked and one still writes (`share_next`), and the one
     /// writer's otherwise.
     fn fresh_table(&self) -> MemTable {
-        self.opts.table_of(
-            self.opts.shared_writers || self.share_next,
+        let shared = self.opts.shared_writers || self.share_next;
+        let t = self.opts.table_of(
+            shared,
             &self.shared.block_pool,
             self.shared.shared_cap.load(AtomicOrdering::Relaxed),
-        )
+        );
+        // The table the writer installs for its handles, made whole here,
+        // before anyone else has it (`Options::shared_populates`).
+        if shared && self.share_flip.take() && self.opts.shared_populates {
+            self.shared
+                .share_populated
+                .fetch_add(t.populate_shared() as u64, AtomicOrdering::Relaxed);
+        }
+        t
     }
 
     /// Where the state a publish of `fresh` as the live table makes keeps
@@ -44160,6 +44253,27 @@ impl Db {
         self.puts_in_place
     }
 
+    /// A handle that writes: `reader`'s, counted among the handles that
+    /// write from here and not from its first write (`Reader::put`,
+    /// `append`, `delete`, `rmw`). Refused where no handle may write: a
+    /// store with neither `Options::shared_writers` nor a live table it
+    /// shares on demand (`Options::share_on_write`).
+    ///
+    /// The claim commits, as `commit` does, what the writer has staged.
+    /// In a store that shares on demand that commit finds the handle and
+    /// installs the shared table for it (`share_look`), made whole where
+    /// `Options::shared_populates` says: so the handle's first write
+    /// lands, where a handle from `reader` has its first write answered
+    /// `false` until the writer's next commit, and what installing a
+    /// table costs is paid here, where a thread is given its handle, and
+    /// not inside its first operation.
+    pub fn writer(&mut self) -> Result<Reader> {
+        let r = self.reader()?;
+        r.may_write_shared()?;
+        self.commit()?;
+        Ok(r)
+    }
+
     /// `Reader::reader`, the writer's: under `Options::put_in_place`
     /// refused while the live table holds a write no commit has covered,
     /// since a put may have overwritten a committed value there, and a
@@ -45488,6 +45602,12 @@ impl Db {
             c[1].load(AtomicOrdering::Relaxed),
             c[2].load(AtomicOrdering::Relaxed),
         ]
+    }
+
+    /// The bytes of the shared tables made whole at their install
+    /// (`Options::shared_populates`), over the store's life.
+    pub fn share_populated(&self) -> u64 {
+        self.shared.share_populated.load(AtomicOrdering::Relaxed)
     }
 
     /// Whether the store takes a handle's write by sharing its live table
@@ -63132,6 +63252,182 @@ mod shared_table {
     #[test]
     fn writers_on_threads_reuse_one_anothers_ranges_lazy() {
         as_lazy(writers_on_threads_reuse_one_anothers_ranges);
+    }
+
+    /// A table of records made whole or not, of `cap` bytes, on huge
+    /// pages or not.
+    fn whole(cap: usize, huge: bool, made: bool) -> MemTable {
+        let m = MemTable::new_shared(
+            BlockShape {
+                prefault: false,
+                index_populated: true,
+                fold_hash: true,
+                mapped: true,
+                pool: None,
+            },
+            cap,
+            0,
+            true,
+            true,
+            true,
+            true,
+            huge,
+            true,
+        );
+        if made {
+            m.populate_shared();
+        }
+        m
+    }
+
+    /// A table made whole (`MemTable::populate_shared`) has every block of
+    /// its value arena up to its cap, each a block's bytes, and the slab's
+    /// blocks for the entries its index takes at half load, made and every
+    /// page of them resident before a writer comes, and no block past
+    /// either; the bytes it answers are those. A table not made whole has
+    /// no block of either. Writes into the one made whole land and read
+    /// back. Read off `mincore`, and so not under qemu-user, which passes
+    /// no `MADV_POPULATE_WRITE` to the kernel
+    /// (`blocks::a_populating_source_maps_a_zeroed_block_written_and_no_other`).
+    #[cfg(all(target_os = "linux", not(supdb_emulated)))]
+    #[test]
+    fn a_table_made_whole_has_its_arena_and_slab_resident_before_a_write() {
+        use super::{blocks, MemEntry, Slab, SLAB_BLOCK};
+        let cap = 6usize << 20;
+        for huge in [true, false] {
+            let bare = whole(cap, huge, false);
+            assert!(bare.vals.blocks[0].load(Acquire).is_null(), "huge {huge}");
+            assert!(
+                bare.entries.blocks[0].load(Acquire).is_null(),
+                "huge {huge}"
+            );
+            assert_eq!(bare.vals.made_ahead.load(Acquire), 0);
+
+            let m = whole(cap, huge, false);
+            let bytes = m.populate_shared();
+            let block = m.vals.block_len();
+            let n = cap.div_ceil(block);
+            assert!(n >= 2, "the cap is over a block, or the loop is not held");
+            assert_eq!(m.vals.made_ahead.load(Acquire), n, "huge {huge}");
+            let mut want = 0;
+            for b in 0..n {
+                let p = m.vals.blocks[b].load(Acquire);
+                assert!(!p.is_null(), "huge {huge}: arena block {b}");
+                assert_eq!(m.vals.caps[b].load(Acquire), block, "block {b}");
+                assert_eq!(
+                    blocks::resident_of(p, block),
+                    block,
+                    "huge {huge}: arena block {b} resident"
+                );
+                want += block;
+            }
+            assert!(
+                m.vals.blocks[n].load(Acquire).is_null(),
+                "huge {huge}: no arena block past the cap"
+            );
+            let slots = m.index().unwrap().slots.len();
+            let slab = Slab::<MemEntry>::block_bytes();
+            let slabs = (slots / 2).div_ceil(SLAB_BLOCK);
+            assert!(slabs >= 2, "the index takes over a slab block's entries");
+            for i in 0..slabs {
+                let p = m.entries.blocks[i].load(Acquire) as *mut u8;
+                assert!(!p.is_null(), "huge {huge}: slab block {i}");
+                assert_eq!(
+                    blocks::resident_of(p, slab),
+                    slab,
+                    "huge {huge}: slab block {i} resident"
+                );
+                want += slab;
+            }
+            assert!(
+                m.entries.blocks[slabs].load(Acquire).is_null(),
+                "huge {huge}: no slab block past the index's entries"
+            );
+            assert_eq!(bytes, want, "huge {huge}: the bytes made");
+
+            let mut l = TableLocal::default();
+            for i in 0..200 {
+                let k = key(i);
+                let v = format!("made-{i}");
+                assert!(m.write_shared(
+                    &mut l,
+                    None,
+                    m.hash(&k),
+                    &k,
+                    SharedWrite::Put(v.as_bytes())
+                ));
+            }
+            for i in 0..200 {
+                let k = key(i);
+                assert_eq!(
+                    copied(&m, &k).map(|(v, _)| v),
+                    Some(vec![format!("made-{i}").into_bytes()]),
+                    "huge {huge}: key {i}"
+                );
+            }
+        }
+    }
+
+    /// A range of over half a block takes one allocation over
+    /// block-aligned blocks of its own, and the blocks a table made whole
+    /// has ahead are a block's bytes each: such a range is laid past them,
+    /// where its allocation is its own, and with the arena's end past the
+    /// cap the table's strides are done. In a table not made whole it is
+    /// laid at the arena's end as it always was, and the strides go on.
+    /// And a value of that size put into a table made whole reads back
+    /// whole beside the keys before it.
+    #[test]
+    fn a_range_over_a_block_is_laid_past_the_blocks_made_ahead() {
+        let cap = 6usize << 20;
+        let m = whole(cap, false, true);
+        let block = m.vals.block_len();
+        let n = cap.div_ceil(block);
+        let at = m.vals.reserve_shared_large(block + 1);
+        assert_eq!(at, n * block, "past the blocks made ahead");
+        assert_eq!(
+            m.vals.caps[n].load(Acquire),
+            2 * block,
+            "its own allocation"
+        );
+        let mut stride = (0, 0);
+        assert!(
+            m.vals.reserve_shared(&mut stride, 64, cap).is_none(),
+            "the arena's end is past the cap"
+        );
+
+        // With room past the range, so that the strides after it show.
+        let roomy = 4 * block;
+        let bare = whole(roomy, false, false);
+        assert_eq!(bare.vals.reserve_shared_large(block + 1), 0);
+        assert_eq!(bare.vals.caps[0].load(Acquire), 2 * block);
+        let mut stride = (0, 0);
+        assert_eq!(
+            bare.vals.reserve_shared(&mut stride, 64, roomy),
+            Some(2 * block),
+            "a table not made whole goes on past the range"
+        );
+
+        let m = whole(cap, false, true);
+        let mut l = TableLocal::default();
+        for i in 0..50 {
+            let k = key(i);
+            assert!(m.write_shared(&mut l, None, m.hash(&k), &k, SharedWrite::Put(b"small")));
+        }
+        let big: Vec<u8> = (0..block + 4096).map(|i| (i % 251) as u8).collect();
+        let k = key(1000);
+        assert!(m.write_shared(&mut l, None, m.hash(&k), &k, SharedWrite::Put(&big)));
+        assert_eq!(
+            copied(&m, &k).map(|(v, _)| v),
+            Some(vec![big]),
+            "the value over a block"
+        );
+        for i in 0..50 {
+            assert_eq!(
+                copied(&m, &key(i)).map(|(v, _)| v),
+                Some(vec![b"small".to_vec()]),
+                "key {i} beside it"
+            );
+        }
     }
 
     /// A shared table that asks for huge pages (`Options::shared_huge`)

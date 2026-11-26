@@ -1478,3 +1478,236 @@ fn the_option_stands_down_beside_what_it_cannot_share_under() {
     drop(db);
     let _ = std::fs::remove_dir_all(&d);
 }
+
+/// A handle claimed to write (`Db::writer`) writes at once: the claim
+/// installs the shared table, where a handle from `reader` has its first
+/// write refused until the writer's next commit, and a second claim
+/// installs nothing more. With the handles gone and the rent paid the
+/// writer leaves the table, and the next claim installs one again. Every
+/// read answers the model at each step, and after a flush and a reopen.
+#[test]
+fn a_handle_claimed_to_write_writes_at_once() {
+    let _w = Watchdog::arm("a claim to write waited a minute");
+    let (d, mut db, mut model) = loaded("writer", options());
+    assert!(!db.live_shared());
+    let w = db.writer().unwrap();
+    assert!(db.live_shared(), "the claim installs the table");
+    assert_eq!(db.share_counts(), [1, 0, 0]);
+    let (k, v) = (key(1), b"claimed-first".to_vec());
+    assert!(
+        w.put(&k, &v).unwrap(),
+        "the first write of a handle claimed to write lands"
+    );
+    model.insert(k, v);
+    let w2 = db.writer().unwrap();
+    assert_eq!(db.share_counts(), [1, 0, 0], "one table for both");
+    for i in 0..300 {
+        let (k, v) = (key(i * 2 + 1), format!("second-{i}").into_bytes());
+        assert!(w2.put(&k, &v).unwrap(), "write {i}");
+        model.insert(k, v);
+    }
+    hold(&db, &model, "claimed");
+
+    drop(w);
+    drop(w2);
+    pay_rent(&mut db, &mut model, "rent");
+    assert!(!db.live_shared(), "the writer has the table back");
+    hold(&db, &model, "left");
+    let w = db.writer().unwrap();
+    assert!(
+        db.live_shared(),
+        "a claim after the writer left installs again"
+    );
+    assert_eq!(db.share_counts()[0], 2);
+    let (k, v) = (key(3), b"claimed-again".to_vec());
+    assert!(w.put(&k, &v).unwrap());
+    model.insert(k, v);
+    hold(&db, &model, "claimed again");
+
+    drop(w);
+    db.flush().unwrap();
+    db.settle().unwrap();
+    hold(&db, &model, "flushed");
+    drop(db);
+    let db = Db::open(&d, options()).unwrap();
+    hold(&db, &model, "reopened");
+    drop(db);
+    let _ = std::fs::remove_dir_all(&d);
+}
+
+/// The claim commits what the writer has staged, as `commit` does: a
+/// handle under the watermark reads the staged value from the claim on and
+/// not before.
+#[test]
+fn a_claim_to_write_commits_what_is_staged() {
+    let _w = Watchdog::arm("a claim over a staged batch waited a minute");
+    let (d, mut db, mut model) = loaded("writer-staged", options());
+    let h = db.reader().unwrap();
+    let k = key(0);
+    let before = model[&k].clone();
+    db.put(&k, b"staged");
+    assert_eq!(
+        handle_values(&h, &k),
+        vec![before],
+        "a staged put is no handle's to read"
+    );
+    let w = db.writer().unwrap();
+    model.insert(k.clone(), b"staged".to_vec());
+    assert_eq!(
+        handle_values(&h, &k),
+        vec![b"staged".to_vec()],
+        "the claim committed it"
+    );
+    assert!(w.put(&key(1), b"after").unwrap());
+    model.insert(key(1), b"after".to_vec());
+    hold(&db, &model, "claimed over a staged batch");
+    drop((h, w));
+    drop(db);
+    let _ = std::fs::remove_dir_all(&d);
+}
+
+/// No handle is claimed to write where none may write: a store whose
+/// writes are logged, which shares nothing, refuses the claim, and holds
+/// no slot for it after.
+#[test]
+fn a_claim_to_write_is_refused_where_no_handle_may_write() {
+    let d = scratch("writer-refused");
+    let mut db = Db::create(
+        &d,
+        Options {
+            held_frames: true,
+            ..options()
+        },
+    )
+    .unwrap();
+    assert!(!db.shares());
+    db.put(b"k", b"v");
+    assert!(db.writer().is_err(), "a claim to write a logged store");
+    // A refused claim's handle goes back: after more refusals than the
+    // reader table has slots, as many handles are to be had as before.
+    let room = |db: &Db| {
+        std::iter::from_fn(|| db.reader().ok())
+            .take(1 << 16)
+            .collect::<Vec<_>>()
+            .len()
+    };
+    let before = room(&db);
+    assert!(
+        before > 0 && before < 1 << 16,
+        "the table's slots: {before}"
+    );
+    for _ in 0..2 * before {
+        assert!(db.writer().is_err());
+    }
+    assert_eq!(room(&db), before, "a refused claim kept its slot");
+    drop(db);
+    let _ = std::fs::remove_dir_all(&d);
+}
+
+/// The table the writer installs for its handles is made whole before it
+/// is published (`Options::shared_populates`): its arena to its cap and
+/// its slab, counted in bytes, at a claim and at a commit that finds a
+/// handle asking alike. A table a freeze makes for the handles is not, and
+/// with the option off none is. The writes land and read back either way.
+#[test]
+fn the_table_installed_for_the_handles_is_made_whole() {
+    let _w = Watchdog::arm("a table made whole waited a minute");
+    let cap = 6usize << 20;
+    for (name, populates, claimed) in [
+        ("whole-claim", true, true),
+        ("whole-asked", true, false),
+        ("whole-off", false, true),
+    ] {
+        let o = Options {
+            shared_table_bytes: cap,
+            shared_populates: populates,
+            ..options()
+        };
+        let (d, mut db, mut model) = loaded(name, o);
+        assert_eq!(db.share_populated(), 0, "{name}: nothing before a handle");
+        let w = if claimed {
+            db.writer().unwrap()
+        } else {
+            let r = db.reader().unwrap();
+            assert!(!r.put(&key(1), b"asks").unwrap(), "{name}");
+            db.commit().unwrap();
+            r
+        };
+        assert!(db.live_shared(), "{name}");
+        let made = db.share_populated();
+        if populates {
+            assert!(
+                made >= cap as u64,
+                "{name}: the table's arena to its cap, {made} bytes"
+            );
+        } else {
+            assert_eq!(made, 0, "{name}: made as it is written");
+        }
+        // Values enough to fill the table, so that a put is refused and
+        // the commit after it freezes the table under a fresh one.
+        let big = vec![0x5Au8; 64 << 10];
+        let before = db.share_counts();
+        for i in 0..160 {
+            let k = format!("fill-{i:04}").into_bytes();
+            write(&mut db, || w.put(&k, &big));
+            model.insert(k, big.clone());
+        }
+        assert!(db.live_shared(), "{name}: still the handles' table");
+        assert_eq!(db.share_counts(), before, "{name}: by freezes, no install");
+        assert_eq!(
+            db.share_populated(),
+            made,
+            "{name}: a table a freeze makes is not made ahead"
+        );
+        hold(&db, &model, name);
+        drop(w);
+        db.flush().unwrap();
+        db.settle().unwrap();
+        hold(&db, &model, name);
+        drop(db);
+        let _ = std::fs::remove_dir_all(&d);
+    }
+}
+
+/// A value of over an arena block put through a handle into a table made
+/// whole is laid past the blocks made ahead, each of which is a block's
+/// bytes: it reads back whole, beside the keys written before it and
+/// after, through the freeze its range ends the table's room with, the
+/// flush and a reopen. The same with the table made as it is written.
+#[test]
+fn a_value_over_an_arena_block_lands_whole_in_a_table_made_ahead() {
+    let _w = Watchdog::arm("a value over a block waited a minute");
+    for (name, populates) in [("over-block-whole", true), ("over-block-bare", false)] {
+        let o = Options {
+            shared_table_bytes: 6 << 20,
+            shared_populates: populates,
+            ..options()
+        };
+        let (d, mut db, mut model) = loaded(name, o.clone());
+        let w = db.writer().unwrap();
+        for i in 0..200 {
+            let (k, v) = (key(i * 2 + 1), format!("before-{i}").into_bytes());
+            write(&mut db, || w.put(&k, &v));
+            model.insert(k, v);
+        }
+        let big: Vec<u8> = (0..(5usize << 20)).map(|i| (i % 251) as u8).collect();
+        let k = b"key-over-a-block".to_vec();
+        write(&mut db, || w.put(&k, &big));
+        model.insert(k, big);
+        for i in 200..400 {
+            let (k, v) = (key(i * 2 + 1), format!("after-{i}").into_bytes());
+            write(&mut db, || w.put(&k, &v));
+            model.insert(k, v);
+        }
+        hold(&db, &model, name);
+        drop(w);
+        db.flush().unwrap();
+        db.settle().unwrap();
+        hold(&db, &model, name);
+        drop(db);
+        let db = Db::open(&d, o).unwrap();
+        hold(&db, &model, name);
+        drop(db);
+        let _ = std::fs::remove_dir_all(&d);
+    }
+}

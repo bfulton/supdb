@@ -7165,6 +7165,52 @@ the second, since nothing names it an invariant; and a mode that only
 its own arm could reach is put under the fuzz the day the default can
 reach it, with the fuzz making the writes the mode exists for.
 
+**A structure made in the middle of a workload, first touched on its
+writers' path at the host's price.** The store that shares on demand
+installed its shared table at the commit a handle's refused write asked
+for, inside that handle's first operation, and the table was memory
+nothing had touched: its index populated there, its arena's huge pages
+zeroed two megabytes a fault by the first writes. The pairings that
+priced the arm ran the load and the threaded mixes alone and read it
+level with the arm whose every table is shared; the first row in the
+row's own pass order read A on one thread at 0.37x to 0.82x of FASTER
+and one cell at ten thousand keys at a quarter, four reps of five. Every
+count of the engine's was the same as the fast reps', and callgrind over
+the probe put the old binary and the new within three instructions an
+operation, so an afternoon went to the sitting before the thread's own
+clock was read: `SUPDB_THREADED_COUNTERS` given each thread's user and
+system time and faults (`getrusage(RUSAGE_THREAD)`) read 19 to 39 ms of
+kernel time over six hundred faults in a cell of fifty, and
+`perf record -e cpu-clock -g` cut to the cell's marks put all of it in
+`clear_page_erms` under `do_huge_pmd_anonymous_page`, from
+`MemTable::write_shared` and from the index's `madvise`. This guest
+reports its free two-megabyte blocks to its host
+(`/sys/module/page_reporting/parameters/page_reporting_order` is 9), so
+a huge page faulted fresh costs 0.2 ms where the guest still backs the
+block and 2 to 10 where it does not, and which it is turns on what the
+passes before freed and when: a pairing of two passes meets a pool the
+runner has just primed, and a row's twelfth pass does not. One fault of
+that kind was a whole cell at the smallest rung. A handle that writes is
+claimed as one now (`Db::writer`), the claim's commit installs the
+table, and the table is made whole before it is published
+(`Options::shared_populates`): the first cell's faults fell from 580 to
+195 at a hundred thousand keys and from 400 to 16 at ten thousand, its
+kernel time to nothing, and the cell reads ahead of FASTER's
+(`docs/engine.md`, a live table that follows who writes it). The rules:
+a pairing is run in the row's whole pass order before its cells are
+believed, for an engine's arm against its sibling as much as against a
+comparator, since what a pass meets in the machine is everything that
+ran before it -- this file said so of a comparator's cache and of a
+policy's state, and the fresh-page price is a third; a cell slow with
+every count level and its instructions level is read on its thread's
+kernel time and faults before the sitting is blamed, the read being one
+`getrusage` a thread; a structure installed in the middle of a workload
+is fresh memory, so who first touches it and where is decided, and the
+place is where the caller says what is coming -- a claim, an open --
+and never the first operation after; and a fault's price on huge pages
+is five hundred pages', so one of them in a cell of a few milliseconds
+is the cell.
+
 ## Standing limitations
 
 These are the engine's, as opposed to refuted predictions. Each is a curve

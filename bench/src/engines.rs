@@ -2039,6 +2039,10 @@ pub struct Supdb {
     /// The live table never shared with a handle's writes
     /// (`Options::share_on_write` off): `supdb-heldnoshare`.
     noshare: bool,
+    /// The shared table the writer installs for its handles made as its
+    /// writers reach it (`Options::shared_populates` off):
+    /// `supdb-heldnopopulate`.
+    nopopulate: bool,
     /// What the reader handles this store gave its threads answered
     /// through the ordered index, summed as each is dropped
     /// (`OrdTally`); only the arm that reads that way hands out handles
@@ -3371,6 +3375,10 @@ struct Policy {
     /// `supdb-heldsharedbig` while one does, its shared table sized from
     /// the store's keys as that arm's is.
     noshare: bool,
+    /// `supdb-heldnopopulate`: `supdb-heldnoframes` with the table it
+    /// installs for its handles made as they write it
+    /// (`Options::shared_populates` off), its first touches the writers'.
+    nopopulate: bool,
 }
 
 /// The conversions a fill makes at most in `supdb-convertcap`: the first
@@ -3726,6 +3734,7 @@ impl Default for Policy {
             sharedfallalways: false,
             sharedrmwprobes: false,
             noshare: false,
+            nopopulate: false,
             defer: false,
             firstfloor: false,
             aheadmin: None,
@@ -10505,6 +10514,7 @@ impl Supdb {
             sharedfallalways,
             sharedrmwprobes,
             noshare,
+            nopopulate,
         } = policy;
         // The table a held store with no frames makes for its handles'
         // writes (`Options::share_on_write`) is sized as the big shared
@@ -11189,6 +11199,7 @@ impl Supdb {
             point_placed_runs: !placedpieces,
             shared_writers: shared,
             share_on_write: !noshare,
+            shared_populates: !nopopulate,
             shared_recycles: !sharednorecycle,
             // The big table's sizing for the table a held store with no
             // frames shares on demand too, which holds the store as
@@ -11595,6 +11606,7 @@ impl Supdb {
             sharedfallalways,
             sharedrmwprobes,
             noshare,
+            nopopulate,
             ord_threads: Default::default(),
         })
     }
@@ -11771,6 +11783,8 @@ struct SupdbSharedWriter<'a> {
     r: supdb::Reader,
     /// The tables this thread found full and froze (`freeze`).
     freezes: std::cell::Cell<u64>,
+    /// The time those commits took, in microseconds.
+    freeze_us: std::cell::Cell<u64>,
 }
 
 impl ThreadWriter for SupdbSharedWriter<'_> {
@@ -11783,6 +11797,7 @@ impl ThreadWriter for SupdbSharedWriter<'_> {
         c.push(("rmw_below", self.r.shared_rmw_below()));
         c.push(("fall_asks", self.r.shared_fall_asks()));
         c.push(("freezes", self.freezes.get()));
+        c.push(("freeze_us", self.freeze_us.get()));
         c
     }
     fn update_batch(&mut self, items: &[(&[u8], &[u8])]) -> Res<()> {
@@ -11817,11 +11832,16 @@ impl SupdbSharedWriter<'_> {
     /// The commit that freezes the table this thread's write found full.
     fn freeze(&self) -> Res<()> {
         self.freezes.set(self.freezes.get() + 1);
-        self.db
+        let t = std::time::Instant::now();
+        let r = self
+            .db
             .lock()
             .map_err(|_| "a writer thread panicked holding the store".to_string())?
             .commit()
-            .map_err(|e| e.to_string())
+            .map_err(|e| e.to_string());
+        self.freeze_us
+            .set(self.freeze_us.get() + t.elapsed().as_micros() as u64);
+        r
     }
 }
 
@@ -11850,6 +11870,8 @@ impl Engine for Supdb {
             if self.noframes {
                 return if self.noshare {
                     "supdb-heldnoshare"
+                } else if self.nopopulate {
+                    "supdb-heldnopopulate"
                 } else if self.shared && self.sharednorecycle {
                     "supdb-heldsharednorecycle"
                 } else if self.shared && self.sharedbig && self.sharednoahead {
@@ -13715,6 +13737,9 @@ impl Engine for Supdb {
                 "share_leaves",
                 (db.share_counts()[1] + db.share_counts()[2]) as f64,
             ),
+            // The bytes of those tables made whole at their install
+            // (`Options::shared_populates`).
+            ("share_populated", db.share_populated() as f64),
             // What the forms' upkeep did: see `Db::forms_events`.
             ("blk_by_upkeep", ev[0] as f64),
             ("table_drops", ev[1] as f64),
@@ -14221,15 +14246,22 @@ impl Engine for Supdb {
         // writes from one handle, so a thread's batch is the handle held
         // for the batch's puts and its commit. The reads take no lock:
         // a `Reader` under `Latest` sees every commit before a read.
+        // A store that shares on demand takes a thread's writes through
+        // its handle as a shared one does, and its handles are claimed as
+        // handles that write (`Db::writer`): the first claim installs the
+        // shared table (`Options::share_on_write`), here, where the
+        // threads are given their handles, as FASTER's log stands from its
+        // open. A refused write still commits and writes again
+        // (`SupdbSharedWriter::freeze`): a table that fills is frozen so.
+        let shared = self.shared || db.shares();
         let mut readers = Vec::with_capacity(n);
         for _ in 0..n {
-            readers.push(db.reader().map_err(|e| e.to_string())?);
+            readers.push(if db.shares() {
+                db.writer().map_err(|e| e.to_string())?
+            } else {
+                db.reader().map_err(|e| e.to_string())?
+            });
         }
-        // A store that shares on demand takes a thread's writes through
-        // its handle as a shared one does: the first of them is refused by
-        // the one writer's table, and the commit a refused write makes
-        // installs a shared one (`Options::share_on_write`).
-        let shared = self.shared || db.shares();
         let db = std::sync::Arc::new(std::sync::Mutex::new(db));
         Ok(readers
             .into_iter()
@@ -14241,6 +14273,7 @@ impl Engine for Supdb {
                             db,
                             r,
                             freezes: std::cell::Cell::new(0),
+                            freeze_us: std::cell::Cell::new(0),
                         }) as Box<dyn ThreadWriter + '_>
                     } else {
                         Box::new(SupdbWriter { db, r }) as Box<dyn ThreadWriter + '_>
@@ -15956,6 +15989,7 @@ pub fn guarantee(arm: &str) -> Option<Guarantee> {
         | "supdb-heldsharedbigfallalways"
         | "supdb-heldsharedbigrmwprobes"
         | "supdb-heldnoshare"
+        | "supdb-heldnopopulate"
         | "supdb-heldbatch1"
         | "proto-shared"
         | "faster" => Guarantee::Memory,
@@ -16569,6 +16603,22 @@ pub fn open(arm: &str, dir: &Path, map_gb: usize) -> Res<Box<dyn Engine>> {
                         held: true,
                         noframes: true,
                         noshare: true,
+                        ..Policy::default()
+                    },
+                )
+            },
+            dir,
+        )?,
+        "supdb-heldnopopulate" => supdb_arm(
+            |d| {
+                Supdb::with_policy(
+                    d,
+                    Policy {
+                        partition: false,
+                        durable: false,
+                        held: true,
+                        noframes: true,
+                        nopopulate: true,
                         ..Policy::default()
                     },
                 )
@@ -18677,6 +18727,7 @@ mod tests {
             ("supdb-heldmemfnv", |a| !a.mem_hash_fold),
             ("supdb-heldbatch1", |a| a.upkeep_batch_pct == 1),
             ("supdb-heldnoshare", |a| !a.share_on_write),
+            ("supdb-heldnopopulate", |a| !a.shared_populates),
         ] {
             let e = open(arm, &root.join(arm), 1).unwrap();
             assert_eq!(e.name(), arm);
@@ -18714,6 +18765,10 @@ mod tests {
                 },
                 "supdb-heldnoshare" => Policy {
                     noshare: true,
+                    ..Policy::default()
+                },
+                "supdb-heldnopopulate" => Policy {
+                    nopopulate: true,
                     ..Policy::default()
                 },
                 _ => Policy {
@@ -18999,6 +19054,8 @@ mod tests {
             "supdb-heldnoframes",
             // And the same store with its table the one writer's.
             "supdb-heldnoshare",
+            // And with its shared table made as the threads write it.
+            "supdb-heldnopopulate",
             "lmdb-nosync",
             "rocksdb-tuned-nosync",
         ] {

@@ -4953,6 +4953,7 @@ fn threaded_mix(
                     let mut wbuf = Batch::with_capacity(YCSB_BATCH, payload.value_size());
                     barrier.wait();
                     let start = Instant::now();
+                    let before = counting.then(thread_usage);
                     let mut w = opened?;
                     let (mut reads, mut bytes) = (0u64, 0u64);
                     for _ in 0..share {
@@ -4984,7 +4985,19 @@ fn threaded_mix(
                     }
                     wbuf.flush_updates_to(w.as_mut())?;
                     let end = Instant::now();
-                    let counts = if counting { w.counters() } else { Vec::new() };
+                    let mut counts = if counting { w.counters() } else { Vec::new() };
+                    if let Some([user, sys, minflt, majflt]) = before {
+                        // The thread's own clock and faults over its
+                        // share, beside its wall: a thread slower than its
+                        // CPU waited, and one whose kernel share grew with
+                        // its faults paid for fresh pages.
+                        let [u, s, mi, ma] = thread_usage();
+                        counts.push(("wall_us", end.duration_since(start).as_micros() as u64));
+                        counts.push(("user_us", u - user));
+                        counts.push(("sys_us", s - sys));
+                        counts.push(("minflt", mi - minflt));
+                        counts.push(("majflt", ma - majflt));
+                    }
                     Ok((start, end, reads, bytes, counts))
                 })
             })
@@ -5030,6 +5043,30 @@ fn threaded_mix(
         eprintln!("{line}");
     }
     Ok(ThreadedMixed { secs, reads, bytes })
+}
+
+/// The calling thread's own user and system time, in microseconds, and
+/// its minor and major faults (`getrusage(RUSAGE_THREAD)`), for the
+/// threaded mixes' counters line.
+#[cfg(target_os = "linux")]
+fn thread_usage() -> [u64; 4] {
+    // SAFETY: `getrusage` fills the struct it is handed and reads nothing.
+    let mut ru: libc::rusage = unsafe { std::mem::zeroed() };
+    // SAFETY: as above; the struct is this frame's own.
+    unsafe { libc::getrusage(libc::RUSAGE_THREAD, &mut ru) };
+    let us = |t: libc::timeval| t.tv_sec as u64 * 1_000_000 + t.tv_usec as u64;
+    [
+        us(ru.ru_utime),
+        us(ru.ru_stime),
+        ru.ru_minflt as u64,
+        ru.ru_majflt as u64,
+    ]
+}
+
+/// Nothing where the host has no per-thread usage.
+#[cfg(not(target_os = "linux"))]
+fn thread_usage() -> [u64; 4] {
+    [0; 4]
 }
 
 /// One YCSB workload over a loaded store: `ops` operations (`ycsb_ops`,
