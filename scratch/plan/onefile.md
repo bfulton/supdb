@@ -52,6 +52,19 @@ the sealing over extents (the page, tag and session half of Pagefile).
   read through it), so the links have a number before `copy_to` replaces
   them.
 
+**Run, 2026-11-26** (`scratch/onefile/notes.md`): X1 resolved nothing in
+core at one and two million keys, a store that frees nothing within a few
+percent of `supdb` either way, so its kill clause holds: on this fleet the
+container's own gain for the plain store is the segment's write and sync
+and the names, and the cells the encrypted roster loses (`ROADMAP.md`: the
+ordered load's double write and its envelope sealed whole at the close, a
+form page across two chunks) are the sealing's, O4 and O5. X2 passed, one
+inode costing three writers nothing measured. X3 read a cold fault about 3%
+dearer through an extent of a large file, at the edge of its spread. X4 is
+not built. The order below is therefore O1, O2 for the segments alone, O4
+and O5 on top of it, and O3 (the log and the slots into the file, the one
+file a store that mobile wants) after them.
+
 ## Stages (the gate green at each end; the count level with the option off)
 
 - **O1 -- the door's file type.** Pagefile's S1 as written: `vault::File`

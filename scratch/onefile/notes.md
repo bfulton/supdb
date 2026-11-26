@@ -71,3 +71,34 @@ file's lock across their flush.
 (`copy_file_range`) and synced, 1.14-1.19 s with the source in the page
 cache and 1.19-1.39 s with it out. No clone on this ext4 (`cp
 --reflink=always`: Operation not supported).
+
+## The experiments the plan owed (`scratch/plan/onefile.md`)
+
+**X1, the frees' ceiling.** `reaper-inline-scratch.patch` with `reap_one`
+answering false, so that nothing is freed until the close, built into the
+`enc` binary and paired in core (`SUPDB_LAG_COUNTERS=1 SUPDB_SCAN_OPS=1 sh
+scripts/pair.sh supdb-reap supdb SIZE --passes load,lag --reps 3`, at
+`dcdd042` with the patch): at a million keys 58 files and 567 MB never
+freed, at two million 125 and 1.4 GB. The ordered load read for whichever
+arm was listed first in all four sittings, by 4-8%; the shuffled load for
+the arm that frees nothing in three sittings of four (1.29x, 1.03x, 0.99x,
+1.11x, one of them in every pair); the sweep's weighted sum 1.08x, 0.95x,
+1.01x, 1.12x. Nothing past what the position does. The disk here holds no
+run of it at ten million keys under a bound, where the frees are 8 s of
+the full rewrite's traced 26.6. So by this the frees are worth a few
+percent of a cell in core, and the bar is not cleared by them.
+
+**X2, one inode under many writers** (`writers.py`, `writers.out`). Three
+writers each making 192 MB durable: into files of their own 1,180-1,280
+MB/s; into reserved extents of one file 1,165-1,315; into extents written
+before, by range with one flush, 1,240-1,666 in the open and 1,290-1,390
+under a bound of 256 MiB. A ranged commit beside them waits tens of
+milliseconds for their bytes in every shape. One inode costs the writers
+nothing measured.
+
+**X3, a mapping an extent** (`mapext.py`, `mapext.out`). 64 MB read cold
+through a mapping of a file of its own and of an extent a gibibyte into a
+2 GB file, through an open of its own: a scan in order 27-29 ms against
+29-31, 4,000 pages at random 171-177 ms against 177-183, the same faults.
+About 3% a cold fault for the extent in three reps of three, at the edge
+of what the reps spread; read again in O2's bounded pairings.
