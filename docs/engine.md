@@ -1753,12 +1753,13 @@ write (`Db::writer`), and its reads through that handle, which is the
 shared table's lean path. Paired at `f7d565c` (`pair.sh supdb-heldhandle
 faster SIZE --passes load,read,mixes,mixes-scrambled,lag --reps 5`, and
 against `supdb-heldnoframes`, at three hundred and a hundred thousand
-keys), our rate over FASTER's in the two orders:
+keys), our rate over FASTER's in the two orders, beside the roster's arm's
+in its own pairing with FASTER at `2c0a1b1` above:
 
 | | 300,000 keys | 100,000 keys | the roster's arm, both rungs |
 |---|---|---|---|
 | burst, the full rewrite | 1.70, 1.63 | 1.71, 1.45 | 0.29-0.48 |
-| burst, ten percent | 1.57, 1.75 | 1.45, 1.68 | 0.36-0.63 |
+| burst, ten percent | 1.57, 1.75 | 1.45, 1.68 | 0.35-0.63 |
 | ycsb-A | 1.17, 0.95 | 0.87, 0.89 | 0.81-0.97 |
 | ycsb-F | 0.98, 0.88 | 0.85, 0.81 | 0.55-0.77 |
 | scrambled A | 1.26, 1.31 | 0.95, 0.92 | 0.72-1.15 |
