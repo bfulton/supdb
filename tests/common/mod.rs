@@ -370,6 +370,35 @@ pub fn mappings_advised_random(needle: &str) -> Vec<(String, bool)> {
     out
 }
 
+/// `mappings_advised_random` with each mapping's offset in its file: for a
+/// store kept in one file, whose every file is a mapping of a range of the
+/// data file and is told from the others by where it begins.
+#[cfg(target_os = "linux")]
+#[allow(dead_code)]
+pub fn mappings_at(needle: &str) -> Vec<(String, u64, bool)> {
+    let smaps = std::fs::read_to_string("/proc/self/smaps").unwrap();
+    let mut out = Vec::new();
+    let mut at: Option<(String, u64)> = None;
+    for line in smaps.lines() {
+        let first = line.split_whitespace().next().unwrap_or("");
+        if let Some(flags) = line.strip_prefix("VmFlags:") {
+            if let Some((p, off)) = at.take() {
+                out.push((p, off, flags.split_whitespace().any(|f| f == "rr")));
+            }
+        } else if first.contains('-') && first.bytes().all(|b| b.is_ascii_hexdigit() || b == b'-') {
+            let f: Vec<&str> = line.split_whitespace().collect();
+            let deleted = line.ends_with("(deleted)");
+            at = match (f.get(2), f.get(5)) {
+                (Some(off), Some(p)) if p.contains(needle) && !deleted => {
+                    Some((p.to_string(), u64::from_str_radix(off, 16).unwrap()))
+                }
+                _ => None,
+            };
+        }
+    }
+    out
+}
+
 /// How many pages of `[off, off + len)` of the store's file at `path` the
 /// page cache holds, wherever the file lies (`store_place`): `mincore` over
 /// a mapping of the file's own that touches nothing.

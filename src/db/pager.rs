@@ -1131,8 +1131,15 @@ pub(crate) struct Back {
     aad: [u8; Header::LEN],
     aead: Box<DynAead>,
     /// Where the envelope was opened, for a drop of the kernel's cache of
-    /// it (`Paged::forget`), which a mapping's own advice does not reach.
+    /// it (`Paged::forget`), which a mapping's own advice does not reach;
+    /// and where in that file it begins, which is its start for an
+    /// envelope that is a file and its place for one kept in a store's
+    /// data file (`onefile`).
     path: std::path::PathBuf,
+    at: u64,
+    /// What holds the envelope's place in a store's data file for as long
+    /// as this reads it: dropped with it, and the room is the store's.
+    _room: Option<Box<dyn std::any::Any + Send + Sync>>,
 }
 
 impl Back {
@@ -1143,6 +1150,19 @@ impl Back {
         // SAFETY: the contract `MmapBytes::open` takes: an envelope is
         // written once, before the store names it, and not again.
         let map = unsafe { memmap2::Mmap::map(&file)? };
+        Back::over(map, path, 0, None, aead)
+    }
+
+    /// The envelope `map` is a mapping of, under `aead`: the file at
+    /// `path` from its byte `at` on, held where it lies by `room` for as
+    /// long as this stands.
+    pub(crate) fn over(
+        map: memmap2::Mmap,
+        path: &std::path::Path,
+        at: u64,
+        room: Option<Box<dyn std::any::Any + Send + Sync>>,
+        aead: Box<DynAead>,
+    ) -> Result<Back> {
         let hdr = crypt::checked_header(&crate::bytes::SliceBytes(&map))?;
         if hdr.chunk_shift() != CHUNK_SHIFT {
             return Err(Error::new(
@@ -1159,6 +1179,8 @@ impl Back {
             hdr,
             aead,
             path: path.to_path_buf(),
+            at,
+            _room: room,
         })
     }
 
@@ -2149,7 +2171,7 @@ impl Paging for Paged {
                 libc::MADV_DONTNEED,
             );
         }
-        drop_cached(&back.path, from, to - from);
+        drop_cached(&back.path, back.at as usize + from, to - from);
     }
 
     /// The envelope's bytes for the range asked of the kernel, in the

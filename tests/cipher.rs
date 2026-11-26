@@ -32,6 +32,16 @@ fn under(n: u8) -> Options {
     }
 }
 
+/// The engine's options as the tests' switches have them: the store's
+/// envelopes files of its data file under `SUPDB_TEST_ONEFILE=1`
+/// (`Options::one_file`), and files of the directory otherwise.
+fn base() -> Options {
+    Options {
+        one_file: common::one_file_switch(),
+        ..Options::default()
+    }
+}
+
 /// Seals and partitions of a quarter megabyte, so that a test's few
 /// megabytes leave a log, pieces, several merged partitions -- whose names
 /// carry their fences -- and their indexes behind.
@@ -40,7 +50,7 @@ fn small() -> Options {
         seal_bytes: 256 << 10,
         partition_bytes: Some(256 << 10),
         l0_trigger: 2,
-        ..Options::default()
+        ..base()
     }
 }
 
@@ -63,13 +73,47 @@ fn scratch(name: &str) -> PathBuf {
     d
 }
 
-fn names(dir: &Path) -> Vec<String> {
+/// The names in `dir` itself: what a search of the device reads, and what
+/// a copy of the directory is made of.
+fn dir_names(dir: &Path) -> Vec<String> {
     let mut v: Vec<String> = std::fs::read_dir(dir)
         .unwrap()
         .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
         .collect();
     v.sort();
     v
+}
+
+/// The names of the store's files wherever it keeps them: the directory's
+/// own and, for a store kept in one file that is open there, the
+/// envelopes its data file holds (`common::store_names`). A closed store
+/// kept in one file has the directory's alone, its envelopes' names being
+/// in its sealed manifest, so a test that reads them reads them while the
+/// store is open.
+fn names(dir: &Path) -> Vec<String> {
+    common::store_names(dir)
+}
+
+/// The length of the store's file `name`, wherever it lies.
+fn len_of(dir: &Path, name: &str) -> u64 {
+    common::store_len(dir.join(name))
+}
+
+/// The store's files whose names `pick` takes, each with the file of the
+/// directory its bytes lie in and its range there: itself from its start
+/// in a store of files, and a range of the data file in a store kept in
+/// one, which has to be open for the asking. For a test that changes a
+/// byte of one of them.
+fn places(dir: &Path, pick: impl Fn(&str) -> bool) -> Vec<(String, String, u64, u64)> {
+    names(dir)
+        .into_iter()
+        .filter(|n| pick(n))
+        .map(|n| {
+            let (file, at, len) = common::store_place(dir.join(&n));
+            let file = file.file_name().unwrap().to_string_lossy().into_owned();
+            (n, file, at, len)
+        })
+        .collect()
 }
 
 const MARK: &str = "IN-THE-CLEAR";
@@ -136,7 +180,7 @@ fn holds(db: &Db, n: u32) {
 
 /// Every file in `dir` that holds `needle`, by name.
 fn files_holding(dir: &Path, needle: &[u8]) -> Vec<String> {
-    names(dir)
+    dir_names(dir)
         .into_iter()
         .filter(|n| {
             let bytes = std::fs::read(dir.join(n)).unwrap();
@@ -160,6 +204,14 @@ fn a_store_under_a_cipher_reads_as_itself_and_is_ciphertext_in_its_directory() {
         holds(&db, n);
         let c = db.cipher_counts().unwrap();
         assert!(c.persisted > 2, "segments reached the directory: {c:?}");
+        // Kept as the tests' switch says: in the store's data file, with
+        // envelopes there to count, or as files of the directory.
+        assert_eq!(
+            db.one_counts().is_some_and(|c| c.files > 2),
+            common::one_file_switch(),
+            "{:?}",
+            db.one_counts()
+        );
         assert_eq!(
             c.cache.fills, 0,
             "and none was read back from it: the store fits its cache: {c:?}"
@@ -179,6 +231,9 @@ fn a_store_under_a_cipher_reads_as_itself_and_is_ciphertext_in_its_directory() {
             || name == "LOCK"
             || name == "manifest"
             || name == "manifest.alt"
+            // The data file of a store kept in one (`Options::one_file`),
+            // which holds the envelopes there.
+            || (name == "store.one" && common::one_file_switch())
             || (name.starts_with("wal-") && name[4..].bytes().all(|b| b.is_ascii_digit()))
             // A retired log kept to be the next one (`Options::recycle_wal`):
             // a sealed log under a number, as a live one is.
@@ -203,7 +258,8 @@ fn a_store_under_a_cipher_reads_as_itself_and_is_ciphertext_in_its_directory() {
     // values in the files and a fence in a name.
     let plain = scratch("reads-plain");
     {
-        let mut db = Db::create(&plain, small()).unwrap();
+        // A store of files, whose partitions' names are the directory's.
+        let mut db = Db::create(&plain, common::files(small())).unwrap();
         fill(&mut db, n);
     }
     for needle in [MARK, KEY_MARK] {
@@ -218,7 +274,7 @@ fn a_store_under_a_cipher_reads_as_itself_and_is_ciphertext_in_its_directory() {
 
 /// A directory's files, each by name with its bytes.
 fn snapshot(dir: &Path) -> Vec<(String, Vec<u8>)> {
-    names(dir)
+    dir_names(dir)
         .into_iter()
         .map(|n| {
             let bytes = std::fs::read(dir.join(&n)).unwrap();
@@ -229,7 +285,7 @@ fn snapshot(dir: &Path) -> Vec<(String, Vec<u8>)> {
 
 /// `dir` made to hold exactly `files`.
 fn restore(dir: &Path, files: &[(String, Vec<u8>)]) {
-    for n in names(dir) {
+    for n in dir_names(dir) {
         std::fs::remove_file(dir.join(n)).unwrap();
     }
     for (n, bytes) in files {
@@ -385,7 +441,7 @@ fn tiny(n: u8) -> Options {
         seal_bytes: 16 << 10,
         partition_bytes: Some(16 << 10),
         l0_trigger: 2,
-        ..Options::default()
+        ..base()
     }
 }
 
@@ -426,7 +482,7 @@ fn stored_bytes(dir: &Path) -> u64 {
     names(dir)
         .iter()
         .filter(|n| n.starts_with("x-"))
-        .map(|n| std::fs::metadata(dir.join(n)).unwrap().len())
+        .map(|n| len_of(dir, n))
         .sum()
 }
 
@@ -861,7 +917,7 @@ fn builders_build_through_a_small_cache(
         scan_cache_ahead_min_blocks: usize::MAX,
         ..small()
     };
-    {
+    let size = {
         let mut db = Db::create(&dir, opts(true)).unwrap();
         for i in 0..n {
             db.append(&k(i), &v(i, 0));
@@ -872,8 +928,8 @@ fn builders_build_through_a_small_cache(
         db.commit().unwrap();
         db.flush().unwrap();
         db.settle().unwrap();
-    }
-    let size = stored_bytes(&dir);
+        stored_bytes(&dir)
+    };
     assert!(
         size > 4 * cache,
         "the store is {size} bytes, not several times its cache of {cache}"
@@ -975,7 +1031,19 @@ fn a_changed_byte_is_refused_or_is_where_the_log_ends() {
     let (mut refused, mut unread, mut earlier, mut whole) = (0, 0, 0, 0);
     for (name, bytes) in &pristine {
         let stride = (bytes.len() / 24).max(1);
-        for at in (0..bytes.len()).step_by(stride) {
+        let mut ats: Vec<usize> = (0..bytes.len()).step_by(stride).collect();
+        if name == "store.one" {
+            // The data file of a store kept in one: every envelope behind
+            // a head of a megabyte, so most of two dozen steps over the
+            // whole fall in the head. What lies past it is walked at steps
+            // of its own, which fall in the envelopes' headers, their
+            // bodies and the room between them as the steps above fall in
+            // a file an envelope.
+            let head = 1usize << 20;
+            let fine = (bytes.len().saturating_sub(head) / 120).max(1);
+            ats.extend((head..bytes.len()).step_by(fine));
+        }
+        for at in ats {
             restore(&dir, &pristine);
             let mut bad = bytes.clone();
             bad[at] ^= 1;
@@ -1066,8 +1134,13 @@ fn a_log_cut_anywhere_opens_as_the_commits_before_the_cut() {
 fn an_envelope_nobody_names_is_swept_and_one_missing_is_refused() {
     let n = 4_000;
     let dir = scratch("orphan");
+    // A store of files: the envelopes here are copied, torn and removed by
+    // their paths. What a store kept in one file does with room no
+    // manifest names, and with a place its manifest names that is not
+    // there, is `tests/onefile.rs`'s.
+    let files = || common::files(under(5));
     {
-        let mut db = Db::create(&dir, under(5)).unwrap();
+        let mut db = Db::create(&dir, files()).unwrap();
         fill(&mut db, n);
     }
     let segment = names(&dir)
@@ -1078,7 +1151,7 @@ fn an_envelope_nobody_names_is_swept_and_one_missing_is_refused() {
     std::fs::copy(dir.join(&segment), dir.join(&orphan)).unwrap();
     std::fs::write(dir.join(format!("{orphan}.o")), b"torn").unwrap();
     {
-        let db = Db::open(&dir, under(5)).unwrap();
+        let db = Db::open(&dir, files()).unwrap();
         holds(&db, n);
         assert_eq!(db.cipher_counts().unwrap().swept, 2);
     }
@@ -1089,7 +1162,7 @@ fn an_envelope_nobody_names_is_swept_and_one_missing_is_refused() {
     let index = format!("{segment}.o");
     std::fs::remove_file(dir.join(&index)).unwrap();
     {
-        let mut db = Db::open(&dir, under(5)).unwrap();
+        let mut db = Db::open(&dir, files()).unwrap();
         holds(&db, n);
         assert!(db.ord_rebuilt() > 0);
         db.put(&k(0), &v(0, 1));
@@ -1108,7 +1181,7 @@ fn an_envelope_nobody_names_is_swept_and_one_missing_is_refused() {
             std::fs::remove_file(dir.join(any)).unwrap();
         }
     }
-    assert!(Db::open(&dir, under(5)).is_err());
+    assert!(Db::open(&dir, files()).is_err());
 }
 
 /// A fall back past a damaged slot under a cipher, where the slot passed
@@ -1531,6 +1604,7 @@ fn an_ordered_run_under_a_cipher_keeps_its_commits_through_the_log() {
             || name.starts_with("manifest")
             || name.starts_with("wal-")
             || name.starts_with("spare-")
+            || (name == "store.one" && common::one_file_switch())
             || name.starts_with("x-");
         assert!(known, "a file named {name}");
     }
@@ -1731,7 +1805,7 @@ fn the_compact_form_under_a_cipher_is_built_read_and_found_again() {
         }
         db.commit().unwrap();
     }
-    let partitions = {
+    let (partitions, all) = {
         let mut db = Db::open(&dir, asked()).unwrap();
         let mut seen = 0u32;
         db.scan(b"", usize::MAX, kv(&mut |_k, _v| seen += 1))
@@ -1760,11 +1834,10 @@ fn the_compact_form_under_a_cipher_is_built_read_and_found_again() {
             "no read was answered through the form"
         );
         assert_eq!(after.fallbacks, before.fallbacks, "a read fell back");
-        forms.len()
+        (forms.len(), names(&dir))
     };
-    // In the directory: an envelope a form file, beside its segment's,
-    // and no name or byte of the store's in the clear.
-    let all = names(&dir);
+    // Among the store's files: an envelope a form file, beside its
+    // segment's, and no name or byte of the store's in the clear.
     let forms: Vec<&String> = all.iter().filter(|n| n.ends_with(".z")).collect();
     assert_eq!(forms.len(), partitions, "an envelope a form file: {all:?}");
     for z in &forms {
@@ -1781,6 +1854,7 @@ fn the_compact_form_under_a_cipher_is_built_read_and_found_again() {
             || name.starts_with("manifest")
             || name.starts_with("wal-")
             || name.starts_with("spare-")
+            || (name == "store.one" && common::one_file_switch())
             || name.starts_with("x-");
         assert!(known, "a file named {name}");
     }
@@ -1929,7 +2003,7 @@ fn a_form_larger_than_its_cache(eager: bool) {
         let bytes: u64 = names(&dir)
             .iter()
             .filter(|n| n.ends_with(".z"))
-            .map(|n| std::fs::metadata(dir.join(n)).unwrap().len())
+            .map(|n| len_of(&dir, n))
             .sum();
         (forms.len(), bytes)
     };
@@ -2098,7 +2172,7 @@ fn a_walk_through_a_form_file_under_a_cipher_asks_for_the_pages_it_will_cross() 
                 },
                 zpages: supdb::ZPages::Always,
                 zpages_min_bytes: 0,
-                ..Options::default()
+                ..base()
             };
             assert!(!opts.zpages_scan_prefetch, "the option as shipped");
             let mut db = Db::create(&dir, opts).unwrap();
@@ -2183,10 +2257,10 @@ fn form_build_rests(name: &str, stride: bool) {
         // Built by the form's own settle, after the reopen, and not as
         // the partition lands.
         zpages_eager: false,
-        ..Options::default()
+        ..base()
     };
     let dir = scratch(name);
-    {
+    let largest = {
         let mut db = Db::create(&dir, opts()).unwrap();
         for i in 0..n {
             db.append(&k(i), &val(i));
@@ -2202,13 +2276,13 @@ fn form_build_rests(name: &str, stride: bool) {
             0,
             "a build before the reopen"
         );
-    }
-    let largest = names(&dir)
-        .iter()
-        .filter(|n| n.starts_with("x-") && !n.ends_with(".z"))
-        .map(|n| std::fs::metadata(dir.join(n)).unwrap().len())
-        .max()
-        .unwrap();
+        names(&dir)
+            .iter()
+            .filter(|n| n.starts_with("x-") && !n.ends_with(".z"))
+            .map(|n| len_of(&dir, n))
+            .max()
+            .unwrap()
+    };
     assert!(
         largest > 2 * (cache + slack),
         "the largest segment is {largest} bytes: a build that held it whole would pass the bound"
@@ -2248,7 +2322,7 @@ fn form_build_rests(name: &str, stride: bool) {
         names(&dir)
             .iter()
             .filter(|n| n.ends_with(".z"))
-            .map(|n| std::fs::metadata(dir.join(n)).unwrap().len())
+            .map(|n| len_of(&dir, n))
             .sum()
     } else {
         0
@@ -2296,21 +2370,21 @@ fn an_attach_decrypts_what_it_reads_of_a_form_file_and_not_the_file() {
         zpages_min_bytes: 0,
         seal_bytes: 16 << 20,
         partition_bytes: Some(16 << 20),
-        ..Options::default()
+        ..base()
     };
-    {
+    let chunks = {
         let mut db = Db::create(&dir, opts()).unwrap();
         fill(&mut db, n);
         db.flush().unwrap();
         db.settle().unwrap();
         db.zpages_settle().unwrap();
         assert_eq!(db.zpage_form_files().len(), 1, "one partition, one form");
-    }
-    let form = names(&dir)
-        .into_iter()
-        .find(|n| n.ends_with(".z"))
-        .expect("a form file's envelope");
-    let chunks = std::fs::metadata(dir.join(&form)).unwrap().len() / 4096;
+        let form = names(&dir)
+            .into_iter()
+            .find(|n| n.ends_with(".z"))
+            .expect("a form file's envelope");
+        len_of(&dir, &form) / 4096
+    };
     assert!(chunks > 200, "a form file of {chunks} chunks");
     let db = Db::open(&dir, opts()).unwrap();
     assert_eq!(db.zpage_form_files().len(), 1);
@@ -2341,15 +2415,15 @@ fn a_form_file_is_built_through_a_cache_its_partition_does_not_fit() {
         zpages_min_bytes: 0,
         seal_bytes: 64 << 20,
         partition_bytes: Some(64 << 20),
-        ..Options::default()
+        ..base()
     };
-    {
+    let size = {
         let mut db = Db::create(&dir, opts(supdb::ZPages::Off)).unwrap();
         fill(&mut db, n);
         db.flush().unwrap();
         db.settle().unwrap();
-    }
-    let size = stored_bytes(&dir);
+        stored_bytes(&dir)
+    };
     assert!(
         size > cache + slack + (2 << 20),
         "the partition is {size} bytes, within the cache of {cache} and its slack"
@@ -2404,7 +2478,7 @@ fn a_build_drops_the_ciphertext_behind_its_walk_where_it_is_told_to() {
             zpages_drop_raw: false,
             seal_bytes: 64 << 20,
             partition_bytes: Some(64 << 20),
-            ..Options::default()
+            ..base()
         };
         {
             let mut db = Db::create(&dir, opts(supdb::ZPages::Off)).unwrap();
@@ -2412,13 +2486,13 @@ fn a_build_drops_the_ciphertext_behind_its_walk_where_it_is_told_to() {
             db.flush().unwrap();
             db.settle().unwrap();
         }
+        let mut db = Db::open(&dir, opts(supdb::ZPages::Always)).unwrap();
         let segment = names(&dir)
             .into_iter()
             .filter(|name| name.starts_with("x-") && !name.contains('.'))
-            .max_by_key(|name| std::fs::metadata(dir.join(name)).unwrap().len())
+            .max_by_key(|name| len_of(&dir, name))
             .expect("a segment's envelope");
-        let len = std::fs::metadata(dir.join(&segment)).unwrap().len() as usize;
-        let mut db = Db::open(&dir, opts(supdb::ZPages::Always)).unwrap();
+        let len = len_of(&dir, &segment) as usize;
         db.zpages_settle().unwrap();
         assert_eq!(db.zpage_form_files().len(), 1);
         let pages = common::cached_pages(dir.join(&segment), 0, len);
@@ -2454,16 +2528,18 @@ fn a_form_file_goes_with_its_segment_whether_or_not_this_open_knew_it() {
         }
         forms
     };
-    {
+    // Each listing is read with the store open, where a store kept in one
+    // file has its envelopes' names to give.
+    let before = {
         let mut db = Db::create(&dir, opts(supdb::ZPages::Always)).unwrap();
         fill(&mut db, n);
         db.flush().unwrap();
         db.settle().unwrap();
         db.zpages_settle().unwrap();
-    }
-    let before = beside(&dir);
+        beside(&dir)
+    };
     assert!(before.len() > 2, "form files to lose: {before:?}");
-    {
+    let after = {
         let mut db = Db::open(&dir, opts(supdb::ZPages::Off)).unwrap();
         // Unknown to this open, and still there: a store that ran with the
         // option may run with it again.
@@ -2481,12 +2557,17 @@ fn a_form_file_goes_with_its_segment_whether_or_not_this_open_knew_it() {
         db.scan(b"", usize::MAX, kv(&mut |_k, _v| seen += 1))
             .unwrap();
         assert_eq!(seen, n);
-    }
-    let after = beside(&dir);
-    assert!(
-        before.iter().filter(|z| after.contains(z)).count() < before.len(),
-        "no partition was rewritten: {after:?}"
-    );
+        let after = beside(&dir);
+        assert!(
+            before.iter().filter(|z| after.contains(z)).count() < before.len(),
+            "no partition was rewritten: {after:?}"
+        );
+        after
+    };
+    // And closed and opened again, nothing of them came back.
+    let db = Db::open(&dir, opts(supdb::ZPages::Off)).unwrap();
+    assert_eq!(beside(&dir), after);
+    drop(db);
 }
 
 /// A byte changed in a form file is never read as data: the store reads
@@ -2514,7 +2595,10 @@ fn form_file_damage(name: &str, stride: bool) {
         zpages_min_bytes: 0,
         ..tiny(16)
     };
-    let want = {
+    // The form files with where their bytes lie, read while the store is
+    // open: a file each in a store of files, a range of the data file in
+    // a store kept in one.
+    let (want, forms) = {
         let mut db = Db::create(&dir, opts()).unwrap();
         if stride {
             // Numbered keys once each, in order, a value of one width:
@@ -2545,21 +2629,30 @@ fn form_file_damage(name: &str, stride: bool) {
             stride,
             "premise: the body under test is the one built: {z:?}"
         );
-        digest_of(&db)
+        (digest_of(&db), places(&dir, |n| n.ends_with(".z")))
     };
     let pristine = snapshot(&dir);
+    let bytes_of = |file: &str| -> &Vec<u8> {
+        &pristine
+            .iter()
+            .find(|(n, _)| n == file)
+            .unwrap_or_else(|| panic!("{file} is no file of the directory"))
+            .1
+    };
     // A form file is the store's to make again: a byte changed anywhere in
     // its envelope is the form's failure alone. The store opens, every read
     // answers the store it was -- through the raw form where the file left
     // service -- and nothing poisons the store, as for a plain store's.
     let (mut out_of_service, mut whole) = (0, 0);
-    for (name, bytes) in pristine.iter().filter(|(n, _)| n.ends_with(".z")) {
-        let stride = (bytes.len() / 24).max(1);
-        for at in (0..bytes.len()).step_by(stride) {
+    assert!(!forms.is_empty(), "no form file's envelope to change");
+    for (name, file, base, len) in &forms {
+        let (base, len) = (*base as usize, *len as usize);
+        let stride = (len / 24).max(1);
+        for at in (0..len).step_by(stride) {
             restore(&dir, &pristine);
-            let mut bad = bytes.clone();
-            bad[at] ^= 1;
-            std::fs::write(dir.join(name), &bad).unwrap();
+            let mut bad = bytes_of(file).clone();
+            bad[base + at] ^= 1;
+            std::fs::write(dir.join(file), &bad).unwrap();
             let db = Db::open(&dir, opts()).unwrap_or_else(|e| {
                 panic!("{name}, byte {at}: a form file's damage refused the store: {e}")
             });
@@ -2605,17 +2698,18 @@ fn form_file_damage(name: &str, stride: bool) {
     );
     // Every form file changed, a byte a chunk: which of them the store
     // serves is the controller's, and a file it does not is read by nobody.
-    for (name, bytes) in pristine.iter().filter(|(n, _)| n.ends_with(".z")) {
+    for (_, file, base, len) in &forms {
         use std::os::unix::fs::FileExt;
-        let mut bad = bytes.clone();
+        let (base, len) = (*base as usize, *len as usize);
+        let mut bad = bytes_of(file)[base..base + len].to_vec();
         for at in (4096..bad.len()).step_by(4096) {
             bad[at] ^= 1;
         }
         let f = std::fs::OpenOptions::new()
             .write(true)
-            .open(dir.join(name))
+            .open(dir.join(file))
             .unwrap();
-        f.write_all_at(&bad, 0).unwrap();
+        f.write_all_at(&bad, base as u64).unwrap();
         f.sync_all().unwrap();
     }
     // Rounds of reads until one meets a chunk the evictor gave back, which
@@ -2691,7 +2785,7 @@ fn a_merge_reading_its_inputs_beside_the_cache_fills_nothing_of_them() {
                 seal_bytes: 4 << 20,
                 partition_bytes: None,
                 l0_trigger: 1,
-                ..Options::default()
+                ..base()
             },
         )
         .unwrap();
@@ -2775,7 +2869,7 @@ fn a_merge_under_a_cipher_asks_ahead_for_its_cold_inputs() {
                 merge_read_ahead: plain,
                 merge_read_ahead_cipher: window
                     .unwrap_or(Options::default().merge_read_ahead_cipher),
-                ..Options::default()
+                ..base()
             },
         )
         .unwrap();
@@ -2847,6 +2941,28 @@ fn a_segment_landed_after_a_scan_has_its_envelope_advised_as_a_plain_ones() {
     // `x-` and a token, the ordered indexes' and the form files' carrying
     // a suffix beside it.
     let envelopes = || -> Vec<(String, bool)> {
+        if common::one_file_switch() {
+            // In a store kept in one file an envelope is a range of the
+            // data file, and its mapping one of that range: each mapping
+            // of the data file is the segment's whose place it begins in.
+            let places: Vec<(u64, u64, String)> = names(&dir)
+                .into_iter()
+                .filter(|n| n.starts_with("x-") && n.len() == 34)
+                .map(|n| {
+                    let (_, at, len) = common::store_place(dir.join(&n));
+                    (at, len, n)
+                })
+                .collect();
+            return common::mappings_at(&dir.join("store.one").to_string_lossy())
+                .into_iter()
+                .filter_map(|(_, off, rr)| {
+                    places
+                        .iter()
+                        .find(|(at, len, _)| (*at..*at + *len).contains(&off))
+                        .map(|(_, _, n)| (n.clone(), rr))
+                })
+                .collect();
+        }
         common::mappings_advised_random(&dir.to_string_lossy())
             .into_iter()
             .filter(|(p, _)| {

@@ -193,7 +193,7 @@ owner's:
 | `src/db/dirkey.rs` | a live store's directory under a key, encrypted by the kernel (`Encryption::Kernel`): the requests of Linux's file encryption, what `create` and `open` hold a directory to, and `lock`, with no cipher and no byte of a read path in it -- the module's own docs, and `scripts/fscrypt.sh` for a filesystem to test it on |
 | `src/db/vault.rs` | a live store under a cipher the caller supplies (`Encryption::Cipher`): the door every file operation of the engine goes through, which is the standard library's call for a plain store, and the file it hands out (`vault::File`), whose methods are the calls the engine made on a descriptor; a file as a memory file while it is written and as its envelope in the directory after; the marker and the keys, the caller's wrapping the store's and the store's wrapping a key a file; the manifest's slot and the log's record sealed, with no cipher in the crate -- the module's own docs, `tests/cipher.rs`, and `ZFUZZ_CIPHER=1` for the differential fuzz |
 | `src/db/pager.rs` | the cache a store under a cipher reads its files through: a file as address space its plaintext's length, a chunk of it decrypted where it is first asked for and a megabyte given back at a time once the cache is past its budget and no reader could hold it; the holds and rests of the threads that read with no slot of the reader table, the two lines past the budget at which the store's own work and then a caller's read wait, the failure a read remembers, and the view a merge reads its inputs through beside the cache (`Stream`), with no cipher in it and no reader of the format -- the module's own docs, and `tests/cipher.rs` for a store several times its cache |
-| `src/db/onefile.rs` | a store kept in one file (`Options::one_file`, off): the table behind the door that makes a segment, its ordered index and its form file an extent of the store's data file (`store.one`) -- the names, the free room and its reuse once a manifest later than the one that named it is known durable, growth reserved from the device and not written, a file moved while it is being written and never once it is mapped, the use a mapping or a handle holds on its room, the syncs and the rides by which a manifest may name a file, and the section a manifest lists the places in, with no reader of the format and no byte of a read path in it; the log, the manifest's slots and an ordered run are files of the directory still -- the module's own docs, `tests/onefile.rs`, `SUPDB_TEST_ONEFILE=1` for the suite's tests over it and `ZFUZZ_ONEFILE=1` for the differential fuzz |
+| `src/db/onefile.rs` | a store kept in one file (`Options::one_file`, off): the table behind the door that makes a segment, its ordered index and its form file an extent of the store's data file (`store.one`) -- the names, the free room and its reuse once a manifest later than the one that named it is known durable, growth reserved from the device and not written, a file moved while it is being written and never once it is mapped, the use a mapping or a handle holds on its room, the syncs and the rides by which a manifest may name a file, and the section a manifest lists the places in, with no reader of the format and no byte of a read path in it; under a cipher the files it holds are the store's envelopes, in a table the vault has (`Vault::one`), with no cipher in the module; the log, the manifest's slots and an ordered run are files of the directory still -- the module's own docs, `tests/onefile.rs`, `SUPDB_TEST_ONEFILE=1` for the suite's tests over it, `tests/cipher.rs` among them, and `ZFUZZ_ONEFILE=1` for the differential fuzz, with `ZFUZZ_CIPHER=1` for the store under a cipher kept so |
 | `src/db/zselect.rs` | the compact form's selector: `ZSelect::step`, a function of its state and an explicit `Input` (no clock, thread or file), the one definition of the transitions between FITS, SUSPECT, building, COMPACT and the trial, the replays that hold it, the model of a cache's faults over populations of pages (`model_populations`), and what the reads of a store in two forms cost with the moves between the forms that pay (`forms_cost`, `conversions`) -- the module's own docs |
 | `src/format.rs` | the on-disk format's fixed quantities, owned by no writer |
 | `src/block.rs`, `src/index.rs`, `src/flatindex.rs` | the format itself: blocks, extents, the flat key index -- `docs/index-theory.md` |
@@ -10746,7 +10746,15 @@ over is made so that the loop fails where it is empty for the wrong
 reason, since a loop over nothing asserts nothing; and a checksum of
 bytes a writer has just handed over is taken from the hand-over, since
 reading them back is a device read wherever the writer meant them to
-leave the cache.
+leave the cache. And short by a binary once more, at the next stage:
+`tests/cipher.rs` built every store's options on the engine's defaults
+and took nothing of the switch, so the stage that kept a store under a
+cipher in one file would have been gated green by thirty-five tests of
+stores of files. Under the switch twenty-three failed, each on an
+envelope found by a listing of the directory; they read a store's
+envelopes by name while it is open now, a closed store kept in one file
+having their names in its sealed manifest alone, and two that copy and
+remove envelopes by their paths say they are of a store of files.
 
 **A listing made eight times to find a difference, and never read for
 what the loop did.** The count over the store in one file read the
@@ -10789,6 +10797,84 @@ times what the builds were chasing; a count taken in the middle of a
 stage is not the stage's, and whatever changed after it is in the next
 one whichever file it was in; and a probe red by the allocator alone is
 run again before it is read.
+
+**A file's edge, in a file of files.** A stride file built ahead keeps a
+word for its attach only where its read-back read the device: none of
+its pages in the page cache as the read-back began, by `mincore`, after
+the build wrote it back and dropped it (`zfile::Built::left_seal`). In a
+store kept in one file one build in a dozen found pages there, and
+`the_words_kept_for_stride_files_are_held_to_the_live_partitions` went
+red under the tests' switch, 5 runs of 60 with four at once and none of
+60 as a store of files; it had passed the stage's gate. Three guesses
+came before the trace and each was wrong in a way the trace showed in
+one reading: a file moved by the table, a folio of the room's last
+tenant astride the range, the kernel's reclaim holding the pages. Each
+look's pages printed (a scratch line) gave half the file, sixteen pages
+at one edge; an `strace -f -tt -y` of the mapping and advice calls, laid
+to the file's place in the data file, gave the rest: the build next door
+began its read-back at its file's trailer, and the kernel reads around a
+mapping's fault in the file the mapping is of, sixteen pages to either
+side on this device, stopping at that file's end and not at the
+mapping's. A store of files is clipped at each file's end; in the data
+file the window ran fourteen pages into the next file, three hundred
+microseconds after that file's build had dropped them. Pages so read are
+the device's, read after the writeback was waited for and the drop made;
+what a look cannot tell them from is a page the drop skipped. So a build
+that dropped its output and finds pages drops the file again and looks
+again, twice at the most, and a look that finds none says the written
+copy is out of the cache (`zfile::reads_device`, held by a unit test
+that reads the pages back in at a seam between the drop and the look,
+and by its mutant). That took the test to one failure in a hundred, and
+the one left is another thing: every page of one file resident through
+three looks and through a drop of the whole data file's cache, so held,
+dirty or under writeback, in 6 runs of 1,540; the probe that would say
+which was added then, and the next 7,200 runs, 800 of them with the
+memory group filled to its limit, had none (`ROADMAP.md`). The rules:
+what the kernel does at a file's end -- its read-around, its readahead,
+its truncation of a window -- a file of files has to expect at every
+file's edge inside it, as it has to do what an unlink did; a count that
+answers "is any of it there" is asked straight after the act it follows,
+and again after the act is repeated, where a neighbour can make the
+answer yes for a reason that is not the one feared; a flake that is one
+run in twelve under load is looped under a syscall trace before a
+mechanism is named for it, since under the trace it failed every other
+run; and a failure that stops coming when its probe is in is written
+down as open, with what was seen and the count of runs on each side,
+never as fixed.
+
+**One sync for a call's envelopes, through a handle that was not the
+segment's.** In a store under a cipher kept in one file an envelope's
+sync is a sync of the data file, and a segment's envelope and its
+index's were first written with none and covered by one sync of the
+table's own handle at the call's end: one flush of the device a landing
+where the shape before made two. A writeback error is reported once to
+each open file, so an error another thread's sync through the table's
+handle had taken would have been answered `Ok` to the segment's writer,
+and the next manifest named a segment the device might not hold. No test
+could have shown it without a device that fails; it was read off the
+comment on `One::sync`, written a stage earlier, which says a segment is
+covered by its own handle's sync alone. The index's envelope is written
+ahead of its segment's now, with no sync, and the segment's sync through
+its own handle covers both: one flush still, a count the tests hold
+(`tests/onefile.rs`, a sync a piece). The rule this file has for the log
+and the run's file holds for every file a manifest names: the sync that
+lets a file be named is made through the handle its writes went through,
+whatever other sync would have covered the same bytes.
+
+**A lookup widened for one caller, read by all of them.** The door finds
+a plain store's one-file table by its directory (`vault::one_under`), and
+the first way a store under a cipher found its vault's table was the same
+function, answering the vault's where no plain table stood. Six callers
+ask it. Three wanted either store's -- the manifest on the device told to
+the table, the segment work's look, the tests' seams -- and three ask
+what only a plain store wants of its writers: a seal announcing its
+pieces' sizes, a merge writing its index ahead of its piece's sync. Under
+a cipher those became true too, and a seal's pieces were announced to
+the cache's room, which nothing had priced, under a comment that said
+"nothing asked of a store under a cipher". Two functions now, the second
+(`vault::one_of`) for the three. The rule: a function widened to answer
+for a new case is read at every caller before the change is built on,
+and where the callers split, so does the function.
 
 ## Standing limitations
 

@@ -88,7 +88,10 @@ const FORM: &[&str] = &[
 /// The vault's functions that are the door every file operation of the
 /// engine goes through, a plain store's included, and so name no cipher:
 /// forms.md R0's verbs, the plain I/O verbs beside them, the directory's
-/// guards and fsync counters, and the I/O trace the tests read. Any other
+/// guards and fsync counters, the table of a store kept in one file by
+/// its directory -- a plain store's (`one_under`) or whichever store's
+/// (`one_of`), whose callers do with it what they do for a plain store --
+/// and the I/O trace the tests read. Any other
 /// `vault::name` a form writes is counted under its own name. `vault::real`
 /// is not one: it is the log's name passed through to the directory under a
 /// cipher. `File` is the type every one of those opens and creates answers,
@@ -123,6 +126,7 @@ const DOOR: &[&str] = &[
     "DirSync",
     "hold_one",
     "one_under",
+    "one_of",
     "kill_one",
     "OneHeld",
     "clear_file",

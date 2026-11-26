@@ -294,3 +294,65 @@ way it is kept, and `store_place`, `store_len`, `store_file` and
 lists files and then opens one by its path fails on the path under the
 switch where a listing of the directory would have found nothing. In the table, under `cfg(test)`: `tight`, a first room
 of the first write's length, and `mid_sync`, a call inside a file's sync.
+
+## O4 as built: a store under a cipher in the data file (2026-11-26)
+
+**The least form.** Under a cipher a store's kept files are memory files
+while they are written and envelopes after, and the envelope was a file
+of the directory under a token (`x-<token>`, `.o` an ordered index's,
+`.z` a form file's). In a store kept in one file the envelope is a file
+of the vault's own table (`Vault::one`), an extent of `store.one` under
+the same name; nothing else of the envelope, the pager or the keys
+moved. The door's operations on an envelope go through six helpers of
+the vault's (`env_create`, `env_open`, `env_back`, `env_exists`,
+`env_remove`, `env_rename`), each the table's call or the directory's.
+A view's backing is a mapping of the envelope's range made through an
+open of its own (`One::map_held`), the room held for as long as the
+mapping stands (`pager::Back::over`), and a drop of its pages is a drop
+of that range of the data file. Pagefile's page-aligned chunks with the
+tags apart are not built here: nothing O4's cells measure asks for them,
+and the stage that does is the run sealed as it is written (O5), whose
+envelope cannot open with a header that holds its length.
+
+**The manifest.** The one-file format's (`STORE_FORMAT_ONE`), the table's
+section behind the names, sealed whole as a slot is under a cipher: the
+names the store has its files under are in the sealed manifest, the
+tokens and wrapped keys behind it, and the section lists each envelope's
+place under its token's name. An open reads its slots and makes their
+segments known first, and makes the table what the slot it takes lists
+after (`One::adopt`), so the ordered indexes are found then
+(`Vault::adopt_ords`). The store says how it is kept: an open asks for
+the cipher and nothing else.
+
+**The syncs.** A segment's envelope is synced through its own handle,
+which answers its writes' errors; its ordered index's is written ahead
+of it with no sync and rides that one, so a segment is one flush of the
+device and the manifest that names it lists its index. The first
+version wrote both with no sync and synced the data file once through
+the table's handle at the call's end. A writeback error is reported to
+each open file once: one that another thread's sync through the table's
+handle had already taken would have been answered `Ok` to the segment's
+writer, and a manifest named the segment. Read off O2's own comment on
+`One::sync` ("a segment is covered by its own handle's sync alone")
+before any test went near it; the files layout's rule on a kept sync's
+error is the same rule.
+
+**Which table.** Two lookups. `vault::one_under` is the plain store's
+table and nothing else, asked by a plain store's writers for what only
+it wants of them (a seal's pieces' room said ahead, a merge's index
+written before its piece's sync). `vault::one_of` is either store's, by
+the directory the engine names its files in or the store's own: the
+manifest on the device told to the table, the segment work's look at
+what no manifest lists (`Maint::one_look`, the names by `Vault::beside`),
+and the tests' seams. One lookup for both was the first version, and
+gave a seal under a cipher the plain store's announcement of its pieces'
+sizes, which the cache's room reads.
+
+**A kill, in a test.** `Db::crash` leaves a store under a cipher held
+open in the process (the vault's registration is the forgotten store's),
+so a kill of one is a copy of its directory with the segment work
+paused, opened elsewhere (`tests/onefile.rs`, `kill`): the slots, the
+log and the data file as the death leaves them and no memory file. The
+tests of `tests/cipher.rs` take the tests' switch (`base`), and read a
+store's envelopes by name while it is open, a closed store kept in one
+file having their names in its sealed manifest alone.

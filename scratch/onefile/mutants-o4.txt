@@ -1,0 +1,32 @@
+# Mutants of a store under a cipher kept in one file (O4), each a rule taken
+# away. A line:
+#   id | file | exact text | replacement | what it breaks
+# Run by a copy of scratch/onefile/mut.py whose tests are the door modules'
+# unit tests, tests/onefile.rs, tests/cipher.rs and the cipher tests of
+# tests/zpages.rs under SUPDB_TEST_ONEFILE=1, and ten seeds of the fuzz
+# under ZFUZZ_CIPHER=1 ZFUZZ_ONEFILE=1. A mutant no test fails is a hole.
+C01 | src/db/vault.rs | Back::over(map, one.data_path(), at, Some(room), aead) | Back::over(map, one.data_path(), 0, Some(room), aead) | a drop of an envelope's pages drops the data file's head
+C02 | src/db/vault.rs | Back::over(map, one.data_path(), at, Some(room), aead) | Back::over(map, one.data_path(), at, None, aead) | an envelope's room given away under the mapping that reads it
+C03 | src/db/pager.rs | back.at as usize + from | from | a drop of a range of an envelope lands at the data file's start
+C04 | src/db/vault.rs | (Some(_), Some(ord)) => self.ord_envelope(ord, &disk, &key)?, | (Some(_), Some(_)) if false => None, | an index written behind its segment's sync: listed by no manifest that names its segment
+C05 | src/db/vault.rs | if self.one().is_none() && made && dir_sync { | if made && dir_sync { | (equivalent: a directory fsync more) expected to survive
+C06 | src/db.rs | if let Some(places) = &places {\n                out.extend_from_slice(places);\n            } | | a manifest of a store in one file with no places behind it
+C07 | src/db.rs | Some(_) => STORE_FORMAT_ONE,\n                None => STORE_FORMAT, | Some(_) => STORE_FORMAT,\n                None => STORE_FORMAT, | a store in one file that says it is a store of files
+C08 | src/db/vault.rs | let Some(one) = self.one() else {\n            return Ok(None);\n        }; | let Some(one) = self.one().filter(\|_\| false) else {\n            return Ok(None);\n        }; | places never listed
+C09 | src/db/vault.rs | let with: Vec<String> = files.iter().flat_map(\|(t, _)\| riders(t)).collect(); | let with: Vec<String> = Vec::new(); | a manifest that lists no index and no form file
+C10 | src/db.rs | if let Some(one) = vault::one_of(dir) {\n                one.durable(seq);\n            } | if let Some(one) = vault::one_under(dir) {\n                one.durable(seq);\n            } | the vault's table never told a manifest is on the device
+C11 | src/db.rs | let one = vault::one_of(dir);\n        if one.is_some() { | let one = vault::one_under(dir);\n        if one.is_some() { | the segment work without the vault's table: nothing listed after a landing
+C12 | src/db.rs | Some(v) => v.beside(self.segs().iter().map(\|s\| s.name.as_str())), | Some(_) => Vec::new(), | a form file's envelope built since the last landing is in no manifest
+C13 | src/db/vault.rs | Some(one) => one.on_device(&d.name()).unwrap_or(false), | Some(_) => true, | a place written over read as the envelope a slot named
+C14 | src/db/vault.rs | if std::fs::metadata(self.real.join(onefile::NAME)).is_ok_and(\|m\| m.len() > onefile::HEAD) {\n            return Ok(true);\n        } | | a data file beside no slot opened as a store of nothing, its envelopes swept
+C15 | src/db/vault.rs | if self.one().is_none() {\n            let _ = std::fs::remove_file(self.real.join(onefile::NAME));\n        } | | a creation's data file outlives the store of files opened over it
+C16 | src/db.rs | v.adopt_ords(&Db::with_ords(&m.names)); | | every ordered index composed again at an open
+C17 | src/db/vault.rs | Some(one) => {\n                one.remove(name);\n            } | Some(_) => {} | an envelope's room never given back
+C18 | src/db/vault.rs | Some(one) => one\n                .rename(from, to)\n                .ok_or_else(\|\| Error::from(ErrorKind::NotFound)), | Some(_) => Ok(()), | a form file's envelope left under its temp name
+C19 | src/db/vault.rs | Some(one) => one.holds(name), | Some(_) => false, | no envelope found beside a segment's
+C20 | src/db/vault.rs | } else {\n            out.ride();\n        } | } | an index's envelope that rides no sync: listed by no manifest
+C21 | src/db/vault.rs | .find(\|v\| v.decoy == dir \|\| v.real == dir) | .find(\|v\| v.real == dir) | the vault's table not found by the directory the engine names its files in
+C22 | src/db/vault.rs | .flat_map(\|t\| riders(&t))\n        .collect() | .flat_map(\|t\| riders(&t))\n        .filter(\|_\| false)\n        .collect() | the segment work lists nothing beside a segment
+C23 | src/db/zfile.rs | Some(_) if plan.drop_output && !asks && looks < 3 => { | Some(_) if plan.drop_output && !asks && looks < 1 => { | pages read back in after a build's drop cost it its word
+C24 | src/db/zfile.rs | Some(_) if plan.drop_output && !asks && looks < 3 => { | Some(_) if !asks && looks < 3 => { | a build that kept its pages drops them at its read-back
+C25 | src/db/vault.rs | let odisk = Disk {\n                kind: Kind::Ord,\n                ..disk\n            };\n            if !files.contains_key(ord) && self.env_exists(&odisk.name()) { | let odisk = Disk {\n                kind: Kind::Ord,\n                ..disk\n            };\n            if !files.contains_key(ord) { | an index adopted where the table holds none

@@ -18,6 +18,12 @@ use supdb::{Db, Options};
 mod common;
 use common::{kv, vf};
 
+/// `dir` for a body two tests run, the plain store's and the one under a
+/// cipher: each under a name of its own.
+fn tdir(tag: &str, name: &str) -> PathBuf {
+    dir(&format!("{tag}{name}"))
+}
+
 fn dir(name: &str) -> PathBuf {
     let d = std::env::temp_dir().join(format!("supdb-next-onefile-{name}-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&d);
@@ -76,13 +82,19 @@ fn value(db: &Db, k: &[u8]) -> Option<Vec<u8>> {
 }
 
 /// The names in `d` that are a segment's, an ordered index's or a form
-/// file's under a name of their own.
+/// file's under a name of their own, or under a cipher an envelope's.
 fn own_files(d: &Path) -> Vec<String> {
     let mut v: Vec<String> = std::fs::read_dir(d)
         .unwrap()
         .flatten()
         .map(|e| e.file_name().to_string_lossy().into_owned())
-        .filter(|n| n.ends_with(".sup") || n.ends_with(".oidx") || n.ends_with(".zpg"))
+        .filter(|n| {
+            n.ends_with(".sup")
+                || n.ends_with(".oidx")
+                || n.ends_with(".zpg")
+                // Under a cipher: an envelope.
+                || n.starts_with("x-")
+        })
         .collect();
     v.sort();
     v
@@ -147,7 +159,20 @@ fn a_store_in_one_file_reads_as_itself_and_keeps_no_segment_under_a_name() {
 
 #[test]
 fn room_a_merge_retires_is_written_over_and_the_file_stops_growing() {
-    let d = dir("reuse");
+    room_a_merge_retires_is_written_over_and_the_file_stops_growing_in(small, "");
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn room_a_merge_retires_is_written_over_and_the_file_stops_growing_under_a_cipher() {
+    room_a_merge_retires_is_written_over_and_the_file_stops_growing_in(sealed_small, "sealed-");
+}
+
+fn room_a_merge_retires_is_written_over_and_the_file_stops_growing_in(
+    small: fn(bool) -> Options,
+    tag: &str,
+) {
+    let d = tdir(tag, "reuse");
     let mut model = BTreeMap::new();
     let mut db = Db::create(&d, small(true)).unwrap();
     let mut ends = Vec::new();
@@ -170,7 +195,23 @@ fn room_a_merge_retires_is_written_over_and_the_file_stops_growing() {
 
 #[test]
 fn a_reader_holding_a_retired_segment_reads_it_whatever_was_written_since() {
-    let d = dir("pinned");
+    a_reader_holding_a_retired_segment_reads_it_whatever_was_written_since_in(small, "");
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn a_reader_holding_a_retired_segment_reads_it_whatever_was_written_since_under_a_cipher() {
+    a_reader_holding_a_retired_segment_reads_it_whatever_was_written_since_in(
+        sealed_small,
+        "sealed-",
+    );
+}
+
+fn a_reader_holding_a_retired_segment_reads_it_whatever_was_written_since_in(
+    small: fn(bool) -> Options,
+    tag: &str,
+) {
+    let d = tdir(tag, "pinned");
     let mut model = BTreeMap::new();
     let mut db = Db::create(&d, small(true)).unwrap();
     load(&mut db, &mut model, 3000, "old");
@@ -210,15 +251,25 @@ fn a_reader_holding_a_retired_segment_reads_it_whatever_was_written_since() {
 
 #[test]
 fn a_store_killed_at_a_landing_reads_every_commit() {
+    a_store_killed_at_a_landing_reads_every_commit_in(small, "");
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn a_store_killed_at_a_landing_reads_every_commit_under_a_cipher() {
+    a_store_killed_at_a_landing_reads_every_commit_in(sealed_small, "sealed-");
+}
+
+fn a_store_killed_at_a_landing_reads_every_commit_in(small: fn(bool) -> Options, tag: &str) {
     for background in [true, false] {
-        let d = dir(if background { "kill-bg" } else { "kill-inline" });
+        let d = tdir(tag, if background { "kill-bg" } else { "kill-inline" });
         let mut model = BTreeMap::new();
         let mut db = Db::create(&d, small(background)).unwrap();
         load(&mut db, &mut model, 3000, "a");
         // Seals and merges in flight, nothing settled, and the store
         // gone as a process's death takes it.
         load(&mut db, &mut model, 3000, "b");
-        db.crash();
+        let d = kill(db, &d);
         let mut db = Db::open(&d, small(background)).unwrap();
         assert_eq!(dump(&db), model);
         // And it goes on: what the dead store's threads had in flight is
@@ -234,7 +285,17 @@ fn a_store_killed_at_a_landing_reads_every_commit() {
 
 #[test]
 fn a_slot_that_names_room_since_written_over_is_refused() {
-    let d = dir("fallback");
+    a_slot_that_names_room_since_written_over_is_refused_in(small, "");
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn a_slot_that_names_room_since_written_over_is_refused_under_a_cipher() {
+    a_slot_that_names_room_since_written_over_is_refused_in(sealed_small, "sealed-");
+}
+
+fn a_slot_that_names_room_since_written_over_is_refused_in(small: fn(bool) -> Options, tag: &str) {
+    let d = tdir(tag, "fallback");
     let mut model = BTreeMap::new();
     let mut db = Db::create(&d, small(true)).unwrap();
     load(&mut db, &mut model, 3000, "a");
@@ -305,6 +366,19 @@ fn a_checkpoint_of_a_store_in_one_file_is_a_store_of_files() {
 
 #[test]
 fn the_option_is_refused_beside_the_manifest_shapes_it_cannot_keep() {
+    the_option_is_refused_beside_the_manifest_shapes_it_cannot_keep_in(small, "");
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn the_option_is_refused_beside_the_manifest_shapes_it_cannot_keep_under_a_cipher() {
+    the_option_is_refused_beside_the_manifest_shapes_it_cannot_keep_in(sealed_small, "sealed-");
+}
+
+fn the_option_is_refused_beside_the_manifest_shapes_it_cannot_keep_in(
+    small: fn(bool) -> Options,
+    tag: &str,
+) {
     for (name, o) in [
         (
             "pending",
@@ -321,7 +395,7 @@ fn the_option_is_refused_beside_the_manifest_shapes_it_cannot_keep() {
             },
         ),
     ] {
-        let d = dir(&format!("refuse-{name}"));
+        let d = tdir(tag, &format!("refuse-{name}"));
         let e = Db::create(&d, o).err().expect("refused");
         assert!(e.to_string().contains("one_file"), "{name}: {e}");
         assert!(!d.join("store.one").exists(), "{name}: nothing was made");
@@ -343,6 +417,27 @@ fn copy_files(from: &Path, to: &Path) {
     }
 }
 
+/// The store gone as a process's death takes it, and the directory it is
+/// opened in again. A plain store's is its own (`Db::crash`). A store
+/// under a cipher is held open in this process past the forget, so the
+/// kill is a copy of its directory, taken with the segment work paused:
+/// every file as the death leaves it -- the slots, the log, and the data
+/// file with whatever the seals and merges in flight had written into it
+/// -- and none of its memory files, which is what a store under a cipher
+/// loses.
+fn kill(db: Db, d: &Path) -> PathBuf {
+    if db.cipher_counts().is_none() {
+        db.crash();
+        return d.to_path_buf();
+    }
+    let to = PathBuf::from(format!("{}-killed", d.display()));
+    let paused = db.pause_segment_work();
+    copy_files(d, &to);
+    drop(paused);
+    db.crash();
+    to
+}
+
 fn wait_for(what: &str, mut done: impl FnMut() -> bool) {
     let t = std::time::Instant::now();
     while !done() {
@@ -356,7 +451,23 @@ fn wait_for(what: &str, mut done: impl FnMut() -> bool) {
 
 #[test]
 fn a_seal_cut_between_its_landing_and_its_sync_leaves_room_nobody_names() {
-    let root = dir("unsynced");
+    a_seal_cut_between_its_landing_and_its_sync_leaves_room_nobody_names_in(small, "");
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn a_seal_cut_between_its_landing_and_its_sync_leaves_room_nobody_names_under_a_cipher() {
+    a_seal_cut_between_its_landing_and_its_sync_leaves_room_nobody_names_in(
+        sealed_small,
+        "sealed-",
+    );
+}
+
+fn a_seal_cut_between_its_landing_and_its_sync_leaves_room_nobody_names_in(
+    small: fn(bool) -> Options,
+    tag: &str,
+) {
+    let root = tdir(tag, "unsynced");
     let (d, whole, cut) = (root.join("store"), root.join("whole"), root.join("cut"));
     std::fs::create_dir_all(&d).unwrap();
     let mut model = BTreeMap::new();
@@ -408,7 +519,20 @@ fn a_seal_cut_between_its_landing_and_its_sync_leaves_room_nobody_names() {
 
 #[test]
 fn a_data_file_cut_under_a_place_its_manifest_names_is_refused() {
-    let d = dir("cut-named");
+    a_data_file_cut_under_a_place_its_manifest_names_is_refused_in(small, "");
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn a_data_file_cut_under_a_place_its_manifest_names_is_refused_under_a_cipher() {
+    a_data_file_cut_under_a_place_its_manifest_names_is_refused_in(sealed_small, "sealed-");
+}
+
+fn a_data_file_cut_under_a_place_its_manifest_names_is_refused_in(
+    small: fn(bool) -> Options,
+    tag: &str,
+) {
+    let d = tdir(tag, "cut-named");
     let mut model = BTreeMap::new();
     let mut db = Db::create(&d, small(true)).unwrap();
     load(&mut db, &mut model, 3000, "a");
@@ -439,7 +563,23 @@ fn a_data_file_cut_under_a_place_its_manifest_names_is_refused() {
 
 #[test]
 fn a_data_file_beside_no_slot_is_refused_and_a_creations_alone_is_swept() {
-    let d = dir("no-slot");
+    a_data_file_beside_no_slot_is_refused_and_a_creations_alone_is_swept_in(small, "");
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn a_data_file_beside_no_slot_is_refused_and_a_creations_alone_is_swept_under_a_cipher() {
+    a_data_file_beside_no_slot_is_refused_and_a_creations_alone_is_swept_in(
+        sealed_small,
+        "sealed-",
+    );
+}
+
+fn a_data_file_beside_no_slot_is_refused_and_a_creations_alone_is_swept_in(
+    small: fn(bool) -> Options,
+    tag: &str,
+) {
+    let d = tdir(tag, "no-slot");
     let mut model = BTreeMap::new();
     let mut db = Db::create(&d, small(true)).unwrap();
     load(&mut db, &mut model, 3000, "a");
@@ -454,15 +594,19 @@ fn a_data_file_beside_no_slot_is_refused_and_a_creations_alone_is_swept() {
         .err()
         .expect("no slot beside a data file");
     let e = e.to_string();
+    // By the data file's name, or under a cipher by what it holds: the
+    // envelopes of segments only a slot names.
     assert!(
-        e.contains("refused") && e.contains("store.one") && e.contains("nothing was removed"),
+        e.contains("refused")
+            && (e.contains("store.one") || e.contains("envelopes"))
+            && e.contains("nothing was removed"),
         "{e}"
     );
     assert_eq!(listing(&d), before);
     // A store whose creation wrote its data file and no manifest held
     // nothing: it opens as a store of files, and the data file goes.
-    let d = dir("no-slot-new");
-    Db::create(&d, small(true)).unwrap().crash();
+    let d = tdir(tag, "no-slot-new");
+    let d = kill(Db::create(&d, small(true)).unwrap(), &d);
     for s in ["manifest", "manifest.alt"] {
         std::fs::write(d.join(s), b"").unwrap();
     }
@@ -478,7 +622,17 @@ fn a_data_file_beside_no_slot_is_refused_and_a_creations_alone_is_swept() {
 
 #[test]
 fn a_store_of_files_stays_one_whatever_the_option_says() {
-    let d = dir("files");
+    a_store_of_files_stays_one_whatever_the_option_says_in(small, "");
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn a_store_of_files_stays_one_whatever_the_option_says_under_a_cipher() {
+    a_store_of_files_stays_one_whatever_the_option_says_in(sealed_small, "sealed-");
+}
+
+fn a_store_of_files_stays_one_whatever_the_option_says_in(small: fn(bool) -> Options, tag: &str) {
+    let d = tdir(tag, "files");
     let mut model = BTreeMap::new();
     let mut db = Db::create(
         &d,
@@ -503,7 +657,23 @@ fn a_store_of_files_stays_one_whatever_the_option_says() {
 
 #[test]
 fn a_store_in_one_file_is_refused_under_the_manifest_shapes_it_cannot_keep() {
-    let d = dir("refuse-open");
+    a_store_in_one_file_is_refused_under_the_manifest_shapes_it_cannot_keep_in(small, "");
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn a_store_in_one_file_is_refused_under_the_manifest_shapes_it_cannot_keep_under_a_cipher() {
+    a_store_in_one_file_is_refused_under_the_manifest_shapes_it_cannot_keep_in(
+        sealed_small,
+        "sealed-",
+    );
+}
+
+fn a_store_in_one_file_is_refused_under_the_manifest_shapes_it_cannot_keep_in(
+    small: fn(bool) -> Options,
+    tag: &str,
+) {
+    let d = tdir(tag, "refuse-open");
     let mut model = BTreeMap::new();
     let mut db = Db::create(&d, small(true)).unwrap();
     load(&mut db, &mut model, 1000, "a");
@@ -536,12 +706,42 @@ fn a_store_in_one_file_is_refused_under_the_manifest_shapes_it_cannot_keep() {
         );
         assert_eq!(listing(&d), before, "{name}");
     }
-    assert_eq!(dump(&Db::open(&d, Options::default()).unwrap()), model);
+    // And with neither asked, as the store is kept.
+    assert_eq!(
+        dump(
+            &Db::open(
+                &d,
+                Options {
+                    manifest_pending: false,
+                    manifest_slots: true,
+                    ..small(true)
+                }
+            )
+            .unwrap()
+        ),
+        model
+    );
 }
 
 #[test]
 fn form_files_are_kept_in_the_data_file_and_found_by_the_open_after_a_kill() {
-    let d = dir("forms");
+    form_files_are_kept_in_the_data_file_and_found_by_the_open_after_a_kill_in(small, "");
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn form_files_are_kept_in_the_data_file_and_found_by_the_open_after_a_kill_under_a_cipher() {
+    form_files_are_kept_in_the_data_file_and_found_by_the_open_after_a_kill_in(
+        sealed_small,
+        "sealed-",
+    );
+}
+
+fn form_files_are_kept_in_the_data_file_and_found_by_the_open_after_a_kill_in(
+    small: fn(bool) -> Options,
+    tag: &str,
+) {
+    let d = tdir(tag, "forms");
     let mut model = BTreeMap::new();
     let forced = || Options {
         zpages: supdb::ZPages::Always,
@@ -565,7 +765,7 @@ fn form_files_are_kept_in_the_data_file_and_found_by_the_open_after_a_kill() {
         let c = db.one_counts().unwrap();
         c.listed == c.files
     });
-    db.crash();
+    let d = kill(db, &d);
     let mut db = Db::open(&d, forced()).unwrap();
     db.zpages_settle().unwrap();
     let again = db.zpage_counts();
@@ -577,6 +777,113 @@ fn form_files_are_kept_in_the_data_file_and_found_by_the_open_after_a_kill() {
     }
 }
 
+#[cfg(target_os = "linux")]
+fn cipher(n: u8) -> supdb::StoreCipher {
+    supdb::StoreCipher::new(common::Gcm::new(&[n; 32]), common::Gcm::new).key_id(u64::from(n))
+}
+
+/// `small` under a cipher: the store's envelopes in its data file.
+#[cfg(target_os = "linux")]
+fn sealed(background: bool, n: u8) -> Options {
+    Options {
+        encryption: supdb::Encryption::Cipher(cipher(n)),
+        ..small(background)
+    }
+}
+
+/// `sealed` under one key, as a body two tests run takes its options: the
+/// plain store's `small`, or this.
+#[cfg(target_os = "linux")]
+fn sealed_small(background: bool) -> Options {
+    sealed(background, 31)
+}
+
+/// Whether `needle` is anywhere in the files of `d`, the data file among
+/// them.
+#[cfg(target_os = "linux")]
+fn on_device(d: &Path, needle: &[u8]) -> bool {
+    std::fs::read_dir(d).unwrap().flatten().any(|e| {
+        std::fs::read(e.path())
+            .map(|b| b.windows(needle.len()).any(|w| w == needle))
+            .unwrap_or(false)
+    })
+}
+
+/// A store under a cipher kept in one file (`Options::one_file` beside
+/// `Encryption::Cipher`): its segments', indexes' and form files'
+/// envelopes are files of the data file and none is a file of the
+/// directory's; it reads as itself through its seals and merges, across a
+/// close, and opened with nothing asked but its cipher; nothing it holds is
+/// on the device in the clear, where the same writes in a store of no
+/// cipher are; and a wrong key is refused as it is for a store of files.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_store_under_a_cipher_is_kept_in_one_file_and_reads_as_itself() {
+    for background in [true, false] {
+        let d = dir(if background {
+            "sealed-bg"
+        } else {
+            "sealed-inline"
+        });
+        let mut model = BTreeMap::new();
+        let mut db = Db::create(&d, sealed(background, 21)).unwrap();
+        load(&mut db, &mut model, 4000, "a");
+        db.flush().unwrap();
+        db.settle().unwrap();
+        assert!(db.levels().0 > 1, "partitions, so merges ran");
+        assert_eq!(dump(&db), model);
+        let c = db.one_counts().expect("a store in one file");
+        assert!(c.files > 0 && c.held > 0 && c.reused > 0, "{c:?}");
+        // No envelope under a name of its own: the directory holds the
+        // marker, the lock, the log, the slots and the data file.
+        let envelopes: Vec<String> = std::fs::read_dir(&d)
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|n| n.starts_with("x-"))
+            .collect();
+        assert_eq!(envelopes, Vec::<String>::new(), "{c:?}");
+        assert!(d.join("store.one").is_file());
+        db.close().unwrap();
+        // Nothing of it in the clear on the device.
+        assert!(!on_device(&d, b"key-000017"), "a key in the clear");
+        assert!(!on_device(&d, b"a-3999"), "a value in the clear");
+        // Opened with its cipher and nothing else asked: the store says
+        // how it is kept.
+        let opened = Options {
+            encryption: supdb::Encryption::Cipher(cipher(21)),
+            ..Options::default()
+        };
+        let db = Db::open(&d, opened).unwrap();
+        let c = db.one_counts().expect("a store in one file");
+        assert!(c.durable > 0 && c.listed > 0, "{c:?}");
+        assert_eq!(dump(&db), model);
+        for i in [0u32, 1, 1999, 3999] {
+            assert_eq!(value(&db, &key(i)), model.get(&key(i)).cloned());
+        }
+        assert_eq!(db.ord_rebuilt(), 0, "every ordered index was listed");
+        db.close().unwrap();
+        // Another key is refused, and nothing is changed by the refusal.
+        let before = listing(&d);
+        let wrong = Options {
+            encryption: supdb::Encryption::Cipher(cipher(22)),
+            ..Options::default()
+        };
+        let e = Db::open(&d, wrong).err().expect("a wrong key").to_string();
+        assert!(e.contains("does not open the store"), "{e}");
+        assert_eq!(listing(&d), before);
+    }
+    // The control: the same writes with no cipher are found.
+    let d = dir("sealed-control");
+    let mut model = BTreeMap::new();
+    let mut db = Db::create(&d, small(true)).unwrap();
+    load(&mut db, &mut model, 4000, "a");
+    db.flush().unwrap();
+    db.settle().unwrap();
+    db.close().unwrap();
+    assert!(on_device(&d, b"key-000017") && on_device(&d, b"a-3999"));
+}
+
 /// An open that publishes tells the table its manifest is on the device,
 /// as the segment work's publishes do (`SlotChoice::write_shape`). Here
 /// the open names the piece a killed writer's run became, so the slot it
@@ -584,12 +891,25 @@ fn form_files_are_kept_in_the_data_file_and_found_by_the_open_after_a_kill() {
 /// table knows durable is the open's own.
 #[test]
 fn an_opens_publish_tells_the_table_its_manifest_is_on_the_device() {
+    an_opens_publish_tells_the_table_its_manifest_is_on_the_device_in(small, "");
+}
+
+// No twin under a cipher: a run's commits there are frames of the log
+// and its file a memory file a kill takes, so the open after one replays
+// the log and publishes nothing.
+fn an_opens_publish_tells_the_table_its_manifest_is_on_the_device_in(
+    small: fn(bool) -> Options,
+    tag: &str,
+) {
     for background in [true, false] {
-        let d = dir(if background {
-            "open-publish-bg"
-        } else {
-            "open-publish-inline"
-        });
+        let d = tdir(
+            tag,
+            if background {
+                "open-publish-bg"
+            } else {
+                "open-publish-inline"
+            },
+        );
         let mut model = BTreeMap::new();
         let mut db = Db::create(&d, small(background)).unwrap();
         load(&mut db, &mut model, 2000, "a");
@@ -612,7 +932,7 @@ fn an_opens_publish_tells_the_table_its_manifest_is_on_the_device() {
         db.commit().unwrap();
         let at_kill = db.one_counts().unwrap().durable;
         assert_eq!(at_kill, taken, "the premise: nothing published since");
-        db.crash();
+        let d = kill(db, &d);
         let db = Db::open(&d, small(background)).unwrap();
         assert_eq!(dump(&db), model);
         let c = db.one_counts().unwrap();
@@ -631,7 +951,20 @@ fn an_opens_publish_tells_the_table_its_manifest_is_on_the_device() {
 /// with no index to compose again.
 #[test]
 fn an_index_is_named_by_the_manifest_that_names_its_segment() {
-    let d = dir("index-with-piece");
+    an_index_is_named_by_the_manifest_that_names_its_segment_in(small, "");
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn an_index_is_named_by_the_manifest_that_names_its_segment_under_a_cipher() {
+    an_index_is_named_by_the_manifest_that_names_its_segment_in(sealed_small, "sealed-");
+}
+
+fn an_index_is_named_by_the_manifest_that_names_its_segment_in(
+    small: fn(bool) -> Options,
+    tag: &str,
+) {
+    let d = tdir(tag, "index-with-piece");
     let mut model = BTreeMap::new();
     // The segment work inside the writer's own operations: every landing
     // a commit drove has written its manifest when the commit returns,
@@ -641,7 +974,7 @@ fn an_index_is_named_by_the_manifest_that_names_its_segment() {
     db.flush().unwrap();
     assert!(db.levels().0 > 1, "partitions, so merges landed");
     let c = db.one_counts().unwrap();
-    db.crash();
+    let d = kill(db, &d);
     let mut db = Db::open(&d, small(false)).unwrap();
     assert_eq!(dump(&db), model);
     assert_eq!(
@@ -657,11 +990,21 @@ fn an_index_is_named_by_the_manifest_that_names_its_segment() {
         model.insert(key(i), v);
     }
     db.commit().unwrap();
+    let (segs, syncs) = (db.segments(), db.one_counts().unwrap().syncs);
     db.seal().unwrap();
     db.settle().unwrap();
     assert!(db.levels().1 >= 1, "a piece stands: {:?}", db.levels());
     let c = db.one_counts().unwrap();
-    db.crash();
+    // One sync of the data file a piece, its index covered by it: where
+    // the index is written behind its piece's sync it wants a second, a
+    // flush of the device more at every landing.
+    let pieces = (db.segments() - segs) as u64;
+    assert!(
+        pieces >= 1 && c.syncs - syncs <= pieces,
+        "{} syncs of the data file for {pieces} pieces: {c:?}",
+        c.syncs - syncs
+    );
+    let d = kill(db, &d);
     let db = Db::open(&d, small(false)).unwrap();
     assert_eq!(dump(&db), model);
     assert_eq!(
@@ -681,7 +1024,17 @@ fn an_index_is_named_by_the_manifest_that_names_its_segment() {
 /// none to build.
 #[test]
 fn a_close_lists_what_was_built_since_the_last_landing() {
-    let d = dir("close-lists");
+    a_close_lists_what_was_built_since_the_last_landing_in(small, "");
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn a_close_lists_what_was_built_since_the_last_landing_under_a_cipher() {
+    a_close_lists_what_was_built_since_the_last_landing_in(sealed_small, "sealed-");
+}
+
+fn a_close_lists_what_was_built_since_the_last_landing_in(small: fn(bool) -> Options, tag: &str) {
+    let d = tdir(tag, "close-lists");
     let opts = || Options {
         zpages: supdb::ZPages::Always,
         zpages_min_bytes: 0,
@@ -720,15 +1073,30 @@ fn a_close_lists_what_was_built_since_the_last_landing() {
 /// over a named one's with the store closed.
 #[test]
 fn a_place_holding_another_files_first_page_is_refused_by_its_row() {
-    let d = dir("head-check");
+    a_place_holding_another_files_first_page_is_refused_by_its_row_in(small, "");
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn a_place_holding_another_files_first_page_is_refused_by_its_row_under_a_cipher() {
+    a_place_holding_another_files_first_page_is_refused_by_its_row_in(sealed_small, "sealed-");
+}
+
+fn a_place_holding_another_files_first_page_is_refused_by_its_row_in(
+    small: fn(bool) -> Options,
+    tag: &str,
+) {
+    let d = tdir(tag, "head-check");
     let mut model = BTreeMap::new();
     let mut db = Db::create(&d, small(true)).unwrap();
     load(&mut db, &mut model, 3000, "a");
     db.flush().unwrap();
     db.settle().unwrap();
-    let segs: Vec<String> = common::seg_names(&d)
+    // The segments by the names the table has them under: their own,
+    // or under a cipher their envelopes', a token with no suffix.
+    let segs: Vec<String> = Db::one_names(&d)
         .into_iter()
-        .filter(|n| Db::one_place(&d, n).is_some())
+        .filter(|n| n.ends_with(".sup") || (n.starts_with("x-") && n.len() == 34))
         .collect();
     assert!(segs.len() >= 2, "two segments in the data file: {segs:?}");
     let (a, _) = Db::one_place(&d, &segs[0]).unwrap();
@@ -751,9 +1119,16 @@ fn a_place_holding_another_files_first_page_is_refused_by_its_row() {
         .err()
         .expect("a place written over");
     let e = e.to_string();
+    // Named as the manifest names it: the segment's own name, which
+    // under a cipher is not the envelope's the table has it under.
+    let named = if segs[0].starts_with("x-") {
+        "names ".to_string()
+    } else {
+        format!("names {}", segs[0])
+    };
     assert!(
         e.contains("refused: the manifest slot")
-            && e.contains(&format!("names {}", segs[0]))
+            && e.contains(&named)
             && e.contains("nothing was removed"),
         "{e}"
     );

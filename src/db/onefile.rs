@@ -915,6 +915,30 @@ impl One {
         Some(self.using(name)?.map())
     }
 
+    /// The file under `name` mapped as its bytes alone, for a reader that
+    /// keeps the mapping itself and reads it by offsets of its own -- the
+    /// cache of a store under a cipher, whose envelopes are files here
+    /// (`pager::Back`): the mapping, what holds the file's room for as long
+    /// as the reader keeps it, and where in the data file the file begins.
+    /// `None` where it is no file of the table.
+    #[allow(clippy::type_complexity)]
+    pub(crate) fn map_held(
+        self: &Arc<One>,
+        name: &str,
+    ) -> Option<Result<(memmap2::Mmap, Box<dyn std::any::Any + Send + Sync>, u64)>> {
+        let u = self.using(name)?;
+        Some(u.map_raw().map(|(m, hold, at)| {
+            let hold: Box<dyn std::any::Any + Send + Sync> = Box::new(hold);
+            (m, hold, at)
+        }))
+    }
+
+    /// The data file's path, for an advice by a descriptor of the caller's
+    /// own over a range of it.
+    pub(crate) fn data_path(&self) -> &Path {
+        &self.path
+    }
+
     /// Whether `name`'s bytes are what a manifest listed for it: its first
     /// page under the checksum the manifest carried. `None` where it is no
     /// file of the table.
@@ -1179,6 +1203,13 @@ impl Using {
 
     /// The file mapped for reading, the mapping holding a use of its own.
     fn map(&self) -> Result<MmapBytes> {
+        let (m, hold, _) = self.map_raw()?;
+        Ok(MmapBytes::from_map_held(m, Box::new(hold)))
+    }
+
+    /// The file's bytes mapped, the use that holds its room for as long as
+    /// the mapping stands, and where in the data file they begin.
+    fn map_raw(&self) -> Result<(memmap2::Mmap, Using, u64)> {
         let hold = self.again();
         let loc = {
             // Under the file's own lock, so a move in flight is over
@@ -1207,7 +1238,7 @@ impl Using {
                 .len(len)
                 .map(&own)?
         };
-        Ok(MmapBytes::from_map_held(m, Box::new(hold)))
+        Ok((m, hold, loc.base))
     }
 }
 

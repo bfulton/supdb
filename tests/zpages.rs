@@ -6514,11 +6514,13 @@ fn a_warm_under_a_cipher_asks_for_the_envelope_and_decrypts_nothing() {
         1,
         "one form file's envelope: {envelopes:?}"
     );
-    let env = MmapBytes::open(&envelopes[0]).unwrap();
-    let env_len = env.len() as usize;
+    // Where its bytes lie: a file of its own, or a range of the store's
+    // data file.
+    let env_len = common::store_len(&envelopes[0]) as usize;
     let t = std::time::Instant::now();
     let share = loop {
-        let share = env.resident_share(0, env_len).expect("the kernel says");
+        let share =
+            common::cached_pages(&envelopes[0], 0, env_len) as f64 / env_len.div_ceil(4096) as f64;
         if share >= 0.9 || t.elapsed() > std::time::Duration::from_secs(20) {
             break share;
         }
@@ -8437,17 +8439,14 @@ fn the_controller_buys_builds_and_installs_the_form_under_a_cipher() {
     // No form file is its writer's memory still: each has its envelope.
     assert_eq!(db.cipher_counts().unwrap().files, 0);
     drop(r);
-    db.close().unwrap();
-    let on_disk = std::fs::read_dir(&dir)
-        .unwrap()
-        .filter(|e| {
-            e.as_ref()
-                .unwrap()
-                .file_name()
-                .to_string_lossy()
-                .ends_with(".z")
-        })
+    // Among the store's files, wherever it keeps them, read while it is
+    // open: a store kept in one file has its envelopes' names to give
+    // then, and in its sealed manifest alone once it is closed.
+    let on_disk = common::store_names(&dir)
+        .iter()
+        .filter(|n| n.ends_with(".z"))
         .count() as u64;
+    db.close().unwrap();
     assert_eq!(on_disk, forms, "an envelope a form file");
     let _ = std::fs::remove_dir_all(&dir);
 }
@@ -9010,15 +9009,14 @@ fn a_drop_of_a_partitions_raw_pages_under_a_cipher_gives_its_plaintext_back() {
         );
         // The segments' envelopes, by their names: an envelope of a
         // segment carries no kind's suffix.
-        let raw: u64 = std::fs::read_dir(&dir)
-            .unwrap()
-            .flatten()
-            .filter(|e| {
-                e.file_name()
-                    .to_str()
+        let raw: u64 = common::store_paths(&dir)
+            .into_iter()
+            .filter(|p| {
+                p.file_name()
+                    .and_then(|n| n.to_str())
                     .is_some_and(|n| n.starts_with("x-") && !n.contains('.'))
             })
-            .map(|e| e.metadata().unwrap().len())
+            .map(common::store_len)
             .sum();
         assert!(
             raw > 2 << 20,
@@ -9075,28 +9073,26 @@ fn form_files_an_earlier_open_left_under_a_cipher_are_dormant_and_then_attached(
         ))
     };
     let dir = scratch("auto-dormant-cipher");
-    let model = {
+    // The form files' envelopes among the store's files, wherever it
+    // keeps them, counted while the store is open: a store kept in one
+    // file has their names in its sealed manifest alone once it is
+    // closed.
+    let envelopes = || {
+        common::store_names(&dir)
+            .iter()
+            .filter(|n| n.ends_with(".z"))
+            .count() as u64
+    };
+    let (model, on_disk) = {
         let mut db = Db::create(&dir, forced(|o| o.encryption = cipher())).unwrap();
         let model = ordered_load(&mut db, 20_000, 0x4A9);
         db.zpages_settle().unwrap();
         let c = db.zpage_counts();
         assert!(c.form_files >= 1 && c.form_files == c.partitions, "{c:?}");
+        let on_disk = envelopes();
         db.close().unwrap();
-        model
+        (model, on_disk)
     };
-    let envelopes = || {
-        std::fs::read_dir(&dir)
-            .unwrap()
-            .filter(|e| {
-                e.as_ref()
-                    .unwrap()
-                    .file_name()
-                    .to_string_lossy()
-                    .ends_with(".z")
-            })
-            .count() as u64
-    };
-    let on_disk = envelopes();
     assert!(on_disk > 0);
     let inject = std::sync::Arc::new(supdb::ZInject::new());
     inject.set_budget(1 << 20);

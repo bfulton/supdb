@@ -478,7 +478,14 @@ the plaintext it covers in the store's cache
 merges in flight (`Options::zpages_rewarm_beside_merges`), and
 `supdb-cipherautoaheadflat` the same with its merges asking ahead in one
 window for every input and over their records alone
-(`Options::merge_ahead_shares` off), the shape before. And
+(`Options::merge_ahead_shares` off), the shape before. And three kept
+in one file (`Options::one_file` beside the cipher), the store's
+envelopes extents of its data file where the arms above keep each a
+file of the directory: `supdb-cipheronefile` beside `supdb-cipher`,
+`supdb-cipherautoonefile` beside `supdb-cipherauto`, and
+`supdb-ingestcipherautoonefile` beside `supdb-ingestcipherauto`; the
+plain store kept so is `supdb-onefile` beside `supdb`, and
+`supdb-ingestonefile` buffered. And
 two that force the compact form
 there, each coding priced by itself: `supdb-cipherzpages`, every
 partition's form file in the block coding, and `supdb-cipherzstride`,

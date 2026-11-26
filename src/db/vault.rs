@@ -662,6 +662,13 @@ struct Entry {
     disk: Option<Disk>,
 }
 
+/// The names of the envelopes kept beside the segment's under `token`,
+/// which a store makes again where they are missing: its ordered index's
+/// and its form file's.
+fn riders(token: &[u8; 16]) -> [String; 2] {
+    [disk_name(token, Kind::Ord), disk_name(token, Kind::Form)]
+}
+
 /// Whether `name` is a file whose bytes the engine seals itself, record by
 /// record or slot by slot, and which therefore lives in the directory as
 /// it is: the log, a retired log file kept to be the next one
@@ -714,6 +721,10 @@ pub(crate) struct Vault {
     /// What the store's writers have said is coming, which the room its
     /// cache follows has as well (`Coming`).
     coming: Arc<Coming>,
+    /// The table of the store's data file, where the store is kept in one
+    /// (`Options::one_file`): every envelope is a file of that table and
+    /// none is a file of the directory's (`keep_in`).
+    one: std::sync::OnceLock<Arc<One>>,
     pub(crate) counts: Counts,
 }
 
@@ -1052,7 +1063,13 @@ pub(crate) fn hold_one(one: Arc<One>) -> OneHeld {
     OneHeld(one)
 }
 
-/// The table of the store kept in one file in `dir`, if there is one.
+/// The table of the plain store kept in one file in `dir`, if there is
+/// one: what the door routes a plain store's file operations by, and what
+/// a plain store's writers ask before they do what only it wants of them
+/// (a piece's room said ahead, an index written before its piece's sync).
+/// A store under a cipher has none here, whichever way it is kept: its
+/// files are its vault's, and its vault's table holds their envelopes
+/// (`one_of`).
 pub(crate) fn one_under(dir: &Path) -> Option<Arc<One>> {
     if VAULTS.load(Ordering::Acquire) == 0 {
         return None;
@@ -1060,9 +1077,32 @@ pub(crate) fn one_under(dir: &Path) -> Option<Arc<One>> {
     lock(&ONES).iter().find(|o| o.dir == dir).cloned()
 }
 
-/// A test's crash of the store kept in one file in `dir` (`Db::crash`):
-/// its table taken out of the door's reach and killed (`One::kill`), so
-/// the store opened in its place is the only one that writes the file.
+/// The table of the store kept in one file in `dir`, plain or under a
+/// cipher: a plain store's own, or the one a store under a cipher keeps
+/// its envelopes in, found by the directory the engine names its files in
+/// or by the store's own. For what is the table's whoever's files it
+/// holds: the manifest on the device told to it, the segment work's look
+/// at what no manifest lists, and a test's reading of its names and
+/// places.
+pub(crate) fn one_of(dir: &Path) -> Option<Arc<One>> {
+    if VAULTS.load(Ordering::Acquire) == 0 {
+        return None;
+    }
+    if let Some(o) = lock(&ONES).iter().find(|o| o.dir == dir) {
+        return Some(o.clone());
+    }
+    lock(&REGISTRY)
+        .iter()
+        .find(|v| v.decoy == dir || v.real == dir)
+        .and_then(|v| v.one().cloned())
+}
+
+/// A test's crash of the plain store kept in one file in `dir`
+/// (`Db::crash`): its table taken out of the door's reach and killed
+/// (`One::kill`), so the store opened in its place is the only one that
+/// writes the file. A store under a cipher stays held open in the process
+/// past the forget, its vault's registration being the forgotten store's,
+/// and its table with it: the tests kill one by a copy of its directory.
 pub(crate) fn kill_one(dir: &Path) {
     let gone = {
         let mut reg = lock(&ONES);
@@ -1211,30 +1251,17 @@ fn reopen(mem: &OsFile, write: bool, append: bool) -> Result<OsFile> {
 /// the whole file's device time after the whole file's cipher time, end to
 /// end.
 struct Ahead {
-    file: OsFile,
+    file: File,
     at: u64,
     hint: bool,
 }
 
 impl Write for Ahead {
     fn write(&mut self, data: &[u8]) -> Result<usize> {
-        self.file.write_all(data)?;
-        #[cfg(target_os = "linux")]
+        self.file.write_all_at(data, self.at)?;
         if self.hint {
-            use std::os::fd::AsRawFd;
-            // SAFETY: a hint over a range of a file this owns; the call
-            // reads and writes no memory of ours.
-            unsafe {
-                libc::sync_file_range(
-                    self.file.as_raw_fd(),
-                    self.at as libc::off64_t,
-                    data.len() as libc::off64_t,
-                    libc::SYNC_FILE_RANGE_WRITE,
-                );
-            }
+            self.file.start_writeback(self.at, data.len() as u64);
         }
-        #[cfg(not(target_os = "linux"))]
-        let _ = self.hint;
         self.at += data.len() as u64;
         Ok(data.len())
     }
@@ -1272,8 +1299,93 @@ impl Vault {
                 pager
             },
             coming,
+            one: std::sync::OnceLock::new(),
             counts: Counts::default(),
         })
+    }
+
+    /// The table of the store's data file, where the store is kept in one.
+    pub(crate) fn one(&self) -> Option<&Arc<One>> {
+        self.one.get()
+    }
+
+    /// The directory the store's own files are in: the log, the manifest,
+    /// the marker, and the data file of a store kept in one.
+    pub(crate) fn real_dir(&self) -> &Path {
+        &self.real
+    }
+
+    /// The store is kept in one file from here: its envelopes are made,
+    /// read, renamed and removed as files of `one`, at the names they
+    /// would have had in the directory. Said once, where the store is
+    /// made or where the slot an open takes says so, before any envelope
+    /// is written or read.
+    pub(crate) fn keep_in(&self, one: Arc<One>) {
+        let _ = self.one.set(one);
+    }
+
+    // -- where an envelope is kept ---------------------------------------
+
+    /// An envelope made under `name`, to be written.
+    fn env_create(&self, name: &str) -> Result<File> {
+        match self.one() {
+            Some(one) => one.make(name).and_then(File::ext),
+            None => OsFile::create(self.real.join(name)).map(File::os),
+        }
+    }
+
+    /// The envelope under `name` opened to be read as a file.
+    fn env_open(&self, name: &str) -> Result<File> {
+        match self.one() {
+            Some(one) => one
+                .reopen(name, false)
+                .unwrap_or_else(|| Err(Error::from(ErrorKind::NotFound)))
+                .and_then(File::ext),
+            None => OsFile::open(self.real.join(name)).map(File::os),
+        }
+    }
+
+    /// The envelope under `name` as the cache reads it, under `aead`.
+    fn env_back(&self, name: &str, aead: Box<DynAead>) -> Result<Back> {
+        match self.one() {
+            Some(one) => {
+                let (map, room, at) = one
+                    .map_held(name)
+                    .unwrap_or_else(|| Err(Error::from(ErrorKind::NotFound)))?;
+                Back::over(map, one.data_path(), at, Some(room), aead)
+            }
+            None => Back::open(&self.real.join(name), aead),
+        }
+    }
+
+    /// Whether the store holds an envelope under `name`.
+    fn env_exists(&self, name: &str) -> bool {
+        match self.one() {
+            Some(one) => one.holds(name),
+            None => self.real.join(name).exists(),
+        }
+    }
+
+    /// The envelope under `name` removed, if there is one.
+    fn env_remove(&self, name: &str) {
+        match self.one() {
+            Some(one) => {
+                one.remove(name);
+            }
+            None => {
+                let _ = std::fs::remove_file(self.real.join(name));
+            }
+        }
+    }
+
+    /// The envelope under `from` renamed `to`, over whatever was there.
+    fn env_rename(&self, from: &str, to: &str) -> Result<()> {
+        match self.one() {
+            Some(one) => one
+                .rename(from, to)
+                .ok_or_else(|| Error::from(ErrorKind::NotFound)),
+            None => std::fs::rename(self.real.join(from), self.real.join(to)),
+        }
     }
 
     /// The cache the store's files are read through.
@@ -1412,7 +1524,7 @@ impl Vault {
         let key = self
             .unwrap(&Vault::file_aad(&disk.token), &disk.wrapped)
             .ok_or_else(|| refused("a file's key does not unwrap under the store's"))?;
-        Back::open(&self.real.join(disk.name()), (self.data)(&key.0))
+        self.env_back(&disk.name(), (self.data)(&key.0))
     }
 
     /// A view of the file beside the cache, read in order under `hold`
@@ -1497,7 +1609,7 @@ impl Vault {
         // From the envelope's header, which says how much plaintext it
         // holds: a length asked of a file nothing has read yet.
         let mut head = [0u8; crypt::Header::LEN];
-        OsFile::open(self.real.join(disk.name()))?.read_exact(&mut head)?;
+        self.env_open(&disk.name())?.read_exact_at(&mut head, 0)?;
         Ok(crypt::Header::parse(&head)?.plain_len())
     }
 
@@ -1512,7 +1624,7 @@ impl Vault {
                 .values()
                 .any(|o| o.disk.as_ref().is_some_and(|x| x.same(&d)));
             if !shared {
-                let _ = std::fs::remove_file(self.real.join(d.name()));
+                self.env_remove(&d.name());
                 if d.kind == Kind::Seg {
                     // The form file beside a segment goes with it where no
                     // name of the store's holds it: one written and never
@@ -1525,7 +1637,7 @@ impl Vault {
                         .values()
                         .any(|o| o.disk.as_ref().is_some_and(|x| x.same(&z)));
                     if !held {
-                        let _ = std::fs::remove_file(self.real.join(z.name()));
+                        self.env_remove(&z.name());
                     }
                 }
             }
@@ -1678,17 +1790,20 @@ impl Vault {
     /// envelope took half as long again: each piece waits for the device
     /// where the cached pieces go to it together.
     fn write_envelope(&self, mem: &OsFile, disk: &Disk, key: &Key, sync: bool) -> Result<u64> {
-        self.write_envelope_at(mem, &self.real.join(disk.name()), key, sync)
+        self.write_envelope_at(mem, &disk.name(), key, sync)
     }
 
-    /// `write_envelope` to a path of the caller's choosing.
-    fn write_envelope_at(&self, mem: &OsFile, path: &Path, key: &Key, sync: bool) -> Result<u64> {
+    /// `write_envelope` under a name of the caller's choosing. One that is
+    /// not synced here rides the next sync of the store's data file where
+    /// the store is kept in one (`File::ride`), which is nothing for a file
+    /// of the directory's.
+    fn write_envelope_at(&self, mem: &OsFile, name: &str, key: &Key, sync: bool) -> Result<u64> {
         let aead = (self.data)(&key.0);
         let len = mem.metadata()?.len();
         // Under a key of the file's own, which has no name of the caller's.
         let opts = EncryptOptions::default();
         let mut out = Ahead {
-            file: OsFile::create(path)?,
+            file: self.env_create(name)?,
             at: 0,
             hint: sync,
         };
@@ -1703,6 +1818,8 @@ impl Vault {
         let out = out.file;
         if sync {
             out.sync_all()?;
+        } else {
+            out.ride();
         }
         Counts::add(&self.counts.persisted, 1);
         Counts::add(&self.counts.persisted_bytes, len);
@@ -1850,9 +1967,30 @@ impl Vault {
                         wrapped: self.wrap(&Vault::file_aad(&token), &key)?,
                         kind: Kind::Seg,
                     };
+                    // In the store's data file the segment's ordered index
+                    // is written ahead of it, with no sync of its own, and
+                    // the segment's sync covers both: it is a sync of the
+                    // data file, made through the segment's own handle,
+                    // which answers its writes' errors as no other
+                    // handle's sync does once one has reported them. One
+                    // flush of the device a segment, where a sync of the
+                    // segment and then one for its index were two; and
+                    // the manifest this call is for lists the index, since
+                    // a manifest lists what a sync has covered and an
+                    // index it does not list is room the next open gives
+                    // away. A plain store kept in one file writes its
+                    // index ahead of its piece's sync for the same reason
+                    // (`Emitter::leave_piece`).
+                    let ahead = match (self.one(), ord) {
+                        (Some(_), Some(ord)) => self.ord_envelope(ord, &disk, &key)?,
+                        _ => None,
+                    };
                     let keep = self.keeps(&mem);
                     #[cfg(test)]
                     tests::persist_gate(&self.real);
+                    // A write that fails here leaves the index's envelope
+                    // under a token no segment has: no manifest lists it,
+                    // and it is free room to the open after.
                     self.write_envelope(&mem, &disk, &key, true)?;
                     made = true;
                     if named {
@@ -1874,50 +2012,98 @@ impl Vault {
                         self.settled(&mut files, seg, &mem, &disk, keep)?;
                     } else {
                         // Removed while its envelope was written: nobody's.
-                        let _ = std::fs::remove_file(self.real.join(disk.name()));
+                        self.env_remove(&disk.name());
                     }
                     drop(files);
+                    if let (Some(ord), Some((omem, odisk, okeep))) = (ord, ahead) {
+                        self.ord_settled(ord, &omem, &odisk, okeep)?;
+                    }
                     disk
                 }
             };
+            // The index of a store of files, written behind its segment;
+            // and in either store one composed after its segment had its
+            // envelope, which an open that found none makes.
             if let Some(ord) = ord {
-                let e = lock(&self.files).get(ord).cloned();
-                if let Some(Entry {
-                    mem: Some(mem),
-                    disk: None,
-                    ..
-                }) = e
-                {
+                let waits = matches!(
+                    lock(&self.files).get(ord),
+                    Some(Entry {
+                        mem: Some(_),
+                        disk: None,
+                        ..
+                    })
+                );
+                if waits {
                     let key = self
                         .unwrap(&Vault::file_aad(&disk.token), &disk.wrapped)
                         .ok_or_else(|| refused("a file's key does not unwrap under the store's"))?;
-                    let odisk = Disk {
-                        kind: Kind::Ord,
-                        ..disk.clone()
-                    };
-                    let keep = self.keeps(&mem);
-                    self.write_envelope(&mem, &odisk, &key, false)?;
-                    made = true;
-                    let mut files = lock(&self.files);
-                    let mut held = false;
-                    if let Some(e) = files.get_mut(ord) {
-                        if e.mem.as_ref().is_some_and(|m| Arc::ptr_eq(m, &mem)) {
-                            e.disk = Some(odisk.clone());
-                            held = true;
-                        }
+                    if let Some((mem, odisk, keep)) = self.ord_envelope(ord, &disk, &key)? {
+                        made = true;
+                        self.ord_settled(ord, &mem, &odisk, keep)?;
                     }
-                    if held {
-                        self.settled(&mut files, ord, &mem, &odisk, keep)?;
-                    }
-                    drop(files);
                 }
             }
             out.push((disk.token, disk.wrapped));
         }
-        if made && dir_sync {
+        // The directory's own fsync, for the names of the envelopes made.
+        // In the store's data file an envelope has no name of the
+        // directory's: a segment's was synced through its own handle with
+        // its index's ahead of it, and an index written behind its
+        // segment's sync -- one an open composed again -- is covered by the
+        // store's next sync of the data file and listed by the manifest
+        // after it (`Maint::one_look`), as a plain store's is.
+        if self.one().is_none() && made && dir_sync {
             OsFile::open(&self.real)?.sync_all()?;
         }
         Ok(out)
+    }
+
+    /// The ordered index `ord` of the segment under `disk`, written as an
+    /// envelope under the segment's token and `key` with no sync of its
+    /// own, where the store holds it in memory with none: the memory
+    /// file, the envelope's place and whether the cache keeps the
+    /// plaintext, for `ord_settled`. Nothing where the store holds no
+    /// such file or it has its envelope.
+    fn ord_envelope(
+        &self,
+        ord: &str,
+        disk: &Disk,
+        key: &Key,
+    ) -> Result<Option<(Arc<OsFile>, Disk, bool)>> {
+        let e = lock(&self.files).get(ord).cloned();
+        let Some(Entry {
+            mem: Some(mem),
+            disk: None,
+            ..
+        }) = e
+        else {
+            return Ok(None);
+        };
+        let odisk = Disk {
+            kind: Kind::Ord,
+            ..disk.clone()
+        };
+        let keep = self.keeps(&mem);
+        self.write_envelope(&mem, &odisk, key, false)?;
+        Ok(Some((mem, odisk, keep)))
+    }
+
+    /// `ord`, whose envelope `ord_envelope` wrote, named by it and handed
+    /// to the cache (`settled`), where the store still holds the memory
+    /// file under that name.
+    fn ord_settled(&self, ord: &str, mem: &Arc<OsFile>, odisk: &Disk, keep: bool) -> Result<()> {
+        let mut files = lock(&self.files);
+        let mut held = false;
+        if let Some(e) = files.get_mut(ord) {
+            if e.mem.as_ref().is_some_and(|m| Arc::ptr_eq(m, mem)) {
+                e.disk = Some(odisk.clone());
+                held = true;
+            }
+        }
+        if held {
+            self.settled(&mut files, ord, mem, odisk, keep)?;
+        }
+        Ok(())
     }
 
     /// `seg`'s compact form, the file the store holds as `form`, written to
@@ -1977,16 +2163,19 @@ impl Vault {
             ..sdisk
         };
         let keep = !cold && self.keeps(&mem);
-        let path = self.real.join(zdisk.name());
-        let tmp = self.real.join(format!("{}{ENVELOPE_TMP}", zdisk.name()));
+        let name = zdisk.name();
+        let tmp = format!("{name}{ENVELOPE_TMP}");
         self.write_envelope_at(&mem, &tmp, &key, sync)?;
         if cold {
-            if let Ok(f) = OsFile::open(&tmp) {
-                drop_cached(&f);
+            if let Ok(f) = self.env_open(&tmp) {
+                // Written back, waited for by range, which asks for no
+                // flush of the device, and the clean pages dropped.
+                let _ = f.written_back(0, 0);
+                f.drop_all();
             }
         }
-        std::fs::rename(&tmp, &path).inspect_err(|_| {
-            let _ = std::fs::remove_file(&tmp);
+        self.env_rename(&tmp, &name).inspect_err(|_| {
+            self.env_remove(&tmp);
         })?;
         let mut files = lock(&self.files);
         let held = match files.get_mut(form) {
@@ -2001,7 +2190,7 @@ impl Vault {
             self.settled(&mut files, form, &mem, &zdisk, keep)?;
         } else {
             // Removed while its envelope was written: nobody's.
-            let _ = std::fs::remove_file(&path);
+            self.env_remove(&name);
         }
         Ok(held)
     }
@@ -2027,7 +2216,7 @@ impl Vault {
             kind: Kind::Form,
             ..sdisk
         };
-        if !self.real.join(zdisk.name()).exists() {
+        if !self.env_exists(&zdisk.name()) {
             return false;
         }
         // The view another name over the same envelope has already.
@@ -2079,7 +2268,7 @@ impl Vault {
                 kind: Kind::Ord,
                 ..disk
             };
-            if !files.contains_key(ord) && self.real.join(odisk.name()).exists() {
+            if !files.contains_key(ord) && self.env_exists(&odisk.name()) {
                 let page = page_of(&files, &odisk);
                 files.insert(
                     ord.to_string(),
@@ -2114,6 +2303,11 @@ impl Vault {
     /// Whether the directory holds a segment's envelope: for an open that
     /// read no slot, and so knows none of them.
     fn holds_segments(&self) -> Result<bool> {
+        // A data file with anything past its head is a store's kept in
+        // one file, whose envelopes only a slot lists the places of.
+        if std::fs::metadata(self.real.join(onefile::NAME)).is_ok_and(|m| m.len() > onefile::HEAD) {
+            return Ok(true);
+        }
         for entry in std::fs::read_dir(&self.real)? {
             let name = entry?.file_name().to_string_lossy().into_owned();
             if matches!(disk_parse(&name), Some((_, Kind::Seg))) {
@@ -2129,7 +2323,73 @@ impl Vault {
         lock(&self.files)
             .get(name)
             .and_then(|e| e.disk.clone())
-            .is_some_and(|d| self.real.join(d.name()).exists())
+            .is_some_and(|d| match self.one() {
+                // Its place holding what the slot listed there
+                // (`One::on_device`).
+                Some(one) => one.on_device(&d.name()).unwrap_or(false),
+                None => self.real.join(d.name()).exists(),
+            })
+    }
+
+    /// What the manifest of sequence `seq` that names `files` carries
+    /// behind its own bytes where the store is kept in one file: the
+    /// table's section, the place of each segment's envelope under the
+    /// name its token gives it and, where a sync has covered them, of its
+    /// ordered index's and its form file's (`One::image`). `None` for a
+    /// store whose envelopes are files of the directory.
+    pub(crate) fn places(&self, seq: u64, files: &[FileKey]) -> Result<Option<Vec<u8>>> {
+        let Some(one) = self.one() else {
+            return Ok(None);
+        };
+        let segs: Vec<String> = files.iter().map(|(t, _)| disk_name(t, Kind::Seg)).collect();
+        let with: Vec<String> = files.iter().flat_map(|(t, _)| riders(t)).collect();
+        one.image(seq, &segs, &with).map(Some)
+    }
+
+    /// What the table may hold beside each of the segments the store has
+    /// under `segs` that has its envelope: `places`' second list for
+    /// them, for the segment work's look at what no manifest lists yet
+    /// (`Maint::one_look`).
+    pub(crate) fn beside<'a>(&self, segs: impl Iterator<Item = &'a str>) -> Vec<String> {
+        let files = lock(&self.files);
+        segs.filter_map(|s| {
+            files
+                .get(s)
+                .and_then(|e| e.disk.as_ref())
+                .filter(|d| d.kind == Kind::Seg)
+                .map(|d| d.token)
+        })
+        .flat_map(|t| riders(&t))
+        .collect()
+    }
+
+    /// The ordered index of each segment in `segs` known to the store
+    /// where its envelope is a file of the store's data file: for an open
+    /// of a store kept in one file, whose table is made what the slot
+    /// taken lists only once that slot is chosen, after the slots were
+    /// read and their segments made known (`adopt`), when no index was
+    /// there to be found.
+    pub(crate) fn adopt_ords(&self, segs: &[(String, Option<String>)]) {
+        let mut files = lock(&self.files);
+        for (seg, ord) in segs {
+            let (Some(ord), Some(disk)) = (ord, files.get(seg).and_then(|e| e.disk.clone())) else {
+                continue;
+            };
+            let odisk = Disk {
+                kind: Kind::Ord,
+                ..disk
+            };
+            if !files.contains_key(ord) && self.env_exists(&odisk.name()) {
+                files.insert(
+                    ord.clone(),
+                    Entry {
+                        mem: None,
+                        page: None,
+                        disk: Some(odisk),
+                    },
+                );
+            }
+        }
     }
 
     /// Every envelope in the directory that no file of the store is in,
@@ -2147,6 +2407,13 @@ impl Vault {
     /// with the marker as it was.
     pub(crate) fn sweep(&self) -> Result<usize> {
         let _ = std::fs::remove_file(self.real.join(format!("{MARKER}.tmp")));
+        // A data file beside a store that is not kept in one is nobody's:
+        // a creation's that never wrote its manifest. One that holds
+        // anything beside no slot was refused before this
+        // (`holds_segments`).
+        if self.one().is_none() {
+            let _ = std::fs::remove_file(self.real.join(onefile::NAME));
+        }
         let files = lock(&self.files);
         let mut swept = 0;
         for entry in std::fs::read_dir(&self.real)? {
@@ -4063,31 +4330,6 @@ pub(crate) fn persist_form(
         Some(v) => v.persist_form(seg, form, sync, cold).map(|_| ()),
         None => Ok(()),
     }
-}
-
-/// A file's pages written back and dropped from the kernel's cache: the
-/// writeback waited for by range, which asks for no flush of the device,
-/// then the clean pages dropped.
-fn drop_cached(file: &OsFile) {
-    #[cfg(target_os = "linux")]
-    {
-        use std::os::fd::AsRawFd;
-        // SAFETY: a writeback and an advice over a descriptor this call
-        // borrows; neither changes a byte of the file.
-        unsafe {
-            libc::sync_file_range(
-                file.as_raw_fd(),
-                0,
-                0,
-                libc::SYNC_FILE_RANGE_WAIT_BEFORE
-                    | libc::SYNC_FILE_RANGE_WRITE
-                    | libc::SYNC_FILE_RANGE_WAIT_AFTER,
-            );
-            libc::posix_fadvise(file.as_raw_fd(), 0, 0, libc::POSIX_FADV_DONTNEED);
-        }
-    }
-    #[cfg(not(target_os = "linux"))]
-    let _ = file;
 }
 
 /// The form file beside `seg` made known to the store as `form`, where a

@@ -214,15 +214,52 @@ file a store that mobile wants) after them.
   the states a rotation and a run's close leave built by hand.
   Pairings as O2, with the durable and buffered loads' phases
   (`SUPDB_LOAD_PHASES`, `SUPDB_DRAIN_STEPS`).
-- **O4 -- the sealing over extents.** Pagefile's S2-S3 with extents below
-  it: Once, Regen and Regen-lazy for segments, indexes and form files, the
-  tags apart, the pager's chunk a page; the log sealed as today, in its
-  extents. Arm `supdb-cipheronefile` beside `supdb-cipherauto`, the
-  envelope the default still. Pairings: against `supdb-cipherauto`, and
-  against `rocksdb-tuned-enc` and `lmdb-enc` in the cells the roster loses
-  (`ROADMAP.md`, what the encrypted roster says).
+- **O4 -- a store under a cipher kept in one file.** Built in the least
+  form its cells call for (the owner: "Try to stay focused and
+  efficient"): the envelope as it is -- header, chunks of 4,080 bytes
+  with their tags inline, the pager over it unchanged -- and each
+  envelope a file of the vault's own table in `store.one` under the name
+  it had in the directory (`x-<token>`, `.o`, `.z`). The manifest is the
+  one-file format's with the table's section behind it, the whole sealed
+  as a slot is; the log, the slots, the marker and the lock are files of
+  the directory still. A call that writes envelopes writes them with no
+  sync of their own and syncs the data file once at its end
+  (`Vault::persist_with`), a segment's and its index's under one flush.
+  What Pagefile's S2-S3 drew larger -- chunks of whole pages with the
+  tags apart, the classes -- waits for the stage that needs it: O5, where
+  a run sealed as it is written cannot have a header that holds its
+  length. Arms `supdb-cipheronefile` beside `supdb-cipher`,
+  `supdb-cipherautoonefile` beside `supdb-cipherauto`,
+  `supdb-ingestcipherautoonefile` buffered.
+  - **Predicted, before the first pairing** (`supdb-cipherautoonefile`
+    against `supdb-cipherauto`, ten million keys under 1.25 GiB,
+    `--passes load,lag`, then the row's passes). The mechanisms that
+    differ: no inode is freed, so the segment work's 5.4 s of 25 in
+    frees through the full rewrite (`CLAUDE.md`, a cost moved off the
+    threads that paid it) is not paid; no envelope has a name of the
+    directory's, so a landing makes no directory fsync; an envelope's
+    sync is a sync of the data file, which covers whatever else is dirty
+    in it; the page cache drops a retired envelope's pages at the room's
+    last holder and not at an unlink; every read is the pager's, through
+    a mapping of the envelope's range made through an open of its own.
+    So: the full rewrite's burst ahead, 1.05x to 1.2x (the plain store
+    read 1.2x; under a cipher the merges' decrypt and seal are more of
+    the burst and the frees less); the other bursts level to a few
+    percent ahead; the loads level to 1.05x; every scan pass level, the
+    cache and the chunks being the same. What would refute it: (1) the
+    pass after the full rewrite behind, with more pieces standing at it
+    -- landings later, each sync waiting on other merges' dirty
+    envelopes in the one file; (2) a pass behind with more major faults
+    on the scanning thread and the same pieces -- the kernel's readahead
+    or the drop of a range behaving differently over a range of one file
+    than over a file; (3) a burst behind -- the reservation's unwritten
+    extents converted at each sync (`ROADMAP.md`, what leans); (4) the
+    group killed -- a memory file and its envelope's pages in the data
+    file both standing where the files layout had dropped one.
 - **O5 -- the run its own log under a cipher, the controller on.**
-  Pagefile's S4-S5 (the Log class, `finish`), E4's model first.
+  Pagefile's S4-S5 (the Log class, `finish`), E4's model first; and with
+  it the sealing O4 left as it was: chunks of whole pages, the tags
+  apart, sealed as the file is written.
 - **O6 -- the defaults.** Each flipped only where the suite reads it better
   and the gate passes with it on: the plain store's layout, the cipher's.
   An old store's rewrite at its first open, the docs, the arms of the

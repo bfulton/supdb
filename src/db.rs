@@ -19337,7 +19337,7 @@ impl SlotChoice {
             self.landed(slot);
             // On the device: what no manifest from this one on lists is
             // room a store in one file may write over.
-            if let Some(one) = vault::one_under(dir) {
+            if let Some(one) = vault::one_of(dir) {
                 one.durable(seq);
             }
         }
@@ -19490,8 +19490,22 @@ fn manifest_image(
     match vault::stored(dir) {
         vault::Stored::Files => Ok(manifest_encode(seq, covered_seq, needs_log, names, pending)),
         vault::Stored::Vault(v) => {
-            let out = manifest_encode(seq, covered_seq, needs_log, names, pending);
+            // Every segment's envelope first. Where the store is kept in
+            // one file the manifest is a store in one file's, with the
+            // place of each envelope behind it under the name its token
+            // gives it (`Vault::places`); and either way the whole is
+            // sealed as a slot under a cipher is.
             let files = v.persist(&Db::with_ords(names), true)?;
+            let places = v.places(seq, &files)?;
+            let format = match places {
+                Some(_) => STORE_FORMAT_ONE,
+                None => STORE_FORMAT,
+            };
+            let mut out =
+                manifest_encode_with(seq, covered_seq, names, pending, Some(format), needs_log);
+            if let Some(places) = &places {
+                out.extend_from_slice(places);
+            }
             v.seal_manifest(seq, &out, &files)
         }
         // A store kept in one file: its own format version, and behind
@@ -40274,7 +40288,13 @@ impl Db {
     /// nothing for a store of files (`Options::one_file`).
     #[doc(hidden)]
     pub fn one_counts(&self) -> Option<OneCounts> {
-        self.one.as_ref().map(|o| o.one().counts())
+        // A plain store's table is the store's own registration, and a
+        // store under a cipher keeps its envelopes in its vault's, found
+        // by the directory the engine names its files in.
+        match &self.one {
+            Some(o) => Some(o.one().counts()),
+            None => vault::one_of(&self.dir).map(|o| o.counts()),
+        }
     }
 
     /// Where the file the store open at `dir` keeps in its data file
@@ -40282,7 +40302,7 @@ impl Db {
     /// reads what the kernel holds of one file's pages or damages them.
     #[doc(hidden)]
     pub fn one_place(dir: &Path, name: &str) -> Option<(u64, u64)> {
-        vault::one_under(dir)?.place(name)
+        vault::one_of(dir)?.place(name)
     }
 
     /// The names of the files the store open at `dir` keeps in its data
@@ -40291,7 +40311,7 @@ impl Db {
     /// A test's, which finds a store's segments by their names.
     #[doc(hidden)]
     pub fn one_names(dir: &Path) -> Vec<String> {
-        vault::one_under(dir).map(|o| o.names()).unwrap_or_default()
+        vault::one_of(dir).map(|o| o.names()).unwrap_or_default()
     }
 
     /// The bytes of the file the store open at `dir` keeps in its data
@@ -40300,7 +40320,7 @@ impl Db {
     /// files by their names.
     #[doc(hidden)]
     pub fn one_read(dir: &Path, name: &str) -> Option<Vec<u8>> {
-        vault::one_under(dir)?.bytes(name)
+        vault::one_of(dir)?.bytes(name)
     }
 
     /// What the store has done with its cipher since it was opened, or
@@ -41173,18 +41193,21 @@ impl Db {
         // and a vault is made in one; and on the directory itself, before
         // a cipher's stands in for it below.
         let lock = StoreLock::take(dir)?;
-        let decoy = held.as_ref().map(vault::Held::dir);
-        let dir = decoy.as_deref().unwrap_or(dir);
         // A store kept in one file (`Options::one_file`): its data file
         // made, and its table the door's from here, before the first
         // manifest is written, which says how the store is kept, and whose
-        // directory fsync below is the data file's name's too. Nothing
-        // under a cipher, whose files are the vault's.
-        let one = if opts.one_file && held.is_none() {
-            Some(vault::hold_one(onefile::One::create(dir)?))
-        } else {
-            None
+        // directory fsync below is the data file's name's too. Under a
+        // cipher the table is the vault's, whose envelopes are its files.
+        let one = match (&held, opts.one_file) {
+            (_, false) => None,
+            (None, true) => Some(vault::hold_one(onefile::One::create(dir)?)),
+            (Some(h), true) => {
+                h.vault().keep_in(onefile::One::create(dir)?);
+                None
+            }
         };
+        let decoy = held.as_ref().map(vault::Held::dir);
+        let dir = decoy.as_deref().unwrap_or(dir);
         let mut wal = Wal::create(&Db::wal_path(dir, 0), 0, WAL_CHAINED)?;
         if let Some((cap, reuses, frames)) = wal_hold(&opts) {
             wal.set_hold(cap, reuses, frames);
@@ -41792,20 +41815,35 @@ impl Db {
                         MANIFEST_SLOTS[m.slot]
                     ))
                 };
-                if held.is_some() {
-                    return Err(refused(
-                        "which a store opened with a key of the caller's is not".into(),
-                    ));
-                }
                 if !opts.manifest_slots || opts.manifest_pending {
                     return Err(refused(
                         "which opens under neither manifest_pending nor manifest_slots off".into(),
                     ));
                 }
-                let one = onefile::One::open(dir).map_err(|e| refused(format!("and {e}")))?;
-                one.adopt(m.seq, &m.extents)
-                    .map_err(|e| refused(format!("and {e}")))?;
-                Some(vault::hold_one(one))
+                match &held {
+                    None => {
+                        let one =
+                            onefile::One::open(dir).map_err(|e| refused(format!("and {e}")))?;
+                        one.adopt(m.seq, &m.extents)
+                            .map_err(|e| refused(format!("and {e}")))?;
+                        Some(vault::hold_one(one))
+                    }
+                    // Under a cipher the table is the vault's, and the
+                    // files it lists places for are envelopes: the ordered
+                    // indexes among them are made known to the store now
+                    // that the table holds them, the slots having been
+                    // read before it did.
+                    Some(h) => {
+                        let v = h.vault();
+                        let one = onefile::One::open(v.real_dir())
+                            .map_err(|e| refused(format!("and {e}")))?;
+                        one.adopt(m.seq, &m.extents)
+                            .map_err(|e| refused(format!("and {e}")))?;
+                        v.keep_in(one);
+                        v.adopt_ords(&Db::with_ords(&m.names));
+                        None
+                    }
+                }
             }
             _ => None,
         };
@@ -56072,12 +56110,17 @@ impl Maint {
             return;
         }
         let op = self.op();
-        let with: Vec<String> = self
-            .segs()
-            .iter()
-            .flat_map(|s| [Db::ord_name_for(&s.name), zfile::zpg_name_for(&s.name)])
-            .flatten()
-            .collect();
+        // By the names the table holds them under: their own, or under a
+        // cipher their envelopes'.
+        let with: Vec<String> = match vault::under(&self.dir) {
+            Some(v) => v.beside(self.segs().iter().map(|s| s.name.as_str())),
+            None => self
+                .segs()
+                .iter()
+                .flat_map(|s| [Db::ord_name_for(&s.name), zfile::zpg_name_for(&s.name)])
+                .flatten()
+                .collect(),
+        };
         let (mut list, sync) = one.owed(&with);
         if sync {
             let since = *self.one_wait.get_or_insert_with(std::time::Instant::now);
@@ -56121,7 +56164,7 @@ impl Maint {
             // the passes they ran beside.
             eprintln!("zepoch mono={:.6}", mono_secs());
         }
-        let one = vault::one_under(dir);
+        let one = vault::one_of(dir);
         if one.is_some() {
             r.shared
                 .slot_watching

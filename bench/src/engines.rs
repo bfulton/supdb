@@ -4945,6 +4945,50 @@ impl Supdb {
         )
     }
 
+    /// `supdb-cipher` kept in one file (`Options::one_file` beside
+    /// `Encryption::Cipher`): its envelopes extents of one data file,
+    /// which a merge's retired inputs are room in where a store of files
+    /// frees them. `supdb-cipheronefile`.
+    pub fn create_cipher_onefile(path: &Path) -> Res<Supdb> {
+        Supdb::with_policy(
+            path,
+            Policy {
+                cipher: true,
+                onefile: true,
+                ..Policy::default()
+            },
+        )
+    }
+
+    /// `supdb-cipherauto` kept in one file: `supdb-cipherautoonefile`.
+    pub fn create_cipherauto_onefile(path: &Path) -> Res<Supdb> {
+        Supdb::with_policy(
+            path,
+            Policy {
+                cipher: true,
+                cipher_auto: true,
+                onefile: true,
+                ..Policy::default()
+            },
+        )
+    }
+
+    /// `supdb-ingestcipherauto` kept in one file:
+    /// `supdb-ingestcipherautoonefile`.
+    pub fn create_ingest_cipherauto_onefile(path: &Path) -> Res<Supdb> {
+        Supdb::with_policy(
+            path,
+            Policy {
+                cipher: true,
+                cipher_auto: true,
+                onefile: true,
+                partition: false,
+                durable: false,
+                ..Policy::default()
+            },
+        )
+    }
+
     /// `supdb-ingest` as `supdb-onefile`.
     pub fn create_ingest_onefile(path: &Path) -> Res<Supdb> {
         Supdb::with_policy(
@@ -12064,6 +12108,9 @@ impl Engine for Supdb {
         if self.cipher {
             let zstride = self.zstride == Some(supdb::ZStride::Forced);
             return match self.durable {
+                true if self.onefile && self.cipher_auto => "supdb-cipherautoonefile",
+                false if self.onefile && self.cipher_auto => "supdb-ingestcipherautoonefile",
+                true if self.onefile => "supdb-cipheronefile",
                 true if self.zpages && zstride && self.cipher_apart => "supdb-cipherzstrideapart",
                 true if self.zpages && zstride && self.cipher_half => "supdb-cipherzstridehalf",
                 true if self.cipher_half => "supdb-cipherhalf",
@@ -15953,6 +16000,8 @@ pub fn guarantee(arm: &str) -> Option<Guarantee> {
         | "supdb-cipher64"
         | "supdb-cipherlog"
         | "supdb-cipherauto"
+        | "supdb-cipheronefile"
+        | "supdb-cipherautoonefile"
         | "supdb-cipherautolandmodel"
         | "supdb-cipherautomergeapart"
         | "supdb-cipherautomergestream"
@@ -16475,6 +16524,7 @@ pub fn guarantee(arm: &str) -> Option<Guarantee> {
         | "supdb-ingestcipher"
         | "supdb-ingestcipherlog"
         | "supdb-ingestcipherauto"
+        | "supdb-ingestcipherautoonefile"
         // A write-once segment makes nothing durable before its one sync.
         | "supdb-segment"
         | "supdb-segment-enc"
@@ -16602,6 +16652,11 @@ pub fn open(arm: &str, dir: &Path, map_gb: usize) -> Res<Box<dyn Engine>> {
         "supdb-cipherlog" => supdb_arm(Supdb::create_cipherlog, dir)?,
         "supdb-ingestcipherlog" => supdb_arm(Supdb::create_ingest_cipherlog, dir)?,
         "supdb-cipherauto" => supdb_arm(Supdb::create_cipherauto, dir)?,
+        "supdb-cipheronefile" => supdb_arm(Supdb::create_cipher_onefile, dir)?,
+        "supdb-cipherautoonefile" => supdb_arm(Supdb::create_cipherauto_onefile, dir)?,
+        "supdb-ingestcipherautoonefile" => {
+            supdb_arm(Supdb::create_ingest_cipherauto_onefile, dir)?
+        }
         "supdb-cipherautolandmodel" => supdb_arm(Supdb::create_cipherauto_landmodel, dir)?,
         "supdb-cipherautomergeapart" => supdb_arm(Supdb::create_cipherauto_mergeapart, dir)?,
         "supdb-cipherautomergestream" => supdb_arm(Supdb::create_cipherauto_mergestream, dir)?,
@@ -21728,6 +21783,23 @@ mod tests {
                 let z = Supdb::create_ingest_onefile(&dir("ingestonefile")).unwrap();
                 assert_eq!(z.name(), "supdb-ingestonefile");
                 assert!(z.db.as_ref().unwrap().options().one_file);
+                // And under a cipher, the envelopes in the data file.
+                #[cfg(target_os = "linux")]
+                {
+                    let z = Supdb::create_cipher_onefile(&dir("cipheronefile")).unwrap();
+                    assert_eq!(z.name(), "supdb-cipheronefile");
+                    let o = z.db.as_ref().unwrap().options();
+                    assert!(o.one_file && !o.zpages_under_cipher);
+                    assert!(z.db.as_ref().unwrap().one_counts().is_some());
+                    let z = Supdb::create_cipherauto_onefile(&dir("cipherautoonefile")).unwrap();
+                    assert_eq!(z.name(), "supdb-cipherautoonefile");
+                    let o = z.db.as_ref().unwrap().options();
+                    assert!(o.one_file && o.zpages_under_cipher);
+                    let z = Supdb::create_ingest_cipherauto_onefile(&dir("ingestcipherautoonefile"))
+                        .unwrap();
+                    assert_eq!(z.name(), "supdb-ingestcipherautoonefile");
+                    assert!(z.db.as_ref().unwrap().options().one_file);
+                }
                 let z = Supdb::create_jobsheap(&dir("jobsheap")).unwrap();
                 assert_eq!(z.name(), "supdb-jobsheap");
                 assert_eq!(z.features(), base.features());

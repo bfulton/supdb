@@ -114,7 +114,10 @@
 //!   read of room given away too soon, or a slot naming room since
 //!   written over, is a difference from `r` or a store refused. The
 //!   concurrent range's one store is kept so too. A flag and not a draw;
-//!   a range in which no store kept a file in its data file fails.
+//!   a range in which no store kept a file in its data file fails. With
+//!   `ZFUZZ_CIPHER` the files there are the store's envelopes, a crash a
+//!   store whose memory files are gone and whose data file holds what a
+//!   manifest listed and what its dead threads were writing.
 //! - `ZFUZZ_RECYCLE=1`: both stores write their log's files again in
 //!   place (`Options::recycle_wal`), so a log behind which its last life's
 //!   records lie is replayed after every crash; a flag and not a draw.
@@ -2934,13 +2937,9 @@ fn run_range() {
         assert!(zreads > 0, "no read or scan went through a form file");
     }
     // And a run under `ZFUZZ_ONEFILE` is a run of two stores of files
-    // unless `z` kept files in its data file; under a cipher the option
-    // does nothing yet, and says so.
+    // unless `z` kept files in its data file: its segments, or under
+    // `ZFUZZ_CIPHER` their envelopes.
     if one_file_on() && ran > 0 {
-        assert!(
-            !under_cipher(),
-            "ZFUZZ_ONEFILE beside ZFUZZ_CIPHER: a store under a cipher is not kept in one file yet"
-        );
         assert!(one > 0, "no store kept a file in its data file");
     }
 }

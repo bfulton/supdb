@@ -7666,6 +7666,13 @@ pub(super) struct BuildPlan {
     /// make.
     #[cfg(test)]
     pub residency_unknown: bool,
+    /// A test's: called with the stride file's temp name once the build
+    /// has dropped its output and before it looks at what the cache holds
+    /// of it (`reads_device`), for a test that reads pages of the file
+    /// back in as a neighbour's read-around does in a store kept in one
+    /// file.
+    #[cfg(test)]
+    pub beside: Option<fn(&Path)>,
 }
 
 impl BuildPlan {
@@ -7696,6 +7703,8 @@ impl BuildPlan {
             damage: None,
             #[cfg(test)]
             residency_unknown: false,
+            #[cfg(test)]
+            beside: None,
         }
     }
 
@@ -9122,6 +9131,55 @@ fn read_back_residency(map: &MmapBytes, plan: &BuildPlan) -> Option<f64> {
     map.resident_share(0, map.len() as usize)
 }
 
+/// Whether the read-back about to begin over `map`, the stride file at
+/// `tmp` mapped, reads the device: none of the file's pages in the page
+/// cache now (`read_back_residency`).
+///
+/// A build that dropped its output (`BuildPlan::drop_output`) and finds
+/// pages of it in the cache all the same drops the file again and looks
+/// again, twice at the most. In a store of files nothing brings a page of
+/// a file under its temp name back. In a store kept in one file
+/// (`Options::one_file`) a neighbour does: the kernel reads around a
+/// mapping's fault in the file the mapping is of, half its readahead
+/// window to either side, and stops at that file's end and not at the
+/// mapping's, which in the data file is the next file's first pages or the
+/// one before's last. A build's read-back beside this one, opening its
+/// file at the trailer, read fourteen pages of the next build's file back
+/// in a few hundred microseconds after that build had dropped them, by a
+/// trace of the two threads' calls, and the file was left with no word for
+/// its attach (`Built::left_seal`): one file of seventeen built two at a
+/// time, in one run in twelve. The pages so read are the device's, read
+/// after this build's writeback was waited for and its pages dropped. What
+/// a look cannot tell them from is a page the drop skipped, which is the
+/// cache's copy of what was written. So the file is dropped again, and a
+/// look that then finds nothing says the copy written is out of the cache:
+/// whatever page comes into it after that is read from the device, by this
+/// read-back or by a neighbour's reading around. A page a mapping holds is
+/// skipped by every drop, and is a read-back of the cache as before.
+///
+/// `asks` is a build whose mappings lend nothing whole
+/// (`StrideWalked::ASKS`), under a cipher: its output is a memory file,
+/// which no drop puts on a device.
+fn reads_device(tmp: &Path, map: &MmapBytes, plan: &BuildPlan, asks: bool) -> bool {
+    #[cfg(test)]
+    if let Some(beside) = plan.beside {
+        beside(tmp);
+    }
+    for looks in 1..=3 {
+        match read_back_residency(map, plan) {
+            Some(share) if share == 0.0 => return true,
+            Some(_) if plan.drop_output && !asks && looks < 3 => {
+                let Ok(f) = super::vault::open(tmp) else {
+                    return false;
+                };
+                f.drop_range(0, 0);
+            }
+            _ => return false,
+        }
+    }
+    false
+}
+
 /// What the read-back of a stride file found (`check_stride`).
 enum StrideCheck {
     /// Every rank read back; `device` where none of the file's pages was in
@@ -9177,7 +9235,7 @@ fn check_stride<I: Images, W: StrideWalked>(
 ) -> Result<StrideCheck> {
     let refused = StrideCheck::Refused(Outcome::NotStride(StrideNo::SelfCheck));
     let map = by.map_out(tmp)?;
-    let device = read_back_residency(&map, plan) == Some(0.0);
+    let device = reads_device(tmp, &map, plan, W::ASKS);
     // The file's range, and for a build whose mappings lend nothing whole
     // each range of it asked for before it is read (`StrideWalked::ASKS`):
     // the trailer and the resident part here, and a page where it is
@@ -18250,6 +18308,51 @@ mod tests {
         let map = MmapBytes::open(tmp).unwrap();
         std::hint::black_box(map.slice_at(ZPAGE as u64, 1).unwrap()[0]);
         *HELD_MAPPING.lock().unwrap() = Some(map);
+    }
+
+    /// A neighbour's read of a stride file's pages after the build dropped
+    /// them: the first pages of the file under its temp name read through
+    /// the page cache, as a mapping's read-around in the data file of a
+    /// store kept in one reads the next file's (`reads_device`).
+    #[cfg(target_os = "linux")]
+    fn read_its_first_pages(tmp: &Path) {
+        use std::os::unix::fs::FileExt;
+        let mut buf = vec![0u8; 14 * ZPAGE];
+        std::fs::File::open(tmp)
+            .unwrap()
+            .read_exact_at(&mut buf, 0)
+            .unwrap();
+    }
+
+    /// Pages of a stride file that came back into the cache after the
+    /// build dropped it are the device's, and the build's read-back is of
+    /// the device all the same: the file is dropped again and found out of
+    /// the cache before the read-back begins, so the build leaves its word
+    /// (`Built::left_seal`). Without the second drop the build of a store
+    /// kept in one file lost the word wherever a neighbour's read-back read
+    /// around its own file's end. A page a mapping holds is no such page:
+    /// every drop skips it, and the build is checked as before, which
+    /// `a_stride_build_is_trusted_only_where_its_read_back_read_the_device`
+    /// holds with the second drop in place.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn pages_read_back_in_after_a_builds_drop_are_dropped_before_its_read_back() {
+        let fx = stride_fixture("stride-redrop", 3000, 100, 0x5e);
+        let _ = std::fs::remove_file(&fx.out);
+        let plan = BuildPlan {
+            drop_output: true,
+            beside: Some(read_its_first_pages as fn(&Path)),
+            ..stride_plan(StrideAsk::OrBlock)
+        };
+        let b = match build(&fx.seg, &fx.out, ID, END, &plan).unwrap() {
+            Outcome::Built(b) if b.coding == FileCoding::Stride => b,
+            other => panic!("not a stride file: {other:?}"),
+        };
+        assert!(b.file_bytes > 16 * ZPAGE as u64, "pages to read back in");
+        assert!(
+            b.stride_device && b.left_seal().is_some(),
+            "pages read back in after the drop left the build with no word"
+        );
     }
 
     /// A stride build is trusted -- at the attach that follows it and at a

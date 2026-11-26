@@ -1278,7 +1278,11 @@ turned on neither.
     group's memory by kind through the pass (`scripts/groupmem.py`), and
     whether one inode's page cache under reclaim is the cost, every file
     of the store being pages of one file where the default's are of
-    dozens.
+    dozens. A third since: the kernel's read-around at a mapping's fault
+    stops at the data file's end and not at the mapped file's
+    (`CLAUDE.md`, a file's edge), so a mapping left at the default advice
+    reads sixteen pages of each neighbour; which mappings of that pass
+    are, and what they bring in, is not counted.
   - The clean store's scan pass under 1.25 GiB, 0.79x in no pair of
     three in one sitting, with half again the major faults, and level in
     the next.
@@ -1291,6 +1295,22 @@ turned on neither.
   - Writes into room reserved and never written convert the extent at
     each writeback's end on ext4 (the kernel's log counted them); not
     priced in the loads' sync phases.
+  - A stride file built ahead and dropped keeps no word for a trusted
+    attach where pages of it are in the cache as its read-back begins
+    and two more drops do not take them (`zfile::reads_device`), and is
+    checked page by page at its first touches instead. The one cause
+    found, a neighbour's read-around, is what the second drop is for.
+    Another is not found: every page of one file of seventeen resident
+    through three looks and through a drop of the whole data file's
+    cache -- so held, dirty or under writeback -- in 6 runs of 1,540 of
+    `the_words_kept_for_stride_files_are_held_to_the_live_partitions`
+    under `SUPDB_TEST_ONEFILE=1`, four at once, and in none of the 7,200
+    after, 800 of them with the memory group at its limit. What would
+    tell the three apart, at the third look: a writeback of the whole
+    data file waited for and a drop behind it, the process's mappings
+    over the file's range (`/proc/self/maps`), and the table's counts.
+    Not seen as a store of files in 860 runs, which at that rate proves
+    nothing.
   The row's passes under 1.25 GiB, paired at `b22446f` with each mapping
   on an open of its own (`pair.sh supdb-onefile supdb 10000000 --bound
   1342177280 --passes
