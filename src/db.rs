@@ -1071,6 +1071,9 @@ pub struct ZCounts {
     /// (`zselect::model_raw`).
     pub model_hash_bytes: u64,
     pub model_record_bytes: u64,
+    /// The store's files whole as the tick last summed them, the level-0
+    /// pieces' with the partitions' (`Options::heads_owned_past_fill`).
+    pub model_whole_bytes: u64,
     /// Form files the controller retired.
     pub retired: u64,
     /// Stride files built, and the builds that asked for the stride form
@@ -6732,6 +6735,36 @@ pub struct Options {
     /// none. On; `supdb-headsmodel` is the model's word alone.
     #[doc(hidden)]
     pub heads_owned_beside_copies: bool,
+    /// The heads of a partition the raw form serves are copied while the
+    /// controller's model says the raw form fits and it is asking nothing
+    /// -- the raw gate, where `z_heads_look` made no copy -- wherever the
+    /// store's files whole -- every segment's hash region, record region
+    /// and ordered index, the level-0 pieces' with the partitions' --
+    /// have stood past the fill share of its budget (`zselect::FORM_FILL`,
+    /// the share that leaves the cache's other tenants theirs) at a
+    /// reading of the model, and from then on. The model's fit is of the
+    /// pages a read touches, the partitions' two populations, and a burst
+    /// puts a store's worth of pieces in the cache beside them: the group
+    /// comes to its limit, and the kernel takes the pages written once
+    /// and never read first, the ordered indexes of the partitions the
+    /// burst's merges had just landed. With the copies of fixed-size
+    /// records a fifth smaller (`Options::copy_packed`) a store of three
+    /// million keys under 1.25 GiB never left the raw gate through a full
+    /// rewrite, no head was copied, and half the passes after it took two
+    /// hundred major faults on their scans' seeks, three times a pass's
+    /// length, where the larger process had tripped the census and had
+    /// its seventeen partitions' heads copied. The line is the store's own
+    /// arithmetic and not a reading of the group, so it is crossed in the
+    /// middle of the burst, seconds ahead of the limit: read as the
+    /// group's unused memory less the margin, once a second, the limit
+    /// was seen in half the sweeps, and read as the kernel's count of the
+    /// times the limit was met (`memory.failcnt`) it was seen in none
+    /// before the pass, the group first meeting its limit as the burst
+    /// ends. Off leaves the raw gate's heads the page cache's;
+    /// `supdb-headspastfill` is the arm, and `supdb-copypackedheads` with
+    /// the packed copy.
+    #[doc(hidden)]
+    pub heads_owned_past_fill: bool,
     /// The hot-raw policy's skew bar read against the room
     /// (`Maint::z_hot_look`): the candidate partition is asked for where its
     /// raw bytes fit the group's unused memory and it is read more a key
@@ -7918,6 +7951,7 @@ impl Default for Options {
             heads_look_ms: 0,
             heads_owned: true,
             heads_owned_beside_copies: true,
+            heads_owned_past_fill: false,
             zpages_hot_skew_room: false,
             zpages_hot_room_margin_pct: 0,
             zpages_walk_owns_decodes: false,
@@ -22209,7 +22243,7 @@ struct Shared {
     /// those made for a grant of the records' place alone, the model
     /// saying the raw form does not fit
     /// (`Options::heads_owned_beside_copies`).
-    heads_events: [AtomicU64; 3],
+    heads_events: [AtomicU64; 4],
     /// The dead names given to retired form files (`zfile::zpg_dead_name`).
     next_dead: AtomicU64,
     /// A test's holds on the builder's thread (`ZHOLD_START`,
@@ -27985,6 +28019,7 @@ impl Reader {
             footprint_held: get(&ev.footprint_held),
             model_hash_bytes: get(&ev.model_hash),
             model_record_bytes: get(&ev.model_records),
+            model_whole_bytes: get(&ev.model_whole),
             retired: get(&ev.retired),
             stride_builds: get(&ev.stride_builds),
             stride_declines: std::array::from_fn(|i| get(&ev.stride_declines[i])),
@@ -38614,7 +38649,12 @@ impl Db {
             z: zfile::ZEvents::default(),
             retired_z: RetireList::new(),
             retired_heads: RetireList::new(),
-            heads_events: [AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0)],
+            heads_events: [
+                AtomicU64::new(0),
+                AtomicU64::new(0),
+                AtomicU64::new(0),
+                AtomicU64::new(0),
+            ],
             next_dead: AtomicU64::new(1),
             zbuild_hold: std::sync::Arc::new(std::sync::atomic::AtomicU8::new(zhold_of(&opts))),
             z_finish_live: std::sync::atomic::AtomicUsize::new(0),
@@ -39455,7 +39495,12 @@ impl Db {
             z: zev,
             retired_z: RetireList::new(),
             retired_heads: RetireList::new(),
-            heads_events: [AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0)],
+            heads_events: [
+                AtomicU64::new(0),
+                AtomicU64::new(0),
+                AtomicU64::new(0),
+                AtomicU64::new(0),
+            ],
             next_dead: AtomicU64::new(1),
             zbuild_hold: std::sync::Arc::new(std::sync::atomic::AtomicU8::new(zhold_of(&opts))),
             z_finish_live: std::sync::atomic::AtomicUsize::new(0),
@@ -47227,6 +47272,14 @@ impl Db {
         )
     }
 
+    /// The copies of heads made under the raw gate, the store's files
+    /// whole past the fill share of its budget
+    /// (`Options::heads_owned_past_fill`).
+    #[doc(hidden)]
+    pub fn heads_past_fill(&self) -> u64 {
+        self.shared.heads_events[3].load(AtomicOrdering::Relaxed)
+    }
+
     /// The copies of heads made for a grant of the records' place alone,
     /// the controller's model saying the raw form does not fit
     /// (`Options::heads_owned_beside_copies`).
@@ -50961,6 +51014,11 @@ struct Maint {
     /// bytes (`z_misfit_is_the_caches`): with no point read near, the
     /// store reads as left raw for `z_heads_look` all the same.
     z_misfit_caches: bool,
+    /// Whether the store's files whole have stood past the fill share of
+    /// its budget at a reading of the model (`z_model`): what
+    /// `z_heads_look` copies heads on under the raw gate
+    /// (`Options::heads_owned_past_fill`).
+    z_past_fill: bool,
     /// The coding the selector chose at its last reading
     /// (`Options::zpages_coding_auto`, `zselect::choose_coding`), which the
     /// builds after it are planned in; none until a reading with both
@@ -51740,6 +51798,7 @@ impl Maint {
             z_refresh_due: false,
             z_leaves_raw: false,
             z_misfit_caches: false,
+            z_past_fill: false,
             z_coding_pick: None,
             z_pick_size: None,
             z_ops_life: 0,
@@ -53520,7 +53579,13 @@ impl Maint {
             return;
         }
         let gate = self.shared.zgate.load();
-        if gate == zselect::GATE_RAW {
+        // Under the raw gate the heads are the page cache's, which holds
+        // them while the store fits -- and does not once the store's
+        // files whole have outgrown the cache's share of the budget,
+        // whatever the model says of the pages a read touches
+        // (`Options::heads_owned_past_fill`).
+        let past_fill = self.opts.heads_owned_past_fill && self.z_past_fill;
+        if gate == zselect::GATE_RAW && !past_fill {
             return;
         }
         let near = self.scans_near();
@@ -53548,6 +53613,9 @@ impl Maint {
                     !served && seg.z_declined.load(AtomicOrdering::Relaxed) != 0,
                     false,
                 )
+            } else if gate == zselect::GATE_RAW {
+                // Every partition is the raw form's here.
+                (true, false)
             } else {
                 (census_raw, !model_raw)
             };
@@ -53563,6 +53631,9 @@ impl Maint {
                 self.shared.heads_events[0].fetch_add(1, AtomicOrdering::Relaxed);
                 if by_place {
                     self.shared.heads_events[2].fetch_add(1, AtomicOrdering::Relaxed);
+                }
+                if gate == zselect::GATE_RAW {
+                    self.shared.heads_events[3].fetch_add(1, AtomicOrdering::Relaxed);
                 }
                 // The mapping's pages are no seek's now: out of this
                 // process's tables, and out of the cache where it lets
@@ -58362,15 +58433,19 @@ impl Maint {
                 rate
             }
         };
-        let (hash, records) = {
+        // The populations a read touches, the partitions', and beside
+        // them the store's files whole: every segment's two regions and
+        // its ordered index, the level-0 pieces' with the partitions'.
+        let (hash, records, whole) = {
             let _op = self.op();
-            self.segs()
-                .iter()
-                .filter(|s| s.level > 0)
-                .fold((0u64, 0u64), |(h, r), s| {
-                    let (sh, sr) = s.foot();
-                    (h.saturating_add(sh), r.saturating_add(sr))
-                })
+            self.segs().iter().fold((0u64, 0u64, 0u64), |(h, r, w), s| {
+                let w = w.saturating_add(s.raw_bytes());
+                if s.level == 0 {
+                    return (h, r, w);
+                }
+                let (sh, sr) = s.foot();
+                (h.saturating_add(sh), r.saturating_add(sr), w)
+            })
         };
         self.shared
             .z
@@ -58380,7 +58455,19 @@ impl Maint {
             .z
             .model_records
             .store(records, AtomicOrdering::Relaxed);
+        self.shared
+            .z
+            .model_whole
+            .store(whole, AtomicOrdering::Relaxed);
         self.z_past_budget = hash.saturating_add(records) > budget;
+        // The store whole past the fill share of its budget
+        // (`Options::heads_owned_past_fill`): the cache then holds more of
+        // the store's than the budget leaves it, whatever the model says
+        // of the pages a read touches, and the kernel is taking some. Once
+        // past, the store is one whose cache the kernel shrinks: a merge
+        // that folds the pieces away takes the sum back under the line
+        // while the pages it wrote stand in the cache still.
+        self.z_past_fill |= whole > zselect::form_fill(budget);
         let (phi_z, phi_z_scan) = match self.z_sample_size {
             Some((w_z, resident, pages_per_key)) => {
                 let z = zselect::model_z(budget, resident, w_z);

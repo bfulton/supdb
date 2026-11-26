@@ -1458,6 +1458,12 @@ pub struct Supdb {
     /// (`Options::copy_packed`): `supdb-copypacked` and
     /// `supdb-ingestcopypacked`.
     copypacked: bool,
+    /// A raw partition's heads copied under the raw gate once the store's
+    /// files whole are past the fill share of its budget
+    /// (`Options::heads_owned_past_fill`):
+    /// `supdb-headspastfill`, and with the packed copy
+    /// `supdb-copypackedheads`.
+    headspastfill: bool,
     /// A settle's patch searches a copy for a key above its last entry
     /// (`Options::settle_append_last` off): `supdb-settlesearch` and
     /// `supdb-ingestsettlesearch`.
@@ -2932,6 +2938,9 @@ struct Policy {
     identityblob: bool,
     /// A copy of fixed-size records as one stream: `...copypacked`.
     copypacked: bool,
+    /// Heads copied under the raw gate past the fill line:
+    /// `...headspastfill`.
+    headspastfill: bool,
     /// The patch's search for an appended key: `...settlesearch`.
     settlesearch: bool,
     /// The patch's walk of the sources for a lone key: `...settlesources`.
@@ -3575,6 +3584,7 @@ impl Default for Policy {
             copyspan: false,
             identityblob: false,
             copypacked: false,
+            headspastfill: false,
             settlesearch: false,
             settlesources: false,
             scanlevers: false,
@@ -10521,6 +10531,7 @@ impl Supdb {
             copyspan,
             identityblob,
             copypacked,
+            headspastfill,
             settlesearch,
             settlesources,
             scanlevers,
@@ -11176,6 +11187,7 @@ impl Supdb {
             copy_prefetch_span: copyspan,
             identity_by_keys: !identityblob,
             copy_packed: copypacked,
+            heads_owned_past_fill: headspastfill,
             settle_append_last: !settlesearch,
             settle_lone_chain: !settlesources,
             forms_convert_from: if densefrom > 0 {
@@ -11586,6 +11598,7 @@ impl Supdb {
             copyspan,
             identityblob,
             copypacked,
+            headspastfill,
             settlesearch,
             settlesources,
             scanlevers,
@@ -12745,6 +12758,12 @@ impl Engine for Supdb {
                 "supdb-ingestcopyspan"
             };
         }
+        if self.copypacked && self.headspastfill {
+            return "supdb-copypackedheads";
+        }
+        if self.headspastfill {
+            return "supdb-headspastfill";
+        }
         if self.copypacked {
             return if self.partition {
                 "supdb-copypacked"
@@ -13872,6 +13891,7 @@ impl Engine for Supdb {
             ("heads_disowned", db.heads_owned_counts().1 as f64),
             ("heads_owned_mb", (db.heads_owned_counts().2 >> 20) as f64),
             ("heads_beside_copies", db.heads_beside_copies() as f64),
+            ("heads_past_fill", db.heads_past_fill() as f64),
             // The jobs' pool, process-wide and ever (`Options::jobs_pooled`).
             ("job_pool_takes", supdb::Db::job_pool_counts()[0] as f64),
             ("job_pool_keeps", supdb::Db::job_pool_counts()[1] as f64),
@@ -15735,6 +15755,8 @@ pub fn guarantee(arm: &str) -> Option<Guarantee> {
         | "supdb-ingestidentityblob"
         | "supdb-copypacked"
         | "supdb-ingestcopypacked"
+        | "supdb-copypackedheads"
+        | "supdb-headspastfill"
         | "supdb-settlesearch"
         | "supdb-ingestsettlesearch"
         | "supdb-settlesources"
@@ -17075,6 +17097,31 @@ pub fn open(arm: &str, dir: &Path, map_gb: usize) -> Res<Box<dyn Engine>> {
                     d,
                     Policy {
                         copypacked: true,
+                        ..Policy::default()
+                    },
+                )
+            },
+            dir,
+        )?,
+        "supdb-copypackedheads" => supdb_arm(
+            |d| {
+                Supdb::with_policy(
+                    d,
+                    Policy {
+                        copypacked: true,
+                        headspastfill: true,
+                        ..Policy::default()
+                    },
+                )
+            },
+            dir,
+        )?,
+        "supdb-headspastfill" => supdb_arm(
+            |d| {
+                Supdb::with_policy(
+                    d,
+                    Policy {
+                        headspastfill: true,
                         ..Policy::default()
                     },
                 )
@@ -20595,6 +20642,37 @@ mod tests {
                 assert_eq!(z.features(), base.features());
                 let o = z.db.as_ref().unwrap().options();
                 assert!(o.copy_packed && !b.copy_packed);
+                assert!(!o.heads_owned_past_fill);
+            }
+            {
+                let z = Supdb::with_policy(
+                    &dir("copypackedheads"),
+                    Policy {
+                        copypacked: true,
+                        headspastfill: true,
+                        ..Policy::default()
+                    },
+                )
+                .unwrap();
+                assert_eq!(z.name(), "supdb-copypackedheads");
+                assert_eq!(z.features(), base.features());
+                let o = z.db.as_ref().unwrap().options();
+                assert!(o.copy_packed && o.heads_owned_past_fill);
+            }
+            {
+                let z = Supdb::with_policy(
+                    &dir("headspastfill"),
+                    Policy {
+                        headspastfill: true,
+                        ..Policy::default()
+                    },
+                )
+                .unwrap();
+                assert_eq!(z.name(), "supdb-headspastfill");
+                assert_eq!(z.features(), base.features());
+                let o = z.db.as_ref().unwrap().options();
+                assert!(o.heads_owned_past_fill && !b.heads_owned_past_fill);
+                assert!(!o.copy_packed);
             }
             {
                 let z = Supdb::with_policy(
