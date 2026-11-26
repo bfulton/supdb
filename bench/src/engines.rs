@@ -2051,6 +2051,18 @@ pub struct Supdb {
     /// behind a commit, as FASTER's session makes them:
     /// `supdb-heldhandle`.
     ownhandle: bool,
+    /// EXPERIMENT, with `ownhandle`: the handle given up at the arm's
+    /// first scan after it and the shared table sealed there
+    /// (`Db::seal`, which leaves the shared form where no handle
+    /// writes), and claimed again once `OWN_ENTER` updates have come
+    /// with no scan among them: `supdb-heldhandleleaves`.
+    ownleaves: bool,
+    /// The updates the arm has made since its last scan, under
+    /// `ownleaves`.
+    own_since_scan: usize,
+    /// Under `ownhandle`: the claims of the handle and their time in
+    /// microseconds, the leaves and theirs.
+    own_switch: [u64; 4],
     /// What the reader handles this store gave its threads answered
     /// through the ordered index, summed as each is dropped
     /// (`OrdTally`); only the arm that reads that way hands out handles
@@ -3391,7 +3403,18 @@ struct Policy {
     /// updates and reads through a handle claimed to write, a write at a
     /// time and no batch behind a commit, which is FASTER's one level.
     ownhandle: bool,
+    /// EXPERIMENT, `supdb-heldhandleleaves`: `supdb-heldhandle` that
+    /// gives its handle up at its first scan and seals the shared table
+    /// there, so its scans meet the one writer's store again, and claims
+    /// the handle again once `OWN_ENTER` updates have come since its last
+    /// scan. Prices leaving the shared form for the writer's own work.
+    ownleaves: bool,
 }
+
+/// The updates with no scan among them after which `supdb-heldhandleleaves`
+/// claims its handle again: more than a scan mix's batch holds, so E's
+/// inserts between its scans never enter, and under a burst's first batch.
+const OWN_ENTER: usize = 256;
 
 /// The conversions a fill makes at most in `supdb-convertcap`: the first
 /// version's cap, about a pass's worth of conversions at a hundred
@@ -3748,6 +3771,7 @@ impl Default for Policy {
             noshare: false,
             nopopulate: false,
             ownhandle: false,
+            ownleaves: false,
             defer: false,
             firstfloor: false,
             aheadmin: None,
@@ -10529,6 +10553,7 @@ impl Supdb {
             noshare,
             nopopulate,
             ownhandle,
+            ownleaves,
         } = policy;
         // The table a held store with no frames makes for its handles'
         // writes (`Options::share_on_write`) is sized as the big shared
@@ -11622,6 +11647,9 @@ impl Supdb {
             noshare,
             nopopulate,
             ownhandle,
+            ownleaves,
+            own_since_scan: 0,
+            own_switch: [0; 4],
             own: None,
             ord_threads: Default::default(),
         })
@@ -11888,6 +11916,18 @@ impl Engine for Supdb {
                     "supdb-heldnoshare"
                 } else if self.nopopulate {
                     "supdb-heldnopopulate"
+                } else if self.lendbursts && !self.piecesonly {
+                    "supdb-heldlendbursts"
+                } else if self.pacelends {
+                    "supdb-heldpacelends"
+                } else if self.nopace {
+                    "supdb-heldnopace"
+                } else if self.piecesonly && self.lendbursts {
+                    "supdb-heldpiecesonlylend"
+                } else if self.piecesonly {
+                    "supdb-heldpiecesonly"
+                } else if self.ownleaves {
+                    "supdb-heldhandleleaves"
                 } else if self.ownhandle {
                     "supdb-heldhandle"
                 } else if self.shared && self.sharednorecycle {
@@ -13613,16 +13653,26 @@ impl Engine for Supdb {
             // A write at a time through the handle, claimed at the first
             // of them; a refused write commits and is made again, which
             // freezes a table that is full.
-            let own = match &self.own {
-                Some(o) => o,
-                None => self.own.insert(db.writer().map_err(|e| e.to_string())?),
-            };
-            for (k, v) in items {
-                while !own.put(k, v).map_err(|e| e.to_string())? {
-                    db.commit().map_err(|e| e.to_string())?;
+            self.own_since_scan = self.own_since_scan.saturating_add(items.len());
+            let enters = !self.ownleaves || self.own_since_scan >= OWN_ENTER;
+            if self.own.is_some() || enters {
+                let own = match &self.own {
+                    Some(o) => o,
+                    None => {
+                        let t = std::time::Instant::now();
+                        let o = db.writer().map_err(|e| e.to_string())?;
+                        self.own_switch[0] += 1;
+                        self.own_switch[1] += t.elapsed().as_micros() as u64;
+                        self.own.insert(o)
+                    }
+                };
+                for (k, v) in items {
+                    while !own.put(k, v).map_err(|e| e.to_string())? {
+                        db.commit().map_err(|e| e.to_string())?;
+                    }
                 }
+                return Ok(());
             }
-            return Ok(());
         }
         // One call for the batch, as `write_batch` makes of a load's: the
         // store pins once for all of it (`Db::put_batch`).
@@ -13642,6 +13692,26 @@ impl Engine for Supdb {
         supdb_get(db, key)
     }
     fn range(&mut self, from: &[u8], n: usize) -> Res<usize> {
+        if self.ownleaves {
+            self.own_since_scan = 0;
+            if self.own.take().is_some() {
+                // The handle given up and the shared table sealed: with
+                // no handle that writes the seal makes the next table the
+                // one writer's. A table the handle left empty is not
+                // sealed, and is left at the second commit to find no
+                // handle (`Db::share_look`).
+                let db = self.db.as_mut().ok_or("db closed")?;
+                let t = std::time::Instant::now();
+                db.seal().map_err(|e| e.to_string())?;
+                for _ in 0..2 {
+                    if db.live_shared() {
+                        db.commit().map_err(|e| e.to_string())?;
+                    }
+                }
+                self.own_switch[2] += 1;
+                self.own_switch[3] += t.elapsed().as_micros() as u64;
+            }
+        }
         let db = self.db.as_ref().ok_or("db closed")?;
         supdb_range(db, from, n)
     }
@@ -13778,6 +13848,10 @@ impl Engine for Supdb {
             // The bytes of those tables made whole at their install
             // (`Options::shared_populates`).
             ("share_populated", db.share_populated() as f64),
+            ("own_claims", self.own_switch[0] as f64),
+            ("own_claim_us", self.own_switch[1] as f64),
+            ("own_leaves", self.own_switch[2] as f64),
+            ("own_leave_us", self.own_switch[3] as f64),
             // What the forms' upkeep did: see `Db::forms_events`.
             ("blk_by_upkeep", ev[0] as f64),
             ("table_drops", ev[1] as f64),
@@ -16029,6 +16103,12 @@ pub fn guarantee(arm: &str) -> Option<Guarantee> {
         | "supdb-heldnoshare"
         | "supdb-heldnopopulate"
         | "supdb-heldhandle"
+        | "supdb-heldhandleleaves"
+        | "supdb-heldlendbursts"
+        | "supdb-heldpacelends"
+        | "supdb-heldnopace"
+        | "supdb-heldpiecesonly"
+        | "supdb-heldpiecesonlylend"
         | "supdb-heldbatch1"
         | "proto-shared"
         | "faster" => Guarantee::Memory,
@@ -16674,6 +16754,119 @@ pub fn open(arm: &str, dir: &Path, map_gb: usize) -> Res<Box<dyn Engine>> {
                         held: true,
                         noframes: true,
                         ownhandle: true,
+                        ..Policy::default()
+                    },
+                )
+            },
+            dir,
+        )?,
+        // The roster's arm with a burst's batches lent to the upkeep
+        // thread and never waited for (`Options::upkeep_inline_bursts`
+        // off): the writer at its own rate, the thread's trail the first
+        // scan's to wait out or settle.
+        "supdb-heldlendbursts" => supdb_arm(
+            |d| {
+                Supdb::with_policy(
+                    d,
+                    Policy {
+                        partition: false,
+                        durable: false,
+                        held: true,
+                        noframes: true,
+                        lendbursts: true,
+                        ..Policy::default()
+                    },
+                )
+            },
+            dir,
+        )?,
+        // The roster's arm with a burst's batches paced within the share
+        // and not held for their filing (`Options::upkeep_pace_holds`
+        // off): the thread a hundredth of the store behind at most.
+        "supdb-heldpacelends" => supdb_arm(
+            |d| {
+                Supdb::with_policy(
+                    d,
+                    Policy {
+                        partition: false,
+                        durable: false,
+                        held: true,
+                        noframes: true,
+                        pacelends: true,
+                        ..Policy::default()
+                    },
+                )
+            },
+            dir,
+        )?,
+        // The roster's arm with every batch of a burst filed by the
+        // commit itself (`Options::upkeep_pace_pct` at zero): the hold's
+        // work on the writer's own thread, with no hand-over.
+        "supdb-heldnopace" => supdb_arm(
+            |d| {
+                Supdb::with_policy(
+                    d,
+                    Policy {
+                        partition: false,
+                        durable: false,
+                        held: true,
+                        noframes: true,
+                        nopace: true,
+                        ..Policy::default()
+                    },
+                )
+            },
+            dir,
+        )?,
+        // The roster's arm with its forms holding the pieces' fold alone
+        // and the memtables' keys laid over a walk from the scan snapshot
+        // (`Options::forms_pieces_only`): the settle files no write.
+        "supdb-heldpiecesonly" => supdb_arm(
+            |d| {
+                Supdb::with_policy(
+                    d,
+                    Policy {
+                        partition: false,
+                        durable: false,
+                        held: true,
+                        noframes: true,
+                        piecesonly: true,
+                        ..Policy::default()
+                    },
+                )
+            },
+            dir,
+        )?,
+        // `supdb-heldpiecesonly` with a burst's batches lent and never
+        // waited for.
+        "supdb-heldpiecesonlylend" => supdb_arm(
+            |d| {
+                Supdb::with_policy(
+                    d,
+                    Policy {
+                        partition: false,
+                        durable: false,
+                        held: true,
+                        noframes: true,
+                        piecesonly: true,
+                        lendbursts: true,
+                        ..Policy::default()
+                    },
+                )
+            },
+            dir,
+        )?,
+        "supdb-heldhandleleaves" => supdb_arm(
+            |d| {
+                Supdb::with_policy(
+                    d,
+                    Policy {
+                        partition: false,
+                        durable: false,
+                        held: true,
+                        noframes: true,
+                        ownhandle: true,
+                        ownleaves: true,
                         ..Policy::default()
                     },
                 )
