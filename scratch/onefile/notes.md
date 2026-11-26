@@ -43,3 +43,12 @@ one flush, 47 ms and one. An fdatasync of a file with nothing dirty still
 reaches the device here, 0.05 ms and one flush. Sound only over blocks
 written once before: a range's writeback covers no allocation, so a data
 file that grows is synced itself where it grows.
+
+`grow.py DIR` -- a landing of 64 MB by what its blocks were before it, two
+runs. Never written, past the file's end or reserved by `fallocate`: 54-59
+ms with the data file synced and then the slot, two flushes. Written once
+before, with zeros or with a segment: 44-46 ms by range with the slot's
+sync the one flush, 46-50 with the data file's own sync. Writing the zeros:
+54-57 ms for the 64 MB; reserving them: 0.2-0.3. So a block's first use
+costs about 12 ms in 64 MB, once, and writing zeros ahead to save it costs
+four to five times that in bytes the next flush pays for.
