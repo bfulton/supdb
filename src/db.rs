@@ -63847,7 +63847,11 @@ mod shared_table {
     /// has its value arena, where its records lie, and its index mapped
     /// advised onto them, and one that does not has neither: read off the
     /// kernel's flags for the mapping that holds a record and the index.
-    #[cfg(target_os = "linux")]
+    /// Not under qemu-user (`supdb_emulated`), which answers the advice
+    /// and passes it to no kernel, so no mapping there carries the flag
+    /// (`blocks::a_huge_source_maps_its_large_blocks_aligned_and_advised_and_pools_none`);
+    /// the native ARM leg runs it.
+    #[cfg(all(target_os = "linux", not(supdb_emulated)))]
     #[test]
     fn a_shared_table_on_huge_pages_maps_its_records_and_index_there() {
         if !std::path::Path::new("/sys/kernel/mm/transparent_hugepage/enabled").exists() {

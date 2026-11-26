@@ -1446,12 +1446,16 @@ mod tests {
     /// byte, and neither takes such a block from its pool nor gives one to
     /// it; a block under `HUGE` from it, and every block of a source that is
     /// not huge, are as they were. Where the kernel has no huge pages the
-    /// advice is refused and the flag absent, so the flag is read only
-    /// where the kernel keeps the setting.
+    /// advice is refused and the flag absent, and under qemu-user
+    /// (`supdb_emulated`) the advice is answered and passed to no kernel,
+    /// so the flag is read only where a kernel keeps the setting; where
+    /// the block is cut and what the pool holds are the source's own and
+    /// are held everywhere.
     #[cfg(target_os = "linux")]
     #[test]
     fn a_huge_source_maps_its_large_blocks_aligned_and_advised_and_pools_none() {
-        let thp = std::path::Path::new("/sys/kernel/mm/transparent_hugepage/enabled").exists();
+        let thp = !cfg!(supdb_emulated)
+            && std::path::Path::new("/sys/kernel/mm/transparent_hugepage/enabled").exists();
         let len = 2 * HUGE;
         let pool = std::sync::Arc::new(BlockPool::new(4 * len, true));
         let huge = Source::new(true, Some(pool.clone())).huge(true);

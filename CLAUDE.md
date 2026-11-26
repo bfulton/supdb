@@ -139,6 +139,25 @@ to run (`lz4-sys`'s) hands the host's `cc` `-arch arm64`, and a Linux
 for the hosted runners alone to show is timing on their hardware and the
 tests run, not only type-checked, on ARM and macOS.
 
+One hosted leg can be run here, and the gate does not run it. `cross-arm`
+runs the library's tests for ARM under qemu-user, which answers `madvise`
+advice with success and passes it to no kernel, so a test that reads the
+kernel's answer to advice -- the `hg` flag of a mapping advised onto huge
+pages, `mincore` after a populate or an ask -- cannot pass there, and is
+compiled out of that job alone by `supdb_emulated` (`Cargo.toml`,
+`.github/workflows/ci.yml`), the native ARM leg running it. Two tests of
+the shared table's huge pages were written without it and failed the leg
+at the first hosted run of the pull request that brought them, as the
+populate test had before them: `scripts/check.sh` has no such leg, and
+nothing here had run one. Where the cross compiler and
+`qemu-aarch64-static` are installed the job's own command runs in two
+minutes (its step's three `CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_`
+variables before `cargo test --profile checked --target
+aarch64-unknown-linux-gnu --lib`), and a test that reads
+`/proc/self/smaps` or `mincore` behind an `madvise` is run under it
+before it is pushed. Where only part of a test reads the kernel, that
+part goes behind `cfg!(supdb_emulated)` and the rest runs everywhere.
+
 A hosted job's log cannot be read while the job runs, so one that is
 overdue is read by its groups once it ends before it is called anything:
 the macOS leg ran fifty-five minutes where it had run twenty-five, was
