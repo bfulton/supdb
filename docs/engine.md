@@ -2041,6 +2041,77 @@ going on without the whole trail filed -- the blocks it walks settled as
 it reaches them, the thread filing the rest beside it -- which nothing
 here builds.
 
+#### The point mixes on one thread, by what is taken away
+
+The roster's arm of the held log trails FASTER on the point mixes one
+thread runs, in every row banked with the two. Timed by kind in the row's
+pass order, three arms each without one more thing were set beside
+FASTER (`pair.sh SUPDB_MIX_KINDS=1 ARM faster SIZE --passes
+load,read,read-threaded,scan,scan-threaded,mixes,scan-mixed,mixes-scrambled`,
+`--reps 12` at a hundred thousand keys and `--reps 8` at three hundred
+thousand, at `02bab06`): `supdb-heldnoframes`, the roster's;
+`supdb-heldnfnocache`, the same with no block cache; and
+`supdb-heldinplace`, that with its upkeep inline and a put that overwrites
+(Updates in place, above). The timer is on for every arm, so a difference
+is sound and a ratio is drawn toward one. Nanoseconds an operation as the
+mix counts them, a read-modify-write one, the medians over both sittings
+and FASTER's over the three pairings:
+
+| | 100k: FASTER | roster | no cache | in place | 300k: FASTER | roster | no cache | in place |
+|---|---|---|---|---|---|---|---|---|
+| C | 142 | 164 | 171 | 163 | 188 | 187 | 187 | 180 |
+| B | 145 | 171 | 174 | 165 | 197 | 205 | 199 | 200 |
+| A | 144 | 202 | 156 | 137 | 191 | 235 | 193 | 172 |
+| F | 206 | 358 | 302 | 229 | 261 | 380 | 334 | 294 |
+| D | 277 | 289 | 298 | 300 | 425 | 387 | 397 | 407 |
+| scrambled C | 233 | 269 | 259 | 282 | 341 | 333 | 299 | 290 |
+| scrambled B | 233 | 265 | 222 | 237 | 336 | 306 | 297 | 298 |
+| scrambled A | 225 | 308 | 201 | 213 | 310 | 321 | 262 | 259 |
+| scrambled F | 313 | 387 | 338 | 349 | 390 | 434 | 423 | 414 |
+| scrambled D | 187 | 226 | 213 | 197 | 242 | 262 | 281 | 243 |
+
+Three things, each read by taking it away.
+
+The forms filed beside the writer are the largest. The row's scan passes
+come before its mixes, so the store is near reads through them and the
+upkeep thread files every commit into the blocks' forms (What the scans
+leave the writes, above). A write of A's, a commit of a hundred over a
+hundred, costs 193 ns in the roster's arm, 115 with no cache and 130 in
+FASTER at a hundred thousand keys, and 208, 138 and 166 at three hundred
+thousand; the scrambled B's 486 against 189 and 191. With no cache A is
+within a tenth of FASTER at the smaller rung and level at the larger, four
+fifths and more of its gap, and F has given back two fifths of its own.
+Part of that is the thread's alertness (`Options::upkeep_alert`): backed
+off, in the same order with no timer (`pair.sh supdb-heldnoalert
+supdb-heldnoframes 100000` the same passes `--reps 30`, and `300000
+--reps 12`), A read 1.18 and 1.17 of the roster's arm and then 1.02 and
+1.24, the scrambled A 1.20 and 1.11 and then 1.20 and 1.17, F 0.96 to 1.02
+and E, which the alert is for, 0.95 and 0.99 and then 0.96 and 1.24. So
+the alert is A's tax, E's price for its going is not resolved, and what
+the cache costs F's writes beside it, 229 ns against 158, is not laid to a
+cause.
+
+Puts that append are the second. With no cache F's write is 158 ns and
+overwriting 78, against FASTER's 85 (135, 81 and 68 at the larger rung),
+and A's 115 and 87 against 130, which is A ahead of FASTER at both rungs.
+An overwrite needs nothing else to read the live table's values, and the
+upkeep thread reads them to file them, so the first two go together: a
+store has both or neither.
+
+The get is what is left. On the clean store C reads, a get costs 164 ns
+against FASTER's 142 at a hundred thousand keys, 163 to 171 across the
+three arms, and in the arm that overwrites the five unscrambled mixes'
+gets are twenty to thirty-three more than FASTER's; at three hundred
+thousand C's are level, 180 to 188, both engines waiting on the same
+misses, and the write mixes' are not, F's 250 against 227. That is F at
+0.9 of FASTER with the other two gone.
+
+With no timer the rates lean the same way and resolve less (`pair.sh ARM
+faster SIZE` the same passes, `--reps 25` and `--reps 12`): at a hundred
+thousand keys the roster's A read 0.77 and 0.89 of FASTER's and its F
+0.62 and 0.64, with no cache 0.90 and 0.98 and 0.77 and 0.76, and in place
+0.95 and 1.03 and 0.95 and 0.83.
+
 #### Beside FASTER out of core
 
 A store larger than memory is what FASTER's log is made for, and the

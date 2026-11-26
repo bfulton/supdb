@@ -7414,6 +7414,27 @@ in the suite's figures, at `full` scale where it says so:
   settled as it reaches them from the batch sorted once, and the thread
   filing the rest beside the scans, which needs the forms' state shared
   between the two where it is lent whole to one today.
+- Under the held log the point mixes one thread runs trail FASTER in
+  every row banked with the two, wherever the row's scan passes have left
+  the store near reads: by kind in the row's order, 0.6x to 0.85x on A, B
+  and F at a hundred thousand keys and 0.7x to 0.8x on A and F at three
+  hundred thousand (`docs/engine.md`, the point mixes on one thread, by
+  what is taken away, at `02bab06`). Three things, each by the arm
+  without it. The forms filed beside the writer, four fifths of A's gap
+  and two fifths of F's, which `supdb-heldnfnocache` is without: the
+  upkeep thread's work on another core, and the writer's wait for the
+  lines it read. Puts that append, which `supdb-heldinplace` is without,
+  A ahead of FASTER with it; an overwrite needs nothing else to read the
+  live table's values and the thread reads them to file them, so a store
+  has the first two or neither. And the one writer's get, twenty to
+  thirty nanoseconds over FASTER's at a hundred thousand keys in every
+  arm, C on a clean store among them, which is F at 0.9x with the other
+  two gone. The levers are the roadmap's (`ROADMAP.md`, Engine): the
+  forms stood down through a stretch of point operations, which waits on
+  the scan that goes on without the whole trail filed, since the scans
+  after the stretch pay for what was not kept; the thread's alertness,
+  which is a sixth of A and whose price to E is not resolved; and the one
+  writer's get at the shared table's length.
 - The scan pass after a burst pays its first scan for the burst's end:
   the wait for the upkeep thread's pass in flight, the log read, the
   settle of what the thread trailed by and the snapshot's extension,
