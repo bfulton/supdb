@@ -48,3 +48,8 @@ Pairings (`SUPDB_LAG_COUNTERS=1 SUPDB_SCAN_OPS=1 sh scripts/pair.sh A B
   partition. A cut is held to the inode's link count.
 - `recycle.py`: a 64 MB file written fresh with the old one freed, 103 ms
   (write 12, fsync 61, free 28); written over a dead file's blocks, 60 ms.
+- inline (`reaper-inline-scratch.patch`, one free a turn on the segment
+  work): cipher clean pass 0.42x and 0.42x, pass after the full rewrite
+  1.25x and 1.85x, 2.9 GB waiting at the peak; plain clean pass 0.16x and
+  0.70x, 1% burst 0.62x and 0.11x. Every shape that defers the frees moves
+  their discards into the passes after the load.
