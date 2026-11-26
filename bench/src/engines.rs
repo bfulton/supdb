@@ -1446,6 +1446,18 @@ pub struct Supdb {
     /// (`Options::scan_runs_held`): `supdb-runsheld` and
     /// `supdb-ingestrunsheld`.
     runsheld: bool,
+    /// A copy asked for over the entries its walk reads
+    /// (`Options::copy_prefetch_span`): `supdb-copyspan` and
+    /// `supdb-ingestcopyspan`.
+    copyspan: bool,
+    /// A settle's patch searches a copy for a key above its last entry
+    /// (`Options::settle_append_last` off): `supdb-settlesearch` and
+    /// `supdb-ingestsettlesearch`.
+    settlesearch: bool,
+    /// A settle's patch walks the sources for a key only its chain holds
+    /// (`Options::settle_lone_chain` off): `supdb-settlesources` and
+    /// `supdb-ingestsettlesources`.
+    settlesources: bool,
     /// The three scan levers together: `supdb-scanlevers` and
     /// `supdb-ingestscanlevers`.
     scanlevers: bool,
@@ -2906,6 +2918,12 @@ struct Policy {
     sparsespan: bool,
     /// The runs through one raw walker: `...runsheld`.
     runsheld: bool,
+    /// A copy's ask over its walk's entries: `...copyspan`.
+    copyspan: bool,
+    /// The patch's search for an appended key: `...settlesearch`.
+    settlesearch: bool,
+    /// The patch's walk of the sources for a lone key: `...settlesources`.
+    settlesources: bool,
     /// The three scan levers together: `...scanlevers`.
     scanlevers: bool,
     /// The writer's copy line from `DENSEFROM`: `...densefrom`.
@@ -3542,6 +3560,9 @@ impl Default for Policy {
             formahead: false,
             sparsespan: false,
             runsheld: false,
+            copyspan: false,
+            settlesearch: false,
+            settlesources: false,
             scanlevers: false,
             densefrom: 0,
             convert16: false,
@@ -10483,6 +10504,9 @@ impl Supdb {
             formahead,
             sparsespan,
             runsheld,
+            copyspan,
+            settlesearch,
+            settlesources,
             scanlevers,
             densefrom,
             convert16,
@@ -11133,6 +11157,9 @@ impl Supdb {
             scan_form_ahead: formahead || scanlevers,
             scan_prefetch_sparse_span: sparsespan || scanlevers,
             scan_runs_held: runsheld || scanlevers,
+            copy_prefetch_span: copyspan,
+            settle_append_last: !settlesearch,
+            settle_lone_chain: !settlesources,
             forms_convert_from: if densefrom > 0 {
                 densefrom
             } else if convert16 {
@@ -11538,6 +11565,9 @@ impl Supdb {
             formahead,
             sparsespan,
             runsheld,
+            copyspan,
+            settlesearch,
+            settlesources,
             scanlevers,
             densefrom,
             convert16,
@@ -12686,6 +12716,27 @@ impl Engine for Supdb {
                 "supdb-runsheld"
             } else {
                 "supdb-ingestrunsheld"
+            };
+        }
+        if self.copyspan {
+            return if self.partition {
+                "supdb-copyspan"
+            } else {
+                "supdb-ingestcopyspan"
+            };
+        }
+        if self.settlesearch {
+            return if self.partition {
+                "supdb-settlesearch"
+            } else {
+                "supdb-ingestsettlesearch"
+            };
+        }
+        if self.settlesources {
+            return if self.partition {
+                "supdb-settlesources"
+            } else {
+                "supdb-ingestsettlesources"
             };
         }
         if self.settlebuildsfiled {
@@ -15639,6 +15690,12 @@ pub fn guarantee(arm: &str) -> Option<Guarantee> {
         | "supdb-ingestsparsespan"
         | "supdb-runsheld"
         | "supdb-ingestrunsheld"
+        | "supdb-copyspan"
+        | "supdb-ingestcopyspan"
+        | "supdb-settlesearch"
+        | "supdb-ingestsettlesearch"
+        | "supdb-settlesources"
+        | "supdb-ingestsettlesources"
         | "supdb-scanlevers"
         | "supdb-ingestscanlevers"
         | "supdb-densefrom"
@@ -16937,6 +16994,84 @@ pub fn open(arm: &str, dir: &Path, map_gb: usize) -> Res<Box<dyn Engine>> {
                         partition: false,
                         durable: false,
                         runsheld: true,
+                        ..Policy::default()
+                    },
+                )
+            },
+            dir,
+        )?,
+        "supdb-copyspan" => supdb_arm(
+            |d| {
+                Supdb::with_policy(
+                    d,
+                    Policy {
+                        copyspan: true,
+                        ..Policy::default()
+                    },
+                )
+            },
+            dir,
+        )?,
+        "supdb-ingestcopyspan" => supdb_arm(
+            |d| {
+                Supdb::with_policy(
+                    d,
+                    Policy {
+                        partition: false,
+                        durable: false,
+                        copyspan: true,
+                        ..Policy::default()
+                    },
+                )
+            },
+            dir,
+        )?,
+        "supdb-settlesearch" => supdb_arm(
+            |d| {
+                Supdb::with_policy(
+                    d,
+                    Policy {
+                        settlesearch: true,
+                        ..Policy::default()
+                    },
+                )
+            },
+            dir,
+        )?,
+        "supdb-ingestsettlesearch" => supdb_arm(
+            |d| {
+                Supdb::with_policy(
+                    d,
+                    Policy {
+                        partition: false,
+                        durable: false,
+                        settlesearch: true,
+                        ..Policy::default()
+                    },
+                )
+            },
+            dir,
+        )?,
+        "supdb-settlesources" => supdb_arm(
+            |d| {
+                Supdb::with_policy(
+                    d,
+                    Policy {
+                        settlesources: true,
+                        ..Policy::default()
+                    },
+                )
+            },
+            dir,
+        )?,
+        "supdb-ingestsettlesources" => supdb_arm(
+            |d| {
+                Supdb::with_policy(
+                    d,
+                    Policy {
+                        partition: false,
+                        durable: false,
+                        settlesources: true,
                         ..Policy::default()
                     },
                 )
@@ -20337,6 +20472,50 @@ mod tests {
                 assert_eq!(z.features(), base.features());
                 let o = z.db.as_ref().unwrap().options();
                 assert!(o.scan_runs_held && !b.scan_runs_held);
+            }
+            {
+                let z = Supdb::with_policy(
+                    &dir("copyspan"),
+                    Policy {
+                        copyspan: true,
+                        ..Policy::default()
+                    },
+                )
+                .unwrap();
+                assert_eq!(z.name(), "supdb-copyspan");
+                assert_eq!(z.features(), base.features());
+                let o = z.db.as_ref().unwrap().options();
+                assert!(o.copy_prefetch_span && !b.copy_prefetch_span);
+            }
+            {
+                let z = Supdb::with_policy(
+                    &dir("settlesearch"),
+                    Policy {
+                        settlesearch: true,
+                        ..Policy::default()
+                    },
+                )
+                .unwrap();
+                assert_eq!(z.name(), "supdb-settlesearch");
+                assert_eq!(z.features(), base.features());
+                let o = z.db.as_ref().unwrap().options();
+                assert!(!o.settle_append_last && b.settle_append_last);
+                assert!(o.settle_lone_chain);
+            }
+            {
+                let z = Supdb::with_policy(
+                    &dir("settlesources"),
+                    Policy {
+                        settlesources: true,
+                        ..Policy::default()
+                    },
+                )
+                .unwrap();
+                assert_eq!(z.name(), "supdb-settlesources");
+                assert_eq!(z.features(), base.features());
+                let o = z.db.as_ref().unwrap().options();
+                assert!(!o.settle_lone_chain && b.settle_lone_chain);
+                assert!(o.settle_append_last);
             }
             {
                 let z = Supdb::with_policy(

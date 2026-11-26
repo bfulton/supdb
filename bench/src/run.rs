@@ -5045,6 +5045,12 @@ struct MixKinds {
     gets: (u64, f64),
     scans: (u64, f64),
     commits: (u64, f64),
+    /// The mix's first four scans and its longest, in seconds: a mix at
+    /// the smallest rung is a millisecond, and a first scan that settles
+    /// what the mix before left is a share of it no sum over the scans
+    /// names.
+    scan_first: [f64; 4],
+    scan_max: f64,
     irq0: [u64; 2],
     /// The engine's seals and the milliseconds its commits spent freezing
     /// at the mix's start (`seals`, `freeze_ms`; zeros for an engine that
@@ -5068,6 +5074,8 @@ impl MixKinds {
             gets: (0, 0.0),
             scans: (0, 0.0),
             commits: (0, 0.0),
+            scan_first: [0.0; 4],
+            scan_max: 0.0,
             irq0: if on { irq_counts() } else { [0; 2] },
             seals0: if on { seal_counts(e) } else { [0.0; 2] },
         }
@@ -5084,16 +5092,35 @@ impl MixKinds {
         }
     }
 
+    /// A scan's time, into the scans' sum and beside it the first four
+    /// and the longest.
+    fn add_scan(&mut self, t0: Option<Instant>) {
+        if let Some(t0) = t0 {
+            let d = t0.elapsed().as_secs_f64();
+            if let Some(f) = self.scan_first.get_mut(self.scans.0 as usize) {
+                *f = d;
+            }
+            self.scan_max = self.scan_max.max(d);
+            self.scans.0 += 1;
+            self.scans.1 += d;
+        }
+    }
+
     fn report(&self, e: &dyn Engine, arm: &str, mix: &str, size: u64, ops: u64, total: f64) {
         if self.on {
             let irq = irq_counts();
             let seals = seal_counts(e);
             eprintln!(
-                "mixkinds {arm} {mix} size {size} ops {ops} gets {} {:.3} scans {} {:.3} commits {} {:.3} total {:.3} tlb {} cal {} seals {} freeze {:.3}",
+                "mixkinds {arm} {mix} size {size} ops {ops} gets {} {:.3} scans {} {:.3} first_us {:.1} {:.1} {:.1} {:.1} max_us {:.1} commits {} {:.3} total {:.3} tlb {} cal {} seals {} freeze {:.3}",
                 self.gets.0,
                 self.gets.1 * 1e3,
                 self.scans.0,
                 self.scans.1 * 1e3,
+                self.scan_first[0] * 1e6,
+                self.scan_first[1] * 1e6,
+                self.scan_first[2] * 1e6,
+                self.scan_first[3] * 1e6,
+                self.scan_max * 1e6,
                 self.commits.0,
                 self.commits.1 * 1e3,
                 total * 1e3,
@@ -5274,7 +5301,7 @@ fn ycsb(
             km.key_into(existing(&mut keys, committed), &mut kb);
             let t0 = kinds.start();
             e.range(&kb, YCSB_SCAN)?;
-            MixKinds::add(&mut kinds.scans, t0);
+            kinds.add_scan(t0);
         } else if prmw > 0 {
             km.key_into(existing(&mut keys, committed), &mut kb);
             let t0 = kinds.start();

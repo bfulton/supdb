@@ -40,7 +40,35 @@ const YCSBS: [Mix; 6] = [
 ];
 const ORDER: [char; 6] = ['C', 'B', 'A', 'F', 'D', 'E'];
 
-fn mix(e: &mut dyn Engine, w: &Mix, size: u64, salt: u64, inserted: &mut u64, payload: &Payload) {
+/// A mix's last commit, the tail of its batch.
+type Tail = fn(&mut Batch, &mut dyn Engine, bool);
+
+fn tail_plain(wbuf: &mut Batch, e: &mut dyn Engine, is_insert: bool) {
+    if is_insert {
+        wbuf.flush(e).unwrap()
+    } else {
+        wbuf.flush_updates(e).unwrap()
+    }
+}
+
+/// The scrambled E's one commit, alone in a function callgrind can toggle
+/// on (`--toggle-collect='e_scrambled::e_tail'`): the mix's inserts, above
+/// every key, committed after its scans.
+#[inline(never)]
+fn e_tail(wbuf: &mut Batch, e: &mut dyn Engine, is_insert: bool) {
+    tail_plain(wbuf, e, is_insert);
+    std::hint::black_box(0xE7A1_u64);
+}
+
+fn mix(
+    e: &mut dyn Engine,
+    w: &Mix,
+    size: u64,
+    salt: u64,
+    inserted: &mut u64,
+    payload: &Payload,
+    tail: Tail,
+) {
     let (letter, pread, pupd, pins, pscan, prmw, dist) = *w;
     let ops = (size / 6).max(1_000);
     let keyspace = match dist {
@@ -92,11 +120,7 @@ fn mix(e: &mut dyn Engine, w: &Mix, size: u64, salt: u64, inserted: &mut u64, pa
             }
         }
     }
-    if is_insert {
-        wbuf.flush(e).unwrap()
-    } else {
-        wbuf.flush_updates(e).unwrap()
-    }
+    tail(&mut wbuf, e, is_insert);
 }
 
 /// The scrambled E, alone in a function callgrind can toggle on. The
@@ -104,8 +128,17 @@ fn mix(e: &mut dyn Engine, w: &Mix, size: u64, salt: u64, inserted: &mut u64, pa
 #[inline(never)]
 fn e_phase(e: &mut dyn Engine, size: u64, inserted: &mut u64, payload: &Payload) -> u64 {
     let w = YCSBS.iter().find(|w| w.0 == 'E').unwrap();
-    mix(e, w, size, 0x5300, inserted, payload);
+    mix(e, w, size, 0x5300, inserted, payload, e_tail);
     std::hint::black_box(0xE5C2_u64)
+}
+
+/// E's first scan, alone in a function callgrind can toggle on
+/// (`--toggle-collect='e_scrambled::first_scan'`, mode `first`): the scan
+/// that meets whatever the write mixes before it left unfiled.
+#[inline(never)]
+fn first_scan(e: &mut dyn Engine, kb: &[u8; 16]) -> u64 {
+    e.range(kb, YCSB_SCAN).unwrap();
+    std::hint::black_box(0xF125_u64)
 }
 
 /// One scan of one entry, alone in a function a profile can name.
@@ -145,6 +178,7 @@ fn main() {
             0,
             &mut inserted,
             &payload,
+            tail_plain,
         );
     }
     // The scan pass over the store the mixes left, as `scan-mixed` makes it.
@@ -153,14 +187,92 @@ fn main() {
         db_key_into(r.below(size), &mut kb);
         e.range(&kb, 100).unwrap();
     }
+    let mode = a.next().unwrap_or_default();
+    // `first`: the counters read here, four mixes ahead of E, so that the
+    // read's own effect on the store (it takes the writer's upkeep home)
+    // is long gone when E begins, and nothing scans between this and E.
+    let c_before = (mode == "first").then(|| e.counters());
     for l in ORDER.iter().filter(|&&l| l != 'E') {
         let w = YCSBS.iter().find(|w| w.0 == *l).unwrap();
-        mix(e.as_mut(), w, size, 0x5300, &mut inserted, &payload);
+        mix(
+            e.as_mut(),
+            w,
+            size,
+            0x5300,
+            &mut inserted,
+            &payload,
+            tail_plain,
+        );
+    }
+    if let Some(c0) = c_before {
+        // E's first scans one at a time: the key generator made as the
+        // mix makes it, between D's last commit and the first scan, then
+        // eight scans of fifty timed apart and the scan's phases over the
+        // first of them (an arm with the scan timers on has them).
+        let keyspace = size + inserted + 2 * ((size / 6).max(1_000) * 5 / 100);
+        let committed = size + inserted;
+        let mut keys = KeyGen::new(KeyDist::Scrambled, keyspace, 0x9C5B ^ 'E' as u64 ^ 0x5300);
+        let mut us = Vec::new();
+        let mut c1 = None;
+        for i in 0..8 {
+            let k = loop {
+                let k = keys.next();
+                if k < committed {
+                    break k;
+                }
+            };
+            db_key_into(k, &mut kb);
+            let t = std::time::Instant::now();
+            if i == 0 {
+                std::hint::black_box(first_scan(e.as_mut(), &kb));
+            } else {
+                e.range(&kb, YCSB_SCAN).unwrap();
+            }
+            us.push(t.elapsed().as_secs_f64() * 1e6);
+            if i == 0 {
+                c1 = Some(e.counters());
+            }
+        }
+        let c1 = c1.unwrap();
+        let get =
+            |c: &[(&str, f64)], k: &str| c.iter().find(|(n, _)| *n == k).map_or(0.0, |(_, v)| *v);
+        let d = |k: &str| get(&c1, k) - get(&c0, k);
+        println!(
+            "{arm} {size}: E's first scans us {}",
+            us.iter()
+                .map(|u| format!("{u:.1}"))
+                .collect::<Vec<_>>()
+                .join(" ")
+        );
+        let names: Vec<&str> = c1
+            .iter()
+            .map(|(n, _)| *n)
+            .filter(|n| {
+                n.starts_with("scan_")
+                    || n.contains("settle")
+                    || n.contains("upkeep")
+                    || n.contains("pass_")
+                    || n.contains("fill")
+                    || n.contains("blk_")
+                    || n.contains("snapshot")
+            })
+            .collect();
+        println!(
+            "  over the first: {}",
+            names
+                .iter()
+                .filter(|n| d(n) != 0.0)
+                .map(|n| format!("{n} {:.1}", d(n)))
+                .collect::<Vec<_>>()
+                .join(" | ")
+        );
+        drop(e);
+        let _ = std::fs::remove_dir_all(&dir);
+        return;
     }
     // `scans`: the store E meets, read by scans of one, ten and fifty
     // from the scrambled distribution's keys, interleaved by round, for
     // a scan's fixed start against its cost an entry; nothing written.
-    let mode = a.next().unwrap_or_default();
     if mode == "scans1" {
         // Scans of one entry alone, for a profile of a scan's start.
         let keyspace = size + inserted;
@@ -236,10 +348,32 @@ fn main() {
     // The phase repeated where a third argument asks, for a profile's
     // samples: each round inserts its share past the store's end again.
     let rounds: usize = mode.parse().unwrap_or(1);
+    // `E_COUNTS=1`: the engine's walk counts over the phase, read before
+    // it and after; the read before takes the writer's upkeep home, so the
+    // phase's first scan is not the suite's then.
+    let counts = std::env::var_os("E_COUNTS").is_some();
+    let c0 = counts.then(|| e.counters());
     eprintln!("e_phase start");
     let t = std::time::Instant::now();
     for _ in 0..rounds {
         std::hint::black_box(e_phase(e.as_mut(), size, &mut inserted, &payload));
+    }
+    if let Some(c0) = c0 {
+        let c1 = e.counters();
+        let get =
+            |c: &[(&str, f64)], k: &str| c.iter().find(|(n, _)| *n == k).map_or(0.0, |(_, v)| *v);
+        let d = |k: &str| get(&c1, k) - get(&c0, k);
+        println!(
+            "  walks copy {} sparse {} other {} starts at rank {} search {} | built by engine {} upkeep {} | unsealed {}",
+            d("walk_copy"),
+            d("walk_sparse"),
+            d("walk_other"),
+            d("start_at_rank"),
+            d("start_search"),
+            d("blk_by_engine"),
+            d("blk_by_upkeep"),
+            get(&c1, "unsealed"),
+        );
     }
     println!(
         "{arm} {size}: scrambled E x{rounds} in {:.3} ms",

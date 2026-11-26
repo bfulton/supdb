@@ -1843,6 +1843,31 @@ pub struct Options {
     /// `supdb-settlelazyraw` is the arm.
     #[doc(hidden)]
     pub settle_lazy_raw: bool,
+    /// A settle's patch of a copy finds a key above the copy's last entry
+    /// by one compare with that entry and appends it, where it searched
+    /// the copy's keys for its place (`Reader::splice_run`): the last block
+    /// of the last partition collects every key inserted past the store's
+    /// end, each above the one before, and each insert's patch was a
+    /// binary search of the copy -- ten compares through the entries and
+    /// the keys, a sixth of the patch's instructions -- for the answer
+    /// "after the last". Off searches, the shape before;
+    /// `supdb-settlesearch` and `supdb-ingestsettlesearch` are the arms.
+    #[doc(hidden)]
+    pub settle_append_last: bool,
+    /// A settle's patch takes a key's run from the key's own chain where
+    /// no older source can hold the key (`Reader::patch_block`): the write
+    /// is the live table's, the partition has no record of the key at its
+    /// cut, no level-0 piece meets the partition and no table is frozen.
+    /// A `put` leaves a tombstone in the chain, which masks every older
+    /// source, and its run has been written from the chain since the
+    /// masked path; a plain insert leaves none, so it took the general
+    /// path -- a context made, an overlay of one key allocated, the
+    /// sources walked for a key none of them holds -- about seven hundred
+    /// instructions to learn that the run is the chain's. Off takes the
+    /// general path, the shape before; `supdb-settlesources` and
+    /// `supdb-ingestsettlesources` are the arms.
+    #[doc(hidden)]
+    pub settle_lone_chain: bool,
     /// A covered partition's settle files a written key under the block the
     /// ordered index's samples name (`OrdIndex::floor_stride`, one sample a
     /// block, in memory) before it asks the form file, its cut left for the
@@ -6002,6 +6027,22 @@ pub struct Options {
     /// beside point-read mixes, which it never touches, at 0.84x, a sitting
     /// that resolves nothing. Off; `supdb-leancopyprefetch` is the arm.
     pub copy_prefetch_from_start: bool,
+    /// EXPERIMENT: a copy's prefetch asks for the lines its walk reads and
+    /// no others: the entries from the one the walk starts at, as many as
+    /// the scan still wants, and the keys and the first kilobyte of values
+    /// of those entries, placed by the block's mean lengths so that no
+    /// entry is loaded to place them (`CachedBlock::prefetch_span`). The
+    /// whole prefetch asks for every entry and key of the block and the
+    /// first kilobyte of its values, wherever the walk starts: a scan of
+    /// fifty that starts at a copy's fortieth entry by rank
+    /// (`copy_start_at_rank`) was asked for thirty-two lines of entries
+    /// and keys of which it reads twelve, and for the values of the
+    /// block's first ten entries, none of which it reads, while the value
+    /// it reads first was left to a miss; and the block it walks into
+    /// next was asked for whole where the scan wants its first few
+    /// entries. A copy the walk searches is asked for whole as before.
+    /// Off; `supdb-copyspan` and `supdb-ingestcopyspan` are the arms.
+    pub copy_prefetch_span: bool,
     /// EXPERIMENT: the prefetch of the copy block a copy walk reaches next
     /// paced through the walk -- four lines of each of its three buffers
     /// every sixteen entries, the whole of it by the forty-eighth
@@ -7545,6 +7586,8 @@ impl Default for Options {
             zpages_memo_hash: true,
             zpages_settle_span: true,
             settle_lazy_raw: false,
+            settle_append_last: true,
+            settle_lone_chain: true,
             settle_covered_samples: true,
             zpages_trusted_views: true,
             zpages_memo_bytes: 8 << 20,
@@ -7795,6 +7838,7 @@ impl Default for Options {
             forms_rebase: true,
             copy_start_at_rank: true,
             copy_prefetch_from_start: false,
+            copy_prefetch_span: false,
             scan_prefetch_paced: false,
             piece_ranks_by_heads: true,
             forms_to_writer: false,
@@ -20204,6 +20248,32 @@ impl CachedBlock {
         let r = (e[2] as usize).min(self.vals.len());
         prefetch_lines(self.vals[r..].as_ptr(), (self.vals.len() - r).min(256));
     }
+    /// The lines a walk of `n` entries from entry `i` reads
+    /// (`Options::copy_prefetch_span`): those entries, their keys, and the
+    /// head of their values, a kilobyte as the whole prefetch asks for of
+    /// the block's first. The keys and the values are placed by the block's
+    /// mean lengths -- exact where the keys and the runs are each of one
+    /// length and lie in the entries' order, which a copy's are until a
+    /// longer run is appended past them -- since the entry that names them
+    /// is a load the asks would wait for. Each buffer is asked for from
+    /// the line its first byte is on.
+    fn prefetch_span(&self, i: usize, n: usize) {
+        let len = self.ents.len();
+        if i >= len || n == 0 {
+            return;
+        }
+        let m = n.min(len - i);
+        let lines = |ptr: *const u8, bytes: usize| {
+            let lead = ptr as usize & 63;
+            prefetch_lines(ptr.wrapping_sub(lead), bytes + lead);
+        };
+        lines(self.ents[i..].as_ptr() as *const u8, m * 16);
+        let part = |total: usize, at: usize| (total as u64 * at as u64 / len as u64) as usize;
+        let (k0, k1) = (part(self.keys.len(), i), part(self.keys.len(), i + m));
+        lines(self.keys[k0..].as_ptr(), k1 - k0);
+        let (v0, v1) = (part(self.vals.len(), i), part(self.vals.len(), i + m));
+        lines(self.vals[v0..].as_ptr(), (v1 - v0).min(1024));
+    }
     fn each_value(&self, e: &[u32; 4], mut f: impl FnMut(&[u8])) {
         let run = &self.vals[e[2] as usize..(e[2] + e[3]) as usize];
         let mut p = 0usize;
@@ -20402,6 +20472,7 @@ fn prefetch_block(
     estimate: bool,
     whole: bool,
     sparse_span: bool,
+    copy_span: Option<bool>,
 ) {
     // The partition's records are asked for only where the walk will read
     // them raw: under the form file the walk's pages are the form's, which
@@ -20419,8 +20490,15 @@ fn prefetch_block(
         // An identity copy walked from the entry `at` names is prefetched
         // from there (`Options::copy_prefetch_from_start`); a copy the walk
         // will search, whole.
-        Cached::Block(blk) => match at {
-            Some(i) if blk.identity => blk.prefetch_from(i),
+        // By span (`Options::copy_prefetch_span`) where the walk takes
+        // its entry without a search: by rank in an identity copy, or at
+        // the block's first where it walks in from the block before
+        // (`copy_span` says which).
+        Cached::Block(blk) => match (at, copy_span) {
+            (Some(i), Some(enters)) if (blk.identity || enters) && !blk.wide => {
+                blk.prefetch_span(i, n)
+            }
+            (Some(i), None) if blk.identity => blk.prefetch_from(i),
             _ => blk.prefetch(whole),
         },
         Cached::Sparse(sb) => {
@@ -23676,6 +23754,11 @@ struct FormsState {
     /// under `Options::zpages_block_cursor` resolves them where its walk
     /// stops and counts none.
     lazy_cuts: Counts<2>,
+    /// Patches that took a key's run from its own chain as the one source
+    /// that can hold it (`Options::settle_lone_chain`), and patches that
+    /// appended a key past a copy's last entry on one compare
+    /// (`Options::settle_append_last`).
+    settle_short: Counts<2>,
     /// The settle's resolves whose stride was planned ahead
     /// (`Options::settle_seek_ahead`).
     seeks_planned: std::cell::Cell<u64>,
@@ -23863,6 +23946,7 @@ impl FormsState {
             span_starts: std::cell::Cell::new(0),
             start_cache: std::cell::RefCell::new(StartCache::new()),
             lazy_cuts: Counts::new(),
+            settle_short: Counts::new(),
             seeks_planned: std::cell::Cell::new(0),
             heads_looks: std::cell::RefCell::new(Vec::new()),
             patch_asks: std::cell::Cell::new(0),
@@ -34318,15 +34402,38 @@ impl Reader {
         // values, the same chain was walked twice a write, two dependent
         // misses each, a twelfth of the settle's instructions.
         let mut offs = self.fs().settle_offs.borrow_mut();
-        let masked = tombs
-            && slot != u32::MAX
-            && from.live_offs_into(from.entry(slot as usize), &mut offs, from_wm);
         let (c, at_eq) = BuildCtx::cut_known(cut, lo, hi);
         let same = c < hi && at_eq == Ordering::Equal;
+        // A key no source older than its table can hold: the write is the
+        // live table's, the partition has no record of the key at its cut,
+        // no piece meets the partition and no table is frozen. Its run is
+        // its chain's, as a masked key's is, whether or not a tombstone
+        // ends the chain (`Options::settle_lone_chain`): a plain insert
+        // leaves none, and took the general path below to learn that
+        // nothing older held it. The live table's writes alone: a write
+        // read from a table frozen since names that table's chain, and
+        // whether the claim holds of it is nothing an answer shows -- with
+        // no piece, no frozen table and no record, whatever that table
+        // held has gone, the sources' walk writes the key no run, and a
+        // write settled after this one writes the run again -- so it
+        // keeps the walk, which is the one that is right at every step.
+        let lone = self.opts.settle_lone_chain
+            && live_src
+            && slot != u32::MAX
+            && !same
+            && table.pieces.is_empty()
+            && self.frozen().is_empty();
+        let masked = (tombs || lone)
+            && slot != u32::MAX
+            && from.live_offs_into(from.entry(slot as usize), &mut offs, from_wm);
         let mut run_scratch = self.fs().settle_run.borrow_mut();
         let run: &mut Vec<u8> = &mut run_scratch;
         run.clear();
-        if masked {
+        if masked || lone {
+            // Counted where the chain is the run for the lone key's sake.
+            if !masked {
+                self.fs().settle_short.add(0, 1);
+            }
             // The masked key's run, written from its chain: every older
             // source is masked, so this is the whole run and none of the
             // machinery the general path needs -- an `Over` allocated
@@ -34340,6 +34447,44 @@ impl Reader {
                 let v = from.value_at(off);
                 run.extend_from_slice(&(v.len() as u32).to_le_bytes());
                 run.extend_from_slice(v);
+            }
+            // A lone key's run held to what the sources' walk makes of it,
+            // in a checked build: the claim is that no older source holds
+            // the key, and the walk is what would find one.
+            #[cfg(debug_assertions)]
+            if lone && !masked {
+                let mut check: Vec<u8> = Vec::new();
+                let ctx = self.build_ctx();
+                let ov = Overlay {
+                    over: vec![Over {
+                        key,
+                        sk: Some(UKey::live(slot, NO_RUN)),
+                        cut,
+                        pieces: 0..0,
+                    }],
+                    held: Vec::new(),
+                    snap: &NO_SNAPSHOT,
+                    stale: &ctx.stale,
+                };
+                let mut em = Emit {
+                    tombs,
+                    scratch: Vec::new(),
+                };
+                ctx.emit_over(
+                    &mut |_, v: &[u8]| {
+                        check.extend_from_slice(&(v.len() as u32).to_le_bytes());
+                        check.extend_from_slice(v);
+                    },
+                    &mut em,
+                    &ov,
+                    0,
+                    None::<(usize, &mut PartReader<'_>)>,
+                    src,
+                )?;
+                debug_assert_eq!(
+                    *run, check,
+                    "a lone key's run from its chain disagrees with the sources' walk"
+                );
             }
         } else {
             let mut held: Vec<(&[u8], usize, usize, u32)> = Vec::new();
@@ -34456,12 +34601,30 @@ impl Reader {
                     );
                     (c - lo, true)
                 } else {
-                    let i = blk.lower_bound(key);
-                    (
-                        i,
-                        i < blk.ents.len()
-                            && key_cmp(blk.key(&blk.ents[i]), key) == Ordering::Equal,
-                    )
+                    // A key above the copy's last entry goes after it:
+                    // one compare, where the search made ten to say so
+                    // (`Options::settle_append_last`).
+                    let past = self.opts.settle_append_last
+                        && blk
+                            .ents
+                            .last()
+                            .is_some_and(|e| key_cmp(blk.key(e), key) == Ordering::Less);
+                    if past {
+                        debug_assert_eq!(
+                            blk.lower_bound(key),
+                            blk.ents.len(),
+                            "a key above a copy's last entry is searched to another place"
+                        );
+                        self.fs().settle_short.add(1, 1);
+                        (blk.ents.len(), false)
+                    } else {
+                        let i = blk.lower_bound(key);
+                        (
+                            i,
+                            i < blk.ents.len()
+                                && key_cmp(blk.key(&blk.ents[i]), key) == Ordering::Equal,
+                        )
+                    }
                 };
                 // A run no longer than the one it replaces is written
                 // over it: the values stay where a build laid them and
@@ -35442,10 +35605,12 @@ impl Reader {
                 };
                 // The entry a copy's walk starts at, where the walk takes
                 // it by rank: this block's start less its first rank.
-                let copy_at = (self.opts.copy_prefetch_from_start
+                let copy_at = ((self.opts.copy_prefetch_from_start
+                    || self.opts.copy_prefetch_span)
                     && self.opts.copy_start_at_rank
                     && rank != usize::MAX)
                     .then(|| start - lo);
+                let copy_span = self.opts.copy_prefetch_span;
                 let mut pace: Option<Pace> = None;
                 if !fetched && self.opts.scan_prefetch {
                     prefetch_block(
@@ -35458,6 +35623,9 @@ impl Reader {
                         self.opts.seek_prefetch_dir,
                         self.opts.copy_prefetch_whole,
                         self.opts.scan_prefetch_sparse_span,
+                        // A block after the scan's first is walked from
+                        // its first entry, whatever its copy holds.
+                        copy_span.then_some(!first),
                     );
                 }
                 fetched = false;
@@ -35487,6 +35655,7 @@ impl Reader {
                                 self.opts.seek_prefetch_dir,
                                 self.opts.copy_prefetch_whole,
                                 self.opts.scan_prefetch_sparse_span,
+                                copy_span.then_some(true),
                             ),
                         }
                         fetched = true;
@@ -42058,6 +42227,16 @@ impl Db {
     pub fn lazy_cuts(&self) -> [u64; 2] {
         self.take_back_upkeep();
         self.r.fs().lazy_cuts.get()
+    }
+
+    /// The writer's own settles' patches that took a key's run from its
+    /// chain alone (`Options::settle_lone_chain`) and that appended a key
+    /// past a copy's last entry without a search
+    /// (`Options::settle_append_last`).
+    #[doc(hidden)]
+    pub fn settle_short(&self) -> [u64; 2] {
+        self.take_back_upkeep();
+        self.r.fs().settle_short.get()
     }
 
     /// The writer's own settles' resolves whose stride of heads was
