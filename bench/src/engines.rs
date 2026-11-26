@@ -15502,9 +15502,13 @@ macro_rules! roster {
     };
 }
 #[cfg(faster)]
-pub const ARMS: [&str; 15] = roster!("supdb-heldnoframes", "faster");
+pub const ARMS: [&str; 15] = ARMS_EVERYWHERE;
 #[cfg(not(faster))]
 pub const ARMS: [&str; 13] = roster!();
+/// `ARMS` as a host that builds FASTER has it, named on every host: the
+/// order the figures draw a row's curves in (`drawn_order`), since a row is
+/// drawn wherever it is read and not only where it was measured.
+pub const ARMS_EVERYWHERE: [&str; 15] = roster!("supdb-heldnoframes", "faster");
 
 /// The arms a bounded run (`Scale::Ooc`) measures by default: the default
 /// and the three shipping options whose difference is what a read past
@@ -15552,9 +15556,12 @@ macro_rules! ooc_roster {
     };
 }
 #[cfg(faster)]
-pub const OOC_ARMS: [&str; 10] = ooc_roster!("supdb-heldpart", "faster");
+pub const OOC_ARMS: [&str; 10] = OOC_ARMS_EVERYWHERE;
 #[cfg(not(faster))]
 pub const OOC_ARMS: [&str; 8] = ooc_roster!();
+/// `OOC_ARMS` as a host that builds FASTER has it, as `ARMS_EVERYWHERE` is
+/// `ARMS`.
+pub const OOC_ARMS_EVERYWHERE: [&str; 10] = ooc_roster!("supdb-heldpart", "faster");
 
 pub fn guarantee(arm: &str) -> Option<Guarantee> {
     Some(match arm {
@@ -18913,6 +18920,24 @@ pub fn check_matched(arms: &[String], dir: &Path) -> Res<()> {
 pub fn every_arm() -> Vec<&'static str> {
     let mut v: Vec<&'static str> = ARMS.to_vec();
     for a in OOC_ARMS {
+        if !v.contains(&a) {
+            v.push(a);
+        }
+    }
+    v
+}
+
+/// The rosters' arms in the order the figures draw curves in, each once:
+/// `every_arm` as a host that builds FASTER has it, on every host. The
+/// arms of FASTER's guarantee are in this build's rosters only where
+/// FASTER is built (`cfg(faster)`, Linux on x86-64), and a figure is
+/// drawn from a row wherever the row is read: ordered by this build's
+/// rosters, a row that carried `supdb-heldnoframes` drew it by its place in
+/// the roster on the host that measured it and by its name on ARM and
+/// macOS, and the committed figures failed their check on both.
+pub fn drawn_order() -> Vec<&'static str> {
+    let mut v: Vec<&'static str> = ARMS_EVERYWHERE.to_vec();
+    for a in OOC_ARMS_EVERYWHERE {
         if !v.contains(&a) {
             v.push(a);
         }

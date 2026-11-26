@@ -1090,7 +1090,21 @@ clock and no host in it but what the row records, and its test draws the
 same rows twice and holds the bytes equal, since a check that compares a
 drawing to a redrawing is only as good as the drawing's determinism. The
 rule: a derived file may be committed when a check regenerates it and
-fails on a difference, and never otherwise.
+fails on a difference, and never otherwise. The build was a third input
+nobody had listed. The curves were ordered by the rosters, and the
+rosters name the arms of FASTER's guarantee only where FASTER is built
+(`cfg(faster)`, Linux on x86-64): the first rows banked with
+`supdb-heldnoframes` in them drew it by its place in the roster on the
+host that measured them and by its name on ARM and macOS, and the
+committed figures failed their check on both legs of the pull request
+that banked them, with the test that draws the same rows twice green on
+all three, since a host agrees with itself. The order is the rosters' as
+a host that builds every arm has them (`engines::drawn_order`), a test
+holds it on the hosts without FASTER, and the failure was made here
+before the fix by building the suite with the arm off. A function "of
+the rows alone" is held to that by drawing on a build that differs, and
+a check that runs on three hosts is read on all three before a row's
+commit is called drawn.
 
 **Rows from the hosted runners.** `bank-row.yml` runs the quick ladder on
 each hosted runner after a merge to `main` and proposes the rows as one
