@@ -238,7 +238,10 @@ fn a_zpages_life(name: &str) {
         // switch, whose keys and values here the stride form holds, the
         // check is asked for, so the flip reaches the retire list.
         zpages_stride_trust_built: false,
-        ..common::options()
+        // The form files are found, flipped and counted in the process's
+        // mappings by their names in the directory: a store of files
+        // (`common::files`; `a_one_file_life` is the store in one file).
+        ..common::files(common::options())
     };
     let mut db = Db::create(&d, opts.clone()).unwrap();
     let keys = 20_000u32;
@@ -411,7 +414,8 @@ fn a_stride_life(name: &str) {
         scan_block_cache: false,
         seal_bytes: 1 << 20,
         partition_bytes: Some(256 << 10),
-        ..common::options()
+        // Its stride files by their names, as `a_zpages_life`'s.
+        ..common::files(common::options())
     };
     let keys = 12_000u32;
     let key = |k: u32| format!("k{k:06}").into_bytes();
@@ -531,6 +535,112 @@ fn a_stride_life(name: &str) {
     let _ = std::fs::remove_dir_all(&d);
 }
 
+/// The mappings this process holds of the data file of the store in `d`
+/// (`Options::one_file`), as `/proc/self/maps` names them.
+#[cfg(target_os = "linux")]
+fn data_file_mappings(d: &std::path::Path) -> usize {
+    let name = d.join("store.one");
+    let name = name.to_string_lossy();
+    std::fs::read_to_string("/proc/self/maps")
+        .unwrap()
+        .lines()
+        .filter(|l| l.contains(&*name))
+        .count()
+}
+
+/// A store kept in one file (`Options::one_file`) with its form forced:
+/// seals, merges that retire segments, their indexes and their form files
+/// into room the next ones are written over, a handle pinned at a snapshot
+/// across a round of them, and the store closed with the pin still held.
+/// The files the pin reads are let go by the handle's drop, the table
+/// with the last of them, and nothing of the data file stays mapped after
+/// it: the table, an entry a file and the hold a mapping keeps on its
+/// file are what this life adds to the count.
+fn a_one_file_life(name: &str) {
+    let d = std::env::temp_dir().join(format!("supdb-next-leak-{name}-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&d);
+    std::fs::create_dir_all(&d).unwrap();
+    let opts = Options {
+        one_file: true,
+        zpages: supdb::ZPages::Always,
+        zpages_min_bytes: 0,
+        scan_block_cache: false,
+        seal_bytes: 256 << 10,
+        partition_bytes: Some(256 << 10),
+        l0_trigger: 2,
+        ..common::options()
+    };
+    let mut db = Db::create(&d, opts.clone()).unwrap();
+    let keys = 12_000u32;
+    let key = |k: u32| format!("key-{k:08}").into_bytes();
+    fn read_some(r: &supdb::Reader, keys: u32) {
+        for k in (0..keys).step_by(97) {
+            let key = format!("key-{k:08}").into_bytes();
+            r.read_all(&key, vf(&mut |_| {})).unwrap();
+            r.count(&key).unwrap();
+        }
+    }
+    let mut x = 0x9E37_79B9_7F4A_7C15u64;
+    let mut round = |db: &mut Db, tag: u8| {
+        for _ in 0..keys {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            db.put(&key((x % keys as u64) as u32), &[tag; 100]);
+        }
+        db.commit().unwrap();
+        db.flush().unwrap();
+        db.zpages_settle().unwrap();
+    };
+    for tag in 0..3u8 {
+        round(&mut db, tag);
+        read_some(&db, keys);
+    }
+    let h = db.reader().unwrap();
+    std::thread::spawn(move || read_some(&h, keys))
+        .join()
+        .unwrap();
+    let c = db.one_counts().expect("a store in one file");
+    assert!(c.files > 2 && c.reused > 0, "{c:?}");
+    assert!(db.zpage_counts().reads > 0 && db.zpage_counts().form_files > 1);
+    // The pin, and a round whose merges retire what it reads.
+    let pinned = db.reader().unwrap();
+    pinned.snapshot();
+    read_some(&pinned, keys);
+    round(&mut db, 9);
+    read_some(&db, keys);
+    read_some(&pinned, keys);
+    assert!(
+        db.one_counts().unwrap().files > db.segments() as u64,
+        "the pin holds files the merges retired: {:?}",
+        db.one_counts()
+    );
+    drop(db);
+    #[cfg(target_os = "linux")]
+    assert!(
+        data_file_mappings(&d) > 0,
+        "the pin holds its files past the store's close"
+    );
+    drop(pinned);
+    #[cfg(target_os = "linux")]
+    assert_eq!(
+        data_file_mappings(&d),
+        0,
+        "no mapping of the data file survives the last handle"
+    );
+    let db = Db::open(&d, opts).unwrap();
+    assert!(db.one_counts().is_some());
+    read_some(&db, keys);
+    drop(db);
+    #[cfg(target_os = "linux")]
+    assert_eq!(
+        data_file_mappings(&d),
+        0,
+        "no mapping of the data file survives its close"
+    );
+    let _ = std::fs::remove_dir_all(&d);
+}
+
 /// A store's blocks come from the kernel by default (`Options::blocks_mapped`)
 /// and the allocator the count below sees nothing of them, so they are
 /// counted on their own (`Db::mapped_bytes`): zero past every store's
@@ -547,6 +657,7 @@ fn a_closed_store_gives_back_what_it_allocated() {
     a_three_frozen_life("warm-three");
     a_zpages_life("warm-zpages");
     a_stride_life("warm-stride");
+    a_one_file_life("warm-onefile");
     assert_eq!(
         Db::mapped_bytes(),
         0,
@@ -554,7 +665,7 @@ fn a_closed_store_gives_back_what_it_allocated() {
     );
     let before = LIVE.load(Ordering::SeqCst);
     let lives = 4;
-    let kinds = 6;
+    let kinds = 7;
     for i in 0..lives {
         a_store_life(&format!("life-{i}"), true);
         a_store_life(&format!("heap-{i}"), false);
@@ -562,6 +673,7 @@ fn a_closed_store_gives_back_what_it_allocated() {
         a_three_frozen_life(&format!("three-{i}"));
         a_zpages_life(&format!("zpages-{i}"));
         a_stride_life(&format!("stride-{i}"));
+        a_one_file_life(&format!("onefile-{i}"));
     }
     let after = LIVE.load(Ordering::SeqCst);
     let kept = after - before;

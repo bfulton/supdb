@@ -49,10 +49,13 @@ const ENC: &[&str] = &[
     "src/db/vault.rs",
 ];
 
-/// The seam both sides may name: `Bytes`, `MmapBytes`, `Paging`. Counted
+/// The seam both sides may name: `Bytes`, `MmapBytes`, `Paging`, and the
+/// table of the files a store keeps in its data file (`db::onefile`), which
+/// the door sends a file operation to and the engine makes, opens and
+/// lists in its manifest, and which knows of no cipher. Counted
 /// against the cipher's tokens with every line staged `stays`, so a new
 /// cipher-named predicate there is growth.
-const SEAM: &[&str] = &["src/bytes.rs"];
+const SEAM: &[&str] = &["src/bytes.rs", "src/db/onefile.rs"];
 
 /// The crate root: the modules and the re-exports of both sides. Counted
 /// against the cipher's tokens with every line staged `stays`, since a
@@ -118,6 +121,13 @@ const DOOR: &[&str] = &[
     "sync_slot",
     "sync_dir_as",
     "DirSync",
+    "hold_one",
+    "one_under",
+    "kill_one",
+    "OneHeld",
+    "clear_file",
+    "map_clear",
+    "ride",
     "guard",
     "guarded",
     "adopt_guard",
@@ -2342,6 +2352,7 @@ const DOOR_MODS: &[&str] = &[
     "src/crypt.rs",
     "src/db/blocks.rs",
     "src/db/dirkey.rs",
+    "src/db/onefile.rs",
     "src/db/pager.rs",
     "src/db/vault.rs",
 ];
@@ -3411,21 +3422,28 @@ fn a_new_allow_of_the_door_fails_in_each_spelling() {
 #[test]
 fn an_allow_moved_or_taken_away_fails_until_the_list_follows() {
     let listed = door_listed(&root());
-    // `file_facts`'s allow moved onto `drop_written`.
+    // `thread_major_faults`'s allow moved onto `drop_written`.
     let src = edited("src/db/zfile.rs", |t| {
         let t = t.replacen(
             "fn drop_written(",
             "#[allow(clippy::disallowed_methods)]\nfn drop_written(",
             1,
         );
-        let at = t.find("\npub(super) fn file_facts(").expect("file_facts");
-        let allow = t[..at].rfind("#[allow(").expect("file_facts's allow");
+        let at = t
+            .find("\npub(super) fn thread_major_faults(")
+            .expect("thread_major_faults");
+        let allow = t[..at]
+            .rfind("#[allow(")
+            .expect("thread_major_faults's allow");
         let end = allow + t[allow..].find('\n').unwrap() + 1;
         format!("{}{}", &t[..allow], &t[end..])
     });
     let e = door_check(&src, &listed).expect_err("a move");
     assert!(e.contains("drop_written: 1 > 0"), "{e}");
-    assert!(e.contains("file_facts: 0 < 1 listed: lower"), "{e}");
+    assert!(
+        e.contains("thread_major_faults: 0 < 1 listed: lower"),
+        "{e}"
+    );
 }
 
 #[test]

@@ -1,0 +1,64 @@
+# Mutants of the store in one file (O2), each a rule taken away. A line:
+#   id | file | exact text | replacement | what it breaks
+# Run by scratch/onefile/mut.py; a mutant no test fails is a hole.
+M01 | src/db/onefile.rs | if named != 0 && named >= s.durable { | if false { | room a manifest named is free at once
+M02 | src/db/onefile.rs | if s.waiting[i].0 < seq { | if s.waiting[i].0 <= seq { | room freed by the manifest that names it
+M03 | src/db/onefile.rs | if seq <= s.durable {\n            return;\n        } | | a durable sequence taken backwards
+M04 | src/db/onefile.rs | if !self.is_durable(e) {\n                    return Err | if false {\n                    return Err | a manifest names a segment no sync covered
+M05 | src/db/onefile.rs | if self.is_durable(e) {\n                    rows.push((name, e.clone())); | if true {\n                    rows.push((name, e.clone())); | a manifest names a companion no sync covered
+M06 | src/db/onefile.rs | rode == w && self.sync_done.load(Ordering::Acquire) > at | rode == w && self.sync_done.load(Ordering::Acquire) >= at | a ride covered by a sync begun before it
+M07 | src/db/onefile.rs | rode == w && self.sync_done | rode <= w && self.sync_done | a ride that covers writes made after it
+M08 | src/db/onefile.rs | self.u.ext.covered.fetch_max(w + 1, Ordering::AcqRel); | self.u.ext.covered.fetch_max(self.u.ext.wrote.load(Ordering::Acquire) + 1, Ordering::AcqRel); | a sync that covers a write made during it
+M09 | src/db/onefile.rs | hold.ext.mapped.store(true, Ordering::Release); | | a mapped file may be moved
+M10 | src/db/onefile.rs | if e.mapped.load(Ordering::Acquire) {\n            return Err | if false {\n            return Err | a mapped file is moved
+M11 | src/db/onefile.rs | one.file.write_all_at(&buf[..n], at + done)?; | | a move that copies nothing
+M12 | src/db/onefile.rs | if at > len {\n            self.fill(len, at)?;\n        } | | a gap left as the room's last file wrote it
+M13 | src/db/onefile.rs | let n = buf.len().min((len - at) as usize); | let n = buf.len(); | a read past a file's end into the next file
+M14 | src/db/onefile.rs | if self.u.one.dead.load(Ordering::Acquire) {\n            return Err(Error::other(\n                "a write to a file of a store that is gone (Db::crash)",\n            ));\n        }\n        Ok(loc) | Ok(loc) | a dead store writes
+M15 | src/db/onefile.rs | let n = if len == 0 {\n            end - at\n        } else {\n            len.min(end - at)\n        }; | let n = len; | an advice of length nothing reaches the data file's end
+M16 | src/db/onefile.rs | if One::section_crc(seq, body) != crc { | if crate::block::crc32(body) != crc && false { | a section of another manifest read as this one's
+M17 | src/db/onefile.rs | if !fits \|\| (cap != 0 && !space.take_at(*base, cap)) { | if !fits { | two rows over one range adopted
+M18 | src/db/onefile.rs | Some(want) => self.head_of(&e).is_ok_and(\|got\| got == want), | Some(_) => true, | a row whose room was written over read as there
+M19 | src/db/onefile.rs | let keep = up(e.len(), GRAIN);\n            if keep < loc.cap { | let keep = up(e.len(), GRAIN);\n            if false { | a writer's unused room never comes back
+M20 | src/db/onefile.rs | self.one.let_go(&mut s, &self.ext); | | room never given back when its last user goes
+M21 | src/db/onefile.rs | if e.names.load(Ordering::Acquire) != 0 \|\| e.users.load(Ordering::Acquire) != 0 { | if e.names.load(Ordering::Acquire) != 0 { | room given back under a mapping
+M22 | src/db/onefile.rs | e.users.fetch_add(1, Ordering::AcqRel);\n        Some(Using { | Some(Using { | a use not counted
+M23#1 | src/db/vault.rs | Behind::One(o, name) if onefile::takes(&name) => return o.make(&name).and_then(File::ext), | Behind::One(o, name) if false => return o.make(&name).and_then(File::ext), | nothing made in the data file by create
+M24 | src/db.rs | if let Some(one) = &self.one {\n            one.durable(seq);\n        } | | the table never told a manifest is durable by the segment work
+M25 | src/db.rs | let _ = self.sync_owed_slot();\n        self.one_look(true); | let _ = self.sync_owed_slot(); | a close that lists nothing built since the last landing
+M26 | src/db.rs | self.z_step();\n            self.one_look(false); | self.z_step(); | a quiet store never lists what it built
+M27 | src/db.rs | vault::kill_one(&me.dir); | | a crashed store's threads write on
+M28 | src/db.rs | one.adopt(m.seq, &m.extents) | one.adopt(0, &m.extents) | the slot taken read as naming nothing
+M29 | src/db.rs | } else if let Some(there) = one.and_then(\|o\| o.on_device(n)) {\n                !there | } else if let Some(_there) = one.and_then(\|o\| o.on_device(n)) {\n                false | a place written over read as there
+M30 | src/db.rs | && vault::len(dir.join(onefile::NAME)).is_ok_and(\|n\| n > onefile::HEAD) | && false | no slot beside a data file opened as a store of nothing
+M31 | src/db.rs | if !opts.manifest_slots \|\| opts.manifest_pending {\n                    return Err(refused( | if false {\n                    return Err(refused( | a store in one file opened under the pending slot
+M32 | src/db.rs | if opts.one_file && (!opts.manifest_slots \|\| opts.manifest_pending) { | if false { | a store in one file made under the pending slot
+M33 | src/db.rs | index_first: vault::one_under(&dir).is_some(),\n        pieces, | index_first: false,\n        pieces, | a merge's index written after its piece's sync
+M34 | src/db.rs | // kept in one file (`vault::File::ride`).\n    f.ride(); | // kept in one file (`vault::File::ride`). | a seal's index never rides
+M35 | src/db.rs | fault: if placed { RUN_FILE_PLACED } else { 0 }, | fault: 0, | a writer of a data file's file on the fast calls
+M36 | src/db.rs | if one.is_none()\n            && listed | if false\n            && listed | a creation's data file left beside a store of files
+M37 | src/db.rs | .fetch_or(SLOT_TOLD_ONE, AtomicOrdering::AcqRel); | .fetch_or(0, AtomicOrdering::AcqRel); | the slot's sync tells no table
+M38 | src/db.rs | if let Some(one) = vault::one_under(dir) {\n                one.durable(seq);\n            } | | an open's publish tells the table nothing
+M39 | src/db/onefile.rs | self.hinted(loc.base + at, n as u64);\n        drop(loc);\n        self.wrote(at + n as u64);\n        Ok(n) | drop(loc);\n        self.wrote(at + n as u64);\n        Ok(n) | (a hint, not a rule: expected to survive)
+M40 | src/db/onefile.rs | listed += u64::from(e.named.load(Ordering::Acquire) != 0); | listed += 1; | (a count: the test's wait)
+M41#1 | src/db/vault.rs | Behind::One(o, name) => o.holds(&name) \|\| path.is_file(), | Behind::One(_, _) => path.is_file(), | a form file of the data file not seen by the controller's looks
+M42 | src/db.rs | write_ord(self.dir, &p.name, &ord, self.ord_durable)?;\n                seg.sync_all()\n                    .map_err(\|e\| err(&format!("compact finish: {e}")))?; | write_ord(self.dir, &p.name, &ord, self.ord_durable)?;\n                drop(seg); | a merge\'s piece never synced
+M43 | src/db/onefile.rs | if tail + s.space.run_at(tail) == s.end { | if tail == s.end { | a file with free room behind it to the data file's end is moved
+M44 | src/db/onefile.rs | let more = (s.end / 8).clamp(STEP, 64 * BIG); | let more = (s.end / 8).clamp(BIG, 64 * BIG); | (a size, not a rule: expected to survive)
+M45 | src/db/onefile.rs | for &(_, at, len) in &gone {\n            self.forget(at, len);\n        } | | room given back keeps its pages in the page cache
+M46 | src/db/onefile.rs | .map(&own)? | .map(&hold.one.file)? | (the kernel's readahead state, one for the store: held by the bounded pairing, expected to survive)
+M47 | src/db/onefile.rs | v[a..b].copy_from_slice(&part[..take]); | | a first page kept without the bytes written to it
+M48 | src/db/onefile.rs | else {\n            *h = Head::Unread;\n            return;\n        }; | else {\n            return;\n        }; | a page written after its listing keeps the checksum taken
+M49 | src/db/onefile.rs | Head::Page(v) => v.truncate(len.min(GRAIN) as usize), | Head::Page(_) => {} | a cut leaves what was written past it in the page kept
+M50 | src/db/onefile.rs | _ => *h = Head::Unread,\n        }\n    } | _ => {}\n        }\n    } | a cut of a listed file keeps the checksum taken
+M51 | src/db/onefile.rs | v.resize(e.len().min(GRAIN) as usize, 0);\n                        One::head_sum(v) | One::head_sum(v) | a page short of the file's length checksummed short
+M52 | src/db/onefile.rs | let done = self.os.write_all_at(buf, loc.base + at);\n        if at < GRAIN { | let done = self.os.write_all_at(buf, loc.base + at);\n        if false { | a write of the first page the table does not see
+M53 | src/db/onefile.rs | if at < GRAIN && n != 0 {\n            let n = usize::try_from(n).ok(); | if false {\n            let n = usize::try_from(n).ok(); | a vectored write of the first page the table does not see
+M54 | src/db/onefile.rs | n -= part.len();\n            at += part.len() as u64; | n -= part.len(); | a second slice written over the first in the page kept
+M55 | src/db/onefile.rs | if len != now && len.min(now) < GRAIN { | if false { | a length set inside the first page the table does not see
+M56 | src/db/onefile.rs | let take = part.len().min((GRAIN - at) as usize); | let take = part.len(); | a write across the page's end kept past the page
+# M41#1, the controller's look for a form file by its path, outlived the two binaries the runner
+# runs and the form-file tests under the one-file switch: those tests' controller stores had not
+# taken the switch. With them under it fifteen fail (SUPDB_TEST_ONEFILE=1 cargo test --profile
+# checked --test zpages), and the door's unit test of the looks holds it in the library's tests.
+# M39, M44 and M46 are a hint, a size and the kernel's readahead state: expected to survive.

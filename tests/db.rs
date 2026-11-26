@@ -1727,14 +1727,7 @@ fn the_oracle_holds_under_the_shape_with_seals_that_keep_the_wal() {
 /// id the seal gave it; a merge writes a fresh one, so the id in the name is
 /// what tells the two apart on disk.
 fn seg_names(d: &std::path::Path) -> Vec<String> {
-    let mut v: Vec<String> = std::fs::read_dir(d)
-        .unwrap()
-        .flatten()
-        .map(|e| e.file_name().to_string_lossy().into_owned())
-        .filter(|n| n.ends_with(".sup"))
-        .collect();
-    v.sort();
-    v
+    common::seg_names(d)
 }
 
 /// A flush that leaves one full-range piece promotes it instead of merging.
@@ -1913,6 +1906,10 @@ fn a_point_read_over_tombstones_in_every_source_answers_from_one_probe_of_each()
     }
 }
 
+fn ord_names(d: &std::path::Path) -> Vec<String> {
+    common::ord_names(d)
+}
+
 /// A frozen table is probed by its own hash, whatever table is live over
 /// it. A hashed table folds a sixteen-byte key's two words where every
 /// other key takes its FNV word (`Options::mem_hash_fold`), and an ordered
@@ -1997,17 +1994,6 @@ fn a_frozen_tables_sixteen_byte_key_is_read_beside_an_open_run() {
     }
 }
 
-fn ord_names(d: &std::path::Path) -> Vec<String> {
-    let mut v: Vec<String> = std::fs::read_dir(d)
-        .unwrap()
-        .flatten()
-        .map(|e| e.file_name().to_string_lossy().into_owned())
-        .filter(|n| n.starts_with("ord-"))
-        .collect();
-    v.sort();
-    v
-}
-
 /// Every live segment has an ordered index, and one the open finds
 /// missing, damaged or describing another segment is rebuilt from the
 /// segment's keys, byte for byte, and counted.
@@ -2028,7 +2014,7 @@ fn a_segment_whose_ordered_index_is_missing_or_damaged_rebuilds_it_at_open() {
     // partition instead of folding into it.
     let no_merge = || Options {
         compact: false,
-        ..common::options()
+        ..common::files(common::options())
     };
     let d = dir("ord-required");
     let mut db = Db::create(&d, no_merge()).unwrap();
@@ -3145,7 +3131,7 @@ fn a_rebuilt_ordered_index_serves_point_reads_as_the_one_it_replaced() {
     let opts = || Options {
         point_via_ord: true,
         zpages: supdb::ZPages::Auto,
-        ..common::options()
+        ..common::files(common::options())
     };
     let key = |k: u32| format!("key-{k:05}").into_bytes();
     let d = dir("ordread-rebuild");
@@ -3245,7 +3231,7 @@ fn an_ordered_index_naming_the_wrong_keys_never_returns_another_keys_values() {
     let opts = || Options {
         point_via_ord: true,
         zpages: supdb::ZPages::Auto,
-        ..common::options()
+        ..common::files(common::options())
     };
     let n = 1_000u32;
     let key = |k: u32| format!("key-{k:05}").into_bytes();
@@ -3915,7 +3901,7 @@ fn a_crash_before_the_manifest_lands_keeps_the_pre_merge_store() {
     // manifest naming deleted files, which is a different question (it
     // now answers it with a diagnosis rather than an ENOENT).
     let d = dir("mergewin");
-    let mut db = Db::create(&d, small_opts(2)).unwrap();
+    let mut db = Db::create(&d, common::files(small_opts(2))).unwrap();
     let mut model: HashMap<Vec<u8>, Vec<Vec<u8>>> = HashMap::new();
     for round in 0u32..6 {
         for k in 0u32..100 {
@@ -3942,7 +3928,7 @@ fn a_crash_before_the_manifest_lands_keeps_the_pre_merge_store() {
         let name = name.unwrap().file_name();
         std::fs::copy(d.join(&name), d2.join(&name)).unwrap();
     }
-    let mut db2 = Db::open(&d2, small_opts(2)).unwrap();
+    let mut db2 = Db::open(&d2, common::files(small_opts(2))).unwrap();
     for k in 0u32..100 {
         db2.append(format!("k{k:04}").as_bytes(), b"extra");
     }
@@ -3962,7 +3948,7 @@ fn a_crash_before_the_manifest_lands_keeps_the_pre_merge_store() {
         std::fs::copy(d2.join(name), d.join(name)).unwrap();
     }
 
-    let db = Db::open(&d, small_opts(2)).unwrap();
+    let db = Db::open(&d, common::files(small_opts(2))).unwrap();
     let after: Vec<String> = std::fs::read_dir(&d)
         .unwrap()
         .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
@@ -4270,7 +4256,7 @@ fn a_seal_through_the_one_value_path_writes_the_segment_the_general_path_does() 
         let d = dir(if put_one { "sealputone" } else { "sealrun" });
         let opts = Options {
             seal_put_one: put_one,
-            ..wal_arm()
+            ..common::files(wal_arm())
         };
         let mut db = Db::create(&d, opts).unwrap();
         for c in 0u32..3000 {
@@ -4444,7 +4430,7 @@ fn deleted_values_do_not_survive_the_merge() {
     let opts = Options {
         seal_bytes: 256 << 10,
         l0_trigger: 3,
-        ..common::options()
+        ..common::files(common::options())
     };
     let mut db = Db::create(&d, opts.clone()).unwrap();
     let filler = vec![b'x'; 200];
@@ -8508,7 +8494,8 @@ fn a_manifest_publish_leaves_its_spare_to_the_sweep() {
         seal_bytes: 1 << 20,
         partition_bytes: Some(64 << 10),
         manifest_slots: false,
-        ..common::options()
+        // A store in one file keeps no such manifest (`Options::one_file`).
+        ..common::files(common::options())
     };
     let spares = |d: &std::path::Path| -> Vec<String> {
         let mut v: Vec<String> = std::fs::read_dir(d)
@@ -9803,7 +9790,7 @@ fn a_direct_run_streamed_from_its_table_is_the_run_the_copies_write() {
         seal_bytes: 64 << 20,
         partition_bytes: Some(1 << 20),
         direct_stream: stream,
-        ..common::options()
+        ..common::files(common::options())
     };
     let drive = |d: &std::path::Path, stream: bool| -> (Db, ScanModel) {
         let mut db = Db::create(d, opts(stream)).unwrap();
@@ -10928,15 +10915,7 @@ fn a_reader_under_latest_sees_the_commit_of_a_key_it_settled_uncommitted() {
 #[test]
 fn a_first_flush_seals_the_partition_in_one_publish() {
     let key = |k: u32| format!("key-{k:05}").into_bytes();
-    let files = |d: &std::path::Path| -> Vec<String> {
-        let mut v: Vec<String> = std::fs::read_dir(d)
-            .unwrap()
-            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
-            .filter(|n| n.ends_with(".sup"))
-            .collect();
-        v.sort();
-        v
-    };
+    let files = |d: &std::path::Path| -> Vec<String> { seg_names(d) };
     for (name, shuffled) in [
         ("first-partition-ordered", false),
         ("first-partition-shuffled", true),
@@ -16100,7 +16079,7 @@ fn segment_files(d: &std::path::Path) -> Vec<String> {
 #[test]
 fn a_segment_the_manifest_does_not_name_is_swept_and_its_wal_replayed() {
     let d = dir("unnamed-seg");
-    let mut db = Db::create(&d, wal_arm()).unwrap();
+    let mut db = Db::create(&d, common::files(wal_arm())).unwrap();
     assert!(d.join("manifest").exists(), "a manifest from birth");
     let mut model: BTreeMap<Vec<u8>, Vec<Vec<u8>>> = BTreeMap::new();
     for round in 0u32..3 {
@@ -16122,7 +16101,7 @@ fn a_segment_the_manifest_does_not_name_is_swept_and_its_wal_replayed() {
         let name = e.unwrap().file_name();
         std::fs::copy(d.join(&name), d2.join(&name)).unwrap();
     }
-    let mut db2 = Db::open(&d2, wal_arm()).unwrap();
+    let mut db2 = Db::open(&d2, common::files(wal_arm())).unwrap();
     db2.seal().unwrap();
     db2.settle().unwrap();
     assert_eq!(db2.levels(), (0, 1), "the copy sealed one piece");
@@ -16143,7 +16122,7 @@ fn a_segment_the_manifest_does_not_name_is_swept_and_its_wal_replayed() {
         );
     }
 
-    let db = Db::open(&d, wal_arm()).unwrap();
+    let db = Db::open(&d, common::files(wal_arm())).unwrap();
     for name in &moved {
         assert!(!d.join(name).exists(), "{name} is swept at open");
     }
@@ -16241,7 +16220,7 @@ fn a_failed_landing_stops_the_seals_behind_it_and_a_reopen_replays_them() {
 #[test]
 fn a_store_from_before_manifests_opens_from_its_segment_names() {
     let d = dir("premanifest");
-    let mut db = Db::create(&d, wal_arm()).unwrap();
+    let mut db = Db::create(&d, common::files(wal_arm())).unwrap();
     let mut model: BTreeMap<Vec<u8>, Vec<Vec<u8>>> = BTreeMap::new();
     for round in 0u32..2 {
         for k in 0u32..200 {
@@ -16270,7 +16249,7 @@ fn a_store_from_before_manifests_opens_from_its_segment_names() {
         "the fallback reads seg- names: {segs:?}"
     );
 
-    let db = Db::open(&d, wal_arm()).unwrap();
+    let db = Db::open(&d, common::files(wal_arm())).unwrap();
     assert_eq!(db.segments(), 1, "the segment taken as live from its name");
     for (key, want) in &model {
         assert_eq!(
@@ -20000,7 +19979,8 @@ fn a_pending_manifest_is_the_store_only_once_its_segment_reads_back_whole() {
                 checksums,
                 ..Default::default()
             },
-            ..common::options()
+            // A store in one file keeps no pending name.
+            ..common::files(common::options())
         };
         let mut db = Db::create(&d, opts.clone()).unwrap();
         let mut m = ScanModel::default();
@@ -20068,7 +20048,8 @@ fn a_clean_close_leaves_no_pending_name() {
     let opts = Options {
         seal_bytes: 1 << 20,
         manifest_pending: true,
-        ..common::options()
+        // A store in one file keeps no pending name.
+        ..common::files(common::options())
     };
     let mut db = Db::create(&d, opts.clone()).unwrap();
     for k in (0..2000u32).rev() {
@@ -20171,7 +20152,7 @@ fn a_run_whose_keys_the_table_keeps_leaves_the_segment_the_copies_leave() {
         partition_bytes: Some(1 << 20),
         direct_derive_keys: derive,
         direct_keys_in_stream: in_stream,
-        ..common::options()
+        ..common::files(common::options())
     };
     let drive = |d: &std::path::Path, derive: bool, in_stream: bool| {
         let mut db = Db::create(d, opts(derive, in_stream)).unwrap();
@@ -20519,7 +20500,7 @@ fn the_directory_hint_writes_the_segment_and_the_ordered_index_the_default_does(
         });
         let opts = Options {
             seek_prefetch_dir: hint,
-            ..common::options()
+            ..common::files(common::options())
         };
         let mut db = Db::create(&d, opts).unwrap();
         for c in 0u32..3000 {

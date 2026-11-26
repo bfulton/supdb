@@ -156,7 +156,9 @@ owner's:
   which says what of the layer's design (`scratch/seam/design.md`) it
   keeps and what it replaces. It is held to the same two bars: every
   stage behind an option and an arm until the suite reads it better and
-  the gate passes with it on, and the count level with it off.
+  the gate passes with it on, and the count level with it off. What is
+  built of it and what its pairings leave open is one item of
+  `ROADMAP.md` ("The store in one file: what is built, and what leans").
 - **`scratch/` is this branch's working records, and comes off before a
   merge or a pull request**, as it came off PR #6. The layer's design
   (`scratch/seam/design.md`, its decisions and the forms' contract
@@ -183,6 +185,7 @@ owner's:
 | `src/db/dirkey.rs` | a live store's directory under a key, encrypted by the kernel (`Encryption::Kernel`): the requests of Linux's file encryption, what `create` and `open` hold a directory to, and `lock`, with no cipher and no byte of a read path in it -- the module's own docs, and `scripts/fscrypt.sh` for a filesystem to test it on |
 | `src/db/vault.rs` | a live store under a cipher the caller supplies (`Encryption::Cipher`): the door every file operation of the engine goes through, which is the standard library's call for a plain store, and the file it hands out (`vault::File`), whose methods are the calls the engine made on a descriptor; a file as a memory file while it is written and as its envelope in the directory after; the marker and the keys, the caller's wrapping the store's and the store's wrapping a key a file; the manifest's slot and the log's record sealed, with no cipher in the crate -- the module's own docs, `tests/cipher.rs`, and `ZFUZZ_CIPHER=1` for the differential fuzz |
 | `src/db/pager.rs` | the cache a store under a cipher reads its files through: a file as address space its plaintext's length, a chunk of it decrypted where it is first asked for and a megabyte given back at a time once the cache is past its budget and no reader could hold it; the holds and rests of the threads that read with no slot of the reader table, the two lines past the budget at which the store's own work and then a caller's read wait, the failure a read remembers, and the view a merge reads its inputs through beside the cache (`Stream`), with no cipher in it and no reader of the format -- the module's own docs, and `tests/cipher.rs` for a store several times its cache |
+| `src/db/onefile.rs` | a store kept in one file (`Options::one_file`, off): the table behind the door that makes a segment, its ordered index and its form file an extent of the store's data file (`store.one`) -- the names, the free room and its reuse once a manifest later than the one that named it is known durable, growth reserved from the device and not written, a file moved while it is being written and never once it is mapped, the use a mapping or a handle holds on its room, the syncs and the rides by which a manifest may name a file, and the section a manifest lists the places in, with no reader of the format and no byte of a read path in it; the log, the manifest's slots and an ordered run are files of the directory still -- the module's own docs, `tests/onefile.rs`, `SUPDB_TEST_ONEFILE=1` for the suite's tests over it and `ZFUZZ_ONEFILE=1` for the differential fuzz |
 | `src/db/zselect.rs` | the compact form's selector: `ZSelect::step`, a function of its state and an explicit `Input` (no clock, thread or file), the one definition of the transitions between FITS, SUSPECT, building, COMPACT and the trial, the replays that hold it, the model of a cache's faults over populations of pages (`model_populations`), and what the reads of a store in two forms cost with the moves between the forms that pay (`forms_cost`, `conversions`) -- the module's own docs |
 | `src/format.rs` | the on-disk format's fixed quantities, owned by no writer |
 | `src/block.rs`, `src/index.rs`, `src/flatindex.rs` | the format itself: blocks, extents, the flat key index -- `docs/index-theory.md` |
@@ -205,11 +208,11 @@ three readers parse what it wrote: `Blob` over a mapped file, `Blob` over a
 copying source, and `SparseBlob` over ranges. That is why `format.rs`
 belongs to none of them.
 
-Six modules carry a blanket allowance of the door's two lints
+Seven modules carry a blanket allowance of the door's two lints
 (`clippy::disallowed_methods`, `clippy::disallowed_types`), and they are
-the door: `vault`, `bytes`, `pager`, `crypt`, `dirkey` and `blocks`, the
-modules that open, map, advise and sync files and read the process's own
-counters for everyone else. An allowance anywhere else is an item's, with
+the door: `vault`, `bytes`, `pager`, `crypt`, `dirkey`, `blocks` and
+`onefile`, the modules that open, map, advise and sync files and read the
+process's own counters for everyone else. An allowance anywhere else is an item's, with
 its reason, and `tests/data/door.txt` counts it. No other module carries a
 blanket lint allowance; `block` and `flatindex` allow `dead_code` on the
 wasm target only, where their writer halves have no caller. Nothing is
@@ -256,9 +259,9 @@ twelve seconds in the next. It installs no recommended extras, so a
 package a job needs and another only recommends is named, as `cross-arm`
 names the target's C library.
 
-`sh scripts/check.sh` runs every group -- build, test, stride, lint, wasm, bench,
-lists -- and CI calls the same script with the same names, so a green run
-here is a green run there. tests/source.rs reads every file under
+`sh scripts/check.sh` runs every group -- build, test, stride, onefile, lint,
+wasm, bench, lists -- and CI calls the same script with the same names, so a
+green run here is a green run there. tests/source.rs reads every file under
 `.github/workflows`: a workflow that runs on a change's event (`ci.yml`,
 and `apple-silicon.yml`, which runs the `machine` group where a pull
 request changes the machine capture) is held to run steps that are a
@@ -10616,6 +10619,168 @@ it is spent on, which here cost nothing; each kind of range the fuzz has
 is run past the gate's at every stage, since three seeds of a kind hold
 three seeds; and a diagnostic is run once on the plainest store before
 the day it is wanted.
+
+**Room given back that kept its pages, and a mapping made through the
+store's one open.** The store in one file (`Options::one_file`) was
+predicted before its first pairing, with four ways the prediction could
+fail named beside it (`scratch/plan/onefile.md`), and under a bound two
+of the four were what the pairings read. In core it read level, as
+predicted. At ten million keys under 1.25 GiB the full rewrite's burst
+read 1.24x of the default's, the frees it no longer makes, and the scan
+pass after it 0.3x, the clean store's 0.7x. Room a merge retires had
+kept its pages in the page cache, where a store of files drops a retired
+file's at its unlink: written once and read by nobody, which is how the
+kernel ranks the segments and form files written since, so a reclaim
+under the bound took those -- 110 thousand refaults in the pass against
+25, nine thousand major faults against none. The pages are dropped where
+the room's last holder lets go, before the room can be another file's
+(`One::dropped`), and the pass read level in a pairing of two reps. At
+three reps it read 0.5x and 0.7x, in no pair of six, the scanning thread
+at 2,700 to 4,900 major faults against none to 430 and every tenth of
+the pass a twentieth of a second longer: every mapping was made through
+the table's one open of the data file. The kernel keeps a readahead
+window and a count of a mapping's misses on the open file the mapping
+was made through, and stops reading around a fault once the count is
+past a hundred; a store of files has both a segment, and here a merge's
+and a build's misses were counted against the scans of every other
+file. The plan's probe had mapped its extent through an open of its own,
+and the comment over the call said the code did. A mapping is made
+through its own open now (`Using::map`): the pass's major faults 70 to
+520 against none to 500, the pass level, every burst of the sweep ahead
+in both orders, and the one-thread read pass under 1 GiB, behind in six
+pairs of six before, level. The rules: what a file system does at an
+unlink, a truncate or a close is part of what a file is, so a layout
+that keeps a file's room has each of those to do itself, the page
+cache's drop here as the discard was the one meant to go; what the
+kernel keeps on an open file -- the readahead window, the miss count, an
+advice by `posix_fadvise`, a sync's error -- is shared by everything
+made through that open, so each reader that had a file of its own has an
+open of its own; a comment that says what a call does is held to the
+call, since the probe had measured the shape the comment described; a
+prediction written with its refutations named is read by those names
+first, which made each of the two an hour's hunt; and a fix that reads
+level at two reps is read again at three before the cell is called
+closed, the second cause having stood under the first's noise.
+
+**A reservation a mebibyte at the least, found by the disk it filled.**
+The first run of the tests with their stores in one file
+(`SUPDB_TEST_ONEFILE=1`) ended with a test binary that printed three
+failures and no result line, in the one binary none of whose tests take
+the switch. It passed alone, and whole, on a clean temp directory. The
+stores the binaries before it had left were 3.8 GB in 771 data files, on
+an allowance with 4.9 free: a data file was made longer by a mebibyte at
+the least and a file that outgrew its room given a mebibyte more, so a
+store of a few hundred kilobytes reserved two to five, where a store of
+files holds what it wrote, and the binary had died of a full disk, which
+under `--no-fail-fast` cargo reports as a target that failed and nothing
+more. The step is sixteen pages now (`onefile::STEP`), and lowering it
+found a waste the mebibyte had hidden: a file that outgrew its room with
+free room behind it reaching the data file's end, but less than it asked
+for, was moved, its bytes copied, where the data file could be made
+longer for the rest; the lone writer's unit test, green since it was
+written, went red at the new step. The tests' stores are still about
+twice a store of files' on disk, the alignment a file is placed at
+being reserved with it, so the gate's `onefile` group runs in a temp
+directory of its own and removes it. The rules: a test binary that ends
+with no result line and no watchdog's line is read against `df` before
+anything else, and `df` is read before a run of the tests under a new
+layout, not after it; a floor is priced on the smallest store the
+library makes, the rule the log's megabyte left here; and a constant
+lowered is a test of every branch its old value kept anything from
+taking.
+
+**A switch's first run, sorted by what each test holds.** Ninety-nine
+tests failed under that switch and none was the engine's: four set a
+shape of the manifest a store in one file refuses, and every other finds
+a store's files in its directory. Those came in three kinds. A test that only names files -- the segments' names, the
+partitions' fences, the form files standing -- asks the store now
+(`Db::one_names`, `common::store_names`) and runs under the switch. A
+test that reads a file's bytes without changing them -- a form file's
+fence for its windows, a trailer, a size, what the kernel holds of a
+range -- reads them where they lie (`Db::one_read`, `Db::one_place`,
+`common::store_file`). A test that opens, copies, links, damages or maps
+a file by its path says it is of a store of files (`common::files`, the
+form tests' `forced_files`). Sorted so, half of them run under the
+switch that would have been pinned, the scans over a covered store and
+the drop of a served partition's raw pages among them. And the first
+count was short by a binary: the form-file tests build their stores by a
+helper of their own and had not taken the switch at all, 246 green of a
+binary with no store in one file, until the helper took it and 45 went
+red. The rules: a switch's green is read after a count that the
+switch's mechanism fired in each binary, as a fuzz range under a switch
+asserts of itself; and a test that fails under a switch is sorted by
+what it holds -- a name, bytes, a path -- before it is pinned, since a
+pin is a test the switch no longer runs. It was short by a helper as
+well, inside that binary: the controller's tests (`ZPages::Auto`, the
+store as it ships) make their stores by a second helper, which took
+nothing of the switch, so the controller's looks, builds ahead, attaches
+and drops had run over no store in one file while the binary read 246
+green under it. A mutant found it and no count had: the door's look for
+a form file by its path (`vault::is_file`, the controller's
+`Db::z_on_disk`) answering no for every file of the data file passed the
+binary whole. With that helper under the switch 24 tests failed, each on
+a path or a listing, and with the listings made of the store's files as
+paths whichever way it keeps them (`common::store_paths`, and
+`store_place`, `store_len`, `cached_pages` and the tests' `evict` and
+`unmap_pages` answering for a path where its bytes lie) eighteen run and
+six that remove a file by its path, or know one by its inode or its
+time, are pinned; the mutant then fails fifteen. One of the eighteen
+was the engine's: a file built ahead and dropped from the page cache as
+it is written stood there by a page, its first, which the manifest that
+listed the file had read back from the device for the row's checksum, on
+the thread every landing goes through. The table keeps a file's first
+page as its writes make it now and reads nothing (`onefile::Head`,
+`OneCounts::head_reads`). The corollaries: the count that a switch's
+mechanism fired is taken a helper at a time, by every constructor of a
+store the binary has, and a mutant of the mechanism that the binary
+passes under the switch is the count nobody took; a listing a test loops
+over is made so that the loop fails where it is empty for the wrong
+reason, since a loop over nothing asserts nothing; and a checksum of
+bytes a writer has just handed over is taken from the hand-over, since
+reading them back is a device read wherever the writer meant them to
+leave the cache.
+
+**A listing made eight times to find a difference, and never read for
+what the loop did.** The count over the store in one file read the
+public writer's loop -- `SegmentWriter`'s `begin`, `value` and `end`
+written into the seal probe's own function -- a few instructions a key
+over the base with no line of the loop changed. Eight builds of the
+probe were counted by instruction to find where
+(`scratch/onefile/design.md` has the table): each differed in where the
+compiler kept the loop's values, a field twelve bytes wider in the
+writer was enough to move it, and none gave the loop back. A divide a
+record was found in the write beside it and taken out, the probe read
+three a key under the base, and the stage's count was called settled.
+Taken again on the stage's last tree it read the loop nine over and the
+probe two: by mnemonic eleven moves more and four address computations
+fewer, a jump, one padding `nop` for another, and nothing the writer's
+source had gained, the changes since being a table's bookkeeping, a
+mapping's open and a read path's fix. What took it back had been in
+every one of those listings. The loop called `SegmentWriter::layout`
+twice a key, at `begin` and at `end`, for a choice made at the first
+key: the arguments, the call, the answer written through a pointer and
+tested, twenty-four instructions each time, in the base as in the head.
+Answered inline, the choice itself out of line (`layout_first`), the
+seal probe reads 53 instructions a key under the base, the ordered loads
+28 and a merge 72 of the 150 it is under by. The merge's other part was
+the same shape one function over: `Emitter::leave`, the step every key
+of a merge takes, an increment and a compare, had the piece's finish
+written into it, twenty-one instructions a key for the body's frame in
+the base and twenty-two the day the finish was given a second order of
+its writes; the finish is a function of its own (`leave_piece`). And one
+probe of the last count read 86 instructions a scan over with every
+function of the engine level: the allocator's count in the base's own
+binary had moved between two runs of it, which the probe run again
+said in ten minutes (`sh scripts/cost.sh 84a94f4 scan_long_z`). The
+rules: a count that moves with a loop's register allocation is not
+chased by a third build, since the allocation is the compiler's again at
+the next change anywhere in the unit; the listing is read instead for
+the work the loop does -- a call that returns, an answer asked for
+again, a divide -- because that can be taken back and here was six
+times what the builds were chasing; a count taken in the middle of a
+stage is not the stage's, and whatever changed after it is in the next
+one whichever file it was in; and a probe red by the allocator alone is
+run again before it is read.
 
 ## Standing limitations
 

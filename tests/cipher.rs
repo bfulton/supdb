@@ -2421,7 +2421,7 @@ fn a_build_drops_the_ciphertext_behind_its_walk_where_it_is_told_to() {
         let mut db = Db::open(&dir, opts(supdb::ZPages::Always)).unwrap();
         db.zpages_settle().unwrap();
         assert_eq!(db.zpage_form_files().len(), 1);
-        let pages = common::cached_pages(&dir.join(&segment), 0, len);
+        let pages = common::cached_pages(dir.join(&segment), 0, len);
         pages as f64 / len.div_ceil(4096) as f64
     };
     let (kept, dropped) = (cached(false), cached(true));

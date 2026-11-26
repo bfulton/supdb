@@ -60,7 +60,9 @@ fn life_with(name: &str, mapped: bool, budget: Option<u64>) -> Life {
             common::options().zpages
         },
         zpages_inject: inject,
-        ..common::options()
+        // The two stores' files are compared by name, byte for byte: a
+        // store of files (`common::files`).
+        ..common::files(common::options())
     };
     let opts = Options {
         jobs_mapped: mapped,

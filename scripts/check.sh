@@ -46,6 +46,19 @@
 #            between two hand runs: the adaptations it made of other tests,
 #            and the stride form under threads and under a checkpoint, ran
 #            in no gate
+#   onefile  the tests again with their stores kept in one file (an
+#            EXPERIMENT, `Options::one_file`): every test that takes its
+#            options from tests/common, under SUPDB_TEST_ONEFILE, so that
+#            its seals, merges, form builds and opens go through the
+#            store's data file, but the tests of a directory's own files,
+#            which say so (`common::files`); and bounded seed ranges of
+#            the differential fuzz and of its readers on threads with the
+#            `z` store in one file beside `r` in files (ZFUZZ_ONEFILE),
+#            in the clear, with the block cache's paths, and with the
+#            compact form forced, each failing a range in which no store
+#            kept a file in its data file. The test group's binaries. Its
+#            own group for the stride group's reason: a switch only a
+#            hand ran holds nothing between two hand runs
 #   lint     clippy at -D warnings, for this host and for the macOS target
 #            (the library alone from a host that is not a Mac), the format
 #            gate, on Linux the door (scripts/door: the
@@ -133,7 +146,7 @@
 set -eu
 cd "$(dirname "$0")/.."
 
-ALL="build test stride lint wasm bench lists"
+ALL="build test stride onefile lint wasm bench lists"
 # Lowercase because `GROUPS` is a built-in bash variable holding the current
 # user's group ids. Assigning to it does not take, so on any host where
 # /bin/sh is bash -- macOS ships bash 3.2 as /bin/sh -- this loop would have
@@ -164,6 +177,32 @@ for g in $groups; do
         cargo test --profile checked --test fuzz fuzz_range -- --exact
       ZFUZZ_ZPAGES=1 ZFUZZ_STRIDE=1 ZFUZZ_CONVERT=1 ZFUZZ_FROM=0 ZFUZZ_TO=4 \
         cargo test --profile checked --test fuzz concurrent_range -- --exact
+      ;;
+    onefile)
+      say "onefile"
+      # The group's stores in a temp directory of its own, removed where
+      # the group passes. A store in one file reserves its data file's
+      # growth from the device, so a test's store of a few hundred
+      # kilobytes holds a megabyte or three where a store of files holds
+      # what it wrote: the group's stores were three gigabytes beside the
+      # test group's one, and the first run of them left a test binary
+      # dead of a full disk. Spelled as the kernel resolves it, since the
+      # tests that find a store's mappings match /proc/self/maps by the
+      # store's directory. A group that fails leaves its stores to be read.
+      one_tmp=$(mktemp -d "${TMPDIR:-/tmp}/supdb-onefile.XXXXXX")
+      one_tmp=$(cd "$one_tmp" && pwd -P)
+      TMPDIR="$one_tmp" SUPDB_TEST_ONEFILE=1 \
+        cargo test --profile checked --no-fail-fast
+      TMPDIR="$one_tmp" ZFUZZ_ONEFILE=1 ZFUZZ_FROM=0 ZFUZZ_TO=24 \
+        cargo test --profile checked --test fuzz fuzz_range -- --exact
+      TMPDIR="$one_tmp" ZFUZZ_ONEFILE=1 ZFUZZ_FROM=0 ZFUZZ_TO=4 \
+        cargo test --profile checked --test fuzz concurrent_range -- --exact
+      TMPDIR="$one_tmp" ZFUZZ_ONEFILE=1 ZFUZZ_CACHE=all ZFUZZ_OPTVARY=1 \
+        ZFUZZ_FROM=0 ZFUZZ_TO=24 \
+        cargo test --profile checked --test fuzz fuzz_range -- --exact
+      TMPDIR="$one_tmp" ZFUZZ_ONEFILE=1 ZFUZZ_ZPAGES=1 ZFUZZ_FROM=0 ZFUZZ_TO=24 \
+        cargo test --profile checked --test fuzz fuzz_range -- --exact
+      rm -rf "$one_tmp"
       ;;
     lint)
       say "lint"

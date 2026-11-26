@@ -20,6 +20,7 @@ allow	src/bytes.rs	<file>	1	the mapped byte source and its advice (MmapBytes)
 allow	src/crypt.rs	<file>	1	/dev/urandom for an envelope's id, and the reader's anonymous plaintext mapping
 allow	src/db/blocks.rs	<file>	1	the engine's anonymous blocks, mapped, counted and given back
 allow	src/db/dirkey.rs	<file>	1	the kernel-key ioctls on directory descriptors
+allow	src/db/onefile.rs	<file>	1	the files a store keeps in its data file: opened, written, synced, advised and mapped as extents of it
 allow	src/db/pager.rs	<file>	1	the cache's memory files, their mappings and their advice
 allow	src/db/vault.rs	<file>	1	the door itself
 # The engine: not a file.
@@ -47,14 +48,8 @@ allow	src/db.rs	Db::create	1	create_dir_all of the store's real directory, which
 allow	src/db.rs	Db::checkpoint	1	the caller's destination asked whether it exists; refused under a cipher above it
 allow	src/db.rs	Maint::checkpoint_into	1	the caller's destination, made and removed; refused under a cipher in Db::checkpoint
 # The engine: a form file asked by path, fail closed under a cipher.
-allow	src/db.rs	Maint::z_files_cover	1	is_file of a form file by path: under a cipher the decoy answers no (S5 prices the controller there)
-allow	src/db.rs	Maint::z_cross	1	is_file of a form file by path: under a cipher the decoy answers no (S5 prices the controller there)
 # The compact form's builder and reader.
-allow	src/db/zfile.rs	build_file_seen	1	Mmap::map of a plain segment's door handle (SegSrc::File)
-allow	src/db/zfile.rs	PlacedWalk::map_out	1	maps a plain store's stride build's own output by path, for its read-back; a kept file's is mapped through the door (StrideWalked for Held)
 allow	src/db/zfile.rs	thread_major_faults	1	getrusage (G3: Memory)
-allow	src/db/zfile.rs	file_facts	1	maps a form file by path: under a cipher the decoy maps nothing and the reading falls back to a sample (S5)
-allow	src/db/zfile.rs	time_file_decodes	1	maps a form file by path: as file_facts (S5)
 allow	src/db/zfile.rs	read_budget	1	/proc and cgroup reads (G3: Memory)
 # Paths written outside the door's modules.
 literal	src/db.rs	llc_bytes	1	/sys/devices/system/cpu (G3: Memory)

@@ -763,7 +763,9 @@ fn a_merges_drops_behind_begin_at_each_inputs_first_record() {
             l0_trigger: 2,
             merge_drop_behind: true,
             merge_drop_chunk: chunk,
-            ..common::options()
+            // Each input is opened by its name for its records' place: a
+            // store of files (`common::files`).
+            ..common::files(common::options())
         },
     )
     .unwrap();

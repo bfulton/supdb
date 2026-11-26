@@ -7840,11 +7840,10 @@ fn build_file_seen(
     };
     let made = match src {
         SegSrc::File(file) => {
-            // SAFETY: the contract `MmapBytes::open` takes: a sealed
-            // segment is never truncated under a mapping.
-            // The door (tests/data/door.txt): a plain segment's door handle mapped (SegSrc::File).
-            #[allow(clippy::disallowed_methods, clippy::disallowed_types)]
-            let map = MmapBytes::from_map(unsafe { memmap2::Mmap::map(file.as_os())? });
+            // The segment mapped through the handle the walk drops it
+            // behind by: a file of its own, or its extent of the store's
+            // data file (`vault::File::map`).
+            let map = file.map()?;
             let blob = Blob::open_with(map, opts)?;
             blob.advise_normal();
             let facts = blob.z_source_facts().ok_or_else(|| {
@@ -8104,6 +8103,11 @@ fn name_built(
             let _ = f.sync_data();
         }
         b.sync_us = (t.elapsed().as_micros() as u64).max(1);
+    } else {
+        // In a store kept in one file a manifest lists the form file only
+        // once a sync has covered it, and a build that asks for none is
+        // covered by the store's next (`vault::ride`).
+        super::vault::ride(out);
     }
     Ok(Outcome::Built(b))
 }
@@ -8433,10 +8437,8 @@ impl StrideWalked for PlacedWalk<'_> {
     }
     #[inline]
     fn rest(&mut self) {}
-    // The door (tests/data/door.txt): the stride build's own output by path, a plain store's.
-    #[allow(clippy::disallowed_methods)]
     fn map_out(&self, tmp: &Path) -> Result<MmapBytes> {
-        MmapBytes::open(tmp)
+        super::vault::map(tmp)
     }
 }
 
@@ -10412,8 +10414,6 @@ pub(super) struct FileFacts {
     pub stride: bool,
 }
 
-// The door (tests/data/door.txt): a form file by path: under a cipher the decoy maps nothing.
-#[allow(clippy::disallowed_methods)]
 pub(super) fn file_facts(
     path: &Path,
     blob: &Blob<MmapBytes>,
@@ -10422,7 +10422,7 @@ pub(super) fn file_facts(
     advise: bool,
     stride: &StrideAttach,
 ) -> Option<FileFacts> {
-    let map = MmapBytes::open(path).ok()?;
+    let map = super::vault::map_clear(path).ok()?;
     // The advice before the first read, as the attach's: under the kernel's
     // default the trailer's page pulls a readahead window in around it.
     if advise {
@@ -10479,8 +10479,6 @@ pub(super) struct DecodeTiming {
     pub faults: u64,
 }
 
-// The door (tests/data/door.txt): a form file by path: under a cipher the decoy maps nothing.
-#[allow(clippy::disallowed_methods)]
 pub(super) fn time_file_decodes(
     path: &Path,
     blob: &Blob<MmapBytes>,
@@ -10490,7 +10488,7 @@ pub(super) fn time_file_decodes(
     own_decode: bool,
     advise: bool,
 ) -> Option<DecodeTiming> {
-    let map = MmapBytes::open(path).ok()?;
+    let map = super::vault::map_clear(path).ok()?;
     if advise {
         map.advise_random();
     }

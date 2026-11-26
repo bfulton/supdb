@@ -154,6 +154,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, AtomicU8, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 
+use super::onefile::{self, ExtFile, One};
 pub use super::pager::PagerCounts;
 use super::pager::{self, Back, Paged, Pager};
 use crate::bytes::Paging;
@@ -1014,11 +1015,127 @@ fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
     m.lock().unwrap_or_else(|e| e.into_inner())
 }
 
-/// The stores under a cipher open in this process, found by the directory
-/// each gave its engine. The count is read first, so a process with none
-/// pays a load a file operation.
+/// The stores open in this process whose files the door finds somewhere
+/// other than under their names in a directory: the stores under a cipher,
+/// found by the directory each gave its engine (`REGISTRY`), and the stores
+/// kept in one file, found by their own (`ONES`). The count is of both and
+/// is read first, so a process with neither pays a load a file operation.
 static VAULTS: AtomicUsize = AtomicUsize::new(0);
 static REGISTRY: Mutex<Vec<Arc<Vault>>> = Mutex::new(Vec::new());
+static ONES: Mutex<Vec<Arc<One>>> = Mutex::new(Vec::new());
+
+/// A store kept in one file held open: the registration the door finds its
+/// table by (`onefile`), for as long as the store is open.
+pub(crate) struct OneHeld(Arc<One>);
+
+impl OneHeld {
+    pub(crate) fn one(&self) -> &Arc<One> {
+        &self.0
+    }
+}
+
+impl Drop for OneHeld {
+    fn drop(&mut self) {
+        let mut reg = lock(&ONES);
+        if let Some(i) = reg.iter().position(|o| Arc::ptr_eq(o, &self.0)) {
+            reg.swap_remove(i);
+            VAULTS.fetch_sub(1, Ordering::AcqRel);
+        }
+    }
+}
+
+/// `one` registered as the table of the store in its directory, until the
+/// answer is dropped.
+pub(crate) fn hold_one(one: Arc<One>) -> OneHeld {
+    lock(&ONES).push(one.clone());
+    VAULTS.fetch_add(1, Ordering::AcqRel);
+    OneHeld(one)
+}
+
+/// The table of the store kept in one file in `dir`, if there is one.
+pub(crate) fn one_under(dir: &Path) -> Option<Arc<One>> {
+    if VAULTS.load(Ordering::Acquire) == 0 {
+        return None;
+    }
+    lock(&ONES).iter().find(|o| o.dir == dir).cloned()
+}
+
+/// A test's crash of the store kept in one file in `dir` (`Db::crash`):
+/// its table taken out of the door's reach and killed (`One::kill`), so
+/// the store opened in its place is the only one that writes the file.
+pub(crate) fn kill_one(dir: &Path) {
+    let gone = {
+        let mut reg = lock(&ONES);
+        reg.iter().position(|o| o.dir == dir).map(|i| {
+            VAULTS.fetch_sub(1, Ordering::AcqRel);
+            reg.swap_remove(i)
+        })
+    };
+    if let Some(o) = gone {
+        o.kill();
+    }
+}
+
+/// How the store in a directory is kept, for the one caller that writes
+/// what names its files (`db::manifest_image`): as files of the directory,
+/// under a cipher, or in one file. One load for a store of files.
+pub(crate) enum Stored {
+    Files,
+    Vault(Arc<Vault>),
+    One(Arc<One>),
+}
+
+/// `Stored` for the store in `dir`.
+#[inline]
+pub(crate) fn stored(dir: &Path) -> Stored {
+    if VAULTS.load(Ordering::Acquire) == 0 {
+        return Stored::Files;
+    }
+    stored_slow(dir)
+}
+
+#[cold]
+fn stored_slow(dir: &Path) -> Stored {
+    if let Some(o) = lock(&ONES).iter().find(|o| o.dir == dir) {
+        return Stored::One(o.clone());
+    }
+    match lock(&REGISTRY).iter().find(|v| v.decoy == dir) {
+        Some(v) => Stored::Vault(v.clone()),
+        None => Stored::Files,
+    }
+}
+
+/// What stands behind a path the engine names: nothing, for a file of a
+/// directory's own; a store under a cipher; or the table of a store kept
+/// in one file, which holds some of its directory's names and not others.
+enum Behind {
+    Plain,
+    Vault(Arc<Vault>, String),
+    One(Arc<One>, String),
+}
+
+/// `Behind` for `path`: one load where no such store is open.
+#[inline]
+fn behind(path: &Path) -> Behind {
+    if VAULTS.load(Ordering::Acquire) == 0 {
+        return Behind::Plain;
+    }
+    behind_slow(path)
+}
+
+#[cold]
+fn behind_slow(path: &Path) -> Behind {
+    let (Some(dir), Some(name)) = (path.parent(), path.file_name().and_then(|n| n.to_str())) else {
+        return Behind::Plain;
+    };
+    if let Some(o) = lock(&ONES).iter().find(|o| o.dir == dir) {
+        return Behind::One(o.clone(), name.to_string());
+    }
+    match lock(&REGISTRY).iter().find(|v| v.decoy == dir) {
+        Some(v) => Behind::Vault(v.clone(), name.to_string()),
+        None => Behind::Plain,
+    }
+}
 
 /// The store under a cipher whose engine was given `dir`, if `dir` is one.
 pub(crate) fn under(dir: &Path) -> Option<Arc<Vault>> {
@@ -2310,18 +2427,96 @@ impl LogCipher {
 /// (`pwritev`, `sync_file_range`, `posix_fadvise`, a second description by
 /// `/proc/self/fd`, `kcmp`). So the engine names no descriptor, and a file
 /// that is not a file of the directory's own has one place to be told from
-/// one that is. A plain store's file and a memory file of a store under a
-/// cipher are both the standard library's file under it.
-pub(crate) struct File(OsFile);
+/// one that is: a plain store's file and a memory file of a store under a
+/// cipher are the standard library's file under it, and a file of a store
+/// kept in one file is an extent of that file (`onefile::ExtFile`), every
+/// offset the engine names the file's own.
+///
+/// The two are told apart by one test a call, of `ext`, and a caller that
+/// makes a test of its own before every call -- a segment's writer, whose
+/// every write and sync asks one byte first -- carries the answer there
+/// and calls the directory's file with no test (`plain`): `os` is at one
+/// place in both kinds, and under a file of a data file it is a
+/// descriptor of nothing (`nowhere`), which takes no write and syncs
+/// nothing, so a call that should have asked fails where it is made, and
+/// never writes the data file at an offset that is another file's.
+pub(crate) struct File {
+    os: OsFile,
+    /// Dropped by `File`'s own drop, out of line, where there is one: a
+    /// file of the directory's own is closed on one test, and its drop
+    /// stays small enough to be written into whoever drops it.
+    ext: std::mem::ManuallyDrop<Option<Box<ExtFile>>>,
+}
 
-impl File {
-    /// The standard library's file under this one, for the callers that
-    /// hand it to something that takes one: a mapping made of it
-    /// (`memmap2`), a lock on it, a test's look at its descriptor. Each is
-    /// of a file the directory holds under its own name.
+impl Drop for File {
     #[inline]
-    pub(crate) fn as_os(&self) -> &OsFile {
-        &self.0
+    fn drop(&mut self) {
+        if self.ext.is_some() {
+            self.drop_ext();
+        }
+    }
+}
+
+/// Which of the two a file is, as each of its methods asks.
+enum Kept<'a> {
+    Os(&'a OsFile),
+    Ext(&'a ExtFile),
+}
+
+/// A descriptor of nothing, read-only on `/dev/null`: what stands at
+/// `File::os` under a file of a store's data file. A write through it is
+/// refused, a sync of it is an error, a read of it is the end of a file,
+/// and an advice or a writeback over it is of no page.
+fn nowhere() -> Result<OsFile> {
+    static NOWHERE: std::sync::OnceLock<OsFile> = std::sync::OnceLock::new();
+    let f = match NOWHERE.get() {
+        Some(f) => f,
+        None => {
+            let f = OsFile::open("/dev/null")?;
+            NOWHERE.get_or_init(|| f)
+        }
+    };
+    f.try_clone()
+}
+
+/// One `pwritev` of `iov` at `at` on `f`: what the call returned.
+#[inline(always)]
+fn os_pwritev(f: &OsFile, iov: &[std::io::IoSlice<'_>], at: u64) -> isize {
+    use std::os::fd::AsRawFd;
+    // SAFETY: `IoSlice` is ABI-compatible with `iovec` on unix, and every
+    // slice it names is borrowed for the call.
+    unsafe {
+        libc::pwritev(
+            f.as_raw_fd(),
+            iov.as_ptr() as *const libc::iovec,
+            iov.len().min(1024) as libc::c_int,
+            at as libc::off_t,
+        )
+    }
+}
+
+/// A file as one of the directory's own, with no look at which it is
+/// (`File::plain`): the calls a writer makes beside a test of its own.
+pub(crate) struct Plain<'a>(&'a OsFile);
+
+impl Plain<'_> {
+    /// `File::pwritev`.
+    #[inline(always)]
+    pub(crate) fn pwritev(&self, iov: &[std::io::IoSlice<'_>], at: u64) -> isize {
+        os_pwritev(self.0, iov, at)
+    }
+
+    /// `File::write_all_at`.
+    #[inline]
+    pub(crate) fn write_all_at(&self, buf: &[u8], at: u64) -> Result<()> {
+        std::os::unix::fs::FileExt::write_all_at(self.0, buf, at)
+    }
+
+    /// `Write::write_all`.
+    #[inline]
+    pub(crate) fn write_all(&self, buf: &[u8]) -> Result<()> {
+        let mut f = self.0;
+        f.write_all(buf)
     }
 
     /// `File::sync_data`.
@@ -2330,73 +2525,14 @@ impl File {
         self.0.sync_data()
     }
 
-    /// `File::sync_all`.
-    #[inline]
-    pub(crate) fn sync_all(&self) -> Result<()> {
-        self.0.sync_all()
-    }
-
-    /// `File::set_len`.
-    #[inline]
-    pub(crate) fn set_len(&self, len: u64) -> Result<()> {
-        self.0.set_len(len)
-    }
-
-    /// The file's length: `File::metadata`'s.
-    #[inline]
-    pub(crate) fn len(&self) -> Result<u64> {
-        Ok(self.0.metadata()?.len())
-    }
-
-    /// `File::try_clone`: a second handle on the same open file
-    /// description, its position shared.
-    #[inline]
-    pub(crate) fn try_clone(&self) -> Result<File> {
-        self.0.try_clone().map(File)
-    }
-
-    /// `FileExt::read_exact_at`.
-    #[inline]
-    pub(crate) fn read_exact_at(&self, buf: &mut [u8], at: u64) -> Result<()> {
-        std::os::unix::fs::FileExt::read_exact_at(&self.0, buf, at)
-    }
-
-    /// `FileExt::write_all_at`.
-    #[inline]
-    pub(crate) fn write_all_at(&self, buf: &[u8], at: u64) -> Result<()> {
-        std::os::unix::fs::FileExt::write_all_at(&self.0, buf, at)
-    }
-
-    /// One `pwritev` of `iov` at `at`: what the call returned, the bytes
-    /// written or a negative with the error in `errno`. The loop over a
-    /// short count is the caller's (`db::pwritev_loop`).
-    #[inline(always)]
-    pub(crate) fn pwritev(&self, iov: &[std::io::IoSlice<'_>], at: u64) -> isize {
-        use std::os::fd::AsRawFd;
-        // SAFETY: `IoSlice` is ABI-compatible with `iovec` on unix, and
-        // every slice it names is borrowed for the call.
-        unsafe {
-            libc::pwritev(
-                self.0.as_raw_fd(),
-                iov.as_ptr() as *const libc::iovec,
-                iov.len().min(1024) as libc::c_int,
-                at as libc::off_t,
-            )
-        }
-    }
-
-    /// The pages of `len` bytes at `at` handed to the device, waiting for
-    /// nothing: `sync_file_range` with the write flag on Linux, where it
-    /// is a hint the later fsync is shorter for; nothing on another
-    /// platform, and nothing on an error, since the fsync that follows
-    /// writes whatever this did not.
+    /// `File::start_writeback`.
     #[inline]
     pub(crate) fn start_writeback(&self, at: u64, len: u64) {
         #[cfg(target_os = "linux")]
         {
             use std::os::fd::AsRawFd;
-            // SAFETY: a hint over a range of an open file; the call reads
-            // and writes no memory of ours.
+            // SAFETY: a writeback over a range of an open file; the call
+            // reads and writes no memory of ours.
             let _ = unsafe {
                 libc::sync_file_range(
                     self.0.as_raw_fd(),
@@ -2409,6 +2545,215 @@ impl File {
         #[cfg(not(target_os = "linux"))]
         let _ = (at, len);
     }
+}
+
+impl File {
+    #[inline]
+    fn os(f: OsFile) -> File {
+        File {
+            os: f,
+            ext: std::mem::ManuallyDrop::new(None),
+        }
+    }
+
+    fn ext(f: ExtFile) -> Result<File> {
+        Ok(File {
+            os: nowhere()?,
+            ext: std::mem::ManuallyDrop::new(Some(Box::new(f))),
+        })
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn drop_ext(&mut self) {
+        // SAFETY: dropped once, here, from the file's own drop.
+        unsafe { std::mem::ManuallyDrop::drop(&mut self.ext) }
+    }
+
+    #[inline(always)]
+    fn kept(&self) -> Kept<'_> {
+        match &*self.ext {
+            None => Kept::Os(&self.os),
+            Some(x) => Kept::Ext(x),
+        }
+    }
+
+    /// The file as one of the directory's own, with no look at which it
+    /// is: for a caller that has asked (`is_placed`) and carries the
+    /// answer on a test it makes anyway. Under a file of a store's data
+    /// file this is a descriptor of nothing, and every call on it fails
+    /// or does nothing.
+    #[inline(always)]
+    pub(crate) fn plain(&self) -> Plain<'_> {
+        Plain(&self.os)
+    }
+
+    /// Whether this is a file of a store's data file, which `plain`'s
+    /// calls are not for.
+    #[inline]
+    pub(crate) fn is_placed(&self) -> bool {
+        self.ext.is_some()
+    }
+
+    /// A file of a store's data file hands each of its writes to the
+    /// device as it lands (`start_writeback` over the bytes written)
+    /// where `on`: what a segment's writer does for a file of its own
+    /// after each piece, said once here since such a file's writes are
+    /// made off the writer's fast path. Nothing for a file of the
+    /// directory's own.
+    pub(crate) fn hint_writes(&self, on: bool) {
+        if let Kept::Ext(x) = self.kept() {
+            x.hint_writes(on);
+        }
+    }
+
+    /// The standard library's file under this one, for the callers that
+    /// hand it to something that takes one: a mapping made of it
+    /// (`memmap2`). Each is of a file the directory holds under its own
+    /// name -- the log, a run of ordered ingest -- and a file of a store's
+    /// data file, which has none of its own, is refused: its mapping is
+    /// `map`'s.
+    #[inline]
+    pub(crate) fn as_os(&self) -> Result<&OsFile> {
+        match self.kept() {
+            Kept::Os(f) => Ok(f),
+            Kept::Ext(_) => Err(Error::other(
+                "a file of the store's data file has no file of its own",
+            )),
+        }
+    }
+
+    /// The file mapped whole for reading, as `vault::map` maps it by its
+    /// path: a mapping of the file under this handle, or of its extent.
+    pub(crate) fn map(&self) -> Result<MmapBytes> {
+        match self.kept() {
+            // SAFETY: the contract `MmapBytes::open` takes -- the file is
+            // not cut under the mapping.
+            Kept::Os(f) => Ok(MmapBytes::from_map(unsafe { memmap2::Mmap::map(f)? })),
+            Kept::Ext(x) => x.map(),
+        }
+    }
+
+    /// `File::sync_data`.
+    #[inline]
+    pub(crate) fn sync_data(&self) -> Result<()> {
+        match self.kept() {
+            Kept::Os(f) => f.sync_data(),
+            Kept::Ext(x) => x.sync(),
+        }
+    }
+
+    /// `File::sync_all`.
+    #[inline]
+    pub(crate) fn sync_all(&self) -> Result<()> {
+        match self.kept() {
+            Kept::Os(f) => f.sync_all(),
+            Kept::Ext(x) => x.sync(),
+        }
+    }
+
+    /// This file's bytes are all written and it asks for no sync of its
+    /// own: for a file a store regenerates, written beside one whose sync
+    /// follows. Nothing for a file of its own, which a store finds again by
+    /// its name and checks; a file of a store's data file is found only
+    /// through a manifest, which names what a sync has covered, so it asks
+    /// to be covered by the next sync of any file of the store
+    /// (`ExtFile::ride`).
+    #[inline]
+    pub(crate) fn ride(&self) {
+        if let Kept::Ext(x) = self.kept() {
+            x.ride();
+        }
+    }
+
+    /// `File::set_len`.
+    #[inline]
+    pub(crate) fn set_len(&self, len: u64) -> Result<()> {
+        match self.kept() {
+            Kept::Os(f) => f.set_len(len),
+            Kept::Ext(x) => x.set_len(len),
+        }
+    }
+
+    /// The file's length: `File::metadata`'s.
+    #[inline]
+    pub(crate) fn len(&self) -> Result<u64> {
+        match self.kept() {
+            Kept::Os(f) => Ok(f.metadata()?.len()),
+            Kept::Ext(x) => Ok(x.len()),
+        }
+    }
+
+    /// `File::try_clone`: a second handle on the same open file
+    /// description, its position shared.
+    #[inline]
+    pub(crate) fn try_clone(&self) -> Result<File> {
+        match self.kept() {
+            Kept::Os(f) => f.try_clone().map(File::os),
+            Kept::Ext(x) => x.try_clone().and_then(File::ext),
+        }
+    }
+
+    /// `FileExt::read_exact_at`.
+    #[inline]
+    pub(crate) fn read_exact_at(&self, buf: &mut [u8], at: u64) -> Result<()> {
+        match self.kept() {
+            Kept::Os(f) => std::os::unix::fs::FileExt::read_exact_at(f, buf, at),
+            Kept::Ext(x) => x.read_exact_at(buf, at),
+        }
+    }
+
+    /// `FileExt::write_all_at`.
+    #[inline]
+    pub(crate) fn write_all_at(&self, buf: &[u8], at: u64) -> Result<()> {
+        match self.kept() {
+            Kept::Os(f) => std::os::unix::fs::FileExt::write_all_at(f, buf, at),
+            Kept::Ext(x) => x.write_all_at(buf, at),
+        }
+    }
+
+    /// One `pwritev` of `iov` at `at`: what the call returned, the bytes
+    /// written or a negative with the error in `errno`. The loop over a
+    /// short count is the caller's (`db::pwritev_loop`).
+    #[inline(always)]
+    pub(crate) fn pwritev(&self, iov: &[std::io::IoSlice<'_>], at: u64) -> isize {
+        match self.kept() {
+            Kept::Os(f) => os_pwritev(f, iov, at),
+            Kept::Ext(x) => x.pwritev(iov, at),
+        }
+    }
+
+    /// The descriptor a call on this file is made through and the range
+    /// `[at, at + len)` of the file as that descriptor has it: the file's
+    /// own and the range as given, a length of nothing reaching the file's
+    /// end; or the data file's and the range within the file's extent, a
+    /// length of nothing being the extent's and never the data file's.
+    /// `None` where the range is nothing of the file's.
+    #[cfg(target_os = "linux")]
+    #[inline]
+    fn fd_range(&self, at: u64, len: u64) -> Option<(libc::c_int, u64, u64)> {
+        use std::os::fd::AsRawFd;
+        match self.kept() {
+            Kept::Os(f) => Some((f.as_raw_fd(), at, len)),
+            Kept::Ext(x) => {
+                let (at, len) = x.range(at, len);
+                (len != 0).then(|| (x.description().as_raw_fd(), at, len))
+            }
+        }
+    }
+
+    /// The pages of `len` bytes at `at` handed to the device, waiting for
+    /// nothing: `sync_file_range` with the write flag on Linux, where it
+    /// is a hint the later fsync is shorter for; nothing on another
+    /// platform, and nothing on an error, since the fsync that follows
+    /// writes whatever this did not.
+    #[inline]
+    pub(crate) fn start_writeback(&self, at: u64, len: u64) {
+        #[cfg(target_os = "linux")]
+        let _ = self.sync_range(at, len, libc::SYNC_FILE_RANGE_WRITE);
+        #[cfg(not(target_os = "linux"))]
+        let _ = (at, len);
+    }
 
     /// `sync_file_range` over `len` bytes at `at` with `flags`, a length
     /// of nothing reaching the file's end: what the call returned. Linux's
@@ -2416,17 +2761,12 @@ impl File {
     #[cfg(target_os = "linux")]
     #[inline]
     pub(crate) fn sync_range(&self, at: u64, len: u64, flags: libc::c_uint) -> libc::c_int {
-        use std::os::fd::AsRawFd;
+        let Some((fd, at, len)) = self.fd_range(at, len) else {
+            return 0;
+        };
         // SAFETY: a writeback over a range of an open file; the call
         // reads and writes no memory of ours.
-        unsafe {
-            libc::sync_file_range(
-                self.0.as_raw_fd(),
-                at as libc::off64_t,
-                len as libc::off64_t,
-                flags,
-            )
-        }
+        unsafe { libc::sync_file_range(fd, at as libc::off64_t, len as libc::off64_t, flags) }
     }
 
     /// `posix_fadvise` over `len` bytes at `at`, a length of nothing
@@ -2435,13 +2775,15 @@ impl File {
     #[cfg(target_os = "linux")]
     #[inline]
     pub(crate) fn advise(&self, at: u64, len: u64, advice: libc::c_int) -> libc::c_int {
-        use std::os::fd::AsRawFd;
+        let Some((fd, at, len)) = self.fd_range(at, len) else {
+            return 0;
+        };
         let (Ok(at), Ok(len)) = (libc::off_t::try_from(at), libc::off_t::try_from(len)) else {
             return libc::EINVAL;
         };
         // SAFETY: an advice over a range of an open file; nothing is
         // written.
-        unsafe { libc::posix_fadvise(self.0.as_raw_fd(), at, len, advice) }
+        unsafe { libc::posix_fadvise(fd, at, len, advice) }
     }
 
     /// `POSIX_FADV_DONTNEED` over `len` bytes at `at`, a length of nothing
@@ -2497,7 +2839,7 @@ impl File {
         #[cfg(not(target_os = "linux"))]
         {
             let _ = (at, len);
-            self.0.sync_data()
+            self.sync_data()
         }
     }
 
@@ -2505,14 +2847,19 @@ impl File {
     /// syncs it beside this one's holder and has to be told of a failure
     /// of its own (`db::HelperShared`): through `/proc/self/fd/<fd>` on
     /// Linux, a path built on the stack; a duplicate of the descriptor
-    /// elsewhere.
+    /// elsewhere. Of a file of a store's data file, another open of the
+    /// data file.
     pub(crate) fn reopen(&self) -> Result<File> {
+        let f = match self.kept() {
+            Kept::Os(f) => f,
+            Kept::Ext(x) => return x.reopen().and_then(File::ext),
+        };
         #[cfg(target_os = "linux")]
         {
             use std::os::fd::{AsRawFd, FromRawFd};
             let mut path = *b"/proc/self/fd/\0\0\0\0\0\0\0\0\0\0\0\0";
             let mut digits = [0u8; 10];
-            let (mut fd, mut n) = (self.0.as_raw_fd() as u32, 0);
+            let (mut fd, mut n) = (f.as_raw_fd() as u32, 0);
             loop {
                 digits[n] = b'0' + (fd % 10) as u8;
                 n += 1;
@@ -2536,18 +2883,27 @@ impl File {
                 return Err(Error::last_os_error());
             }
             // SAFETY: a descriptor just opened, owned by nothing else.
-            Ok(File(unsafe { OsFile::from_raw_fd(fd) }))
+            Ok(File::os(unsafe { OsFile::from_raw_fd(fd) }))
         }
         #[cfg(not(target_os = "linux"))]
         {
-            self.try_clone()
+            f.try_clone().map(File::os)
+        }
+    }
+
+    /// The descriptor the file's calls are made through, its number.
+    #[inline]
+    fn raw(&self) -> libc::c_int {
+        use std::os::fd::AsRawFd;
+        match self.kept() {
+            Kept::Os(f) => f.as_raw_fd(),
+            Kept::Ext(x) => x.description().as_raw_fd(),
         }
     }
 
     /// Whether this and `other` are one open file description (`kcmp`'s
     /// `KCMP_FILE`).
     pub(crate) fn same_description(&self, other: &File) -> bool {
-        use std::os::fd::AsRawFd;
         #[cfg(target_os = "linux")]
         {
             const KCMP_FILE: libc::c_int = 0;
@@ -2560,8 +2916,8 @@ impl File {
                     pid,
                     pid,
                     KCMP_FILE,
-                    self.0.as_raw_fd() as libc::c_ulong,
-                    other.0.as_raw_fd() as libc::c_ulong,
+                    self.raw() as libc::c_ulong,
+                    other.raw() as libc::c_ulong,
                 )
             };
             assert!(r >= 0, "kcmp: {}", Error::last_os_error());
@@ -2569,162 +2925,252 @@ impl File {
         }
         #[cfg(not(target_os = "linux"))]
         {
-            self.0.as_raw_fd() == other.0.as_raw_fd()
+            self.raw() == other.raw()
         }
     }
 
     /// The file's inode number, for a test's seam that names which file a
-    /// failure was made for.
+    /// failure was made for; for a file of a store's data file, a number
+    /// as much its own.
     pub(crate) fn ino(&self) -> Result<u64> {
         use std::os::unix::fs::MetadataExt;
-        Ok(self.0.metadata()?.ino())
+        match self.kept() {
+            Kept::Os(f) => Ok(f.metadata()?.ino()),
+            Kept::Ext(x) => Ok(x.id()),
+        }
     }
 
     /// `File::try_lock`: an exclusive `flock`, taken or refused at once. A
     /// store's `LOCK` alone (`open_lock`).
     #[inline]
     pub(crate) fn try_lock(&self) -> std::result::Result<(), std::fs::TryLockError> {
-        self.0.try_lock()
+        match self.kept() {
+            Kept::Os(f) => f.try_lock(),
+            Kept::Ext(_) => Err(std::fs::TryLockError::Error(Error::other(
+                "a lock on a file of the store's data file",
+            ))),
+        }
     }
 
     /// `File::unlock`.
     #[inline]
     pub(crate) fn unlock(&self) -> Result<()> {
-        self.0.unlock()
+        match self.kept() {
+            Kept::Os(f) => f.unlock(),
+            Kept::Ext(_) => Ok(()),
+        }
     }
+}
+
+/// `Read::read_to_end` over a file of a store's data file: the rest of it,
+/// read in one piece, its length known.
+fn ext_to_end(x: &ExtFile, buf: &mut Vec<u8>) -> Result<usize> {
+    let at = x.seek(std::io::SeekFrom::Current(0))?;
+    let n = x.len().saturating_sub(at) as usize;
+    let had = buf.len();
+    buf.resize(had + n, 0);
+    x.read_exact_at(&mut buf[had..], at)?;
+    x.seek(std::io::SeekFrom::Start(at + n as u64))?;
+    Ok(n)
 }
 
 // The standard library's file answers `read_to_end` and its kin with the
 // file's length in hand, where a default built on `read` grows a buffer by
 // guesses: each is handed on as it is, so a read through the door makes
 // the calls a read of the file made.
-impl Read for File {
-    #[inline]
-    fn read(&mut self, buf: &mut [u8]) -> Result<usize> {
-        self.0.read(buf)
-    }
-
-    #[inline]
-    fn read_vectored(&mut self, bufs: &mut [std::io::IoSliceMut<'_>]) -> Result<usize> {
-        self.0.read_vectored(bufs)
-    }
-
-    #[inline]
-    fn read_to_end(&mut self, buf: &mut Vec<u8>) -> Result<usize> {
-        self.0.read_to_end(buf)
-    }
-
-    #[inline]
-    fn read_to_string(&mut self, buf: &mut String) -> Result<usize> {
-        self.0.read_to_string(buf)
-    }
-
-    #[inline]
-    fn read_exact(&mut self, buf: &mut [u8]) -> Result<()> {
-        self.0.read_exact(buf)
-    }
-}
-
 impl Read for &File {
     #[inline]
     fn read(&mut self, buf: &mut [u8]) -> Result<usize> {
-        (&self.0).read(buf)
+        match self.kept() {
+            Kept::Os(f) => (&*f).read(buf),
+            Kept::Ext(x) => x.read(buf),
+        }
     }
 
     #[inline]
     fn read_vectored(&mut self, bufs: &mut [std::io::IoSliceMut<'_>]) -> Result<usize> {
-        (&self.0).read_vectored(bufs)
+        match self.kept() {
+            Kept::Os(f) => (&*f).read_vectored(bufs),
+            Kept::Ext(x) => match bufs.iter_mut().find(|b| !b.is_empty()) {
+                Some(b) => x.read(b),
+                None => Ok(0),
+            },
+        }
     }
 
     #[inline]
     fn read_to_end(&mut self, buf: &mut Vec<u8>) -> Result<usize> {
-        (&self.0).read_to_end(buf)
+        match self.kept() {
+            Kept::Os(f) => (&*f).read_to_end(buf),
+            Kept::Ext(x) => ext_to_end(x, buf),
+        }
     }
 
     #[inline]
     fn read_to_string(&mut self, buf: &mut String) -> Result<usize> {
-        (&self.0).read_to_string(buf)
+        match self.kept() {
+            Kept::Os(f) => (&*f).read_to_string(buf),
+            Kept::Ext(x) => {
+                let mut bytes = Vec::new();
+                let n = ext_to_end(x, &mut bytes)?;
+                buf.push_str(
+                    std::str::from_utf8(&bytes)
+                        .map_err(|_| Error::new(ErrorKind::InvalidData, "not UTF-8"))?,
+                );
+                Ok(n)
+            }
+        }
+    }
+}
+
+impl Read for File {
+    #[inline]
+    fn read(&mut self, buf: &mut [u8]) -> Result<usize> {
+        (&*self).read(buf)
+    }
+
+    #[inline]
+    fn read_vectored(&mut self, bufs: &mut [std::io::IoSliceMut<'_>]) -> Result<usize> {
+        (&*self).read_vectored(bufs)
+    }
+
+    #[inline]
+    fn read_to_end(&mut self, buf: &mut Vec<u8>) -> Result<usize> {
+        (&*self).read_to_end(buf)
+    }
+
+    #[inline]
+    fn read_to_string(&mut self, buf: &mut String) -> Result<usize> {
+        (&*self).read_to_string(buf)
     }
 
     #[inline]
     fn read_exact(&mut self, buf: &mut [u8]) -> Result<()> {
-        (&self.0).read_exact(buf)
-    }
-}
-
-impl Write for File {
-    #[inline]
-    fn write(&mut self, buf: &[u8]) -> Result<usize> {
-        self.0.write(buf)
-    }
-
-    #[inline]
-    fn write_vectored(&mut self, bufs: &[std::io::IoSlice<'_>]) -> Result<usize> {
-        self.0.write_vectored(bufs)
-    }
-
-    #[inline]
-    fn write_all(&mut self, buf: &[u8]) -> Result<()> {
-        self.0.write_all(buf)
-    }
-
-    #[inline]
-    fn flush(&mut self) -> Result<()> {
-        self.0.flush()
+        match self.kept() {
+            Kept::Os(f) => {
+                let mut f = f;
+                f.read_exact(buf)
+            }
+            Kept::Ext(x) => {
+                let mut rest = buf;
+                while !rest.is_empty() {
+                    match x.read(rest)? {
+                        0 => {
+                            return Err(Error::new(
+                                ErrorKind::UnexpectedEof,
+                                "failed to fill whole buffer",
+                            ))
+                        }
+                        n => rest = &mut rest[n..],
+                    }
+                }
+                Ok(())
+            }
+        }
     }
 }
 
 impl Write for &File {
     #[inline]
     fn write(&mut self, buf: &[u8]) -> Result<usize> {
-        (&self.0).write(buf)
+        match self.kept() {
+            Kept::Os(f) => (&*f).write(buf),
+            Kept::Ext(x) => x.write(buf),
+        }
     }
 
     #[inline]
     fn write_vectored(&mut self, bufs: &[std::io::IoSlice<'_>]) -> Result<usize> {
-        (&self.0).write_vectored(bufs)
-    }
-
-    #[inline]
-    fn write_all(&mut self, buf: &[u8]) -> Result<()> {
-        (&self.0).write_all(buf)
+        match self.kept() {
+            Kept::Os(f) => (&*f).write_vectored(bufs),
+            Kept::Ext(x) => match bufs.iter().find(|b| !b.is_empty()) {
+                Some(b) => x.write(b),
+                None => Ok(0),
+            },
+        }
     }
 
     #[inline]
     fn flush(&mut self) -> Result<()> {
-        (&self.0).flush()
+        match self.kept() {
+            Kept::Os(f) => (&*f).flush(),
+            Kept::Ext(_) => Ok(()),
+        }
     }
 }
 
-impl std::io::Seek for File {
+impl Write for File {
     #[inline]
-    fn seek(&mut self, pos: std::io::SeekFrom) -> Result<u64> {
-        self.0.seek(pos)
+    fn write(&mut self, buf: &[u8]) -> Result<usize> {
+        (&*self).write(buf)
+    }
+
+    #[inline]
+    fn write_vectored(&mut self, bufs: &[std::io::IoSlice<'_>]) -> Result<usize> {
+        (&*self).write_vectored(bufs)
+    }
+
+    #[inline]
+    fn write_all(&mut self, buf: &[u8]) -> Result<()> {
+        match self.kept() {
+            Kept::Os(f) => {
+                let mut f = f;
+                f.write_all(buf)
+            }
+            Kept::Ext(_) => {
+                let mut rest = buf;
+                while !rest.is_empty() {
+                    let n = (&*self).write(rest)?;
+                    rest = &rest[n..];
+                }
+                Ok(())
+            }
+        }
+    }
+
+    #[inline]
+    fn flush(&mut self) -> Result<()> {
+        (&*self).flush()
     }
 }
 
 impl std::io::Seek for &File {
     #[inline]
     fn seek(&mut self, pos: std::io::SeekFrom) -> Result<u64> {
-        (&self.0).seek(pos)
+        match self.kept() {
+            Kept::Os(f) => (&*f).seek(pos),
+            Kept::Ext(x) => x.seek(pos),
+        }
+    }
+}
+
+impl std::io::Seek for File {
+    #[inline]
+    fn seek(&mut self, pos: std::io::SeekFrom) -> Result<u64> {
+        (&*self).seek(pos)
     }
 }
 
 impl std::fmt::Debug for File {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        self.0.fmt(f)
+        match self.kept() {
+            Kept::Os(o) => o.fmt(f),
+            Kept::Ext(x) => write!(f, "File(extent {:#x})", x.id()),
+        }
     }
 }
 
 /// `File::create`: the file made, or cut to nothing, and open for writing.
 pub(crate) fn create(path: impl AsRef<Path>) -> Result<File> {
     let path = path.as_ref();
-    let f = match locate(path) {
-        None => OsFile::create(path),
-        Some((v, name)) if passes(&name) => OsFile::create(v.real.join(name)),
-        Some((v, name)) => v.make(&name),
+    let f = match behind(path) {
+        Behind::Plain => OsFile::create(path),
+        Behind::Vault(v, name) if passes(&name) => OsFile::create(v.real.join(name)),
+        Behind::Vault(v, name) => v.make(&name),
+        Behind::One(o, name) if onefile::takes(&name) => return o.make(&name).and_then(File::ext),
+        Behind::One(..) => OsFile::create(path),
     };
-    f.map(File)
+    f.map(File::os)
 }
 
 /// The file at `path`, just made, is to hold `bytes`: said to the store's
@@ -2732,10 +3178,14 @@ pub(crate) fn create(path: impl AsRef<Path>) -> Result<File> {
 /// file it would otherwise learn of a page at a time (`Coming`). Nothing
 /// for a plain store, whose files are the page cache's.
 pub(crate) fn expect(path: impl AsRef<Path>, bytes: u64) {
-    if let Some((v, name)) = locate(path.as_ref()) {
-        if !passes(&name) {
-            v.expect(&name, bytes);
+    match behind(path.as_ref()) {
+        Behind::Plain => {}
+        Behind::Vault(v, name) => {
+            if !passes(&name) {
+                v.expect(&name, bytes);
+            }
         }
+        Behind::One(o, name) => o.expect(&name, bytes),
     }
 }
 
@@ -2751,23 +3201,29 @@ pub(crate) fn create_rw(path: impl AsRef<Path>) -> Result<File> {
             .truncate(true)
             .open(p)
     };
-    let f = match locate(path) {
-        None => plain(path),
-        Some((v, name)) if passes(&name) => plain(&v.real.join(name)),
-        Some((v, name)) => v.make(&name),
+    let f = match behind(path) {
+        Behind::Plain => plain(path),
+        Behind::Vault(v, name) if passes(&name) => plain(&v.real.join(name)),
+        Behind::Vault(v, name) => v.make(&name),
+        Behind::One(o, name) if onefile::takes(&name) => return o.make(&name).and_then(File::ext),
+        Behind::One(..) => plain(path),
     };
-    f.map(File)
+    f.map(File::os)
 }
 
 /// `File::open`: a file that exists, for reading.
 pub(crate) fn open(path: impl AsRef<Path>) -> Result<File> {
     let path = path.as_ref();
-    let f = match locate(path) {
-        None => OsFile::open(path),
-        Some((v, name)) if passes(&name) => OsFile::open(v.real.join(name)),
-        Some((v, name)) => v.reopen_written(&name),
+    let f = match behind(path) {
+        Behind::Plain => OsFile::open(path),
+        Behind::Vault(v, name) if passes(&name) => OsFile::open(v.real.join(name)),
+        Behind::Vault(v, name) => v.reopen_written(&name),
+        Behind::One(o, name) => match o.reopen(&name, false) {
+            Some(r) => return r.and_then(File::ext),
+            None => OsFile::open(path),
+        },
     };
-    f.map(File)
+    f.map(File::os)
 }
 
 /// A file that exists, opened for writing where the caller says, cut
@@ -2775,12 +3231,16 @@ pub(crate) fn open(path: impl AsRef<Path>) -> Result<File> {
 pub(crate) fn open_write(path: impl AsRef<Path>) -> Result<File> {
     let path = path.as_ref();
     let plain = |p: &Path| OpenOptions::new().write(true).open(p);
-    let f = match locate(path) {
-        None => plain(path),
-        Some((v, name)) if passes(&name) => plain(&v.real.join(name)),
-        Some((v, name)) => v.rewrite(&name, false),
+    let f = match behind(path) {
+        Behind::Plain => plain(path),
+        Behind::Vault(v, name) if passes(&name) => plain(&v.real.join(name)),
+        Behind::Vault(v, name) => v.rewrite(&name, false),
+        Behind::One(o, name) => match o.reopen(&name, true) {
+            Some(r) => return r.and_then(File::ext),
+            None => plain(path),
+        },
     };
-    f.map(File)
+    f.map(File::os)
 }
 
 /// A file that exists, opened to be read and written where the caller
@@ -2788,12 +3248,16 @@ pub(crate) fn open_write(path: impl AsRef<Path>) -> Result<File> {
 pub(crate) fn open_rw(path: impl AsRef<Path>) -> Result<File> {
     let path = path.as_ref();
     let plain = |p: &Path| OpenOptions::new().read(true).write(true).open(p);
-    let f = match locate(path) {
-        None => plain(path),
-        Some((v, name)) if passes(&name) => plain(&v.real.join(name)),
-        Some((v, name)) => v.rewrite(&name, false),
+    let f = match behind(path) {
+        Behind::Plain => plain(path),
+        Behind::Vault(v, name) if passes(&name) => plain(&v.real.join(name)),
+        Behind::Vault(v, name) => v.rewrite(&name, false),
+        Behind::One(o, name) => match o.reopen(&name, true) {
+            Some(r) => return r.and_then(File::ext),
+            None => plain(path),
+        },
     };
-    f.map(File)
+    f.map(File::os)
 }
 
 /// A file opened to be read and written at the offset its caller seeks
@@ -2810,15 +3274,19 @@ pub(crate) fn open_append(path: impl AsRef<Path>) -> Result<File> {
             .truncate(false)
             .open(p)
     };
-    let f = match locate(path) {
-        None => plain(path),
-        Some((v, name)) if passes(&name) => plain(&v.real.join(name)),
-        Some((v, name)) => match v.rewrite(&name, true) {
+    let f = match behind(path) {
+        Behind::Plain => plain(path),
+        Behind::Vault(v, name) if passes(&name) => plain(&v.real.join(name)),
+        Behind::Vault(v, name) => match v.rewrite(&name, true) {
             Err(e) if e.kind() == ErrorKind::NotFound => v.make(&name),
             r => r,
         },
+        Behind::One(o, name) => match o.reopen(&name, true) {
+            Some(r) => return r.and_then(File::ext),
+            None => plain(path),
+        },
     };
-    f.map(File)
+    f.map(File::os)
 }
 
 /// A store's lock file (`db::StoreLock`), made if it is not there and cut
@@ -2832,7 +3300,7 @@ pub(crate) fn open_lock(path: impl AsRef<Path>) -> Result<File> {
         .create(true)
         .truncate(false)
         .open(path)
-        .map(File)
+        .map(File::os)
 }
 
 /// A file opened to be written in place, made if it is not there and cut
@@ -2849,15 +3317,19 @@ pub(crate) fn open_slot(path: impl AsRef<Path>) -> Result<File> {
             .truncate(false)
             .open(p)
     };
-    let f = match locate(path) {
-        None => plain(path),
-        Some((v, name)) if passes(&name) => plain(&v.real.join(name)),
-        Some((v, name)) => match v.rewrite(&name, false) {
+    let f = match behind(path) {
+        Behind::Plain => plain(path),
+        Behind::Vault(v, name) if passes(&name) => plain(&v.real.join(name)),
+        Behind::Vault(v, name) => match v.rewrite(&name, false) {
             Err(e) if e.kind() == ErrorKind::NotFound => v.make(&name),
             r => r,
         },
+        Behind::One(o, name) => match o.reopen(&name, true) {
+            Some(r) => return r.and_then(File::ext),
+            None => plain(path),
+        },
     };
-    f.map(File)
+    f.map(File::os)
 }
 
 /// A manifest slot's bytes made durable as the page cache holds them: an
@@ -2871,7 +3343,8 @@ pub(crate) fn sync_slot(
 ) -> Result<()> {
     match failed {
         Some(e) => Err(e),
-        None => f.sync_data(),
+        // A slot is a file of the directory's own.
+        None => f.plain().sync_data(),
     }?;
     note_file("sync_slot", path, f);
     Ok(())
@@ -2882,10 +3355,10 @@ pub(crate) fn sync_slot(
 pub(crate) fn read(path: impl AsRef<Path>) -> Result<Vec<u8>> {
     use crate::bytes::Bytes;
     let path = path.as_ref();
-    match locate(path) {
-        None => std::fs::read(path),
-        Some((v, name)) if passes(&name) => std::fs::read(v.real.join(name)),
-        Some((v, name)) => {
+    match behind(path) {
+        Behind::Plain => std::fs::read(path),
+        Behind::Vault(v, name) if passes(&name) => std::fs::read(v.real.join(name)),
+        Behind::Vault(v, name) => {
             let page = v.page_of(&name)?;
             let _held = v.pager.hold();
             let src = MmapBytes::paged(page);
@@ -2894,6 +3367,15 @@ pub(crate) fn read(path: impl AsRef<Path>) -> Result<Vec<u8>> {
             v.pager.check()?;
             Ok(buf)
         }
+        Behind::One(o, name) => match o.reopen(&name, false) {
+            Some(f) => {
+                let f = f?;
+                let mut buf = vec![0u8; f.len() as usize];
+                f.read_exact_at(&mut buf, 0)?;
+                Ok(buf)
+            }
+            None => std::fs::read(path),
+        },
     }
 }
 
@@ -2902,8 +3384,15 @@ pub(crate) fn read(path: impl AsRef<Path>) -> Result<Vec<u8>> {
 /// copy as it lies, so a path under one is refused.
 pub(crate) fn copy(from: impl AsRef<Path>, to: impl AsRef<Path>) -> Result<u64> {
     let (from, to) = (from.as_ref(), to.as_ref());
-    match (locate(from), locate(to)) {
-        (None, None) => std::fs::copy(from, to),
+    match (behind(from), behind(to)) {
+        (Behind::Plain, Behind::Plain) => std::fs::copy(from, to),
+        // A file of a store's data file is copied out of it, into a file
+        // of its own (`One::copy_out`); any other file of that store's
+        // directory is the directory's.
+        (Behind::One(o, name), Behind::Plain) => match o.copy_out(&name, to) {
+            Some(r) => r,
+            None => std::fs::copy(from, to),
+        },
         _ => Err(Error::new(
             ErrorKind::Unsupported,
             "a copy of a file of a store under a cipher",
@@ -3020,15 +3509,34 @@ pub(crate) fn rename(from: impl AsRef<Path>, to: impl AsRef<Path>) -> Result<()>
     if GUARDED.load(Ordering::Relaxed) != 0 {
         unguard(from)?;
     }
-    match (locate(from), locate(to)) {
-        (None, None) => std::fs::rename(from, to),
-        (Some((v, a)), Some((w, b))) if Arc::ptr_eq(&v, &w) && passes(&a) == passes(&b) => {
+    match (behind(from), behind(to)) {
+        (Behind::Plain, Behind::Plain) => std::fs::rename(from, to),
+        (Behind::Vault(v, a), Behind::Vault(w, b))
+            if Arc::ptr_eq(&v, &w) && passes(&a) == passes(&b) =>
+        {
             if passes(&a) {
                 std::fs::rename(v.real.join(a), v.real.join(b))
             } else {
                 v.rename(&a, &b)
             }
         }
+        // In a store kept in one file: a file of the table is renamed in
+        // the table, and a file of the directory's own in the directory,
+        // where a name of the table it takes is the table's no longer.
+        (Behind::One(o, a), Behind::One(w, b)) if Arc::ptr_eq(&o, &w) => {
+            if o.rename(&a, &b).is_some() {
+                return Ok(());
+            }
+            std::fs::rename(from, to)?;
+            let _ = o.remove(&b);
+            Ok(())
+        }
+        (Behind::One(o, a), Behind::Plain) if !o.holds(&a) => std::fs::rename(from, to),
+        (Behind::Plain, Behind::One(..)) => std::fs::rename(from, to),
+        (Behind::One(..), _) => Err(Error::new(
+            ErrorKind::Unsupported,
+            "a rename of a file of the store's data file out of the store",
+        )),
         _ => Err(Error::new(
             ErrorKind::Unsupported,
             "a rename between a store under a cipher and somewhere else",
@@ -3042,30 +3550,51 @@ pub(crate) fn rename(from: impl AsRef<Path>, to: impl AsRef<Path>) -> Result<()>
 /// memory back under the mapping (`Mapped`).
 pub(crate) fn open_mapped(path: impl AsRef<Path>) -> Result<(File, Mapped)> {
     let path = path.as_ref();
-    match locate(path) {
-        None => Ok((File(OsFile::open(path)?), Mapped(None))),
-        Some((v, name)) if passes(&name) => {
-            Ok((File(OsFile::open(v.real.join(name))?), Mapped(None)))
+    match behind(path) {
+        Behind::Plain => Ok((File::os(OsFile::open(path)?), Mapped(None))),
+        Behind::Vault(v, name) if passes(&name) => {
+            Ok((File::os(OsFile::open(v.real.join(name))?), Mapped(None)))
         }
-        Some((v, name)) => {
+        Behind::Vault(v, name) => {
             let (file, mem) = v.map_written(&name)?;
-            Ok((File(file), Mapped(Some((v, mem)))))
+            Ok((File::os(file), Mapped(Some((v, mem)))))
         }
+        Behind::One(o, name) => match o.reopen(&name, false) {
+            Some(f) => Ok((File::ext(f?)?, Mapped(None))),
+            None => Ok((File::os(OsFile::open(path)?), Mapped(None))),
+        },
     }
 }
 
 /// `std::fs::hard_link`.
 pub(crate) fn hard_link(from: impl AsRef<Path>, to: impl AsRef<Path>) -> Result<()> {
     let (from, to) = (from.as_ref(), to.as_ref());
-    match (locate(from), locate(to)) {
-        (None, None) => std::fs::hard_link(from, to),
-        (Some((v, a)), Some((w, b))) if Arc::ptr_eq(&v, &w) && passes(&a) == passes(&b) => {
+    match (behind(from), behind(to)) {
+        (Behind::Plain, Behind::Plain) => std::fs::hard_link(from, to),
+        (Behind::Vault(v, a), Behind::Vault(w, b))
+            if Arc::ptr_eq(&v, &w) && passes(&a) == passes(&b) =>
+        {
             if passes(&a) {
                 std::fs::hard_link(v.real.join(a), v.real.join(b))
             } else {
                 v.link(&a, &b)
             }
         }
+        // In a store kept in one file: a file of the table gains a name
+        // in the table, a file of the directory's own a link in it.
+        (Behind::One(o, a), Behind::One(w, b)) if Arc::ptr_eq(&o, &w) => match o.link(&a, &b) {
+            Some(r) => r,
+            None => std::fs::hard_link(from, to),
+        },
+        (Behind::One(o, a), Behind::Plain) if !o.holds(&a) => std::fs::hard_link(from, to),
+        (Behind::Plain, Behind::One(..)) => std::fs::hard_link(from, to),
+        // A link out of the data file is refused, as a link across
+        // filesystems is: a caller that wants the file elsewhere copies
+        // it (`copy`).
+        (Behind::One(..), _) => Err(Error::new(
+            ErrorKind::Unsupported,
+            "a link to a file of the store's data file from outside the store",
+        )),
         _ => Err(Error::new(
             ErrorKind::Unsupported,
             "a link between a store under a cipher and somewhere else",
@@ -3085,20 +3614,25 @@ pub(crate) fn remove_file(path: impl AsRef<Path>) -> Result<()> {
             "a test's failure between the guard's unlink and the file's",
         ));
     }
-    match locate(path) {
-        None => std::fs::remove_file(path),
-        Some((v, name)) if passes(&name) => std::fs::remove_file(v.real.join(name)),
-        Some((v, name)) => v.remove(&name),
+    match behind(path) {
+        Behind::Plain => std::fs::remove_file(path),
+        Behind::Vault(v, name) if passes(&name) => std::fs::remove_file(v.real.join(name)),
+        Behind::Vault(v, name) => v.remove(&name),
+        Behind::One(o, name) => match o.remove(&name) {
+            Some(()) => Ok(()),
+            None => std::fs::remove_file(path),
+        },
     }
 }
 
 /// `Path::exists`.
 pub(crate) fn exists(path: impl AsRef<Path>) -> bool {
     let path = path.as_ref();
-    match locate(path) {
-        None => path.exists(),
-        Some((v, name)) if passes(&name) => v.real.join(name).exists(),
-        Some((v, name)) => lock(&v.files).contains_key(&name),
+    match behind(path) {
+        Behind::Plain => path.exists(),
+        Behind::Vault(v, name) if passes(&name) => v.real.join(name).exists(),
+        Behind::Vault(v, name) => lock(&v.files).contains_key(&name),
+        Behind::One(o, name) => o.holds(&name) || path.exists(),
     }
 }
 
@@ -3107,10 +3641,11 @@ pub(crate) fn exists(path: impl AsRef<Path>) -> bool {
 pub(crate) fn on_device(path: impl AsRef<Path>) -> bool {
     let path = path.as_ref();
     note("on_device", path);
-    match locate(path) {
-        None => path.exists(),
-        Some((v, name)) if passes(&name) => v.real.join(name).exists(),
-        Some((v, name)) => v.on_device(&name),
+    match behind(path) {
+        Behind::Plain => path.exists(),
+        Behind::Vault(v, name) if passes(&name) => v.real.join(name).exists(),
+        Behind::Vault(v, name) => v.on_device(&name),
+        Behind::One(o, name) => o.on_device(&name).unwrap_or_else(|| path.exists()),
     }
 }
 
@@ -3126,20 +3661,25 @@ pub(crate) fn holds_envelopes(dir: impl AsRef<Path>) -> Result<bool> {
 /// `Path::is_file`.
 pub(crate) fn is_file(path: impl AsRef<Path>) -> bool {
     let path = path.as_ref();
-    match locate(path) {
-        None => path.is_file(),
-        Some((v, name)) if passes(&name) => v.real.join(name).is_file(),
-        Some((v, name)) => lock(&v.files).contains_key(&name),
+    match behind(path) {
+        Behind::Plain => path.is_file(),
+        Behind::Vault(v, name) if passes(&name) => v.real.join(name).is_file(),
+        Behind::Vault(v, name) => lock(&v.files).contains_key(&name),
+        Behind::One(o, name) => o.holds(&name) || path.is_file(),
     }
 }
 
 /// The file's length, as `std::fs::metadata` has it.
 pub(crate) fn len(path: impl AsRef<Path>) -> Result<u64> {
     let path = path.as_ref();
-    match locate(path) {
-        None => Ok(std::fs::metadata(path)?.len()),
-        Some((v, name)) if passes(&name) => Ok(std::fs::metadata(v.real.join(name))?.len()),
-        Some((v, name)) => v.len(&name),
+    match behind(path) {
+        Behind::Plain => Ok(std::fs::metadata(path)?.len()),
+        Behind::Vault(v, name) if passes(&name) => Ok(std::fs::metadata(v.real.join(name))?.len()),
+        Behind::Vault(v, name) => v.len(&name),
+        Behind::One(o, name) => match o.len(&name) {
+            Some(n) => Ok(n),
+            None => Ok(std::fs::metadata(path)?.len()),
+        },
     }
 }
 
@@ -3153,6 +3693,11 @@ pub(crate) fn names(dir: impl AsRef<Path>) -> Result<Vec<String>> {
             let mut out = Vec::new();
             for entry in std::fs::read_dir(dir)? {
                 out.push(entry?.file_name().to_string_lossy().into_owned());
+            }
+            // A store kept in one file: the names its table holds beside
+            // the directory's own.
+            if let Some(o) = one_under(dir) {
+                out.extend(o.names());
             }
             Ok(out)
         }
@@ -3375,7 +3920,13 @@ pub(crate) fn note_file(what: &'static str, path: impl AsRef<Path>, f: &File) {
         use std::io::Seek;
         use std::os::fd::AsRawFd;
         let path = real(path);
-        let at = (&mut &f.0).stream_position().unwrap_or(u64::MAX);
+        let (fd, at) = match f.kept() {
+            Kept::Os(o) => (
+                o.as_raw_fd(),
+                (&mut &*o).stream_position().unwrap_or(u64::MAX),
+            ),
+            Kept::Ext(x) => (x.description().as_raw_fd(), u64::MAX),
+        };
         io_trace(what, &path);
         for r in IO_TRACE
             .lock()
@@ -3383,7 +3934,7 @@ pub(crate) fn note_file(what: &'static str, path: impl AsRef<Path>, f: &File) {
             .iter_mut()
             .filter(|r| path.starts_with(&r.0))
         {
-            r.2.push((what, path.clone(), f.0.as_raw_fd(), at));
+            r.2.push((what, path.clone(), fd, at));
         }
     }
 }
@@ -3448,8 +3999,8 @@ pub(crate) fn trace_io(dir: &Path, on: bool) -> Vec<(&'static str, PathBuf)> {
 /// is where nothing is.
 pub(crate) fn real(path: impl AsRef<Path>) -> PathBuf {
     let path = path.as_ref();
-    match locate(path) {
-        Some((v, name)) if passes(&name) => v.real.join(name),
+    match behind(path) {
+        Behind::Vault(v, name) if passes(&name) => v.real.join(name),
         _ => path.to_path_buf(),
     }
 }
@@ -3461,7 +4012,7 @@ pub(crate) fn open_dir(dir: impl AsRef<Path>) -> Result<File> {
         Some(v) => OsFile::open(&v.real),
         None => OsFile::open(dir),
     };
-    f.map(File)
+    f.map(File::os)
 }
 
 /// The segments in `pairs`, each with its ordered index's name, made
@@ -3556,16 +4107,76 @@ pub(crate) fn kept(path: impl AsRef<Path>) -> bool {
     matches!(locate(path.as_ref()), Some((_, name)) if !passes(&name))
 }
 
+/// Whether a store that is told what a file is to hold (`expect`) is in
+/// `dir`: a store under a cipher, or one kept in one file. A caller that
+/// would have to add its inputs up to say asks first, so a plain store
+/// adds nothing up.
+pub(crate) fn announces(dir: impl AsRef<Path>) -> bool {
+    if VAULTS.load(Ordering::Acquire) == 0 {
+        return false;
+    }
+    let dir = dir.as_ref();
+    one_under(dir).is_some() || under(dir).is_some()
+}
+
+/// The file at `path`, whose bytes are all written, asks for no sync of
+/// its own (`File::ride`): nothing for a file of a directory's own, and
+/// for a file of a store's data file the mark that the next sync of the
+/// store covers it. By its path, for a caller that has closed the file.
+pub(crate) fn ride(path: impl AsRef<Path>) {
+    if let Behind::One(o, name) = behind(path.as_ref()) {
+        o.ride(&name);
+    }
+}
+
+/// `Path::is_file` for a file of a store in the clear: its own file in its
+/// directory, or a file of its data file. Never for a store under a
+/// cipher, whose engine names a directory that is not there: the callers
+/// are the controller's looks for a form file an earlier build left,
+/// which under a cipher find none and read what they would have read off
+/// the file from a sample (`zfile::file_facts`).
+pub(crate) fn clear_file(path: impl AsRef<Path>) -> bool {
+    let path = path.as_ref();
+    match behind(path) {
+        Behind::Plain => path.is_file(),
+        Behind::One(o, name) => o.holds(&name) || path.is_file(),
+        Behind::Vault(..) => false,
+    }
+}
+
+/// `MmapBytes::open` for a file of a store in the clear, as `clear_file`
+/// answers for one: its own file mapped, or its extent of the store's
+/// data file. Refused for a store under a cipher, as the directory its
+/// engine names refuses it.
+pub(crate) fn map_clear(path: impl AsRef<Path>) -> Result<MmapBytes> {
+    let path = path.as_ref();
+    match behind(path) {
+        Behind::Plain => MmapBytes::open(path),
+        Behind::One(o, name) => match o.map(&name) {
+            Some(m) => m,
+            None => MmapBytes::open(path),
+        },
+        Behind::Vault(..) => Err(Error::new(
+            ErrorKind::NotFound,
+            "a file of a store under a cipher mapped as it lies",
+        )),
+    }
+}
+
 /// The file mapped for reading, as `MmapBytes::open` maps it. A kept
 /// file's mapping is a paged one (`pager::Paged`): address space the
 /// file's length, of which a range is read by asking for it, under a pin
 /// of the store's reader table or a hold (`hold`).
 pub(crate) fn map(path: impl AsRef<Path>) -> Result<MmapBytes> {
     let path = path.as_ref();
-    match locate(path) {
-        None => MmapBytes::open(path),
-        Some((v, name)) if passes(&name) => MmapBytes::open(&v.real.join(name)),
-        Some((v, name)) => Ok(MmapBytes::paged(v.page_of(&name)?)),
+    match behind(path) {
+        Behind::Plain => MmapBytes::open(path),
+        Behind::Vault(v, name) if passes(&name) => MmapBytes::open(&v.real.join(name)),
+        Behind::Vault(v, name) => Ok(MmapBytes::paged(v.page_of(&name)?)),
+        Behind::One(o, name) => match o.map(&name) {
+            Some(m) => m,
+            None => MmapBytes::open(path),
+        },
     }
 }
 
@@ -3788,6 +4399,34 @@ pub(crate) mod tests {
 
     fn put(path: &Path, bytes: &[u8]) {
         create(path).unwrap().write_all(bytes).unwrap();
+    }
+
+    /// The door's looks for a file by its path find one a store's data
+    /// file keeps (`onefile::One`): what the controller asks of a form
+    /// file an earlier build left before it maps it, and what the forced
+    /// builds ask before they build one (`is_file`, `clear_file`,
+    /// `map_clear`).
+    #[test]
+    fn a_file_of_a_onefile_store_is_found_by_the_looks_by_path() {
+        use crate::bytes::Bytes as _;
+        let d = dir("one-looks");
+        let one = One::create(&d).unwrap();
+        let held = hold_one(one.clone());
+        let data: Vec<u8> = (0..70_000u32).map(|i| (i * 31 + 7) as u8).collect();
+        let f = one.make("kept").unwrap();
+        f.write_all_at(&data, 0).unwrap();
+        f.sync().unwrap();
+        drop(f);
+        let path = d.join("kept");
+        assert!(!path.exists(), "no file of the directory's own");
+        assert!(is_file(&path), "a file of the data file is there");
+        assert!(clear_file(&path), "and is one of a store in the clear");
+        let other = d.join("never");
+        assert!(!is_file(&other) && !clear_file(&other));
+        let m = map_clear(&path).unwrap();
+        assert_eq!(m.slice_at(0, data.len()).unwrap(), &data[..]);
+        drop(m);
+        drop(held);
     }
 
     fn pair(seg: &str, ord: Option<&str>) -> Vec<(String, Option<String>)> {

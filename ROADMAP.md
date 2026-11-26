@@ -1255,6 +1255,52 @@ turned on neither.
   sits on extents where the design had a stored file a logical file, with
   no sealed names. `scratch/plan/onefile.md` has the stages and what each
   is held to; `scratch/onefile/design.md` the decisions.
+- [ ] **The store in one file: what is built, and what leans.** Built:
+  the plain store's segments, ordered indexes and form files as extents
+  of one data file (`Options::one_file`, off; `src/db/onefile.rs`; the
+  arms `supdb-onefile` and `supdb-ingestonefile`). The log, the
+  manifest's slots, the lock and an ordered run are files of the
+  directory still, and a store under a cipher ignores the option. Held
+  by `tests/onefile.rs`, the suite's tests with their stores in it
+  (`SUPDB_TEST_ONEFILE=1`), the differential fuzz (`ZFUZZ_ONEFILE=1`) and
+  the `onefile` group. Paired against the default
+  (`scratch/plan/onefile.md` has each command and table): level in
+  memory at three hundred thousand and three million keys; at ten
+  million keys under 1.25 GiB and 1 GiB every burst of the lag sweep
+  ahead, the full rewrite's 1.2x in every pair, for the frees it no
+  longer makes, and its scan passes level once retired room's pages were
+  dropped and each mapping had an open of its own (`CLAUDE.md`, room
+  given back that kept its pages). What leans against it, each to be
+  understood before the option is anyone's default:
+  - The three-thread read pass after the load under 1 GiB, 0.94x in ten
+    pairs of twelve, the one-thread pass level at 1.14x to 1.17x the
+    default's refaults. Not explained. Two readings not taken: the
+    group's memory by kind through the pass (`scripts/groupmem.py`), and
+    whether one inode's page cache under reclaim is the cost, every file
+    of the store being pages of one file where the default's are of
+    dozens.
+  - The clean store's scan pass under 1.25 GiB, 0.79x in no pair of
+    three in one sitting, with half again the major faults, and level in
+    the next.
+  - The scrambled F mix under 1.25 GiB, 0.81x and 0.96x, behind in six
+    pairs of six, read before each mapping had an open of its own and
+    not since.
+  - A file's sync is an fdatasync of the data file, so it pays for
+    whatever else of the store is dirty there: a seal's sync beside a
+    merge's output in flight, or a form file's build. A sync of the
+    file's own range, with the journal's commit only where the data file
+    grew, is not built. The sync the segment work makes for files that
+    rode (`ONE_RIDE_WAIT`, a second of quiet) can fall inside a pass.
+  - Writes into room reserved and never written convert the extent at
+    each writeback's end on ext4 (the kernel's log counted them); not
+    priced in the loads' sync phases.
+  - The row's passes under 1.25 GiB have not been paired since each
+    mapping had an open of its own.
+  Then the stages left, in the order agreed: the sealing over extents,
+  for a store under a cipher in one file; a run its own log under a
+  cipher, with the controller on; the log, the slots and the run into
+  the file, and the full-copy checkpoint; the defaults, each only where
+  the suite reads it better and the gate passes with it on.
 
 ### Before a pull request
 
@@ -1324,6 +1370,24 @@ turned on neither.
   different widths, a value in a block -- is on no probe of either
   line's: `walk_fixed` leaves that path as it was by construction, and
   nothing counts it.
+  And over the store in one file (`sh scripts/cost.sh 84a94f4`, at the
+  stage's commit): every probe at or under the commit before the stage by
+  its total -- the segment writer 53 instructions a key under, a merge
+  150, the ordered loads 28 -- but the two scans through the block form,
+  a fifth and a quarter of an instruction a scan over in the allocator
+  and `memset` with every function of the engine level; and red by
+  function on what the list
+  above describes and on a file's own operations. A piece's vectored
+  write (`pwritev_all`) nineteen over with `Vec::from_iter`, forty-six a
+  write, inlined into it; the stream's flush one over a flush, its
+  source unchanged; in the landing probe `RawVec::grow_one` and
+  `File::write_all` under another name each, the same count either
+  side, and 414 instructions of drop glue over the run; the seal probe's
+  own function two a key over with `SegmentWriter::layout`'s answer,
+  forty-eight a key, now inline in it; and sixty-five instructions a
+  segment where one is made and finished (`create`, `layout_first`,
+  `find_boundary`, `finish_unsynced_with` for `finish`), the door's look
+  at each file operation of a store that keeps files.
 - [ ] **The gates that have run on no hosted runner.** The `cost`,
   `lists`, `cross-arm`, `machine`, `enc` and `fscrypt` jobs first run
   where the first pull request is opened, and the `machine` group has not

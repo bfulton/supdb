@@ -59,6 +59,7 @@ pub fn with_stride(mut o: supdb::Options) -> supdb::Options {
 pub fn options() -> supdb::Options {
     let o = supdb::Options {
         jobs_mapped: !jobs_heap_switch(),
+        one_file: one_file_switch(),
         ..supdb::Options::default()
     };
     if !stride_switch() {
@@ -69,6 +70,28 @@ pub fn options() -> supdb::Options {
         zpages_min_bytes: 0,
         ..o
     })
+}
+
+/// Whether the tests' stores are kept in one file (`Options::one_file`):
+/// `SUPDB_TEST_ONEFILE=1`, read once. The option is off in the engine, so
+/// a run of the tests under the switch is the one run that takes every
+/// seal, merge, form build and open of theirs through the store's data
+/// file. A test that is about the files a store of files keeps in its
+/// directory -- their names, their bytes, a link to one -- names that
+/// store (`files`).
+pub fn one_file_switch() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("SUPDB_TEST_ONEFILE").is_ok_and(|v| v == "1"))
+}
+
+/// `o` as a store of files, whatever the switch says: for a test of the
+/// directory's own files.
+#[allow(dead_code)]
+pub fn files(o: supdb::Options) -> supdb::Options {
+    supdb::Options {
+        one_file: false,
+        ..o
+    }
 }
 
 /// Whether the tests' stores take their jobs' large arrays from the
@@ -108,15 +131,91 @@ pub fn without_the_clock(bytes: &[u8]) -> Vec<u8> {
     out
 }
 
-/// The store's segment files by name, in name order.
-pub fn seg_names(d: &std::path::Path) -> Vec<String> {
+/// The names of a store's files, wherever it keeps them: the directory's
+/// own, and for a store in one file that is open there the names its
+/// data file holds (`Db::one_names`). A store in one file that is closed
+/// has only the directory's, which is its log, its slots and its runs: a
+/// test that reads a closed store's segments by name is a test of a
+/// store of files (`files`).
+pub fn store_names(d: &std::path::Path) -> Vec<String> {
     let mut v: Vec<String> = std::fs::read_dir(d)
         .unwrap()
         .flatten()
         .map(|e| e.file_name().to_string_lossy().into_owned())
-        .filter(|n| n.ends_with(".sup"))
         .collect();
+    v.extend(supdb::Db::one_names(d));
     v.sort();
+    v.dedup();
+    v
+}
+
+/// The bytes of a store's file at `p`: the directory's own, or for a
+/// store in one file that is open there, the file its data file keeps
+/// under that name (`Db::one_read`). For a test that reads a file a store
+/// wrote -- a form file's fence, a trailer -- and changes nothing of it.
+pub fn store_file(p: impl AsRef<std::path::Path>) -> Vec<u8> {
+    let p = p.as_ref();
+    match std::fs::read(p) {
+        Ok(b) => b,
+        Err(e) => {
+            let name = p.file_name().unwrap().to_string_lossy();
+            supdb::Db::one_read(p.parent().unwrap(), &name)
+                .unwrap_or_else(|| panic!("{}: {e}", p.display()))
+        }
+    }
+}
+
+/// Every file of the store at `d` as a path under it (`store_names`): the
+/// directory's own and, for a store in one file that is open there, each
+/// file its data file keeps, under the name the store has it by, which is
+/// no file of the directory's. A test that goes on to ask something of
+/// such a path asks it where the bytes lie (`store_place`, `store_len`,
+/// `store_file`, `cached_pages`); one that opens, removes or changes a
+/// file by its path is a test of a store of files (`files`), and fails on
+/// the path here where a listing of the directory would have found
+/// nothing and passed.
+#[allow(dead_code)]
+pub fn store_paths(d: impl AsRef<std::path::Path>) -> Vec<std::path::PathBuf> {
+    let d = d.as_ref();
+    store_names(d).into_iter().map(|n| d.join(n)).collect()
+}
+
+/// Where the bytes of a store's file at `p` lie: the file to open, and the
+/// offset and the length in it. A file of the directory's own is itself,
+/// from its start; a file of a store in one file that is open there is a
+/// range of the store's data file (`Db::one_place`).
+#[allow(dead_code)]
+pub fn store_place(p: impl AsRef<std::path::Path>) -> (std::path::PathBuf, u64, u64) {
+    let p = p.as_ref();
+    match std::fs::metadata(p) {
+        Ok(m) => (p.to_path_buf(), 0, m.len()),
+        Err(e) => {
+            let dir = p.parent().unwrap();
+            let name = p.file_name().unwrap().to_string_lossy();
+            let (at, len) =
+                supdb::Db::one_place(dir, &name).unwrap_or_else(|| panic!("{}: {e}", p.display()));
+            (dir.join("store.one"), at, len)
+        }
+    }
+}
+
+/// The length of a store's file at `p`, wherever it lies (`store_place`).
+#[allow(dead_code)]
+pub fn store_len(p: impl AsRef<std::path::Path>) -> u64 {
+    store_place(p).2
+}
+
+/// The store's segments by name, in name order (`store_names`).
+pub fn seg_names(d: &std::path::Path) -> Vec<String> {
+    let mut v = store_names(d);
+    v.retain(|n| n.ends_with(".sup"));
+    v
+}
+
+/// The store's ordered indexes by name, in name order (`store_names`).
+pub fn ord_names(d: &std::path::Path) -> Vec<String> {
+    let mut v = store_names(d);
+    v.retain(|n| n.starts_with("ord-"));
     v
 }
 
@@ -271,12 +370,16 @@ pub fn mappings_advised_random(needle: &str) -> Vec<(String, bool)> {
     out
 }
 
-/// How many pages of `[off, off + len)` of the file at `path` the page cache
-/// holds: `mincore` over a mapping of the file's own that touches nothing.
+/// How many pages of `[off, off + len)` of the store's file at `path` the
+/// page cache holds, wherever the file lies (`store_place`): `mincore` over
+/// a mapping of the file's own that touches nothing.
 #[cfg(target_os = "linux")]
-pub fn cached_pages(path: &std::path::Path, off: usize, len: usize) -> usize {
+pub fn cached_pages(path: impl AsRef<std::path::Path>, off: usize, len: usize) -> usize {
     use std::os::unix::io::AsRawFd;
-    let f = std::fs::File::open(path).unwrap();
+    let path = path.as_ref();
+    let (file, at, _) = store_place(path);
+    let off = off + at as usize;
+    let f = std::fs::File::open(&file).unwrap();
     let size = f.metadata().unwrap().len() as usize;
     // SAFETY: a read-only shared mapping of the whole file, advised over a
     // range inside it, and unmapped before it returns; nothing reads it.

@@ -1223,7 +1223,8 @@ fn frames_a_durable_seal_covers_are_never_written() {
     for slots in [true, false] {
         let opts = || Options {
             manifest_slots: slots,
-            ..explicit()
+            // The renamed manifest is a store of files' alone.
+            ..common::files(explicit())
         };
         let d = dir(&format!("covered-{slots}"));
         let mut db = Db::create(&d, opts()).unwrap();
@@ -1303,7 +1304,8 @@ fn frames_a_durable_seal_covers_are_never_written() {
     let d = dir("covered-pending");
     let opts = || Options {
         manifest_pending: true,
-        ..explicit()
+        // A store in one file keeps no pending name.
+        ..common::files(explicit())
     };
     let mut db = Db::create(&d, opts()).unwrap();
     logged_batch(&mut db, 0);
@@ -1357,7 +1359,9 @@ fn held_frames_wait(pending: bool) {
     let d = dir(&format!("readable-{pending}"));
     let opts = || Options {
         manifest_pending: pending,
-        ..inline(explicit())
+        // A pending name, and a segment torn in the directory by its
+        // name: a store of files.
+        ..common::files(inline(explicit()))
     };
     let mut db = Db::create(&d, opts()).unwrap();
     db.hold_seal_durable(true);

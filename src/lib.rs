@@ -247,6 +247,10 @@ pub use db::dirkey::{self, DirKey, DirState};
 pub use db::vault::{
     key_id as cipher_key_id, rewrap as cipher_rewrap, CipherCounts, PagerCounts, StoreCipher,
 };
+/// A test's counts of a store kept in one file (`Options::one_file`).
+#[cfg(not(target_family = "wasm"))]
+#[doc(hidden)]
+pub use db::OneCounts;
 #[cfg(not(target_family = "wasm"))]
 pub use db::{
     BackgroundIo, Db, Encryption, HelperFault, Isolation, Options, ReadAdvice, Reader,

@@ -1949,6 +1949,10 @@ pub struct Supdb {
     /// The jobs' arrays from the allocator, the engine's shape before
     /// (`Options::jobs_mapped` off): `supdb-jobsheap`.
     jobsheap: bool,
+    /// The store's segments, their ordered indexes and their form files
+    /// kept in one data file (`Options::one_file`): `supdb-onefile`, and
+    /// `supdb-ingestonefile` buffered.
+    onefile: bool,
     /// The jobs' mapped arrays kept in a pool between jobs while the
     /// store has room and given back where it reads short
     /// (`Options::jobs_pooled`, with `jobsmapped`): `supdb-jobspooled`.
@@ -3302,6 +3306,9 @@ struct Policy {
     /// The jobs' arrays from the allocator (`Options::jobs_mapped` off):
     /// `supdb-jobsheap` beside `supdb`.
     jobsheap: bool,
+    /// The store kept in one file (`Options::one_file`): `supdb-onefile`
+    /// beside `supdb`, `supdb-ingestonefile` beside `supdb-ingest`.
+    onefile: bool,
     /// The jobs' mapped arrays from a pool that keeps them between jobs
     /// while the store has room and gives them back where it reads short
     /// of memory (`Options::jobs_pooled`): `supdb-jobspooled` beside
@@ -3688,6 +3695,7 @@ impl Default for Policy {
             jobsmapped: false,
             jobsshort: false,
             jobsheap: false,
+            onefile: false,
             jobspooled: false,
             zmemoslab: false,
             held: false,
@@ -4918,6 +4926,33 @@ impl Supdb {
             path,
             Policy {
                 jobsheap: true,
+                ..Policy::default()
+            },
+        )
+    }
+
+    /// `supdb` kept in one file (`Options::one_file`): its segments, their
+    /// ordered indexes and their form files extents of one data file,
+    /// which a merge's retired inputs are room in where a store of files
+    /// frees them. `supdb-onefile`.
+    pub fn create_onefile(path: &Path) -> Res<Supdb> {
+        Supdb::with_policy(
+            path,
+            Policy {
+                onefile: true,
+                ..Policy::default()
+            },
+        )
+    }
+
+    /// `supdb-ingest` as `supdb-onefile`.
+    pub fn create_ingest_onefile(path: &Path) -> Res<Supdb> {
+        Supdb::with_policy(
+            path,
+            Policy {
+                partition: false,
+                durable: false,
+                onefile: true,
                 ..Policy::default()
             },
         )
@@ -10757,6 +10792,7 @@ impl Supdb {
             jobsmapped,
             jobsshort,
             jobsheap,
+            onefile,
             jobspooled,
             zmemoslab,
             held,
@@ -11383,6 +11419,7 @@ impl Supdb {
             zpages_stride_step_direct: zstridestep
                 .unwrap_or(supdb::Options::default().zpages_stride_step_direct),
             jobs_mapped: !jobsheap && (jobsmapped || supdb::Options::default().jobs_mapped),
+            one_file: onefile,
             jobs_mapped_when_short: jobsshort,
             jobs_pooled: jobspooled,
             zpages_memo_slab: zmemoslab,
@@ -11840,6 +11877,7 @@ impl Supdb {
             jobsmapped,
             jobsshort,
             jobsheap,
+            onefile,
             jobspooled,
             zmemoslab,
             held,
@@ -12463,6 +12501,13 @@ impl Engine for Supdb {
         }
         if self.jobsheap {
             return "supdb-jobsheap";
+        }
+        if self.onefile {
+            return if self.partition {
+                "supdb-onefile"
+            } else {
+                "supdb-ingestonefile"
+            };
         }
         if self.jobsshort {
             return "supdb-jobsshort";
@@ -16289,6 +16334,8 @@ pub fn guarantee(arm: &str) -> Option<Guarantee> {
         | "supdb-zstrideallslab"
         | "supdb-jobsshort"
         | "supdb-jobsheap"
+        | "supdb-onefile"
+        | "supdb-ingestonefile"
         | "supdb-nobuycross"
         | "supdb-jobspooled"
         | "supdb-zslabjobs"
@@ -17748,6 +17795,8 @@ pub fn open(arm: &str, dir: &Path, map_gb: usize) -> Res<Box<dyn Engine>> {
         "supdb-zstrideallslab" => supdb_arm(Supdb::create_zstride_all_slab, dir)?,
         "supdb-jobsshort" => supdb_arm(Supdb::create_jobsshort, dir)?,
         "supdb-jobsheap" => supdb_arm(Supdb::create_jobsheap, dir)?,
+        "supdb-onefile" => supdb_arm(Supdb::create_onefile, dir)?,
+        "supdb-ingestonefile" => supdb_arm(Supdb::create_ingest_onefile, dir)?,
         "supdb-nobuycross" => supdb_arm(Supdb::create_nobuycross, dir)?,
         "supdb-jobspooled" => supdb_arm(Supdb::create_jobspooled, dir)?,
         "supdb-zslabjobs" => supdb_arm(Supdb::create_zslabjobs, dir)?,
@@ -21672,6 +21721,13 @@ mod tests {
                 assert_eq!(z.features(), base.features());
                 let o = z.db.as_ref().unwrap().options();
                 assert!(!o.zpages_buy_crosses && o.jobs_mapped && !o.jobs_pooled);
+                let z = Supdb::create_onefile(&dir("onefile")).unwrap();
+                assert_eq!(z.name(), "supdb-onefile");
+                assert_eq!(z.features(), base.features());
+                assert!(z.db.as_ref().unwrap().options().one_file);
+                let z = Supdb::create_ingest_onefile(&dir("ingestonefile")).unwrap();
+                assert_eq!(z.name(), "supdb-ingestonefile");
+                assert!(z.db.as_ref().unwrap().options().one_file);
                 let z = Supdb::create_jobsheap(&dir("jobsheap")).unwrap();
                 assert_eq!(z.name(), "supdb-jobsheap");
                 assert_eq!(z.features(), base.features());

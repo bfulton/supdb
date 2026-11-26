@@ -374,6 +374,12 @@ pub struct MmapBytes {
     lend: u64,
     len: u64,
     own: Own,
+    /// What a mapping of part of a file holds on for as long as it stands
+    /// (`from_map_held`), behind `own` and so dropped once the mapping has
+    /// gone. Beside the kind and no kind of its own: a mapped part of a
+    /// file is a mapped file in every answer, and a third kind was a third
+    /// arm in every match a reader of a mapped file makes.
+    _hold: Option<Box<Box<dyn MapHeld>>>,
 }
 
 // Two kinds and no third: `MmapBytes::map` answers `None` for every kind
@@ -386,6 +392,13 @@ enum Own {
     Map(memmap2::Mmap),
     Paged(std::sync::Arc<dyn Paging>),
 }
+
+/// What a mapping of part of a file holds on for as long as it stands
+/// (`MmapBytes::from_map_held`): dropped once the mapping is unmapped. A
+/// store kept in one file holds a file's room by it, so the room is not
+/// given to another file under a reader (`db::onefile`).
+#[cfg(not(target_family = "wasm"))]
+pub(crate) trait MapHeld: Send + Sync {}
 
 // SAFETY: the pointer is into a mapping `own` keeps for the value's life,
 // read-only through this type; a mapped file is `Send + Sync` and so is a
@@ -496,6 +509,19 @@ impl MmapBytes {
             lend: map.len() as u64,
             len: map.len() as u64,
             own: Own::Map(map),
+            _hold: None,
+        }
+    }
+
+    /// A mapping of part of a file, under the contract `open` takes, and
+    /// `held` kept until the mapping has gone.
+    pub(crate) fn from_map_held(map: memmap2::Mmap, held: Box<dyn MapHeld>) -> MmapBytes {
+        MmapBytes {
+            ptr: map.as_ptr(),
+            lend: map.len() as u64,
+            len: map.len() as u64,
+            own: Own::Map(map),
+            _hold: Some(Box::new(held)),
         }
     }
 
@@ -507,6 +533,7 @@ impl MmapBytes {
             lend: 0,
             len: pager.size(),
             own: Own::Paged(pager),
+            _hold: None,
         }
     }
 

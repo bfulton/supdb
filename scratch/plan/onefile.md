@@ -91,6 +91,117 @@ file a store that mobile wants) after them.
     GiB and 1 GiB, `load,lag` and the row's order; `discards.py` and
     `inv.sh` over the arm, the frees at nothing and the names' calls gone.
     Prediction from X1 and the probes, written here before the pairing.
+  - **The prediction (written before any pairing of the arm).** In core,
+    300 thousand and three million keys: every read, scan and mix cell
+    inside the floor the default reads against itself (up to a fifth at
+    these rungs); the loads and the lag bursts within a few percent
+    either way, as X1's store that freed nothing read. A landing has no
+    rename and no directory fsync of its own (0.6 ms by `prims.py`), which
+    at these rungs is under what a pairing resolves. Under a bound at ten
+    million keys: the full rewrite's burst ahead by what the segment work
+    spent freeing (7.4 s of 26.6 traced, `inv.py`), 1.05x to 1.2x, with
+    more merges landed in it and so the pass after it level or ahead by
+    the pieces it meets; the clean store's pass and the read passes level,
+    a cold fault 3% dearer at most (X3); the loads level, a block's first
+    use 12 ms in 64 MB (`grow.py`) against a fresh file's names.
+    `discards.py` over the arm: the frees at nothing but the runs' files
+    and the log's.
+  - **What would refute it, named before it is looked for.** (1) A file's
+    own sync is an fdatasync of the data file, which writes back every
+    dirty page of every file in flight: a seal's durable landing waiting
+    for a merge's megabytes (`login.py`'s 189 ms, where X2's writers each
+    synced their own). Read in the seals' waits (`seal_waits`) and the
+    drain's stamps in both arms before the rates. (2) Every mapping is
+    made through the table's one open of the data file, so the kernel's
+    readahead state and its count of mapping misses are one for the
+    store, where a store of files has one a segment and X3 mapped its
+    extent through an open of its own: read in the major faults a read
+    and a scan of the bounded passes, and the lever, an open a mapping,
+    priced only if they are over. (3) Writes into reserved blocks convert
+    their extents at each writeback's end (the kernel's log said so 136
+    times over one test run): read in the loads' sync phases. (4) Room
+    retired is not dropped from the page cache when it is given back, so
+    under a bound a retired segment's pages stand until reclaim finds
+    them, where an unlink drops a file's at once: read in the group's
+    cache by the pass (`groupmem.py`), and the lever is a drop of the
+    range where its last holder goes.
+  - **In core, as read (2026-11-26, the tree before O2's commit over
+    `911256e`).** `sh scripts/pair.sh supdb-onefile supdb 300000` and
+    `... 3000000 --reps 6`, in `bench/`: no cell on the one side in both
+    orders with its pairs behind it. At 300 thousand keys whichever arm
+    was listed second read ahead on the shuffled load (1.08x, 1.05x) and
+    on the pass after the full rewrite (1.08x in both). At three million
+    the cells that leaned the same way twice were the full rewrite's
+    burst, 1.06x for the store in one file in both orders (four pairs of
+    six and three), and B, the scrambled D and the scrambled F against it
+    by 3-10% (one to three pairs of six), each inside what the default
+    reads against itself; the one-percent burst read 0.87x in six pairs
+    of six in one order and 1.13x in four of six in the other. The
+    ordered load's bytes on disk are 2.5% more in every pair, the data
+    file's reserved end. As predicted: nothing in core.
+  - **Under 1.25 GiB at ten million keys, as read, and the fourth
+    refutation taken.** `sh scripts/pair.sh SUPDB_LAG_COUNTERS=1
+    SUPDB_SCAN_OPS=1 supdb-onefile supdb 10000000 --bound 1342177280
+    --passes load,lag --reps 2 --ops-div 10`, the tree before the drop
+    below. The full rewrite's burst 1.24x and 1.23x for the store in one
+    file in every pair, the prediction's upper end. And the passes
+    refuted the rest of it: after the full rewrite 0.36x and 0.28x, the
+    clean store's 0.66x and 0.72x, every pair, with the pass after the
+    rewrite refaulting 110 thousand pages against 25, taking 9,060 major
+    faults against none and reading 430 MB at the device against 98
+    (`lagdev`). Refutation (4) as named: room a merge retires kept its
+    pages in the page cache, written once and read by nobody, which is
+    how the kernel ranks the files written since, so a reclaim took
+    those. The pages are dropped where the last holder of the room lets
+    go, before the room is free (`One::dropped`). The same command
+    again: the burst 1.19x and 1.18x in every pair, the pass after the
+    rewrite 0.98x and 0.84x (one pair of two, none of two), the clean
+    store's 1.03x and 0.91x, the sweep's weighted sum 0.86x and 0.98x of
+    the default's time. Read again at three reps and under 1 GiB, with
+    the row's passes, below.
+  - **Three reps, both bounds, and the second refutation taken.** With
+    the drop (`... --reps 3`, and the row's passes `--passes
+    load,read,read-threaded,scan,scan-threaded,mixes,scan-mixed,mixes-scrambled`,
+    under `--bound 1342177280` and `1073741824`): the full rewrite's
+    burst 1.20x and 1.18x under 1.25 GiB and 1.22x and 1.21x under 1
+    GiB, every pair of twelve; and under 1.25 GiB the pass after it
+    still 0.52x and 0.74x, no pair of six, with the scanning thread
+    taking 2,700 to 4,900 major faults in five reps of six where the
+    default's took none to 430, a twentieth of a second more on every
+    tenth of the pass; under 1 GiB the one-thread read pass after the
+    load 0.95x and 0.87x, no pair of six. Refutation (2) as named: every
+    mapping was made through the table's one open of the data file, so
+    the kernel's readahead window and its count of a mapping's misses,
+    which stops the reading around a fault past a hundred, were one for
+    the store. The comment over the call said an open of the mapping's
+    own, as X3's probe had mapped; the code did not. A mapping is made
+    through its own open now (`Using::map`). The same pairings again:
+    the scanning thread's major faults in that pass 70 to 520 against 0
+    to 500, the pass 1.14x (three pairs of three) and 0.92x (one of
+    three), every burst of the sweep ahead in both orders (1.22x and
+    1.23x, 1.14x and 1.10x, 1.14x and 1.24x), the sweep's weighted sum
+    1.00x and 0.79x of the default's time; and under 1 GiB the
+    one-thread read pass 1.00x and 0.99x. What still leans there after
+    three reps: the three-thread read pass 0.91x in both orders (one
+    pair of six) and the one-thread scan pass 0.90x and 0.95x (one of
+    six), read again at six reps below; C in two shapes by the hot-raw
+    policy's release, in both arms.
+  - **Six reps of the read and scan passes under 1 GiB.** The same
+    command with `--passes load,read,read-threaded,scan,scan-threaded
+    --reps 6`: the three-thread read pass 0.94x in both orders, behind in
+    ten pairs of twelve; the one-thread read pass level, at 1.14x to
+    1.17x the default's refaults; the scan passes level. Not explained,
+    and open in `ROADMAP.md` with what else leans.
+  - **The controller's tests, and a read the manifest made.** The
+    form-file tests' controller stores had not taken the tests' switch
+    (`CLAUDE.md`, a switch's first run). Under it one test of eighteen
+    was the engine's: a manifest that listed a file read the file's first
+    page back for the row's checksum, a device read a file for a form
+    file built ahead and dropped as it is written, on the segment work's
+    thread, the page left in the cache. The table keeps a file's first
+    page as its writes make it (`onefile::Head`). The pairings above are
+    of the tree before it; at ten million keys it is a page for each of
+    the builds ahead a load makes, two dozen.
 - **O3 -- one file.** The log as extents (rotation, retirement, the first
   extent's pre-write), the slots at the head, ordered ingest's run as an
   extent with its marker in the log, `copy_to` and the old name's fate.

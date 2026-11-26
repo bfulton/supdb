@@ -107,6 +107,14 @@
 //! - `ZFUZZ_MERGEPAR=n`: both stores run up to `n` partition merges at
 //!   once over disjoint ranges (`Options::merge_parallel`); a flag and not
 //!   a draw.
+//! - `ZFUZZ_ONEFILE=1`: the `z` store is kept in one file
+//!   (`Options::one_file`) while `r` is a store of files over the same
+//!   writes: its segments, their indexes and its form files extents of a
+//!   data file whose room is written over as merges retire them, so a
+//!   read of room given away too soon, or a slot naming room since
+//!   written over, is a difference from `r` or a store refused. The
+//!   concurrent range's one store is kept so too. A flag and not a draw;
+//!   a range in which no store kept a file in its data file fails.
 //! - `ZFUZZ_RECYCLE=1`: both stores write their log's files again in
 //!   place (`Options::recycle_wal`), so a log behind which its last life's
 //!   records lie is replayed after every crash; a flag and not a draw.
@@ -219,6 +227,11 @@ fn env_u64(name: &str) -> Option<u64> {
 
 fn env_flag(name: &str) -> bool {
     std::env::var(name).is_ok_and(|v| v == "1")
+}
+
+/// Whether the `z` store is kept in one file (`ZFUZZ_ONEFILE`).
+fn one_file_on() -> bool {
+    env_flag("ZFUZZ_ONEFILE")
 }
 
 fn trace_on() -> bool {
@@ -915,6 +928,8 @@ fn opts(c: &Cfg) -> Options {
 /// over the same writes -- the strongest check a second read path has.
 fn opts_z(c: &Cfg) -> Options {
     let mut o = opts(c);
+    // Under `ZFUZZ_ONEFILE` the store is kept in one file.
+    o.one_file = one_file_on();
     if zpages_forced() {
         o.zpages = supdb::ZPages::Always;
         o.zpages_min_bytes = 0;
@@ -1875,6 +1890,10 @@ struct Stats {
     /// opens. What says a run under a small cache read through one.
     evicted: u64,
     fills: u64,
+    /// The files the `z` store kept in its data file and the times it
+    /// wrote over room a file had given back, summed over its opens: what
+    /// says a run under `ZFUZZ_ONEFILE` was of a store in one file.
+    one: u64,
     /// The reads and scans the `z` store answered through a form file,
     /// summed over its opens: what says a run with the compact form
     /// forced read through one.
@@ -2249,6 +2268,7 @@ fn run_seed_inner(seed: u64, want_cache: bool, verbose: bool) -> Result<Stats, S
         beside: 0,
         evicted: 0,
         fills: 0,
+        one: 0,
         zreads: 0,
         switches: 0,
         kept: 0,
@@ -2470,6 +2490,9 @@ fn run_seed_inner(seed: u64, want_cache: bool, verbose: bool) -> Result<Stats, S
                         st.evicted += c.cache.evicted_units;
                         st.fills += c.cache.fills;
                     }
+                    if let Some(c) = z.one_counts() {
+                        st.one += c.files + c.reused;
+                    }
                     st.zreads += z.zpage_counts().reads + z.zpage_counts().scans;
                     st.switches += z.forms_off_counts()[..2].iter().sum::<u64>();
                     st.kept += z.snapshots_kept();
@@ -2669,6 +2692,9 @@ fn run_seed_inner(seed: u64, want_cache: bool, verbose: bool) -> Result<Stats, S
         st.evicted += c.cache.evicted_units;
         st.fills += c.cache.fills;
     }
+    if let Some(c) = z.one_counts() {
+        st.one += c.files + c.reused;
+    }
     st.zreads += z.zpage_counts().reads + z.zpage_counts().scans;
     st.switches += z.forms_off_counts()[..2].iter().sum::<u64>();
     st.kept += z.snapshots_kept();
@@ -2787,6 +2813,7 @@ fn run_range() {
     let mut stride = StrideStats::default();
     let ran = seeds.len();
     let (mut evicted, mut fills, mut zreads) = (0u64, 0u64, 0u64);
+    let mut one = 0u64;
     for seed in seeds {
         // The seeds whose held log builds no frames, from the draws alone.
         let drawn = seed_draws(seed, want_cache).0;
@@ -2817,6 +2844,7 @@ fn run_range() {
                 beside += s.beside;
                 evicted += s.evicted;
                 fills += s.fills;
+                one += s.one;
                 zreads += s.zreads;
                 switches += s.switches;
                 recuts += s.recuts;
@@ -2905,6 +2933,16 @@ fn run_range() {
     if zpages_forced() {
         assert!(zreads > 0, "no read or scan went through a form file");
     }
+    // And a run under `ZFUZZ_ONEFILE` is a run of two stores of files
+    // unless `z` kept files in its data file; under a cipher the option
+    // does nothing yet, and says so.
+    if one_file_on() && ran > 0 {
+        assert!(
+            !under_cipher(),
+            "ZFUZZ_ONEFILE beside ZFUZZ_CIPHER: a store under a cipher is not kept in one file yet"
+        );
+        assert!(one > 0, "no store kept a file in its data file");
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -2948,6 +2986,10 @@ fn run_concurrent(seed: u64, secs_ops: usize, snapshots: bool) -> Result<(u64, u
         opts_z(&cfg)
     } else {
         opts(&cfg)
+    };
+    let made = Options {
+        one_file: one_file_on(),
+        ..made
     };
     let mut db = Db::create(&dir, with_cipher(made)).map_err(|e| format!("create: {e}"))?;
     census_gate(&db, heads_flip || stride);
@@ -3271,6 +3313,14 @@ fn run_concurrent(seed: u64, secs_ops: usize, snapshots: bool) -> Result<(u64, u
     let e = errs.lock().unwrap().clone();
     if !e.is_empty() {
         return Err(format!("seed {seed} ({cfg:?}): {:?}", &e[..e.len().min(4)]));
+    }
+    // Under `ZFUZZ_ONEFILE` a seed whose store kept nothing in its data
+    // file ran a store of files.
+    if one_file_on() && db.one_counts().is_none_or(|c| c.files == 0) {
+        return Err(format!(
+            "seed {seed} ({cfg:?}): the store kept no file in its data file: {:?}",
+            db.one_counts()
+        ));
     }
     let (owned, given, _) = db.heads_owned_counts();
     let c = db.zpage_counts();
