@@ -7458,6 +7458,10 @@ pub(super) struct BuildPlan {
     /// rename while the bit is set, so a test can land what it likes
     /// between a build's last look at the cancel and its file's name.
     pub hold: Option<std::sync::Arc<std::sync::atomic::AtomicU8>>,
+    /// Whether the tests' crash has ended the store the build is of
+    /// (`Db::crash`): a build held before its rename in such a store
+    /// leaves its file under the temp name, as a crash there does.
+    pub life: Option<std::sync::Arc<super::Life>>,
     /// The form file's own pages written back and dropped from the page
     /// cache once it is written (`drop_written`): a build ahead the
     /// controller has not bought, beside a raw form that fits its budget,
@@ -7535,6 +7539,7 @@ impl BuildPlan {
             own_decode: false,
             cancel: None,
             hold: None,
+            life: None,
             drop_output: false,
             sync: false,
             stride: StrideAsk::No,
@@ -7566,10 +7571,12 @@ impl BuildPlan {
             .is_some_and(|c| c.load(Ordering::Acquire))
     }
 
-    fn wait_rename(&self) {
-        if let Some(h) = &self.hold {
-            super::zbuild_hold_wait(h, super::ZHOLD_RENAME);
-        }
+    /// The test's hold before the rename waited out, or `true` where the
+    /// store was crashed under it.
+    fn wait_rename(&self) -> bool {
+        self.hold
+            .as_ref()
+            .is_some_and(|h| super::zbuild_hold_wait(h, super::ZHOLD_RENAME, self.life.as_deref()))
     }
 }
 
@@ -7775,7 +7782,11 @@ fn name_built(tmp: &Path, out: &Path, plan: &BuildPlan, mut b: Built) -> Result<
         let _ = std::fs::remove_file(tmp);
         return Ok(Outcome::Cancelled);
     }
-    plan.wait_rename();
+    if plan.wait_rename() {
+        // Crashed under the hold: the file stays under its temp name, for
+        // the open after to find as a crash before the rename leaves it.
+        return Ok(Outcome::Cancelled);
+    }
     std::fs::rename(tmp, out).inspect_err(|_| {
         let _ = std::fs::remove_file(tmp);
     })?;

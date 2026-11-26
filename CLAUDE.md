@@ -1353,7 +1353,10 @@ unlock and not by the descriptor's close, since a child the process forked
 holds a copy of the descriptor and the lock with it (`StoreLock`); a test
 that emulates a crash calls `Db::crash`, which gives the lock up as a dead
 process's is given up, since a `mem::forget` keeps it and the reopen is
-refused as a second open. A crash between any
+refused as a second open, and which returns only once nothing of the
+store is left in its directory: every thread of it that writes its files
+or reads them through a mapping ended, or parked for good under the
+test's own hold (`Life`). A crash between any
 two of those leaves either a WAL that replays the whole memtable, with a
 segment the manifest never named --
 possibly torn -- swept at open, or a complete, named segment plus a WAL

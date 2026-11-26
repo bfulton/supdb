@@ -1371,6 +1371,89 @@ fn a_reopened_store_attaches_the_form_files_it_finds_and_off_leaves_them_alone()
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// A form file's build in flight at the tests' crash (`Db::crash`) is no
+/// longer in the directory when the crash returns. It was: the dead
+/// store's builder wrote on under its temp name while the store opened
+/// again built the same partition under the same one, and the one reading
+/// its own pages back through a mapping of a file the other had just
+/// truncated took a bus error, one run of the run log's tests in sixty to a
+/// hundred with every store's form forced. Let go as the crash is called,
+/// the build has its file named when the crash returns; held at its start
+/// it has written nothing, and held at its rename its file stays under
+/// the temp name, the two states a crash at either place leaves. The
+/// directory then stands as it is, and the store opened again builds the
+/// partition's form file itself and reads every key.
+#[test]
+fn a_build_in_flight_at_a_crash_is_through_or_held_when_the_crash_returns() {
+    for (name, at_rename, held, want) in [
+        ("crash-build", false, false, (1usize, 0usize)),
+        ("crash-build-held", false, true, (0, 0)),
+        ("crash-rename-held", true, true, (0, 1)),
+    ] {
+        let dir = scratch(name);
+        let mut db = Db::create(&dir, forced(|_| {})).unwrap();
+        if at_rename {
+            db.hold_zpage_rename(true);
+        } else {
+            db.hold_zpage_build(true);
+        }
+        let model = ordered_load(&mut db, 3000, 0xC4A5);
+        let t = std::time::Instant::now();
+        while !db.zpage_build_waiting() {
+            assert!(
+                t.elapsed() < JOB_WALL,
+                "{name}: the build never reached its hold"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+        if !held {
+            db.hold_zpage_build(false);
+        }
+        db.crash();
+        let listed = || -> Vec<(String, u64)> {
+            let mut v: Vec<(String, u64)> = std::fs::read_dir(&dir)
+                .unwrap()
+                .map(|e| {
+                    let e = e.unwrap();
+                    (
+                        e.file_name().to_string_lossy().into_owned(),
+                        e.metadata().unwrap().len(),
+                    )
+                })
+                .collect();
+            v.sort();
+            v
+        };
+        let left = listed();
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        assert_eq!(
+            listed(),
+            left,
+            "{name}: the directory moved after the crash returned"
+        );
+        let ends = |with: &str| left.iter().filter(|(n, _)| n.ends_with(with)).count();
+        assert_eq!(
+            (ends(".zpg"), ends(".zpg.tmp")),
+            want,
+            "{name}: the form file and its temp name, {left:?}"
+        );
+        let mut db = Db::open(&dir, forced(|_| {})).unwrap();
+        db.zpages_settle().unwrap();
+        let c = db.zpage_counts();
+        assert_eq!((c.partitions, c.form_files), (1, 1), "{name}: {c:?}");
+        let keys: Vec<Vec<u8>> = model.keys().cloned().collect();
+        check(&db, &model, &keys, name);
+        db.close().unwrap();
+        let left = listed();
+        assert_eq!(
+            left.iter().filter(|(n, _)| n.ends_with(".zpg.tmp")).count(),
+            0,
+            "{name}: a temp name past the reopened store's close, {left:?}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
 #[test]
 fn a_build_that_fails_is_counted_and_the_store_reads_raw() {
     let dir = scratch("failed");
