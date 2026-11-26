@@ -52,3 +52,17 @@ sync the one flush, 46-50 with the data file's own sync. Writing the zeros:
 54-57 ms for the 64 MB; reserving them: 0.2-0.3. So a block's first use
 costs about 12 ms in 64 MB, once, and writing zeros ahead to save it costs
 four to five times that in bytes the next flush pays for.
+
+`login.py DIR [BOUND]` -- whether the log can live in the data file
+(`login.out`): 300 commits of 16.8 KB back to back beside a writer of
+megabyte pieces in the data file. With the writer's bytes left in the page
+cache: a log of its own 0.14 ms a commit; in the data file 189 ms by
+`fdatasync`, which writes the whole file's dirty pages back, 0.22 by an
+`O_DSYNC` write, which syncs its own range, and 0.17 by `O_DIRECT|O_DSYNC`.
+With the writer hinting its pieces to the device, or under a bound of 256
+MiB that writes them back for it, a commit pays for the writer's bytes
+either way and the two layouts read alike: 170-180 ms plain under the
+bound in both, 32-37 hinted in both. One shape stands apart: direct
+synchronous commits in the data file read 0.13-0.16 ms beside any writer
+and the writer fell from 1.3 GB/s to 30-90 MB/s, the commits holding the
+file's lock across their flush.
