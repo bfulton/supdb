@@ -17882,11 +17882,15 @@ fn a_finish_in_flight_at_a_crash_is_through_or_held_when_the_crash_returns() {
             |o| {
                 o.zpages_stride = ZStride::Forced;
                 o.zpages_build_at_finish = true;
-                o.partition_bytes = Some(160 << 10);
+                // Partitions of megabytes, so that an output's build
+                // outlasts the crash's wait for the store's other
+                // threads: a finish nobody waited for built its two
+                // hundred kilobytes before the crash returned anyway.
+                o.partition_bytes = Some(4 << 20);
                 o.zpages_land_cold_past = false;
                 o.l0_trigger = 1;
             },
-            |db| numbered_load(db, 20_000, 100, 0xF1B0),
+            |db| numbered_load(db, 120_000, 100, 0xF1B0),
         );
         inject.set_budget(raw * 3 / 2);
         assert!(
@@ -17897,7 +17901,7 @@ fn a_finish_in_flight_at_a_crash_is_through_or_held_when_the_crash_returns() {
         let c0 = db.zpage_counts();
         db.hold_zpage_build(true);
         let mut rng = Rng(0xF1B1);
-        for i in 20_000 - 200..20_000 {
+        for i in 120_000 - 200..120_000 {
             let v: Vec<u8> = (0..100).map(|_| (rng.next() >> 24) as u8).collect();
             db.put(&numbered_key(i), &v);
         }
