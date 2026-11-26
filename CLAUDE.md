@@ -10580,6 +10580,43 @@ thread; a deferred cost is a backlog, read as a peak (2.9 GB here)
 before it is read as a saving; and where every way of moving a cost
 loses, the lever is the cost's cause.
 
+**A hash taken once for every table, on the word that every table has
+one shape.** The general point read and the count hashed a key once for
+the memtables, by the live table, and probed each frozen table with that
+hash, under a comment that every table of a store is made with one
+shape. A hashed table folds a sixteen-byte key's two words
+(`Options::mem_hash_fold`, on since #29) where every other key takes its
+FNV word; an ordered table, which is the live one for as long as a run
+of ordered ingest is open, has no index and folds nothing, so its hash
+of a sixteen-byte key was FNV's and a frozen hashed table probed by it
+missed. Beside an open run a read and a count answered without whatever
+a frozen table held of such a key -- a committed append read as the
+values before it, a delete as not made -- with nothing raised, in the
+store as it ships, and sixteen bytes is the suite's own key. The lean
+reads were right by a guard each, and the guard was what sent every such
+read to the one path that was wrong: they leave an ordered live table to
+the general read. The differential fuzz's readers on threads found it at
+their seventeenth seed, where the gate's range is three: thirteen runs
+of sixteen at main's head, sixteen of sixteen at the commit before the
+stage that met it, and it was met while a new switch was run past the
+gate's range, so it was read as the switch's for the quarter of an hour
+the seed took to fail as often without it. One option turned off at a
+time through a scratch override named the fold, none of eight runs red
+without it. Each frozen table is probed by its own hash now
+(`Reader::frozen_hash`), and `tests/db.rs` builds the state at fifteen,
+sixteen and seventeen bytes, red at sixteen with the old hash put back.
+The handle's own diagnostic (`Reader::debug_key`) had a hole of the same
+age: it indexed the handle's block tables, of which a handle that has
+walked no block holds none, and panicked in the one run that asked it.
+The rules: "every X of a store has one shape" is read against every
+constructor of X, and a second constructor that sets the field another
+way makes the sentence false wherever the two kinds stand together; a
+value derived from one object and spent on another is derived by the one
+it is spent on, which here cost nothing; each kind of range the fuzz has
+is run past the gate's at every stage, since three seeds of a kind hold
+three seeds; and a diagnostic is run once on the plainest store before
+the day it is wanted.
+
 ## Standing limitations
 
 These are the engine's, as opposed to refuted predictions. Each is a curve

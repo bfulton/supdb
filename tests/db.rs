@@ -1913,6 +1913,90 @@ fn a_point_read_over_tombstones_in_every_source_answers_from_one_probe_of_each()
     }
 }
 
+/// A frozen table is probed by its own hash, whatever table is live over
+/// it. A hashed table folds a sixteen-byte key's two words where every
+/// other key takes its FNV word (`Options::mem_hash_fold`), and an ordered
+/// table, the live one while a run of ordered ingest is open, folds none:
+/// the general read hashed the key once by the live table and probed the
+/// frozen tables with it, so beside an open run a frozen table's sixteen-
+/// byte keys were absent to every read and count -- an append read as the
+/// values before it, a delete as not made. Here: a partition, a hashed
+/// table of appends and deletes frozen with its seal's landing held, and
+/// a run opened above the store's greatest key, read through the writer
+/// and through a handle, at sixteen bytes and a byte either side.
+#[test]
+fn a_frozen_tables_sixteen_byte_key_is_read_beside_an_open_run() {
+    for width in [15usize, 16, 17] {
+        let d = dir(&format!("frozen-fold-beside-run-{width}"));
+        let mut db = Db::create(
+            &d,
+            Options {
+                seal_bytes: 1 << 20,
+                ..common::options()
+            },
+        )
+        .unwrap();
+        let key = |k: u32| format!("k{k:0w$}", w = width - 1).into_bytes();
+        assert_eq!(key(0).len(), width);
+        let n = 300u32;
+        for k in 0..n {
+            db.append(&key(k), b"old");
+        }
+        db.commit().unwrap();
+        db.flush().unwrap();
+        db.settle().unwrap();
+        // The hashed table: a second value for some keys and a delete of
+        // others, frozen, its seal's landing held so it stays a table.
+        db.hold_seal_landing(true);
+        for k in (0..n).step_by(7) {
+            db.append(&key(k), b"new");
+        }
+        for k in (3..n).step_by(7) {
+            db.delete(&key(k));
+        }
+        db.commit().unwrap();
+        db.seal().unwrap();
+        assert_eq!(
+            db.frozen_tables(),
+            1,
+            "{width}: the table is frozen, its landing held"
+        );
+        // The run: keys above every key of the store, into an ordered
+        // table that is the live one from here.
+        for k in n..n + 20 {
+            db.append(&key(k), b"run");
+        }
+        db.commit().unwrap();
+        assert!(
+            db.run_synced_bytes().is_some(),
+            "{width}: a run of ordered ingest is open over the frozen table"
+        );
+        let h = db.reader().unwrap();
+        for (what, r) in [("the writer", &*db), ("a handle", &h)] {
+            for k in 0..n + 20 {
+                let want: Vec<Vec<u8>> = if k >= n {
+                    vec![b"run".to_vec()]
+                } else if k % 7 == 0 {
+                    vec![b"old".to_vec(), b"new".to_vec()]
+                } else if k % 7 == 3 {
+                    Vec::new()
+                } else {
+                    vec![b"old".to_vec()]
+                };
+                assert_eq!(read_vec(r, &key(k)), want, "{width}: {what}: key {k}");
+                assert_eq!(
+                    r.count(&key(k)).unwrap(),
+                    want.len() as u64,
+                    "{width}: {what}: the count of key {k}"
+                );
+            }
+        }
+        drop(h);
+        db.hold_seal_landing(false);
+        db.settle().unwrap();
+    }
+}
+
 fn ord_names(d: &std::path::Path) -> Vec<String> {
     let mut v: Vec<String> = std::fs::read_dir(d)
         .unwrap()

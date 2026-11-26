@@ -30755,6 +30755,33 @@ impl Reader {
     /// it has tombstones at all. What the pass found of each source it
     /// probed comes back beside the cut, for the reads after it to take
     /// (`Options::read_probes_once`; empty with the option off).
+    /// A frozen table's hash of `key`, the table's own (`MemTable::hash`):
+    /// from the key's FNV word where the read took one
+    /// (`Options::read_hash_once`), and for a sixteen-byte key in a table
+    /// that folds, the fold.
+    ///
+    /// The general reads took the live table's hash for the frozen ones,
+    /// on the word that every table of a store has one shape. While a run
+    /// of ordered ingest is open the live table is an ordered one, which
+    /// has no index and folds no key (`MemTable::new_ordered`), so its
+    /// hash of a sixteen-byte key was FNV's, and a frozen hashed table
+    /// probed by it missed: a read and a count answered without whatever
+    /// the frozen table held of the key, for as long as the run stood
+    /// over it -- a value appended and committed, or a delete, which read
+    /// as the values before it. Readers on threads found it at the
+    /// differential fuzz's seventeenth concurrent seed, which the gate's
+    /// range stops short of, a key of sixteen bytes among keys of other
+    /// lengths (`tests/db.rs`,
+    /// `a_frozen_tables_sixteen_byte_key_is_read_beside_an_open_run`).
+    #[inline(always)]
+    fn frozen_hash(fr: &MemTable, key: &[u8], fnv: u64, once: bool) -> u64 {
+        if once {
+            fr.hash_with(key, fnv)
+        } else {
+            fr.hash(key)
+        }
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn tomb_pass<'s>(
         &self,
@@ -30763,7 +30790,6 @@ impl Reader {
         key: &[u8],
         fnv: u64,
         hash: u64,
-        frozen_hash: u64,
         mem_empty: bool,
         holds: impl Fn(&Seg) -> bool,
     ) -> (usize, Probed<'s>) {
@@ -30784,7 +30810,7 @@ impl Reader {
         // The frozen tables newest first: the newest holding a tombstone is
         // the cut.
         for (i, fr) in st.frozen.iter().enumerate().rev() {
-            let got = fr.get_with(frozen_hash, key, MemTable::ALL);
+            let got = fr.get_with(Reader::frozen_hash(fr, key, fnv, once), key, MemTable::ALL);
             if keep {
                 if let Some(slot) = probed.frozen.get_mut(i) {
                     *slot = Some(got);
@@ -31385,7 +31411,7 @@ impl Reader {
         // The newest-first pass tombstones require, and what it found of
         // each source it probed (`Options::read_probes_once`).
         let (start, probed) = if tombs {
-            self.tomb_pass(st, l0, key, fnv, hash, mem_h(key), mem_empty, holds)
+            self.tomb_pass(st, l0, key, fnv, hash, mem_empty, holds)
         } else {
             (0, Probed::default())
         };
@@ -31451,7 +31477,7 @@ impl Reader {
             }
             let got = match probed.frozen.get(i) {
                 Some(&Some(got)) => got,
-                _ => fr.get_with(mem_h(key), key, MemTable::ALL),
+                _ => fr.get_with(Reader::frozen_hash(fr, key, fnv, once), key, MemTable::ALL),
             };
             if let Some(e) = got {
                 let (offs, _) = fr.live_chain(e, SEE_ALL);
@@ -38541,10 +38567,16 @@ impl Reader {
                 "partition {p} blob {} block {b} cut {cut}: ",
                 seg.blob.id()
             );
-            match fs.tables.borrow()[p].borrow().as_ref() {
+            // A handle that has walked no block holds no table for any
+            // partition: indexed, this panicked for a store with the cache
+            // off, in the one call made to find out what a handle holds.
+            let tables = fs.tables.borrow();
+            let table = tables.get(p).map(|t| t.borrow());
+            match table.as_ref().and_then(|t| t.as_ref()) {
                 None => {
                     let _ = write!(out, "no table; ");
                 }
+
                 Some(t) => {
                     let kind = t.slots.get(b).and_then(|s| s.as_deref()).map(|c| match c {
                         Cached::Clean => "clean",
@@ -39828,7 +39860,7 @@ impl Reader {
         // The newest-first pass tombstones require, and what it found of
         // each source it probed (`Options::read_probes_once`).
         let (start, probed) = if tombs {
-            self.tomb_pass(st, l0, key, fnv, hash, mem_h(key), mem_empty, holds)
+            self.tomb_pass(st, l0, key, fnv, hash, mem_empty, holds)
         } else {
             (0, Probed::default())
         };
@@ -39856,7 +39888,7 @@ impl Reader {
             }
             let got = match probed.frozen.get(i) {
                 Some(&Some(got)) => got,
-                _ => fr.get_with(mem_h(key), key, MemTable::ALL),
+                _ => fr.get_with(Reader::frozen_hash(fr, key, fnv, once), key, MemTable::ALL),
             };
             if let Some(e) = got {
                 n += u64::from(e.count);
