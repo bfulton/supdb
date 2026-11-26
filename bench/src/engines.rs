@@ -1118,6 +1118,11 @@ pub struct Supdb {
     /// engine's default: `supdb-landfresh` and `supdb-ingestlandfresh`
     /// make it at every landing that retires a table.
     landfresh: Option<bool>,
+    /// A run of ordered ingest begun in a file made ahead of it
+    /// (`Options::run_spare`), `None` for the engine's default:
+    /// `supdb-runcreate` and `supdb-ingestruncreate` make the file at the
+    /// run's first commit.
+    runspare: Option<bool>,
     /// A scan that starts in a block the writer holds a form for counted
     /// as a reuse by the forms-off rule
     /// (`Options::scan_forms_off_counts_built`), `None` for the engine's
@@ -2603,6 +2608,11 @@ struct Policy {
     /// engine's default: `supdb-landfresh` and `supdb-ingestlandfresh`
     /// make it at every landing that retires a table.
     landfresh: Option<bool>,
+    /// A run of ordered ingest begun in a file made ahead of it
+    /// (`Options::run_spare`), `None` for the engine's default:
+    /// `supdb-runcreate` and `supdb-ingestruncreate` make the file at the
+    /// run's first commit.
+    runspare: Option<bool>,
     /// A scan that starts in a block the writer holds a form for counted
     /// as a reuse by the forms-off rule
     /// (`Options::scan_forms_off_counts_built`), `None` for the engine's
@@ -3464,6 +3474,7 @@ impl Default for Policy {
             closereadable: None,
             bloompieces: None,
             landfresh: None,
+            runspare: None,
             formsoffbuilt: None,
             formson: false,
             formsoffkept: false,
@@ -8266,6 +8277,34 @@ impl Supdb {
         )
     }
 
+    /// `supdb` whose runs of ordered ingest make their file at their
+    /// first commit (`Options::run_spare` off), the shape before: the
+    /// first fdatasync carries the new inode and the first sync that
+    /// acknowledges anything fsyncs the directory for the name.
+    /// `supdb-runcreate`.
+    pub fn create_runcreate(path: &Path) -> Res<Supdb> {
+        Supdb::with_policy(
+            path,
+            Policy {
+                runspare: Some(false),
+                ..Policy::default()
+            },
+        )
+    }
+
+    /// `supdb-ingest` as `supdb-runcreate`. `supdb-ingestruncreate`.
+    pub fn create_ingest_runcreate(path: &Path) -> Res<Supdb> {
+        Supdb::with_policy(
+            path,
+            Policy {
+                partition: false,
+                durable: false,
+                runspare: Some(false),
+                ..Policy::default()
+            },
+        )
+    }
+
     /// `supdb-ingest` as `supdb-directfull`. `supdb-ingestdirectfull`.
     pub fn create_ingest_directfull(path: &Path) -> Res<Supdb> {
         Supdb::with_policy(
@@ -10355,6 +10394,7 @@ impl Supdb {
             closereadable,
             bloompieces,
             landfresh,
+            runspare,
             formsoffbuilt,
             formson,
             formsoffkept,
@@ -10900,6 +10940,7 @@ impl Supdb {
                 .unwrap_or(supdb::Options::default().close_readable_inline),
             bloom_pieces_only: bloompieces.unwrap_or(supdb::Options::default().bloom_pieces_only),
             land_fresh_lazy: landfresh.unwrap_or(supdb::Options::default().land_fresh_lazy),
+            run_spare: runspare.unwrap_or(supdb::Options::default().run_spare),
             scan_forms_off_counts_built: formsoffbuilt
                 .unwrap_or(supdb::Options::default().scan_forms_off_counts_built),
             scan_forms_off_unreused: !formson,
@@ -11408,6 +11449,7 @@ impl Supdb {
             closereadable,
             bloompieces,
             landfresh,
+            runspare,
             formsoffbuilt,
             formson,
             formsoffkept,
@@ -13237,6 +13279,13 @@ impl Engine for Supdb {
                 "supdb-landfresh"
             } else {
                 "supdb-ingestlandfresh"
+            };
+        }
+        if self.runspare == Some(false) {
+            return if self.partition {
+                "supdb-runcreate"
+            } else {
+                "supdb-ingestruncreate"
             };
         }
         match (
@@ -15665,6 +15714,7 @@ pub fn guarantee(arm: &str) -> Option<Guarantee> {
         | "supdb-closeseal"
         | "supdb-bloomalways"
         | "supdb-landfresh"
+        | "supdb-runcreate"
         | "supdb-jobspooled"
         | "supdb-zslabjobs"
         | "supdb-zstrideallslabjobs"
@@ -15770,6 +15820,7 @@ pub fn guarantee(arm: &str) -> Option<Guarantee> {
         | "supdb-ingestcloseseal"
         | "supdb-ingestbloomalways"
         | "supdb-ingestlandfresh"
+        | "supdb-ingestruncreate"
         | "supdb-ingestsettlefar"
         | "supdb-ingesttofit"
         | "supdb-ingestprefetch1k"
@@ -17108,6 +17159,8 @@ pub fn open(arm: &str, dir: &Path, map_gb: usize) -> Res<Box<dyn Engine>> {
         "supdb-ingestbloomalways" => supdb_arm(Supdb::create_ingest_bloomalways, dir)?,
         "supdb-landfresh" => supdb_arm(Supdb::create_landfresh, dir)?,
         "supdb-ingestlandfresh" => supdb_arm(Supdb::create_ingest_landfresh, dir)?,
+        "supdb-runcreate" => supdb_arm(Supdb::create_runcreate, dir)?,
+        "supdb-ingestruncreate" => supdb_arm(Supdb::create_ingest_runcreate, dir)?,
         "supdb-ingestdirectfull" => supdb_arm(Supdb::create_ingest_directfull, dir)?,
         "supdb-jobspooled" => supdb_arm(Supdb::create_jobspooled, dir)?,
         "supdb-zslabjobs" => supdb_arm(Supdb::create_zslabjobs, dir)?,
@@ -20850,6 +20903,43 @@ mod tests {
                     assert!(
                         so.bloom_pieces_only && so.land_fresh_lazy,
                         "the engine's defaults"
+                    );
+                    assert_eq!(
+                        open(arm, &dir(&format!("{arm}-open")), 1).unwrap().name(),
+                        arm
+                    );
+                    assert_eq!(guarantee(arm), guarantee(s.name()), "{arm}");
+                }
+                for (z, s, arm) in [
+                    (
+                        Supdb::create_runcreate(&dir("runcreate")).unwrap(),
+                        &base,
+                        "supdb-runcreate",
+                    ),
+                    (
+                        Supdb::create_ingest_runcreate(&dir("ingestruncreate")).unwrap(),
+                        &sib,
+                        "supdb-ingestruncreate",
+                    ),
+                ] {
+                    assert_eq!(z.name(), arm);
+                    assert_eq!(z.features(), s.features(), "{arm}");
+                    let o = z.db.as_ref().unwrap().options();
+                    let so = s.db.as_ref().unwrap().options();
+                    assert!(!o.run_spare, "{arm}");
+                    assert!(so.run_spare, "the engine's default");
+                    assert_eq!(
+                        (
+                            o.bloom_pieces_only,
+                            o.land_fresh_lazy,
+                            o.close_readable_inline
+                        ),
+                        (
+                            so.bloom_pieces_only,
+                            so.land_fresh_lazy,
+                            so.close_readable_inline
+                        ),
+                        "{arm}: the arm differs in the run's file alone"
                     );
                     assert_eq!(
                         open(arm, &dir(&format!("{arm}-open")), 1).unwrap().name(),

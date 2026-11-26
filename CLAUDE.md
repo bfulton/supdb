@@ -178,7 +178,13 @@ had left fourteen hundred test stores in the private temp directories
 (1.3 GB), and the bench workspace's `target` held 14 GB, 3.6 of it the
 checked profile's example binaries, which the gate's bench group rebuilds
 and nothing reads. Read `df` of the temp volume before a timing run, and
-delete the test stores and the checked examples first.
+delete the test stores and the checked examples first. And `perf record`
+keeps a copy of every binary it sampled, by build id, under `~/.debug`:
+a bench binary is a third of a gigabyte, a session's profiles had left
+twenty-nine of them there, eleven gigabytes, and the gate's links died of
+the bus error above while every directory this file names had been
+cleaned twice. `perf record -N` keeps none; `du` the home directory
+before reading the allowance as the builds'.
 
 The test group's compile was thirty-three minutes of a gate's
 thirty-seven, for four minutes of tests, and the cause was in the
@@ -1425,7 +1431,15 @@ rotation's barrier for its new log file had the name in the directory
 already, and none in a store whose commits never sync, whose landings'
 directory fsyncs carry it; a barrier that fails fails the commit, and a
 run that closes owing one is the next sync's, as a run that closed
-unsynced is. The close is
+unsynced is. And none for a run begun in a file made ahead of it
+(`Options::run_spare`): an empty file under the temp name of an id the
+writer reserved as the run before began, made where the directory is
+synced anyway -- by the store's creation ahead of the manifest's, by a
+landing ahead of its own -- and called ready only once that sync has
+returned, so the name is behind a barrier before the run's first record
+is. A run that finds the file made and not yet called ready takes it as
+one it made itself, barrier and all; an empty one a crash leaves is no
+run, and the open removes it. The close is
 the seal's shape with one difference: the finished segment is hard-linked
 under its piece name rather than renamed, and the temp name stays until the
 manifest names the segment, because a name the manifest lacks is swept at
@@ -7068,6 +7082,43 @@ after the work it governs moves ahead of the work wherever a bound can
 take it, the bound held to the finished result in every checked build;
 and a copy of a length the compiler cannot see is a call, so the common
 length gets a load of its own.
+
+**A sync made ahead for the next run, beside the commits of this
+one.** A run of ordered ingest made its file at its first commit, and
+that commit paid for it twice: the fdatasync carried the new inode, and
+the first acknowledged sync fsynced the directory for the name -- 0.78
+and 0.29 ms against the 0.45 to 0.57 of the run's later syncs, in a load
+of ten commits (`strace -f -T` over the load at ten thousand keys). So
+the file was made ahead (`Options::run_spare`): the store's first at its
+creation, ahead of the manifest's sync of the directory, and each one
+after by the segment work as the one before was taken. The first commit
+read 0.3 ms shorter in both orders and the load 1% faster: the nine
+commits after it had given 0.2 back, since the segment work's sync of the
+directory for the next file ran beside them and the two wait on one
+journal. The phase column named it, the rate could not. The next file is
+made now where the directory is synced anyway, at a landing, and the
+load reads 9-10% faster at ten thousand keys in both orders
+(`SUPDB_LOAD_PHASES=1 bench/scripts/pair.sh supdb supdb-runcreate 10000
+--passes load --reps 24`, at the commit that made the option). The rule this file had for it: a sync handed
+to a helper is hidden only while nothing needs the device beside it, and
+a saving made by doing a thing early is priced where the early thing is
+done, the phase after the one it leaves. Three things about the tests
+came with it. A run's id is the writer's to reserve, as the run before
+begins, or the second run's file is under one name where the file was
+ready and another where it was not, and every test that names a run's
+file by its number bets on the segment work's turn. A count of the
+files the segment work made is a count of the landings that ran, which
+is the threads' timing: two assertions of it failed nine runs of thirty
+six at a time until they asked for at least the count the test caused.
+And the hunt's worst hour was a store that refused to open after the
+test's crash, "the manifest names a segment which is not in the store",
+with the segment in a copy of the directory taken a line earlier:
+`Db::crash` leaves a store's threads running, the segment work of the
+crashed store retired the segment under the store that opened next, and
+the file's own notes say so of every store it crashes with that work on
+a thread. A test that crashes a store runs its segment work inline or
+holds it, and one written beside a new mechanism is read against the
+file's helpers before its failure is read as the mechanism's.
 
 ## Open targets, and the one standing limitation
 

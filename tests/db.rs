@@ -10050,13 +10050,16 @@ fn a_value_the_record_cannot_hold_sends_its_batch_through_the_wal() {
             db.commit().unwrap();
         }
         let (_, _, written) = db.wal_durable();
-        let tmp = d.join("direct-00000000.tmp");
+        // Whether a run began: its file holds something. The file alone
+        // says nothing, the first run's being made ahead of it, empty
+        // (`Options::run_spare`).
+        let began = std::fs::metadata(d.join("direct-00000000.tmp")).is_ok_and(|m| m.len() > 0);
         if big {
             assert!(written > 8, "{name}: through the WAL");
-            assert!(!tmp.exists(), "{name}: no segment opened");
+            assert!(!began, "{name}: no segment opened");
         } else {
             assert!(written <= 8, "{name}: the WAL untouched");
-            assert!(tmp.exists(), "{name}: a segment open");
+            assert!(began, "{name}: a segment open");
         }
         db.crash();
         let db = Db::open(&d, common::options()).unwrap();
@@ -18502,6 +18505,9 @@ fn a_handed_tables_log_is_retired_at_its_landing_and_replays_before_it() {
                 p.file_name()
                     .and_then(|s| s.to_str())
                     .is_some_and(|s| s.starts_with("direct-") && s.ends_with(".tmp"))
+                    // An empty one is the next run's, made ahead of it
+                    // (`Options::run_spare`), and no run.
+                    && std::fs::metadata(p).is_ok_and(|m| m.len() > 0)
             })
             .collect();
         assert_eq!(tmp.len(), 1, "the tail's open run: {tmp:?}");
@@ -23350,7 +23356,9 @@ fn drain_check(r: &Reader, keys: &[Vec<u8>], what: &str) {
     }
 }
 
-/// The run of ordered ingest's temp names a store's directory holds.
+/// The run of ordered ingest's temp names a store's directory holds: the
+/// files that hold something, an empty one being the next run's, made
+/// ahead of it (`Options::run_spare`).
 fn direct_temps(d: &std::path::Path) -> Vec<PathBuf> {
     let mut v: Vec<PathBuf> = std::fs::read_dir(d)
         .unwrap()
@@ -23360,6 +23368,7 @@ fn direct_temps(d: &std::path::Path) -> Vec<PathBuf> {
             p.file_name()
                 .and_then(|n| n.to_str())
                 .is_some_and(|n| n.starts_with("direct-") && n.ends_with(".tmp"))
+                && std::fs::metadata(p).is_ok_and(|m| m.len() > 0)
         })
         .collect();
     v.sort();

@@ -412,6 +412,12 @@ struct Cfg {
     /// Such a seed makes a fifth of its writes puts of eight-byte values,
     /// out of the appends' share.
     in_place: bool,
+    /// A run of ordered ingest begun in a file made ahead of it
+    /// (`Options::run_spare`): off in a quarter of the seeds under
+    /// `ZFUZZ_OPTVARY`, the side generator's draw after the overwrite's,
+    /// and on otherwise, as the engine has it, so a run that makes its own
+    /// file is held to the model beside one that finds it made.
+    run_spare: bool,
     /// Under `ZFUZZ_STRIDE`, the stride form's steer; `None` without it.
     stride: Option<StrideSteer>,
 }
@@ -713,6 +719,7 @@ fn pick_cfg(rng: &mut Rng, want_cache: bool) -> Cfg {
     let live_first = side.chance(25);
     let mem_fnv = side.chance(25);
     let in_place = side.chance(25);
+    let spare_off = side.chance(25);
     // A generator of its own, as `side` is, so that the switch moves none
     // of the draws below.
     let stride =
@@ -787,6 +794,7 @@ fn pick_cfg(rng: &mut Rng, want_cache: bool) -> Cfg {
         live_first: vary && live_first,
         mem_fold: !(vary && mem_fnv),
         in_place: vary && explicit_on && in_place,
+        run_spare: !(vary && spare_off),
         stride,
     }
 }
@@ -811,6 +819,7 @@ fn opts(c: &Cfg) -> Options {
         zpages_memo_ahead: c.memo_ahead,
         zpages_point_part: c.point_part,
         zpages_point_keys: c.point_keys,
+        run_spare: c.run_spare,
         zpages_scan_admit: c.scan_admit,
         zpages_walk_part: c.walk_part,
         zpages_cursor_steps: c.cursor_steps,

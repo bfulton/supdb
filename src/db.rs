@@ -5355,6 +5355,36 @@ pub struct Options {
     /// landing.
     #[doc(hidden)]
     pub land_fresh_lazy: bool,
+    /// A run of ordered ingest begins in a file made ahead of it: an empty
+    /// file under the run's temp name whose entry in the directory is
+    /// behind a sync before the run asks for it, so the run's first commit
+    /// is a commit like the rest. Without one a run made its file at that
+    /// commit, whose fdatasync then carried the new inode, and the first
+    /// sync that acknowledged anything fsynced the directory for the name
+    /// (`Db::dir_barrier`): 0.78 ms and 0.29 against the 0.45 to 0.57 ms
+    /// of a run's later fdatasyncs at ten thousand keys under `strace -T`.
+    /// The store's first is made as the store is created, ahead of the
+    /// manifest's own sync of the directory. The writer reserves the next
+    /// run's id as each run begins and the segment work makes that file
+    /// where it syncs the directory anyway, at a landing, or once at its
+    /// first turn in a store opened (`RunSpare`): made as the last one
+    /// was taken, its sync ran beside the run's first commits, which wait
+    /// on the same journal, and gave back there two thirds of what the
+    /// file had saved the first -- 0.3 ms off the first commit and 0.2
+    /// back over the nine after it, the load 1% faster in both orders. A
+    /// run that finds no file ready makes its own, with its own barrier.
+    /// A file nobody began in is an empty file under a temp name, which
+    /// the open removes as it removes a run with no committed record, and
+    /// a store closed removes behind the segment work's join. The durable
+    /// ordered load reads 6.7-6.9 ms against 7.4-7.6 for the arm at ten
+    /// thousand keys in both orders, its first commit 0.72-0.75 ms
+    /// against 1.00-1.04, and 3-9% faster at thirty thousand
+    /// (`bench/scripts/pair.sh SUPDB_LOAD_PHASES=1 supdb supdb-runcreate
+    /// 10000 --passes load --reps 24`); the buffered load, whose commits
+    /// sync nothing, reads level. On; off, the file made at the run's
+    /// first commit, `supdb-runcreate` and `supdb-ingestruncreate`.
+    #[doc(hidden)]
+    pub run_spare: bool,
     /// EXPERIMENT, refuted and kept as an arm: a drain's seal copies the
     /// frozen table's chains into a snapshot for the scans over the
     /// store while the seal runs, as any seal does (`seal_snapshot`),
@@ -7725,6 +7755,7 @@ impl Default for Options {
             close_readable_inline: true,
             bloom_pieces_only: true,
             land_fresh_lazy: true,
+            run_spare: true,
             drain_snapshot: true,
             seal_snapshot_far: false,
             land_ranks_far: false,
@@ -9137,6 +9168,25 @@ struct Direct {
     /// makes it so (`Db::sync_run`), since a sync of the file does not
     /// promise the entry that names it.
     named: bool,
+}
+
+/// The file made ahead for the next run of ordered ingest
+/// (`Options::run_spare`), by the segment id reserved for that run. The
+/// writer reserves the id as the run before it begins, so a run's id does
+/// not turn on whether its file was ready, and the segment work makes the
+/// file: `Wanted` until it has, `Made` once the empty file is under the
+/// run's temp name, `Ready` once a sync of the directory stands behind
+/// that, and `Failed` where it could not be made. A run begins in a
+/// `Ready` file with no barrier of its own; any other it takes as it
+/// took none, making the file and its barrier itself. `Off` in a store
+/// without the option.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RunSpare {
+    Off,
+    Wanted(u64),
+    Made(u64),
+    Ready(u64),
+    Failed(u64),
 }
 
 /// A run of ordered ingest that closed with commits no sync had covered,
@@ -19838,6 +19888,11 @@ struct SealCounts {
     /// acknowledges a commit of it, and none where a rotation's barrier
     /// had carried the name already (`Db::dir_barrier`).
     run_names: AtomicU64,
+    /// Runs of ordered ingest that began in a file made ahead of them
+    /// (`Options::run_spare`), and the files so made after the store's
+    /// first, by the segment work.
+    run_spares: AtomicU64,
+    run_spares_made: AtomicU64,
     /// Time the writer spent in the seals its commits started: the wait
     /// for room, the freeze, and the seal's writer half.
     freeze_ns: AtomicU64,
@@ -19875,6 +19930,8 @@ impl SealCounts {
             rotated_unsynced: get(&self.rotated_unsynced),
             loose_synced: get(&self.loose_synced),
             run_names: get(&self.run_names),
+            run_spares: get(&self.run_spares),
+            run_spares_made: get(&self.run_spares_made),
             freeze_ns: get(&self.freeze_ns),
         }
     }
@@ -19951,6 +20008,10 @@ pub struct SealWaits {
     /// Directory barriers made for the temp names of runs of ordered
     /// ingest (`SealCounts`).
     pub run_names: u64,
+    /// Runs that began in a file made ahead of them, and the files the
+    /// segment work made so (`Options::run_spare`).
+    pub run_spares: u64,
+    pub run_spares_made: u64,
     pub freeze_ns: u64,
 }
 
@@ -21954,6 +22015,9 @@ struct Shared {
     /// A test's: the writer's next directory barrier fails
     /// (`Db::fail_next_dir_barrier`).
     fail_dir_barrier: std::sync::atomic::AtomicBool,
+    /// A test's: the segment work's next sync of the directory for a run's
+    /// file made ahead fails (`Db::fail_next_spare_sync`).
+    fail_spare_sync: std::sync::atomic::AtomicBool,
     /// An error of the segment work's, for the writer's next commit to
     /// return: one slot, the first error kept.
     maint_err: AtomicPtr<std::io::Error>,
@@ -21965,6 +22029,23 @@ struct Shared {
     /// the manifest covers the WAL, taken by the writer. One slot and a
     /// swap each way, since one spare is enough.
     spare_wal: AtomicPtr<PathBuf>,
+    /// The file made ahead for the next run of ordered ingest
+    /// (`RunSpare`). Behind a lock the writer takes where a run begins and
+    /// the segment work takes for each step it moves the slot by, so the
+    /// writer never makes the file the other thread is making. No commit
+    /// takes it.
+    spare_run: std::sync::Mutex<RunSpare>,
+    /// A test's: a landing's sync of the directory waits here before it
+    /// calls the file it made ready (`Db::hold_spare_named`).
+    spare_named_hold: std::sync::atomic::AtomicBool,
+    /// A store opened, whose first spare the segment work makes at its
+    /// first turn with a sync of the directory for it alone: there is no
+    /// landing to make it at, and the open is no place for the sync.
+    spare_run_first: std::sync::atomic::AtomicBool,
+    /// The store was closed, which leaves no run's file made ahead: the
+    /// drop removes the one that waits, behind the segment work's join
+    /// (`Db::close_inner`).
+    spare_run_off: std::sync::atomic::AtomicBool,
     keeper_seq: AtomicU64,
     keeper_done: AtomicU64,
     snap_kept: AtomicU64,
@@ -22948,6 +23029,12 @@ impl Shared {
             .swap(std::ptr::null_mut(), AtomicOrdering::AcqRel);
         // SAFETY: put by `put_maint_err`, and the swap made it this call's.
         (!p.is_null()).then(|| *unsafe { Box::from_raw(p) })
+    }
+
+    /// The run's spare slot, whatever a panic under the lock left of it:
+    /// the slot is a word, whole at every instant.
+    fn run_spare(&self) -> std::sync::MutexGuard<'_, RunSpare> {
+        self.spare_run.lock().unwrap_or_else(|e| e.into_inner())
     }
 
     /// The spare waiting, if one is.
@@ -37647,6 +37734,12 @@ impl Db {
     /// covers. A crash between the rename and the WAL reset then leaves a
     /// WAL whose covered prefix is skipped by sequence on replay instead of
     /// replayed into duplicates.
+    /// The temp name a run of ordered ingest keeps its records under until
+    /// the manifest names its segment.
+    fn direct_tmp(dir: &Path, id: u64) -> PathBuf {
+        dir.join(format!("direct-{id:08}.tmp"))
+    }
+
     fn seg_name(n: u64, end_seq: u64) -> String {
         format!("seg-{n:08}-{end_seq:016}.sup")
     }
@@ -37763,7 +37856,18 @@ impl Db {
             wal.set_hold(cap, reuses, frames);
         }
         let mut spare_wal: *mut PathBuf = std::ptr::null_mut();
-        let next_seg = 0u64;
+        let mut next_seg = 0u64;
+        // The first run's file, made ahead (`Options::run_spare`): before
+        // the manifest below, whose writing ends in a sync of the
+        // directory in either shape, so the name is behind one when the
+        // store is returned.
+        let mut spare_run = RunSpare::Off;
+        let spare_run_first = false;
+        if opts.run_spare {
+            File::create(Db::direct_tmp(dir, next_seg))?;
+            spare_run = RunSpare::Ready(next_seg);
+            next_seg += 1;
+        }
         if let Some((ahead, runs, cap)) = wal_ahead(&opts) {
             // Pre-written as the commits reach it, and no spare until a
             // retired file is one.
@@ -37932,9 +38036,14 @@ impl Db {
             fail_landing: std::sync::atomic::AtomicBool::new(false),
             fail_presync: std::sync::atomic::AtomicBool::new(false),
             fail_dir_barrier: std::sync::atomic::AtomicBool::new(false),
+            fail_spare_sync: std::sync::atomic::AtomicBool::new(false),
             maint_err: AtomicPtr::new(std::ptr::null_mut()),
             maint_stop: std::sync::atomic::AtomicBool::new(false),
             spare_wal: AtomicPtr::new(spare_wal),
+            spare_run: std::sync::Mutex::new(spare_run),
+            spare_run_first: std::sync::atomic::AtomicBool::new(spare_run_first),
+            spare_named_hold: std::sync::atomic::AtomicBool::new(false),
+            spare_run_off: std::sync::atomic::AtomicBool::new(false),
             keeper_seq: AtomicU64::new(0),
             keeper_done: AtomicU64::new(0),
             snap_kept: AtomicU64::new(0),
@@ -38617,7 +38726,16 @@ impl Db {
                 opts.wal_ahead_beside,
             );
         }
-        let next_seg = seg_ids.iter().map(|&(n, _)| n + 1).max().unwrap_or(0);
+        let mut next_seg = seg_ids.iter().map(|&(n, _)| n + 1).max().unwrap_or(0);
+        // The next run's id reserved and its file left to the segment
+        // work's first turn (`Maint::run_spare_look`): made here it would
+        // put a sync of the directory on every open.
+        let mut spare_run = RunSpare::Off;
+        let spare_run_first = opts.run_spare;
+        if opts.run_spare {
+            spare_run = RunSpare::Wanted(next_seg);
+            next_seg += 1;
+        }
         let spare_wal = spare_wals
             .into_iter()
             .next()
@@ -38759,9 +38877,14 @@ impl Db {
             fail_landing: std::sync::atomic::AtomicBool::new(false),
             fail_presync: std::sync::atomic::AtomicBool::new(false),
             fail_dir_barrier: std::sync::atomic::AtomicBool::new(false),
+            fail_spare_sync: std::sync::atomic::AtomicBool::new(false),
             maint_err: AtomicPtr::new(std::ptr::null_mut()),
             maint_stop: std::sync::atomic::AtomicBool::new(false),
             spare_wal: AtomicPtr::new(spare_wal),
+            spare_run: std::sync::Mutex::new(spare_run),
+            spare_run_first: std::sync::atomic::AtomicBool::new(spare_run_first),
+            spare_named_hold: std::sync::atomic::AtomicBool::new(false),
+            spare_run_off: std::sync::atomic::AtomicBool::new(false),
             keeper_seq: AtomicU64::new(0),
             keeper_done: AtomicU64::new(0),
             snap_kept: AtomicU64::new(0),
@@ -39625,9 +39748,40 @@ impl Db {
             return Ok(());
         }
         if self.direct.is_none() {
-            let id = self.shared.next_seg.fetch_add(1, AtomicOrdering::Relaxed);
-            let tmp = self.dir.join(format!("direct-{id:08}.tmp"));
-            let _ = std::fs::remove_file(&tmp);
+            // In the file made ahead where it is ready (`Options::run_spare`):
+            // its name is behind a directory sync already, so the run asks
+            // for no barrier of its own, and the writer below opens the
+            // file it finds, empty, where it would have made one. The id
+            // was reserved as the run before began, and the next run's is
+            // reserved here, for the segment work to make the file of.
+            let (id, tmp, named) = if self.opts.run_spare {
+                let next = self.shared.next_seg.fetch_add(1, AtomicOrdering::Relaxed);
+                let was = std::mem::replace(&mut *self.shared.run_spare(), RunSpare::Wanted(next));
+                match was {
+                    RunSpare::Ready(id) => {
+                        SealCounts::add(&self.shared.seal_counts.run_spares, 1);
+                        (id, Db::direct_tmp(&self.dir, id), true)
+                    }
+                    RunSpare::Wanted(id) | RunSpare::Made(id) | RunSpare::Failed(id) => {
+                        let tmp = Db::direct_tmp(&self.dir, id);
+                        let _ = std::fs::remove_file(&tmp);
+                        (id, tmp, false)
+                    }
+                    // A store opened without the option holds no
+                    // reservation; none is made for one.
+                    RunSpare::Off => {
+                        let tmp = Db::direct_tmp(&self.dir, next);
+                        let _ = std::fs::remove_file(&tmp);
+                        *self.shared.run_spare() = RunSpare::Off;
+                        (next, tmp, false)
+                    }
+                }
+            } else {
+                let id = self.shared.next_seg.fetch_add(1, AtomicOrdering::Relaxed);
+                let tmp = Db::direct_tmp(&self.dir, id);
+                let _ = std::fs::remove_file(&tmp);
+                (id, tmp, false)
+            };
             let mut opts = Db::segment_opts(&self.opts);
             self.shared.job_buffers(&self.opts, &mut opts);
             let mut w = PieceWriter::create(&tmp, &opts, 0, self.opts.inline_bytes)?;
@@ -39661,7 +39815,7 @@ impl Db {
                 stream_from: 0,
                 payload_from: 0,
                 unsynced: false,
-                named: false,
+                named,
             });
         }
         let mem = self.r.mem().clone();
@@ -43108,6 +43262,52 @@ impl Db {
         )
     }
 
+    /// A test's: the segment work's next sync of the directory for a
+    /// run's file made ahead fails, so that file is no spare
+    /// (`Options::run_spare`).
+    #[doc(hidden)]
+    pub fn fail_next_spare_sync(&self) {
+        self.shared
+            .fail_spare_sync
+            .store(true, AtomicOrdering::Release);
+    }
+
+    /// A test's: a landing that has made the next run's file and synced
+    /// the directory waits before it calls the file ready, for as long as
+    /// this is set (`Options::run_spare`).
+    #[doc(hidden)]
+    pub fn hold_spare_named(&self, on: bool) {
+        self.shared
+            .spare_named_hold
+            .store(on, AtomicOrdering::Release);
+    }
+
+    /// A test's: the segment work makes the next run's file at its next
+    /// turn with a sync of the directory for it alone, as it does once
+    /// for a store opened (`Maint::run_spare_look`).
+    #[doc(hidden)]
+    pub fn run_spare_look_again(&self) {
+        self.shared
+            .spare_run_first
+            .store(true, AtomicOrdering::Release);
+    }
+
+    /// A test's: what stands for the next run of ordered ingest's file
+    /// (`Options::run_spare`) -- 0 nothing, the option off; 1 its id
+    /// reserved and the file not made; 2 the file made ahead and its name
+    /// synced; 3 the file tried and not made; 4 the file made and its
+    /// name behind no sync yet.
+    #[doc(hidden)]
+    pub fn run_spare_state(&self) -> u8 {
+        match *self.shared.run_spare() {
+            RunSpare::Off => 0,
+            RunSpare::Wanted(_) => 1,
+            RunSpare::Ready(_) => 2,
+            RunSpare::Failed(_) => 3,
+            RunSpare::Made(_) => 4,
+        }
+    }
+
     /// A test's: whether the temp name of the run of ordered ingest in
     /// progress is behind no directory barrier yet, none where no run is
     /// open; and the count of runs that closed loose whose names are
@@ -43157,6 +43357,14 @@ impl Db {
         if let Some(spare) = self.shared.take_spare() {
             let _ = std::fs::remove_file(spare);
         }
+        // Nor begin a run in one (`Options::run_spare`): the one that
+        // waits, or that a turn of the segment work is still making, is
+        // removed by the drop once that thread is joined. Taken here, a
+        // file the thread made a moment later outlived the close, as the
+        // log's spare once did.
+        self.shared
+            .spare_run_off
+            .store(true, AtomicOrdering::Release);
         Ok(())
     }
 }
@@ -50221,6 +50429,7 @@ impl Maint {
             self.z_step();
             self.short_look();
             self.sweep_spares();
+            self.run_spare_look();
             std::thread::park_timeout(MAINT_POLL);
         }
         self.sweep_spares();
@@ -51019,7 +51228,7 @@ impl Maint {
         // landing's, the segments published and unnamed, and wedges the
         // queue as one there does.
         if dir_owed {
-            if let Err(e) = File::open(&self.dir).and_then(|d| d.sync_all()) {
+            if let Err(e) = self.sync_dir_and_spare() {
                 self.shared.in_seal.fetch_sub(1, AtomicOrdering::AcqRel);
                 self.shared.seal_wedged.store(true, AtomicOrdering::Release);
                 return Err(e);
@@ -51157,7 +51366,7 @@ impl Maint {
             if defer_dir {
                 return Ok(true);
             }
-            File::open(&self.dir)?.sync_all()?;
+            self.sync_dir_and_spare()?;
         }
         Ok(false)
     }
@@ -58415,6 +58624,112 @@ impl Maint {
         }
     }
 
+    /// The next run's file made, where the writer has reserved its id and
+    /// it is not made yet (`Options::run_spare`): the empty file under
+    /// the run's temp name, its name behind no sync. Under the slot's
+    /// lock, so the writer never makes the file this is making. A file
+    /// that cannot be made is no spare, and is not tried again until the
+    /// run that would have had it has begun. The id made, for
+    /// `run_spare_named`.
+    fn run_spare_make(&mut self) -> Option<u64> {
+        if !self.opts.run_spare {
+            return None;
+        }
+        let mut slot = self.shared.run_spare();
+        let RunSpare::Wanted(id) = *slot else {
+            return None;
+        };
+        let tmp = Db::direct_tmp(&self.dir, id);
+        let _ = std::fs::remove_file(&tmp);
+        match File::create(&tmp) {
+            Ok(_) => {
+                *slot = RunSpare::Made(id);
+                Some(id)
+            }
+            Err(_) => {
+                let _ = std::fs::remove_file(&tmp);
+                *slot = RunSpare::Failed(id);
+                None
+            }
+        }
+    }
+
+    /// The file `run_spare_make` made is behind a sync of the directory:
+    /// ready for a run to begin in with no barrier of its own, unless the
+    /// writer has taken it meanwhile, as a file it made itself.
+    fn run_spare_named(&mut self, made: Option<u64>) {
+        let Some(id) = made else {
+            return;
+        };
+        let mut slot = self.shared.run_spare();
+        if *slot == RunSpare::Made(id) {
+            *slot = RunSpare::Ready(id);
+            SealCounts::add(&self.shared.seal_counts.run_spares_made, 1);
+        }
+    }
+
+    /// The directory synced for a landing's names, and the next run's
+    /// file with them (`Options::run_spare`): made just ahead of the sync
+    /// and ready once it has returned, so the file's name costs no sync of
+    /// its own. Made at the moment the writer took the last one it was a
+    /// sync of the directory beside the run's first commits, which wait on
+    /// the same journal, and gave back there two thirds of what the file
+    /// saved the first.
+    fn sync_dir_and_spare(&mut self) -> Result<()> {
+        let made = self.run_spare_make();
+        File::open(&self.dir)?.sync_all()?;
+        // A test's hold between the sync and the slot's step
+        // (`Db::hold_spare_named`): the window a run may begin in, taking
+        // the file as one it made itself.
+        while self.shared.spare_named_hold.load(AtomicOrdering::Acquire) {
+            std::thread::park_timeout(std::time::Duration::from_millis(1));
+        }
+        self.run_spare_named(made);
+        Ok(())
+    }
+
+    /// A store opened has no landing to make its first spare at: made
+    /// here, at the segment work's first turn, with a sync of the
+    /// directory for it alone (`Options::run_spare`). A sync that fails
+    /// leaves no spare and no file. No test can lose a name, so the sync
+    /// is held only as far as a failure injected in its place is
+    /// (`tests/runlog.rs`).
+    fn run_spare_look(&mut self) {
+        if !self.opts.run_spare
+            || !self
+                .shared
+                .spare_run_first
+                .swap(false, AtomicOrdering::AcqRel)
+        {
+            return;
+        }
+        let Some(id) = self.run_spare_make() else {
+            return;
+        };
+        let synced = if self
+            .shared
+            .fail_spare_sync
+            .swap(false, AtomicOrdering::AcqRel)
+        {
+            // A test's failure of the directory's sync
+            // (`Db::fail_next_spare_sync`).
+            Err(std::io::Error::other(
+                "the directory's sync failed (injected)",
+            ))
+        } else {
+            File::open(&self.dir).and_then(|d| d.sync_all())
+        };
+        if synced.is_ok() {
+            self.run_spare_named(Some(id));
+            return;
+        }
+        let mut slot = self.shared.run_spare();
+        if *slot == RunSpare::Made(id) {
+            let _ = std::fs::remove_file(Db::direct_tmp(&self.dir, id));
+            *slot = RunSpare::Failed(id);
+        }
+    }
+
     /// The spares the publishes left, unlinked: an inode freed is a
     /// discard round trip here, paid where nobody waits.
     fn sweep_spares(&mut self) {
@@ -58782,6 +59097,9 @@ impl Drop for Db {
         self.shared.zbuild_hold.store(0, AtomicOrdering::Release);
         self.shared.upkeep_hold_at.store(0, AtomicOrdering::Release);
         self.shared.kept_hold.store(0, AtomicOrdering::Release);
+        self.shared
+            .spare_named_hold
+            .store(false, AtomicOrdering::Release);
         self.stop_upkeep();
         self.stop_keeper();
         self.stop_trimmer();
@@ -58800,6 +59118,15 @@ impl Drop for Db {
                 if let Some(h) = a.handle.take() {
                     let _ = h.join();
                 }
+            }
+        }
+        // A store closed leaves no file made ahead for a run
+        // (`Options::run_spare`): behind the join above, after which no
+        // turn of the segment work can offer one.
+        if self.shared.spare_run_off.load(AtomicOrdering::Acquire) {
+            let was = std::mem::replace(&mut *self.shared.run_spare(), RunSpare::Off);
+            if let RunSpare::Ready(id) | RunSpare::Made(id) = was {
+                let _ = std::fs::remove_file(Db::direct_tmp(&self.dir, id));
             }
         }
         // Behind the segment work's last landing: what the log still
