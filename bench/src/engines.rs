@@ -519,6 +519,9 @@ fn dir_size_into(p: &Path, seen: &mut std::collections::HashSet<(u64, u64)>) -> 
 /// (every segment contributes candidates) until range-partitioned compaction
 /// lands; that cost is the arm's to show, not to hide.
 pub struct Supdb {
+    /// `supdb-heldhandle`'s handle, claimed at its first update; ahead of
+    /// the store, so that it goes first.
+    own: Option<supdb::Reader>,
     db: Option<supdb::Db>,
     path: PathBuf,
     /// False for the ingest-first arm: a flush stops partitioning what it
@@ -2043,6 +2046,11 @@ pub struct Supdb {
     /// writers reach it (`Options::shared_populates` off):
     /// `supdb-heldnopopulate`.
     nopopulate: bool,
+    /// EXPERIMENT: the arm's own updates and reads made through a handle
+    /// claimed to write (`Db::writer`), a write at a time with no batch
+    /// behind a commit, as FASTER's session makes them:
+    /// `supdb-heldhandle`.
+    ownhandle: bool,
     /// What the reader handles this store gave its threads answered
     /// through the ordered index, summed as each is dropped
     /// (`OrdTally`); only the arm that reads that way hands out handles
@@ -3379,6 +3387,10 @@ struct Policy {
     /// installs for its handles made as they write it
     /// (`Options::shared_populates` off), its first touches the writers'.
     nopopulate: bool,
+    /// EXPERIMENT, `supdb-heldhandle`: `supdb-heldnoframes` with its own
+    /// updates and reads through a handle claimed to write, a write at a
+    /// time and no batch behind a commit, which is FASTER's one level.
+    ownhandle: bool,
 }
 
 /// The conversions a fill makes at most in `supdb-convertcap`: the first
@@ -3735,6 +3747,7 @@ impl Default for Policy {
             sharedrmwprobes: false,
             noshare: false,
             nopopulate: false,
+            ownhandle: false,
             defer: false,
             firstfloor: false,
             aheadmin: None,
@@ -10515,6 +10528,7 @@ impl Supdb {
             sharedrmwprobes,
             noshare,
             nopopulate,
+            ownhandle,
         } = policy;
         // The table a held store with no frames makes for its handles'
         // writes (`Options::share_on_write`) is sized as the big shared
@@ -11607,6 +11621,8 @@ impl Supdb {
             sharedrmwprobes,
             noshare,
             nopopulate,
+            ownhandle,
+            own: None,
             ord_threads: Default::default(),
         })
     }
@@ -11872,6 +11888,8 @@ impl Engine for Supdb {
                     "supdb-heldnoshare"
                 } else if self.nopopulate {
                     "supdb-heldnopopulate"
+                } else if self.ownhandle {
+                    "supdb-heldhandle"
                 } else if self.shared && self.sharednorecycle {
                     "supdb-heldsharednorecycle"
                 } else if self.shared && self.sharedbig && self.sharednoahead {
@@ -13574,7 +13592,9 @@ impl Engine for Supdb {
             // with reads that borrow it, so nothing observes a batch
             // half-applied. That is the axis LMDB held over every Supdb arm
             // and the residual every matched comparison carried.
-            transactions: true,
+            // But for the arm whose writes go a write at a time through a
+            // handle, each visible as it is made: FASTER's one level.
+            transactions: !self.ownhandle,
             // Equalized off, matching lmdb -- see create().
             checksums: false,
             reopen_for_write: true,
@@ -13589,6 +13609,21 @@ impl Engine for Supdb {
     }
     fn update_batch(&mut self, items: &[(&[u8], &[u8])]) -> Res<()> {
         let db = self.db.as_mut().ok_or("db closed")?;
+        if self.ownhandle {
+            // A write at a time through the handle, claimed at the first
+            // of them; a refused write commits and is made again, which
+            // freezes a table that is full.
+            let own = match &self.own {
+                Some(o) => o,
+                None => self.own.insert(db.writer().map_err(|e| e.to_string())?),
+            };
+            for (k, v) in items {
+                while !own.put(k, v).map_err(|e| e.to_string())? {
+                    db.commit().map_err(|e| e.to_string())?;
+                }
+            }
+            return Ok(());
+        }
         // One call for the batch, as `write_batch` makes of a load's: the
         // store pins once for all of it (`Db::put_batch`).
         db.put_batch(items);
@@ -13600,6 +13635,9 @@ impl Engine for Supdb {
         Ok(())
     }
     fn get(&mut self, key: &[u8]) -> Res<usize> {
+        if let Some(own) = &self.own {
+            return supdb_get(own, key);
+        }
         let db = self.db.as_ref().ok_or("db closed")?;
         supdb_get(db, key)
     }
@@ -15990,6 +16028,7 @@ pub fn guarantee(arm: &str) -> Option<Guarantee> {
         | "supdb-heldsharedbigrmwprobes"
         | "supdb-heldnoshare"
         | "supdb-heldnopopulate"
+        | "supdb-heldhandle"
         | "supdb-heldbatch1"
         | "proto-shared"
         | "faster" => Guarantee::Memory,
@@ -16619,6 +16658,22 @@ pub fn open(arm: &str, dir: &Path, map_gb: usize) -> Res<Box<dyn Engine>> {
                         held: true,
                         noframes: true,
                         nopopulate: true,
+                        ..Policy::default()
+                    },
+                )
+            },
+            dir,
+        )?,
+        "supdb-heldhandle" => supdb_arm(
+            |d| {
+                Supdb::with_policy(
+                    d,
+                    Policy {
+                        partition: false,
+                        durable: false,
+                        held: true,
+                        noframes: true,
+                        ownhandle: true,
                         ..Policy::default()
                     },
                 )
