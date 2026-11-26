@@ -1552,6 +1552,23 @@ object is keyed by that object's identity, never by its place or its
 range, because a publish that keeps the position and replaces the object
 is exactly what a merge does.
 
+It came again in a writer's own state of the shared table
+(`TableLocal`): its reservation in the value arena and the ranges it keeps
+for reuse, kept with the table they are of by the table's address. A
+freeze's seal frees a table, and the next table can be made where it stood:
+a writer whose state named the old table by that address took its cursor
+and its ranges for the new one's, and the next chunk it laid there wrote
+its raw `prev`, `NO_CHUNK`, over a live record's head, which the next put
+of that key asked a prefetch of and the arena's bounds check refused. One
+run in fifty to a hundred of the threaded writers' test, at every commit
+of the shared table back to its first, read for weeks as a flake beside
+two timing bets in the same tests. An assertion that the state's table
+number matched wherever its address did fired six times in two hundred
+runs and named it; the state is keyed by a number every shared table takes
+at its making now (`SharedTable::uid`), and a unit test makes the second
+table in the first's allocation. An address is a place, and a freed
+object's place is the next object's.
+
 **A replay that builds the thing without the last step of the live
 path.** A reopen replays the WAL into the memtable through the same
 `append` and `delete` a live write takes, and stopped there: the live

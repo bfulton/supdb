@@ -108,11 +108,15 @@ fn handles_on_threads_write_one_live_table_and_every_write_lands() {
     let seals0 = db.seal_waits().joins;
     let db = Arc::new(Mutex::new(db));
     let stop = std::sync::atomic::AtomicBool::new(false);
+    // The reader has read a value: the writers' end waits for it before it
+    // stops the reader, whose first pass a loaded host may start after the
+    // writes are done -- one run in several hundred, with nothing wrong.
+    let read_one = std::sync::atomic::AtomicBool::new(false);
     std::thread::scope(|s| {
         let mut handles = handles.into_iter();
         let reader = handles.next().unwrap();
         let watcher = {
-            let stop = &stop;
+            let (stop, read_one) = (&stop, &read_one);
             s.spawn(move || {
                 let mut seen = 0u64;
                 while !stop.load(std::sync::atomic::Ordering::Relaxed) {
@@ -124,6 +128,7 @@ fn handles_on_threads_write_one_live_table_and_every_write_lands() {
                                     let s = std::str::from_utf8(v).expect("a value of one write");
                                     assert!(s.starts_with("common-"), "a value torn: {s:?}");
                                     seen += 1;
+                                    read_one.store(true, std::sync::atomic::Ordering::Release);
                                 }),
                             )
                             .unwrap();
@@ -173,6 +178,9 @@ fn handles_on_threads_write_one_live_table_and_every_write_lands() {
             })
             .collect();
         let done: Vec<_> = writers.into_iter().map(|h| h.join()).collect();
+        while !read_one.load(std::sync::atomic::Ordering::Acquire) && !watcher.is_finished() {
+            std::thread::yield_now();
+        }
         stop.store(true, std::sync::atomic::Ordering::Relaxed);
         let seen = watcher.join();
         for d in done {
@@ -186,6 +194,10 @@ fn handles_on_threads_write_one_live_table_and_every_write_lands() {
         }
     });
     let mut db = Arc::try_unwrap(db).ok().unwrap().into_inner().unwrap();
+    // The seals the freezes made land on the segment work's thread, up to
+    // the frozen list's three of them still in flight as the writes end;
+    // counted before they had, the freezes read short one run in hundreds.
+    db.settle().unwrap();
     assert!(
         db.seal_waits().joins - seals0 >= 4,
         "the writes froze the table {} times, too few to cross a freeze",
@@ -271,13 +283,17 @@ fn handles_overwrite_in_place_beside_reads_and_scans_and_every_value_is_whole() 
     let handles: Vec<supdb::Reader> = (0..THREADS + 1).map(|_| db.reader().unwrap()).collect();
     let db = Arc::new(Mutex::new(db));
     let stop = std::sync::atomic::AtomicBool::new(false);
+    // The reader has read a value: the writers' end waits for it before it
+    // stops the reader, whose first pass a loaded host may start after the
+    // writes are done -- one run in several hundred, with nothing wrong.
+    let read_one = std::sync::atomic::AtomicBool::new(false);
     let key = |i: usize| format!("inplace-{i:05}").into_bytes();
     let whole = |v: &[u8]| v.len() == 64 && v.iter().all(|&b| b == v[0]);
     let rewrites: u64 = std::thread::scope(|s| {
         let mut handles = handles.into_iter();
         let reader = handles.next().unwrap();
         let watcher = {
-            let stop = &stop;
+            let (stop, read_one) = (&stop, &read_one);
             s.spawn(move || {
                 let mut seen = 0u64;
                 while !stop.load(std::sync::atomic::Ordering::Relaxed) {
@@ -288,6 +304,7 @@ fn handles_overwrite_in_place_beside_reads_and_scans_and_every_value_is_whole() 
                                 vf(&mut |v| {
                                     assert!(whole(v), "a read met a value torn: {v:?}");
                                     seen += 1;
+                                    read_one.store(true, std::sync::atomic::Ordering::Release);
                                 }),
                             )
                             .unwrap();
@@ -326,6 +343,9 @@ fn handles_overwrite_in_place_beside_reads_and_scans_and_every_value_is_whole() 
             })
             .collect();
         let made: Vec<_> = writers.into_iter().map(|h| h.join()).collect();
+        while !read_one.load(std::sync::atomic::Ordering::Acquire) && !watcher.is_finished() {
+            std::thread::yield_now();
+        }
         stop.store(true, std::sync::atomic::Ordering::Relaxed);
         let seen = watcher.join();
         let made: u64 = made

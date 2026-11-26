@@ -14469,6 +14469,8 @@ const SLOT_TENTATIVE: u64 = 0xffff_ffff;
 struct SharedTable {
     /// The value arena's bytes past which a put finds the table full.
     cap_bytes: usize,
+    /// This table's number, unique in the process (`TableLocal::uid`).
+    uid: u64,
     /// Entry numbers claimed, at or past the slab's length.
     claimed: AtomicUsize,
     /// A put found the table full: set once, by whichever writer met the
@@ -14494,7 +14496,14 @@ struct SharedTable {
 /// table it names is not the one written.
 #[derive(Default)]
 pub(crate) struct TableLocal {
-    table: usize,
+    /// The table this state is of, by its number (`SharedTable::uid`) and
+    /// not its address: a freeze's seal frees a table, the next table can
+    /// be made where it stood, and a writer whose state named the old one
+    /// by its address took its reservation and its ranges for the new
+    /// one's, laying a chunk's `prev` over a record's head -- one run in
+    /// thirty of the threaded writers' test, from the shared table's first
+    /// commit on.
+    uid: u64,
     keys: (usize, usize),
     vals: (usize, usize),
     /// Ranges replaced since the writer last bumped the epoch, as offset
@@ -14524,6 +14533,8 @@ pub(crate) struct TableLocal {
 /// reads the pins: each bump is a locked add on a word every writer
 /// shares, and each reading a load of every reader's slot, a line each.
 const RECYCLE_BATCH: usize = 128;
+/// The next shared table's number (`SharedTable::uid`); zero is no table's.
+static SHARED_UID: AtomicU64 = AtomicU64::new(1);
 /// The ready ranges a writer keeps; past this the oldest is left where it
 /// lies, garbage until the table is sealed, so a writer whose replaced
 /// lengths never come back holds no unbounded list.
@@ -16540,6 +16551,7 @@ impl MemTable {
             shared: shared.map(|(cap_bytes, _, _)| {
                 Box::new(SharedTable {
                     cap_bytes,
+                    uid: SHARED_UID.fetch_add(1, AtomicOrdering::Relaxed),
                     claimed: AtomicUsize::new(0),
                     full: std::sync::atomic::AtomicBool::new(false),
                     vers: (0..SHARED_STRIPES).map(|_| AtomicU32::new(0)).collect(),
@@ -18224,10 +18236,9 @@ impl MemTable {
         w: SharedWrite<'_>,
     ) -> bool {
         let st = self.shared.as_deref().expect("a shared table's");
-        let me = self as *const MemTable as usize;
-        if l.table != me {
+        if l.uid != st.uid {
             *l = TableLocal {
-                table: me,
+                uid: st.uid,
                 rewrites: l.rewrites,
                 ..TableLocal::default()
             };
@@ -18358,10 +18369,9 @@ impl MemTable {
         f: &mut dyn FnMut(&[u8]),
     ) -> SharedRmw {
         let st = self.shared.as_deref().expect("a shared table's");
-        let me = self as *const MemTable as usize;
-        if l.table != me {
+        if l.uid != st.uid {
             *l = TableLocal {
-                table: me,
+                uid: st.uid,
                 rewrites: l.rewrites,
                 ..TableLocal::default()
             };
@@ -61706,6 +61716,53 @@ mod shared_table {
         let st = m.shared.as_deref().unwrap();
         assert_eq!(st.claimed.load(Acquire), made as usize);
         assert_eq!(m.len(), made as usize);
+    }
+
+    /// A writer's own state of a table -- its reservation in the value
+    /// arena and the ranges it keeps for reuse -- is of that table and no
+    /// other: a table made where a freed one stood, at its address, is
+    /// written as a fresh table, and every key of it reads back what its
+    /// writes put. The state was keyed by the table's address, which a
+    /// freeze's seal frees and the next table can take: the threaded
+    /// writers' test met it one run in thirty, the writer reusing a range
+    /// of the old table in the new one and a chunk's raw `prev` landing on
+    /// a record's head. The two tables here stand in one allocation.
+    #[test]
+    fn a_writers_state_of_a_freed_table_is_not_taken_for_one_at_its_address() {
+        as_records(|| {
+            let rd = Readers::new(false, true);
+            let mut l = TableLocal::default();
+            let put = |m: &MemTable, l: &mut TableLocal, k: &[u8], v: &[u8]| {
+                assert!(m.write_shared(l, Some(&rd), m.hash(k), k, SharedWrite::Put(v)));
+            };
+            let mut room = Box::new(std::mem::MaybeUninit::<MemTable>::uninit());
+            let a: &MemTable = room.write(shaped(64 << 20, true));
+            let at = a as *const MemTable;
+            for round in 0..4 * RECYCLE_BATCH {
+                put(a, &mut l, &key((round % 8) as u64), &[round as u8; 100]);
+            }
+            assert!(l.kept > 0, "the writer keeps ranges of the first table");
+            // SAFETY: written above, and nothing borrows it past here.
+            unsafe { room.assume_init_drop() };
+            let b: &MemTable = room.write(shaped(64 << 20, true));
+            assert_eq!(
+                b as *const MemTable, at,
+                "the second table at the first's address"
+            );
+            for i in 0..64 {
+                put(b, &mut l, &key(1000 + i), &[0xB0; 100]);
+            }
+            for i in 0..64 {
+                assert_eq!(
+                    head_value(b, &key(1000 + i)),
+                    Some(Some(vec![0xB0; 100])),
+                    "key {i} of the second table"
+                );
+            }
+            assert_eq!(l.kept, 0, "nothing of the first table kept for the second");
+            // SAFETY: written above, and nothing borrows it past here.
+            unsafe { room.assume_init_drop() };
+        });
     }
 
     /// A writer's puts over one key reuse the bytes of the puts they
