@@ -152,11 +152,20 @@ pub struct Passes {
     #[serde(default)]
     pub recover: bool,
     /// The threaded mixes, `threads-A` and its kin (`THREADED`): gets and
-    /// puts from several threads at once, on a store of their own. In no
-    /// row of the series: off in `all`, and run where `--passes` names
-    /// them, for what they cost every arm (`DESIGN.md`).
+    /// puts from several threads at once, on a store of their own, for
+    /// every arm. In no row of the series: off in `all`, and run where
+    /// `--passes` names them, for what they cost every arm (`DESIGN.md`).
     #[serde(default)]
     pub mixes_threaded: bool,
+    /// The threaded mixes for the arms of the guarantee FASTER's is
+    /// (`Guarantee::Memory`) alone, whose comparator's own benchmark they
+    /// are and whose commits reach no device, so that they cost a row a
+    /// minute where every arm's cost it as much again as the row
+    /// (`threaded_runs`). A row's in core: on in `all`, off in a pairing,
+    /// which runs them where they are named, and off in a list of passes.
+    /// Absent from a plan written before it, where it reads as off.
+    #[serde(default)]
+    pub threads_held: bool,
 }
 
 impl Passes {
@@ -187,17 +196,27 @@ impl Passes {
             lag: true,
             recover: true,
             mixes_threaded: false,
+            threads_held: true,
         }
     }
 
     /// What a pairing runs where it names no passes (`bench ab`): every
     /// pass but the recovery workloads, which load two stores more an arm
-    /// a rep and are run by the pairing that asks for them.
+    /// a rep and are run by the pairing that asks for them, and the
+    /// threaded mixes, which a pairing names.
     pub fn paired() -> Passes {
         Passes {
             recover: false,
+            threads_held: false,
             ..Passes::all()
         }
+    }
+
+    /// Whether `arm`'s pass runs the threaded mixes: named for every arm,
+    /// or a row's for an arm of FASTER's guarantee (`threads_held`).
+    pub fn threaded_runs(&self, arm: &str) -> bool {
+        self.mixes_threaded
+            || (self.threads_held && engines::guarantee(arm) == Some(Guarantee::Memory))
     }
 
     /// A comma-separated list of `NAMES`; a name not among them is an
@@ -215,6 +234,7 @@ impl Passes {
             lag: false,
             recover: false,
             mixes_threaded: false,
+            threads_held: false,
         };
         let mut any = false;
         for name in list.split(',').map(str::trim).filter(|s| !s.is_empty()) {
@@ -3368,7 +3388,7 @@ fn one_pass(
     // reads' must. In memory only: no count is read around them, so a
     // bounded row carries none.
     let mut mix_threaded = Vec::new();
-    if passes.mixes_threaded && plan.bound.is_none() {
+    if passes.threaded_runs(arm) && plan.bound.is_none() {
         prime_fresh_pool(prime_bytes_for(size, plan.bound_bytes()))?;
         // The lag store's files are still here where that store was built.
         let _ = std::fs::remove_dir_all(dir);
@@ -4884,6 +4904,13 @@ struct ThreadedMixed {
 /// Nothing syncs inside the window. A buffered arm's commit is in the
 /// kernel when it returns, and what an engine promises less than that is
 /// its arm's to say (`Features`).
+///
+/// With `SUPDB_THREADED_COUNTERS` set, each thread's handle's own counts
+/// (`ThreadWriter::counters`), read once its share is done, summed over
+/// the threads and printed as one `threadcounters` line a cell on stderr:
+/// how a supdb handle's reads were answered, and under the shared table
+/// the operations its own probe ended and the first touches it read
+/// below it, which say which regime a cell is in.
 #[allow(clippy::too_many_arguments)]
 fn threaded_mix(
     e: &mut dyn Engine,
@@ -4901,9 +4928,11 @@ fn threaded_mix(
         return Err("a threaded mix needs at least one thread".to_string());
     }
     let name = e.name();
+    let counting = std::env::var_os("SUPDB_THREADED_COUNTERS").is_some();
     let openers = e.thread_writers(threads)?;
     let barrier = std::sync::Barrier::new(threads + 1);
-    type Timed = Result<(Instant, Instant, u64, u64), String>;
+    type Counts = Vec<(&'static str, u64)>;
+    type Timed = Result<(Instant, Instant, u64, u64, Counts), String>;
     let results: Vec<Timed> = std::thread::scope(|s| {
         let workers: Vec<_> = openers
             .into_iter()
@@ -4924,6 +4953,7 @@ fn threaded_mix(
                     let mut wbuf = Batch::with_capacity(YCSB_BATCH, payload.value_size());
                     barrier.wait();
                     let start = Instant::now();
+                    let before = counting.then(thread_usage);
                     let mut w = opened?;
                     let (mut reads, mut bytes) = (0u64, 0u64);
                     for _ in 0..share {
@@ -4955,7 +4985,20 @@ fn threaded_mix(
                     }
                     wbuf.flush_updates_to(w.as_mut())?;
                     let end = Instant::now();
-                    Ok((start, end, reads, bytes))
+                    let mut counts = if counting { w.counters() } else { Vec::new() };
+                    if let Some([user, sys, minflt, majflt]) = before {
+                        // The thread's own clock and faults over its
+                        // share, beside its wall: a thread slower than its
+                        // CPU waited, and one whose kernel share grew with
+                        // its faults paid for fresh pages.
+                        let [u, s, mi, ma] = thread_usage();
+                        counts.push(("wall_us", end.duration_since(start).as_micros() as u64));
+                        counts.push(("user_us", u - user));
+                        counts.push(("sys_us", s - sys));
+                        counts.push(("minflt", mi - minflt));
+                        counts.push(("majflt", ma - majflt));
+                    }
+                    Ok((start, end, reads, bytes, counts))
                 })
             })
             .collect();
@@ -4973,8 +5016,16 @@ fn threaded_mix(
     let (mut reads, mut bytes) = (0u64, 0u64);
     let mut first: Option<Instant> = None;
     let mut last: Option<Instant> = None;
+    // Summed over the threads.
+    let mut counts: Vec<(&'static str, u64)> = Vec::new();
     for r in results {
-        let (start, end, n, b) = r?;
+        let (start, end, n, b, c) = r?;
+        for (k, v) in c {
+            match counts.iter_mut().find(|(n, _)| *n == k) {
+                Some((_, t)) => *t += v,
+                None => counts.push((k, v)),
+            }
+        }
         reads += n;
         bytes += b;
         first = Some(first.map_or(start, |f| f.min(start)));
@@ -4984,7 +5035,38 @@ fn threaded_mix(
         (Some(f), Some(l)) => l.duration_since(f).as_secs_f64(),
         _ => 0.0,
     };
+    if counting {
+        let mut line = format!("threadcounters {name} {pass} threads={threads} ops={ops}");
+        for (k, v) in &counts {
+            line.push_str(&format!(" {k}={v}"));
+        }
+        eprintln!("{line}");
+    }
     Ok(ThreadedMixed { secs, reads, bytes })
+}
+
+/// The calling thread's own user and system time, in microseconds, and
+/// its minor and major faults (`getrusage(RUSAGE_THREAD)`), for the
+/// threaded mixes' counters line.
+#[cfg(target_os = "linux")]
+fn thread_usage() -> [u64; 4] {
+    // SAFETY: `getrusage` fills the struct it is handed and reads nothing.
+    let mut ru: libc::rusage = unsafe { std::mem::zeroed() };
+    // SAFETY: as above; the struct is this frame's own.
+    unsafe { libc::getrusage(libc::RUSAGE_THREAD, &mut ru) };
+    let us = |t: libc::timeval| t.tv_sec as u64 * 1_000_000 + t.tv_usec as u64;
+    [
+        us(ru.ru_utime),
+        us(ru.ru_stime),
+        ru.ru_minflt as u64,
+        ru.ru_majflt as u64,
+    ]
+}
+
+/// Nothing where the host has no per-thread usage.
+#[cfg(not(target_os = "linux"))]
+fn thread_usage() -> [u64; 4] {
+    [0; 4]
 }
 
 /// One YCSB workload over a loaded store: `ops` operations (`ycsb_ops`,
@@ -5870,7 +5952,7 @@ pub fn lmdb_map_gb(size: u64, value_size: usize) -> usize {
 /// was left, and from its third rep the rung read at a tenth to a twentieth
 /// of the reps before, faulting on every page. `malloc_trim(0)` took that
 /// process from 12.9 GB resident to 2.1 GB.
-fn release_freed_memory() {
+pub fn release_freed_memory() {
     #[cfg(all(target_os = "linux", target_env = "gnu"))]
     // SAFETY: takes and returns plain integers; releasing free pages is
     // what it is for, and it takes the allocator's own locks.
@@ -6000,58 +6082,6 @@ mod tests {
         assert_eq!(stop_after("10000"), None);
         assert_eq!(stop_after("ten-1"), None);
         assert_eq!(stop_after(""), None);
-    }
-
-    /// Held between the one test that counts what `release_freed_memory`
-    /// returns and the tests that run a pass, which call it: the release is
-    /// the process's, so a pass's `malloc_trim` in another test's thread
-    /// takes the freed blocks the first is about to count, and the test
-    /// failed -- on blocks that "were not resident to begin with", or on a
-    /// release that returned less than most of them -- in runs of the whole
-    /// binary at the default thread count once a test that runs a pass was
-    /// beside it. A pass takes this shared, and the measurement
-    /// exclusively. The guard is taken through `into_inner`, so a test that
-    /// fails holding it fails nobody else.
-    static TRIM: std::sync::RwLock<()> = std::sync::RwLock::new(());
-
-    /// The shape that filled the full run's memory: a thread allocates
-    /// small blocks in its own arena, frees them, and exits, with one block
-    /// allocated last still live so the arena cannot give its heap back from
-    /// the top. The freed memory stays resident until the runner releases
-    /// it -- the first assertion is that the test reached that case at all,
-    /// the second that the release returns most of it.
-    #[cfg(all(target_os = "linux", target_env = "gnu"))]
-    #[test]
-    fn a_dropped_stores_freed_memory_is_returned_before_the_next_pass() {
-        let _alone = TRIM.write().unwrap_or_else(|e| e.into_inner());
-        const BLOCKS: usize = 3_000_000;
-        const SIZE: usize = 100;
-        let held = BLOCKS * SIZE;
-        let pin = std::thread::spawn(|| {
-            let mut v: Vec<Box<[u8; SIZE]>> = Vec::with_capacity(BLOCKS);
-            for i in 0..BLOCKS {
-                v.push(Box::new([i as u8; SIZE]));
-            }
-            let pin = Box::new([1u8; SIZE]);
-            std::hint::black_box(&v);
-            drop(v);
-            pin
-        })
-        .join()
-        .unwrap();
-        let before = resident_bytes().unwrap();
-        release_freed_memory();
-        let after = resident_bytes().unwrap();
-        assert!(
-            before >= held as u64,
-            "the freed blocks were not resident to begin with: {before} bytes, {held} allocated"
-        );
-        assert!(
-            before - after >= held as u64 / 2,
-            "released {} of the {held} bytes freed ({before} -> {after})",
-            before.saturating_sub(after)
-        );
-        drop(pin);
     }
 
     /// Holm's step-down against hand-worked cases: it stops at the first
@@ -7128,7 +7158,6 @@ mod tests {
     /// mixes had been in every row and in no pairing.
     #[test]
     fn a_pairing_carries_every_quantity_a_row_carries() {
-        let _pass = TRIM.read().unwrap_or_else(|e| e.into_inner());
         let root = std::env::temp_dir().join(format!("supdb-bench-flat-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
         let mut plan = Plan::new(Scale::Quick, vec![], 30_000, 4);
@@ -7157,7 +7186,6 @@ mod tests {
     /// under its own pass name: a pass without it reports none.
     #[test]
     fn the_second_mix_family_reports_six_rates_under_its_pass() {
-        let _pass = TRIM.read().unwrap_or_else(|e| e.into_inner());
         let root = std::env::temp_dir().join(format!("supdb-bench-ycsbs-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
         let mut plan = Plan::new(Scale::Quick, vec![], 30_000, 4);
@@ -7199,7 +7227,6 @@ mod tests {
     fn the_pass_refuses_a_forced_arm_that_covers_nothing_and_runs_one_that_does() {
         // A pass releases freed memory to the system: not while the test that
         // counts what the release returns is counting.
-        let _pass = TRIM.read().unwrap_or_else(|e| e.into_inner());
         let root = std::env::temp_dir().join(format!("supdb-bench-zpass-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
         let mut plan = Plan::new(Scale::Quick, vec![], 30_000, 4);
@@ -7332,11 +7359,35 @@ mod tests {
             all,
             Passes {
                 mixes_threaded: true,
+                threads_held: false,
                 ..Passes::all()
             }
         );
         assert!(!Passes::all().mixes_threaded && !Passes::paired().mixes_threaded);
         assert!(Passes::parse("mixes-threaded").unwrap().mixes_threaded);
+        // A row runs them for the arms of FASTER's guarantee alone, a
+        // pairing and a list of passes for none unless they are named, and
+        // named they run for every arm.
+        assert!(Passes::all().threads_held && !Passes::paired().threads_held);
+        for (arm, in_a_row) in [
+            ("supdb-heldnoframes", true),
+            ("supdb-heldnoshare", true),
+            ("supdb", false),
+            ("supdb-ingest", false),
+            ("lmdb", false),
+            ("rocksdb-tuned-nosync", false),
+        ] {
+            assert_eq!(Passes::all().threaded_runs(arm), in_a_row, "{arm}, a row");
+            assert!(!Passes::paired().threaded_runs(arm), "{arm}, a pairing");
+            assert!(
+                !Passes::parse("load,mixes").unwrap().threaded_runs(arm),
+                "{arm}"
+            );
+            assert!(
+                Passes::parse("mixes-threaded").unwrap().threaded_runs(arm),
+                "{arm}"
+            );
+        }
         let some = Passes::parse("read, scan-threaded,lag").unwrap();
         assert!(some.read && some.scan_threaded && some.lag);
         assert!(!some.load && !some.read_threaded && !some.scan && !some.mixes);
@@ -7359,6 +7410,7 @@ mod tests {
         assert_eq!(
             Passes {
                 recover: true,
+                threads_held: true,
                 ..Passes::paired()
             },
             Passes::all()
@@ -7366,6 +7418,7 @@ mod tests {
         assert!(Passes::parse("recover").unwrap().recover);
         let mut old = serde_json::to_value(Passes::all()).unwrap();
         old.as_object_mut().unwrap().remove("recover").unwrap();
+        old.as_object_mut().unwrap().remove("threads_held").unwrap();
         let old: Passes = serde_json::from_value(old).unwrap();
         assert_eq!(old, Passes::paired());
     }

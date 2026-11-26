@@ -164,6 +164,17 @@ fn main() {
             );
             supdb_bench::run::lag_mark(&arm, pct, "end");
             let c1 = e.counters();
+            // LAG_ALL=1: every counter that moved over the point, on stderr.
+            if std::env::var_os("LAG_ALL").is_some() {
+                let mut all = String::new();
+                for (n, v) in &c1 {
+                    let dv = v - get(&c0, n);
+                    if dv != 0.0 {
+                        all.push_str(&format!(" {n}={dv:.0}"));
+                    }
+                }
+                eprintln!("all {pct}:{all}");
+            }
             let up = get(&c1, "upkeep_ms") - get(&c0, "upkeep_ms");
             let cpu = (get(&c1, "upkeep_cpu_us") - get(&c0, "upkeep_cpu_us")) / 1e3;
             let maint = (get(&c1, "maint_cpu_us") - get(&c0, "maint_cpu_us")) / 1e3;
@@ -183,7 +194,9 @@ fn main() {
             let ext = get(&c1, "snapshot_extends") - get(&c0, "snapshot_extends");
             let d = |n: &str| get(&c1, n) - get(&c0, n);
             let upkeep_built = format!(
-                "first {first:.2}ms up_built {:.0} drops {:.0} ahead {:.0}/{:.0}/{:.0} notable {:.0} fill {:.0}/{:.0} bld skip {:.0}/{:.0} built {:.0} inst drop {:.0} skip {:.0} walks {:.0}/{:.0}/{:.0} starts {:.0}/{:.0}",
+                "first {first:.2}ms placed {:.0} conv {:.0} up_built {:.0} drops {:.0} ahead {:.0}/{:.0}/{:.0} notable {:.0} fill {:.0}/{:.0} bld skip {:.0}/{:.0} built {:.0} inst drop {:.0} skip {:.0} walks {:.0}/{:.0}/{:.0} starts {:.0}/{:.0}",
+                d("settle_placed"),
+                d("settle_converted"),
                 d("blk_by_upkeep"),
                 d("table_drops"),
                 d("ahead_starts"),

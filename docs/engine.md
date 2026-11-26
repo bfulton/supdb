@@ -1133,6 +1133,985 @@ the threaded writers' mixes read 1.04-1.21x for it in both sittings, RMW
 on one thread 1.21x, the single-threaded mixes within the lean of E, which
 makes no point read, at 1.06x and 1.12x the other way.
 
+#### A live table every writer writes
+
+The threaded writers' mixes are FASTER's for two reasons, and the lock the
+threads take turns behind is not the larger one.
+- **Reads over pieces.** Each thread writes as many keys as the store holds,
+  three hundred thousand operations a thread. The live table seals at a tenth
+  of the store, so a mix seals seven to twenty-seven times. Its puts append,
+  since a handle is live. Fourteen to forty-six pieces stand under every read.
+  Profiled at 7b286c3 (`SUPDB_LAG_MARK=1 perf record -e cpu-clock -c 500000
+  -k CLOCK_MONOTONIC` over `bench ab --arms supdb-heldinplace,faster --size
+  300000 --passes load,mixes-threaded --reps 1`, cut to each mix by its marks
+  and to each thread), the read path is two thirds of a writer thread's time.
+  A merge thread takes a third to two thirds of a core beside it.
+- **The lock.** At three threads each writer is on its core under two thirds
+  of the mix, waiting the rest.
+
+A scratch build at that commit let a put overwrite beside a live handle and
+took the seal's share cap off. It read the one-thread RMW at 2.1M operations
+a second where the arm reads 1.1-1.3M, with 0-3 seals a mix. Three threads
+stayed at 2.8x of it in FASTER's favour. A spin lock in place of the mutex
+resolved nothing in two sittings, so the writers' turns themselves are the
+cost, not the lock's wake.
+
+The probe `proto::Shared` (arm `proto-shared`, at `5be4c26`) is the hashed
+memtable in the shape the engine keeps it:
+- an index of tagged entry numbers, never grown;
+- entries of twenty-four bytes;
+- keys in an arena and values in chunks of the engine's format.
+
+Every thread writes it at once, with no lock, over a read-only base standing
+for the partitions:
+- **A get** copies the head's value between two equal, even readings of the
+  entry's version.
+- **A put of a key the table holds** takes the version odd by a
+  compare-and-swap. It overwrites a value of its length as
+  `Options::put_in_place` does, and appends otherwise.
+- **A put of a new key** publishes its entry by a compare-and-swap of the
+  probe's vacant slot.
+- **A read-modify-write** is one probe under one hold of the version, as
+  FASTER's arm's is one operation.
+
+Each writer claims the arena and the entries in strides of its own. Paired
+with FASTER in both orders (`bench ab --arms proto-shared,faster --size 300000
+--passes load,mixes-threaded --reps 3`, and with `--arms faster,proto-shared`),
+by the geometric mean of the two orders, ours over FASTER's:
+- **A:** 1.02-1.10x scrambled and 0.98-1.40x uniform, at one to three threads.
+- **RMW with its own operation:** 0.87x, 1.07x and 0.99x at one, two and three
+  threads; the uniform RMW 0.83x, 1.07x and 1.00x.
+- **RMW made of a get and a put** (`PROTO_NO_RMW=1`): 0.72-0.79x scrambled
+  and 0.87-0.96x uniform.
+
+The one probe is what the RMW lacked: a get, and a put a hundred operations
+later, probe a line twice that FASTER's operation probes once. The first
+order read every cell of the arm listed second slower by up to a fifth, which
+is why both orders are in the means.
+
+In the engine the shared table is `Options::shared_writers` (arm
+`supdb-heldshared`, `supdb-heldnfinline` with the table shared and ordered
+ingest off). A handle writes with `Reader::put`, `append` and `delete`, and
+gets `false` from a table that is full. The writer's next commit freezes the
+full table, and the freeze waits out every handle still writing it before
+it publishes the table frozen: the table is closed, an epoch is bumped, and
+each writer's slot is read until it holds that epoch or none, a write that
+finds the table closed being answered as a full table's is
+(`Db::close_shared`; the wait came after the publish until a scan made
+inside it was found to have sorted a table still being written). Values are
+appended, never overwritten, so a reader reads the table as it reads the
+one writer's.
+Three things the threads found that no single-writer test could:
+- **The slab's length** waits at the first entry claimed and not yet
+  written, and is carried on by whichever writer gets there. Two writers
+  that each store their own entry's head and then load the other's can each
+  miss the other's under release and acquire alone, and the length stopped
+  one short with both entries written. A sequentially consistent fence
+  between the stores and the loads closes it (`MemTable::advance_shared`).
+  Without it, two writers inserting at once left the length short in 26
+  rounds of 200,000 on this machine.
+- **That length was also the count a handle's lookup is bounded by**, and
+  the table's emptiness. While another writer held an entry below its own
+  open, a thread's own put was hidden from its next read through its
+  handle. The index names an entry only once it is written, so a shared
+  table's lookup is unbounded, while a walk still takes the length
+  (`MemTable::committed_at`), and its emptiness is its claimed count
+  (`MemTable::is_empty`).
+- **The seal's copy** sized its buffer by the one writer's byte counts,
+  which a shared table's writers never move. It sizes it by the arena's end
+  now (`ByteArena::used`).
+
+Paired with FASTER at `7c90d45` (`bench/scripts/pair.sh supdb-heldshared
+faster 300000 --passes load,mixes-threaded --reps 3`), it does not scale.
+A reads 2.2-2.3M operations a second on one thread and 3.0-3.2M on three,
+where FASTER reads 6.5-7.1M. RMW, made of a get and a put, reads 1.2-1.7M
+at every thread count, about a fifth of FASTER's at three. The profile of
+the three-thread RMW, cut to its marks, says why:
+- **The writers are off their cores a third of the window.** A sampled
+  profile does not say what they wait on, and that was not traced. Where a
+  writer waits by design is the freeze: on the writer's mutex, and in the
+  grace. A freeze comes every few megabytes, since the seal cap is a tenth
+  of the store and every put grows the table by its value. The seal and
+  merge threads take most of the fourth core.
+- **More than half of `write_shared`'s samples, over the profile's mixes,
+  are an insert's two shared words**:
+  the claimed count's `lock xadd` and the length's compare-and-swap. Every
+  fresh table makes a new entry for every key written into it, so most puts
+  into a fresh table are inserts.
+- **A read of a key the live table does not hold** walks the frozen tables,
+  the pieces and the partition, where FASTER's read is one probe and one
+  record.
+
+The same arm with the seal cap off, a seal at `seal_bytes` alone, read RMW
+at three threads 1.6M to 2.2M operations a second in a scratch run, and A
+3.2M to 3.6M. The writers were then on their cores five sixths of the
+window, and the live table's probes and the read through the sources were
+what was left. The levers are in that order:
+- a put of a value of the length it replaces overwrites it in place under
+  the stripe's version, with readers copying between two equal readings, so
+  the table stops growing on overwrites;
+- a read-modify-write that probes once;
+- a shared table sized for the held log's promise and not by the seal's
+  share of the store.
+
+The first and the last are built, with the second:
+- **A put or a delete recycles what it replaces** (`Options::shared_recycles`,
+  on in the shared mode). It lays its tombstone over nothing, since none of
+  the table's readers is isolated from a write and nothing reads past the
+  tombstone. The chain it replaces is one put's pair or one delete's
+  tombstone, which its writer keeps by length. Each batch of 128 such ranges
+  is tagged by a bump of the epoch, and the pins are read at the bump. A
+  range serves a write of its length once every reader is pinned at or past
+  its tag, so bytes a reader may hold are never written again under it
+  (`TableLocal`).
+- **A handle's read-modify-write** (`Reader::rmw`) is one probe and one hold
+  of the key's stripe where the live chain holds a tombstone. That covers
+  every key a put has reached, and is FASTER's `Rmw` as one operation.
+  Elsewhere it is a read and then a put.
+- **`supdb-heldsharedbig`** sizes the table at twice the store's records as
+  FASTER's log counts them (`Options::shared_table_bytes`), so the table
+  holds every key with room for the ranges not yet reused. Its index is
+  twice the bytes of FASTER's.
+
+Paired at `7b895b9`, with the same passes and reps as above:
+- **Against FASTER** (`pair.sh supdb-heldsharedbig faster 300000`), the
+  writers scale. At three threads A reads 5.8M operations a second, 0.75x
+  and 0.82x of FASTER's by the two orders. RMW reads 4.7-5.1M, 0.56x and
+  0.68x, where the appending arm read 1.55M. At one thread RMW is 0.54-0.63x
+  of FASTER's, so what is left is each operation's cost, not the scaling.
+- **The recycling alone** (`pair.sh supdb-heldshared
+  supdb-heldsharednorecycle 300000`), at the seal's cap, reads the scrambled
+  A at three threads 1.62x and 1.85x of the appending arm. The uniform A and
+  RMW move by an eighth or less either way, and the scrambled A at one
+  thread a fifth, in opposite directions in the two orders. Under uniform
+  keys the distinct keys alone fill a table of a tenth of the store, so it
+  freezes whatever its puts reuse.
+
+What each operation costs is now the gap. One thread's RMW, profiled at the
+same commit and laid on its loads, is four misses in a row:
+- the index slot, three fifths of the probe's samples;
+- the entry, nine tenths of the entry's decode;
+- the key, in its own arena, for the compare, two fifths of the probe;
+- the value chunk's header, half the RMW's body.
+
+FASTER's is two, the bucket and the record that holds the key and the
+value. The entry names both the key and the chain's head, so the head can
+be asked for while the key compare waits (`Options::shared_chunk_ahead`, on
+in the shared mode; `supdb-heldsharedbignoahead` asks nothing). Profiled arm
+against arm at `eee91bb`, the RMW body lost a seventh to a fifth of its
+samples, as aimed, about a fiftieth of the thread's. The pairing
+(`pair.sh supdb-heldsharedbig supdb-heldsharedbignoahead 300000`) resolved
+nothing either way, its cells moving by up to a third in both directions
+between the orders.
+
+The waits left are the slot, the entry and the key. The levers on them:
+- An index sized by the keys and not by the table's cap: 4M slots for
+  300,000 keys at the big arm's cap, 32 MiB beside FASTER's 16, which this
+  host's L3 holds and its TLB, on 4 KiB pages, does not.
+- A key record that holds the chain's head, so a probe goes from the slot
+  to the key record and then to the value, the entry read only by walks.
+- A value overwritten in place in that record, under the stripe's version,
+  which would make the probe FASTER's two misses.
+
+All three are built:
+- **The index is sized by keys** (`Options::shared_index_slots`).
+  `supdb-heldsharedbig` takes three slots a key of the store, a million and
+  8 MiB at three hundred thousand keys, half of FASTER's index. The cap's
+  sizing is the arm `supdb-heldsharedbigcapindex`.
+- **A new key is a record** (`Options::shared_records`): the chain's head,
+  its count, its lock and its entry's number, then the key, then its first
+  write, one reservation in the value arena. The index slot names the
+  record, and the entry names the record only for the walks by number.
+  `supdb-heldsharedbignorecords` keeps entries and chunks apart.
+- **A put of a value of the length it replaces overwrites it in place**
+  (`Options::shared_in_place`), under the record's lock as a sequence
+  lock's writer writes. A read of the live table copies the key's chain
+  between two equal, even readings of that lock. A freeze closes the table
+  to overwrites, waits out the writers that may be making one and settles
+  the table before it publishes it frozen, so no frozen table is read that
+  way. `supdb-heldsharedbignoinplace` lays its puts down.
+
+Paired and profiled at `80bf367`, with the same passes and reps:
+- **Against FASTER** (`pair.sh supdb-heldsharedbig faster 300000`), at
+  three threads, ours over FASTER's by the mean of the two orders: RMW
+  0.89x, A 0.87x, the uniform RMW 0.95x and the uniform A 0.86x. Listed
+  first, the arm read 0.96-1.02x of FASTER's in all four. Listed second, it
+  read 0.75-0.95x: the order effect the probe's pairings showed, at the
+  arm's cost both times.
+- **The overwrite alone** (`pair.sh supdb-heldsharedbig
+  supdb-heldsharedbignoinplace 300000`) read the uniform RMW at three
+  threads 1.24x in both orders, the RMW 1.17x by the mean, and A within a
+  sixteenth either way, 1.03x scrambled and 0.94x uniform.
+- **The record**, profiled arm against arm (`supdb-heldsharedbignorecords`
+  beside it in one run): one thread's RMW windows took about a tenth to a
+  fifth fewer samples for the same operations. The entry's decode, a fifth of the
+  thread without records, is gone; the record's own load takes its place,
+  the second of two misses, as FASTER's record is.
+- **The index's size** resolved nothing in its pairing, cells moving both
+  ways between the orders.
+
+#### Past FASTER: what an operation costs
+
+Counted at `ef97fef`, an operation of the threaded mixes took up to three
+times FASTER's instructions, inside each arm's own call with the harness
+left out (`valgrind --tool=callgrind --collect-atstart=no`, toggled on each
+arm's `ThreadWriter::get`, `update_batch` and `rmw`, around `bench ab
+--arms supdb-heldsharedbig,faster --size 300000 --passes
+load,mixes-threaded --reps 1`):
+
+| instructions | ours | FASTER |
+|---|---|---|
+| get | 1,338 | 365 |
+| read-modify-write | 887 | 462 |
+| put | 692 | 434 |
+
+A get spent 317 of them copying the key's chain into two vectors it then
+freed, 188 in the probe and 133 placing the partition and hashing the key,
+for a read the live table answered three times in four. The writes were
+layers, each looking the record's block up again. The probe
+`bench/examples/shared_ops.rs` takes the harness out of the loop: every
+arm's store loaded in one process, every key put once through a thread
+writer, then gets, puts and read-modify-writes over keys drawn before the
+clock, the arms by turns phase by phase, since on this host one process's
+memory reads a factor apart from the next one's. At `c75da23`, `shared_ops
+ARMS 300000 15 zipf` with `ARMS` the four arms named below and `faster`,
+three sittings, nanoseconds an operation on one thread:
+
+| | get | put | read-modify-write |
+|---|---|---|---|
+| `supdb-heldsharedbig` | 184-191 | 204-209 | 200-271 |
+| `supdb-heldsharedbignoahead` | 210-216 | 235-242 | 212-227 |
+| `supdb-heldsharedbignolean` | 334-340 | 266-269 | 285-296 |
+| `faster` | 210-217 | 224-233 | 228-240 |
+
+- **The lean path** (`Options::shared_lean`; `supdb-heldsharedbignolean`
+  is the layered one). A get, put or read-modify-write of a key whose live
+  chain is one put's goes from the slot to the record by one lookup of its
+  block and reads the key, the lock, the head and the value through that
+  address, the value copied to the stack between two readings of the lock
+  where the table rewrites. Every other shape takes the layers. Counted in
+  the probe's phases at `c75da23` (callgrind toggled on
+  `shared_ops::phase_gets`, `phase_puts` and `phase_rmws`, one round): 442,
+  464 and 488 instructions, the layered path's 1,521, 729 and 912, FASTER's
+  378, 416 and 483. With the counts level, FASTER first ran each operation
+  in two thirds of the lean path's time.
+- **The record's lines asked for at the slot.** Laid on its instructions,
+  85% of a get's samples were two loads: the slot, and the record's first
+  word. FASTER's record holds its value at a fixed offset, so the core asks
+  for every line of it at once; ours names its value through its head, and
+  the value's lines were asked for only once the first had come. The lean
+  probe asks for the record's next lines as the key compare loads the first
+  (`MemTable::ask_record`, under `Options::shared_chunk_ahead`;
+  `supdb-heldsharedbignoahead` asks nothing).
+- **Huge pages** (`Options::shared_huge`; `supdb-heldsharedbignohuge`).
+  With the ask in, a sixth of a three-thread read-modify-write's samples sat
+  on the ask's prefetch instruction: the first to touch the record's page,
+  charged for its walk. The table's value arena and index, 81 MB and 8 MB at
+  three hundred thousand keys, are many times what the TLB maps at 4 KiB;
+  mapped 2 MiB-aligned and advised `MADV_HUGEPAGE` (`blocks::map_huge`),
+  84 MB of the probe's 112 MB of anonymous memory read as huge pages in its
+  `smaps_rollup`. On three threads at `c75da23` (`SHARED_OPS_THREADS=3
+  shared_ops supdb-heldsharedbig,supdb-heldsharedbignohuge,faster 300000 15
+  zipf`, and `uniform`, three sittings of each), the small pages read A in
+  1.01-1.17x the huge pages' time and the read-modify-write in 1.02-1.21x;
+  FASTER read them in 1.03-1.10x and 1.06-1.23x. FASTER's log and index are
+  on small pages under the kernel's `madvise` policy.
+- **The pin's fence**, priced and not taken: `supdb-heldsharedbigasym`
+  pins with a plain store the sweep fences for (`Options::asym_pins`), and
+  read the probe's puts 8% faster on one thread and nothing either way on
+  three; the suite at ten reps, below, resolves it no better.
+
+The suite's cell that still went to FASTER was A at two threads, in both
+orders. A runs first, on the store the load and its sync leave, so its
+cells are where a key is first touched: a get falls below the live table to
+the partition, and a put inserts the key's record. The probe on such a
+store (`SHARED_OPS_FRESH=1`, one round, the arms both ways round, three
+sittings of each, at `c75da23`) separates the two: on one thread a read
+that falls through takes 303-500 ns to FASTER's 195-317
+(`SHARED_OPS_THREADS=1 SHARED_OPS_ONLY=gets`), and an insert as the eager
+arm makes it 193-254 to FASTER's 293-418 (`SHARED_OPS_ONLY=puts`); on three
+threads the eager insert takes 229-395, three threads inserting slower than
+one. A quarter of an insert was two words every writer writes:
+the claimed count, and the slab's length, which each insert carried over
+the entries written below the first one not yet written, behind a
+sequentially consistent fence. The length is the walks' -- a scan's, the
+seal's -- and no point read or write reads it, so an insert leaves it now
+and whoever reads it carries it (`Options::shared_len_lazy`,
+`MemTable::len`; `supdb-heldsharedbigeagerlen` carries it at every
+insert): the freeze once its writers are out, a scan as it walks, the
+upkeep. Two readers had been reading it on every operation, and the test
+that holds a handle's gets and puts to leaving it alone found the second:
+an operation took the table's commit bounds, which a shared table's reads
+have no use for, and its note of the read compared the log's position. At
+`c75da23` (`SHARED_OPS_FRESH=1 SHARED_OPS_THREADS=3 SHARED_OPS_ONLY=puts
+shared_ops supdb-heldsharedbig,supdb-heldsharedbigeagerlen,faster 300000 1
+zipf`, and the arms the other way round, three of each), three threads
+inserted in 133-194 ns an operation, the eager arm in 229-395 and FASTER in
+161-190.
+
+What is left of a first touch is the read that falls through: 887
+instructions to FASTER's 372 on a fresh store at `c75da23`, the partition
+placed by a search whose every step called `memcmp`, the key's FNV, the
+partition's fences and filter, and the layered read's own steps, then the
+partition's slot and record. Paired at `c75da23`
+(`bench/scripts/pair.sh supdb-heldsharedbig faster 300000 --passes
+load,mixes-threaded --reps 3`), FASTER's rate over ours by the mean of the
+two orders, under one ours:
+
+| | one thread | two | three |
+|---|---|---|---|
+| A | 1.05 | 0.97 | 0.91 |
+| A, uniform | 0.85 | 1.02 | 0.87 |
+| read-modify-write | 0.93 | 0.96 | 0.88 |
+| read-modify-write, uniform | 0.85 | 0.81 | 0.76 |
+
+The two cells over one read 1.27 and 0.87, and 1.05 and 0.98, in the two
+sittings. Three changes to that read, each an option with an arm:
+
+- **The read of a store that is a partition and the live table**
+  (`Options::point_lone_absent`; `supdb-heldsharedbignolone` takes the
+  placed read). A store just loaded has no piece and no frozen table, and
+  `Reader::read_lone` reads such a store as its partition and the live
+  table alone, but refused any table that rewrites in place, since such a
+  table is read through a copy. A key the lean probe found no record of
+  has nothing in the table to copy, and takes that read now.
+- **The fences as words** (`Options::point_fence_words`,
+  `State::fence_words`; `supdb-heldsharedbignowords` searches the bytes).
+  Each partition's upper fence is held as its bytes big-endian in a `u128`,
+  zero-padded, beside its length, which orders against a key's first
+  sixteen bytes taken the same way as the bytes do, so a step of the search
+  is two integer compares; and the placed partition's fences are not
+  compared again, the partitions tiling the key space.
+- **The partition asked for ahead** (`Options::shared_fall_ahead`;
+  `supdb-heldsharedbignofall` asks nothing). The read waits on three lines
+  in turn, the table's slot, the partition's slot and its record, where
+  FASTER's waits on two, and the partition's slot is a function of the key
+  alone: a handle whose last read fell below the table asks for its next
+  key's partition slot before it probes the table, and hands the key's word
+  and partition to the read below. At `c75da23` this read level on the
+  fresh store and was taken out, on the reading that the core issued the
+  partition's load itself past the predicted branch, which nothing had
+  measured. The fresh store's table holds no key, so its index had never
+  been written, and a read of an untouched mapping maps the kernel's zero
+  page (`use_zero_page` is on here): every slot the probe read was one
+  cached page, the table's probe never missed, and the ask had no wait to
+  stand beside.
+
+`SHARED_OPS_SPLIT=1` gives the probe the store the ask is for: the odd
+keys put, the phases' keys drawn from the even ones, so a first touch meets
+a table that holds half the store. Counted there at `9fb49d9` (callgrind
+toggled on `shared_ops::phase_gets`, `SHARED_OPS_SPLIT=1
+SHARED_OPS_ONLY=gets shared_ops ARM 300000 1 zipf`), a read that falls
+through executes 696 instructions, 789 with the fences' bytes and 978 by
+the placed read, which does not take the partition the ask found and finds
+it again; FASTER's executes 371. Timed there (`... shared_ops
+supdb-heldsharedbig,supdb-heldsharedbignofall,supdb-heldsharedbigfallalways,faster
+300000 6 zipf` and the arms the other way round, four sittings of each),
+the read took 112-220 ns, 144-262 without the ask, and FASTER's 122-205.
+
+Paired at `9fb49d9` at ten reps (`pair.sh supdb-heldsharedbig faster 300000
+--passes load,mixes-threaded --reps 10`), every cell is ours in both
+orders, FASTER's rate over ours:
+
+| | one thread | two | three |
+|---|---|---|---|
+| A | 0.83 | 0.97 | 0.96 |
+| A, uniform | 0.71 | 0.88 | 0.79 |
+| read-modify-write | 0.88 | 0.86 | 0.79 |
+| read-modify-write, uniform | 0.77 | 0.68 | 0.73 |
+
+and a pairing of the same engine an hour before it, the tree uncommitted,
+read every cell ours as well (A 0.84, 0.87 and 0.86). The three changes
+priced one at a time against the default at ten reps (`pair.sh
+supdb-heldsharedbig supdb-heldsharedbignofall 300000 --passes
+load,mixes-threaded --reps 10`, and `...nolone`, `...nowords`) resolve
+little alone: without the ask the read-modify-write cells read 0.88-0.98 in
+two pairings of three and level in the third, with the uniform ones
+slowest; without either of the other two the cells lean their way in one
+or two pairings of three and sit level in the rest, and the counts above
+are their verdict, each a strict removal of work. The pin's fence came back the same way: the
+arm with asymmetric pins (`supdb-heldsharedbigasym`) read 3-11% ahead in one
+ten-rep pairing and level, 0.95-1.08, in the next two, so it stays an arm.
+And the A cell at two threads, the weakest, read 0.87 in one pairing and
+0.97 in the other.
+
+A read-modify-write of a key the table lacks probed the table three times
+before it read below it -- in the
+lean probe, in the layered read-modify-write (`MemTable::rmw_shared`) and
+in the read -- and twice more in the put after it, its lean probe and its
+insert, and asked for the partition only after the table's miss. It reads
+below in the pin and the state of its lean probe now, asks for the
+partition ahead where the last read fell through, and inserts with the hash
+it took (`Options::shared_rmw_absent`; `supdb-heldsharedbigrmwprobes`
+probes again). Counted on the split store at `8e235df`
+(`SHARED_OPS_SPLIT=1 SHARED_OPS_ONLY=rmws shared_ops ARM 300000 1 DIST`
+under callgrind toggled on `shared_ops::phase_rmws`): 1,086 instructions an
+operation uniform and 943 zipf, against 1,424 and 1,168, and FASTER's 631
+and 590. Timed on one thread, one round a process since the rounds after
+the first are second touches, four processes of each order: 434-552 ns
+uniform against 481-574 and FASTER's 351-483, and 355-539 zipf against
+402-488 and FASTER's 284-332. A key's first read-modify-write is the one
+operation FASTER still runs faster here. Paired at ten reps (`pair.sh
+supdb-heldsharedbig supdb-heldsharedbigrmwprobes 300000 --passes
+load,mixes-threaded --reps 10`), the read-modify-write cells read 0.90-1.00
+without it in five of six while the A cells, which make none, lean to 1.11,
+so the count is its verdict; and against FASTER the same day every cell was
+ours a third time, A 0.85, 0.91 and 0.91, the uniform read-modify-write
+0.82, 0.71 and 0.69.
+
+The read-modify-write cells are not first touches, though this section
+said the uniform one's were nearly all, from the probe's store. The
+threaded mixes run in their table's order on one store, and the big table
+is sized to hold the whole store, so it never freezes there: by the first
+read-modify-write cell the two A mixes before it have written nearly every
+key into it. Counted per cell (`SUPDB_THREADED_COUNTERS=1 bench ab --arms
+supdb-heldsharedbig,faster --size 300000 --passes load,mixes-threaded
+--reps 1`, the `threadcounters` lines, at the commit of this paragraph),
+the uniform read-modify-write's first touches are 3,417 of 300,000
+operations on one thread, 1,199 of 600,000 on two and 414 of 900,000 on
+three, the Zipfian one's 11,599, 6,417 and 3,660, and no table froze. The
+cell a first touch weighs on is the first one: A on one thread, whose gets
+fell below the table 83,163 times of about 150,000. So the read-modify-
+write cells are second touches all but a few in a hundred, the operation
+ours wins, and the pairing's lean of a tenth there could not have been the
+option's, which acts on a hundredth of their operations; and the first
+touch FASTER still wins is priced in the cells by A on one thread alone.
+
+The series' arm of FASTER's guarantee is `supdb-heldnoframes`, the held
+log with the one writer's table, and the shared arm is in no roster.
+Paired over every pass a row runs and the threaded mixes (`pair.sh
+supdb-heldsharedbig supdb-heldnoframes SIZE --passes
+load,read,read-threaded,scan,scan-threaded,mixes,scan-mixed,mixes-scrambled,lag,recover,mixes-threaded
+--reps 4` at ten, a hundred and three hundred thousand keys, at the commit
+of this paragraph), the shared arm's rate over the other's in both orders
+is 1.2x to 10x on the threaded mixes but for A on one thread, 0.77-0.99,
+and 2.3x to 3.9x on the lag sweep's bursts of ten and a hundred percent;
+and it is 0.47-0.72 on the ordered load, 0.15-0.18 on ycsb-E and 0.24-0.43
+on the scrambled E, 0.39-0.61 on the threaded scans after the mixes,
+0.07-0.10 on the pass after the full rewrite and 0.27-0.40 after the
+ten-percent burst, and its ordered load's recovery loses every batch where
+the other loses none. Neither arm is the faster. The shared arm's losses
+are what its option turns off: the ordered ingest, which is the load and
+its recovery, and the block cache with its upkeep thread, which is every
+scan after writes. Its wins are the handles' writes, which only the
+threaded mixes make, and the bursts' commits, which file nothing into a
+cache.
+
+#### A live table that follows who writes it
+
+`Options::share_on_write` makes the two arms one store, and it is the
+engine's under the held log with no frames. A store opens with the one
+writer's table and what goes with it. A handle's write to that table is
+answered `false`, as a full shared table's is; the writer's next commit
+finds a handle that writes and installs a shared table, the live table
+frozen under it, an empty one replaced, a run of ordered ingest closed
+first (`Db::share_look`, `Db::share`). While a state holds a shared table,
+live or frozen, the store is read and written as the shared arm is: no
+block form is built, kept or published, nothing is lent to the upkeep
+thread, no table is kept for its look, no builder is started, and no run
+of ordered ingest takes the live table's place (`Reader::sharing`). Each of
+those was an option `shared_writers` refuses at the open, and each is a
+hazard of a table and not of a store: a form is a copy of a block's values
+kept current from the one writer's log, and a handle's write is in no log.
+So they are stood down by the state an operation holds. Every change of
+that state is a publish, which a handle meets as a new generation and
+drops its tables at, as at any; the writer's own go at its flip.
+
+A handle that will write is claimed as one (`Db::writer`): the claim
+commits what the writer has staged, and that commit, finding the handle,
+installs the table, so the handle's first write lands. A handle from
+`reader` still asks by its first write, which is refused, and is given the
+table at the writer's next commit: the install then falls inside that
+handle's first operation.
+
+The table installed is made whole before it is published
+(`Options::shared_populates`, `MemTable::populate_shared`;
+`supdb-heldnopopulate` leaves its memory to the writes that reach it):
+every block of its value arena up to its cap and the slab's blocks for the
+entries its index takes, populated for writing, with the index, which a
+table always had so. A table installed in the middle of a workload is
+memory nothing has touched, and its first writes zeroed it on their own
+path, two megabytes a fault where the arena is on huge pages. What a fault
+costs is the host's: this guest reports its free two-megabyte blocks to its
+host, a huge page faulted fresh is 0.2 ms where the guest still backs the
+block and 2 to 10 ms where it does not, and which it is turns on what the
+passes before freed and when. In a row's pass order the threaded mixes'
+first cell, A on one thread, spent 19 to 39 ms of its fifty in the kernel
+in most reps at a hundred thousand keys, every sample of it in
+`clear_page_erms` under a huge-page fault from `MemTable::write_shared` or
+from the index's `madvise`, and one fault of the kind was the whole of a
+cell at ten thousand keys. The pairings of two passes had not met it: the
+runner primes a pool of pages before each store, and the cell came within
+the two seconds the guest keeps a freed block. A range of over half an
+arena block is one allocation over blocks of its own, which a block made
+ahead is not, so such a value is laid past the blocks made ahead and ends
+the table's room (`ByteArena::made_ahead`). A table a freeze makes for the
+handles is not made ahead, its writers waiting on the commit that makes
+it.
+
+In the row's pass order (`SUPDB_THREADED_COUNTERS=1 bench run --scale
+quick --top SIZE --bottom SIZE --reps 5 --arms
+supdb-heldnoframes,supdb-heldnopopulate,faster --out DIR`, the
+`threadcounters` lines, at `2c0a1b1`), A on one thread, the table made
+whole beside the table left to its writes:
+
+| keys | faults | the thread's kernel time, ms |
+|---|---|---|
+| 300,000 | 569-576, 1,342-1,349 | 0-4, 24-78 |
+| 100,000 | 193-195, 579-581 | 0, 0-19 |
+| 10,000 | 16-17, 400-401 | 0, 0-2.7 |
+
+FASTER's thread takes none to three: its log and index were touched by its
+load. The faults left are the partition's mapped pages under the gets that
+fall below the table.
+
+Paired with the shape before over every pass a row runs and the threaded
+mixes (`pair.sh supdb-heldnoframes supdb-heldnoshare SIZE --passes
+load,read,read-threaded,scan,scan-threaded,mixes,scan-mixed,mixes-scrambled,lag,recover,mixes-threaded
+--reps 4` at ten, a hundred and three hundred thousand keys, at `2c0a1b1`),
+the threaded mixes at two and three threads read 1.4x to 9.5x in both
+orders at every rung, the read-modify-write mixes on one thread 2.3x to
+4.1x, A with uniform keys on one thread 1.07 to 1.62, and A on one thread
+0.92 and 1.02, 1.02 and 1.12, and 0.87 and 0.89 from the largest rung down:
+one thread through a handle is the shared table's path where the one
+writer's table would have served it, and the store cannot know a second
+thread is not coming. Of the cells no handle writes in, none held a
+direction across this pairing and the one at `c0791b7`.
+
+Beside FASTER in the same pass order (`pair.sh supdb-heldnoframes faster
+SIZE --passes` the same `--reps 5`, at `2c0a1b1`), our rate over FASTER's by
+the mean of the two orders, three hundred thousand keys, a hundred
+thousand and ten thousand:
+
+| | one thread | two | three |
+|---|---|---|---|
+| A | 1.08, 1.18, 1.27 | 1.09, 1.03, 1.25 | 1.00, 1.00, 1.07 |
+| A, uniform | 1.13, 0.99, 1.02 | 0.99, 1.08, 1.01 | 1.13, 1.13, 1.04 |
+| read-modify-write | 1.12, 1.14, 0.92 | 1.10, 1.14, 1.15 | 1.09, 1.12, 1.26 |
+| read-modify-write, uniform | 1.23, 1.22, 0.93 | 1.13, 1.29, 1.00 | 1.26, 1.18, 1.04 |
+
+No cell is FASTER's in both orders; ours took 91 pairs of 120 at each of
+the two larger rungs and 75 at the smallest, where a cell is a few
+milliseconds. What the guarantee's group still loses to FASTER is where
+the one writer's table serves: the single-threaded update mixes, F at
+0.50 to 0.77 at every rung in both orders, and the lag sweep's bursts at
+0.29 to 0.93.
+
+The way back is the writer's. A seal makes the next table, so a seal that
+finds no handle that writes makes the one writer's, at no cost of its own.
+A commit that finds none counts the writer's own writes into the table and
+the entries its own scans asked for, from the first commit to find none,
+and leaves the table once they come to its entries: frozen under the
+writer's table and sealed, or taken off the frozen list again where it
+held nothing (`Db::unshare`, `Db::unfreeze`). Leaving costs a seal of the
+table's entries and a merge of its piece, so the store has done about that
+much work in the form that suits its work less before it pays to leave, and
+handles that come and go cost a leave only after as much work without
+them. The store reads as it did once the shared tables have landed.
+
+Three things held because every write went through one thread, and a
+shared table's writes go through none of them. None showed in the arm that
+shares for a store's life:
+- **The sequence.** A seal ends at the store's sequence, which a logged
+  write moves, and the pieces are read in the order of the sequences their
+  names carry. Two tables sealed with no logged write between them carried
+  one, their pieces fell to the order of their names, and a reopened store
+  read the older piece's values over a newer put. A shared table takes a
+  number at its freeze, and counts as a commit no manifest covers, so a run
+  of ordered ingest begun after it starts past what the store can vouch
+  for and is not served without it after a crash.
+- **The greatest key.** A run of ordered ingest opens above the store's
+  greatest key, which the writer moves at each of its writes. A run opened
+  under keys handles had written made a piece open above over keys the
+  shared table's pieces held beside it, partitions promoted from them did
+  not tile, and a merge refused its own key. The greatest key is brought up
+  to the shared tables' keys before a run is judged against it
+  (`Db::refresh_max_key`).
+- **A frozen table that was still written.** The freeze published the table
+  and then waited out the handles that had taken it before. A scan inside
+  that wait sorted the table as it stood and left the order on it for the
+  seal and for every scan after, short of a write that landed later. A
+  table is closed to writes before it is published frozen, the writes in
+  flight waited out first, and a write that finds it closed is answered as
+  a full table's is (`Db::close_shared`).
+
+The differential fuzz found the first two once it wrote through handles
+(`ZFUZZ_SHARE=all`, six seeds of fourteen hundred over four configurations),
+and a test that held the freeze's wait open found the third.
+
+#### What a burst costs under the held log
+
+FASTER has one isolation level: each read, upsert and read-modify-write is
+atomic on its record and visible to every session as it is made, with no
+batch and no commit (`bench/vendor/faster/shim.cc`, `GetAtomic` and
+`PutAtomic`), and it has no scan. Every supdb arm stages a batch that a
+commit publishes whole (`Features::transactions`) and keeps block forms
+for its scans, and a burst of updates pays for the second: the lag
+sweep's bursts were the cells of FASTER's row the roster's arm lost by the
+most, 0.29 to 0.63 of FASTER's rate at `2c0a1b1`.
+
+What they lost by is not the write. The writer's own CPU over a burst is
+the same whatever the live table is and whoever writes it, and level with
+FASTER's whole burst; the rest was the commit waiting for its batch to be
+filed into the block forms the scans after it walk. The sweep's full
+rewrite at three hundred thousand keys, in milliseconds, with the lag
+counters on (`SUPDB_LAG_COUNTERS=1 bench ab --arms A,B --size 300000
+--passes load,lag --reps 4`, at `3f413cd`, medians of the four):
+
+| arm | a burst's batches | burst | writer's CPU | held for | upkeep thread, its passes | scan pass after |
+|---|---|---|---|---|---|---|
+| `supdb-heldpaced` | lent, each commit held until the thread has filed its batch | 380 | 103 | 273 | 241, 278 | 11.5 |
+| `supdb-heldpacelends` | lent, the thread a hundredth of the store behind at most | 288 | 125 | 139 | 285, 142 | 13.0 |
+| `supdb-heldfiles` | filed by the commit | 297 | 278 | | 18, 7 | 9.4 |
+| `supdb-heldnoframes` | lent and never waited for | 100 | 96 | | 113, 6 | 84 |
+| `supdb-heldnfnocache` | no block cache, so nothing filed | 89 | 75 | | | 97 |
+| `supdb-heldhandle` | through a handle on the shared table, which files nothing | 83 | 83 | | | 113 |
+
+FASTER's burst there is 130 ms. At a hundred thousand keys the bursts read
+106, 84, 85, 40, 32 and 28 ms in that order and the passes 3.2, 3.7, 2.9,
+19, 32 and 31.
+
+Filing a write into its block's form costs two to three times what the
+write does, on whichever thread pays, and no part of it is most of it:
+the upkeep thread over the held full rewrite is 46% the settle, of which
+the patches themselves are a tenth of the thread and the rest the batch's
+sort, the resolves and the bookkeeping, 27% the fill's conversions of
+sparse forms to copies and 15% the snapshot (`perf record -e cpu-clock -c
+100000 -k CLOCK_MONOTONIC --call-graph dwarf,8192` over `bench ab --arms
+supdb-heldnoframes,supdb-heldnoframes --size 300000 --passes load,lag
+--reps 3` under `SUPDB_LAG_MARK=1` at `ccf6455`, whose roster arm held;
+the samples between a ten-percent pass's end and the full rewrite's
+pass's start, by thread). So one thread files at half the
+writer's rate or less, and a store with one such thread has the burst at
+the writer's rate or the pass after it at the filed store's, not both:
+the table's rows are that trade, and the shapes in between -- the trail
+bounded, the forms holding the pieces' fold alone -- sit on it and escape
+nothing (`supdb-heldpiecesonly` and `supdb-heldpiecesonlylend` at
+`ccf6455`, under the table's command).
+
+Two things follow, and both are the engine's now.
+
+A batch held for its filing is the commit's own filing with a hand-over to
+another core in front of it: the writer waits for all of it, nothing runs
+beside it, and the batch's lines are read from the other core. The hold
+had been added to the pace to win a pass back and was never paired with
+the inline fill the pace had replaced. A buffered burst's batches are
+filed by their commits (`Options::upkeep_pace_pct` at zero). In the
+buffered arm, our rate over the paced and held arm's in the two orders
+(`bench/scripts/pair.sh supdb-ingest supdb-ingestpaced SIZE --passes
+load,read,mixes,mixes-scrambled,lag --reps 5`, at `3f413cd`):
+
+| | 1,000,000 keys | 300,000 | 100,000 |
+|---|---|---|---|
+| burst, the full rewrite | 1.14, 1.17 | 1.44, 1.20 | 1.18, 1.27 |
+| burst, ten percent | 1.21, 1.28 | 1.13, 1.14 | 1.15, 1.29 |
+| burst, one percent | 1.16, 1.02 | 1.13, 1.34 | 0.91, 0.92 |
+| pass after the full rewrite | 1.16, 1.01 | 0.94, 1.17 | 1.12, 1.11 |
+| pass after ten percent | 0.98, 1.08 | 1.33, 1.30 | 1.07, 1.09 |
+| pass after one percent | 1.00, 1.12 | 1.03, 1.24 | 0.72, 0.94 |
+| the sweep's weighted time | 0.88, 0.86 | 0.73, 0.81 | 0.96, 0.80 |
+
+and at three million keys the bursts 1.00x to 1.22x and the passes 1.00x
+to 1.07x (`pair.sh supdb-ingestnopace supdb-ingest 3000000 --passes
+load,lag --reps 3`, at `ccf6455`, where the arms were named so). Against
+`lmdb-nosync` at `3f413cd` every lag cell is ours at three hundred and a
+hundred thousand keys, the bursts 1.9x to 3.3x and the passes 1.4x to
+2.6x. Under the held log the same pairing (`supdb-heldfiles
+supdb-heldpaced`) reads the bursts 0.98x to 1.50x at three hundred
+thousand keys, and at a hundred thousand whichever arm is listed first.
+
+And under the held log a burst's batches are lent to the upkeep thread
+and never filed by a commit or waited for (`Options::held_bursts_lend`):
+the burst at the writer's rate, the thread filing behind it in passes as
+long as its trail, and what it has not filed when a scan comes that
+scan's to wait out and settle. Against `faster` in the row's order
+(`pair.sh supdb-heldnoframes faster SIZE --passes
+load,read,mixes,mixes-scrambled,lag --reps 5`, at `3f413cd`), our rate
+over FASTER's in the two orders:
+
+| | 300,000 keys | 100,000 | 10,000 |
+|---|---|---|---|
+| burst, the full rewrite | 1.49, 1.24 | 0.63, 0.97 | 1.30, 0.85 |
+| burst, ten percent | 2.08, 1.35 | 1.47, 1.42 | 2.41, 1.89 |
+| burst, one percent | 2.21, 1.98 | 1.89, 2.07 | 1.06, 0.85 |
+| ycsb-A | 0.97, 0.99 | 0.96, 0.77 | 0.89, 0.99 |
+| ycsb-B | 1.00, 1.07 | 1.01, 1.22 | 1.17, 1.15 |
+| ycsb-C | 1.19, 1.18 | 0.99, 1.45 | 1.17, 1.24 |
+| ycsb-D | 1.18, 1.13 | 1.23, 1.09 | 1.07, 1.22 |
+| ycsb-F | 0.80, 0.79 | 0.70, 0.58 | 0.87, 0.75 |
+| scrambled A | 0.97, 0.99 | 0.85, 0.83 | 0.97, 0.82 |
+| scrambled B | 1.09, 1.13 | 1.10, 1.08 | 1.03, 0.85 |
+| scrambled C | 1.09, 1.07 | 1.03, 0.98 | 0.94, 1.00 |
+| scrambled D | 0.91, 0.85 | 0.71, 0.90 | 0.74, 0.62 |
+| scrambled F | 0.90, 0.81 | 0.69, 0.74 | 0.63, 0.48 |
+
+The scan pass straight after a burst pays for what the burst did not
+file. Against the bursts filed by their commits (`pair.sh
+supdb-heldnoframes supdb-heldfiles`, at `3f413cd`, three hundred and a
+hundred thousand keys) the bursts read 1.9x to 3.6x and the passes after
+them 0.70x to 0.92x after one percent rewritten, 0.31x to 0.58x after ten
+and 0.09x to 0.18x after a hundred, the first scan waiting out the
+thread's pass in flight and settling its trail and the walks then meeting
+sparse forms where the filed store has copies; the sweep's weighted time,
+a burst and twice its pass, reads 0.78x to 0.92x. FASTER has no cell for
+those passes. The mixes' batches are too small to be a burst's and are
+handed as before.
+
+The handle's path is not what the bursts were short of. `supdb-heldhandle`
+makes the arm's own updates a write at a time through a handle claimed to
+write (`Db::writer`), with no batch behind a commit, which is FASTER's one
+level; a shared table stands the block cache and the upkeep thread down,
+and the arm with no block cache and the one writer's table has the same
+bursts. Against that arm (`pair.sh supdb-heldhandle supdb-heldnfnocache`,
+at `3f413cd`) the handle reads F 0.89x to 1.31x and the scrambled F 1.11x
+to 1.29x, a read-modify-write being one operation through it, A within a
+tenth either way, D 0.85x to 1.01x, and its bursts no faster. Nor does leaving the
+shared form at a scan pay: the arm that gave its handle up at its first
+scan and sealed the table there (`supdb-heldhandleleaves`, `pair.sh` with
+`supdb-heldnoframes`, at `ccf6455`) read the passes after the bursts at
+0.09x to 0.11x of the roster's arm's of that commit after the full
+rewrite, as the arm that never leaves does, the seal landing inside no
+pass, with E 0.74x to 0.88x and the scrambled E 0.43x to 0.59x for the
+leave they hold. Neither is built into the store.
+
+What FASTER still has of the row's single-threaded cells is F and the
+scrambled F, the scrambled D, the scrambled A below three hundred
+thousand keys, and the full rewrite's burst at a hundred thousand, where
+the burst's seals and the thread share four cores with the writer.
+
+#### What filing a write costs
+
+Filing a write into its block's form is the cost behind both halves of
+that trade: the commit pays it where it files its own batch, and the first
+scan after a burst waits it out where the batch was lent. Counted over the
+lag sweep at a hundred thousand keys, the buffered arm, whose commits file
+(`valgrind --tool=callgrind --collect-atstart=no
+--toggle-collect='<supdb::db::Reader>::maintain_forms'
+bench/target/release/examples/lag_only ARM 100000 1`, 111,000 writes, at
+`3f4f23f`), in millions of instructions:
+
+| step | `supdb-ingestsettlefat`, the settle before | `supdb-ingest` |
+|---|---|---|
+| the whole | 431, 3,900 a write | 374, 3,400 a write |
+| the patches staged through `patch_block` | 107 | 66 |
+| conversions of dense forms | 31, in the fill | 33, in the settle |
+| the fill beyond them | 29 | 18 |
+| the batch's sort by key offset | 17 | none |
+| its sort by prefix | 27 | 25 |
+| the snapshot's refresh | 57 | 50 |
+| the log read | 19 | 20 |
+
+It was not one cost. A patch over a copy's own record took a few hundred
+instructions and a patch of a sparse form two thousand: a search of its
+deltas, an insert into them, its three buffers grown. Which a write met
+turned on a rule written for something else. The fill is what rebuilds a
+sparse form of sixteen deltas as a copy, and it is left for a later pass
+while the writer has a commit posted (`Options::upkeep_fill_skips_posted`),
+which was priced on the syncing pace. Under a lent burst a commit is
+always posted, so no form became a copy for the length of a burst, every
+patch of it was the sparse kind, and the scans after it walked forms of
+up to sixty-four deltas (`LAG_ALL=1 lag_only supdb-heldsettlefat 300000
+1`: `walk_sparse` 7,616 over the pass after the full rewrite and
+`walk_copy` none).
+
+And on the upkeep thread two loads were a tenth of its time. The settle
+sorts its batch by the keys' first sixteen bytes and carried each write's
+place in the pending list through the sort; the resolve then read the
+write by that index and the key's bytes from the table's arena, in key
+order from two structures laid out in arrival order, inside iterations too
+long for the core to overlap. Sampled over a lent full rewrite at three
+hundred thousand keys and laid on source lines (`perf record -e cpu-clock
+-F 20000 -k CLOCK_MONOTONIC` over `SUPDB_LAG_MARK=1 lag_only
+supdb-heldnoframes 300000 4`, the thread's samples between the ten-percent
+pass's end and the full rewrite's, each address through `llvm-addr2line
+-i`, at `3e4605c`), the load of the write held 6.4% of the thread and the
+first reads of the key's bytes 5.9%.
+
+Four options, each the engine's, each with the shape before as an arm for
+the durable, the buffered and the held log's (`supdb-settle...`,
+`supdb-ingestsettle...`, `supdb-heldsettle...`; `...settlefat` is all four
+off):
+
+- `Options::settle_gathers`: the writes are gathered once into key order,
+  and a key of sixteen bytes or fewer is rebuilt from the prefix words the
+  batch was sorted by, so the resolve reads neither the list nor the arena
+  in key order. It adds a million instructions to the count above and
+  takes the two loads away.
+- `Options::settle_sorts_once`: the comparison sort by key offset ahead of
+  the prefix sort is gone. It was there so that the stable prefix sort
+  would leave a key's writes together; the prefix sort does that by itself
+  unless two keys share sixteen bytes, and a run of equal prefix words
+  holding more than one key is grouped by key afterwards.
+- `Options::settle_patch_in_place`: a put over a copy whose entries are
+  its block's records, one value above a tombstone and no longer than the
+  run the entry holds, is copied over that run from the key's chain.
+  Everything else is the staged patch's.
+- `Options::settle_converts`: a sparse form the batch takes to the dense
+  count is converted before the batch's keys are spliced into it, so they
+  patch the copy; within the cache's budget, which it asks what the fill
+  asks, and with nothing withdrawn from the state, since the copy holds
+  what the form held.
+
+Each alone, by the same count: the batch sorted twice reads 396 million,
+every patch staged 404, the conversions left to the fill 389, the resolve
+without its gather 372.
+
+Against the settle before (`pair.sh A B SIZE --passes
+load,read,mixes,mixes-scrambled,lag --reps 5`, at `3f4f23f`; the first
+arm's rate over the second's, the sitting that lists it first and then
+the other):
+
+| | `supdb-heldnoframes` over `supdb-heldsettlefat` | `supdb-ingest` over `supdb-ingestsettlefat` |
+|---|---|---|
+| pass after the full rewrite, 10k | 1.19, 1.76 | 0.86, 1.26 |
+| 100k | 2.67, 2.40 | 1.16, 0.94 |
+| 300k | 2.40, 1.54 | 0.99, 0.89 |
+| the full rewrite's burst, 10k | 1.29, 1.54 | 1.07, 1.07 |
+| 100k | 1.02, 1.11 | 1.29, 1.02 |
+| 300k | 0.87, 1.11 | 1.18, 1.00 |
+| the sweep's weighted time, 10k | 0.86, 0.76 | 0.99, 0.92 |
+| 100k | 0.81, 0.71 | 0.88, 1.01 |
+| 300k | 0.71, 0.74 | 0.89, 1.02 |
+
+What resolves is the held log's pass after a full rewrite and its weighted
+time, in every sitting at every rung. A cell the options cannot reach
+moved as far as the buffered arm's cells did: the read-only mix, which
+runs before any settle, read 0.75 to 1.43 between the two arms over the
+same sittings, and the arm paired with itself (`pair.sh supdb-ingest
+supdb-ingest 300000 --passes load,read,mixes --reps 15`) read its mixes
+0.85 to 1.04. At three million keys the buffered arm's bursts read 1.19,
+1.19 after a hundred percent, 1.16, 1.11 after ten and 1.28, 1.31 after
+one, and the sweep's weighted time 0.82, 0.85 (`pair.sh supdb-ingest
+supdb-ingestsettlefat 3000000 --passes load,lag --reps 3`), beside a
+clean-store pass, which no settle precedes, at 1.28, 1.34: the count is
+the verdict for that arm and the rates are not. The mixes of those
+pairings are not reached at all: no scan comes before them in that pass
+order, a store nothing has scanned files nothing (`reads_around`), and E
+makes the same walks and builds under either (`SUPDB_MIX_COUNTERS=1
+SUPDB_MIX_KINDS=1 bench ab --arms supdb-ingest,supdb-ingestsettlefat
+--size 100000 --passes load,read,mixes --reps 7`: 18,139, 6,230 and 541
+walks by form in both, 21.4 ms against 21.5). Under a bound nothing
+resolved and nothing was killed (`pair.sh supdb supdb-settlenoconvert
+3000000 --bound 1073741824 --reps 3 --ops-div 10 --passes load,lag`).
+
+A row runs its scan passes before its mixes, so there the thread files
+the mixes' writes and the lean shapes are in them: by the pairing's own
+counts, seventeen thousand patches in place a pass at a hundred thousand
+keys and fifty to seventy thousand at three hundred thousand, one to five
+conversions, and the builds of the settle before to within two. Paired in
+that order, at `02bab06` (`pair.sh A B SIZE --passes
+load,read,read-threaded,scan,scan-threaded,mixes,scan-mixed,mixes-scrambled`:
+`supdb-heldnoframes supdb-heldsettlefat` at ten and a hundred thousand
+keys and `supdb-ingest supdb-ingestsettlefat` at a hundred and three
+hundred thousand with `--reps 30`, the held pair at three hundred
+thousand and `supdb supdb-settlefat` at a hundred thousand with `--reps
+20`, and that pair at three hundred thousand with `--reps 12`), no mix
+holds a direction. The twelve mixes read 0.95 to 1.05 for the held arm at
+a hundred thousand keys and 0.95 to 1.11 for the buffered arm at three
+hundred thousand, in both orders; the other pairings read them 0.79 to
+1.16, and where a cell there reads one way in both orders it does so
+beside C, which runs before any write, reading the same way -- the held
+pair at three hundred thousand keys has B, the scrambled D and E and C
+all at 0.90 to 0.96. An arm paired with itself in that order reads the
+mixes 0.85 to 1.15 (`pair.sh supdb-heldnoframes supdb-heldnoframes
+100000` and `pair.sh supdb-ingest supdb-ingest 300000`, the same passes,
+`--reps 30`). Shorter sittings had said otherwise and did not repeat:
+five reps an order read the held arm's B and C at 0.8 in nineteen pairs
+of twenty, and fifteen the buffered arm's scrambled A, B, C and F at 0.76
+to 0.91 in both orders.
+
+The trade stands, narrower. The thread does not file faster than it did:
+over a lent full rewrite at three hundred thousand keys its CPU reads 127
+ms against 133 and at a hundred thousand 44 against 43 (`lag_only`, the
+two arms alternated, medians of eight), because what the lean patches save
+it spends on the conversions the fill used to skip, four thousand of them
+at about ten microseconds. What that buys is the pass: copies to walk, 198
+thousand of the burst's 270 thousand patches in place, and a first scan
+that waits 64 ms where it waited 79. Behind a burst filed by its commits
+the whole pass is about ten. Filing a write is still several times a
+write, and three things are left in it, by the same count: the settle's
+asks ahead are half of its own instructions (its callees apart, 59
+million in `supdb-settlenoahead` against 122 in `supdb`, each ask having
+been priced as a win at three million keys under a bound, where a miss is
+memory's and not a cache's); a conversion is twenty thousand instructions,
+most of them the partition's records read through the general scan; and
+the snapshot's refresh sorts the keys the settle has just sorted. None of
+them is the factor the trade needs. That would take the scan after a burst
+going on without the whole trail filed -- the blocks it walks settled as
+it reaches them, the thread filing the rest beside it -- which nothing
+here builds.
+
+#### The point mixes on one thread, by what is taken away
+
+The roster's arm of the held log trails FASTER on the point mixes one
+thread runs, in every row banked with the two. Timed by kind in the row's
+pass order, three arms each without one more thing were set beside
+FASTER (`pair.sh SUPDB_MIX_KINDS=1 ARM faster SIZE --passes
+load,read,read-threaded,scan,scan-threaded,mixes,scan-mixed,mixes-scrambled`,
+`--reps 12` at a hundred thousand keys and `--reps 8` at three hundred
+thousand, at `02bab06`): `supdb-heldnoframes`, the roster's;
+`supdb-heldnfnocache`, the same with no block cache; and
+`supdb-heldinplace`, that with its upkeep inline and a put that overwrites
+(Updates in place, above). The timer is on for every arm, so a difference
+is sound and a ratio is drawn toward one. Nanoseconds an operation as the
+mix counts them, a read-modify-write one, the medians over both sittings
+and FASTER's over the three pairings:
+
+| | 100k: FASTER | roster | no cache | in place | 300k: FASTER | roster | no cache | in place |
+|---|---|---|---|---|---|---|---|---|
+| C | 142 | 164 | 171 | 163 | 188 | 187 | 187 | 180 |
+| B | 145 | 171 | 174 | 165 | 197 | 205 | 199 | 200 |
+| A | 144 | 202 | 156 | 137 | 191 | 235 | 193 | 172 |
+| F | 206 | 358 | 302 | 229 | 261 | 380 | 334 | 294 |
+| D | 277 | 289 | 298 | 300 | 425 | 387 | 397 | 407 |
+| scrambled C | 233 | 269 | 259 | 282 | 341 | 333 | 299 | 290 |
+| scrambled B | 233 | 265 | 222 | 237 | 336 | 306 | 297 | 298 |
+| scrambled A | 225 | 308 | 201 | 213 | 310 | 321 | 262 | 259 |
+| scrambled F | 313 | 387 | 338 | 349 | 390 | 434 | 423 | 414 |
+| scrambled D | 187 | 226 | 213 | 197 | 242 | 262 | 281 | 243 |
+
+Three things, each read by taking it away.
+
+The forms filed beside the writer are the largest. The row's scan passes
+come before its mixes, so the store is near reads through them and the
+upkeep thread files every commit into the blocks' forms (What the scans
+leave the writes, above). A write of A's, a commit of a hundred over a
+hundred, costs 193 ns in the roster's arm, 115 with no cache and 130 in
+FASTER at a hundred thousand keys, and 208, 138 and 166 at three hundred
+thousand; the scrambled B's 486 against 189 and 191. With no cache A is
+within a tenth of FASTER at the smaller rung and level at the larger, four
+fifths and more of its gap, and F has given back two fifths of its own.
+Part of that is the thread's alertness (`Options::upkeep_alert`): backed
+off, in the same order with no timer (`pair.sh supdb-heldnoalert
+supdb-heldnoframes 100000` the same passes `--reps 30`, and `300000
+--reps 12`), A read 1.18 and 1.17 of the roster's arm and then 1.02 and
+1.24, the scrambled A 1.20 and 1.11 and then 1.20 and 1.17, F 0.96 to 1.02
+and E, which the alert is for, 0.95 and 0.99 and then 0.96 and 1.24. So
+the alert is A's tax, E's price for its going is not resolved, and what
+the cache costs F's writes beside it, 229 ns against 158, is not laid to a
+cause.
+
+Puts that append are the second. With no cache F's write is 158 ns and
+overwriting 78, against FASTER's 85 (135, 81 and 68 at the larger rung),
+and A's 115 and 87 against 130, which is A ahead of FASTER at both rungs.
+An overwrite needs nothing else to read the live table's values, and the
+upkeep thread reads them to file them, so the first two go together: a
+store has both or neither.
+
+The get is what is left. On the clean store C reads, a get costs 164 ns
+against FASTER's 142 at a hundred thousand keys, 163 to 171 across the
+three arms, and in the arm that overwrites the five unscrambled mixes'
+gets are twenty to thirty-three more than FASTER's; at three hundred
+thousand C's are level, 180 to 188, both engines waiting on the same
+misses, and the write mixes' are not, F's 250 against 227. That is F at
+0.9 of FASTER with the other two gone.
+
+With no timer the rates lean the same way and resolve less (`pair.sh ARM
+faster SIZE` the same passes, `--reps 25` and `--reps 12`): at a hundred
+thousand keys the roster's A read 0.77 and 0.89 of FASTER's and its F
+0.62 and 0.64, with no cache 0.90 and 0.98 and 0.77 and 0.76, and in place
+0.95 and 1.03 and 0.95 and 0.83.
+
 #### Beside FASTER out of core
 
 A store larger than memory is what FASTER's log is made for, and the
@@ -4732,6 +5711,12 @@ are lent as before, and A and F read level arm against arm. Level 2 of
 the upkeep (`supdb-ingesthold`) holds the bursts too, and also files the
 mixes' small batches in the commit, which took a third off A's and F's
 margins: the hold is a burst's decision, not the upkeep's level.
+
+Neither the pace nor the hold is the engine's now: held, a paced batch is
+the commit's own filing behind a hand-over, and the inline fill reads the
+bursts and the passes at or ahead of it at every rung (what a burst costs
+under the held log, above). `supdb-ingestpaced` is the hold and
+`supdb-ingestpacelends` the trail within the share.
 
 #### The buffered load's write path: six copies of a value, and the pages they touch
 

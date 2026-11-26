@@ -239,9 +239,12 @@ pub const LATEST: &str = "latest";
 /// default first (a bounded row's arms are not all in `ARMS`), then any
 /// arm of the row that neither names, by name. A row is history and the
 /// rosters are today's, so they order the curves and never choose them:
-/// a comparator retired since a row was banked is still that row's.
+/// a comparator retired since a row was banked is still that row's. The
+/// rosters are taken as a host that builds every arm has them
+/// (`engines::drawn_order`), not as this build does, so the order is a
+/// function of the row and the renderer on every host.
 fn arm_order<'a>(present: impl Iterator<Item = &'a String>) -> Vec<String> {
-    let mut order: Vec<String> = crate::engines::every_arm()
+    let mut order: Vec<String> = crate::engines::drawn_order()
         .iter()
         .map(|a| a.to_string())
         .collect();
@@ -795,6 +798,47 @@ mod tests {
         assert_eq!(ticks[0], 0.0);
     }
 
+    /// The curves' order is the same on a host that builds FASTER and on
+    /// one that does not: the arms of FASTER's guarantee, which this
+    /// build's rosters name only where FASTER is built, are drawn in their
+    /// roster's order everywhere and not by name, and what this build's
+    /// rosters hold is in the drawn order as it is in theirs. On a host
+    /// with FASTER the two orders are one, so the lists cannot drift where
+    /// both are compiled; the hosts without it are where the first half
+    /// fails if the order is taken from the build again.
+    #[test]
+    fn the_curves_order_does_not_depend_on_which_arms_this_host_builds() {
+        let present: Vec<String> = ["faster", "supdb-heldpart", "supdb-heldnoframes", "supdb"]
+            .iter()
+            .map(|a| a.to_string())
+            .collect();
+        let order = arm_order(present.iter());
+        let at = |a: &str| order.iter().position(|o| o == a).unwrap();
+        assert!(
+            at("supdb") < at("supdb-heldnoframes")
+                && at("supdb-heldnoframes") < at("faster")
+                && at("faster") < at("supdb-heldpart"),
+            "{order:?}"
+        );
+        let drawn = crate::engines::drawn_order();
+        let built = crate::engines::every_arm();
+        let places: Vec<usize> = built
+            .iter()
+            .map(|a| {
+                drawn
+                    .iter()
+                    .position(|d| d == a)
+                    .unwrap_or_else(|| panic!("{a} is built here and drawn nowhere"))
+            })
+            .collect();
+        assert!(
+            places.windows(2).all(|w| w[0] < w[1]),
+            "{built:?} in {drawn:?}"
+        );
+        #[cfg(faster)]
+        assert_eq!(drawn, built);
+    }
+
     /// An arm a banked row carries that today's rosters do not name is
     /// still drawn, after the rosters' arms, and the default leads.
     #[test]
@@ -806,9 +850,9 @@ mod tests {
         let order = arm_order(present.iter());
         assert_eq!(order[0], crate::engines::ARMS[0]);
         let at = |a: &str| order.iter().position(|o| o == a);
-        let roster = crate::engines::every_arm().len();
+        let roster = crate::engines::drawn_order().len();
         for retired in ["rocksdb-nosync", "zz-retired"] {
-            if !crate::engines::every_arm().contains(&retired) {
+            if !crate::engines::drawn_order().contains(&retired) {
                 assert!(
                     at(retired).is_some_and(|i| i >= roster),
                     "{retired}: {order:?}"

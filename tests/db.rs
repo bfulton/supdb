@@ -12,7 +12,7 @@ use supdb::{Db, Isolation, Options, ReadAdvice, Reader};
 mod common;
 #[cfg(target_os = "linux")]
 use common::cached_pages;
-use common::{kv, vf, without_the_clock};
+use common::{kv, vf, watchdog_exit, without_the_clock, Watchdog};
 
 fn dir(name: &str) -> PathBuf {
     let d = std::env::temp_dir().join(format!("supdb-next-{name}-{}", std::process::id()));
@@ -12068,6 +12068,222 @@ fn a_buffered_commit_near_reads_files_its_burst_and_lends_a_small_batch() {
     drop(live);
 }
 
+/// Under the held log a burst's batches are lent to the upkeep thread and
+/// never filed by their commits or waited for
+/// (`Options::held_bursts_lend`): with the thread held before its pass,
+/// each commit of a burst returns with its batch lent and unfiled, the one
+/// a scan preceded among them, and no commit holds; the scan after the
+/// burst files what the thread had not, and every key reads as written
+/// through the writer and through a handle. A batch too small to wake the
+/// thread for is handed as under any policy, settled by the commit a scan
+/// preceded and lent to nobody. With the option off the held log's commits
+/// file their bursts themselves, and under a policy that is not the held
+/// log the option lends nothing.
+#[test]
+fn a_held_logs_burst_is_lent_and_never_waited_for() {
+    // The writes lent to the thread and not filed by its report, before
+    // the burst, after its first commit and after its third, and whether
+    // the small batch's commit moved the count. The count is the writer's
+    // own and stands where no commit lends: the load's one commit, with
+    // no scan before it, is lent under every policy, and whether the scan
+    // before the burst found the thread's report of it is the thread's
+    // timing -- the count before the burst is the load's twenty thousand
+    // or nothing. So a burst that lends nothing leaves the count where it
+    // was, whichever that is, and one that lends starts it over at its
+    // first batch: the first version held the first count under the one
+    // before the burst, which under the gate's load was nothing.
+    let run = |name: &str, sync: supdb::SyncPolicy, lend: Option<bool>| -> [u64; 4] {
+        let d = dir(name);
+        let mut opts = Options {
+            upkeep: supdb::Upkeep::Background(1),
+            sync,
+            partition_bytes: Some(256 << 10),
+            // The plain seal, so the few hundred writes below seal nothing.
+            seal_max_pct: 0,
+            ..common::options()
+        };
+        if let Some(lend) = lend {
+            opts.held_bursts_lend = lend;
+        }
+        let mut db = Db::create(&d, opts).unwrap();
+        let keys = 20_000u32;
+        let key = |k: u32| format!("key-{k:06}").into_bytes();
+        for k in 0..keys {
+            db.append(&key(k), b"0");
+        }
+        db.commit().unwrap();
+        db.flush().unwrap();
+        assert!(db.levels().0 > 0, "partitions for the forms to hang on");
+        let live = db.reader().unwrap();
+        let mut want: HashMap<u32, String> = HashMap::new();
+        let check = |db: &Db, want: &HashMap<u32, String>, when: &str| {
+            let verify = |k: &[u8], v: &[u8], who: &str| {
+                let kn: u32 = std::str::from_utf8(&k[4..]).unwrap().parse().unwrap();
+                let got = std::str::from_utf8(v).unwrap();
+                let expect = want.get(&kn).map_or("0", |s| s.as_str());
+                assert_eq!(got, expect, "{name}: key {kn} {when} through {who}");
+            };
+            let mut seen = 0u32;
+            db.scan(
+                &key(0),
+                keys as usize,
+                kv(&mut |k, v| {
+                    verify(k, v, "the writer");
+                    seen += 1;
+                }),
+            )
+            .unwrap();
+            assert_eq!(seen, keys, "{name}: every key {when} through the writer");
+            let r = db.reader().unwrap();
+            let mut seen = 0u32;
+            r.scan(
+                &key(0),
+                keys as usize,
+                kv(&mut |k, v| {
+                    verify(k, v, "a handle");
+                    seen += 1;
+                }),
+            )
+            .unwrap();
+            assert_eq!(seen, keys, "{name}: every key {when} through a handle");
+        };
+        let mut x = 0x2545_F491_4F6C_DD1Du64;
+        let mut write = |db: &mut Db, want: &mut HashMap<u32, String>, n: usize, v: &str| {
+            for _ in 0..n {
+                x ^= x << 13;
+                x ^= x >> 7;
+                x ^= x << 17;
+                let k = (x % keys as u64) as u32;
+                db.put(&key(k), v.as_bytes());
+                want.insert(k, v.to_string());
+            }
+            db.commit().unwrap();
+        };
+        // Reads are around, and the burst's first commit is the one a scan
+        // preceded. The thread is held before its pass, so whatever a
+        // commit lends stands unfiled, and a commit that waited for its
+        // filing would not return.
+        check(&db, &want, "before any write");
+        let watch = Watchdog::arm("a commit of a burst never returned beside a held thread");
+        db.hold_upkeep_pass(true);
+        let holds = db.upkeep_counts()[4];
+        let before = db.upkeep_behind_writes();
+        write(&mut db, &mut want, 300, "a");
+        let first = db.upkeep_behind_writes();
+        write(&mut db, &mut want, 300, "b");
+        write(&mut db, &mut want, 300, "c");
+        let third = db.upkeep_behind_writes();
+        assert_eq!(db.upkeep_counts()[4], holds, "{name}: no commit held");
+        db.hold_upkeep_pass(false);
+        check(&db, &want, "after the burst");
+        db.settle().unwrap();
+        // A batch too small to wake the thread for, behind the scans above.
+        db.hold_upkeep_pass(true);
+        let at = db.upkeep_behind_writes();
+        write(&mut db, &mut want, 100, "d");
+        let small = u64::from(db.upkeep_behind_writes() != at);
+        db.hold_upkeep_pass(false);
+        drop(watch);
+        check(&db, &want, "after the small batch");
+        drop(live);
+        db.close().unwrap();
+        let _ = std::fs::remove_dir_all(&d);
+        [before, first, third, small]
+    };
+    let [before, first, third, small] = run("held-burst-lent", supdb::SyncPolicy::Explicit, None);
+    assert_eq!(
+        (first, third),
+        (300, 900),
+        "every commit of the burst lent its batch, the first among them, from {before}"
+    );
+    assert_eq!(small, 0, "a small batch a scan preceded is the commit's");
+    let [before, first, third, small] =
+        run("held-burst-filed", supdb::SyncPolicy::Explicit, Some(false));
+    assert_eq!(
+        (first, third, small),
+        (before, before, 0),
+        "with the option off the held log's commits file their bursts"
+    );
+    let [before, first, third, small] = run(
+        "buffered-burst-filed",
+        supdb::SyncPolicy::EveryN(u32::MAX),
+        Some(true),
+    );
+    assert_eq!(
+        (first, third, small),
+        (before, before, 0),
+        "the option lends nothing under a policy that is not the held log"
+    );
+}
+
+/// As the options stand, a buffered burst's batches are filed by their
+/// commits, the ones after the first as the first is: none is lent to the
+/// upkeep thread and no commit holds for it, where a share of the store
+/// paced (`Options::upkeep_pace_pct` above zero) lends each batch within
+/// the share and holds for its filing. The batches here are within a
+/// hundredth of the store's keys, which a pace of one would lend.
+#[test]
+fn a_default_burst_is_filed_by_its_commits() {
+    let d = dir("default-burst-filed");
+    let mut db = Db::create(
+        &d,
+        Options {
+            sync: supdb::SyncPolicy::EveryN(u32::MAX),
+            upkeep: supdb::Upkeep::Background(1),
+            partition_bytes: Some(256 << 10),
+            seal_max_pct: 0,
+            ..common::options()
+        },
+    )
+    .unwrap();
+    let keys = 100_000u32;
+    let key = |k: u32| format!("key-{k:06}").into_bytes();
+    for k in 0..keys {
+        db.append(&key(k), b"0");
+    }
+    db.commit().unwrap();
+    db.flush().unwrap();
+    assert!(db.levels().0 > 0, "partitions for the forms to hang on");
+    let mut want: HashMap<u32, String> = HashMap::new();
+    // Reads around: a scan over the store.
+    let mut n = 0u32;
+    db.scan(&key(0), 100, kv(&mut |_, _| n += 1)).unwrap();
+    assert_eq!(n, 100);
+    let (holds, lent) = (db.upkeep_counts()[4], db.upkeep_behind_writes());
+    let mut x = 0x2545_F491_4F6C_DD1Du64;
+    for round in 0..4u32 {
+        for _ in 0..300 {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            let k = (x % keys as u64) as u32;
+            db.put(&key(k), format!("b{round}").as_bytes());
+            want.insert(k, format!("b{round}"));
+        }
+        db.commit().unwrap();
+        assert_eq!(
+            (db.upkeep_counts()[4], db.upkeep_behind_writes()),
+            (holds, lent),
+            "commit {round}: nothing lent and nothing held for"
+        );
+    }
+    let mut seen = 0u32;
+    db.scan(
+        &key(0),
+        keys as usize,
+        kv(&mut |k, v| {
+            let kn: u32 = std::str::from_utf8(&k[4..]).unwrap().parse().unwrap();
+            let expect = want.get(&kn).map_or("0", |s| s.as_str());
+            assert_eq!(std::str::from_utf8(v).unwrap(), expect, "key {kn}");
+            seen += 1;
+        }),
+    )
+    .unwrap();
+    assert_eq!(seen, keys);
+    db.close().unwrap();
+    let _ = std::fs::remove_dir_all(&d);
+}
+
 /// The first batch after a scan, filed in the commit on the writer's own
 /// path, files into the forms that stand and builds nothing -- neither the
 /// settle's builds nor the commit's fill -- for the walks after it to build
@@ -17582,65 +17798,6 @@ fn a_write_after_a_handed_seal_takes_a_fresh_table_from_whichever_side_swapped()
         for k in 0..n {
             let want = if k % 11 == 0 || k == 3 { 2 } else { 1 };
             assert_eq!(read_vec(&r, &tail_key(k)), vec![tail_val(want)], "key {k}");
-        }
-    }
-}
-
-/// A watchdog's exit: the message on the process's own stderr, past the
-/// harness's capture, then the exit. The harness captures what a test's
-/// threads print, a watchdog's thread among them, so a watchdog that
-/// printed through `eprintln!` and exited left the whole binary ending with
-/// code 101 after a hundred and sixty-six tests, no failure named and no
-/// summary -- the dev binary under the whole file's load, where a window
-/// a minute holds in the checked profile runs several times longer.
-fn watchdog_exit(what: &str) -> ! {
-    use std::io::Write;
-    let said = std::fs::OpenOptions::new()
-        .write(true)
-        .open("/dev/stderr")
-        .and_then(|mut e| writeln!(e, "watchdog: {what}"));
-    if said.is_err() {
-        eprintln!("watchdog: {what}");
-    }
-    std::process::exit(101);
-}
-
-/// Exits the process unless dropped within a minute: for a test whose
-/// failure is a wait that never returns, so it reports itself rather
-/// than hanging. Dropped as the waits end, or by the unwind of a failure
-/// in them, so an assertion reports itself and not the watchdog.
-struct Watchdog {
-    done: std::sync::Arc<std::sync::atomic::AtomicBool>,
-    watch: Option<std::thread::JoinHandle<()>>,
-}
-
-impl Watchdog {
-    fn arm(what: &'static str) -> Watchdog {
-        let done = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let watch = {
-            let done = done.clone();
-            std::thread::spawn(move || {
-                let t = std::time::Instant::now();
-                while !done.load(std::sync::atomic::Ordering::Relaxed) {
-                    if t.elapsed() > std::time::Duration::from_secs(60) {
-                        watchdog_exit(what);
-                    }
-                    std::thread::sleep(std::time::Duration::from_millis(20));
-                }
-            })
-        };
-        Watchdog {
-            done,
-            watch: Some(watch),
-        }
-    }
-}
-
-impl Drop for Watchdog {
-    fn drop(&mut self) {
-        self.done.store(true, std::sync::atomic::Ordering::Relaxed);
-        if let Some(w) = self.watch.take() {
-            let _ = w.join();
         }
     }
 }

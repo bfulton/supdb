@@ -1068,9 +1068,15 @@ fn frames_a_durable_seal_covers_are_never_written() {
     let mut db = Db::create(&d, explicit()).unwrap();
     logged_batch(&mut db, 0);
     let a = db.wal_held().held;
+    // The seal held short of durable while the second batch commits: a
+    // seal that had landed first would have its frames dropped by that
+    // commit, and what is held would be the second table's alone.
+    db.hold_seal_durable(true);
     db.seal().unwrap();
     logged_batch(&mut db, 1);
     let ab = db.wal_held().held;
+    assert_eq!(ab, 2 * a, "both tables' frames held while the seal is");
+    db.hold_seal_durable(false);
     db.settle().unwrap();
     db.commit().unwrap();
     let h = db.wal_held();

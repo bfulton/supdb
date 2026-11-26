@@ -272,3 +272,62 @@ pub fn cached_pages(path: &std::path::Path, off: usize, len: usize) -> usize {
         vec.iter().filter(|b| **b & 1 != 0).count()
     }
 }
+
+/// A watchdog's exit: the message on the process's own stderr, past the
+/// harness's capture, then the exit. The harness captures what a test's
+/// threads print, a watchdog's thread among them, so a watchdog that
+/// printed through `eprintln!` and exited left the whole binary ending with
+/// code 101 after a hundred and sixty-six tests, no failure named and no
+/// summary -- the dev binary under the whole file's load, where a window
+/// a minute holds in the checked profile runs several times longer.
+pub fn watchdog_exit(what: &str) -> ! {
+    use std::io::Write;
+    let said = std::fs::OpenOptions::new()
+        .write(true)
+        .open("/dev/stderr")
+        .and_then(|mut e| writeln!(e, "watchdog: {what}"));
+    if said.is_err() {
+        eprintln!("watchdog: {what}");
+    }
+    std::process::exit(101);
+}
+
+/// Exits the process unless dropped within a minute: for a test whose
+/// failure is a wait that never returns, so it reports itself rather
+/// than hanging. Dropped as the waits end, or by the unwind of a failure
+/// in them, so an assertion reports itself and not the watchdog.
+pub struct Watchdog {
+    done: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    watch: Option<std::thread::JoinHandle<()>>,
+}
+
+impl Watchdog {
+    pub fn arm(what: &'static str) -> Watchdog {
+        let done = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let watch = {
+            let done = done.clone();
+            std::thread::spawn(move || {
+                let t = std::time::Instant::now();
+                while !done.load(std::sync::atomic::Ordering::Relaxed) {
+                    if t.elapsed() > std::time::Duration::from_secs(60) {
+                        watchdog_exit(what);
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(20));
+                }
+            })
+        };
+        Watchdog {
+            done,
+            watch: Some(watch),
+        }
+    }
+}
+
+impl Drop for Watchdog {
+    fn drop(&mut self) {
+        self.done.store(true, std::sync::atomic::Ordering::Relaxed);
+        if let Some(w) = self.watch.take() {
+            let _ = w.join();
+        }
+    }
+}
