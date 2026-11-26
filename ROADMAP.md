@@ -132,20 +132,22 @@ The suite has to be fair before any of its numbers are quoted.
   store is under a cgroup bound, where free memory is page cache the
   store does not have (`Options::forms_to_fit`'s trim, priced in core
   before it is the default under a bound); and 1 GiB.
-- [ ] **An arm at FASTER's promise.** `faster` is in the roster with a
-  guarantee of its own, in memory until a checkpoint, and nothing to be
-  compared with there: the buffered arms hand every commit to the kernel
-  and FASTER hands it to nobody. A supdb arm whose log stays in the
-  process's memory between checkpoints would be the matched one, and is
-  an arm for that comparison and not a default. Done when the group has a
-  supdb arm in it and the figures draw it.
-- [ ] **The threaded mixes in a row, or not.** `threads-A` and `threads-RMW`
+- [x] **An arm at FASTER's promise.** `faster` is in the roster with a
+  guarantee of its own, in memory until a checkpoint, and had nothing to
+  be compared with there: the buffered arms hand every commit to the
+  kernel and FASTER hands it to nobody. `supdb-heldnoframes` is the
+  matched arm, opened under the one policy of the engine's that promises
+  what FASTER does (`SyncPolicy::Explicit`): a commit is in the process
+  until a sync. It is an arm for that comparison and not a default. It
+  sits in FASTER's group in the roster, `supdb-heldpart` in the bounded
+  one, and the figures draw the group (`bench/DESIGN.md`, Arms).
+- [x] **The threaded mixes in a row, or not.** `threads-A` and `threads-RMW`
   are the workloads FASTER is picked for, gets and puts from several
-  threads at once, and they run only where `--passes mixes-threaded` asks:
-  a store's worth of operations a thread, on one thread and each thread
-  count, for every arm, is hours more a full row. Done when a row carries
-  them for the arms and at the operation count somebody chose, or the
-  suite says why it does not.
+  threads at once. A row in core carries them for the arms of FASTER's
+  guarantee, a store's worth of operations a thread, on one thread and
+  each thread count; for every arm that is hours more a full row, so the
+  rest run them only where `--passes mixes-threaded` asks
+  (`bench/DESIGN.md`).
 - [ ] **Match the checksum work, or state it.** RocksDB reads with
   `verify_checksums(false)`, under which it verifies no data block it
   reads, from the file or into its cache. supdb verifies a segment's key
