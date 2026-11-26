@@ -461,6 +461,13 @@ pub trait ThreadWriter {
     fn rmw(&mut self, _key: &[u8], _value: &[u8]) -> Option<Res<usize>> {
         None
     }
+    /// What this handle counted of its own operations, read on its thread
+    /// once its share is done and outside the clock: the threaded mixes'
+    /// `threadcounters` line (`SUPDB_THREADED_COUNTERS`). Nothing for an
+    /// engine that counts nothing a thread.
+    fn counters(&self) -> Vec<(&'static str, u64)> {
+        Vec::new()
+    }
 }
 
 /// Becomes a `ThreadWriter` on the thread that calls it; see
@@ -11689,6 +11696,17 @@ impl ThreadReader for supdb::Reader {
     }
 }
 
+/// A thread handle's own counts of how its point reads were answered
+/// (`Reader::point_lean_reads`, `point_placed_reads`).
+fn handle_counters(r: &supdb::Reader) -> Vec<(&'static str, u64)> {
+    let (lone, layers) = r.point_lean_reads();
+    vec![
+        ("lone", lone),
+        ("layers", layers),
+        ("placed", r.point_placed_reads()),
+    ]
+}
+
 /// A writer thread's supdb: a `Reader` of its own for the reads, and the
 /// store's one writer, shared with the other threads, for the batches.
 struct SupdbWriter<'a> {
@@ -11699,6 +11717,9 @@ struct SupdbWriter<'a> {
 impl ThreadWriter for SupdbWriter<'_> {
     fn get(&mut self, key: &[u8]) -> Res<usize> {
         supdb_get(&self.r, key)
+    }
+    fn counters(&self) -> Vec<(&'static str, u64)> {
+        handle_counters(&self.r)
     }
     fn update_batch(&mut self, items: &[(&[u8], &[u8])]) -> Res<()> {
         let mut db = self
@@ -11720,11 +11741,21 @@ impl ThreadWriter for SupdbWriter<'_> {
 struct SupdbSharedWriter<'a> {
     db: std::sync::Arc<std::sync::Mutex<&'a mut supdb::Db>>,
     r: supdb::Reader,
+    /// The tables this thread found full and froze (`freeze`).
+    freezes: std::cell::Cell<u64>,
 }
 
 impl ThreadWriter for SupdbSharedWriter<'_> {
     fn get(&mut self, key: &[u8]) -> Res<usize> {
         supdb_get(&self.r, key)
+    }
+    fn counters(&self) -> Vec<(&'static str, u64)> {
+        let mut c = handle_counters(&self.r);
+        c.push(("lean", self.r.shared_lean_ops()));
+        c.push(("rmw_below", self.r.shared_rmw_below()));
+        c.push(("fall_asks", self.r.shared_fall_asks()));
+        c.push(("freezes", self.freezes.get()));
+        c
     }
     fn update_batch(&mut self, items: &[(&[u8], &[u8])]) -> Res<()> {
         for (k, v) in items {
@@ -11757,6 +11788,7 @@ impl ThreadWriter for SupdbSharedWriter<'_> {
 impl SupdbSharedWriter<'_> {
     /// The commit that freezes the table this thread's write found full.
     fn freeze(&self) -> Res<()> {
+        self.freezes.set(self.freezes.get() + 1);
         self.db
             .lock()
             .map_err(|_| "a writer thread panicked holding the store".to_string())?
@@ -14164,7 +14196,11 @@ impl Engine for Supdb {
                 let db = db.clone();
                 Box::new(move || {
                     Ok(if shared {
-                        Box::new(SupdbSharedWriter { db, r }) as Box<dyn ThreadWriter + '_>
+                        Box::new(SupdbSharedWriter {
+                            db,
+                            r,
+                            freezes: std::cell::Cell::new(0),
+                        }) as Box<dyn ThreadWriter + '_>
                     } else {
                         Box::new(SupdbWriter { db, r }) as Box<dyn ThreadWriter + '_>
                     })

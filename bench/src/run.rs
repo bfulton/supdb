@@ -4884,6 +4884,13 @@ struct ThreadedMixed {
 /// Nothing syncs inside the window. A buffered arm's commit is in the
 /// kernel when it returns, and what an engine promises less than that is
 /// its arm's to say (`Features`).
+///
+/// With `SUPDB_THREADED_COUNTERS` set, each thread's handle's own counts
+/// (`ThreadWriter::counters`), read once its share is done, summed over
+/// the threads and printed as one `threadcounters` line a cell on stderr:
+/// how a supdb handle's reads were answered, and under the shared table
+/// the operations its own probe ended and the first touches it read
+/// below it, which say which regime a cell is in.
 #[allow(clippy::too_many_arguments)]
 fn threaded_mix(
     e: &mut dyn Engine,
@@ -4901,9 +4908,11 @@ fn threaded_mix(
         return Err("a threaded mix needs at least one thread".to_string());
     }
     let name = e.name();
+    let counting = std::env::var_os("SUPDB_THREADED_COUNTERS").is_some();
     let openers = e.thread_writers(threads)?;
     let barrier = std::sync::Barrier::new(threads + 1);
-    type Timed = Result<(Instant, Instant, u64, u64), String>;
+    type Counts = Vec<(&'static str, u64)>;
+    type Timed = Result<(Instant, Instant, u64, u64, Counts), String>;
     let results: Vec<Timed> = std::thread::scope(|s| {
         let workers: Vec<_> = openers
             .into_iter()
@@ -4955,7 +4964,8 @@ fn threaded_mix(
                     }
                     wbuf.flush_updates_to(w.as_mut())?;
                     let end = Instant::now();
-                    Ok((start, end, reads, bytes))
+                    let counts = if counting { w.counters() } else { Vec::new() };
+                    Ok((start, end, reads, bytes, counts))
                 })
             })
             .collect();
@@ -4973,8 +4983,16 @@ fn threaded_mix(
     let (mut reads, mut bytes) = (0u64, 0u64);
     let mut first: Option<Instant> = None;
     let mut last: Option<Instant> = None;
+    // Summed over the threads.
+    let mut counts: Vec<(&'static str, u64)> = Vec::new();
     for r in results {
-        let (start, end, n, b) = r?;
+        let (start, end, n, b, c) = r?;
+        for (k, v) in c {
+            match counts.iter_mut().find(|(n, _)| *n == k) {
+                Some((_, t)) => *t += v,
+                None => counts.push((k, v)),
+            }
+        }
         reads += n;
         bytes += b;
         first = Some(first.map_or(start, |f| f.min(start)));
@@ -4984,6 +5002,13 @@ fn threaded_mix(
         (Some(f), Some(l)) => l.duration_since(f).as_secs_f64(),
         _ => 0.0,
     };
+    if counting {
+        let mut line = format!("threadcounters {name} {pass} threads={threads} ops={ops}");
+        for (k, v) in &counts {
+            line.push_str(&format!(" {k}={v}"));
+        }
+        eprintln!("{line}");
+    }
     Ok(ThreadedMixed { secs, reads, bytes })
 }
 

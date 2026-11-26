@@ -5113,8 +5113,8 @@ pub struct Options {
     /// read found.
     pub shared_fall_always: bool,
     /// Under `shared_lean`, a handle's read-modify-write of a key the live
-    /// table has no record of -- a key's first touch, which the uniform
-    /// mix's are nearly all -- reads the key below the table in the pin
+    /// table has no record of -- a key's first touch -- reads the key
+    /// below the table in the pin
     /// and the state its lean probe was made in, and asks for the key's
     /// partition slot ahead of that probe where the handle's last read
     /// fell below the table (`shared_fall_ahead`), then puts. It probed

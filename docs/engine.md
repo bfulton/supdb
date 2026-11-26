@@ -1531,8 +1531,8 @@ ten-rep pairing and level, 0.95-1.08, in the next two, so it stays an arm.
 And the A cell at two threads, the weakest, read 0.87 in one pairing and
 0.97 in the other.
 
-A read-modify-write of a key the table lacks, which the uniform mix's are
-nearly all, probed the table three times before it read below it -- in the
+A read-modify-write of a key the table lacks probed the table three times
+before it read below it -- in the
 lean probe, in the layered read-modify-write (`MemTable::rmw_shared`) and
 in the read -- and twice more in the put after it, its lean probe and its
 insert, and asked for the partition only after the table's miss. It reads
@@ -1554,6 +1554,44 @@ without it in five of six while the A cells, which make none, lean to 1.11,
 so the count is its verdict; and against FASTER the same day every cell was
 ours a third time, A 0.85, 0.91 and 0.91, the uniform read-modify-write
 0.82, 0.71 and 0.69.
+
+The read-modify-write cells are not first touches, though this section
+said the uniform one's were nearly all, from the probe's store. The
+threaded mixes run in their table's order on one store, and the big table
+is sized to hold the whole store, so it never freezes there: by the first
+read-modify-write cell the two A mixes before it have written nearly every
+key into it. Counted per cell (`SUPDB_THREADED_COUNTERS=1 bench ab --arms
+supdb-heldsharedbig,faster --size 300000 --passes load,mixes-threaded
+--reps 1`, the `threadcounters` lines, at the commit of this paragraph),
+the uniform read-modify-write's first touches are 3,417 of 300,000
+operations on one thread, 1,199 of 600,000 on two and 414 of 900,000 on
+three, the Zipfian one's 11,599, 6,417 and 3,660, and no table froze. The
+cell a first touch weighs on is the first one: A on one thread, whose gets
+fell below the table 83,163 times of about 150,000. So the read-modify-
+write cells are second touches all but a few in a hundred, the operation
+ours wins, and the pairing's lean of a tenth there could not have been the
+option's, which acts on a hundredth of their operations; and the first
+touch FASTER still wins is priced in the cells by A on one thread alone.
+
+The series' arm of FASTER's guarantee is `supdb-heldnoframes`, the held
+log with the one writer's table, and the shared arm is in no roster.
+Paired over every pass a row runs and the threaded mixes (`pair.sh
+supdb-heldsharedbig supdb-heldnoframes SIZE --passes
+load,read,read-threaded,scan,scan-threaded,mixes,scan-mixed,mixes-scrambled,lag,recover,mixes-threaded
+--reps 4` at ten, a hundred and three hundred thousand keys, at the commit
+of this paragraph), the shared arm's rate over the other's in both orders
+is 1.2x to 10x on the threaded mixes but for A on one thread, 0.77-0.99,
+and 2.3x to 3.9x on the lag sweep's bursts of ten and a hundred percent;
+and it is 0.47-0.72 on the ordered load, 0.15-0.18 on ycsb-E and 0.24-0.43
+on the scrambled E, 0.39-0.61 on the threaded scans after the mixes,
+0.07-0.10 on the pass after the full rewrite and 0.27-0.40 after the
+ten-percent burst, and its ordered load's recovery loses every batch where
+the other loses none. Neither arm is the faster. The shared arm's losses
+are what its option turns off: the ordered ingest, which is the load and
+its recovery, and the block cache with its upkeep thread, which is every
+scan after writes. Its wins are the handles' writes, which only the
+threaded mixes make, and the bursts' commits, which file nothing into a
+cache.
 
 #### Beside FASTER out of core
 
