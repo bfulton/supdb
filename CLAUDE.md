@@ -7364,6 +7364,29 @@ alone: the test that would kill it reaches its state by holds that the
 load stretched, so a mutant's verdict is taken with nothing else on the
 machine and a survivor is run again by itself before it is read.
 
+A sixth was found after the change had been written up, by the question
+of whether it was ready to be proposed. Its pairings ran the load, the
+read pass, the mixes and the lag sweep, and the write-up said the mixes
+were not reached at all: far from a scan nothing is filed. A store is
+near reads only once it has been scanned (`reads_around`), a row runs its
+scan passes before its mixes, and in that order the settle placed
+seventeen thousand patches a pass through the mixes at a hundred thousand
+keys. So a sentence true of the pairing's order had been written of the
+row's, and the latest row's mixes beside FASTER, lower than the two rows
+before at one rung, had nothing to be read against. Paired in the row's
+order the mixes read level (`docs/engine.md`, what filing a write costs),
+and the pairing had its own lesson twice: five reps an order read two
+mixes at 0.8 in nineteen pairs of twenty, one of them a mix that runs
+before any write, and fifteen read four scrambled mixes at 0.76 to 0.91
+in both orders, and neither came back at thirty beside the arm paired
+with itself. The rule this file already has is that a pairing runs the
+row's whole order; its corollary is that a statement that a cell is not
+reached names the gate that keeps it out and is made of the order the
+gate was read in, since the gate here was open in the one order that
+matters. And a pairing whose sittings take seconds is run at thirty reps
+before it is read at five, with the cell the option cannot reach read
+first.
+
 ## Standing limitations
 
 These are the engine's, as opposed to refuted predictions. Each is a curve

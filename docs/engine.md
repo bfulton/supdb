@@ -1984,14 +1984,41 @@ supdb-ingest 300000 --passes load,read,mixes --reps 15`) read its mixes
 one, and the sweep's weighted time 0.82, 0.85 (`pair.sh supdb-ingest
 supdb-ingestsettlefat 3000000 --passes load,lag --reps 3`), beside a
 clean-store pass, which no settle precedes, at 1.28, 1.34: the count is
-the verdict for that arm and the rates are not. The mixes are not
-reached at all: their write mixes file nothing far from a scan, and E
+the verdict for that arm and the rates are not. The mixes of those
+pairings are not reached at all: no scan comes before them in that pass
+order, a store nothing has scanned files nothing (`reads_around`), and E
 makes the same walks and builds under either (`SUPDB_MIX_COUNTERS=1
 SUPDB_MIX_KINDS=1 bench ab --arms supdb-ingest,supdb-ingestsettlefat
 --size 100000 --passes load,read,mixes --reps 7`: 18,139, 6,230 and 541
 walks by form in both, 21.4 ms against 21.5). Under a bound nothing
 resolved and nothing was killed (`pair.sh supdb supdb-settlenoconvert
 3000000 --bound 1073741824 --reps 3 --ops-div 10 --passes load,lag`).
+
+A row runs its scan passes before its mixes, so there the thread files
+the mixes' writes and the lean shapes are in them: by the pairing's own
+counts, seventeen thousand patches in place a pass at a hundred thousand
+keys and fifty to seventy thousand at three hundred thousand, one to five
+conversions, and the builds of the settle before to within two. Paired in
+that order, at `02bab06` (`pair.sh A B SIZE --passes
+load,read,read-threaded,scan,scan-threaded,mixes,scan-mixed,mixes-scrambled`:
+`supdb-heldnoframes supdb-heldsettlefat` at ten and a hundred thousand
+keys and `supdb-ingest supdb-ingestsettlefat` at a hundred and three
+hundred thousand with `--reps 30`, the held pair at three hundred
+thousand and `supdb supdb-settlefat` at a hundred thousand with `--reps
+20`, and that pair at three hundred thousand with `--reps 12`), no mix
+holds a direction. The twelve mixes read 0.95 to 1.05 for the held arm at
+a hundred thousand keys and 0.95 to 1.11 for the buffered arm at three
+hundred thousand, in both orders; the other pairings read them 0.79 to
+1.16, and where a cell there reads one way in both orders it does so
+beside C, which runs before any write, reading the same way -- the held
+pair at three hundred thousand keys has B, the scrambled D and E and C
+all at 0.90 to 0.96. An arm paired with itself in that order reads the
+mixes 0.85 to 1.15 (`pair.sh supdb-heldnoframes supdb-heldnoframes
+100000` and `pair.sh supdb-ingest supdb-ingest 300000`, the same passes,
+`--reps 30`). Shorter sittings had said otherwise and did not repeat:
+five reps an order read the held arm's B and C at 0.8 in nineteen pairs
+of twenty, and fifteen the buffered arm's scrambled A, B, C and F at 0.76
+to 0.91 in both orders.
 
 The trade stands, narrower. The thread does not file faster than it did:
 over a lent full rewrite at three hundred thousand keys its CPU reads 127
