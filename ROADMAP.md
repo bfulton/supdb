@@ -208,6 +208,39 @@ What an engine picker would hit, roughly in order.
   `5df99d6`, is unresolved by it now and sits level with LMDB's without
   sync in the rows. What the filing costs a burst of one commit is not
   decomposed.
+- [ ] **The forms shared between the writer's scans and its upkeep
+  thread.** The writer's block tables and scan snapshot are lent whole to
+  one thread at a time (`CLAUDE.md`, the writer's upkeep is lent, never
+  shared), and a scan through the writer takes them home: it waits out the
+  thread's pass in flight and files everything the thread trails by before
+  it walks its first block. Filing a write into its block's form costs
+  several times the write on whichever thread pays (`docs/engine.md`, what
+  filing a write costs), so one thread files at about half the writer's
+  rate, and a store has a burst at the writer's rate or the scan pass after
+  it at the filed store's, not both. The engine picks by policy today: a
+  buffered commit files its burst itself, a syncing one lends it under a
+  pace, and only the held log lends it outright
+  (`Options::held_bursts_lend`). There the bursts run 1.7x to 3.4x of the
+  filed store's and the scan pass straight after a full rewrite at 0.15x
+  to 0.35x of it, the first scan's wait and settle 64 ms of a pass of 74
+  at three hundred thousand keys (`bench/scripts/pair.sh
+  supdb-heldnoframes supdb-heldfiles 300000 --passes
+  load,read,mixes,mixes-scrambled,lag --reps 5` at `3f4f23f`). What is
+  left in the filing itself is a flat tail, none of it the factor. The
+  lever is the scan: going on without the whole trail filed, settling the
+  blocks it walks as it reaches them, from the batch sorted once, while
+  the thread files the rest beside it. Done when the pass after a lent
+  burst reads level with the pass behind a filed one in both orders of
+  that pairing with the bursts still at the lent rate; the buffered
+  commit's own filing and the syncing commit's pace, which both exist to
+  bound what the first scan meets, are each priced against lending beside
+  it; the shape before is an arm; and the reader-thread tests and the
+  differential fuzz hold it at every upkeep level. Open for the design:
+  what the two threads share and in what unit it changes hands, a block
+  or a partition's table, where one word hands the whole of it over today
+  and nothing in it is `Sync`; what a scan must have filed before it may
+  walk a block, the keys created since its snapshot among it; and what a
+  pass may publish to reader handles while the writer is walking.
 - [x] **Order ordered ingest's runs across a machine's crash.** Under a
   policy that does not sync at every commit (`SyncPolicy::EveryN`), a
   machine's crash could keep a later run, or frames in the log, and take
