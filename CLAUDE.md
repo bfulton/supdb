@@ -2439,7 +2439,27 @@ ever: under the gate's load once, every run with a sleep of 50 ms ahead
 of the put. The flush waits for the hold now, and its sibling, which
 slept 50 ms on the reading that a held write would be inside its hold by
 then, waits for the count of writes the hold has taken
-(`Db::shared_writes_held`). The
+(`Db::shared_writes_held`). And as frames: the test that a held log
+drops the frames a durable seal covers sealed its first table, committed
+a second batch and read what the log held then as both tables' frames,
+on the bet that the seal would not be durable before that commit. A seal
+that was had its frames dropped by the commit, the count read one
+table's, and the assertion after it compared against nothing held: once
+under the gate's load, none of fifty-five runs alone or as the whole
+binary, and every run with sixty milliseconds slept after the seal. It
+holds the seal short of durable across the batch now
+(`hold_seal_durable`) and asserts what it had assumed. And as a race to
+be met in ten tries: the suite's prototype table's test wants two writers
+racing to make one key's entry, a window of tens of nanoseconds, and made
+its store again until one had raced, ten at most. One store holds no
+race in half the runs on four idle cores and in every run on one, each
+writer through its first round inside a slice of its own, so ten in a
+row came up empty once under the gate's load. The first inserts yield
+their core inside the window now, by a count the test sets
+(`proto::tests::WIDE_INSERTS`), and the first store races on one CPU as
+on four. The base rate was first read off a stale binary of another
+build layout, none of a hundred and thirty runs failing where the
+current one fails half its single stores. The
 rule: a test that
 needs a state holds it, and a bet on timing loses the first time the
 thing it bets against gets faster; a state the test needs only to have
@@ -7210,6 +7230,53 @@ place is where the caller says what is coming -- a claim, an open --
 and never the first operation after; and a fault's price on huge pages
 is five hundred pages', so one of them in a cell of a few milliseconds
 is the cell.
+
+**A gain put on the path an arm wrote through, that was the worker the
+path stood down.** The arm whose own updates go through a handle on the
+shared table (`supdb-heldhandle`) read the lag sweep's bursts at 1.45x to
+1.75x of FASTER's where the roster's arm read 0.3x to 0.6x, the docs put
+the difference on the batch a commit publishes, and the next thing to
+build was a store that takes the shared form for its own writer's writes
+and leaves it for its scans. A shared table stands the block cache and
+the upkeep thread down, so the arm differed from the roster's in two
+things, and the one nobody had priced was the second. It was priced by
+accident: the arm built for the plan's other half, the handle given up
+and the table sealed at the first scan (`supdb-heldhandleleaves`, at
+`ccf6455`), printed the lag counters, and they put the roster's full
+rewrite at a hundred thousand keys at 107 ms of wall, 34 of the writer's
+CPU and 73 of holds, beside the handle arm's 35. The arm with the block
+cache off (`supdb-heldnfnocache`), in the tree for weeks, read the bursts
+at 1.05x to 2.58x of FASTER's with the one writer's table and no handle,
+and the handle arm beside it level but for F (`bench/scripts/pair.sh
+supdb-heldnfnocache faster SIZE --passes
+load,read,mixes,mixes-scrambled,lag --reps 5`, and `supdb-heldhandle
+supdb-heldnfnocache`, at `ccf6455`, a hundred and three hundred thousand
+keys). The writer's CPU over a burst is the same in every form the live
+table takes and level with FASTER's. What the burst cells lost by was the
+commits' wait for the forms' filing, which costs two to three times the
+write on whichever thread pays, with no part of it to take out: over a
+full rewrite the upkeep thread is 46% settle, the patches themselves a
+tenth, 27% conversions and 15% the snapshot. And the hold had never been
+paired with what it had become. A paced batch held until the thread has
+filed it is the commit's own filing with a hand-over in front of it, and
+the inline fill the pace had replaced read the bursts 1.06x to 1.45x and
+the passes level or better from a hundred thousand keys to three million
+(`pair.sh supdb-ingestnopace supdb-ingest`, at `ccf6455`); the pace had
+beaten the inline fill while it lent, and the hold added to win a pass
+back took that away unpriced. The leave was refuted on its own cell: its
+seal landed inside no pass after a burst, so the scans merged their
+sources as if the store had never left, 0.09x to 0.11x of the roster's
+after a full rewrite, with E 0.74x to 0.88x for the leave it holds
+(`pair.sh supdb-heldhandleleaves supdb-heldnoframes`, at `ccf6455`). The
+rules: an arm that differs from its base in a path and in what the path
+stands down prices neither, so the arm that removes only the thing stood
+down is paired before the gain is given a cause, and here it was in the
+tree; a burst's wall is read beside the writer's CPU and its holds, which
+the lag counters print, before its rate is put on the write path; a
+mechanism added on top of another is paired against the shape it has
+turned back into, not only against the shape it was added to; and a move
+between forms is priced on the pass it lands in, by whether its work is
+done inside that pass.
 
 ## Standing limitations
 

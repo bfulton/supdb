@@ -446,6 +446,16 @@ struct Cfg {
     /// Such a seed makes a fifth of its writes puts of eight-byte values,
     /// out of the appends' share.
     in_place: bool,
+    /// Every batch a burst's (`Options::upkeep_inline_min` at one), so a
+    /// store of a few hundred keys reaches the rules a burst is handed by:
+    /// filed by its commit, or under the held log lent and never waited
+    /// for (`Options::held_bursts_lend`). In a quarter of the seeds under
+    /// `ZFUZZ_OPTVARY`, the side generator's draw after the overwrite's.
+    bursts_all: bool,
+    /// A held log's bursts filed by their commits
+    /// (`Options::held_bursts_lend` off): in a quarter of the seeds under
+    /// `ZFUZZ_OPTVARY`, the side generator's next draw.
+    held_files: bool,
     /// Under `ZFUZZ_STRIDE`, the stride form's steer; `None` without it.
     stride: Option<StrideSteer>,
 }
@@ -747,6 +757,7 @@ fn pick_cfg(rng: &mut Rng, want_cache: bool) -> Cfg {
     let live_first = side.chance(25);
     let mem_fnv = side.chance(25);
     let in_place = side.chance(25);
+    let (bursts_all, held_files) = (side.chance(25), side.chance(25));
     // A generator of its own, as `side` is, so that the switch moves none
     // of the draws below.
     let stride =
@@ -821,6 +832,8 @@ fn pick_cfg(rng: &mut Rng, want_cache: bool) -> Cfg {
         live_first: vary && live_first,
         mem_fold: !(vary && mem_fnv),
         in_place: vary && explicit_on && in_place,
+        bursts_all: vary && bursts_all,
+        held_files: vary && held_files,
         stride,
     }
 }
@@ -994,6 +1007,10 @@ fn opts_z(c: &Cfg) -> Options {
         o.scan_cache_bytes = 32 << 10;
         o.forms_to_fit = true;
     }
+    if c.bursts_all {
+        o.upkeep_inline_min = 1;
+    }
+    o.held_bursts_lend = !c.held_files;
     // Last, over whatever the flags set: the overwrite and what it needs.
     if c.in_place {
         o.put_in_place = true;

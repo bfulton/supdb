@@ -4302,10 +4302,18 @@ pub struct Options {
     /// that has to be woken and whose pass the first scan then waits
     /// out. A paced batch is held for its filing by default
     /// (`upkeep_pace_holds`), the trail the share allows read as the first
-    /// scan's to pay, so the share now draws which batches the thread
-    /// files while the commit waits and which the commit files itself.
-    /// Zero files every such batch in the commit, the shape before:
-    /// `supdb-ingestnopace` (`docs/engine.md`).
+    /// scan's to pay, so the share draws which batches the thread files
+    /// while the commit waits and which the commit files itself.
+    /// Zero, the default, files every such batch in the commit. A batch
+    /// held for its filing is the commit's own filing with a hand-over to
+    /// another core in front of it and the batch's lines read from that
+    /// core: the writer waits for all of it and nothing runs beside it.
+    /// Paired against the share at a hundredth with the hold, the inline
+    /// fill read the bursts faster and the passes after them level or
+    /// faster at every rung from a hundred thousand keys to three
+    /// million, in both orders (`docs/engine.md`, what a burst costs
+    /// under the held log). `supdb-ingestpaced` is the share at a
+    /// hundredth, held, and `supdb-ingestpacelends` it with the trail.
     pub upkeep_pace_pct: usize,
     /// A buffered commit's batch that `upkeep_pace_pct` paces is held
     /// until the thread has filed it (`Hand::Pace(0)`), where the share
@@ -4325,10 +4333,30 @@ pub struct Options {
     /// thread still files, so the forms stand built where the inline fill
     /// (`upkeep_pace_pct` at zero) leaves them to the scans. A syncing
     /// commit's pace is its own (`upkeep_pace_syncs_bp`). Off is the batch
-    /// lent within the share, the shape before; `supdb-ingestpacelends` is
-    /// the arm.
+    /// lent within the share; `supdb-ingestpacelends` is the arm. Nothing
+    /// is paced at the default share of zero, so the option acts only
+    /// where `upkeep_pace_pct` is set.
     #[doc(hidden)]
     pub upkeep_pace_holds: bool,
+    /// Under the held log (`SyncPolicy::Explicit`), a burst's batches --
+    /// the commits `upkeep_inline_bursts` would file themselves -- are
+    /// lent to the upkeep thread and never filed by the commit or waited
+    /// for: the writer runs at its own rate, the thread files behind it
+    /// in passes as long as its trail, and what it has not filed when a
+    /// scan comes is that scan's to wait out and settle. Filing a write
+    /// into its block's form costs two to three times what the write
+    /// does, on whichever thread pays, so a burst filed as it goes runs
+    /// at a third to a fifth of the writer's rate; a store whose log is
+    /// held has been told that its writes come first, and its bursts are
+    /// what a store with no scans at all is measured by. The scans
+    /// straight after a burst pay for it: the pass after a full rewrite
+    /// runs at a tenth to a third of its rate behind a burst that was
+    /// filed, and the burst and twice that pass together still take less
+    /// time (`docs/engine.md`, what a burst costs under the held log). A
+    /// batch too small to wake the thread for is handed as under every
+    /// policy. Off: a burst under the held log filed by its commits, as
+    /// under any other; `supdb-heldfiles` is the arm.
+    pub held_bursts_lend: bool,
     /// A syncing commit's batch of a burst lent and paced as
     /// `upkeep_pace_pct` paces a buffered one, within this share of the
     /// store's keys in basis points, while the store is in core: the
@@ -7832,8 +7860,9 @@ impl Default for Options {
             upkeep_alert_poll_us: 200,
             upkeep_inline_bursts: true,
             upkeep_inline_min: UPKEEP_WAKE_WRITES,
-            upkeep_pace_pct: 1,
+            upkeep_pace_pct: 0,
             upkeep_pace_holds: true,
+            held_bursts_lend: true,
             upkeep_pace_syncs_bp: 25,
             upkeep_pace_syncs_to_share: true,
             upkeep_pace_syncs_model: true,
@@ -48538,8 +48567,14 @@ impl Db {
         // The share of the store's keys a paced batch is within and the
         // thread may trail by (`Options::upkeep_pace_pct`).
         let mut share = (keys as u64).saturating_mul(self.opts.upkeep_pace_pct as u64) / 100;
+        // Under the held log a burst's batch is lent and never filed here
+        // or waited for (`Options::held_bursts_lend`).
+        let burst_lent = self.opts.held_bursts_lend
+            && matches!(self.opts.sync, SyncPolicy::Explicit)
+            && batch >= self.opts.upkeep_inline_min;
         if level == 1
             && self.opts.upkeep_inline_bursts
+            && !burst_lent
             && !syncs
             && reads_around
             && batch >= self.opts.upkeep_inline_min
@@ -48588,6 +48623,7 @@ impl Db {
         if level == 1
             && self.opts.upkeep_inline_bursts
             && self.opts.upkeep_settle_after_scans
+            && !burst_lent
             && !syncs
             && reads_around
             && self.upkeep_since_scan == 0

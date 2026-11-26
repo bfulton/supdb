@@ -359,6 +359,21 @@ makes the arm's own updates a write at a time through such a handle, with
 no batch behind a commit, which is the one isolation level FASTER has, and
 never leaves the shared table. All four are for pricing.
 
+A burst of its own writer's -- the lag sweep's -- is lent to the upkeep
+thread and never filed by a commit or waited for
+(`Options::held_bursts_lend`, the engine's under this log), so the burst
+cells are the writer's rate, as FASTER's are of a store that files nothing
+and scans nothing, and the scan pass straight after a burst is the one
+that pays for the block forms the burst did not file. That pass has no
+cell in `faster` to stand beside, and reads against the arm's own rows.
+`supdb-heldfiles` files a burst's batches in their commits, as the engine
+does under every other policy; `supdb-heldpaced` lends the batches after a
+burst's first and holds each commit until the thread has filed its batch,
+which was the engine's shape, and `supdb-heldpacelends` lets the thread
+trail by a hundredth of the store; `supdb-heldnfnocache`, with no block
+cache, files nothing at all. For pricing, as `supdb-ingestpaced` and
+`supdb-ingestpacelends` are of the buffered arm.
+
 The two differ on the ordered scan and the reopen, which `faster` has not
 got and has no setting for. The check that holds a guarantee's arms to one
 set of features (`engines::check_matched`, where a run starts) refuses
