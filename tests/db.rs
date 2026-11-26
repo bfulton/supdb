@@ -22380,6 +22380,282 @@ fn a_second_open_of_a_store_is_refused_until_the_first_is_gone() {
     let _ = std::fs::remove_dir_all(&d);
 }
 
+/// The directory read twice a third of a second apart, and held to be the
+/// same both times: what a crashed store's directory is from the moment
+/// the crash returns.
+fn stands_still(d: &std::path::Path, what: &str) -> BTreeMap<String, Vec<u8>> {
+    let lens = |m: &BTreeMap<String, Vec<u8>>| -> Vec<(String, usize)> {
+        m.iter().map(|(n, b)| (n.clone(), b.len())).collect()
+    };
+    let a = the_directory(d);
+    std::thread::sleep(std::time::Duration::from_millis(300));
+    let b = the_directory(d);
+    assert_eq!(
+        lens(&a),
+        lens(&b),
+        "{what}: the directory moved after the crash returned"
+    );
+    assert!(
+        a == b,
+        "{what}: a file's bytes changed after the crash returned"
+    );
+    a
+}
+
+/// The segment files among a directory's names.
+fn sup_count(m: &BTreeMap<String, Vec<u8>>) -> usize {
+    m.keys().filter(|n| n.ends_with(".sup")).count()
+}
+
+/// The options of the crash tests below: seals and merges where the test
+/// asks for them, the keys through the memtable, and a first partitioning
+/// at the second piece.
+fn crash_opts() -> Options {
+    Options {
+        seal_bytes: 64 << 20,
+        partition_bytes: Some(64 << 10),
+        l0_trigger: 2,
+        merge_parallel: 1,
+        merge_parallel_quiet: 0,
+        promote: false,
+        merge_chains: false,
+        direct_ingest: false,
+        ..common::options()
+    }
+}
+
+/// Every key of `n` put once, scrambled, and committed.
+fn crash_batch(db: &mut Db, n: u32, tag: &str) {
+    for i in 0..n {
+        db.put(
+            format!("key-{:05}", (i * 7919) % n).as_bytes(),
+            format!("{tag:-<64}").as_bytes(),
+        );
+    }
+    db.commit().unwrap();
+}
+
+/// A crashed store opened again reads every key's last put.
+fn crash_reopens(d: &std::path::Path, n: u32, tag: &str) {
+    let db = Db::open(d, crash_opts()).unwrap();
+    let want = format!("{tag:-<64}").into_bytes();
+    for i in (0..n).step_by(37) {
+        let k = format!("key-{i:05}");
+        let mut got = Vec::new();
+        db.read_all(k.as_bytes(), vf(&mut |v: &[u8]| got.push(v.to_vec())))
+            .unwrap();
+        assert_eq!(got, vec![want.clone()], "{k} after the reopen");
+    }
+    db.close().unwrap();
+    let _ = std::fs::remove_dir_all(d);
+}
+
+/// The tests' crash leaves nothing of the store moving in its directory
+/// (`Db::crash`). It left every thread running: the segment work's went on
+/// landing and retiring, and a seal or a merge in flight wrote its files
+/// under whoever opened the store next. A seal let go as the crash is
+/// called has run to its end when the crash returns -- its piece on disk,
+/// named by no manifest the crash waited for -- and the directory then
+/// stands as it is; a seal held stays held, its piece never written.
+#[test]
+fn a_seal_in_flight_at_a_crash_is_through_before_the_crash_returns() {
+    let n = 3000u32;
+    for held in [false, true] {
+        let d = dir(if held {
+            "crash-seal-held"
+        } else {
+            "crash-seal"
+        });
+        let mut db = Db::create(&d, crash_opts()).unwrap();
+        crash_batch(&mut db, n, "a");
+        let before = sup_count(&the_directory(&d));
+        db.hold_seal_landing(true);
+        db.seal().unwrap();
+        if !held {
+            db.hold_seal_landing(false);
+        }
+        db.crash();
+        let left = stands_still(&d, "a seal in flight");
+        assert_eq!(
+            sup_count(&left) > before,
+            !held,
+            "held {held}: the seal's piece, {:?}",
+            left.keys().collect::<Vec<_>>()
+        );
+        crash_reopens(&d, n, "a");
+    }
+}
+
+/// And a merge: one held before it reads anything is in flight for as long
+/// as the test says, and let go as the crash is called it has written its
+/// outputs when the crash returns, with nobody to land them, whether or
+/// not a hold stands before its landing, and whether or not the planner
+/// is waiting to join it there (`Db::plan_joins_merge`); held at its
+/// start, it writes none, and the crash does not wait for it.
+#[test]
+fn a_merge_in_flight_at_a_crash_is_through_before_the_crash_returns() {
+    let n = 3000u32;
+    for (name, held, landing, joined) in [
+        ("crash-merge", false, false, false),
+        ("crash-merge-held", true, false, false),
+        ("crash-merge-landing", false, true, false),
+        ("crash-merge-joined", false, true, true),
+    ] {
+        let d = dir(name);
+        let mut db = Db::create(&d, crash_opts()).unwrap();
+        db.hold_merge_start(true);
+        db.hold_merge_landing(landing);
+        for tag in ["a", "b"] {
+            crash_batch(&mut db, n, tag);
+            db.seal().unwrap();
+        }
+        wait_for("the first partitioning, held at its start", || {
+            db.merges_in_flight() == 1
+        });
+        // The pieces durable, so that the segments written after this
+        // are the merge's alone.
+        wait_for("the seals durable", || !db.in_flight().0);
+        let before = sup_count(&the_directory(&d));
+        if !held {
+            db.hold_merge_start(false);
+        }
+        // A third piece, whose landing plans a merge beside the one held
+        // at its landing and waits to join it first.
+        if joined {
+            crash_batch(&mut db, n, "c");
+            db.plan_joins_merge(true);
+            db.seal().unwrap();
+            wait_for("the planner's join", || db.merge_plan_joining());
+        }
+        db.crash();
+        let left = stands_still(&d, name);
+        assert_eq!(
+            sup_count(&left) > before,
+            !held,
+            "{name}: the merge's outputs, {:?}",
+            left.keys().collect::<Vec<_>>()
+        );
+        crash_reopens(&d, n, if joined { "c" } else { "b" });
+    }
+}
+
+/// And the two threads that wait under a hold of their own: the segment
+/// work's, held between a landing's state and its swap, and the upkeep
+/// thread, held before its pass. A crash that finds either parked leaves
+/// it parked for good and returns, the landing never published and the
+/// pass never run, and the store opens again on what its log holds.
+#[test]
+fn a_thread_parked_under_a_hold_at_a_crash_stays_parked() {
+    let n = 3000u32;
+    // The landing's swap.
+    let d = dir("crash-swap-held");
+    let mut db = Db::create(&d, crash_opts()).unwrap();
+    crash_batch(&mut db, n, "a");
+    db.hold_landing_swap(true);
+    db.seal().unwrap();
+    wait_for("the landing at its swap", || db.landing_holding());
+    db.crash();
+    stands_still(&d, "a landing held at its swap");
+    crash_reopens(&d, n, "a");
+    // The upkeep thread's pass: a scan first, so that a commit's batch is
+    // one the thread is lent.
+    let d = dir("crash-upkeep-held");
+    let mut db = Db::create(
+        &d,
+        Options {
+            upkeep: supdb::Upkeep::Background(1),
+            ..crash_opts()
+        },
+    )
+    .unwrap();
+    crash_batch(&mut db, n, "a");
+    db.flush().unwrap();
+    db.settle().unwrap();
+    let mut seen = 0;
+    db.scan(b"", 100, kv(&mut |_, _| seen += 1)).unwrap();
+    assert!(seen > 0);
+    db.hold_upkeep_pass(true);
+    crash_batch(&mut db, n, "b");
+    wait_for("the upkeep thread at its hold", || db.upkeep_holding());
+    db.crash();
+    stands_still(&d, "an upkeep pass held");
+    crash_reopens(&d, n, "b");
+}
+
+/// The upkeep thread reads the store's files through their mappings, and a
+/// test may cut one back the moment its crash returns: a pass let go as
+/// the crash is called has ended when the crash returns, and none ends
+/// after. The segment work is the writer's own here, so that the pass is
+/// all the crash has to wait for, and the passes are read through a handle,
+/// which a crashed store still answers.
+#[test]
+fn an_upkeep_pass_in_flight_at_a_crash_is_through_before_the_crash_returns() {
+    let n = 3000u32;
+    let d = dir("crash-upkeep");
+    let opts = || Options {
+        upkeep: supdb::Upkeep::Background(1),
+        publish_in_background: false,
+        ..crash_opts()
+    };
+    let mut db = Db::create(&d, opts()).unwrap();
+    crash_batch(&mut db, n, "a");
+    db.flush().unwrap();
+    db.settle().unwrap();
+    let mut seen = 0;
+    db.scan(b"", 100, kv(&mut |_, _| seen += 1)).unwrap();
+    assert!(seen > 0);
+    let r = db.reader().unwrap();
+    db.hold_upkeep_pass(true);
+    crash_batch(&mut db, n, "b");
+    wait_for("the upkeep thread at its hold", || db.upkeep_holding());
+    let before = r.upkeep_passes_ended();
+    db.hold_upkeep_pass(false);
+    db.crash();
+    let at = r.upkeep_passes_ended();
+    assert_eq!(
+        at,
+        before + 1,
+        "the pass let go at the crash, ended when the crash returned"
+    );
+    std::thread::sleep(std::time::Duration::from_millis(200));
+    assert_eq!(r.upkeep_passes_ended(), at, "a pass after the crash");
+    drop(r);
+    let db = Db::open(&d, opts()).unwrap();
+    assert_eq!(db.count(b"key-00037").unwrap(), 1);
+    db.close().unwrap();
+    let _ = std::fs::remove_dir_all(&d);
+}
+
+/// And the segment work's own thread, which a flush is answered ahead of:
+/// the slot's sync, the log's retirement and whatever it starts next were
+/// its to do after the crash had returned. A store crashed straight after
+/// its flush stands still.
+#[test]
+fn the_segment_work_ends_with_a_crash_straight_after_a_flush() {
+    let n = 3000u32;
+    for round in 0..8 {
+        let d = dir("crash-flush");
+        // The keeper's thread in half the rounds: it ends with the store
+        // as the upkeep's does, and a crash that waited for one that ran
+        // on would not return.
+        let mut db = Db::create(
+            &d,
+            Options {
+                snapshot_keeper: round % 2 == 1,
+                ..crash_opts()
+            },
+        )
+        .unwrap();
+        crash_batch(&mut db, n, "a");
+        db.flush().unwrap();
+        crash_batch(&mut db, n, "b");
+        db.flush().unwrap();
+        db.crash();
+        stands_still(&d, &format!("round {round}: a crash after a flush"));
+        crash_reopens(&d, n, "b");
+    }
+}
+
 /// The same refusal from another process: this test binary run again on
 /// this one test, with the store's path in `SUPDB_LOCK_PROBE`, opens the
 /// store and says through its exit code what it got. Refused while the
