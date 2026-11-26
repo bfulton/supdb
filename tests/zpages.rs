@@ -17863,6 +17863,79 @@ fn a_build_ahead_bought_while_in_flight_is_trusted_at_once_where_its_read_back_r
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// A build at a merge's output finish in flight at the tests' crash
+/// (`Db::crash`), as a build ahead is in the test of that name: held at
+/// its start it builds nothing, in a store the crash has ended, and let go
+/// as the crash is called its file is named when the crash returns. A
+/// store whose every partition's file was built ahead; its greatest keys
+/// put again, sealed and merged, the outputs' finishes held at their start.
+/// The form files named after the crash that were not there before it are
+/// the finishes': none where they stayed held, one a finish where they
+/// were let go, and the form files stand as they are either way.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_finish_in_flight_at_a_crash_is_through_or_held_when_the_crash_returns() {
+    for (name, held) in [("crash-finish", false), ("crash-finish-held", true)] {
+        let (dir, mut db, _model, inject, raw) = land_store_loaded(
+            name,
+            50,
+            |o| {
+                o.zpages_stride = ZStride::Forced;
+                o.zpages_build_at_finish = true;
+                o.partition_bytes = Some(160 << 10);
+                o.zpages_land_cold_past = false;
+                o.l0_trigger = 1;
+            },
+            |db| numbered_load(db, 20_000, 100, 0xF1B0),
+        );
+        inject.set_budget(raw * 3 / 2);
+        assert!(
+            tick_until_built(&db, |c| c.prebuilt >= c.partitions && !building(c)),
+            "{name}: built ahead: {:?}",
+            db.zpage_counts()
+        );
+        let c0 = db.zpage_counts();
+        db.hold_zpage_build(true);
+        let mut rng = Rng(0xF1B1);
+        for i in 20_000 - 200..20_000 {
+            let v: Vec<u8> = (0..100).map(|_| (rng.next() >> 24) as u8).collect();
+            db.put(&numbered_key(i), &v);
+        }
+        db.commit().unwrap();
+        db.seal().unwrap();
+        wait_for("the merge landed with its output's finish held", || {
+            let c = db.zpage_counts();
+            c.finish_starts > c0.finish_starts
+                && db.merges_in_flight() == 0
+                && db.zpage_build_waiting()
+        });
+        let started = (db.zpage_counts().finish_starts - c0.finish_starts) as usize;
+        let before = named_form_files(&dir);
+        if !held {
+            db.hold_zpage_build(false);
+        }
+        db.crash();
+        let left = form_files(&dir);
+        let new = named_form_files(&dir)
+            .iter()
+            .filter(|f| !before.contains(f))
+            .count();
+        // Every finish that had started, and those of the outputs that
+        // waited for a builder's place behind them.
+        assert!(
+            if held { new == 0 } else { new >= started },
+            "{name}: {new} files of {started} finishes held, {before:?} then {left:?}"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        assert_eq!(
+            form_files(&dir),
+            left,
+            "{name}: a form file or a temp name moved after the crash returned"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
 /// A promotion while a build at a merge's output finish is in flight: the
 /// output is opened again under a new name with its form file's fields
 /// kept, and the finish is in flight for the form file and not the name

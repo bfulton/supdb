@@ -29801,6 +29801,14 @@ impl Reader {
         (self.lone_reads.get(), self.layer_reads.get())
     }
 
+    /// A test's: the passes the store's upkeep thread has ended, read
+    /// through a handle so that it can be read of a store the tests'
+    /// crash has taken (`Db::crash`), whose `Db` is gone.
+    #[doc(hidden)]
+    pub fn upkeep_passes_ended(&self) -> u64 {
+        self.shared.upkeep.passes.load(AtomicOrdering::Relaxed)
+    }
+
     /// Of the layered reads `point_lean_reads` counts, the ones the read
     /// that places its sources first answered
     /// (`Options::point_layers_lean`, `Reader::read_placed`); the rest

@@ -22582,6 +22582,50 @@ fn a_thread_parked_under_a_hold_at_a_crash_stays_parked() {
     crash_reopens(&d, n, "b");
 }
 
+/// The upkeep thread reads the store's files through their mappings, and a
+/// test may cut one back the moment its crash returns: a pass let go as
+/// the crash is called has ended when the crash returns, and none ends
+/// after. The segment work is the writer's own here, so that the pass is
+/// all the crash has to wait for, and the passes are read through a handle,
+/// which a crashed store still answers.
+#[test]
+fn an_upkeep_pass_in_flight_at_a_crash_is_through_before_the_crash_returns() {
+    let n = 3000u32;
+    let d = dir("crash-upkeep");
+    let opts = || Options {
+        upkeep: supdb::Upkeep::Background(1),
+        publish_in_background: false,
+        ..crash_opts()
+    };
+    let mut db = Db::create(&d, opts()).unwrap();
+    crash_batch(&mut db, n, "a");
+    db.flush().unwrap();
+    db.settle().unwrap();
+    let mut seen = 0;
+    db.scan(b"", 100, kv(&mut |_, _| seen += 1)).unwrap();
+    assert!(seen > 0);
+    let r = db.reader().unwrap();
+    db.hold_upkeep_pass(true);
+    crash_batch(&mut db, n, "b");
+    wait_for("the upkeep thread at its hold", || db.upkeep_holding());
+    let before = r.upkeep_passes_ended();
+    db.hold_upkeep_pass(false);
+    db.crash();
+    let at = r.upkeep_passes_ended();
+    assert_eq!(
+        at,
+        before + 1,
+        "the pass let go at the crash, ended when the crash returned"
+    );
+    std::thread::sleep(std::time::Duration::from_millis(200));
+    assert_eq!(r.upkeep_passes_ended(), at, "a pass after the crash");
+    drop(r);
+    let db = Db::open(&d, opts()).unwrap();
+    assert_eq!(db.count(b"key-00037").unwrap(), 1);
+    db.close().unwrap();
+    let _ = std::fs::remove_dir_all(&d);
+}
+
 /// And the segment work's own thread, which a flush is answered ahead of:
 /// the slot's sync, the log's retirement and whatever it starts next were
 /// its to do after the crash had returned. A store crashed straight after
@@ -22591,7 +22635,17 @@ fn the_segment_work_ends_with_a_crash_straight_after_a_flush() {
     let n = 3000u32;
     for round in 0..8 {
         let d = dir("crash-flush");
-        let mut db = Db::create(&d, crash_opts()).unwrap();
+        // The keeper's thread in half the rounds: it ends with the store
+        // as the upkeep's does, and a crash that waited for one that ran
+        // on would not return.
+        let mut db = Db::create(
+            &d,
+            Options {
+                snapshot_keeper: round % 2 == 1,
+                ..crash_opts()
+            },
+        )
+        .unwrap();
         crash_batch(&mut db, n, "a");
         db.flush().unwrap();
         crash_batch(&mut db, n, "b");
