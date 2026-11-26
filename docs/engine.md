@@ -1597,6 +1597,148 @@ scan after writes. Its wins are the handles' writes, which only the
 threaded mixes make, and the bursts' commits, which file nothing into a
 cache.
 
+#### A live table that follows who writes it
+
+`Options::share_on_write` makes the two arms one store, and it is the
+engine's under the held log with no frames. A store opens with the one
+writer's table and what goes with it. A handle's write to that table is
+answered `false`, as a full shared table's is; the writer's next commit
+finds a handle that writes and installs a shared table, the live table
+frozen under it, an empty one replaced, a run of ordered ingest closed
+first (`Db::share_look`, `Db::share`). While a state holds a shared table,
+live or frozen, the store is read and written as the shared arm is: no
+block form is built, kept or published, nothing is lent to the upkeep
+thread, no table is kept for its look, no builder is started, and no run
+of ordered ingest takes the live table's place (`Reader::sharing`). Each of
+those was an option `shared_writers` refuses at the open, and each is a
+hazard of a table and not of a store: a form is a copy of a block's values
+kept current from the one writer's log, and a handle's write is in no log.
+So they are stood down by the state an operation holds. Every change of
+that state is a publish, which a handle meets as a new generation and
+drops its tables at, as at any; the writer's own go at its flip.
+
+A handle that will write is claimed as one (`Db::writer`): the claim
+commits what the writer has staged, and that commit, finding the handle,
+installs the table, so the handle's first write lands. A handle from
+`reader` still asks by its first write, which is refused, and is given the
+table at the writer's next commit: the install then falls inside that
+handle's first operation.
+
+The table installed is made whole before it is published
+(`Options::shared_populates`, `MemTable::populate_shared`;
+`supdb-heldnopopulate` leaves its memory to the writes that reach it):
+every block of its value arena up to its cap and the slab's blocks for the
+entries its index takes, populated for writing, with the index, which a
+table always had so. A table installed in the middle of a workload is
+memory nothing has touched, and its first writes zeroed it on their own
+path, two megabytes a fault where the arena is on huge pages. What a fault
+costs is the host's: this guest reports its free two-megabyte blocks to its
+host, a huge page faulted fresh is 0.2 ms where the guest still backs the
+block and 2 to 10 ms where it does not, and which it is turns on what the
+passes before freed and when. In a row's pass order the threaded mixes'
+first cell, A on one thread, spent 19 to 39 ms of its fifty in the kernel
+in most reps at a hundred thousand keys, every sample of it in
+`clear_page_erms` under a huge-page fault from `MemTable::write_shared` or
+from the index's `madvise`, and one fault of the kind was the whole of a
+cell at ten thousand keys. The pairings of two passes had not met it: the
+runner primes a pool of pages before each store, and the cell came within
+the two seconds the guest keeps a freed block. A range of over half an
+arena block is one allocation over blocks of its own, which a block made
+ahead is not, so such a value is laid past the blocks made ahead and ends
+the table's room (`ByteArena::made_ahead`). A table a freeze makes for the
+handles is not made ahead, its writers waiting on the commit that makes
+it.
+
+In the row's pass order (`SUPDB_THREADED_COUNTERS=1 bench run --scale
+quick --top SIZE --bottom SIZE --reps 5 --arms
+supdb-heldnoframes,supdb-heldnopopulate,faster --out DIR`, the
+`threadcounters` lines, at `2c0a1b1`), A on one thread, the table made
+whole beside the table left to its writes:
+
+| keys | faults | the thread's kernel time, ms |
+|---|---|---|
+| 300,000 | 569-576, 1,342-1,349 | 0-4, 24-78 |
+| 100,000 | 193-195, 579-581 | 0, 0-19 |
+| 10,000 | 16-17, 400-401 | 0, 0-2.7 |
+
+FASTER's thread takes none to three: its log and index were touched by its
+load. The faults left are the partition's mapped pages under the gets that
+fall below the table.
+
+Paired with the shape before over every pass a row runs and the threaded
+mixes (`pair.sh supdb-heldnoframes supdb-heldnoshare SIZE --passes
+load,read,read-threaded,scan,scan-threaded,mixes,scan-mixed,mixes-scrambled,lag,recover,mixes-threaded
+--reps 4` at ten, a hundred and three hundred thousand keys, at `2c0a1b1`),
+the threaded mixes at two and three threads read 1.4x to 9.5x in both
+orders at every rung, the read-modify-write mixes on one thread 2.3x to
+4.1x, A with uniform keys on one thread 1.07 to 1.62, and A on one thread
+0.92 and 1.02, 1.02 and 1.12, and 0.87 and 0.89 from the largest rung down:
+one thread through a handle is the shared table's path where the one
+writer's table would have served it, and the store cannot know a second
+thread is not coming. Of the cells no handle writes in, none held a
+direction across this pairing and the one at `c0791b7`.
+
+Beside FASTER in the same pass order (`pair.sh supdb-heldnoframes faster
+SIZE --passes` the same `--reps 5`, at `2c0a1b1`), our rate over FASTER's by
+the mean of the two orders, three hundred thousand keys, a hundred
+thousand and ten thousand:
+
+| | one thread | two | three |
+|---|---|---|---|
+| A | 1.08, 1.18, 1.27 | 1.09, 1.03, 1.25 | 1.00, 1.00, 1.07 |
+| A, uniform | 1.13, 0.99, 1.02 | 0.99, 1.08, 1.01 | 1.13, 1.13, 1.04 |
+| read-modify-write | 1.12, 1.14, 0.92 | 1.10, 1.14, 1.15 | 1.09, 1.12, 1.26 |
+| read-modify-write, uniform | 1.23, 1.22, 0.93 | 1.13, 1.29, 1.00 | 1.26, 1.18, 1.04 |
+
+No cell is FASTER's in both orders; ours took 91 pairs of 120 at each of
+the two larger rungs and 75 at the smallest, where a cell is a few
+milliseconds. What the guarantee's group still loses to FASTER is where
+the one writer's table serves: the single-threaded update mixes, F at
+0.50 to 0.77 at every rung in both orders, and the lag sweep's bursts at
+0.29 to 0.93.
+
+The way back is the writer's. A seal makes the next table, so a seal that
+finds no handle that writes makes the one writer's, at no cost of its own.
+A commit that finds none counts the writer's own writes into the table and
+the entries its own scans asked for, from the first commit to find none,
+and leaves the table once they come to its entries: frozen under the
+writer's table and sealed, or taken off the frozen list again where it
+held nothing (`Db::unshare`, `Db::unfreeze`). Leaving costs a seal of the
+table's entries and a merge of its piece, so the store has done about that
+much work in the form that suits its work less before it pays to leave, and
+handles that come and go cost a leave only after as much work without
+them. The store reads as it did once the shared tables have landed.
+
+Three things held because every write went through one thread, and a
+shared table's writes go through none of them. None showed in the arm that
+shares for a store's life:
+- **The sequence.** A seal ends at the store's sequence, which a logged
+  write moves, and the pieces are read in the order of the sequences their
+  names carry. Two tables sealed with no logged write between them carried
+  one, their pieces fell to the order of their names, and a reopened store
+  read the older piece's values over a newer put. A shared table takes a
+  number at its freeze, and counts as a commit no manifest covers, so a run
+  of ordered ingest begun after it starts past what the store can vouch
+  for and is not served without it after a crash.
+- **The greatest key.** A run of ordered ingest opens above the store's
+  greatest key, which the writer moves at each of its writes. A run opened
+  under keys handles had written made a piece open above over keys the
+  shared table's pieces held beside it, partitions promoted from them did
+  not tile, and a merge refused its own key. The greatest key is brought up
+  to the shared tables' keys before a run is judged against it
+  (`Db::refresh_max_key`).
+- **A frozen table that was still written.** The freeze published the table
+  and then waited out the handles that had taken it before. A scan inside
+  that wait sorted the table as it stood and left the order on it for the
+  seal and for every scan after, short of a write that landed later. A
+  table is closed to writes before it is published frozen, the writes in
+  flight waited out first, and a write that finds it closed is answered as
+  a full table's is (`Db::close_shared`).
+
+The differential fuzz found the first two once it wrote through handles
+(`ZFUZZ_SHARE=all`, six seeds of fourteen hundred over four configurations),
+and a test that held the freeze's wait open found the third.
+
 #### Beside FASTER out of core
 
 A store larger than memory is what FASTER's log is made for, and the
