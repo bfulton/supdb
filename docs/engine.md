@@ -7686,6 +7686,53 @@ summed (faster in every pair of both), the 10% point at 0.84x and 0.91x
 (4 and 5 of 6), the 0% point at 0.88x and 0.91x (4 of 6 each), the 100%
 point level, and nothing at 100k on one side.
 
+#### A settle's conversion leaves the fill its walk
+
+The fill converts a light form, one under the dense count, only on a walk
+of the tables, and a walk starts where a patch leaves the tables
+incomplete: a write into a block with no form, or a form left at the dense
+count. A settle that converts the form its batch grows dense
+(`Options::settle_converts`) leaves no such form, so in a store whose every
+block holds a form no walk started and the light forms stayed deltas. The
+settle marks the tables for the fill where it converts
+(`Options::settle_convert_fills`; `supdb-settleconvertquiet` and
+`supdb-ingestsettleconvertquiet` convert and leave no walk).
+
+At ten thousand keys, in the row's pass order (`P` is
+`load,read,read-threaded,scan,scan-threaded,mixes,scan-mixed,mixes-scrambled`;
+the first arm's rate over the second's, the sitting that lists it first
+and then the other):
+
+| scrambled E | |
+|---|---|
+| `supdb` over `supdb-settleconvertquiet`, 10k | 1.34, 1.35 (30 pairs of 32) |
+| `supdb-ingest` over `supdb-ingestsettleconvertquiet`, 10k | 1.11, 1.28 (26 of 32) |
+| `supdb` over `lmdb`, 10k | 1.32, 1.30 (24 of 24) |
+| `supdb-ingest` over `lmdb-nosync`, 10k | 1.10, 1.13 (21 of 24) |
+| `supdb` over `supdb-settleconvertquiet`, 30k | 1.13, 1.00 |
+| 100k | 1.06, 1.01 |
+| 300k | 0.94, 1.00 |
+
+(`pair.sh supdb-settleconvertquiet supdb 10000 --passes P --reps 16`, the
+buffered pair the same, `pair.sh supdb lmdb 10000 --passes P --reps 12`,
+and the rungs above with `--reps 12`, `16` and `8`, at `3b419ea9`.) By the counts of one
+rep an arm (`SUPDB_MIX_COUNTERS=1 SUPDB_MIX_CENSUS=1 bench ab --arms
+supdb-settleconvertquiet,supdb --size 10000 --passes P --reps 1`): after
+the scrambled F mix the writer's tables hold 156 copies and one sparse
+form with the walk left and 59 and 98 without it, the upkeep thread
+having built 185 and 186 forms in that mix against 10 and none, and the
+scrambled E walks
+2,803 copies and 22 sparse forms against 1,078 and 1,747. Timed by kind
+with the conversion and without it (`pair.sh SUPDB_MIX_KINDS=1
+supdb-settlenoconvert supdb 10000 --passes P --reps 16`, before the
+option), a scan of the scrambled E took 0.67 µs over the sparse forms and
+0.46 over the copies, with its commit and its first scan level. Nothing
+else resolves: the other mixes at every rung read within what the arm
+reads against itself (`pair.sh supdb supdb 100000 --passes P --reps 16`:
+0.94 to 1.12), and the lag sweep at a hundred thousand keys is level under
+both policies (`pair.sh supdb-settleconvertquiet supdb 100000 --passes
+load,lag --reps 8`).
+
 #### The frozen tables' bytes
 
 The list is held to bytes as well as to a count (`Options::frozen_bytes`):

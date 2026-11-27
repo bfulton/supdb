@@ -7861,6 +7861,49 @@ over the path and its fallback; and a word whose meaning one line moved
 is given a type, so that the other line's use of the old meaning stops
 compiling where it would have stopped working.
 
+**A step made earlier, and the walk its lateness had been starting.** The
+main line's settle converts a sparse form its batch takes to the dense
+count before it splices the batch (`Options::settle_converts`). Before
+it the patch left the form at the dense count and marked the tables
+incomplete, which is what has the fill walk them, and that walk is where
+the fill meets the light forms, the ones under the dense count it
+converts on the upkeep thread (`forms_convert_from`). A write into a
+block with no form starts a walk too, and at ten thousand keys every
+block holds a form once the first write mixes are through, so there the
+dense crossings were the only thing starting one. Converted by the
+settle, the form no longer crossed anything: after the scrambled F mix
+98 of 157 blocks stood sparse where one had, the scrambled E walked
+1,747 sparse forms and 1,078 copies where it had walked 22 and 2,803,
+its scans 0.67 µs each against 0.46, and the cell read 0.95x of LMDB in
+both orders where the row before the merge had it at 1.31x. Nothing was
+wrong and nothing raised. The merged head's quick row had the cell at
+0.91x under both policies; a pairing in the row's order confirmed the
+durable one; the main line's four settle options taken away one at a
+time named the conversion, 1.25x and 1.32x without it in thirty-two
+pairs of thirty-two, the other three level and the cell within a
+twentieth for the arm against itself; the mix timed by kind named the
+scans; the walks by
+form named the forms; and the census by kind after each mix named the
+mix that had stopped converting them, 194 builds on the thread there
+against 9. The conversion had been priced in the row's order at a
+hundred thousand keys and up for these arms and at ten thousand for the
+held arm alone, and at a hundred thousand it does not resolve. A settle
+that converts leaves the fill its walk now
+(`Options::settle_convert_fills`; `supdb-settleconvertquiet` is the
+conversion with no walk left): 156 copies after that mix again, the cell
+1.30x and 1.32x of LMDB in twenty-four pairs of twenty-four, 1.34x and
+1.35x of the arm without it, and nothing resolved at thirty, a hundred or
+three hundred thousand keys or on the lag sweep. The rules are ones this
+file has, met from the other side: when a step is moved earlier, what its
+old place had been triggering is listed, the marks it left and who read
+them, as it is for a saving; a change is paired at the smallest rung in
+the row's order for every arm it reaches, since a store small enough
+that every block holds a form is a regime of its own; and a cell a row
+loses that the row before had won is decomposed before the row is
+banked, by removal of what landed between the two. What stays implicit
+is the trigger: a light form is converted only where something else has
+the fill walk the tables.
+
 ## Open targets, and the one standing limitation
 
 A cell a comparator wins is a target, never a limit to be written down
