@@ -2767,13 +2767,18 @@ fn a_copy_of_fixed_size_records_is_one_stream_until_a_write_it_cannot_take() {
             db.commit().unwrap();
             db.seal().unwrap();
         }
+        let drops_before = db.forms_drop_reasons();
         db.hold_seal_durable(false);
         merged_past(&mut db, merges_before);
         answers(&db, &want, &from, "across the merges");
         assert_eq!(
             db.block_cache_packed(),
             (p0, n0),
-            "{packed}: carried as they were"
+            "{packed}: carried as they were; drops by site and refusals before {:?}, after {:?}, \
+             merges {}",
+            drops_before,
+            db.forms_drop_reasons(),
+            db.seal_waits().merges - merges_before
         );
         let (claimed, holds) = db.block_cache_identity();
         assert!(claimed == n0 && holds == n0, "{packed}: and their ranks");

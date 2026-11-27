@@ -74,7 +74,11 @@ EOF
 if [ -n "${SEAL_RED_EXTRA:-}" ]; then
   cat "$SEAL_RED_EXTRA" >> "$copy/lines" || fail "no $SEAL_RED_EXTRA"
 fi
-listed=$(wc -l < "$copy/lines")
+# lines FILE: its count of lines, as a number alone: BSD's `wc` pads the
+# count with spaces, and on the macOS leg every `file:line` below read
+# `file:   19884`, which no error's location matched.
+lines() { wc -l < "$1" | tr -d ' '; }
+listed=$(lines "$copy/lines")
 
 # check: `cargo check` of the library of the copy, under the profile the
 # tests build with (the code under `cfg(debug_assertions)` included), its
@@ -97,7 +101,7 @@ place() {
     [ "$f" = - ] && continue
     [ -f "$copy/$f" ] || fail "no $f"
     printf '\n%s\n' "$line" >> "$copy/$f"
-    echo "$f:$(wc -l < "$copy/$f")" >> "$copy/placed"
+    echo "$f:$(lines "$copy/$f")" >> "$copy/placed"
   done < "$copy/lines"
 }
 
@@ -105,7 +109,7 @@ cp "$root/Cargo.toml" "$root/Cargo.lock" "$copy/" || fail "copy"
 
 # 1. At home: every line compiles.
 place 1
-homes=$(wc -l < "$copy/placed")
+homes=$(lines "$copy/placed")
 [ "$homes" -gt 0 ] || fail "no line has a home"
 out=$(check)
 status=$?
@@ -123,7 +127,7 @@ missing=""
 while read -r at; do
   printf '%s\n' "$out" | grep -q "^$at:[0-9]*: error" || missing="$missing $at"
 done < "$copy/placed"
-abroad=$(wc -l < "$copy/placed")
+abroad=$(lines "$copy/placed")
 if [ -n "$missing" ] || [ "$abroad" != "$listed" ]; then
   printf '%s\n' "$out"
   fail "no error at$missing ($abroad of the list's $listed placed)"
