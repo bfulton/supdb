@@ -20,7 +20,7 @@ No timing run and no callgrind count has been made. The only build behind a figu
 | 2 | full rows at 7 reps, numbered keys and ids | commands ready, not run: waits for C0; the banked shape (section 7, item 1) | 4.2 |
 | 3 | out-of-core rows under 1 GiB and 1.25 GiB, numbered keys and ids | commands ready, not run: waits for C0 | 4.2 |
 | 4 | noise floor: an arm paired with itself | commands ready, not run: waits for C0; the reader that turns the tables into a floor a cell is not written | 4.4 |
-| 5 | callgrind instruction counts by function | commands ready, not run: waits for C0 | 3.2 |
+| 5 | callgrind instruction counts by function | taken: five counts of C0 against itself, three of them red on timing (3.4); the gate's fix is the first pull request | 3.4 |
 | 6 | the pinned hot-function list | agreed by default (section 7, item 12); C0 counted against itself is running | 3.1 |
 | 7 | wasm size | measured today at b3a043dc (tree 7f58d776), by one `--build` run | 2 |
 | 8 | test count | measured today at b3a043dc (tree 7f58d776) | 2 |
@@ -218,6 +218,27 @@ sh scripts/cost.sh <the commit before> <probe>       # the bisect, a commit at a
 - `LIBRARY GAINED` with no engine function beside it is not chased: libc and the allocator move between two runs of one build.
 - A pull request that edits a probe, or one of the suite's per-operation items, changes what both sides run or is refused.
 - An arm a probe names (`supdb`, `supdb-ingest`, `supdb-nocachezpages`, `supdb-nocachezstride`), once renamed or removed, fails that side's probe: exit 2 from the job, 1 from the group.
+
+### 3.4 C0 counted against itself
+
+Five counts of C0 against itself, on this host, in a clean worktree at
+C0 (`sh scripts/cost.sh HEAD`, `COST_BASE_TARGET` kept between them): green,
+RED, RED, green, RED. Every red was a function whose count follows the
+threads' timing or the heap's state, on identical code:
+
+| probe | function | moves across the five counts, an op |
+|---|---|---|
+| merge | `supdb::db::Db::land_seal` | +0.846, +0.425, -0.002 |
+| merge | `merge_walk::main` | -0.082, +0.004, -0.086, +0.027 |
+| load_durable | `supdb::bytes::MmapBytes::resident_share` | +0.037 |
+| scan_long_z | glibc's `unlink_chunk.isra.0` | -7.542, +6.366, -6.342 |
+
+So the gate as it stood would fail three pull requests in five that changed
+nothing. The first pull request into `release-candidate` gives these
+functions bounds by the rule `scripts/cost-hot.txt` already states (three
+times the most each moved in self-counts), lets a bound name a library
+function, and shows the count of C0 green three times in a row before
+phase 1 leans on it.
 
 ## 4. The rows and the noise floor
 
