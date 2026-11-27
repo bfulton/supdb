@@ -3,7 +3,8 @@
 Open work, one item each: what it is, when it is done, and the design note
 where there is one. Figures name the row they are read from. High priority
 is a wrong answer, an API or format that is harder to change later, a
-number not yet fair to publish, or an arm the bound kills.
+number not yet fair to publish, an arm the bound kills, or a cell more than
+a tenth behind its comparator or behind a shape the engine already reaches.
 
 ## High priority
 
@@ -46,9 +47,6 @@ number not yet fair to publish, or an arm the bound kills.
   the process's `/proc/self/io` count, which equals bytes on disk for
   buffered arms, while `bench/DESIGN.md` calls it the device's counter.
   Done when it reads the device, or is renamed.
-
-## Low priority
-
 - [ ] **The scan pass after a lent burst.** Under the held log a burst is
   lent to the upkeep thread, and the first scan waits for the thread's pass
   and settles its trail: the pass after a full rewrite reads 0.15x to 0.35x
@@ -87,23 +85,6 @@ number not yet fair to publish, or an arm the bound kills.
   writing scans by merging until the writer commits. Done when such a
   store scans at the block cache's rate with no commit. Design:
   `docs/engine.md`, "A live table that follows who writes it".
-- [ ] **The first scan after a burst.** It waits for the upkeep thread's
-  pass in flight and settles what the thread trailed by, and a merge the
-  idle plan starts can run beside it. Done when that scan costs what the
-  scans behind it do, at three million keys in memory and under both
-  bounds, with no burst slower. Design: `docs/engine.md`, "The first scan
-  after the buffered burst".
-- [ ] **The settle's cost a key.** Filing a write into its block's form
-  is what E's commit and a burst's first scan pay. The buffered scrambled E
-  at ten thousand keys reads level with LMDB and E's commit costs twice
-  LMDB's. Done when both are ahead under both policies. Design:
-  `docs/engine.md`, "What filing a write costs".
-- [ ] **A light form's conversion with a trigger of its own.** A form under
-  the dense count is converted only on a walk something else started, so a
-  store of light forms converts none. Done when the conversion is started
-  by scans reading the form, priced on the scrambled E at every rung.
-  Design: `docs/engine.md`, "A settle's conversion leaves the fill its
-  walk".
 - [ ] **The buffered arm against LMDB without sync.** The quick row at
   `33bc663` reads its scan pass at 0.93x to 0.96x, its scrambled E at
   0.89x and the pass after a full rewrite at 0.88x at three hundred
@@ -123,21 +104,48 @@ number not yet fair to publish, or an arm the bound kills.
   fifth to a quarter slower than the same store folded; over random ids
   the threaded scans after the mixes trail LMDB. Done when those scans
   read level with the scan pass before them, over ids and numbered keys.
-- [ ] **The index layouts the study found.** Done when one is built behind
-  an option and priced in the suite's shape, or refuted there. Design:
-  `docs/index-theory.md`.
 - [ ] **The ordered load beside the builds ahead.** It reads 0.85x to
   0.88x of `supdb-nozpages` at ten million keys under both bounds. Done when
   it reads level, or the trade is priced against `supdb-noland` in the
   roster. Design: `docs/engine.md`, "Out of core: the second form".
-- [ ] **The writer's reads in the census.** No arm differs from the
-  default in `zpages_writer_census` alone. Done when one does and the A and
-  F mixes are priced with it.
 - [ ] **The pass after a full rewrite under a bound.** Over random ids at
   ten million keys under 1 GiB it reads 0.6x to 0.9x of LMDB: the merge
   debt written beside it, and a working set larger than the bound. Done
   when it is ahead in both orders with the burst no slower. Design:
   `docs/engine.md`, "Out of core: keys that are no run of numbers".
+- [ ] **The crossing off the landings' thread.** The crossing's asks run
+  on the thread every landing goes through, beside the first reads. Done
+  when they run off it and the read pass after the load reads one shape.
+- [ ] **The memos of decoded groups in slabs.** `zpages_memo_slab`
+  returns the memos' memory and is off, since the hot-raw policy's room is
+  drawn from memory the slab moves. Done when the room is drawn from
+  something else and the slab is priced again at both ten-million bounds.
+
+## Low priority
+
+- [ ] **The first scan after a burst.** It waits for the upkeep thread's
+  pass in flight and settles what the thread trailed by, and a merge the
+  idle plan starts can run beside it. Done when that scan costs what the
+  scans behind it do, at three million keys in memory and under both
+  bounds, with no burst slower. Design: `docs/engine.md`, "The first scan
+  after the buffered burst".
+- [ ] **The settle's cost a key.** Filing a write into its block's form
+  is what E's commit and a burst's first scan pay. The buffered scrambled E
+  at ten thousand keys reads level with LMDB and E's commit costs twice
+  LMDB's. Done when both are ahead under both policies. Design:
+  `docs/engine.md`, "What filing a write costs".
+- [ ] **A light form's conversion with a trigger of its own.** A form under
+  the dense count is converted only on a walk something else started, so a
+  store of light forms converts none. Done when the conversion is started
+  by scans reading the form, priced on the scrambled E at every rung.
+  Design: `docs/engine.md`, "A settle's conversion leaves the fill its
+  walk".
+- [ ] **The index layouts the study found.** Done when one is built behind
+  an option and priced in the suite's shape, or refuted there. Design:
+  `docs/index-theory.md`.
+- [ ] **The writer's reads in the census.** No arm differs from the
+  default in `zpages_writer_census` alone. Done when one does and the A and
+  F mixes are priced with it.
 - [ ] **A store past its budget that is only scanned.** The controller
   buys on point reads' faults, and a sweep of bursts and scans has none.
   The banked rows show no sweep starting raw; the pairings did. Done when
@@ -147,18 +155,11 @@ number not yet fair to publish, or an arm the bound kills.
   store passes half a budget that moves with the process, so a store on
   the line is bet on by chance. Done when the bet is called off under the
   selector's line, or the line ignores the engine's transient memory.
-- [ ] **The crossing off the landings' thread.** The crossing's asks run
-  on the thread every landing goes through, beside the first reads. Done
-  when they run off it and the read pass after the load reads one shape.
 - [ ] **The full rewrite's burst at three million keys under 1 GiB.** The
   upkeep thread builds copies from raw records the cache let go, and the
   sampler samples for a purchase no read is near. Done when the burst takes
   the faults of its fast reps in every rep, with the pass after it no
   slower.
-- [ ] **The memos of decoded groups in slabs.** `zpages_memo_slab`
-  returns the memos' memory and is off, since the hot-raw policy's room is
-  drawn from memory the slab moves. Done when the room is drawn from
-  something else and the slab is priced again at both ten-million bounds.
 - [ ] **Keys that are no run of numbers.** The sparse stride form is not
   the default anywhere, the block form's threaded scans trail LMDB over
   ids, and `supdb-nocache` was killed once. Every ids row predates four
