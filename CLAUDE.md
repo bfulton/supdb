@@ -10927,8 +10927,9 @@ numbers. What showed it was every thread's state and kernel stack fifty
 times a second (`/proc/<pid>/task/*/stat` and `stack`), the samples
 summed by thread and by the frame they waited in. The eighth is held to
 a gibibyte (`onefile::AHEAD_MOST`), and a device with no room for the
-step ahead is asked for the file's alone: forty-six growths a row, and
-nothing in the allocator in three sampled passes. It is a dilution: a
+step ahead is asked for the file's alone: forty-six growths a row,
+nothing in the allocator in three sampled passes, and the pass ahead of
+the default's in both orders where it had been behind. It is a dilution: a
 growth can still fall on a busy moment, and the log's, when the log is
 an extent of the file, cannot be an ask on a commit's path. The rules:
 a cap on a proportional step is read at the sizes the suite's largest

@@ -347,11 +347,68 @@ file a store that mobile wants) after them.
     times a row, since the eighth it grows by was held to 64 MiB. Held
     to a gibibyte (`onefile::AHEAD_MOST`): 46 growths a row, and none,
     none and 0.02 s in the allocator over three reps' read passes. The
-    pass's rate with it is not paired yet.
+    same six reps an order at `12277af`: the pass 1.47x and 1.22x ahead,
+    five pairs of six and four of six, at 0.58x and 0.54x of the
+    default's major faults a read; the shuffled load 1.28x and 1.15x in
+    six pairs of six each.
+  - **Read: where a merge's CPU goes under a cipher.** The merge threads
+    over the full rewrite's burst, by thread state fifty times a second
+    and by symbol (`perf record -e cpu-clock -F 499 -a`, the merges'
+    threads told by lifetime against `mergejob`, since they take the
+    maint thread's name): 54 to 62% of their samples runnable, 15 to 20%
+    in a futex, 6 to 19% in a page's read; and of their CPU, AES-GCM
+    4.7%, the output's trip through its memory file (`shmem_get_folio`,
+    `shmem_write_end`, `copy_folio_from_iter`, the page lists' locks,
+    the memory group's charge, the shootdowns at its unmap) about a
+    fifth, and `memmove` a tenth. The device stood 0.70 to 0.76 busy at
+    435 to 494 MB/s of writes. So the debt the pass after the full
+    rewrite meets is the merges' CPU, a fifth of which is the output
+    held whole in memory until its envelope: O5's, by the envelope
+    sealed as it is written.
 - **O5 -- the run its own log under a cipher, the controller on.**
   Pagefile's S4-S5 (the Log class, `finish`), E4's model first; and with
   it the sealing O4 left as it was: chunks of whole pages, the tags
-  apart, sealed as the file is written.
+  apart, sealed as the file is written. Drawn again at O4's end against
+  what the roster loses, cheapest first, each part its own commit and
+  its own pairing:
+  - **O5a, the controller on as shipped under a cipher.** The one thing a
+    store under a cipher still does not do as a store in the clear does
+    (`cipher_controller`), off on the block form's 0.73x of the raw form
+    at five million keys under 640 MiB, measured before the stride form
+    went under a cipher and before the cache followed the room. With it
+    on (`supdb-cipherauto`) the store reads 1.9-2.1x of encrypted
+    RocksDB there where as shipped it reads 0.75-0.78x (`ROADMAP.md`,
+    reads and scans out of core). Owed before the default moves: the
+    pairing on against off in core (`pair.sh supdb-cipherauto
+    supdb-cipher 300000`, and 30000), where nothing should move, and at
+    five million keys under 640 MiB and ten million under 1 GiB and 1.25
+    GiB, the row's passes and the lag sweep, read cell by cell; then the
+    gate with it on, and `supdb-ciphernoauto` the arm of the shape
+    before.
+  - **O5b, an envelope written beside its file.** A file under a cipher
+    is written whole into a memory file and sealed at its end
+    (`Vault::write_envelope_at`), since every chunk's check covers the
+    header and the header holds the length. A second layout for a
+    store's own files (the published `crypt` envelope stays version 1):
+    a chunk's check covers the header less the length and a byte that
+    says whether it is the last, and the last chunk's covers the length
+    as well, so every chunk but the last is sealed as soon as a byte
+    past it is written and a reader that opens the file checks the last
+    chunk with the first. The writer's three writes behind its frontier
+    -- the superblock page, the head reserve, the key section's header
+    (`SegmentWriter::finish`) -- are chunks held back until the finish,
+    and a write into a chunk already sealed is refused, since its nonce
+    would be used twice. What it is for, by the merges' profile above: a
+    finish that no longer encrypts its whole output at its end, a file
+    whose sealed chunks the cache can give back while it is written,
+    and, where the cache has no room for the output, no memory file at
+    all, which is the fifth of a merge's CPU the profile puts in it.
+  - **O5c, the run its own log.** O5b over a run whose every commit is
+    durable: a commit's partial chunk is not sealed as chunk c, which
+    the next commit would seal again, but as a record behind the run's
+    frontier that the next commit's whole chunks replace, and the open
+    reads the run's envelope to its last whole commit where it replays
+    the log's frames now (`Db::log_run`, gone under it).
 - **O6 -- the defaults.** Each flipped only where the suite reads it better
   and the gate passes with it on: the plain store's layout, the cipher's.
   An old store's rewrite at its first open, the docs, the arms of the

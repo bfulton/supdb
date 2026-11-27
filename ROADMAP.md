@@ -1334,17 +1334,17 @@ turned on neither.
     writer held to what the merges retire where nothing else holds it,
     which gives the burst's gain back. Read it again once an envelope is
     sealed as it is written, which changes what a merge costs.
-  - Under a cipher, the one-thread read pass after the load: 0.92x at
-    the median of twelve reps an arm, ahead in three pairs of twelve,
-    not resolved. One cause was found and taken out, the data file made
-    longer on the form builder's thread inside the pass
-    (`onefile::AHEAD_MOST`), by its count and not yet by a pairing of
-    the rate. What the pass pays in both layouts is the larger thing:
-    the crossing's read-back of four to six hundred megabytes of form
-    files as the reads begin, behind which the last two form files take
-    two to four seconds to build and the form is installed half a
-    second to a second into the pass (the standing limitation on the
-    read pass after a load, in `CLAUDE.md`).
+  - Under a cipher, the one-thread read pass after the load read 0.92x
+    at the median of twelve reps an arm until the data file stopped
+    being made longer on the form builder's thread inside the pass
+    (`onefile::AHEAD_MOST`); with it, 1.47x and 1.22x ahead, five pairs
+    of six and four of six, with fewer major faults a read in both
+    orders. What the pass pays in both layouts is the larger thing: the
+    crossing's read-back of four to six hundred megabytes of form files
+    as the reads begin, behind which the last two form files take two to
+    four seconds to build and the form is installed half a second to a
+    second into the pass (the standing limitation on the read pass after
+    a load, in `CLAUDE.md`).
   - Under a cipher, the first three points of the lag sweep are served
     by stride files or by block files rep by rep, in both arms, by
     whether the store in the stride form fits the conversion's room at
@@ -1359,14 +1359,11 @@ turned on neither.
   shuffled load, 1.06x and 1.03x ahead in six pairs of six; the scrambled
   F mix, 0.81x and 0.96x before the mappings' own opens, read 0.94x in
   one order and 1.15x in the other.
-  Owed on the cipher's stage before it is called closed, none of it run
-  on the tree with the growth's step changed: the differential fuzz's
-  ranges under `ZFUZZ_ONEFILE=1 ZFUZZ_CIPHER=1`, the count
-  (`sh scripts/cost.sh`), the lists against both bases, the whole gate
-  with the `onefile` group, mutants of the step and its fall back
-  (`scratch/onefile/mutants-o4.txt`), a pairing of the read pass with
-  the step, the row in memory, and the lost cells against
-  `rocksdb-tuned-enc`.
+  Owed on the cipher's stage before it is called closed: the
+  differential fuzz's ranges under `ZFUZZ_ONEFILE=1 ZFUZZ_CIPHER=1`, the
+  count (`sh scripts/cost.sh`), the lists against both bases, the whole
+  gate with the `onefile` group, the row in memory, and the cells
+  against `rocksdb-tuned-enc`.
   Then the stages left, in the order agreed: a run its own log under a
   cipher, with the controller on, and with it an envelope of whole pages
   sealed as it is written; the log, the slots and the run into the

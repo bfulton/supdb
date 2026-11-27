@@ -16667,9 +16667,7 @@ pub fn open(arm: &str, dir: &Path, map_gb: usize) -> Res<Box<dyn Engine>> {
         "supdb-cipherauto" => supdb_arm(Supdb::create_cipherauto, dir)?,
         "supdb-cipheronefile" => supdb_arm(Supdb::create_cipher_onefile, dir)?,
         "supdb-cipherautoonefile" => supdb_arm(Supdb::create_cipherauto_onefile, dir)?,
-        "supdb-ingestcipherautoonefile" => {
-            supdb_arm(Supdb::create_ingest_cipherauto_onefile, dir)?
-        }
+        "supdb-ingestcipherautoonefile" => supdb_arm(Supdb::create_ingest_cipherauto_onefile, dir)?,
         "supdb-cipherautolandmodel" => supdb_arm(Supdb::create_cipherauto_landmodel, dir)?,
         "supdb-cipherautomergeapart" => supdb_arm(Supdb::create_cipherauto_mergeapart, dir)?,
         "supdb-cipherautomergestream" => supdb_arm(Supdb::create_cipherauto_mergestream, dir)?,
@@ -21808,8 +21806,9 @@ mod tests {
                     assert_eq!(z.name(), "supdb-cipherautoonefile");
                     let o = z.db.as_ref().unwrap().options();
                     assert!(o.one_file && o.zpages_under_cipher);
-                    let z = Supdb::create_ingest_cipherauto_onefile(&dir("ingestcipherautoonefile"))
-                        .unwrap();
+                    let z =
+                        Supdb::create_ingest_cipherauto_onefile(&dir("ingestcipherautoonefile"))
+                            .unwrap();
                     assert_eq!(z.name(), "supdb-ingestcipherautoonefile");
                     assert!(z.db.as_ref().unwrap().options().one_file);
                 }

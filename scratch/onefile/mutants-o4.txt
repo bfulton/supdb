@@ -34,6 +34,6 @@ C23 | src/db/zfile.rs | Some(_) if plan.drop_output && !asks && looks < 3 => { |
 C24 | src/db/zfile.rs | Some(_) if plan.drop_output && !asks && looks < 3 => { | Some(_) if !asks && looks < 3 => { | a build that kept its pages drops them at its read-back
 C25 | src/db/vault.rs | let odisk = Disk {\n                kind: Kind::Ord,\n                ..disk\n            };\n            if !files.contains_key(ord) && self.env_exists(&odisk.name()) { | let odisk = Disk {\n                kind: Kind::Ord,\n                ..disk\n            };\n            if !files.contains_key(ord) { | an index adopted where the table holds none
 C26 | src/db/vault.rs | one.expect(name, h.stored_len()); | let _ = h; | an envelope written with no word of its size: grown and moved as it is written
-C27 | src/db/onefile.rs | const AHEAD_MOST: u64 = 1024 * BIG; | const AHEAD_MOST: u64 = 64 * BIG; | the eighth held to 64 MiB: eighty asks of the filesystem a row (not run yet)
-C28 | src/db/onefile.rs | end = up(at + len, GRAIN);\n            self.reserve(s.end, end)?; | self.reserve(s.end, end)?; | a device with no room for the step ahead asked for the step again (not run yet)
-C29 | src/db/onefile.rs | if e.raw_os_error() != Some(libc::ENOSPC) {\n                return Err(e);\n            } | return Err(e); | no room for the step ahead refuses the file (not run yet)
+C27 | src/db/onefile.rs | const AHEAD_MOST: u64 = 1024 * BIG; | const AHEAD_MOST: u64 = 64 * BIG; | the eighth held to 64 MiB: eighty asks of the filesystem a row
+C28 | src/db/onefile.rs | end = up(at + len, GRAIN);\n            self.reserve(s.end, end)?; | self.reserve(s.end, end)?; | a device with no room for the step ahead asked for the step again
+C29 | src/db/onefile.rs | if e.raw_os_error() != Some(libc::ENOSPC) {\n                return Err(e);\n            } | return Err(e); | no room for the step ahead refuses the file
