@@ -6,7 +6,7 @@ and FASTER. This file is the rules for working on it. `bench/CLAUDE.md` has
 the suite's, `bench/DESIGN.md` says how a thing is measured, `ROADMAP.md`
 holds the open work, and `docs/engine.md` the design and its measurements.
 
-The incident behind each rule is in this file as it stood at `09cadec0`. A
+The incident behind each rule is in this file as it stood at `e40d6283`. A
 pointer elsewhere of the form (`CLAUDE.md`, *entry*) names an entry there.
 
 ## Writing
@@ -60,9 +60,10 @@ pointer elsewhere of the form (`CLAUDE.md`, *entry*) names an entry there.
 - The gate is of the tree, not of the default: a commit that adds a test,
   an arm's included, runs the groups that run it. The `stride` group runs
   every test again with a form file serving the store.
-- Outside the default set: `cost` (`deps.sh profile`), `enc` (`deps.sh
-  openssl`), `cross-arm`, `machine` and `fscrypt`, on the filesystem `sudo
-  sh scripts/fscrypt.sh up DIR "$(id -u):$(id -g)"` makes.
+- Outside the default set: `cost` (`deps.sh profile`; in CI by hand,
+  `.github/workflows/cost.yml`), `enc` (`deps.sh openssl`), `cross-arm`,
+  `machine` and `fscrypt`, on the filesystem `sudo sh scripts/fscrypt.sh up
+  DIR "$(id -u):$(id -g)"` makes.
 - `lists` holds `tests/data`'s lists, which only go down, and `cost` counts
   a store in the clear by function, both against `scripts/base.sh`'s base;
   a raise is declared in `scripts/raises.txt`. A new toolchain or
@@ -386,6 +387,8 @@ Tests
 - A fix for a race is held to the race made wide before it is believed. A
   flake is reproduced by choosing its phase, beside the load it failed
   under, not by repeating the run.
+- A flake that comes once in hundreds of whole runs is run as the few tests
+  it fails in, several at once, before a probe of it is judged.
 - A clean result proves nothing about a path the test never took. A test's
   premise is asserted at the fixture.
 - A seam that stands in for an event leaves what the event leaves.

@@ -511,23 +511,23 @@ a tenth behind its comparator or behind a shape the engine already reaches.
   not because of the borrow's type. Done when the readers are generic over a
   source that hands each range, as `flatindex`'s are over `Sect`, with the
   plain store's eight readers counted beside it.
-- [ ] **A form file resident at its trusted attach.** A form file built
-  ahead and dropped is taken as cold at its read-back and attached trusted;
-  in the one data file its pages can stay resident through two drops
-  (`zfile::reads_device`), and it is checked page by page instead. Besides a
-  neighbour's read-around a cause is unfound, seen in 6 runs of 1,540 of
-  `the_words_kept_for_stride_files_are_held_to_the_live_partitions` and on
-  the hosted ARM leg. Done when the test records, at the third look's
-  failure, each page's flags and mappings and the residency after a waited
-  writeback, and the cause is named.
-- [ ] **The hosted gates green on main.** At #35's head (`0e6ec30`) the ARM
-  `test` leg failed the `tests/durable.rs` test of a run's close-synced
-  commits outliving older log frames: "the closed run's link: the case was
-  not reached". The door's libc test reads the libc `Cargo.lock` resolves
-  from cargo's registry and fails a vendored or offline layout, and one
-  `tests/durable.rs` test holds about a thousand descriptors open. Done when
-  every job of `ci.yml` passes at main's head, that case reached on the ARM
-  runner, and the libc test's layout is chosen.
+- [ ] **A one-file build's reads bounded to its own extent.** In the one
+  data file a build's reads through a mapping are read around and ahead by
+  the kernel past its own file into the next, so a second build ahead reads
+  the first's dropped file back as fast as it drops it, and that form file
+  is attached checked page by page instead of trusted. The tests that hold
+  every word take one build at a time there (`one_build_ahead_in_one_file`).
+  Done when every read a build makes in the data file is bounded to its
+  extent, the mapping advised random and asked ahead in pieces, and the
+  one-file arm's builds are priced with it.
+- [ ] **The hosted gates green on main.** At #35's merge (`09cadec0`) the
+  x64 `test` leg failed `tests/settle.rs`'s
+  `a_copy_of_fixed_size_records_is_one_stream_until_a_write_it_cannot_take`,
+  its copies dropped across a merge that kept their keys; here it failed
+  once in about 150 whole runs of the binary. At #35's head the ARM leg had
+  failed a `tests/durable.rs` case not reached. The door's libc test fails
+  a vendored or offline registry. Done when every job of `ci.yml` passes at
+  main's head and the settle state is held through a seam.
 - [ ] **The count's verdict by function.** `sh scripts/cost.sh` exits red by
   function, so a function the other build inlines reads as a gain beside the
   caller that lost more; loop-head padding counts as instructions
