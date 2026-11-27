@@ -455,14 +455,16 @@ device, so `ab` names the device at its table's head and its rates are
 read as two arms on one device and not as a disk's. And a store under a
 cipher of the caller's (`Encryption::Cipher`), here AES-256-GCM:
 `supdb-cipher` and `supdb-ingestcipher`. Its pair is `supdb`, or
-`supdb-ingest`, itself, which differs from it by the cipher, the store's
-own cache of plaintext, and the compact form's controller, which leaves a
-store under a cipher in the raw form as shipped. Two more price a store
-under a cipher against itself: `supdb-cipherlog` and
-`supdb-ingestcipherlog`, an ordered load through the log with no run,
-which is the shape before the run was kept there; and `supdb-cipherauto`
-and `supdb-ingestcipherauto`, the controller on
-(`Options::zpages_under_cipher`), with `supdb-cipherautolandmodel` the
+`supdb-ingest`, itself, which differs from it by the cipher and the
+store's own cache of plaintext. More price a store under a cipher
+against itself: `supdb-cipherlog` and `supdb-ingestcipherlog`, an
+ordered load through the log with no run, which is the shape before the
+run was kept there; `supdb-ciphernoauto` and `supdb-ingestciphernoauto`,
+the compact form's controller left out under a cipher
+(`Options::zpages_under_cipher` off), the shape before it shipped on;
+and `supdb-cipherauto` and `supdb-ingestcipherauto`, the controller
+pinned on, the arms it was priced by before, with
+`supdb-cipherautolandmodel` the
 first of those with its builds ahead at landing started by the
 controller's budget alone (`Options::zpages_land_cache_pct` at zero),
 where the engine starts them past a share of the store's own cache as

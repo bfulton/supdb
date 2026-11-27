@@ -2614,7 +2614,17 @@ leave the form in five million reads either, its model reading the raw
 form at 0.29 faults a read and the form at none while the census read
 0.60 through the form: under a cipher the model's budget is of two
 caches in series, the store's and the kernel's, and nothing has held its
-prediction to a measurement there.
+prediction to a measurement there. It stayed off for a month after the
+two things that decided it had changed: numbered keys took the stride
+form under a cipher, which fits that bound where the block form did
+not, and the cache of plaintext came to follow the room. Paired again
+at O4's end, the store with it on read 3x to 4x of the store as shipped
+there, its scans 15x to 33x and its mixes 2.2x to 62x in both orders,
+and the switch was the one thing a store under a cipher still did not do
+as a store in the clear does; it is on as shipped now, with what it
+costs in the option's doc. A choice made off on a measurement is a
+measurement of the mechanisms that stood that day, so it is taken again
+when one of them changes, not when somebody next asks why it is off.
 
 The rules: a feature that "cannot work" under a mode is a claim about
 the code that does the work today, and it is checked at each place that
@@ -10939,6 +10949,27 @@ is busiest, not where the call was first timed; and where two arms'
 faults and counters agree and their rates do not, the next instrument
 is what each thread waits in, sampled, since a wait in the kernel that
 is not a fault is in no fault count.
+
+**A damage made by a twin's bytes, which were the same bytes.** The
+one-file test that writes one segment's first page over another's, to
+hold the open to the manifest's checksum of each file's first page,
+failed one run in eight alone and was read for a gate as luck in the
+runs before: two partitions of one merge with the same number of keys
+have the same superblock to the byte, its sizes, offsets and second
+finished all alike, so the page written over was the page that was
+there and the open was right to read the store whole. A print of
+whether the two pages differed named it in one loop of forty. The test
+picks a pair whose first pages differ now. The rule: a damage made by
+substitution is held to having changed something, since a copy of a
+file's twin is no damage, and a test that fails one run in eight is
+looped alone before it is read as anything else. The same gate's stride
+group found the cipher twin of the one-file test of a seal cut before
+its sync failing one run in two alone under the switch: its baseline of
+the room the store holds was read behind `settle`, which joins no form
+build, and a form file built after it was room the open took beside a
+named segment; read behind `zpages_settle`, none in sixty. A twin added
+under a mode runs under every switch its sibling does before the twin
+is called held, since the stride group had passed it once by the coin.
 
 ## Standing limitations
 

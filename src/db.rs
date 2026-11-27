@@ -1318,10 +1318,9 @@ pub enum Encryption {
     /// so a file changed on the device is refused at the read that first
     /// wants the changed bytes, with an error every operation after it
     /// answers with too. Every option means what it means for a store in
-    /// the clear, with one choice made differently: the controller leaves
-    /// such a store in the raw form (`Options::zpages_under_cipher`),
-    /// where the compact form has measured slower; `ZPages::Always` builds
-    /// it there as anywhere, in either of its layouts
+    /// the clear, the compact form's controller among them
+    /// (`Options::zpages_under_cipher`); `ZPages::Always` builds the form
+    /// there as anywhere, in either of its layouts
     /// (`Options::zpages_stride`). One mechanism reads a file as its mapping
     /// lies, which a store under a cipher does not lend, and so does not
     /// act there: the heads' copy is not made (`Options::heads_owned`).
@@ -6496,22 +6495,26 @@ pub struct Options {
     /// a cipher (`Encryption::Cipher`): with it off, `ZPages::Auto` reads
     /// there as `Off`, and `Always` builds the form as it does anywhere.
     ///
-    /// Off as shipped, on a measurement. A form page is four kibibytes and
-    /// an envelope's chunk holds sixteen bytes less, its tag beside it, so
-    /// a page of a form file lies across two chunks and a cold read
-    /// through the form takes two pages of ciphertext from the device,
-    /// where the raw read it replaces takes one once the hash slots are
-    /// resident, as they are. At five million keys under 640 MiB the
-    /// controller bought the form, every read went through it, and the
-    /// read pass ran at 0.73x of the same store with the form off, 0.60
-    /// major faults a read against 0.43 with every build long finished
-    /// (`bench/scripts/pair.sh supdb-cipherauto supdb-cipher 5000000
-    /// --bound 671088640 --passes read --reps 2 --ops-div 10`, and one
-    /// sitting at `--ops-div 1`). Everything under it works and is held
-    /// by tests -- the sampler, the builds ahead, the buy, the install,
-    /// the crossing -- and it wants an envelope whose chunks are whole
-    /// pages before the form pays (`ROADMAP.md`). `supdb-cipherauto` and
-    /// `supdb-ingestcipherauto` are the arms with it on.
+    /// On as shipped, as it is for a store in the clear. It was off for as
+    /// long as the form the controller bought there was the block form: a
+    /// form page is four kibibytes and an envelope's chunk sixteen bytes
+    /// less, so a page lies across two chunks, and at five million keys
+    /// under 640 MiB the form read at 0.73x of the raw form it replaced.
+    /// Numbered keys take the stride form since, which fits that bound, and
+    /// the cache of plaintext follows the room: with it on, the same store
+    /// reads at 3x to 4x of the store with it off, its threaded reads at
+    /// 44x to 55x, its scans at 15x to 33x and its mixes at 2.2x to 62x,
+    /// in both orders (`bench/scripts/pair.sh supdb-cipherauto
+    /// supdb-cipher 5000000 --bound 671088640 --passes
+    /// load,read,read-threaded,scan,scan-threaded,mixes,scan-mixed,mixes-scrambled,lag
+    /// --reps 2 --ops-div 10`, at `9ef998b`), where encrypted RocksDB reads
+    /// at 1.3x of the store with it off. What it costs, in both orders: the
+    /// loads at 0.79x to 0.92x, the full rewrite's burst at 0.57x to 0.62x
+    /// and the lag sweep's passes over the clean store and after the one-
+    /// and ten-percent bursts at 0.24x to 0.85x, the plain store's out-of-core
+    /// regime (`ROADMAP.md`). In memory it builds nothing and steps alone.
+    /// `supdb-ciphernoauto` and `supdb-ingestciphernoauto` are the arms with
+    /// it off.
     pub zpages_under_cipher: bool,
     /// The controller suspects at the moment the store crosses
     /// the selector's line to suspect, where it suspected on two hot model
@@ -8037,7 +8040,7 @@ impl Default for Options {
             zpages_ahead_builders: 2,
             zpages_sample_between: false,
             zpages_cover_resident: true,
-            zpages_under_cipher: false,
+            zpages_under_cipher: true,
             zpages_suspect_at_crossing: true,
             zpages_reading_from_files: true,
             zpages_recode_auto: false,
@@ -19046,13 +19049,10 @@ fn ref_pack(off: u64, len: u32) -> u64 {
 const RUN_REFS: u8 = 1;
 const RUN_LOGGED: u8 = 2;
 
-/// The compact form's controller under a cipher: left to the raw form
-/// unless the store asks for it (`Options::zpages_under_cipher`), since a
-/// form page lies across two chunks of an envelope and the form it buys
-/// there has measured slower than the raw form it replaces. The one
-/// thing a store under a cipher does not do as a store in the clear does,
-/// and a choice of form, which is what a controller is for; the form
-/// itself builds, seals and reads there under `ZPages::Always`.
+/// The compact form's controller under a cipher, left out where the store
+/// is told to leave it (`Options::zpages_under_cipher` off): the raw form
+/// whatever the store measures. The form itself builds, seals and reads
+/// there under `ZPages::Always` either way.
 fn cipher_controller(opts: &mut Options) {
     if opts.zpages == ZPages::Auto && !opts.zpages_under_cipher {
         opts.zpages = ZPages::Off;
@@ -65467,11 +65467,16 @@ mod cipher_looks {
         ));
         let _ = std::fs::remove_dir_all(&dir);
         let cache: u64 = 2 << 20;
+        // The compact form off: its builds read through the cache beside
+        // the merge and announce their files' sizes in the count this
+        // reads for the merge's output (`vault::expect`), which with the
+        // controller on as shipped they did, six megabytes of them.
         let opts = Options {
             encryption: Encryption::Cipher(vault::tests::cipher(6).cache_bytes(cache)),
             seal_bytes: 256 << 10,
             partition_bytes: Some(256 << 10),
             l0_trigger: 2,
+            zpages: ZPages::Off,
             ..Options::default()
         };
         let n = 200_000u32;

@@ -385,6 +385,28 @@ file a store that mobile wants) after them.
     GiB, the row's passes and the lag sweep, read cell by cell; then the
     gate with it on, and `supdb-ciphernoauto` the arm of the shape
     before.
+    *Read at `9ef998b`* (`SUPDB_LAG_COUNTERS=1 sh scripts/pair.sh
+    supdb-cipherauto supdb-cipher ...`, the row's passes and the lag
+    sweep, two reps an order; on against off, both orders):
+    in core at 300,000 keys nothing built or censused, the read pass
+    0.965x and 0.969x, every other cell with whichever arm was listed
+    second; at 30,000 nothing in both orders. Under 640 MiB at five
+    million keys: reads 3.1-4.0x, threaded reads 44-55x, scans 15-33x,
+    the mixes 2.2-62x, the full rewrite's pass 1.7-1.8x, the one- and
+    ten-percent bursts 1.9-3.9x; the loads 0.90-0.92x ordered and
+    0.79-0.82x shuffled, the clean store's pass 0.83-0.85x, the passes
+    after the one- and ten-percent bursts 0.42-0.43x and 0.24-0.72x, the
+    full rewrite's burst 0.57-0.62x. Under 1 GiB at ten million: reads
+    1.5-1.9x, threaded 2.5-10x, scans 1.9-5.3x, the mixes 1.3-4.8x, the
+    full rewrite's pass 2.5-5.2x, the clean and ten-percent passes 1.1x
+    and 1.2-5.0x; the loads 0.80-0.88x and 0.75-0.76x, the one-percent
+    pass 0.40-0.44x, the full rewrite's burst 0.49-0.52x. Under 1.25 GiB:
+    reads 3.2-4.5x, threaded 38-40x, scans 10-29x, the mixes 1.7-47x, the
+    full rewrite's pass 4.0-5.3x; the loads 0.84-0.87x and 0.82-0.83x, the
+    clean pass 0.82-0.83x, the one- and ten-percent passes 0.40-0.47x and
+    0.20-0.31x, the full rewrite's burst 0.49-0.51x. Every cell resolved
+    in both orders. Shipped on; the loads and the lighter lag passes are
+    the roadmap's two items under the controller under a cipher.
   - **O5b, an envelope written beside its file.** A file under a cipher
     is written whole into a memory file and sealed at its end
     (`Vault::write_envelope_at`), since every chunk's check covers the

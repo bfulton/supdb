@@ -8830,13 +8830,14 @@ fn form_files_on_disk_are_dormant_under_auto_and_attached_when_the_form_is_wante
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// As shipped the controller leaves a store under a cipher in the raw form
-/// (`Options::zpages_under_cipher` off): the same store that is driven to
-/// the compact form with the option on steps no selector, builds nothing
-/// and reads raw with it off, under the same seam and the same reads.
+/// With `Options::zpages_under_cipher` off the controller leaves a store
+/// under a cipher in the raw form: the same store that is driven to the
+/// compact form with the option on, as shipped, steps no selector, builds
+/// nothing and reads raw with it off, under the same seam and the same
+/// reads.
 #[cfg(target_os = "linux")]
 #[test]
-fn the_controller_leaves_a_store_under_a_cipher_raw_unless_it_is_asked() {
+fn the_controller_leaves_a_store_under_a_cipher_raw_where_it_is_told_to() {
     let dir = scratch("auto-cipher-off");
     let inject = std::sync::Arc::new(supdb::ZInject::new());
     inject.set_budget(1 << 20);
@@ -8850,6 +8851,7 @@ fn the_controller_leaves_a_store_under_a_cipher_raw_unless_it_is_asked() {
             zpages: ZPages::Auto,
             zpages_min_bytes: 0,
             zpages_inject: Some(inject.clone()),
+            zpages_under_cipher: false,
             encryption: supdb::Encryption::Cipher(supdb::StoreCipher::new(
                 common::Gcm::new(&[0x5a; 32]),
                 common::Gcm::new,

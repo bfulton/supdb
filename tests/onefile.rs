@@ -475,6 +475,11 @@ fn a_seal_cut_between_its_landing_and_its_sync_leaves_room_nobody_names_in(
     load(&mut db, &mut model, 2000, "a");
     db.flush().unwrap();
     db.settle().unwrap();
+    // And every partition's form file where the form is forced (the stride
+    // group's switch): `settle` joins no build, and a form file landing
+    // after the count below is room the open takes beside a named
+    // segment, which read as the unnamed seal's in one run of two.
+    db.zpages_settle().unwrap();
     let before = db.one_counts().unwrap();
     let len_before = std::fs::metadata(d.join("store.one")).unwrap().len();
     // A seal's segments in place and read from, their sync not begun: the
@@ -1142,9 +1147,17 @@ fn a_place_holding_another_files_first_page_is_refused_by_its_row_in(
         .filter(|n| n.ends_with(".sup") || (n.starts_with("x-") && n.len() == 34))
         .collect();
     assert!(segs.len() >= 2, "two segments in the data file: {segs:?}");
-    let (a, _) = Db::one_place(&d, &segs[0]).unwrap();
-    let (b, _) = Db::one_place(&d, &segs[1]).unwrap();
+    let places: Vec<u64> = segs
+        .iter()
+        .map(|s| Db::one_place(&d, s).unwrap().0)
+        .collect();
     db.close().unwrap();
+    // Two segments whose first pages differ: partitions of one merge with
+    // the same number of keys have the same superblock to the byte -- its
+    // sizes, its offsets and the second it was finished in, nothing of the
+    // file's own -- and a page written over by its twin is no damage, which
+    // the open was right to read as itself in one run of eight.
+    let first = &segs[0];
     {
         use std::os::unix::fs::FileExt;
         let f = std::fs::OpenOptions::new()
@@ -1152,9 +1165,17 @@ fn a_place_holding_another_files_first_page_is_refused_by_its_row_in(
             .write(true)
             .open(d.join("store.one"))
             .unwrap();
-        let mut page = [0u8; 4096];
-        f.read_exact_at(&mut page, b).unwrap();
-        f.write_all_at(&page, a).unwrap();
+        let page_at = |at: u64| {
+            let mut p = [0u8; 4096];
+            f.read_exact_at(&mut p, at).unwrap();
+            p
+        };
+        let page = places[1..]
+            .iter()
+            .map(|&at| page_at(at))
+            .find(|p| *p != page_at(places[0]))
+            .expect("two segments with first pages that differ");
+        f.write_all_at(&page, places[0]).unwrap();
         f.sync_all().unwrap();
     }
     let before = listing(&d);
@@ -1164,10 +1185,10 @@ fn a_place_holding_another_files_first_page_is_refused_by_its_row_in(
     let e = e.to_string();
     // Named as the manifest names it: the segment's own name, which
     // under a cipher is not the envelope's the table has it under.
-    let named = if segs[0].starts_with("x-") {
+    let named = if first.starts_with("x-") {
         "names ".to_string()
     } else {
-        format!("names {}", segs[0])
+        format!("names {first}")
     };
     assert!(
         e.contains("refused: the manifest slot")

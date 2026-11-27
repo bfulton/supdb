@@ -523,8 +523,8 @@ pub struct Supdb {
     dirkey: bool,
     /// The store is under a cipher of the caller's (`Policy::cipher`).
     cipher: bool,
-    /// `Policy::cipher_auto`.
-    cipher_auto: bool,
+    /// `Policy::cipher_auto`: what the arm pins, which names it.
+    cipher_auto: Option<bool>,
     /// `Policy::cipher_cache`.
     cipher_cache: u64,
     /// `Policy::cipher_log`.
@@ -2058,9 +2058,7 @@ struct Policy {
     /// here AES-256-GCM: `supdb-cipher` and `supdb-ingestcipher`. Its
     /// directory holds its files' envelopes and it reads them through a
     /// cache of plaintext of its own. Its pair is `supdb`, or
-    /// `supdb-ingest`, itself: it differs by the cipher, and by the
-    /// compact form's controller, which leaves a store under a cipher in
-    /// the raw form as shipped (`cipher_auto`).
+    /// `supdb-ingest`, itself: it differs by the cipher alone.
     cipher: bool,
     /// The plaintext the store under a cipher may hold, bytes
     /// (`StoreCipher::cache_bytes`), or zero for the engine's own choice,
@@ -2075,12 +2073,14 @@ struct Policy {
     /// `supdb-cipherlog` and `supdb-ingestcipherlog`, what the run is
     /// priced against under the cipher.
     cipher_log: bool,
-    /// The store under a cipher with the compact form's controller on
-    /// (`Options::zpages_under_cipher`), which is off as shipped:
-    /// `supdb-cipherauto` and `supdb-ingestcipherauto`, the form the
-    /// controller buys under a cipher priced against the raw form it
-    /// stays in otherwise.
-    cipher_auto: bool,
+    /// The compact form's controller under a cipher
+    /// (`Options::zpages_under_cipher`), where an arm pins it, and the
+    /// engine's otherwise: on in `supdb-cipherauto` and
+    /// `supdb-ingestcipherauto`, the arms that priced it before it was
+    /// shipped on, and off in `supdb-ciphernoauto` and
+    /// `supdb-ingestciphernoauto`, the shape before, a store under a
+    /// cipher left in the raw form.
+    cipher_auto: Option<bool>,
     /// The store under a cipher with each chunk's ciphertext left to its
     /// own read of the device (`StoreCipher::chunks_apart`), where the
     /// store as shipped asks for the ciphertext of an ask's chunks
@@ -3374,7 +3374,7 @@ impl Default for Policy {
         Policy {
             dir_key: false,
             cipher: false,
-            cipher_auto: false,
+            cipher_auto: None,
             cipher_cache: 0,
             cipher_log: false,
             cipher_apart: false,
@@ -3998,13 +3998,42 @@ impl Supdb {
     }
 
     /// `supdb-cipher` and `supdb-ingestcipher` with the compact form's
-    /// controller on (`Policy::cipher_auto`).
+    /// controller under a cipher left out (`Policy::cipher_auto`), the
+    /// shape before it shipped on: the raw form whatever the store
+    /// measures.
+    pub fn create_ciphernoauto(path: &Path) -> Res<Supdb> {
+        Supdb::with_policy(
+            path,
+            Policy {
+                cipher: true,
+                cipher_auto: Some(false),
+                ..Policy::default()
+            },
+        )
+    }
+
+    pub fn create_ingest_ciphernoauto(path: &Path) -> Res<Supdb> {
+        Supdb::with_policy(
+            path,
+            Policy {
+                cipher: true,
+                cipher_auto: Some(false),
+                partition: false,
+                durable: false,
+                ..Policy::default()
+            },
+        )
+    }
+
+    /// `supdb-cipher` and `supdb-ingestcipher` with the compact form's
+    /// controller pinned on (`Policy::cipher_auto`), the arms that priced
+    /// it before it shipped on.
     pub fn create_cipherauto(path: &Path) -> Res<Supdb> {
         Supdb::with_policy(
             path,
             Policy {
                 cipher: true,
-                cipher_auto: true,
+                cipher_auto: Some(true),
                 ..Policy::default()
             },
         )
@@ -4018,7 +4047,7 @@ impl Supdb {
             path,
             Policy {
                 cipher: true,
-                cipher_auto: true,
+                cipher_auto: Some(true),
                 cipher_land_model: true,
                 ..Policy::default()
             },
@@ -4033,7 +4062,7 @@ impl Supdb {
             path,
             Policy {
                 cipher: true,
-                cipher_auto: true,
+                cipher_auto: Some(true),
                 cipher_merge_stream: true,
                 ..Policy::default()
             },
@@ -4048,7 +4077,7 @@ impl Supdb {
             path,
             Policy {
                 cipher: true,
-                cipher_auto: true,
+                cipher_auto: Some(true),
                 cipher_drops_keep: true,
                 ..Policy::default()
             },
@@ -4063,7 +4092,7 @@ impl Supdb {
             path,
             Policy {
                 cipher: true,
-                cipher_auto: true,
+                cipher_auto: Some(true),
                 zrewarmbeside: true,
                 ..Policy::default()
             },
@@ -4078,7 +4107,7 @@ impl Supdb {
             path,
             Policy {
                 cipher: true,
-                cipher_auto: true,
+                cipher_auto: Some(true),
                 aheadflat: true,
                 ..Policy::default()
             },
@@ -4092,7 +4121,7 @@ impl Supdb {
             path,
             Policy {
                 cipher: true,
-                cipher_auto: true,
+                cipher_auto: Some(true),
                 cipher_merge_apart: true,
                 ..Policy::default()
             },
@@ -4192,7 +4221,7 @@ impl Supdb {
             path,
             Policy {
                 cipher: true,
-                cipher_auto: true,
+                cipher_auto: Some(true),
                 partition: false,
                 durable: false,
                 ..Policy::default()
@@ -4966,7 +4995,7 @@ impl Supdb {
             path,
             Policy {
                 cipher: true,
-                cipher_auto: true,
+                cipher_auto: Some(true),
                 onefile: true,
                 ..Policy::default()
             },
@@ -4980,7 +5009,7 @@ impl Supdb {
             path,
             Policy {
                 cipher: true,
-                cipher_auto: true,
+                cipher_auto: Some(true),
                 onefile: true,
                 partition: false,
                 durable: false,
@@ -11546,7 +11575,9 @@ impl Supdb {
         // an ordered load through the log with no run, the shape before,
         // and the compact form's controller on, the shape not shipped.
         if cipher {
-            opts.zpages_under_cipher = cipher_auto;
+            if let Some(on) = cipher_auto {
+                opts.zpages_under_cipher = on;
+            }
             if cipher_land_model {
                 opts.zpages_land_cache_pct = 0;
             }
@@ -12108,8 +12139,10 @@ impl Engine for Supdb {
         if self.cipher {
             let zstride = self.zstride == Some(supdb::ZStride::Forced);
             return match self.durable {
-                true if self.onefile && self.cipher_auto => "supdb-cipherautoonefile",
-                false if self.onefile && self.cipher_auto => "supdb-ingestcipherautoonefile",
+                true if self.onefile && self.cipher_auto == Some(true) => "supdb-cipherautoonefile",
+                false if self.onefile && self.cipher_auto == Some(true) => {
+                    "supdb-ingestcipherautoonefile"
+                }
                 true if self.onefile => "supdb-cipheronefile",
                 true if self.zpages && zstride && self.cipher_apart => "supdb-cipherzstrideapart",
                 true if self.zpages && zstride && self.cipher_half => "supdb-cipherzstridehalf",
@@ -12118,16 +12151,28 @@ impl Engine for Supdb {
                 true if self.zpages => "supdb-cipherzpages",
                 true if self.cipher_log => "supdb-cipherlog",
                 false if self.cipher_log => "supdb-ingestcipherlog",
-                true if self.cipher_auto && self.cipher_land_model => "supdb-cipherautolandmodel",
-                true if self.cipher_auto && self.cipher_merge_apart => "supdb-cipherautomergeapart",
-                true if self.cipher_auto && self.cipher_merge_stream => {
+                true if self.cipher_auto == Some(true) && self.cipher_land_model => {
+                    "supdb-cipherautolandmodel"
+                }
+                true if self.cipher_auto == Some(true) && self.cipher_merge_apart => {
+                    "supdb-cipherautomergeapart"
+                }
+                true if self.cipher_auto == Some(true) && self.cipher_merge_stream => {
                     "supdb-cipherautomergestream"
                 }
-                true if self.cipher_auto && self.cipher_drops_keep => "supdb-cipherautodropskeep",
-                true if self.cipher_auto && self.zrewarmbeside => "supdb-cipherautorewarmbeside",
-                true if self.cipher_auto && self.aheadflat => "supdb-cipherautoaheadflat",
-                true if self.cipher_auto => "supdb-cipherauto",
-                false if self.cipher_auto => "supdb-ingestcipherauto",
+                true if self.cipher_auto == Some(true) && self.cipher_drops_keep => {
+                    "supdb-cipherautodropskeep"
+                }
+                true if self.cipher_auto == Some(true) && self.zrewarmbeside => {
+                    "supdb-cipherautorewarmbeside"
+                }
+                true if self.cipher_auto == Some(true) && self.aheadflat => {
+                    "supdb-cipherautoaheadflat"
+                }
+                true if self.cipher_auto == Some(true) => "supdb-cipherauto",
+                false if self.cipher_auto == Some(true) => "supdb-ingestcipherauto",
+                true if self.cipher_auto == Some(false) => "supdb-ciphernoauto",
+                false if self.cipher_auto == Some(false) => "supdb-ingestciphernoauto",
                 true if self.cipher_cache != 0 => "supdb-cipher64",
                 true => "supdb-cipher",
                 false => "supdb-ingestcipher",
@@ -16013,6 +16058,7 @@ pub fn guarantee(arm: &str) -> Option<Guarantee> {
         | "supdb-cipher64"
         | "supdb-cipherlog"
         | "supdb-cipherauto"
+        | "supdb-ciphernoauto"
         | "supdb-cipheronefile"
         | "supdb-cipherautoonefile"
         | "supdb-cipherautolandmodel"
@@ -16537,6 +16583,7 @@ pub fn guarantee(arm: &str) -> Option<Guarantee> {
         | "supdb-ingestcipher"
         | "supdb-ingestcipherlog"
         | "supdb-ingestcipherauto"
+        | "supdb-ingestciphernoauto"
         | "supdb-ingestcipherautoonefile"
         // A write-once segment makes nothing durable before its one sync.
         | "supdb-segment"
@@ -16665,6 +16712,7 @@ pub fn open(arm: &str, dir: &Path, map_gb: usize) -> Res<Box<dyn Engine>> {
         "supdb-cipherlog" => supdb_arm(Supdb::create_cipherlog, dir)?,
         "supdb-ingestcipherlog" => supdb_arm(Supdb::create_ingest_cipherlog, dir)?,
         "supdb-cipherauto" => supdb_arm(Supdb::create_cipherauto, dir)?,
+        "supdb-ciphernoauto" => supdb_arm(Supdb::create_ciphernoauto, dir)?,
         "supdb-cipheronefile" => supdb_arm(Supdb::create_cipher_onefile, dir)?,
         "supdb-cipherautoonefile" => supdb_arm(Supdb::create_cipherauto_onefile, dir)?,
         "supdb-ingestcipherautoonefile" => supdb_arm(Supdb::create_ingest_cipherauto_onefile, dir)?,
@@ -16681,6 +16729,7 @@ pub fn open(arm: &str, dir: &Path, map_gb: usize) -> Res<Box<dyn Engine>> {
         "supdb-cipherhalf" => supdb_arm(Supdb::create_cipher_half, dir)?,
         "supdb-ingestcipher" => supdb_arm(Supdb::create_ingest_cipher, dir)?,
         "supdb-ingestcipherauto" => supdb_arm(Supdb::create_ingest_cipherauto, dir)?,
+        "supdb-ingestciphernoauto" => supdb_arm(Supdb::create_ingest_ciphernoauto, dir)?,
         "supdb-nocacheordread" => supdb_arm(Supdb::create_nocache_ordread, dir)?,
         "supdb-nocachezpages" => supdb_arm(Supdb::create_nocache_zpages, dir)?,
         "supdb-nocachezpagesnodrop" => supdb_arm(Supdb::create_nocache_zpages_nodrop, dir)?,
@@ -19633,10 +19682,15 @@ mod tests {
         let cipher = arm("supdb-cipher", Supdb::create_cipher);
         let log = arm("supdb-cipherlog", Supdb::create_cipherlog);
         let auto = arm("supdb-cipherauto", Supdb::create_cipherauto);
+        let noauto = arm("supdb-ciphernoauto", Supdb::create_ciphernoauto);
         let zblock = arm("supdb-cipherzpages", Supdb::create_cipher_zpages);
         let zstride = arm("supdb-cipherzstride", Supdb::create_cipher_zstride);
         let o = |a: &Supdb| a.db.as_ref().unwrap().options().clone();
         let (p, c, l, z) = (o(&plain), o(&cipher), o(&log), o(&auto));
+        assert!(
+            !o(&noauto).zpages_under_cipher,
+            "supdb-ciphernoauto leaves the controller out"
+        );
         let (zb, zs) = (o(&zblock), o(&zstride));
         // The store's options give the cipher to the store, which holds it
         // where the options do not (`Db::cipher_counts` answers for it).
@@ -19717,8 +19771,8 @@ mod tests {
         );
         assert!(p.direct_ingest, "supdb's ordered loads go to a run");
         assert!(
-            !c.zpages_under_cipher,
-            "supdb-cipher leaves the controller out"
+            c.zpages_under_cipher,
+            "supdb-cipher lets the controller in, as the engine ships"
         );
         assert!(!l.direct_ingest, "supdb-cipherlog loads through the log");
         assert_eq!(
@@ -21800,7 +21854,7 @@ mod tests {
                     let z = Supdb::create_cipher_onefile(&dir("cipheronefile")).unwrap();
                     assert_eq!(z.name(), "supdb-cipheronefile");
                     let o = z.db.as_ref().unwrap().options();
-                    assert!(o.one_file && !o.zpages_under_cipher);
+                    assert!(o.one_file && o.zpages_under_cipher);
                     assert!(z.db.as_ref().unwrap().one_counts().is_some());
                     let z = Supdb::create_cipherauto_onefile(&dir("cipherautoonefile")).unwrap();
                     assert_eq!(z.name(), "supdb-cipherautoonefile");

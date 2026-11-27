@@ -917,8 +917,23 @@ until the run is its own log). What it loses:
   shape that is left. Done when `supdb-cipher` reads and scans ahead of
   `rocksdb-tuned-enc` in both sittings: the controller on as shipped
   under a cipher, which wants its pairings in core and at the other
-  bounds first, and the shape that is left.
-- [ ] **The loads with the controller on under a cipher.** At five
+  bounds first, and the shape that is left. The controller is on as
+  shipped now (`Options::zpages_under_cipher`), on pairings against the
+  store with it off in core and at the three bounds (`sh
+  bench/scripts/pair.sh SUPDB_LAG_COUNTERS=1 supdb-cipherauto
+  supdb-cipher SIZE --bound B --passes
+  load,read,read-threaded,scan,scan-threaded,mixes,scan-mixed,mixes-scrambled,lag
+  --reps 2 --ops-div 10` at `9ef998b`, five million keys under 640 MiB
+  and ten million under 1 GiB and 1.25 GiB; `scratch/plan/onefile.md`,
+  O5a, has the cells): every read, scan and mix cell ahead at every bound
+  in both orders, by 1.3x to 62x, and in core nothing built and nothing
+  resolved but the read pass at 0.97x in both orders. What it costs is
+  the two items below. The comparator pairing with it shipped is owed.
+- [ ] **The loads with the controller on under a cipher.** Shipped on
+  now, the loads read 0.79-0.92x of the store with it off at every bound
+  in both orders, the shuffled load the lower (at `9ef998b`, the pairings
+  in the item above), so what follows is the cost the default carries.
+  At five
   million keys under 640 MiB the controller's builds during a load -- the
   builds ahead at landing in the ordered load, the builds at a merge's
   finish in the shuffled load's drain, twenty-two of them there for
@@ -950,7 +965,14 @@ until the run is its own log). What it loses:
   waiting on, the log's sync beside the builds' envelopes going to the
   device or a hand-off to another thread. The plain store builds at a
   merge's finish in a shuffled load as well.
-- [ ] **The lag sweep with the controller on under a cipher.** At ten
+- [ ] **The lag sweep with the controller on under a cipher.** Shipped
+  on now. At `9ef998b` (the pairings two items above), against the store
+  with it off: the full rewrite's pass 1.7x to 5.3x and the one- and
+  ten-percent bursts 1.2x to 3.9x ahead at every bound, and behind, in
+  both orders, the full rewrite's burst at 0.49-0.62x, the pass after the
+  one-percent burst at 0.40-0.47x, and under 640 MiB and 1.25 GiB the
+  clean store's pass at 0.82-0.85x and the ten-percent pass at
+  0.20-0.72x. At ten
   million keys under 1.25 GiB the store with the controller on reads,
   scans and runs every mix at 2.5x to 40x the store with it off, and its
   lag sweep's scan passes over the clean store and after the one- and
