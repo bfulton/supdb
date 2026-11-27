@@ -928,7 +928,20 @@ until the run is its own log). What it loses:
   O5a, has the cells): every read, scan and mix cell ahead at every bound
   in both orders, by 1.3x to 62x, and in core nothing built and nothing
   resolved but the read pass at 0.97x in both orders. What it costs is
-  the two items below. The comparator pairing with it shipped is owed.
+  the two items below. Against encrypted RocksDB with it shipped, at
+  five million keys under 640 MiB (`BIN=$PWD/target-enc/release/bench sh
+  scripts/pair.sh supdb-cipher rocksdb-tuned-enc 5000000 --bound
+  671088640 --passes load,read,scan,mixes,mixes-scrambled,lag --reps 2
+  --ops-div 10` at `e88a6ba`, in `bench/`; the threaded passes left out,
+  where RocksDB under the bound was killed in every rep): ahead in every
+  cell in both orders but two -- reads 3.3-4.0x, scans 17-19x, the
+  mixes 2.6-36x, the shuffled load 1.13-1.15x, the clean, one- and
+  ten-percent passes 1.2-1.9x, every burst 1.4-5x -- and behind on the
+  ordered load, 0.89-0.97x, and on the pass after the full rewrite,
+  0.55-0.82x. The first is the run's records written twice ("An ordered
+  run under a cipher as its own log"); the second the merges' debt at the
+  pass, a fifth of whose CPU is the output's trip through its memory file
+  ("An envelope written beside its segment").
 - [ ] **The loads with the controller on under a cipher.** Shipped on
   now, the loads read 0.79-0.92x of the store with it off at every bound
   in both orders, the shuffled load the lower (at `9ef998b`, the pairings
