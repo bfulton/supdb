@@ -1,8 +1,8 @@
 <svg xmlns="http://www.w3.org/2000/svg" width="760" height="420" viewBox="0 0 760 420" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" fill="#1b1b1b">
 <rect width="760" height="420" fill="white"/>
-<text x="72" y="28" font-size="15" font-weight="600">At 10⁷ keys supdb is 28.9× ahead of FASTER</text>
+<text x="72" y="28" font-size="15" font-weight="600">At 10⁷ keys supdb is 31.5× ahead of FASTER</text>
 <text x="72" y="47" font-size="12">YCSB-A, update-heavy (50/50 read/update, zipfian), throughput, in memory until a checkpoint, to 10⁷ keys</text>
-<text x="72" y="64" font-size="11" fill="#6b6b6b">x86_64/intel-r-xeon-r-processor-2.30ghz/4c/16g/hypervisor/b1280m · 001781d · 2026-11-26 · median with 95% CI over 3 reps</text>
+<text x="72" y="64" font-size="11" fill="#6b6b6b">x86_64/intel-r-xeon-r-processor-2.30ghz/4c/16g/hypervisor/b1280m · 5fea7c0 · 2026-11-27 · median with 95% CI over 3 reps</text>
 <line x1="72" y1="372" x2="610" y2="372" stroke="#c8c8c8" stroke-width="1"/>
 <line x1="72" y1="88" x2="72" y2="372" stroke="#c8c8c8" stroke-width="1"/>
 <line x1="135.0" y1="372" x2="135.0" y2="375" stroke="#c8c8c8" stroke-width="1"/>
@@ -20,10 +20,10 @@
 <line x1="67" y1="88.0" x2="72" y2="88.0" stroke="#c8c8c8" stroke-width="1"/>
 <text x="63" y="92.0" font-size="11" text-anchor="end" fill="#6b6b6b">4M</text>
 <text x="10" y="80" font-size="11" text-anchor="start" fill="#6b6b6b">ops/s</text>
-<path d="M135.0,179.5 L547.0,196.2 L547.0,217.3 L135.0,219.0 Z" fill="#1b1b1b" fill-opacity="0.10"/>
-<path d="M135.0,148.2 L547.0,365.4 L547.0,366.7 L135.0,163.9 Z" fill="#8c8c8c" fill-opacity="0.10"/>
-<path d="M135.0,195.7 L547.0,214.5 " fill="none" stroke="#1b1b1b" stroke-width="2" stroke-linejoin="round" stroke-linecap="round"/>
-<path d="M135.0,159.6 L547.0,366.5 " fill="none" stroke="#8c8c8c" stroke-width="1.6" stroke-linejoin="round" stroke-linecap="round"/>
-<text x="618.0" y="218.5" font-size="11" fill="#1b1b1b">supdb (log held in memory)</text>
-<text x="618.0" y="370.5" font-size="11" fill="#8c8c8c">FASTER</text>
+<path d="M135.0,180.4 L547.0,191.4 L547.0,229.7 L135.0,226.2 Z" fill="#1b1b1b" fill-opacity="0.10"/>
+<path d="M135.0,119.2 L547.0,366.3 L547.0,366.8 L135.0,201.1 Z" fill="#8c8c8c" fill-opacity="0.10"/>
+<path d="M135.0,204.0 L547.0,195.6 " fill="none" stroke="#1b1b1b" stroke-width="2" stroke-linejoin="round" stroke-linecap="round"/>
+<path d="M135.0,134.5 L547.0,366.4 " fill="none" stroke="#8c8c8c" stroke-width="1.6" stroke-linejoin="round" stroke-linecap="round"/>
+<text x="618.0" y="199.6" font-size="11" fill="#1b1b1b">supdb (log held in memory)</text>
+<text x="618.0" y="370.4" font-size="11" fill="#8c8c8c">FASTER</text>
 </svg>
