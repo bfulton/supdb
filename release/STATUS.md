@@ -19,8 +19,8 @@ and merges that branch to main for the tag.
 | 0 | History audit (A) | coordinator's subagents | `release/history.md`, evidence under `release/history/` | done: no credential in any ref, nothing to rotate | nothing |
 | 0 | History decision (B) | Bright | none | keep history and fix forward, the plan's default; the audit finds nothing for a rewrite (`release/history.md`) | nothing, unless Bright overrules |
 | 0 | Release-candidate branch, C0 | coordinator | `release-candidate`, cut at C0 = `b3a043dc` (tree `7f58d776`) | done; `ci` was green on all nine legs at that commit (push run 46057759527) | nothing |
-| 0 | Baseline at C0 | measurement agent, in a cloud session of its own | `release/baseline.md` | static counts and commands prepared; the rows and the noise floor are about 39 hours of runs that need a machine to themselves, so they run apart from the passes | the run sheet's verification |
-| 1 | Delete: options ledger, dead code, API surface | not assigned | `release/options.csv` | the ledger's mechanical columns are being generated | C0, decision 1 |
+| 0 | Baseline at C0 | measurement agent, in a cloud session of its own | `release/baseline.md` | prepared and verified (three rounds; seven minor defects open, listed there); static counts measured; the cost count of C0 against itself is running here; rows and floor not started | the measurement session |
+| 1 | Delete: options ledger, dead code, API surface | coordinator's subagents | `release/options.csv` | mechanical columns done and verified; the judgment pass is next | decision 1, defaulted to hidden fields and `#[non_exhaustive]` unless Bright overrules |
 | 2 | Reshape: split `src/db.rs`, style | not assigned | none | not started | phase 1 |
 | 3 | Verify: audits, then fixes | not assigned | `release/findings/` | not started; inputs from the history audit: `bank-row.yml`'s write token, unpinned actions, five workflows without `permissions:` | phase 2, decisions 4 and 7 |
 | 4 | Tests: flake loop, runtime, coverage | not assigned | none | not started | the last fix of phase 3, decision 5 |
@@ -36,7 +36,7 @@ still open below is what changes what ships.
 
 | # | Decision | Sets | State |
 |---|---|---|---|
-| 1 | Experimental options: stay in the public `Options` type, or move to a sub-struct or a feature | phase 1 | open; the ledger's counts are being prepared for it |
+| 1 | Experimental options: stay in the public `Options` type, or move to a sub-struct or a feature | phase 1 | default taken: they stay in `Options`, hidden from the docs, and `Options` becomes `#[non_exhaustive]`; Bright may overrule |
 | 2 | Is encryption in this tag | phase 3's scope | yes: the tag is of main, and encryption is on main since #35 |
 | 3 | Version and tag name; whether to publish to crates.io | phases 5 and 7 | open; `Cargo.toml` says 0.1.0 |
 | 4 | The format compatibility promise that starts at the tag | phase 3 | open |
