@@ -1109,6 +1109,22 @@ pub(crate) fn one_of(dir: &Path) -> Option<Arc<One>> {
         .and_then(|v| v.one().cloned())
 }
 
+/// A test's crash of the store under a cipher in `dir` (`Db::crash`),
+/// whose registration stays with the forgotten store as a dead process's
+/// would not: the cache's evictor stopped, since a dead process's cache
+/// gives nothing back after it. Left running, every crashed store's
+/// evictor read its room every twenty milliseconds for the rest of the
+/// process, a `mincore` over every mapped block alive in it, the forgotten
+/// stores' among them: at the end of a test binary under
+/// `SUPDB_TEST_ONEFILE` fifty-eight of them held the process's map lock
+/// between them, and the store a test had open crawled through every
+/// `mmap` it made. Nothing for a store in the clear.
+pub(crate) fn crash(dir: &Path) {
+    if let Some(v) = under(dir) {
+        v.pager.stop();
+    }
+}
+
 /// A test's crash of the plain store kept in one file in `dir`
 /// (`Db::crash`): its table taken out of the door's reach and killed
 /// (`One::kill`), so the store opened in its place is the only one that

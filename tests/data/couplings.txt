@@ -63,6 +63,7 @@ src/db.rs	Db::cipher_counts	vault::CipherCounts	code	1	stays	public counters
 src/db.rs	Db::close_run	run logged	code	4	S4 (conditional; else stays)	RUN_LOGGED: the logged run; and the close readable on the writer (Options::close_readable_inline, main #33) is never a logged run's, whose envelope is the seal thread's to write
 src/db.rs	Db::close_run	vault::persist	code	1	S6	vault::persist
 src/db.rs	Db::commit_direct	run logged	code	7	S4 (conditional; else stays)	log_run
+src/db.rs	Db::crash	vault::crash	code	1	stays	a test's crash stops the threads of an encrypted store's registration, which outlives the forget where a dead process's threads do not (the cache's evictor, whose reading of its room every twenty milliseconds was a mincore over every block mapped in the process, fifty-eight of them at a binary's end holding its map lock); one call by the directory, nothing for a store in the clear
 src/db.rs	Db::create	cipher	code	4	stays	the open names the mode; S5 takes one cipher token (cipher_controller call)
 src/db.rs	Db::create	crypt	code	4	stays	the open names the mode; S5 takes one cipher token (cipher_controller call)
 src/db.rs	Db::create	dirkey	code	1	stays	the open names the mode; S5 takes one cipher token (cipher_controller call)

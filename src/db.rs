@@ -24877,6 +24877,7 @@ struct SealCounts {
     /// stretch (`Options::merge_parallel_quiet`).
     merges_quiet: AtomicU64,
     held_landings: AtomicU64,
+    readable_held: AtomicU64,
     /// The seal thread's phases, summed over seals: the sort of the frozen
     /// table, the snapshot's build and publish, and the record loop.
     seal_sort_ns: AtomicU64,
@@ -24965,6 +24966,7 @@ impl SealCounts {
             joins: get(&self.joins),
             publishes: get(&self.publishes),
             held_landings: get(&self.held_landings),
+            readable_held: get(&self.readable_held),
             merges: get(&self.merges),
             plans: get(&self.plans),
             merges_beside: get(&self.merges_beside),
@@ -25018,6 +25020,11 @@ pub struct SealWaits {
     /// landing writes the manifest. One per look, so a merge held across
     /// several polls counts several.
     pub held_landings: u64,
+    /// Polls a test's hold of the readable landing turned away with a
+    /// seal's readable phase due (`Db::hold_readable_landing`): where a
+    /// test learns that the phase is due, which the seal's segments being
+    /// renamed into place does not say.
+    pub readable_held: u64,
     /// Partition merges landed, and the plans landings made: a seal's
     /// durable landing plans the merges the landed set makes due, and so
     /// does a merge's own under `Options::merge_chains`.
@@ -53964,8 +53971,10 @@ impl Db {
     /// store opens again in this process. `mem::forget` alone keeps the
     /// lock, and the reopen is refused as a second open. The upkeep thread
     /// and the others that read the store's files end with it too, since
-    /// a test may cut a file back once this returns; the trim thread,
-    /// which touches no file, runs on until the process ends.
+    /// a test may cut a file back once this returns, and so do the
+    /// threads of an encrypted store's registration (`vault::crash`);
+    /// the trim thread, which touches no file, runs on until the process
+    /// ends.
     #[doc(hidden)]
     pub fn crash(self) {
         let mut me = std::mem::ManuallyDrop::new(self);
@@ -53990,6 +53999,9 @@ impl Db {
             me.shared.upkeep.thread.get(),
             me.shared.keeper_thread.get(),
         ]);
+        // And the threads of an encrypted store's registration, which run
+        // on past a forget where a dead process's do not.
+        vault::crash(&me.dir);
         // Then the table of a store in one file, against any thread of the
         // store's no count holds: a store opened after this one gives away
         // room such a thread was writing into. Shut before the counted
@@ -61724,6 +61736,7 @@ impl Maint {
         // A test's hold, asked where the landings' syscalls follow.
         if readable && self.shared.seal_hold.load(AtomicOrdering::Relaxed) & SEAL_HOLD_READABLE != 0
         {
+            SealCounts::add(&self.shared.seal_counts.readable_held, 1);
             return;
         }
         let op = self.op();

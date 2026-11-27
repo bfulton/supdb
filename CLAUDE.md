@@ -11652,6 +11652,37 @@ the one that was running and not the one that left the thread; and a
 test that waits for a thread is sized so that the thread outlasts
 whatever else the wait covers, or the wait passes without it.
 
+It came again from a thread `Life` does not count, because it writes no
+file. A store under a cipher keeps its registration in the process past
+a crash, and its registration's cache has an evictor that reads its
+room every twenty milliseconds, a `mincore` over every block mapped in
+the process, the crashed stores' among them. The hosted ARM leg's
+`onefile` group failed a run-close test whose wait for a link ran out,
+and four copies of `tests/durable.rs` run at once under
+`SUPDB_TEST_ONEFILE` here each sat past nine minutes on one test. That
+test passed in thirty seconds in a process of its own. Every thread's
+state and kernel stack in one stuck process
+(`/proc/<pid>/task/*/stat`, `stack`) named it: fifty-eight evictors in
+`mincore`, thirty of them in D, and the open store's segment work in D
+in `vm_mmap_pgoff` and `madvise_lock`, behind the map lock they held
+between them. A crash stops the evictor now (`vault::crash`), and a test
+holds the thread's task gone once a close or a crash returns, by the
+thread id the counts carry (`PagerCounts::evictor_tid`). The same
+stress, run again, found two tests the contention had hidden. One was a
+bet: `a_merge_finished_beside_a_failing_seal_is_held_in_the_same_look`
+waited for the seal's piece to be renamed into place, which comes before
+the seal thread says the piece is readable, and let a merge go in
+between. A sleep of half a second put there failed it every run, and it
+waits now for a poll the readable hold turned away
+(`SealWaits::readable_held`). The other was a copy helper
+(`os_copy`) that ignored its errors, so a full disk built a crash state
+with its log missing, which read as a store refusing to open. The
+corollary: a test's stand-in for a dead process stops every thread the
+dead process would not have, counted or not, since a thread that only
+reads the process's own state is still the next test's load; and a
+helper that builds a test's state fails on the errors it meets, or the
+state it builds is a different state.
+
 **A stamp read as the end of the step it begins.** The drain's stamps
 name `readable` where the seal thread hands its segments over, and the
 first decomposition of the durable shuffled load at ten thousand keys

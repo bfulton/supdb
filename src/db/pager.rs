@@ -93,7 +93,7 @@ use crate::crypt::{self, Aead, Header, TAG};
 use std::cell::Cell;
 use std::fs::File;
 use std::io::{Error, ErrorKind, Result};
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, AtomicU8, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, OnceLock, RwLock, Weak};
 use std::time::Duration;
 
@@ -367,6 +367,10 @@ pub struct PagerCounts {
     /// file's pages gave back (`Paged::forget`), and their plaintext.
     pub dropped_units: u64,
     pub dropped_bytes: u64,
+    /// The evictor's thread id (`gettid`), 0 before its first look and off
+    /// Linux: what a test reads `/proc/self/task` by to hold that a store's
+    /// end, or its crash, ended the thread (`Db::crash`).
+    pub evictor_tid: i64,
 }
 
 /// What a cache whose budget follows the room asks of the platform
@@ -500,6 +504,9 @@ pub(crate) struct Pager {
     woken: Condvar,
     stop: AtomicBool,
     thread: Mutex<Option<std::thread::JoinHandle<()>>>,
+    /// The evictor's thread id, from its first look; 0 before it, and off
+    /// Linux.
+    tid: AtomicI64,
     counts: Counts,
 }
 
@@ -552,6 +559,7 @@ impl Pager {
             woken: Condvar::new(),
             stop: AtomicBool::new(false),
             thread: Mutex::new(None),
+            tid: AtomicI64::new(0),
             counts: Counts::default(),
         });
         p.set_budget(limit);
@@ -770,6 +778,7 @@ impl Pager {
             streamed: r(&c.streamed),
             dropped_units: r(&c.dropped_units),
             dropped_bytes: r(&c.dropped_bytes),
+            evictor_tid: self.tid.load(Ordering::Acquire),
         }
     }
 
@@ -947,6 +956,12 @@ impl Pager {
     // -- the evictor ---------------------------------------------------
 
     fn run(me: Weak<Pager>) {
+        #[cfg(target_os = "linux")]
+        if let Some(p) = me.upgrade() {
+            // SAFETY: a call with no arguments that only reads.
+            p.tid
+                .store(i64::from(unsafe { libc::gettid() }), Ordering::Release);
+        }
         loop {
             let Some(p) = me.upgrade() else {
                 return;

@@ -396,6 +396,59 @@ fn an_unpinned_writer_is_refused_under_a_cipher() {
     holds(&Db::open(&dir, under(1)).unwrap(), n);
 }
 
+/// The evictor of a store's cache ends with the store, at its close and
+/// at a test's crash (`Db::crash`), as a dead process's does. Left running
+/// at a crash, each crashed store's evictor read the room every twenty
+/// milliseconds for the rest of the process, a `mincore` over every mapped
+/// block alive in it, and at the end of a test binary under
+/// `SUPDB_TEST_ONEFILE` fifty-eight of them held the process's map lock
+/// between them while the one store still open crawled through its
+/// `mmap`s. Read off the thread's task in `/proc/self/task`, which goes a
+/// moment after the join that ends it.
+#[test]
+fn a_stores_close_and_its_crash_each_end_its_caches_evictor() {
+    let evictor = |db: &Db| {
+        let t = std::time::Instant::now();
+        loop {
+            let tid = db.cipher_counts().unwrap().cache.evictor_tid;
+            if tid != 0 {
+                let task = PathBuf::from(format!("/proc/self/task/{tid}"));
+                assert!(task.exists(), "the premise: the evictor {tid} runs");
+                return task;
+            }
+            assert!(
+                t.elapsed() < std::time::Duration::from_secs(60),
+                "the evictor never made its first look"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+    };
+    let gone = |task: &Path, how: &str| {
+        let t = std::time::Instant::now();
+        while task.exists() {
+            assert!(
+                t.elapsed() < std::time::Duration::from_secs(10),
+                "the evictor ({}) runs on past the store's {how}",
+                task.display()
+            );
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+    };
+    for how in ["close", "crash"] {
+        let dir = scratch(&format!("evictor-{how}"));
+        let mut db = Db::create(&dir, under(1)).unwrap();
+        fill(&mut db, 200);
+        let task = evictor(&db);
+        if how == "close" {
+            db.close().unwrap();
+        } else {
+            db.crash();
+        }
+        gone(&task, how);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
 fn mix(mut h: u64, bytes: &[u8]) -> u64 {
     for &b in bytes {
         h = (h ^ u64::from(b)).wrapping_mul(0x0100_0000_01b3);

@@ -6103,7 +6103,13 @@ fn ss_commit_answer(db: &mut Db) -> std::io::Error {
             Ok(()) => {
                 assert!(
                     t.elapsed() < std::time::Duration::from_secs(120),
-                    "no commit answered the segment work's failure"
+                    "no commit answered the segment work's failure: the queue stopped {}, \
+                     in flight {:?}, the seal's fault pending {}, levels {:?}, waits {:?}",
+                    db.seals_wedged(),
+                    db.in_flight(),
+                    db.seal_sync_fault_pending(),
+                    db.levels(),
+                    db.seal_waits()
                 );
                 std::thread::sleep(std::time::Duration::from_millis(1));
             }
@@ -6709,6 +6715,7 @@ fn a_flush_after_a_failed_inline_presync_is_not_ok_over_the_lost_records() {
 /// shipped the drain is answered at the readable landing, every write it
 /// covers durable before it, and the failure is the next commit's.
 fn ss_run_close_fails(tag: &str, by_flush: bool, inline: bool, strict: bool) {
+    eprintln!("ss_run_close_fails: {tag}");
     let d = dir(&format!("dur-ss-runclose-{tag}"));
     let crash = dir(&format!("dur-ss-runclose-{tag}-crash"));
     let opts = Options {
@@ -7734,11 +7741,20 @@ fn a_merge_finished_beside_a_failing_seal_is_held_in_the_same_look() {
     db.hold_readable_landing(true);
     db.fail_next_seal_dir_sync();
     ss_third(&mut db, &mut model);
+    let polls = db.seal_waits().readable_held;
     db.seal().unwrap();
     wait_for("the third piece renamed into place", || {
         seg_names(&d).len() > pieces_before.len()
     });
     let third = ss_new_piece(&d, &pieces_before);
+    // The merge let go only once a poll has met the seal's readable phase
+    // under the hold: the rename comes before the seal thread says its
+    // segments are readable, and a merge let go between the two landed,
+    // manifest and all, in a poll that held nothing, ahead of the failure
+    // -- once in a run of the binary four at a time.
+    wait_for("the seal's readable phase held", || {
+        db.seal_waits().readable_held > polls
+    });
     db.hold_merge_landing(false);
     wait_for("the merge past its hold", || !db.merge_waits_at_landing());
     // The merge thread returns its outputs once let go; given its moment.
@@ -7834,7 +7850,17 @@ fn os_copy(src: &Path, dst: &Path) {
     if let Ok(rd) = std::fs::read_dir(src) {
         for e in rd.flatten() {
             if e.file_type().map(|t| t.is_file()).unwrap_or(false) {
-                let _ = std::fs::copy(e.path(), dst.join(e.file_name()));
+                // A file gone between the listing and the copy is one the
+                // store removed; any other failure is the copy's, and a
+                // state with a file missing for it -- the disk full, four
+                // binaries at once -- reads as a store that refuses to
+                // open for want of its log.
+                match std::fs::copy(e.path(), dst.join(e.file_name())) {
+                    Err(x) if x.kind() != std::io::ErrorKind::NotFound => {
+                        panic!("copying {} for a crash state: {x}", e.path().display())
+                    }
+                    _ => {}
+                }
             }
         }
     }
