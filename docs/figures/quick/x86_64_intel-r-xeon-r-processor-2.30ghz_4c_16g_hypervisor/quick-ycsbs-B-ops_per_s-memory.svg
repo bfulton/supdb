@@ -1,8 +1,8 @@
 <svg xmlns="http://www.w3.org/2000/svg" width="760" height="420" viewBox="0 0 760 420" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" fill="#1b1b1b">
 <rect width="760" height="420" fill="white"/>
-<text x="72" y="28" font-size="15" font-weight="600">At 3×10⁵ keys supdb is level with FASTER</text>
+<text x="72" y="28" font-size="15" font-weight="600">At 3×10⁵ keys supdb is 1.1× behind FASTER</text>
 <text x="72" y="47" font-size="12">YCSB-B, read-mostly (95/5 read/update, scrambled zipfian), throughput, in memory until a checkpoint, to 3×10⁵ keys</text>
-<text x="72" y="64" font-size="11" fill="#6b6b6b">x86_64/intel-r-xeon-r-processor-2.30ghz/4c/16g/hypervisor · 001781d · 2026-11-26 · median with 95% CI over 5 reps</text>
+<text x="72" y="64" font-size="11" fill="#6b6b6b">x86_64/intel-r-xeon-r-processor-2.30ghz/4c/16g/hypervisor · 33bc663 · 2026-11-27 · median with 95% CI over 5 reps</text>
 <line x1="72" y1="372" x2="610" y2="372" stroke="#c8c8c8" stroke-width="1"/>
 <line x1="72" y1="88" x2="72" y2="372" stroke="#c8c8c8" stroke-width="1"/>
 <line x1="98.3" y1="372" x2="98.3" y2="378" stroke="#c8c8c8" stroke-width="1"/>
@@ -15,19 +15,18 @@
 <line x1="67" y1="372.0" x2="72" y2="372.0" stroke="#c8c8c8" stroke-width="1"/>
 <text x="63" y="376.0" font-size="11" text-anchor="end" fill="#6b6b6b">0</text>
 <line x1="67" y1="301.0" x2="72" y2="301.0" stroke="#c8c8c8" stroke-width="1"/>
-<text x="63" y="305.0" font-size="11" text-anchor="end" fill="#6b6b6b">2M</text>
+<text x="63" y="305.0" font-size="11" text-anchor="end" fill="#6b6b6b">2.5M</text>
 <line x1="67" y1="230.0" x2="72" y2="230.0" stroke="#c8c8c8" stroke-width="1"/>
-<text x="63" y="234.0" font-size="11" text-anchor="end" fill="#6b6b6b">4M</text>
+<text x="63" y="234.0" font-size="11" text-anchor="end" fill="#6b6b6b">5M</text>
 <line x1="67" y1="159.0" x2="72" y2="159.0" stroke="#c8c8c8" stroke-width="1"/>
-<text x="63" y="163.0" font-size="11" text-anchor="end" fill="#6b6b6b">6M</text>
+<text x="63" y="163.0" font-size="11" text-anchor="end" fill="#6b6b6b">7.5M</text>
 <line x1="67" y1="88.0" x2="72" y2="88.0" stroke="#c8c8c8" stroke-width="1"/>
-<text x="63" y="92.0" font-size="11" text-anchor="end" fill="#6b6b6b">8M</text>
+<text x="63" y="92.0" font-size="11" text-anchor="end" fill="#6b6b6b">10M</text>
 <text x="10" y="80" font-size="11" text-anchor="start" fill="#6b6b6b">ops/s</text>
-<path d="M98.3,118.7 L255.1,106.5 L426.9,129.1 L583.7,189.9 L583.7,267.2 L426.9,234.4 L255.1,245.5 L98.3,227.0 Z" fill="#8c8c8c" fill-opacity="0.10"/>
-<path d="M98.3,211.9 L255.1,168.2 L426.9,205.2 L583.7,203.3 L583.7,283.3 L426.9,262.0 L255.1,265.3 L98.3,244.2 Z" fill="#1b1b1b" fill-opacity="0.10"/>
-<path d="M98.3,141.0 L255.1,185.5 L426.9,201.9 L583.7,255.8 " fill="none" stroke="#8c8c8c" stroke-width="1.6" stroke-linejoin="round" stroke-linecap="round"/>
-<path d="M98.3,219.6 L255.1,241.8 L426.9,252.4 L583.7,250.3 " fill="none" stroke="#1b1b1b" stroke-width="2" stroke-linejoin="round" stroke-linecap="round"/>
-<text x="618.0" y="254.3" font-size="11" fill="#1b1b1b">supdb (in memory until a sync)</text>
-<line x1="612.0" y1="255.8" x2="616.0" y2="263.3" stroke="#8c8c8c" stroke-width="0.75"/>
-<text x="618.0" y="267.3" font-size="11" fill="#8c8c8c">FASTER</text>
+<path d="M98.3,117.8 L255.1,159.2 L426.9,210.1 L583.7,174.3 L583.7,256.1 L426.9,237.3 L255.1,206.1 L98.3,171.0 Z" fill="#8c8c8c" fill-opacity="0.10"/>
+<path d="M98.3,225.3 L255.1,247.1 L426.9,190.6 L583.7,198.5 L583.7,237.8 L426.9,256.8 L255.1,262.5 L98.3,286.3 Z" fill="#1b1b1b" fill-opacity="0.10"/>
+<path d="M98.3,162.9 L255.1,187.5 L426.9,233.3 L583.7,215.6 " fill="none" stroke="#8c8c8c" stroke-width="1.6" stroke-linejoin="round" stroke-linecap="round"/>
+<path d="M98.3,256.7 L255.1,248.1 L426.9,246.6 L583.7,225.9 " fill="none" stroke="#1b1b1b" stroke-width="2" stroke-linejoin="round" stroke-linecap="round"/>
+<text x="618.0" y="219.6" font-size="11" fill="#8c8c8c">FASTER</text>
+<text x="618.0" y="232.6" font-size="11" fill="#1b1b1b">supdb (in memory until a sync)</text>
 </svg>
