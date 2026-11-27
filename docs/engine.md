@@ -7734,11 +7734,11 @@ both policies (`pair.sh supdb-settleconvertquiet supdb 100000 --passes
 load,lag --reps 8`).
 
 Under the held log nothing resolves either way, at `44ed27e3`. In memory at a
-hundred thousand keys the mixes and the lag sweep read 0.89 to 1.20 between
+hundred thousand keys the mixes and the lag sweep read 0.89 to 1.23 between
 the arms with the read and the scan pass, which run before any settle,
 reading 0.89 to 1.18 beside them (`pair.sh supdb-heldnfsettleconvertquiet
 supdb-heldnoframes 100000 --passes P --reps 12`, and `--passes load,lag
---reps 8`). At three million keys under 1 GiB the mixes read 0.75 to 1.33
+--reps 8`). At three million keys under 1 GiB the mixes read 0.75 to 1.13
 (`pair.sh supdb-heldpartsettleconvertquiet supdb-heldpart 3000000 --bound
 1073741824 --passes P --ops-div 10 --reps 8`), where the arm paired with
 itself reads them 0.84 to 1.20 and its scrambled A, B and C at 0.84 to
