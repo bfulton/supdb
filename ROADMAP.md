@@ -8,14 +8,19 @@ a tenth behind its comparator or behind a shape the engine already reaches.
 
 ## High priority
 
-- [ ] **A scan's limit counts the keys it answers.** `scan(from, limit)`
-  counts deleted keys the store still records, so a page comes back
-  short: with eight of the first sixteen keys deleted, a scan of ten hands
-  over five values. Count only keys that hold a value, and add
-  `scan_page`, which answers where the next page starts. Open: whether a
-  partition may hold a record with no value, a format change. Done when the
-  differential fuzz pages a store end to end with deletes unsealed, in a
-  piece and in a partition, and the scan pass and ycsb-E are priced.
+- [ ] **A partition an older release promoted, holding a key with no
+  value.** A store's scans count the keys that hold a value, and its
+  partitions' walks count ranks, since no partition holds a record with
+  none (`Seg::bare`). A release from before that rule promoted a piece
+  holding a delete of a key nothing was written to after it, so a store it
+  wrote may have such a partition, whose walks count the key toward a
+  scan's limit until a merge rewrites its range. Done when a test builds
+  the store as that release left it and its scans count as the rule's do.
+- [ ] **What a segment's readers count.** `Blob::scan`, `SparseBlob` and the
+  wasm ABI's scans count a record toward the limit whether or not it holds
+  a value, and a segment written through `SegmentWriter::end_with(true)`
+  with no value holds one. Done when the readers' contract says which, and
+  the three readers are held to it against each other.
 - [ ] **A cheaper verification at open, and a way to skip it.** Every open
   but a cipher's (`Bytes::authenticated`) verifies each segment's whole key
   section against its checksum row, which with inline records is the whole

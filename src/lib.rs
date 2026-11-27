@@ -253,7 +253,7 @@ pub use db::vault::{
 pub use db::OneCounts;
 #[cfg(not(target_family = "wasm"))]
 pub use db::{
-    BackgroundIo, Db, Encryption, HelperFault, Isolation, Options, ReadAdvice, Reader,
+    BackgroundIo, Db, Encryption, HelperFault, Isolation, Options, Page, ReadAdvice, Reader,
     SegmentOptions, SegmentWrite, SegmentWriter, SyncPolicy, Txn, Upkeep, ZInject, ZPages, ZStride,
     MERGE_AHEAD_WINDOW, STORE_FORMAT, STORE_FORMAT_OLDEST,
 };

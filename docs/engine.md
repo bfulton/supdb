@@ -122,8 +122,18 @@ checkpoint.
   probe on the sources that hold the key. Every merge writes the bottom
   level, so a tombstone never survives one: values older than it are
   dropped, a key with nothing live is left out, and its bytes come back at
-  the next merge that reaches it. What that costs and what it returns is
-  measured under the next point.
+  the next merge that reaches it. A scan's limit counts the keys that hold
+  a value, so the merge paths and the block walks count a key once a value
+  of it is handed over, and a form that keeps an entry for a deleted key
+  (a copy, a sparse form) counts it only where its run holds one. A
+  partition holds no record without a value: the merge leaves such a key
+  out, and a promotion takes no piece that holds one -- a piece's open, or
+  its writer, records whether it does (`Seg::bare`) -- so a partition's
+  walks, raw and through its form file, go on counting ranks. A scan's
+  window over a block takes its limit of keys from each source, enough
+  while every key counted; where keys with no value leave the walk short,
+  it stops at the window's last key and the scan resumes above it. What
+  that costs and what it returns is measured under the next point.
 - **Commit is a batch, and a batch is atomic.** WAL frames carry a kind --
   put, delete, commit -- and replay applies the frames between commit
   frames whole or not at all; a partial batch used to replay as whole,

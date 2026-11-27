@@ -108,6 +108,8 @@ tx.commit()?;
 db.read_all(b"user:42", |v| println!("{}", String::from_utf8_lossy(v)))?;
 let n = db.count(b"user:42")?;       // costs a lookup, not a read
 db.scan(b"user:", 100, |key, value| { /* in key order */ })?;
+let page = db.scan_page(b"user:", 100, |key, value| { /* the same */ })?;
+// page.next: where the next page starts; None once a page comes back short
 db.close()?;
 ```
 

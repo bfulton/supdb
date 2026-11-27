@@ -13,7 +13,11 @@
 //!
 //! The answers are held to the model through the writer, through fresh and
 //! claimed handles, by count, and by a raw scan of the whole store, whose
-//! keys must come in order with each key's values together. A failure
+//! keys must come in order with each key's values together; and the whole
+//! store a page at a time (`Reader::scan_page`), every page but the last
+//! handing over its limit of keys that hold a value, wherever the deletes
+//! stand -- a range whose pages never met a deleted key's record unsealed,
+//! in a piece, and in a partition under its delete fails. A failure
 //! names its seed, the step it was found at and the configuration, and one
 //! seed is rerun alone:
 //!
@@ -1924,6 +1928,123 @@ fn scan_all(r: &Reader) -> (Model, Vec<String>) {
     (m, faults)
 }
 
+/// The whole store a page at a time (`Reader::scan_page`), `page` keys a
+/// page, as the model the pages answer together and the faults of their
+/// counts and order: every page hands over `page` keys, each holding a
+/// value, and names where the next starts, but the last, which hands over
+/// fewer and names none.
+fn page_all(r: &Reader, page: usize) -> (Model, Vec<String>) {
+    let mut m: Model = BTreeMap::new();
+    let mut faults = Vec::new();
+    let mut from: Vec<u8> = Vec::new();
+    let mut last: Option<Vec<u8>> = None;
+    for turn in 0usize.. {
+        let mut keys = 0usize;
+        let p = r
+            .scan_page(
+                &from,
+                page,
+                common::kv(&mut |k, v| {
+                    if last.as_deref() != Some(k) {
+                        if last.as_deref().is_some_and(|l| l > k) || m.contains_key(k) {
+                            faults.push(format!(
+                                "page {turn} of {page} handed over key {} out of order",
+                                show(k)
+                            ));
+                        }
+                        keys += 1;
+                        last = Some(k.to_vec());
+                    }
+                    m.entry(k.to_vec()).or_default().push(v.to_vec())
+                }),
+            )
+            .unwrap();
+        if p.keys != keys {
+            faults.push(format!(
+                "page {turn} of {page} from {} counted {} keys and handed over {keys}",
+                show(&from),
+                p.keys
+            ));
+        }
+        match p.next {
+            Some(next) if keys == page && next > from => from = next,
+            Some(next) => {
+                faults.push(format!(
+                    "page {turn} of {page} from {} handed over {keys} keys and named the next at {}",
+                    show(&from),
+                    show(&next)
+                ));
+                break;
+            }
+            None => {
+                if keys >= page {
+                    faults.push(format!(
+                        "page {turn} of {page} from {} handed over a full page and named no next",
+                        show(&from)
+                    ));
+                }
+                break;
+            }
+        }
+        if faults.len() >= 3 {
+            break;
+        }
+    }
+    faults.truncate(3);
+    (m, faults)
+}
+
+/// The paged walk of `paged_check` beside the model, for `src` named
+/// `name`: the pages' answers against the model's live keys, and where the
+/// model's deleted keys still stand -- `seen` counted for each place -- a
+/// partition holding one with nothing above it a fault, since no partition
+/// holds a record with no value and a delete above one is the only thing
+/// that would take its values away.
+fn paged_check(
+    name: &str,
+    src: &Reader,
+    model: &Model,
+    page: usize,
+    seen: &mut [u64; 4],
+    fails: &mut Vec<String>,
+) {
+    let want = live(model);
+    let (got, faults) = page_all(src, page);
+    for x in faults {
+        fail(fails, format!("{name} paged by {page}: {x}"));
+    }
+    if got != want {
+        explain_scan(&format!("{name} pages of {page}"), src, &got, &want);
+        fail(
+            fails,
+            format!(
+                "{name} paged by {page} differs from the model: {}",
+                model_diff(&got, &want)
+            ),
+        );
+    }
+    let mut met = [false; 3];
+    for (k, _) in model.iter().filter(|(_, v)| v.is_empty()) {
+        let [unsealed, piece, part] = src.holders_of(k);
+        met[0] |= unsealed;
+        met[1] |= piece;
+        met[2] |= part && (unsealed || piece);
+        if part && !unsealed && !piece {
+            fail(
+                fails,
+                format!(
+                    "{name}: a partition holds deleted key {} with nothing above it",
+                    show(k)
+                ),
+            );
+        }
+    }
+    seen[0] += 1;
+    for (n, m) in seen[1..].iter_mut().zip(met) {
+        *n += u64::from(m);
+    }
+}
+
 fn live(model: &Model) -> Model {
     model
         .iter()
@@ -2129,6 +2250,12 @@ struct Stats {
     share: [u64; 4],
     /// The `z` store's stride form under `ZFUZZ_STRIDE`.
     stride: StrideStats,
+    /// The stores walked end to end a page at a time (`Reader::scan_page`),
+    /// and of those walks the ones over a key the model holds deleted
+    /// whose record a source still holds unsealed, in a piece, and in a
+    /// partition with the delete above it: what says the pages met the
+    /// deletes in each place.
+    paged: [u64; 4],
 }
 
 /// What the stride form did in a seed (`ZCounts`' stride counts), summed
@@ -2474,6 +2601,7 @@ fn run_seed_inner(seed: u64, want_cache: bool, verbose: bool) -> Result<Stats, S
         reads: [0; 3],
         point: [0; 17],
         stride: StrideStats::default(),
+        paged: [0; 4],
     };
     let mut fails: Vec<String> = Vec::new();
     let mut absent = absent_around(&pool, &mut rng);
@@ -2917,6 +3045,23 @@ fn run_seed_inner(seed: u64, want_cache: bool, verbose: bool) -> Result<Stats, S
                     );
                 }
             }
+            // And a page at a time, the page's size moving with the
+            // check's turn and drawn from nothing, so that no seed's draws
+            // move: a scan's limit counts the keys that hold a value,
+            // wherever the deletes stand.
+            let page = 1 + (step as usize / 200) % 7;
+            paged_check("z writer", &z, &model, page, &mut st.paged, &mut fails);
+            paged_check("r writer", &r, &model, page, &mut st.paged, &mut fails);
+            if let Some(hz) = claim(&z, &cfg)? {
+                paged_check(
+                    "z fresh handle",
+                    &hz,
+                    &model,
+                    page,
+                    &mut st.paged,
+                    &mut fails,
+                );
+            }
         }
         if !fails.is_empty() {
             break;
@@ -2957,6 +3102,24 @@ fn run_seed_inner(seed: u64, want_cache: bool, verbose: bool) -> Result<Stats, S
         if let Some(sn) = claim(&z, &cfg)? {
             sn.snapshot();
             check_keys("final z snapshot", &sn, &model, &probe, &mut fails);
+        }
+        for page in [1, 3] {
+            paged_check(
+                "final z writer",
+                &z,
+                &model,
+                page,
+                &mut st.paged,
+                &mut fails,
+            );
+            paged_check(
+                "final r writer",
+                &r,
+                &model,
+                page,
+                &mut st.paged,
+                &mut fails,
+            );
         }
     }
     let mut ok = fails.is_empty();
@@ -3091,6 +3254,7 @@ fn run_range() {
     let mut share = [0u64; 4];
     let mut sharing_seeds = 0u64;
     let mut stride = StrideStats::default();
+    let mut paged = [0u64; 4];
     let ran = seeds.len();
     let (mut evicted, mut fills, mut zreads) = (0u64, 0u64, 0u64);
     let mut one = 0u64;
@@ -3146,6 +3310,9 @@ fn run_range() {
                 for (a, b) in reads.iter_mut().zip(s.reads) {
                     *a += b;
                 }
+                for (a, b) in paged.iter_mut().zip(s.paged) {
+                    *a += b;
+                }
             }
             Err(e) => bad.push(format!("seed {seed}: {e}")),
         }
@@ -3180,6 +3347,18 @@ fn run_range() {
         reads[2],
         bad.len()
     );
+    eprintln!(
+        "seeds {from}..{to}: paged walks {}, over a deleted key held unsealed {} in a piece {} in a partition under its delete {}",
+        paged[0], paged[1], paged[2], paged[3]
+    );
+    // The pages are held to the model wherever the deletes stand: a range
+    // whose walks never met a deleted key's record in one of the places a
+    // store keeps it tested nothing of that place.
+    if bad.is_empty() && paged[0] > 0 && paged[1..].contains(&0) {
+        bad.push(format!(
+            "the paged walks met no deleted key in one of the places a store holds one: {paged:?}"
+        ));
+    }
     if share_mode() > 0 {
         eprintln!(
             "seeds {from}..{to}: {sharing_seeds} sharing, shared tables installed {} left at a commit {} left at a seal {}, writes through handles {}",

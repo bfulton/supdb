@@ -11521,6 +11521,17 @@ struct Seg {
     /// have bought is the reclaim, which is why `promote_unpartitioned`
     /// leaves a lone piece holding one to the merge.
     tombs: bool,
+    /// Whether any record here holds no value: a delete of a key nothing
+    /// was written to after it, which a seal writes so that the key's older
+    /// values stay masked.
+    ///
+    /// False for every partition, and `Seg::open` assumes that for a `par-`
+    /// name as it does `tombs`. A merge leaves such a key out, and a
+    /// promotion takes no piece that holds one (`promotion_chain`), so a
+    /// partition's records are the keys a scan of it answers, one a rank,
+    /// and its walks -- the raw records', a form file's -- count ranks
+    /// where a scan's limit counts keys.
+    bare: bool,
     /// The key and value bytes the segment holds, as its writer recorded
     /// them; for a segment that recorded none, two thirds of its file,
     /// the ratio `seal_threshold` is calibrated at.
@@ -13391,7 +13402,7 @@ type ComposeFn<'a> = dyn FnMut(&SegmentWriter) -> Result<Composed> + 'a;
 /// What a piece writer's finish from a key source hands back: the
 /// segment's file, the ordered index's bytes and the landing's facts where
 /// they were composed (`PieceWriter::finish_unsynced_from`).
-type PieceFinished = (vault::File, Vec<u8>, Option<(BlockedBloom, bool)>);
+type PieceFinished = (vault::File, Vec<u8>, Option<(BlockedBloom, Tombs)>);
 
 /// What the file of a run of ordered ingest holds up to its last good
 /// commit marker (`SegmentWriter::walk_run`): where each committed record
@@ -15721,7 +15732,19 @@ impl Default for SegmentOptions {
 /// tombstone, and whether the keys are deferred -- kept by the table that
 /// streams them and handed to the finish, the ordered index composed from
 /// there too (`Options::direct_derive_keys`).
-struct PieceWriter(Box<SegmentWriter>, crate::ordindex::Builder, bool, bool);
+struct PieceWriter(Box<SegmentWriter>, crate::ordindex::Builder, Tombs, bool);
+
+/// What a piece's records say of its deletes, which its landing knows from
+/// its writer and its open otherwise walks the records for
+/// (`Seg::bloom_and_tombs`).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct Tombs {
+    /// Whether any extent carries the tombstone flag.
+    any: bool,
+    /// Whether any record holds no value: a delete of a key nothing was
+    /// written to after it. No partition holds such a record (`Seg::bare`).
+    bare: bool,
+}
 
 impl PieceWriter {
     fn create(
@@ -15736,7 +15759,7 @@ impl PieceWriter {
         Ok(PieceWriter(
             Box::new(w),
             crate::ordindex::Builder::new_in(opts.maps()),
-            false,
+            Tombs::default(),
             false,
         ))
     }
@@ -15753,7 +15776,7 @@ impl PieceWriter {
         Ok(PieceWriter(
             Box::new(w),
             crate::ordindex::Builder::new(),
-            false,
+            Tombs::default(),
             true,
         ))
     }
@@ -15793,10 +15816,10 @@ impl PieceWriter {
         self.1.reserve(n, key_bytes);
     }
 
-    /// What the landing's open would walk the records for: the Bloom and
-    /// whether any key ended with a tombstone. `None` where the writer
-    /// cannot say (`SegmentWriter::landing_bloom`).
-    fn landing_facts(&self) -> Option<(BlockedBloom, bool)> {
+    /// What the landing's open would walk the records for: the Bloom, and
+    /// whether any key ended with a tombstone and whether any with no value.
+    /// `None` where the writer cannot say (`SegmentWriter::landing_bloom`).
+    fn landing_facts(&self) -> Option<(BlockedBloom, Tombs)> {
         self.0.landing_bloom().map(|b| (b, self.2))
     }
 
@@ -15822,7 +15845,15 @@ impl PieceWriter {
     }
 
     fn end_with(&mut self, tombstone: bool) -> Result<()> {
-        self.2 |= tombstone;
+        // A record with no value is a delete's, which the flag marks: the
+        // first partition a seal names directly is asked for none by the
+        // flag alone.
+        debug_assert!(
+            tombstone || self.0.records > 0,
+            "a piece's record with no value carries the tombstone flag"
+        );
+        self.2.any |= tombstone;
+        self.2.bare |= self.0.records == 0;
         self.0.end_with(tombstone)
     }
 
@@ -15887,7 +15918,7 @@ impl PieceWriter {
     /// Whether any key ended with a tombstone: a piece with one cannot
     /// be a partition as it is, since the bottom level drops them.
     fn tombs(&self) -> bool {
-        self.2
+        self.2.any
     }
 
     fn set_marks(&mut self, on: bool) {
@@ -16221,7 +16252,7 @@ impl Seg {
         random: bool,
         advise_ord: bool,
         verify: bool,
-        facts: Option<(BlockedBloom, bool)>,
+        facts: Option<(BlockedBloom, Tombs)>,
     ) -> Result<Seg> {
         Seg::open_full(dir, name, random, advise_ord, verify, false, facts)
     }
@@ -16233,7 +16264,7 @@ impl Seg {
         advise_ord: bool,
         verify: bool,
         verify_index: bool,
-        facts: Option<(BlockedBloom, bool)>,
+        facts: Option<(BlockedBloom, Tombs)>,
     ) -> Result<Seg> {
         let src = vault::map(dir.join(name)).map_err(|e| {
             // A manifest naming a segment that is not on disk is a damaged
@@ -16314,6 +16345,7 @@ impl Seg {
                 Some(f) => f,
                 None => Seg::bloom_and_tombs(&blob)?,
             };
+            let Tombs { any: tombs, bare } = tombs;
             return Ok(Seg {
                 keyseq: KeySeq(blob.id()),
                 blob: SegBlob(blob),
@@ -16329,6 +16361,7 @@ impl Seg {
                 ord,
                 ord_rebuilt,
                 tombs,
+                bare,
                 data,
                 z: zfile::ZCell::new(),
                 z_spare: zfile::ZCell::new(),
@@ -16379,6 +16412,7 @@ impl Seg {
                 ord,
                 ord_rebuilt,
                 tombs: false,
+                bare: false,
                 data,
                 z: zfile::ZCell::new(),
                 z_spare: zfile::ZCell::new(),
@@ -16406,6 +16440,7 @@ impl Seg {
             Some(f) => f,
             None => Seg::bloom_and_tombs(&blob)?,
         };
+        let Tombs { any: tombs, bare } = tombs;
         Ok(Seg {
             keyseq: KeySeq(blob.id()),
             blob: SegBlob(blob),
@@ -16421,6 +16456,7 @@ impl Seg {
             ord,
             ord_rebuilt,
             tombs,
+            bare,
             data,
             z: zfile::ZCell::new(),
             z_spare: zfile::ZCell::new(),
@@ -16496,18 +16532,20 @@ impl Seg {
         Ok((ord, true))
     }
 
-    /// The Bloom for a level-0 piece and whether any of its extents carries
-    /// the tombstone flag: one walk of the key section for both, which a
-    /// piece pays for the Bloom anyway.
-    fn bloom_and_tombs(blob: &Blob<MmapBytes>) -> Result<(BlockedBloom, bool)> {
+    /// The Bloom for a level-0 piece, whether any of its extents carries
+    /// the tombstone flag and whether any of its records holds no value:
+    /// one walk of the key section for all three, which a piece pays for
+    /// the Bloom anyway.
+    fn bloom_and_tombs(blob: &Blob<MmapBytes>) -> Result<(BlockedBloom, Tombs)> {
         let mut bloom = BlockedBloom::with_capacity(blob.keys());
-        let mut tombs = false;
+        let mut tombs = Tombs::default();
         for rank in 0..blob.keys() {
             let (k, exts) = blob
                 .exts_at(rank)
                 .ok_or_else(|| err("segment key walk: a rank the index does not have"))?;
             bloom.insert(k);
-            tombs |= exts.iter().any(|e| e.is_tombstone());
+            tombs.any |= exts.iter().any(|e| e.is_tombstone());
+            tombs.bare |= exts.iter().all(|e| e.records() == 0);
         }
         Ok((bloom, tombs))
     }
@@ -24790,7 +24828,7 @@ type DirectFinished = (
     bool,
     vault::File,
     Vec<u8>,
-    Option<(BlockedBloom, bool)>,
+    Option<(BlockedBloom, Tombs)>,
 );
 
 const DRAIN_STEP_NAMES: [&str; 19] = [
@@ -25320,6 +25358,13 @@ impl CachedBlock {
             }
             None => self.key(&self.ents[i]),
         }
+    }
+    /// Whether entry `i` holds a value: a key whose values a delete took
+    /// keeps its entry, with an empty run, so that the copy's entries stay
+    /// the block's ranks; a packed copy's every entry holds one.
+    #[inline]
+    fn holds_values_i(&self, i: usize) -> bool {
+        self.fixed.is_some() || self.ents[i][3] != 0
     }
     /// Entry `i`'s values, in order.
     #[inline]
@@ -26048,6 +26093,15 @@ struct DeltaEnt {
     run: (u32, u32),
 }
 
+impl DeltaEnt {
+    /// Whether the key holds a value: one whose values a delete took keeps
+    /// its entry, with an empty run, for the cut it names.
+    #[inline]
+    fn holds_values(&self) -> bool {
+        self.run.1 != 0
+    }
+}
+
 impl SparseBlock {
     /// The entry of a key whose cut and sameness the resolve found, and
     /// whether it is there: the entries sort by key, which is by cut,
@@ -26366,6 +26420,10 @@ struct Overlay<'a> {
     /// written since its copy, whose runs are not read.
     snap: &'a Snapshot,
     stale: &'a SlotSet,
+    /// A scan's window, cut short of the block (`BuildCtx::window_cut`): it
+    /// holds every key of its sources up to its last and none past it, so
+    /// a walk over it stops at its last key, and the scan resumes above.
+    cut: bool,
 }
 
 /// PROTOTYPE: what emitting an overlay key needs beyond the key: whether
@@ -28639,6 +28697,17 @@ pub enum Isolation {
     Dirty,
 }
 
+/// One page of a walk taken a page at a time (`Reader::scan_page`).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Page {
+    /// The keys the page handed over, each holding a value.
+    pub keys: usize,
+    /// Where the next page starts: the least key above the last one this
+    /// page handed over, or `None` where the page reached the end of the
+    /// store short of its limit.
+    pub next: Option<Vec<u8>>,
+}
+
 /// A handle that reads the store: the read API, over the state the
 /// writer publishes, with caches of its own -- the scan snapshot and the
 /// block tables -- so that no two handles share anything but what the
@@ -29381,6 +29450,10 @@ struct FormsState {
     /// that must know the path was taken: scans that finished without a
     /// snapshot, and scans that stopped to build one and went on.
     lazy_scans: Counts<2>,
+    /// Block walks that stopped at the last key of a window cut short of
+    /// its sources and resumed the scan above it (`Overlay::cut`), for the
+    /// test that must know the path was taken.
+    window_resumes: Counts<1>,
     /// EXPERIMENT: what the settles met, for a measurement of the
     /// backlog's density: settles, keys, blocks those keys fall in, and
     /// blocks at or past `Options::forms_settle_rebuild_from`.
@@ -29535,6 +29608,7 @@ impl FormsState {
             log_short: std::cell::Cell::new(false),
             fill_owed: std::cell::Cell::new(false),
             lazy_scans: Counts::new(),
+            window_resumes: Counts::new(),
             settle_density: Counts::new(),
             settle_refused: Counts::new(),
             settle_blocks: std::cell::RefCell::new(Vec::new()),
@@ -33215,6 +33289,17 @@ impl Reader {
             self.z_refused("promotion: an empty piece");
             return None;
         }
+        // Nor a piece that holds a record with no value, a delete of a key
+        // nothing was written to after it: the merge leaves such a key out,
+        // and a partition holds none (`Seg::bare`), so that its walks count
+        // its records as the keys a scan answers.
+        if let Some(&si) = pieces.iter().find(|&&si| self.segs()[si].bare) {
+            self.z_refused(&format!(
+                "promotion: {} holds a key with no value",
+                self.segs()[si].name
+            ));
+            return None;
+        }
         pieces.sort_by_key(|&si| first_of(si));
         let mut bounds = Vec::with_capacity(pieces.len());
         let mut prev_last: Option<Vec<u8>> = floor;
@@ -36187,10 +36272,48 @@ impl Reader {
         snap
     }
 
+    /// The keys from `from` on, in key order, at most `limit` of them, each
+    /// key's values handed to `f` in append order, and how many keys were
+    /// handed over. A key counts toward the limit only where it holds a
+    /// value: a key a delete left no value of is no key of a scan's,
+    /// wherever the delete and the values it took lie.
     pub fn scan<F: FnMut(&[u8], &[u8])>(&self, from: &[u8], limit: usize, f: F) -> Result<usize> {
         let entered = self.enter();
         let r = self.scan_in(from, limit, f);
         entered.finish(r)
+    }
+
+    /// `scan` as one page of a walk taken a page at a time: the keys it
+    /// handed over, and where the next page starts -- the least key above
+    /// the last one this page handed over -- or `None` where the page
+    /// reached the end of the store short of its limit. A page that ends
+    /// at the store's last key names a next page, which hands over nothing
+    /// and names none. A page of no keys starts the next where it started.
+    pub fn scan_page<F: FnMut(&[u8], &[u8])>(
+        &self,
+        from: &[u8],
+        limit: usize,
+        mut f: F,
+    ) -> Result<Page> {
+        if limit == 0 {
+            return Ok(Page {
+                keys: 0,
+                next: Some(from.to_vec()),
+            });
+        }
+        let mut last: Vec<u8> = Vec::new();
+        let keys = self.scan(from, limit, |k, v| {
+            if last.as_slice() != k {
+                last.clear();
+                last.extend_from_slice(k);
+            }
+            f(k, v)
+        })?;
+        let next = (keys == limit).then(|| {
+            last.push(0);
+            last
+        });
+        Ok(Page { keys, next })
     }
 
     /// `wait` run with nothing of the store's files lent to this handle's
@@ -36511,13 +36634,7 @@ impl Reader {
             self.refresh_snapshot(gen, use_cache, true);
             let cache = self.fs().scan_keys.borrow();
             let unsealed: &Snapshot = &cache.as_ref().expect("scan snapshot").1;
-            let walked = self.scan_blocks(&from, limit - seen, Some(unsealed), true, &mut f);
-            // The buffer back for the next resume, whatever the walk said.
-            *self.fs().resume_key.borrow_mut() = from;
-            return match walked? {
-                Walk::Done(n) => Ok(seen + n),
-                Walk::Resume { .. } => Err(err("block scan: resumed without a snapshot")),
-            };
+            return self.scan_blocks_resumed(from, limit, seen, unsealed, &mut f);
         }
         let t = self.tick_start();
         self.refresh_snapshot(gen, use_cache, moved);
@@ -36533,7 +36650,10 @@ impl Reader {
         if use_cache {
             return match self.scan_blocks(from, limit, Some(unsealed), false, &mut f)? {
                 Walk::Done(n) => Ok(n),
-                Walk::Resume { .. } => Err(err("block scan: stopped with a snapshot in hand")),
+                Walk::Resume { seen } => {
+                    let from = std::mem::take(&mut *self.fs().resume_key.borrow_mut());
+                    self.scan_blocks_resumed(from, limit, seen, unsealed, &mut f)
+                }
             };
         }
         let mut mc = unsealed.cursor(from);
@@ -36628,11 +36748,19 @@ impl Reader {
                     }
                 }
             }
+            // A key counts toward the limit once a value of it is handed
+            // over: one whose every value a delete took is no key of the
+            // scan's.
+            let mut answered = false;
+            let mut emit = |v: &[u8]| {
+                answered = true;
+                f(key, v)
+            };
             for (j, (seg, rank)) in cursors.iter_mut().enumerate() {
                 if seg.raw().key_at(*rank) == Some(key) {
                     if j >= start {
                         seg.raw()
-                            .values_at(*rank, |v| f(key, v))
+                            .values_at(*rank, &mut emit)
                             .map_err(|e| err(&format!("segment scan read: {e}")))?;
                     }
                     *rank += 1;
@@ -36645,7 +36773,7 @@ impl Reader {
                     }
                     if let Some(e) = fr.get(key, MemTable::ALL) {
                         for off in fr.live_chain(e, SEE_ALL).0 {
-                            f(key, fr.value_at(off));
+                            emit(fr.value_at(off));
                         }
                     }
                 }
@@ -36653,12 +36781,14 @@ impl Reader {
                     if let Some(e) = self.mem().get(key, self.len_bound.get()) {
                         let (mut offs, mut copy) = (Vec::new(), ChainCopy::default());
                         self.mem()
-                            .live_values(e, self.wm(), &mut offs, &mut copy, |v| f(key, v));
+                            .live_values(e, self.wm(), &mut offs, &mut copy, &mut emit);
                     }
                 }
                 unsealed.advance(&mut mc);
             }
-            seen += 1;
+            if answered {
+                seen += 1;
+            }
         }
         self.zcensus_scanned(seen);
         Ok(seen)
@@ -38835,6 +38965,14 @@ impl Reader {
     pub fn lazy_scans(&self) -> (u64, u64) {
         let v = self.fs().lazy_scans.get();
         (v[0], v[1])
+    }
+
+    /// Block walks that stopped at the last key of a window cut short of
+    /// its sources, keys a delete left no value of among the window's, and
+    /// resumed the scan above it (`Overlay::cut`).
+    #[doc(hidden)]
+    pub fn window_resumes(&self) -> u64 {
+        self.fs().window_resumes.get()[0]
     }
 
     #[doc(hidden)]
@@ -41673,6 +41811,7 @@ impl Reader {
                     held: Vec::new(),
                     snap: &NO_SNAPSHOT,
                     stale: &ctx.stale,
+                    cut: false,
                 };
                 let mut em = Emit {
                     tombs,
@@ -41720,6 +41859,7 @@ impl Reader {
                 held,
                 snap: &NO_SNAPSHOT,
                 stale: &ctx.stale,
+                cut: false,
             };
             let mut em = Emit {
                 tombs,
@@ -42288,6 +42428,38 @@ impl Reader {
     /// snapshot and returns `Walk::Resume` at the first block that needs
     /// it, before emitting anything from that block; `resumed` is the
     /// same scan going on, which counts nothing twice.
+    /// The rest of a block scan of `limit` that stopped at `from` with
+    /// `seen` keys handed over, over the snapshot in hand: walked from
+    /// there, and again from where each walk stops, until one is done. A
+    /// walk with the snapshot stops only at a window cut short of its
+    /// sources (`Overlay::cut`), whose last key it has handed over, so
+    /// each walk starts above the one before it.
+    fn scan_blocks_resumed<F: FnMut(&[u8], &[u8])>(
+        &self,
+        mut from: Vec<u8>,
+        limit: usize,
+        mut seen: usize,
+        unsealed: &Snapshot,
+        f: &mut F,
+    ) -> Result<usize> {
+        loop {
+            let done = match self.scan_blocks(&from, limit - seen, Some(unsealed), true, f) {
+                Ok(Walk::Resume { seen: n }) => {
+                    seen += n;
+                    let mut k = self.fs().resume_key.borrow_mut();
+                    debug_assert!(k.as_slice() > from.as_slice(), "a resumed walk moves on");
+                    std::mem::swap(&mut from, &mut k);
+                    continue;
+                }
+                Ok(Walk::Done(n)) => Ok(seen + n),
+                Err(e) => Err(e),
+            };
+            // The buffer back for the next resume, whatever the walk said.
+            *self.fs().resume_key.borrow_mut() = from;
+            return done;
+        }
+    }
+
     fn scan_blocks<F: FnMut(&[u8], &[u8])>(
         &self,
         from: &[u8],
@@ -42848,6 +43020,15 @@ impl Reader {
                     1,
                 );
                 let took_from = seen;
+                // Where the scan resumes when a window this block's walk
+                // took was cut short of its sources (`Overlay::cut`): just
+                // above the window's last key.
+                let mut resume: Option<Vec<u8>> = None;
+                let resume_of = |ov: &Overlay, seen: usize| {
+                    (ov.cut && seen < limit)
+                        .then(|| ov.over.last().map(|o| [o.key, &[0]].concat()))
+                        .flatten()
+                };
                 // The first block this turn walks: the clean run below may
                 // take several, and the promotion after the walk credits
                 // each with what the run took from it.
@@ -42950,12 +43131,16 @@ impl Reader {
                                 &mut *f,
                             )?,
                         };
+                        if let Some(ov) = &mem_ov {
+                            resume = resume_of(ov, seen);
+                        }
                     }
                     Cached::Clean if mem_ov.is_some() => {
                         let ov = mem_ov.as_ref().expect("checked");
                         seen += ctx
                             .walk_block(src, pr, start..hi, ov, limit - seen, |_k| {}, &mut *f)?
                             .0;
+                        resume = resume_of(ov, seen);
                     }
                     Cached::Clean => {
                         // Every clean block built after this one joins the
@@ -43035,6 +43220,7 @@ impl Reader {
                         let ov = mem_ov.as_ref().expect("checked");
                         seen +=
                             ctx.walk_copy_over(src, blk, ov, from_key, limit - seen, &mut *f)?;
+                        resume = resume_of(ov, seen);
                     }
                     Cached::Block(blk) => {
                         // The seek's rank is the entry when the copy's
@@ -43093,7 +43279,10 @@ impl Reader {
                                 }
                                 let k = blk.key(e);
                                 blk.each_value(e, |v| f(k, v));
-                                seen += 1;
+                                // An entry whose values a delete took is
+                                // kept for the copy's ranks, and is no key
+                                // of the scan's.
+                                seen += usize::from(e[3] != 0);
                             }
                         }
                         if pace.is_some() {
@@ -43113,6 +43302,7 @@ impl Reader {
                         seen += ctx
                             .walk_block(src, pr, start..hi, &ov, limit - seen, |_k| {}, &mut *f)?
                             .0;
+                        resume = resume_of(&ov, seen);
                         let fs = self.fs();
                         fs.wide_walks.set(fs.wide_walks.get() + 1);
                         if priced {
@@ -43255,6 +43445,14 @@ impl Reader {
                         }
                     }
                 }
+                // A cut window walked to its last key short of the limit:
+                // the rest of the scan from just above it, in a walk of its
+                // own (`scan_body`).
+                if let Some(k) = resume {
+                    self.count_takes(takes);
+                    self.fs().window_resumes.add(0, 1);
+                    return Ok(self.resume_at(seen, &k));
+                }
                 b += 1;
                 first = false;
             }
@@ -43270,6 +43468,27 @@ impl Reader {
     /// PROTOTYPE: the cache's blocks by kind, for a measurement: clean,
     /// sparse, copies, wide.
     #[doc(hidden)]
+    /// A test's: which sources hold a record of `key`, whatever its values,
+    /// for this handle -- the live or a frozen table, a level-0 piece, a
+    /// partition.
+    #[doc(hidden)]
+    pub fn holders_of(&self, key: &[u8]) -> [bool; 3] {
+        let _e = self.enter();
+        let unsealed = self.mem().slot_of(key, usize::MAX).is_some()
+            || self
+                .frozen()
+                .iter()
+                .any(|f| f.slot_of(key, usize::MAX).is_some());
+        let mut held = [unsealed, false, false];
+        for s in self.segs() {
+            let r = s.ord.seek(key, |i| s.raw().key_at(i));
+            if r < s.blob.keys() && s.raw().key_at(r) == Some(key) {
+                held[if s.level > 0 { 2 } else { 1 }] = true;
+            }
+        }
+        held
+    }
+
     /// Where one key stands for this handle, for a test that found a scan
     /// answering it wrongly: its slots in the memtables, the handle's
     /// snapshot and bounds over it, what its block's table has filed and
@@ -44220,7 +44439,7 @@ impl Reader {
                     }
                 }
                 let tombs = *tombs.get_or_insert_with(|| self.has_tombstones());
-                self.emit_unsealed(
+                let answered = self.emit_unsealed(
                     &mut f,
                     &mut scratch,
                     tombs,
@@ -44232,7 +44451,7 @@ impl Reader {
                     rank += 1;
                 }
                 unsealed.advance(&mut mc);
-                seen += 1;
+                seen += usize::from(answered);
             }
             match &seg.hi {
                 Some(h) => cursor = h.as_slice(),
@@ -44245,9 +44464,10 @@ impl Reader {
                 break;
             };
             let tombs = *tombs.get_or_insert_with(|| self.has_tombstones());
-            self.emit_unsealed(&mut f, &mut scratch, tombs, (uk, &sk), None, unsealed)?;
+            let answered =
+                self.emit_unsealed(&mut f, &mut scratch, tombs, (uk, &sk), None, unsealed)?;
             unsealed.advance(&mut mc);
-            seen += 1;
+            seen += usize::from(answered);
         }
         Ok(seen)
     }
@@ -44295,7 +44515,7 @@ impl Reader {
                 }
             }
             let tombs = *tombs.get_or_insert_with(|| self.has_tombstones());
-            self.emit_unsealed(
+            let answered = self.emit_unsealed(
                 f,
                 scratch,
                 tombs,
@@ -44307,7 +44527,7 @@ impl Reader {
                 c.advance();
             }
             unsealed.advance(mc);
-            seen += 1;
+            seen += usize::from(answered);
         }
         self.pwalk_close(Some(PWalk::Z(c)));
         Ok(seen)
@@ -44318,7 +44538,8 @@ impl Reader {
     /// equal key, then the frozen memtables', then the live one's, each
     /// older source cut by a tombstone in a newer. Sources are numbered
     /// partition 0, the frozen tables 1.. oldest first, live after them;
-    /// `start` is the oldest one whose values are live.
+    /// `start` is the oldest one whose values are live. Whether a value was
+    /// handed over: a key a delete left none of is no key of the scan's.
     fn emit_unsealed<F: FnMut(&[u8], &[u8])>(
         &self,
         f: &mut F,
@@ -44327,8 +44548,13 @@ impl Reader {
         entry: (&[u8], &UKey),
         part: Option<PartVals<'_, '_>>,
         snap: &Snapshot,
-    ) -> Result<()> {
+    ) -> Result<bool> {
         let (key, uk) = entry;
+        let mut answered = false;
+        let mut f = |k: &[u8], v: &[u8]| {
+            answered = true;
+            f(k, v)
+        };
         let frozen = self.frozen();
         debug_assert_eq!(snap.bases.len(), frozen.len(), "a base a frozen table");
         let nf = frozen.len();
@@ -44405,7 +44631,7 @@ impl Reader {
                     .live_values(e, self.wm(), scratch, &mut copy, |v| f(key, v));
             }
         }
-        Ok(())
+        Ok(answered)
     }
 
     /// The merge over unrouted sources, the `scan_merge` arm: one cursor walking the
@@ -44567,10 +44793,17 @@ impl Reader {
                 }
             }
 
+            // A key counts toward the limit once a value of it is handed
+            // over, as in the merge over rank cursors.
+            let mut answered = false;
+            let mut emit = |v: &[u8]| {
+                answered = true;
+                f(key, v)
+            };
             if pkey == Some(key) {
                 if start == 0 {
                     if let Some(w) = pw.as_ref() {
-                        w.values(&mut |v: &[u8]| f(key, v))?;
+                        w.values(&mut emit)?;
                     }
                 }
                 padv = true;
@@ -44580,7 +44813,7 @@ impl Reader {
                     if j + 1 >= start {
                         c.seg
                             .raw()
-                            .values_at(c.rank, |v| f(key, v))
+                            .values_at(c.rank, &mut emit)
                             .map_err(|e| err(&format!("segment scan read: {e}")))?;
                     }
                     c.rank += 1;
@@ -44594,7 +44827,7 @@ impl Reader {
                         let e = fr.entry(slot as usize);
                         fr.live_offs_into(e, &mut scratch, SEE_ALL);
                         for &off in &scratch {
-                            f(key, fr.value_at(off));
+                            emit(fr.value_at(off));
                         }
                     }
                 }
@@ -44602,11 +44835,13 @@ impl Reader {
                     let e = self.mem().entry(sk.mem as usize);
                     let mut copy = ChainCopy::default();
                     self.mem()
-                        .live_values(e, self.wm(), &mut scratch, &mut copy, |v| f(key, v));
+                        .live_values(e, self.wm(), &mut scratch, &mut copy, &mut emit);
                 }
                 unsealed.advance(&mut mc);
             }
-            seen += 1;
+            if answered {
+                seen += 1;
+            }
         }
         self.pwalk_close(pw.take());
         Ok(seen)
@@ -46761,7 +46996,7 @@ impl Db {
             std::collections::BTreeMap::new();
         // The pieces this open makes of the runs it takes, each with what
         // its finish composed (`finish_run`).
-        let mut run_facts: Vec<(String, (BlockedBloom, bool))> = Vec::new();
+        let mut run_facts: Vec<(String, (BlockedBloom, Tombs))> = Vec::new();
         // The open's slot writes, taken for the runs' and given back after.
         let mut slots = OpenSlots {
             slot,
@@ -48124,7 +48359,7 @@ impl Db {
         sealed: u64,
         live: &mut Vec<String>,
         mseq: &mut u64,
-        facts: &mut Vec<(String, (BlockedBloom, bool))>,
+        facts: &mut Vec<(String, (BlockedBloom, Tombs))>,
         slots: &mut OpenSlots,
     ) -> Result<()> {
         let last_lo: Option<Vec<u8>> = live
@@ -48201,7 +48436,7 @@ impl Db {
         covs: &mut Vec<(u64, u64)>,
         live: &mut Vec<String>,
         mseq: &mut u64,
-        facts: &mut Vec<(String, (BlockedBloom, bool))>,
+        facts: &mut Vec<(String, (BlockedBloom, Tombs))>,
         slots: &mut OpenSlots,
         firsts: &mut Vec<(u64, Vec<u8>)>,
     ) -> Result<u64> {
@@ -58677,6 +58912,7 @@ impl<'s> BuildCtx<'s> {
                 held,
                 snap,
                 stale,
+                cut: false,
             });
         }
         if !self.merge_pieces {
@@ -58723,6 +58959,7 @@ impl<'s> BuildCtx<'s> {
             held,
             snap,
             stale,
+            cut: false,
         })
     }
     /// `overlay_runs` for a walk that takes at most `cap` of the overlay's
@@ -58849,6 +59086,7 @@ impl<'s> BuildCtx<'s> {
             held,
             snap,
             stale,
+            cut: false,
         })
     }
     /// PROTOTYPE: every key above the partition in block `b`, from the
@@ -59026,22 +59264,31 @@ impl<'s> BuildCtx<'s> {
         let (cursor, limit) = window;
         let window_of =
             |s: &Snapshot, s0: usize, s1: usize| BuildCtx::window_of(s, s0, s1, cursor, limit);
+        let mut frontier: Option<&[u8]> = None;
         let sb = table.snap_at(self.rd, src.seg, unsealed)?;
         let snap = window_of(unsealed, sb.at[b] as usize, sb.at[b + 1] as usize);
+        Self::snap_cut(&mut frontier, unsealed, &snap, sb.at[b + 1] as usize);
         let cuts = sb.cuts_of(self.rd, b, src.seg, unsealed)?;
         let mut frozen: FrozenRuns<'_> = Default::default();
         for (i, (f, base)) in frozen.iter_mut().zip(&unsealed.bases).enumerate() {
             *f = match table.fsnap_at(self.rd, i, src.seg, unsealed)? {
-                Some(fb) => Some((
-                    window_of(base, fb.at[b] as usize, fb.at[b + 1] as usize),
-                    fb.cuts_of(self.rd, b, src.seg, base)?,
-                )),
+                Some(fb) => {
+                    let w = window_of(base, fb.at[b] as usize, fb.at[b + 1] as usize);
+                    Self::snap_cut(&mut frontier, base, &w, fb.at[b + 1] as usize);
+                    Some((w, fb.cuts_of(self.rd, b, src.seg, base)?))
+                }
                 None => None,
             };
         }
         let key_of = |slot: u32| self.mem.key_of(self.mem.entry(slot as usize));
         let f0 = wide.sorted.partition_point(|&(i, _)| key_of(i) < cursor);
-        let filed = &wide.sorted[f0..wide.sorted.len().min(f0.saturating_add(limit))];
+        let f1 = wide.sorted.len().min(f0.saturating_add(limit));
+        let filed = &wide.sorted[f0..f1];
+        Self::cut_last(
+            &mut frontier,
+            f1 < wide.sorted.len(),
+            filed.last().map(|&(i, _)| key_of(i)),
+        );
         // A scan's walk takes at most `limit` of the overlay's keys
         // (`Options::scan_wide_capped`).
         let cap = if self.rd.opts.scan_wide_capped {
@@ -59061,14 +59308,27 @@ impl<'s> BuildCtx<'s> {
                     .ord
                     .seek(p.cursor_from(cursor), |i| p.raw().key_at(i))
                     .clamp(r0, r1);
-                (
-                    *j,
-                    r..r1.min(r.saturating_add(limit)),
-                    ranks.as_ref().map(|v| v.as_slice()),
-                )
+                let end = r1.min(r.saturating_add(limit));
+                Self::cut_last(
+                    &mut frontier,
+                    end < r1,
+                    end.checked_sub(1).and_then(|i| p.raw().key_at(i)),
+                );
+                (*j, r..end, ranks.as_ref().map(|v| v.as_slice()))
             })
             .collect();
-        self.overlay_runs(src, mem, &pieces, unsealed, cap)
+        // The memtables' keys capped at `cap` before the pieces' runs are
+        // laid beside them: a capped list is a source cut at its last key.
+        if mem.len() >= cap {
+            Self::cut_last(&mut frontier, true, mem.last().map(|o| o.key));
+        }
+        let mut ov = self.overlay_runs(src, mem, &pieces, unsealed, cap)?;
+        // And the merge of the two capped at `cap` again.
+        if ov.over.len() >= cap {
+            Self::cut_last(&mut frontier, true, ov.over.last().map(|o| o.key));
+        }
+        Self::window_cut(&mut ov, frontier);
+        Ok(ov)
     }
     /// PROTOTYPE: the oldest source whose values for an overlay key are
     /// live: 0 with no tombstone in the way, else one past the newest
@@ -59138,7 +59398,8 @@ impl<'s> BuildCtx<'s> {
     /// the live one --
     /// and the newest that holds a tombstone for the key cuts every older
     /// one. `part` names the partition's own record for the key, if it has
-    /// one, and the block's reader to read it through.
+    /// one, and the block's reader to read it through. Whether a value was
+    /// handed over: a key a delete left none of is no key of a scan's.
     fn emit_over<F: FnMut(&[u8], &[u8])>(
         &self,
         f: &mut F,
@@ -59147,7 +59408,12 @@ impl<'s> BuildCtx<'s> {
         oi: usize,
         part: Option<(usize, &mut PartReader<'_>)>,
         src: Sources,
-    ) -> Result<()> {
+    ) -> Result<bool> {
+        let mut answered = false;
+        let mut f = |k: &[u8], v: &[u8]| {
+            answered = true;
+            f(k, v)
+        };
         let o = &ov.over[oi];
         let held = &ov.held[o.pieces.start as usize..o.pieces.end as usize];
         let nc = src.l0.len();
@@ -59213,13 +59479,14 @@ impl<'s> BuildCtx<'s> {
                 }
             }
         }
-        Ok(())
+        Ok(answered)
     }
     /// PROTOTYPE: the walk over the partition's ranks with the overlay's
     /// keys laid over: the walk `scan_partitions` makes, on a block, with
     /// every source. `on_key` sees every key once before its values,
     /// tombstone-only keys included, which is what a copy needs and a
-    /// caller's closure does not. Answers the keys seen and whether every
+    /// caller's closure does not. Answers the keys that handed over a
+    /// value, which a scan's limit counts, and whether every
     /// overlay key it emitted replaced a partition record of its own,
     /// which is `copy_block`'s identity.
     #[allow(clippy::too_many_arguments)]
@@ -59242,6 +59509,10 @@ impl<'s> BuildCtx<'s> {
         while seen < limit {
             let end = rank.saturating_add(limit - seen).min(hi);
             let next = ov.over.get(oi);
+            // A cut window holds nothing past its last key.
+            if next.is_none() && ov.cut {
+                break;
+            }
             // The records below the next overlay key, and the key's cut:
             // the run to a cut a source carried, or the run until the key,
             // whose end is the cut, where the build searches.
@@ -59280,12 +59551,13 @@ impl<'s> BuildCtx<'s> {
                 scratch: self.take_offs(),
             });
             on_key(o.key);
-            self.emit_over(&mut f, em, ov, oi, same.then_some((rank, &mut *pr)), src)?;
+            let answered =
+                self.emit_over(&mut f, em, ov, oi, same.then_some((rank, &mut *pr)), src)?;
             if same {
                 rank += 1;
             }
             oi += 1;
-            seen += 1;
+            seen += usize::from(answered);
         }
         if let Some(em) = em {
             self.give_offs(em.scratch);
@@ -59521,6 +59793,45 @@ impl<'s> BuildCtx<'s> {
         }
         lo..s1.min(lo.saturating_add(limit))
     }
+    /// The least of the last keys of the sources' windows that were cut
+    /// short of their sources, `last` one of them where its window was cut:
+    /// what `window_cut` cuts at.
+    fn cut_last<'k>(frontier: &mut Option<&'k [u8]>, cut: bool, last: Option<&'k [u8]>) {
+        if let (true, Some(k)) = (cut, last) {
+            if frontier.is_none_or(|f| k < f) {
+                *frontier = Some(k);
+            }
+        }
+    }
+    /// `cut_last` for a window `w` of a snapshot's run that ends at `end`.
+    fn snap_cut<'k>(
+        frontier: &mut Option<&'k [u8]>,
+        s: &'k Snapshot,
+        w: &std::ops::Range<usize>,
+        end: usize,
+    ) {
+        let last = w.end.checked_sub(1).and_then(|i| s.get(i)).map(|(k, _)| k);
+        Self::cut_last(frontier, w.end < end, last);
+    }
+    /// A scan's window made whole up to where it is cut: `frontier` the
+    /// least of the last keys of its sources' windows that were cut short
+    /// of their sources (`cut_last`), every key of every source up to it
+    /// is in the window, and the keys past it are taken out, the window
+    /// marked cut. A window of `limit` keys from each source held enough
+    /// for a scan of `limit` while every key counted; a key a delete left
+    /// no value of counts nothing, so the walk over a cut window stops at
+    /// its last key and the scan resumes above it (`Walk::Resume`).
+    fn window_cut(ov: &mut Overlay<'_>, frontier: Option<&[u8]>) {
+        if let Some(f) = frontier {
+            let keep = ov.over.partition_point(|o| o.key <= f);
+            ov.over.truncate(keep);
+            debug_assert!(
+                ov.over.last().is_some_and(|o| o.key == f),
+                "a cut window holds the key it is cut at"
+            );
+            ov.cut = true;
+        }
+    }
     /// Under `pieces_only`: the memtables' keys over block `b` from the
     /// cursor on, as an overlay with no piece in it -- the snapshot's
     /// run, each base's and the keys filed since -- or none when no
@@ -59539,20 +59850,20 @@ impl<'s> BuildCtx<'s> {
         let sb = table.snap_at(self.rd, src.seg, unsealed)?;
         let mut any = sb.at[b + 1] > sb.at[b] || !table.added[b].is_empty();
         let mut frozen: FrozenRuns<'_> = Default::default();
+        let mut frontier: Option<&[u8]> = None;
         for (i, (f, base)) in frozen.iter_mut().zip(&unsealed.bases).enumerate() {
             *f = match table.fsnap_at(self.rd, i, src.seg, unsealed)? {
                 Some(fb) => {
                     any |= fb.at[b + 1] > fb.at[b];
-                    Some((
-                        BuildCtx::window_of(
-                            base,
-                            fb.at[b] as usize,
-                            fb.at[b + 1] as usize,
-                            cursor,
-                            limit,
-                        ),
-                        fb.cuts_of(self.rd, b, src.seg, base)?,
-                    ))
+                    let w = BuildCtx::window_of(
+                        base,
+                        fb.at[b] as usize,
+                        fb.at[b + 1] as usize,
+                        cursor,
+                        limit,
+                    );
+                    Self::snap_cut(&mut frontier, base, &w, fb.at[b + 1] as usize);
+                    Some((w, fb.cuts_of(self.rd, b, src.seg, base)?))
                 }
                 None => None,
             };
@@ -59568,6 +59879,7 @@ impl<'s> BuildCtx<'s> {
             cursor,
             limit,
         );
+        Self::snap_cut(&mut frontier, unsealed, &snap, sb.at[b + 1] as usize);
         let key_of = |slot: u32| self.mem.key_of(self.mem.entry(slot as usize));
         let filed: Vec<(u32, u32)> = self
             .filed_cuts(src, b, &table.added[b])
@@ -59579,12 +59891,14 @@ impl<'s> BuildCtx<'s> {
         if over.is_empty() {
             return Ok(None);
         }
-        let ov = Overlay {
+        let mut ov = Overlay {
             over,
             held: Vec::new(),
             snap: unsealed,
             stale: &self.stale,
+            cut: false,
         };
+        Self::window_cut(&mut ov, frontier);
         // The chains the walk will read, fetched ahead as a build's are:
         // after a burst every overlaid key is written since the runs were
         // copied and read from its chain, two dependent misses a key.
@@ -59595,7 +59909,9 @@ impl<'s> BuildCtx<'s> {
     /// -- the partition's values and the pieces', oldest first -- unless a
     /// memtable tombstone masks every source older than it, then the
     /// memtables' values through `emit_over`, which reads the pieces and
-    /// the partition for nothing since the overlay names none.
+    /// the partition for nothing since the overlay names none. `run`
+    /// emits the form's run and answers whether it holds a value; this,
+    /// whether either handed one over.
     fn emit_both<F: FnMut(&[u8], &[u8])>(
         &self,
         f: &mut F,
@@ -59603,13 +59919,11 @@ impl<'s> BuildCtx<'s> {
         ov: &Overlay,
         oi: usize,
         src: Sources,
-        run: impl FnOnce(&mut F),
-    ) -> Result<()> {
+        run: impl FnOnce(&mut F) -> bool,
+    ) -> Result<bool> {
         let start = self.oldest_live(em, ov, &ov.over[oi], &[], src);
-        if start == 0 {
-            run(f);
-        }
-        self.emit_over(f, em, ov, oi, None, src)
+        let ran = start == 0 && run(f);
+        Ok(self.emit_over(f, em, ov, oi, None, src)? || ran)
     }
     /// `walk_deltas` with the memtables' keys over the block slipped in
     /// beside the form's: two key-ordered lists over one walk of the
@@ -59643,7 +59957,8 @@ impl<'s> BuildCtx<'s> {
         while seen < limit {
             let d = blk.ents.get(di);
             let o = ov.over.get(oi);
-            if d.is_none() && o.is_none() {
+            // A cut window holds nothing past its last key.
+            if (d.is_none() || ov.cut) && o.is_none() {
                 break;
             }
             let end = rank.saturating_add(limit - seen).min(hi);
@@ -59686,21 +60001,23 @@ impl<'s> BuildCtx<'s> {
                     break;
                 }
             }
-            if take_over {
+            let answered = if take_over {
                 let o = o.expect("taken");
-                match d.filter(|e| blk.key(e) == o.key) {
+                let answered = match d.filter(|e| blk.key(e) == o.key) {
                     Some(e) => {
-                        self.emit_both(&mut f, &mut em, ov, oi, src, |f| {
-                            blk.each_value(e, |v| f(o.key, v))
+                        let answered = self.emit_both(&mut f, &mut em, ov, oi, src, |f| {
+                            blk.each_value(e, |v| f(o.key, v));
+                            e.holds_values()
                         })?;
                         di += 1;
                         if e.same {
                             rank += 1;
                         }
+                        answered
                     }
                     None => {
                         let same = rank < hi && oat == Ordering::Equal;
-                        self.emit_over(
+                        let answered = self.emit_over(
                             &mut f,
                             &mut em,
                             ov,
@@ -59711,9 +60028,11 @@ impl<'s> BuildCtx<'s> {
                         if same {
                             rank += 1;
                         }
+                        answered
                     }
-                }
+                };
                 oi += 1;
+                answered
             } else {
                 let e = d.expect("taken");
                 let k = blk.key(e);
@@ -59722,10 +60041,11 @@ impl<'s> BuildCtx<'s> {
                 if e.same {
                     rank += 1;
                 }
-            }
-            seen += 1;
+                e.holds_values()
+            };
+            seen += usize::from(answered);
         }
-        if seen < limit && rank < hi {
+        if seen < limit && rank < hi && !ov.cut {
             let want = (hi - rank).min(limit - seen);
             seen += pr.scan(rank, want, &mut f)?;
         }
@@ -59760,30 +60080,36 @@ impl<'s> BuildCtx<'s> {
         let n = blk.len();
         while seen < limit {
             let order = match (i < n, ov.over.get(oi)) {
+                // A cut window holds nothing past its last key.
                 (false, None) => break,
+                (true, None) if ov.cut => break,
                 (true, None) => Ordering::Less,
                 (false, Some(_)) => Ordering::Greater,
                 (true, Some(o)) => blk.key_i(i).cmp(o.key),
             };
-            match order {
+            let answered = match order {
                 Ordering::Less => {
                     let k = blk.key_i(i);
                     blk.values_i(i, |v| f(k, v));
                     i += 1;
+                    blk.holds_values_i(i - 1)
                 }
                 Ordering::Greater => {
-                    self.emit_over(&mut f, &mut em, ov, oi, None, src)?;
+                    let answered = self.emit_over(&mut f, &mut em, ov, oi, None, src)?;
                     oi += 1;
+                    answered
                 }
                 Ordering::Equal => {
-                    self.emit_both(&mut f, &mut em, ov, oi, src, |f| {
-                        blk.values_i(i, |v| f(blk.key_i(i), v))
+                    let answered = self.emit_both(&mut f, &mut em, ov, oi, src, |f| {
+                        blk.values_i(i, |v| f(blk.key_i(i), v));
+                        blk.holds_values_i(i)
                     })?;
                     i += 1;
                     oi += 1;
+                    answered
                 }
-            }
-            seen += 1;
+            };
+            seen += usize::from(answered);
         }
         self.give_offs(em.scratch);
         Ok(seen)
@@ -59824,7 +60150,7 @@ impl<'s> BuildCtx<'s> {
             }
             let k = blk.key(e);
             blk.each_value(e, |v| f(k, v));
-            seen += 1;
+            seen += usize::from(e.holds_values());
             if e.same {
                 rank += 1;
             }
@@ -60498,7 +60824,7 @@ struct SealReadable {
     /// For each name, what the writer knows of it that the landing's open
     /// would otherwise walk the records for: the Bloom and the tombstone
     /// flag (`PieceWriter::landing_facts`). Set before the names.
-    facts: std::sync::OnceLock<Vec<Option<(BlockedBloom, bool)>>>,
+    facts: std::sync::OnceLock<Vec<Option<(BlockedBloom, Tombs)>>>,
     wake: Option<std::thread::Thread>,
 }
 
@@ -60704,7 +61030,7 @@ fn seal_readable(
     shared: &Shared,
     readable: &SealReadable,
     names: &[String],
-    facts: Vec<Option<(BlockedBloom, bool)>>,
+    facts: Vec<Option<(BlockedBloom, Tombs)>>,
 ) {
     debug_assert_eq!(facts.len(), names.len(), "a fact a name");
     let _ = readable.facts.set(facts);
@@ -62577,7 +62903,7 @@ impl Maint {
     fn land_readable(
         &mut self,
         names: &[String],
-        facts: &[Option<(BlockedBloom, bool)>],
+        facts: &[Option<(BlockedBloom, Tombs)>],
         table: &std::sync::Arc<MemTable>,
         defer_dir: bool,
     ) -> Result<bool> {
@@ -71157,7 +71483,7 @@ mod streaming_writes {
 mod landing_facts {
     use super::*;
 
-    /// The Bloom and the tombstone flag the writer hands the landing
+    /// The Bloom and the tombstone facts the writer hands the landing
     /// (`PieceWriter::landing_facts`) are the ones a walk of the finished
     /// segment's records builds (`Seg::bloom_and_tombs`), bit for bit, and
     /// a segment opened either way answers `may_hold` alike.
@@ -71176,13 +71502,23 @@ mod landing_facts {
         for i in 0..5000u32 {
             let key = format!("key-{i:08}");
             w.begin(key.as_bytes()).unwrap();
-            w.value(format!("value-{i}").as_bytes());
-            w.end_with(i % 7 == 0).unwrap();
+            // Every eleventh key a delete with nothing after it.
+            if i % 11 != 0 {
+                w.value(format!("value-{i}").as_bytes());
+            }
+            w.end_with(i % 7 == 0 || i % 11 == 0).unwrap();
         }
         let facts = w
             .landing_facts()
             .expect("a records-first segment has every key's hash");
-        assert!(facts.1, "a key ended with a tombstone");
+        assert_eq!(
+            facts.1,
+            Tombs {
+                any: true,
+                bare: true
+            },
+            "keys ended with a tombstone, some with no value"
+        );
         let (seg, ord) = w.finish_unsynced().unwrap();
         drop(seg);
         write_ord_unsynced(&dir, &name, &ord).unwrap();
@@ -71201,7 +71537,8 @@ mod landing_facts {
             assert_eq!(walked.slot_addr(fnv), walked.raw().slot_addr(fnv), "{k}");
             assert_eq!(handed.slot_addr(fnv), handed.raw().slot_addr(fnv), "{k}");
         }
-        assert_eq!(walked.tombs, handed.tombs);
+        assert_eq!((walked.tombs, walked.bare), (handed.tombs, handed.bare));
+        assert!(walked.bare, "the walk found the records with no value");
         assert_eq!(
             walked.bloom.as_ref().unwrap().blocks,
             handed.bloom.as_ref().unwrap().blocks,

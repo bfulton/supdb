@@ -5717,10 +5717,10 @@ fn a_short_scan_keeps_the_random_advice_and_a_long_one_gives_it_up() {
 
 /// What a scan over the store must answer, kept beside it: each key's live
 /// values in append order, and the keys any unsealed source has touched
-/// since the last flush. A touched key is visited by the scan and counts
-/// toward its limit whether or not it has a value left -- that is what the
-/// merge over unrouted sources does with a tombstone-only key, and the bulk
-/// walk has to agree with it.
+/// since the last flush, which the point reads of `check` sample. A scan
+/// visits a key and counts it toward its limit only where the key holds a
+/// value: a key whose values a delete took is no key of a scan's, wherever
+/// the delete and the values lie.
 #[derive(Default)]
 struct ScanModel {
     vals: BTreeMap<Vec<u8>, Vec<Vec<u8>>>,
@@ -5750,11 +5750,11 @@ impl ScanModel {
         self.vals.retain(|_, v| !v.is_empty());
         self.touched.clear();
     }
-    /// The keys a scan visits, in order.
+    /// The keys a scan visits, in order: those that hold a value.
     fn visited(&self) -> Vec<&[u8]> {
         self.vals
             .iter()
-            .filter(|(k, v)| !v.is_empty() || self.touched.contains(*k))
+            .filter(|(_, v)| !v.is_empty())
             .map(|(k, _)| k.as_slice())
             .collect()
     }
@@ -5847,6 +5847,60 @@ impl ScanModel {
         self.check_scans(db, state);
     }
 
+    /// The store walked end to end a page at a time (`Reader::scan_page`),
+    /// `page` keys a page, against the model: each page hands over the
+    /// model's next `page` keys with their values and names where the next
+    /// starts, but the last, which hands over what is left and names none.
+    fn check_pages(&self, db: &Reader, page: usize, state: &str) {
+        let visited = self.visited();
+        let lossy = |b: &[u8]| String::from_utf8_lossy(b).into_owned();
+        let mut from: Vec<u8> = Vec::new();
+        let mut at = 0usize;
+        for turn in 0..=visited.len() {
+            let want = &visited[at..visited.len().min(at + page)];
+            let mut got: Vec<(Vec<u8>, Vec<Vec<u8>>)> = Vec::new();
+            let p = db
+                .scan_page(
+                    &from,
+                    page,
+                    kv(&mut |k, v| match got.last_mut() {
+                        Some((lk, vs)) if lk.as_slice() == k => vs.push(v.to_vec()),
+                        _ => got.push((k.to_vec(), vec![v.to_vec()])),
+                    }),
+                )
+                .unwrap();
+            let wanted: Vec<(Vec<u8>, Vec<Vec<u8>>)> = want
+                .iter()
+                .map(|k| (k.to_vec(), self.vals[*k].clone()))
+                .collect();
+            assert_eq!(
+                (p.keys, &got),
+                (want.len(), &wanted),
+                "{state}: page {turn} of {page} from {:?}",
+                lossy(&from)
+            );
+            at += want.len();
+            match p.next {
+                Some(next) => {
+                    assert_eq!(p.keys, page, "{state}: page {turn} names a next page");
+                    let last = &got.last().expect("a full page").0;
+                    assert_eq!(
+                        next,
+                        [last.as_slice(), &[0]].concat(),
+                        "{state}: page {turn}'s next starts just above its last key"
+                    );
+                    from = next;
+                }
+                None => {
+                    assert!(p.keys < page, "{state}: page {turn} short of its limit");
+                    assert_eq!(at, visited.len(), "{state}: the pages reached the end");
+                    return;
+                }
+            }
+        }
+        panic!("{state}: the pages of {page} never ended");
+    }
+
     /// The scans of `check` alone, for a store that must stay far from
     /// point reads (`Options::scan_cache_copies_fit`).
     fn check_scans(&self, db: &Reader, state: &str) {
@@ -5866,6 +5920,330 @@ impl ScanModel {
             for &limit in &[1usize, 2, 3, 5, 17, usize::MAX] {
                 self.compare_scan(db, &visited, from, limit, state);
             }
+        }
+    }
+}
+
+/// Where a scan-limit fixture leaves its deletes and the values they take.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum DelShape {
+    /// The keys and their deletes in the live table.
+    Unsealed,
+    /// The keys and their deletes sealed into one piece, before any
+    /// partition: the piece holds a record with no value for each.
+    Piece,
+    /// The keys in a piece, their deletes unsealed over it.
+    OverAPiece,
+    /// The keys in the partitions, their deletes unsealed over them.
+    OverPartitions,
+    /// The keys in the partitions, their deletes in a piece over them.
+    PieceOverPartitions,
+    /// The keys written and deleted past the partitions' last key, sealed
+    /// and flushed: a run of pieces the flush would promote by rename.
+    PastThePartitions,
+}
+
+/// A store whose first keys are deleted every other one, left in `shape`,
+/// with its model: forty keys `key-00000` on, two values on every third,
+/// and eight of the sixteen from `first` deleted, `first` being four in
+/// the shape past the partitions, whose first four keys are the partition
+/// the rest are past, and zero in every other.
+fn deleted_every_other(d: &std::path::Path, o: Options, shape: DelShape) -> (Db, ScanModel) {
+    let key = |k: u32| format!("key-{k:05}");
+    let mut db = Db::create(
+        d,
+        Options {
+            seal_bytes: 1 << 30,
+            direct_ingest: false,
+            ..o
+        },
+    )
+    .unwrap();
+    let mut m = ScanModel::default();
+    let first = if shape == DelShape::PastThePartitions {
+        4
+    } else {
+        0
+    };
+    let write = |db: &mut Db, m: &mut ScanModel, keys: std::ops::Range<u32>| {
+        for k in keys {
+            m.append(db, &key(k), &format!("v{k}"));
+            if k % 3 == 0 {
+                m.append(db, &key(k), &format!("w{k}"));
+            }
+        }
+    };
+    let delete = |db: &mut Db, m: &mut ScanModel| {
+        for k in (first..first + 16).step_by(2) {
+            m.delete(db, &key(k));
+        }
+    };
+    match shape {
+        DelShape::Unsealed => {
+            write(&mut db, &mut m, 0..40);
+            db.commit().unwrap();
+            delete(&mut db, &mut m);
+            db.commit().unwrap();
+        }
+        DelShape::Piece => {
+            write(&mut db, &mut m, 0..40);
+            delete(&mut db, &mut m);
+            db.commit().unwrap();
+            db.seal().unwrap();
+            db.settle().unwrap();
+        }
+        DelShape::OverAPiece => {
+            write(&mut db, &mut m, 0..40);
+            db.commit().unwrap();
+            db.seal().unwrap();
+            db.settle().unwrap();
+            delete(&mut db, &mut m);
+            db.commit().unwrap();
+        }
+        DelShape::OverPartitions | DelShape::PieceOverPartitions => {
+            write(&mut db, &mut m, 0..40);
+            db.commit().unwrap();
+            db.flush().unwrap();
+            m.flushed();
+            delete(&mut db, &mut m);
+            db.commit().unwrap();
+            if shape == DelShape::PieceOverPartitions {
+                db.seal().unwrap();
+                db.settle().unwrap();
+            }
+        }
+        DelShape::PastThePartitions => {
+            write(&mut db, &mut m, 0..first);
+            db.commit().unwrap();
+            db.flush().unwrap();
+            m.flushed();
+            write(&mut db, &mut m, first..40);
+            delete(&mut db, &mut m);
+            db.commit().unwrap();
+            db.flush().unwrap();
+            m.flushed();
+        }
+    }
+    (db, m)
+}
+
+/// A scan's limit counts the keys it answers, wherever the deletes and the
+/// values they took lie: with eight of the first sixteen keys deleted, a
+/// scan of ten hands over ten keys' values, through every scan path
+/// (`scan_path_arms`), on the writer and on a handle, and with the deletes
+/// in each place a store keeps them (`DelShape`). Every other start and
+/// limit is held to the model beside it (`ScanModel::check`).
+#[test]
+fn a_scans_limit_counts_the_keys_that_hold_a_value() {
+    use DelShape::*;
+    let shapes = [
+        Unsealed,
+        Piece,
+        OverAPiece,
+        OverPartitions,
+        PieceOverPartitions,
+        PastThePartitions,
+    ];
+    for (arm, o) in scan_path_arms() {
+        for shape in shapes {
+            let name = format!("{arm} {shape:?}");
+            let d = dir(&format!("limit-counts-{arm}-{shape:?}"));
+            let (db, m) = deleted_every_other(&d, o.clone(), shape);
+            // The fixture is the shape it names.
+            let (parts, pieces) = db.levels();
+            let want = match shape {
+                Unsealed => (0, 0),
+                Piece | OverAPiece => (0, 1),
+                OverPartitions | PastThePartitions => (parts.max(1), 0),
+                PieceOverPartitions => (parts.max(1), 1),
+            };
+            assert_eq!((parts, pieces), want, "{name}: partitions and pieces");
+            let r = db.reader().unwrap();
+            for (who, src) in [("writer", &*db), ("handle", &r)] {
+                let mut keys: Vec<Vec<u8>> = Vec::new();
+                let n = src
+                    .scan(
+                        b"",
+                        10,
+                        kv(&mut |k, _| {
+                            if keys.last().map(Vec::as_slice) != Some(k) {
+                                keys.push(k.to_vec());
+                            }
+                        }),
+                    )
+                    .unwrap();
+                assert_eq!(
+                    (n, keys.len()),
+                    (10, 10),
+                    "{name}: the {who}'s scan of ten counts and hands over ten keys"
+                );
+                m.check(src, &format!("{name}, the {who}"));
+                for page in [1, 2, 3, 7, 10, 64] {
+                    m.check_pages(src, page, &format!("{name}, the {who}"));
+                }
+            }
+            drop(r);
+            db.close().unwrap();
+            let _ = std::fs::remove_dir_all(&d);
+        }
+    }
+}
+
+/// A page of no keys names its own start as the next, and a page that ends
+/// at the store's last key names a next page that hands over nothing and
+/// names none, whatever the keys: the empty key, keys of `0xff` bytes, and
+/// a key of the longest length, whose next page starts at a key one byte
+/// longer than a key may be.
+#[test]
+fn a_page_names_where_the_next_starts_at_the_edges_of_the_key_space() {
+    let d = dir("page-edges");
+    let mut db = Db::create(&d, common::options()).unwrap();
+    let long = vec![0xffu8; u16::MAX as usize];
+    let keys: Vec<Vec<u8>> = vec![
+        Vec::new(),
+        vec![0],
+        vec![0xff],
+        vec![0xff, 0xff],
+        long.clone(),
+    ];
+    for k in &keys {
+        db.append(k, b"v");
+    }
+    db.commit().unwrap();
+    let none =
+        |db: &Db, from: &[u8], limit: usize| db.scan_page(from, limit, kv(&mut |_, _| {})).unwrap();
+    for sealed in [false, true] {
+        let state = if sealed { "flushed" } else { "unsealed" };
+        assert_eq!(
+            none(&db, b"\x01", 0),
+            supdb::Page {
+                keys: 0,
+                next: Some(b"\x01".to_vec())
+            },
+            "{state}: a page of no keys"
+        );
+        // Every key a page of one, each naming the next just above it.
+        let mut from = Vec::new();
+        for k in &keys {
+            let p = none(&db, &from, 1);
+            let next = [k.as_slice(), &[0]].concat();
+            assert_eq!(
+                p,
+                supdb::Page {
+                    keys: 1,
+                    next: Some(next.clone())
+                },
+                "{state}: the page of key {:?}",
+                &k[..k.len().min(4)]
+            );
+            from = next;
+        }
+        assert_eq!(
+            from.len(),
+            u16::MAX as usize + 1,
+            "{state}: past the longest key"
+        );
+        assert_eq!(
+            none(&db, &from, 1),
+            supdb::Page {
+                keys: 0,
+                next: None
+            },
+            "{state}: the page after the last key"
+        );
+        // The whole store in one page that ends at its last key.
+        assert_eq!(
+            none(&db, b"", keys.len()).next,
+            Some([long.as_slice(), &[0]].concat()),
+            "{state}: a page ending at the last key"
+        );
+        assert_eq!(
+            none(&db, b"", keys.len() + 1),
+            supdb::Page {
+                keys: keys.len(),
+                next: None
+            },
+            "{state}: a page past the last key"
+        );
+        db.flush().unwrap();
+    }
+    db.close().unwrap();
+    let _ = std::fs::remove_dir_all(&d);
+}
+
+/// A flush promotes a piece past the partitions' last key by rename, and
+/// takes none that holds a record with no value -- a delete of a key
+/// nothing was written to after it -- which it merges instead, so that no
+/// partition holds one and a partition's walk counts its records as the
+/// keys a scan answers. The same piece with puts in the deletes' place,
+/// each a tombstone with a value after it, or with appends alone, is
+/// promoted. Each is asked with the piece's facts from its writer and, the
+/// store reopened between the seal and the flush, from the open's walk of
+/// its records.
+#[test]
+fn a_promotion_takes_no_piece_that_holds_a_key_with_no_value() {
+    let key = |k: u32| format!("key-{k:05}");
+    for (what, write) in [("deletes", 0u8), ("puts", 1), ("appends", 2)] {
+        for reopened in [false, true] {
+            let name = format!("{what}{}", if reopened { ", reopened" } else { "" });
+            let d = dir(&format!("promote-bare-{what}-{reopened}"));
+            let o = Options {
+                seal_bytes: 1 << 30,
+                direct_ingest: false,
+                ..common::options()
+            };
+            let mut db = Db::create(&d, o.clone()).unwrap();
+            let mut m = ScanModel::default();
+            for k in 0..4 {
+                m.append(&mut db, &key(k), &format!("v{k}"));
+            }
+            db.commit().unwrap();
+            db.flush().unwrap();
+            m.flushed();
+            assert_eq!(db.levels(), (1, 0), "{name}: one partition below the piece");
+            for k in 4..40 {
+                m.append(&mut db, &key(k), &format!("v{k}"));
+            }
+            for k in (4..20).step_by(2) {
+                match write {
+                    0 => m.delete(&mut db, &key(k)),
+                    1 => {
+                        m.delete(&mut db, &key(k));
+                        m.append(&mut db, &key(k), &format!("p{k}"));
+                    }
+                    _ => {}
+                }
+            }
+            db.commit().unwrap();
+            db.seal().unwrap();
+            db.settle().unwrap();
+            assert_eq!(db.levels(), (1, 1), "{name}: a piece past the partition");
+            if reopened {
+                db.crash();
+                db = Db::open(&d, o.clone()).unwrap();
+                assert_eq!(db.levels(), (1, 1), "{name}: the piece reopened");
+            }
+            let before = db.promotions().0;
+            db.flush().unwrap();
+            m.flushed();
+            let promoted = db.promotions().0 - before;
+            let (parts, pieces) = db.levels();
+            if write == 0 {
+                assert_eq!(
+                    (promoted, parts, pieces),
+                    (0, 1, 0),
+                    "{name}: the piece merged, not promoted"
+                );
+            } else {
+                assert_eq!(
+                    (promoted, parts, pieces),
+                    (1, 2, 0),
+                    "{name}: the piece promoted"
+                );
+            }
+            m.check(&db, &name);
+            db.close().unwrap();
+            let _ = std::fs::remove_dir_all(&d);
         }
     }
 }
@@ -9241,6 +9619,79 @@ fn a_wide_blocks_window_stops_at_the_scans_limit() {
         db.settle().unwrap();
         m.check(&db, &format!("{state}, landed"));
         held(&db, 0);
+    }
+}
+
+/// A scan's window over a block takes its limit of keys from each source,
+/// which held enough while every key counted; a run of keys a delete left
+/// no value of counts nothing, so the walk stops at the window's last key
+/// and the scan resumes above it (`Overlay::cut`) until it has its limit.
+/// Held over a wide block's window (`Options::scan_wide_capped` on and
+/// off) and the memtables' window over a pieces-only form
+/// (`Options::forms_pieces_only`), with a run of keys past the partitions'
+/// end appended and deleted in the live table and scans of a few from
+/// inside it, each a page at a time beside it.
+#[test]
+fn a_scan_resumes_past_a_window_of_keys_with_no_value() {
+    for (shape, capped, pieces_only) in [
+        ("wide capped", true, false),
+        ("wide", false, false),
+        ("pieces only", true, true),
+    ] {
+        let d = dir(&format!("window-resume-{capped}-{pieces_only}"));
+        let opts = Options {
+            seal_bytes: 1 << 20,
+            partition_bytes: Some(2 << 10),
+            l0_trigger: 64,
+            scan_block_cache: true,
+            scan_wide_capped: capped,
+            forms_pieces_only: pieces_only,
+            forms_copy_hot_wide: false,
+            ..common::options()
+        };
+        let mut db = Db::create(&d, opts).unwrap();
+        let mut m = ScanModel::default();
+        for k in (0..600u32).step_by(3) {
+            m.append(&mut db, &format!("key-{k:05}"), &format!("p{k}"));
+        }
+        db.commit().unwrap();
+        db.flush().unwrap();
+        m.flushed();
+        let tail = |k: u32| format!("key-00600x{k:04}");
+        for k in 0..1280u32 {
+            m.append(&mut db, &tail(k), "tail");
+        }
+        // Forty keys appended and deleted, between and among the rest.
+        for k in 100..140u32 {
+            m.delete(&mut db, &tail(k));
+        }
+        if pieces_only {
+            db.commit().unwrap();
+            db.seal().unwrap();
+            db.settle().unwrap();
+            for k in 100..140u32 {
+                m.append(&mut db, &format!("{}+", tail(k)), "live");
+                m.delete(&mut db, &format!("{}+", tail(k)));
+            }
+        }
+        db.commit().unwrap();
+        let before = db.window_resumes();
+        for from in [tail(98), tail(100), tail(120)] {
+            for limit in [1usize, 3, 5] {
+                m.check_one(&db, from.as_bytes(), limit, shape);
+            }
+        }
+        assert!(
+            db.window_resumes() > before,
+            "{shape}: a walk stopped at a cut window and the scan resumed"
+        );
+        m.check(&db, shape);
+        for page in [1, 4] {
+            m.check_pages(&db, page, shape);
+        }
+        held(&db, 0);
+        db.close().unwrap();
+        let _ = std::fs::remove_dir_all(&d);
     }
 }
 

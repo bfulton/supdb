@@ -44,6 +44,7 @@ Reader::zpage_counts	-	a test seam or a counter: reads or sets the store's bookk
 Reader::ord_point_reads	-	a test seam or a counter: reads or sets the store's bookkeeping, at no key, entry, block or step of an operation
 Reader::read_all	read,read_z,read_s,work
 Reader::scan	scan,scan_long,scan_z,scan_long_z,scan_s,scan_long_s,work,land
+Reader::scan_page	-	a scan by the page: `scan` beneath it, which the scan probes count, and a copy of the last key a page hands over; no probe walks by the page
 Reader::forms_trims	-	a test seam or a counter: reads or sets the store's bookkeeping, at no key, entry, block or step of an operation
 Reader::forms_trim_looks	-	a test seam or a counter: reads or sets the store's bookkeeping, at no key, entry, block or step of an operation
 Reader::forms_trim_us	-	a test seam or a counter: reads or sets the store's bookkeeping, at no key, entry, block or step of an operation
@@ -55,11 +56,13 @@ Reader::published_kind	-	a test seam or a counter: reads or sets the store's boo
 Reader::form_choices	-	a test seam or a counter: reads or sets the store's bookkeeping, at no key, entry, block or step of an operation
 Reader::hot_start_counts	-	a test seam or a counter: reads or sets the store's bookkeeping, at no key, entry, block or step of an operation
 Reader::lazy_scans	-	a test seam or a counter: reads or sets the store's bookkeeping, at no key, entry, block or step of an operation
+Reader::window_resumes	-	a test seam or a counter: reads or sets the store's bookkeeping, at no key, entry, block or step of an operation
 Reader::settle_density	-	a test seam or a counter: reads or sets the store's bookkeeping, at no key, entry, block or step of an operation
 Reader::start_cache_counts	-	a test seam or a counter: reads or sets the store's bookkeeping, at no key, entry, block or step of an operation
 Reader::canonical_forms	-	a test seam or a counter: reads or sets the store's bookkeeping, at no key, entry, block or step of an operation
 Reader::published_form_bytes	-	a test seam or a counter: reads or sets the store's bookkeeping, at no key, entry, block or step of an operation
 Reader::debug_key	-	a debug accessor naming a key's sources, for a failing test
+Reader::holders_of	-	a test seam naming the sources that hold a key's record, for the differential fuzz, at no key, entry, block or step of an operation
 Reader::block_cache_kinds	-	a test seam or a counter: reads or sets the store's bookkeeping, at no key, entry, block or step of an operation
 Reader::block_cache_layout	-	a test seam or a counter: reads or sets the store's bookkeeping, at no key, entry, block or step of an operation
 Reader::block_cache_identity	-	a test seam or a counter: reads or sets the store's bookkeeping, at no key, entry, block or step of an operation
