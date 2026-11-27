@@ -11525,12 +11525,16 @@ struct Seg {
     /// was written to after it, which a seal writes so that the key's older
     /// values stay masked.
     ///
-    /// False for every partition, and `Seg::open` assumes that for a `par-`
-    /// name as it does `tombs`. A merge leaves such a key out, and a
-    /// promotion takes no piece that holds one (`promotion_chain`), so a
-    /// partition's records are the keys a scan of it answers, one a rank,
-    /// and its walks -- the raw records', a form file's -- count ranks
-    /// where a scan's limit counts keys.
+    /// False for a partition this release made, and `Seg::open` assumes
+    /// that for a `par-` name as it does `tombs`. A merge leaves such a key
+    /// out, and a promotion takes no piece that holds one
+    /// (`promotion_chain`), so a partition's records are the keys a scan of
+    /// it answers, one a rank, and its walks -- the raw records', a form
+    /// file's -- count ranks where a scan's limit counts keys. A release
+    /// from before the rule promoted such pieces; the open walks every
+    /// partition a slot names without saying it holds none
+    /// (`Seg::walk_bare`), and while one that does stands the scans take
+    /// the merge paths (`State::segs_bare`).
     bare: bool,
     /// The key and value bytes the segment holds, as its writer recorded
     /// them; for a segment that recorded none, two thirds of its file,
@@ -16548,6 +16552,25 @@ impl Seg {
             tombs.bare |= exts.iter().all(|e| e.records() == 0);
         }
         Ok((bloom, tombs))
+    }
+
+    /// Whether this partition holds a record with no value, found by a walk
+    /// of its records and kept in `bare`: for a partition a slot names
+    /// without saying it holds none (`MANIFEST_CLEAN`), which a release
+    /// from before the rule may have promoted from a piece holding a delete
+    /// with nothing written after it.
+    fn walk_bare(&mut self) -> Result<bool> {
+        let b = self.raw();
+        for rank in 0..b.keys() {
+            let (_, exts) = b
+                .exts_at(rank)
+                .ok_or_else(|| err("segment key walk: a rank the index does not have"))?;
+            if exts.iter().all(|e| e.records() == 0) {
+                self.bare = true;
+                return Ok(true);
+            }
+        }
+        Ok(false)
     }
 
     /// Whether `key` sorts below this segment's lower fence. An open fence
@@ -22146,10 +22169,21 @@ fn check_options(opts: &Options) -> Result<()> {
 /// (`Manifest::needs_log`), which a reader from before them never reads
 /// and a body without them reads as nothing known: a release that does not
 /// read them opens the store as it did, without the check they allow.
+/// Behind those, four bytes of checks (`MANIFEST_CLEAN`), read and written
+/// the same way: a reader from before them stops at the word before, and a
+/// body without them says nothing, which is what such a release writes.
 const MANIFEST_MAGIC: &[u8; 9] = b"SUPDBMAN\x03";
 /// The magic's bytes before the version byte: a manifest that carries them
 /// with a version past this one's is a newer release's, refused as one.
 const MANIFEST_HEAD: &[u8; 8] = b"SUPDBMAN";
+
+/// The bit of a version-3 body's checks word, behind the log file it needs,
+/// that says no partition the slot names holds a record with no value
+/// (`Seg::bare`). A release from before the word reads no further than the
+/// word before it and writes none, so a slot it writes over a store says
+/// nothing of the store's partitions, and the next open walks them to find
+/// out: a partition it promoted may hold such a record.
+const MANIFEST_CLEAN: u32 = 1;
 
 /// The store's format version: one number for the files a store's
 /// directory holds, recorded in every manifest the store writes and
@@ -22245,6 +22279,9 @@ struct OpenSlots {
     /// The log file the slot taken needs (`Manifest::needs_log`), which
     /// every slot the open writes carries on.
     needs_log: u64,
+    /// What the slot taken said of its partitions (`Manifest::clean`),
+    /// which every slot the open writes says again.
+    clean: bool,
 }
 
 /// Which manifest slot a publish writes: never the one holding the newest
@@ -22284,12 +22321,22 @@ impl SlotChoice {
         opts: &Options,
         seq: u64,
         covered_seq: u64,
-        needs_log: u64,
+        (needs_log, clean): (u64, bool),
         names: &[String],
         tear: bool,
     ) -> Result<usize> {
         let slot = self.next();
-        manifest_write_shape(dir, opts, slot, seq, covered_seq, needs_log, names, tear)?;
+        manifest_write_shape(
+            dir,
+            opts,
+            slot,
+            seq,
+            covered_seq,
+            needs_log,
+            clean,
+            names,
+            tear,
+        )?;
         if opts.manifest_slots {
             self.landed(slot);
             // On the device: what no manifest from this one on lists is
@@ -22364,6 +22411,7 @@ fn manifest_encode(
     seq: u64,
     covered_seq: u64,
     needs_log: u64,
+    clean: bool,
     names: &[String],
     pending: &[String],
 ) -> Vec<u8> {
@@ -22374,6 +22422,7 @@ fn manifest_encode(
         pending,
         Some(STORE_FORMAT),
         needs_log,
+        clean,
     )
 }
 
@@ -22388,13 +22437,15 @@ fn manifest_encode_as(
     pending: &[String],
     format: Option<u32>,
 ) -> Vec<u8> {
-    manifest_encode_with(seq, covered_seq, names, pending, format, 0)
+    manifest_encode_with(seq, covered_seq, names, pending, format, 0, false)
 }
 
 /// `manifest_encode_as` with the log file the slot needs behind the format
 /// word (`Manifest::needs_log`), where a format is recorded: zero says
 /// nothing is known of it. A reader from before the word stops at the
-/// format and never reads it.
+/// format and never reads it. Behind it the slot's checks
+/// (`MANIFEST_CLEAN` where `clean`), which a reader from before them never
+/// reads and a release from before them never writes.
 fn manifest_encode_with(
     seq: u64,
     covered_seq: u64,
@@ -22402,6 +22453,7 @@ fn manifest_encode_with(
     pending: &[String],
     format: Option<u32>,
     needs_log: u64,
+    clean: bool,
 ) -> Vec<u8> {
     let mut body = Vec::new();
     body.extend_from_slice(&covered_seq.to_le_bytes());
@@ -22418,6 +22470,8 @@ fn manifest_encode_with(
     if let Some(f) = format {
         body.extend_from_slice(&f.to_le_bytes());
         body.extend_from_slice(&needs_log.to_le_bytes());
+        let checks = if clean { MANIFEST_CLEAN } else { 0 };
+        body.extend_from_slice(&checks.to_le_bytes());
     }
     let crc = block::crc32_resume(crc32(&seq.to_le_bytes()), &body);
     let mut out = Vec::with_capacity(body.len() + 25);
@@ -22446,11 +22500,19 @@ fn manifest_image(
     seq: u64,
     covered_seq: u64,
     needs_log: u64,
+    clean: bool,
     names: &[String],
     pending: &[String],
 ) -> Result<Vec<u8>> {
     match vault::stored(dir) {
-        vault::Stored::Files => Ok(manifest_encode(seq, covered_seq, needs_log, names, pending)),
+        vault::Stored::Files => Ok(manifest_encode(
+            seq,
+            covered_seq,
+            needs_log,
+            clean,
+            names,
+            pending,
+        )),
         vault::Stored::Vault(v) => {
             // Every segment's envelope first. Where the store is kept in
             // one file the manifest is a store in one file's, with the
@@ -22463,8 +22525,15 @@ fn manifest_image(
                 Some(_) => STORE_FORMAT_ONE,
                 None => STORE_FORMAT,
             };
-            let mut out =
-                manifest_encode_with(seq, covered_seq, names, pending, Some(format), needs_log);
+            let mut out = manifest_encode_with(
+                seq,
+                covered_seq,
+                names,
+                pending,
+                Some(format),
+                needs_log,
+                clean,
+            );
             if let Some(places) = &places {
                 out.extend_from_slice(places);
             }
@@ -22481,6 +22550,7 @@ fn manifest_image(
                 pending,
                 Some(STORE_FORMAT_ONE),
                 needs_log,
+                clean,
             );
             let with: Vec<String> = names
                 .iter()
@@ -22519,12 +22589,23 @@ fn manifest_write_slot(
     seq: u64,
     covered_seq: u64,
     needs_log: u64,
+    clean: bool,
     names: &[String],
     pending: &[String],
     tear: bool,
 ) -> Result<()> {
-    manifest_write_slot_unsynced(dir, slot, seq, covered_seq, needs_log, names, pending, tear)?
-        .sync_data()?;
+    manifest_write_slot_unsynced(
+        dir,
+        slot,
+        seq,
+        covered_seq,
+        needs_log,
+        clean,
+        names,
+        pending,
+        tear,
+    )?
+    .sync_data()?;
     Ok(())
 }
 
@@ -22540,11 +22621,12 @@ fn manifest_write_slot_unsynced(
     seq: u64,
     covered_seq: u64,
     needs_log: u64,
+    clean: bool,
     names: &[String],
     pending: &[String],
     tear: bool,
 ) -> Result<vault::File> {
-    let out = manifest_image(dir, seq, covered_seq, needs_log, names, pending)?;
+    let out = manifest_image(dir, seq, covered_seq, needs_log, clean, names, pending)?;
     let f = vault::open_slot(dir.join(MANIFEST_SLOTS[slot]))?;
     if tear {
         f.write_all_at(&out[..out.len() / 2], 0)?;
@@ -22606,13 +22688,24 @@ fn manifest_write_shape(
     seq: u64,
     covered_seq: u64,
     needs_log: u64,
+    clean: bool,
     names: &[String],
     tear: bool,
 ) -> Result<()> {
     if opts.manifest_slots {
-        return manifest_write_slot(dir, slot, seq, covered_seq, needs_log, names, &[], tear);
+        return manifest_write_slot(
+            dir,
+            slot,
+            seq,
+            covered_seq,
+            needs_log,
+            clean,
+            names,
+            &[],
+            tear,
+        );
     }
-    if let Some(spare) = manifest_write(dir, seq, covered_seq, needs_log, names, false)? {
+    if let Some(spare) = manifest_write(dir, seq, covered_seq, needs_log, clean, names, false)? {
         let _ = vault::remove_file(spare);
     }
     Ok(())
@@ -22631,10 +22724,11 @@ fn manifest_write(
     seq: u64,
     covered_seq: u64,
     needs_log: u64,
+    clean: bool,
     names: &[String],
     spare: bool,
 ) -> Result<Option<PathBuf>> {
-    let out = manifest_image(dir, seq, covered_seq, needs_log, names, &[])?;
+    let out = manifest_image(dir, seq, covered_seq, needs_log, clean, names, &[])?;
     let tmp = dir.join("manifest.tmp");
     {
         let mut f = vault::create(&tmp)?;
@@ -22686,6 +22780,12 @@ struct Manifest {
     /// Zero where nothing is known: a slot from before the word, a store
     /// that has retired nothing, a checkpoint, which holds no log.
     needs_log: u64,
+    /// Whether the slot says that no partition it names holds a record with
+    /// no value (`MANIFEST_CLEAN`): what a release that keeps the rule
+    /// writes where it knows it of every partition (`Seg::bare`). False
+    /// for a slot from before the word, which a release from before it
+    /// writes, whose partitions an open walks to find out.
+    clean: bool,
     /// The places of the store's files in its data file, where the store
     /// is kept in one (`STORE_FORMAT_ONE`): the table the slot carries
     /// behind its manifest (`onefile::One::parse`). Empty for a store of
@@ -22772,6 +22872,10 @@ fn manifest_parse(buf: &[u8]) -> Result<Manifest> {
         Some(w) if version >= 3 => u64::from_le_bytes(w.try_into().unwrap()),
         _ => 0,
     };
+    let checks = match body.get(p + 12..p + 16) {
+        Some(w) if version >= 3 => u32::from_le_bytes(w.try_into().unwrap()),
+        _ => 0,
+    };
     // A store kept in one file: the table of its files' places, behind the
     // manifest and under the manifest's sequence, so a slot whose write was
     // torn between the two is a torn slot.
@@ -22792,6 +22896,7 @@ fn manifest_parse(buf: &[u8]) -> Result<Manifest> {
         pending,
         format,
         needs_log,
+        clean: checks & MANIFEST_CLEAN != 0,
         extents,
     })
 }
@@ -22939,7 +23044,17 @@ mod store_format {
         // By its bytes, since a slot without the word reads as version 1
         // too: the slot is the encoding with the word, not without it.
         let slot = std::fs::read(d.join(slot_after(&m, m.seq))).unwrap();
-        let with = manifest_encode_as(m.seq, m.covered, &m.names, &m.pending, Some(STORE_FORMAT));
+        // And it says no partition it names holds a record with no value.
+        assert!(m.clean, "this release's slot says its partitions clean");
+        let with = manifest_encode_with(
+            m.seq,
+            m.covered,
+            &m.names,
+            &m.pending,
+            Some(STORE_FORMAT),
+            m.needs_log,
+            m.clean,
+        );
         let without = manifest_encode_as(m.seq, m.covered, &m.names, &m.pending, None);
         assert_eq!(&slot[..with.len()], &with[..]);
         assert_ne!(&slot[..without.len()], &without[..]);
@@ -23071,7 +23186,7 @@ mod store_format {
     #[test]
     fn a_newer_manifest_layout_is_refused_and_not_taken_for_torn() {
         let (d, m) = a_store("format-newer-layout");
-        let mut newer = manifest_encode(m.seq + 1, m.covered, 0, &m.names, &[]);
+        let mut newer = manifest_encode(m.seq + 1, m.covered, 0, true, &m.names, &[]);
         newer[8] = MANIFEST_MAGIC[8] + 1;
         std::fs::write(d.join(slot_after(&m, m.seq + 1)), newer).unwrap();
         let before = the_directory(&d);
@@ -23085,6 +23200,45 @@ mod store_format {
         assert_eq!(db.count(b"k00999").unwrap(), 1);
         drop(db);
         let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// The checks word behind the log file a slot needs: `MANIFEST_CLEAN`
+    /// written and read back, a body that ends before the word -- what a
+    /// release from before it writes -- read as saying nothing of the
+    /// partitions, and every field before the word read the same with it
+    /// and without it, as a reader from before it reads them.
+    #[test]
+    fn the_checks_word_says_the_partitions_clean_and_its_absence_nothing() {
+        let names = vec![
+            "par-00000001-0000000000000009--.sup".to_string(),
+            "pcs-00000002-0000000000000010-6b-.sup".to_string(),
+        ];
+        let pending = &names[1..];
+        let clean = manifest_encode_with(9, 7, &names, pending, Some(STORE_FORMAT), 31, true);
+        let silent = manifest_encode_with(9, 7, &names, pending, Some(STORE_FORMAT), 31, false);
+        // The body as a release from before the word wrote it: the word
+        // cut, the length and the checksum made again over what is left.
+        let mut before = clean.clone();
+        before.truncate(before.len() - 4);
+        let body_len = (before.len() - 25) as u32;
+        before[17..21].copy_from_slice(&body_len.to_le_bytes());
+        let crc = block::crc32_resume(crc32(&9u64.to_le_bytes()), &before[25..]);
+        before[21..25].copy_from_slice(&crc.to_le_bytes());
+        let read = |b: &[u8]| {
+            let m = manifest_parse(b).unwrap();
+            (
+                (m.seq, m.covered, m.names, m.pending, m.format, m.needs_log),
+                m.clean,
+            )
+        };
+        let (fields, said) = read(&clean);
+        assert!(said, "the word says the partitions clean");
+        assert_eq!(
+            read(&silent),
+            (fields.clone(), false),
+            "the word says nothing"
+        );
+        assert_eq!(read(&before), (fields, false), "no word says nothing");
     }
 
     /// A store written before versions were recorded -- every slot without
@@ -23114,8 +23268,16 @@ mod store_format {
         assert_eq!(newest.format, STORE_FORMAT);
         // The log file a slot needs, behind the format word, written and
         // read back.
-        let needs =
-            manifest_parse(&manifest_encode_with(9, 7, &m.names, &[], Some(42), 31)).unwrap();
+        let needs = manifest_parse(&manifest_encode_with(
+            9,
+            7,
+            &m.names,
+            &[],
+            Some(42),
+            31,
+            false,
+        ))
+        .unwrap();
         assert_eq!((needs.format, needs.needs_log), (42, 31));
         let with =
             manifest_parse(&manifest_encode_as(9, 7, &m.names, &m.names[..1], Some(42))).unwrap();
@@ -26922,6 +27084,11 @@ struct State {
     /// read asked it of every segment, forty-one pointer chases a read
     /// at thirty million keys.
     segs_tombs: bool,
+    /// Whether any live partition holds a record with no value
+    /// (`Seg::bare`), which only a partition an older release promoted
+    /// does: a scan takes the merge paths while one stands, which count the
+    /// keys they hand over where a partition's walks count its ranks.
+    segs_bare: bool,
     /// Per partition, the id of the blob whose block boundaries it
     /// shares: its own for a partition that met none to share them with,
     /// its predecessor's for one a publish kept or rewrote over the same
@@ -27310,6 +27477,13 @@ struct Shared {
     /// Ordered indexes the open rebuilt from their segments
     /// (`Seg::open_ord`); see `Db::ord_rebuilt`.
     ord_rebuilt: AtomicU64,
+    /// The partitions the open walked for a record with no value, the slot
+    /// it took saying nothing of them (`MANIFEST_CLEAN`), and of those the
+    /// ones that held one (`Seg::walk_bare`); see `Db::bare_walks`.
+    bare_walks: [AtomicU64; 2],
+    /// A test's: the store writes as a release from before `Seg::bare`
+    /// did (`Db::write_as_older_release`).
+    as_older: std::sync::atomic::AtomicBool,
     /// What building and attaching form files did over the store's life
     /// (`Options::zpages`), counted by the thread that did it; a read's
     /// own counts are on its slot's line. See `Db::zpage_counts`.
@@ -32827,6 +33001,15 @@ impl Reader {
         self.segs().iter().map(|s| s.name.clone()).collect()
     }
 
+    /// What a slot written now says of the partitions it names
+    /// (`MANIFEST_CLEAN`): that none holds a record with no value, where no
+    /// live partition does. A partition that does is one an open found
+    /// (`Seg::bare`), and goes only by a merge, so the live set holds every
+    /// one a slot written now could name.
+    fn parts_clean(&self) -> bool {
+        !self.state().segs_bare && !self.shared.as_older.load(AtomicOrdering::Relaxed)
+    }
+
     /// Whether any source can end a key's older values. False for a store
     /// nothing was ever deleted from, which lets every read skip the
     /// newest-first pass tombstones require.
@@ -32868,15 +33051,26 @@ impl Reader {
                     .collect(),
             );
         }
+        // A partition an older release left holding a record with no value
+        // (`Seg::bare`) is due whatever stands over it: the merge leaves
+        // such a key out, and the scans walk the store by merging until no
+        // partition holds one.
+        let bare = |f: &Fence| {
+            self.segs()
+                .iter()
+                .any(|s| s.level > 0 && s.bare && s.lo == f.0 && s.hi == f.1)
+        };
         Some(
             parts
                 .into_iter()
                 .filter(|f| {
-                    self.segs()
-                        .iter()
-                        .filter(|s| s.level == 0 && s.lo == f.0 && s.hi == f.1)
-                        .count()
-                        >= threshold
+                    bare(f)
+                        || self
+                            .segs()
+                            .iter()
+                            .filter(|s| s.level == 0 && s.lo == f.0 && s.hi == f.1)
+                            .count()
+                            >= threshold
                 })
                 .collect(),
         )
@@ -33293,7 +33487,8 @@ impl Reader {
         // nothing was written to after it: the merge leaves such a key out,
         // and a partition holds none (`Seg::bare`), so that its walks count
         // its records as the keys a scan answers.
-        if let Some(&si) = pieces.iter().find(|&&si| self.segs()[si].bare) {
+        let older = self.shared.as_older.load(AtomicOrdering::Relaxed);
+        if let Some(&si) = pieces.iter().find(|&&si| self.segs()[si].bare && !older) {
             self.z_refused(&format!(
                 "promotion: {} holds a key with no value",
                 self.segs()[si].name
@@ -36541,8 +36736,12 @@ impl Reader {
             self.share_scanned
                 .set(self.share_scanned.get().saturating_add(limit as u64));
         }
-        let forms_off = cache_on && partitioned && self.forms_off_scan(from);
-        let use_cache = cache_on && partitioned && !forms_off;
+        // A partition an older release promoted with a record of no value
+        // in it is walked by none of the paths that count its ranks
+        // (`State::segs_bare`): the merges count the keys they hand over.
+        let bare = self.state().segs_bare;
+        let forms_off = cache_on && partitioned && !bare && self.forms_off_scan(from);
+        let use_cache = cache_on && partitioned && !forms_off && !bare;
         if forms_off {
             self.signal_scan();
             self.shared
@@ -36668,7 +36867,7 @@ impl Reader {
         // routed flush this is the shape the store is in. An earlier
         // version had this path, a refactor dropped it, and the scan axis
         // paid for it.
-        if !self.segs().iter().any(|s| s.level == 0) {
+        if !bare && !self.segs().iter().any(|s| s.level == 0) {
             return self.scan_partitions(from, limit, mc, unsealed, f);
         }
 
@@ -46058,10 +46257,10 @@ impl Db {
         // file that may be torn, and the manifest is what says it is not
         // the store's. The scan stays for stores written before manifests.
         if opts.manifest_slots {
-            manifest_write_slot(dir, 0, 0, 0, 0, &[], &[], false)?;
+            manifest_write_slot(dir, 0, 0, 0, 0, true, &[], &[], false)?;
             manifest_make_slots(dir, false, false)?;
         } else {
-            manifest_write(dir, 0, 0, 0, &[], false)?;
+            manifest_write(dir, 0, 0, 0, true, &[], false)?;
         }
         let segs: Vec<std::sync::Arc<Seg>> = Vec::new();
         let block_pool = opts.block_pool();
@@ -46070,6 +46269,7 @@ impl Db {
         let data_bytes = 0;
         let l0_aligned = false;
         let segs_tombs = false;
+        let segs_bare = false;
         let (parts, piece_runs, fence_words) = State::placing(&segs, l0_aligned);
         let layout = segs
             .iter()
@@ -46099,6 +46299,7 @@ impl Db {
             piece_runs,
             fence_words,
             segs_tombs,
+            segs_bare,
             layout,
         };
         let shared = std::sync::Arc::new(Shared {
@@ -46130,6 +46331,8 @@ impl Db {
             fill_owed_due: AtomicU64::new(0),
             ahead_cold: AtomicU64::new(0),
             ord_rebuilt: AtomicU64::new(0),
+            bare_walks: [AtomicU64::new(0), AtomicU64::new(0)],
+            as_older: std::sync::atomic::AtomicBool::new(false),
             z: zfile::ZEvents::default(),
             retired_z: RetireList::new(),
             retired_heads: RetireList::new(),
@@ -46753,6 +46956,11 @@ impl Db {
         let pending: Vec<String> = manifest.as_ref().map_or(Vec::new(), |m| m.pending.clone());
         let taken = manifest.as_ref().map(|m| MANIFEST_SLOTS[m.slot]);
         let needs_log = manifest.as_ref().map_or(0, |m| m.needs_log);
+        // Whether the slot taken says no partition it names holds a record
+        // with no value (`MANIFEST_CLEAN`): every slot this open writes
+        // says what that one did, since it names those partitions before
+        // they are walked below; a store with no slot has no partition.
+        let clean = manifest.as_ref().is_none_or(|m| m.clean);
         let (sealed, mut live) = match manifest {
             Some(m) => (m.covered, m.names),
             None => {
@@ -46839,7 +47047,15 @@ impl Db {
             if alt_found {
                 if taken == Some(MANIFEST_SLOTS[1]) {
                     mseq += 1;
-                    slot.write_shape(dir, &opts, mseq, sealed, needs_log, &live, take(&mut tear))?;
+                    slot.write_shape(
+                        dir,
+                        &opts,
+                        mseq,
+                        sealed,
+                        (needs_log, clean),
+                        &live,
+                        take(&mut tear),
+                    )?;
                 }
                 let removed = if opts.fail_open_alt_removal {
                     Err(err("a test failed the open's removal of manifest.alt"))
@@ -46889,8 +47105,15 @@ impl Db {
         // same writes.
         if !had_manifest {
             mseq += 1;
-            let to =
-                slot.write_shape(dir, &opts, mseq, sealed, needs_log, &live, take(&mut tear))?;
+            let to = slot.write_shape(
+                dir,
+                &opts,
+                mseq,
+                sealed,
+                (needs_log, clean),
+                &live,
+                take(&mut tear),
+            )?;
             if opts.manifest_slots {
                 synced[to] = mseq;
             }
@@ -46913,8 +47136,15 @@ impl Db {
                 open_synced.push(".".into());
             }
             mseq += 1;
-            let to =
-                slot.write_shape(dir, &opts, mseq, sealed, needs_log, &live, take(&mut tear))?;
+            let to = slot.write_shape(
+                dir,
+                &opts,
+                mseq,
+                sealed,
+                (needs_log, clean),
+                &live,
+                take(&mut tear),
+            )?;
             open_synced.push(MANIFEST_SLOTS[to].into());
             synced[to] = mseq;
             if upgrade {
@@ -46925,6 +47155,7 @@ impl Db {
                     mseq - 1,
                     sealed,
                     needs_log,
+                    clean,
                     &live,
                     &[],
                     take(&mut tear),
@@ -46934,7 +47165,7 @@ impl Db {
             // The one manifest of a store that keeps no slots, in this
             // version.
             mseq += 1;
-            manifest_write_shape(dir, &opts, 0, mseq, sealed, needs_log, &live, false)?;
+            manifest_write_shape(dir, &opts, 0, mseq, sealed, needs_log, clean, &live, false)?;
         }
         // The runs of ordered ingest a crash left under their temp names.
         // A run's records up to its last commit marker are the batches
@@ -47003,6 +47234,7 @@ impl Db {
             synced,
             tear,
             needs_log,
+            clean,
         };
         // Empty temp names: the file a store makes ahead of its next run
         // (`Options::run_spare`), which no run began in. Removed once the
@@ -47336,6 +47568,7 @@ impl Db {
         // Where the store starts. `Random` starts advised and never moves;
         let starts_random = opts.read_advice.starts_random();
         let mut segs = Vec::with_capacity(live.len());
+        let (mut bare_walked, mut bare_found) = (0u64, 0u64);
         for name in &live {
             let advise_ord = opts.read_advice != ReadAdvice::Normal;
             let made = run_facts
@@ -47361,9 +47594,26 @@ impl Db {
                     true,
                 )?,
             });
+            // A partition the slot says nothing of may be one an older
+            // release promoted from a piece holding a delete with no value
+            // after it (`MANIFEST_CLEAN`): its records walked once, here.
+            if let Some(seg) = segs.last_mut().filter(|s| !clean && s.level > 0) {
+                bare_walked += 1;
+                bare_found += u64::from(seg.walk_bare()?);
+            }
             // Nothing lent by that open is read again.
             if let Some(h) = &opening {
                 h.rest();
+            }
+        }
+        // A walk that found every partition clean is said in a slot, once,
+        // at the first open after a slot that said nothing of them, so that
+        // the next open walks none (`MANIFEST_CLEAN`).
+        if bare_walked > 0 && bare_found == 0 {
+            mseq += 1;
+            let to = slot.write_shape(dir, &opts, mseq, sealed, (needs_log, true), &live, false)?;
+            if opts.manifest_slots {
+                synced[to] = mseq;
             }
         }
         let mut segs: Vec<std::sync::Arc<Seg>> =
@@ -47484,6 +47734,7 @@ impl Db {
         let store_bytes = Db::store_bytes_of(dir, &segs);
         let data_bytes = Db::data_bytes_of(&segs);
         let segs_tombs = segs.iter().any(|s| s.tombs);
+        let segs_bare = segs.iter().any(|s| s.bare);
         let max_key = Db::max_seg_key(&segs).max(replay_max);
         debug_assert_eq!(
             max_key,
@@ -47519,6 +47770,7 @@ impl Db {
             piece_runs,
             fence_words,
             segs_tombs,
+            segs_bare,
             layout,
         };
         let shared = std::sync::Arc::new(Shared {
@@ -47550,6 +47802,8 @@ impl Db {
             fill_owed_due: AtomicU64::new(0),
             ahead_cold: AtomicU64::new(0),
             ord_rebuilt: AtomicU64::new(ord_rebuilt),
+            bare_walks: [AtomicU64::new(bare_walked), AtomicU64::new(bare_found)],
+            as_older: std::sync::atomic::AtomicBool::new(false),
             z: zev,
             retired_z: RetireList::new(),
             retired_heads: RetireList::new(),
@@ -48407,7 +48661,7 @@ impl Db {
             opts,
             *mseq,
             sealed,
-            slots.needs_log,
+            (slots.needs_log, slots.clean),
             live,
             std::mem::take(&mut slots.tear),
         )?;
@@ -50205,6 +50459,7 @@ impl Db {
             piece_runs: cur.piece_runs.clone(),
             fence_words: cur.fence_words.clone(),
             segs_tombs: cur.segs_tombs,
+            segs_bare: cur.segs_bare,
             layout: cur.layout.clone(),
         });
         self.published(old);
@@ -51474,6 +51729,7 @@ impl Db {
             piece_runs: cur.piece_runs.clone(),
             fence_words: cur.fence_words.clone(),
             segs_tombs: cur.segs_tombs,
+            segs_bare: cur.segs_bare,
             layout: cur.layout.clone(),
         }
     }
@@ -51765,6 +52021,7 @@ impl Db {
                 piece_runs: cur.piece_runs.clone(),
                 fence_words: cur.fence_words.clone(),
                 segs_tombs: cur.segs_tombs,
+                segs_bare: cur.segs_bare,
                 layout: cur.layout.clone(),
             };
             if carry {
@@ -53759,6 +54016,16 @@ impl Db {
     #[doc(hidden)]
     pub fn seals_wedged(&self) -> bool {
         self.shared.seal_wedged.load(AtomicOrdering::Acquire)
+    }
+
+    /// A test's: while `on`, the store writes as a release from before the
+    /// rule that no partition holds a record with no value did -- a
+    /// promotion takes a piece that holds one, and a slot says nothing of
+    /// the partitions it names (`MANIFEST_CLEAN`) -- so that a test can
+    /// leave the store such a release left.
+    #[doc(hidden)]
+    pub fn write_as_older_release(&self, on: bool) {
+        self.shared.as_older.store(on, AtomicOrdering::Relaxed);
     }
 
     /// A test's: while `on`, every seal thread waits before it writes
@@ -57537,6 +57804,19 @@ impl Db {
     /// segment and rebuilt from their segments' keys (`Options::ord_durable`).
     pub fn ord_rebuilt(&self) -> u64 {
         self.shared.ord_rebuilt.load(AtomicOrdering::Relaxed)
+    }
+
+    /// The partitions the open walked for a record with no value, the slot
+    /// it took saying nothing of them (`MANIFEST_CLEAN`), and of those the
+    /// ones that held one, which the scans take the merge paths around
+    /// until a merge rewrites them (`State::segs_bare`).
+    #[doc(hidden)]
+    pub fn bare_walks(&self) -> (u64, u64) {
+        let w = &self.shared.bare_walks;
+        (
+            w[0].load(AtomicOrdering::Relaxed),
+            w[1].load(AtomicOrdering::Relaxed),
+        )
     }
 
     /// Partitions' ordered-index heads copied into anonymous memory over
@@ -63460,6 +63740,7 @@ impl Maint {
             AtomicOrdering::Relaxed,
         );
         let segs_tombs = segs.iter().any(|s| s.tombs);
+        let segs_bare = segs.iter().any(|s| s.bare);
         loop {
             let cur_p = self.shared.state.load(AtomicOrdering::Acquire);
             // SAFETY: this handle is pinned for its operation, and a state
@@ -63538,6 +63819,7 @@ impl Maint {
                 piece_runs: piece_runs.clone(),
                 fence_words: fence_words.clone(),
                 segs_tombs,
+                segs_bare,
             };
             let rebases = if swapped_live {
                 0
@@ -64058,11 +64340,14 @@ impl Maint {
         }
         // A range refused for a piece over it that a later range's
         // promotion took -- an open-ended piece over the last ranges,
-        // promoted at the last -- has nothing left to merge.
+        // promoted at the last -- has nothing left to merge, unless its
+        // partition holds a record with no value, which is due by itself
+        // (`merge_due`).
         rest.retain(|f| {
-            self.segs()
-                .iter()
-                .any(|s| s.level == 0 && fences_overlap(&s.lo, &s.hi, &f.0, &f.1))
+            self.segs().iter().any(|s| {
+                (s.level == 0 && fences_overlap(&s.lo, &s.hi, &f.0, &f.1))
+                    || (s.level > 0 && s.bare && s.lo == f.0 && s.hi == f.1)
+            })
         });
         Ok(rest)
     }
@@ -64181,14 +64466,20 @@ impl Maint {
             // old name read it, and reading it again was most of the
             // promotion a drain waits for, 6-7 ms for a run of three
             // hundred thousand keys.
-            segs[si] = std::sync::Arc::new(Seg::open(
+            let mut seg = Seg::open(
                 &self.dir,
                 &new,
                 self.advice_random(),
                 self.opts.read_advice != ReadAdvice::Normal,
                 self.opts.segment.checksums,
                 false,
-            )?);
+            )?;
+            // What the old name's open found of its records goes with the
+            // file: a partition the open found holding a record with no
+            // value, its fence closed by the pieces promoted above it,
+            // holds it still (`Seg::bare`).
+            seg.bare = segs[si].bare;
+            segs[si] = std::sync::Arc::new(seg);
             old_names.push(old);
         }
         vault::sync_dir(&self.dir)?;
@@ -64307,6 +64598,7 @@ impl Maint {
             self.manifest_seq,
             covered,
             needs_log,
+            self.parts_clean(),
             names,
             pending,
             tear,
@@ -64441,7 +64733,17 @@ impl Maint {
             }
         }
         // A checkpoint holds no log, so its slot needs none.
-        manifest_write_shape(tmp, &self.opts, 0, 1, self.covered_seq, 0, &names, false)?;
+        manifest_write_shape(
+            tmp,
+            &self.opts,
+            0,
+            1,
+            self.covered_seq,
+            0,
+            self.parts_clean(),
+            &names,
+            false,
+        )?;
         vault::sync_dir(tmp)
     }
 
@@ -64504,6 +64806,7 @@ impl Maint {
             self.manifest_seq,
             self.covered_seq,
             needs_log,
+            self.parts_clean(),
             &self.live_names(),
             self.opts.manifest_spare,
         )?;

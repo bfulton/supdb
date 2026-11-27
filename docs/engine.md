@@ -129,7 +129,13 @@ checkpoint.
   partition holds no record without a value: the merge leaves such a key
   out, and a promotion takes no piece that holds one -- a piece's open, or
   its writer, records whether it does (`Seg::bare`) -- so a partition's
-  walks, raw and through its form file, go on counting ranks. A scan's
+  walks, raw and through its form file, go on counting ranks. A release
+  from before the rule promoted such pieces, so every slot now says in a
+  word behind the log file it needs that its partitions hold none
+  (`MANIFEST_CLEAN`); a release from before the word writes none, and an
+  open that takes a slot without it walks the partitions once, takes the
+  scans off their walks while one that holds such a record stands, and has
+  the next landing merge it out. A scan's
   window over a block takes its limit of keys from each source, enough
   while every key counted; where keys with no value leave the walk short,
   it stops at the window's last key and the scan resumes above it. What

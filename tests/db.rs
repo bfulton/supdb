@@ -6248,6 +6248,135 @@ fn a_promotion_takes_no_piece_that_holds_a_key_with_no_value() {
     }
 }
 
+/// A store a release from before the rule that no partition holds a
+/// record with no value left -- a piece holding deletes with nothing after
+/// them promoted to a partition, and slots that say nothing of the
+/// partitions (`Db::write_as_older_release`) -- scans by the keys that
+/// hold a value once reopened: the open walks every partition the slot
+/// says nothing of and finds the one, the scans take the merge paths while
+/// it stands, and the flush merges it out, after which the slots say the
+/// partitions hold none and the open after walks nothing. Through every
+/// scan path.
+#[test]
+fn a_store_an_older_release_promoted_into_scans_by_the_keys_that_hold_a_value() {
+    let key = |k: u32| format!("key-{k:05}");
+    for (arm, o) in scan_path_arms() {
+        let name = format!("older-promoted {arm}");
+        let d = dir(&format!("older-promoted-{arm}"));
+        let o = Options {
+            seal_bytes: 1 << 30,
+            direct_ingest: false,
+            ..o
+        };
+        let mut db = Db::create(&d, o.clone()).unwrap();
+        db.write_as_older_release(true);
+        let mut m = ScanModel::default();
+        for k in 0..4 {
+            m.append(&mut db, &key(k), &format!("v{k}"));
+        }
+        db.commit().unwrap();
+        db.flush().unwrap();
+        m.flushed();
+        for k in 4..40 {
+            m.append(&mut db, &key(k), &format!("v{k}"));
+        }
+        for k in (4..20).step_by(2) {
+            m.delete(&mut db, &key(k));
+        }
+        db.commit().unwrap();
+        db.flush().unwrap();
+        m.flushed();
+        // The older release's store: the piece holding the deletes
+        // promoted, and slots saying nothing of the partitions.
+        assert_eq!(
+            (db.promotions().0, db.levels()),
+            (1, (2, 0)),
+            "{name}: the piece promoted"
+        );
+        db.close().unwrap();
+        let mut db = Db::open(&d, o.clone()).unwrap();
+        assert_eq!(
+            db.bare_walks(),
+            (2, 1),
+            "{name}: both partitions walked, one bare"
+        );
+        m.check(&db, &format!("{name}, reopened"));
+        for page in [1, 3, 10] {
+            m.check_pages(&db, page, &format!("{name}, reopened"));
+        }
+        let r = db.reader().unwrap();
+        m.check(&r, &format!("{name}, reopened, a handle"));
+        drop(r);
+        // The store written again: its next landing merges the partition
+        // that holds them, due whatever stands over it.
+        m.append(&mut db, &key(40), "after");
+        db.commit().unwrap();
+        db.flush().unwrap();
+        m.flushed();
+        db.settle().unwrap();
+        assert_eq!(db.levels().1, 0, "{name}: nothing above the partitions");
+        m.check(&db, &format!("{name}, merged"));
+        db.close().unwrap();
+        let db = Db::open(&d, o.clone()).unwrap();
+        assert_eq!(
+            db.bare_walks(),
+            (0, 0),
+            "{name}: the slot says the partitions clean"
+        );
+        m.check(&db, &format!("{name}, merged and reopened"));
+        db.close().unwrap();
+        let _ = std::fs::remove_dir_all(&d);
+    }
+}
+
+/// A store this release wrote is walked at no open, and one an older
+/// release wrote over after it is walked at the next: a slot such a
+/// release writes says nothing of the partitions (`MANIFEST_CLEAN`), and
+/// one of its promotions may have made a partition that holds a record
+/// with no value.
+#[test]
+fn a_slot_an_older_release_writes_has_the_partitions_walked() {
+    let d = dir("older-slot-walks");
+    let mut db = Db::create(&d, common::options()).unwrap();
+    for k in 0..300u32 {
+        db.append(format!("key-{k:05}").as_bytes(), b"v");
+    }
+    db.commit().unwrap();
+    db.flush().unwrap();
+    db.close().unwrap();
+    let mut db = Db::open(&d, common::options()).unwrap();
+    assert_eq!(
+        db.bare_walks(),
+        (0, 0),
+        "this release's store is walked at no open"
+    );
+    let parts = db.levels().0 as u64;
+    assert!(parts > 0, "a store with partitions");
+    db.write_as_older_release(true);
+    for k in 300..320u32 {
+        db.append(format!("key-{k:05}").as_bytes(), b"v");
+    }
+    db.commit().unwrap();
+    db.flush().unwrap();
+    let parts = db.levels().0 as u64;
+    db.close().unwrap();
+    let db = Db::open(&d, common::options()).unwrap();
+    assert_eq!(
+        db.bare_walks(),
+        (parts, 0),
+        "every partition walked after an older release's slot, none bare"
+    );
+    db.close().unwrap();
+    let db = Db::open(&d, common::options()).unwrap();
+    assert_eq!(
+        db.bare_walks(),
+        (0, 0),
+        "and at no open after this release's slot"
+    );
+    db.close().unwrap();
+    let _ = std::fs::remove_dir_all(&d);
+}
+
 /// The bulk walk over partitions with unsealed keys laid over it, held to
 /// the merge it stands in for, in every state the store passes through.
 ///

@@ -164,3 +164,5 @@ tests/data/couplings.txt	src/db.rs vault::crash code	0	1	Db::crash stops the cac
 tests/data/cost-entries.txt	Reader::scan_page	0	1	a scan by the page (ROADMAP, a scan's limit counts the keys it answers): `scan` beneath it, which the scan probes count, and a copy of the last key a page hands over
 tests/data/cost-entries.txt	Reader::window_resumes	0	1	a test seam that counts the block walks a cut window stopped and the scan resumed above, read by tests/db.rs, at no key, entry, block or step of an operation
 tests/data/cost-entries.txt	Reader::holders_of	0	1	a test seam that names the sources holding a key's record, read by tests/fuzz.rs, at no key, entry, block or step of an operation
+tests/data/cost-entries.txt	Db::bare_walks	0	1	a test seam that counts the partitions an open walked for a record with no value and those it found, read by tests/db.rs, at no key, entry, block or step of an operation
+tests/data/cost-entries.txt	Db::write_as_older_release	0	1	a test seam that has the store write as a release from before MANIFEST_CLEAN did, read by tests/db.rs, at no key, entry, block or step of an operation

@@ -8,14 +8,6 @@ a tenth behind its comparator or behind a shape the engine already reaches.
 
 ## High priority
 
-- [ ] **A partition an older release promoted, holding a key with no
-  value.** A store's scans count the keys that hold a value, and its
-  partitions' walks count ranks, since no partition holds a record with
-  none (`Seg::bare`). A release from before that rule promoted a piece
-  holding a delete of a key nothing was written to after it, so a store it
-  wrote may have such a partition, whose walks count the key toward a
-  scan's limit until a merge rewrites its range. Done when a test builds
-  the store as that release left it and its scans count as the rule's do.
 - [ ] **What a segment's readers count.** `Blob::scan`, `SparseBlob` and the
   wasm ABI's scans count a record toward the limit whether or not it holds
   a value, and a segment written through `SegmentWriter::end_with(true)`

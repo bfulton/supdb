@@ -63,6 +63,8 @@ Reader::canonical_forms	-	a test seam or a counter: reads or sets the store's bo
 Reader::published_form_bytes	-	a test seam or a counter: reads or sets the store's bookkeeping, at no key, entry, block or step of an operation
 Reader::debug_key	-	a debug accessor naming a key's sources, for a failing test
 Reader::holders_of	-	a test seam naming the sources that hold a key's record, for the differential fuzz, at no key, entry, block or step of an operation
+Db::bare_walks	-	a test seam or a counter: reads or sets the store's bookkeeping, at no key, entry, block or step of an operation
+Db::write_as_older_release	-	a test seam that has the store write as a release from before the rule that no partition holds a record with no value, at no key, entry, block or step of an operation
 Reader::block_cache_kinds	-	a test seam or a counter: reads or sets the store's bookkeeping, at no key, entry, block or step of an operation
 Reader::block_cache_layout	-	a test seam or a counter: reads or sets the store's bookkeeping, at no key, entry, block or step of an operation
 Reader::block_cache_identity	-	a test seam or a counter: reads or sets the store's bookkeeping, at no key, entry, block or step of an operation
