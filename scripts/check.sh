@@ -294,6 +294,10 @@ for g in $groups; do
       # failed where it must has earned no verdict on the tree.
       sh scripts/ratchet-red.sh || exit 1
       sh scripts/ratchet.sh || exit 1
+      # Every commit after the same base carries a signature
+      # (scripts/signed.sh), its red input first.
+      sh scripts/signed.sh --red || exit 1
+      sh scripts/signed.sh || exit 1
       ;;
     cross-arm)
       say "cross-arm"

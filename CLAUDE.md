@@ -173,8 +173,8 @@ owner's:
   drew larger waits for the pairing that asks for it.
 - **`scratch/` was this branch's working records, and came off for the
   pull request**, as it came off PR #6: every `scratch/` path this file
-  and `ROADMAP.md` cite is of the tree at `3442b07`, the last commit
-  that holds it (`git show 3442b07:scratch/plan/onefile.md`). The
+  and `ROADMAP.md` cite is of the tree at `5b81772`, the last commit
+  that holds it (`git show 5b81772:scratch/plan/onefile.md`). The
   layer's design (`scratch/seam/design.md`, its decisions and the forms' contract
   beside it); the stage plans (`scratch/plan/g1.md`, closed, with a
   critic's account of what each gate holds and a way to write past it
@@ -212,7 +212,7 @@ owner's:
 | `tests/source.rs` | the gates over the tree's own text, over a lexer in `tests/lex/`: the wall between the forms and the encryption modules (`tests/data/couplings.txt`), what the door's clippy run cannot see (`tests/data/door.txt`, `door-libc.txt`), every public entry point of `Reader`, `Db` and `Blob` to a cost probe or a reason (`tests/data/cost-entries.txt`), the seal's tokens to the calls they are made for, and every workflow under `.github/workflows` to the groups of `scripts/check.sh` |
 | `scripts/door/` | the door by symbol: a clippy run of its own over the library with the barred calls in `clippy.toml` (`run.sh`, in the `lint` group), and its red input (`red.sh`) |
 | `scripts/cost.sh`, `cost-diff.py`, `cost-hot.txt`, `cost-red.sh` | what a store in the clear pays, counted: the probes built at a base and at the tree under callgrind and compared by function, and the count's red input -- the `cost` group |
-| `scripts/ratchet.sh`, `ratchet.py`, `raises.txt`, `ratchet-red.sh`, `base.sh` | the lists that only go down, held across a change against the base `base.sh` takes from the event, a raise declared in `raises.txt` -- the `lists` group |
+| `scripts/ratchet.sh`, `ratchet.py`, `raises.txt`, `ratchet-red.sh`, `base.sh`, `signed.sh` | the lists that only go down, held across a change against the base `base.sh` takes from the event, a raise declared in `raises.txt`, and every commit after that base signed -- the `lists` group |
 | `scripts/seal-red.sh`, `seal-red-red.sh` | the seal's red input: a copy of the crate in which each whole borrow the read path keeps compiles in its own module and fails abroad, and that check's own red input -- in the `lint` group |
 | `experiments/ffi/` | what a C ABI and a Python binding cost a point read, borrowed against copied, beside LMDB's and RocksDB's C APIs; its own manifest and dated results, and not built by the gate -- its `README.md` |
 
@@ -570,7 +570,16 @@ the working tree in place -- blocked a pull request's merge until it and
 the four commits after it were made again and the branch force-pushed.
 Mutants run in a worktree of their own, with a target of its own, so the
 tree a commit is made from is never the one being rewritten, and a
-commit is made by `git commit`.
+commit is made by `git commit`. It came again at this branch's pull
+request, fifty-four commits wide: fifty-two of two days on which the
+environment signed nothing, and two merges made with `git commit-tree`,
+so the request opened with every one of them unverified and the branch
+was made again from the first of them, each commit signed with its tree,
+its authors and its dates as they were (`git commit-tree -S`), the
+citations of the remade commits in the messages and the docs moved to
+their new names, and force-pushed with the owner's leave. The `lists`
+group holds it now: every commit after the base carries a signature
+(`scripts/signed.sh`), read before a push and not at the pull request.
 
 Keep it that way. Every gate this repository has broken has broken the same
 way: a check that was not running, or one reporting a verdict it had not
@@ -746,7 +755,7 @@ pays for every byte anyone sent the device since the last one. A commit
 of 16.8 KB into a pre-written file takes 0.13 ms alone and 180 ms beside
 a writer that hints megabyte pieces to the device, in another file or in
 the commit's own, and 0.15 where that writer's bytes are still in the
-page cache (`python3 scratch/onefile/prims.py DIR`, at `3ca9014`). Traced
+page cache (`python3 scratch/onefile/prims.py DIR`, at `428fac0`). Traced
 over the lag sweep's full rewrite at ten million keys under 1.25 GiB
 (`scratch/onefile/inv.sh`, an `strace -f -T` of `supdb` laid to phase,
 thread and purpose by `inv.py`), the writer spent 18.1 s of 26.6 in the
@@ -2506,7 +2515,7 @@ pages: each unit's chunks marked unread, so that a read after the drop
 keeps its unit, and the units marked with the pass's own under one wait
 for the readers (`Paged::drop_units`, `Pager::mark_dropped`;
 `StoreCipher::drops_keep_plaintext` is the shape before,
-`supdb-cipherautodropskeep` its arm). Paired at `95c4f1b`
+`supdb-cipherautodropskeep` its arm). Paired at `145fab2`
 (`SUPDB_LAG_COUNTERS=1 SUPDB_SCAN_OPS=1 bench/scripts/pair.sh
 supdb-cipherauto supdb-cipherautodropskeep 10000000 --bound 1342177280
 --passes load,lag --reps 2 --ops-div 10`): the pass after the
@@ -2552,7 +2561,7 @@ segments, pieces most of them, where the plain store's took 363 in all
 record -a -e major-faults -c 1 -d -k CLOCK_MONOTONIC` over `bench run
 --scale ooc --bound 1342177280 --ops-div 10 --reps 1 --top 10000000
 --bottom 10000000 --arms supdb-cipherauto --passes load,lag`, at
-`eee60c4`). A scratch build of that commit left a merge's reads cold
+`838d3dd`). A scratch build of that commit left a merge's reads cold
 for the clock, the chunks it decrypted counted as asked for by nobody,
 with the shape before an arm: it fired, 1.3-1.4 million fills a sweep
 left cold, and the burst gave back 450 MB of partitions' records and
@@ -2707,7 +2716,7 @@ to completion, since everything built after it is built on its answer.
 The stride form went under a cipher the same way round, built and then
 priced, and its first pairing was the plan's line a second time.
 `bench/scripts/pair.sh supdb-cipherzstride supdb-cipher 5000000 --bound
-671088640 --passes read,scan --reps 2 --ops-div 10` at `3ea2aa2`, the
+671088640 --passes read,scan --reps 2 --ops-div 10` at `f98ec29`, the
 binary the encrypted comparators' (`bench/DESIGN.md`): point reads at
 0.81-0.83x of the raw form's under a cipher, 0.61 major faults a read
 against 0.47, scans at 1.04-1.22x. A stride page is two chunks as a form
@@ -2715,7 +2724,7 @@ page is, a read asks the cache for its page, and the envelope is mapped
 for reads far apart, so each chunk's fill waited for the device by
 itself. Asked for together the two come in one read (`Paged::ask_together`):
 against the arm that keeps them apart (`supdb-cipherzstrideapart`, the
-same command at `01b6f0b`, three reps) the reads are 1.28x and 1.33x at
+same command at `9408ddd`, three reps) the reads are 1.28x and 1.33x at
 0.15 major faults against 0.59, the device's bytes the same. With a
 walk's pages asked as it begins beside it, the form reads 1.07x and
 1.11x of the raw form under a cipher and scans 1.35x and 1.37x, and
@@ -2779,7 +2788,7 @@ rewrite and its pass, and was killed after the pass with 359 MiB of its
 own and 270 in files being written, which this paragraph called the
 writer piling up behind landings a cipher makes slower, on those two
 figures, and which was the store's close (the close's pin, below).
-Priced at `a166b4c` at that store and bound: against the
+Priced at `2c1dafd` at that store and bound: against the
 half in both orders (`pair.sh supdb-cipher supdb-cipherhalf 5000000
 --bound 671088640 --passes read,read-threaded,scan,scan-threaded,mixes
 --reps 2 --ops-div 10`) the store as shipped reads 1.11-1.25x, scans
@@ -3215,8 +3224,8 @@ nobody waiting for it, and passes because the evictor's hand goes by a
 unit just read once before it takes it. The hold has a test of its own
 for it (`a_hold_idles_for_a_wait_and_stands_again_after_it`). For a
 plain store's merge the method is the bare call, a type's as the rests
-are, and the count read level (`sh scripts/cost.sh 2476938 merge land
-work` at `2a23cc4`). The rules: a hold is a pin, so the waits under one
+are, and the count read level (`sh scripts/cost.sh 9e63a68 merge land
+work` at `34819ed`). The rules: a hold is a pin, so the waits under one
 are found and said as the waits under a slot were, a file write on the
 holder's own thread among them; an instrument kept in the tree is read
 again over the next sitting's lines before the figure it explains is
@@ -3258,7 +3267,7 @@ It came again as a read, over keys the roster had not run under a
 cipher. At five million ids under 640 MiB (`bench ab --arms
 supdb-cipherauto,supdb-cipher --size 5000000 --bound 671088640 --keys ids
 --passes load,read,read-threaded,scan,scan-threaded,mixes,scan-mixed,mixes-scrambled
---reps 5 --ops-div 10`, at `884443b`) the store as shipped was killed in
+--reps 5 --ops-div 10`, at `fc66ceb`) the store as shipped was killed in
 a scan mix in four reps of five, E in three and the scrambled E in one,
 where forty-six sittings over numbered keys had killed none. The mix's first scan settles what the write mixes
 before it left unfiled, some fifty thousand scattered writes, and over
@@ -3317,7 +3326,7 @@ them hung the merge's test where they should have failed it: the
 assertion fired while the merge stood at the vault's test gate, and the
 store's drop joined a merge nothing would let go. The gate is a guard
 that opens at its drop now, the rule this file already had for a test
-that parks a thread. With it, the same command at `39ecdd7`: neither arm
+that parks a thread. With it, the same command at `5036c23`: neither arm
 killed in five reps of five, and the most the kernel could not take back
 581-595 MiB of the 640 in every pass of the ten, where the run before it
 had 621-636 in four passes of five, the killed one among them (`rss`,
@@ -3357,7 +3366,7 @@ timer put in the read for the count and taken out. It had stood in
 apart", the cell the store lost to encrypted RocksDB at 0.41-0.43x while
 it read at 1.75-1.96x of it (`BIN=$PWD/target-enc/release/bench
 scripts/pair.sh supdb-cipherauto rocksdb-tuned-enc 5000000 --bound
-671088640 --passes read,scan --reps 3 --ops-div 10` at `52d9cb7`), and a
+671088640 --passes read,scan --reps 3 --ops-div 10` at `b7b7f90`), and a
 pass's faults divided by its scans is what made nineteen stalls read as
 a property of every scan: `SUPDB_SCAN_OPS=1` printed the first four
 scans at 23-103 ms beside the median in the first run it was asked for.
@@ -3418,7 +3427,7 @@ shipped it quoted the eight reps of the version before the move. Paired
 then, the moved line read like the shape before, both arms in two shapes
 (`bench ab --arms supdb-cipherauto,supdb-cipherautolandmodel --size
 5000000 --bound 671088640 --passes load,read,read-threaded,scan,scan-threaded,mixes
---reps 4 --ops-div 10` at `52c0286`), since half the cache in files is
+--reps 4 --ops-div 10` at `15f5924`), since half the cache in files is
 about four fifths of it in all, one or two partitions later than the
 holding, and a quarter is where the builder starts with no backlog. The
 rules: a line a mechanism starts at is drawn on the store that pays for
@@ -3458,7 +3467,7 @@ and the pass 4.2 s where it was 10.3-10.6 (`Options::merge_read_ahead_cipher`,
 on; `supdb-cipherautomergeapart` is the shape before). Paired, four
 pairs in both orders (`scripts/pair.sh supdb-cipherauto
 supdb-cipherautomergeapart 10000000 --bound 1342177280 --passes load,lag
---reps 2 --ops-div 10 --pairs _per_s` at `a19ffc6`): the pass 2.1-2.5x
+--reps 2 --ops-div 10 --pairs _per_s` at `8346a0f`): the pass 2.1-2.5x
 and the shuffled load 1.09-1.34x in every pair, the full rewrite's burst
 0.74-0.77x in every pair, its merges beside the writer now, and the
 other passes and bursts level. The rules: a
@@ -3537,7 +3546,7 @@ directory, placed by the rank's share of it (`Options::merge_ahead_shares`,
 pairings (`BIN=$PWD/target-enc/release/bench sh scripts/pair.sh
 SUPDB_LAG_COUNTERS=1 SUPDB_MERGE_TRACE=1 SUPDB_LAG_MARK=1 supdb-cipherauto
 supdb-cipherautoaheadflat 10000000 --bound 1342177280 --passes load,lag
---reps 3 --ops-div 10`, in `bench/`, at `b63c2de`): 530 major
+--reps 3 --ops-div 10`, in `bench/`, at `0478889`): 530 major
 faults over the burst, 70-80 merges landed in it where 55-69 had, 31-50
 pieces at the pass where 61-75 stood, and the pass 520-842 thousand
 entries a second in four reps of six, about twice RocksDB's; in the other
@@ -10039,7 +10048,7 @@ log that did not exist when the wait began.
 The whole count of that change then read red in a probe no line of it
 runs: the writer's round, `work_probe::main` one instruction a key over,
 100,018 in 148 million, with the suite's point read level (`sh
-scripts/cost.sh 83e63ed work read` at the commit). Summed by mnemonic
+scripts/cost.sh 7b563bc work read` at the commit). Summed by mnemonic
 over the function's instructions in the two builds (`--dump-instr=yes`,
 each instruction's count laid to its disassembly), the gain was 100,001
 `nop`s and seventeen moves of code run once. The read as `main` inlines
@@ -10367,8 +10376,8 @@ look as the writer's does: a byte among its fields and its forms' word
 for "not asked". Every handle's constructor ends in `paged_bits`, the
 step that sets the cipher's bit, and the two went there, behind the test
 the step already made. The count against the commit before (`sh
-scripts/cost.sh 884443b merge land work scan scan_long read`, at
-`38eff95`) read red in two functions no line of the change runs: the
+scripts/cost.sh fc66ceb merge land work scan scan_long read`, at
+`1d06abe`) read red in two functions no line of the change runs: the
 writer's round, 250,037 instructions over the probe's `main`, two and a
 half a key, and 280 over the landing probe's run in `Db::seal`, thirty-five
 a seal. Summed by mnemonic the round's gain was moves and address
@@ -10387,7 +10396,7 @@ now by the one constructor whose handles look (`new_reader`): the byte
 among the handle's fields and the word through the handle's own
 `not_asked`, behind one test of whether the store has a cache, at a
 handle made; `paged_bits` and every other constructor are the text they
-were, and the count reads level (the same command at `f2640ea`). A third
+were, and the count reads level (the same command at `3fbc5ed`). A third
 condition written with it, that only a counted handle rests, outlived
 both tests under its mutant: the builder ahead's and the keeper's handles
 reach no look, so nothing could hold it, and it came out. The rules: a
@@ -10758,7 +10767,7 @@ work: a retired segment, its index and its form file renamed to a dead
 name, which keeps the inode whoever unmaps it, and freed once nothing
 holds the segment by a thread of the lowest class
 (`Options::retired_reaped`, in `scratch/reap/reaper-v1.patch` against
-`dcdd042`, five tests and twelve mutants). It did what it was built to
+`990a2ab`, five tests and twelve mutants). It did what it was built to
 do, the segment work's time in frees under a second and the writer's
 near nothing, and lost the cells after the load in every pairing
 (`SUPDB_LAG_COUNTERS=1 SUPDB_SCAN_OPS=1 sh scripts/pair.sh supdb-reap
@@ -10978,7 +10987,7 @@ its writes; the finish is a function of its own (`leave_piece`). And one
 probe of the last count read 86 instructions a scan over with every
 function of the engine level: the allocator's count in the base's own
 binary had moved between two runs of it, which the probe run again
-said in ten minutes (`sh scripts/cost.sh 84a94f4 scan_long_z`). The
+said in ten minutes (`sh scripts/cost.sh acbaa31 scan_long_z`). The
 rules: a count that moves with a loop's register allocation is not
 chased by a third build, since the allocation is the compiler's again at
 the next change anywhere in the unit; the listing is read instead for

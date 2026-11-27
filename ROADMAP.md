@@ -419,7 +419,7 @@ What an engine picker would hit, roughly in order.
 - [ ] **A write's first touch of the memtable's index, priced across
   every core.** A profile of the writer through the lag sweep's full
   rewrite at ten million keys under 1.25 GiB (`perf record -a -g`, cut to
-  the burst by `SUPDB_LAG_MARK`, at `b7a1177`) put 12.5% of the plain
+  the burst by `SUPDB_LAG_MARK`, at `26315ea`) put 12.5% of the plain
   store's writer in `smp_call_function_many_cond` under
   `MemTable::index_insert`, by way of `ptep_clear_flush`: a page of the
   hash index read by the probe before the insert writes it maps the
@@ -903,7 +903,7 @@ What an engine picker would hit, roughly in order.
   offsets, each page after the page's check, and for a file whose
   mapping lends nothing whole that check is where the page is asked for,
   at every read (`ZFile::asks`, `MmapBytes::lend_asked_map`). A store in
-  the clear runs the code it ran (`sh scripts/cost.sh 83e63ed read_s
+  the clear runs the code it ran (`sh scripts/cost.sh 7b563bc read_s
   scan_s scan_long_s`). Held by the stride oracle under a cipher in a
   small cache (`tests/zpages.rs`), a stride file's damage and its
   build's rests (`tests/cipher.rs`), and the differential fuzz with the
@@ -913,7 +913,7 @@ What an engine picker would hit, roughly in order.
   out-of-line call a record of a walk, which in core is the scans at
   nine tenths of the raw form's under a cipher (`bench ab --arms
   supdb-cipherzstride,supdb-cipher --size 100000 --reps 3 --passes
-  load,read,scan` at `3ea2aa2`, one sitting) and wants a walk that asks
+  load,read,scan` at `f98ec29`, one sitting) and wants a walk that asks
   its run once; and
   the borrow its readers index spans the cache's whole range, pages
   other threads fill among them, so it holds by what the readers read,
@@ -947,7 +947,7 @@ What an engine picker would hit, roughly in order.
   it a breath at a time (`CLAUDE.md`, the close's pin). The drop's joins
   say they hold nothing now, held by
   `a_close_that_joins_a_merge_holds_nothing_of_the_cache` and its two
-  mutants. With it, at `b8b7e28`: the lag sweep in twelve sittings of
+  mutants. With it, at `471ec44`: the lag sweep in twelve sittings of
   twelve (`bench ab --arms supdb-cipherauto,supdb-cipher --size 5000000
   --bound 671088640 --passes lag --reps 6 --ops-div 10`), the most the
   kernel could not take back 582-615 MiB of the 640 where the killed
@@ -963,7 +963,7 @@ What an engine picker would hit, roughly in order.
   one rep in three. The settle's look rests in a handle's outermost read
   and a merge says what each output is to hold where it opens it
   (`CLAUDE.md`, both, with their tests in `cipher_looks` and the
-  vault's). With them, at `39ecdd7` (`bench ab --arms
+  vault's). With them, at `5036c23` (`bench ab --arms
   supdb-cipherauto,supdb-cipher --size 5000000 --bound 671088640 --keys
   ids --passes
   load,read,read-threaded,scan,scan-threaded,mixes,scan-mixed,mixes-scrambled
@@ -975,7 +975,7 @@ What an engine picker would hit, roughly in order.
     under 1 GiB and 1.25 GiB, ten sittings each of the lag sweep and of
     the mixes, over numbered keys and over ids, with
     `scripts/stallwatch.py` beside them. Done when none is killed. Begun
-    at `5112f9a` over numbered keys, both cipher arms, every pass, two
+    at `9057a50` over numbered keys, both cipher arms, every pass, two
     pairs a bound (`bench ab --arms supdb-cipherauto,supdb-cipher --size
     3000000 --bound 1073741824 --reps 2 --ops-div 10`, and `--size
     10000000 --bound 1342177280`): none killed and the watcher with
@@ -987,14 +987,14 @@ What an engine picker would hit, roughly in order.
     each reaches the room a reading late, as a merge's output did. A
     form file's build says what its file is to hold where it makes it
     (`vault::expect` in `zfile::write_pages` and `write_stride`, at
-    `153a623`): at ten million keys under 1.25 GiB two form files built
+    `88e4d77`): at ten million keys under 1.25 GiB two form files built
     ahead at the ordered load's end had grown shared memory by 99 MiB in
     86 ms beside a cache at its budget, and the same three loads a side
     (`SUPDB_PAGER_TRACE=1 SUPDB_LAG_MARK=1 bench ab --arms
     supdb-cipherauto,supdb-cipherauto --size 10000000 --bound 1342177280
     --passes load --reps 3 --ops-div 10` beside `GROUPMEM_INTERVAL_MS=20
     scripts/groupmem.py sample`) read the most the kernel could not take
-    back at 1,214-1,253 MiB of the 1,280 at `781e2b8` and at 1,195-1,226
+    back at 1,214-1,253 MiB of the 1,280 at `eee0834` and at 1,195-1,226
     with the announcement, none killed either way. A merge's own arrays,
     and a seal's sort and its writer's, are the engine's mappings
     (`Options::jobs_mapped`), which the room counts as they are mapped:
@@ -1013,7 +1013,7 @@ What an engine picker would hit, roughly in order.
     wrote each output's envelope under its hold of the cache, and writes
     it unheld now (`CLAUDE.md`, the trace that named the close;
     `a_merge_writing_an_envelope_holds_nothing_of_the_cache`). The same
-    sweep at `2a23cc4`, twelve sittings: 60 waits of sixty milliseconds
+    sweep at `34819ed`, twelve sittings: 60 waits of sixty milliseconds
     or more where it read 246, five and a half seconds of them for
     thirty, and the longest of a sitting 107 ms at the median for 220.
     What is left of them is no wait on a file: a thread's own cold reads
@@ -1139,7 +1139,7 @@ in, and what stands between the branch and a pull request.
 
 The roster is `bench run --scale quick --arms enc --out DIR` in the `enc`
 build (`bench/DESIGN.md`), read cell by cell by `python3
-bench/scripts/encrow.py ROW.json`; what follows is that row at `b12bd36`.
+bench/scripts/encrow.py ROW.json`; what follows is that row at `cc1af6a`.
 From ten to three hundred thousand keys the store under a cipher is ahead
 of each encrypted comparator, every rep of it on the better side of every
 rep of theirs, in about five cells of six of the durable group and four
@@ -1151,7 +1151,7 @@ until the run is its own log). What it loses:
 
 - [ ] **Reads and scans out of core.** `BIN=$PWD/bench/target-enc/release/bench
   bench/scripts/pair.sh supdb-cipher rocksdb-tuned-enc 5000000 --bound
-  671088640 --passes read,scan --reps 2 --ops-div 10` at `b12bd36`:
+  671088640 --passes read,scan --reps 2 --ops-div 10` at `cc1af6a`:
   encrypted RocksDB reads at 1.3-1.4x the store under a cipher and scans
   at 3.5x; encrypted LMDB (the same pairing against `lmdb3-enc`) scans at
   1.3x and reads at a quarter. The plain store is not out of core at that
@@ -1162,13 +1162,13 @@ until the run is its own log). What it loses:
   form was declined there when the pairing ran, and the controller is off
   because a form page lies across two chunks. With the stride form built
   there and forced (`supdb-cipherzstride` in that pairing's place, three
-  reps, at `01b6f0b`), the ciphertext of an ask's chunks asked for
+  reps, at `9408ddd`), the ciphertext of an ask's chunks asked for
   together and a walk's pages asked as it begins, encrypted RocksDB
   reads at 1.31-1.32x and scans at 1.9-2.2x: the form reads 1.07-1.11x
   of the raw form under a cipher and scans 1.35-1.37x (the same pairing
   against `supdb-cipher`), and the together ask is 1.28-1.33x of the
   reads' rate by itself (against `supdb-cipherzstrideapart`). What the
-  cell turns on is the plaintext held. A scratch build of `3ea2aa2` with
+  cell turns on is the plaintext held. A scratch build of `f98ec29` with
   the together ask and a cache whose size came from the environment, at
   500 MiB of the 640 where the store takes half of what is free at its
   open, read the forced stride
@@ -1181,7 +1181,7 @@ until the run is its own log). What it loses:
   scan of a hundred where RocksDB reads the same bytes from the device
   with none and are not yet taken apart, then the controller on under a
   cipher, all under
-  "Engine". With the cache following the room (`a166b4c`, the same
+  "Engine". With the cache following the room (`2c1dafd`, the same
   command, three reps): the forced stride form reads at 2.7x and 3.1x of
   encrypted RocksDB and scans at 0.59-0.75x of it; the store as shipped,
   in the raw form, which the room cannot hold, still reads at 0.75-0.78x
@@ -1200,7 +1200,7 @@ until the run is its own log). What it loses:
   publishes the index now. After it the cell read in two shapes, by how
   many partitions had their form file when the load ended, and the
   builds ahead start past a quarter of the store's own cache now as well
-  (`CLAUDE.md`, a line drawn on the page cache). At `6f04f9e`, with
+  (`CLAUDE.md`, a line drawn on the page cache). At `99c8fef`, with
   every pair printed (`BIN=$PWD/target-enc/release/bench
   scripts/pair.sh supdb-cipherauto rocksdb-tuned-enc 5000000 --bound
   671088640 --passes read,scan --reps 4 --ops-div 10 --pairs _per_s`):
@@ -1216,9 +1216,9 @@ until the run is its own log). What it loses:
   bench/scripts/pair.sh SUPDB_LAG_COUNTERS=1 supdb-cipherauto
   supdb-cipher SIZE --bound B --passes
   load,read,read-threaded,scan,scan-threaded,mixes,scan-mixed,mixes-scrambled,lag
-  --reps 2 --ops-div 10` at `9ef998b`, five million keys under 640 MiB
+  --reps 2 --ops-div 10` at `9b5c4f5`, five million keys under 640 MiB
   and ten million under 1 GiB and 1.25 GiB; the stage plan,
-  `scratch/plan/onefile.md` at `3442b07`, O5a, has the cells): every
+  `scratch/plan/onefile.md` at `5b81772`, O5a, has the cells): every
   read, scan and mix cell ahead at every bound in both orders, by 1.3x to 62x, and in core nothing built and nothing
   resolved but the read pass at 0.97x in both orders: the census's hooks,
   11.6 instructions a read of 1,220 (`valgrind --tool=callgrind
@@ -1231,7 +1231,7 @@ until the run is its own log). What it loses:
   five million keys under 640 MiB (`BIN=$PWD/target-enc/release/bench sh
   scripts/pair.sh supdb-cipher rocksdb-tuned-enc 5000000 --bound
   671088640 --passes load,read,scan,mixes,mixes-scrambled,lag --reps 2
-  --ops-div 10` at `e88a6ba`, in `bench/`; the threaded passes left out,
+  --ops-div 10` at `bfd3818`, in `bench/`; the threaded passes left out,
   where RocksDB under the bound was killed in every rep): ahead in every
   cell in both orders but two -- reads 3.3-4.0x, scans 17-19x, the
   mixes 2.6-36x, the shuffled load 1.13-1.15x, the clean, one- and
@@ -1243,7 +1243,7 @@ until the run is its own log). What it loses:
   ("An envelope written beside its segment").
 - [ ] **The loads with the controller on under a cipher.** Shipped on
   now, the loads read 0.79-0.92x of the store with it off at every bound
-  in both orders, the shuffled load the lower (at `9ef998b`, the pairings
+  in both orders, the shuffled load the lower (at `9b5c4f5`, the pairings
   in the item above), so what follows is the cost the default carries.
   At five
   million keys under 640 MiB the controller's builds during a load -- the
@@ -1253,7 +1253,7 @@ until the run is its own log). What it loses:
   loads about a twentieth against the same store with the controller off
   (`scripts/pair.sh SUPDB_LOAD_PHASES=1 supdb-cipherauto supdb-cipher
   5000000 --bound 671088640 --passes load --reps 4 --pairs _per_s` at
-  `acbc5ae`): the ordered load's commits half a second longer at the same
+  `6916fd5`): the ordered load's commits half a second longer at the same
   CPU, the shuffled load's drain a second longer. Against encrypted
   RocksDB the ordered load is still ahead with it (1.08-1.21x in eight
   pairs of eight) and the shuffled load is not (0.82-1.04x, behind in
@@ -1278,7 +1278,7 @@ until the run is its own log). What it loses:
   device or a hand-off to another thread. The plain store builds at a
   merge's finish in a shuffled load as well.
 - [ ] **The lag sweep with the controller on under a cipher.** Shipped
-  on now. At `9ef998b` (the pairings two items above), against the store
+  on now. At `9b5c4f5` (the pairings two items above), against the store
   with it off: the full rewrite's pass 1.7x to 5.3x and the one- and
   ten-percent bursts 1.2x to 3.9x ahead at every bound, and behind, in
   both orders, the full rewrite's burst at 0.49-0.62x, the pass after the
@@ -1301,7 +1301,7 @@ until the run is its own log). What it loses:
   RocksDB at the same bound (`BIN=$PWD/target-enc/release/bench
   scripts/pair.sh supdb-cipherauto rocksdb-tuned-enc 10000000 --bound
   1342177280 --passes load,read,scan,lag --reps 2 --ops-div 10 --pairs
-  _per_s` at `27e5c5e`) the store with the controller on is ahead on the
+  _per_s` at `d1ec43b`) the store with the controller on is ahead on the
   reads (2-14x) and the scans (2.7-6x) in four pairs of four, on every
   burst (1.9-3.7x), and on the three lighter lag passes and the ordered
   load in three of four; it is behind on the shuffled load (0.85-0.93x)
@@ -1322,7 +1322,7 @@ until the run is its own log). What it loses:
   store's limitation is not the account of it. Beside the plain store in
   one sitting (`bench ab --arms supdb,supdb-cipherauto --size 10000000
   --bound 1342177280 --passes load,lag --reps 1 --ops-div 10`, with
-  `SUPDB_LAG_COUNTERS=1 SUPDB_SCAN_OPS=1`, at `27e5c5e`): the plain store
+  `SUPDB_LAG_COUNTERS=1 SUPDB_SCAN_OPS=1`, at `d1ec43b`): the plain store
   meets the pass with 41 pieces standing and nothing merging, 26 major
   faults and 138 MB read in it, 508 ms; under a cipher 144 pieces and its
   merges inside the pass, 259,000 major faults, 1.1 GB read and 1.0 GB
@@ -1345,16 +1345,16 @@ until the run is its own log). What it loses:
   not in memory, which says nothing of a source read by the piece, and a
   merge under a cipher asks a window ahead, a window whole, as shipped
   now (`Options::merge_read_ahead_cipher`, `CLAUDE.md`, a first page
-  standing for a window). Paired against the shape before at `a19ffc6`:
+  standing for a window). Paired against the shape before at `8346a0f`:
   the pass 2.1-2.5x, the shuffled load 1.09-1.34x, the full rewrite's
   burst 0.74-0.77x, every pair of four; 39-44 pieces at the pass.
-  Against encrypted RocksDB again at `7675d82` (the command in the item
+  Against encrypted RocksDB again at `7ac4209` (the command in the item
   above, `--reps 2`, four pairs): the pass at 0.45-0.62x where it was
   0.21-0.27x, and with it the shuffled load ahead, 1.04-1.15x in four
   pairs of four where it was behind in four, the ordered load 1.01-1.15x,
   reads 2.1-21x, scans 2.9-7x, the clean store's pass 1.08-1.41x and every
   burst 1.5-4x; the passes after the one- and ten-percent bursts ahead in
-  two pairs and three of four. Read beside the plain store's at `b7a1177`
+  two pairs and three of four. Read beside the plain store's at `26315ea`
   (`SUPDB_LAG_COUNTERS=1 SUPDB_MERGE_TRACE=1 SUPDB_LAG_MARK=1`, one sweep
   of each, and `perf record -a -g` cut to the burst and to the pass by
   the marks): both meet the pass with 34 pieces, and the plain store's
@@ -1371,7 +1371,7 @@ until the run is its own log). What it loses:
   decrypted into a buffer of the merge's own that its rests write again,
   a chunk the cache holds copied from it) moves 181-187 MB of input a
   CPU-second in the burst, and paired against the shape before at
-  `b7a1177` with it in the tree (`bench ab --arms
+  `26315ea` with it in the tree (`bench ab --arms
   supdb-cipherautomergestream,supdb-cipherauto --size 10000000 --bound
   1342177280 --passes load,lag --reps 2 --ops-div 10 --pairs _per_s`):
   the pass after the full rewrite 1.24x in both pairs, and the clean
@@ -1387,7 +1387,7 @@ until the run is its own log). What it loses:
   load, 1,053 MB of shared memory charged where the process mapped 850:
   the writes no reading of the room sees ("A store under a cipher under
   a bound"). With a drop giving the plaintext it covers back
-  (`StoreCipher::drops_keep_plaintext` off, at `95c4f1b`, `CLAUDE.md`)
+  (`StoreCipher::drops_keep_plaintext` off, at `145fab2`, `CLAUDE.md`)
   the cache meets the pass holding the pieces and the form files and
   almost none of the partitions' records, and the pass still reads
   near three seconds: the scanning thread's major faults are 8,300 on
@@ -1420,10 +1420,10 @@ until the run is its own log). What it loses:
   gives a served partition's records back (`SUPDB_LAG_COUNTERS=1
   SUPDB_SCAN_OPS=1 bench/scripts/pair.sh supdb-cipherautomergestream
   supdb-cipherauto 10000000 --bound 1342177280 --passes load,lag --reps
-  2 --ops-div 10` at `068aca1`), still loses: the full rewrite's pass
+  2 --ops-div 10` at `f22e9df`), still loses: the full rewrite's pass
   0.84-0.93x of the shipped store and the ten-percent pass 0.80-0.82x
   in both sittings, the loads level.
-  Against encrypted RocksDB at `9e7ae54` (the command in the item above,
+  Against encrypted RocksDB at `2027778` (the command in the item above,
   `--passes load,read,scan,lag --reps 2`, four pairs) the pass read
   0.87-0.96x, every other cell of the pairing ahead or level: the reads
   4-4.9x, the scans 13-14x, the three lighter lag passes 1.9-2.8x, every
@@ -1589,7 +1589,7 @@ turned on neither.
   sits on extents where the design had a stored file a logical file, with
   no sealed names. The stages and what each was held to were
   `scratch/plan/onefile.md`, and the decisions with the probe behind each
-  `scratch/onefile/design.md` and `notes.md`, at `3442b07`, the last commit
+  `scratch/onefile/design.md` and `notes.md`, at `5b81772`, the last commit
   that holds `scratch/`; what is left of them is the item below.
 - [ ] **The store in one file: what is built, and what leans.** Built:
   the plain store's segments, ordered indexes and form files as extents
@@ -1607,7 +1607,7 @@ turned on neither.
   (`SUPDB_TEST_ONEFILE=1`, `tests/cipher.rs` among them), the
   differential fuzz (`ZFUZZ_ONEFILE=1`, with `ZFUZZ_CIPHER=1`) and
   the `onefile` group. Paired against the default
-  (`scratch/plan/onefile.md` at `3442b07` has each command and table): level in
+  (`scratch/plan/onefile.md` at `5b81772` has each command and table): level in
   memory at three hundred thousand and three million keys; at ten
   million keys under 1.25 GiB and 1 GiB every burst of the lag sweep
   ahead, the full rewrite's 1.2x in every pair, for the frees it no
@@ -1656,7 +1656,7 @@ turned on neither.
     nothing.
   - Under a cipher (`supdb-cipherautoonefile` against
     `supdb-cipherauto`, ten million keys under 1.25 GiB;
-    `scratch/plan/onefile.md` at `3442b07` has the commands and counts): the scan
+    `scratch/plan/onefile.md` at `5b81772` has the commands and counts): the scan
     pass after the lag sweep's full rewrite, 0.43x and 0.32x in no pair
     of four, with the burst before it 1.17x and 1.24x ahead in every
     pair. The pass's time is one line through the megabytes merges write
@@ -1687,7 +1687,7 @@ turned on neither.
     the load's end; level shape by shape, and a pairing of two reps a
     sitting reads the coin. Whether the layout moves the coin is not
     known: three reps of ten in the stride form against six.
-  The row's passes under 1.25 GiB, paired at `b22446f` with each mapping
+  The row's passes under 1.25 GiB, paired at `ee4bf6e` with each mapping
   on an open of its own (`pair.sh supdb-onefile supdb 10000000 --bound
   1342177280 --passes
   load,read,read-threaded,scan,scan-threaded,mixes,scan-mixed,mixes-scrambled
@@ -1779,8 +1779,8 @@ turned on neither.
   instruction a key over the commit before with no instruction of its
   hot code changed (`CLAUDE.md`, "A second way for a check to say yes").
   The merge probe reads red by it since the merge's asks covered their
-  inputs' directories (`b63c2de`): `compact_run` ten instructions a key
-  over `9e7ae54` in a plain store, which asks nothing ahead, the sum by
+  inputs' directories (`0478889`): `compact_run` ten instructions a key
+  over `2027778` in a plain store, which asks nothing ahead, the sum by
   mnemonic +2.0M of `xchg %ax,%ax`, `nopl` and `nopw` against -0.4M of
   `data16` and the rest the same to within a few instructions over the
   run, with the ask's look out of line and the plain walk's source
@@ -1796,7 +1796,7 @@ turned on neither.
   landing probe reads `RawVec::grow_one` 58,176 instructions under the
   commit before and `RawVec::grow_one (over the engine)` the same 58,176
   over, red, each of the function's three source rows the same count on
-  both sides (`sh scripts/cost.sh f24e380 land` at the commit of the
+  both sides (`sh scripts/cost.sh 01a34c3 land` at the commit of the
   door's file type). The declared group above is what answers it. And
   the count is a function of the compiler: against one
   line's head it moved four probes from under to over with a toolchain
@@ -1815,7 +1815,7 @@ turned on neither.
   different widths, a value in a block -- is on no probe of either
   line's: `walk_fixed` leaves that path as it was by construction, and
   nothing counts it.
-  And over the store in one file (`sh scripts/cost.sh 84a94f4`, at the
+  And over the store in one file (`sh scripts/cost.sh acbaa31`, at the
   stage's commit): every probe at or under the commit before the stage by
   its total -- the segment writer 53 instructions a key under, a merge
   150, the ordered loads 28 -- but the two scans through the block form,
@@ -1868,7 +1868,7 @@ turned on neither.
   units was read by whoever launched it and by no reviewer: the wall, the
   door, the count, the lists' check, the count against the other line,
   the seal's rebuild, the `cross-arm` group's repair, and five of the
-  durability pricing units before them; `594fe3ca`, the merge probe's
+  durability pricing units before them; `a39aaaa5`, the merge probe's
   functions, was read by one reader. Done when the branch's whole diff of
   `src`, `tests/source.rs` and `scripts` has had a review that did not
   write it.

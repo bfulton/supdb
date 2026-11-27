@@ -17,7 +17,7 @@
 # lowered in the same change. The scopes say where; a coupling moved between
 # scopes changes no total. SUPDB_WALL_PRINT=1 prints the measured table.
 src/blob.rs	Blob::scan_at	piecewise/ASK_PIECES	code	2	stays	the dispatch on the source kind (R2 keeps it in blob)
-src/blob.rs	Blob::scan_at_in	piecewise/ASK_PIECES	code	1	stays	the dispatch on the source kind (R2 keeps it in blob); new since 682b2c09
+src/blob.rs	Blob::scan_at_in	piecewise/ASK_PIECES	code	1	stays	the dispatch on the source kind (R2 keeps it in blob); new since 3b36b029
 src/blob.rs	Blob::scan_refused	piecewise/ASK_PIECES	code	1	stays	the dispatch on the source kind (R2 keeps it in blob)
 src/blob.rs	Blob::willneed_at	piecewise/ASK_PIECES	code	1	stays	an ask ahead over a source that lends by the piece is the span whole, the source asking for what of it it does not hold; a source that lends whole keeps the first page's test
 src/blob.rs	Sec::pieces	piecewise/ASK_PIECES	code	1	stays	the dispatch on the source kind (R2 keeps it in blob)
@@ -94,10 +94,10 @@ src/db.rs	Db::open	vault::Held	code	1	stays	the open names the mode; S5 takes on
 src/db.rs	Db::open	vault::Vault	code	1	stays	the open names the mode; S5 takes one cipher token (cipher_controller call)
 src/db.rs	Db::open	vault::real	code	1	S6	the log's pass-by-name surfaced in the engine (check 2.3)
 src/db.rs	Db::open	vault::refuse_marked	code	2	stays	the open names the mode; S5 takes one cipher token (cipher_controller call)
-src/db.rs	Db::open_refusals	cipher	code	3	stays	the open names the mode; split out of Db::open since 682b2c09
-src/db.rs	Db::open_refusals	envelope	code	2	stays	the open names the mode; split out of Db::open since 682b2c09
-src/db.rs	Db::open_refusals	vault::holds_envelopes	code	1	stays	the open names the mode; split out of Db::open since 682b2c09
-src/db.rs	Db::open_refusals	vault::on_device	code	1	stays	the open names the mode; split out of Db::open since 682b2c09
+src/db.rs	Db::open_refusals	cipher	code	3	stays	the open names the mode; split out of Db::open since 3b36b029
+src/db.rs	Db::open_refusals	envelope	code	2	stays	the open names the mode; split out of Db::open since 3b36b029
+src/db.rs	Db::open_refusals	vault::holds_envelopes	code	1	stays	the open names the mode; split out of Db::open since 3b36b029
+src/db.rs	Db::open_refusals	vault::on_device	code	1	stays	the open names the mode; split out of Db::open since 3b36b029
 src/db.rs	Db::restart_cipher_peak	cipher	code	1	stays	public counter of the cache, beside Db::cipher_counts
 src/db.rs	Db::restart_cipher_peak	pager	code	1	stays	public counter of the cache, beside Db::cipher_counts
 src/db.rs	Db::restart_cipher_peak	vault (field or module word)	code	1	stays	public counter of the cache, beside Db::cipher_counts

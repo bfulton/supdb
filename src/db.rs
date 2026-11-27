@@ -6997,7 +6997,7 @@ pub struct Options {
     /// in both orders (`bench/scripts/pair.sh supdb-cipherauto
     /// supdb-cipher 5000000 --bound 671088640 --passes
     /// load,read,read-threaded,scan,scan-threaded,mixes,scan-mixed,mixes-scrambled,lag
-    /// --reps 2 --ops-div 10`, at `9ef998b`), where encrypted RocksDB reads
+    /// --reps 2 --ops-div 10`, at `9b5c4f5`), where encrypted RocksDB reads
     /// at 1.3x of the store with it off. What it costs, in both orders: the
     /// loads at 0.79x to 0.92x, the full rewrite's burst at 0.57x to 0.62x
     /// and the lag sweep's passes over the clean store and after the one-
@@ -52102,9 +52102,9 @@ impl Reader {
         // constructor shares: set on the handle after it was made, in
         // `paged_bits`, they cost a store in the clear a copy of the
         // handle at every seal, whose thread makes one (`sh scripts/cost.sh
-        // 884443b land` at `72e04f9`, `Db::seal`), and before that two and
+        // fc66ceb land` at `1c7262c`, `Db::seal`), and before that two and
         // a half instructions a key of the writer's round, in a function
-        // no line of it runs (the same count's `work` at `c1eeafb`).
+        // no line of it runs (the same count's `work` at `e002b04`).
         let rests = self.shared.pager.is_some();
         let r = Reader {
             shared: self.shared.clone(),
