@@ -54,5 +54,5 @@ Code, tests and the design notes (`docs/engine.md`, `docs/index-theory.md`)
 here; the suite, its rows and its figures under `bench/`. Keep `README.md`
 and the crate docs to what is true now and likely to stay so: no standing
 figures, a figure attached to a change goes in the pull request that made
-it, rounded. The reasoning and the history go in `CLAUDE.md` on each side,
-where a reader who wants them can follow the pointer.
+it, rounded. The rules go in `CLAUDE.md` on each side; the measurement or
+incident behind a new rule goes in the pull request that adds it.

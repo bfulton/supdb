@@ -5,18 +5,21 @@ review of the benchmark suite (2026-10-17 to 10-20).
 
 Each item says why it matters and when it is done.
 
-## Accepted losses
+## Acceptable losses
 
-Rows supdb is expected to lose, measured and published anyway. Losing them
-is the cost of the design, and showing them is what makes the wins credible.
+Cells supdb may lose, measured and published anyway. Losing them is a
+price worth paying for what the design buys, not a verdict that they cannot
+be won, and showing them is what makes the wins credible.
 
-- **Storage size.** 1.31 bytes on disk per byte stored, against LMDB's 1.15
-  and RocksDB's 1.03 (2026-10-17 run). Measured already.
-- **Recovery after a crash.** LMDB never recovers: its file is always
-  consistent, so it opens instantly. supdb replays its WAL on open, and
-  walks a run of ordered ingest the crash left open to write the index
-  its close would have written. Measured by the `recover` workloads
-  (`bench/DESIGN.md`).
+- **Bytes stored.** A segment keeps its key section, its ordered index and
+  its filter beside the records, and out of core the compact form's files
+  stand beside the raw ones, so supdb stores more bytes on disk per byte
+  than LMDB or RocksDB (`bytes_on_disk_per_byte`, in the load's figures).
+- **Recovery after a crash, against LMDB.** LMDB's file is always
+  consistent, so it opens without recovering. supdb replays its WAL and
+  finishes a run of ordered ingest the crash left open, so its open trails
+  LMDB's; it is ahead of RocksDB's replay. Measured by the `recover`
+  workloads (`bench/DESIGN.md`).
 
 ## Benchmark
 
@@ -32,7 +35,7 @@ The suite has to be fair before any of its numbers are quoted.
   after N committed batches, with an uncommitted tail), then time the open
   and the first read, for every arm. `recover` and `recover-shuffled` do,
   after the ordered load's batches and after the shuffled load's, in the
-  in-core rows (`bench/DESIGN.md`). An accepted loss against LMDB; the
+  in-core rows (`bench/DESIGN.md`). An acceptable loss against LMDB; the
   point is to measure it.
 - [x] **Match what a buffered commit survives, or state it.** The
   recovery workloads hold every arm's reopened store to the batches its
@@ -390,13 +393,12 @@ What an engine picker would hit, roughly in order.
   `Db::share_look`). A store whose handles stop writing and whose writer
   then only reads keeps the shared form, and its scans merge their
   sources, a sixth of the block cache's rate on ycsb-E, until the writer
-  commits; and a scan beside handles that write always merges
-  (`CLAUDE.md`, Standing limitations). The levers named there are the
-  segment work's thread leaving the table for an idle writer, which needs
-  the freeze made safe from a second thread, and a form kept current from
-  the shared table's own writes, which needs them logged. Done when a
-  store that has stopped writing through handles scans at the block
-  cache's rate without a commit of the writer's.
+  commits; and a scan beside handles that write always merges. The
+  levers are the segment work's thread leaving the table for an idle
+  writer, which needs the freeze made safe from a second thread, and a
+  form kept current from the shared table's own writes, which needs them
+  logged. Done when a store that has stopped writing through handles scans
+  at the block cache's rate without a commit of the writer's.
 - [x] **Order ordered ingest's runs across a machine's crash.** Under a
   policy that does not sync at every commit (`SyncPolicy::EveryN`), a
   machine's crash could keep a later run, or frames in the log, and take
@@ -434,10 +436,9 @@ What an engine picker would hit, roughly in order.
   in flight, the log read, the settle of what the thread trailed by and the
   snapshot's extension, 0.4 to 14 ms at three million keys where the rest
   of a divided pass is 12 to 15, with a merge the idle plan starts at that
-  scan beside it in a rep in four (`CLAUDE.md`, open targets). It is what
-  the pass after a full rewrite at three million keys under 1 GiB has left
-  against LMDB's, level to a tenth ahead where the same pass in memory is
-  1.8x. Two levers are priced and neither chosen: the share the syncing
+  scan beside it in a rep in four. It is what the pass after a full
+  rewrite at three million keys under 1 GiB has left against LMDB's, level
+  to a tenth ahead where the same pass in memory is 1.8x. Two levers are priced and neither chosen: the share the syncing
   pace lets the thread trail by (`Options::upkeep_pace_syncs_bp`), which
   gives the first scan back and takes an eighth to a third of the small
   bursts, and the idle plan's merge held off or run at the idle I/O class
@@ -1925,9 +1926,8 @@ off (`docs/engine.md`, "Out of core: the second form").
   unsealed keys, whose sort is the pass's first scan. There the pass over
   random ids reads 0.6x to 0.9x of LMDB and over numbered keys 1.1x to
   1.3x, a third of it user time, a quarter the kernel's fault handling and
-  the rest device waits (`CLAUDE.md`, open targets). The idle I/O class
-  for the merges and their inputs asked ahead were priced on it and
-  refuted. Done when the pass over ids is ahead of LMDB in both orders
+  the rest device waits. The idle I/O class for the merges and their
+  inputs asked ahead were priced on it and refuted. Done when the pass over ids is ahead of LMDB in both orders
   under 1 GiB with the burst no slower, by the bytes of that working set
   or the merge path's user time over them.
 - [ ] **A store past its budget that is only scanned.** The controller
