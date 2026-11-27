@@ -10,11 +10,22 @@ tracks in the working tree (`git ls-files`, or a walk where git is absent)
 and builds nothing. Two runs over one tree print the same bytes. What was
 parsed is counted on stderr, and the tool exits 1 where a field, a default,
 a struct literal or an arm's policy cannot be placed. `--sites` prints, on
-stderr, every site counted for the named options with its file and line:
-the check of a row is that list read against grep. `--summary` reads a
-ledger written earlier and prints its tallies, tab-separated: a line a type
-(`by_type`), and the cross-tabulation of EXPERIMENT, `#[doc(hidden)]` and
-"an arm sets it" (`cross`), for `Options` and for every type together.
+stderr, every site counted for the named options with its file and line,
+and then one line an option with the number of sites listed: the check of
+a row is that list read against grep. A name that is no row of the ledger
+(`Type.name`, the first two columns) exits 1 with nothing on stdout, so
+a misspelt name is not read as an option with no site. `--summary`
+reads a ledger written earlier and prints its tallies, tab-separated: a
+line a type (`by_type`), and the cross-tabulation of EXPERIMENT,
+`#[doc(hidden)]` and "an arm sets it" (`cross`), for `Options` and for
+every type together; a path that cannot be read, or a file that is no
+ledger, exits 1. In both tables `default_true`, `default_false` and
+`default_other` split `rows` by the text of the `default` column. `bool`
+counts the rows whose value is a `bool`: the declared type, or for a
+StoreCipher setter the type of the field it assigns. A default of `true`
+or `false` on any other row exits 1, so `bool` is `default_true` plus
+`default_false` plus `bool_default_other`, the bools whose default is
+another expression.
 
 THE OPTION TYPES. `Options` and `SegmentOptions` (src/db.rs), `BlobOptions`
 (src/blob.rs), `EncryptOptions` and `ReadOptions` (src/crypt.rs): one row a
@@ -59,9 +70,10 @@ doc_markers
       On           the same with on.
     `Off: ...`, `Off, ...` and `Off is ...` are not matched: in this
     tree they describe what the store does with the option off, whichever
-    way it ships (of the bool fields whose doc has `Off:`, more default
-    to true than to false). The `default` column is the authority; a bool
-    whose marker disagrees with it raises `doc_default_mismatch`.
+    way it ships (of the bool options whose doc has `\bOff:`, more
+    default to true than to false: the two counts are a line of stderr).
+    The `default` column is the authority; a bool whose marker disagrees
+    with it raises `doc_default_mismatch`.
 doc_lines
     Lines of `///` rustdoc on the field (or setter).
 arms_in_doc
@@ -1233,6 +1245,7 @@ OFF_ON = (
     r"(?:(?:^|(?<=[.;:)] ))%(W)s(?:[;.]| by default| as shipped))"
     r"|(?i:\b%(w)s by default\b|\b%(w)s as shipped\b|\bas shipped, %(w)s\b|\band %(w)s:)"
 )
+OFF_COLON = re.compile(r"\bOff:")
 MARKERS = [
     ("EXPERIMENT", re.compile(r"\bEXPERIMENT\b")),
     ("refuted", re.compile(r"(?i)\brefuted\b")),
@@ -1245,17 +1258,60 @@ MARKERS = [
 SITES = set()
 
 
+SUMMARY_COLS = [
+    "struct", "name", "type", "default", "doc_hidden", "doc_markers", "arms_in_doc", "read_sites_src",
+    "bench_policy_field", "bench_arms_setting", "fuzz_drawn", "fuzz_how", "flags",
+]
+
+
+def value_type(struct, typ):
+    """The type of an option's value from the `type` column: the column
+    itself, or for a StoreCipher setter, `(params) -> field: type`, the
+    type of the field it assigns."""
+    if struct != "StoreCipher" or not typ.startswith("("):
+        return typ
+    depth = 0
+    for i, c in enumerate(typ):
+        depth += (c == "(") - (c == ")")
+        if depth == 0:
+            rest = typ[i + 1 :]
+            if rest.startswith(" -> ") and ": " in rest:
+                return rest.split(": ", 1)[1]
+            break
+    die(f"StoreCipher: cannot read the assigned field's type from `{typ}`")
+
+
 def summary(path):
     """Tallies of a ledger written earlier, tab-separated."""
-    with open(path, newline="") as f:
-        rows = list(csv.DictReader(f))
+    try:
+        with open(path, newline="") as f:
+            reader = csv.DictReader(f)
+            head = reader.fieldnames or []
+            rows = list(reader)
+    except (OSError, UnicodeDecodeError, csv.Error) as e:
+        die(f"--summary: cannot read {path}: {getattr(e, 'strerror', None) or e}")
+    missing = [c for c in SUMMARY_COLS if c not in head]
+    if missing:
+        die(f"--summary: {path} is not a ledger: no column {', '.join(missing)}")
     order = [t for t, _ in TYPES]
+    for n, r in enumerate(rows, 2):
+        if None in r or None in r.values() or not r["bench_arms_setting"].isdigit():
+            die(f"--summary: {path}, line {n}: not a row of the ledger")
+        if r["struct"] not in order:
+            die(f"--summary: {path}, line {n}: `{r['struct']}` is no option type")
 
     def has(r, col, v):
         return v in r[col].split(";")
 
     def kind(r):
         return r["default"] if r["default"] in ("true", "false") else "other"
+
+    def is_bool(r):
+        return value_type(r["struct"], r["type"]) == "bool"
+
+    for r in rows:
+        if kind(r) != "other" and not is_bool(r):
+            die(f"--summary: {r['struct']}.{r['name']}: default `{r['default']}` on a value of type `{r['type']}`")
 
     tallies = [
         ("rows", lambda r: True),
@@ -1278,9 +1334,11 @@ def summary(path):
         ("doc_default_mismatch", lambda r: has(r, "flags", "doc_default_mismatch")),
         ("bench_fixed", lambda r: has(r, "flags", "bench_fixed")),
         ("no_doc", lambda r: has(r, "flags", "no_doc")),
-        ("bool", lambda r: r["type"] == "bool"),
-        ("default_true", lambda r: r["default"] == "true"),
-        ("default_false", lambda r: r["default"] == "false"),
+        ("bool", is_bool),
+        ("default_true", lambda r: kind(r) == "true"),
+        ("default_false", lambda r: kind(r) == "false"),
+        ("default_other", lambda r: kind(r) == "other"),
+        ("bool_default_other", lambda r: is_bool(r) and kind(r) == "other"),
     ]
     w = csv.writer(sys.stdout, delimiter="\t", lineterminator="\n")
     w.writerow(["by_type", "type"] + [n for n, _ in tallies])
@@ -1346,14 +1404,19 @@ def main():
         say(f"{s}: typed receivers {', '.join(sorted(recv[s])) or '(none)'}")
     impls = {(p, s): merge_spans(impl_spans(srcs[p], s)) for p in srcs if p.startswith("src/") for s in structs}
 
-    suite = Suite(srcs[ENGINES], opts)
     key = {(o.struct, o.name): o for o in opts}
+    unknown = sorted(n for n in SITES if tuple(n.split(".", 1)) not in key)
+    if unknown:
+        die(f"--sites: no such option: {', '.join(unknown)} (a name is Type.name, the ledger's first two columns)")
+    listed = {n: 0 for n in SITES}
+    suite = Suite(srcs[ENGINES], opts)
     patterns = {s: 0 for s in structs}
     prefixes = {s: set() for s in structs}
     unplaced = []
 
     def trace(o, kind, path, pos, src):
         if f"{o.struct}.{o.name}" in SITES:
+            listed[f"{o.struct}.{o.name}"] += 1
             line = src.raw[src.starts[src.line(pos) - 1] :].split("\n", 1)[0].strip()
             say(f"site {o.struct}.{o.name} {kind} {path}:{src.line(pos)}: {line[:110]}")
 
@@ -1491,10 +1554,13 @@ def main():
     w.writerow(cols)
     order = {s: i for i, s in enumerate(structs)}
     n_rows = {s: 0 for s in structs}
+    off_colon = {"true": 0, "false": 0, "other": 0}
     for o in sorted(opts, key=lambda o: (order[o.struct], o.order)):
         n_rows[o.struct] += 1
         doc = " ".join(" ".join(o.doc).split())
         markers = [n for n, p in MARKERS if p.search(doc)]
+        if value_type(o.struct, o.type) == "bool" and OFF_COLON.search(doc):
+            off_colon[o.default if o.default in off_colon else "other"] += 1
         named = list(dict.fromkeys(ARM.findall(doc)))
         hidden = int(any(re.fullmatch(r"#\[\s*doc\s*\(\s*hidden\s*\)\s*\]", a) for a in o.attrs))
         own = len(re.findall(r"\b%s::%s\b" % (o.struct, o.name), doc))
@@ -1554,6 +1620,12 @@ def main():
         say(f"{s}: {n_rows[s]} rows ({f} fields, {d} default entries)")
         if n_rows[s] != r:
             die(f"{s}: {n_rows[s]} rows written, {r} expected")
+    say(
+        "bool options whose rustdoc has `Off:` (\\bOff:), which is no marker: "
+        f"{off_colon['true']} default to true, {off_colon['false']} to false, {off_colon['other']} to another expression"
+    )
+    for n in sorted(listed):
+        say(f"sites listed for {n}: {listed[n]}")
     say(f"{sum(n_rows.values())} rows")
 
 

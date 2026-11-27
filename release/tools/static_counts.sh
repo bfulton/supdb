@@ -20,10 +20,11 @@
 # tree_less_release
 #   A fingerprint of everything the tree holds outside release/: the hash
 #   `git hash-object --stdin` gives the listing `git ls-tree -r HEAD` with
-#   the release/ lines taken out. Of the counts below only
-#   `worktree_dirty_paths`, `tracked_files` and `tracked_bytes` read
-#   release/, so two commits that agree here agree on every other count,
-#   whatever was committed under release/ between them.
+#   the release/ lines taken out. Of the lines below five read release/:
+#   `worktree_dirty_paths`, `tracked_files`, `tracked_bytes`,
+#   `tracked_files_release` and `tracked_bytes_release`. Two commits that
+#   agree here agree on every other count, whatever was committed under
+#   release/ between them.
 # worktree_dirty_paths
 #   Lines of `git status --porcelain`: tracked files changed and untracked
 #   files not ignored.
