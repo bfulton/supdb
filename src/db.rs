@@ -16548,8 +16548,12 @@ impl Seg {
                 .exts_at(rank)
                 .ok_or_else(|| err("segment key walk: a rank the index does not have"))?;
             bloom.insert(k);
-            tombs.any |= exts.iter().any(|e| e.is_tombstone());
-            tombs.bare |= exts.iter().all(|e| e.records() == 0);
+            // A record with no value is a delete's, which carries the flag:
+            // only a flagged record is asked whether it holds one.
+            if exts.iter().any(|e| e.is_tombstone()) {
+                tombs.any = true;
+                tombs.bare |= exts.iter().all(|e| e.records() == 0);
+            }
         }
         Ok((bloom, tombs))
     }
