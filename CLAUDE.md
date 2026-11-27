@@ -1881,7 +1881,10 @@ runs the two. Its edits name text in the tree, and two of them named
 text a change and then a merge had replaced, for two days before a pull
 request's first run of the group read red: the `lint` group holds every
 edit's text in place in a second (`COST_RED_ANCHORS=1`), since the group
-itself runs on a pull request and nowhere else. The first version of the list named
+itself runs by hand alone (`.github/workflows/cost.yml`): it ran on every
+pull request and push until it was most of an hour and red by function
+against a line the branch had grown apart from, a verdict a person reads
+and no check makes. The first version of the list named
 its functions as paths, `supdb::db::Reader::read_all`, matched as
 substrings of callgrind's names, which print a method as
 `<supdb::db::Reader>::read_all_in::<G>::{closure#5}`: no line named an
@@ -11057,7 +11060,22 @@ run in twelve under load is looped under a syscall trace before a
 mechanism is named for it, since under the trace it failed every other
 run; and a failure that stops coming when its probe is in is written
 down as open, with what was seen and the count of runs on each side,
-never as fixed.
+never as fixed. It was not another thing. Run as the tests that hold
+every word, four at once alone, it failed one run in ten, where the
+whole binary had failed one in a few hundred; the probe was put where
+the third look gives up, every page's flags and map count from the
+kernel and the pages around the file beside them, and read each page
+clean, unmapped and in folios inside the file, with the free page before
+the file resident too, which no write of anyone's touches. It was the
+second build ahead's readahead, again the kernel at a file's end, through
+the whole of a file at a time and not its edge: a build's reads through
+a mapping run ahead in the data file past its own file into the next,
+the file the first build has just dropped, as fast as that build drops
+it. One build at a time failed none of 800 (`ROADMAP.md` has the lever).
+The corollary: a flake that comes once in hundreds of whole runs is run
+as the few tests it fails in, several at once, before its probe is
+judged, since the probe's verdict of none in ten was a rate nobody could
+have read.
 
 **One sync for a call's envelopes, through a handle that was not the
 segment's.** In a store under a cipher kept in one file an envelope's

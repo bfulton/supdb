@@ -9773,6 +9773,29 @@ fn land_store_with(
     land_store_loaded(name, pct, extra, |db| ordered_load(db, 20_000, 0x4A9))
 }
 
+/// One build ahead at a time where the store is kept in one file
+/// (`Options::zpages_ahead_builders`), for a test that holds every build
+/// ahead to a read-back that read the device -- its word kept for a trusted
+/// attach, or its file cold. A build's reads through a mapping of its own
+/// file or its partition's are read around and ahead by the kernel in the
+/// file the mapping is of, and in the data file that runs past the file's
+/// end into the next: a second build beside the first read the pages the
+/// first had just dropped back into the cache from the device, all of its
+/// file of thirty-one pages through its three looks, and the first gave up
+/// its word, as it has to where it cannot tell those pages from the copy it
+/// wrote (`zfile::reads_device`). Under `SUPDB_TEST_ONEFILE=1`, four of
+/// these tests at once failed 61 runs of 600 that way, a page probe at the
+/// third look finding every page clean, unmapped and in folios inside the
+/// file with the free page before it read as well; one build at a time
+/// failed none of 800. In a store of files a file's end stops the kernel's
+/// reads, and two builds stay.
+#[cfg(target_os = "linux")]
+fn one_build_ahead_in_one_file(o: &mut Options) {
+    if o.one_file {
+        o.zpages_ahead_builders = 1;
+    }
+}
+
 /// `land_store_with` loaded by `load`.
 #[cfg(target_os = "linux")]
 fn land_store_loaded(
@@ -10069,6 +10092,7 @@ fn builds_ahead_under_a_cipher_seal_their_form_files_and_keep_them_cold() {
         ));
         o.zpages_under_cipher = true;
         o.partition_bytes = Some(400 << 10);
+        one_build_ahead_in_one_file(o);
     });
     let before = db.cipher_counts().expect("a store under a cipher");
     inject.set_budget(raw * 3 / 2);
@@ -18760,6 +18784,7 @@ fn a_stride_file_built_ahead_is_trusted_at_its_late_attach_where_its_read_back_r
                     o.zpages_cover_resident = false;
                     o.zpages_suspect_at_crossing = false;
                 }
+                one_build_ahead_in_one_file(o);
             },
             |db| numbered_load(db, 20_000, 100, 0xA4EA),
         );
@@ -19045,6 +19070,7 @@ fn stride_store_with_a_build_ahead_held(
             o.zpages_stride = ZStride::Forced;
             o.partition_bytes = Some(160 << 10);
             o.zpages_land_cold_past = false;
+            one_build_ahead_in_one_file(o);
             extra(o);
         },
         |db| numbered_load(db, 20_000, 100, 0xA4EB),
@@ -22391,6 +22417,7 @@ fn the_words_kept_for_stride_files_are_held_to_the_live_partitions() {
             o.zpages_stride = ZStride::Forced;
             o.partition_bytes = Some(160 << 10);
             o.zpages_land_cold_past = false;
+            one_build_ahead_in_one_file(o);
         },
         |db| numbered_load(db, 20_000, 100, 0x5EA1),
     );
