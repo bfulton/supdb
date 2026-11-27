@@ -122,6 +122,38 @@
 //! - `ZFUZZ_MERGEPAR=n`: both stores run up to `n` partition merges at
 //!   once over disjoint ranges (`Options::merge_parallel`); a flag and not
 //!   a draw.
+//! - `ZFUZZ_ONEFILE=1`: the `z` store is kept in one file
+//!   (`Options::one_file`) while `r` is a store of files over the same
+//!   writes: its segments, their indexes and its form files extents of a
+//!   data file whose room is written over as merges retire them, so a
+//!   read of room given away too soon, or a slot naming room since
+//!   written over, is a difference from `r` or a store refused. The
+//!   concurrent range's one store is kept so too. A flag and not a draw;
+//!   a range in which no store kept a file in its data file fails. With
+//!   `ZFUZZ_CIPHER` the files there are the store's envelopes, a crash a
+//!   store whose memory files are gone and whose data file holds what a
+//!   manifest listed and what its dead threads were writing.
+//! - `ZFUZZ_RECYCLE=1`: both stores write their log's files again in
+//!   place (`Options::recycle_wal`), so a log behind which its last life's
+//!   records lie is replayed after every crash; a flag and not a draw.
+//! - `ZFUZZ_CIPHERCACHE=n`, with `ZFUZZ_CIPHER`: the `z` store's cache of
+//!   plaintext is `n` bytes (`StoreCipher::cache_bytes`), which for a small
+//!   `n` is a store that does not fit it.
+//! - `ZFUZZ_CIPHER=1`: the `z` store is kept under a cipher
+//!   (`Encryption::Cipher`) and `r` in the clear, so a store whose files are in
+//!   memory and whose directory is sealed is read against the model and
+//!   against a plain store over the same writes, across closes and crashes.
+//!   `fuzz_range_under_a_cipher` is the range run so with nothing set, and
+//!   the variable is for the other tests and for a range run by hand.
+//! - `ZFUZZ_SYNCVARY=1`: a seed draws its sync policy from four --
+//!   `Always`, and `EveryN` of one, of eight and of `u32::MAX`, which
+//!   is due never -- where it draws from the first and the third alone,
+//!   and a crash under `EveryN` follows a `sync` of both stores, which
+//!   promises what a crash keeps, where under `EveryN` it is otherwise a
+//!   close. The draw is one more in the seed's stream, so every seed's
+//!   operations differ from the same seed's without the variable: a
+//!   failure under it is attributed by running the seed with it on the
+//!   commit before, never by reading the policy's name.
 //! - `ZFUZZ_CENSUS=1`: a store whose form is not forced runs no controller
 //!   and reads as out of core from its open on (the census gate, set
 //!   through the test's seam, which a controller's tick would write over),
@@ -202,6 +234,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use supdb::{Db, Options, Reader, SyncPolicy, Upkeep};
 
+mod common;
+
 /// The seeds a run with no range takes: few, because the test lives in the gate.
 const DEFAULT_SEEDS: u64 = 4;
 
@@ -211,6 +245,11 @@ fn env_u64(name: &str) -> Option<u64> {
 
 fn env_flag(name: &str) -> bool {
     std::env::var(name).is_ok_and(|v| v == "1")
+}
+
+/// Whether the `z` store is kept in one file (`ZFUZZ_ONEFILE`).
+fn one_file_on() -> bool {
+    env_flag("ZFUZZ_ONEFILE")
 }
 
 /// `ZFUZZ_SHARE`: 0 unset, 1 where the seed's own draws hold its log with
@@ -252,6 +291,25 @@ thread_local! {
     /// return an error are far from the loop that knows it, and the failure
     /// line names it.
     static STEP: std::cell::Cell<i64> = const { std::cell::Cell::new(-1) };
+    /// Whether this thread's seeds keep `z` under a cipher: the test that
+    /// runs the range so sets it, and `ZFUZZ_CIPHER` sets it for every
+    /// test. A thread's and not the process's, since the tests of a binary
+    /// run beside each other.
+    static CIPHER: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// The cache a store under a cipher is given, in bytes, for the test
+    /// that runs the range under one too small for its stores.
+    static CIPHER_CACHE: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    /// Whether the `z` store has the compact form forced on, for the test
+    /// that runs the range so; `ZFUZZ_ZPAGES` sets it for every test.
+    static ZPAGES: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+fn zpages_forced() -> bool {
+    ZPAGES.get() || env_flag("ZFUZZ_ZPAGES")
+}
+
+fn under_cipher() -> bool {
+    CIPHER.get() || env_flag("ZFUZZ_CIPHER")
 }
 
 type Model = BTreeMap<Vec<u8>, Vec<Vec<u8>>>;
@@ -843,10 +901,15 @@ fn pick_cfg(rng: &mut Rng, want_cache: bool) -> Cfg {
         sync: {
             // Drawn as it always was, so that the draws after it stand,
             // and replaced where the seed holds its log.
-            let drawn = if rng.chance(50) {
-                SyncPolicy::Always
-            } else {
-                SyncPolicy::EveryN(8)
+            let drawn = match (rng.chance(50), env_flag("ZFUZZ_SYNCVARY")) {
+                (_, true) => [
+                    SyncPolicy::Always,
+                    SyncPolicy::EveryN(1),
+                    SyncPolicy::EveryN(8),
+                    SyncPolicy::EveryN(u32::MAX),
+                ][rng.below(4)],
+                (true, false) => SyncPolicy::Always,
+                (false, false) => SyncPolicy::EveryN(8),
             };
             if vary && explicit_on {
                 SyncPolicy::Explicit
@@ -980,6 +1043,9 @@ fn opts(c: &Cfg) -> Options {
     if let Some(n) = env_u64("ZFUZZ_MERGEPAR") {
         o.merge_parallel = n as usize;
     }
+    if env_flag("ZFUZZ_RECYCLE") {
+        o.recycle_wal = true;
+    }
     o
 }
 
@@ -989,7 +1055,9 @@ fn opts(c: &Cfg) -> Options {
 /// over the same writes -- the strongest check a second read path has.
 fn opts_z(c: &Cfg) -> Options {
     let mut o = opts(c);
-    if env_flag("ZFUZZ_ZPAGES") {
+    // Under `ZFUZZ_ONEFILE` the store is kept in one file.
+    o.one_file = one_file_on();
+    if zpages_forced() {
         o.zpages = supdb::ZPages::Always;
         o.zpages_min_bytes = 0;
     }
@@ -1072,12 +1140,18 @@ fn opts_z(c: &Cfg) -> Options {
     // (`Options::zpages_both`): the spares' builds, their collect beside the
     // served file and their retirement with a merged segment, and whatever
     // the reads heat into a flip, are read against the raw store.
-    if env_flag("ZFUZZ_BOTH") && env_flag("ZFUZZ_ZPAGES") {
+    if env_flag("ZFUZZ_BOTH") && zpages_forced() {
         o.zpages_recode = true;
         o.zpages_recode_keep = true;
         o.zpages_both = true;
         o.zpages_drop_raw = true;
     }
+    // Under `ZFUZZ_CIPHER` the `z` store is kept under a cipher
+    // (`Encryption::Cipher`) while `r` is in the clear over the same writes:
+    // its files in memory, its directory sealed, its ordered bursts through
+    // the log, and a crash there a store whose memory is gone, reopened
+    // from what its directory holds.
+    o = with_cipher(o);
     if env_flag("ZFUZZ_PROMOTE") && c.cache {
         o.promote_entries = 8;
         o.zpages_promote_copies = true;
@@ -1102,6 +1176,30 @@ fn opts_z(c: &Cfg) -> Options {
         o.forms_off_snapshot_kept = false;
     }
     o
+}
+
+/// `o` under a cipher where the thread's seeds run so (`under_cipher`), and
+/// as it is otherwise.
+fn with_cipher(mut o: Options) -> Options {
+    if under_cipher() {
+        let mut c = supdb::StoreCipher::new(common::Gcm::new(&[0x5a; 32]), common::Gcm::new);
+        // The cache the store reads its files through, where the run names
+        // one: a few kilobytes is less than any store here holds, so every
+        // read is of a chunk decrypted for it and given back behind it.
+        if let Some(bytes) = cipher_cache() {
+            c = c.cache_bytes(bytes);
+        }
+        o.encryption = supdb::Encryption::Cipher(c);
+    }
+    o
+}
+
+/// `ZFUZZ_CIPHERCACHE`, or what the test running the range set.
+fn cipher_cache() -> Option<u64> {
+    match CIPHER_CACHE.get() {
+        0 => env_u64("ZFUZZ_CIPHERCACHE"),
+        n => Some(n),
+    }
 }
 
 /// A handle on `z`, or none where the store refuses it as a store that
@@ -1953,6 +2051,19 @@ struct Stats {
     /// Partition merges started beside another in flight, summed as
     /// `abandons` is: what says a run under `ZFUZZ_MERGEPAR` reached them.
     beside: u64,
+    /// Under a cipher: the megabytes of plaintext the `z` store's cache
+    /// gave back and the chunks it decrypted, summed over the store's
+    /// opens. What says a run under a small cache read through one.
+    evicted: u64,
+    fills: u64,
+    /// The files the `z` store kept in its data file and the times it
+    /// wrote over room a file had given back, summed over its opens: what
+    /// says a run under `ZFUZZ_ONEFILE` was of a store in one file.
+    one: u64,
+    /// The reads and scans the `z` store answered through a form file,
+    /// summed over its opens: what says a run with the compact form
+    /// forced read through one.
+    zreads: u64,
     /// The `z` store's switches between the block path and the merge path
     /// with no forms (`Options::scan_forms_off_unreused`), summed as
     /// `abandons` is: what says a run under `ZFUZZ_FORMSOFF` switched.
@@ -2277,7 +2388,18 @@ fn cfg_line(c: &Cfg) -> String {
 
 fn run_seed_inner(seed: u64, want_cache: bool, verbose: bool) -> Result<Stats, String> {
     let (cfg, mut rng) = seed_draws(seed, want_cache);
-    let tag = format!("s{seed}");
+    // A directory of its own for each range that runs beside the plain
+    // one over the same seeds: under a cipher, under one with a cache too
+    // small for its stores, and under that with the compact form forced.
+    let tag = format!(
+        "s{seed}{}{}",
+        match (CIPHER.get(), CIPHER_CACHE.get()) {
+            (false, _) => "",
+            (true, 0) => "c",
+            (true, _) => "cs",
+        },
+        if ZPAGES.get() { "z" } else { "" }
+    );
     let (dz, dr) = (scratch(&format!("{tag}-z")), scratch(&format!("{tag}-r")));
     if verbose {
         eprintln!("seed {seed}{}: {cfg:?}", pin_note());
@@ -2338,6 +2460,10 @@ fn run_seed_inner(seed: u64, want_cache: bool, verbose: bool) -> Result<Stats, S
         abandons: 0,
         bindings: 0,
         beside: 0,
+        evicted: 0,
+        fills: 0,
+        one: 0,
+        zreads: 0,
         switches: 0,
         kept: 0,
         in_place: 0,
@@ -2636,6 +2762,14 @@ fn run_seed_inner(seed: u64, want_cache: bool, verbose: bool) -> Result<Stats, S
                     st.abandons += z.upkeep_abandons() + r.upkeep_abandons();
                     st.bindings += z.cache_bindings() + r.cache_bindings();
                     st.beside += z.seal_waits().merges_beside + r.seal_waits().merges_beside;
+                    if let Some(c) = z.cipher_counts() {
+                        st.evicted += c.cache.evicted_units;
+                        st.fills += c.cache.fills;
+                    }
+                    if let Some(c) = z.one_counts() {
+                        st.one += c.files + c.reused;
+                    }
+                    st.zreads += z.zpage_counts().reads + z.zpage_counts().scans;
                     st.switches += z.forms_off_counts()[..2].iter().sum::<u64>();
                     st.kept += z.snapshots_kept();
                     st.in_place += z.puts_in_place();
@@ -2645,12 +2779,23 @@ fn run_seed_inner(seed: u64, want_cache: bool, verbose: bool) -> Result<Stats, S
                     count_heads(&mut st, &z);
                     count_heads(&mut st, &r);
                     st.stride.add(&z.zpage_counts());
+                    let every = matches!(cfg.sync, SyncPolicy::EveryN(_));
+                    let synced = every && env_flag("ZFUZZ_SYNCVARY") && rng.chance(50);
+                    if synced {
+                        // What the sync promises: every commit before it,
+                        // a run's held tail among them, kept by the crash.
+                        z.sync().map_err(|e| format!("sync z: {e}"))?;
+                        r.sync().map_err(|e| format!("sync r: {e}"))?;
+                        // A sync commits what is staged first.
+                        for op in staged.drain(..) {
+                            apply(&mut model, &op);
+                        }
+                    }
                     // A store that holds its log is dropped too: what it
                     // held goes to the file as it drops, every commit of
-                    // it, and the open replays them.
-                    let clean = rng.chance(50)
-                        || matches!(cfg.sync, SyncPolicy::EveryN(_))
-                        || !cfg.held_frames;
+                    // it, and the open replays them; one that syncs every
+                    // few commits only once a sync has covered them.
+                    let clean = rng.chance(50) || (every && !synced) || !cfg.held_frames;
                     if clean {
                         for op in staged.drain(..) {
                             // close commits the staged batch.
@@ -2821,6 +2966,14 @@ fn run_seed_inner(seed: u64, want_cache: bool, verbose: bool) -> Result<Stats, S
     st.abandons += z.upkeep_abandons() + r.upkeep_abandons();
     st.bindings += z.cache_bindings() + r.cache_bindings();
     st.beside += z.seal_waits().merges_beside + r.seal_waits().merges_beside;
+    if let Some(c) = z.cipher_counts() {
+        st.evicted += c.cache.evicted_units;
+        st.fills += c.cache.fills;
+    }
+    if let Some(c) = z.one_counts() {
+        st.one += c.files + c.reused;
+    }
+    st.zreads += z.zpage_counts().reads + z.zpage_counts().scans;
     st.switches += z.forms_off_counts()[..2].iter().sum::<u64>();
     st.kept += z.snapshots_kept();
     st.in_place += z.puts_in_place();
@@ -2861,6 +3014,48 @@ fn run_seed_inner(seed: u64, want_cache: bool, verbose: bool) -> Result<Stats, S
 
 #[test]
 fn fuzz_range() {
+    run_range();
+}
+
+/// The range again with `z` kept under a cipher (`Encryption::Cipher`) and
+/// `r` in the clear: the store whose files are in memory and whose
+/// directory is sealed, read against the model and against a plain store
+/// over the same writes, with each crash a store whose memory is gone.
+#[test]
+#[cfg(target_os = "linux")]
+fn fuzz_range_under_a_cipher() {
+    CIPHER.set(true);
+    run_range();
+}
+
+/// The range a third time, `z` under a cipher with a cache of sixteen
+/// kilobytes: a store that does not fit what it may hold of itself, every
+/// file of it read by the chunk, decrypted where it is read and given back
+/// behind the read, against the model and a plain store. What holds a
+/// store larger than its memory to the answers of one that fits.
+#[test]
+#[cfg(target_os = "linux")]
+fn fuzz_range_under_a_cipher_that_does_not_fit_its_cache() {
+    CIPHER.set(true);
+    CIPHER_CACHE.set(16 << 10);
+    run_range();
+}
+
+/// The range a fourth time, `z` under a cipher with a cache of sixteen
+/// kilobytes and the compact form forced on: every partition's form file
+/// built from records read by the piece through that cache, sealed beside
+/// its segment, and read and scanned through, against the model and a
+/// plain store in the raw form over the same writes.
+#[test]
+#[cfg(target_os = "linux")]
+fn fuzz_range_under_a_cipher_with_the_compact_form() {
+    CIPHER.set(true);
+    CIPHER_CACHE.set(16 << 10);
+    ZPAGES.set(true);
+    run_range();
+}
+
+fn run_range() {
     let from = env_u64("ZFUZZ_FROM").unwrap_or(0);
     let to = env_u64("ZFUZZ_TO").unwrap_or(from + DEFAULT_SEEDS);
     let want_cache =
@@ -2897,6 +3092,8 @@ fn fuzz_range() {
     let mut sharing_seeds = 0u64;
     let mut stride = StrideStats::default();
     let ran = seeds.len();
+    let (mut evicted, mut fills, mut zreads) = (0u64, 0u64, 0u64);
+    let mut one = 0u64;
     for seed in seeds {
         // The seeds whose held log builds no frames, from the draws alone.
         let drawn = seed_draws(seed, want_cache).0;
@@ -2928,6 +3125,10 @@ fn fuzz_range() {
                 abandons += s.abandons;
                 bindings += s.bindings;
                 beside += s.beside;
+                evicted += s.evicted;
+                fills += s.fills;
+                one += s.one;
+                zreads += s.zreads;
                 switches += s.switches;
                 recuts += s.recuts;
                 kept += s.kept;
@@ -2950,7 +3151,7 @@ fn fuzz_range() {
         }
     }
     eprintln!(
-        "seeds {from}..{to}: reopens {reopens}, abandons {abandons}, bindings {bindings}, merges beside {beside}, forms-off switches {switches}, sparse forms recut {recuts}, heads owned {} given back {}, point parts {} admits {} key hits {} walk owned {} walk parts {} hot starts {} copy starts {} stale exits {} cursor steps {} bounds by head {} landings left {} quiet merges {} key sequences kept {} rank patches {} rank starts {} copies packed {} unpacked {}, snapshots kept {kept}, log frames dropped {} spilled {}, held logs with no frames {frameless}, reads with no record asked {unasked}, live table asked first {live_first}, memtables hashed by FNV {mem_fnv}, overwriting puts {} overwrites {}, point reads two-source {} layered {} placed {}, FAILURES {}",
+        "seeds {from}..{to}: reopens {reopens}, abandons {abandons}, bindings {bindings}, merges beside {beside}, cache units given back {evicted}, chunks decrypted {fills}, reads through a form {zreads}, forms-off switches {switches}, sparse forms recut {recuts}, heads owned {} given back {}, point parts {} admits {} key hits {} walk owned {} walk parts {} hot starts {} copy starts {} stale exits {} cursor steps {} bounds by head {} landings left {} quiet merges {} key sequences kept {} rank patches {} rank starts {} copies packed {} unpacked {}, snapshots kept {kept}, log frames dropped {} spilled {}, held logs with no frames {frameless}, reads with no record asked {unasked}, live table asked first {live_first}, memtables hashed by FNV {mem_fnv}, overwriting puts {} overwrites {}, point reads two-source {} layered {} placed {}, FAILURES {}",
         heads[0],
         heads[1],
         point[0],
@@ -3022,6 +3223,26 @@ fn fuzz_range() {
         eprintln!("FAIL: {b}");
     }
     assert!(bad.is_empty(), "{} seeds failed", bad.len());
+    // A run under a cache too small for its stores is a run of nothing
+    // unless the cache turned over: every chunk read was decrypted for the
+    // read and given back behind it, many times over.
+    if under_cipher() && cipher_cache().is_some_and(|b| b < 1 << 20) {
+        assert!(
+            evicted > 0 && fills > 0,
+            "a small cache gave nothing back: {evicted} units, {fills} chunks"
+        );
+    }
+    // And a run with the compact form forced is a run of the raw form
+    // unless reads were answered through form files.
+    if zpages_forced() {
+        assert!(zreads > 0, "no read or scan went through a form file");
+    }
+    // And a run under `ZFUZZ_ONEFILE` is a run of two stores of files
+    // unless `z` kept files in its data file: its segments, or under
+    // `ZFUZZ_CIPHER` their envelopes.
+    if one_file_on() && ran > 0 {
+        assert!(one > 0, "no store kept a file in its data file");
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -3066,7 +3287,11 @@ fn run_concurrent(seed: u64, secs_ops: usize, snapshots: bool) -> Result<(u64, u
     } else {
         opts(&cfg)
     };
-    let mut db = Db::create(&dir, made).map_err(|e| format!("create: {e}"))?;
+    let made = Options {
+        one_file: one_file_on(),
+        ..made
+    };
+    let mut db = Db::create(&dir, with_cipher(made)).map_err(|e| format!("create: {e}"))?;
     census_gate(&db, heads_flip || stride);
     let nkeys = 150 + rng.below(250);
     let keys: Arc<Vec<Vec<u8>>> = Arc::new(
@@ -3336,6 +3561,51 @@ fn run_concurrent(seed: u64, secs_ops: usize, snapshots: bool) -> Result<(u64, u
         committed[j].store(pack(epoch[j], n[j]), Ordering::SeqCst);
     }
     db.settle().map_err(|e| format!("settle: {e}"))?;
+    if convert {
+        // The asks above are taken at the segment work's turn with the
+        // builder free and nothing due it, each one replaced by the next:
+        // beside the seals' and merges' builds a seed's asks were all
+        // replaced untaken in one run of the stride group, and the range's
+        // check that a partition left the stride form went red over a
+        // store that was never asked. With the readers still at it, the
+        // first served partition is asked three times and each ask settled,
+        // which takes it, so it moves to the form it is not in three times
+        // over: a stride file to the block form, and a block file back --
+        // the keys here are numbers of one width, which a block file's move
+        // into the stride form asks of them (`StrideNo::askable`). Out,
+        // in, out, or in, out, in where the asks above left it a block
+        // file: a move each way at the least. (Asked by turns until one
+        // left, the served partitions were asked once in every run, the
+        // first a stride file each time, so the turns and their bound were
+        // reached by nothing.)
+        //
+        // The count starts with the builder at rest. A plain settle joins
+        // no form build and takes no ask, so with the builder free at the
+        // loop's end and its last ask not yet taken, the segment work's
+        // turn behind the settle above started that conversion, it landed
+        // inside the first settled ask, and three asks read as four moves
+        // -- (1, 3), once in a gate's stride group and in every run with
+        // that state built. The form's own settle takes what was asked and
+        // waits for it.
+        db.zpages_settle()
+            .map_err(|e| format!("zpages settle: {e}"))?;
+        let before = db.zpage_counts();
+        for _ in 0..3 {
+            db.zpages_convert_ask(0);
+            db.zpages_settle()
+                .map_err(|e| format!("zpages settle: {e}"))?;
+        }
+        let after = db.zpage_counts();
+        let moved = (
+            after.stride_converts - before.stride_converts,
+            after.stride_converts_back - before.stride_converts_back,
+        );
+        if moved.0 + moved.1 != 3 || moved.0.abs_diff(moved.1) != 1 {
+            return Err(format!(
+                "seed {seed} ({cfg:?}): three settled asks of the first partition moved it in and out {moved:?} times"
+            ));
+        }
+    }
     stop.store(true, Ordering::Relaxed);
     for t in threads {
         t.join().map_err(|_| "reader thread panicked".to_string())?;
@@ -3343,6 +3613,14 @@ fn run_concurrent(seed: u64, secs_ops: usize, snapshots: bool) -> Result<(u64, u
     let e = errs.lock().unwrap().clone();
     if !e.is_empty() {
         return Err(format!("seed {seed} ({cfg:?}): {:?}", &e[..e.len().min(4)]));
+    }
+    // Under `ZFUZZ_ONEFILE` a seed whose store kept nothing in its data
+    // file ran a store of files.
+    if one_file_on() && db.one_counts().is_none_or(|c| c.files == 0) {
+        return Err(format!(
+            "seed {seed} ({cfg:?}): the store kept no file in its data file: {:?}",
+            db.one_counts()
+        ));
     }
     let (owned, given, _) = db.heads_owned_counts();
     let c = db.zpage_counts();

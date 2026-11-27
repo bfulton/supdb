@@ -933,6 +933,41 @@ tool is held to the tool as somebody last ran it; read the loop before
 the rate. The upstream repository is no longer maintained, which is why
 the pin is its last commit and why nobody else will have met this.
 
+**A comparator's wrapper is not the comparator, and a comparator's
+unreleased line is what it is.** The encrypted comparators (`src/enc.rs`,
+feature `enc`) were first built the way a Rust user reaches them. LMDB's
+encryption came through `heed3`, and its three-thread scan pass died with
+`MDB_PAGE_NOTFOUND` at ten thousand keys, while the unit test, one thread
+and three thousand keys, passed. The threaded read pass beside it had
+answered, at a tenth of the plain line's rate, and the harness checks no
+value it reads: whether those reads were right is not known. Two things
+were under it, read off LMDB's source and then held by a mutant. An
+encrypted environment shares one buffer of decrypted pages a chunk between
+its transactions and records a page as decrypted in the transaction's own
+copy of the chunk's bits, so a second transaction decrypts the page again
+into the buffer the first is reading; LMDB's sample module writes the
+plaintext from the input, each byte over itself, and the wrapper copies the
+ciphertext into the output and decrypts it there. And the wrapper makes its
+cipher from the key at every page. The arm is on LMDB's C API now, with a
+hook in the sample's shape and a context a thread, and a test of three
+threads that compares every value, which the in-place hook fails with that
+error. Then the pairing at a million keys died in the shuffled load,
+`MDB_PROBLEM` at a commit, and that one is LMDB's alone: the plain line
+loads it, transactions of a hundred keys load it, and the reproduction is
+forty lines of the C API (`a_write_transaction_over_two_thousand_chunks`).
+The arm is not given smaller transactions for it. And the `rocksdb` crate
+has no way to hand RocksDB an Env but its own two, so the encrypted Env is
+given the crate's private shape, a transmute whose size the compiler checks
+and whose meaning a test of what the device holds does. The rules: a
+comparator is built on the interface its authors ship where the wrapper
+adds work or removes a guarantee, and the difference is written at the arm;
+a comparator arm's test reads back every value it wrote, under threads,
+since the suite's passes read without checking and a comparator that
+answers wrong answers fast; a comparator that fails the suite's shape is
+measured where it runs and said to stop where it stops, never reshaped
+until it passes; and a search of the device for plaintext has its control,
+the plain twin's files, which has to find it.
+
 **A verdict that was its pipe's, and a yardstick that did less than the
 arm.** `scripts/comparators.sh` printed its table through `tee`, and a
 pipe's status is its last command's: the table's script answered a cell

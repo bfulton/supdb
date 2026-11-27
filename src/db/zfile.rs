@@ -45,7 +45,7 @@ use super::zpages::{
     STRIDE_SAMPLE,
 };
 use super::zpages::{trailer_crc, trailer_magic};
-use crate::blob::{Blob, BlobOptions, ZSource};
+use crate::blob::{Blob, BlobOptions, Records, ZSource};
 use crate::bytes::{Bytes, MmapBytes};
 use crate::flatindex::{
     compact_fixed_at, compact_fixed_tomb_at, parse_record, parse_record_tail, rd_u32, record_key,
@@ -54,11 +54,30 @@ use crate::flatindex::{
 use crate::index::Ext;
 use std::cell::{Cell, RefCell};
 use std::cmp::Ordering as KeyOrder;
-use std::fs::{File, OpenOptions};
 use std::io::{ErrorKind, Result, Write};
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicU64, AtomicU8, Ordering};
 use std::sync::Arc;
+
+/// The token the stride form's two borrows of a mapping take, made in this
+/// module alone (its constructor is `pub(in crate::db::zfile)`), so that
+/// the compiler refuses either in any other module (forms.md R2). A
+/// mapping as it lies (`MmapBytes::lend_whole_map`): all of a mapped file,
+/// which a page's first check is made over, and nothing of a mapping that
+/// lends by the piece. And a mapping's whole range
+/// (`MmapBytes::lend_asked_map`): what a stride file's readers index at
+/// their offsets, each page of it after the page's check, which for a file
+/// that asks is where the page is asked for (`ZFile::stride_page_check`).
+pub(crate) mod lend_seal {
+    pub struct Token(());
+
+    impl Token {
+        #[inline(always)]
+        pub(in crate::db::zfile) fn new() -> Token {
+            Token(())
+        }
+    }
+}
 
 /// The size floor: a partition whose record region is under this many bytes
 /// is declined and no file is written (`Options::zpages_min_bytes`). The form
@@ -411,6 +430,55 @@ fn emit_fixed<F: FnMut(&[u8], &[u8])>(k: &[u8], run: &[u8], records: usize, f: &
     }
 }
 
+/// A walk's run of common records, in a function of its own: `first`, the
+/// record the walk found at its position (`compact_fixed_at`), and the
+/// records of that shape after it in `group`, at most `left` in all, each
+/// held to `until` and handed to `f` (`emit_fixed`). Returns where it
+/// stopped, how many it handed over, and how the key it stopped at
+/// compares with `until` where it stopped for that; it stops short of
+/// `left` with no order at a record of any other shape, which the walk
+/// reads through the parse.
+///
+/// Out of line because the walk is not: `ZCursor::walk_inner` holds the
+/// coded groups' walk, the parse of every other shape of record and their
+/// values' reads beside this loop, and what the loop kept in registers
+/// followed whatever those inlined. The same source read 80 instructions a
+/// record in one build and 90 in another whose only difference was a
+/// reader three calls away (`Blob::read_exts_inline`), and three other
+/// shapes of that reader read 82, 82 and 83. Here the loop holds a group,
+/// a position, a count and the callback and nothing else, and the limit
+/// and the group's end are one count (`left`). Entered on a record the
+/// walk has already found to be of the shape, so a record of another
+/// shape is read as it was, with no call that finds nothing.
+#[inline(never)]
+fn walk_fixed<'g, F: FnMut(&[u8], &[u8])>(
+    group: &'g [u8],
+    mut off: usize,
+    first: (&'g [u8], &'g [u8], usize, usize),
+    left: usize,
+    until: Option<&[u8]>,
+    f: &mut F,
+) -> (usize, usize, Option<KeyOrder>) {
+    let mut took = 0usize;
+    let mut rec = Some(first);
+    while let Some((k, run, records, next)) = rec {
+        if let Some(u) = until {
+            match k.cmp(u) {
+                KeyOrder::Less => {}
+                order => return (off, took, Some(order)),
+            }
+        }
+        emit_fixed(k, run, records, f);
+        off = next;
+        took += 1;
+        if took == left {
+            break;
+        }
+        rec = compact_fixed_at(group, off);
+    }
+    (off, took, None)
+}
+
 /// Record `i` of a coded group handed to `f` as the walk hands a decoded
 /// record: its key assembled into `key`, and its values read where the raw
 /// tail lies when the record parses there, else from the record decoded on
@@ -435,7 +503,7 @@ fn coded_record_to<F: FnMut(&[u8], &[u8])>(
         if let Some(h) = coded_header(head0, &r) {
             if let Some((exts, tail, _)) = parse_record_tail(h, r.tail) {
                 let k: &[u8] = key.as_slice();
-                raw.read_exts(&exts, tail, |v: &[u8]| f(k, v))?;
+                raw.read_exts_inline(&exts, tail, |v: &[u8]| f(k, v))?;
                 return Ok(true);
             }
         }
@@ -446,7 +514,7 @@ fn coded_record_to<F: FnMut(&[u8], &[u8])>(
     let Some((k, exts, tail, _)) = parse_record(img, 0) else {
         return Ok(false);
     };
-    raw.read_exts(&exts, tail, |v: &[u8]| f(k, v))?;
+    raw.read_exts_inline(&exts, tail, |v: &[u8]| f(k, v))?;
     Ok(true)
 }
 
@@ -1309,7 +1377,7 @@ impl<'a> ZCursor<'a> {
             }
             Group::Page(_) | Group::Buf(_) | Group::Memo(..) => {
                 match parse_record(self.group(), self.off) {
-                    Some((_, exts, tail, _)) => self.raw().read_exts(&exts, tail, &mut *f),
+                    Some((_, exts, tail, _)) => self.raw().read_exts_inline(&exts, tail, &mut *f),
                     None => {
                         // The first decode walked every record of the group
                         // whole, so this is a group changed under the mapping:
@@ -1545,22 +1613,18 @@ impl<'a> ZCursor<'a> {
             {
                 let group = self.group();
                 while n < limit && rank < end {
-                    // The common record in place; any other shape through
-                    // the parse.
-                    if let Some((k, run, records, next)) = compact_fixed_at(group, off) {
-                        if let Some(u) = until {
-                            match k.cmp(u) {
-                                KeyOrder::Less => {}
-                                order => {
-                                    stop = Some(order);
-                                    break;
-                                }
-                            }
+                    // The common records in place, a run of them at a time
+                    // (`walk_fixed`); any other shape through the parse.
+                    if let Some(first) = compact_fixed_at(group, off) {
+                        let left = (limit - n).min(end - rank);
+                        let (at, took, met) = walk_fixed(group, off, first, left, until, f);
+                        off = at;
+                        rank += took;
+                        n += took;
+                        if met.is_some() {
+                            stop = met;
+                            break;
                         }
-                        emit_fixed(k, run, records, f);
-                        off = next;
-                        rank += 1;
-                        n += 1;
                         continue;
                     }
                     let Some((k, exts, tail, len)) = parse_record(group, off) else {
@@ -1580,7 +1644,8 @@ impl<'a> ZCursor<'a> {
                             }
                         }
                     }
-                    self.raw().read_exts(&exts, tail, &mut |v: &[u8]| f(k, v))?;
+                    self.raw()
+                        .read_exts_inline(&exts, tail, &mut |v: &[u8]| f(k, v))?;
                     off += len;
                     rank += 1;
                     n += 1;
@@ -1632,6 +1697,13 @@ impl<'a> ZCursor<'a> {
             if let Some(order) = stop {
                 return Ok((n, order));
             }
+            // Here short of the group's end with nothing wrong, the turn
+            // took its limit: a turn that neither took a record nor met
+            // `until` would be taken again for good.
+            debug_assert!(
+                n >= limit,
+                "a walk's turn that took nothing and met nothing"
+            );
         }
         Ok((n, KeyOrder::Greater))
     }
@@ -3439,7 +3511,7 @@ pub(super) struct ZFile {
     /// cache once its name is gone (`ZFile::drop_cache`), since a mapping's
     /// own advice reaches only the pages it maps. `None` where it did not
     /// open.
-    file: Option<std::fs::File>,
+    file: Option<super::vault::File>,
     /// The mapping was advised random (`ZFile::advised`).
     advised: bool,
     /// Heap copies of the resident part's tables, never evicted.
@@ -3477,6 +3549,19 @@ pub(super) struct ZFile {
     verified: Box<[AtomicU64]>,
     /// One bit per page: a check failed.
     bad: Box<[AtomicU64]>,
+    /// The mapping lends nothing of the file whole: a page of it is asked
+    /// for before it is read, at each read, and what was asked for is read
+    /// for as long as the read's pin or hold stands. Set at the attach. A
+    /// stride file that asks has no page marked `verified`, the bit being
+    /// what would keep a later read from asking, so every read of a page
+    /// of it comes to the page's check and is asked for there
+    /// (`ZFile::stride_page_check`).
+    asks: bool,
+    /// One bit per page of a stride file that asks: the page passed its
+    /// check (`StrideBody::page_ok`) at an ask, so the asks after it ask
+    /// and check nothing again. Empty for any other file, whose `verified`
+    /// bit says so.
+    asked_ok: Box<[AtomicU64]>,
     /// Whether the block form's paths serve this file, in the one byte each
     /// of them loads first: nothing set for a block file in service;
     /// `GATE_DAMAGED` once any check failed, the file out of service and the
@@ -3609,8 +3694,10 @@ pub(super) enum StrideAttach {
 
 /// What an attach read of a form file, either body's, for `ZFile::assemble`.
 struct Assembly {
+    /// Whether the mapping lends nothing whole (`ZFile::asks`).
+    asks: bool,
     map: MmapBytes,
-    file: Option<std::fs::File>,
+    file: Option<super::vault::File>,
     advise: bool,
     fence: ZFence,
     filter: Option<super::BlockedBloom>,
@@ -3693,7 +3780,17 @@ impl ZFile {
     ) -> std::result::Result<ZFile, Reject> {
         let memo = memo.into();
         let damage = |e: ZError| Reject::Damage(e.to_string());
-        let map = match MmapBytes::open(path) {
+        // The attach's own reads -- the trailer, the resident part, the
+        // sampled pages, and the live segment's header and checksum row --
+        // under a hold of the store's cache where the store has one: an
+        // attach is made by whichever thread collects a build or opens the
+        // store, pinned in the reader table or not, and what it reads it
+        // copies or checks before it returns. Nothing for a plain store.
+        let _hold = path.parent().and_then(super::vault::hold);
+        // Through the store's door: a plain store's file mapped, and for a
+        // store under a cipher the cache's view of the form file's
+        // envelope, of which a page is read by asking for it.
+        let map = match super::vault::map(path) {
             Ok(m) => m,
             Err(e) if e.kind() == ErrorKind::NotFound => return Err(Reject::Missing),
             Err(e) => return Err(Reject::Damage(format!("the file does not open: {e}"))),
@@ -3707,7 +3804,22 @@ impl ZFile {
         if advise {
             map.advise_random();
         }
-        let file = std::fs::File::open(path).ok();
+        // A file of a store under a cipher has no descriptor: its pages
+        // are the store's cache's to give back, never an advice's.
+        let file = super::vault::open(path).ok();
+        // Whether the mapping lends nothing of the file whole, each range
+        // of it asked for before it is read: the one place the form asks
+        // its source which kind it is (`ZFile::asks`).
+        let asks = map.piecewise();
+        // A file that asks has its walks ask ahead whatever the option
+        // says (`Options::zpages_scan_prefetch`, `ZFile::ask_ahead`,
+        // `stride_ask_ahead`): the pages a walk will cross are bytes of an
+        // envelope mapped for reads far apart, each read from the device
+        // by itself where its chunk is decrypted, and asked for as the
+        // walk begins they come while it reads its first. A mapped file's
+        // walk is left to the option, which is the kernel's readahead
+        // priced against the ask.
+        let prefetch = prefetch || asks;
         let len = map.len();
         if len < ZTRAILER as u64 || !len.is_multiple_of(ZPAGE as u64) {
             return Err(damage(ZError::Length));
@@ -3728,11 +3840,12 @@ impl ZFile {
             let StrideAttached {
                 body,
                 trusted: trusted_all,
-            } = ZFile::attach_stride(&map, blob, id, end_seq, stride)?;
+            } = ZFile::attach_stride(&map, asks, blob, id, end_seq, stride)?;
             let n_pages = body.pages();
             let nkeys = body.keys() as usize;
             let zfile = ZFile::assemble(
                 Assembly {
+                    asks,
                     map,
                     file,
                     advise,
@@ -3750,6 +3863,16 @@ impl ZFile {
                 memo_ahead,
             );
             if trusted_all {
+                // A trusted file is one its build read back from the
+                // device (`Built::stride_device`), which no build of a
+                // file that asks says: it reads its file back out of the
+                // store's cache, where the file stands whole. Marked
+                // verified, a page of a file that asks would never be
+                // asked for (`ZFile::asks`).
+                debug_assert!(
+                    !zfile.asks,
+                    "a stride file that asks, trusted at its attach"
+                );
                 for p in 0..zfile.checked {
                     set_bit(&zfile.verified, p);
                 }
@@ -3794,6 +3917,7 @@ impl ZFile {
         let bind = bind32(id, end_seq, facts.nkeys, facts.row_crc);
         let mut zfile = ZFile::assemble(
             Assembly {
+                asks,
                 map,
                 file,
                 advise,
@@ -3834,7 +3958,17 @@ impl ZFile {
             ZBody::Stride(body) => body.checked_pages(),
         };
         let words = checked.div_ceil(64);
+        // A stride file that asks: its pages' bits in `asked_ok`, its
+        // `verified` bits never set (`ZFile::stride_page`).
+        let asks = a.asks;
+        let asked_words = if asks && matches!(a.body, ZBody::Stride(_)) {
+            words
+        } else {
+            0
+        };
         ZFile {
+            asks,
+            asked_ok: (0..asked_words).map(|_| AtomicU64::new(0)).collect(),
             map: a.map,
             file: a.file,
             advised: a.advise,
@@ -3910,6 +4044,7 @@ impl ZFile {
     /// back.
     fn attach_stride(
         map: &MmapBytes,
+        asks: bool,
         blob: &Blob<MmapBytes>,
         id: u64,
         end_seq: u64,
@@ -3917,13 +4052,32 @@ impl ZFile {
     ) -> std::result::Result<StrideAttached, Reject> {
         let damage = |e: ZError| Reject::Damage(e.to_string());
         let identity = |why: &str| Reject::Identity(why.into());
-        let bytes: &[u8] = &map.0;
+        // The file's range, and what the attach reads of it asked for
+        // first where the mapping lends nothing whole: the trailer, the
+        // resident part, and each page a sampled slot or number lies in,
+        // under the attach's hold. Nothing asked of a mapped file.
+        let bytes: &[u8] = map.lend_asked_map(lend_seal::Token::new());
+        let had = |off: u64, len: usize| !asks || map.slice_at(off, len).is_some();
+        let len = bytes.len() as u64;
+        if len < ZTRAILER as u64 || !had(len - ZTRAILER as u64, ZTRAILER) {
+            return Err(damage(ZError::Length));
+        }
         let (trailer, layout) = StrideBody::open(bytes).map_err(damage)?;
         let facts = blob
             .z_source_facts()
             .ok_or_else(|| identity("the segment has no checksum row to be bound to"))?;
         same_segment(&trailer.seg_ident(), &facts, id, end_seq).map_err(identity)?;
+        // The resident part and the zeros after it, to the trailer's page.
+        let res_bytes =
+            usize::try_from(layout.res_pages * ZPAGE as u64).map_err(|_| damage(ZError::Length))?;
+        if !had(layout.res_off, res_bytes) {
+            return Err(damage(ZError::ResidentCrc));
+        }
         let body = StrideBody::with_row(bytes, trailer, layout).map_err(damage)?;
+        // A page held to its check, asked for first where the file asks.
+        let page_good = |q: u32| {
+            PageOk::from(had(u64::from(q) * ZPAGE as u64, ZPAGE) && body.page_ok(bytes, q))
+        };
         if let StrideAttach::Trust(seal) = *stride {
             if trailer_crc(&bytes[bytes.len() - ZTRAILER..]) == Some(seal) {
                 return Ok(StrideAttached {
@@ -3938,7 +4092,7 @@ impl ZFile {
         // number for a whole run, and for a sparse form from the number its
         // page holds, the page checked first and its failure damage.
         let key_of = |rank: u64, kbuf: &mut [u8; STRIDE_KEY_MAX]| {
-            body.key_at_into(bytes, rank, kbuf, &mut |q| body.page_ok(bytes, q))
+            body.key_at_into(bytes, rank, kbuf, &mut |q| page_good(q))
                 .map(|k| k.map(<[u8]>::to_vec))
                 .map_err(|_| damage(ZError::PageCrc))
         };
@@ -3958,7 +4112,7 @@ impl ZFile {
             let rank = body.rank_on_page(p);
             // Every page the slot spans, the sampled one among them, against
             // its word of the row before the slot is read.
-            let value = match body.values_at(bytes, rank, &mut |q| body.page_ok(bytes, q)) {
+            let value = match body.values_at(bytes, rank, &mut |q| page_good(q)) {
                 StrideAt::Value(value) => value,
                 StrideAt::Absent | StrideAt::Bad(_) => return Err(damage(ZError::PageCrc)),
             };
@@ -4321,6 +4475,13 @@ impl ZFile {
 
     /// Page `p`'s view, where it has bytes and they parse; `None` takes the
     /// page out of service.
+    ///
+    /// Inlined, and said to be: a point read through the form takes its
+    /// page's view here, and the compiler, which had put this in the read,
+    /// left it a call once the module grew elsewhere -- sixteen
+    /// instructions a read of a plain store through its form, found
+    /// counting that read by function against the commit before.
+    #[inline(always)]
     fn view_of(&self, p: usize) -> Option<PageView<'_>> {
         debug_assert!(!self.is_stride(), "a block-only helper over a stride file");
         let v = self
@@ -4870,7 +5031,7 @@ impl ZFile {
                 // for exactly them. One that stops short is the raw form's
                 // own damage, which the caller's raw walk meets again and
                 // names.
-                let n = raw.scan_at(rank, want, &mut *f)?;
+                let n = raw.scan_either(rank, want, f)?;
                 out.nopage += 1;
                 out.seen += n;
                 rank += n;
@@ -5061,7 +5222,7 @@ impl ZFile {
                                 out.end = ScanEnd::Fallback;
                                 return Ok(());
                             };
-                            raw.read_exts(&exts, tail, &mut |v: &[u8]| f(k, v))?;
+                            raw.read_exts_inline(&exts, tail, &mut |v: &[u8]| f(k, v))?;
                             off += len;
                         }
                     }
@@ -5266,7 +5427,7 @@ impl ZFile {
                 decoded,
             } => match parse_record(opened.bytes(), off) {
                 Some((_, exts, tail, _)) => raw
-                    .read_exts(&exts, tail, &mut *f)
+                    .read_exts_inline(&exts, tail, &mut *f)
                     .map(|n| ZRead::Served { n, decoded }),
                 None => {
                     // The first decode walked every record whole: a group
@@ -5565,23 +5726,22 @@ impl ZFile {
     /// against the row, or all of them where the attach trusted the file
     /// (`StrideAttach::Trust`).
     pub(super) fn verified_pages(&self) -> u64 {
-        popcount(&self.verified)
+        popcount(&self.verified) + popcount(&self.asked_ok)
     }
 
     pub(super) fn bad_pages(&self) -> u64 {
         popcount(&self.bad)
     }
 
-    /// The share of the file's pages the page cache holds now (`mincore`
-    /// over the mapping): whether a build that reads the form reads memory
-    /// or the device. Over the whole file whichever body it holds, so a
-    /// stride file's row and trailer count as region B and the trailer do.
+    /// The share of the file a read would find in memory now, asked of
+    /// its mapping (`Bytes::resident_share`): whether a build that reads
+    /// the form reads memory or the device. Over the whole file whichever
+    /// body it holds, so a stride file's row and trailer count as region B
+    /// and the trailer do.
     pub(super) fn pages_resident(&self) -> f64 {
-        let len = self.map.len();
-        match self.map.slice_at(0, len as usize) {
-            Some(bytes) => super::resident_share(bytes),
-            None => 0.0,
-        }
+        self.map
+            .resident_share(0, self.map.len() as usize)
+            .unwrap_or(0.0)
     }
 
     /// Heap bytes the form file keeps resident: the fence and the filter, and
@@ -5731,7 +5891,7 @@ impl ZFile {
     pub(super) fn drop_cache(&self) {
         self.map.advise_dontneed();
         if let Some(f) = &self.file {
-            super::fadvise_dontneed(f);
+            f.drop_all();
         }
     }
 
@@ -5844,20 +6004,33 @@ impl ZFile {
         self.raw_reads.load(Ordering::Relaxed)
     }
 
-    /// The mapping whole, which a stride file's value pages are read from
-    /// at their offsets.
+    /// The file's whole range, which a stride file's value pages are read
+    /// from at their offsets, each after its check (`ZFile::stride_page`):
+    /// a mapped file's bytes, and for a file that asks (`ZFile::asks`) the
+    /// range its pages are asked into, a page of which is the file's only
+    /// once that check has asked for it (`MmapBytes::lend_asked_map`).
     fn stride_bytes(&self) -> &[u8] {
-        &self.map.0
+        self.map.lend_asked_map(lend_seal::Token::new())
+    }
+
+    /// The file as its mapping lends it whole: all of a mapped file, and
+    /// nothing of a file that asks, over which a page's check fails and is
+    /// made by the ask (`ZFile::stride_page_check`).
+    fn stride_lent(&self) -> &[u8] {
+        self.map.lend_whole_map(lend_seal::Token::new())
     }
 
     /// Value page `p` of a stride file, checked against its word of the row
     /// (`StrideBody::page_ok`) where this process has not verified it --
     /// the check counted on the reading handle's memo, the page marked
     /// verified where it passes, the page and the file out of service where
-    /// it fails. Whether the page may be read.
-    fn stride_page(&self, body: &StrideBody, memo: &ZMemo, p: u32) -> bool {
+    /// it fails. Whether the page may be read. A file that asks
+    /// (`ZFile::asks`) has no page marked verified, so every read of a
+    /// page of it goes on to the check, which is where the page is asked
+    /// for.
+    fn stride_page(&self, body: &StrideBody, memo: &ZMemo, p: u32) -> PageOk {
         if bit(&self.verified, p as usize) {
-            return true;
+            return PageOk::YES;
         }
         memo.count_stride_check();
         self.stride_page_check(body, p)
@@ -5868,23 +6041,65 @@ impl ZFile {
     /// sparse form's numbers, the one page such a read touches. The check
     /// is the same and so is the bit it leaves; what goes uncounted is a
     /// check a page, once a process.
-    fn stride_page_uncounted(&self, body: &StrideBody, p: u32) -> bool {
-        bit(&self.verified, p as usize) || self.stride_page_check(body, p)
+    fn stride_page_uncounted(&self, body: &StrideBody, p: u32) -> PageOk {
+        if bit(&self.verified, p as usize) {
+            return PageOk::YES;
+        }
+        self.stride_page_check(body, p)
     }
 
     /// Page `p` against its word of the row and, for a page of numbers,
-    /// its samples (`StrideBody::page_ok`): marked verified where it
-    /// passes, and it and the file out of service where it fails.
+    /// its samples (`StrideBody::page_ok`), over the file as its mapping
+    /// lends it whole: marked verified where it passes, the answer the bit
+    /// it set. Where it does not, the page failed, or the mapping lends
+    /// nothing whole and the page is to be asked for
+    /// (`ZFile::stride_page_asked`): the file's kind is found where the
+    /// check fails, so that a mapped file's check is the code it was, and
+    /// the two answers leave by the register each was made in (`PageOk`).
     #[inline(never)]
-    fn stride_page_check(&self, body: &StrideBody, p: u32) -> bool {
+    fn stride_page_check(&self, body: &StrideBody, p: u32) -> PageOk {
         let i = p as usize;
-        if body.page_ok(self.stride_bytes(), p) {
-            set_bit(&self.verified, i);
-            true
+        if body.page_ok(self.stride_lent(), p) {
+            let mask = 1u64 << (i & 63);
+            self.verified[i >> 6].fetch_or(mask, Ordering::Relaxed);
+            PageOk(mask)
         } else {
-            self.fail(i);
-            false
+            self.stride_page_asked(i)
         }
+    }
+
+    /// What a stride page's check answers once it has failed over the file
+    /// as its mapping lends it. A mapped file's page failed: it and the
+    /// file leave service. A file that asks is asked for the page, which
+    /// makes it the file's bytes in the range the readers index
+    /// (`ZFile::stride_bytes`) for as long as this read's pin or hold
+    /// stands; the page is then held to its check the first time it is
+    /// asked for (`asked_ok`), and at every ask after it is the ask alone.
+    /// Where the page cannot be had -- a chunk of it failed its own check,
+    /// a read of it failed -- or fails its check, it and the file leave
+    /// service, as a mapped file's do. Never marked `verified`: every read
+    /// of the page comes here to ask.
+    #[inline(never)]
+    fn stride_page_asked(&self, i: usize) -> PageOk {
+        let had =
+            self.asks && i < self.checked && self.map.slice_at((i * ZPAGE) as u64, ZPAGE).is_some();
+        if had && bit(&self.asked_ok, i) {
+            return PageOk::YES;
+        }
+        // The page's first ask. The bit is stored here and at no ask
+        // after: every reader of the file comes through this function at
+        // every read, and a store a read would have them all writing one
+        // line.
+        if had
+            && self
+                .stride()
+                .is_some_and(|body| body.page_ok(self.stride_bytes(), i as u32))
+        {
+            set_bit(&self.asked_ok, i);
+            return PageOk::YES;
+        }
+        self.fail(i);
+        PageOk::NO
     }
 
     /// `read_all` of a stride file: the key's one value, its slot's pages
@@ -7001,15 +7216,19 @@ pub(super) struct Warm {
 /// `path` read into the page cache, chunk by chunk, so that the first reads
 /// of a form file that is on disk and cold -- after a restart -- fault on
 /// nothing: a cold file of `P` pages costs `r` reads `P(1 - e^(-r/P))`
-/// major faults, as bad as the raw form. Each chunk the kernel reports
-/// wholly resident is skipped; the rest is asked for with `MADV_WILLNEED`
-/// and then read a page at a time, so the pages are there when this
-/// returns and its time is the read's. `cancel`, looked at between chunks,
-/// stops it where it is; what was read stays read.
+/// major faults, as bad as the raw form. Each chunk its mapping reports
+/// wholly in memory (`Bytes::resident_share`) is skipped; the rest is
+/// asked for (`Bytes::advise_willneed`) and, where the mapping lends its
+/// pages unasked, a mapped file's, then read a page at a time, so the
+/// pages are there when this returns and its time is the read's. A file
+/// read through the store's cache, under a cipher, has what stands behind
+/// it asked for and is not read: a read would decrypt it into the store's
+/// cache, where the warm is for the kernel's. `cancel`, looked at between
+/// chunks, stops it where it is; what was read stays read.
 pub(super) fn warm_file(path: &Path, cancel: Option<&AtomicBool>) -> Result<Warm> {
     let start = std::time::Instant::now();
-    let map = MmapBytes::open(path)?;
-    let len = map.0.len();
+    let map = super::vault::map(path)?;
+    let len = map.len() as usize;
     let page = crate::bytes::os_page_size();
     let mut w = Warm::default();
     let mut sum = 0u64;
@@ -7020,16 +7239,15 @@ pub(super) fn warm_file(path: &Path, cancel: Option<&AtomicBool>) -> Result<Warm
         }
         let span = ZWARM_CHUNK.min(len - off);
         let pages = span.div_ceil(page);
-        let resident = map.resident_pages(off, span);
-        if resident >= pages {
+        let share = map.resident_share(off as u64, span).unwrap_or(0.0);
+        if share >= 1.0 {
             w.skipped += span as u64;
         } else {
             map.advise_willneed(off as u64, span);
-            let mut at = off;
-            while at < off + span {
-                sum = sum.wrapping_add(u64::from(map.0[at]));
-                at += page;
-            }
+            // A page a time, of a mapped file; a paged mapping's page is
+            // not touched.
+            sum = sum.wrapping_add(map.touch(off as u64, span));
+            let resident = ((share * pages as f64).round() as usize).min(pages);
             w.bytes += ((pages - resident) * page).min(span) as u64;
         }
         off += span;
@@ -7099,13 +7317,13 @@ trait PieceSink {
 /// dirty pages pushed the raw form's out until the file was dropped whole
 /// at its end, and the raw form's refaults read as the group's pressure.
 struct FileSink<'a> {
-    file: &'a File,
+    file: &'a super::vault::File,
     drop: bool,
     prev: Option<(u64, u64)>,
 }
 
 impl<'a> FileSink<'a> {
-    fn new(file: &'a File, drop: bool) -> FileSink<'a> {
+    fn new(file: &'a super::vault::File, drop: bool) -> FileSink<'a> {
         FileSink {
             file,
             drop,
@@ -7118,7 +7336,7 @@ impl PieceSink for FileSink<'_> {
     fn put(&mut self, at: u64, piece: &[u8]) -> Result<()> {
         let mut f = self.file;
         f.write_all(piece)?;
-        super::start_writeback(self.file, at, piece.len() as u64);
+        self.file.start_writeback(at, piece.len() as u64);
         if self.drop {
             if let Some((a, n)) = self.prev {
                 drop_written_range(self.file, a, n)?;
@@ -7180,7 +7398,7 @@ impl<S: PieceSink> Pieces<S> {
 
 /// A file's own pages written back and dropped from the page cache, the
 /// whole of it (`drop_written_range`).
-fn drop_written(file: &File) -> Result<()> {
+fn drop_written(file: &super::vault::File) -> Result<()> {
     drop_written_range(file, 0, 0)
 }
 
@@ -7192,24 +7410,14 @@ fn drop_written(file: &File) -> Result<()> {
 /// failed and that the drop skipped -- one a mapping holds -- reads right
 /// from the cache and wrong from the device.
 #[cfg(target_os = "linux")]
-fn drop_written_range(file: &File, at: u64, n: u64) -> Result<()> {
-    use std::os::unix::io::AsRawFd;
+fn drop_written_range(file: &super::vault::File, at: u64, n: u64) -> Result<()> {
     written_back_range(file, at, n)?;
-    // SAFETY: an advice over a descriptor this call holds open; it changes
-    // no byte of the file.
-    unsafe {
-        libc::posix_fadvise(
-            file.as_raw_fd(),
-            at as libc::off64_t,
-            n as libc::off64_t,
-            libc::POSIX_FADV_DONTNEED,
-        );
-    }
+    file.drop_range(at, n);
     Ok(())
 }
 
 #[cfg(not(target_os = "linux"))]
-fn drop_written_range(_file: &File, _at: u64, _n: u64) -> Result<()> {
+fn drop_written_range(_file: &super::vault::File, _at: u64, _n: u64) -> Result<()> {
     Ok(())
 }
 
@@ -7236,38 +7444,14 @@ fn fail_next_writeback(on: bool) {
 /// commit and the device for no flush, as an fsync would. Off Linux, where
 /// nothing waits for a range, the file's sync. A test's seam answers an
 /// error once (`fail_next_writeback`).
-fn written_back_range(file: &File, at: u64, n: u64) -> Result<()> {
+fn written_back_range(file: &super::vault::File, at: u64, n: u64) -> Result<()> {
     #[cfg(test)]
     if WRITEBACK_FAILS.with(|f| f.replace(false)) {
         return Err(std::io::Error::other(
             "the form file's writeback was made to fail",
         ));
     }
-    #[cfg(target_os = "linux")]
-    {
-        use std::os::unix::io::AsRawFd;
-        // SAFETY: a writeback over a descriptor this call holds open; it
-        // reads and writes no memory of ours.
-        let rc = unsafe {
-            libc::sync_file_range(
-                file.as_raw_fd(),
-                at as libc::off64_t,
-                n as libc::off64_t,
-                libc::SYNC_FILE_RANGE_WAIT_BEFORE
-                    | libc::SYNC_FILE_RANGE_WRITE
-                    | libc::SYNC_FILE_RANGE_WAIT_AFTER,
-            )
-        };
-        if rc != 0 {
-            return Err(std::io::Error::last_os_error());
-        }
-        Ok(())
-    }
-    #[cfg(not(target_os = "linux"))]
-    {
-        let _ = (at, n);
-        file.sync_data()
-    }
+    file.written_back(at, n)
 }
 
 /// A stride file's writeback waited for and its error read before its
@@ -7280,7 +7464,7 @@ fn written_back_range(file: &File, at: u64, n: u64) -> Result<()> {
 /// copy wrong under a check of the right one. A build that drops its
 /// output reads the error of each piece's writeback but the last's as it
 /// drops the piece (`drop_written_range`), and this wait reads the last's.
-fn read_writeback(file: &File) -> Result<()> {
+fn read_writeback(file: &super::vault::File) -> Result<()> {
     written_back_range(file, 0, 0)
 }
 
@@ -7294,55 +7478,36 @@ fn read_writeback(file: &File) -> Result<()> {
 /// of each. The bytes asked for; an error opening the form file asks for
 /// none.
 #[cfg(target_os = "linux")]
-pub(super) fn swap_ahead(seg: &File, at: u64, len: u64, form: &Path) -> u64 {
-    use std::os::unix::io::AsRawFd;
+pub(super) fn swap_ahead(seg: &super::vault::File, at: u64, len: u64, form: &Path) -> u64 {
     let page = ZPAGE as u64;
     let (a, b) = (at.next_multiple_of(page), (at + len) & !(page - 1));
-    // SAFETY: advices over file descriptors this call holds open; neither
-    // changes a byte of either file.
-    unsafe {
-        if a < b {
-            libc::posix_fadvise(
-                seg.as_raw_fd(),
-                a as libc::off_t,
-                (b - a) as libc::off_t,
-                libc::POSIX_FADV_DONTNEED,
-            );
-        }
+    if a < b {
+        seg.drop_range(a, b - a);
     }
     ask_file(form)
 }
 
 #[cfg(not(target_os = "linux"))]
-pub(super) fn swap_ahead(_seg: &File, _at: u64, _len: u64, _form: &Path) -> u64 {
+pub(super) fn swap_ahead(_seg: &super::vault::File, _at: u64, _len: u64, _form: &Path) -> u64 {
     0
 }
 
 /// The file at `form` asked of the kernel whole (`POSIX_FADV_WILLNEED`), in
 /// the pieces the kernel reads whole (`crate::bytes::WILLNEED_PIECE`): the
-/// bytes asked for, none where the file does not open. The ask starts the
-/// reads and waits for none of them, and a page the cache holds already is
-/// not read again.
+/// bytes asked for, none where the file does not open through the door
+/// (`vault::open`, which opens no form file of a store under a cipher once
+/// it has its envelope). The ask starts the reads and waits for none of
+/// them, and a page the cache holds already is not read again.
 #[cfg(target_os = "linux")]
 pub(super) fn ask_file(form: &Path) -> u64 {
-    use std::os::unix::io::AsRawFd;
-    let Ok(f) = File::open(form) else {
+    let Ok(f) = super::vault::open(form) else {
         return 0;
     };
-    let n = f.metadata().map_or(0, |m| m.len());
+    let n = f.len().unwrap_or(0);
     let mut off = 0u64;
     while off < n {
         let w = (n - off).min(crate::bytes::WILLNEED_PIECE as u64);
-        // SAFETY: an advice over a file descriptor this call holds open;
-        // it changes no byte of the file.
-        unsafe {
-            libc::posix_fadvise(
-                f.as_raw_fd(),
-                off as libc::off_t,
-                w as libc::off_t,
-                libc::POSIX_FADV_WILLNEED,
-            );
-        }
+        f.ask_range(off, w);
         off += w;
     }
     n
@@ -7353,60 +7518,45 @@ pub(super) fn ask_file(_form: &Path) -> u64 {
     0
 }
 
-/// Drop `[from, to)` of the file behind the build: the pages of its own
-/// mapping first, then the page cache's, because the cache skips a page a
-/// mapping still holds. The window is trimmed to whole pages inside it, and
-/// the pages another mapping holds -- the readers' hot raw pages -- survive
-/// the second call by design.
+/// Drop `[from, to)` of the segment behind the build, offsets in its file:
+/// the pages of its own mapping first (`Bytes::advise_dontneed_range`),
+/// then the page cache's by the file's descriptor, because the cache skips
+/// a page a mapping still holds. The window is trimmed to whole pages
+/// inside it, and the pages another mapping holds -- the readers' hot raw
+/// pages -- survive the second call by design.
 #[cfg(target_os = "linux")]
-fn drop_behind(base: usize, file: &File, from: usize, to: usize) {
-    use std::os::unix::io::AsRawFd;
+fn drop_behind(map: &MmapBytes, file: &super::vault::File, from: usize, to: usize) {
     let a = from.next_multiple_of(ZPAGE);
     let b = to & !(ZPAGE - 1);
     if a >= b {
         return;
     }
-    // SAFETY: a read-only shared mapping of a file, advised over a range
-    // inside it: the call drops this process's page-table entries for the
-    // range and nothing else, and the next touch faults the page back in.
-    unsafe {
-        libc::madvise((base + a) as *mut libc::c_void, b - a, libc::MADV_DONTNEED);
-        libc::posix_fadvise(
-            file.as_raw_fd(),
-            a as libc::off_t,
-            (b - a) as libc::off_t,
-            libc::POSIX_FADV_DONTNEED,
-        );
-    }
+    map.advise_dontneed_range(a as u64, b - a);
+    file.drop_range(a as u64, (b - a) as u64);
 }
 
 #[cfg(not(target_os = "linux"))]
-fn drop_behind(_base: usize, _file: &File, _from: usize, _to: usize) {}
+fn drop_behind(_map: &MmapBytes, _file: &super::vault::File, _from: usize, _to: usize) {}
 
-/// Ask the kernel for `[from, to)` of the mapping at `base` ahead of a walk
-/// (`MADV_WILLNEED`): the reads are issued at once and the walk's faults
-/// then find the pages in flight or resident, so one wait of the walk's
-/// fetches the window and not the device's readahead. The start is taken
-/// down to its page, and the window is asked in pieces the kernel reads
-/// whole (`crate::bytes::WILLNEED_PIECE`): asked at once, a window past the
-/// device's largest request was read only up to it. The call is advice and
-/// its failure is nobody's.
+/// Ask for `[from, to)` of the segment's mapping, offsets in its file,
+/// ahead of a walk (`Bytes::advise_willneed`): the reads are issued at
+/// once and the walk's faults then find the pages in flight or resident,
+/// so one wait of the walk's fetches the window and not the device's
+/// readahead. The start is taken down to its page, so that the pieces the
+/// mapping asks in (`crate::bytes::WILLNEED_PIECE`) start on one; asked at
+/// once, a window past the device's largest request was read only up to
+/// it. The call is advice and its failure is nobody's. Off Linux it asks
+/// nothing, as the plain build never has.
 #[cfg(target_os = "linux")]
-fn ask_ahead(base: usize, from: usize, to: usize) {
-    let mut a = from & !(ZPAGE - 1);
-    while a < to {
-        let n = crate::bytes::WILLNEED_PIECE.min(to - a);
-        // SAFETY: a read-only shared mapping of a file, advised over a range
-        // inside it; the kernel reads pages in and changes nothing else.
-        unsafe {
-            libc::madvise((base + a) as *mut libc::c_void, n, libc::MADV_WILLNEED);
-        }
-        a += n;
+fn ask_ahead(map: &MmapBytes, from: usize, to: usize) {
+    let a = from & !(ZPAGE - 1);
+    if a < to {
+        map.advise_willneed(a as u64, to - a);
     }
 }
 
 #[cfg(not(target_os = "linux"))]
-fn ask_ahead(_base: usize, _from: usize, _to: usize) {}
+fn ask_ahead(_map: &MmapBytes, _from: usize, _to: usize) {}
 
 /// What a build is asked, and the two sizes it works in. The floor and
 /// whether the raw bytes are dropped are the store's options; the piece and
@@ -7524,6 +7674,13 @@ pub(super) struct BuildPlan {
     /// make.
     #[cfg(test)]
     pub residency_unknown: bool,
+    /// A test's: called with the stride file's temp name once the build
+    /// has dropped its output and before it looks at what the cache holds
+    /// of it (`reads_device`), for a test that reads pages of the file
+    /// back in as a neighbour's read-around does in a store kept in one
+    /// file.
+    #[cfg(test)]
+    pub beside: Option<fn(&Path)>,
 }
 
 impl BuildPlan {
@@ -7555,6 +7712,8 @@ impl BuildPlan {
             damage: None,
             #[cfg(test)]
             residency_unknown: false,
+            #[cfg(test)]
+            beside: None,
         }
     }
 
@@ -7632,6 +7791,23 @@ pub(super) fn build(
     timed_build(|| build_seen(seg_path, out, id, end_seq, plan, &mut |_, _| {}))
 }
 
+/// A segment's file as a build reads it: a plain store's, open, to be
+/// mapped whole; or a file a store under a cipher keeps, as the store's
+/// cache maps it, read by the piece.
+pub(super) enum SegSrc {
+    File(super::vault::File),
+    Kept(MmapBytes),
+}
+
+/// The segment file at `path` opened for a build (`SegSrc`).
+pub(super) fn open_seg(path: &Path) -> Result<SegSrc> {
+    if super::vault::kept(path) {
+        Ok(SegSrc::Kept(super::vault::map(path)?))
+    } else {
+        Ok(SegSrc::File(super::vault::open(path)?))
+    }
+}
+
 /// `build`, with `seen` called with each range of the segment's file the
 /// build hands to the drop behind the walk, as offsets in the file and
 /// before the range is dropped: a test's view of which bytes the build
@@ -7644,146 +7820,282 @@ fn build_seen(
     plan: &BuildPlan,
     seen: &mut dyn FnMut(usize, usize),
 ) -> Result<Outcome> {
-    let file = File::open(seg_path)?;
-    build_file_seen(file, out, id, end_seq, plan, seen)
+    let src = open_seg(seg_path)?;
+    build_file_seen(src, seg_path, out, id, end_seq, plan, seen)
 }
 
-/// `build` from a segment file already open: what the segment work hands a
-/// build on a thread of its own, opened before the thread starts, so that a
-/// promotion's unlink of the old name between the two does not fail it.
+/// `build` from a segment file already open (`open_seg`): what the segment
+/// work hands a build on a thread of its own, opened before the thread
+/// starts, so that a promotion's unlink of the old name between the two
+/// does not fail it. `seg_path` is the name it was opened by.
 pub(super) fn build_file(
-    file: File,
+    src: SegSrc,
+    seg_path: &Path,
     out: &Path,
     id: u64,
     end_seq: u64,
     plan: &BuildPlan,
 ) -> Result<Outcome> {
-    timed_build(|| build_file_seen(file, out, id, end_seq, plan, &mut |_, _| {}))
+    timed_build(|| build_file_seen(src, seg_path, out, id, end_seq, plan, &mut |_, _| {}))
 }
 
 fn build_file_seen(
-    file: File,
+    src: SegSrc,
+    seg_path: &Path,
     out: &Path,
     id: u64,
     end_seq: u64,
     plan: &BuildPlan,
     seen: &mut dyn FnMut(usize, usize),
 ) -> Result<Outcome> {
-    // SAFETY: the contract `MmapBytes::open` takes: a sealed segment is
-    // never truncated under a mapping.
-    let map = MmapBytes(unsafe { memmap2::Mmap::map(&file)? });
-    let base = map.0.as_ptr() as usize;
-    let blob = Blob::open_with(
-        map,
-        BlobOptions {
-            verify_checksums: false,
-            verify_index: false,
-            ..Default::default()
-        },
-    )?;
-    blob.advise_normal();
-    let facts = blob.z_source_facts().ok_or_else(|| {
-        super::err("z build: the segment has no checksum row to bind a form file to")
-    })?;
-    let (recs, dir) = blob
-        .record_regions()
-        .ok_or_else(|| super::err("z build: the segment's records are not resident"))?;
-    let recs_len = usize::try_from(facts.recs_len).unwrap_or(usize::MAX);
-    if recs_len < plan.floor {
-        return Ok(plan.declined(Decline::Small(recs_len), StrideNo::Small));
-    }
-    if blob.blocks() > 0 {
-        return Ok(plan.declined(Decline::BlockBacked, StrideNo::BlockBacked));
-    }
-    let nkeys = blob.keys();
-    let bind = bind32(id, end_seq, facts.nkeys, facts.row_crc);
     let tmp = {
         let mut s = out.as_os_str().to_owned();
         s.push(".tmp");
         std::path::PathBuf::from(s)
     };
-    let block = |seen: &mut dyn FnMut(usize, usize)| {
-        write_pages(
-            &file, base, recs, dir, nkeys, bind, &tmp, &facts, id, end_seq, plan, seen,
-        )
+    let opts = BlobOptions {
+        verify_checksums: false,
+        verify_index: false,
+        ..Default::default()
     };
-    // A partition the plan keeps in the block form by its keys' place is
-    // not asked (`BuildPlan::stride_below`).
-    let ask = match plan.stride_below.as_deref() {
-        Some(cut) if blob.key_at(0).is_some_and(|first| first >= cut) => StrideAsk::No,
-        _ => plan.stride,
-    };
-    // Nor one whose first key lies in no range the plan asks in
-    // (`BuildPlan::stride_spans`).
-    let ask = match plan.stride_spans.as_deref() {
-        Some(spans) if !blob.key_at(0).is_some_and(|first| in_spans(spans, first)) => StrideAsk::No,
-        _ => ask,
-    };
-    let made = match ask {
-        StrideAsk::No => block(seen),
-        ask => {
-            let images = SegImages::new(recs, dir, nkeys);
-            let checked = stride_precheck(&images, plan.stride_sparse).map_err(|why| {
-                // A run with gaps this plan leaves for a conversion to ask:
-                // named as that, and not as the holes a plan that takes no
-                // such run finds in it.
-                let later = plan.stride_sparse_later
-                    && !plan.stride_sparse
-                    && stride_precheck(&images, true).is_ok_and(|f| f.sparse_last.is_some());
-                if later {
-                    StrideNo::Deferred
-                } else {
-                    why
+    let made = match src {
+        SegSrc::File(file) => {
+            // The segment mapped through the handle the walk drops it
+            // behind by: a file of its own, or its extent of the store's
+            // data file (`vault::File::map`).
+            let map = file.map()?;
+            let blob = Blob::open_with(map, opts)?;
+            blob.advise_normal();
+            let facts = blob.z_source_facts().ok_or_else(|| {
+                super::err("z build: the segment has no checksum row to bind a form file to")
+            })?;
+            let (recs, dir) = match blob.records() {
+                Some(Records::Whole(recs, dir)) => (recs, dir),
+                // A mapped file lends whole: its records by the piece, or
+                // none, are a segment this build cannot read.
+                Some(Records::Pieces(..)) | None => {
+                    return Err(super::err(
+                        "z build: the segment's records are not resident",
+                    ))
                 }
-            });
-            let walked = match checked {
-                Ok(sf) => write_stride(
-                    &file, base, recs, dir, nkeys, bind, &tmp, &facts, id, end_seq, &sf, plan, seen,
-                ),
-                // The two ends decide before the temporary name is this
-                // build's: asked for the stride form alone, their decline
-                // is the opening's and leaves the name alone, since a way
-                // out removes only a name its build opened, and the name is
-                // the partition's, which another build of it may hold.
-                Err(why) if ask == StrideAsk::Only => return Ok(Outcome::NotStride(why)),
-                Err(why) => Ok(Outcome::NotStride(why)),
             };
-            match walked {
-                // A late decline: the block body is built in the same
-                // call, over records the walk left warm, under the same
-                // temporary name, which its writer opens truncated.
-                Ok(Outcome::NotStride(why)) if ask == StrideAsk::OrBlock => {
-                    block(seen).map(|o| match o {
-                        Outcome::Built(b) => Outcome::Built(Built {
-                            stride_no: Some(why),
-                            ..b
-                        }),
+            // Where the two regions lie in the file, from the section's
+            // header: what the walk's asks and drops are placed by.
+            let (recs_at, dir_at) = blob
+                .record_region_place()
+                .zip(blob.record_dir_place())
+                .map(|((r, _), (d, _))| (r as usize, d as usize))
+                .ok_or_else(|| super::err("z build: the segment's records are not resident"))?;
+            let map = blob.source();
+            let recs_len = usize::try_from(facts.recs_len).unwrap_or(usize::MAX);
+            if recs_len < plan.floor {
+                return Ok(plan.declined(Decline::Small(recs_len), StrideNo::Small));
+            }
+            if blob.blocks() > 0 {
+                return Ok(plan.declined(Decline::BlockBacked, StrideNo::BlockBacked));
+            }
+            let nkeys = blob.keys();
+            let bind = bind32(id, end_seq, facts.nkeys, facts.row_crc);
+            let block = |seen: &mut dyn FnMut(usize, usize)| {
+                let images = SegImages::new(recs, dir, nkeys);
+                let mut by = Mapped {
+                    file: &file,
+                    map,
+                    recs,
+                    dir,
+                    recs_at,
+                    dir_at,
+                    asked: 0,
+                    asked_bytes: 0,
+                    dropped: 0,
+                    seen,
+                };
+                write_pages(
+                    &images, &mut by, nkeys, bind, &tmp, &facts, id, end_seq, plan,
+                )
+            };
+            match stride_asked(plan, blob.key_at(0)) {
+                StrideAsk::No => block(seen),
+                ask => {
+                    let images = SegImages::new(recs, dir, nkeys);
+                    let walked = match stride_opening(&images, plan) {
+                        Ok(sf) => write_stride(
+                            &images,
+                            &mut PlacedWalk {
+                                file: &file,
+                                at: Placed {
+                                    map,
+                                    recs,
+                                    dir,
+                                    recs_at,
+                                    dir_at,
+                                },
+                                seen: &mut *seen,
+                            },
+                            nkeys,
+                            bind,
+                            &tmp,
+                            &facts,
+                            id,
+                            end_seq,
+                            &sf,
+                            plan,
+                        ),
+                        // The two ends decide before the temporary name is
+                        // this build's: asked for the stride form alone,
+                        // their decline is the opening's and leaves the name
+                        // alone, since a way out removes only a name its
+                        // build opened, and the name is the partition's,
+                        // which another build of it may hold.
+                        Err(why) if ask == StrideAsk::Only => return Ok(Outcome::NotStride(why)),
+                        Err(why) => Ok(Outcome::NotStride(why)),
+                    };
+                    match walked {
+                        // A late decline: the block body is built in the
+                        // same call, over records the walk left warm, under
+                        // the same temporary name, which its writer opens
+                        // truncated.
+                        Ok(Outcome::NotStride(why)) if ask == StrideAsk::OrBlock => block(seen)
+                            .map(|o| match o {
+                                Outcome::Built(b) => Outcome::Built(Built {
+                                    stride_no: Some(why),
+                                    ..b
+                                }),
+                                other => other,
+                            }),
                         other => other,
-                    })
+                    }
                 }
-                other => other,
+            }
+        }
+        SegSrc::Kept(map) => {
+            // A file of a store under a cipher: read through the store's
+            // cache by the piece, under a hold, this thread having no slot
+            // of the reader table, and rested as the walk goes so that the
+            // cache gives back what the pages before were read from. Either
+            // body, as the plan asks, by the rules a mapped file's is asked
+            // by.
+            let Some(dir) = out.parent() else {
+                return Err(super::err("z build: a form file with no directory"));
+            };
+            let hold = super::vault::hold(dir)
+                .ok_or_else(|| super::err("z build: a kept file of no store under a cipher"))?;
+            let blob = Blob::open_with(map, opts)?;
+            let facts = blob.z_source_facts().ok_or_else(|| {
+                super::err("z build: the segment has no checksum row to bind a form file to")
+            })?;
+            let (recs, words) = match blob.records() {
+                Some(Records::Pieces(recs, words)) => (recs, words),
+                // A kept file lends by the piece: its records lent whole,
+                // or none, are a segment this build was not handed.
+                Some(Records::Whole(..)) | None => {
+                    return Err(super::err(
+                        "z build: the segment's records are not to be had",
+                    ))
+                }
+            };
+            let recs_len = usize::try_from(facts.recs_len).unwrap_or(usize::MAX);
+            if recs_len < plan.floor {
+                return Ok(plan.declined(Decline::Small(recs_len), StrideNo::Small));
+            }
+            if blob.blocks() > 0 {
+                return Ok(plan.declined(Decline::BlockBacked, StrideNo::BlockBacked));
+            }
+            let nkeys = blob.keys();
+            let bind = bind32(id, end_seq, facts.nkeys, facts.row_crc);
+            let images = PieceImages {
+                recs,
+                dir: words,
+                nkeys,
+            };
+            let held = || Held {
+                hold: &hold,
+                map: blob.source(),
+                recs,
+                dir: words,
+                asked: 0,
+                asked_bytes: 0,
+                dropped: 0,
+            };
+            // A record that does not read is an image of no bytes, which
+            // no page takes and the build refuses as a record with no key;
+            // the failure itself the store's cache remembers, for every
+            // read after it.
+            let block = || {
+                write_pages(
+                    &images,
+                    &mut held(),
+                    nkeys,
+                    bind,
+                    &tmp,
+                    &facts,
+                    id,
+                    end_seq,
+                    plan,
+                )
+            };
+            match stride_asked(plan, blob.key_at(0)) {
+                StrideAsk::No => block(),
+                ask => {
+                    let walked = match stride_opening(&images, plan) {
+                        Ok(sf) => write_stride(
+                            &images,
+                            &mut held(),
+                            nkeys,
+                            bind,
+                            &tmp,
+                            &facts,
+                            id,
+                            end_seq,
+                            &sf,
+                            plan,
+                        ),
+                        // As a mapped file's: the opening's decline leaves
+                        // the temporary name alone.
+                        Err(why) if ask == StrideAsk::Only => return Ok(Outcome::NotStride(why)),
+                        Err(why) => Ok(Outcome::NotStride(why)),
+                    };
+                    match walked {
+                        Ok(Outcome::NotStride(why)) if ask == StrideAsk::OrBlock => {
+                            block().map(|o| match o {
+                                Outcome::Built(b) => Outcome::Built(Built {
+                                    stride_no: Some(why),
+                                    ..b
+                                }),
+                                other => other,
+                            })
+                        }
+                        other => other,
+                    }
+                }
             }
         }
     };
     match made {
-        Ok(Outcome::Built(b)) => name_built(&tmp, out, plan, b),
+        Ok(Outcome::Built(b)) => name_built(&tmp, out, seg_path, plan, b),
         other => {
-            let _ = std::fs::remove_file(&tmp);
+            let _ = super::vault::remove_file(&tmp);
             other
         }
     }
 }
 
 /// A file either body's writer built, given its name: the cancel's last
-/// look, the test's hold, the rename, and the sync where the plan asks for
-/// it -- the one tail both writers end in, so that what a name promises is
-/// promised once.
-fn name_built(tmp: &Path, out: &Path, plan: &BuildPlan, mut b: Built) -> Result<Outcome> {
+/// look, the test's hold, the rename, under a cipher the file's envelope,
+/// and the sync where the plan asks for it -- the one tail both writers
+/// end in, so that what a name promises is promised once.
+fn name_built(
+    tmp: &Path,
+    out: &Path,
+    seg_path: &Path,
+    plan: &BuildPlan,
+    mut b: Built,
+) -> Result<Outcome> {
     // The cancel's last look, before the file gets its name; a build past
     // it renames whatever landed meanwhile, and the collect finds the
     // target gone and the file an orphan.
     if plan.cancelled() {
-        let _ = std::fs::remove_file(tmp);
+        let _ = super::vault::remove_file(tmp);
         return Ok(Outcome::Cancelled);
     }
     if plan.wait_rename() {
@@ -7791,29 +8103,415 @@ fn name_built(tmp: &Path, out: &Path, plan: &BuildPlan, mut b: Built) -> Result<
         // the open after to find as a crash before the rename leaves it.
         return Ok(Outcome::Cancelled);
     }
-    std::fs::rename(tmp, out).inspect_err(|_| {
-        let _ = std::fs::remove_file(tmp);
+    super::vault::rename(tmp, out).inspect_err(|_| {
+        let _ = super::vault::remove_file(tmp);
     })?;
+    let t = std::time::Instant::now();
+    // Under a cipher the file is a memory file until it has its envelope,
+    // which is written here, on the build's thread, beside its segment's:
+    // from there the store's cache can give its pages back, which is what
+    // a form file is for.
+    if let (Some(dir), Some(seg), Some(form)) = (
+        out.parent(),
+        seg_path.file_name().and_then(|n| n.to_str()),
+        out.file_name().and_then(|n| n.to_str()),
+    ) {
+        super::vault::persist_form(dir, seg, form, plan.sync, plan.drop_output).inspect_err(
+            |_| {
+                let _ = super::vault::remove_file(out);
+            },
+        )?;
+    }
     if plan.sync {
-        let t = std::time::Instant::now();
-        if let Ok(f) = File::open(out) {
+        if let Ok(f) = super::vault::open(out) {
             let _ = f.sync_data();
         }
         b.sync_us = (t.elapsed().as_micros() as u64).max(1);
+    } else {
+        // In a store kept in one file a manifest lists the form file only
+        // once a sync has covered it, and a build that asks for none is
+        // covered by the store's next (`vault::ride`).
+        super::vault::ride(out);
     }
     Ok(Outcome::Built(b))
 }
 
+/// What `plan` asks of a segment whose first key is `first`: the stride
+/// form as the plan asks it, or not at all for a partition the plan keeps
+/// in the block form by its keys' place (`BuildPlan::stride_below`) or
+/// whose first key lies in no range the plan asks in
+/// (`BuildPlan::stride_spans`). One rule for a mapped segment and a kept
+/// one.
+fn stride_asked(plan: &BuildPlan, first: Option<&[u8]>) -> StrideAsk {
+    let ask = match plan.stride_below.as_deref() {
+        Some(cut) if first.is_some_and(|first| first >= cut) => StrideAsk::No,
+        _ => plan.stride,
+    };
+    match plan.stride_spans.as_deref() {
+        Some(spans) if !first.is_some_and(|first| in_spans(spans, first)) => StrideAsk::No,
+        _ => ask,
+    }
+}
+
+/// The stride form's opening checks of a partition the plan asks it for
+/// (`stride_precheck`), and the decline's reason where they refuse it: a
+/// run with gaps that this plan leaves for a conversion to ask is named as
+/// that (`StrideNo::Deferred`), and not as the holes a plan that takes no
+/// such run finds in it.
+fn stride_opening(
+    images: &impl Images,
+    plan: &BuildPlan,
+) -> std::result::Result<StrideFacts, StrideNo> {
+    stride_precheck(images, plan.stride_sparse).map_err(|why| {
+        let later = plan.stride_sparse_later
+            && !plan.stride_sparse
+            && stride_precheck(images, true).is_ok_and(|f| f.sparse_last.is_some());
+        if later {
+            StrideNo::Deferred
+        } else {
+            why
+        }
+    })
+}
+
+/// The records of a segment a store under a cipher keeps, as images, each
+/// asked of the store's cache where it is read (`flatindex::Pieces`): the
+/// directory's word for the rank, then a window that holds the record.
+/// What `SegImages` is over a section borrowed whole.
+struct PieceImages<'a> {
+    recs: crate::flatindex::Pieces<'a, MmapBytes>,
+    dir: crate::flatindex::Pieces<'a, MmapBytes>,
+    nkeys: usize,
+}
+
+impl Images for PieceImages<'_> {
+    fn records(&self) -> usize {
+        self.nkeys
+    }
+    fn image(&self, rank: usize) -> &[u8] {
+        use crate::flatindex::Sect;
+        let Some(off) = rank.checked_mul(4).and_then(|at| self.dir.u32_at(at)) else {
+            return &[];
+        };
+        self.recs.image(off as usize).unwrap_or(&[])
+    }
+}
+
+/// What a build does about the cache its segment is read through, at the
+/// three places it has something to say: before a page is filled from a
+/// rank, once a page is written and the walk stands at the next rank, and
+/// at the walk's end. A type and not a value, so a plain store's build is
+/// the code it was and a build under a cipher has none of it.
+trait Walked {
+    /// Before the fill at `rank`.
+    fn ahead(&mut self, rank: usize, plan: &BuildPlan);
+    /// A page written; the walk stands at `rank` of `nkeys`.
+    fn passed(&mut self, rank: usize, nkeys: usize, plan: &BuildPlan);
+    /// The walk over.
+    fn done(&mut self, plan: &BuildPlan);
+    /// The raw bytes asked for ahead of the walk, for the build's report.
+    fn asked_bytes(&self) -> u64;
+}
+
+/// A plain store's segment as the stride walk reads it: its mapping, the
+/// two regions lent whole, and where they start in the file, from the
+/// section's header (`Blob::record_region_place`, `record_dir_place`).
+struct Placed<'a> {
+    map: &'a MmapBytes,
+    recs: &'a [u8],
+    dir: &'a [u8],
+    recs_at: usize,
+    dir_at: usize,
+}
+
+/// A plain store's segment, mapped: the raw records asked for ahead of the
+/// walk a window at a time, and dropped from the page cache behind it.
+/// `map` is the segment's mapping and `file` its descriptor; `recs_at` and
+/// `dir_at` are where the two regions start in the file, from the header.
+struct Mapped<'a> {
+    file: &'a super::vault::File,
+    map: &'a MmapBytes,
+    recs: &'a [u8],
+    dir: &'a [u8],
+    recs_at: usize,
+    dir_at: usize,
+    asked: usize,
+    asked_bytes: u64,
+    dropped: usize,
+    seen: &'a mut dyn FnMut(usize, usize),
+}
+
+impl Mapped<'_> {
+    /// The raw bytes the walk has passed, handed to the cache to forget.
+    fn forget(&mut self, from: usize, to: usize, plan: &BuildPlan) {
+        if plan.drop_behind && from < to {
+            (self.seen)(from, to);
+            drop_behind(self.map, self.file, from, to);
+        }
+    }
+}
+
+impl Walked for Mapped<'_> {
+    // The raw bytes ahead of the walk, asked for a window at a time: the
+    // next window is asked for once the walk is within half a window of
+    // the end of what was asked, so between half a window and a whole one
+    // is in flight ahead of it.
+    #[inline]
+    fn ahead(&mut self, rank: usize, plan: &BuildPlan) {
+        let recs = self.recs;
+        if plan.ahead > 0 && self.asked < recs.len() {
+            let at = rd_u32(self.dir, rank * 4)
+                .map_or(recs.len(), |o| o as usize)
+                .min(recs.len());
+            if at + plan.ahead / 2 >= self.asked {
+                let to = self.asked.saturating_add(plan.ahead).min(recs.len());
+                ask_ahead(self.map, self.recs_at + self.asked, self.recs_at + to);
+                self.asked_bytes += (to - self.asked) as u64;
+                self.asked = to;
+            }
+        }
+    }
+
+    // The raw records the walk has passed, a window at a time: the
+    // directory says where the next one begins.
+    #[inline]
+    fn passed(&mut self, rank: usize, nkeys: usize, plan: &BuildPlan) {
+        let recs = self.recs;
+        let consumed = if rank < nkeys {
+            rd_u32(self.dir, rank * 4).map_or(recs.len(), |o| o as usize)
+        } else {
+            recs.len()
+        }
+        .min(recs.len());
+        if consumed.saturating_sub(self.dropped) >= plan.window {
+            self.forget(self.recs_at + self.dropped, self.recs_at + consumed, plan);
+            self.dropped = consumed;
+        }
+    }
+
+    fn done(&mut self, plan: &BuildPlan) {
+        self.forget(
+            self.recs_at + self.dropped,
+            self.recs_at + self.recs.len(),
+            plan,
+        );
+        self.forget(self.dir_at, self.dir_at + self.dir.len(), plan);
+    }
+
+    fn asked_bytes(&self) -> u64 {
+        self.asked_bytes
+    }
+}
+
+/// A segment a store under a cipher keeps, read under a hold. What the
+/// plain build asks of the page cache this asks of the kernel's cache of
+/// the segment's envelope, through the store's cache's view of the file:
+/// the records' ciphertext asked for a window ahead of the walk, since the
+/// envelope is mapped for far-apart reads and nothing else reads ahead of
+/// a walk, and dropped behind it where the plan says so. And a rest at
+/// each page written, where nothing the walk was lent is read again -- a
+/// page's images are asked for by the fill that reads them -- so the
+/// store's cache gives back what the pages before were read from, and
+/// waits where it is past its budget.
+struct Held<'a> {
+    hold: &'a super::pager::Hold,
+    map: &'a MmapBytes,
+    recs: crate::flatindex::Pieces<'a, MmapBytes>,
+    dir: crate::flatindex::Pieces<'a, MmapBytes>,
+    asked: usize,
+    asked_bytes: u64,
+    dropped: usize,
+}
+
+impl Held<'_> {
+    /// Where the record at `rank` begins in the record region, by the
+    /// directory, or the region's end.
+    fn at(&self, rank: usize, nkeys: usize) -> usize {
+        use crate::flatindex::Sect;
+        let n = self.recs.size();
+        if rank >= nkeys {
+            return n;
+        }
+        self.dir.u32_at(rank * 4).map_or(n, |o| o as usize).min(n)
+    }
+}
+
+impl Walked for Held<'_> {
+    fn ahead(&mut self, rank: usize, plan: &BuildPlan) {
+        use crate::flatindex::Sect;
+        let n = self.recs.size();
+        if plan.ahead > 0 && self.asked < n {
+            let at = self.at(rank, usize::MAX);
+            if at + plan.ahead / 2 >= self.asked {
+                let to = self.asked.saturating_add(plan.ahead).min(n);
+                self.map
+                    .advise_willneed(self.recs.offset() + self.asked as u64, to - self.asked);
+                self.asked_bytes += (to - self.asked) as u64;
+                self.asked = to;
+            }
+        }
+    }
+
+    fn passed(&mut self, rank: usize, nkeys: usize, plan: &BuildPlan) {
+        if plan.drop_behind {
+            let consumed = self.at(rank, nkeys);
+            if consumed.saturating_sub(self.dropped) >= plan.window {
+                self.map.advise_dontneed_range(
+                    self.recs.offset() + self.dropped as u64,
+                    consumed - self.dropped,
+                );
+                self.dropped = consumed;
+            }
+        }
+        self.hold.rest();
+    }
+
+    fn done(&mut self, plan: &BuildPlan) {
+        use crate::flatindex::Sect;
+        if plan.drop_behind {
+            let n = self.recs.size();
+            self.map.advise_dontneed_range(
+                self.recs.offset() + self.dropped as u64,
+                n.saturating_sub(self.dropped),
+            );
+            self.map
+                .advise_dontneed_range(self.dir.offset(), self.dir.size());
+        }
+    }
+
+    fn asked_bytes(&self) -> u64 {
+        self.asked_bytes
+    }
+}
+
+/// What the stride walk does about the cache its segment is read through
+/// and where the segment's records lie in it, by offsets into the record
+/// region: a type and not a value, as the block walk's is (`Walked`), so
+/// that a plain store's stride build is the code it was.
+trait StrideWalked {
+    /// Whether the mappings this build reads its records from and reads
+    /// its file back through lend nothing whole, a range of them asked for
+    /// before it is read.
+    const ASKS: bool;
+    /// Where rank `r`'s record begins in the record region, the region's
+    /// length past the last rank: the directory says, as it says to the
+    /// block walk.
+    fn rec_at(&self, r: usize, nkeys: usize) -> usize;
+    /// The record region's length.
+    fn recs_len(&self) -> usize;
+    /// `[from, to)` of the record region asked for ahead of the walk.
+    fn ask(&mut self, from: usize, to: usize);
+    /// `[from, to)` of the record region, which nothing of this build
+    /// reads again, given to the cache to forget where the plan drops
+    /// behind.
+    fn forget(&mut self, from: usize, to: usize, plan: &BuildPlan);
+    /// The directory, the same, at the build's end.
+    fn forget_dir(&mut self, plan: &BuildPlan);
+    /// Between two ranks: nothing the walk was lent before is read after.
+    fn rest(&mut self);
+    /// The file the walk wrote, mapped for its read-back.
+    fn map_out(&self, tmp: &Path) -> Result<MmapBytes>;
+}
+
+/// A plain store's segment under the stride walk: the two regions lent
+/// whole and placed in the file (`Placed`), the segment's descriptor for
+/// the drop behind the walk, and the build's count of what it dropped.
+struct PlacedWalk<'a> {
+    file: &'a super::vault::File,
+    at: Placed<'a>,
+    seen: &'a mut dyn FnMut(usize, usize),
+}
+
+impl PlacedWalk<'_> {
+    /// `[from, to)` of the file dropped from the page cache where the plan
+    /// drops behind.
+    fn drop(&mut self, from: usize, to: usize, plan: &BuildPlan) {
+        if plan.drop_behind && from < to {
+            (self.seen)(from, to);
+            drop_behind(self.at.map, self.file, from, to);
+        }
+    }
+}
+
+impl StrideWalked for PlacedWalk<'_> {
+    const ASKS: bool = false;
+    #[inline]
+    fn rec_at(&self, r: usize, nkeys: usize) -> usize {
+        let (recs, dir) = (self.at.recs, self.at.dir);
+        if r < nkeys {
+            rd_u32(dir, r * 4).map_or(recs.len(), |o| o as usize)
+        } else {
+            recs.len()
+        }
+        .min(recs.len())
+    }
+    #[inline]
+    fn recs_len(&self) -> usize {
+        self.at.recs.len()
+    }
+    #[inline]
+    fn ask(&mut self, from: usize, to: usize) {
+        ask_ahead(self.at.map, self.at.recs_at + from, self.at.recs_at + to);
+    }
+    fn forget(&mut self, from: usize, to: usize, plan: &BuildPlan) {
+        self.drop(self.at.recs_at + from, self.at.recs_at + to, plan);
+    }
+    fn forget_dir(&mut self, plan: &BuildPlan) {
+        self.drop(self.at.dir_at, self.at.dir_at + self.at.dir.len(), plan);
+    }
+    #[inline]
+    fn rest(&mut self) {}
+    fn map_out(&self, tmp: &Path) -> Result<MmapBytes> {
+        super::vault::map(tmp)
+    }
+}
+
+/// A kept segment under the stride walk: its records asked of the kernel's
+/// cache of the envelope a window ahead and dropped from it behind, as the
+/// block walk's are (`Walked for Held`), a rest between two ranks wherever
+/// a page has gone out since the last, and the file read back through the
+/// store's cache, a page asked for before it is read.
+impl StrideWalked for Held<'_> {
+    const ASKS: bool = true;
+    fn rec_at(&self, r: usize, nkeys: usize) -> usize {
+        self.at(r, nkeys)
+    }
+    fn recs_len(&self) -> usize {
+        use crate::flatindex::Sect;
+        self.recs.size()
+    }
+    fn ask(&mut self, from: usize, to: usize) {
+        self.map
+            .advise_willneed(self.recs.offset() + from as u64, to.saturating_sub(from));
+    }
+    fn forget(&mut self, from: usize, to: usize, plan: &BuildPlan) {
+        if plan.drop_behind && from < to {
+            self.map
+                .advise_dontneed_range(self.recs.offset() + from as u64, to - from);
+        }
+    }
+    fn forget_dir(&mut self, plan: &BuildPlan) {
+        use crate::flatindex::Sect;
+        if plan.drop_behind {
+            self.map
+                .advise_dontneed_range(self.dir.offset(), self.dir.size());
+        }
+    }
+    fn rest(&mut self) {
+        self.hold.rest();
+    }
+    fn map_out(&self, tmp: &Path) -> Result<MmapBytes> {
+        super::vault::map(tmp)
+    }
+}
+
 /// The pages, the resident part and the trailer of the form file of the
-/// segment whose records and directory these are, written to `tmp`. `base`
-/// is the address of the segment's mapping and `file` its descriptor, for
-/// the drop-behind.
+/// segment whose records `images` are, written to `tmp`; `by` is what the
+/// walk does about the cache the segment is read through (`Walked`).
 #[allow(clippy::too_many_arguments)]
-fn write_pages(
-    file: &File,
-    base: usize,
-    recs: &[u8],
-    dir: &[u8],
+fn write_pages<I: Images, W: Walked>(
+    images: &I,
+    by: &mut W,
     nkeys: usize,
     bind: u32,
     tmp: &Path,
@@ -7821,15 +8519,18 @@ fn write_pages(
     id: u64,
     end_seq: u64,
     plan: &BuildPlan,
-    seen: &mut dyn FnMut(usize, usize),
 ) -> Result<Outcome> {
-    let out = OpenOptions::new()
-        .write(true)
-        .create(true)
-        .truncate(true)
-        .open(tmp)?;
+    let out = super::vault::create(tmp)?;
+    // What the file is to hold, said where it is made: under a cipher it is
+    // a memory file until its envelope, which no count of the store's cache
+    // has and the room learns of a page at a time, and two of them built
+    // ahead at a load's end with the cache at its budget put the group within
+    // thirty mebibytes of its limit. The partition's records, which the
+    // groups compress: about the most the file holds where they compress,
+    // and a little less than it where they do not, the rest a reading's to
+    // see. Nothing for a plain store.
+    super::vault::expect(tmp, facts.recs_len);
     let mut w = Pieces::new(FileSink::new(&out, plan.drop_output), plan.piece);
-    let images = SegImages::new(recs, dir, nkeys);
     let mut scratch = FillScratch::new();
     scratch.group_bytes = plan.group_bytes;
     scratch.coding = plan.coding;
@@ -7840,11 +8541,8 @@ fn write_pages(
     scratch.own_decode = plan.own_decode;
     let mut verify_buf = GroupBuf::new();
     let mut fence = ZFence::new();
-    let recs_at = recs.as_ptr() as usize - base;
-    let dir_at = dir.as_ptr() as usize - base;
     let (mut rank, mut pages) = (0usize, 0u32);
     let mut total_ulen = 0u64;
-    let mut dropped = 0usize;
     // The last record no page held, for the decline of a partition that
     // has nothing else.
     let mut last_nopage: Option<NoPage> = None;
@@ -7852,35 +8550,13 @@ fn write_pages(
     // from each record before the walk drops it from the cache: a read of a
     // key the filter rejects is answered absent from the heap.
     let mut bloom = super::BlockedBloom::with_capacity(nkeys);
-    // The raw bytes the walk has passed, handed to the cache to forget.
-    let mut forget = |from: usize, to: usize| {
-        if plan.drop_behind && from < to {
-            seen(from, to);
-            drop_behind(base, file, from, to);
-        }
-    };
-    // The raw bytes ahead of the walk, asked for a window at a time: the
-    // next window is asked for once the walk is within half a window of
-    // the end of what was asked, so between half a window and a whole one
-    // is in flight ahead of it.
-    let (mut asked, mut asked_bytes) = (0usize, 0u64);
     while rank < nkeys {
         if plan.cancelled() {
             return Ok(Outcome::Cancelled);
         }
-        if plan.ahead > 0 && asked < recs.len() {
-            let at = rd_u32(dir, rank * 4)
-                .map_or(recs.len(), |o| o as usize)
-                .min(recs.len());
-            if at + plan.ahead / 2 >= asked {
-                let to = asked.saturating_add(plan.ahead).min(recs.len());
-                ask_ahead(base, recs_at + asked, recs_at + to);
-                asked_bytes += (to - asked) as u64;
-                asked = to;
-            }
-        }
+        by.ahead(rank, plan);
         let mut page = [0u8; ZPAGE];
-        match fill_page(&images, rank, bind, &mut scratch, &mut page) {
+        match fill_page(images, rank, bind, &mut scratch, &mut page) {
             Fill::Page(g) => {
                 let first = images.image(rank);
                 let key = record_key(first, 0)
@@ -7906,18 +8582,7 @@ fn write_pages(
                 total_ulen += g.ulen as u64;
                 pages += 1;
                 rank += g.count;
-                // The raw records the walk has passed, a window at a time:
-                // the directory says where the next one begins.
-                let consumed = if rank < nkeys {
-                    rd_u32(dir, rank * 4).map_or(recs.len(), |o| o as usize)
-                } else {
-                    recs.len()
-                }
-                .min(recs.len());
-                if consumed.saturating_sub(dropped) >= plan.window {
-                    forget(recs_at + dropped, recs_at + consumed);
-                    dropped = consumed;
-                }
+                by.passed(rank, nkeys, plan);
             }
             Fill::NoPage(why) => {
                 // A record no page holds is an entry of the fence with no
@@ -7942,8 +8607,7 @@ fn write_pages(
             }
         }
     }
-    forget(recs_at + dropped, recs_at + recs.len());
-    forget(dir_at, dir_at + dir.len());
+    by.done(plan);
     if pages == 0 {
         return Ok(Outcome::Declined(Decline::NoPage(
             last_nopage.unwrap_or(NoPage::Unplaceable),
@@ -7979,7 +8643,7 @@ fn write_pages(
         fill: scratch.stats,
         file_bytes,
         total_ulen,
-        asked: asked_bytes,
+        asked: by.asked_bytes(),
         wall_us: 0,
         cpu_us: 0,
         majflt: 0,
@@ -8244,11 +8908,9 @@ fn stride_key_is(
 /// read-back would keep the whole file dirty beside the raw form instead,
 /// the shape the per-piece drop was made to end.
 #[allow(clippy::too_many_arguments)]
-fn write_stride(
-    file: &File,
-    base: usize,
-    recs: &[u8],
-    dir: &[u8],
+fn write_stride<I: Images, W: StrideWalked>(
+    images: &I,
+    by: &mut W,
     nkeys: usize,
     bind: u32,
     tmp: &Path,
@@ -8257,32 +8919,12 @@ fn write_stride(
     end_seq: u64,
     sf: &StrideFacts,
     plan: &BuildPlan,
-    seen: &mut dyn FnMut(usize, usize),
 ) -> Result<Outcome> {
-    let images = SegImages::new(recs, dir, nkeys);
-    let recs_at = recs.as_ptr() as usize - base;
-    let dir_at = dir.as_ptr() as usize - base;
-    let mut forget = |from: usize, to: usize| {
-        if plan.drop_behind && from < to {
-            seen(from, to);
-            drop_behind(base, file, from, to);
-        }
-    };
-    // Where rank `r`'s record begins in the region, the region's end past
-    // the last: the directory says, as it says to the block walk.
-    let rec_at = |r: usize| {
-        if r < nkeys {
-            rd_u32(dir, r * 4).map_or(recs.len(), |o| o as usize)
-        } else {
-            recs.len()
-        }
-        .min(recs.len())
-    };
-    let out = OpenOptions::new()
-        .write(true)
-        .create(true)
-        .truncate(true)
-        .open(tmp)?;
+    let recs_len = by.recs_len();
+    let out = super::vault::create(tmp)?;
+    // What the file is to hold, to the byte, said where it is made, as a
+    // block body's is (`write_pages`).
+    super::vault::expect(tmp, sf.layout.file_len);
     let mut w = Pieces::new(FileSink::new(&out, plan.drop_output), plan.piece);
     let lay = sf.layout;
     let codec = sf.codec;
@@ -8297,17 +8939,25 @@ fn write_stride(
     // error, which is a measure over all of them; nothing for a whole run.
     let mut numbers: Vec<u64> =
         Vec::with_capacity(if sf.sparse_last.is_some() { nkeys } else { 0 });
+    // The value pages gone out as of the last rest: a walk that rests
+    // (`StrideWalked::rest`) does so between two ranks, the record it
+    // copies a page from being lent to it until the copy ends.
+    let mut rested = 0u32;
     for r in 0..nkeys {
-        let at = rec_at(r);
+        if p != rested {
+            by.rest();
+            rested = p;
+        }
+        let at = by.rec_at(r, nkeys);
         if r == 0 || at - looked >= plan.window {
             if plan.cancelled() {
                 return Ok(Outcome::Cancelled);
             }
             looked = at;
         }
-        if plan.ahead > 0 && asked < recs.len() && at + plan.ahead / 2 >= asked {
-            let to = asked.saturating_add(plan.ahead).min(recs.len());
-            ask_ahead(base, recs_at + asked, recs_at + to);
+        if plan.ahead > 0 && asked < recs_len && at + plan.ahead / 2 >= asked {
+            let to = asked.saturating_add(plan.ahead).min(recs_len);
+            by.ask(asked, to);
             asked_bytes += (to - asked) as u64;
             asked = to;
         }
@@ -8347,8 +8997,9 @@ fn write_stride(
             Ok(v) => v,
             Err(why) => {
                 if plan.stride == StrideAsk::Only {
-                    forget(recs_at, recs_at + rec_at(r + 1));
-                    forget(dir_at, dir_at + dir.len());
+                    let read = by.rec_at(r + 1, nkeys);
+                    by.forget(0, read, plan);
+                    by.forget_dir(plan);
                 }
                 return Ok(Outcome::NotStride(why));
             }
@@ -8433,33 +9084,29 @@ fn write_stride(
         drop_written(&out)?;
     }
     let mut dropped = 0usize;
-    let mut looked = 0usize;
-    let checked = check_stride(tmp, &images, facts, id, end_seq, plan, &mut |r| {
-        let at = rec_at(r);
-        if r == 0 || at - looked >= plan.window {
-            if plan.cancelled() {
-                return false;
-            }
-            looked = at;
-        }
-        if at - dropped >= plan.window {
-            forget(recs_at + dropped, recs_at + at);
-            dropped = at;
-        }
-        true
-    })?;
+    let checked = check_stride(
+        tmp,
+        images,
+        by,
+        nkeys,
+        &mut dropped,
+        facts,
+        id,
+        end_seq,
+        plan,
+    )?;
     let device = match checked {
         StrideCheck::Refused(Outcome::Cancelled) => return Ok(Outcome::Cancelled),
         StrideCheck::Refused(o) if plan.stride == StrideAsk::OrBlock => return Ok(o),
         StrideCheck::Refused(o) => {
-            forget(recs_at + dropped, recs_at + recs.len());
-            forget(dir_at, dir_at + dir.len());
+            by.forget(dropped, recs_len, plan);
+            by.forget_dir(plan);
             return Ok(o);
         }
         StrideCheck::Read { device } => device,
     };
-    forget(recs_at + dropped, recs_at + recs.len());
-    forget(dir_at, dir_at + dir.len());
+    by.forget(dropped, recs_len, plan);
+    by.forget_dir(plan);
     if plan.drop_output {
         drop_written(&out)?;
     }
@@ -8485,18 +9132,67 @@ fn write_stride(
     }))
 }
 
-/// The kernel's count of the pages of the mapped stride file it holds as
-/// the read-back begins (`MmapBytes::resident_count`), or `None` where it
-/// would not say: a count refused is no count of none, and only a count of
-/// none says the read-back reads the device (`check_stride`). A test's seam
-/// answers `None` (`BuildPlan::residency_unknown`).
-fn read_back_residency(map: &MmapBytes, plan: &BuildPlan) -> Option<usize> {
+/// The share of the mapped stride file in memory as the read-back begins
+/// (`Bytes::resident_share`), or `None` where the source would not say: a
+/// count refused is no count of none, and only a share of none says the
+/// read-back reads the device (`check_stride`). A test's seam answers
+/// `None` (`BuildPlan::residency_unknown`).
+fn read_back_residency(map: &MmapBytes, plan: &BuildPlan) -> Option<f64> {
     #[cfg(test)]
     if plan.residency_unknown {
         return None;
     }
     let _ = plan;
-    map.resident_count(0, map.0.len())
+    map.resident_share(0, map.len() as usize)
+}
+
+/// Whether the read-back about to begin over `map`, the stride file at
+/// `tmp` mapped, reads the device: none of the file's pages in the page
+/// cache now (`read_back_residency`).
+///
+/// A build that dropped its output (`BuildPlan::drop_output`) and finds
+/// pages of it in the cache all the same drops the file again and looks
+/// again, twice at the most. In a store of files nothing brings a page of
+/// a file under its temp name back. In a store kept in one file
+/// (`Options::one_file`) a neighbour does: the kernel reads around a
+/// mapping's fault in the file the mapping is of, half its readahead
+/// window to either side, and stops at that file's end and not at the
+/// mapping's, which in the data file is the next file's first pages or the
+/// one before's last. A build's read-back beside this one, opening its
+/// file at the trailer, read fourteen pages of the next build's file back
+/// in a few hundred microseconds after that build had dropped them, by a
+/// trace of the two threads' calls, and the file was left with no word for
+/// its attach (`Built::left_seal`): one file of seventeen built two at a
+/// time, in one run in twelve. The pages so read are the device's, read
+/// after this build's writeback was waited for and its pages dropped. What
+/// a look cannot tell them from is a page the drop skipped, which is the
+/// cache's copy of what was written. So the file is dropped again, and a
+/// look that then finds nothing says the copy written is out of the cache:
+/// whatever page comes into it after that is read from the device, by this
+/// read-back or by a neighbour's reading around. A page a mapping holds is
+/// skipped by every drop, and is a read-back of the cache as before.
+///
+/// `asks` is a build whose mappings lend nothing whole
+/// (`StrideWalked::ASKS`), under a cipher: its output is a memory file,
+/// which no drop puts on a device.
+fn reads_device(tmp: &Path, map: &MmapBytes, plan: &BuildPlan, asks: bool) -> bool {
+    #[cfg(test)]
+    if let Some(beside) = plan.beside {
+        beside(tmp);
+    }
+    for looks in 1..=3 {
+        match read_back_residency(map, plan) {
+            Some(0.0) => return true,
+            Some(_) if plan.drop_output && !asks && looks < 3 => {
+                let Ok(f) = super::vault::open(tmp) else {
+                    return false;
+                };
+                f.drop_range(0, 0);
+            }
+            _ => return false,
+        }
+    }
+    false
 }
 
 /// What the read-back of a stride file found (`check_stride`).
@@ -8515,9 +9211,12 @@ enum StrideCheck {
 /// the segment it names the live one (`same_segment`), and at each rank the
 /// two quantities a file holds of it -- the value its slot holds, every
 /// page checked against the row once as a reader's verified bits check it,
-/// and the key its trailer's codec renders there. `each` is told of a rank
-/// before it is read and stops the check where it answers false. `None`
-/// where the file reads back; else what the build answers.
+/// and the key its trailer's codec renders there. Before a rank is read the
+/// cancel is looked at, once a window of the records, and the records the
+/// check is past are given to the cache to forget (`StrideWalked::forget`,
+/// `dropped` what has been), the check being the build's last read of
+/// them. `StrideCheck::Read` where the file reads back; else what the
+/// build answers.
 ///
 /// A key's read (`StrideBody::read_all`) is not a third leg: it is the
 /// codec's inverse of the render the key leg holds, then the value leg's
@@ -8538,20 +9237,41 @@ enum StrideCheck {
 /// skips -- dirty, locked, mapped -- is read back from the cache with
 /// nothing said.
 #[allow(clippy::too_many_arguments)]
-fn check_stride(
+fn check_stride<I: Images, W: StrideWalked>(
     tmp: &Path,
-    images: &SegImages,
+    images: &I,
+    by: &mut W,
+    nkeys: usize,
+    dropped: &mut usize,
     facts: &ZSource,
     id: u64,
     end_seq: u64,
     plan: &BuildPlan,
-    each: &mut dyn FnMut(usize) -> bool,
 ) -> Result<StrideCheck> {
     let refused = StrideCheck::Refused(Outcome::NotStride(StrideNo::SelfCheck));
-    let map = MmapBytes::open(tmp)?;
-    let device = read_back_residency(&map, plan) == Some(0);
-    let bytes: &[u8] = &map.0;
-    let Ok(body) = StrideBody::from_bytes(bytes) else {
+    let map = by.map_out(tmp)?;
+    let device = reads_device(tmp, &map, plan, W::ASKS);
+    // The file's range, and for a build whose mappings lend nothing whole
+    // each range of it asked for before it is read (`StrideWalked::ASKS`):
+    // the trailer and the resident part here, and a page where it is
+    // first checked below. Once is enough for this file alone: it is the
+    // build's own output, with no envelope yet, which the store's cache
+    // holds whole until it has one, so a rest between two ranks gives
+    // nothing of it back.
+    let bytes: &[u8] = map.lend_asked_map(lend_seal::Token::new());
+    let had = |off: u64, len: usize| !W::ASKS || map.slice_at(off, len).is_some();
+    let len = bytes.len() as u64;
+    if len < ZTRAILER as u64 || !had(len - ZTRAILER as u64, ZTRAILER) {
+        return Ok(refused);
+    }
+    let Ok((trailer, layout)) = StrideBody::open(bytes) else {
+        return Ok(refused);
+    };
+    let res_bytes = usize::try_from(layout.res_pages * ZPAGE as u64).unwrap_or(usize::MAX);
+    if !had(layout.res_off, res_bytes) {
+        return Ok(refused);
+    }
+    let Ok(body) = StrideBody::with_row(bytes, trailer, layout) else {
         return Ok(refused);
     };
     if same_segment(&body.trailer().seg_ident(), facts, id, end_seq).is_err() {
@@ -8559,9 +9279,29 @@ fn check_stride(
     }
     let mut verified = vec![false; body.checked_pages()];
     let mut kbuf = [0u8; STRIDE_KEY_MAX];
+    let mut looked = 0usize;
+    // The value page the rank before read its slot's end from: the walk
+    // rests where the ranks cross to a later one.
+    let mut page = 0u32;
     for r in 0..images.records() {
-        if !each(r) {
-            return Ok(StrideCheck::Refused(Outcome::Cancelled));
+        let at = by.rec_at(r, nkeys);
+        if r == 0 || at - looked >= plan.window {
+            if plan.cancelled() {
+                return Ok(StrideCheck::Refused(Outcome::Cancelled));
+            }
+            looked = at;
+        }
+        if at - *dropped >= plan.window {
+            by.forget(*dropped, at, plan);
+            *dropped = at;
+        }
+        let rank = r as u64;
+        if W::ASKS {
+            let last = body.span_pages(rank, 1).1;
+            if last != page {
+                by.rest();
+                page = last;
+            }
         }
         let Ok((key, value)) = stride_record(images.image(r)) else {
             return Ok(refused);
@@ -8569,11 +9309,10 @@ fn check_stride(
         let mut good = |p: u32| {
             let i = p as usize;
             if !verified[i] {
-                verified[i] = body.page_ok(bytes, p);
+                verified[i] = had(u64::from(p) * ZPAGE as u64, ZPAGE) && body.page_ok(bytes, p);
             }
-            verified[i]
+            PageOk::from(verified[i])
         };
-        let rank = r as u64;
         if body.values_at(bytes, rank, &mut good) != StrideAt::Value(value) {
             return Ok(refused);
         }
@@ -8605,6 +9344,37 @@ pub(super) struct StrideBody {
     samples: Box<[u64]>,
 }
 
+/// What a stride page's check answers: whether the page may be read. A
+/// word, zero where it may not, and no `bool`: the check has two ways of
+/// saying yes -- a mapped file's page passed and its bit was set, or a
+/// file that asks was asked for it (`ZFile::stride_page_check`) -- and it
+/// answers each in the register the answer was made in, the bit or the
+/// ask's word. Answered as a `bool`, a mapped file's first check of a page
+/// loads a `true` it did not load while that check had the one way.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(transparent)]
+pub(super) struct PageOk(u64);
+
+impl PageOk {
+    /// The page may be read.
+    pub(super) const YES: PageOk = PageOk(1);
+    /// The page may not be read.
+    pub(super) const NO: PageOk = PageOk(0);
+
+    /// Whether the page may be read.
+    #[inline(always)]
+    pub(super) fn ok(self) -> bool {
+        self.0 != 0
+    }
+}
+
+impl From<bool> for PageOk {
+    #[inline(always)]
+    fn from(ok: bool) -> PageOk {
+        PageOk(u64::from(ok))
+    }
+}
+
 /// What a stride body answers of a rank.
 #[derive(Debug, PartialEq, Eq)]
 pub(super) enum StrideAt<'f> {
@@ -8630,6 +9400,7 @@ impl StrideBody {
     /// segment's identity, which is the live segment's to hold the trailer
     /// to (`same_segment`), and no value page, each of which is checked
     /// against the row where a read first touches it (`StrideBody::page_ok`).
+    #[cfg(test)]
     pub(super) fn from_bytes(file: &[u8]) -> std::result::Result<StrideBody, ZError> {
         let (trailer, layout) = StrideBody::open(file)?;
         StrideBody::with_row(file, trailer, layout)
@@ -8801,7 +9572,7 @@ impl StrideBody {
         &self,
         file: &[u8],
         key: &[u8],
-        good: &mut dyn FnMut(u32) -> bool,
+        good: &mut dyn FnMut(u32) -> PageOk,
     ) -> std::result::Result<(u64, KeyOrder), u32> {
         let n = self.keys();
         if self.trailer.sparse.is_none() {
@@ -8877,11 +9648,12 @@ impl StrideBody {
         &self,
         file: &[u8],
         rank: u64,
-        good: &mut dyn FnMut(u32) -> bool,
+        good: &mut dyn FnMut(u32) -> PageOk,
     ) -> std::result::Result<u64, u32> {
         let at = self.layout.k_off() + rank * 8;
         let p = (at / ZPAGE as u64) as u32;
-        if !good(p) {
+        if !good(p).ok() {
+            core::hint::cold_path();
             return Err(p);
         }
         let at = at as usize;
@@ -8911,7 +9683,7 @@ impl StrideBody {
         &self,
         file: &[u8],
         x: u64,
-        good: &mut dyn FnMut(u32) -> bool,
+        good: &mut dyn FnMut(u32) -> PageOk,
     ) -> std::result::Result<(u64, bool), u32> {
         let n = self.keys();
         let (Some(sp), base) = (self.trailer.sparse, self.trailer.codec.base()) else {
@@ -8940,7 +9712,7 @@ impl StrideBody {
         let len = STRIDE_SAMPLE.min(n - lo) as usize;
         let at = (self.layout.k_off() + lo * 8) as usize;
         let p = (at / ZPAGE) as u32;
-        if !good(p) {
+        if !good(p).ok() {
             return Err(p);
         }
         let run = file[at..at + len * 8].as_chunks::<8>().0;
@@ -8972,7 +9744,7 @@ impl StrideBody {
         &self,
         file: &[u8],
         key: &[u8],
-        good: &mut dyn FnMut(u32) -> bool,
+        good: &mut dyn FnMut(u32) -> PageOk,
     ) -> std::result::Result<Option<u64>, u32> {
         let c = &self.trailer.codec;
         let Some(x) = c.decode(key) else {
@@ -8996,7 +9768,7 @@ impl StrideBody {
         file: &[u8],
         rank: u64,
         buf: &'b mut [u8; STRIDE_KEY_MAX],
-        good: &mut dyn FnMut(u32) -> bool,
+        good: &mut dyn FnMut(u32) -> PageOk,
     ) -> std::result::Result<Option<&'b [u8]>, u32> {
         if rank >= self.keys() {
             return Ok(None);
@@ -9032,7 +9804,7 @@ impl StrideBody {
         next: u64,
         key: &mut [u8],
         direct: bool,
-        good: &mut dyn FnMut(u32) -> bool,
+        good: &mut dyn FnMut(u32) -> PageOk,
     ) -> std::result::Result<bool, u32> {
         if self.trailer.sparse.is_some() {
             let x = self.number_at(file, next, good)?;
@@ -9067,14 +9839,14 @@ impl StrideBody {
         &self,
         file: &'f [u8],
         rank: u64,
-        good: &mut dyn FnMut(u32) -> bool,
+        good: &mut dyn FnMut(u32) -> PageOk,
     ) -> StrideAt<'f> {
         if rank >= self.keys() {
             return StrideAt::Absent;
         }
         let (first, last) = self.span_pages(rank, 1);
         for p in first..=last {
-            if !good(p) {
+            if !good(p).ok() {
                 return StrideAt::Bad(p);
             }
         }
@@ -9101,7 +9873,7 @@ impl StrideBody {
         &self,
         file: &[u8],
         key: &[u8],
-        good: &mut dyn FnMut(u32) -> bool,
+        good: &mut dyn FnMut(u32) -> PageOk,
         f: &mut dyn FnMut(&[u8]),
     ) -> StrideRead {
         let rank = match self.rank_of(file, key, good) {
@@ -9426,6 +10198,8 @@ impl ZInject {
 /// that costs a syscall and no file. `None` off Linux and where the call
 /// fails. `RUSAGE_THREAD` is Linux's 1, named here because the libc
 /// crate this tree builds with does not name it for this target.
+// The door (tests/data/door.txt): getrusage (G3: Memory).
+#[allow(clippy::disallowed_methods)]
 pub(super) fn thread_major_faults() -> Option<u64> {
     #[cfg(target_os = "linux")]
     {
@@ -9549,9 +10323,43 @@ pub(super) fn sample(
     let facts = blob.z_source_facts().ok_or_else(|| {
         super::err("z sample: the segment has no checksum row to bind a form file to")
     })?;
-    let (recs, dir) = blob
-        .record_regions()
-        .ok_or_else(|| super::err("z sample: the segment's records are not resident"))?;
+    // The records where the reader holds them whole, and by the piece
+    // where its source lends so: a store under a cipher's, each record
+    // asked of the store's cache, under the caller's pin or hold.
+    match blob.records() {
+        Some(Records::Whole(recs, dir)) => sample_of(
+            &SegImages::new(recs, dir, blob.keys()),
+            blob,
+            &facts,
+            id,
+            end_seq,
+            floor,
+            shape,
+        ),
+        Some(Records::Pieces(recs, dir)) => {
+            let images = PieceImages {
+                recs,
+                dir,
+                nkeys: blob.keys(),
+            };
+            sample_of(&images, blob, &facts, id, end_seq, floor, shape)
+        }
+        None => Err(super::err(
+            "z sample: the segment's records are not resident",
+        )),
+    }
+}
+
+/// `sample` over the segment's records as `images` has them.
+fn sample_of<I: Images>(
+    images: &I,
+    blob: &Blob<MmapBytes>,
+    facts: &ZSource,
+    id: u64,
+    end_seq: u64,
+    floor: usize,
+    shape: FillShape,
+) -> Result<Sample> {
     let recs_len = usize::try_from(facts.recs_len).unwrap_or(usize::MAX);
     let mut s = Sample {
         nkeys: facts.nkeys,
@@ -9568,7 +10376,6 @@ pub(super) fn sample(
     }
     let nkeys = blob.keys();
     let bind = bind32(id, end_seq, facts.nkeys, facts.row_crc);
-    let images = SegImages::new(recs, dir, nkeys);
     let mut scratch = FillScratch::new();
     shape.apply(&mut scratch);
     let mut buf = GroupBuf::new();
@@ -9590,7 +10397,7 @@ pub(super) fn sample(
         // this rank.
         for step in 1..=SAMPLE_CHAIN {
             let c0 = super::thread_cpu_ns();
-            match fill_page(&images, rank, bind, &mut scratch, &mut page) {
+            match fill_page(images, rank, bind, &mut scratch, &mut page) {
                 Fill::Page(g) => {
                     if step < SAMPLE_CHAIN {
                         rank += g.count;
@@ -9688,7 +10495,7 @@ pub(super) fn file_facts(
     advise: bool,
     stride: &StrideAttach,
 ) -> Option<FileFacts> {
-    let map = MmapBytes::open(path).ok()?;
+    let map = super::vault::map_clear(path).ok()?;
     // The advice before the first read, as the attach's: under the kernel's
     // default the trailer's page pulls a readahead window in around it.
     if advise {
@@ -9703,7 +10510,7 @@ pub(super) fn file_facts(
         if *stride == StrideAttach::Refuse {
             return None;
         }
-        let (t, lay) = StrideBody::open(&map.0).ok()?;
+        let (t, lay) = StrideBody::open(map.lend_whole_map(lend_seal::Token::new())).ok()?;
         same_segment(&t.seg_ident(), &blob.z_source_facts()?, id, end_seq).ok()?;
         return Some(FileFacts {
             bytes: len,
@@ -9754,7 +10561,7 @@ pub(super) fn time_file_decodes(
     own_decode: bool,
     advise: bool,
 ) -> Option<DecodeTiming> {
-    let map = MmapBytes::open(path).ok()?;
+    let map = super::vault::map_clear(path).ok()?;
     if advise {
         map.advise_random();
     }
@@ -9825,6 +10632,8 @@ pub(super) fn time_file_decodes(
 /// `MemAvailable` less the margin (`Budget::within_available`), since
 /// neither a group's limit nor the machine's total sees the other processes
 /// beside the store. Off Linux there is no reading.
+// The door (tests/data/door.txt): /proc and cgroup reads (G3: Memory).
+#[allow(clippy::disallowed_methods)]
 #[cfg(target_os = "linux")]
 pub fn read_budget() -> Option<Budget> {
     budget_from(&|p: &Path| std::fs::read_to_string(p).ok())
@@ -9851,6 +10660,7 @@ fn budget_from(read: &dyn Fn(&Path) -> Option<String>) -> Option<Budget> {
                 return Some(
                     Budget::of(limit, st.rss.saturating_add(st.rss_huge), st.refaults)
                         .with_cache(st.cache)
+                        .with_shmem(st.shmem)
                         .within_available(available),
                 );
             }
@@ -9880,15 +10690,25 @@ fn budget_from(read: &dyn Fn(&Path) -> Option<String>) -> Option<Budget> {
                 return Some(
                     Budget::of(limit, st.anon, st.refaults)
                         .with_cache(st.file)
+                        .with_shmem(st.shmem)
                         .within_available(available),
                 );
             }
         }
     }
-    let anon = read(Path::new("/proc/self/status"))
-        .and_then(|t| parse_status_rss_anon(&t))
+    let status = read(Path::new("/proc/self/status"));
+    let anon = status
+        .as_deref()
+        .and_then(parse_status_rss_anon)
         .unwrap_or(0);
-    Some(Budget::of(total, anon, None).within_available(available))
+    let shmem = status
+        .as_deref()
+        .and_then(super::zselect::parse_status_rss_shmem);
+    Some(
+        Budget::of(total, anon, None)
+            .with_shmem(shmem)
+            .within_available(available),
+    )
 }
 
 #[cfg(not(target_os = "linux"))]
@@ -9896,10 +10716,84 @@ pub fn read_budget() -> Option<Budget> {
     None
 }
 
+/// How much more the process may hold in memory the kernel cannot take
+/// back, or, below nothing, how much of it has to go: the limit in effect
+/// less the process's anonymous memory and the margin, as `read_budget`
+/// has them, less the shared memory the platform is charging now -- memory
+/// files' pages, read from the platform and not from a count of what was
+/// put in them, since a count by the byte is under what the pages take and
+/// a file not yet counted is charged all the same; `held` stands in where
+/// the platform does not say -- held under what the machine has available,
+/// which has such memory out of it already, and less what the store's
+/// large buffers have mapped and not touched, which no reading of the
+/// process's memory sees until they are written (`blocks::mapped_bytes`
+/// less `blocks::mapped_resident_bytes`). `None` where the platform gives
+/// no reading.
+pub(crate) fn unreclaimable_slack(held: u64) -> Option<i64> {
+    let b = read_budget()?;
+    let coming =
+        super::blocks::mapped_bytes().saturating_sub(super::blocks::mapped_resident_bytes());
+    Some(slack_of(&b, held, coming as u64))
+}
+
+/// `unreclaimable_slack` over a reading: `coming` the bytes mapped and not
+/// yet touched.
+fn slack_of(b: &Budget, held: u64, coming: u64) -> i64 {
+    let signed = |v: u64| i64::try_from(v).unwrap_or(i64::MAX);
+    let by_limit = b
+        .limit
+        .saturating_sub(b.anon)
+        .saturating_sub(super::zselect::margin(b.limit));
+    (signed(by_limit) - signed(b.shmem.unwrap_or(held))).min(signed(b.budget)) - signed(coming)
+}
+
+/// The bytes of large buffers the store has mapped (`blocks::mapped_bytes`):
+/// what rises as the process is about to take memory, read where a load is
+/// all there is time for.
+pub(crate) fn buffers_mapped() -> u64 {
+    super::blocks::mapped_bytes() as u64
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A mapped segment's record region and directory, lent whole.
+    fn whole_records<B: Bytes>(blob: &Blob<B>) -> (&[u8], &[u8]) {
+        match blob.records() {
+            Some(Records::Whole(recs, dir)) => (recs, dir),
+            Some(Records::Pieces(..)) | None => panic!("the records lent whole"),
+        }
+    }
     use crate::db::zpages::ZCODING_RECORD;
+    use std::fs::OpenOptions;
+
+    /// What more the process may hold in memory the kernel cannot take
+    /// back: the limit less the process's own memory, the margin and the
+    /// shared memory the platform charges, below nothing where that much
+    /// has to go; `held` in the platform's place where it does not say;
+    /// under what the machine has available; and less what is mapped and
+    /// not yet touched.
+    #[test]
+    fn the_slack_for_memory_the_kernel_cannot_take_back() {
+        const MIB: u64 = 1 << 20;
+        let at = |shmem: Option<u64>| Budget::of(640 * MIB, 50 * MIB, None).with_shmem(shmem);
+        let mib = |v: i64| v / MIB as i64;
+        // 640 less 50 of the process, less the margin's 64: 526 for all
+        // of it, of which 400 is charged.
+        assert_eq!(mib(slack_of(&at(Some(400 * MIB)), 0, 0)), 126);
+        assert_eq!(mib(slack_of(&at(Some(400 * MIB)), 0, 20 * MIB)), 106);
+        // Charged past the room: that much has to go, whatever the stores
+        // count themselves holding.
+        assert_eq!(mib(slack_of(&at(Some(581 * MIB)), 514 * MIB, 0)), -55);
+        // The platform silent on what it charges: the stores' own count.
+        assert_eq!(mib(slack_of(&at(None), 514 * MIB, 0)), 12);
+        // A machine with less available than the limit leaves: that less.
+        let tight = at(Some(100 * MIB)).within_available(Some(94 * MIB));
+        assert_eq!(tight.budget, 30 * MIB);
+        assert_eq!(mib(slack_of(&tight, 0, 0)), 30);
+        assert_eq!(mib(slack_of(&tight, 0, 40 * MIB)), -10);
+    }
 
     /// A machine of 16 GiB with `available` free of it, the process in a
     /// v1 group limited to `v1` or a v2 group limited to `v2` where given,
@@ -11422,6 +12316,40 @@ mod tests {
         ]);
         assert!(!cur.fell_back(), "start {start} limit {limit}");
         (seen, marks, counts)
+    }
+
+    /// A walk hands over no record past the end the cursor holds for its
+    /// group, whatever the group's bytes go on to hold: the run of common
+    /// records is counted against the limit and the group's end both
+    /// (`walk_fixed`'s `left`). The end is the group's count, held under
+    /// its page's entry and the partition's keys, and a group's bytes hold
+    /// exactly its records, so no store's walk can tell the two bounds
+    /// from one. The test lowers the end by hand: a run bounded by the
+    /// limit alone hands over the group's next records, and the walk as
+    /// written moves on to the next group three records in.
+    #[test]
+    fn a_walk_hands_over_no_record_past_its_groups_end() {
+        let fx = Fixture::new("walk-end", suite(1200, 43), 256);
+        let mut zfile = fx.zfile();
+        zfile.own_decoder = true;
+        zfile.cursor_view = true;
+        let v = page_view(zfile.page_bytes(0).unwrap()).unwrap();
+        let c0 = usize::from(v.group(0).unwrap().count);
+        assert!(c0 > 5 && v.groups() > 1, "a first group of {c0} records");
+        let memo = ZMemo::new();
+        let mut cur = ZCursor::at(&memo, &zfile, &fx.blob, 0);
+        assert_eq!((cur.rank, cur.end), (0, c0), "opened whole");
+        cur.end = 3;
+        let mut keys: Vec<Vec<u8>> = Vec::new();
+        let (got, _) = cur
+            .walk_until(None, 5, &mut |k: &[u8], _: &[u8]| keys.push(k.to_vec()))
+            .unwrap();
+        assert_eq!(got, 5);
+        let want: Vec<Vec<u8>> = [0, 1, 2, c0, c0 + 1]
+            .iter()
+            .map(|&i| fx.recs[i].0.clone())
+            .collect();
+        assert_eq!(keys, want, "three of the first group, then the second's");
     }
 
     /// A walk's partial decode (`Options::zpages_walk_part`): a walk that
@@ -13468,7 +14396,7 @@ mod tests {
         let map = MmapBytes::open(&fx.seg).unwrap();
         let base = map.slice_at(0, 1).unwrap().as_ptr() as usize;
         let blob = Blob::open(map).unwrap();
-        let (_, dir) = blob.record_regions().unwrap();
+        let (_, dir) = whole_records(&blob);
         let dir_off = dir.as_ptr() as usize - base;
         drop(blob);
         // Two directory words swapped in a copy of the segment: ranks 40 and
@@ -13492,7 +14420,7 @@ mod tests {
     #[cfg(target_os = "linux")]
     fn evict(p: &Path) {
         use std::os::unix::io::AsRawFd;
-        let f = File::open(p).unwrap();
+        let f = std::fs::File::open(p).unwrap();
         f.sync_all().unwrap();
         // SAFETY: a hint on an open descriptor.
         let rc = unsafe { libc::posix_fadvise(f.as_raw_fd(), 0, 0, libc::POSIX_FADV_DONTNEED) };
@@ -13511,13 +14439,18 @@ mod tests {
     fn an_ask_ahead_brings_the_cold_pages_in() {
         let fx = Fixture::new("ahead", suite(3000, 9), 1 << 20);
         let page = crate::bytes::os_page_size();
+        let pages = |m: &MmapBytes| {
+            let len = m.len() as usize;
+            let all = len.div_ceil(page);
+            let share = m.resident_share(0, len).expect("the kernel says");
+            ((share * all as f64).round() as usize, all)
+        };
         let cold = |name: &str| {
             let p = fx.dir.join(name);
             std::fs::copy(&fx.seg, &p).unwrap();
             evict(&p);
             let m = MmapBytes::open(&p).unwrap();
-            let all = m.0.len().div_ceil(page);
-            let res = m.resident_pages(0, m.0.len());
+            let (res, all) = pages(&m);
             assert!(
                 res < all / 4,
                 "{name}: {res} of {all} resident after the eviction"
@@ -13525,23 +14458,68 @@ mod tests {
             (m, all)
         };
         let (asked, all) = cold("seg-asked");
-        ask_ahead(asked.0.as_ptr() as usize, 0, asked.0.len());
+        ask_ahead(&asked, 0, asked.len() as usize);
         let (left, _) = cold("seg-left");
         let t = std::time::Instant::now();
-        let mut res = asked.resident_pages(0, asked.0.len());
+        let mut res = pages(&asked).0;
         while res * 4 < all * 3 && t.elapsed() < std::time::Duration::from_secs(5) {
             std::thread::sleep(std::time::Duration::from_millis(10));
-            res = asked.resident_pages(0, asked.0.len());
+            res = pages(&asked).0;
         }
         assert!(
             res * 4 >= all * 3,
             "{res} of {all} pages resident after the ask"
         );
-        let untouched = left.resident_pages(0, left.0.len());
+        let untouched = pages(&left).0;
         assert!(
             untouched < all / 4,
             "{untouched} of {all} resident with nothing asked"
         );
+    }
+
+    /// The build's drop behind (`drop_behind`) takes the mapping's own
+    /// pages over the whole pages inside its window and none outside it:
+    /// a window from mid-page to mid-page over a file whose every page
+    /// the mapping holds leaves the pages before and after it mapped, by
+    /// the kernel's page table (`/proc/self/pagemap`'s present bit; the
+    /// page cache's count says nothing of a mapping). Not under qemu-user
+    /// (`supdb_emulated`), whose page table is not the program's.
+    #[cfg(all(target_os = "linux", not(supdb_emulated)))]
+    #[test]
+    fn a_drop_behind_unmaps_the_window_and_no_page_past_it() {
+        use std::io::{Read, Seek, SeekFrom};
+        let fx = Fixture::new("dropwin", suite(100, 9), 1 << 20);
+        let p = fx.dir.join("window");
+        let n = 64usize;
+        std::fs::write(&p, vec![7u8; n * ZPAGE]).unwrap();
+        let file = super::super::vault::open(&p).unwrap();
+        let map = MmapBytes::open(&p).unwrap();
+        let base = map.addr();
+        let mut pm = std::fs::File::open("/proc/self/pagemap").unwrap();
+        let mut mapped = || -> Vec<bool> {
+            (0..n)
+                .map(|i| {
+                    let at = (base + i * ZPAGE) / crate::bytes::os_page_size();
+                    pm.seek(SeekFrom::Start(at as u64 * 8)).unwrap();
+                    let mut w = [0u8; 8];
+                    pm.read_exact(&mut w).unwrap();
+                    u64::from_le_bytes(w) >> 63 == 1
+                })
+                .collect()
+        };
+        let touched: u64 = (0..n)
+            .map(|i| u64::from(map.slice_at((i * ZPAGE) as u64, 1).unwrap()[0]))
+            .sum();
+        std::hint::black_box(touched);
+        assert!(
+            mapped().iter().all(|&m| m),
+            "every page touched and mapped first"
+        );
+        // From mid-page 8 to mid-page 24: whole pages 9..24.
+        drop_behind(&map, &file, 8 * ZPAGE + 100, 24 * ZPAGE + 100);
+        let now = mapped();
+        let want: Vec<bool> = (0..n).map(|i| !(9..24).contains(&i)).collect();
+        assert_eq!(now, want, "mapped after a drop behind pages 9..24");
     }
 
     /// A form file evicted from the page cache and warmed: every page
@@ -13558,7 +14536,10 @@ mod tests {
         let page = crate::bytes::os_page_size();
         let pages = |p: &Path| {
             let m = MmapBytes::open(p).unwrap();
-            (m.resident_pages(0, m.0.len()), m.0.len().div_ceil(page))
+            let len = m.len() as usize;
+            let all = len.div_ceil(page);
+            let share = m.resident_share(0, len).expect("the kernel says");
+            ((share * all as f64).round() as usize, all)
         };
         evict(&fx.out);
         let (res, all) = pages(&fx.out);
@@ -13573,6 +14554,32 @@ mod tests {
         assert_eq!(res, all, "resident after the warm");
         let again = warm_file(&fx.out, None).unwrap();
         assert_eq!((again.bytes, again.skipped), (0, b.file_bytes), "{again:?}");
+        // Three quarters of the file read back, with no readahead past
+        // what is read: a chunk most of whose pages are in the cache is
+        // still warmed, its cold pages read and counted, and is whole after.
+        {
+            use std::io::Read;
+            use std::os::unix::io::AsRawFd;
+            evict(&fx.out);
+            let mut f = std::fs::File::open(&fx.out).unwrap();
+            // SAFETY: a hint on an open descriptor.
+            unsafe { libc::posix_fadvise(f.as_raw_fd(), 0, 0, libc::POSIX_FADV_RANDOM) };
+            let part = all * 3 / 4 * page;
+            let mut buf = vec![0u8; part];
+            f.read_exact(&mut buf).unwrap();
+            let (res, all) = pages(&fx.out);
+            assert!(
+                res * 2 > all && res < all,
+                "{res} of {all} resident after the partial read"
+            );
+            let w = warm_file(&fx.out, None).unwrap();
+            assert_eq!(
+                (w.bytes, w.skipped),
+                (b.file_bytes - (res * page) as u64, 0),
+                "a chunk {res} of {all} pages resident: {w:?}"
+            );
+            assert_eq!(pages(&fx.out).0, all, "resident after the warm");
+        }
         evict(&fx.out);
         let cancel = AtomicBool::new(true);
         let none = warm_file(&fx.out, Some(&cancel)).unwrap();
@@ -14294,7 +15301,7 @@ mod tests {
                     continue;
                 }
                 all += 1;
-                res += m.resident_pages(p * ZPAGE, ZPAGE);
+                res += usize::from(m.resident_share((p * ZPAGE) as u64, ZPAGE) == Some(1.0));
             }
             (res, all)
         };
@@ -14466,7 +15473,7 @@ mod tests {
         let map = MmapBytes::open(&fx.seg).unwrap();
         let base = map.slice_at(0, 1).unwrap().as_ptr() as usize;
         let blob = Blob::open(map).unwrap();
-        let (recs, dir) = blob.record_regions().unwrap();
+        let (recs, dir) = whole_records(&blob);
         let recs_at = recs.as_ptr() as usize - base;
         let (recs_end, dir_at) = (recs_at + recs.len(), dir.as_ptr() as usize - base);
         let dir_end = dir_at + dir.len();
@@ -14802,14 +15809,14 @@ mod tests {
     /// The precheck over a fixture's records, as a build makes it where
     /// its plan takes no run with gaps.
     fn precheck_of(fx: &Fixture) -> std::result::Result<StrideFacts, StrideNo> {
-        let (recs, dir) = fx.blob.record_regions().unwrap();
+        let (recs, dir) = whole_records(&fx.blob);
         stride_precheck(&SegImages::new(recs, dir, fx.blob.keys()), false)
     }
 
     /// The precheck as a build makes it where its plan takes one
     /// (`BuildPlan::stride_sparse`).
     fn precheck_sparse_of(fx: &Fixture) -> std::result::Result<StrideFacts, StrideNo> {
-        let (recs, dir) = fx.blob.record_regions().unwrap();
+        let (recs, dir) = whole_records(&fx.blob);
         stride_precheck(&SegImages::new(recs, dir, fx.blob.keys()), true)
     }
 
@@ -14880,7 +15887,7 @@ mod tests {
             Ok(())
         );
         assert_eq!(body.keys(), fx.recs.len() as u64);
-        let mut good = |p: u32| body.page_ok(&bytes, p);
+        let mut good = |p: u32| PageOk::from(body.page_ok(&bytes, p));
         let mut kbuf = [0u8; STRIDE_KEY_MAX];
         for (r, (key, vals, _)) in fx.recs.iter().enumerate() {
             let rank = r as u64;
@@ -15834,7 +16841,7 @@ mod tests {
         let map = MmapBytes::open(&fx.seg).unwrap();
         let base = map.slice_at(0, 1).unwrap().as_ptr() as usize;
         let blob = Blob::open(map).unwrap();
-        let (recs, dir) = blob.record_regions().unwrap();
+        let (recs, dir) = whole_records(&blob);
         let at = rd_u32(dir, 300 * 4).unwrap() as usize;
         let key = record_key(&recs[at..], 0).unwrap();
         assert_eq!(key, b"k000300");
@@ -15870,7 +16877,7 @@ mod tests {
         };
         let n = 400;
         let fx = full("stride-full", stride_recs(n, 100, 0x59));
-        let (recs, dir) = fx.blob.record_regions().unwrap();
+        let (recs, dir) = whole_records(&fx.blob);
         let images = SegImages::new(recs, dir, n);
         for r in 0..n {
             assert!(
@@ -15954,7 +16961,7 @@ mod tests {
                 w.finish(1).unwrap();
             },
         );
-        let (recs, dir) = fx.blob.record_regions().unwrap();
+        let (recs, dir) = whole_records(&fx.blob);
         let images = SegImages::new(recs, dir, n);
         let at = |r: usize| rd_u32(dir, r * 4).unwrap() as usize;
         let gaps = (0..n - 1)
@@ -15985,7 +16992,7 @@ mod tests {
         let map = MmapBytes::open(&fx.seg).unwrap();
         let base = map.slice_at(0, 1).unwrap().as_ptr() as usize;
         let blob = Blob::open(map).unwrap();
-        let (recs, dir) = blob.record_regions().unwrap();
+        let (recs, dir) = whole_records(&blob);
         let recs_at = recs.as_ptr() as usize - base;
         let (recs_end, dir_at) = (recs_at + recs.len(), dir.as_ptr() as usize - base);
         let dir_end = dir_at + dir.len();
@@ -16118,7 +17125,7 @@ mod tests {
         let map = MmapBytes::open(&fx.seg).unwrap();
         let base = map.slice_at(0, 1).unwrap().as_ptr() as usize;
         let blob = Blob::open(map).unwrap();
-        let (recs, dir) = blob.record_regions().unwrap();
+        let (recs, dir) = whole_records(&blob);
         let recs_at = recs.as_ptr() as usize - base;
         let past = recs_at + rd_u32(dir, (mid + 1) * 4).unwrap() as usize;
         let dir_at = dir.as_ptr() as usize - base;
@@ -16698,7 +17705,7 @@ mod tests {
         let mut touched = Vec::new();
         let mut good = |p: u32| {
             touched.push(p);
-            body.page_ok(&bytes, p)
+            PageOk::from(body.page_ok(&bytes, p))
         };
         // The last key of the first page of numbers, in the run before the
         // lie: found, on its own page.
@@ -16800,7 +17807,7 @@ mod tests {
         let first = (rank * w / ZPAGE as u64) as u32;
         for bad in [first, first + 1] {
             assert_eq!(
-                body.values_at(&bytes, rank, &mut |p| p != bad),
+                body.values_at(&bytes, rank, &mut |p| PageOk::from(p != bad)),
                 StrideAt::Bad(bad),
                 "page {bad} of rank {rank}'s two"
             );
@@ -17314,8 +18321,53 @@ mod tests {
 
     fn hold_a_page_mapped(tmp: &Path) {
         let map = MmapBytes::open(tmp).unwrap();
-        std::hint::black_box(map.0[ZPAGE]);
+        std::hint::black_box(map.slice_at(ZPAGE as u64, 1).unwrap()[0]);
         *HELD_MAPPING.lock().unwrap() = Some(map);
+    }
+
+    /// A neighbour's read of a stride file's pages after the build dropped
+    /// them: the first pages of the file under its temp name read through
+    /// the page cache, as a mapping's read-around in the data file of a
+    /// store kept in one reads the next file's (`reads_device`).
+    #[cfg(target_os = "linux")]
+    fn read_its_first_pages(tmp: &Path) {
+        use std::os::unix::fs::FileExt;
+        let mut buf = vec![0u8; 14 * ZPAGE];
+        std::fs::File::open(tmp)
+            .unwrap()
+            .read_exact_at(&mut buf, 0)
+            .unwrap();
+    }
+
+    /// Pages of a stride file that came back into the cache after the
+    /// build dropped it are the device's, and the build's read-back is of
+    /// the device all the same: the file is dropped again and found out of
+    /// the cache before the read-back begins, so the build leaves its word
+    /// (`Built::left_seal`). Without the second drop the build of a store
+    /// kept in one file lost the word wherever a neighbour's read-back read
+    /// around its own file's end. A page a mapping holds is no such page:
+    /// every drop skips it, and the build is checked as before, which
+    /// `a_stride_build_is_trusted_only_where_its_read_back_read_the_device`
+    /// holds with the second drop in place.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn pages_read_back_in_after_a_builds_drop_are_dropped_before_its_read_back() {
+        let fx = stride_fixture("stride-redrop", 3000, 100, 0x5e);
+        let _ = std::fs::remove_file(&fx.out);
+        let plan = BuildPlan {
+            drop_output: true,
+            beside: Some(read_its_first_pages as fn(&Path)),
+            ..stride_plan(StrideAsk::OrBlock)
+        };
+        let b = match build(&fx.seg, &fx.out, ID, END, &plan).unwrap() {
+            Outcome::Built(b) if b.coding == FileCoding::Stride => b,
+            other => panic!("not a stride file: {other:?}"),
+        };
+        assert!(b.file_bytes > 16 * ZPAGE as u64, "pages to read back in");
+        assert!(
+            b.stride_device && b.left_seal().is_some(),
+            "pages read back in after the drop left the build with no word"
+        );
     }
 
     /// A stride build is trusted -- at the attach that follows it and at a

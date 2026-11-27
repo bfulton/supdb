@@ -38,10 +38,37 @@ fn dir(name: &str) -> PathBuf {
 /// the window is built: the child stops in `pre_exec`, says so through one
 /// pipe and waits on another, and the store is closed and opened while it
 /// waits. To the kernel a child held there is a child that never execs.
+///
+/// Run in the clear and under a cipher (`Encryption::Cipher`): the lock is
+/// a file of the store's own directory either way (`vault::open_lock`),
+/// and a store under a cipher holds more of its directory open across a
+/// close -- its marker, its envelopes and their memory files -- for a
+/// child's copy to keep. The cipher's arm is Linux's alone, which has the
+/// memory files a store under a cipher keeps its plaintext in.
 #[test]
 fn a_store_closed_while_a_forked_child_holds_its_lock_opens_again() {
-    let d = dir("fork-window");
-    let mut db = Db::create(&d, common::options()).unwrap();
+    for cipher in [false, true] {
+        if cipher && !cfg!(target_os = "linux") {
+            continue;
+        }
+        closed_beside_a_forked_child(cipher);
+    }
+}
+
+fn opts(cipher: bool) -> supdb::Options {
+    let mut o = common::options();
+    if cipher {
+        o.encryption = supdb::Encryption::Cipher(supdb::StoreCipher::new(
+            common::Gcm::new(&[7; 32]),
+            common::Gcm::new,
+        ));
+    }
+    o
+}
+
+fn closed_beside_a_forked_child(cipher: bool) {
+    let d = dir(&format!("fork-window-{cipher}"));
+    let mut db = Db::create(&d, opts(cipher)).unwrap();
     db.append(b"k", b"v");
     db.commit().unwrap();
 
@@ -96,11 +123,11 @@ fn a_store_closed_while_a_forked_child_holds_its_lock_opens_again() {
     // The child is between its fork and its exec, with its copy of the
     // lock's descriptor open.
     db.close().unwrap();
-    let reopened = Db::open(&d, common::options());
+    let reopened = Db::open(&d, opts(cipher));
     let second = reopened
         .as_ref()
         .ok()
-        .map(|_| Db::open(&d, common::options()).err().map(|e| e.kind()));
+        .map(|_| Db::open(&d, opts(cipher)).err().map(|e| e.kind()));
 
     // The child let go whatever the opens said, so a failure leaves none.
     go_w.write_all(&[1]).unwrap();
@@ -109,9 +136,17 @@ fn a_store_closed_while_a_forked_child_holds_its_lock_opens_again() {
 
     let mut db = reopened.expect("the reopen of a store closed beside a forked child");
     assert_eq!(db.count(b"k").unwrap(), 1);
+    // A second open in this process is refused: by the lock in the clear,
+    // and under a cipher by the store's registry of its open vaults, which
+    // the open asks before it reaches the lock.
+    let refused = if cipher {
+        std::io::ErrorKind::AlreadyExists
+    } else {
+        std::io::ErrorKind::WouldBlock
+    };
     assert_eq!(
         second,
-        Some(Some(std::io::ErrorKind::WouldBlock)),
+        Some(Some(refused)),
         "a second open beside the reopened store, the child's stale copy still open"
     );
     db.append(b"k2", b"v");

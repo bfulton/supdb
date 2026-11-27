@@ -59,6 +59,7 @@ pub fn with_stride(mut o: supdb::Options) -> supdb::Options {
 pub fn options() -> supdb::Options {
     let o = supdb::Options {
         jobs_mapped: !jobs_heap_switch(),
+        one_file: one_file_switch(),
         ..supdb::Options::default()
     };
     if !stride_switch() {
@@ -69,6 +70,28 @@ pub fn options() -> supdb::Options {
         zpages_min_bytes: 0,
         ..o
     })
+}
+
+/// Whether the tests' stores are kept in one file (`Options::one_file`):
+/// `SUPDB_TEST_ONEFILE=1`, read once. The option is off in the engine, so
+/// a run of the tests under the switch is the one run that takes every
+/// seal, merge, form build and open of theirs through the store's data
+/// file. A test that is about the files a store of files keeps in its
+/// directory -- their names, their bytes, a link to one -- names that
+/// store (`files`).
+pub fn one_file_switch() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("SUPDB_TEST_ONEFILE").is_ok_and(|v| v == "1"))
+}
+
+/// `o` as a store of files, whatever the switch says: for a test of the
+/// directory's own files.
+#[allow(dead_code)]
+pub fn files(o: supdb::Options) -> supdb::Options {
+    supdb::Options {
+        one_file: false,
+        ..o
+    }
 }
 
 /// Whether the tests' stores take their jobs' large arrays from the
@@ -108,15 +131,91 @@ pub fn without_the_clock(bytes: &[u8]) -> Vec<u8> {
     out
 }
 
-/// The store's segment files by name, in name order.
-pub fn seg_names(d: &std::path::Path) -> Vec<String> {
+/// The names of a store's files, wherever it keeps them: the directory's
+/// own, and for a store in one file that is open there the names its
+/// data file holds (`Db::one_names`). A store in one file that is closed
+/// has only the directory's, which is its log, its slots and its runs: a
+/// test that reads a closed store's segments by name is a test of a
+/// store of files (`files`).
+pub fn store_names(d: &std::path::Path) -> Vec<String> {
     let mut v: Vec<String> = std::fs::read_dir(d)
         .unwrap()
         .flatten()
         .map(|e| e.file_name().to_string_lossy().into_owned())
-        .filter(|n| n.ends_with(".sup"))
         .collect();
+    v.extend(supdb::Db::one_names(d));
     v.sort();
+    v.dedup();
+    v
+}
+
+/// The bytes of a store's file at `p`: the directory's own, or for a
+/// store in one file that is open there, the file its data file keeps
+/// under that name (`Db::one_read`). For a test that reads a file a store
+/// wrote -- a form file's fence, a trailer -- and changes nothing of it.
+pub fn store_file(p: impl AsRef<std::path::Path>) -> Vec<u8> {
+    let p = p.as_ref();
+    match std::fs::read(p) {
+        Ok(b) => b,
+        Err(e) => {
+            let name = p.file_name().unwrap().to_string_lossy();
+            supdb::Db::one_read(p.parent().unwrap(), &name)
+                .unwrap_or_else(|| panic!("{}: {e}", p.display()))
+        }
+    }
+}
+
+/// Every file of the store at `d` as a path under it (`store_names`): the
+/// directory's own and, for a store in one file that is open there, each
+/// file its data file keeps, under the name the store has it by, which is
+/// no file of the directory's. A test that goes on to ask something of
+/// such a path asks it where the bytes lie (`store_place`, `store_len`,
+/// `store_file`, `cached_pages`); one that opens, removes or changes a
+/// file by its path is a test of a store of files (`files`), and fails on
+/// the path here where a listing of the directory would have found
+/// nothing and passed.
+#[allow(dead_code)]
+pub fn store_paths(d: impl AsRef<std::path::Path>) -> Vec<std::path::PathBuf> {
+    let d = d.as_ref();
+    store_names(d).into_iter().map(|n| d.join(n)).collect()
+}
+
+/// Where the bytes of a store's file at `p` lie: the file to open, and the
+/// offset and the length in it. A file of the directory's own is itself,
+/// from its start; a file of a store in one file that is open there is a
+/// range of the store's data file (`Db::one_place`).
+#[allow(dead_code)]
+pub fn store_place(p: impl AsRef<std::path::Path>) -> (std::path::PathBuf, u64, u64) {
+    let p = p.as_ref();
+    match std::fs::metadata(p) {
+        Ok(m) => (p.to_path_buf(), 0, m.len()),
+        Err(e) => {
+            let dir = p.parent().unwrap();
+            let name = p.file_name().unwrap().to_string_lossy();
+            let (at, len) =
+                supdb::Db::one_place(dir, &name).unwrap_or_else(|| panic!("{}: {e}", p.display()));
+            (dir.join("store.one"), at, len)
+        }
+    }
+}
+
+/// The length of a store's file at `p`, wherever it lies (`store_place`).
+#[allow(dead_code)]
+pub fn store_len(p: impl AsRef<std::path::Path>) -> u64 {
+    store_place(p).2
+}
+
+/// The store's segments by name, in name order (`store_names`).
+pub fn seg_names(d: &std::path::Path) -> Vec<String> {
+    let mut v = store_names(d);
+    v.retain(|n| n.ends_with(".sup"));
+    v
+}
+
+/// The store's ordered indexes by name, in name order (`store_names`).
+pub fn ord_names(d: &std::path::Path) -> Vec<String> {
+    let mut v = store_names(d);
+    v.retain(|n| n.starts_with("ord-"));
     v
 }
 
@@ -239,12 +338,77 @@ pub fn dead_arena(bytes: usize) -> Vec<u8> {
     .unwrap()
 }
 
-/// How many pages of `[off, off + len)` of the file at `path` the page cache
-/// holds: `mincore` over a mapping of the file's own that touches nothing.
+/// Whether each live mapping of this process whose path contains `needle` is
+/// advised `MADV_RANDOM`, as the kernel says it (`rr` in `VmFlags`): the
+/// mapping is the only thing that can be asked, and a store's own record of
+/// what it last asked of it is a claim the kernel does not have to share. A
+/// mapping of a file that was unlinked (`(deleted)`) is a retired segment's,
+/// held until the last reader that could have it leaves, and is nobody's to
+/// advise any more.
 #[cfg(target_os = "linux")]
-pub fn cached_pages(path: &std::path::Path, off: usize, len: usize) -> usize {
+pub fn mappings_advised_random(needle: &str) -> Vec<(String, bool)> {
+    let smaps = std::fs::read_to_string("/proc/self/smaps").unwrap();
+    let mut out = Vec::new();
+    let mut path: Option<String> = None;
+    for line in smaps.lines() {
+        let first = line.split_whitespace().next().unwrap_or("");
+        if let Some(flags) = line.strip_prefix("VmFlags:") {
+            if let Some(p) = path.take() {
+                out.push((p, flags.split_whitespace().any(|f| f == "rr")));
+            }
+        } else if first.contains('-') && first.bytes().all(|b| b.is_ascii_hexdigit() || b == b'-') {
+            // A mapping's first line: range, permissions, offset, device,
+            // inode and the path, if it has one.
+            let mut f = line.split_whitespace().skip(5);
+            let deleted = line.ends_with("(deleted)");
+            path = f
+                .next()
+                .filter(|p| p.contains(needle) && !deleted)
+                .map(str::to_string);
+        }
+    }
+    out
+}
+
+/// `mappings_advised_random` with each mapping's offset in its file: for a
+/// store kept in one file, whose every file is a mapping of a range of the
+/// data file and is told from the others by where it begins.
+#[cfg(target_os = "linux")]
+#[allow(dead_code)]
+pub fn mappings_at(needle: &str) -> Vec<(String, u64, bool)> {
+    let smaps = std::fs::read_to_string("/proc/self/smaps").unwrap();
+    let mut out = Vec::new();
+    let mut at: Option<(String, u64)> = None;
+    for line in smaps.lines() {
+        let first = line.split_whitespace().next().unwrap_or("");
+        if let Some(flags) = line.strip_prefix("VmFlags:") {
+            if let Some((p, off)) = at.take() {
+                out.push((p, off, flags.split_whitespace().any(|f| f == "rr")));
+            }
+        } else if first.contains('-') && first.bytes().all(|b| b.is_ascii_hexdigit() || b == b'-') {
+            let f: Vec<&str> = line.split_whitespace().collect();
+            let deleted = line.ends_with("(deleted)");
+            at = match (f.get(2), f.get(5)) {
+                (Some(off), Some(p)) if p.contains(needle) && !deleted => {
+                    Some((p.to_string(), u64::from_str_radix(off, 16).unwrap()))
+                }
+                _ => None,
+            };
+        }
+    }
+    out
+}
+
+/// How many pages of `[off, off + len)` of the store's file at `path` the
+/// page cache holds, wherever the file lies (`store_place`): `mincore` over
+/// a mapping of the file's own that touches nothing.
+#[cfg(target_os = "linux")]
+pub fn cached_pages(path: impl AsRef<std::path::Path>, off: usize, len: usize) -> usize {
     use std::os::unix::io::AsRawFd;
-    let f = std::fs::File::open(path).unwrap();
+    let path = path.as_ref();
+    let (file, at, _) = store_place(path);
+    let off = off + at as usize;
+    let f = std::fs::File::open(&file).unwrap();
     let size = f.metadata().unwrap().len() as usize;
     // SAFETY: a read-only shared mapping of the whole file, advised over a
     // range inside it, and unmapped before it returns; nothing reads it.
@@ -271,6 +435,105 @@ pub fn cached_pages(path: &std::path::Path, off: usize, len: usize) -> usize {
         assert_eq!(r, 0, "mincore: {err}");
         vec.iter().filter(|b| **b & 1 != 0).count()
     }
+}
+
+use ring::aead::{Aad, LessSafeKey, Nonce, Tag, UnboundKey, AES_256_GCM};
+
+/// AES-256-GCM, `ring`'s, as the hook takes it: the whole of what a caller
+/// writes.
+pub struct Gcm(LessSafeKey);
+
+impl Gcm {
+    pub fn new(key: &[u8; 32]) -> Gcm {
+        Gcm(LessSafeKey::new(
+            UnboundKey::new(&AES_256_GCM, key).expect("a 32-byte key"),
+        ))
+    }
+}
+
+impl supdb::crypt::Aead for Gcm {
+    fn encrypt(
+        &self,
+        nonce: &[u8; supdb::crypt::NONCE],
+        aad: &[u8],
+        buf: &mut [u8],
+    ) -> [u8; supdb::crypt::TAG] {
+        let nonce = Nonce::assume_unique_for_key(*nonce);
+        let tag = self
+            .0
+            .seal_in_place_separate_tag(nonce, Aad::from(aad), buf)
+            .expect("a chunk is far under the cipher's limit");
+        tag.as_ref().try_into().expect("a sixteen-byte tag")
+    }
+    fn decrypt(
+        &self,
+        nonce: &[u8; supdb::crypt::NONCE],
+        aad: &[u8],
+        buf: &mut [u8],
+        tag: &[u8; supdb::crypt::TAG],
+    ) -> bool {
+        let nonce = Nonce::assume_unique_for_key(*nonce);
+        self.0
+            .open_in_place_separate_tag(nonce, Aad::from(aad), Tag::from(*tag), buf, 0..)
+            .is_ok()
+    }
+}
+
+/// CRC32C (Castagnoli) resumed from `seed`, as the manifest's header
+/// carries it over its sequence and body, for a slot a test writes by hand.
+pub fn crc32c_from(seed: u32, data: &[u8]) -> u32 {
+    let mut crc = !seed;
+    for &b in data {
+        crc ^= u32::from(b);
+        for _ in 0..8 {
+            crc = if crc & 1 != 0 {
+                (crc >> 1) ^ 0x82F6_3B78
+            } else {
+                crc >> 1
+            };
+        }
+    }
+    !crc
+}
+
+/// A plain version-3 manifest's covered sequence and names as the
+/// version-2 manifest of `seq` a writer before the pending flags would have
+/// written: the 25-byte header (magic, sequence, body length, CRC over the
+/// sequence and the body), then the covered sequence, a count, and per name
+/// a u16 length and the bytes.
+pub fn manifest_v2_of(v3: &[u8], seq: u64) -> Vec<u8> {
+    assert_eq!(&v3[..9], b"SUPDBMAN\x03", "a plain version-3 manifest");
+    let body3 = &v3[25..];
+    let n = u32::from_le_bytes(body3[8..12].try_into().unwrap()) as usize;
+    let mut body = Vec::new();
+    body.extend_from_slice(&body3[..8]);
+    body.extend_from_slice(&(n as u32).to_le_bytes());
+    let mut p = 12;
+    for _ in 0..n {
+        let l = u16::from_le_bytes(body3[p..p + 2].try_into().unwrap()) as usize;
+        body.extend_from_slice(&body3[p..p + 2 + l]);
+        // The version-3 flag byte after the name has no version-2 place.
+        p += 2 + l + 1;
+    }
+    let crc = crc32c_from(crc32c_from(0, &seq.to_le_bytes()), &body);
+    let mut v2 = Vec::new();
+    v2.extend_from_slice(b"SUPDBMAN\x02");
+    v2.extend_from_slice(&seq.to_le_bytes());
+    v2.extend_from_slice(&(body.len() as u32).to_le_bytes());
+    v2.extend_from_slice(&crc.to_le_bytes());
+    v2.extend_from_slice(&body);
+    v2
+}
+
+/// Whether `name` in `d` is a run's temp file: `direct-*.tmp` with
+/// something in it. An empty one is the spare a store makes ahead of its
+/// next run (`Options::run_spare`), which the open removes and no run
+/// has written.
+#[allow(dead_code)]
+pub fn is_run_file(d: &std::path::Path, name: &str) -> bool {
+    name.starts_with("direct-")
+        && name.ends_with(".tmp")
+        && std::fs::metadata(d.join(name)).is_ok_and(|m| m.len() > 0)
 }
 
 /// A watchdog's exit: the message on the process's own stderr, past the

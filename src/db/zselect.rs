@@ -2638,6 +2638,11 @@ pub struct Budget {
     /// The file pages the group holds now, `None` where the platform does
     /// not say: what `slack` is read from.
     pub cache: Option<u64>,
+    /// The shared memory charged against the limit, `None` where the
+    /// platform does not say: memory files' pages, which the kernel cannot
+    /// take back and a count of what was put in them need not match
+    /// (`zfile::unreclaimable_slack`).
+    pub shmem: Option<u64>,
 }
 
 /// A twentieth of the limit, and sixty-four mebibytes at least: what the
@@ -2654,12 +2659,18 @@ impl Budget {
             refaults,
             budget: limit.saturating_sub(anon).saturating_sub(margin(limit)),
             cache: None,
+            shmem: None,
         }
     }
 
     /// The budget with the group's file pages read beside it.
     pub fn with_cache(self, cache: Option<u64>) -> Budget {
         Budget { cache, ..self }
+    }
+
+    /// The budget with the shared memory charged read beside it.
+    pub fn with_shmem(self, shmem: Option<u64>) -> Budget {
+        Budget { shmem, ..self }
     }
 
     /// The group's unused memory less the margin: its limit less its
@@ -2817,6 +2828,8 @@ pub struct StatV1 {
     pub refaults: Option<u64>,
     /// The page cache the group holds (`cache`), `None` where absent.
     pub cache: Option<u64>,
+    /// The shared memory in it (`shmem`), `None` where absent.
+    pub shmem: Option<u64>,
 }
 
 pub fn parse_stat_v1(text: &str) -> StatV1 {
@@ -2832,6 +2845,7 @@ pub fn parse_stat_v1(text: &str) -> StatV1 {
             "rss" => s.rss = v,
             "rss_huge" => s.rss_huge = v,
             "cache" => s.cache = Some(v),
+            "shmem" => s.shmem = Some(v),
             "workingset_refault_file" | "workingset_refault" => s.refaults = Some(v),
             _ => {}
         }
@@ -2847,6 +2861,8 @@ pub struct StatV2 {
     pub refaults: Option<u64>,
     /// The file-backed pages the group holds (`file`), `None` where absent.
     pub file: Option<u64>,
+    /// The shared memory among them (`shmem`), `None` where absent.
+    pub shmem: Option<u64>,
 }
 
 pub fn parse_stat_v2(text: &str) -> StatV2 {
@@ -2860,6 +2876,7 @@ pub fn parse_stat_v2(text: &str) -> StatV2 {
         match k {
             "anon" => s.anon = v,
             "file" => s.file = Some(v),
+            "shmem" => s.shmem = Some(v),
             "workingset_refault_file" | "workingset_refault" => s.refaults = Some(v),
             _ => {}
         }
@@ -2891,6 +2908,11 @@ pub fn parse_meminfo_available(text: &str) -> Option<u64> {
 /// `RssAnon` of `/proc/self/status`, bytes.
 pub fn parse_status_rss_anon(text: &str) -> Option<u64> {
     parse_kb(text, "RssAnon:")
+}
+
+/// `RssShmem` of `/proc/self/status`, bytes.
+pub fn parse_status_rss_shmem(text: &str) -> Option<u64> {
+    parse_kb(text, "RssShmem:")
 }
 
 fn parse_kb(text: &str, key: &str) -> Option<u64> {
@@ -3048,7 +3070,7 @@ mod tests {
             Some("/sys/fs/cgroup/unified")
         );
         assert_eq!(parse_mount("none /x tmpfs rw 0 0\n", "cgroup"), None);
-        let stat = "cache 1024\nrss 2048\nrss_huge 4096\nmapped_file 7\n\
+        let stat = "cache 1024\nrss 2048\nrss_huge 4096\nshmem 512\nmapped_file 7\n\
                     workingset_refault_file 99\nhierarchical_memory_limit 1073741824\n";
         assert_eq!(
             parse_stat_v1(stat),
@@ -3058,15 +3080,17 @@ mod tests {
                 rss_huge: 4096,
                 refaults: Some(99),
                 cache: Some(1024),
+                shmem: Some(512),
             }
         );
         assert_eq!(parse_stat_v1("rss 5\n").refaults, None);
         assert_eq!(
-            parse_stat_v2("anon 123\nfile 9\nworkingset_refault_file 4\n"),
+            parse_stat_v2("anon 123\nfile 9\nshmem 3\nworkingset_refault_file 4\n"),
             StatV2 {
                 anon: 123,
                 refaults: Some(4),
                 file: Some(9),
+                shmem: Some(3),
             }
         );
         assert_eq!(parse_limit("max\n"), None);

@@ -20,7 +20,7 @@
 use std::path::{Path, PathBuf};
 use supdb::bytes::{Bytes, MmapBytes, VecBytes};
 use supdb::SegmentWriter;
-use supdb::{Blob, SegmentOptions};
+use supdb::{Blob, BlobOptions, SegmentOptions};
 
 fn scratch(name: &str) -> PathBuf {
     let d = std::env::temp_dir().join(format!("supdb-blobtest-{name}"));
@@ -191,6 +191,937 @@ fn a_source_that_cannot_lend_answers_the_same() {
         "this source has nothing to lend, and the test is worthless if it does"
     );
     reads_what_was_written(&blob, &want);
+}
+
+/// The copies a `Piecewise` has lent, by offset and length.
+type Lent = std::collections::HashMap<(u64, usize), Box<[u64]>>;
+
+/// A source that lends by the piece (`Bytes::piecewise`), and lends exactly
+/// what it is asked for: each `slice_at` answers with a copy of the range in
+/// memory of its own, at the range's alignment in the file, with nothing of
+/// the file on either side of it. A reader that asked for less than it then
+/// read finds zeroes or the end of a slice, never the bytes that would have
+/// been there in a mapping, so a reader that agrees with the mapped one
+/// through this source has asked for every byte it read. It counts what it
+/// was asked for, since a reader that asked for its sections whole would
+/// agree as well. It checks nothing of what it lends unless it is made
+/// `checked`, where it answers `authenticated` as a paged mapping does.
+struct Piecewise {
+    bytes: Vec<u8>,
+    piece: u64,
+    checks: bool,
+    /// A byte no range that holds it is lent past (`Piecewise::refusing`),
+    /// as a source refuses a range it cannot read.
+    refuse: Option<u64>,
+    /// What has been lent, by the range asked for: a range asked for again
+    /// is lent from the copy made for it the first time, since every copy
+    /// stands for as long as the source does and a walk asks for the same
+    /// windows many times over.
+    lent: std::sync::Mutex<Lent>,
+    asked: std::sync::atomic::AtomicU64,
+    /// The longest range asked for in one `slice_at`.
+    longest: std::sync::atomic::AtomicU64,
+}
+
+impl Piecewise {
+    fn new(bytes: Vec<u8>, piece: u64) -> Piecewise {
+        Piecewise {
+            bytes,
+            piece,
+            checks: false,
+            refuse: None,
+            lent: std::sync::Mutex::new(std::collections::HashMap::new()),
+            asked: std::sync::atomic::AtomicU64::new(0),
+            longest: std::sync::atomic::AtomicU64::new(0),
+        }
+    }
+
+    /// One that says it has checked what it lends (`Bytes::authenticated`).
+    fn checked(bytes: Vec<u8>, piece: u64) -> Piecewise {
+        Piecewise {
+            checks: true,
+            ..Piecewise::new(bytes, piece)
+        }
+    }
+
+    /// One that checks nothing and lends no range that holds byte `at`.
+    fn refusing(bytes: Vec<u8>, piece: u64, at: u64) -> Piecewise {
+        Piecewise {
+            refuse: Some(at),
+            ..Piecewise::new(bytes, piece)
+        }
+    }
+
+    fn asked(&self) -> u64 {
+        self.asked.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    fn longest(&self) -> u64 {
+        self.longest.load(std::sync::atomic::Ordering::Relaxed)
+    }
+}
+
+impl Bytes for Piecewise {
+    fn len(&self) -> u64 {
+        self.bytes.len() as u64
+    }
+    fn read_at(&self, off: u64, dst: &mut [u8]) -> std::io::Result<()> {
+        Copying(self.bytes.clone()).read_at(off, dst)
+    }
+    fn slice_at(&self, off: u64, len: usize) -> Option<&[u8]> {
+        let end = off.checked_add(len as u64)?;
+        if end > self.len() || self.refuse.is_some_and(|r| off <= r && r < end) {
+            return None;
+        }
+        self.asked
+            .fetch_add(len as u64, std::sync::atomic::Ordering::Relaxed);
+        self.longest
+            .fetch_max(len as u64, std::sync::atomic::Ordering::Relaxed);
+        let phase = (off % 8) as usize;
+        let mut lent = self.lent.lock().unwrap();
+        let buf = lent.entry((off, len)).or_insert_with(|| {
+            let mut buf = vec![0u64; (phase + len).div_ceil(8) + 1].into_boxed_slice();
+            // SAFETY: `phase + len` bytes fit the buffer, and the source
+            // range is inside `bytes`.
+            unsafe {
+                std::ptr::copy_nonoverlapping(
+                    self.bytes.as_ptr().add(off as usize),
+                    buf.as_mut_ptr().cast::<u8>().add(phase),
+                    len,
+                );
+            }
+            buf
+        });
+        // SAFETY: the buffer is kept in `lent` for this source's life,
+        // boxed, so it does not move when the map grows, and it is never
+        // written again: the slice lent from it stands as long as `self`.
+        Some(unsafe { std::slice::from_raw_parts(buf.as_ptr().cast::<u8>().add(phase), len) })
+    }
+    fn piecewise(&self) -> bool {
+        true
+    }
+    fn authenticated(&self) -> bool {
+        self.checks
+    }
+    fn piece_end(&self, off: u64) -> u64 {
+        ((off / self.piece + 1) * self.piece).min(self.len())
+    }
+}
+
+/// Every answer of one reader held to another's, rank by rank and key by
+/// key: the keys, the extents, the seeks, the scans and the counts.
+fn agree<A: Bytes, B: Bytes>(a: &Blob<A>, b: &Blob<B>) {
+    assert_eq!(a.keys(), b.keys());
+    assert_eq!(a.blocks(), b.blocks());
+    assert_eq!(a.index_bytes(), b.index_bytes());
+    assert_eq!(a.version(), b.version());
+    assert_eq!(a.payload_bytes(), b.payload_bytes());
+    for rank in 0..a.keys() + 2 {
+        assert_eq!(a.key_at(rank), b.key_at(rank), "key at {rank}");
+        let (x, y) = (a.exts_at_full(rank), b.exts_at_full(rank));
+        assert_eq!(x.is_some(), y.is_some(), "record at {rank}");
+        if let (Some((ka, ea, ta)), Some((kb, eb, tb))) = (x, y) {
+            assert_eq!(ka, kb);
+            assert_eq!(ea.iter().collect::<Vec<_>>(), eb.iter().collect::<Vec<_>>());
+            assert_eq!(ta, tb, "inline tail at {rank}");
+        }
+        let (mut va, mut vb) = (Vec::new(), Vec::new());
+        let na = a.values_at(rank, |v| va.push(v.to_vec())).unwrap();
+        let nb = b.values_at(rank, |v| vb.push(v.to_vec())).unwrap();
+        assert_eq!((na, va), (nb, vb), "values at {rank}");
+    }
+    let mut probes: Vec<Vec<u8>> = (0..a.keys())
+        .step_by(7)
+        .filter_map(|r| a.key_at(r).map(<[u8]>::to_vec))
+        .collect();
+    probes.push(Vec::new());
+    probes.push(b"term=".to_vec());
+    probes.push(b"term=00000003x".to_vec());
+    probes.push(b"zzzz".to_vec());
+    for key in &probes {
+        assert_eq!(a.seek(key), b.seek(key), "seek");
+        assert_eq!(
+            a.lookup(key).map(|e| e.iter().copied().collect::<Vec<_>>()),
+            b.lookup(key).map(|e| e.iter().copied().collect::<Vec<_>>()),
+            "lookup"
+        );
+        for limit in [0, 1, 5, 64, usize::MAX] {
+            let (mut sa, mut sb) = (Vec::new(), Vec::new());
+            let na = a
+                .scan(key, limit, |k, v| sa.push((k.to_vec(), v.to_vec())))
+                .unwrap();
+            let nb = b
+                .scan(key, limit, |k, v| sb.push((k.to_vec(), v.to_vec())))
+                .unwrap();
+            assert_eq!((na, sa), (nb, sb), "scan of {limit}");
+            let (mut ca, mut cb) = (Vec::new(), Vec::new());
+            a.scan_counts(key, limit, |k, n| {
+                ca.push((k.to_vec(), n));
+                true
+            })
+            .unwrap();
+            b.scan_counts(key, limit, |k, n| {
+                cb.push((k.to_vec(), n));
+                true
+            })
+            .unwrap();
+            assert_eq!(ca, cb, "counts over {limit}");
+            let (mut fa, mut fb) = (Vec::new(), Vec::new());
+            a.scan_counts_fixed(key, limit, 4, |k, n| {
+                fa.push((k.to_vec(), n));
+                true
+            })
+            .unwrap();
+            b.scan_counts_fixed(key, limit, 4, |k, n| {
+                fb.push((k.to_vec(), n));
+                true
+            })
+            .unwrap();
+            assert_eq!(fa, fb, "fixed counts over {limit}");
+        }
+    }
+}
+
+/// A source that lends by the piece answers as the mapping does, having
+/// been asked for every byte it was read by -- and for little: a reader
+/// that borrowed its key section whole at each lookup would agree on every
+/// answer and ask for the section a lookup. The shapes are the ones a
+/// record takes (full and compact, values inline, in plain blocks and in
+/// compressed ones), and the pieces are small enough that a record crosses
+/// one in most of them and large enough in the last that none does.
+#[test]
+fn a_source_that_lends_by_the_piece_answers_the_same() {
+    for (name, compress, compact) in [
+        ("plain", false, false),
+        ("compact", false, true),
+        ("compressed", true, false),
+    ] {
+        let path = scratch(&format!("piecewise-{name}"));
+        let want = build_opts(&path, 600, compress, 256, compact);
+        let raw = std::fs::read(&path).unwrap();
+        let mapped = Blob::open(MmapBytes::open(&path).unwrap()).expect("blob open");
+        for piece in [24, 64, 4080, 1 << 16] {
+            // A source that has checked what it lends, as a paged mapping
+            // has: one that has not has its row verified at the open,
+            // which asks for the section a piece at a time
+            // (`a_source_by_the_piece_that_checks_nothing_has_its_row_verified_at_open`).
+            let blob =
+                Blob::open(Piecewise::checked(raw.clone(), piece)).expect("open by the piece");
+            assert!(blob.zero_copy(), "{name}: a piece lent is not a copy");
+            let at_open = blob_source(&blob).asked();
+            assert!(
+                at_open < 4096,
+                "{name}, pieces of {piece}: an open asked for {at_open} bytes of a section of {}",
+                blob.index_bytes()
+            );
+            reads_what_was_written(&blob, &want);
+            agree(&mapped, &blob);
+        }
+        // What a point read asks for: a slot or two, and the record's
+        // window, which is the piece the record lies in.
+        let blob = Blob::open(Piecewise::new(raw.clone(), 256)).expect("open by the piece");
+        let before = blob_source(&blob).asked();
+        let reads = 50;
+        for (key, _) in want.iter().step_by(want.len() / reads).take(reads) {
+            assert!(blob.lookup(key).is_some());
+        }
+        let per = (blob_source(&blob).asked() - before) / reads as u64;
+        assert!(
+            per < 1024,
+            "{name}: a lookup asked for {per} bytes of a section of {}",
+            blob.index_bytes()
+        );
+    }
+}
+
+/// The source a reader was opened over.
+fn blob_source<B: Bytes>(blob: &Blob<B>) -> &B {
+    blob.source()
+}
+
+/// A key section's checksum row is the one check of its records a reader
+/// makes, and the open is where a reader that holds the section whole makes
+/// it. A source that lends by the piece is not asked for its section whole
+/// at the open, which is what its kind is for; where it has checked what it
+/// lends itself (`Bytes::authenticated`, a paged mapping's tag over every
+/// chunk) the row is skipped, and where it has not the row is verified
+/// there all the same, a piece an ask: a flipped byte of the records with
+/// the block checksums whole fails that open, as it fails a mapped file's,
+/// and opens over a source that says it checked it.
+#[test]
+fn a_source_by_the_piece_that_checks_nothing_has_its_row_verified_at_open() {
+    let path = scratch("piecewise-unchecked-row");
+    build_opts(&path, 3000, false, 256, false);
+    let clean = std::fs::read(&path).unwrap();
+    let mapped = MmapBytes::open(&path).unwrap();
+    assert!(!mapped.authenticated(), "a mapped file checks nothing");
+    let empty = path.with_file_name("empty");
+    std::fs::write(&empty, b"").unwrap();
+    assert!(
+        !MmapBytes::open(&empty).unwrap().authenticated(),
+        "an empty mapped file checks nothing either"
+    );
+    assert!(!VecBytes(Vec::new()).authenticated());
+    assert!(!Piecewise::new(Vec::new(), 64).authenticated());
+    assert!(Advised::new(Piecewise::checked(Vec::new(), 64)).authenticated());
+    let (key_off, key_len) = {
+        let b = Blob::open(mapped).expect("blob open");
+        assert!(b.index_checksummed(), "a segment's index carries a row");
+        (b.index_offset() as usize, b.index_bytes())
+    };
+    let piece = 1usize << supdb::flatindex::PIECE_SHIFT;
+    assert!(
+        key_len > 4 * piece,
+        "the fixture's key section spans several pieces: {key_len}"
+    );
+    // The pieces are cut at the file's offsets, not the section's: a
+    // section that began on a piece would read the same either way.
+    assert_ne!(
+        key_off % piece,
+        0,
+        "the key section starts off a piece boundary"
+    );
+    let crc_off = supdb::flatindex::Header::parse(&clean[key_off..key_off + key_len])
+        .expect("the section's header")
+        .crc_off;
+    assert!(crc_off > 0 && crc_off < key_len);
+    let off_verify = BlobOptions {
+        verify_index: false,
+        ..BlobOptions::default()
+    };
+    let mut tried = 0;
+    for i in 1..13 {
+        let at = key_off + i * key_len / 13;
+        let mut bytes = clean.clone();
+        bytes[at] ^= 0x40;
+        tried += 1;
+        let whole = refusal(Blob::open(VecBytes(bytes.clone())));
+        assert!(
+            whole.is_some(),
+            "a flip at section offset {} opened whole",
+            at - key_off
+        );
+        assert_eq!(
+            refusal(Blob::open(Piecewise::new(bytes.clone(), 4080))),
+            whole,
+            "a flip at section offset {} opened over a source by the piece that checks nothing, \
+             or was refused for another piece",
+            at - key_off
+        );
+        assert!(
+            Blob::open(Piecewise::checked(bytes.clone(), 4080)).is_ok(),
+            "a flip at section offset {} was checked over a source that checked it",
+            at - key_off
+        );
+        // A wrapper says what the source it wraps says.
+        assert!(
+            Blob::open(Advised::new(Piecewise::checked(bytes.clone(), 4080))).is_ok(),
+            "a flip at section offset {} was checked through a wrapper of a source that checked it",
+            at - key_off
+        );
+        // With the row's verification off, nothing checks it.
+        assert!(
+            Blob::open_with(VecBytes(bytes.clone()), off_verify).is_ok()
+                && Blob::open_with(Piecewise::new(bytes, 4080), off_verify).is_ok(),
+            "a flip at section offset {} was checked with the row's verification off",
+            at - key_off
+        );
+    }
+    assert_eq!(tried, 12);
+    // Every piece's compare is reached, the first and the last above all:
+    // a byte of each, its last, flipped, the whole reader's refusal naming
+    // that piece and the reader by the piece's the same. The first piece is
+    // short, the section not starting on a piece, and its last byte lies
+    // past the header, so the refusal is the row's; the last piece's last
+    // byte is the one before the row.
+    let shift = supdb::flatindex::Header::parse(&clean[key_off..key_off + key_len])
+        .expect("the section's header")
+        .piece_shift;
+    let cut: Vec<(usize, usize)> =
+        supdb::flatindex::pieces(crc_off, shift, key_off as u64).collect();
+    assert!(cut.len() > 4, "the fixture spans several pieces");
+    assert!(
+        cut[0].1 < piece && cut[0].1 > supdb::flatindex::HEADER_BYTES,
+        "the first piece is short and holds bytes past the header: {:?}",
+        cut[0]
+    );
+    assert_eq!(
+        cut[cut.len() - 1].1,
+        crc_off,
+        "the last piece ends at the row"
+    );
+    for (p, &(_, end)) in cut.iter().enumerate() {
+        let mut bytes = clean.clone();
+        bytes[key_off + end - 1] ^= 0x40;
+        let whole = refusal(Blob::open(VecBytes(bytes.clone())));
+        assert!(
+            whole
+                .as_deref()
+                .is_some_and(|m| m.ends_with(&format!("mismatch in piece {p}"))),
+            "a flip at the end of piece {p} is refused by the whole reader for it: {whole:?}"
+        );
+        assert_eq!(
+            refusal(Blob::open(Piecewise::new(bytes, 4080))),
+            whole,
+            "a flip at the end of piece {p} of {} opened over a source by the piece \
+             that checks nothing, or was refused for another piece",
+            cut.len()
+        );
+    }
+    // A piece or the row the source will not lend fails the open, and is
+    // not asked for at an open that verifies nothing.
+    // The piece a byte of the section lies in, cut at the file's offsets.
+    let first = piece - key_off % piece;
+    let piece_of = |x: usize| {
+        if x < first {
+            0
+        } else {
+            1 + (x - first) / piece
+        }
+    };
+    for (what, at, names) in [
+        (
+            "a piece of the records",
+            key_off + key_len / 2,
+            Some(piece_of(key_len / 2)),
+        ),
+        ("the row", key_off + crc_off + 1, None),
+    ] {
+        let said = refusal(Blob::open(Piecewise::refusing(
+            clean.clone(),
+            4080,
+            at as u64,
+        )));
+        assert!(said.is_some(), "{what} not lent opened");
+        if let Some(p) = names {
+            assert!(
+                said.as_deref()
+                    .is_some_and(|m| m.ends_with(&format!("piece {p}"))),
+                "{what} not lent: {said:?}, not piece {p}"
+            );
+        }
+        assert!(
+            Blob::open_with(
+                Piecewise::refusing(clean.clone(), 4080, at as u64),
+                off_verify
+            )
+            .is_ok(),
+            "{what}: the refusal is the verification's"
+        );
+    }
+    // The clean file opens over both, and the one that checks nothing is
+    // asked for every byte of its section, no more than a piece an ask.
+    let unchecked = Blob::open(Piecewise::new(clean.clone(), 4080)).expect("clean open");
+    let (asked, longest) = (
+        blob_source(&unchecked).asked(),
+        blob_source(&unchecked).longest(),
+    );
+    assert!(
+        asked as usize >= key_len - 4 * key_len.div_ceil(piece) && longest as usize <= piece,
+        "the row's verification asked for {asked} bytes of a section of {key_len}, \
+         {longest} at most in one ask"
+    );
+    let checked = Blob::open(Piecewise::checked(clean.clone(), 4080)).expect("clean open");
+    assert!(blob_source(&checked).asked() < 4096);
+    let _ = std::fs::remove_dir_all(path.parent().unwrap());
+}
+
+/// What an open's refusal said, or `None` where it opened.
+fn refusal<B: Bytes, E: std::fmt::Display>(open: Result<Blob<B>, E>) -> Option<String> {
+    open.err().map(|e| e.to_string())
+}
+
+/// The row's word is held whole: a change to a piece whose CRC32C differs
+/// from the row's word in its top byte alone is refused over a source by
+/// the piece that checks nothing, as over a whole one. A flip of one byte
+/// changes every byte of the CRC but by a chance of one in sixteen
+/// million, so the flips of the test above cannot tell a compare of three
+/// bytes from one of four; this change is forged for it, from the CRC's
+/// linearity: a set of bits of one piece whose deltas cancel in the low
+/// three bytes.
+#[test]
+fn a_piece_whose_crc_moves_in_its_top_byte_alone_is_refused_by_the_piece() {
+    let path = scratch("piecewise-top-byte");
+    build_opts(&path, 3000, false, 256, false);
+    let clean = std::fs::read(&path).unwrap();
+    let (key_off, key_len) = {
+        let b = Blob::open(MmapBytes::open(&path).unwrap()).expect("blob open");
+        (b.index_offset() as usize, b.index_bytes())
+    };
+    let hdr = supdb::flatindex::Header::parse(&clean[key_off..key_off + key_len])
+        .expect("the section's header");
+    let pieces: Vec<(usize, usize)> =
+        supdb::flatindex::pieces(hdr.crc_off, hdr.piece_shift, key_off as u64).collect();
+    assert!(pieces.len() > 4, "the fixture spans several pieces");
+    let (a, b) = pieces[pieces.len() / 2];
+    // The CRC's change for one bit flipped at byte `p` of the piece, `bit`
+    // of it: the register's linear part from that byte to the piece's end.
+    let len = b - a;
+    let delta = |p: usize, bit: u32| {
+        let mut c = 1u32 << bit;
+        for _ in 0..8 * (len - p) {
+            c = if c & 1 != 0 {
+                (c >> 1) ^ 0x82F6_3B78
+            } else {
+                c >> 1
+            };
+        }
+        c
+    };
+    // Gaussian elimination over the low 24 bits of the last eight bytes'
+    // sixty-four bits: the first combination that cancels there and not
+    // in the top byte.
+    let mut basis: Vec<(u32, u64)> = Vec::new();
+    let mut found = None;
+    for j in 0..64u32 {
+        let (p, bit) = (len - 8 + (j / 8) as usize, j % 8);
+        let d = delta(p, bit);
+        let (mut low, mut mask) = (d & 0xFF_FFFF, 1u64 << j);
+        for &(bl, bm) in &basis {
+            if low ^ bl < low {
+                low ^= bl;
+                mask ^= bm;
+            }
+        }
+        if low == 0 {
+            let full = (0..64)
+                .filter(|k| mask >> k & 1 != 0)
+                .fold(0, |x, k| x ^ delta(len - 8 + (k / 8) as usize, k % 8));
+            if full >> 24 != 0 {
+                found = Some(mask);
+                break;
+            }
+            continue;
+        }
+        basis.push((low, mask));
+        basis.sort_by_key(|x| std::cmp::Reverse(x.0));
+    }
+    let mask = found.expect("a combination of bits that cancels in the low three bytes");
+    let mut bytes = clean.clone();
+    for k in (0..64).filter(|k| mask >> k & 1 != 0) {
+        bytes[key_off + a + len - 8 + (k / 8) as usize] ^= 1 << (k % 8);
+    }
+    let crc = |s: &[u8]| {
+        let mut c = !0u32;
+        for &x in s {
+            c ^= u32::from(x);
+            for _ in 0..8 {
+                c = if c & 1 != 0 {
+                    (c >> 1) ^ 0x82F6_3B78
+                } else {
+                    c >> 1
+                };
+            }
+        }
+        !c
+    };
+    let moved = crc(&clean[key_off + a..key_off + b]) ^ crc(&bytes[key_off + a..key_off + b]);
+    assert!(
+        moved & 0xFF_FFFF == 0 && moved != 0,
+        "the forged change moves the piece's CRC in its top byte alone: {moved:#010x}"
+    );
+    let whole = refusal(Blob::open(VecBytes(bytes.clone())));
+    assert!(
+        whole
+            .as_deref()
+            .is_some_and(|m| m.ends_with(&format!("piece {}", pieces.len() / 2))),
+        "the whole reader refuses the forged piece: {whole:?}"
+    );
+    assert_eq!(
+        refusal(Blob::open(Piecewise::new(bytes, 4080))),
+        whole,
+        "the forged piece opened over a source by the piece that checks nothing"
+    );
+    let _ = std::fs::remove_dir_all(path.parent().unwrap());
+}
+
+/// An advice a reader gave its source, by its kind and its range.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Advice {
+    Willneed(u64, usize),
+    Dontneed(u64, usize),
+}
+
+/// A source that answers as the one it wraps and records every advice it
+/// is given (`advise_willneed`, `advise_dontneed_range`), so that two
+/// readers over the same bytes, one that lends whole and one by the piece,
+/// can be held to asking for the same ranges. It says the bytes of one
+/// range are resident (`resident_at`, `resident_share`), none by default,
+/// so that an ask is held to being skipped over resident pages and only
+/// there.
+struct Advised<B> {
+    inner: B,
+    said: std::sync::Mutex<Vec<Advice>>,
+    resident: std::sync::Mutex<(u64, u64)>,
+}
+
+impl<B> Advised<B> {
+    fn new(inner: B) -> Advised<B> {
+        Advised {
+            inner,
+            said: std::sync::Mutex::new(Vec::new()),
+            resident: std::sync::Mutex::new((0, 0)),
+        }
+    }
+
+    /// The bytes `a..b` said to be resident from now on.
+    fn resident(&self, a: u64, b: u64) {
+        *self.resident.lock().unwrap() = (a, b);
+    }
+
+    fn take(&self) -> Vec<Advice> {
+        std::mem::take(&mut *self.said.lock().unwrap())
+    }
+}
+
+impl<B: Bytes> Bytes for Advised<B> {
+    fn len(&self) -> u64 {
+        self.inner.len()
+    }
+    fn read_at(&self, off: u64, dst: &mut [u8]) -> std::io::Result<()> {
+        self.inner.read_at(off, dst)
+    }
+    fn slice_at(&self, off: u64, len: usize) -> Option<&[u8]> {
+        self.inner.slice_at(off, len)
+    }
+    fn piecewise(&self) -> bool {
+        self.inner.piecewise()
+    }
+    fn authenticated(&self) -> bool {
+        self.inner.authenticated()
+    }
+    fn piece_end(&self, off: u64) -> u64 {
+        self.inner.piece_end(off)
+    }
+    fn advise_willneed(&self, off: u64, len: usize) -> usize {
+        self.said.lock().unwrap().push(Advice::Willneed(off, len));
+        len
+    }
+    fn advise_dontneed_range(&self, off: u64, len: usize) {
+        self.said.lock().unwrap().push(Advice::Dontneed(off, len));
+    }
+    fn resident_at(&self, off: u64) -> Option<bool> {
+        let (a, b) = *self.resident.lock().unwrap();
+        (a <= off && off < b).then_some(true)
+    }
+    fn resident_share(&self, off: u64, len: usize) -> Option<f64> {
+        let (a, b) = *self.resident.lock().unwrap();
+        (a <= off && off.saturating_add(len as u64) <= b).then_some(1.0)
+    }
+}
+
+/// What a reader answers and advises for the ranks of a segment: every
+/// record's offset, the record region's place, and the asks and drops of
+/// a fixed set of calls, each with the advice it gave.
+type AdviceTrace = (
+    Vec<Option<u64>>,
+    Option<(u64, usize)>,
+    Vec<(usize, Vec<Advice>)>,
+);
+
+fn advice_trace<B: Bytes>(blob: &Blob<Advised<B>>) -> AdviceTrace {
+    let keys = blob.keys();
+    let offsets: Vec<Option<u64>> = (0..keys + 2).map(|r| blob.record_offset(r)).collect();
+    let place = blob.record_region_place();
+    let src = blob_source(blob);
+    let _ = src.take();
+    let mut calls = Vec::new();
+    for (rank, n, cap) in [
+        (0, keys, usize::MAX),
+        (0, 1, usize::MAX),
+        (keys / 2, 10, 64),
+        (keys / 3, 40, 1 << 20),
+        (keys - 1, 5, 1 << 20),
+        (keys, 3, 1 << 20),
+        (keys / 2, 4, 0),
+    ] {
+        let got = blob.willneed_ranks(rank, n, cap);
+        calls.push((got, src.take()));
+    }
+    for (rank, n) in [(0, keys), (0, 0), (keys / 3, 20), (keys - 1, 9), (keys, 1)] {
+        let got = blob.willneed_dir(rank, n);
+        calls.push((got, src.take()));
+    }
+    if let (Some(a), Some(b)) = (offsets[1], offsets[keys / 2]) {
+        blob.drop_records(a, b);
+    }
+    calls.push((0, src.take()));
+    (offsets, place, calls)
+}
+
+/// The advice a reader asks of its source for a span of ranks or of
+/// directory words, and the file offset of a record, answer the same for
+/// a source that lends by the piece as for one that lends whole, and the
+/// same offsets as the file itself says: the record's key at its offset,
+/// and the directory word the ask for a rank's word starts at naming that
+/// record. A reader by the piece once answered nothing to all of them, so
+/// that every ask ahead and every drop behind of a store under a cipher
+/// was a call that did nothing.
+#[test]
+fn the_advice_by_rank_answers_the_same_for_a_source_by_the_piece() {
+    for (name, compact) in [("plain", false), ("compact", true)] {
+        let path = scratch(&format!("advice-{name}"));
+        let want = build_opts(&path, 600, false, 256, compact);
+        let raw = std::fs::read(&path).unwrap();
+        let keys = want.len();
+        let mapped = Blob::open(MmapBytes::open(&path).unwrap()).expect("blob open");
+        let whole = Blob::open(Advised::new(VecBytes(raw.clone()))).expect("open whole");
+        assert!(!blob_source(&whole).piecewise() && whole.zero_copy());
+        let whole_trace = advice_trace(&whole);
+        // A reader that copied its section at the open answers as the one
+        // that lends it.
+        let copied = Blob::open(Advised::new(Copying(raw.clone()))).expect("open copying");
+        assert!(!blob_source(&copied).piecewise() && !copied.zero_copy());
+        let copied_trace = advice_trace(&copied);
+        holds_to_the_file(
+            &format!("{name}, copied"),
+            &copied,
+            &copied_trace,
+            &raw,
+            &want,
+            &mapped,
+        );
+        assert_eq!(copied_trace, whole_trace, "{name}: the copying reader");
+        for piece in [24, 64, 4080] {
+            let blob = Blob::open(Advised::new(Piecewise::new(raw.clone(), piece)))
+                .expect("open by the piece");
+            assert!(blob_source(&blob).piecewise());
+            let before = blob_source(&blob).inner.asked();
+            let trace = advice_trace(&blob);
+            let asked = blob_source(&blob).inner.asked() - before;
+            let (offsets, place, calls) = &trace;
+            // What the calls read they asked the source for by the piece:
+            // a few words of the directory and the header a call, never the
+            // key section whole, which a reader that borrowed it whole would
+            // ask for at every call.
+            let region = place.map_or(0, |(_, l)| l as u64);
+            assert!(
+                asked < region / 4,
+                "{name}, pieces of {piece}: asked for {asked} bytes, the region is {region}"
+            );
+            for (r, off) in offsets.iter().enumerate() {
+                assert_eq!(
+                    off.is_some(),
+                    r < keys,
+                    "{name}, pieces of {piece}: record offset at {r}"
+                );
+            }
+            assert!(place.is_some(), "{name}, pieces of {piece}: region place");
+            for (i, (got, said)) in calls.iter().enumerate().take(4) {
+                assert!(
+                    *got > 0 && !said.is_empty(),
+                    "{name}, pieces of {piece}: ask {i} answered {got} with {said:?}"
+                );
+            }
+            holds_to_the_file(
+                &format!("{name}, pieces of {piece}"),
+                &blob,
+                &trace,
+                &raw,
+                &want,
+                &mapped,
+            );
+            assert_eq!(
+                trace, whole_trace,
+                "{name}, pieces of {piece}: the piece reader against the whole one"
+            );
+        }
+        holds_to_the_file(name, &whole, &whole_trace, &raw, &want, &mapped);
+    }
+}
+
+/// An ask ahead over a span (`Blob::willneed_at`) is skipped where the
+/// span's first page is resident for a source that lends whole, whose
+/// pages the kernel reads ahead in order from there, and is the span
+/// whatever its first page for one that lends by the piece, which answers
+/// an ask for what of the span it does not hold and holds what its cache
+/// has not given back, a unit here and there: a merge under a cipher read
+/// half its ciphertext a page a fault with the first page standing for
+/// the window.
+#[test]
+fn an_ask_ahead_over_a_source_by_the_piece_is_the_span_whatever_its_first_page() {
+    fn ask<B: Bytes>(
+        blob: &Blob<Advised<B>>,
+        at: u64,
+        len: usize,
+        first: bool,
+    ) -> (usize, Vec<Advice>) {
+        let src = blob_source(blob);
+        let _ = src.take();
+        src.resident(if first { at } else { 0 }, if first { at + 1 } else { 0 });
+        let n = blob.willneed_at(at, len);
+        src.resident(0, 0);
+        (n, src.take())
+    }
+    let path = scratch("ask-whole");
+    build_opts(&path, 600, false, 256, false);
+    let raw = std::fs::read(&path).unwrap();
+    let whole = Blob::open(Advised::new(VecBytes(raw.clone()))).expect("open whole");
+    let pieces =
+        Blob::open(Advised::new(Piecewise::new(raw.clone(), 4080))).expect("open by the piece");
+    assert!(blob_source(&pieces).piecewise() && !blob_source(&whole).piecewise());
+    let (at, len) = whole.record_region_place().expect("a record region");
+    let len = len.min(1 << 20);
+    assert!(len > 8192, "a span of several pages: {len}");
+    assert_eq!(
+        ask(&whole, at, len, true),
+        (0, vec![]),
+        "whole, first page resident"
+    );
+    assert_eq!(
+        ask(&whole, at, len, false),
+        (len, vec![Advice::Willneed(at, len)]),
+        "whole, nothing resident"
+    );
+    for first in [true, false] {
+        assert_eq!(
+            ask(&pieces, at, len, first),
+            (len, vec![Advice::Willneed(at, len)]),
+            "by the piece, first page resident {first}"
+        );
+    }
+    assert_eq!(ask(&pieces, at, 0, false), (0, vec![]), "an empty span");
+    let _ = std::fs::remove_file(&path);
+}
+
+/// A reader's answers held to the file they are about: each record's key
+/// at its offset, the offsets a mapped reader answers, the region's place
+/// its span, every ask over ranks inside the region and each directory ask
+/// at the word that names its rank's record.
+fn holds_to_the_file<B: Bytes>(
+    name: &str,
+    blob: &Blob<Advised<B>>,
+    trace: &AdviceTrace,
+    raw: &[u8],
+    want: &[(Vec<u8>, Vec<Vec<u8>>)],
+    mapped: &Blob<MmapBytes>,
+) {
+    let keys = want.len();
+    // The offsets are the file's: each record's key lies at its offset,
+    // and they are the ones a mapped reader answers.
+    let (offsets, place, calls) = trace;
+    for (r, (key, _)) in want.iter().enumerate() {
+        let off = offsets[r].expect("a record's offset") as usize;
+        let near = &raw[off..(off + key.len() + 16).min(raw.len())];
+        assert!(
+            near.windows(key.len()).any(|w| w == key.as_slice()),
+            "{name}: record {r}'s key is not at its offset {off}"
+        );
+        assert_eq!(offsets[r], mapped.record_offset(r), "{name}: mapped at {r}");
+    }
+    let span = mapped
+        .record_region_place()
+        .map(|(o, l)| (o, l as u64))
+        .expect("the region's place");
+    assert_eq!(
+        place.map(|(o, l)| (o, l as u64)),
+        Some(span),
+        "{name}: the region's place is the mapped reader's"
+    );
+    assert_eq!(
+        Some(span.0),
+        offsets[0],
+        "{name}: the region starts at rank 0"
+    );
+    // The span a raw point read touches, from the hash slots through the
+    // records, is the header's, whoever holds the section: it holds the
+    // record region and lies in the file.
+    let read = blob.raw_read_span().expect("a raw read's span");
+    assert_eq!(
+        Some(read),
+        mapped.raw_read_span(),
+        "{name}: a raw read's span"
+    );
+    assert!(
+        read.0 <= span.0
+            && span.0 + span.1 <= read.0 + read.1
+            && read.0 + read.1 <= raw.len() as u64,
+        "{name}: the read span {read:?} against the region {span:?}"
+    );
+    // Every ask over ranks lies in the record region, and asks for
+    // something; past the last rank there is nothing to ask for.
+    for (got, said) in &calls[..7] {
+        for a in said {
+            let Advice::Willneed(o, l) = *a else {
+                panic!("{name}: an ask over ranks gave {a:?}");
+            };
+            assert!(
+                o >= span.0 && o + l as u64 <= span.0 + span.1 && l == *got && l > 0,
+                "{name}: the ask {a:?} against the region {span:?}"
+            );
+        }
+    }
+    assert_eq!(
+        calls[5],
+        (0, Vec::new()),
+        "{name}: an ask past the last rank"
+    );
+    assert_eq!(calls[6], (0, Vec::new()), "{name}: an ask of no bytes");
+    for (got, said) in &calls[7..12] {
+        for a in said {
+            assert!(
+                matches!(*a, Advice::Willneed(_, l) if l > 0 && l == *got),
+                "{name}: a directory ask {a:?}"
+            );
+        }
+    }
+    // The ask for a rank's directory word starts at the word that names
+    // the rank's record, read out of the file.
+    let word = |o: u64| u32::from_le_bytes(raw[o as usize..o as usize + 4].try_into().unwrap());
+    let dir_at = |rank: usize| match blob.willneed_dir(rank, 1) {
+        0 => panic!("{name}: no ask for the directory word of rank {rank}"),
+        _ => match blob_source(blob).take().as_slice() {
+            [Advice::Willneed(o, 8)] => *o,
+            other => panic!("{name}: the directory ask at {rank} was {other:?}"),
+        },
+    };
+    let d0 = dir_at(0);
+    for r in [1, keys / 3, keys - 2] {
+        let d = dir_at(r);
+        assert_eq!(d, d0 + 4 * r as u64, "{name}: directory word of {r}");
+        assert_eq!(
+            (word(d) - word(d0)) as u64,
+            offsets[r].unwrap() - offsets[0].unwrap(),
+            "{name}: the word at {d} names record {r}"
+        );
+    }
+    // The asks over ranks start at the first rank's record and the drop
+    // runs between the two offsets it was given.
+    assert_eq!(
+        calls[1].1.first(),
+        Some(&Advice::Willneed(offsets[0].unwrap(), calls[1].0)),
+        "{name}: the ask for rank 0"
+    );
+    let (a, b) = (offsets[1].unwrap(), offsets[keys / 2].unwrap());
+    assert_eq!(
+        calls.last().unwrap().1,
+        vec![Advice::Dontneed(a, (b - a) as usize)],
+        "{name}: the drop"
+    );
+    // An ask whose first page is resident is skipped, by the residency of
+    // the offset the ask would start at and of no other.
+    let src = blob_source(blob);
+    let o0 = offsets[0].unwrap();
+    src.resident(o0, o0 + 1);
+    assert_eq!(
+        blob.willneed_ranks(0, 4, usize::MAX),
+        0,
+        "{name}: rank 0 resident"
+    );
+    assert!(
+        blob.willneed_ranks(keys / 2, 4, usize::MAX) > 0,
+        "{name}: rank {}",
+        keys / 2
+    );
+    src.resident(d0, d0 + 1);
+    assert_eq!(blob.willneed_dir(0, 1), 0, "{name}: word 0 resident");
+    assert!(blob.willneed_dir(1, 1) > 0, "{name}: word 1 not resident");
+    assert!(
+        blob.willneed_ranks(0, 4, usize::MAX) > 0,
+        "{name}: rank 0 again"
+    );
+    src.resident(0, 0);
+    let _ = src.take();
 }
 
 /// Compact records, through a source that lends and one that copies: the
@@ -668,6 +1599,63 @@ fn a_walk_over_a_compressed_block_decompresses_each_chunk_once() {
     );
 }
 
+/// The walk by the piece over the common record -- values of one width,
+/// inline -- answers as the mapping's for scans that cross several of its
+/// windows of ranks: each window moves the rank by what it walked, and a
+/// rank moved by the count walked since the scan began, or since anything
+/// but the window's start, hands out the records of the wrong ranks from
+/// the second window on. The shapes of `a_source_that_lends_by_the_piece_
+/// answers_the_same` are records of mixed lengths, which that walk hands to
+/// the general one at the first record, so they never reach a second window.
+#[test]
+fn a_walk_by_the_piece_across_its_windows_answers_as_the_mapped_one() {
+    for compact in [false, true] {
+        let path = scratch(&format!("piecewise-windows-{compact}"));
+        let opts = SegmentOptions {
+            compact_records: compact,
+            ..SegmentOptions::default()
+        };
+        let mut w = SegmentWriter::create(&path, &opts).expect("create");
+        w.set_inline_max(256);
+        let mut want = Vec::new();
+        for k in 0..300usize {
+            let key = format!("term={k:08}").into_bytes();
+            let n = if k % 5 == 0 { 3 } else { 1 };
+            w.begin(&key).expect("begin");
+            let vals: Vec<Vec<u8>> = (0..n).map(|i| format!("{k:06}.{i}").into_bytes()).collect();
+            for v in &vals {
+                w.value(v);
+            }
+            w.end().expect("end");
+            want.push((key, vals));
+        }
+        w.finish(1).expect("finish");
+        let raw = std::fs::read(&path).unwrap();
+        let mapped = Blob::open(MmapBytes::open(&path).unwrap()).expect("blob open");
+        for piece in [64, 4080, 1 << 16] {
+            let blob = Blob::open(Piecewise::new(raw.clone(), piece)).expect("open by the piece");
+            reads_what_was_written(&blob, &want);
+            agree(&mapped, &blob);
+            for from in [0usize, 1, 63, 64, 65, 130] {
+                for limit in [65usize, 128, 200, usize::MAX] {
+                    let (mut sa, mut sb) = (Vec::new(), Vec::new());
+                    let na = mapped
+                        .scan_at(from, limit, |k, v| sa.push((k.to_vec(), v.to_vec())))
+                        .unwrap();
+                    let nb = blob
+                        .scan_at(from, limit, |k, v| sb.push((k.to_vec(), v.to_vec())))
+                        .unwrap();
+                    assert_eq!(
+                        (na, sa),
+                        (nb, sb),
+                        "compact {compact}, pieces of {piece}: a scan of {limit} from rank {from}"
+                    );
+                }
+            }
+        }
+    }
+}
+
 #[test]
 fn a_paced_walk_hands_out_what_the_plain_walk_does() {
     // `scan_at_paced` asks for the records ahead of its walk and is
@@ -703,6 +1691,94 @@ fn a_paced_walk_hands_out_what_the_plain_walk_does() {
             }
         }
     }
+}
+
+/// The walks over a reader that holds its key section whole --
+/// `scan_at_paced` and a `run_walk`'s -- refuse a source that lends by the
+/// piece before they walk anything, with `Unsupported`: that refusal is the
+/// engine's word that a segment is to be walked by the piece, a window of
+/// records an ask, and a walk that took such a source a record at a time
+/// would answer the same and ask for every record on its own. `scan_at`
+/// walks it.
+#[test]
+fn the_whole_walks_refuse_a_source_that_lends_by_the_piece() {
+    let path = scratch("whole-walks-refuse");
+    build_opts(&path, 300, false, 256, false);
+    let raw = std::fs::read(&path).unwrap();
+    let blob = Blob::open(Piecewise::new(raw, 4080)).expect("open by the piece");
+    let keys = blob.keys();
+    assert!(keys > 100);
+    let mut seen = 0usize;
+    let mut count = |_: &[u8], _: &[u8]| seen += 1;
+    let cb: &mut dyn FnMut(&[u8], &[u8]) = &mut count;
+    for lead in [0usize, 64] {
+        let e = blob
+            .scan_at_paced(0, keys, lead, &mut *cb)
+            .expect_err("a paced walk over a source by the piece is refused");
+        assert_eq!(e.kind(), std::io::ErrorKind::Unsupported, "lead={lead}");
+    }
+    let e = blob
+        .run_walk()
+        .scan_at(0, keys, &mut *cb)
+        .expect_err("a run walk over a source by the piece is refused");
+    assert_eq!(e.kind(), std::io::ErrorKind::Unsupported);
+    let walked = blob.scan_at(0, keys, &mut *cb).expect("scan_at walks it");
+    assert_eq!(walked, keys);
+    let after = seen;
+    let mut seen = 0usize;
+    let mut count = |_: &[u8], _: &[u8]| seen += 1;
+    let cb: &mut dyn FnMut(&[u8], &[u8]) = &mut count;
+    let _ = blob.scan_at_paced(0, keys, 0, &mut *cb);
+    let _ = blob.run_walk().scan_at(0, keys, &mut *cb);
+    assert!(after > 0, "`scan_at` handed out the records");
+    assert_eq!(seen, 0, "a refused walk handed nothing out");
+}
+
+/// A source that lends whole until it is told to stop, and then lends
+/// nothing and is not one that lends by the piece: a reader over it has
+/// its key section neither whole nor by the piece.
+struct StopsLending {
+    bytes: Vec<u8>,
+    lends: std::sync::atomic::AtomicBool,
+}
+
+impl Bytes for StopsLending {
+    fn len(&self) -> u64 {
+        self.bytes.len() as u64
+    }
+    fn read_at(&self, off: u64, dst: &mut [u8]) -> std::io::Result<()> {
+        Copying(self.bytes.clone()).read_at(off, dst)
+    }
+    fn slice_at(&self, off: u64, len: usize) -> Option<&[u8]> {
+        if !self.lends.load(std::sync::atomic::Ordering::Relaxed) {
+            return None;
+        }
+        let end = off.checked_add(len as u64)?;
+        self.bytes.get(off as usize..usize::try_from(end).ok()?)
+    }
+}
+
+/// A seek over a reader whose key section cannot be read, whole or by the
+/// piece, answers the end: no key is at or after the query, and a scan
+/// from there walks nothing.
+#[test]
+fn a_seek_over_a_section_that_does_not_read_answers_the_end() {
+    let path = scratch("seek-unread");
+    let want = build_opts(&path, 300, false, 256, false);
+    let src = StopsLending {
+        bytes: std::fs::read(&path).unwrap(),
+        lends: std::sync::atomic::AtomicBool::new(true),
+    };
+    let blob = Blob::open(src).expect("open while it lends");
+    let keys = blob.keys();
+    assert_eq!(blob.seek(&want[0].0), 0, "the first key, while it lends");
+    blob.source()
+        .lends
+        .store(false, std::sync::atomic::Ordering::Relaxed);
+    for (key, _) in want.iter().step_by(37) {
+        assert_eq!(blob.seek(key), keys, "a seek with nothing to read");
+    }
+    assert_eq!(blob.seek(b""), keys);
 }
 
 #[test]

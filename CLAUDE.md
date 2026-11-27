@@ -26,6 +26,169 @@ reader gets a checked number instead of a snapshot; a figure attached to a
 *change* belongs in the PR that made it, rounded), no history, and no narrative
 of the change that produced the text.
 
+## The encryption work on this branch
+
+This branch carries the encryption feature -- `Encryption::Cipher`,
+`Encryption::Kernel`, `supdb::crypt` -- and the crash-safety fixes found
+building it, on top of the main line. It was built beside a line of the
+owner's engine work (`claude/e-recode-stride-selector-g5f6hl`, "upstream"
+in the notes), merged into it as it went, which went to the main line as
+#27, squashed: its commits the notes cite are in that pull request's
+history (`refs/pull/27/head`), and from #27 on the line this branch
+merges is `main`. What is left of it is in `ROADMAP.md`
+("Encryption: what is left before it merges"). What it is held to is the
+owner's:
+
+- **It merges whole, against two bars.** "We're not going to merge
+  partial", and "our eventual bar for merging requires no impact for
+  unencrypted runs, and beating competitors on added encryption
+  benchmarks." The first is the count, by function, against the commit
+  before each change (`scripts/cost.sh`), with timing rows against
+  the main line before a merge is proposed, since a count sees no stall. The
+  second is the encrypted roster (`bench run --arms enc`,
+  `bench/DESIGN.md`), read cell by cell (`bench/scripts/encrow.py`).
+  Bytes on disk is no cell of it ("I don't care much about bytes on
+  disk"). The layer that is to clear the second bar was designed while
+  every pairing under a cipher was the engine against itself; the
+  comparators' first row and pairings put the bounded reads and scans
+  first, and the stride form under a cipher, last of five small changes
+  in the plan, ahead of every stage of it. A bar that names a competitor
+  is measured against the competitor before the design that is to clear
+  it is fixed.
+- **Nothing is switched off, refused or limited under a cipher as a
+  property of the design**, and a cost is never accepted: it is
+  understood, by a count or a probe, and taken back. "The goal is an
+  encryption feature which is reliable, performant, and not fragile to
+  maintain." A bug or a flaky test met on the way is fixed where it is
+  met, whichever line wrote it.
+- **The main line is merged here and never written to**, as upstream
+  was. Fetch it, merge it into this branch, build it and count against
+  it; never push to it or to another line. Push here whenever there is
+  a commit: the gate is for what a commit claims, not for the push. No
+  pull request until the owner asks for one; the owner asked on
+  2026-11-27 -- "rebase on main after a merge then put anything not done
+  which is important in the roadmap and open a pr" -- and the rebase was
+  read as the merge below again, the branch holding six hundred commits
+  that its docs cite, and done as one, main's #30 to #33. "Stay wholly
+  off of upstream" was read for half a day as never fetch, merge or count
+  against it, where it meant never modify it: an instruction about
+  another line is said back as the operations it forbids before the
+  widest reading is acted on. "Let's also rebase on main" was the same
+  kind: the branch is two hundred commits through eleven merges, and
+  twenty-four commits the docs cite are on it alone, so a rewrite would
+  have pointed their citations at nothing; it was said back as a merge
+  or a rewrite with that count, and is merged. A squash of what the
+  branch already holds -- #27 was upstream's `7fda1f9` to the byte -- is
+  merged with the squashed line's last commit as the base
+  (`git read-tree -m -u <that commit> HEAD <main's head>`), so the merge
+  carries what is new on the main line and nothing the branch has
+  already changed is offered back to it as a conflict.
+- **A report to the owner is short and says where things stand.** The
+  owner reads this branch from outside it, and has said that they lost
+  its thread and that its size worries them: the bar and what stands
+  against it first, in plain sentences, and the detail where it lives.
+- **A merge of upstream or the main line is held to more than its
+  conflicts.** Its text
+  merges nearly clean each time and is wrong in the same places:
+  upstream's new code maps a file by its path (`MmapBytes::open`) or
+  reads residency over a mapping's lent bytes, the two things this
+  branch moved behind the seam (`vault::map`, `map_len`,
+  `map_resident_share`, `OrdIndex::resident_share`), three sites at one
+  merge; at the next an advice and a count over those bytes with a read
+  of `/proc/self/pagemap` beside them, which a source answers now
+  (`Bytes::populate_read`, `Bytes::mapped_share`, and a paged mapping's
+  pager for it). It is wrong outside the engine too, where nothing
+  conflicts: that merge gave a set-up step upstream's suite had come to
+  need (FASTER's sources, which its build script stops without) to
+  upstream's CI jobs and to neither job this branch had added that
+  builds the suite, nor to the worktree the count builds its base in;
+  and at the merge of #27 the suite's build became a file
+  (`bench/.cargo/config.toml`, one machine level and one set of C and
+  C++ flags for every engine) read from the directory a build starts in,
+  which a worktree of the commit before it does not have, so the count's
+  base would have been compiled at the default level beside a head at
+  x86-64-v3 and every function's count been the flags' as well: the
+  count gives the base the head's file as it gives it the head's probes.
+  At the merge of #29 main's log came to hold its commits in the process
+  (`SyncPolicy::Explicit`) through the write path this branch had made
+  put back a failed write and seal its records, and the text merged into
+  a tree every test passed but main's crash oracle: a run of ordered
+  ingest may open over a log holding committed batches there, where this
+  branch's run read any frame in the log's buffer as a logged run's put
+  back, so a `sync` with nothing new for the run wrote the run's batch
+  to the log again under new numbers and the reopened store held it
+  twice. The run asks for frames staged now (`Wal::staged`), and the
+  put-back takes no commit frame off a holding log's batches, which are
+  committed. A premise one side wrote as "nothing else is there" is read
+  against every state the other side's new mechanism puts there.
+  What each merge is shown to hold: nothing of either side lost, every
+  function both sides touched read once in its merged body; the
+  toolchain the runners use (`rust-toolchain.toml`), under which the lint and the count are the runner's (the entry
+  on a count held under one compiler, below); this branch's gates over
+  upstream's new code, each answered in its own terms (a count raised in
+  its list with the raise declared in `scripts/raises.txt`, and the
+  lists run against the main line and against the branch's tip before
+  the merge, `SUPDB_BASE=<that tip> sh scripts/check.sh lists`);
+  whatever set-up upstream's jobs gained given to this branch's
+  (`tests/source.rs` holds the comparators' pair); each new mechanism of
+  upstream's read for which bytes it reads and through what, and held
+  under a cipher by a test where it reads a file; the differential fuzz
+  beyond the gate's range, under a cipher in a small cache, in the
+  clear, and with the compact form forced under a cipher
+  (`ZFUZZ_CACHE=all ZFUZZ_OPTVARY=1` in each); every arm of the rosters
+  opened once at the smallest rung, the encrypted roster's by the `enc`
+  group, and a forced arm at a rung the harness takes it at (at three
+  hundred thousand keys upstream's own build refuses one: a partition
+  under the form's floor holds over a hundredth of the keys);
+  `sh scripts/cost.sh <its head>`, every probe at or under
+  that head by its total and no function's gain new (it exits red by
+  function there, on moves: `ROADMAP.md`); and the whole gate.
+- **The store in one file is built on this branch.** The owner, the day
+  a third tier for freeing retired files was built, priced and refuted
+  ("A cost moved off the threads that paid it", below): "I wonder if
+  there's an opportunity to make our own filesystem abstraction that
+  uses only a single real file, and gives us more control over the
+  performance of fs operations. Using a single file would give us an
+  advantage on mobile", and then "Let's build all this here because we
+  think this helps us clear the perf bar." The decisions made with the
+  owner are in `scratch/onefile/design.md` -- one file a store, the
+  manifest's slots at its head, the log and every segment extents of it,
+  space reused and never freed in steady state, growth reserved and not
+  written, a checkpoint a full copy (`copy_to`; "Okay, let's go with full
+  copy checkpoints") -- with the probe behind each in
+  `scratch/onefile/notes.md`, and the stages in `scratch/plan/onefile.md`,
+  which says what of the layer's design (`scratch/seam/design.md`) it
+  keeps and what it replaces. It is held to the same two bars: every
+  stage behind an option and an arm until the suite reads it better and
+  the gate passes with it on, and the count level with it off. What is
+  built of it and what its pairings leave open is one item of
+  `ROADMAP.md` ("The store in one file: what is built, and what leans").
+  Asked what the path to a pull request was, with the log's move into the
+  file and the defaults offered as work for after one, the owner: "Do
+  all. Don't open a pr which is complete and will lead to a bunch of
+  other PRs." Every stage is this branch's, the defaults among them, and
+  the pull request is the one that needs no other behind it; and, the
+  same hour, "Try to stay focused and efficient though": a stage is
+  built in the least form that its cells call for, and a form the plan
+  drew larger waits for the pairing that asks for it.
+- **`scratch/` was this branch's working records, and came off for the
+  pull request**, as it came off PR #6: every `scratch/` path this file
+  and `ROADMAP.md` cite is of the tree at `5b81772`, the last commit
+  that holds it (`git show 5b81772:scratch/plan/onefile.md`). The
+  layer's design (`scratch/seam/design.md`, its decisions and the forms' contract
+  beside it); the stage plans (`scratch/plan/g1.md`, closed, with a
+  critic's account of what each gate holds and a way to write past it
+  in `scratch/plan/build/close/g1-built.md`, to be read before a gate is
+  touched; `g2.md`, the pass under a cipher, whose line numbers and
+  counts are of a tree several merges old); each unit's notes and mutants
+  (`scratch/plan/build/<unit>/`, `scratch/stage0/`); the encrypted
+  roster's first row and pairings (`scratch/enc/`). It held a handoff
+  note as well, written again at every stop, which grew to twelve hundred
+  lines of rules, open items and measurements that each had a home
+  already, beside a status the history has; the owner had it removed. A
+  rule goes in this file, an open item in `ROADMAP.md`, a fact of the
+  suite in `bench/`, and a session's status nowhere.
+
 ## Layout
 
 | path | what |
@@ -33,14 +196,24 @@ of the change that produced the text.
 | `src/db.rs` | the engine: WAL with atomic batches, memtable, sealed segments, partitioned compaction, tombstones, `Txn`, and the `SegmentWriter` every segment is written by -- `docs/engine.md` |
 | `src/db/zpages.rs` | the compact form's layout: the page, the directory of the groups it holds, the group, the fill that cuts records into groups and packs them into pages, the fence, the trailer and the identity a form file is bound by, with no file, thread or clock in it -- the module's own docs, and `bench/examples/zsize.rs` for what it makes of the engine's bytes |
 | `src/db/zfile.rs` | the compact form's file on the engine's side: the builder that writes a partition's form file from the partition's own bytes, the attach that binds it to its segment by content, the cell a segment holds it in, the point read, the count, the scan walk and the cursor through it, behind `Options::zpages`, and the controller's platform side, the cache budget read from the cgroup and the test's seam for it; the block cache's reads of a covered partition go through it too (`Options::zpages_block_cache`); and the stride form (`Options::zpages_stride`; `zpages_stride_room` keeps it to the builds made while the store in it fits, `zpages_stride_convert` moves a served partition between it and the block form, and `zpages_stride_below`, an arm's, keeps it to the partitions under a key), a partition's values alone at their stride where its keys are one run of numbers -- the module's own docs, and `docs/engine.md` for where it wins and where it does not fit |
+| `src/db/dirkey.rs` | a live store's directory under a key, encrypted by the kernel (`Encryption::Kernel`): the requests of Linux's file encryption, what `create` and `open` hold a directory to, and `lock`, with no cipher and no byte of a read path in it -- the module's own docs, and `scripts/fscrypt.sh` for a filesystem to test it on |
+| `src/db/vault.rs` | a live store under a cipher the caller supplies (`Encryption::Cipher`): the door every file operation of the engine goes through, which is the standard library's call for a plain store, and the file it hands out (`vault::File`), whose methods are the calls the engine made on a descriptor; a file as a memory file while it is written and as its envelope in the directory after; the marker and the keys, the caller's wrapping the store's and the store's wrapping a key a file; the manifest's slot and the log's record sealed, with no cipher in the crate -- the module's own docs, `tests/cipher.rs`, and `ZFUZZ_CIPHER=1` for the differential fuzz |
+| `src/db/pager.rs` | the cache a store under a cipher reads its files through: a file as address space its plaintext's length, a chunk of it decrypted where it is first asked for and a megabyte given back at a time once the cache is past its budget and no reader could hold it; the holds and rests of the threads that read with no slot of the reader table, the two lines past the budget at which the store's own work and then a caller's read wait, the failure a read remembers, and the view a merge reads its inputs through beside the cache (`Stream`), with no cipher in it and no reader of the format -- the module's own docs, and `tests/cipher.rs` for a store several times its cache |
+| `src/db/onefile.rs` | a store kept in one file (`Options::one_file`, off): the table behind the door that makes a segment, its ordered index and its form file an extent of the store's data file (`store.one`) -- the names, the free room and its reuse once a manifest later than the one that named it is known durable, growth reserved from the device and not written, a file moved while it is being written and never once it is mapped, the use a mapping or a handle holds on its room, the syncs and the rides by which a manifest may name a file, and the section a manifest lists the places in, with no reader of the format and no byte of a read path in it; under a cipher the files it holds are the store's envelopes, in a table the vault has (`Vault::one`), with no cipher in the module; the log, the manifest's slots and an ordered run are files of the directory still -- the module's own docs, `tests/onefile.rs`, `SUPDB_TEST_ONEFILE=1` for the suite's tests over it, `tests/cipher.rs` among them, and `ZFUZZ_ONEFILE=1` for the differential fuzz, with `ZFUZZ_CIPHER=1` for the store under a cipher kept so |
 | `src/db/zselect.rs` | the compact form's selector: `ZSelect::step`, a function of its state and an explicit `Input` (no clock, thread or file), the one definition of the transitions between FITS, SUSPECT, building, COMPACT and the trial, the replays that hold it, the model of a cache's faults over populations of pages (`model_populations`), and what the reads of a store in two forms cost with the moves between the forms that pay (`forms_cost`, `conversions`) -- the module's own docs |
 | `src/format.rs` | the on-disk format's fixed quantities, owned by no writer |
 | `src/block.rs`, `src/index.rs`, `src/flatindex.rs` | the format itself: blocks, extents, the flat key index -- `docs/index-theory.md` |
-| `src/bytes.rs`, `src/blob.rs` | the read path over any byte source; compiles for wasm |
+| `src/bytes.rs`, `src/blob.rs` | the read path over any byte source, one that lends whole, one that copies, and one that lends by the piece it is asked for (`Bytes::piecewise`, `flatindex::Pieces`); compiles for wasm |
+| `src/crypt.rs` | a finished file published encrypted and read through the `Bytes` seam: the envelope, the hook a caller's cipher fits (`Aead`), `Encrypted` as a byte source over the stored object and `encrypt` as its writer, with no cipher in the crate; compiles for wasm and nothing in the module links it -- the module's own docs, `examples/crypt.rs` for the adapter, and `web/crypt.mjs` for the browser's half |
 | `src/wasmapi.rs` | the C ABI the browser calls; hand-written because the module's size is budgeted |
-| `web/` | the browser reader, its byte sources, the Worker it runs in, and the size control -- `web/README.md` |
-| `tests/` | the engine's contract, the read paths held to each other, the format's damage cases, a checkpoint held to the store it was made of, a crashed store's runs held to its log, the store's lock beside a forked child; `tests/common` holds what more than one file needs |
+| `web/` | the browser reader, its byte sources, the fetcher that decrypts, the Worker it runs in, and the size control -- `web/README.md` |
+| `tests/` | the engine's contract, the read paths held to each other, the format's damage cases, a checkpoint held to the store it was made of, a crashed store's runs held to its log, the store's lock beside a forked child; `tests/common` holds what more than one file needs, and `tests/data` the envelope on record |
 | `bench/` | the benchmark suite: its own cargo workspace and the one build every engine in it is compiled to (`bench/.cargo/config.toml`), the arms, the runner, the gate and the figures -- `bench/DESIGN.md` |
+| `tests/source.rs` | the gates over the tree's own text, over a lexer in `tests/lex/`: the wall between the forms and the encryption modules (`tests/data/couplings.txt`), what the door's clippy run cannot see (`tests/data/door.txt`, `door-libc.txt`), every public entry point of `Reader`, `Db` and `Blob` to a cost probe or a reason (`tests/data/cost-entries.txt`), the seal's tokens to the calls they are made for, and every workflow under `.github/workflows` to the groups of `scripts/check.sh` |
+| `scripts/door/` | the door by symbol: a clippy run of its own over the library with the barred calls in `clippy.toml` (`run.sh`, in the `lint` group), and its red input (`red.sh`) |
+| `scripts/cost.sh`, `cost-diff.py`, `cost-hot.txt`, `cost-red.sh` | what a store in the clear pays, counted: the probes built at a base and at the tree under callgrind and compared by function, and the count's red input -- the `cost` group |
+| `scripts/ratchet.sh`, `ratchet.py`, `raises.txt`, `ratchet-red.sh`, `base.sh`, `signed.sh` | the lists that only go down, held across a change against the base `base.sh` takes from the event, a raise declared in `raises.txt`, and every commit after that base signed -- the `lists` group |
+| `scripts/seal-red.sh`, `seal-red-red.sh` | the seal's red input: a copy of the crate in which each whole borrow the read path keeps compiles in its own module and fails abroad, and that check's own red input -- in the `lint` group |
 | `experiments/ffi/` | what a C ABI and a Python binding cost a point read, borrowed against copied, beside LMDB's and RocksDB's C APIs; its own manifest and dated results, and not built by the gate -- its `README.md` |
 
 One writer produces the format, `SegmentWriter`, with two callers -- `Db`
@@ -49,10 +222,15 @@ three readers parse what it wrote: `Blob` over a mapped file, `Blob` over a
 copying source, and `SparseBlob` over ranges. That is why `format.rs`
 belongs to none of them.
 
-No module carries a blanket lint allowance; `block` and `flatindex` allow
-`dead_code` on the wasm target only, where their writer halves have no
-caller. Nothing is exempt from the format gate, and everything holds to
-`-D warnings`.
+Seven modules carry a blanket allowance of the door's two lints
+(`clippy::disallowed_methods`, `clippy::disallowed_types`), and they are
+the door: `vault`, `bytes`, `pager`, `crypt`, `dirkey`, `blocks` and
+`onefile`, the modules that open, map, advise and sync files and read the
+process's own counters for everyone else. An allowance anywhere else is an item's, with
+its reason, and `tests/data/door.txt` counts it. No other module carries a
+blanket lint allowance; `block` and `flatindex` allow `dead_code` on the
+wasm target only, where their writer halves have no caller. Nothing is
+exempt from the format gate, and everything holds to `-D warnings`.
 
 ## Running the checks
 
@@ -95,9 +273,57 @@ twelve seconds in the next. It installs no recommended extras, so a
 package a job needs and another only recommends is named, as `cross-arm`
 names the target's C library.
 
-`sh scripts/check.sh` runs every group -- build, test, stride, lint, wasm, bench --
-and CI calls the same script with the same names, so a green run here is a
-green run there. Every group denies warnings, the wasm group since it was
+`sh scripts/check.sh` runs every group -- build, test, stride, onefile, lint,
+wasm, bench, lists -- and CI calls the same script with the same names, so a
+green run here is a green run there. tests/source.rs reads every file under
+`.github/workflows`: a workflow that runs on a change's event (`ci.yml`,
+and `apple-silicon.yml`, which runs the `machine` group where a pull
+request changes the machine capture) is held to run steps that are a
+group's call or set-up on its short list, one that checks no change (the
+measurements, the rows' proposal) to triggers that are no change's -- by
+hand, on a schedule, after a merge to main -- and one it does not list is
+red, as is a group no job runs and a line of a set-up script that writes
+the job's environment unlisted (`$GITHUB_ENV` is a way to set a check's
+knobs from outside it). The first version read `ci.yml` alone, and review
+found `apple-silicon.yml` checking pull requests by hand beside it: a
+check whose scope is one member of a set passes the next member, so it
+reads the whole set and fails a member it does not list. Two checks the
+YAML used to make itself are groups now, `cross-arm` (the linker, the
+qemu runner and the `--cfg` the job's environment carried) and the cost
+job's base, which `scripts/base.sh` decides from the event's values for
+every check that compares the tree with the commit before it. The lists
+that only go down -- `tests/data/couplings.txt`, the door's two,
+`tests/data/cost-entries.txt`'s reasons -- are held across a change by the
+`lists` group against that base, since each list's test sees one tree: a
+raise is declared in `scripts/raises.txt` and matched exactly, where it was
+once a CODEOWNERS line, a check that ran on nobody's machine. The workflow's
+test first read the `run:` lines and nothing else, and review found three
+ways round it that it passed: an `if: false` on the step or the job, which
+left the group counted as run; a `continue-on-error`, which reads a red
+group green; and an `env:` that set the base (`SUPDB_BASE: HEAD`, the tree
+against itself) or narrowed a group (`RATCHET_RED_STEPS`, `COST_PROBES`).
+It reads every key of the workflow now, against lists of its own, and the
+second review found the reader of keys keyed on the parent's name: a job
+named `inputs` took any key as an input's, its `if: false` among them, and
+its group counted as run; the triggers were read by their keys alone, so a
+workflow that ran on no pull request read green; and the groups' `case`
+ended at the first `esac` at any depth, so a group after a nested case was
+read by nobody. A key is read by the whole path to it. The lists'
+check had the same shape one level up: it held each list the tree's
+registry named, and a change that moved a list from the registry to its
+not-held table, with a raise beside it, read green; the registry is held to
+the base's now. A check over one kind of line passes everything written in
+another kind, and a check whose scope is written in the tree it checks is
+held to the scope at the base. And the lists' check answered by its
+base: the first raises a change declared (two cost entries for test seams
+a merge of upstream brought) read green against the branch's tip before
+the change, which is a push's before, and red against the main line, which
+predates every list -- there a list is new, nothing of it is held, and the
+declarations matched no raise. One raises.txt is read under both events,
+so a line for a list the base does not have holds nothing and is said so
+(`ratchet-red.sh` has the case, and the same line red against a base that
+has the list). A check that takes a base is run against every base an
+event can hand it before it is called green. Every group denies warnings, the wasm group since it was
 found printing six dead-code warnings and reporting green: the module built
 under cargo's default of warn, and nobody reads a build log that ends in
 sizes. Four were `format`'s superblock constants, which `blob` kept copies
@@ -129,16 +355,70 @@ manifests' `rust-version` is the oldest toolchain the crates build with
 and does not move with it. A `RUSTUP_TOOLCHAIN` in the environment
 outranks the file, which the script refuses and a bare `cargo` does not.
 The lint group type-checks the engine for the macOS target too (`cargo
-clippy --release --all-targets --target aarch64-apple-darwin -- -D
+clippy --release --lib --bins --target aarch64-apple-darwin -- -D
 warnings`, which needs the target's rust-std and no cross toolchain):
 three helpers in `tests/zpages.rs` that only Linux's tests call were dead
 code there, and no lint on Linux could say so. The suite has no such
 leg: its comparators compile C in their build scripts, the first of them
 to run (`lz4-sys`'s) hands the host's `cc` `-arch arm64`, and a Linux
-`cc` refuses it, so the suite's would take a cross compiler. What is left
-for the hosted runners alone to show is timing on their hardware and the
-tests run, not only type-checked, on ARM and macOS.
+`cc` refuses it, so the suite's would take a cross compiler. On this
+branch the engine's tests and examples are in the same case: their
+cipher (`ring`, a dev-dependency) compiles C and assembly for the target
+in its build script, and clang here, given the target, wants Apple's
+headers (`TargetConditionals.h`, then the C library's). Clang builds it
+for the target here against stand-ins for the four such headers it reads
+(`scripts/macos-headers`), freestanding and never linked, so the lint
+group lints every target for macOS from a Linux host as the macOS leg of
+CI does, the tests and the examples among them. It linted the library and
+its binaries alone for a while, and the pull request's first two macOS
+legs failed on what that left out: two test seams in `vault` under
+`cfg(test)` alone that call a module only Linux compiles, then an
+example's and two test files' Linux calls with no guard. Its first
+run here found the library itself not compiling for macOS: two of the
+cache's advices under a cipher (`posix_fadvise` and `MADV_POPULATE_READ`,
+in `pager.rs`) were Linux's alone with no guard, from two commits that no
+macOS build had seen, CI having run on no pull request of this branch.
+They are behind `cfg(target_os = "linux")` now, nothing elsewhere, where
+no store under a cipher is made (`pager::memfile`). The third macOS leg
+compiled every test and ran them, and seventy-one of `tests/durable.rs`
+failed at their first line: a store under a cipher there is refused at
+its creation, and nothing had said which tests make one. The same
+refusal made on Linux for one run (`memfile` answering as it does off
+Linux, a scratch change behind a variable, reverted after) named every
+such test of the engine's and the suite's in twenty minutes, those
+already behind the guard among them, so a test of a mode one platform
+alone has is found by that platform's primitive refused and not by a
+hosted run a binary at a time; a test with a plain arm beside the
+cipher's keeps the plain one off Linux. And the `test` group runs every
+binary whichever fails (`--no-fail-fast`), since that leg's log ended at
+the first red one. What is left for the hosted runners alone to show is
+timing on their hardware and the tests run, not only type-checked, on
+ARM and macOS.
 
+The `cross-arm` group died in two runs of five with "QEMU internal
+SIGSEGV" and no test failed, and the first reading put it on the
+tests added since the last green run. It was the shell's
+`RUST_BACKTRACE=1`: a test that panics on purpose has its backtrace
+symbolized, the symbolizer reads `/proc/self/maps`, and qemu-user 8.2
+fakes that file from its own record of the guest's mappings and crashes
+reading it while another thread maps or unmaps -- a C program of four
+threads and no engine dies the same way every run, and the same tests
+with backtraces off never do. qemu's `-strace -D` named it in one
+batch, the test binary run straight under the emulator with no cargo in
+the loop (eight of twelve dead there against two of five through
+cargo), and the group sets `RUST_BACKTRACE=0` for its run. An
+instrument's crash is traced to the calls in flight before it is read
+as any test's, and a variable of the caller's environment is one of the
+inputs a group fixes for itself. Review then found two ways round the
+variable that it passed: the library's own code reading the file or
+making a backtrace -- a unit test that formats `Backtrace::force_capture()`
+killed one run in twelve under the fix -- which tests/source.rs now
+refuses by line (`the_library_reads_no_maps_and_makes_no_backtrace`); and
+the variable moved after `--lib`, where cargo takes it for a test-name
+filter and the group ran no test and exited 0, so the case holds its run
+to `0 filtered out`. A fix that rests on an input is held where the input
+can be undone, and a group's verdict by exit status is held to the count
+of what it ran.
 One hosted leg can be run here, and the gate does not run it. `cross-arm`
 runs the library's tests for ARM under qemu-user, which answers `madvise`
 advice with success and passes it to no kernel, so a test that reads the
@@ -155,7 +435,11 @@ minutes (its step's three `CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_`
 variables before `cargo test --profile checked --target
 aarch64-unknown-linux-gnu --lib`), and a test that reads
 `/proc/self/smaps` or `mincore` behind an `madvise` is run under it
-before it is pushed. Where only part of a test reads the kernel, that
+before it is pushed. A test of an advice kept for an envelope to come
+was not, and failed the leg at the next pull request's first run; the
+group run here then found a second, of the cache under a cipher, betting
+that the evictor had no pass in flight begun before a reader pinned,
+which under the emulator's pace it had (`Pager::era_now`). Where only part of a test reads the kernel, that
 part goes behind `cfg!(supdb_emulated)` and the rest runs everywhere.
 
 A hosted job's log cannot be read while the job runs, so one that is
@@ -167,6 +451,43 @@ three times their time, with the tests a quarter slower beside them. A
 runner is that much slower some days. Every job of `ci` has a
 `timeout-minutes` a few times its longest run, since a job without one
 runs to GitHub's six hours, as `cross-arm` did once inside its `apt-get`.
+
+The forms and the encryption are kept apart by two gates, so that a change
+to a form needs no change under the cipher and one that would be wrong
+under it fails in the clear. The wall: `tests/source.rs`
+(`the_forms_and_the_cipher_do_not_name_each_other`) counts the tokens by
+which a form module names the encryption (`vault::kept`, `ATTN_PAGED`,
+`piecewise`, the word `cipher` and their kin) and by which an
+encryption module names a form, by file, token and region, against
+`tests/data/couplings.txt`: a total above the file's is growth and red, one
+below it is red until the file is lowered in the same change, and a
+coupling moved between functions changes no total. Its tokens are a list,
+and each spelling review found it passing is a test of its own -- a
+renamed re-export at the crate root, an alias of the crate, a vault call
+written as a path or broken across lines, a macro the encryption side
+exports -- but a branch on the cipher in words the list does not have
+passes until the list grows. The door: no file, mapping, advice, sync or
+process read in the library outside the six modules above, by symbol --
+clippy's barred calls over the library under the checked profile on Linux
+(`scripts/door/run.sh`, config `scripts/door/clippy.toml`), red first by
+`scripts/door/red.sh`, which writes a barred call of each family into a
+copy of `zfile.rs` and requires each refused by its own entry, read off
+clippy's output by pattern and so in no colour (`--color never`): CI sets
+`CARGO_TERM_COLOR=always`, a diagnostic's first line then starts with an
+escape, and the red input read all eleven of its lines as missing on both
+Linux legs of the pull request's first run, as the seal's red input would
+have next, with every test of the run passed before it. It
+replaced a unit test that read `db.rs` for the calls by text, which never
+read `zfile.rs`'s `File::open`, `File::options()` and `fs::read_to_string`:
+a check by text over one file passes the next file and every alias, where
+clippy resolves the path. What clippy cannot see the source test holds by
+text against `tests/data/door.txt` -- an item's allow and its reason, a
+`/proc` path, an `extern` block, code a `cfg` compiles out of the door's
+build -- and the barred libc calls are held to the libc Cargo.lock
+resolves, read out of cargo's registry
+(`every_libc_call_that_takes_a_string_is_barred_or_said_to_touch_no_file`),
+so a vendored or offline layout fails that test outright. Threads are not
+barred yet: `std::thread::` is counted by file there, and grows red.
 
 The tests leave their stores under the temp directory, one per test and
 process (`supdb-next-<name>-<pid>`), so a day of test runs on one box is
@@ -189,15 +510,20 @@ stores, and a run whose store another run's cleanup removed mid-test
 fails with a bare `NotFound` from whatever file operation came next --
 eight tests of one run, one of them in six runs alone, before a syscall
 trace showed the store's directory gone and nothing in the process that
-removed it. A pairing's arm is the other way the allowance is found
-spent: `bench ab` at ten million keys exited 1 after the comparator's
-sweep with its own store left behind and nothing in its table or on its
-stderr naming the cause, at zero bytes free; the three gates of the day
-had left fourteen hundred test stores in the private temp directories
-(1.3 GB), and the bench workspace's `target` held 14 GB, 3.6 of it the
-checked profile's example binaries, which the gate's bench group rebuilds
-and nothing reads. Read `df` of the temp volume before a timing run, and
-delete the test stores and the checked examples first. And `perf record`
+removed it. Spell that `TMPDIR` canonically: the tests that find a
+store's mappings match `/proc/self/maps`, which names the resolved path,
+by the store's directory as a prefix, so a `TMPDIR` written with a `..`
+in it failed four zpages tests and the leak test every run, five of five
+alone, with "one form file mapped: []". A pairing's arm is the other
+way the allowance is found spent: `bench ab` at ten million keys exited
+1 after the comparator's sweep with its own store left behind and
+nothing in its table or on its stderr naming the cause, at zero bytes
+free; the three gates of the day had left fourteen hundred test stores
+in the private temp directories (1.3 GB), and the bench workspace's
+`target` held 14 GB, 3.6 of it the checked profile's example binaries,
+which the gate's bench group rebuilds and nothing reads. Read `df` of
+the temp volume before a timing run, and delete the test stores and the
+checked examples first. And `perf record`
 keeps a copy of every binary it sampled, by build id, under `~/.debug`:
 a bench binary is a third of a gigabyte, a session's profiles had left
 twenty-nine of them there, eleven gigabytes, and the gate's links died of
@@ -261,7 +587,16 @@ the working tree in place -- blocked a pull request's merge until it and
 the four commits after it were made again and the branch force-pushed.
 Mutants run in a worktree of their own, with a target of its own, so the
 tree a commit is made from is never the one being rewritten, and a
-commit is made by `git commit`.
+commit is made by `git commit`. It came again at this branch's pull
+request, fifty-four commits wide: fifty-two of two days on which the
+environment signed nothing, and two merges made with `git commit-tree`,
+so the request opened with every one of them unverified and the branch
+was made again from the first of them, each commit signed with its tree,
+its authors and its dates as they were (`git commit-tree -S`), the
+citations of the remade commits in the messages and the docs moved to
+their new names, and force-pushed with the owner's leave. The `lists`
+group holds it now: every commit after the base carries a signature
+(`scripts/signed.sh`), read before a push and not at the pull request.
 
 Keep it that way. Every gate this repository has broken has broken the same
 way: a check that was not running, or one reporting a verdict it had not
@@ -302,8 +637,14 @@ at its close, which no other pull request can read and which counted
 against the limit for a week after. A
 second definition of "the checks" is how the next one of those starts.
 
-A change to an engine default lands only once `sh scripts/check.sh`
-has passed with the new default in place.
+A change to an engine default lands only once the suite has read it
+better (the owner's rule: a default changes after benchmarks confirm it,
+and nothing else waits for them) and `sh scripts/check.sh` has passed
+with the new default in place. A gate's later groups compile the tree as
+it stands when they start, and `scripts/cost.sh` builds its base from
+this tree's example sources, so an edit made while either runs is in the
+verdict of a run that began before it: nothing edits the tree until the
+run's last line, and one cargo runs at a time.
 
 ## Profiling
 
@@ -426,7 +767,22 @@ before reading a sync phase as the device's, time its steps -- the buffered
 load's sync at three hundred thousand keys stayed level after the
 fsync inside it fell from 25 ms to under one, because the phase was a
 segment close whose checksum row re-read the section (`docs/engine.md`,
-the streaming write). The suite's device-bytes quantity is
+the streaming write). And the flush is the device's, not the file's: it
+pays for every byte anyone sent the device since the last one. A commit
+of 16.8 KB into a pre-written file takes 0.13 ms alone and 180 ms beside
+a writer that hints megabyte pieces to the device, in another file or in
+the commit's own, and 0.15 where that writer's bytes are still in the
+page cache (`python3 scratch/onefile/prims.py DIR`, at `428fac0`). Traced
+over the lag sweep's full rewrite at ten million keys under 1.25 GiB
+(`scratch/onefile/inv.sh`, an `strace -f -T` of `supdb` laid to phase,
+thread and purpose by `inv.py`), the writer spent 18.1 s of 26.6 in the
+log's fdatasync, 9,000 commits at 2.0 ms where a quiet one is under
+half, while 9.6 GB went to the device for 1.3 GB of updates: log 1.5,
+merge outputs 5.7, form files 2.3. That is what a durable commit waits
+on beside the merges, which the entry on the scrambled E's commits left
+open: the lever on a durable write phase is the bytes everything beside
+it sends the device, and the class or the order of the requests moves
+none of it. The suite's device-bytes quantity is
 `/proc/self/io`'s `write_bytes`, which the kernel counts at dirtying
 time per folio: a one-megabyte write makes a one-megabyte folio, and a
 patch of a hundred bytes made in place after the folio was written
@@ -1242,6 +1598,2006 @@ and the one a byte-source abstraction most easily loses. `tests/blob.rs`
 pins it, because a native reader that started copying would still pass every
 correctness check.
 
+**The envelope is around the file, and nothing inside the format knows
+it.** `supdb::crypt` wraps a finished file: a header in the first page,
+then the plaintext in chunks, each encrypted on its own under the caller's
+cipher, read back as a `Bytes`. That is why it cost the readers no change,
+and it is the constraint. The crate ships no cipher -- the dev-dependency
+on `ring` is the tests' and the examples', a caller like any other -- and
+the wasm module links none: the browser decrypts at the fetch with
+WebCrypto (`web/crypt.mjs`, a wrapper round the fetcher every source
+takes), so nothing of `crypt` is in the module (a build with its names
+kept has no symbol of it; the size moves by tens of bytes with what LTO
+inlines elsewhere, which is not the module growing), the plans stay
+plaintext ranges, and what the cache keeps in OPFS is plaintext. The layout is
+therefore written down twice, in Rust and in JavaScript, which is what
+this file says not to do with a superblock constant;
+`tests/data/crypt-v1.bin` is what holds the two to one answer.
+`tests/crypt.rs` requires `encrypt_with_id` to write exactly those bytes,
+and `web/crypt.test.mjs`, which the wasm group runs under Node
+(`scripts/deps.sh` readies it), requires `crypt.mjs` to read them, so a
+layout change once this has merged is a new version and a new file beside
+that one, never that file written again. An `Encrypted` verifies its first
+chunk at open, so a header is never believed before a tag has covered it,
+`len()` included, and a wrong key fails there; every tag covers the header
+and every nonce is the object's id and the chunk's index, which is what
+refuses a chunk moved, borrowed from another object or cut off the end; the
+zeroes between the header and the first chunk are under no tag and are
+checked to be zeroes. A nonce repeated under one key gives both objects
+away, so an id is drawn per envelope and `encrypt_with_id` is for tests.
+
+Every choice in it that is not the cipher's was made on
+`cargo run --release --example crypt_cost`, which reads one segment plain
+and through each kind of reader in one process, and the first version,
+pushed before that probe existed, was wrong in each of them. It decrypted
+at every read, with the thread's last chunk remembered, on the reading
+that a `Blob` copies its index once at open and a lookup touches the
+source rarely: a point read of a run in a block read the source at every
+call and paid two chunks' decryption for it, thirteen times the plain
+read for a short run and near eighty for a run of a value or two at the
+smallest chunk, and worse at every larger one. A reader keeps what it
+decrypts now (`ReadOptions::keep_bytes`, unbounded by default): a chunk
+goes once into an anonymous mapping the plaintext's length and is lent
+from it after (`slice_at`), so `Blob::zero_copy()` is true over an
+envelope and a warm read costs the plain read's time; the bound of zero
+is the reader for an object larger than memory, and what is kept is
+anonymous and the kernel's to reclaim never. Its test cipher was a
+portable AES-GCM at a sixth of the rate `ring` reaches on the same
+core through the wide AES instructions, and the first touch of a chunk
+is the cipher's rate and little else: the adapter an example shows is
+the one a caller copies, so it is the fast one. Its chunks were whole
+pages of plaintext with the tag after, 4112 stored bytes, so every chunk
+lay across two pages of the file and a cold read faulted two where the
+plain file faults one; a stored chunk is the power of two now and the
+plaintext in it sixteen short, and from cold with random advice a read
+through an envelope takes the plain read's faults at the default chunk
+and two to two and a half times them at 16 KiB and up, which is what the
+default was chosen on. That left a chunk found by a divide by 4080 at
+every call, which is a multiply and a shift instead (`Per`): built on
+the divider's latency as this file has it and not priced here. A lent
+section is asked for again at every lookup (`Sec::get` calls `slice_at`
+each time), so a borrow that walked its chunks' states would cost what
+it saves: a reader with every chunk kept answers on one
+load, and before that the longest ranges lent are remembered whole
+(`Kept::known`), the longest kept when a fifth comes, since a run of
+values must not put the key section out. The browser's wrapper asked for
+the header alone before its first fetch, a round trip an open did not
+have; the header rides in the first request now, sized for the whole
+chunks of the default chunk -- sized first by the bytes wanted and their
+tags, it fell short of the last chunk's end and asked twice anyway. And
+the writer made a write a chunk; it hands its sink a megabyte at a time,
+for the folios the page cache makes of it. With a fast cipher what is
+left of a first touch is the fresh page the plaintext is kept in, which
+costs more than decrypting into it: a long range's pages asked for in
+one call before its chunks are filled took a quarter off the open of a
+`Blob` over an envelope and is the default (`ReadOptions::populate`,
+never past what the reader has room to keep), and huge pages under the
+plaintext added four tenths to the open and to the first pass of point
+reads, the kernel zeroing two megabytes for a chunk of four kilobytes
+(`ReadOptions::huge_pages`, refuted and off). The rule: a second way to read is priced beside the
+first, in one process, on every operation the first is measured on,
+before its default is chosen; and the order of the costs is read off the
+probe before any of them is tuned -- the reader's shape was up to
+eighty times, the cipher six, and the layout two by its count of pages.
+
+The suite has the arms the probe could not be: `supdb-segment`, a
+write-once segment read through `Blob`, beside `supdb-segment-enc` and
+`supdb-segment-encbounded`, the same file as an envelope through the
+reader that keeps and the one that keeps nothing, and all three again
+with every value in a block (`bench/DESIGN.md`). They found two things
+the probe had not. The reader that keeps nothing remembered one
+decrypted chunk a thread, and a value in a block is read as the piece of
+the block it lies in, which lies across two chunks more often than in
+one: a walk of a block's values asked for the same two chunks turn about
+and decrypted both at every value, a scan at a twenty-sixth of the
+keeping reader's rate, where the probe's scan had read 1.6x. A thread
+remembers eight now, each in the place its index names, and the same
+pairing reads the scan at a quarter and the point read at a quarter,
+which is its two chunks a read. And the first envelope arm wrote its
+plain file beside the envelope, the segment on the device twice, at half
+the plain arm's load: the plain file goes to memory now (`/dev/shm`),
+which is also the only way the plaintext is never on the device, and the
+load still reads six tenths, the segment written and then encrypted in
+two passes with the reader's open decrypting the index after
+(`ROADMAP.md`, an envelope written in one pass). Through the keeping
+reader the suite's own passes read level with the plain file where the
+values are inline, and the first pass of point reads over values in
+blocks a tenth lower with its p99 three times, each chunk's one
+decryption falling in that pass. The pairing of the two readers at a
+million keys was stopped at forty minutes of ninety: a threaded scan
+pass is `size` scans a thread, so an arm four times slower there is
+priced at a hundred thousand.
+
+**A live store under a key is the kernel's, and the engine's part is to
+refuse.** `Encryption::Kernel` does not encrypt anything: `Db::create` hands
+the kernel the key and sets Linux's file-encryption policy on the store's
+empty directory before it writes into it, `Db::open` holds the
+directory's policy to the key it was given, and from there every file
+the store makes is ciphertext on the device and plaintext in the page
+cache (`src/db/dirkey.rs`). That is the whole reason it is done this
+way: a store reads by lending from its files' mappings, the page cache
+is what holds those bytes, and the kernel is the one place a file can be
+decrypted into it. Encryption the engine did itself would put every byte
+a store reads into memory of its own, as the envelope's reader does for
+one finished file, and take the advice, the residency counts and the
+out-of-core accounting with it. What the engine owes is the refusals,
+and each is a test: a store given a key where the directory cannot be
+encrypted writes nothing; a key given to a store in the clear is refused
+before a byte is read, since the store would go on in the clear under a
+caller who believes otherwise; a directory under another key is refused;
+and an encrypted directory whose key the kernel does not hold is refused
+by name when opened with none, because its files' names are encrypted
+too and it would open as a store of nothing. The key is not kept in the
+options past the call, and a store does not give it up at its close:
+another store or another process may be open under it, and a key given
+up under them is their next file refused.
+
+The tests are in two halves because a test cannot make a filesystem. The
+refusals run wherever the tests do. The rest wants a directory on a
+filesystem with the feature and the file that filesystem is in, to
+search what the device holds for the store's keys, values and file
+names: `scripts/fscrypt.sh up` makes one in a file behind a loop device,
+`scripts/check.sh fscrypt` runs the ignored tests of `tests/dirkey.rs`
+on it and asks for each by name, since a run of no tests is green, and
+CI has a job that does both as the runner's own user. Three things it
+taught. A key is given up through a descriptor, and `lock` asked through
+the store's own directory, which is a file under the key held open for
+the asking: the kernel answered that files were busy every time, and the
+filesystem's root is the descriptor to ask through. A mutant that
+skipped the encryption wrote a store in the clear onto the test
+filesystem, and every run after it found that store's keys on the
+device, in blocks a removed file leaves behind: the device remembers, so
+a red run of that test is followed by `fscrypt.sh down` and `up`, and
+the search has a control, a file written in the clear beside the store
+that it has to find. The same test searched the device for the store's
+file names and went red in the gate after a pairing had put a plain
+store on the filesystem: every store's files have the same names, so a
+name on the device says nothing about this store, and the names are
+held by the locked store's listing, which is this store's alone. And the pairing: `supdb-dirkey` against `supdb`,
+both on that filesystem, read level on every read, scan and read mix in
+both sittings, and at half on every write that syncs, the buffered load
+at a quarter. A bare write and `fdatasync` in an encrypted directory and
+a plain one, no engine in it, read the same 2.4x, and `/proc/crypto`
+named the reason: `xts(ecb(aes-fixed-time))`, a kernel built without the
+AES instructions (`CRYPTO_AES_NI_INTEL` is not set in this guest's), a
+software cipher at a hundred megabytes a second where a kernel that
+names `xts-aes-aesni` runs gigabytes. So the write cells of that pairing
+are this kernel's and nobody's, the read cells are the design's, and the
+price on a kernel with the instructions is not known (`ROADMAP.md`). The
+rule: under the kernel's encryption a write rate is read after
+`/proc/crypto` has named the cipher's driver and after a floor with no
+engine in it has been taken in the same two directories, since the
+cipher is the kernel's and its speed is a property of the build.
+
+**A live store under the caller's cipher reads its files by the piece
+through a cache of its own, and what the engine owes is the door and the
+asking.** `Encryption::Cipher` is the
+second way a store is kept under a key, for a caller who brings the cipher
+(`src/db/vault.rs`). It was asked for first and built second: the caller's
+cipher was the plan from the question that started this, the envelope gave
+it to a finished file, and the live store was then handed to the kernel
+because that kept the read path, without anyone being told the plan had
+changed. The two are not one feature done twice. The kernel's keeps the
+page cache and wants a filesystem that can encrypt; this one goes wherever
+Linux does, authenticates every byte, leaves files that are ciphertext
+wherever they are copied, and reads through a cache of plaintext of a
+size the caller sets.
+They are one option with three values (`Options::encryption`:
+`Encryption::None`, `Kernel`, `Cipher`) and were two for a day: a key
+beside a cipher, each an `Option`, with a test on an encrypting filesystem
+that a store under both read as itself. It did, and it was the wrong
+thing to have made possible. A store under both hands the kernel bytes
+that are ciphertext already, so every byte it writes and every byte an
+open reads is encrypted twice for a device that learns nothing more from
+the second, and the two switches read as two layers to be stacked where
+they are two answers to one question. The choice is an enum, a store kept
+one way is refused when it is opened the other (`tests/dirkey.rs` holds
+both refusals, the cipher's inside a directory the kernel encrypts
+already, which is the filesystem's business and stays possible), and the
+test that composed them is gone. The refusal's own first test passed with
+the refusal deleted: the kernel's key opened the directory, the open went
+on, and failed further in at a manifest it could not parse, an error all
+the same and for no reason anyone would recognise. The test asks for the
+refusal's words and a directory left as it was. The rule: two options
+that answer one question are one option; a test that two things compose
+is first asked whether anyone should want them to; and a refusal is
+tested by what it says, since a store that fails later for another reason
+is refused by accident.
+
+The first shape of it held the store in memory, and that was decided by
+building it. A store reads by lending from mappings and the cipher is in
+the process, so the plaintext is the process's to hold: the first shape
+made each file a memory file (`memfd_create`), written and mapped by the
+code that writes and maps a plain store's, with its envelope written once
+it was finished, because a memory file is a mapping like any other and
+nothing on a read path had to know. The price was written here afterwards
+as a property of the design -- the store has to fit in memory, an open
+decrypts all of it, a descriptor a file -- under the words "the
+constraint and not an accident". It was neither. Nobody who asks for a
+store under a cipher means the stores that fit, and a limit of that size
+was the first thing to say and was said last, in a README, two commits
+and a pairing after it was built. The rule: a feature that holds for some
+stores is a different feature from the one asked for, and which of the
+two is being built is said before it is built; and a constraint a note
+calls the design's is checked for being the cheapest thing to have
+written.
+
+What it takes instead is the readers asking for bytes before they read
+them. `Blob` borrowed its key section whole at every lookup and
+`flatindex` addressed into the borrow, which over a mapped file is the
+kernel's paging and over anything else is the section made present whole.
+A source now says that it lends by the piece (`Bytes::piecewise`); `Blob`
+holds such a source's sections by their place and borrows none of them
+(`Blob::pieces`); and `flatindex`'s readers take any `Sect`, the slice, over which they are the
+code they were, or `Pieces`, each read of which is a `slice_at` of the
+range it wants. The record parsers are not generic and there is still one
+of each: a section by the piece hands them a window that holds the
+record, the piece the offset lies in and then more, which is sound
+because a parse that succeeds has read only bytes it asked the window
+for. `tests/blob.rs` holds the readers to it with a source that lends a
+copy of exactly the range asked for, and counts what it was asked for,
+since a reader that asked for its sections whole would agree on every
+answer too. The engine names one reader type as before: a paged mapping
+is a `MmapBytes` whose lendable length is zero, so its every `slice_at`
+fails the bounds check a mapped file's passes and goes round by the pager
+(`slice_slow`), and nothing in `db.rs` knows which it holds.
+
+The plain store's price was counted, and for a commit it was called
+small where it had to be nothing. The first count read twenty-two
+instructions a point read more, `Blob::flat` out of line where it had
+been inlined; then six in eight hundred and fifty, written here as the
+feature's price with their attribution -- four for a test of whether the
+store has a cache at the top of `read_all`, three for a third kind of
+`Sec` -- beside eighty-eight a scan, a count and a test a key of every
+merge, a counter raised and lowered at every write, and a call a block
+of every builder's look. Six is under what any pairing resolves, which
+is how it was let stand, and it was every store without a cipher paying
+for one. A store in the clear pays nothing an operation now, and the
+count is what holds that: `bench/examples/read_only.rs supdb 100000 1
+n-none` and `lag0_probe.rs supdb 100000 1` under callgrind with the
+toggles the profiling section names, `work_probe.rs 100000 whole` for a
+writer's whole round and `merge_walk.rs 100000 4 1` for a merge, each
+built at `origin/main` from this tree's example sources and at the tree,
+and read by function (`callgrind_annotate`, the functions' own
+instructions side by side), never by the total alone. They read under
+the main line's: the point read seventeen instructions of 848, the scan
+fifty-five a scan of a hundred entries, the round 1.3%, the merge 4.4%.
+Those four were the count, and a store's reads through its compact form
+were not in it: a scan through a form was 370 instructions over the main
+line while this paragraph said nothing was, until the form itself went
+under a cipher and was counted (the compact form, below).
+`sh scripts/cost.sh BASE` is the count made one command: the probes (the
+point read and the scan, each in the raw form, through the compact
+form's blocks and through its stride file, the scan past `SCAN_REST` in
+each, the durable and the buffered
+ordered load whole and their commits under a toggle, a writer's round, a
+merge, the segment work on the writer's thread, a segment written through
+`SegmentWriter` and `Blob::scan_at` through the public API) built at BASE
+from this tree's example sources and at the tree, each under callgrind,
+every function's own instructions side by side, and a failure where a
+hot function gains past its slack (`scripts/cost-diff.py`, below);
+`sh scripts/cost-red.sh` is its red input, and `sh scripts/check.sh cost`
+runs the two. Its edits name text in the tree, and two of them named
+text a change and then a merge had replaced, for two days before a pull
+request's first run of the group read red: the `lint` group holds every
+edit's text in place in a second (`COST_RED_ANCHORS=1`), since the group
+itself runs on a pull request and nowhere else. The first version of the list named
+its functions as paths, `supdb::db::Reader::read_all`, matched as
+substrings of callgrind's names, which print a method as
+`<supdb::db::Reader>::read_all_in::<G>::{closure#5}`: no line named an
+engine function, the only matches were the probes' own functions inside
+other functions' generic arguments, and the point read could have gained
+anything. Its first whole run against upstream said so by printing
+`HOT GAINED` for `read_exts_inline::<coded_record_to<supdb_range::{closure#0}>>`
+in a probe that never scans. The comparator reads canonical names now
+(generic arguments dropped, `<T>::f` read as `T::f`), fails a probe in
+which no line names a function, and names the lines a whole run never
+reached; the red input's first step holds each of those against names
+written as callgrind writes them. A gate's list is held to the names the
+instrument prints, by a fixture in the instrument's own spelling, before
+the list is trusted to name anything. Against itself the count is exact
+for every listed function in a probe with a toggle, while libc's and the
+allocator's counts move between two runs of one build (the point read's
+`memcmp` by most of an instruction a read) and so does the controller's
+look at its budget, which runs on a clock (`!` in the list takes it out).
+And a list is also what a gate does not hold: the list was the only thing
+that could fail, and the review found the scan probe running
+`Reader::install_ahead` and `make_table` once a scan, on no line, so a load
+and a branch in either, or a step moved out of a listed function into a
+helper of its own, read green. A toggle collects the operation on its own
+thread and nothing else, and against itself every function of the engine,
+the suite and the probe it collects has read the same to the instruction,
+but for a few that wait on another thread (the segment writer's look at its
+helper, +16 over the seal probe's run once and +63 over a commit probe's),
+so in a probe with a toggle all of them are hot, listed or not. Where an instrument is exact,
+the gate holds everything it measures; a list is for where it is not.
+The second review found the slack was the same hole. It was a twentieth
+of an instruction an operation, and an operation of the seal, the merge
+and the loads is a key: a load and a branch at every 16 KiB piece of a
+key section is a hundredth an operation and read green, in a probe whose
+every function read the same to the instruction against itself. A slack
+an operation is a slack a key, and the owner's rule names the block and
+the step too. Under a toggle the slack is 64 instructions over the
+probe's whole run, a function, whatever its operations, for every
+function built from source -- the engine's, the suite's, the probe's and
+the standard library's code compiled into the binary, a `#[no_mangle]`
+helper's with them -- and libc's and the allocator's, which move with the
+addresses they are handed, fail past two instructions an operation and a
+twentieth of their own count both. With no toggle (the loads, the round,
+the merge) every function of the engine is hot, listed or not and new
+ones above all, at a hundredth of an instruction an operation: the self
+checks put the rest of their noise at under a two-hundredth. The functions
+that move by more were `~` lines, out of those probes, on the reading that
+each was exact under a toggle; the third review listed the toggled probes'
+functions and found three of them in none -- the writer's sweep at an
+operation's end, the reader table's look, and every function of the
+segment work, which `~supdb::db::Maint::` took out whole on evidence for
+two of its hundred and forty methods -- so a step a landing or a key
+written into a landing, publish or retirement read green in every probe
+that ran it. A `~` line carries a bound now, three times the most two to
+four self-checks moved its function, and names its function, not its type
+(`Maint::collect` and the three others measured past a two-hundredth);
+and the segment work has a toggled probe of its own (`land`: the segment
+work and the upkeep inline, the seal landed before the scan that follows
+it, the store's platform readings through its seam), whose every function
+reads the same against itself but the seal's wait, bounded. A `~` line
+with no bound is refused. The rule: a function taken out of one probe is
+named, with the probe that holds it, and an exclusion with no bound and no
+holder is a function the gate does not measure. The slacks as numbers:
+under a toggle 64 instructions a function over the run; with none, a
+hundredth an operation, which is 1,000 over the loads' 100,000 keys, 3,000
+over the round's 300,000 operations and 2,000 over the merge's 200,000. So
+a fixed cost of up to that much once a store, in its open or its close,
+reads green there -- the owner's rule is a key, an entry, a block or a
+step, and a store's open is none of them -- and a cost of under ten
+instructions a commit of the ordered load's hundred, or a few a 16 KiB
+piece of its stream, is seen by the commit probes (`commit_durable`,
+`commit_buffered`: the toggle on the suite's `write_batch`, the writer's
+appends and its commit) at 64 over the run; a cost a segment by the seal
+probe, four segments of a quarter of its keys, at 16 a segment.
+Counted against the upstream head this branch merged, every probe read
+under it but the scan, eight instructions over, and no function of the
+scan's source had changed: two of upstream's (`forms_off_scan`,
+`scan_seek_seeded`) were inlined in upstream's build and called out of
+line in ours, the scan having grown with the cipher's work, so each
+call paid its frame for a test that answers no in a store in core. Each
+keeps its first test inline now and the rest out of line, and the scan
+reads fifty-two under. Two readings beside it were nothing: `scan_seek`
+fifteen over by its own count, which was upstream's out-of-line `flat`
+inlined into it, thirty-five a call gone; and `memset` 1.2 a key over in
+both loads, which was the reader table zeroed once a store by one `rep
+stosb`, that callgrind counts a byte an instruction. A move by function
+is read beside its callers' and callees' before it is read as a cost,
+and a function whose count moved with no change to its source is first
+asked whether the compiler stopped inlining it into a caller that grew.
+What it took, each a shape:
+
+The question rides a test the operation already makes. Every read looks
+at two bytes of its handle at its start and its end, for the compact
+form's census; the cipher's bit is in both (`ATTN_PAGED`, set where the
+handle is made), so a store under none makes the tests it made, and what
+a read under one does there -- the wait for a cache far past its budget,
+a snapshot's word, the failure its answer is replaced by (`paged_begin`,
+`end_slow`) -- is behind them and out of line. A scan's and a count's
+end look is made with the answer in hand (`Entered::finish`), and
+`leave` with no look in it is where the read came out ahead; a point
+read under a cipher is sent at the start's test to a read of its own
+(`read_all_paged`), since its paths' answers met at that end cost a
+plain point read four instructions (the merge of #29, below). Whether an operation is the
+writer's own is its depth (`WRITER_OP`), where it was a counter; a
+merge's rests are a type (`MergeRest`, `NoRest` for a plain store, which
+compiles to no step counted); the forms' word for "nobody has asked"
+is another under a cipher (`REST_HERE`), and the builder ahead's stop
+word has a third value (`AHEAD_REST`), so the one compare each look
+made sends a store under a cipher to its rest and a plain store on.
+
+The reader's kind is found in the refusal. `Sec` is two kinds again: a
+section of a source that lends by the piece is held by its place, as a
+lent one is, and `Bytes::lend_at` refuses it whole -- for the mapped
+file, by the bound check it always made, against a lendable length of
+zero -- so `Blob::flat` is the function it was and the reader by the
+piece is where it answers `None`. A scan's walk refuses such a source
+before it walks (`Blob::scan_whole`), and the engine takes the walk by
+the piece up in the branch a failed walk takes anyway (`scan_either`);
+`Blob::scan_at`, the caller's, asks the kind only of a type whose values
+can be of it in a caller's hands (`Bytes::ASK_PIECES`).
+
+Naming the second walk inside the first cost the first. `return
+self.scan_pieces(..)` on a branch no plain scan takes was three to four
+instructions an entry of the fixed loop, the callback handed on by
+value, by `&mut` or inside a closure alike; an arm by the piece moved
+behind a closure in every reader (`by_piece(move || ..)`) cost the walk
+of the unsealed keys two an entry and the point read seven. What the
+compiler does with a callback that has a second taker is not something
+a branch's coldness undoes, and the count of each shape was the only
+way to know: six shapes of `scan_at` were built and counted before one
+read level.
+
+And a count that moved by one in a function nobody touched was worth
+the look. `emit_unsealed`, whose source and whose callees' sources were
+the main line's, read one to two instructions an entry over it in every
+build, block placement and a spill, moving with each unrelated change.
+The function held a `RefCell` borrow of the snapshot's stale list from
+its first line to its last, across the caller's callback: taken for the
+one look it is for, the walk of the unsealed keys is sixteen
+instructions an entry under the main line, and a callback that reads
+through the handle no longer runs under a borrow of the handle's state.
+
+A bound restated in a generic caller ahead of the override that made it
+did not fold either. Sealing `Bytes::lend_at` was first tried with the
+method taken off the trait: a lendable length on `Bytes` (`self.lend` for
+a mapping) and the lend a private function of `blob` that refused past
+it and then called `slice_at`, whose own check against the same field
+was to be the same compare. It read `Blob::scan_whole` six instructions
+a scan over the commit before and the public `Blob::scan_at` probe 127 a
+scan, with `key_at` and `copy_block` near one a key in the landing:
+the zero-sized token on the method as it was read level everywhere. A
+check that two inlined functions make of one quantity is counted before
+it is called one check.
+
+And a count is chosen among the shapes that hold a rule, never in place
+of one. `MmapBytes::lend_whole_map`, the successor of the public
+`as_slice`, went in crate-private with no token, on the reading that a
+token a reader would raise the wall's count of the seam's paths out: any
+module of the crate could then write the whole borrow that answers the
+empty slice for a paged mapping, which is the hazard the seal is for, and
+review read it off the signature. It takes the ordered index's token or
+the stride form's, each made in its own module (`lend_seal`, the trait
+`bytes::whole_map_readers::Reader` implemented in the seam alone), with
+the raise declared. A seal is as wide as its token's constructor and
+holds nothing the compiler cannot see: a derive or a `Default` on the
+token, a function of the reader's module that hands one out, one made by
+unsafe code, or a new caller inside the reader's own module all compile,
+and a red line abroad tries only the routes it names. tests/source.rs
+holds each token's module to its one text and every token to the call it
+is made for (`the_seals_tokens_are_made_only_where_they_are_spent`), and
+its first version read both as text: review wrote the route this
+paragraph names in spellings rustfmt keeps and the check read none of --
+a function of the ordered index returning `<lend::Token>::new()`, spent
+abroad by type -- and a renamed import, a call through a function value
+and the names handed to macros as identifiers beside them, each compiling
+with no unsafe. The second version read the words by their position (a
+method after `.`, a module before `::`) and, inside a macro's tokens,
+refused `lent` and `lend` wherever they stood, with an exception list
+keyed by a line's text; and the stage's closing critic found it red on
+ordinary code -- `debug_assert!(to.lent <= n)` in the engine, any
+`.base(x)` of another type, a listed signature rustfmt split -- since
+`lent`, `lend` and `base` are common words here. The seal's words are
+names nothing else in the tree uses now (`lend_at`, `lend_whole_map`,
+`lend_asked_map`, the stride form's borrow of a mapping's whole range
+for readers that ask for each page before they read it, `base_address`,
+`lend_seal`, the tokens' re-exports, `BaseAddressToken`,
+`whole_map_readers`), so each is read as an identifier wherever it
+stands, a macro's tokens included, with no rule for macros: every line of
+src that names one is a call at a site listed by file and scope with its
+token made inside its own parentheses, or a declaration at a site listed
+the same way and standing in a `use`, a listed impl's header, a call's
+signature or a token's module held whole; a `use` of one binds a
+re-export's name and nothing else, and each listed scope is one function
+of its file (`the_seal_leaves_ordinary_code_alone` holds the ordinary
+code and the rewrapped lines; the two `a_seals_token_*` tests hold each
+route). The first version of that held a declaration by its scope alone,
+and review found the scope of a top-level line is the whole top level: a
+macro handed the token's name there (`hand!(OrdLendToken);`) handed a
+token out, gave it an impl or gave the readers' trait to another type,
+where the exact text before it had refused every such line, and a second
+`fn file_facts` in a nested module of zfile took a listed scope's name.
+The rule: a check over source that holds a name holds it by every
+spelling the language gives it, and a name it holds is one the tree uses
+for nothing else, since a check over a common word is a check over
+everyone's code, and an exception list keyed by text is red at the next
+rustfmt; and a site keyed by scope admits whatever that scope can hold,
+so a scope as wide as the top level is keyed by the kind of item too.
+The second review found the call's token read from the word's first row
+of the table, which every row shared, so a row of another token would
+have held every call of the word to it: a value a table's row carries is
+read from the row that matched, and a case with two rows that differ
+holds it. What it still cannot read is a name a macro builds from pieces
+(`concat_idents!` is unstable, `paste` is no dependency), code from
+outside a file, which the wall refuses at a count of zero, and a closure:
+a call inside a closure of a listed scope is that scope's, as the lexer
+has it, so a listed reader that returns the closure, or a function value
+of it, hands the borrow out, and what a listed scope returns is read in
+review (a nested `fn` is a scope of its own, and refused).
+
+The same shape twice more, each read at the
+instruction (`--dump-instr=yes`, each instruction's count beside the
+disassembly, `addr2line -i` for whose inlined code it is) and by
+neither function's source. A caller's function that `Blob::seek` was
+inlined into carried `seek`'s arm by the piece beside the slice's, and
+the public `scan_at`'s loop in the same function read two register
+copies an entry more; `seek`'s arm out of line put the loop back to the
+instruction. And the settle that inlines the ordered index's planned
+seek read thirty-seven instructions a key over the main line with its
+own source unchanged, once `head` bounded its read by a call that
+returns (`head_absent`, the read by the piece) where it had asserted and
+the top level a mapping read by the piece builds at its first seek was
+reached by another (`top_late`). The first fix read the cost as spills
+in the search's loop, held the heads as one slice (`heads_held`), took
+seventeen of the thirty-seven, and was called the compiler's for the
+rest; the count by instruction, made only when a review asked for it,
+put the loop at twelve instructions a probe on both sides all along and
+the excess around it: the query's head and its position in the top
+level kept on the stack across the two calls, reloaded at each compare,
+in a plan stored and copied through memory. Both arms out of line, each
+a function the plain path does not name (`plan_seek_late`,
+`seek_planned_by_piece`), took the rest to eight a key, and those eight
+are still there, the plan stored and copied through the stack: the
+function reads nine a key under the main line because the stride's
+probes read unchecked over the slice the plan cuts, bounded once at the
+slice, two instructions a probe the main line pays, so the growth is
+outweighed inside the function and not removed. A cold call that
+returns is a call the caller's registers are saved across, and a panic
+is not. The rules: a cold path that returns into a hot path is priced in
+the caller, by its instructions, before it is called free for being
+cold; where a function's count moved with its source unchanged, its
+inlined callees are diffed by instruction before its own lines are, and
+before a fix is built on where the cost is thought to be; and a remainder
+is not called the compiler's until the instruction listing says which
+values it keeps where.
+
+What a plain store is still asked is where something is made or waited
+for, never in an operation's path a key, an entry, a block or a step: a
+handle made (`paged_bits`), a snapshot taken or released, a file
+operation (the `vault::` door's counter), a wait on the device or
+another thread (`unlent`, `unlend`), a merge's start and its end
+(`vault::hold`, `check`), a fill's start (`look_mask`). Each is a load
+and a branch beside a syscall, a thread's park or a pass. One more is
+the compiler's and was found counting an ordered load whole: a store's
+creation zeroes its reader table in one call, a hundred kilobytes, where
+the main line's build of the same source (`Readers::new`) wrote it a
+slot at a time, once a store.
+
+Seventeen mutants of the new paths, four of which outlived the tests
+there were: a fill that looks every sixty-four blocks under a cipher,
+which only a store of wide values could tell from one that looks at
+each; the forms' word left the plain one after the forms were given up;
+the writer's own fill not resting, which no test ran, since the
+builders' test filed its burst on the store's thread; and a read that
+does not wait for a cache far past its budget, which had no test since
+the wait was written. Each has one now, and a snapshot under a cipher
+has its first: nothing had read through one, and four of the seventeen
+were its. The last of those tests hung under its own mutant where it
+should have failed, a reader parked in a callback and the failure path
+holding the end that lets it go, so the test moves that end into the
+scope it can fail in. And the tests that hold a cache to its budget run
+one at a time (`one_at_a_time`): four of them at once on four cores
+were each other's stalls, and the larger store's peak read 3% over its
+bound in one run of the file, with nothing of the engine's changed.
+
+The rules: a cost with the option off is nothing or it is a cost, and
+"under what a pairing resolves" is not nothing -- it is counted, by
+function, against the commit before the option existed; a question a
+path must ask is put where the path already asks one; a branch that
+names a second callee for a callback is priced on the first callee's
+loop; and a function whose count moved with no change to its source is
+read for what it keeps live before the move is called the compiler's;
+and a test that parks a thread lets it go on its own failure, or a red
+run of it is a hung one.
+The same count under the cipher read 450 more than its twin in the
+clear and then 230: a page-size `sysconf` on every read, inside the
+test of whether the cache is crowded, and a divide by a field where the
+divisor is a constant.
+
+The cache (`src/db/pager.rs`) is a file as a shared mapping of a memory
+file its plaintext's length, a state a chunk, and the envelope the chunks
+are decrypted from. A chunk is a stored page less its tag, so two chunks
+share a page of plaintext and what is given back is a unit, the least
+run of chunks that is whole pages, 256 of them. What makes giving back
+safe is the reader table. A reader holds what it was lent for the length
+of its operation and nothing says where, so the evictor marks a unit's
+chunks, moves the table's epoch on, and frees once no reader is pinned
+before the move (`PagerGrace`, `Readers::oldest_lent`), which is the rule
+a retired state is freed by; a reader that meets a marked chunk takes the
+unit back, or waits for its pages to be gone and decrypts again.
+Addresses do not move, so a range asked for again after a rest is the
+same bytes in the same place: a walk that rests keeps its borrows by
+asking for them again, and copies nothing. Under debug assertions a read
+with nothing pinned panics (`Paged::ensure`), which is how the threads
+that read with no slot were found, and they hold the cache explicitly
+(`pager::Hold`): a merge over its inputs, the open over its segments.
+
+A pin is longer than a read, and every place that was true held the
+cache past its budget. Each was found the same way, by the count of what
+the evictor waited for (`PagerCounts::longest_wait_us`) and, for the
+length of the hunt, a backtrace kept at each pin and printed for the slot
+being waited on; none was found by reading, and two readings that came
+first were wrong. In the order they fell: a snapshot's handle is pinned
+for its life, so it says at each read what it holds from (`Slot::page`);
+a scan of no limit is one read, so it is walked a thousand keys at a
+time over the one pinned state, with a rest between (`scan_rested`); a
+merge kept every output in memory until its last, so each is given its
+envelope where it is finished (`Emitter::leave`); the writer's flush and
+settle are pinned for as long as the merges they wait for run, and the
+segment work for as long as it joins a thread or syncs a manifest, so a
+wait says it holds nothing (`Reader::unlent`, `unlend`); the landing of a
+merge compares a key a block of the old partition and the new, to carry
+the block cache's copies across (`Db::same_blocks`), which for records of
+a hundred bytes is most of the pages of both, read on the segment work's
+one pin -- the store read into a cache an eighth of its size in fifty
+milliseconds, at every merge -- so it rests as it goes and answers no
+once the cache is crowded; the block cache's builders read every block a
+burst dirtied under one pin, and gave their forms up there
+(`Reader::abandon_asked`) until the first pairing out of the cache showed
+what that cost, below; and merges read their inputs in order at the
+cipher's rate, hundreds of megabytes a second, so whatever stalled the
+evictor for a few milliseconds, they had filled the cache by then, and a
+reader past the crowding line waits for the evictor, briefly and with an
+end (`Pager::breathe`). The rule: under a cache the engine fills itself,
+a pin is priced by what anyone reads while it stands, since the evictor
+waits for the oldest; a wait is the one place code not written for it can
+say it holds nothing; and the instrument is a count of the longest wait
+with the name of who was waited for, built before the first guess.
+
+A chunk that fails its tag is found where it is read, not at the open,
+and the readers' answers are `Option`s in which bytes that did not read
+and a key that is not there look alike: a search treats a record that
+will not decode as "not less", and a lookup a slot that will not read as
+absent. So the pager remembers the first failure and every read of the
+store answers with it from then on (`Pager::check`), asked at the read's
+end. A merge asks before it names its outputs (`vault::check`): one that
+read no values for a key writes the key without them and deletes its
+inputs. `tests/cipher.rs` holds the property restated -- a byte changed
+anywhere is a store refused at its open, a store that refuses to be read,
+or a state the store acknowledged -- and requires each of the outcomes to
+occur.
+
+Four things building it, each a shape. A memory file had two views. The
+envelope's naming and the file's hand-over to the cache took the table's
+lock one after the other, and a reader that mapped the file between them
+made its view and took the memory file from every entry, so the
+hand-over found no entry over the file, made a second view for nobody,
+and the evictor, giving back a megabyte of that view in the instant
+before it was dropped, punched the memory file under the first: a
+segment's hash slots read as zeroes, its key as absent, a delete in it
+unseen, one seed in two hundred of the fuzz under a cache of sixteen
+kilobytes, with every file well-formed. The two are one critical section
+(`Vault::settled`), and a second view of one memory file panics under
+debug assertions. A reader waited for the evictor while holding what the
+evictor waited for: it moved a chunk to busy, found the unit's pages
+going, and waited for them with the chunk still busy, where the evictor
+waits for no chunk to be busy before it lets them go; found reading the
+two loops side by side, since the fuzz had not met it. The reader table
+was handed to the cache after the store's threads were started, so a
+thread that read in between read under a pin nobody waited for; it is
+handed over where the table is made. And the evictor's margin was eight
+megabytes at least, which under a budget of two was every pass giving
+back everything: a floor written for a budget of gigabytes and tested
+under one of megabytes is two different constants.
+
+What holds it: the pager's unit tests under a stand-in cipher (a range is
+the plaintext and nothing else is decrypted, nothing goes under a hold, a
+rest gives way and the range asked again is the same bytes, threads read
+the plaintext while the cache turns over, a changed chunk poisons, a file
+adopted stays until it has its envelope);
+`a_store_larger_than_its_cache_reads_as_itself_within_it`, a store nine
+times its cache through a load, a scan of the whole of it, four reader
+threads beside a writer that flushes, and a reopen, with the cache's peak
+held to its budget and a fixed slack throughout, the open held to a
+handful of chunks a file, and the process to no descriptor for a file;
+`the_block_caches_builders_build_through_a_cache_the_store_does_not_fit`,
+a burst over every block filed by the store's own thread under a cache a
+sixth of the store, held to two mutants;
+and the differential fuzz under a cache of sixteen kilobytes
+(`fuzz_range_under_a_cipher_that_does_not_fit_its_cache` in the gate,
+`ZFUZZ_CIPHER=1 ZFUZZ_CIPHERCACHE=16384` by hand, with `ZFUZZ_CACHE=all
+ZFUZZ_OPTVARY=1` for the block cache's paths), which asserts that the
+cache turned over, since a run under a small cache that gave nothing
+back is a run of the other test.
+
+The engine reaches its files through `vault::` (`create`, `open`, `map`,
+`rename`, `hard_link`, `remove_file`, `names`, `len`, `exists`,
+`sync_dir`), each the standard library's call after one load of a counter
+where no store under a cipher is open in the process. A store under a
+cipher is given a directory that cannot exist, its marker file's path with
+a name after it, so a file operation the door is not in front of fails
+with "not a directory" and writes nothing; and the library is linted for
+the calls the door stands for, by symbol (`scripts/door/run.sh`, under
+"Running the checks"), since the first only fires where a test under a
+cipher reaches the call. A name nobody classed
+is kept in memory: the log and the manifest alone pass to the directory
+under their own names, and the engine seals what it writes into those
+itself, a record a commit and a slot a publish. A new kind of file is
+therefore safe before anyone has thought about it, and lost at the close
+until someone has.
+
+A file being written is a memory file, and an fsync of a memory file is
+of nothing, so every durability the engine
+takes from an fsync of a file that is not the log or the manifest is one a
+store under a cipher gets another way, and there were three. A segment
+before the manifest that names it: the manifest's bytes are made by
+`manifest_image`, which writes and syncs the envelope of every segment it
+names before the slot that names them exists in any form; a seal and a
+merge write theirs earlier, on their own threads, where a plain store pays
+the fsync (`vault::persist`), by name, and pass over a name that has gone,
+since a promotion links a piece under another name and unlinks the first
+while the seal's thread is on its way there, and the manifest that names
+the file writes it whoever did not. Ordered ingest's run, a segment synced
+at every commit: its commits go to the log as well, sealed and synced
+there (`Db::log_run`, below), and its segment gets its envelope where the
+run closes. And the ordered index, which a plain store leaves unsynced and
+composes again where it is missing, as a store under a cipher does. A
+fourth fsync of a kept file is a durability that is not there, and the
+list is the thing to check a change against.
+
+The recycled log was off there too, for as long as it was written down
+that a file written through before its first record could not be a
+sealed one. It can (`Options::recycle_wal`): the spare passes to the
+directory as the log does, a recycled file's header is a key drawn for
+its new life, and what lies behind the header -- the last life's records
+under the last life's key, or the zeroes the file was made with -- fails
+its tag, which is where a sealed log ends. One state is new, the crash
+at a rotation: the log's name on the last life's header, the name being
+the journal's and the header's bytes the page cache's. A plain log's old
+header reads there as a log with nothing in it; a sealed one's is a key
+wrapped for another file, which an open refused as not this store's log.
+The first version synced the header into the spare before the rename, an
+order no test could hold and a store that would not open if a device
+ever lied about it. A store that recycles reads that header as a log
+with nothing in it now (`Wal::replay`'s `recycles`), and one that does
+not still refuses it, since only a changed byte makes it there;
+`tests/cipher.rs` builds the state by renaming the spare, and
+`ZFUZZ_RECYCLE=1` runs the fuzz with recycled logs. The rule: a state a
+crash can leave is one the open reads, built in a test, before it is
+one an fsync's order is trusted to prevent; and "cannot work under a
+cipher" is a claim about a mechanism, to be checked against the
+mechanism before a feature is switched off on it.
+
+Ordered ingest was off there for the same kind of reason, and is on. A
+plain run is its own log: a segment open for append, a marker and an
+fdatasync of that file a commit, the WAL never written. Under a cipher
+the run's file is a memory file until it closes, so a commit synced
+there is synced nowhere, and the first answer was to switch the run off
+(`under_cipher`, the function that fixed a store's options under a
+cipher, gone with the last of them) and send an ordered load through the
+log and a hash table to a seal's sort. The run does not need its file to be its log. It
+is kept whole -- the ordered table, the records laid out once as the
+segment takes them, the close that composes a trailer where a seal sorts
+-- and each commit's batch goes to the log as well, sealed, written and
+synced as any commit's is (`Db::log_run`). The run's segment is named at
+the log's sequence, so the manifest that names it covers its frames and
+a replay skips them; a crash before that replays them into a table, as
+any commit's. The temp file a plain open recovers a run from is not in
+the directory: nothing of a run under a cipher is, until its envelope.
+`bench/scripts/pair.sh supdb-cipher supdb-cipherlog 300000 --passes
+load` prices it against the shape before, the arm with
+`direct_ingest` off: the ordered load 1.23x of it in both sittings and
+1.4-1.56x buffered (`supdb-ingestcipher supdb-ingestcipherlog`), the
+shuffled load level.
+
+Three things building it. The table reads its committed records through
+a mapping of the run's file (`RunMap`), and the cache gives a kept
+file's pages back by the megabyte once the file has its envelope, out
+of the memory that mapping reads. A file its writer has mapped is held
+(`vault::open_mapped`, `Mapped`): the envelope is written where the run
+closes, and the cache's view of the file is owed it
+(`MappedFile::owed`) until the last such mapping is dropped, which is
+the table's drop -- the publish after the run's landing, since the
+state keeps a replaced table for the upkeep's next look
+(`State::replaced`). Until then the run's plaintext is memory the cache
+counts and cannot give back, a seal's worth, as a seal's output in
+flight is. The first version let the vault leave the file at its
+envelope, as a merge's finished piece is left, and the reads after the
+close decrypted what had just been written. The second: the envelope of
+a run's segment is written on the run's own thread (`close_run`), where
+a plain run pays its fsync; with that line deleted every test passed,
+since the manifest writes the envelope of any segment nobody has
+(`manifest_image`), on the segment work's thread inside the landing, so
+the vault counts the envelopes a manifest's call had to write
+(`CipherCounts::late`) and a test holds it at none. The third: the log
+rotates under a run as under any commit, and with the rotation deleted
+every test passed too, the log one file of the run's size; the test
+holds the log's file under a run to twice the rotation's. Ten mutants
+in all, those two the ones that outlived the first tests.
+
+What a plain run pays for it is counted and is under nothing: the bit
+that says a run's commits are logged is in the byte the table already
+carried for `direct_table_refs` (`MemTable::after`, `RUN_REFS`,
+`RUN_LOGGED`), read once at a commit's end where the one flag was, and
+the counters of logged runs are bumped where the log is written, never
+where a run opens. The first fold of the test left two instructions a
+commit, a spill of the byte; the commit had been cloning the table's
+and the store's `Arc`s for the borrow checker, two locked increments
+and two decrements a commit, and borrowed they put `Db::commit_direct`
+a thousand instructions a commit of a thousand keys under the main
+line's (`bench/examples/load_only.rs supdb 100000 1` under callgrind,
+built at `origin/main` and at the tree, by function).
+
+What the run costs under a cipher is the double write and the envelope
+at the close, and it is not small: `pair.sh supdb-cipher
+supdb-cipherbase 300000 --passes load` reads the ordered load at 0.68x
+of the plain run in both sittings and the buffered pair at 0.52-0.57x,
+the shuffled loads at 0.80-0.84x, and the device's bytes per byte
+stored at 2.5 against 1.3. With `SUPDB_LOAD_PHASES=1
+SUPDB_DRAIN_STEPS=1` before the arms: the commits 20-50 ms longer over
+three hundred, a write and an fdatasync of the log where the plain run
+syncs its own file; and the drain 77-94 ms against 26-35, of which the
+envelope is 43-55 between the readable landing and the fsync -- forty
+megabytes sealed and written in 33 ms and synced in 20, by `strace -f
+-tt -T -y` over `load_only supdb-cipher 300000 1`, where the plain
+run's bytes went to the device commit by commit -- and 14 more are one
+`unlink`: the log file the run filled and rotated out of, retired on
+the segment work's thread by the manifest publish a drain's promotion
+makes, before the drain is answered. A plain ordered load has no such
+file, and its drain's promotion retires two temp names that are links.
+By the code any drain whose promotion or merge publishes while a closed
+log file waits retires it there (`Maint::publish`, the owed slot
+superseded); it has been looked for in no plain drain. Both are open in
+`ROADMAP.md`: an envelope sealed as the file is written makes a run its
+own log again, and a log retired after the answer takes the inode off
+the drain. From this commit the twin in the clear keeps its
+run, as `supdb` does, so the ordered-load cell of a pairing against the
+twin prices the cipher's run against the plain one, where before it
+priced two loads through the log. The rules: a feature switched off
+under a mode is first asked which part of it the mode breaks, and that
+part is given another way before the rest is given up -- the run lost
+its fsync, not its table or its close; the new shape is priced against
+the old one under the mode before it is priced against the plain
+store, since the second pairing says what is left and only the first
+says whether the work was worth doing; and a mutant that survives
+because another mechanism covers for the deleted one is held by
+counting which mechanism did the work.
+
+The compact form was the last thing off there, and the reason written
+down for it was about the code and was read as being about the form:
+"built from a partition's records borrowed whole and attached by its
+bytes in the page cache, neither of which a file read by the piece
+offers". Neither was the form's. The reader already read a form page by
+asking its mapping for it (`ZFile::page_bytes`, a `slice_at`) and copied
+the resident part to the heap at its attach, so over a paged mapping it
+is the reader it was; and the builder took its records through a trait
+(`zpages::Images`) that had a second implementation for the tests. The
+form builds, seals and reads under a cipher now and `under_cipher` is
+gone; whether the controller should choose it there is another question,
+which a pairing answered no (the end of this section). What it took:
+
+The builder reads by the piece. `PieceImages` is the directory's word for
+a rank and then a window that holds the record (`flatindex::Pieces::image`),
+each asked of the store's cache, on a thread with no slot of the reader
+table and so under a hold (`pager::Hold`). What the build does about the
+cache its segment is read through is a type (`zfile::Walked`), as a
+merge's rests are: `Mapped` is the plain build's code, the page cache's
+advice by the mapping's address, and `Held` rests at each page written,
+where nothing the walk was lent is read again, so a partition several
+times the cache is built within it. The same advice is asked there of
+the kernel's cache of the envelope, below. The attach and the sampler
+take a hold for their own reads the same way.
+
+A form file is an envelope beside its segment's, under the segment's
+token and key: `x-<token>.z`, a third kind after the segment and its
+ordered index (`vault::Kind`). No manifest names it, as none names a
+plain store's: it is a function of its segment, the store learns of it
+where it is first probed or attached (`vault::companion`), the open's
+sweep leaves it while its segment lives, and it goes with its segment
+whether or not this open ever knew it (`Vault::remove`). It is written
+under a temp name and renamed over its own, where a segment's envelope
+is written in place: a segment's token is drawn for its one envelope,
+and a form file is written again for the same segment -- in the other
+coding, or after a page failed a check -- while a reader holds the view
+over the first, whose file a write in place cuts to nothing under it. A
+second envelope under one file's key meets no nonce of the first, each
+envelope's nonces standing behind an id drawn for it.
+
+The controller needed nothing measured anew and one thing forwarded. The
+group's budget, its refaults and a thread's major faults are, under a
+cipher, the kernel's cache of the envelopes, which is where a store that
+does not fit memory waits; so the model, the census and the sampler's
+price of a fault read what they read. What did nothing under a cipher was
+every advice the engine gives the page cache about a mapped file, since a
+paged mapping lends nothing to advise: the build's ask ahead and its drop
+behind, the drop of a partition's raw pages once its form serves, the
+swap at the crossing, the residency a build ahead waits for, and the
+read path's own asks out of core. A paged mapping answers them for the
+file behind it now (`bytes::Paging::resident`, `forget`, `willneed`,
+through `MmapBytes::resident_at`, `advise_dontneed_range`,
+`advise_willneed` and `advise_dontneed`), so every caller of those got
+them and no call site names a cipher. An envelope is mapped for reads far
+apart, so without the ask ahead a build read its segment a chunk a device
+round trip. And a form file built ahead of the controller's buy is kept
+cold: its plaintext is not taken into the store's cache, where it would
+stand in the raw form's place, and its envelope's pages are written back
+and dropped (`Vault::persist_form`'s `cold`).
+
+One thing the forwarding found is the kernel's and holds for a plain
+store too: the page cache keeps a file in folios the size of the writes
+that made them, and a drop of a range takes only the folios wholly
+inside it. The pager's first test of a whole file's drop read a quarter
+of four megabytes still resident, the first megabyte, because the range
+began a page in, past the envelope's header; a whole file is dropped
+whole now, and a partial drop leaves its edges, which the crossing's
+test under a cipher allows for and nothing has looked at for a plain
+store's drops of a record region.
+
+And the forwarding stopped at the kernel's cache. `Paging::forget`
+dropped the envelope's pages for the range given up and left the
+chunks present in the store's cache, "to be given back as the cache
+gives anything back", so a drop under a cipher took the ciphertext a
+miss is read from and kept the plaintext nothing would read: the raw
+records of every partition its form file serves, which the plain
+store's drop (`Options::zpages_drop_raw`) takes out of memory at the
+install, and every range a build drops behind it. At ten million keys
+under 1.25 GiB the cache came to the pass after the lag sweep's full
+rewrite holding 412 MB of partitions' records the pass never read and 53
+MB of the form files it read, which came in a 4 KiB fault at a time,
+9,800 major faults on form files and 12,300 on pieces on the scanning
+thread, and the cache's trace said so in one line, what the cache holds
+present of each kind of file by the first field of its name
+(`SUPDB_PAGER_TRACE=1`, `present par .. pcs .. ord .. zpg ..`), with
+every major fault laid to its file beside it (`perf
+record -a -e major-faults -c 1 -d -k CLOCK_MONOTONIC`, each address
+through the mapping events, cut to the pass's `lagmark` lines). A drop
+gives back the units wholly inside its range now, at the evictor's next
+turn and whatever the budget, as a plain store's drop gives back its
+pages: each unit's chunks marked unread, so that a read after the drop
+keeps its unit, and the units marked with the pass's own under one wait
+for the readers (`Paged::drop_units`, `Pager::mark_dropped`;
+`StoreCipher::drops_keep_plaintext` is the shape before,
+`supdb-cipherautodropskeep` its arm). Paired at `145fab2`
+(`SUPDB_LAG_COUNTERS=1 SUPDB_SCAN_OPS=1 bench/scripts/pair.sh
+supdb-cipherauto supdb-cipherautodropskeep 10000000 --bound 1342177280
+--passes load,lag --reps 2 --ops-div 10`): the pass after the
+ten-percent burst at 270-330 ms in four reps of four where the shape
+before read 1.3-1.6 s in three, the clean store's pass faster in four
+pairs of four, the bursts and the loads level; over the row's passes
+(`--passes load,read,read-threaded,scan,scan-threaded,mixes`, and the
+mixes again at four reps an order) the one-thread read pass after the
+load 1.2-1.6x in eleven pairs of twelve and C 1.09-1.14x in eight of
+eight, nothing resolved against. The pass after the full rewrite leans
+its way in three pairs of four and still reads near three seconds, the
+plain store's 0.36 (`ROADMAP.md`). The evictor now makes a pass wherever
+a drop comes and not only past its budget, and waits for the readers in
+each: 7.7-8.4 s over a sweep against 2.1-3.4, on its own thread, with the
+reads that waited for a crowded cache fewer, 118-171 breaths against
+191-507. And a second lever came from the same trace and moved nothing:
+a form file built at a merge's finish taken whole into the cache whatever
+its room, on the reading that the room had refused the files the pass
+then faulted on, read the full rewrite's pass at 3.3-4.0 s against
+2.6-3.7 in a scratch build, and the trace had shown the cache with room
+through most of the burst; what takes those files out is the next
+reading. The rules: an advice forwarded to a second cache is forwarded
+to every cache its meaning covers -- a drop says the bytes are not
+wanted, wherever they are held -- and a comment that says what a step leaves ("the chunks
+present here stay") is a decision, read again on the day what it leaves
+is counted; and a lever built on why a cache refused a file is held to
+the count of what it refused before it is paired.
+
+What took them out was read next, and the order it pointed at was not
+the lever. The cache's trace counts what the evictor gives back over
+its budget by the first field of each file's name, a drop's apart
+(`given` beside `present`), and names each envelope's file where a view
+is given it (`pagerback`), so a major fault laid to an envelope by its
+address is laid to what the envelope holds. Through the full rewrite's
+burst at ten million keys under 1.25 GiB the evictor gave back 1.4-1.6
+GB of form files and 550-690 MB of pieces against 13-76 MB of
+partitions' records, in two sweeps: a merge's inputs are read and so
+passed over once by the clock, where the files written since are taken
+whole and read by nobody until the pass. The pass's scanning thread
+took 4,900-6,100 major faults on form files and 4,200-7,200 on the
+segments, pieces most of them, where the plain store's took 363 in all
+(`SUPDB_PAGER_TRACE=1 SUPDB_ZPAGES_TRACE=1 SUPDB_LAG_MARK=1` and `perf
+record -a -e major-faults -c 1 -d -k CLOCK_MONOTONIC` over `bench run
+--scale ooc --bound 1342177280 --ops-div 10 --reps 1 --top 10000000
+--bottom 10000000 --arms supdb-cipherauto --passes load,lag`, at
+`838d3dd`). A scratch build of that commit left a merge's reads cold
+for the clock, the chunks it decrypted counted as asked for by nobody,
+with the shape before an arm: it fired, 1.3-1.4 million fills a sweep
+left cold, and the burst gave back 450 MB of partitions' records and
+1.1 GB of form files; paired against the shape before (`SUPDB_LAG_COUNTERS=1
+SUPDB_SCAN_OPS=1 bench/scripts/pair.sh` over `--passes load,lag --reps 2
+--ops-div 10` at that bound) the full rewrite's pass read 1.04x against
+it in one sitting and 1.07x for it in the other, with every lag pass of
+both sittings 4-23% to the arm listed second, and it was taken out. A
+pass reads more of what its burst gave back than the burst had to give
+back unwanted: the burst cycles its merges' inputs and outputs, their
+form files and the seals' pieces through a cache of 450-700 MB, and the
+last form files are built in the pass's first seconds by merges still in
+flight, which the plain store has finished a second before it. The rule:
+an order among what a cache gives back is a lever only where what it
+must give back is no more than what nobody will read again, which the
+count by kind says before the order is changed.
+
+Every test of it passed at its first run, the fuzz's among them, so none
+was believed until its mutant failed it. Twenty-four mutants; four
+outlived the first tests. An envelope written in place passed everything,
+there being no test in which a form file was written twice: the vault's
+unit test writes one, takes a view of it, writes another under the name
+and reads the first through the view. The build's check of whether its
+reads had read could be deleted, since a record that does not read is an
+image of no bytes, which the build already refuses as a record with no
+key: the check went. The footprint read from a section held whole, which
+is zero bytes under a cipher and so a model that says every store fits,
+passed until a test drove the controller there (`tests/zpages.rs`, the
+tests with `cipher` in their names). And the controller's probes for a
+form file an earlier open left passed without the store learning of the
+file as it asked, since the attach learns of it too; what the probe
+alone decides is the swap at the crossing, which the test now waits for.
+One mutant, an attach that holds nothing, did not fail a test and hung
+one: its debug assertion fired on the segment work's thread, and the
+writer waits in `land_seal` for a landing a dead thread will not make
+(`ROADMAP.md`). The runner stops a test binary after seven minutes and
+reads that as the mutant's death, and removes the stores a mutant's
+tests left, after a hung one's filled the disk under the run and took
+its verdicts with it. A fifth outlived everything for longer, and was
+found fixing a flake of the test that names it: a build that never
+rests (`Held::passed` without its rest) passed every test under a
+cipher, the one whose comment says "read under one hold with no rest,
+the builds hold the store" among them, because that test's partitions
+are an eighth of its cache and a build holds one partition at a time.
+`a_form_build_holds_its_cache_and_not_its_partition` builds one ordered
+run's segment, thirteen times the cache, in a store reopened for it --
+a file being written is in memory whole until its envelope, so only a
+reopened store's peak is its builds' alone -- and reads the mutant at
+eleven times the budget. A comment that says what a test holds is held
+to the mutant like any other claim.
+
+A chunk of a form file that fails its tag was a read of the store that
+failed, and the store refused every read after it, where a plain store
+takes a damaged form file out of service and reads the partition raw.
+The pager poisons the store for every file but a form file, which the
+store can make again (`pager::Paged::regenerable`): there the failed
+chunk is a range the file does not lend, and the form's readers already
+take a file out of service at a page that does not lend. The test holds
+both ways a chunk can fail -- at the attach, which reads the file's
+chunks and rejects it, and in service, re-decrypted after the cache gave
+it back -- to the store read whole and never refused
+(`a_changed_byte_in_a_form_file_takes_the_form_out_of_service_and_not_the_store`).
+Its in-service half first damaged "the first form file" of a hash map,
+which in one run in six was a file nothing serves, read by nobody
+through eleven thousand rounds: it damages every one now. And one regime is
+not priced: a store that fits memory and not its own cache of plaintext
+decrypts two chunks for a raw point read and one, and a decode, through
+the form; the controller reads the kernel's cache and sees none of it.
+
+Counting the plain store against the main line for this found what the
+count before it had missed. "A store in the clear pays nothing an
+operation" was held by a point read and a scan of the raw form, a
+writer's round and a merge, and a scan through the compact form was none
+of them: it read 370 instructions a scan of a hundred entries over the
+main line, from the commit that gave the readers a source that lends by
+the piece (`eb377fe4`), four commits before the claim. The walk through
+a form reads a record's values with `Blob::read_exts`, whose read of a
+run in a block is written into its caller; that reader had grown a
+second way to fetch a block, and though no record of a form file's
+partition has a run in a block, the walk's loop kept a register less for
+it, two spills an entry. Out of line for the form's reads
+(`Blob::read_exts_inline`), the scan through a form counts 986
+instructions under the main line's and the point read through one nine
+(the point read has `read_exts` back since the merge of #29, below);
+kept out of line for every caller, the raw scan read 150 over. The same
+count read the point read through a form 1.8 over at first, one helper
+(`ZFile::view_of`) left a call where the main line's build had it in the
+read. The probes are `bench/examples/read_only.rs` and `lag0_probe.rs`
+with `supdb-nocachezpages` beside `supdb`, the toggles as above, built
+at `origin/main` from this tree's example sources and at the tree.
+
+And then it was priced, last, and lost. `bench/scripts/pair.sh
+supdb-cipherauto supdb-cipher 5000000 --bound 671088640 --passes read
+--reps 2 --ops-div 10` (run with the arms named `supdb-cipher` and
+`supdb-ciphernozpages`, at `b4d555bc`): five million keys under 640 MiB,
+the controller buying the form against the same store with the form off.
+The controller bought, nineteen form files, and 470,000 of the pass's
+500,000 reads went through them at 0.60 and 0.75x of the store without
+in the two sittings, 0.69-0.81 major faults a read against 0.49. The
+builds were still reading the device inside that pass (a fault 75-80 µs
+against 30), so it was run again whole, five million reads a sitting
+(`--reps 1 --ops-div 1`): the faults level at 30 µs, every read through
+the form, 0.60 faults a read against 0.43, 0.73x. A form page is four
+kibibytes and an envelope's chunk is sixteen bytes less, its tag stored
+beside it, so every form page lies across two chunks and a cold read
+through the form takes two pages of ciphertext from the device; the raw
+read it replaces takes two as well, a hash slot's and a record's, but
+the hash slots are an eighth of the bytes and stay resident, so it takes
+about one. "ZPAGE 4096 against a chunk's 4080: a form page is two
+chunks" was a line in the plan for this work, written before any of it,
+and was not priced until the form was built, tested, mutated, gated and
+pushed with the controller on. So the controller leaves a store under a
+cipher in the raw form as shipped (`Options::zpages_under_cipher`, off;
+`cipher_controller`), `ZPages::Always` builds the form there, and the
+arms with the controller on are `supdb-cipherauto` and
+`supdb-ingestcipherauto`. What it wants is an envelope whose chunks are
+whole pages, the tags kept apart (`ROADMAP.md`). The controller did not
+leave the form in five million reads either, its model reading the raw
+form at 0.29 faults a read and the form at none while the census read
+0.60 through the form: under a cipher the model's budget is of two
+caches in series, the store's and the kernel's, and nothing has held its
+prediction to a measurement there. It stayed off for a month after the
+two things that decided it had changed: numbered keys took the stride
+form under a cipher, which fits that bound where the block form did
+not, and the cache of plaintext came to follow the room. Paired again
+at O4's end, the store with it on read 3x to 4x of the store as shipped
+there, its scans 15x to 33x and its mixes 2.2x to 62x in both orders,
+and the switch was the one thing a store under a cipher still did not do
+as a store in the clear does; it is on as shipped now, with what it
+costs in the option's doc. A choice made off on a measurement is a
+measurement of the mechanisms that stood that day, so it is taken again
+when one of them changes, not when somebody next asks why it is off.
+
+The rules: a feature that "cannot work" under a mode is a claim about
+the code that does the work today, and it is checked at each place that
+code touches what the mode changes -- here a mapping opened by a path, a
+section borrowed whole, and four file calls -- before the feature is
+given up; an advice forwarded through the type every caller already
+holds reaches the callers nobody listed, where a branch at each call
+site reaches the ones somebody remembered; tests that pass at their
+first run are run against the mutants before anything is said of them;
+and "pays nothing" is said of the operations that were counted, by
+name, with the ones that were not -- every read path a store has, each
+form of it, is a row of the count, and a path left out is a path the
+claim does not cover. And a mechanism made to work under a mode is
+priced under the mode before its default is chosen there, on the cell it
+exists for: this one existed for reads out of core, and the first
+out-of-core pairing was the last thing run. A line in a plan that says
+why a thing may not pay is an experiment owed before the thing is built
+to completion, since everything built after it is built on its answer.
+
+The stride form went under a cipher the same way round, built and then
+priced, and its first pairing was the plan's line a second time.
+`bench/scripts/pair.sh supdb-cipherzstride supdb-cipher 5000000 --bound
+671088640 --passes read,scan --reps 2 --ops-div 10` at `f98ec29`, the
+binary the encrypted comparators' (`bench/DESIGN.md`): point reads at
+0.81-0.83x of the raw form's under a cipher, 0.61 major faults a read
+against 0.47, scans at 1.04-1.22x. A stride page is two chunks as a form
+page is, a read asks the cache for its page, and the envelope is mapped
+for reads far apart, so each chunk's fill waited for the device by
+itself. Asked for together the two come in one read (`Paged::ask_together`):
+against the arm that keeps them apart (`supdb-cipherzstrideapart`, the
+same command at `9408ddd`, three reps) the reads are 1.28x and 1.33x at
+0.15 major faults against 0.59, the device's bytes the same. With a
+walk's pages asked as it begins beside it, the form reads 1.07x and
+1.11x of the raw form under a cipher and scans 1.35x and 1.37x, and
+against encrypted RocksDB (the same command against `rocksdb-tuned-enc`)
+0.76x and 0.47-0.53x, where the store as shipped had read 0.72-0.77x and
+0.29x. Neither was what the cell turns on. The store keeps half of what
+the process may use for its plaintext and leaves half to the kernel's
+cache of the ciphertext, and the two hold the same chunks, a chunk just
+decrypted being the newest page of both. A scratch build that took the
+cache's size from the environment, at 500 MiB of the 640, held the
+stride form nearly whole, 477 MiB at that store where the raw form is
+669, and read 182-183 thousand reads a second against encrypted
+RocksDB's 56, 3.2x and 3.3x in the two sittings, the scans 0.62-0.68x.
+`scratch/seam/design.md` had the finding already from the raw form,
+misses a read on one line in the plaintext held, as a decision left for
+the layer's last stages. A budget that large is memory the kernel cannot
+take back, which is why it is half, and the budget that follows the room
+is the item now worked first (`ROADMAP.md`). The rules: a cache laid
+over another holds the hot set the one under it holds, so the two are
+priced as one cache and the split between them before any form above
+them is; and a plan's stages are put in order by a pairing against the
+competitor in the cell the bar names, since the two things this plan
+was built around, the form page's two chunks and the load's double
+write, were each worth a fraction of the lever it had left for last.
+
+The cache follows the room now (`pager::Room`, `Pager::following`;
+`StoreCipher::cache_half_at_open` is the shape before, `supdb-cipherhalf`
+and `supdb-cipherzstridehalf` its arms): where the cipher names no size
+the evictor reads the platform every twenty milliseconds and sets the
+budget to what the store holds and how much more the process may hold in
+memory the kernel cannot take back, gives way between two readings to
+what the store's large buffers have mapped and not yet touched
+(`Room::claimed`, `blocks::mapped_bytes`), and keeps back what the cache
+lately held past its budget. Its first version was the room less the
+process's memory and a margin, and it was killed under the bound in the
+write mixes, where the half had never been. Two fixes went to models of
+that before the count that named it. The first model was a margin eaten
+by overshoot, a file being written or a reader waited for, and the
+budget was made to keep back what it had overshot: killed the same. The
+second was an evictor stalled behind a pin, and a trace of its waits
+printed nothing through the fatal second. What named it was the group's
+`memory.stat` by kind every ten milliseconds up to the kill beside the
+cache's own count on the evictor's turn: 581 MiB of shared memory
+charged where the cache counted 514 held, with the process's own memory
+at 52. A chunk is 4,080 bytes of plaintext and the memory it takes is
+pages: a chunk decrypted by itself lies across two, so over reads far
+apart the memory resident is the bytes held times two less the share of
+chunks present, a twelfth more at that store, and
+`scratch/seam/design.md` had the ratio on record from the first
+out-of-core pairing (337 MiB of shmem for 274 held). Under half of the
+room nothing had needed the count to be right. The budget is steered by
+the platform's own reading of the shared memory it charges
+(`zfile::unreclaimable_slack`), so the count's error, and a memory file
+not yet counted, are corrected within a reading. The same samples said
+what the store under a cipher had been dying of before any of this: at
+five million keys under 640 MiB the half shape was killed in every rep of
+the lag sweep's full rewrite, the process at 291 MiB of its own memory
+where the plain store peaks at 186, the cache holding its 297 beside it
+and the page cache at nothing; following the room it gets through the
+rewrite and its pass, and was killed after the pass with 359 MiB of its
+own and 270 in files being written, which this paragraph called the
+writer piling up behind landings a cipher makes slower, on those two
+figures, and which was the store's close (the close's pin, below).
+Priced at `2c1dafd` at that store and bound: against the
+half in both orders (`pair.sh supdb-cipher supdb-cipherhalf 5000000
+--bound 671088640 --passes read,read-threaded,scan,scan-threaded,mixes
+--reps 2 --ops-div 10`) the store as shipped reads 1.11-1.25x, scans
+1.6-1.7x on two and three threads and level on one, and runs the six
+mixes at 1.2-1.9x; against encrypted RocksDB (`... supdb-cipherzstride
+rocksdb-tuned-enc ... --passes read,scan --reps 3`) the stride form
+forced reads 2.7x and 3.1x and scans 0.59-0.75x, and the store as
+shipped, whose raw form the room cannot hold, still 0.75-0.78x and
+0.35-0.39x. The rules: what a store counts itself holding is not
+what the platform charges it, so a budget drawn near a limit is steered
+by the platform's reading of the thing limited; a process killed under
+a bound is read from the group's memory by kind, at ten milliseconds, up
+to the kill, before a model of the kill is fixed; and a shape that ran
+with half its room to spare has had none of its accounting tested, so
+the accounting is held to the platform before the spare is taken away.
+
+A plain store's partition is named by its fences, sixteen bytes of two
+keys, so the names cannot go to the directory either: an envelope is named
+by a token drawn for it, the names live in the sealed manifest beside the
+tokens, and an envelope neither slot names is swept at the open, as a
+segment no manifest names is.
+
+The keys were decided on a count. The first sketch sealed everything under
+the caller's cipher, with an envelope's id as its nonces' prefix: eight
+random bytes against a key that seals an envelope a seal and a merge, and
+the chance of two prefixes alike passes the 2^-32 a cipher of this kind is
+held to at sixty-five thousand files, days of a busy store. So the
+caller's cipher wraps one key, the store's own, in the marker, once at the
+creation and once at each open, which is also what lets the caller's key
+live somewhere slow, and lets it be rotated by writing a hundred bytes
+(`cipher_rewrap`); the store's key wraps a key a file, in the manifest for
+a segment and in the header for a log file; and a file's bytes are under
+its own key, where a nonce is a chunk's index or a record's count behind a
+prefix drawn at the open, so a log reopened after a crash never meets a
+nonce its torn tail used. What is authenticated is every byte of a segment,
+an index, a manifest and a log record; what is not is the store taken back
+to an earlier state of itself, the directory put back whole or the log cut
+at a record's end, since nothing in a directory can say a newer one
+existed. `tests/cipher.rs` holds that as a property: a byte changed
+anywhere is a store refused or a store that opens as a state it
+acknowledged, the last or one before it, and never anything else.
+
+The fuzz is the test that matters most (`ZFUZZ_CIPHER=1`, and
+`fuzz_range_under_a_cipher` in the gate): `z` under a cipher and `r` in the
+clear over the same operations, against the model. A crash there is a
+`drop`, and a plain store's dropped files are whole in the page cache
+where a store under a cipher has lost every memory file it had, so the
+order a crash is survived by -- the log kept until a manifest names a
+durable segment -- is held by that run more strictly than by the plain
+one.
+
+Four things building it, each a shape. The rewrite of the engine's file
+calls was mechanical, and one of them was not a file: `File::open(&self.dir)`,
+a handle on the directory for the pending manifest's helper to sync later,
+became `vault::open(&self.dir)`, which under a cipher opens the marker
+file, and the directory's fsync would have been a file's, in an arm no
+test runs under a cipher. It was found reading the list of opens the
+rewrite left and has a call of its own now (`vault::open_dir`); a
+mechanical rewrite is read at every site for what the path names. The
+first test's control, the same store in the clear, was to find a fence in
+a file's name and found none: every key shared its first sixteen bytes,
+the fence's length, so the plain store was one partition named with no
+fence, which this file already says of keys with a long common prefix; a
+control is given something to find, and asserts it found it. The test of
+a log cut at every byte passed its first run with every cut opening as
+the whole store, and the assertion that the cuts fall in several states
+is what said so: a store dropped is not a store crashed with its tail in
+the log, since the drop joins the seals in flight and lands them, so the
+fixture ends in commits small enough to stay under a seal. And the first
+envelopes were written with nothing about the memory files' pages or the
+device thought of, which is the paragraph below.
+
+Forty mutants of it, and seven outlived the first tests, in the three
+ways this file already names. Two were checks behind a tag: a record of
+no bytes refused before its tag was looked at, and a log's name checked
+before its wrapped key, each of which the tag refuses anyway -- the first
+was taken out, since a check nothing can reach is a line nobody can hold,
+and the second is the kind byte's reader and stays. Two were checks no
+input could reach: a slot whose files are not whole files and a slot that
+lists more files than its manifest names, both behind the slot's own tag,
+held now by a slot sealed under the store's key in the test and by the
+count's check moved to where a test can hand it a count
+(`Vault::adopt_all`). And three were tests that did not look: a replay
+that answered the log's header as its length cut the log to nothing at
+the open, and a store that crashes twice in a row, the second time before
+it has written anything, is the test that reads that; an ordered index
+adopted where the directory held none; and the compact form left on,
+which the door had made harmless -- its builds failed at "not a
+directory" and the store went on -- so the test counts the builds begun.
+
+What the first shape cost was read off pairings against the same store
+in the clear,
+`supdb-cipherbase`, which ran with the options a cipher fixed and no
+cipher (`bench/scripts/pair.sh supdb-cipher supdb-cipherbase 300000`, and
+at 100000), and against `supdb` for what the mode cost with what it
+forwent (`pair.sh supdb-cipher supdb 300000`). The twin was an arm for as
+long as a cipher fixed an option, `0ea02c5f` the last commit with it:
+a cipher fixes none now, and the pair of `supdb-cipher` is `supdb`
+itself (`bench/DESIGN.md`). The first
+pairing, at a hundred thousand keys, read three things in both sittings:
+the loads at 0.77-0.89x, the scan pass after the shuffled load at 0.8x,
+and nothing else. The scan pass was faults. `SUPDB_LAG_COUNTERS=1` read 220
+on the scanning thread against a plain store's 40 over the same fourteen
+megabytes, since a memory file's pages are four kilobytes and a first
+touch maps sixteen of them where the plain file's megabyte folios map one
+a fault; whoever opens a kept file maps every page of it now
+(`MADV_POPULATE_READ` in `vault::map`), the pass takes fewer faults than
+the plain store's, and the cell reads level. The loads were the drain, and
+the drain's stamps (`SUPDB_DRAIN_STEPS=1`) said where: from the seal's
+readable landing to its fsync, 5 ms in the clear and 25 under the cipher,
+for a segment of fifteen megabytes whose cipher is three of them. A plain
+segment's bytes go to the device while the segment is built -- the writer
+hints each piece and a helper syncs behind it -- so its fsync finds little
+left to write; an envelope is written after the segment is finished,
+whole, because the envelope's header is every chunk's associated data and
+holds the file's length, so nothing can be sealed before the length is
+known. Two levers were tried on the write itself. Past the page cache
+(`O_DIRECT`, a megabyte a write), on the reading that the ciphertext's
+fresh pages were the cost -- `cargo run --release --example crypt_cost`
+reads the envelope's writer at 1.3 GB/s where the cipher alone runs 7.9
+-- the step grew from 25 ms to 35, each piece waiting for the device where
+the cached pieces go to it together: refuted and taken out. Each piece
+hinted to the device behind the cipher (`sync_file_range`, `vault::Ahead`)
+took it to 21 and stays. What is left is the format's, and is the first
+item under this one in `ROADMAP.md`: at three hundred thousand keys the
+ordered and the shuffled load read 0.83-0.86x of the same store in the
+clear in both sittings, the buffered arms' 0.76-0.84x (`pair.sh
+supdb-ingestcipher supdb-ingestcipherbase 300000`), the full-rewrite
+burst a few percent behind in one sitting, and the scans and the mixes
+level; against `supdb` the shuffled load read the same and the ordered
+load 0.6x, which was ordered ingest's run forgone and not the cipher (the
+run under a cipher, above). One
+cell is not explained: the first single-threaded pass of point reads read
+0.9x at a hundred thousand keys in five sittings of six, and at three
+hundred thousand 0.95x in both sittings of the buffered pair and
+unresolved in the durable one, with the threaded passes after it level;
+with megabyte folios allowed for shared memory
+(`/sys/kernel/mm/transparent_hugepage/hugepages-1024kB/shmem_enabled`) it
+read 0.93x and unresolved, and a merge that lands later under the cipher
+would do the same to a pass of fifty milliseconds. An open decrypted the
+store and a store held a descriptor a file for the file's life, two a
+segment; both went with that shape.
+
+What the second shape costs was read the same way, and in core it costs
+more than the first, which is the trade: `pair.sh supdb-cipher
+supdb-cipherbase 300000` read, across its two sittings, the loads where
+they were, 0.84-0.92x; the single-threaded pass of point reads at 0.92x
+with the threaded passes unresolved; the scan passes at 0.89-0.94x and
+0.80-0.90x threaded; the lag sweep's scans at 0.84-0.86x over the drained
+store, 0.65-0.80x after the one- and the ten-percent burst and 0.80-0.82x
+after the full rewrite; the threaded scan mix at 0.78-0.87x; E at
+0.83-0.90x; and the other mixes level or unresolved. The count named
+the point read's share: 229 instructions over its twin's 841
+(`bench/examples/read_only.rs supdb-cipher 100000 1 n-none` beside
+`supdb-cipherbase`, the toggle as above), spread over the asks -- each a
+call through the source's pointer and a load of a chunk's state -- the
+window a record is parsed in, the look at whether the cache is crowded
+and the look at whether a read failed, with no one of them a fifth of
+it. It is 339 over a twin of 818 since the plain store was made to pay
+nothing: what a read under a cipher does at its start and its end is
+two calls out of line where it was one wrapper, and its first ask is
+for the section whole, refused with an error made and dropped
+(`not_lent`), ninety-five instructions of it in all. Two cheaper shapes
+of each were counted and each cost the plain read three or four
+instructions -- the end's look answered as a verdict and the answer
+replaced in line, and `Blob::flat` asking through an `Option` -- so
+they stay as they are, and the read under a cipher is an open item in
+`ROADMAP.md`. The scans were at 0.25-0.45x of the twin before they were
+given a window of their own: a scan by the piece asked for each record's
+key, its extents and its values apiece, and it asks for sixty-four
+records' span at once now and walks the window with the loop a slice is
+walked by (`Blob::scan_pieces`, `walk_fixed!`). The window's loop had to
+be a function out of line: written into `scan_at` beside the slice's, it
+cost the plain scan five instructions an entry, by what the optimizer
+then left out of line, and named there as a function to call it cost
+three to four, which is why the plain walk refuses the source and the
+engine takes the other up (the plain store's price, above). What reads
+by the rank still asks by the record -- the
+sparse forms' walks, the merge path, the cursor -- and that is the
+bursts' cells and E, and an open item in `ROADMAP.md`.
+
+Out of its cache it was priced against itself: `pair.sh supdb-cipher64
+supdb-cipher 1000000 --reps 4`, a million keys under a cache of 64 MiB
+against the same store under a cache that holds it. Point reads 0.17x on
+one thread and 0.11-0.13x on two and three, the scan passes 0.26x and
+0.15-0.20x threaded, the lag sweep's scans 0.23-0.39x before the full
+rewrite and 0.11-0.19x after it, the mixes that read 0.23-0.66x and A and
+F 0.75-0.92x, the ordered load level and the shuffled within a tenth and
+unresolved in four pairs a sitting. A miss is a chunk copied out of the
+envelope's mapping, which the kernel's page cache holds, and decrypted in
+place into a fresh page of the memory file, with a megabyte given back
+behind it: four microseconds, of which the
+kernel's fault on the fresh page is over half, the copy a fifth and the
+cipher a tenth (`perf record -e cpu-clock --call-graph dwarf` over `cargo
+run --release --example cipher_store 1000000 64`, the samples under
+`Paged::slow` by their leaf). That is a fault a page where a plain store
+out of memory pays a device's answer, and a store larger than memory pays
+both. Where one ask wants several chunks and two or more of them are
+gone, the ciphertext of them all is asked of the kernel before the first
+is decrypted (`Paged::ask_together`; `StoreCipher::chunks_apart` is the
+shape before, `supdb-cipherzstrideapart` its arm), since the envelope is
+mapped for reads far apart and each chunk's fill otherwise waits for the
+device by itself; the fresh pages of a run of chunks populated as one is
+the open item.
+The budget is of the files' plaintext. A file being written is in memory
+whole until it has its envelope, a seal's output or a merge's piece,
+which the cache counts and cannot give back; and the block cache held
+more than the 64 MiB at that pairing's end (`cache_bytes_at_end`), as it
+does beside a plain store, under its own bound (`scan_cache_bytes`).
+`cargo run --release --example cipher_store` prints an open's time and
+the cache's counts through a pass of reads and a scan, for a cache of any
+size.
+
+The first pairing out of the cache read the pass after the full rewrite
+at a twentieth, 1.3 s for a pass of 45-60 ms in the cache, and six things
+were under it, each found by a count and none by reading. The suite
+carries the cache's counts for that (`SUPDB_LAG_COUNTERS=1`, the
+`lagcounterscipher` line under `lagcounters`), beside the scanning
+thread's CPU and sleeps (`SUPDB_SCAN_OPS=1`, `lagops`) and the device's
+bytes (`lagdev`).
+
+The store dropped its own ciphertext. `lagdev` read 53 MB from the device
+in that pass and nothing in the passes before it, and the scanning thread
+slept once a scan: an envelope whose plaintext the cache took whole was
+dropped from the page cache where it was written (`POSIX_FADV_DONTNEED`),
+which was right for as long as a store held its plaintext for life and
+wrong from the day the cache gave any of it back. The kernel's cache of
+the ciphertext is what a miss is read from, and the kernel's to reclaim.
+The rule: what one shape made free is priced again when the shape goes;
+the drop came through the redesign unread, because nothing failed.
+
+The builders gave up. Over the rewriting burst the upkeep thread built
+eighty blocks where its twin in the cache built fifteen thousand, so the
+pass's scans built twelve thousand themselves, 136,000 first touches on
+the scanning thread against 25-33,000 at the points before: a builder
+that found the cache crowded gave its forms up, having no way to let the
+cache give back under its one pin. A builder rests between two blocks now
+(`Reader::build_rest`), where every local it holds is a copy, a position
+or a table. The argument is by the loop's top at each site and by who
+runs the loop -- the upkeep thread, the builder ahead, and the writer
+inside one of its own operations (`WriterOp`), never a read that may be
+nested in a scan's callback, which would rest the scan that lent the
+callback its bytes -- and what holds the argument is the fuzz under a
+cache of sixteen kilobytes with the block cache on, where a borrow read
+past a rest is read out of pages already given back.
+
+The evictor waited eighty milliseconds for one reader
+(`PagerCounts::longest_wait_us`), and the instrument that named the
+reader was built for the hunt and is not in the tree: a thread id a slot,
+written at the pin; the evictor printing the name of the thread it had
+waited eight milliseconds for (`/proc/self/task/<tid>/comm`) and running
+`gdb -p <pid> -batch -ex 'thread apply all bt 16'` on its own process at
+that moment; and a stamp at every pin and rest that printed the stack
+where a stretch of eight milliseconds without one ended. gdb's first
+capture had the writer in `Wal::sync` inside `commit`, pinned, and the
+upkeep thread and a merge asleep in `breathe` behind it: a durable
+store's every commit held the cache shut for the length of its fdatasync,
+which reads nothing of the store's files (`Db::sync_wal` under
+`Reader::unlend`). The stamps split the rest three ways: the fill's
+sixty-four blocks between two looks, a look a block under a cipher now;
+waits on another thread; and stretches of eight to fifteen milliseconds
+in appends that read no file and take a fifth of one, which is a thread
+descheduled with its pin, on four cores with seven threads to run.
+Nothing annotates a timeslice away, so the wait for a cache past its
+budget has two lines: the store's own work waits at the first
+(`Pager::crowded`), a merge and a builder at their rests, and a caller's
+read at the second, half the budget past it (`swamped`). A read waited at
+the first before, twenty milliseconds for an overshoot of megabytes.
+
+Every fill of a cache at its budget took the evictor's lock to tell it
+so, and with three threads filling the scanning thread slept on that lock
+two thousand times a pass (`lagops`, `vcsw`, where its wall was its CPU
+plus a tenth): a flag the evictor clears before it looks, and the lock
+for the first to set it (`Pager::nudge`).
+
+And two that the suite did not show and the builders' test did. A file
+with no envelope yet is counted in what the cache holds and cannot be
+given back, so a seal's output in flight read as a cache past every line
+for as long as its sync took, and each merge beside it slept a breath at
+every rest: the lines are drawn against what could be given back
+(`Pager::could_give`). And `settle` waited for the upkeep thread's pass
+pinned: the pass filled the cache, the evictor waited for the settle's
+pin, and the pass waited a breath for the evictor and gave its forms up,
+three waits in a ring that a timeout ended, every time (`join_upkeep`,
+`hold_within`, `hold_for_upkeep`, each wait under `unlent`).
+
+With the six the pass after the full rewrite reads 0.11-0.19x where it
+read a twentieth, 140-510 ms in the probe's reps for 1.3 s, in two shapes
+by whether the upkeep thread had built the burst's blocks when the pass
+began, and what is left of it is the misses under the blocks the scans
+still build; E went from 0.53-0.57x to 0.66x and the shuffled load from
+0.76-0.80x to within a tenth. The cells that are a miss an operation did
+not move, as they should not.
+
+The builders' test
+(`the_block_caches_builders_build_through_a_cache_the_store_does_not_fit`)
+took five shapes to say anything. With commits of a thousand over the
+store's small files nothing crowded, and the old code passed it. A burst
+that rewrote every key built its blocks without reading one, since a
+rewritten key's record is masked: the burst adds a value to every key
+instead. A seal followed the burst and ended the pass (`seal_max_pct`,
+`seal_idle`, off for it). Then the assertion failed on the old code at
+some eight hundred blocks of nineteen hundred, which was read as the test
+telling the two apart, and it failed on the fixed code at the same count:
+the settle's wait above. It is held to two mutants now, the look without
+the rest and the settle's wait left pinned. A fifth was mine: a script
+that sliced the test file between two markers found the second marker
+before the first, replaced the empty string, and wrote the insertion
+between every two characters of the file. The rules: a test is run
+against the fix before a mutant's failure is read as anything, since a
+red mutant and a red fix at one count are a bug the test found and the
+fix did not have; and an edit by markers asserts the markers' order.
+
+One seed of the fuzz outside the gate's range failed on the main line as
+it did here ("a copy's identity entry disagrees with its search", a plain
+store with the upkeep inline). It was found by running ranges the gate
+does not, and attributed by building the main line's head and running the
+seed there before reading it as this change's; it is the third coming
+of the entry "a rank kept across the rewrite that moved it", below.
+
+And one the hunt did not find, because the store read right in every
+run of it: a chunk lent out of a unit marked twice. One seed in three
+hundred of the fuzz under a cache of sixteen kilobytes, four seeds at a
+time on four cores, ended in a merge that wrote its keys out of order, a
+key outside its piece's fence, or a value that was another's; the same
+seed alone, a hundred and sixty times, in nothing; and the gate's range
+never. It was there on the commit before the day's work, which is the
+first thing that was run. A page the cache gives back reads as zeroes,
+so the read that went wrong was nowhere near where it showed, and the
+instrument was to make it a fault: `SUPDB_PAGER_GUARD`, under debug
+assertions, makes pages given back unreadable until they are filled
+again (`pager::guard_on`). The first run under it faulted in a point
+read's load of a hash slot, a few instructions after the ask that made
+the slot present; a probe at the ask's end said the range was readable
+there; and the reader table printed from the fault had the reader pinned
+at the epoch as it stood, so the evictor had been right not to wait for
+it. The reader had taken a chunk on its state's word. A reader that
+finds its chunk dying takes the unit back and then says the chunk is
+lent, two words and two steps, and a thread that lost its core between
+them stayed off it while the evictor ended the pass the rescue was from
+and marked the unit again in its next, the chunk dying still: said to
+be lent then, the chunk stood in a unit about to be given back, and the
+reader after it, pinned after that mark, read it as it went. The reader
+that says so looks at the unit again now, and where it is marked puts
+the chunk back and takes the unit back from that mark too
+(`Paged::slow`); `a_chunk_is_not_lent_out_of_a_unit_marked_again_under_its_rescue`
+walks the interleaving by hand. `Paged::free` had met the state and
+explained it: it emptied chunks that were dying "or revived by a reader
+that took the unit back from an earlier mark, was waited out by this
+one, and has gone", which is the bug described as a case. It asserts
+now that no chunk of a unit given back is lent. The rules: a state met
+where the design says there is none is asserted, never given a
+sentence; a transition of two steps over two words is looked at again
+after the second; a failure that needs the machine busy is run busy,
+several seeds a core, before a range is called clean; and wrong bytes
+are made a fault before they are chased as wrong answers.
+
+The rules of the hunt: a wait under a pin is a pin, and so is a
+timeslice; a wait is drawn against what its remedy can move, and at
+different lines for work that can wait and a read that cannot; a count
+that includes what cannot be given back fires the wait for nothing; and
+the instrument that names who is waited for is built before the first
+guess, as it was the first time, and was taken out both times.
+
+It came once more as the close, and was on record for a month as
+something else. A store dropped with merges in flight joins them, they
+run to their end and land nothing, and the drop is an operation of the
+writer's, pinned from its first line: the evictor waited for that pin
+for as long as the merges ran, and each merge, resting at a cache past
+its line, read on a breath later (`Hold::rest`), so the cache grew by
+what two merges read between two breaths, four megabytes a second,
+until the group had no page of its file cache left to give. At five
+million keys under 640 MiB the lag sweep ended in it in four sittings of
+ten, the group at its limit for seven to twelve seconds with the
+process's own memory flat, and then the kill. It had been written down
+as the writer piling up behind landings a cipher makes slower, with two
+levers designed for that, on two figures read at a kill and no reading
+of what any thread was doing; the same item said the cache had stood
+over its room for half a second giving nothing back, "and what held it
+is not known either". Three readings named it in an hour. The harness's
+own line: the kill came after the sweep's last pass, where all that is
+left is the store's drop. A trace of the cache's counts beside what
+each file in flight holds (`SUPDB_PAGER_TRACE=1`, a `pagertrace` line a
+tenth of a second from the evictor's reading of its room), which went
+silent seven seconds before the kill: the evictor reads its room at
+every turn and was inside one pass's wait. And every thread's stack
+taken while the group sat at its limit (`scripts/stallwatch.py`, two
+seconds there and then each thread's kernel stack and `gdb -batch`),
+which had every thread asleep: the writer in `Db::drop` joining the
+segment work, the segment work in `Maint::stop` joining a merge, two
+merges in a breath, the evictor in its nap. The drop's joins say they
+hold nothing now (`Reader::unlent`, `unlend`), and
+`a_close_that_joins_a_merge_holds_nothing_of_the_cache` holds a merge
+before its first read, drops the store over it and reads the cache's
+peak through the drop, with the segment work on its thread and inline:
+twenty-eight megabytes over a budget of two with either join left
+pinned, in one wait of fourteen seconds. The rules: a process killed
+under a bound whose own memory is flat through its last seconds is
+waiting and not growing, so its threads' stacks are read before its
+memory is summed by owner; a kill the harness places after a pass is
+read for what runs after the pass, the close first; a note that says
+what held a thing is not known has named the next thing to find out,
+ahead of any lever on the part that is known; and the waits under a pin
+are every join, the close's among them, since a path that runs once a
+store is a path nobody reads under a cache.
+
+The trace that named the close named the next wait in the sitting it
+was built for. The evictor's longest waits had been a figure in every
+row (`longest_ever_ms`), two to three hundred milliseconds, and nobody's:
+laid to what each file in flight held, 205 of the 246 waits of sixty
+milliseconds or more in twelve sittings fell where a merge's finished
+output left the files being written, 120 ms apiece. A merge gives each
+output its envelope where the output is finished, on its own thread,
+fifty megabytes sealed, written and synced (`Emitter::leave`), and it
+did so under its hold of the cache, where the holds had been taught to
+give way at a walk's rests and nowhere else. The stacks were had by
+stopping the process from inside the evictor's wait, sixty milliseconds
+in (`SIGSTOP` to itself, a scratch line), with a watcher reading every
+thread by gdb before letting it go: a merge in `persist_one`, sealing
+or under its `fsync`, in seventeen stops of twenty, and a thread's own
+cold reads between two rests in two. The write runs unheld now
+(`MergeRest::unheld`, `pager::Hold::idle`), and an idle is a rest: the
+walk keeps each input's key from one step to the next
+(`merge_walk_cached`), so the step after is told and asks for them
+again. `a_merge_writing_an_envelope_holds_nothing_of_the_cache` parks a
+merge at a gate before its first output's envelope, reads four times
+the cache through a handle, requires the cache to have given that back
+while the merge stands there, and reads the store whole once the merge
+has gone on over inputs the cache gave back under it. Five mutants, and
+the one that outlived that test is the dangerous one: a hold left at
+nothing after its wait, which reads on to the walk's next rest with
+nobody waiting for it, and passes because the evictor's hand goes by a
+unit just read once before it takes it. The hold has a test of its own
+for it (`a_hold_idles_for_a_wait_and_stands_again_after_it`). For a
+plain store's merge the method is the bare call, a type's as the rests
+are, and the count read level (`sh scripts/cost.sh 9e63a68 merge land
+work` at `34819ed`). The rules: a hold is a pin, so the waits under one
+are found and said as the waits under a slot were, a file write on the
+holder's own thread among them; an instrument kept in the tree is read
+again over the next sitting's lines before the figure it explains is
+left as the machine's; and a guard that protects a reader for a window
+its test cannot open is held where the guard is, by its own state.
+
+It came again one line after that write. Where an output is
+finished a merge starts its form file's build as well (`ZFinish::build`),
+and where every builder's slot was taken it parked for one under its
+hold: the builds it waited for read through the cache and breathe at
+their rests until the evictor gives back, and the evictor waited for the
+merge's hold, so each breath ended into the next and the cache filled
+behind them. At ten million keys under 1.25 GiB it killed the lag
+sweep's full rewrite in four sweeps of five once the merges' asks covered
+their directories (`Options::merge_ahead_shares`) and they finished
+outputs with the slot still taken: the cache's trace went silent three
+seconds before the kill, the group's shared memory rising from 838 to
+994 MB beside 271 of the process's own, and every thread's stacks at the
+limit (`scripts/stallwatch.py` at `--within 200`; at 60 it never fired,
+the unreclaimable memory crossing that line a tenth of a second before
+the kill) had the evictor in `Pager::give`, two merges and both builders
+breathing at their rests and one merge parked in `ZFinish::build` under
+`Emitter::leave`. The slot's wait runs unheld now, with the envelope's
+write; `a_merge_waiting_for_a_build_slot_holds_nothing_of_a_ciphers_cache`
+holds a build at its start under one builder, so that a merge of more
+outputs than one waits at its second for the slot, and reads every key
+of the store through a handle several times the cache over: with the
+wait under the hold the cache gives back nothing and stands at fourteen
+times its budget. Its first version read the store by scans, which a
+block copy in the process's memory answers without the cache, and in
+four runs of thirteen read too little to be a test. The rule is the one
+above at its next site: a wait added beside a wait already unheld is
+held to the same rule in the same change, since the two are one place in
+the walk; and a kill whose cache trace goes silent is read for its
+threads' stacks with a threshold the memory crosses early, not one the
+kill crosses first.
+
+It came again as a read, over keys the roster had not run under a
+cipher. At five million ids under 640 MiB (`bench ab --arms
+supdb-cipherauto,supdb-cipher --size 5000000 --bound 671088640 --keys ids
+--passes load,read,read-threaded,scan,scan-threaded,mixes,scan-mixed,mixes-scrambled
+--reps 5 --ops-div 10`, at `fc66ceb`) the store as shipped was killed in
+a scan mix in four reps of five, E in three and the scrambled E in one,
+where forty-six sittings over numbered keys had killed none. The mix's first scan settles what the write mixes
+before it left unfiled, some fifty thousand scattered writes, and over
+keys whose heads are not the whole of them each resolve reads an index's
+stride and a record through the store's cache, all of it ahead of the
+scan's walk and under the scan's one pin: the cache took in a hundred and
+thirty megabytes in half a second. The stack was had as the merge's was,
+by stopping the process from inside the evictor's wait: the writer in
+`settle_each` under `Reader::scan`. The settle's look, every sixty-four
+keys, was a rest for the upkeep thread and for the writer inside one of
+its own operations and for no read, on this file's argument about a read
+nested in a scan's callback, which is an argument about a nested read and
+had been applied to every read. Every look a read reaches falls ahead of
+the read's walk (`settle_each`, `install_ahead`), where it has lent its
+caller nothing and holds nothing it was lent, so in a handle's outermost
+read the look rests (`Reader::rest_ahead`, `read_rest`, at the line a
+caller's read waits at), and a read inside another's callback rests
+nothing as before. A handle `new_reader` makes looks as the writer's does
+for it (`LOOKS_READER_RESTS`). The tests, in `cipher_looks`: one scan's
+settle of a backlog several times the cache, through the writer and
+through a handle, the cache's peak held to its budget and a read's slack
+(`a_reads_settle_ahead_of_its_walk_gives_the_cache_back`); where a look
+rests, by the slot's page at depth one and at depth two, since the test
+that put a read inside a callback read no byte through a settle there;
+and the rest's wait counted as a breath where another reader holds the
+cache, the test the sixth mutant needed, a rest that never waits having
+passed the first two. With it the store as shipped ran the same passes in
+three reps of three. The rules: an argument that a path may not rest is
+an argument about the state the path is in, here a read's depth, and is
+checked against each state that reaches the function before it is
+written as the function's; what one read does under its pin is the
+backlog the passes before it left, so a pin is priced after the passes
+that fill it and over each shape of key, the shape deciding what a
+resolve reads; and a mode's roster run under one kind of key has not run
+the mode.
+
+And what the budget cannot see until it is there is a file being
+written. With the controller on over ids (`supdb-cipherauto`, the same
+command) the store was killed in the scrambled F mix, one rep in five
+before the settle's rest and one in three after it: the group's memory
+by kind, every ten milliseconds up to the kill, had 232 MiB of the
+process's own and 388 shared, and the cache's trace beside it a merge's
+output of fifty-nine megabytes written in a fifth of a second, with the
+output's form file and the merge's arrays, on a cache steered to within
+its margin of the limit. A memory file is memory the kernel cannot take
+back and is in no count of the cache's, and the platform's reading sees
+it a page at a time as it is written, a reading late. A merge says what
+each output is to hold where it opens it (`vault::expect`: its share of
+the inputs' bytes by its ranks), and the bytes still to come are out of
+the room from then (`vault::Coming`): what was said less what the file
+holds, nothing once the file has its envelope or has gone, and between
+two readings the cache gives way to it at once, as it does to the
+buffers the process has mapped (`Room::claimed`). Nothing is asked of a
+plain store's merge but the door's one load. Eight mutants, and two of
+them hung the merge's test where they should have failed it: the
+assertion fired while the merge stood at the vault's test gate, and the
+store's drop joined a merge nothing would let go. The gate is a guard
+that opens at its drop now, the rule this file already had for a test
+that parks a thread. With it, the same command at `5036c23`: neither arm
+killed in five reps of five, and the most the kernel could not take back
+581-595 MiB of the 640 in every pass of the ten, where the run before it
+had 621-636 in four passes of five, the killed one among them (`rss`,
+`shmem` and the kernel's own, sampled from the group every ten
+milliseconds). A form file's build came next, two of them built ahead at
+the ordered load's end beside a cache at its budget, 99 MiB of shared
+memory in 86 ms and the group within 27 MiB of its limit; it says what
+its file is to hold where it makes it now, the stride form's length to the
+byte and the block form's records, and the same loads' peaks fell from
+1,214-1,253 MiB of the 1,280 to 1,195-1,226. What is still written
+unannounced is a seal's output and an ordered run's file (`ROADMAP.md`).
+The rules:
+a budget steered by a reading is late by what is written between two
+readings, so a writer that knows the size of what it is about to write
+says so before the first byte; a kill one rep in three is a peak
+every rep comes near, so the fix is read on each pass's peak, by the
+group's own count, and not on the kills alone; and the writer to announce
+next is read off the cache's trace at the instants its slack was short,
+by kind of file in flight, against the ones that are announced or have a
+view, since a sampler of the group's memory says how much and not whose,
+and a quarter of a second between its samples misses a peak of a tenth.
+
+**A level made late for the open, read a head an ask where the first
+seek fell.** A store under a cipher reads an ordered index's top level
+at its first seek and not at its open, which is what keeps an open to a
+handful of chunks a file. The level is every sixty-fourth head, so a
+sample lies in every piece of the heads, eight of them in four
+kilobytes, and the late read asked for it a head at a time: each piece
+made present by itself, and once the cache had given the heads back, a
+wait for the device a piece, 26 ms for a partition of two hundred
+thousand keys, at the first seek of every partition. The suite's
+one-thread scan pass at five million keys under 640 MiB is five thousand
+scans. With the controller on its median scan was 4-7.5 µs and the pass
+525-595 ms, and nineteen of those reads were 473-488 ms of it, by a
+timer put in the read for the count and taken out. It had stood in
+`ROADMAP.md` as "two major faults a scan of a hundred ... not yet taken
+apart", the cell the store lost to encrypted RocksDB at 0.41-0.43x while
+it read at 1.75-1.96x of it (`BIN=$PWD/target-enc/release/bench
+scripts/pair.sh supdb-cipherauto rocksdb-tuned-enc 5000000 --bound
+671088640 --passes read,scan --reps 3 --ops-div 10` at `b7b7f90`), and a
+pass's faults divided by its scans is what made nineteen stalls read as
+a property of every scan: `SUPDB_SCAN_OPS=1` printed the first four
+scans at 23-103 ms beside the median in the first run it was asked for.
+The late read asks for the heads a run at a time now
+(`OrdIndex::read_top`, `TOP_RUN`), whose pieces the cache asks of the
+device together, and the pass was 169 ms; and the landing that publishes
+a segment reads its level first (`Maint::tops_before_publish`), while
+the index it has just written is in the cache still: 23.5 ms, twenty-one
+million entries a second with no fault. A plain store is asked one test
+a landing, thirty instructions over the landing probe's run. What a
+landing pays under a cipher was timed the same way: 109-129 ms over the
+80-85 landings of two loads and a lag sweep, most of them microseconds,
+the longest 34 ms where a merge's outputs had lost their heads before
+they landed (`ROADMAP.md`). The rules: a per-operation average over a
+pass of a few thousand operations is read as the first operations beside
+the median before it is read as each operation's, which is this file's
+rule for the smallest rung and holds at five million keys wherever the
+pass is the short thing; a read made late for one path's sake is priced
+where its first use falls and in the unit it asks by, since late and a
+sample an ask was the whole section at a round trip a piece; and what
+was made late for the open is made early again where it is free, at the
+landing that wrote it.
+
+**A line drawn on the page cache, for a store whose records leave its
+own cache.** With the controller on under a cipher the same five million
+keys under 640 MiB read in two shapes after the load, by how many
+partitions had their form file when it ended: all or all but one, and
+the read pass took 4.0-4.8 s and the scan pass 22-25 ms; eleven to
+sixteen, and the controller built the rest from the device beside the
+reads, its conversion policy offered moves out of the stride form, and
+the passes ran 5-13 s and 0.3-0.6 s, a third of the reps and more. The
+builds ahead at landing start past half the controller's budget, which
+is of the kernel's page cache by the raw form's populations, and that is
+where a plain store's records leave memory. A store under a cipher's
+leave where its own cache gives them back. A line of what each file's
+view held, beside the cache's trace for the count and taken out, read
+every partition's plaintext whole in the cache as the builds became due,
+the cache at four fifths of its budget, and a fraction of a second later,
+the builds' own form files in flight beside the load's run files, the
+cache's first pass giving back the plaintext of the partitions the
+builder had not reached, twenty-two mebibytes of one down to three, their
+ciphertext long reclaimed: the partition cold, skipped, and left for the
+crossing. Whether the crossing came inside the load was the coin: inside
+it, the cold partitions were built from the device with nothing reading;
+after it, the builder took them oldest first beside the read pass, a
+second to four each, and the drain's last three partitions, warm, waited
+behind them until the reads had evicted them too, one built in sixteen
+seconds through two thousand faults. The builds ahead start past a
+quarter of the store's own cache as well now, by its partitions' files
+against the cache's budget (`Options::zpages_land_cache_pct`; at zero,
+`supdb-cipherautolandmodel`, the shape before), whichever line is met
+first, and eight traced reps read the fast shape in eight. A first
+version drew it at the same half as the controller's line, by what the
+cache held at the instant, and read the fast shape in seven reps of
+eight; its test found the cache's holding nothing after a settle, the
+line was moved to the files for the test's sake, and the commit that
+shipped it quoted the eight reps of the version before the move. Paired
+then, the moved line read like the shape before, both arms in two shapes
+(`bench ab --arms supdb-cipherauto,supdb-cipherautolandmodel --size
+5000000 --bound 671088640 --passes load,read,read-threaded,scan,scan-threaded,mixes
+--reps 4 --ops-div 10` at `15f5924`), since half the cache in files is
+about four fifths of it in all, one or two partitions later than the
+holding, and a quarter is where the builder starts with no backlog. The
+rules: a line a mechanism starts at is drawn on the store that pays for
+the mechanism's absence, which for a store under a cipher is its own
+cache and not the page cache; a measurement quoted for a change is of
+the code the change commits, so whatever moves the code after the
+measurement, a test's convenience included, is measured again before
+the commit speaks; and a pairing of two arms each in two shapes is read
+by its pairs (`--pairs`), since a median over four reps of a bimodal
+cell is whichever shape two reps fell in.
+
+**A first page standing for a window, over a source that holds pages a
+unit at a time.** The pass after the lag sweep's full rewrite at ten
+million keys under 1.25 GiB ran ten to twenty times slower under a
+cipher than the plain store's, and the roadmap first had it down as the
+plain store's own limitation for that pass, made heavier by merges that
+decrypt and seal. Beside the plain store in one sitting, with every
+merge's account printed (`SUPDB_MERGE_TRACE=1`), it was not: the plain
+store met the pass with 41 pieces standing and nothing merging, the
+store under a cipher with 144 and its merges inside the pass, and a
+merge under a cipher moved 50 MB of input a second of its wall against
+the plain store's 126 and took 825,000 major faults over the sweep to its
+2,500 -- about half the pages of ciphertext it read, each a device round
+trip, through an envelope's mapping advised for reads far apart. The
+merge's ask ahead existed, off as shipped because on the plain store the
+device was busy and it moved nothing (`Options::merge_read_ahead`). On
+under a cipher it fired, 382 asks of 1.3 GB, and moved nothing either.
+`Blob::willneed_at` asked a window only where the window's first page
+was not in memory, a test written for a mapped file, whose kernel reads
+ahead in order from a resident page; a source read by the piece holds
+the chunks its cache has not given back, scattered through the window a
+unit at a time, of which the first page says nothing, and the windows
+the test let through came to a fifth of the input. Asked whole, the pager
+asking for what of a window it does not hold: 102 merges over the sweep
+to 56, 74 MB a second, a seventh of the faults, 39 pieces at the pass
+and the pass 4.2 s where it was 10.3-10.6 (`Options::merge_read_ahead_cipher`,
+on; `supdb-cipherautomergeapart` is the shape before). Paired, four
+pairs in both orders (`scripts/pair.sh supdb-cipherauto
+supdb-cipherautomergeapart 10000000 --bound 1342177280 --passes load,lag
+--reps 2 --ops-div 10 --pairs _per_s` at `8346a0f`): the pass 2.1-2.5x
+and the shuffled load 1.09-1.34x in every pair, the full rewrite's burst
+0.74-0.77x in every pair, its merges beside the writer now, and the
+other passes and bursts level. The rules: a
+lever refuted on one store is tried again where the regime it was
+built for -- here a reader waiting a round trip a page -- is the one in
+front of it, and its counter read before its rate; a residency test
+written for one kind of source is read against every kind that answers
+it, since what a page's residency says of the pages after it is the
+source's to say; and a pass several times the plain store's is first
+taken apart beside the plain store, in one sitting, before it is called
+the plain store's limitation.
+
+**A reader that reads past the cache, priced by the passes after it.**
+With the ask fixed the same pass still met six merges and seven form
+builds of the store under a cipher where the plain store met none, its
+merges at 161 MB of input a CPU-second in the burst against 347, and the
+profiles of the two bursts by function, beside each other, put two
+thirds of the difference in the cache's fills of the merges' inputs,
+seven tenths of a fill faults on a fresh page of a memory file and on
+the envelope's. A merge reads each input once, which is why a store that
+keeps a cache of blocks compacts past it; one that reads into a buffer
+of its own, written again at its rests (`pager::Stream`,
+`StoreCipher::merges_beside_cache`), cut a merge's CPU by a fifth on the
+probe (`bench/examples/merge_cipher.rs`), and its first version, paired
+in the sweep, read the loads' merges worse by a third with three times
+the major faults: an input just written has its plaintext whole in the
+cache, and the stream decrypted it again from an envelope the bound had
+taken out of the kernel's cache, where the cache would have lent it for
+nothing. It copies what the cache holds now. Its own counts were wrong
+twice before that, and each was found by counting the stream's decrypts
+against the distinct chunks it was asked for, one input at a time: a
+rest let the ring write over the chunk the walk stood on, which it then
+asked for again, and an input is read in two places, its directory and
+its records, so the run a record across two chunks begins in was seldom
+the one that could grow. Paired again, the pass it was built for read
+1.24x and the clean store's pass 0.72x, both pairs, because the cache
+the load leaves held the merges' outputs whole where their inputs had
+been given back behind them, and the kernel had less room for the clean
+pass's ciphertext. Off; the arm is `supdb-cipherautomergestream`. Its
+switch was first a field of `Options`, which grew from 1,000 bytes to
+1,008, and the count of the plain store read one `memcmp` of the stride
+form's long scan four instructions longer, a fifth of that function's
+count, with nothing of the change on the path: the same tree with the
+field taken out counted level. It is the cipher's knob now
+(`StoreCipher::merges_beside_cache`), beside the cipher's others. The
+rules: a reader that reads past a cache asks the cache first, since what
+it skips is the cache's to lend for nothing; a lever that changes what a
+cache holds is priced on the passes after the phase it runs in, by what
+the cache holds when they begin; a structure's count of its own work is
+held to the distinct work it was asked for before its rate is read; and
+a knob one mode reads lives in that mode's builder, since a field of
+`Options` is in every store's layout and the count reads the layout.
+
+**A merge's asks, laid to the regions its walk reads.** With the drop
+and the stream settled, the pass after the full rewrite at ten million
+keys under 1.25 GiB read 0.87-0.96x of encrypted RocksDB's in four pairs
+of four, every other cell of the pairing ahead, and what was left of it
+was the burst's merges still running inside it, their device traffic
+2.3 ms a read on the scanning thread against RocksDB's 62 µs. Every major
+fault of the burst laid to its file and its offset, beside each input's
+regions printed at the merge's open (a scratch line, taken out), put
+23,000 of the merges' 36,000 on their partitions' directories, every page
+of every directory once, and most of the rest on their pieces' records
+past the first megabyte. A plain merge maps each input afresh, at the
+kernel's default, and reads around every fault in any phase; a merge
+under a cipher reads through the one view every reader of the file
+shares, advised random, so it had only its own asks, and those covered
+the records alone, in one window for every input: a piece of a twentieth
+of the merge was asked whole at its first rank and read over the whole
+merge, its pages reclaimed meanwhile. A sweep of the window's size, one,
+four and sixteen mebibytes, moved the faults by less than two runs of one
+size apart, which is what said neither in-flight asks nor eviction alone
+was it. The asks follow each input's share of the walk now and cover its
+directory, placed by the rank's share of it (`Options::merge_ahead_shares`,
+`MergeAhead`; `supdb-cipherautoaheadflat` is the shape before), by two
+pairings (`BIN=$PWD/target-enc/release/bench sh scripts/pair.sh
+SUPDB_LAG_COUNTERS=1 SUPDB_MERGE_TRACE=1 SUPDB_LAG_MARK=1 supdb-cipherauto
+supdb-cipherautoaheadflat 10000000 --bound 1342177280 --passes load,lag
+--reps 3 --ops-div 10`, in `bench/`, at `0478889`): 530 major
+faults over the burst, 70-80 merges landed in it where 55-69 had, 31-50
+pieces at the pass where 61-75 stood, and the pass 520-842 thousand
+entries a second in four reps of six, about twice RocksDB's; in the other
+two the burst landed 60-62 merges and the pass read 258-298 thousand.
+The clean store's pass leaned a tenth the other way in nine pairs of
+twelve, and the same arm paired against itself read that pass up to a
+fifth apart in five pairs of six, so it is unresolved. The first faster
+merges also met the wait the entry on a hold's waits names next, a merge
+parked for a build's slot under its hold, which killed four sweeps of five
+until it was unheld. The rules: a merge's faults are laid to its inputs'
+regions before its asks are tuned, since a window that is too small or too
+early reads the same in a total; an ask is sized by the input's share of
+the walk it serves, and covers every region the walk reads in order; and
+where a mode puts a shared view in place of a reader's own mapping, the
+reader's read-ahead is the mode's to supply.
+
+The rules: a second way to hold the same bytes is priced on the first
+operation of every pass as well as on its rate, since a mapping's first
+touch is where two kinds of memory differ; a write slower than its cipher
+is stamped step by step before a lever is chosen, and fresh pages were the
+wrong lever here as they were for the buffered load's sync; and a mode
+that fixes options is given a twin arm with the same options and no mode,
+or its pairing prices the options.
+
+The first tests of the browser's half changed every byte of the record
+and required a refusal, and seven of fourteen mutants of `crypt.mjs`
+survived them: a header with a wrong magic, version or shift fails every
+tag as well, so the three checks could each be deleted, and two checks of
+the object's length each caught what the other was for. A check behind a
+tag is held by asking the parser alone or by an input made under the
+key, as a check behind a checksum is held by a forged one, and of two
+checks on one quantity the test has to reach each where the other
+cannot.
+
 **The three readers agree, and are tested against each other rather than
 against themselves.** The failure mode of a second read path is not a crash
 but a browser quietly answering a different question from the server.
@@ -1304,19 +3660,88 @@ prove it.
 
 **Crash discipline is an order, and every window in it is survivable.**
 Commit is a WAL append and one fdatasync; the batch is durable or its tail
-frame fails its CRC and replay stops before it. Seal is write to a temp name,
+frame fails its CRC and replay stops before it. A write the device refuses
+is put back before the commit answers it -- the file cut to its last good
+length, the batch's commit frame taken off what is pending and its
+sequence number given back -- so the next commit writes the batch again
+under its own frame and the log holds no byte a replay would misread; a
+sync that fails is kept and never retried, and every commit, sync and
+flush answers it until the store is reopened, so nothing after the failure
+is acknowledged over frames the device may not hold (`Db::lost`), and the
+open finds a prefix of what was acknowledged before it. Seal is write to a temp name,
 rename into place, publish to readers, fsync, then the manifest -- one of
 two slot files written in place and fdatasynced, the newest valid slot by
 its publish sequence being the store at open, so a torn publish is the
-slot an open ignores (`Options::manifest_slots`; the shape before it wrote
+slot an open ignores; a publish never writes the slot that holds the
+newest manifest known durable, the last whose fdatasync returned, so the
+slot it does not write is one the device holds whole, and the open
+fdatasyncs both slots as it found them, the one it takes and the other,
+before it removes a file or writes over either (`Options::manifest_slots`,
+`SlotChoice`; the shape before it wrote
 a temp name, renamed it over the old manifest and fsynced the directory,
-`supdb-ingestmanifestrename`). A flush's drain is answered once its
+`supdb-ingestmanifestrename`, and there a seal's names are made durable
+by that publish's directory fsync, on a filesystem that puts a rename
+on the device no sooner than the renames before it; an open under that
+shape fsyncs the directory, and any pending segment it takes from a
+store that ran under the slots, before it removes anything, since the
+manifest it read may be a rename a kill left in the page cache, and then
+removes the slot file a life under the slots left, the manifest it read
+written as `manifest` first where that file held it, so that an open
+under the slots after it makes the file again, fsyncing the directory
+before it makes it and after, before it removes anything). The open removes nothing -- a segment, an
+envelope, a log file, a spare -- and writes no slot until the slot it
+takes is checked against the directory, and refuses with every file as
+it found it where that slot cannot be the store
+(`Db::open_refusals`, `Db::unnamed_refusals`): a name it lists that is
+not there; no slot readable beside `par-` or `pcs-` files, or under a
+cipher beside envelopes, which only a store with a manifest writes; and,
+in the clear, a segment it does not name, newer than every segment it
+names and within what it covers -- a merge's output or a run's -- whose
+last key nothing it names and no run's temp name holds, read by that key
+alone and only in the segments whose fences take it in. Under a cipher an envelope the slot taken does not name has its
+key in no slot the open can read, so it is not held to anything: the
+open sweeps it, and a fall back past a damaged slot that is not refused
+answers without the writes only that slot named (`ROADMAP.md`, both). A
+crash leaves an unnamed segment only from a job whose publish never
+became durable, so nothing was retired behind it and every window opens
+as before; damage that makes the open pass over a durable slot leaves
+one whose log files and temp names may be gone, and a seal's segment
+past what the slot covers is swept as the window's even then, since
+under a buffered policy a torn publish of its landing leaves the same
+files as damage past a log that retired. A seal that fails at any step -- its
+landing, its directory's fsync there, the fsync or the envelope of its
+data before its readable landing or after it, a closing run's presync,
+and under the rename shape the publish that names it --
+stops the seal queue for the life of the open (`Shared::seal_wedged`): no
+seal lands and the segment work writes no manifest from its first look
+at the queue after the failure, the writer's presync's included
+(`Maint::seals_stopped`), so nothing names its segments durable, covers
+its sequence or retires the log that holds its writes, and the fsync is
+never tried again; readers go on reading what was published, every
+`flush` and `settle` answers the failure until the store is reopened,
+and so does every call that has to land a seal for room -- with the
+segment work inline every `seal` and every commit at the threshold, the
+commit's batch in the log first -- a `sync` answers nothing of it since
+what it promises is in the log, until a write is dropped for want of
+room behind the stopped queue -- a write that ends an ordered run, or the
+first write after a `sync` handed the live table to a seal, each of
+which freezes a table -- and from that write on every commit, `sync` and
+`flush` answers it; and the open replays the log and sweeps what no slot
+names.
+Under `manifest_pending` the slot the seal's readable landing wrote
+before the failure stays, naming the segments pending and covering their
+sequence, and the open's rule for a pending name is what reads it. A
+run's close whose records the writer presyncs lands durable only at the
+writer's own ask, after the presync (`SealJob::awaits_writer`). A flush's drain is answered once its
 seal's fsyncs are done and the slot is written, and the slot's fdatasync
 follows on the segment work's thread with the WAL's and temp names'
 retirement behind it (`Options::flush_waits_manifest` is the shape that
 waited, `supdb-waitmanifest`): the round trip was a tenth of a
 ten-thousand-key drain, and a crash inside it is a torn newest slot, the
-case the slots were made for. A flush whose writes were all durable
+case the slots were made for, since any publish before that fdatasync
+writes the same slot again and never the other, giving the owed sync
+up before its write begins, so a write that fails leaves nothing to
+name the slot durable. A flush whose writes were all durable
 before it -- every commit synced, nothing owed a sync, the drain's own
 run synced and named -- is answered sooner still, once its seal's
 segments are published, where the seal is the one in flight and leaves
@@ -1356,7 +3781,24 @@ file before the live one and chains the kind, and a replay that meets a
 sequence gap at a loose boundary ends the log there where at a chained
 one it refuses the open -- and a closed file retires at the next seal's
 durable landing, whose manifest covers it (`seal_rotates_wal` is the arm
-that syncs and rotates at every seal instead). Readers wait for no
+that syncs and rotates at every seal instead). An open takes nothing it
+replays as durable, since a kill leaves the page cache whole: the older
+files it applied frames from go on the loose list, the live file's
+frames count unsynced, and a header the open writes over a file it found
+without one says loose where an older file is, so the first sync by
+policy or `sync` after the open syncs the older files oldest first and
+then the live one, and the first flush covers them by its segment
+instead and is answered behind its slot's fdatasync, as a buffered
+drain is; an open with nothing replayed, or whose cut of a torn tail
+synced the live file, owes nothing. A log file whose first sector is
+zeroes -- a log no sync ever covered, a page a power cut lost -- is a
+log with nothing in it, newest or older, under either kind, and no frame
+behind it is replayed: a sync covers the header with the frames, so none
+was acknowledged unless the device changed bytes it had synced; the gap rules then read the file after an older one,
+the log's end at a loose boundary and a record lost at a chained one,
+since a chained header says the file before it was synced whole and its
+zeroes are damage. A zero header over a first sector that holds anything
+else is damage and refused. Readers wait for no
 fsync and the manifest does, and no manifest is written while a seal's
 segments are published and unsynced -- it would name a segment that may be
 torn and cover a sequence the WAL still has to hold -- so a merge that
@@ -1365,7 +3807,10 @@ finishes in that window lands after the seal (`Maint::collect` holds it,
 window, naming its segments pending (`Options::manifest_pending`,
 `supdb-manifestpending`), trades the order for a rule at the open --
 a pending name counts only once the segment reads back whole, else the
-slot before is the store -- and retires the WAL only behind a slot that
+slot before is the store, and the open that takes it fsyncs the segment,
+its ordered index under `ord_durable` and the directory before it writes
+the slot naming it durable, since a segment read back after a kill was
+read out of the page cache -- and retires the WAL only behind a slot that
 names the segments durable; it bought nothing here, because the thread
 its fsyncs were handed to woke a millisecond late. The seals in flight are a queue (`Maint::sealing`),
 landed in the order they were handed and each in its two phases, and only
@@ -1428,16 +3873,62 @@ not, and an experiment that assumed otherwise measured a 286,000-key seal it
 had never joined.
 
 Ordered ingest has its own log and one more window. A run of keys above the
-store's greatest goes to an ordered memtable and, at each commit, to a
-segment open for append: the batch's records, then a commit marker carrying
-their CRC, length and count, then one fdatasync on that file. The WAL never
+store's greatest -- every key a segment holds or a frame of the log names,
+a delete's included, since recovery replays the log's frames as newer than
+the piece it rebuilds from a run's file -- goes to an ordered memtable and,
+at each commit, to a segment open for append: the batch's records, then a
+commit marker carrying their CRC, length and count, then one fdatasync on
+that file where the policy is due; a commit under `EveryN` that is not
+writes the batch's whole pieces and holds the rest with the writer, and
+a `sync` writes what the run holds and syncs the file, after the log
+beside it -- an open run's only: a run in the clear closed by any write
+it cannot take (a key at or below its greatest, an empty or overlong
+key, a value that does not inline, a `put`, a `delete`) or by any seal
+(`Db::seal`, or a commit's at the threshold) goes to its seal with what
+the policy left unsynced, a `sync` before that seal lands does not cover
+it, and a `flush` does. A run's first due commit syncs the log before
+the run's file wherever the log owed a sync when the run opened -- the
+frames of a table frozen before it, a file a rotation left loose, frames
+an open replayed -- noted once at the run's open and asked in the due
+branch (`Direct::log_owed`), since nothing writes the log while a run is
+open in the clear; under a cipher the run's due commit syncs the log
+behind its own frames anyway; the sync of a batch the run's file owes,
+which a commit with nothing new for the run, a `sync` or a `flush` makes
+whatever the policy (`Db::run_again`), stands in for a due one and syncs
+the log first the same way. That orders the log behind the syncs the
+policy makes and no others: the helper thread behind the run's writer
+fdatasyncs the run's file every `sync_ahead` under any policy, the
+kernel writes its pages back, and a run that closes before its first due
+commit has its records synced by the flush that closes it (the presync)
+and its whole file by its seal's fsync, neither waiting for the durable
+landing of a seal before it -- so before the run's first due commit a
+power cut may keep run commits nobody acknowledged and lose the log's
+older frames (`ROADMAP.md`). The note is of the log alone: a run closed
+into a seal still in flight owes its unsynced commits to that seal's
+landing, and a later run's due commit syncs nothing of its file, so a
+power cut after it may keep the later run and lose the earlier one. A
+log sync that fails at the due commit -- kept where it is an
+fdatasync's, returned as is where a loose file would not open or the
+live header would not chain -- leaves the batch owed by the run's file,
+so the next call with nothing new writes and syncs it, the log first.
+The WAL never
 sees them (`direct_ingest: false` is the arm that still sends them there).
 Recovery walks the temp file's record stream to the last marker whose three
 quantities agree with the records before it and makes what precedes it a
 piece where it lies: the file cut back to that marker and finished as the
 run's close would have finished it (`SegmentWriter::resume_run`), the walk
 standing in for the table as the keys' source; what follows is a batch
-nobody was told was durable. The CRC is
+nobody was told was durable. The run's
+writer writes at the offset it counts, never at the file's cursor, so a
+write the device refuses part way leaves bytes past what counts and the
+next write lands over them; the batch is the writer's whole by then, so
+the failure is held for the commit that syncs it, and the batch is owed
+until a sync covers it -- no commit with nothing new, `sync` or `flush`
+answers `Ok` before one has. A failed fdatasync of the run's file, the
+commit's or the helper's behind the writer, is kept as the log's is, and
+the run's close refuses to finish the file, since its fsync would be the
+retry; a run closed while it owes a batch writes the batch into its
+segment, durable with the segment once it lands. The CRC is
 there because a crash can land the page a marker is on and not a page of its
 batch, and a record whose bytes came back zero still parses. A run stands in
 the store's sequence: its records take one number each, as a WAL record
@@ -1469,9 +3960,7 @@ does not promise the entry that names it, and a run whose name a crash
 took is every commit of it gone. One barrier a run, none where a
 rotation's barrier for its new log file had the name in the directory
 already, and none in a store whose commits never sync, whose landings'
-directory fsyncs carry it; a barrier that fails fails the commit, and a
-run that closes owing one is the next sync's, as a run that closed
-unsynced is. And none for a run begun in a file made ahead of it
+directory fsyncs carry it. And none for a run begun in a file made ahead of it
 (`Options::run_spare`): an empty file under the temp name of an id the
 writer reserved as the run before began, made where the directory is
 synced anyway -- by the store's creation ahead of the manifest's, by a
@@ -1479,7 +3968,18 @@ landing ahead of its own -- and called ready only once that sync has
 returned, so the name is behind a barrier before the run's first record
 is. A run that finds the file made and not yet called ready takes it as
 one it made itself, barrier and all; an empty one a crash leaves is no
-run, and the open removes it. The close is
+run, and the open removes it once it has taken the store, so a refused open
+leaves it. A store under a cipher makes none, its runs being memory
+files with no name until their envelopes. A barrier that fails is never tried again:
+each name it was for gets a second entry, a hard link under its name and
+`.guard` (`vault::guard`), and the directory is synced again, a new
+operation after the failure that the new fsync covers; the guard stands
+until the file goes -- every removal and rename through the door unlinks
+it first -- and an open that finds a guard without its file gives the file
+its name back before anything reads the name. Where the guard cannot be
+made either, the failure is kept (`Db::lost`): reads go on and every write
+answers it, since a directory that cannot make a new entry durable cannot
+make the next name the store writes durable either. The close is
 the seal's shape with one difference: the finished segment is hard-linked
 under its piece name rather than renamed, and the temp name stays until the
 manifest names the segment, because a name the manifest lacks is swept at
@@ -1671,6 +4171,234 @@ reopened store through a handle. The rule: a path that rebuilds a
 structure ends where the live path ends, and a reader that honours a
 mark the live path sets is the test that tells the two apart.
 
+It came back as a mark: the open set the live log's synced mark to its
+length, on the reading that replay read the frames back from the
+device, and after a process kill it had read them from the page cache.
+A `sync` after the reopen found nothing unsynced and answered `Ok`, the
+first flush was answered before its slot's fdatasync with the log
+covering nothing, and a power cut then took what both had acknowledged;
+the older files replay read were not on the loose list either, so the
+first sync would have chained the live header over a file a power cut
+could still cut, and the open after that cut refused a gap it read as a
+record lost. Every test reopened a store and read it, and none synced
+after a reopen and cut the power. The rule: what an open rebuilds from a
+log is as durable as the device has been told, not as the read found
+it, and the open hands the live path the same marks the writes that
+made it would have left -- unsynced, and loose where a sync is owed.
+It came back at the manifest: the open took the newest valid slot as
+the store and synced none, and a slot a drain had written with its
+fdatasync owed is in the page cache alone after a kill; the reopened
+store's first publish wrote over the other slot, the one the device
+held, and a power cut tearing that write left no slot that named the
+store. The open fdatasyncs the slot it takes now, and the other beside
+it ("A slot chosen by its sequence", below), before it unlinks anything
+a slot does not name. And it came back at the pending arm:
+the open took a pending name whose segment read back whole, wrote a
+slot naming it durable that covered the log frames holding its writes,
+and fsynced nothing, so a power cut after the reopen lost the segment's
+unsynced pages and the log was skipped past them; the open fsyncs a
+pending segment, its ordered index where those are kept durable, and
+the directory before the slot that names it durable. The corollary: a
+check that reads a file back proves the page cache, and only an fsync
+makes what it read durable. The first tests of that order read the
+open's record of what it had fsynced and tore what the record lacked,
+and the record said nothing of where the slot's write fell among the
+fsyncs, so an open that synced the directory, or every file after the
+first, after the slot passed them all; the slot's write is in the same
+record now, and the test holds each fsync to a place before it. A record
+the open keeps is the open's word, and an open that skipped the
+directory's fsync and kept the word passed that too: the directory's
+fsync is read off the calls themselves (`Db::trace_dir_io`). Each file's
+was read off the kernel's page flags, which only root may read, so an
+open that skipped a file's fsync and kept the word passed every run
+without the privilege, the gate's among them; each file's fsync goes
+through a call that records it once it returns (`vault::sync_file`),
+and the page flags are a second word where they can be had. Where they
+cannot, the page cache answers for a slot file without them: a drop of
+a file's clean pages (`POSIX_FADV_DONTNEED`) leaves a page no sync has
+written, which `mincore` then finds, against a control written and
+synced by nobody that has to read as unwritten
+(`os_page_kept_unwritten`); a call that recorded a slot's sync it never
+made was caught by the page flags alone until then. The
+corollary: an order is tested by one
+record that holds both of its ends, since a record of each end apart
+holds that each happened and not which came first; and the record is
+made by the call, never beside it by the code under test.
+
+**A sweep made before the choice it was for.** The open listed the
+segments, removed every one its chosen slot did not name, and only
+then found out whether that slot could be the store. With the newest
+slot damaged it fell back to the slot before, swept the segments only
+the damaged slot named -- a flushed run whose temp name had retired
+behind it, the only copy of its records -- and answered `Ok` with every
+flushed key absent; with the slot before naming inputs a merge had
+unlinked, it swept the merge's output and then refused at a segment it
+could not find, in words that named a missing file and not a damaged
+slot; and with both slots emptied beside partitions it took the scan
+kept for stores from before manifests, which takes `seg-` names alone,
+and removed every partition. Every test of the slots tore a publish
+still in flight, whose log still held its writes. The open removes and
+writes nothing now until the slot it takes is checked against the
+directory, and a segment the slot does not name is held to what
+retired behind it: a run's segment, or a merge's, is swept only where a
+run's temp name or the slot's own segments hold its last key. The log
+was a third holder in the first version, and a mutant that took it away
+survived every test: nothing a crash leaves puts a run's or a merge's
+keys in the log alone, so the arm only let damage through. Both ends of
+the segment were read, and a mutant that read either end alone survived
+too: in every state one damaged slot leaves, the two ends are held
+alike, and the last is the one a run's records show at, since a run's
+keys sit above every key before it. And the docs promised every key
+of the segment read where two were. The first version held a seal's
+segment past what the slot covers to the log replaying it as well, and
+a buffered store's torn publish leaves exactly that -- the segment
+synced, the log's frames for it cut by the power cut -- which the open
+must sweep; told apart from damage past a retired log by nothing in the
+files, it is a gap and not a check. And the check ran only where the
+open had passed over a slot, until a mutant that ran it at every open
+survived every test: every state a crash leaves passes it, so the gate
+was a second condition nothing could reach. The rule: a step that removes what
+a decision rules out runs after the decision is made and checked, never
+as part of making it; what it removes is held to the evidence of what
+retired behind it, and only where every crash state leaves different
+evidence; a refusal is tested by its own words, since a refusal
+further in, after the damage is done, carries others; and the docs of
+a check name what it reads, never what it stands for.
+
+**A check added to the open, priced by nobody.** Stage 0 put on every
+open an fdatasync of each manifest slot through a second open of the
+file the slot read had just closed, a stat of every segment the slot
+names beside the directory listing that already said which names were
+there, two more listings of the same directory, the log replayed ahead
+of a refusal that needed nothing of it, and, after a crash, every
+segment the slot names mapped to look up one key whose partition the
+names' fences already said. Each was argued to be free by its unit and
+timed by none, since no cell of the suite opens a store: the suite's
+stores are made, never reopened. A probe of the suite's own store,
+opened a few hundred times with the shapes alternating over the same
+files, priced it: the two fdatasyncs are a quarter of an open of a small
+store and nothing at a large one, and the second opens, the stats and
+the listings a step under what a pairing resolves at every size. The
+open reads its slots once and syncs them through the descriptors it read
+with, answers "is this name there" from its one sorted listing in the
+clear (under a cipher the listing is of the names a slot gave the store,
+so each envelope is still looked for), makes its checks before the
+replay, and looks an unnamed segment's key up in the segments whose
+fences take it in (`Db::name_takes`); the open's own reads are in the
+process's trace (`vault::note`), which is what its tests count. The
+first test of the slots' fold counted the read's own record and so held
+it only against the shape it replaced, whose second open had made one
+too: a second open by path for the sync made no record and passed. The
+slot read and its fdatasync record which descriptor each went through
+(`vault::note_file`, the number and the open file description's offset,
+which a second open of the file does not share), and the test holds the
+two to one. The rule: a step added to a path no cell times is priced by
+a probe of that path before it lands, and every read it makes is first
+asked whether the path already holds the answer -- a descriptor, a
+listing, the fences in a name; and a fold that removes a call is held by
+the identity of what the remaining call used, never by a count of a
+record the removed call would have had to make.
+
+**A slot chosen by its sequence, beside a sync left owed.** The
+manifest's two slots were written by the publish sequence's parity, on
+the reading that the slot before a publish is always durable; the
+drain's slot then had its fdatasync deferred past the answer, and a
+merge's or a promotion's publish in the same drain, or a second seal's,
+wrote the next sequence into the other slot -- the newest durable one --
+while the first was still owed, and dropped the owed sync. A power cut
+tearing that write left the device the older slot, whose retirements
+had run, and the open refused the store over acknowledged commits, or
+both slots torn. Every test of the slots tore the newest slot by hand
+on a store at rest, where the slot before it was durable. Each publish
+now writes the slot that does not hold the newest manifest known
+durable, and a slot is known durable when an fdatasync covering its
+last write has returned (`SlotChoice`), so two publishes with no sync
+between them write one slot twice; the tests watch every slot write
+(`Db::watch_slot_writes`) and build what a cut during it leaves from
+which writes a sync covered. The rule: of two copies kept so that one
+stands while the other is written, the one written is chosen by which
+is known durable, never by a counter, and "known" is a sync that
+returned, never one issued or owed; and a deferral of a sync is checked
+against every step that can follow it before the sync runs. It came
+back on the failure path of the same window: the publish after an owed
+slot writes that slot's file, and a write that failed part way returned
+before the publish gave the owed entry up, so the owed fdatasync ran
+after it, returned over the torn bytes, named the slot durable and
+retired the log behind it, and the next publish went into the only
+valid slot. A sync of a descriptor covers whatever the file holds when
+it runs, not the write it was owed for, so a write into an owed slot
+gives the owed entry up before it begins (`Maint::write_slot`), and a
+test tears that write (`Db::tear_next_slot_write`); another fails a
+slot's fdatasync (`Db::fail_next_slot_sync`), since a slot named durable
+where its sync was issued, not where it returned, is invisible to every
+test whose syncs succeed. The corollary: a
+record of what a pending sync will make durable is dropped the moment
+anything else writes the bytes it covers, on the path where the write
+fails as on the one where it succeeds. And the open's own sync of the
+slot it takes was held only by a test that reads the kernel's page
+flags, which only root may, so in the gate it ran nothing, and the
+order it keeps -- the slot durable before the sweep unlinks what the
+other slot names -- was called unobservable on the reading that no
+unsynced slot names less than the one before it, which a kill between
+a merge's slot write and its fdatasync makes false. A seam fails that
+sync (`Options::fail_open_slot_sync`) and the open is held to leaving
+the directory as it found it. The corollary: a check whose only test
+needs a privilege the gate does not have is a check nothing runs, and a
+claim that an order is unobservable is checked against the kill between
+every write and its sync before it is written down. That seam failed
+the open's sync whichever file the open had opened, so an open that
+synced the other slot passed it and every test but the root one; it
+names the inode it failed for now, and the test holds that to the slot
+taken. And the upgrade's order -- the newest slot written first, the
+one the store was read from after it -- was held by nothing, both
+writes being synced and no test cutting between them, until a seam tore
+the open's first slot write (`Options::tear_open_slot_write`). The
+corollary: a seam that fails an operation names what the operation was
+on, since a mutant that aims the operation at the wrong object fails
+through the seam as well. And the owed entry carried its slot and its
+sequence for a test's record, while the state that owes it already says
+both: a word stored on a drain's path that only a seam reads is a cost
+the seam was to be free of. The docs then said the open syncs its slot
+before it removes any file, and under a cipher the vault's sweep of
+envelopes neither slot names ran before the sync; the order was safe and
+the sentence false, and the test made an exception for the mode instead
+of the code keeping the sentence. The sweep runs after the sync now and
+the test holds both modes to a directory left as found. And the slot
+landed by the open's own writes -- a store's creation, an open with no
+manifest, a run recovered from its temp name -- and by an inline
+publish was held by no test, since every test's first publish came
+after a flush the test had settled and synced: a test tears the first
+publishes after each of those. The corollary: a sentence of a contract
+is checked against every mode before an exception is written into the
+test that holds it, and a choice seeded at several places is held at
+each place, by the first write after it. And the open synced the slot it
+took and left the other to the kernel's writeback. A publish into the
+slot whose fdatasync was owed, the next publish into the same slot -- the
+other holding the newest manifest known durable -- and a kill part way
+through that write leave the page cache holding the slot torn and the
+device free to hold the owed publish in it whole, its writeback having
+run before the torn write dirtied the page again; the reopen passed over
+the torn slot, took the other, swept the owed publish's segment and
+acknowledged commits, and a power cut before anything wrote the torn
+image back handed the next open the owed record as the newest slot, which
+refused the store over a segment that open's sweep had removed. A model
+of the two slots found it, and every test had built the device's slots
+from what a sync covered and the cache's from what the cache held,
+never a slot torn in the cache over one whole beneath it. The open
+fdatasyncs the other slot too, whatever it read as, where the file is
+there -- a newest slot passed over for pending segments included, which
+the open writes over itself but only after its sweep, so a kill between
+the two leaves the same device -- and a seam fails that sync (`Options::fail_open_other_slot_sync`);
+both syncs are read off the calls that made them (`vault::sync_slot`,
+`Db::trace_dir_io`), which holds the open's own sync without root; the
+seam's failure stands in for the fdatasync's result inside that call, so
+a record made before the sync returned, or a sync run and failed after,
+is a record of a failure, which the test refuses. The
+corollary: of two copies kept so one stands while the other is written,
+an open that picks one settles what the device holds of the other before
+it acts on the choice, since a copy read as torn from the cache may be
+whole on the device.
+
 **A path only one arm exercises is a path nothing tests.** A delete was never
 marked dirty, and the checkpoint asked to carry it dropped it, leaving the key
 readable at its old extents. It was invisible for as long as every insertion
@@ -1682,7 +4410,49 @@ arena's block table by the tag, and six sittings of the stream as an arm
 never ran a scan over a run in progress with the cache on; the gate's first
 run with the stream as the default did, in a test written for another bug.
 Flipping the default is the test an arm never gets, so flip it under the
-gate before pricing it as the default.
+gate before pricing it as the default. It came back as a mode
+beside an arm: the open's check that a pending slot's segments read
+back whole walked each with the whole-section scan, which a segment
+read by the piece refuses, so under a cipher every pending slot read as
+torn and the open took the slot before it, whose log the pending
+landing had retired; no test had run `manifest_pending` under a cipher
+and cut the power. An arm's crash test runs under every mode the arm
+can be set beside. And it came back as the arm itself: the
+manifest's rename shape (`manifest_slots` off) was held by reading
+alone while three fixes to the slots were built and tested beside it,
+and the first crash states built under it found three holes the reading
+had named and nobody had made. A publish whose directory fsync failed
+after its rename counted the seal out with the queue going, so the next
+landing's fsync named the seal's segments durable over the entries the
+failed one was for and retired the log; an open of a manifest a kill had
+left renamed and unsynced swept what it stopped naming, and a power cut
+could keep the sweep and lose the rename; and an open of a store that
+had run under `manifest_pending` took its pending names, read out of the
+page cache, without the fsyncs the slots' open makes. A fourth was
+found after those were called closed, in the crossing back: a store that
+ran under the slots, then the rename shape, killed between a rename and
+its directory fsync and opened under the slots again found both slot
+files, the first life's `manifest.alt` among them, so it made neither,
+fsynced no directory, and swept what the renamed manifest stopped
+naming; the tests of the crossing had stores born under the rename
+shape, which have no second file. The rename open takes the file away
+now, before it removes anything else and answering a removal that
+fails, and the slots open makes it and fsyncs the directory before it
+removes anything, the cipher's sweep of envelopes included, which ran
+before that fsync. A fifth was in that fix: the slots open fsynced the
+directory after it made the file, so an open killed between the two, or
+whose fsync failed, left both files, and the open after it made nothing,
+fsynced nothing and swept; the test of the failed fsync reopened and
+asserted only that the reopen succeeded. The directory is fsynced before
+the file is made as well now. The corollary: an arm kept for pricing
+is a shape a store can be opened in, so every crash state built for the
+default is built for the arm, and across a change from one to the other
+and back, with what each life leaves for the next, before a fix to the
+default is called done; and a marker that says a step is done -- here a
+file whose presence says the crossing is made -- is made only once the
+step is durable, and its test runs the open after the one that failed. And a seam a test needs on such an arm's path
+rides the word that path already loads (`vault::sync_dir_as`), never a
+load of its own on every publish.
 
 **The sharp edges of a log are in the bookkeeping around it, never in the
 append.** A value-carrying log queued a key twice when it sealed, re-queued
@@ -2152,6 +4922,92 @@ thirty milliseconds there. The rule: a fast path is gated on the
 property that makes it valid, not on the source it was first written
 for.
 
+It came back as a skip of a promise. `sync` makes everything written
+durable, and synced the log only when the live table was hashed, on the
+reading that an ordered run is its own log and the log holds nothing of
+it; and it did nothing for the run, on the reading that a run's commit
+syncs its file. Both were true under `Always` and neither under
+`EveryN`, the policy whose stores are the ones that call `sync`: a run's
+commit that is not due writes its batch's whole pieces and holds the
+tail, so a `sync` answered `Ok` lost to a process kill every key of a
+run under a megabyte; a run opens over a log that still holds the frames
+of a table frozen before it, unsynced; and under a cipher the run's
+commits are frames of that log. `sync` asks the log what it owes whatever
+the table, and the run by the count of commits no sync has covered,
+which the log's sync starts over, so the run is asked first. The
+corollary: a call whose contract is durability is gated on what is
+unsynced, never on which structure is live, since the policy that
+leaves things unsynced is the one whose callers rely on the call. The
+fix covered the open run and its first docs promised every commit: a
+run closed into a seal in flight holds its unsynced commits on the seal
+thread's way to its segment, beyond anything the writer can sync without
+waiting for that thread, and the review read the gap off the doc before
+any test had gone near it. The restated docs then named two of the ways
+a run closes, a key below its greatest and `Db::seal`, and a run closes
+at every write it cannot take -- a `put`, a `delete`, a key or a value
+the run cannot hold -- and at the seal a commit makes at the threshold,
+which is the common one; a reader of the docs was pointed away from the
+store's own seal. The same docs still promised that `EveryN` loses a
+tail and that the policy's next sync covers the frames an open replayed,
+over a window the unit had itself reproduced and filed: a run's due
+commit syncs the run's file and leaves the log's older frames unsynced. A
+promise is written for the states the fix reached, the states it did not
+reach are named beside it until they are built, and a list of the ways
+into a state is read off the call sites that reach it, never off the
+cases a test happened to build. The due commit's window, once built,
+held the same shape from the other side: the policy's sync of the run
+was written as "the sync", and a sync by policy promises everything
+before it, so the commit that pays it pays whatever it covers -- the log
+an earlier table left owing as well as the run. It reached no cell of
+the suite, whose ordered loads open their runs over a log that owes
+nothing and whose buffered arm's policy is never due, so a test of the
+due commit beside a frozen table, a loose file and a reopen under
+`Always` is what holds it, and one beside a clean log that it syncs
+nothing more. Its first docs then said that a crash keeping the run's
+synced commits keeps every commit before them, and took the exception
+out of the policy's headline: the review read the file's other syncs off
+the writer -- the helper thread that fdatasyncs a run every `sync_ahead`
+of file under any policy, the only sync a buffered store's run ever
+gets before its close, and the kernel's writeback -- and every test's run
+was a few hundred bytes, under the helper's stride. A test with a small
+stride and the helper's count waited on reached it at once. The
+corollary: a sync a policy issues is priced as the promise it makes,
+every file the promise covers, and where the files it covers are known
+when the run begins, the note is taken there and read where the sync is
+due; and a promise about what a crash keeps is read against every way
+the bytes reach the device -- each thread that syncs the file and the
+kernel's writeback -- not only the syncs the fix ordered. The second
+review found two more, read off the code as the first had been. A
+commit of nothing after a run's piece write was refused writes the
+batch again and syncs it whatever the policy, standing in for the due
+commit the failure spent, and synced the run alone: a power cut after
+its `Ok` kept the run's batch and lost every older frame of the log,
+the defect the unit was for, on the one path the note was not read at;
+it reads it now. And a run that closes before any commit of it is due
+is synced twice on the way to its seal, by the flush's presync and by
+the seal's own fsync, both before the seal ahead of it is durable,
+which the docs' list of the ways had left out because it named the ways
+an open run's bytes move. The corollary of the corollary: a sync that
+stands in for one the policy would have made reads every note the
+policy's sync reads, and a list of the ways bytes reach the device is
+read off every function that syncs the file, the close's among them,
+never off the state the run happens to be in when the list is written.
+The third review read two more. A log sync that failed at the due commit
+returned before the run's sync, which was right, and answered an error
+`sync_wal` does not keep where a loose file would not open: the batch,
+marked committed, was then unsynced and owed by nothing -- no write had
+failed -- so under `Always` a commit of nothing after it answered `Ok`
+with nothing synced, a state no path had reached before the unit put a
+second sync ahead of the run's; the failure marks the batch owed now, a
+line on the error path. And the sentence the unit added, that a crash
+keeping a run's synced commit keeps every commit before it, was true of
+the log's commits and not of a run closed earlier into a seal in flight,
+whose file the later run's note says nothing of. The rule: a step put
+ahead of another on a path inherits the failure states the other's
+failure used to leave, so each error it can return is read for what it
+leaves owed; and a promise of "every commit before it" is read against
+every log a commit can be in, the runs' files as well as the WAL.
+
 **A pass that reported done for a turn it skipped.** The upkeep thread's
 pass checked that the state was the commit's by its generation and, where
 a landing from the segment thread had moved it between the hand-over and
@@ -2407,6 +5263,32 @@ of a piece kept across a merge bet that a merge of four hundred thousand
 keys would outlast a seal of twenty, and the bet lost once under the
 gate's load, with a guard naming the case not reached; it holds the
 merge's landing now (`hold_merge_landing`) until the piece has published.
+And as a copy: a test of a power cut after a rotation copied the live
+store file by file as its crash, with a seal its commits had handed in
+flight, on the bet that the seal would not land inside the copy; under
+the whole binary's load it did, between the listing and the manifest's
+copy, and the copy's slot named a segment the copy did not hold -- no
+state a crash leaves, read as the open refusing one. A copy of a live
+store is a crash only while nothing lands, so it holds the landing
+across the copy, and lets it go before anything that can fail. Three
+mutants the test was listed as killing were killed by the race and not
+by the test. The hold was each test's to remember, and most of the
+binary's tests copied a live store: the race came back in a delete's
+crash test, whose copy met a merge's landing and was read once as a
+mutant's kill. Every copy of a live store goes through one helper now,
+which pauses the segment work across the copy
+(`Db::pause_segment_work`, `copy_live` in `tests/durable.rs`): every
+landing, slot write and retirement is that thread's, so the pause holds
+them all and leaves a test no hold to forget, and a copy of a store
+nothing holds open, or one a hold of the test's already keeps from
+landing, says so at its call (`copy_closed`, `copy_held`). The pause's
+mutant is the whole binary run four at a time with the pause taken out.
+And as a clock: a test that held a seal's fsyncs on a timer asserted
+that the flush published the segment within the first half of it, and
+a busy box took longer; the thread that sees the publish lifts the hold
+now. And as a read at an answer: a flush answers a stopped queue without
+waiting for the seal job of the run it closed, whose presync runs on a
+thread of its own, and the test read the presync's record at the answer.
 And as a builder: the test that a publish's builder has its forms
 installed by the next commit under the upkeep thread passed, in most
 runs, because the commit's fill built the blocks -- the builder had
@@ -2435,6 +5317,25 @@ conversion's order holds the first job before its rename and the second
 at its start now, under either turn, and fails on a tick that starts a
 conversion ahead of a partition's own build; the test whose order is
 read off the warms taken in a job a step pins the turn at the step. And
+as a spare: the test of a recycled log under a cipher wrote sixteen
+rounds and asserted that one of their rotations had taken the spare,
+which the segment work offers behind a seal's durable landing; where
+that thread ran behind the writer every rotation made its file, three
+runs of forty-eight under eight-way load, once in a unit's gate whose
+diff the binary could not see. It rotates, flushes and settles, so that a
+retired log stands as the spare, and holds the next rotation's log to
+that file's inode now. And as work left for a step: the cipher test of
+form files built within a cache the store does not fit read the cache's
+evictions after its fill and again after the form's settle, on the bet
+that the builds fall between the two. A store under `ZPages::Always`
+builds as its partitions land (`Options::zpages_eager`), a third of the
+builds had run by the first reading in every run printed, and in one run
+of a gate's stride group all of them had: "the builds gave nothing back"
+over a cache that had given back 690 units. With the test's thread made
+four seconds late to its reading it was red three runs of three. It runs
+twice now, with the builds left to the settle, where the count is exact
+and a build before the reading is itself a failure, and with the builds
+begun at landing, held to having been made. And
 as a poll: two tests of the builds at a merge's output finish sealed
 their last piece and waited to see its merge in flight, a merge of one
 partition that is in flight for five milliseconds, under a poll every
@@ -2485,20 +5386,7 @@ pinned beside the rounds, its thread off its core on a loaded runner
 for as long as the reads -- the last round's forms waiting for that pin,
 rightly, once on a hosted macOS runner and one run in a hundred beside
 five others; the pins in the table at the failure named the slot, and
-the test's segment work runs inside the writer's operations now. And as a sum over two stores: the bounds
-walk test (`a_bounds_walk_places_a_boundary_by_its_head_and_reads_its_record_only_on_a_tie`)
-holds one store's boundaries placed by head plus records read to the
-other store's records, from counters every walk of a store adds to, and
-near reads two walks of the same boundaries race inside the seal: the
-landing's of the piece, and the upkeep thread's of the unsealed keys,
-which are the piece's keys. Where the landing published first the pass
-found nothing unsealed and walked nothing, so a store counted one walk
-or two by the thread's turn: eight runs of 240 beside eight busy loops,
-either store, against none of 240 with the fix under the same load. A scratch line at each of the three
-walks' call sites named the two, and holding the upkeep's pass across
-the landing (`hold_upkeep_pass`) gave the gate's exact numbers every
-run. The test settles the store before the seal now, so the pass is done
-in both stores before anything races it. And as a freeze: the test that a
+the test's segment work runs inside the writer's operations now. And as a freeze: the test that a
 freeze settles a shared table only once an overwrite in flight is through
 spawned the overwrite and flushed at once, on the bet that the put would
 be inside its record's lock before the freeze closed the table to
@@ -2565,12 +5453,33 @@ the one that had passed there, and every run with the thread kept 300 ms
 before the hold, seven built of seven by the counts printed at the
 assertion. Both holds are set before the builds are due now, and each
 build is let from its start to its rename with the next one's start held
-behind it, which passes with 300 ms slept at every step. The
+behind it, which passes with 300 ms slept at every step. And as a form
+file being built under a count: the test of the raw seek's directory
+hint counts a hint a scan and a hint a partition crossed, and with the
+compact form forced (the stride group's `SUPDB_TEST_STRIDE`) a
+partition's form file is built as it lands and serves the scans from
+there, a seek that reads no directory, so the counts were whichever side
+of that build the scans fell on: no hint for the first scan in one run
+of sixty, three hints for four partitions once in a gate's stride group,
+and no hint in every run with the scans held four hundred milliseconds
+behind the flush. It names the raw form, the form whose seek it counts.
+And as an evictor's pass: the pager's test of a cache over its budget
+waited for the cache to come back under the budget and then read what
+the evictor had given back, and a pass goes on past the budget to its
+margin, holding every file it looks at for its length (`Pager::mark`).
+Read beside one, the file's count was a unit short of what the file's
+drop handed over, and the drop itself was the evictor's to finish, the
+count not there when the test read it, once in a gate. The first fix
+waited for the count to appear and failed fourteen runs of a hundred and
+fifty with six at once, on the unit: a wait for one of two things a pass
+in flight leaves is a wait for the pass, so the test stops the evictor
+(`Pager::stop`, which joins it) before it reads either. The
 rule: a test that
 needs a state holds it, and a bet on timing loses the first time the
 thing it bets against gets faster; a state the test needs only to have
 happened is waited for by the count it leaves behind, never by catching
-it; a test that passes is read for
+it; a mutant's kill is read again once a race under the killing test is
+found, since the race kills mutants too; a test that passes is read for
 the path that passed it, since a fallback that does the same work
 passes it too; an injected clock moves the engine's side of a wait
 alone, so whatever the wait is for that the kernel does in its own time
@@ -2611,7 +5520,22 @@ two hundred and forty with the commit's fill inline. The rule is the
 one above, applied to two more states a test cannot see it needs: the
 second a store was finished in, and which side of a hand-off a counter is
 read from. A flake whose trigger is a phase is reproduced by choosing the
-phase, not by repeating the run.
+phase, not by repeating the run. It came again as two signals of one
+failure: the segment work stops the seal queue and then, its look done,
+leaves the failure for the writer's next commit, and tests that waited for
+the stop's flag (or for the seal counted out) and then committed a batch
+read the commit's answer as the failure's -- in about one run of three
+of a mutant pass once the stop moved ahead of the count. A test that
+waits on one signal and reads another waits for the one it reads: here a
+commit with nothing staged, until one answers. Two more helpers of that
+file had the bet and were left when the first was fixed: one went red in
+a whole run a day later, at a seal the failure fell to. The window is a
+few microseconds, so the helpers were found by making it wide, a spin of
+a set width between the stop's flag and the failure's leaving, put into
+the engine for the hunt and taken out after: at a millisecond the two
+were red in twenty-four runs of twenty-five, and the whole binary run
+under the same width named no third. A fix of one test for a race is
+followed by the race made wide under every test of its binary.
 
 **A mark taken whole and then read in part.** A commit publishes the
 log's length, the entry count and the watermark as one mark, and a
@@ -2674,7 +5598,19 @@ refuses an unpinned writer beside another publisher, and the arm runs
 its segment work inline as it did when the pins were priced. The rule:
 an option sound only under another's value is checked against it where
 the store opens, and an arm that keeps an old shape keeps that shape's
-other settings with it.
+other settings with it. It came back as a mode. The condition was
+never "the one thread that publishes" but "nothing else frees what the
+writer reads", and under a cipher the store's cache gives a file's pages
+back once no reader pinned in the reader table could hold them: an
+unpinned writer there was accepted at the open for as long as the cipher
+shipped, the checked build's assertion fired at such a store's first
+landing ("read with nothing pinned"), a release build has no assertion
+and reads pages the cache is free to give back, and nothing opened one,
+the arm being the suite's and plain. It is refused at the open (`tests/cipher.rs`, by its words and a
+directory left as it was). The corollary: a soundness condition is
+written down as the property it rests on, and read again against every
+new party that can break the property, since the list of parties it was
+first checked against is only who existed that day.
 
 **A sweep that read the pins before it took the list.** A retired
 item is freed once every pinned reader is past the epoch its
@@ -2950,6 +5886,279 @@ shipped. The flush answers with the presync's error now, and a hook
 injects the failure for the test. The rule: an fsync's error is consumed
 by the call that sees it, so the result of every sync on a path is
 checked by that path and never left to a later sync of the same file.
+It came back at the log, where the path did check and then forgot: a
+failed fdatasync of the log was the commit's answer, and the next
+commit's fdatasync of the same descriptor, which Linux answers with
+success over pages it marked clean after failing their writeback, was
+the next commit's `Ok`; the frames behind the hole were acknowledged and
+replay stopped before them. A loose file's sync and the directory's fsync
+a new log file's name needs did the same, the second by design, a
+barrier "retried by the syncs after it until it succeeds". The writer
+keeps the first such error now and answers it to every commit, sync and
+flush until the store is reopened, and the check rides the one each of
+them made already: the kept error refills `pending_err` each time it is
+taken. The corollary: a sync's error is not the call's alone either --
+it is a fact about what the device holds, so it is kept for every later
+call that would promise the same bytes, and a retry is never the remedy.
+It came back a third time at the direct run's file, twice. The helper
+thread that syncs a segment behind its writer keeps its fdatasync's error
+for the finish, and its doc said why -- the writer's own fsync, on the
+same description, "would then report nothing" -- while the run's commits
+are the writer's own fsyncs and never the finish: a failure the helper
+met was answered by no commit, and the commit after it was acknowledged
+over the hole. The writer reads the helper's error where it already
+tells the helper it has synced (`synced_all`), so a writer with no helper
+pays nothing. And the run's own failed fdatasync was answered once and
+forgotten as the log's had been, and with the kept error in place a write
+below the store's greatest still closed the run, whose finish fsyncs the
+same file and whose landing names it: a retry with a manifest behind it.
+The finish refuses a file whose sync failed, and asks nothing to know
+it: the lost sync and a held write are bits of the byte the writer's
+test seams already asked beside every write and every sync, so a write
+of a file whose sync failed is refused in the write's own cold path, a
+finish always has its trailer to write, and the first draft's checks of
+two fields of their own, one at the top of every run commit's sync and
+one at every segment's finish, were a load and a branch each that no
+check of the path made before. The corollary: a kept error
+is checked at every path that would sync the same bytes again, the
+background ones included, and not only at the calls that answer the
+caller.
+That check still read the helper's word after the helper had acted on
+it: the helper synced through a duplicate of the writer's descriptor,
+one open file description between them, so a failed fdatasync of the
+helper's took the device's error for both, and a commit whose own
+fdatasync returned in the instant before the helper stored its error
+read the helper's word as clean and was acknowledged over the hole. A
+model of two syncs in flight on one description named the order, and no
+test had built it, since the seam failed the helper's sync by count and
+not by description. The helper opens the file again for itself now
+(`/proc/self/fd`, one open where it is spawned), so the kernel reports
+the error to the writer's description as well, whoever syncs first: on
+this kernel a probe over a loop device on a full tmpfs read the writer's
+fdatasync `Ok` after the duplicate's failed one and the error after its
+own description's. The seam says which description met the error
+(`HelperFault`, `kcmp`) and holds the helper between its syscall and its
+store, which is the window. And the finish's join of the helper, which
+takes its error before a seal's or a merge's segment is renamed into
+place, was held by no test, every test of a failed helper sync being a
+run's; one each now. Those two reach the failure whether the helper
+syncs before the finish asks it to stop or at the stop, and a mutant
+that took the sync at the stop away passed them in five runs of six:
+the stop is held by a test whose helper begins only after it
+(`HelperFault::start_after_stop`), since a path reached by timing is a
+path a test bets on. And the helper names the file by the writer's
+descriptor's number (`/proc/self/fd/<n>`), so a test builds that number
+at two, three and four digits, none of them a palindrome, since a path
+built from a number's digits is wrong in a way only some numbers show.
+Where the open is refused the writer goes on with no helper and keeps
+the checksum row it would have handed over, and a fallback that dropped
+the row passed every test, whose stride spawned the helper before the
+key section's first whole piece, so there was no row to drop: the test
+runs at a stride that leaves pieces in it as well. The corollary: where
+two threads sync one file and either can answer a caller, each syncs
+through its own open file description, since the kernel's error is a
+description's to consume and a word stored after the syscall is a word
+read too early by the other; and a hand-over is tested where there is
+something to hand over.
+It came back a fourth time at the presync itself, whose error the flush
+answered: the presync runs on the writer's thread after the seal job is
+handed, the job's fsync of the same description reports nothing of what
+the presync met, and the segment work landed the job durable whenever its
+thread returned -- before the writer had its answer, by timing, so the
+manifest named the segment and the next flush answered `Ok`. A failed
+presync stops the seal queue now, and a job whose records the writer
+syncs lands durable only at the writer's own ask, which follows the
+presync (`SealJob::awaits_writer`): a flag the segment work reads where
+it already asks whether the job has returned, and no wait anyone made
+before. The corollary: an error answered to the caller is not therefore
+seen by the thread that acts on the same bytes; whoever names the bytes
+durable is ordered after whoever learns they are not. The order was
+landed unpriced, as a serialisation of the landing behind the presync
+and a hop to the writer's ask, and priced after against the shape that
+landed the job whenever its thread returned: the drain's stamps put the
+presync's return before the seal thread's fsync of the trailer in all
+but a drain whose writer lost its core between the two, so the ask is
+in before the job's thread returns and the landing waits for the thread,
+as it did; no rate moved and the file system calls were the same, call for
+call. A reorder is priced by which side of the race each of its ends
+falls on, read off a stamp at each, before the hop it adds is called a
+cost or called free.
+
+**A failure after the publish, left for the next publish to name.** A
+seal lands in two phases, its segments published for readers at the
+first and named by a manifest only once its thread has returned with
+their fsyncs paid, and a seal that failed before its readable landing
+stopped the queue for the life of the open. One that failed after it --
+at its data's fsync, its envelope under a cipher, its directory's fsync
+at the landing itself, a run's presync joined into the job -- did not,
+by design: its comment said the segments "stay live with their sequence
+covered, so the next landing's manifest names them". The next landing
+was a merge's, a later seal's or the pending arm's close, and its slot
+named durable a segment no fsync had covered and covered the sequence of
+the log that held its writes, which the open then skipped: a power cut
+left a store that refused to open over acknowledged writes the log still
+had. Every test of the failure path failed the landing, never the fsync
+after it. The queue stops for every failure now and the fsync is never
+tried again (`Shared::wedge`), and a stopped queue is held as the window
+between a seal's phases is held, for good (`Maint::seal_between_phases`):
+a merge's, a tier's and a promotion's landing wait in that window
+already, the writer's asks end at `join_seal`, a seal's own landings --
+`publish_unsynced` and the pending slot -- are not reached once no seal
+lands, the close asks the queue before it publishes, and `Maint::publish`
+asserts the window shut. The first repair put a refusal in
+`Maint::publish` itself, a load beside every manifest's write, and a
+load in every `sync`; the window was a check every manifest path made
+already, and a `sync` promises nothing of a seal's writes. Every `flush`
+answers the failure. The window was then held for a stop the segment
+work raised itself, and a stop the writer raised -- its run's presync,
+failed after the job was handed -- was held only by the job waiting at
+the front, landed, for the writer's word: a presync that failed before
+the job's readable landing left it unlanded for good, and a merge in
+flight landed its slot after the store had answered the failure, naming
+nothing of the job but writing the manifest the docs said nobody would.
+The review read it off the docs; a test with the job held before its
+finish and a merge at its landing hold made it. The segment work takes
+the stop into its own hold where it already loads the flag, at its look
+at the queue, which every path of it to a manifest makes first. The
+rule: a failure that leaves a thing published
+and not durable is a state, not an error to report and pass: it is held
+where the paths that would make the thing durable already wait for it
+to be durable, and a path that bypasses that wait is the bug; and a test
+of a failure path fails every step of it, the ones after the publish
+above all, since those are the steps a publish has already made look
+done; and a stop either side can raise is held by the flag both sides
+read, never by the shape of whatever job happened to be at the front
+when one of them raised it.
+
+**A refusal that came after the take.** A direct run's close took the
+run from the writer and then waited for room in the frozen list, and a
+refusal there -- the seal queue stopped, the list full behind it --
+dropped the run's writer with its ordered table still live, so the write
+that ended the run went on into the ordered table and panicked in its
+order check, and a `Db::seal` of the run left a table no run backed. The
+close waits for room before it takes anything now, so a refusal leaves
+the run open and its table live; and the write a run cannot take, which
+cannot fail, is dropped only with the refusal kept (`Db::lost`), since a
+write dropped beside a later commit answered `Ok` would break the order
+the commits promise. The first version of the drop took any error the
+wait met with the list full for a refusal, and a merge's error the
+segment work had left for the next commit is one the wait meets while
+the list is full behind seals that will land: backpressure read as a
+stopped queue, a write dropped and the store answering every call
+until it was reopened. The write is dropped only where room will not
+come -- the queue stopped -- and otherwise the error is the next
+commit's and the wait goes on. A second arm, no seal left in flight to
+land, was in the condition for a while and no test could reach it once a
+failed seal stopped the queue before it was counted out, since a frozen
+table is always a seal in flight or a stopped queue's; it was taken out,
+and with it the same arm of the writer's two waits for room
+(`land_seal`, `take_fresh_mem`), which read the seal count for nothing
+else. The write after a
+`sync` handed the live table to a seal had the same shape from before:
+the table's replacement failed, the write was dropped and the next commit
+answered it once, and the commits after that answered `Ok` over it; it is
+dropped and kept on the same terms now (`Db::writes_go`), and behind a
+stopped queue the handed table is frozen where there is room, since
+nothing lands to retire it either way. The docs then said a `sync`
+answers nothing of a stopped queue and named the run's dropped write as
+the one exception, while the hand-off's write is dropped and kept on the
+same terms and from it every `sync` answers too -- which the fix's own
+test asserted beside the doc that denied it. The rule: a step that
+can be refused is asked before anything it would consume is taken, so a
+refusal leaves the state as it found it; a call that cannot fail and
+cannot be done is dropped only where nothing after it is acknowledged;
+and "cannot be done" is read off the state that makes it so, never off
+an error that the state merely happened to be beside; and a contract's
+exceptions are read off every site that keeps the refusal (`keep_lost`),
+not off the site the doc was written beside.
+
+**A failure that left the buffer it failed on for the next call to
+build on.** The log's write staged a commit's frames, wrote them, and
+cleared them; a write the device refused returned before the clear and
+before the cursor moved, and left both as they were mid-failure: the
+batch and its commit frame still pending, and whatever part of the write
+had reached the file sitting past the log's length. The next commit
+appended its own batch and closed it with a frame whose CRC covered
+everything pending, the failed batch's commit frame included, so replay
+rejected it and every commit after the failure was lost; a part written
+shifted every frame after it; and a rotation after either made the open
+refuse the store with a sequence gap the engine had written itself.
+Nothing raised until the open. The failure path now puts back what the
+call changed -- the file cut to its last good length, the commit frame
+off the staged batch and its sequence number given back, so the batch
+joins the next commit's under one frame with no gap -- and a file that
+cannot be cut back is kept as a sync's error is. Two batches under two
+frames was the other shape, and it costs a position kept on every
+commit; this one costs nothing until a write fails. The rule: a call that
+fails part way through changing a buffer and a cursor puts both back to
+where the call found them before it answers, since the next call builds
+on whatever it leaves; and the shape of the put-back is chosen on the
+failure path, where its cost is. Two things the first version of the
+put-back missed, each found in review. Its tests made every store with
+`Db::create`, whose log is written at its cursor, so the seek did the
+work and a put-back without the cut passed them, the retry's bytes
+being always longer than the stray ones; a reopened store's log is
+opened for append, where a write lands at the file's end whatever the
+cursor says and only the cut keeps it from landing behind the stray
+bytes, and the tests run the cuts on a reopened store now. And under a
+cipher an ordered run's commit goes to the log as well (`Db::log_run`),
+after the run has counted the batch its own: a commit or a `sync` with
+nothing new for the run answered `Ok` at the run's "nothing to commit"
+and never wrote the frames the failed write had left staged in the log,
+so the batch was visible and on no device. That early return asks the
+log too now. The batch is still visible from the failed commit on, as a
+run's batch is before its sync, since the run marks its table before
+its log write; the first wording of the crate docs promised readers
+nothing before the next commit, which held for the log's path alone,
+and they name the run's exception now; the second promised the batch
+durable at whichever call wrote it again, which held under `Always`
+alone, since a commit under `EveryN` writes without syncing, and they
+say durable as that call's policy makes it now. The corollaries: a put-back of a file is tested on every
+way the file is opened, since the same calls do different work on each;
+and a "nothing to do" answered from one counter is wrong wherever a
+failure can leave the work in another buffer that counter does not see;
+and a contract written for a failure is read against every path that
+reaches it, since the paths order their marks and writes differently.
+It came back at the direct run, whose file is its own log and whose
+writer had the same shape twice. A piece the device refused at a commit's
+marker returned before the commit counted the batch, with the writer's
+keys, its marker and its CRC already past it, so the next commit handed
+the writer the same keys again and the run refused every commit after it
+as keys out of order, never naming the device; and a write at the sync
+that failed, or failed part way, left the batch counted and the file's
+cursor past what the writer counted, so a commit with nothing new and a
+`sync` answered `Ok` at the run's "nothing to commit" with no write at
+all, and the commit after a part written landed past the stray bytes and
+was lost to the recovery walk. The writer writes at the offset it counts
+now (`pwritev_all`), holds a failure it meets between two syncs with
+every byte for the next sync to write and answer (`AlignedWriter::defer`),
+and says it owes the file in a bit of the same byte its seams and its
+held and lost states share, set where the write fails and cleared on the
+sync's cold path once a sync has covered it, so that early return asks
+one compare it did not make before and the exact count
+(`SegmentWriter::owes`) only behind it: the first draft asked the count
+itself, two loads where the path had none; and a short write, which no
+seam had made, is one now, since a loop that moves the offset on by the
+count it got is a line only a short count reaches. A failure met inside
+a sync that then wrote and synced every byte it held is paid by that
+sync, never answered to the next one, which would answer it without
+writing its own batch. The corollary: a failure in the middle of a call
+whose earlier steps another component has already taken is completed
+forward, never answered from where it stood, since the half that was
+taken cannot be handed back; and a writer that counts its own offset
+writes at it, so that the cursor is never a second count. A run that
+closes while it owes a batch -- a key below its greatest, before any
+commit synced the batch again -- writes the batch into its segment, and
+the close is the batch's sync; a test closes such a run, held and owed,
+under both policies, every arm and a cipher, since the first tests
+closed only runs whose owed batch a sync had already written. The
+writer that stays stuck has a mutant that is not, and it does not fail
+the test of a kept sync: the writer meets the full piece it holds at
+every turn of its write, writes nothing and loops, and only a runner's
+timeout said so. The test runs its writer on a thread of its own with
+an end, and fails where it hung. The corollary: a mutant killed by a
+hang is a test with no end of its own, which is given one before the
+kill is counted.
 
 **A hand-off that left the old run's end with its new owner while the
 giver went on.** A run of ordered ingest goes to its file a write piece
@@ -3300,7 +6509,28 @@ and the two reservations agree (`tests/settle.rs`). The corollary: a fuzz
 whose seeds share one random stream changes every seed's operations when
 a draw is added, so a failure that appears with a new option is attributed
 by running the commit before with the same draws, not by reading the
-option's name.
+option's name. It came back as a quantity the writes keep rather than a
+resource they hand out: the store's greatest key, which a key has to be
+above to open a direct run, was raised by `put` and by `append` and not
+by `delete`, so a key deleted above the greatest and then appended opened
+a run while its tombstone sat in the log past what the manifest covered.
+The live store read the append, the run's table being newer than the
+frozen tombstone; a crash before the tombstone's seal was durable
+rebuilt the run as a piece and replayed the log over it, and the
+acknowledged append read as deleted, at that open and every one after.
+The delete raises the greatest key as the other writes do, and
+`tests/durable.rs` builds the crash in each window of the seal, from a
+delete first, second and alone in its batch, from a transaction, from a
+delete the seal commits with no `commit`, from a delete that ends a run
+and from a tombstone the open replayed (`Db::max_key_of` counts the
+memtable's tombstones). A raise is a raise: one taken as an assignment
+lowers the greatest at a delete below it, and the run that opens there
+spans partitions and is refused by the flush's merge; a greatest
+recomputed at an open without the segments does the same. The
+corollary: a quantity that guards an order between two logs is kept by
+every write that reaches either log, where the write is made and not at
+whichever call makes it durable, and the test of each write is the
+crash, since the live store reads right whichever way the guard went.
 
 **A check spelled twice, and the copy nothing reached.** The form file
 reader's first decode compared a page's rank and count with its fence entry
@@ -3361,7 +6591,21 @@ mapping now, so the settle takes the form file out of its cell into the
 list under the pin, and the handle's drop with no sweep after is what
 frees it. The corollary: a test of one of two mechanisms that free the
 same thing is held to a mutant of that mechanism, since the other frees
-it just as well.
+it just as well. And it came back turned round, as a kill the instrument
+made. The flush tests after a reopen put back, at their power cut, the
+slots a drain had left owed their fdatasync, counted by the hold that
+keeps that fdatasync waiting, and the count was of slots written
+unsynced: with the merges on, the drain joins a merge whose synced
+publish supersedes the slot before the answer, so a drain that deferred
+its slot over a log that owed frames was answered over a slot the device
+held, and the test put that slot back and failed the drain anyway. The
+mutant was dead for the instrument's reason, in the one store shape the
+tests had, where nothing it changed could be lost. The count is of slots still
+owed now, the flush tests run with the merges off as well, where the
+drain's own slot is the only one, and a test holds the instrument both
+ways. The corollary: a mutant's kill is read for whether the state the
+test built is one the mutant makes, since a second mechanism that does
+the first one's work makes the instrument wrong in both directions.
 
 **A process-wide side effect and a test that counts it.**
 `release_freed_memory` is `malloc_trim` of every arena, and the first library
@@ -3386,7 +6630,14 @@ dead arena of thirty-two megabytes read as nine in one run of the whole
 the allocation count has (`tests/leak.rs`); the trim thread's test that
 counts by the same quantity joined it once a hosted ARM run of the `db`
 binary read 211 MB resident beyond use and waited four hundred looks for
-the second trim its dead arena was to cause. A fork is such an effect on
+the second trim its dead arena was to cause. It came back as a record:
+the calls the open's tests read off (`Db::trace_dir_io`) were kept
+process-wide, the record stayed on once any test had turned it on, and
+it grew with every recorded call of every test in the binary while each
+reader filtered it by its own directory. It is kept by the directory a
+test asks for now, and handed back and let go when that test asks it
+off. The corollary: a seam that records is scoped to what the test
+reading it owns, and let go by that test. A fork is such an effect on
 every descriptor the process holds. The crash oracle in `tests/runlog.rs`
 spawns its writers beside tests that open stores, a child holds a copy of
 each store's `LOCK` from its fork to its exec, and a `flock` is the open
@@ -3412,7 +6663,19 @@ child stopped in `pre_exec` while the store is closed and opened. The
 unlock is the taking process's alone, by its pid: it reaches every copy,
 so a forked child that dropped its copy of a `Db` would give up its
 parent's lock with the parent's store still open, which the unit test
-beside the type forks to hold.
+beside the type forks to hold. And it came back as a claim. The cache of a store
+under a cipher gives way, between two readings of its room, to what the
+process's large buffers have mapped and not yet touched
+(`pager::Room::claimed`), a count of every store in the process; the
+test of a cache following a room read it beside thirty other tests'
+stores, under a seam that gave the room and left the claim the
+platform's, so another test mapping a table took this store's budget to
+nothing: "budget: 0, held: 0" under a room of ten mebibytes, in a
+merge's first gate, where it read as the merge's until the whole binary
+was run eight times at the commit and was red in two. A room a test
+gives carries no claim. The corollary: a seam that replaces one input of
+a mechanism replaces every input the mechanism reads from the process,
+or the test is of the process.
 
 **A call site no real input reaches red.** The suite's refusals after the
 read pass and after the shuffled load were green-side only, because a real
@@ -3547,32 +6810,154 @@ against an object is kept only under that object's identity, and a
 carry that keeps the structure across a replacement of the object
 re-takes every position it holds, not only the ones a form holds.
 
-It came a third time as a flag. A copy whose entries are its block's
-records says so (`CachedBlock::identity`), and a patch writes the
-key's entry at its cut less the block's first rank where it does,
-without a search; the copies are what that carry keeps, on the reading
-that their key range is the same on both sides, which is true of their
-keys and not of their ranks. A delete and an insert in one block keep
-the boundaries and the count, and when their writes were lent to the
-upkeep thread and still unsettled at the freezes, the settle filed them
-after the rebase, through the tables the freezes replaced: the inserted
-key resolved to a record of the new partition, and the copy, still
-claiming its identity, took that rank for the key's entry and wrote
-the value over another key's. In the checked profile the assertion
-beside the patch fired, fourteen runs of eight hundred of the
-differential fuzz's seed 1050 under the cache and the option draws and
-none with the fix; in a release build nothing raised. A copy holds its
-identity of the partition its build read now (`CachedBlock::identity_for`,
-the blob id beside the flag), and `tests/settle.rs` builds the state
-by holding the upkeep thread before its pass while the seals and the
-merge land. The walk's start by rank honours the flag the same way,
-though no state was found that walks such a copy before the insert
-that moved its ranks is filed and clears the flag; the prefetch that
-asks for a patch's lines by rank does too, and only aims a prefetch.
-The corollary: a carry is checked against every claim the carried
-structure makes about the object it was derived from -- its positions,
-and the flag that says its entries are the object's own -- since a
-claim kept in a boolean is a position no search will ever re-take.
+It came a third time as a flag, found twice on the two lines that were
+merged, each by a seed of its own. A copy whose entries are its block's
+records says so (`CachedBlock::identity`), and a patch writes the key's
+entry at its cut less the block's first rank where it does, without a
+search; the copies are what that carry keeps, on the reading that their
+key range is the same on both sides, which is true of their keys and not
+of their ranks. On one line a key written into such a block and left to
+the backlog -- a batch no scan's commit filed -- was sealed and folded in
+by the merge, a record of the new partition at the rank it landed at,
+and the patch that filed it after the rewrite took the entry its rank
+named, another key's, and in release wrote the run there: seed 1179 of
+the differential fuzz, which stopped finding it the day the commits near
+reads began filing their own batches (`Options::forms_settle_every`), so
+the seed went green while the bug stood, and only a rebuild at the
+commit that recorded it and a bisect that named a default and not a fix
+said so. On the other a delete and an insert in one block kept the
+boundaries and the count, and when their writes were lent to the upkeep
+thread and still unsettled at the freezes, the settle filed them after
+the rebase, through the tables the freezes replaced, and the inserted
+key's patch wrote its value over another key's: the checked profile's
+assertion beside the patch in fourteen runs of eight hundred of seed
+1050 under the cache and the option draws. Both lines then fixed it, in
+two shapes, and the merge kept one. A copy holds its claim of the
+partition its build read (`identity_of`, the blob id beside the flag).
+A walk's start takes the entry by its rank only where the claim is of
+the partition in hand (`CachedBlock::identity_for`), though no state was
+found that walks such a copy before the insert that moved its ranks is
+filed and clears the flag. A patch under a claim of another partition
+takes the entry its rank names only where one key compare proves that
+entry is the key in hand (`key_eq`, `Reader::splice_run`), since a copy
+holds each key once and in order, and searches by key otherwise: the
+search at every patch into a carried copy was the land probe's cost
+(`scripts/cost.sh`), and the compare is the check that makes the rank
+sound for that one patch: against the upstream head merged, the land
+probe's `CachedBlock::lower_bound` and `Reader::splice_run` read 280
+instructions under it an operation of the probe, a key rewritten. The hint ahead of the patch
+(`copy_entry_at`) takes the claim of the partition in hand alone, as
+upstream's did, and the walk's and the form's (`prefetch_block`,
+`by_cut`) take any claim; each only aims a prefetch. `tests/settle.rs` builds both states: the fold, the drop that
+keeps the block boundaries and the unfiled write, and the upkeep thread
+held before its pass while the seals and the merge land. The rules: a
+claim about a structure's relation to another object names the object,
+like the cache derived from it, and a carry is checked against every
+claim the carried structure makes about the object it was derived from
+-- its positions, and the flag that says its entries are the object's
+own -- since a claim kept in a boolean is a position no search will ever
+re-take; and a seed that goes green after a change in what it draws or
+what the store defaults to is a seed that stopped looking, so it is run
+where it failed, and the bisect from there names whether a fix or a
+steer made it pass.
+
+**Two lines' tests merged by text, one store between them.** A merge of
+upstream that conflicted in three files and merged the rest clean put two
+tests in `tests/settle.rs`, one from each line, that named their stores
+alike (`scratch("copy-identity-rewrite")`, one directory a process): run
+as the binary runs them, four at a time, they removed and wrote each
+other's stores, and the binary was red in fifteen runs of fifteen at the
+create, the settle or the assertions, while each test alone was green. In
+the same merge a function upstream wrote read the ordered index's top
+level as a field, which this line had made a method that reads the level
+by the piece under a cipher (`OrdIndex::top`): there the text did not
+compile, and the field it named would have been an index of no samples
+under a cipher (`a_heads_bracket_by_the_piece_is_the_mapped_ones`). The
+rules: a merge that is clean by text is read for the names both lines
+coined -- a test store's, a field's -- since two lines that each named a
+thing once can name it twice; and a test binary is run whole after a
+merge before any test of it is read alone.
+
+**A note in one cell, copied whole to bump a counter.** After the same
+merge the scan probe read `Reader::scan` eleven instructions a scan over
+upstream by function, and the first reading called six of them the
+compiler's: spills around upstream's `note_read`, which upstream's own
+default made run past its first test at every scan, in a scan this line
+had made larger. The count by instruction against upstream's build
+(`--dump-instr`, each instruction laid to its line by the text of that
+line in each tree) said where they were: the read's note was one
+`Cell<ModeNote>` of six fields, taken whole at every read and put back
+whole at its end, seventeen instructions of `Cell::get` and fifteen of
+`Cell::set` a scan in upstream's build too, for a read that bumps one
+counter and looks at one flag. A cell a field, `Reader::scan` reads
+twenty-one instructions a scan under upstream by function, and the point
+read probe's total thirty-eight a read under upstream's. The same count found
+`cut_raw`'s gain, called codegen beside it, in the heads' search inlined
+into it: a probe through `head()`, whose bound test for the read by the
+piece calls a function that returns, against upstream's assertion; the
+heads in memory searched as the slice they are, bounded once, read under
+upstream. The rules: a gain called the compiler's is first counted by
+instruction against the side it gains over, line by line, since what
+looks like register pressure in a function that grew is as often a step
+both sides pay; and a `Cell` of a struct is a copy of the struct at every
+`get` and every `set`, so a structure a hot path touches a field of is a
+cell a field.
+
+**Two counts compared across a worker's race, and a steer that asked and
+was never answered.** The same merge's whole suite met two reds in tests
+upstream wrote, each once and each green alone. One compared two stores'
+counts of the boundaries a bounds walk read, the option on against off,
+and read the store with the option off at twice the other: a backtrace a
+walk, printed under a scratch variable, put every store's count at two
+walks -- the landing's of the piece and the upkeep thread's of the same
+keys as an unsealed snapshot, filled after the burst's commit -- and the
+red store at one, its seal having frozen the burst before the lent fill
+ran. Held before its pass (`hold_upkeep_pass`) in one store it was red
+in every run, here and on upstream's head. The other was the stride
+group's conversion steer, red where no seed moved a partition out of the
+stride form: its asks are taken only at the segment work's turn with the
+builder free and nothing due, each replaced by the next, and beside the
+seals' builds a seed's asks were all replaced untaken -- thirteen runs of
+twenty-four six at a time, sixteen on upstream's head. The first test
+fills on the writer's thread now and counts from after the fill, since
+whether a commit fills at all is the fills' room's, a reading of the
+group's refaults: counted from before the commit it was green in every
+run here and red in every run where one store's commit was made not to
+fill. The second's first repair asked the served partitions by turns
+until one left the stride form, at most sixty-four asks; with the asks
+counted it took one in each of a hundred and sixty seeds, the first
+partition a stride file every time, so a mutant that always asked the
+first and one that allowed a single ask both passed, and the turns and
+the bound were a check nothing reached. It asks the first partition
+three times now, each ask settled, and holds the moves to one each way
+at the least, which also holds the move back into the stride form that
+most seeds of the range had never made. The rules: a test that holds two
+stores' counts equal counts what the step under test makes, from just
+before it, with every worker that adds to the count made inline or held,
+and every gate on a platform reading left before the count; a steer
+whose asks a worker may replace untaken drives its asks to answers the
+test can name before the run's count is read, and a loop that retries
+until something happens is counted for the turns it took before its
+bound is believed; and a red met once is found by printing who did each
+counted thing, not by running it again until it does not come. The
+second test's repair had the first rule's hole in it: its three asks were
+counted from a reading taken behind a plain `settle`, which joins no form
+build and takes no ask (`zpages_settle` does both), so where the loop's
+last ask was still untaken with the builder free, the segment work's turn
+behind that settle started it, it landed inside the first settled ask,
+and three asks read as four moves, "(1, 3)", once in a gate's stride
+group and in none of fifty-three runs after. Two schedules were forced on
+a guess before anything was printed -- a conversion's build made long,
+the thread's own turns made rare -- and neither made one red in fifty
+runs; a trace of each ask taken and each move counted, beside the test's
+reading, showed a build in flight and an ask pending at the reading in
+its first run, and the state built from that (the builder settled, one
+ask stored, then the plain settle) was red in every seed of every run and
+green with the count begun behind the form's own settle. A count's
+baseline is read behind the join of every worker that moves it, by the
+call that joins that worker and not by a call with a like name; and the
+schedule to force is read off a trace of the state at the reading, since
+a guess at it costs a build and a sweep each time it is wrong.
 
 **A cache a thread kept of things a store had closed.** The memo of
 decoded groups was the thread's, keyed by the form file's attach identity
@@ -4365,6 +7750,27 @@ of the call that happens to need the write; and a burst that costs more
 than its commits is listed under `strace` before its profile is read,
 since the profile of a thread that waits shows the work and not the
 wait.
+
+**A header that needed no sync, read as if it had had one.** A new log
+file's header is written and left to the next sync, which covers it
+with the frames, and the open read a file shorter than its header as a
+log with nothing in it on the reading that a power cut tears a file at
+its end. A power cut can also keep the size and lose the page: a store
+just created, a file a rotation began, the log of a durable ordered
+load whose commits all synced the run's own file, and a buffered
+store's log, which a flush acknowledges past, could each come back with
+a first sector of zeroes where the header was, and every open after refused the
+store as "not a supdb WAL" with its acknowledged writes in segments and
+runs beside it, at every open, since every open reads the log again.
+The test that a fresh store opens after a lost header was never
+written, because the file a test copies is the page cache's, which
+never loses a page. The rule is the fresh-pages one turned to the
+device: what a power cut leaves of a file no sync covered is any part
+of it, the first page included, so an open reads every such state --
+here a first sector of zeroes as a log with nothing in it, and only
+that, since a header zeroed over frames is not a lost page -- and the
+fix is at the read, where it costs an open a compare, never a sync at
+the write, where it would cost every rotation one.
 
 **A point that was not the store it said, and a burst as wide as the
 share it is held to.** The buffered arm's one-percent burst at three
@@ -6621,6 +10027,60 @@ passes counted and the work a pass does, and a regime that holds only
 because something was slow is measured with the slowness gone before it
 is called the regime's cost.
 
+**A second way for a check to say yes, counted three times before it
+cost nothing.** The stride form under a cipher reads as a plain store's
+does, its readers indexing the file's range at its offsets, and a page
+of a file whose mapping lends nothing whole has to be asked for before
+it is read, at every read. The ask went where a page's check already
+goes out of line, the first touch of a page, and the first shape made
+it a tail call on the check's failing branch: every reader and walk read
+the same to the instruction, and the check itself read one instruction a
+page over (`sh scripts/cost.sh HEAD read_s scan_s scan_long_s`). The
+check had answered `true` where it passed and `false` where it failed,
+which the compiler returns as the page's own check's result, still in
+its register; with an arm that returns an answer of its own the passing
+branch loads a `true`. The second shape took the ask off the check: a
+file that asks was given no word in the verified bitmap, and the bound a
+mapped file's lookup always checked sent it to the ask. The check read
+level, the point read one instruction a read under, and the cursor's
+walk 3.9 instructions a record over, a returning call on a loop's cold
+edge where a panic had been, of which `#[cold]` took back one. The third
+has the check answer a word and not a `bool` (`zfile::PageOk`): the bit
+it set, or the ask's word, each in the register it was made in, through
+the closures the readers take. No function moved. Each shape was first
+built in the engine and counted, ten minutes a count; the question was
+one function's own instructions, and twenty lines in a file of their own
+under `rustc -O --emit asm` answered it in seconds once that was tried,
+the three shapes side by side. And the second count was read off the
+first: the wait was for a marker line in a log the run before had left,
+it returned at once, and a shape was called a failure on the numbers of
+the one before it. The rules: a function given a second way to answer
+answers each way in the register that way made, or the first way pays
+for the second; a returning call on a hot loop's cold edge is counted in
+the loop, every time one is added, whatever its attribute; a question
+about one function's instructions is put to a file of that function's
+shape before the engine is built for it; and a wait reads a marker in a
+log that did not exist when the wait began.
+
+The whole count of that change then read red in a probe no line of it
+runs: the writer's round, `work_probe::main` one instruction a key over,
+100,018 in 148 million, with the suite's point read level (`sh
+scripts/cost.sh 7b563bc work read` at the commit). Summed by mnemonic
+over the function's instructions in the two builds (`--dump-instr=yes`,
+each instruction's count laid to its disassembly), the gain was 100,001
+`nop`s and seventeen moves of code run once. The read as `main` inlines
+it holds the loop over the frozen tables, whose head the compiler puts
+on a sixteen-byte boundary; the stride read's cold arm, inlined ahead of
+it, had come out forty-four bytes shorter, so the head that had landed
+on a boundary by itself now wanted three bytes of padding, and the fall
+into the loop runs the padding. The count takes a `nop` for an
+instruction and the gate cannot tell padding from code (`ROADMAP.md`, a
+verdict from the count), so the red stands and is read here. The rule: a
+gain of a whole instruction an operation in a function whose hot code
+did not change is summed by mnemonic before it is read by line, and
+padding is said to be padding only by that sum, never by the absence of
+any other suspect.
+
 **A room that reserved the thing its tenant replaces, and a bind that
 stopped the work that would have made the room.** The row at three
 million keys under 1 GiB read the scan pass after the lag sweep's full
@@ -6790,6 +10250,180 @@ its first file late through a seam (`ZInject::ask_first_late`), inside
 the stall limit, and the wait by the sum fails it every run. A wait and
 the step after it are written against one predicate, since the gap
 between a sum and its parts is exactly the state the step skips.
+
+**A mutant's binary, kept by the restore that undid the mutant.** A
+mutant runner copies a source file aside, writes the mutant, runs the
+tests and moves the copy back. The copy carries the time it was made,
+which is before the mutant's build, and cargo calls a unit fresh by its
+sources' times: the tests after the last mutant ran that mutant's
+binary, with the tree clean and the commit made. A gate's test group
+went red on two of the form's unit tests at an assertion the last mutant
+had been written to trip, the same two that had killed it ten minutes
+before, over the source as committed; the two alone were red three runs
+of three, and an edit of the assertion's words made them green. The
+runner sets the restored file's time to now. The rule: whatever puts a
+source back puts it back as a change, at a time after the last build;
+and a red met behind a mutant pass is read against the pass's last
+mutant before it is read as the tree's -- the tests that failed were its
+kills, and the pass's own log named them.
+
+**A count held under one compiler, read under the next.** The count
+against upstream's head, taken at a merge on the toolchain the runners
+had moved to (1.100, from the container's 1.97), read four probes over
+upstream by total where the count before had every one under: the scans
+through the compact form's blocks by ten instructions a record and
+through its stride file by one. Counted against this branch's own
+commits under the one compiler, the stride step's one was the page
+check's answer made a word (`PageOk`, "A second way for a check to say
+yes"), which the older compiler had read level: the failing branch of
+the sparse number's read, never taken in a store with no damage, was
+laid ahead of the step's return, and the whole run's path jumped over
+it. Marked cold (`core::hint::cold_path`) the step is an instruction
+under upstream's. The block form's ten were no commit's: the same
+source, in which the reader of a parsed record's values that this
+branch had written for that loop under the older compiler
+(`Blob::read_exts_inline`, out of line to give the loop a register
+back) now cost it several. Upstream's own text at that call read two a
+record over upstream's build, the reader as a call three, the common
+records in a loop of their own inside the walk three; the loop in a
+function of its own (`zfile::walk_fixed`), entered on a record the walk
+has already found to be of the common shape, with the limit and the
+group's end one count, reads five under with what the walk does a group
+counted in, and a record of any other shape takes the path it took. Of
+five mutants of its bounds one outlived the form's tests, the bound by
+the group's end, which no store's group can exceed since a group's bytes
+hold exactly its records, and has a test that lowers the end by hand;
+and one hung them, a stop the run did not say to the walk, whose turn
+then took nothing for good: the walk asserts under the checked profile
+that a turn took its limit or met its end. What is left over upstream by function
+there is the form's open path, seventy instructions a scan of a hundred
+records in `zpages::view_with` and its neighbours, from a source file
+that is byte for byte upstream's and reads the same to the instruction
+against this branch's own commits: the release profile is one unit
+under link-time optimization, and an unchanged function's code follows
+the rest of the program. The rules: a fix that rests on what a compiler
+keeps in registers is a fix under that compiler, so the count is taken
+again on each toolchain the runners move to, before a gate is called
+green on it; a hot loop inside a large function is given a function of
+its own, since moving a callee out of its way moves the pressure and
+does not remove it, and four shapes of the callee were counted before
+the loop was moved; a branch a healthy store never takes says so where
+its place is the hot path's cost; a change that was not counted is
+counted before the next is built on it -- two of this branch's were
+not, and the bisect that cleared them is the count they were owed; and
+a move by function with no source behind it is read against the
+profile's unit of optimization before a cause is looked for in the
+function.
+
+It came again with the build. The merge of main's #27 brought the
+suite's build definition (`bench/.cargo/config.toml`: x86-64-v3, where
+the count's probes had been built at the default level), the count gave
+the base the head's file, and against main's head built so two functions
+of this branch read over main's by instructions their sources had not
+gained, where the count before, at the default level, had read them
+level. The writer's `write_all`, one instruction a key in the seal
+probe: the arm that holds a failed piece for the next sync called
+`defer` and rejoined the loop, where main's `write_buf()?` leaves it,
+and the loop's latch, which that path reaches with a register
+clobbered, reloaded the write's length from the stack at every turn;
+the piece's write and its defer are one call out of line now
+(`AlignedWriter::write_piece`), which returns an answer as main's call
+does, and the function counts main's to the instruction. And the open's
+walk of a key section's pieces (`flatindex::verify_pieces_with`), two
+instructions a 16 KiB piece in every probe that opens a segment: the
+closure the walk calls at each piece inlined the paged mapping's
+answers to its ask ahead, two calls through a pointer on an arm a plain
+store takes once a window at most, and the loop kept two values on the
+stack for them; the ask is a function of its own (`blob::ask_window`),
+and the walk counts one a piece under main's. Both were read off each
+build's instructions summed by mnemonic and laid side by side
+(`--dump-instr=yes`), the callers' call counts first, since the same
+count of calls with more instructions a call is the code and more calls
+is the caller. A change to the build definition is a change of
+compiler: the count is taken again under it, every function's gain read
+against the count before, and a base built without the head's
+definition counts the flags.
+
+It came a third time at the merge of #29, in three places. The point
+read carried its answer to an end that may replace it
+(`Entered::finish`), so every path's answer met there as one value in
+registers, its variant tested again after `leave` to be stored and the
+count `supdb_get` drops computed for it: four instructions a read, where
+main's build gives the single-source read an exit of its own. Four shapes
+of the end -- the answer replaced in place, the slow end returning, a
+verdict alone, the general path's end inside it -- each counted the same
+or worse; main's text built in the tree counted main's, and the change
+added back a step at a time named the step: an answer handed to an end
+that may change it. A store under a cipher is sent to a read of its own
+at the start's test now (`read_all_paged`), its bit in the same two
+bytes, and the plain read returns through the guard: `supdb_get` and
+`leave` count main's to the instruction. The bit is read by a load of its
+own: tested on the byte the census's test had loaded, the byte stayed in
+a register for it, an instruction a read in every store whose census's
+slow half runs, and asked by a call of its own (the slow half answering
+whether to send the read on) it laid the read out around a bounds check
+main's build leaves out, two a read of a store at rest. The form's point read had its
+values read by `read_exts_inline`, given to the form's reads for the
+scan's loop, inlined into `part_read_z` at 116 instructions a read where
+main's `read_exts`, a call, is 101; it reads through `read_exts` again,
+in which `Ext::fixed_width` divided twice in this build and once in
+main's, of the same text -- the remainder's test and the quotient never
+paired, written in `u32` and in one block alike -- and divides once now,
+the remainder tested by the product, a multiply over the pair at its
+best in every build. And the seal probe's loop held main's instructions
+with a spill a key more, in a function that also inlines
+`SegmentWriter::create`, whose open goes through the door beside the
+tests' seams; `create` is out of line, and the loop counts two a key
+under main's. `Db::create` the same, inlined into the merge probe's
+`main` with its loops over the store's writes: out of line, half of the
+probe's own gain went with it, and the half a reload a key left in that
+loop is register allocation in a function of the probe's whose engine
+calls are all out of line on both sides. The rules: an answer is handed to a step that may replace
+it only on the path that needs the step, since the merge it forces is
+paid on every path that does not; where several shapes of a change all
+miss, the base's own text is built in the tree and the change added back
+a step at a time, before a fifth shape is guessed; a divide written once
+that a build makes twice is written so that no pass can make it twice;
+and code that runs once a segment stays out of the function that holds
+a loop a key.
+
+**One handle's setup, written into the step every handle's constructor
+ends in.** The settle's rest under a cipher wanted a caller's handle to
+look as the writer's does: a byte among its fields and its forms' word
+for "not asked". Every handle's constructor ends in `paged_bits`, the
+step that sets the cipher's bit, and the two went there, behind the test
+the step already made. The count against the commit before (`sh
+scripts/cost.sh fc66ceb merge land work scan scan_long read`, at
+`1d06abe`) read red in two functions no line of the change runs: the
+writer's round, 250,037 instructions over the probe's `main`, two and a
+half a key, and 280 over the landing probe's run in `Db::seal`, thirty-five
+a seal. Summed by mnemonic the round's gain was moves and address
+computations, the same loop under another register allocation. It was
+found by building, not by reading: the count at each of the two commits
+since the base named the first, and that commit built twice more, each
+with one of its hunks taken out, named the hunk -- the one in
+`paged_bits`, where taking out a refactor of the scan's rest beside it
+moved nothing. The first fix put the two stores in a cold function of
+their own, called on the handle from `paged_bits`: the round read level
+and `Db::seal` still 88 over, eleven a seal with a `memcpy` among them.
+The seal's thread makes a handle, and a call that takes a value by
+reference while it is being built by value has the value built in memory
+and copied to its place, in a store with no cipher. The two are written
+now by the one constructor whose handles look (`new_reader`): the byte
+among the handle's fields and the word through the handle's own
+`not_asked`, behind one test of whether the store has a cache, at a
+handle made; `paged_bits` and every other constructor are the text they
+were, and the count reads level (the same command at `3fbc5ed`). A third
+condition written with it, that only a counted handle rests, outlived
+both tests under its mutant: the builder ahead's and the keeper's handles
+reach no look, so nothing could hold it, and it came out. The rules: a
+step every constructor shares is in every function a constructor is
+inlined into, so what one kind of handle needs is written in that
+kind's constructor, among its fields; a method called by reference on a
+value still being built is a copy of the value, cold or not; and a red
+count in a function the change does not run is bisected before it is
+read -- by commit, then by hunk, a build with each hunk out -- since the
+listing says what moved and only the builds say what moved it.
 
 **A reservation in a budget's arithmetic, read as pages the kernel would
 keep; and a model that took its tenant's bytes for a misfit.** The first
@@ -7102,6 +10736,497 @@ holds, since a drop made in one state cannot reach the next; and an
 invariant a reader leans on is asserted where it is published, not only
 at a write that a stale form need never meet.
 
+**A default the plain store has by its mapping, which a mode's shared
+view had by nobody.** The plain store's segments are advised random in a
+phase of point reads and short scans and keep the kernel's default
+otherwise (`ReadAdvice::Adaptive`), and a segment opened mid-phase is
+advised random where the phase is and left alone where it is not, the
+default being what a plain mapping has. An envelope opens advised random
+(`pager::Back::open`), so under a cipher a segment opened in a phase of
+long scans stayed random until the next switch, and a seal's segment,
+which lands readable before it has an envelope, had none for the switch
+to reach; and a long scan under a cipher is walked a thousand keys at a
+time so that it can rest (`Reader::scan_rested`), each walk advised by
+its own span, so a scan of the whole store was advised random. The
+segment's open gives a paged view the default (`Seg::open_full`), the
+view keeps an advice for an envelope it has not yet (`pager::Paged::advise`),
+and each walk of a rested scan is advised by the scan's span
+(`Reader::scan_body`); a test reads the kernel's flag on the envelopes
+across a point read, a long scan, a seal and a point read again, and the
+pager's unit test holds the advice kept for an envelope to come, which
+the store test reached only by a race. None of the suite's scans reaches
+any of it, at a hundred entries a scan. It was first written down as the
+cause of the merges' faults in the lag sweep's full rewrite, and a trace
+of that sweep then showed the store advised random throughout in both
+stores: a plain merge maps each input afresh, at the kernel's default,
+where a merge under a cipher reads through the one view every reader of
+the file shares, so the plain merge reads around its faults in any phase
+and the one under a cipher has only its own asks, which did not cover the
+directory it places its records by (`Options::merge_ahead_shares`). The
+rules: where a mode replaces mappings each reader makes for itself by one
+view all of them share, each reader's default is read for what the shared
+view gives it, since the view has the advice of whoever set it last; a
+decision by an operation's length is made on the operation and not on the
+piece a mode walks it in; and a fix written on a reading is held to a
+trace of the state it is for before its comment names what it fixed.
+
+**A cost moved off the threads that paid it, and paid by the passes
+after.** An inode freed on this fleet's disk (ext4 with no journal,
+mounted `discard`) is a synchronous discard of every block, 0.43 ms a
+megabyte, and it is paid wherever the file's last reference goes: every
+thread of a pass sampled in the kernel's free path
+(`scratch/reap/discards.py`) put 6.0 s of the full rewrite's 22 on the
+segment work in the clear and 5.4 of 25 under a cipher, the writer a
+quarter to two thirds of a second, and the load's drain one to two
+seconds on the writer, four fifths of it at a mapping's last drop and
+not at an unlink. The owner's lever was a third tier of background
+work: a retired segment, its index and its form file renamed to a dead
+name, which keeps the inode whoever unmaps it, and freed once nothing
+holds the segment by a thread of the lowest class
+(`Options::retired_reaped`, in `scratch/reap/reaper-v1.patch` against
+`990a2ab`, five tests and twelve mutants). It did what it was built to
+do, the segment work's time in frees under a second and the writer's
+near nothing, and lost the cells after the load in every pairing
+(`SUPDB_LAG_COUNTERS=1 SUPDB_SCAN_OPS=1 sh scripts/pair.sh supdb-reap
+supdb 10000000 --bound 1342177280 --passes load,lag --reps 2 --ops-div
+10`, and `supdb-cipherautoreap supdb-cipherauto`): 2.3-2.9 GB of dead
+files waited at the load's end, their discards landed in the clean
+store's pass and the durable burst behind it, 0.36-0.75x and 0.14-0.23x
+in the clear. Freed in cuts of four megabytes at the device's idle
+class, by the segment work itself one file a turn, or written over by
+the next segment's writer in a crude pool, the same cells lost. A
+discard in flight is ahead of a commit's flush at the host whatever
+class the guest gave it, so on a device that charges for a free the
+choices are to pay it where it falls or not to free: the space written
+over, which a probe put at 60 ms for 64 MB against 103 written fresh
+with the old file freed, and which is the store in one file this branch
+builds. One of the variants truncated a file a promotion's link still
+named and died of SIGBUS in a pairing; a cut of a retired file is held
+to the inode's link count. The rules: a cost taken off a thread is
+priced at the device and in the cells after the phase, not on the
+thread; a deferred cost is a backlog, read as a peak (2.9 GB here)
+before it is read as a saving; and where every way of moving a cost
+loses, the lever is the cost's cause.
+
+**A hash taken once for every table, on the word that every table has
+one shape.** The general point read and the count hashed a key once for
+the memtables, by the live table, and probed each frozen table with that
+hash, under a comment that every table of a store is made with one
+shape. A hashed table folds a sixteen-byte key's two words
+(`Options::mem_hash_fold`, on since #29) where every other key takes its
+FNV word; an ordered table, which is the live one for as long as a run
+of ordered ingest is open, has no index and folds nothing, so its hash
+of a sixteen-byte key was FNV's and a frozen hashed table probed by it
+missed. Beside an open run a read and a count answered without whatever
+a frozen table held of such a key -- a committed append read as the
+values before it, a delete as not made -- with nothing raised, in the
+store as it ships, and sixteen bytes is the suite's own key. The lean
+reads were right by a guard each, and the guard was what sent every such
+read to the one path that was wrong: they leave an ordered live table to
+the general read. The differential fuzz's readers on threads found it at
+their seventeenth seed, where the gate's range is three: thirteen runs
+of sixteen at main's head, sixteen of sixteen at the commit before the
+stage that met it, and it was met while a new switch was run past the
+gate's range, so it was read as the switch's for the quarter of an hour
+the seed took to fail as often without it. One option turned off at a
+time through a scratch override named the fold, none of eight runs red
+without it. Each frozen table is probed by its own hash now
+(`Reader::frozen_hash`), and `tests/db.rs` builds the state at fifteen,
+sixteen and seventeen bytes, red at sixteen with the old hash put back.
+The handle's own diagnostic (`Reader::debug_key`) had a hole of the same
+age: it indexed the handle's block tables, of which a handle that has
+walked no block holds none, and panicked in the one run that asked it.
+The rules: "every X of a store has one shape" is read against every
+constructor of X, and a second constructor that sets the field another
+way makes the sentence false wherever the two kinds stand together; a
+value derived from one object and spent on another is derived by the one
+it is spent on, which here cost nothing; each kind of range the fuzz has
+is run past the gate's at every stage, since three seeds of a kind hold
+three seeds; and a diagnostic is run once on the plainest store before
+the day it is wanted.
+
+**Room given back that kept its pages, and a mapping made through the
+store's one open.** The store in one file (`Options::one_file`) was
+predicted before its first pairing, with four ways the prediction could
+fail named beside it (`scratch/plan/onefile.md`), and under a bound two
+of the four were what the pairings read. In core it read level, as
+predicted. At ten million keys under 1.25 GiB the full rewrite's burst
+read 1.24x of the default's, the frees it no longer makes, and the scan
+pass after it 0.3x, the clean store's 0.7x. Room a merge retires had
+kept its pages in the page cache, where a store of files drops a retired
+file's at its unlink: written once and read by nobody, which is how the
+kernel ranks the segments and form files written since, so a reclaim
+under the bound took those -- 110 thousand refaults in the pass against
+25, nine thousand major faults against none. The pages are dropped where
+the room's last holder lets go, before the room can be another file's
+(`One::dropped`), and the pass read level in a pairing of two reps. At
+three reps it read 0.5x and 0.7x, in no pair of six, the scanning thread
+at 2,700 to 4,900 major faults against none to 430 and every tenth of
+the pass a twentieth of a second longer: every mapping was made through
+the table's one open of the data file. The kernel keeps a readahead
+window and a count of a mapping's misses on the open file the mapping
+was made through, and stops reading around a fault once the count is
+past a hundred; a store of files has both a segment, and here a merge's
+and a build's misses were counted against the scans of every other
+file. The plan's probe had mapped its extent through an open of its own,
+and the comment over the call said the code did. A mapping is made
+through its own open now (`Using::map`): the pass's major faults 70 to
+520 against none to 500, the pass level, every burst of the sweep ahead
+in both orders, and the one-thread read pass under 1 GiB, behind in six
+pairs of six before, level. The rules: what a file system does at an
+unlink, a truncate or a close is part of what a file is, so a layout
+that keeps a file's room has each of those to do itself, the page
+cache's drop here as the discard was the one meant to go; what the
+kernel keeps on an open file -- the readahead window, the miss count, an
+advice by `posix_fadvise`, a sync's error -- is shared by everything
+made through that open, so each reader that had a file of its own has an
+open of its own; a comment that says what a call does is held to the
+call, since the probe had measured the shape the comment described; a
+prediction written with its refutations named is read by those names
+first, which made each of the two an hour's hunt; and a fix that reads
+level at two reps is read again at three before the cell is called
+closed, the second cause having stood under the first's noise.
+
+**A reservation a mebibyte at the least, found by the disk it filled.**
+The first run of the tests with their stores in one file
+(`SUPDB_TEST_ONEFILE=1`) ended with a test binary that printed three
+failures and no result line, in the one binary none of whose tests take
+the switch. It passed alone, and whole, on a clean temp directory. The
+stores the binaries before it had left were 3.8 GB in 771 data files, on
+an allowance with 4.9 free: a data file was made longer by a mebibyte at
+the least and a file that outgrew its room given a mebibyte more, so a
+store of a few hundred kilobytes reserved two to five, where a store of
+files holds what it wrote, and the binary had died of a full disk, which
+under `--no-fail-fast` cargo reports as a target that failed and nothing
+more. The step is sixteen pages now (`onefile::STEP`), and lowering it
+found a waste the mebibyte had hidden: a file that outgrew its room with
+free room behind it reaching the data file's end, but less than it asked
+for, was moved, its bytes copied, where the data file could be made
+longer for the rest; the lone writer's unit test, green since it was
+written, went red at the new step. The tests' stores are still about
+twice a store of files' on disk, the alignment a file is placed at
+being reserved with it, so the gate's `onefile` group runs in a temp
+directory of its own and removes it. The rules: a test binary that ends
+with no result line and no watchdog's line is read against `df` before
+anything else, and `df` is read before a run of the tests under a new
+layout, not after it; a floor is priced on the smallest store the
+library makes, the rule the log's megabyte left here; and a constant
+lowered is a test of every branch its old value kept anything from
+taking.
+
+**A switch's first run, sorted by what each test holds.** Ninety-nine
+tests failed under that switch and none was the engine's: four set a
+shape of the manifest a store in one file refuses, and every other finds
+a store's files in its directory. Those came in three kinds. A test that only names files -- the segments' names, the
+partitions' fences, the form files standing -- asks the store now
+(`Db::one_names`, `common::store_names`) and runs under the switch. A
+test that reads a file's bytes without changing them -- a form file's
+fence for its windows, a trailer, a size, what the kernel holds of a
+range -- reads them where they lie (`Db::one_read`, `Db::one_place`,
+`common::store_file`). A test that opens, copies, links, damages or maps
+a file by its path says it is of a store of files (`common::files`, the
+form tests' `forced_files`). Sorted so, half of them run under the
+switch that would have been pinned, the scans over a covered store and
+the drop of a served partition's raw pages among them. And the first
+count was short by a binary: the form-file tests build their stores by a
+helper of their own and had not taken the switch at all, 246 green of a
+binary with no store in one file, until the helper took it and 45 went
+red. The rules: a switch's green is read after a count that the
+switch's mechanism fired in each binary, as a fuzz range under a switch
+asserts of itself; and a test that fails under a switch is sorted by
+what it holds -- a name, bytes, a path -- before it is pinned, since a
+pin is a test the switch no longer runs. It was short by a helper as
+well, inside that binary: the controller's tests (`ZPages::Auto`, the
+store as it ships) make their stores by a second helper, which took
+nothing of the switch, so the controller's looks, builds ahead, attaches
+and drops had run over no store in one file while the binary read 246
+green under it. A mutant found it and no count had: the door's look for
+a form file by its path (`vault::is_file`, the controller's
+`Db::z_on_disk`) answering no for every file of the data file passed the
+binary whole. With that helper under the switch 24 tests failed, each on
+a path or a listing, and with the listings made of the store's files as
+paths whichever way it keeps them (`common::store_paths`, and
+`store_place`, `store_len`, `cached_pages` and the tests' `evict` and
+`unmap_pages` answering for a path where its bytes lie) eighteen run and
+six that remove a file by its path, or know one by its inode or its
+time, are pinned; the mutant then fails fifteen. One of the eighteen
+was the engine's: a file built ahead and dropped from the page cache as
+it is written stood there by a page, its first, which the manifest that
+listed the file had read back from the device for the row's checksum, on
+the thread every landing goes through. The table keeps a file's first
+page as its writes make it now and reads nothing (`onefile::Head`,
+`OneCounts::head_reads`). The corollaries: the count that a switch's
+mechanism fired is taken a helper at a time, by every constructor of a
+store the binary has, and a mutant of the mechanism that the binary
+passes under the switch is the count nobody took; a listing a test loops
+over is made so that the loop fails where it is empty for the wrong
+reason, since a loop over nothing asserts nothing; and a checksum of
+bytes a writer has just handed over is taken from the hand-over, since
+reading them back is a device read wherever the writer meant them to
+leave the cache. And short by a binary once more, at the next stage:
+`tests/cipher.rs` built every store's options on the engine's defaults
+and took nothing of the switch, so the stage that kept a store under a
+cipher in one file would have been gated green by thirty-five tests of
+stores of files. Under the switch twenty-three failed, each on an
+envelope found by a listing of the directory; they read a store's
+envelopes by name while it is open now, a closed store kept in one file
+having their names in its sealed manifest alone, and two that copy and
+remove envelopes by their paths say they are of a store of files.
+
+**A listing made eight times to find a difference, and never read for
+what the loop did.** The count over the store in one file read the
+public writer's loop -- `SegmentWriter`'s `begin`, `value` and `end`
+written into the seal probe's own function -- a few instructions a key
+over the base with no line of the loop changed. Eight builds of the
+probe were counted by instruction to find where
+(`scratch/onefile/design.md` has the table): each differed in where the
+compiler kept the loop's values, a field twelve bytes wider in the
+writer was enough to move it, and none gave the loop back. A divide a
+record was found in the write beside it and taken out, the probe read
+three a key under the base, and the stage's count was called settled.
+Taken again on the stage's last tree it read the loop nine over and the
+probe two: by mnemonic eleven moves more and four address computations
+fewer, a jump, one padding `nop` for another, and nothing the writer's
+source had gained, the changes since being a table's bookkeeping, a
+mapping's open and a read path's fix. What took it back had been in
+every one of those listings. The loop called `SegmentWriter::layout`
+twice a key, at `begin` and at `end`, for a choice made at the first
+key: the arguments, the call, the answer written through a pointer and
+tested, twenty-four instructions each time, in the base as in the head.
+Answered inline, the choice itself out of line (`layout_first`), the
+seal probe reads 53 instructions a key under the base, the ordered loads
+28 and a merge 72 of the 150 it is under by. The merge's other part was
+the same shape one function over: `Emitter::leave`, the step every key
+of a merge takes, an increment and a compare, had the piece's finish
+written into it, twenty-one instructions a key for the body's frame in
+the base and twenty-two the day the finish was given a second order of
+its writes; the finish is a function of its own (`leave_piece`). And one
+probe of the last count read 86 instructions a scan over with every
+function of the engine level: the allocator's count in the base's own
+binary had moved between two runs of it, which the probe run again
+said in ten minutes (`sh scripts/cost.sh acbaa31 scan_long_z`). The
+rules: a count that moves with a loop's register allocation is not
+chased by a third build, since the allocation is the compiler's again at
+the next change anywhere in the unit; the listing is read instead for
+the work the loop does -- a call that returns, an answer asked for
+again, a divide -- because that can be taken back and here was six
+times what the builds were chasing; a count taken in the middle of a
+stage is not the stage's, and whatever changed after it is in the next
+one whichever file it was in; and a probe red by the allocator alone is
+run again before it is read.
+
+**A file's edge, in a file of files.** A stride file built ahead keeps a
+word for its attach only where its read-back read the device: none of
+its pages in the page cache as the read-back began, by `mincore`, after
+the build wrote it back and dropped it (`zfile::Built::left_seal`). In a
+store kept in one file one build in a dozen found pages there, and
+`the_words_kept_for_stride_files_are_held_to_the_live_partitions` went
+red under the tests' switch, 5 runs of 60 with four at once and none of
+60 as a store of files; it had passed the stage's gate. Three guesses
+came before the trace and each was wrong in a way the trace showed in
+one reading: a file moved by the table, a folio of the room's last
+tenant astride the range, the kernel's reclaim holding the pages. Each
+look's pages printed (a scratch line) gave half the file, sixteen pages
+at one edge; an `strace -f -tt -y` of the mapping and advice calls, laid
+to the file's place in the data file, gave the rest: the build next door
+began its read-back at its file's trailer, and the kernel reads around a
+mapping's fault in the file the mapping is of, sixteen pages to either
+side on this device, stopping at that file's end and not at the
+mapping's. A store of files is clipped at each file's end; in the data
+file the window ran fourteen pages into the next file, three hundred
+microseconds after that file's build had dropped them. Pages so read are
+the device's, read after the writeback was waited for and the drop made;
+what a look cannot tell them from is a page the drop skipped. So a build
+that dropped its output and finds pages drops the file again and looks
+again, twice at the most, and a look that finds none says the written
+copy is out of the cache (`zfile::reads_device`, held by a unit test
+that reads the pages back in at a seam between the drop and the look,
+and by its mutant). That took the test to one failure in a hundred, and
+the one left is another thing: every page of one file resident through
+three looks and through a drop of the whole data file's cache, so held,
+dirty or under writeback, in 6 runs of 1,540; the probe that would say
+which was added then, and the next 7,200 runs, 800 of them with the
+memory group filled to its limit, had none (`ROADMAP.md`). The rules:
+what the kernel does at a file's end -- its read-around, its readahead,
+its truncation of a window -- a file of files has to expect at every
+file's edge inside it, as it has to do what an unlink did; a count that
+answers "is any of it there" is asked straight after the act it follows,
+and again after the act is repeated, where a neighbour can make the
+answer yes for a reason that is not the one feared; a flake that is one
+run in twelve under load is looped under a syscall trace before a
+mechanism is named for it, since under the trace it failed every other
+run; and a failure that stops coming when its probe is in is written
+down as open, with what was seen and the count of runs on each side,
+never as fixed.
+
+**One sync for a call's envelopes, through a handle that was not the
+segment's.** In a store under a cipher kept in one file an envelope's
+sync is a sync of the data file, and a segment's envelope and its
+index's were first written with none and covered by one sync of the
+table's own handle at the call's end: one flush of the device a landing
+where the shape before made two. A writeback error is reported once to
+each open file, so an error another thread's sync through the table's
+handle had taken would have been answered `Ok` to the segment's writer,
+and the next manifest named a segment the device might not hold. No test
+could have shown it without a device that fails; it was read off the
+comment on `One::sync`, written a stage earlier, which says a segment is
+covered by its own handle's sync alone. The index's envelope is written
+ahead of its segment's now, with no sync, and the segment's sync through
+its own handle covers both: one flush still, a count the tests hold
+(`tests/onefile.rs`, a sync a piece). The rule this file has for the log
+and the run's file holds for every file a manifest names: the sync that
+lets a file be named is made through the handle its writes went through,
+whatever other sync would have covered the same bytes.
+
+**A lookup widened for one caller, read by all of them.** The door finds
+a plain store's one-file table by its directory (`vault::one_under`), and
+the first way a store under a cipher found its vault's table was the same
+function, answering the vault's where no plain table stood. Six callers
+ask it. Three wanted either store's -- the manifest on the device told to
+the table, the segment work's look, the tests' seams -- and three ask
+what only a plain store wants of its writers: a seal announcing its
+pieces' sizes, a merge writing its index ahead of its piece's sync. Under
+a cipher those became true too, and a seal's pieces were announced to
+the cache's room, which nothing had priced, under a comment that said
+"nothing asked of a store under a cipher". Two functions now, the second
+(`vault::one_of`) for the three. The rule: a function widened to answer
+for a new case is read at every caller before the change is built on,
+and where the callers split, so does the function.
+
+**A file written with no word of its size, in a file of files; and a
+cell lost to the cell beside it won.** The first pairing of a store
+under a cipher kept in one file read its loads at 1.3x to 1.5x the
+default's device bytes and the full rewrite's burst level, against a
+prediction of the burst ahead. An envelope was written into the table
+with nothing said of its length, so it was given a step of room and
+grown or moved, its bytes copied, a megabyte piece at a time, where a
+file of the directory just gets longer; the envelope's header knows the
+stored length before the first byte, and says it now
+(`Vault::write_envelope_at`, `One::expect`), no file moved or grown
+since. With it the burst read 1.2x ahead and the scan pass after it
+0.3x to 0.4x, and the pass's cause was looked for in the layout for an
+afternoon: its faults, its mappings, the kernel's memory for the group.
+Two counts already printed said it was not there. The pass's time over
+twenty-two reps of both arms is one line through the megabytes the
+device is written inside it (`lagdev`), the arms' residuals a twentieth
+of a second either side; and the merges' trace laid to the sweep's marks
+has them retire the same megabytes a second of their wall and of their
+CPU in both arms, three in flight in each. The burst that is four
+seconds shorter ends a gigabyte of merging further behind, and the pass
+reads beside it. It is this file's rule on a stall taken off a writer's
+path, met from the side of the thing that removed the stall, and it is
+recorded open in `ROADMAP.md` with its two levers. The rules: a writer
+into a shared file says its size before its first byte wherever
+anything it holds knows it, and a counter of what the table had to move
+or grow is read at the first pairing before any rate; a cell lost
+behind a cell won in the same sweep is first laid against what the won
+phase left undone, by the counts the sweep prints, before the mechanism
+under test is searched for a cost; and both arms' reps on one line
+against a third quantity is the reading that says the arms differ by
+that quantity alone.
+
+**A step ahead capped where the cap made it no step, and an ask of the
+filesystem on whatever thread wanted room.** The data file is made
+longer by what is asked for and an eighth of itself, "a few times a
+doubling" by the comment over it, and the eighth was held to 64 MiB:
+past half a gigabyte every growth was a file's worth and a constant,
+and a store of seven gigabytes asked the filesystem eighty times in a
+row of the suite. Each ask is a `fallocate` under the table's lock on
+the thread that wanted the room, and ext4 reads a block bitmap from the
+device for each group it has not looked at. Beside a load that is
+milliseconds. In the read pass after a load under a bound, where the
+crossing has just asked half a gigabyte of form files back and every
+small read waits behind megabytes of read-ahead, it was 0.72 s of one
+pass on the thread building the form files the reads were waiting for.
+Nothing in the engine's counters or the pass's faults by file showed
+it: both arms' faults fell on the same kinds of file in the same
+numbers. What showed it was every thread's state and kernel stack fifty
+times a second (`/proc/<pid>/task/*/stat` and `stack`), the samples
+summed by thread and by the frame they waited in. The eighth is held to
+a gibibyte (`onefile::AHEAD_MOST`), and a device with no room for the
+step ahead is asked for the file's alone: forty-six growths a row,
+nothing in the allocator in three sampled passes, and the pass ahead of
+the default's in both orders where it had been behind. It is a dilution: a
+growth can still fall on a busy moment, and the log's, when the log is
+an extent of the file, cannot be an ask on a commit's path. The rules:
+a cap on a proportional step is read at the sizes the suite's largest
+rung reaches, against the comment that says what the step is for; a
+call into the filesystem made under a lock is priced where the device
+is busiest, not where the call was first timed; and where two arms'
+faults and counters agree and their rates do not, the next instrument
+is what each thread waits in, sampled, since a wait in the kernel that
+is not a fault is in no fault count.
+
+**A damage made by a twin's bytes, which were the same bytes.** The
+one-file test that writes one segment's first page over another's, to
+hold the open to the manifest's checksum of each file's first page,
+failed one run in eight alone and was read for a gate as luck in the
+runs before: two partitions of one merge with the same number of keys
+have the same superblock to the byte, its sizes, offsets and second
+finished all alike, so the page written over was the page that was
+there and the open was right to read the store whole. A print of
+whether the two pages differed named it in one loop of forty. The test
+picks a pair whose first pages differ now. The rule: a damage made by
+substitution is held to having changed something, since a copy of a
+file's twin is no damage, and a test that fails one run in eight is
+looped alone before it is read as anything else. The same gate's stride
+group found the cipher twin of the one-file test of a seal cut before
+its sync failing one run in two alone under the switch: its baseline of
+the room the store holds was read behind `settle`, which joins no form
+build, and a form file built after it was room the open took beside a
+named segment; read behind `zpages_settle`, none in sixty. A twin added
+under a mode runs under every switch its sibling does before the twin
+is called held, since the stride group had passed it once by the coin.
+It came again as a store closed behind `settle`: the test that an open's
+publish tells the table read nothing published between an open at rest
+and a kill, and the store opened next built the form file the close had
+left unbuilt and listed it in that window, once on a hosted macOS
+runner and every run here with the test's thread held a second and a
+half there. A test's "at rest" under the switch is behind
+`zpages_settle`.
+
+**Two lines' answers to one ask, merged by text.** This branch's run
+close lands durable only at the writer's word, the drain's ask
+(`SealJob::awaits_writer`), since a presync the writer makes after the
+hand-over can fail where the seal's own fsync would not see it; main's
+drain answers its ask at the seal's readable landing where every write it
+covers was durable before it (`Options::drain_answers_readable`), and
+leaves the durable landing to the segment work's loop. The two merged
+clean in text. With the run closed on the seal thread
+(`close_readable_inline` off, the `supdb-closeseal` arm), the drain's ask
+was answered early, the loop lands no job that awaits the word, and every
+seal behind it waited at the queue for the next flush or settle: a store
+that drains and then only commits fills its frozen list and waits for a
+landing nobody makes. Seven tests of `tests/durable.rs` failed over the
+merged tree, every one a test of the strict drain or of the presync, and
+reading each for the shape it was written for is what found this eighth
+state, on which no test failed. The early answer refuses a job that
+awaits the word now (`Maint::drain_readable`), and
+`a_drain_names_its_runs_segment_durable_before_it_answers` builds it,
+red without the refusal. Three more of the same merge, each where a
+mechanism of one side met a shortcut of the other's. Main's packed copy
+unpacks itself before a write it cannot take in place, and this branch's
+patch then wrote the run over the old one and called the form's bytes
+unchanged, skipping their count: the checked build's assertion in the
+upkeep thread, once in a gate's `settle`. A test's crash
+(`Db::crash`) shut a store in one file's table before main's `Life` had
+waited out the store's threads; the table's registration gone, a landing
+the segment work was in the middle of wrote its slot in the layout of a
+store of files, and the reopen refused a partition it called missing,
+once in twelve runs of `tests/onefile.rs`: the table is shut after the
+threads end. And a helper of `tests/runlog.rs` that this branch had made
+skip empty temp names hid the file main makes ahead of a run from main's
+own tests of it. Both lines had made that file, under one option's name
+(`run_spare`), by two mechanisms: main's is kept, and makes none under a
+cipher. The rules: a merge is read for where each side's mechanism
+answers an ask the other's waits on, or skips a count the other's change
+moves, since a word one side waits for is a word the other side's
+shortcut does not give; a test that fails over a merge is sorted by the
+shape it was written for before it is changed, pinned to that shape,
+with the shipped shape held beside it; and two mechanisms built apart
+for one purpose are one, the shipped line's.
+
+## Standing limitations
 **One number that meant three things while there was one writer.** A
 memtable's length was the prefix a walk may read, the count a handle's
 lookup is bounded by, and whether the table held anything, and with one
@@ -7533,6 +11658,37 @@ switch it failed under, beside load, since the test named in the log is
 the one that was running and not the one that left the thread; and a
 test that waits for a thread is sized so that the thread outlasts
 whatever else the wait covers, or the wait passes without it.
+
+It came again from a thread `Life` does not count, because it writes no
+file. A store under a cipher keeps its registration in the process past
+a crash, and its registration's cache has an evictor that reads its
+room every twenty milliseconds, a `mincore` over every block mapped in
+the process, the crashed stores' among them. The hosted ARM leg's
+`onefile` group failed a run-close test whose wait for a link ran out,
+and four copies of `tests/durable.rs` run at once under
+`SUPDB_TEST_ONEFILE` here each sat past nine minutes on one test. That
+test passed in thirty seconds in a process of its own. Every thread's
+state and kernel stack in one stuck process
+(`/proc/<pid>/task/*/stat`, `stack`) named it: fifty-eight evictors in
+`mincore`, thirty of them in D, and the open store's segment work in D
+in `vm_mmap_pgoff` and `madvise_lock`, behind the map lock they held
+between them. A crash stops the evictor now (`vault::crash`), and a test
+holds the thread's task gone once a close or a crash returns, by the
+thread id the counts carry (`PagerCounts::evictor_tid`). The same
+stress, run again, found two tests the contention had hidden. One was a
+bet: `a_merge_finished_beside_a_failing_seal_is_held_in_the_same_look`
+waited for the seal's piece to be renamed into place, which comes before
+the seal thread says the piece is readable, and let a merge go in
+between. A sleep of half a second put there failed it every run, and it
+waits now for a poll the readable hold turned away
+(`SealWaits::readable_held`). The other was a copy helper
+(`os_copy`) that ignored its errors, so a full disk built a crash state
+with its log missing, which read as a store refusing to open. The
+corollary: a test's stand-in for a dead process stops every thread the
+dead process would not have, counted or not, since a thread that only
+reads the process's own state is still the next test's load; and a
+helper that builds a test's state fails on the errors it meets, or the
+state it builds is a different state.
 
 **A stamp read as the end of the step it begins.** The drain's stamps
 name `readable` where the seal thread hands its segments over, and the

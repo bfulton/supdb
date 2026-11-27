@@ -97,7 +97,9 @@ fn options(pooled: bool, inject: &Arc<ZInject>) -> Options {
         zpages_inject: Some(inject.clone()),
         seal_bytes: 1 << 30,
         seal_max_pct: 0,
-        ..common::options()
+        // The two stores' files are compared by name, byte for byte: a
+        // store of files (`common::files`).
+        ..common::files(common::options())
     }
 }
 

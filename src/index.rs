@@ -54,16 +54,25 @@ impl Ext {
 
     /// The width of a fixed run's values; `None` for a prefixed run or an
     /// empty or inconsistent one.
+    ///
+    /// One divide, and the quotient's product with the count for whether
+    /// it was exact: a remainder taken beside the quotient is a divide the
+    /// compiler pairs with the quotient's in some builds and makes again in
+    /// others, of the same source, in every reader of a fixed run.
     #[inline]
     pub fn fixed_width(&self) -> Option<usize> {
         if !self.is_fixed() {
             return None;
         }
-        let n = self.records() as usize;
-        if n == 0 || !(self.len as usize).is_multiple_of(n) {
+        let n = self.records();
+        if n == 0 {
             return None;
         }
-        Some(self.len as usize / n)
+        let w = self.len / n;
+        if w * n != self.len {
+            return None;
+        }
+        Some(w as usize)
     }
 
     /// A `block` of this value means the run is INLINE: its bytes sit in the
@@ -257,4 +266,47 @@ pub fn encode_run(values: &[u8], lens: &[u32], out: &mut Vec<u8>) -> (u32, u32) 
         at += l as usize;
     }
     (last, 0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Ext;
+
+    fn fixed(len: u32, records: u32) -> Ext {
+        Ext {
+            block: 0,
+            off: 0,
+            len,
+            last: 0,
+            count: records | Ext::FIXED,
+        }
+    }
+
+    /// The width is the length over the count where the count divides it,
+    /// and nothing for a remainder, a count of none or a prefixed run: a
+    /// fixed run whose length the count does not divide is damage, which
+    /// every reader refuses (`each_value`). Asked of the extent alone, since
+    /// the writer never makes one and a file's checksums refuse one before
+    /// any reader meets it.
+    #[test]
+    fn a_fixed_width_is_the_exact_quotient_or_nothing() {
+        assert_eq!(fixed(12, 3).fixed_width(), Some(4));
+        assert_eq!(fixed(3, 3).fixed_width(), Some(1));
+        assert_eq!(fixed(0, 3).fixed_width(), Some(0));
+        assert_eq!(fixed(10, 3).fixed_width(), None);
+        assert_eq!(fixed(11, 3).fixed_width(), None);
+        assert_eq!(fixed(2, 3).fixed_width(), None);
+        assert_eq!(fixed(12, 0).fixed_width(), None);
+        assert_eq!(fixed(0, 0).fixed_width(), None);
+        let prefixed = Ext {
+            count: 3,
+            ..fixed(12, 3)
+        };
+        assert_eq!(prefixed.fixed_width(), None);
+        let tomb = Ext {
+            count: 3 | Ext::FIXED | Ext::TOMBSTONE,
+            ..fixed(12, 3)
+        };
+        assert_eq!(tomb.fixed_width(), Some(4));
+    }
 }

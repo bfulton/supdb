@@ -35,6 +35,144 @@
 //! Sealing is also where the data is sorted by key, because the batch is
 //! already in hand and being copied. That produces sorted runs, which is what
 //! ordered scans will need later, at close to no cost.
+//!
+//! ## What the read path does not hand out
+//!
+//! A reader asks its byte source for the bytes it is about to read
+//! (`Bytes::slice_at`, `Bytes::read_at`), which every kind of source
+//! answers. The read path's own borrows of a section whole -- a section
+//! lent on the bounds check alone, which a source that lends by the piece
+//! refuses, and the record regions as slices -- and the address behind a
+//! paged mapping are not reachable from outside the crate. The examples
+//! that do not compile come in groups, and each group is followed, or
+//! preceded where it continues the one before, by an example that does:
+//! the call a caller outside the crate makes instead.
+//!
+//! A mapping is not lent as it lies by a call of its own:
+//!
+//! ```compile_fail
+//! fn whole(p: &std::path::Path) -> std::io::Result<usize> {
+//!     Ok(supdb::MmapBytes::open(p)?.as_slice().len())
+//! }
+//! ```
+//! ```compile_fail
+//! fn whole(p: &std::path::Path) -> std::io::Result<usize> {
+//!     Ok(supdb::MmapBytes::open(p)?.lend_whole_map().len())
+//! }
+//! ```
+//! ```no_run
+//! fn whole(p: &std::path::Path) -> std::io::Result<usize> {
+//!     Ok(supdb::Bytes::len(&supdb::MmapBytes::open(p)?) as usize)
+//! }
+//! ```
+//!
+//! A section lent on the bounds check alone, which answers nothing for a
+//! source that lends by the piece, is the read path's own; it is not called
+//! from outside the crate, and a caller asks instead:
+//!
+//! ```compile_fail
+//! fn section<B: supdb::Bytes>(b: &B) -> Option<&[u8]> {
+//!     b.lend_at(0, 1)
+//! }
+//! ```
+//! ```no_run
+//! fn section<B: supdb::Bytes>(b: &B) -> Option<&[u8]> {
+//!     b.slice_at(0, 1)
+//! }
+//! ```
+//!
+//! nor with the token it takes, which only the read path makes, whether it
+//! is named or inferred (a call whose argument diverges compiles, and never
+//! reaches the method; one made in unsafe code is outside what a type can
+//! refuse):
+//!
+//! ```compile_fail
+//! fn section<B: supdb::Bytes>(b: &B) -> Option<&[u8]> {
+//!     b.lend_at(0, 1, supdb::blob::lend_seal::Token::new())
+//! }
+//! ```
+//! ```compile_fail
+//! fn section<B: supdb::Bytes>(b: &B) -> Option<&[u8]> {
+//!     b.lend_at(0, 1, Default::default())
+//! }
+//! ```
+//!
+//! and a source outside the crate keeps the default lend, since it cannot
+//! write the method's signature:
+//!
+//! ```compile_fail
+//! struct Mine(Vec<u8>);
+//! impl supdb::Bytes for Mine {
+//!     fn len(&self) -> u64 {
+//!         self.0.len() as u64
+//!     }
+//!     fn read_at(&self, off: u64, dst: &mut [u8]) -> std::io::Result<()> {
+//!         dst.copy_from_slice(&self.0[off as usize..off as usize + dst.len()]);
+//!         Ok(())
+//!     }
+//!     fn lend_at(&self, off: u64, len: usize, _: supdb::blob::lend_seal::Token) -> Option<&[u8]> {
+//!         self.0.get(off as usize..off as usize + len)
+//!     }
+//! }
+//! ```
+//! ```compile_fail
+//! struct Mine(Vec<u8>);
+//! impl supdb::Bytes for Mine {
+//!     fn len(&self) -> u64 {
+//!         self.0.len() as u64
+//!     }
+//!     fn read_at(&self, off: u64, dst: &mut [u8]) -> std::io::Result<()> {
+//!         dst.copy_from_slice(&self.0[off as usize..off as usize + dst.len()]);
+//!         Ok(())
+//!     }
+//!     fn lend_at(&self, off: u64, len: usize) -> Option<&[u8]> {
+//!         self.0.get(off as usize..off as usize + len)
+//!     }
+//! }
+//! ```
+//! ```
+//! struct Mine(Vec<u8>);
+//! impl supdb::Bytes for Mine {
+//!     fn len(&self) -> u64 {
+//!         self.0.len() as u64
+//!     }
+//!     fn read_at(&self, off: u64, dst: &mut [u8]) -> std::io::Result<()> {
+//!         dst.copy_from_slice(&self.0[off as usize..off as usize + dst.len()]);
+//!         Ok(())
+//!     }
+//!     fn slice_at(&self, off: u64, len: usize) -> Option<&[u8]> {
+//!         self.0.get(off as usize..off as usize + len)
+//!     }
+//! }
+//! ```
+//!
+//! What stands behind a paged mapping is the engine's to implement:
+//!
+//! ```compile_fail
+//! fn named<T: supdb::bytes::Paging>(_: &T) {}
+//! ```
+//! ```
+//! fn named<T: supdb::bytes::Bytes>(_: &T) {}
+//! ```
+//!
+//! A segment's record regions are not handed out as slices; where they lie
+//! is:
+//!
+//! ```compile_fail
+//! fn regions(b: &supdb::Blob<supdb::MmapBytes>) -> usize {
+//!     b.record_regions().map_or(0, |(r, _)| r.len())
+//! }
+//! ```
+//! ```compile_fail
+//! fn regions(b: &supdb::Blob<supdb::MmapBytes>) -> usize {
+//!     usize::from(b.record_pieces().is_some())
+//! }
+//! ```
+//! ```
+//! fn regions(b: &supdb::Blob<supdb::MmapBytes>) -> usize {
+//!     b.record_region_place().map_or(0, |(_, n)| n)
+//! }
+//! ```
 
 // The format modules below came from the design artifact rather than being
 // written here; every one holds to -D warnings now, `block` and `flatindex`
@@ -61,6 +199,9 @@ pub mod index;
 pub mod blob;
 /// Where a reader's bytes come from. The seam the wasm build needed.
 pub mod bytes;
+/// An encrypted object read as its plaintext, through the same seam: the
+/// envelope, and the hook a caller's cipher fits.
+pub mod crypt;
 /// The engine: a WAL, a memtable and threads that seal and merge -- none of
 /// which a browser has, and all of which want files to write and map.
 /// Excluded from the wasm build rather than stubbed; `blob` is the read path
@@ -97,8 +238,22 @@ pub use bytes::{Bytes, SliceBytes, VecBytes};
 /// names were the other way round while a second engine owned the shorter
 /// one.
 #[cfg(not(target_family = "wasm"))]
+pub use db::dirkey::{self, DirKey, DirState};
+/// A live store under a cipher the caller supplies (`Encryption::Cipher`): the
+/// cipher as the store takes it, what it counts, the name a store's marker
+/// gives its key, and the store handed from one of the caller's keys to
+/// another.
+#[cfg(not(target_family = "wasm"))]
+pub use db::vault::{
+    key_id as cipher_key_id, rewrap as cipher_rewrap, CipherCounts, PagerCounts, StoreCipher,
+};
+/// A test's counts of a store kept in one file (`Options::one_file`).
+#[cfg(not(target_family = "wasm"))]
+#[doc(hidden)]
+pub use db::OneCounts;
+#[cfg(not(target_family = "wasm"))]
 pub use db::{
-    BackgroundIo, Db, Isolation, Options, ReadAdvice, Reader, SegmentOptions, SegmentWrite,
-    SegmentWriter, SyncPolicy, Txn, Upkeep, ZInject, ZPages, ZStride, MERGE_AHEAD_WINDOW,
-    STORE_FORMAT, STORE_FORMAT_OLDEST,
+    BackgroundIo, Db, Encryption, HelperFault, Isolation, Options, ReadAdvice, Reader,
+    SegmentOptions, SegmentWrite, SegmentWriter, SyncPolicy, Txn, Upkeep, ZInject, ZPages, ZStride,
+    MERGE_AHEAD_WINDOW, STORE_FORMAT, STORE_FORMAT_OLDEST,
 };

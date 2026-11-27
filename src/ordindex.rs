@@ -175,6 +175,26 @@ use crate::bytes::{Bytes, MmapBytes};
 use std::io::{Error, ErrorKind, Result};
 use std::path::Path;
 
+/// The token `MmapBytes::lend_whole_map` takes from the ordered index, made
+/// in this module alone (its constructor is `pub(in crate::ordindex)`): a
+/// whole borrow of a mapping as it lies is written here, where the index takes its
+/// checksum over a mapped file and reads its heads where they lie, and asks
+/// a paged mapping by the piece; the compiler refuses it in any other
+/// module (forms.md R2).
+pub(crate) mod lend_seal {
+    pub struct Token(());
+
+    impl Token {
+        #[inline(always)]
+        pub(in crate::ordindex) fn new() -> Token {
+            Token(())
+        }
+    }
+}
+
+/// The token by a name of its own, for the seam.
+pub(crate) use lend_seal::Token as OrdLendToken;
+
 /// "SUPDORD1", little-endian. The trailing digit is the version, and it
 /// moves whenever an older reader would misread rather than refuse.
 pub(crate) const MAGIC: u64 = 0x3144_524f_4450_5553;
@@ -186,6 +206,10 @@ const HEAD: usize = 8;
 /// cache lines the prefetcher walks, so a seek's cold probes fall in one
 /// run instead of across the file.
 pub(crate) const TOP_STRIDE: usize = 64;
+/// The heads one ask of the top level's late read takes (`read_top`): a
+/// whole number of the level's strides, and the bytes one request of the
+/// device carries on the hosts this runs on (`bytes::WILLNEED_PIECE`).
+const TOP_RUN: usize = crate::bytes::WILLNEED_PIECE / HEAD;
 /// Header word: one more than the keys' common length when every key has
 /// one length and it is at most `pfx + HEAD`, so a head is a whole key and
 /// a seek needs no record; 0 otherwise, and in every file from before the
@@ -451,13 +475,23 @@ pub struct OrdIndex {
     /// seek is the first scan of a pass, which paid the build's walk over
     /// every eighth line of the file -- 60 us at three hundred thousand
     /// keys, a third of that scan.
-    top: Vec<u64>,
+    top_eager: Vec<u64>,
+    /// The top level of a mapping that lends by the piece, read at the
+    /// first seek (`top`): read through `top()` and never the field, which
+    /// is empty for such a mapping.
+    top_late: std::sync::OnceLock<Vec<u64>>,
     /// Where the heads are read: the mapping's, past its header, or a copy
     /// of them the segment holds in anonymous memory (`set_heads`). Under
     /// a memory bound the mapping's pages leave the page cache between two
     /// seeks of them, and a seek that finds one gone waits on the device;
     /// a copy in the process's own memory is not the cache's to take.
     heads: std::sync::atomic::AtomicPtr<u8>,
+    /// The heads a read may take through `heads`: `n` for a mapped file,
+    /// whose heads are in memory, and none for a mapping read by the
+    /// piece, whose every head is asked for out of line (`head_absent`).
+    /// It is the bound every head read tests anyway, so a mapped file's
+    /// read asks nothing it did not ask before.
+    lim: usize,
 }
 
 impl OrdIndex {
@@ -466,17 +500,38 @@ impl OrdIndex {
     /// under an id handed out again later -- is refused here rather than
     /// believed.
     pub fn open(path: &Path, keys: usize) -> Result<OrdIndex> {
-        let map = MmapBytes::open(path)?;
-        let b = &map.0[..];
-        if b.len() < HEADER + 4 {
+        Self::over(crate::db::vault::map(path)?, keys)
+    }
+
+    /// `open` over a mapping already made.
+    fn over(map: MmapBytes, keys: usize) -> Result<OrdIndex> {
+        // A mapping that lends by the piece (`Bytes::piecewise`: a store
+        // under a cipher's, whose bytes are decrypted as they are asked
+        // for) is read by the piece: its header here, and its heads as a
+        // seek reads them. Its checksum is not taken, since that would ask
+        // for the file whole and what such a source lends has passed a
+        // check of its own; and its top level, one head a stride and so a
+        // read of every page of the file, is left to the first seek
+        // (`top`).
+        let paged = map.piecewise();
+        let len = map.len() as usize;
+        if len < HEADER + 4 {
             return Err(bad("shorter than its header"));
         }
-        let body = b.len() - 4;
-        let crc = u32::from_le_bytes(b[body..].try_into().expect("four bytes"));
-        if crc32(&b[..body]) != crc {
-            return Err(bad("checksum does not match"));
+        let body = len - 4;
+        // The mapping as it lies: all of a mapped file, and nothing of a
+        // paged one, of which none is read below.
+        let whole = map.lend_whole_map(lend_seal::Token::new());
+        let head = map
+            .slice_at(0, HEADER)
+            .ok_or_else(|| bad("its header does not read"))?;
+        if !paged {
+            let crc = u32::from_le_bytes(whole[body..].try_into().expect("four bytes"));
+            if crc32(&whole[..body]) != crc {
+                return Err(bad("checksum does not match"));
+            }
         }
-        let rd = |at: usize| u64::from_le_bytes(b[at..at + 8].try_into().expect("eight bytes"));
+        let rd = |at: usize| u64::from_le_bytes(head[at..at + 8].try_into().expect("eight bytes"));
         if rd(0) != MAGIC {
             return Err(bad("wrong magic"));
         }
@@ -507,24 +562,127 @@ impl OrdIndex {
         if heads_at != HEADER || heads_at.checked_add(want) != Some(body) {
             return Err(bad("heads do not fill the file"));
         }
-        let top = (0..n)
-            .step_by(TOP_STRIDE)
-            .map(|i| {
-                let at = HEADER + i * HEAD;
-                u64::from_be_bytes(b[at..at + HEAD].try_into().expect("eight bytes"))
-            })
-            .collect();
-        let heads = std::sync::atomic::AtomicPtr::new(b[HEADER..].as_ptr() as *mut u8);
+        let top = if paged {
+            Vec::new()
+        } else {
+            (0..n)
+                .step_by(TOP_STRIDE)
+                .map(|i| {
+                    let at = HEADER + i * HEAD;
+                    u64::from_be_bytes(whole[at..at + HEAD].try_into().expect("eight bytes"))
+                })
+                .collect()
+        };
+        // A mapping read by the piece has no heads to point at: its heads
+        // are asked for out of line (`head_absent`), and it is never given a
+        // copy (`mapped_heads`).
+        let heads = std::sync::atomic::AtomicPtr::new(if paged {
+            std::ptr::null_mut()
+        } else {
+            whole[HEADER..].as_ptr() as *mut u8
+        });
         Ok(OrdIndex {
             heads,
+            lim: if paged { 0 } else { n },
             map,
             n,
             pfx,
             uniform_len,
             prefix: None,
             advised: std::sync::atomic::AtomicBool::new(false),
-            top,
+            top_eager: top,
+            top_late: std::sync::OnceLock::new(),
         })
+    }
+
+    /// The top level: every `TOP_STRIDE`th head, in memory. Read at the
+    /// open for a mapped file. For a mapping that lends by the piece it is
+    /// read at the first seek and kept: `top` is empty until then, which
+    /// for a mapped file means an index of no keys, so the test a mapped
+    /// file pays is of a length it has loaded already.
+    #[inline]
+    fn top(&self) -> &[u64] {
+        if !self.top_eager.is_empty() {
+            return &self.top_eager;
+        }
+        self.top_late()
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn top_late(&self) -> &[u64] {
+        if self.n == 0 {
+            return &self.top_eager;
+        }
+        self.top_late.get_or_init(|| self.read_top())
+    }
+
+    /// The top level read now where a first seek would read it
+    /// (`top_late`): for whoever publishes a segment it has just written,
+    /// whose index a store under a cipher still holds in its cache, so
+    /// that the read is of memory and no reader's first seek waits for it.
+    /// Nothing for a mapped file, whose level its open read.
+    pub(crate) fn top_now(&self) {
+        let _ = self.top();
+    }
+
+    /// Whether the top level is in memory: read at the open, or since.
+    #[cfg(all(test, target_os = "linux"))]
+    pub(crate) fn top_is_read(&self) -> bool {
+        self.n == 0 || !self.top_eager.is_empty() || self.top_late.get().is_some()
+    }
+
+    /// The top level of a mapping that lends by the piece, read from its
+    /// heads a run of them an ask (`TOP_RUN`). A sample lies in every
+    /// piece of the heads, eight of them in four kilobytes, so the level
+    /// is the heads read whole; asked for a head at a time each piece was
+    /// made present by itself, and where the store's cache had given the
+    /// heads back that was a wait for the device a piece: twenty-six
+    /// milliseconds for an index of two hundred thousand keys, at the
+    /// first seek of every partition, which was nine tenths of the suite's
+    /// one-thread scan pass under a cipher at five million keys under 640
+    /// MiB. A run asked for at once has its pieces' bytes asked of the
+    /// device together (`db::pager`). A run that does not lend is read a
+    /// head at a time, where a head that does not read answers zero and
+    /// its source records what failed (`head_absent`).
+    fn read_top(&self) -> Vec<u64> {
+        let mut top = Vec::with_capacity(self.n.div_ceil(TOP_STRIDE));
+        let mut i = 0;
+        while i < self.n {
+            let run = (self.n - i).min(TOP_RUN);
+            match self.map.slice_at((HEADER + i * HEAD) as u64, run * HEAD) {
+                Some(heads) => top.extend(
+                    heads
+                        .as_chunks::<HEAD>()
+                        .0
+                        .iter()
+                        .step_by(TOP_STRIDE)
+                        .map(|h| u64::from_be_bytes(*h)),
+                ),
+                None => top.extend((i..i + run).step_by(TOP_STRIDE).map(|j| self.head(j))),
+            }
+            i += run;
+        }
+        top
+    }
+
+    /// A head that did not read: past the heads of a mapped file, which is
+    /// the index out of range it always was, or a piece its source could
+    /// not lend, which the source records (`db::pager`) and the read
+    /// answers for; the head is then zero and no rank is trusted by it.
+    #[cold]
+    #[inline(never)]
+    fn head_absent(&self, i: usize) -> u64 {
+        assert!(
+            self.map.piecewise() && i < self.n,
+            "head {i} of an ordered index of {}",
+            self.n
+        );
+        let at = (HEADER + i * HEAD) as u64;
+        match self.map.slice_at(at, HEAD) {
+            Some(b) => u64::from_be_bytes(b.try_into().expect("eight bytes")),
+            None => 0,
+        }
     }
 
     /// Every key of one length no more than the prefix plus eight bytes,
@@ -568,21 +726,59 @@ impl OrdIndex {
     /// first scan at three hundred thousand keys, an eighth of the
     /// suite's threaded scan pass, and the writer paid the same at its
     /// first scan over every state a seal or a merge published.
+    ///
+    /// The one bound is `lim`'s: a mapped file's is `n`, so a rank under
+    /// it reads its head in memory, and a mapping read by the piece has
+    /// none, so every rank of it goes to `whole_key_at_by_piece`, which
+    /// answers as this half does with the heads asked for. That half is a
+    /// tail call, so this half keeps no register across a call for it.
+    /// Out of line, as it was before it had halves: inlined into a
+    /// caller's walk, its instructions are counted as the caller's.
+    #[inline(never)]
     pub fn whole_key_at<'b>(&self, rank: usize, buf: &'b mut Vec<u8>) -> Option<&'b [u8]> {
+        let len = self.uniform_len?;
+        let prefix = self.prefix.as_deref()?;
+        if rank >= self.lim || prefix.len() != self.pfx {
+            return self.whole_key_at_by_piece(rank, buf);
+        }
+        let h = if rank.is_multiple_of(TOP_STRIDE) {
+            self.top_eager[rank / TOP_STRIDE]
+        } else {
+            // SAFETY: `rank` is under `lim`, which a mapped file's heads in
+            // memory number (`head`'s own bound).
+            unsafe { self.head_in_memory(rank) }
+        };
+        Some(Self::key_from_head(prefix, h, len - self.pfx, buf))
+    }
+
+    /// `whole_key_at` past `lim`: a rank past the index, a prefix learned
+    /// short, or a mapping read by the piece, whose top level is read at
+    /// the first seek (`top`) and whose heads are asked for
+    /// (`head_absent`).
+    #[cold]
+    #[inline(never)]
+    fn whole_key_at_by_piece<'b>(&self, rank: usize, buf: &'b mut Vec<u8>) -> Option<&'b [u8]> {
         let len = self.uniform_len?;
         let prefix = self.prefix.as_deref()?;
         if rank >= self.n || prefix.len() != self.pfx {
             return None;
         }
         let h = if rank.is_multiple_of(TOP_STRIDE) {
-            self.top[rank / TOP_STRIDE]
+            self.top()[rank / TOP_STRIDE]
         } else {
             self.head(rank)
         };
+        Some(Self::key_from_head(prefix, h, len - self.pfx, buf))
+    }
+
+    /// The key a head is the whole of: the prefix and the head's first
+    /// `kept` bytes, written into `buf`.
+    #[inline(always)]
+    fn key_from_head<'b>(prefix: &[u8], h: u64, kept: usize, buf: &'b mut Vec<u8>) -> &'b [u8] {
         buf.clear();
         buf.extend_from_slice(prefix);
-        buf.extend_from_slice(&h.to_be_bytes()[..len - self.pfx]);
-        Some(&buf[..])
+        buf.extend_from_slice(&h.to_be_bytes()[..kept]);
+        &buf[..]
     }
 
     /// What the head of the key at `rank` says of the key where it is not
@@ -616,7 +812,7 @@ impl OrdIndex {
         if rank >= self.n || !rank.is_multiple_of(TOP_STRIDE) || prefix.len() != self.pfx {
             return false;
         }
-        let h = self.top[rank / TOP_STRIDE];
+        let h = self.top()[rank / TOP_STRIDE];
         let Some(above) = h.checked_add(1) else {
             return false;
         };
@@ -704,10 +900,26 @@ impl OrdIndex {
         self.map.len()
     }
 
-    /// The file's mapping whole, for whoever asks the kernel about its
-    /// pages (`mincore`): no byte of it is read here.
-    pub fn mapped(&self) -> &[u8] {
-        self.map.slice_at(0, self.map.len() as usize).unwrap_or(&[])
+    /// The share of the file a read would find in memory now, asked of its
+    /// mapping (`Bytes::resident_share`): zero where the source cannot say.
+    pub fn resident_share(&self) -> f64 {
+        self.map
+            .resident_share(0, self.map.len() as usize)
+            .unwrap_or(0.0)
+    }
+
+    /// The file mapped into this process's page tables, asked of its
+    /// mapping (`Bytes::populate_read`): true where the kernel took the
+    /// advice. No byte of it is read here.
+    pub fn populate_read(&self) -> bool {
+        self.map.populate_read(0, self.map.len() as usize)
+    }
+
+    /// The share of the file a read reaches with no fault of the page
+    /// tables' now, asked of its mapping (`Bytes::mapped_share`); `None`
+    /// where the source will not say.
+    pub fn mapped_share(&self) -> Option<f64> {
+        self.map.mapped_share(0, self.map.len() as usize)
     }
 
     /// Whether `advise_random` was called on this mapping.
@@ -725,36 +937,71 @@ impl OrdIndex {
 
     #[inline]
     fn head(&self, i: usize) -> u64 {
-        assert!(i < self.n, "a head past the index");
+        if i >= self.lim {
+            return self.head_absent(i);
+        }
+        // SAFETY: `i` is under `lim`, tested above.
+        unsafe { self.head_in_memory(i) }
+    }
+
+    /// Head `i` read from memory, for a caller that has held `i` under
+    /// `lim` itself.
+    ///
+    /// # Safety
+    /// `i < self.lim`.
+    #[inline(always)]
+    unsafe fn head_in_memory(&self, i: usize) -> u64 {
+        debug_assert!(i < self.lim, "head {i} of {} in memory", self.lim);
+        let p = self.heads.load(std::sync::atomic::Ordering::Acquire);
         // SAFETY: the pointer names `n` heads -- the mapping's, which `open`
         // held to that many, or a copy of exactly those (`set_heads`) --
-        // and `i` is one of them.
-        u64::from_be(unsafe { self.heads_at(i).cast::<u64>().read_unaligned() })
+        // and `i` is one of them, being under `lim`, which is `n` where it
+        // is not zero.
+        u64::from_be(unsafe { p.add(i * HEAD).cast::<u64>().read_unaligned() })
     }
 
-    /// The address of head `lo`, or one past the last.
+    /// The heads in memory, `lim` of them, for a search that reads several
+    /// under one pin: the pointer loaded once, where `head` loads it a
+    /// head. Empty for a mapping read by the piece.
     #[inline]
-    fn heads_at(&self, lo: usize) -> *const u8 {
-        debug_assert!(lo <= self.n);
-        // SAFETY: inside the heads or one past them.
-        unsafe {
-            self.heads
-                .load(std::sync::atomic::Ordering::Acquire)
-                .add(lo * HEAD)
+    fn heads_held(&self) -> &[[u8; HEAD]] {
+        if self.lim == 0 {
+            return &[];
         }
+        let p = self.heads.load(std::sync::atomic::Ordering::Acquire);
+        // SAFETY: as `head`'s: the pointer names `n` heads (`lim` of them,
+        // where `lim` is not zero) for as long as the caller's pin stands,
+        // and a head is eight bytes with no alignment of its own.
+        unsafe { std::slice::from_raw_parts(p as *const [u8; HEAD], self.lim) }
     }
 
-    /// The mapping's heads: what a copy of them is made from.
-    pub(crate) fn mapped_heads(&self) -> &[u8] {
-        &self.map.0[HEADER..HEADER + self.n * HEAD]
+    /// The address of head `lo`, or one past the last; `None` for a mapping
+    /// read by the piece, whose heads are not in memory to point at.
+    #[inline]
+    fn heads_at(&self, lo: usize) -> Option<*const u8> {
+        debug_assert!(lo <= self.n);
+        let p = self.heads.load(std::sync::atomic::Ordering::Acquire);
+        // SAFETY: inside the heads or one past them.
+        (!p.is_null()).then(|| unsafe { p.add(lo * HEAD) as *const u8 })
+    }
+
+    /// The mapping's heads: what a copy of them is made from. `None` for a
+    /// mapping read by the piece, which lends nothing whole and is never
+    /// given a copy.
+    pub(crate) fn mapped_heads(&self) -> Option<&[u8]> {
+        self.map
+            .lend_whole_map(lend_seal::Token::new())
+            .get(HEADER..HEADER + self.n * HEAD)
+            .filter(|_| !self.map.piecewise())
     }
 
     /// Whether the heads are read from a copy and not from the mapping.
     pub fn heads_owned(&self) -> bool {
-        !std::ptr::eq(
-            self.heads.load(std::sync::atomic::Ordering::Acquire),
-            self.mapped_heads().as_ptr(),
-        )
+        let p = self.heads.load(std::sync::atomic::Ordering::Acquire);
+        match self.mapped_heads() {
+            Some(m) => !p.is_null() && !std::ptr::eq(p, m.as_ptr()),
+            None => false,
+        }
     }
 
     /// The heads read from `p` from here on.
@@ -762,18 +1009,23 @@ impl OrdIndex {
     /// # Safety
     /// `p` holds a copy of `mapped_heads`, whole before this call, that
     /// stays as it is and allocated until `reset_heads` and past every
-    /// reader that may have loaded the pointer before it.
+    /// reader that may have loaded the pointer before it; the mapping is
+    /// one `mapped_heads` answers for.
     pub(crate) unsafe fn set_heads(&self, p: *const u8) {
+        debug_assert!(
+            self.mapped_heads().is_some(),
+            "heads copied for a paged mapping"
+        );
         self.heads
             .store(p as *mut u8, std::sync::atomic::Ordering::Release);
     }
 
     /// The heads read from the mapping again.
     pub(crate) fn reset_heads(&self) {
-        self.heads.store(
-            self.mapped_heads().as_ptr() as *mut u8,
-            std::sync::atomic::Ordering::Release,
-        );
+        if let Some(m) = self.mapped_heads() {
+            self.heads
+                .store(m.as_ptr() as *mut u8, std::sync::atomic::Ordering::Release);
+        }
     }
 
     /// `seek` within ranks `lo..hi`: the first rank there whose key is
@@ -818,8 +1070,9 @@ impl OrdIndex {
             }
         }
         let h = head_of(key, self.pfx);
-        let t = lower_bound(&self.top, h);
-        if self.top.get(t) == Some(&h) {
+        let top = self.top();
+        let t = lower_bound(top, h);
+        if top.get(t) == Some(&h) {
             return None;
         }
         Some(t.saturating_sub(1))
@@ -836,7 +1089,7 @@ impl OrdIndex {
             }
         }
         let h = head_of(key, self.pfx);
-        let t = lower_bound(&self.top, h);
+        let t = lower_bound(self.top(), h);
         Some(if t == 0 {
             (0, TOP_STRIDE.min(self.n))
         } else {
@@ -861,20 +1114,18 @@ impl OrdIndex {
         self.map.advise_willneed(off, (hi - lo) * HEAD)
     }
 
-    /// Whether every page of the heads is in the page cache now, by one
-    /// `mincore` over the mapping: what a reader about to ask for the heads
-    /// a run or a stride at a time looks at first, since each of those asks
-    /// reads its own page's residency with a call of its own
-    /// (`willneed_heads`), and over an index that is resident whole they
-    /// are calls and nothing else. False where the kernel will not say.
+    /// Whether every page of the heads is in memory now, by one question
+    /// of the mapping (`Bytes::resident_share`, one `mincore` for a mapped
+    /// file): what a reader about to ask for the heads a run or a stride at
+    /// a time looks at first, since each of those asks reads its own
+    /// page's residency with a call of its own (`willneed_heads`), and over
+    /// an index that is resident whole they are calls and nothing else.
+    /// False where the source will not say.
     pub fn heads_all_resident(&self) -> bool {
         if self.n == 0 || self.heads_owned() {
             return true;
         }
-        let len = self.n * HEAD;
-        let page = crate::bytes::os_page_size();
-        let pages = (HEADER + len).div_ceil(page) - HEADER / page;
-        self.map.resident_pages(HEADER, len) == pages
+        self.map.resident_share(HEADER as u64, self.n * HEAD) == Some(1.0)
     }
 
     /// Every head asked of the kernel, resident or not: for a release under
@@ -944,15 +1195,36 @@ impl OrdIndex {
             }
         }
         let h = head_of(key, self.pfx);
-        let (mut a, mut b) = (lo, hi);
-        while a < b {
-            let m = (a + b) / 2;
-            if self.head(m) < h {
-                a = m + 1;
-            } else {
-                b = m;
+        // Heads in memory are searched as the slice they are, the pointer
+        // loaded once and the window bounded once (`heads_held`): through
+        // `head` the search paid a test of the bound a probe and a call
+        // that returns behind it. A mapping read by the piece holds none,
+        // and is searched a head at a time.
+        let held = self.heads_held();
+        let a = if hi <= held.len() {
+            let (mut a, mut b) = (lo, hi);
+            while a < b {
+                let m = (a + b) / 2;
+                // SAFETY: `lo <= a <= m < b <= hi <= held.len()`.
+                if u64::from_be_bytes(*unsafe { held.get_unchecked(m) }) < h {
+                    a = m + 1;
+                } else {
+                    b = m;
+                }
             }
-        }
+            a
+        } else {
+            let (mut a, mut b) = (lo, hi);
+            while a < b {
+                let m = (a + b) / 2;
+                if self.head(m) < h {
+                    a = m + 1;
+                } else {
+                    b = m;
+                }
+            }
+            a
+        };
         if a >= hi || self.head(a) != h {
             // No head in the window ties the query: a head is a function
             // of its key's bytes, so the key at `a`, if the window has
@@ -1071,7 +1343,7 @@ impl OrdIndex {
         // branch form mispredicted about half its eleven steps over the
         // 2,300 samples of a partition at 300k keys, and each miss cost
         // what a step costs three times over.
-        let t = lower_bound(&self.top, h);
+        let t = lower_bound(self.top(), h);
         // No sample below the query is the first head at or above it. Past
         // the last sample below it, the search runs to the next sample and
         // lands on it when every head between is below.
@@ -1084,7 +1356,9 @@ impl OrdIndex {
         // three of them one after another, each a miss on a cold
         // partition, and issued at once they cost one.
         if lo < hi {
-            crate::db::prefetch_lines(self.heads_at(lo), (hi - lo) * HEAD);
+            if let Some(heads) = self.heads_at(lo) {
+                crate::db::prefetch_lines(heads, (hi - lo) * HEAD);
+            }
         }
         on_window(lo, hi);
         // The stride's heads searched with a mask a step, as the top
@@ -1167,10 +1441,34 @@ impl OrdIndex {
     /// the heads or cannot be planned from memory -- an empty index, a
     /// query outside the common prefix, a prefix not learned -- and the
     /// caller seeks as it did.
+    #[inline]
     pub fn plan_seek(&self, key: &[u8], t: &mut usize) -> Option<SeekPlan> {
+        // An empty top level is an index of no keys for a mapped file, the
+        // test this made of `n` before a mapping read by the piece left it
+        // empty until its first seek (`top`): one test for both, and the
+        // second kind planned out of line (`plan_seek_late`), so that a
+        // caller this is inlined into keeps no call that returns.
+        if self.top_eager.is_empty() {
+            return self.plan_seek_late(key, t);
+        }
+        self.plan_over(&self.top_eager, key, t)
+    }
+
+    /// `plan_seek` for an index with no top level read at its open: none
+    /// for an index of no keys, and the level read at the first seek for
+    /// a mapping read by the piece (`top_late`).
+    #[cold]
+    #[inline(never)]
+    fn plan_seek_late(&self, key: &[u8], t: &mut usize) -> Option<SeekPlan> {
         if self.n == 0 {
             return None;
         }
+        self.plan_over(self.top_late(), key, t)
+    }
+
+    /// `plan_seek` over the top level `top`.
+    #[inline(always)]
+    fn plan_over(&self, top: &[u64], key: &[u8], t: &mut usize) -> Option<SeekPlan> {
         if self.pfx > 0 {
             let prefix = self.prefix.as_deref()?;
             if key.len() < self.pfx
@@ -1182,9 +1480,8 @@ impl OrdIndex {
         }
         let h = head_of(key, self.pfx);
         let was = *t;
-        let same =
-            was < self.top.len() && self.top[was] >= h && (was == 0 || self.top[was - 1] < h);
-        let at = if same { was } else { lower_bound(&self.top, h) };
+        let same = was < top.len() && top[was] >= h && (was == 0 || top[was - 1] < h);
+        let at = if same { was } else { lower_bound(top, h) };
         *t = at;
         // `seek_exact_hint`'s window: nothing to search below the first
         // sample, and otherwise the heads past the last sample below the
@@ -1195,7 +1492,9 @@ impl OrdIndex {
             ((at - 1) * TOP_STRIDE + 1, (at * TOP_STRIDE).min(self.n))
         };
         if !same && lo < hi {
-            crate::db::prefetch_lines(self.heads_at(lo), (hi - lo) * HEAD);
+            if let Some(heads) = self.heads_at(lo) {
+                crate::db::prefetch_lines(heads, (hi - lo) * HEAD);
+            }
         }
         Some(SeekPlan {
             lo: lo as u32,
@@ -1215,6 +1514,48 @@ impl OrdIndex {
     ) -> (usize, Option<bool>) {
         let h = plan.head;
         debug_assert_eq!(h, head_of(key, self.pfx), "a plan is its own key's");
+        // The heads of a mapped file are in memory, every one of them
+        // (`lim` is `n`), and are read here with a bound that cannot fail
+        // and panics if it does; a mapping read by the piece, whose heads
+        // are asked for by a call that returns (`head_absent`), is sought
+        // out of line (`seek_planned_by_piece`). Kept in the function a
+        // settle inlines this into, the call that returns cost the settle
+        // instructions a key in values it kept across the call.
+        if self.lim == 0 {
+            return self.seek_planned_by_piece(plan, key, key_at);
+        }
+        let heads = self.heads_held();
+        debug_assert!(
+            plan.lo <= plan.hi && plan.hi as usize <= heads.len(),
+            "a plan's stride ends before it begins or past the heads"
+        );
+        let (base, hi) = (plan.lo as usize, (plan.hi as usize).min(heads.len()));
+        let stride = &heads[base.min(hi)..hi];
+        let lo = base
+            + crate::db::select_lower_bound(stride.len(), |i| {
+                debug_assert!(i < stride.len(), "a probe past the stride");
+                // SAFETY: `select_lower_bound` probes below its `n`, the
+                // stride's length, and nowhere else.
+                u64::from_be_bytes(*unsafe { stride.get_unchecked(i) }) < h
+            });
+        // `exact_at`'s test of the head at `lo`, over the heads in hand:
+        // `lim` is `n`, so the one bound is both of its tests.
+        match heads.get(lo) {
+            Some(x) if u64::from_be_bytes(*x) == h => self.exact_tied(lo, h, key, key_at),
+            _ => (lo, self.uniform_len.map(|_| false)),
+        }
+    }
+
+    /// `seek_exact_planned` for a mapping read by the piece.
+    #[cold]
+    #[inline(never)]
+    fn seek_planned_by_piece<'a>(
+        &self,
+        plan: SeekPlan,
+        key: &[u8],
+        key_at: impl Fn(usize) -> Option<&'a [u8]>,
+    ) -> (usize, Option<bool>) {
+        let h = plan.head;
         let (base, hi) = (plan.lo as usize, (plan.hi as usize).min(self.n));
         let lo = base + crate::db::select_lower_bound(hi - base, |i| self.head(base + i) < h);
         self.exact_at(lo, h, key, key_at)
@@ -1270,6 +1611,18 @@ impl OrdIndex {
             // would have to say.
             return (lo, self.uniform_len.map(|_| false));
         }
+        self.exact_tied(lo, h, key, key_at)
+    }
+
+    /// `exact_at` where the head at `lo` ties the query's.
+    #[inline(always)]
+    fn exact_tied<'a>(
+        &self,
+        lo: usize,
+        h: u64,
+        key: &[u8],
+        key_at: impl Fn(usize) -> Option<&'a [u8]>,
+    ) -> (usize, Option<bool>) {
         if let Some(len) = self.uniform_len {
             // A head is a whole key. A query no longer than the keys that
             // ties one is that key or a proper prefix of it, so not below
@@ -1644,6 +1997,92 @@ mod tests {
         check_from(&keys, &[b"x", longer.as_slice(), b"zz"], "from-headtie");
     }
 
+    /// A plan's stride begins at or before it ends and within the heads:
+    /// `plan_seek` makes no other, and the planned seek holds it to that in
+    /// a checked build, where its slice of the heads would otherwise read a
+    /// disordered plan as an empty stride, or one past the heads as a stride
+    /// cut to them, and answer as if the plan were another.
+    #[test]
+    #[cfg(debug_assertions)]
+    fn a_plan_out_of_order_or_past_the_heads_is_refused_in_a_checked_build() {
+        let owned: Vec<Vec<u8>> = (0u32..1_000)
+            .map(|i| format!("{:016}", i * 3).into_bytes())
+            .collect();
+        let keys: Vec<&[u8]> = owned.iter().map(|k| k.as_slice()).collect();
+        let p = write(&build(&keys), "planned-disordered");
+        let mut idx = OrdIndex::open(&p, keys.len()).expect("opens");
+        idx.learn_prefix(keys[0]);
+        let key = keys[500];
+        let mut t = usize::MAX;
+        let good = idx.plan_seek(key, &mut t).expect("a mapped index plans");
+        assert!(good.lo <= good.hi, "plan_seek's own plan is in order");
+        let bad = SeekPlan {
+            lo: good.hi + 5,
+            hi: good.hi,
+            head: good.head,
+        };
+        let past = SeekPlan {
+            lo: good.lo,
+            hi: keys.len() as u32 + 10,
+            head: good.head,
+        };
+        for (plan, what) in [
+            (bad, "ends before it begins"),
+            (past, "ends past the heads"),
+        ] {
+            let refused = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                idx.seek_exact_planned(plan, key, |_| None)
+            }));
+            assert!(
+                refused.is_err(),
+                "a plan whose stride {what} was searched as a stride cut to the heads"
+            );
+        }
+        let _ = std::fs::remove_file(&p);
+    }
+
+    /// A mapped index of no keys plans no seek (`plan_seek`'s `None`), and
+    /// its seek answers rank zero.
+    #[test]
+    fn an_index_of_no_keys_plans_nothing() {
+        let p = write(&build(&[]), "planned-empty");
+        let idx = OrdIndex::open(&p, 0).expect("opens");
+        let mut t = usize::MAX;
+        for k in [&b""[..], b"k", b"0000000000000000"] {
+            assert!(
+                idx.plan_seek(k, &mut t).is_none(),
+                "an empty index plans {k:?}"
+            );
+            assert_eq!(idx.seek_exact(k, |_| None).0, 0);
+        }
+        let _ = std::fs::remove_file(&p);
+    }
+
+    /// A mapped file's planned seeks read the top level its open read,
+    /// and never the one a mapping read by the piece makes at its first
+    /// seek (`top_late`).
+    #[test]
+    fn a_mapped_index_plans_from_the_top_level_read_at_its_open() {
+        let owned: Vec<Vec<u8>> = (0u32..3_000)
+            .map(|i| format!("{:016}", i * 3).into_bytes())
+            .collect();
+        let keys: Vec<&[u8]> = owned.iter().map(|k| k.as_slice()).collect();
+        let p = write(&build(&keys), "planned-eager-top");
+        let mut idx = OrdIndex::open(&p, keys.len()).expect("opens");
+        idx.learn_prefix(keys[0]);
+        let mut t = usize::MAX;
+        for k in &keys {
+            assert!(
+                idx.plan_seek(k, &mut t).is_some(),
+                "a key of the index plans"
+            );
+        }
+        assert!(
+            idx.top_late.get().is_none(),
+            "a mapped file's plans read its top level again, which its open read already"
+        );
+    }
+
     /// A planned seek answers as `seek_exact` does, for keys and for
     /// probes between them, with the top-level position carried from one
     /// query to the next in key order, carried from a query anywhere
@@ -1770,7 +2209,7 @@ mod tests {
         };
         let mapped = answers(&idx);
         assert!(!idx.heads_owned());
-        let copy: Vec<u8> = idx.mapped_heads().to_vec();
+        let copy: Vec<u8> = idx.mapped_heads().expect("a mapped file").to_vec();
         // SAFETY: a whole copy of the heads, alive until the reset below.
         unsafe { idx.set_heads(copy.as_ptr()) };
         assert!(idx.heads_owned());
@@ -1819,9 +2258,362 @@ mod tests {
                 String::from_utf8_lossy(k)
             );
             let h = head_of(k, idx.pfx);
-            if super::lower_bound(&idx.top, h) == 0 {
+            if super::lower_bound(idx.top(), h) == 0 {
                 assert_eq!((lo, hi), (0, 0), "below every sample");
             }
+        }
+        let _ = std::fs::remove_file(&p);
+    }
+
+    /// A paged mapping over bytes held in memory, which says the share it
+    /// is given of any range that meets its cold range is resident and all
+    /// of any other: what a mapping read by the piece is to an index. It
+    /// counts what it is asked to make present, and refuses any range
+    /// that meets its last field's.
+    struct InMemory(
+        Vec<u8>,
+        f64,
+        std::ops::Range<u64>,
+        std::sync::atomic::AtomicUsize,
+        std::ops::Range<u64>,
+    );
+    impl crate::bytes::Paging for InMemory {
+        fn base_address(&self, _: crate::bytes::BaseAddressToken) -> *const u8 {
+            self.0.as_ptr()
+        }
+        fn size(&self) -> u64 {
+            self.0.len() as u64
+        }
+        fn ensure(&self, off: u64, len: usize) -> bool {
+            self.3.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            off.checked_add(len as u64)
+                .is_some_and(|e| e <= self.size() && !(off < self.4.end && self.4.start < e))
+        }
+        fn place(&self, off: u64, len: usize) -> Option<*const u8> {
+            self.ensure(off, len)
+                .then(|| self.0.as_ptr().wrapping_add(off as usize))
+        }
+        fn place_piece(&self, off: u64) -> Option<(*const u8, usize)> {
+            match self.piece_from(off) {
+                0 => None,
+                n => Some((self.0.as_ptr().wrapping_add(off as usize), n)),
+            }
+        }
+        fn piece_end(&self, _: u64) -> u64 {
+            self.size()
+        }
+        fn piece_from(&self, off: u64) -> usize {
+            self.size().saturating_sub(off) as usize
+        }
+        fn advise(&self, _: bool) {}
+        fn resident(&self, off: u64, len: usize) -> f64 {
+            let end = off.saturating_add(len as u64);
+            if off < self.2.end && self.2.start < end {
+                self.1
+            } else {
+                1.0
+            }
+        }
+        fn forget(&self, _: u64, _: usize) {}
+        fn willneed(&self, _: u64, _: usize) -> usize {
+            0
+        }
+        fn populate(&self, _: u64, _: usize) -> bool {
+            false
+        }
+        fn mapped(&self, _: u64, _: usize) -> Option<f64> {
+            None
+        }
+    }
+
+    /// `bytes` as an index's mapping read by the piece, `share` of any
+    /// range of it that meets `cold` said to be resident.
+    fn in_memory(bytes: Vec<u8>, share: f64, cold: std::ops::Range<u64>) -> MmapBytes {
+        MmapBytes::paged(std::sync::Arc::new(InMemory(
+            bytes,
+            share,
+            cold,
+            std::sync::atomic::AtomicUsize::new(0),
+            0..0,
+        )))
+    }
+
+    /// Whether every head is in memory is asked of the source, for either
+    /// kind of mapping: an index read by the piece over a source that holds
+    /// all of it answers yes, as a mapped index just written does, and one
+    /// over a source that holds part of it no. Asked of a mapping's lent
+    /// slice, it answered no for ever.
+    #[test]
+    fn the_heads_resident_are_asked_of_the_source_for_either_kind() {
+        let owned: Vec<Vec<u8>> = (0u32..2_000)
+            .map(|i| format!("{:016}", i * 3).into_bytes())
+            .collect();
+        let keys: Vec<&[u8]> = owned.iter().map(|k| k.as_slice()).collect();
+        let p = write(&build(&keys), "heads-resident");
+        let mapped = OrdIndex::open(&p, keys.len()).expect("opens");
+        let over = |share: f64| {
+            OrdIndex::over(
+                in_memory(std::fs::read(&p).unwrap(), share, 0..u64::MAX),
+                keys.len(),
+            )
+            .expect("opens by the piece")
+        };
+        assert!(mapped.heads_all_resident(), "a file just written");
+        assert!(
+            over(1.0).heads_all_resident(),
+            "a source that holds all of it"
+        );
+        assert!(
+            !over(0.99).heads_all_resident(),
+            "one that holds most of it"
+        );
+        assert!(!over(0.0).heads_all_resident(), "one that holds none of it");
+        // The question is of the heads' own bytes, by their place in the
+        // file: the header's being out says nothing of them, and the last
+        // head's being out is an answer of no.
+        let cold = |range: std::ops::Range<u64>| {
+            OrdIndex::over(
+                in_memory(std::fs::read(&p).unwrap(), 0.0, range),
+                keys.len(),
+            )
+            .expect("opens by the piece")
+        };
+        let heads_end = (HEADER + keys.len() * HEAD) as u64;
+        assert!(
+            cold(0..HEADER as u64).heads_all_resident(),
+            "a source whose header alone is out"
+        );
+        assert!(
+            !cold(heads_end - 1..heads_end).heads_all_resident(),
+            "a source whose last head is out"
+        );
+        let _ = std::fs::remove_file(&p);
+    }
+
+    /// An index read by the piece answers every seek as the mapped one
+    /// does: its top level is read at the first seek, so a path that reads
+    /// the level's field and not `top()` sees an index of no samples --
+    /// `plan_seek` planned every key into the window below the first
+    /// sample and the settle filed it at rank zero, under a cipher.
+    #[test]
+    fn an_index_read_by_the_piece_seeks_as_the_mapped_one() {
+        let owned: Vec<Vec<u8>> = (0u32..2_000)
+            .map(|i| format!("{:016}", i * 3).into_bytes())
+            .collect();
+        let keys: Vec<&[u8]> = owned.iter().map(|k| k.as_slice()).collect();
+        let probes: Vec<Vec<u8>> = (0u32..6_100)
+            .map(|i| format!("{i:016}").into_bytes())
+            .collect();
+        let p = write(&build(&keys), "by-the-piece");
+        let mapped = OrdIndex::open(&p, keys.len()).expect("opens");
+        let bytes = std::fs::read(&p).expect("reads");
+        let paged = in_memory(bytes, 1.0, 0..u64::MAX);
+        assert!(paged.piecewise());
+        let mut by_piece = OrdIndex::over(paged, keys.len()).expect("opens by the piece");
+        let mut mapped = mapped;
+        mapped.learn_prefix(keys[0]);
+        by_piece.learn_prefix(keys[0]);
+        let (mut tm, mut tp) = (usize::MAX, usize::MAX);
+        for k in probes.iter().map(|k| k.as_slice()) {
+            let want = mapped.seek_exact(k, resolver(&keys));
+            assert_eq!(by_piece.seek_exact(k, resolver(&keys)), want);
+            assert_eq!(by_piece.floor_stride(k), mapped.floor_stride(k));
+            let (pm, pp) = (mapped.plan_seek(k, &mut tm), by_piece.plan_seek(k, &mut tp));
+            assert_eq!(pm.is_some(), pp.is_some());
+            if let (Some(pm), Some(pp)) = (pm, pp) {
+                assert_eq!(mapped.seek_exact_planned(pm, k, resolver(&keys)), want);
+                assert_eq!(by_piece.seek_exact_planned(pp, k, resolver(&keys)), want);
+            }
+        }
+        let _ = std::fs::remove_file(&p);
+    }
+
+    /// The top level an index read by the piece reads late is the mapped
+    /// one's, sample for sample, and is asked of its source a run of heads
+    /// at a time (`TOP_RUN`): three asks for an index of two runs and a
+    /// part of one, where a head an ask was six hundred and more, each a
+    /// piece of the heads made present by itself. `top_now` is that read,
+    /// made once, and a seek after it asks for its stride alone. A run the
+    /// source cannot lend is read a head at a time, where a head that
+    /// does not read answers zero and every other sample is right.
+    #[test]
+    fn a_top_level_read_late_is_asked_for_a_run_at_a_time() {
+        let n = 2 * TOP_RUN + 6_037;
+        let owned: Vec<Vec<u8>> = (0..n as u64)
+            .map(|i| format!("{:016}", i * 3 + 1).into_bytes())
+            .collect();
+        let keys: Vec<&[u8]> = owned.iter().map(|k| k.as_slice()).collect();
+        let p = write(&build(&keys), "top-by-runs");
+        let mut mapped = OrdIndex::open(&p, n).expect("opens");
+        mapped.learn_prefix(keys[0]);
+        let want = mapped.top().to_vec();
+        assert_eq!(want.len(), n.div_ceil(TOP_STRIDE));
+        let over = |no: std::ops::Range<u64>| {
+            let src = std::sync::Arc::new(InMemory(
+                std::fs::read(&p).expect("reads"),
+                1.0,
+                0..0,
+                std::sync::atomic::AtomicUsize::new(0),
+                no,
+            ));
+            let mut idx =
+                OrdIndex::over(MmapBytes::paged(src.clone()), n).expect("opens by the piece");
+            idx.learn_prefix(keys[0]);
+            (idx, src)
+        };
+        let asked = |src: &InMemory| src.3.load(std::sync::atomic::Ordering::Relaxed);
+
+        let (idx, src) = over(0..0);
+        let at_open = asked(&src);
+        idx.top_now();
+        assert_eq!(asked(&src) - at_open, 3, "an ask a run of heads");
+        assert_eq!(idx.top(), &want[..], "the mapped index's samples");
+        idx.top_now();
+        assert_eq!(asked(&src) - at_open, 3, "read once");
+        let read = asked(&src);
+        let mut t = usize::MAX;
+        let plan = idx
+            .plan_seek(keys[n / 2], &mut t)
+            .expect("a key of the index plans");
+        let got = idx.seek_exact_planned(plan, keys[n / 2], resolver(&keys));
+        assert_eq!(got, mapped.seek_exact(keys[n / 2], resolver(&keys)));
+        assert!(
+            asked(&src) - read <= TOP_STRIDE + 2,
+            "a seek after the level is read asks for its stride: {}",
+            asked(&src) - read
+        );
+
+        // A byte of the second run that does not read: the run is refused
+        // whole and asked for again a head at a time, where the one head
+        // over that byte answers zero and every other sample is the
+        // mapped index's.
+        let second = (HEADER + TOP_RUN * HEAD) as u64;
+        let (idx, src) = over(second..second + 1);
+        let at_open = asked(&src);
+        let top = idx.top().to_vec();
+        let per_run = TOP_RUN / TOP_STRIDE;
+        assert_eq!(top.len(), want.len());
+        assert_eq!(top[per_run], 0, "the head that did not read");
+        assert_ne!(want[per_run], 0);
+        assert_eq!(&top[..per_run], &want[..per_run], "the run before it");
+        assert_eq!(
+            &top[per_run + 1..],
+            &want[per_run + 1..],
+            "every sample after it"
+        );
+        assert_eq!(
+            asked(&src) - at_open,
+            3 + per_run,
+            "the run refused is asked for again a head at a time"
+        );
+        let _ = std::fs::remove_file(&p);
+    }
+
+    /// A head's bracket from an index read by the piece is the mapped
+    /// one's, at every rank: the top level it reads is the one read at the
+    /// first seek (`top()`), so a bracket that read the level's field saw
+    /// an index of no samples under a cipher.
+    #[test]
+    fn a_heads_bracket_by_the_piece_is_the_mapped_ones() {
+        let owned: Vec<Vec<u8>> = (0u32..2_000)
+            .map(|i| format!("{:08}-{:05}", i / 7, i % 7).into_bytes())
+            .collect();
+        let keys: Vec<&[u8]> = owned.iter().map(|k| k.as_slice()).collect();
+        let p = write(&build(&keys), "bracket-by-the-piece");
+        let mut mapped = OrdIndex::open(&p, keys.len()).expect("opens");
+        let paged = in_memory(std::fs::read(&p).expect("reads"), 1.0, 0..u64::MAX);
+        let mut by_piece = OrdIndex::over(paged, keys.len()).expect("opens by the piece");
+        mapped.learn_prefix(keys[0]);
+        by_piece.learn_prefix(keys[0]);
+        assert!(!mapped.uniform(), "the heads are not whole keys");
+        let (mut lo, mut hi, mut plo, mut phi) = (Vec::new(), Vec::new(), Vec::new(), Vec::new());
+        let mut bracketed = 0usize;
+        for r in 0..=keys.len() {
+            let want = mapped.head_bracket(r, &mut lo, &mut hi);
+            let got = by_piece.head_bracket(r, &mut plo, &mut phi);
+            assert_eq!(got, want, "a bracket at rank {r}");
+            if want {
+                bracketed += 1;
+                assert_eq!((&plo, &phi), (&lo, &hi), "the bracket at rank {r}");
+            }
+        }
+        assert!(bracketed > 1, "brackets taken: {bracketed}");
+        let _ = std::fs::remove_file(&p);
+    }
+
+    /// A key from the heads of an index read by the piece is the mapped
+    /// one's, at every rank and one past the last, a top level's rank and
+    /// a head's alike: the mapped index reads its heads in memory under
+    /// one bound (`lim`), and the one read by the piece, whose bound is
+    /// zero, answers through `whole_key_at_by_piece` -- a half that read
+    /// the mapped one's top level or heads saw none under a cipher. A
+    /// prefix learned short sends a mapped index there too, and answers
+    /// nothing.
+    #[test]
+    fn a_whole_key_by_the_piece_is_the_mapped_ones() {
+        let owned: Vec<Vec<u8>> = (0u32..1_000)
+            .map(|i| format!("{:016}", i * 7).into_bytes())
+            .collect();
+        let keys: Vec<&[u8]> = owned.iter().map(|k| k.as_slice()).collect();
+        let p = write(&build(&keys), "whole-by-the-piece");
+        let mut mapped = OrdIndex::open(&p, keys.len()).expect("opens");
+        let paged = in_memory(std::fs::read(&p).expect("reads"), 1.0, 0..u64::MAX);
+        let mut by_piece = OrdIndex::over(paged, keys.len()).expect("opens by the piece");
+        mapped.learn_prefix(keys[0]);
+        by_piece.learn_prefix(keys[0]);
+        assert!(
+            mapped.uniform() && by_piece.uniform(),
+            "heads are whole keys"
+        );
+        let (mut a, mut b) = (Vec::new(), Vec::new());
+        for r in 0..keys.len() + 2 {
+            let want = keys.get(r).copied();
+            assert_eq!(mapped.whole_key_at(r, &mut a), want, "mapped, rank {r}");
+            assert_eq!(
+                by_piece.whole_key_at(r, &mut b),
+                want,
+                "by the piece, rank {r}"
+            );
+        }
+        mapped.learn_prefix(&keys[0][..2]);
+        for r in [0, 1, TOP_STRIDE, keys.len() - 1] {
+            assert_eq!(
+                mapped.whole_key_at(r, &mut a),
+                None,
+                "prefix short, rank {r}"
+            );
+        }
+        let _ = std::fs::remove_file(&p);
+    }
+
+    /// A prefix learned short of the index's common prefix -- from a key
+    /// shorter than it, which `learn_prefix` takes -- brackets nothing: a
+    /// head is the key's bytes after `pfx` of them, and a bracket built from
+    /// fewer would place a key by bytes that are not its head's.
+    #[test]
+    fn a_heads_bracket_is_refused_under_a_prefix_learned_short() {
+        let owned: Vec<Vec<u8>> = (0u32..2_000)
+            .map(|i| format!("{:08}-{:05}", i / 7, i % 7).into_bytes())
+            .collect();
+        let keys: Vec<&[u8]> = owned.iter().map(|k| k.as_slice()).collect();
+        let p = write(&build(&keys), "bracket-short-prefix");
+        let mut idx = OrdIndex::open(&p, keys.len()).expect("opens");
+        assert!(
+            idx.pfx > 2,
+            "the keys share a prefix longer than the one learned"
+        );
+        let (mut lo, mut hi) = (Vec::new(), Vec::new());
+        idx.learn_prefix(keys[0]);
+        assert!(
+            idx.head_bracket(0, &mut lo, &mut hi),
+            "learned whole, rank 0 brackets"
+        );
+        idx.learn_prefix(&keys[0][..2]);
+        for r in 0..=keys.len() {
+            assert!(
+                !idx.head_bracket(r, &mut lo, &mut hi),
+                "a bracket at rank {r}"
+            );
         }
         let _ = std::fs::remove_file(&p);
     }

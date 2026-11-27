@@ -411,6 +411,34 @@ pub fn verify_pieces_with(
     Ok(())
 }
 
+/// `verify_pieces` over a section of any kind (`Sect`): each piece asked
+/// for on its own, and the row once, so a section by the piece is never
+/// asked for whole. `Err(piece)` names the first mismatch or a piece the
+/// section does not lend; `Err(usize::MAX)` a row it does not lend. The row
+/// holds a word for every piece by its length, so each piece is held to
+/// its word as the two are walked together.
+pub fn verify_pieces_in<'a, S: Sect<'a>>(
+    sec: S,
+    crc_off: usize,
+    shift: u32,
+    base: u64,
+) -> std::result::Result<(), usize> {
+    let n = checksum_row_len(crc_off, shift, base);
+    let row = sec
+        .range(crc_off, crc_off.saturating_add(n))
+        .ok_or(usize::MAX)?;
+    for (i, ((a, b), word)) in pieces(crc_off, shift, base)
+        .zip(row.as_chunks::<4>().0)
+        .enumerate()
+    {
+        let got = sec.range(a, b).ok_or(i)?;
+        if crate::block::crc32(got).to_le_bytes() != *word {
+            return Err(i);
+        }
+    }
+    Ok(())
+}
+
 /// Where the fence lies in a section of `sec_len` bytes: from its offset
 /// array to the start of whichever region comes next, or the section end.
 /// `(0, 0)` for a section without a fence. Both writers put the fence
@@ -713,6 +741,209 @@ pub fn parse_record_tail(header: [u8; 4], rest: &[u8]) -> Option<(Exts<'_>, &[u8
     let t_at = n * EXT_BYTES;
     let tail = rest.get(t_at..t_at.checked_add(tail_len)?)?;
     Some((Exts::Borrowed(exts), tail, t_at + tail_len))
+}
+
+/// A section as a reader holds it: the bytes whole, or a source asked for
+/// them by the piece.
+///
+/// Every reader of this format was written over `&[u8]`, the section
+/// borrowed whole and addressed into, and that is still what a reader over
+/// a mapped file runs: the impl for `&[u8]` is the slice operations the
+/// functions below used to spell out, so their code over a slice is the
+/// code they were. `Pieces` is the other impl, for a source that makes
+/// bytes present when they are asked for (`Bytes::piecewise`): nothing of
+/// the section is touched but through one of these calls, each of which
+/// asks the source for the bytes it is about to read.
+///
+/// The record parsers are not generic and there is one of each
+/// (`parse_record`, `record_key`): a section by the piece hands them a
+/// window that holds the record and they parse it as they parse any slice.
+pub trait Sect<'a>: Copy {
+    /// The bytes `a..b` as a section of the same kind; nothing is read.
+    fn part(self, a: usize, b: usize) -> Option<Self>;
+    /// The bytes `a..b`, lent.
+    fn range(self, a: usize, b: usize) -> Option<&'a [u8]>;
+    /// A little-endian word at `at`.
+    fn u32_at(self, at: usize) -> Option<u32>;
+    fn u64_at(self, at: usize) -> Option<u64>;
+    /// The record at `off`, parsed (`parse_record`).
+    fn record(self, off: usize) -> Option<ParsedRecord<'a>>;
+    /// The key of the record at `off` alone (`record_key`).
+    fn key(self, off: usize) -> Option<&'a [u8]>;
+    /// The section's length in bytes.
+    fn size(self) -> usize;
+    /// Where this section, a part of `outer` (`part`), begins in it,
+    /// bytes: a pointer's difference for a slice, the sources' offsets'
+    /// for a section by the piece.
+    fn start_in(self, outer: Self) -> usize;
+}
+
+impl<'a> Sect<'a> for &'a [u8] {
+    #[inline(always)]
+    fn part(self, a: usize, b: usize) -> Option<Self> {
+        self.get(a..b)
+    }
+    #[inline(always)]
+    fn range(self, a: usize, b: usize) -> Option<&'a [u8]> {
+        self.get(a..b)
+    }
+    #[inline(always)]
+    fn u32_at(self, at: usize) -> Option<u32> {
+        rd_u32(self, at)
+    }
+    #[inline(always)]
+    fn u64_at(self, at: usize) -> Option<u64> {
+        rd_u64(self, at)
+    }
+    #[inline(always)]
+    fn record(self, off: usize) -> Option<ParsedRecord<'a>> {
+        parse_record(self, off)
+    }
+    #[inline(always)]
+    fn key(self, off: usize) -> Option<&'a [u8]> {
+        record_key(self, off)
+    }
+    #[inline(always)]
+    fn size(self) -> usize {
+        self.len()
+    }
+    #[inline(always)]
+    fn start_in(self, outer: Self) -> usize {
+        self.as_ptr() as usize - outer.as_ptr() as usize
+    }
+}
+
+/// A section of a source that lends by the piece: where it lies in the
+/// source, and nothing of its bytes. Each read asks the source for the
+/// range it wants (`Bytes::slice_at`), which is where such a source makes
+/// the bytes present.
+pub struct Pieces<'a, B: ?Sized> {
+    src: &'a B,
+    off: u64,
+    len: usize,
+}
+
+impl<B: ?Sized> Clone for Pieces<'_, B> {
+    fn clone(&self) -> Self {
+        *self
+    }
+}
+impl<B: ?Sized> Copy for Pieces<'_, B> {}
+
+/// The most a record's window grows to before the record is taken for
+/// damage: a key is at most 64 KiB and a record's extents at most a few
+/// hundred, so a record that has not parsed in this much is not one.
+const RECORD_WINDOW: usize = 16 << 20;
+
+impl<'a, B: crate::bytes::Bytes + ?Sized> Pieces<'a, B> {
+    /// `len` bytes of `src` at `off`, as a section.
+    pub fn new(src: &'a B, off: u64, len: usize) -> Pieces<'a, B> {
+        Pieces { src, off, len }
+    }
+
+    /// `f` over a window of the section from `off` that holds what `f`
+    /// parses there: the bytes to the end of the piece `off` lies in
+    /// first, which hold a record that does not cross a piece, then a
+    /// piece more, then twice as much each time. `f` answers `None` for a
+    /// window too short, since every byte of what it parses is a byte it
+    /// asked the window for; it answers `None` for damage too, which is
+    /// found when the window has grown to the section's end or to more
+    /// than any record is.
+    #[inline]
+    fn window<R>(self, off: usize, f: impl Fn(&'a [u8]) -> Option<R>) -> Option<R> {
+        if off >= self.len {
+            return None;
+        }
+        let room = self.len - off;
+        let at = self.off + off as u64;
+        // The piece the offset lies in, in one ask: a record that does
+        // not cross a piece, which is most of them, is parsed here.
+        let first = self.src.piece_at(at)?;
+        let first = &first[..first.len().min(room)];
+        if let Some(r) = f(first) {
+            return Some(r);
+        }
+        let piece = first.len().max(1);
+        if piece >= room {
+            return None;
+        }
+        let end = at + piece as u64;
+        let mut want = (self.src.piece_end(end).saturating_sub(at) as usize)
+            .max(piece + 1)
+            .min(room);
+        loop {
+            if let Some(r) = f(self.src.slice_at(at, want)?) {
+                return Some(r);
+            }
+            if want >= room || want >= RECORD_WINDOW {
+                return None;
+            }
+            // A piece more was the first try past the offset's own, for a
+            // record that crosses into the next; after that the window
+            // doubles.
+            want = (want * 2).min(room);
+        }
+    }
+}
+
+impl<'a, B: crate::bytes::Bytes + ?Sized> Pieces<'a, B> {
+    /// Where the section lies in its source.
+    pub fn offset(self) -> u64 {
+        self.off
+    }
+
+    /// The record at `off` as its image: the bytes `parse_record` consumes
+    /// for it, padding included (`record_key_next`), from a window that
+    /// holds them. What a reader that copies records out whole asks for,
+    /// one ask a record that does not cross a piece.
+    pub fn image(self, off: usize) -> Option<&'a [u8]> {
+        self.window(off, |w| {
+            let (_, next) = record_key_next(w, 0)?;
+            w.get(..next)
+        })
+    }
+}
+
+impl<'a, B: crate::bytes::Bytes + ?Sized> Sect<'a> for Pieces<'a, B> {
+    #[inline]
+    fn part(self, a: usize, b: usize) -> Option<Self> {
+        (a <= b && b <= self.len).then(|| Pieces {
+            src: self.src,
+            off: self.off + a as u64,
+            len: b - a,
+        })
+    }
+    #[inline]
+    fn range(self, a: usize, b: usize) -> Option<&'a [u8]> {
+        if a > b || b > self.len {
+            return None;
+        }
+        self.src.slice_at(self.off + a as u64, b - a)
+    }
+    #[inline]
+    fn u32_at(self, at: usize) -> Option<u32> {
+        rd_u32(self.range(at, at.checked_add(4)?)?, 0)
+    }
+    #[inline]
+    fn u64_at(self, at: usize) -> Option<u64> {
+        rd_u64(self.range(at, at.checked_add(8)?)?, 0)
+    }
+    #[inline]
+    fn record(self, off: usize) -> Option<ParsedRecord<'a>> {
+        self.window(off, |w| parse_record(w, 0))
+    }
+    #[inline]
+    fn key(self, off: usize) -> Option<&'a [u8]> {
+        self.window(off, |w| record_key(w, 0))
+    }
+    #[inline]
+    fn size(self) -> usize {
+        self.len
+    }
+    #[inline]
+    fn start_in(self, outer: Self) -> usize {
+        (self.off - outer.off) as usize
+    }
 }
 
 /// The fence, held on its own: `fence_n + 1` offsets and the key blob they
@@ -1912,6 +2143,25 @@ impl FlatIndex {
     /// removed. Per-record bounds are checked at the point of use instead, so
     /// a damaged record costs that one lookup rather than the open.
     pub fn parse(sec: &[u8]) -> Option<FlatIndex> {
+        FlatIndex::parse_in(sec)
+    }
+
+    /// `parse` over a section however its reader holds it: the header's
+    /// words, the section's length, and the one word of the fence's
+    /// offsets that says how long its keys are.
+    pub fn parse_in<'a, S: Sect<'a>>(sec: S) -> Option<FlatIndex> {
+        let len = sec.size();
+        let head = sec.range(0, HEADER.min(len))?;
+        FlatIndex::parse_head(head, len, |at| sec.u32_at(at))
+    }
+
+    /// `sec` is the section's header, `len` the section's length, and
+    /// `word` a little-endian word of the section by its offset.
+    fn parse_head(
+        sec: &[u8],
+        len: usize,
+        word: impl Fn(usize) -> Option<u32>,
+    ) -> Option<FlatIndex> {
         if !is_flat(sec) {
             return None;
         }
@@ -1977,7 +2227,7 @@ impl FlatIndex {
             (recs_off, recs_end),
         ];
         for (a, b) in regions {
-            if a < HEADER || b > sec.len() || a > b {
+            if a < HEADER || b > len || a > b {
                 return None;
             }
         }
@@ -2005,15 +2255,14 @@ impl FlatIndex {
                 return None;
             }
             let offs_end = fence_offs_off.checked_add(fence_n.checked_add(1)?.checked_mul(4)?)?;
-            if fence_offs_off < HEADER || offs_end > sec.len() {
+            if fence_offs_off < HEADER || offs_end > len {
                 return None;
             }
-            let offs = sec.get(fence_offs_off..offs_end)?;
             // The last offset is the blob length, and the blob sits directly
             // after the offsets.
-            let blob_len = rd_u32(offs, fence_n * 4)? as usize;
+            let blob_len = word(fence_offs_off.checked_add(fence_n * 4)?)? as usize;
             let blob_end = offs_end.checked_add(blob_len)?;
-            if blob_end > sec.len() {
+            if blob_end > len {
                 return None;
             }
             // The fence region may not overlap the others either.
@@ -2041,7 +2290,7 @@ impl FlatIndex {
         // verifies. Here: the row starts inside the section, past the header.
         let (crc_off, piece_shift) = match checksum_words(sec).ok()? {
             Some((off, shift)) => {
-                if off < HEADER || off > sec.len() {
+                if off < HEADER || off > len {
                     return None;
                 }
                 (off, shift)
@@ -2083,14 +2332,18 @@ impl FlatIndex {
 
     /// The key and extents of the record at `off` within the record region.
     #[inline]
-    fn record<'a>(&self, sec: &'a [u8], off: usize) -> Option<(&'a [u8], Exts<'a>)> {
+    fn record<'a, S: Sect<'a>>(&self, sec: S, off: usize) -> Option<(&'a [u8], Exts<'a>)> {
         self.record_full(sec, off).map(|(k, e, _)| (k, e))
     }
 
     /// `record`, plus the record's tail: the bytes of its inline runs, sized
     /// from the extents that name `Ext::INLINE`. Empty for a record without
     /// one, which is every record `Store` writes.
-    fn record_full<'a>(&self, sec: &'a [u8], off: usize) -> Option<(&'a [u8], Exts<'a>, &'a [u8])> {
+    fn record_full<'a, S: Sect<'a>>(
+        &self,
+        sec: S,
+        off: usize,
+    ) -> Option<(&'a [u8], Exts<'a>, &'a [u8])> {
         // Records are laid out 4-aligned within the section and the section is
         // written at an 8-aligned file offset, so the extent borrow inside
         // `parse_record` is aligned by construction. It checks anyway, and the
@@ -2098,14 +2351,14 @@ impl FlatIndex {
         // aligned the section, records were aligned relative to the section
         // and not absolutely, and this is what turned undefined behaviour
         // into a miss.
-        let recs = sec.get(self.recs.0..self.recs.1)?;
-        parse_record(recs, off).map(|(k, e, t, _)| (k, e, t))
+        let recs = sec.part(self.recs.0, self.recs.1)?;
+        recs.record(off).map(|(k, e, t, _)| (k, e, t))
     }
 
     /// Extents for `key`, borrowed from the mapping. No allocation, no decode.
-    pub fn lookup<'a>(
+    pub fn lookup<'a, S: Sect<'a>>(
         &self,
-        sec: &'a [u8],
+        sec: S,
         key: &[u8],
         hash_of: fn(&[u8]) -> u64,
     ) -> Option<Exts<'a>> {
@@ -2120,9 +2373,9 @@ impl FlatIndex {
     /// returned the rebuilt extent read the C mix at about 0.85x of the
     /// shape before compact records (`docs/engine.md`).
     #[inline]
-    pub fn with_lookup<'a, R>(
+    pub fn with_lookup<'a, R, S: Sect<'a>>(
         &self,
-        sec: &'a [u8],
+        sec: S,
         key: &[u8],
         hash_of: fn(&[u8]) -> u64,
         f: impl FnOnce(&[Ext], &'a [u8]) -> R,
@@ -2184,25 +2437,25 @@ impl FlatIndex {
     /// `with_lookup` for a key whose hash the caller has already taken, as
     /// a point read over several sources takes it once for all of them.
     #[inline]
-    pub fn with_lookup_hashed<'a, R>(
+    pub fn with_lookup_hashed<'a, R, S: Sect<'a>>(
         &self,
-        sec: &'a [u8],
+        sec: S,
         key: &[u8],
         h: u64,
         f: impl FnOnce(&[Ext], &'a [u8]) -> R,
     ) -> Option<R> {
-        let hash = sec.get(self.hash.0..self.hash.1)?;
-        let recs = sec.get(self.recs.0..self.recs.1)?;
+        let hash = sec.part(self.hash.0, self.hash.1)?;
+        let recs = sec.part(self.recs.0, self.recs.1)?;
         let tag = ((h >> 56) | 1) & 0xff;
         let mut s = (h as usize) & self.mask;
         for _ in 0..self.hash_cap {
-            let packed = rd_u64(hash, s * SLOT)?;
+            let packed = hash.u64_at(s * SLOT)?;
             if packed == 0 {
                 return None;
             }
             if packed >> 56 == tag {
                 let off = (packed & 0x00ff_ffff_ffff_ffff) as usize;
-                if let Some((k, exts, tail, _)) = parse_record(recs, off) {
+                if let Some((k, exts, tail, _)) = recs.record(off) {
                     if k == key {
                         return Some(match exts {
                             Exts::One(e) => f(std::slice::from_ref(&e), tail),
@@ -2291,9 +2544,9 @@ impl FlatIndex {
     }
 
     /// `lookup`, with the record's tail of inline runs.
-    pub fn lookup_full<'a>(
+    pub fn lookup_full<'a, S: Sect<'a>>(
         &self,
-        sec: &'a [u8],
+        sec: S,
         key: &[u8],
         hash_of: fn(&[u8]) -> u64,
     ) -> Option<(Exts<'a>, &'a [u8])> {
@@ -2301,20 +2554,20 @@ impl FlatIndex {
     }
 
     /// `lookup_full` for a key whose hash the caller has already taken.
-    pub fn lookup_full_hashed<'a>(
+    pub fn lookup_full_hashed<'a, S: Sect<'a>>(
         &self,
-        sec: &'a [u8],
+        sec: S,
         key: &[u8],
         h: u64,
     ) -> Option<(Exts<'a>, &'a [u8])> {
-        let hash = sec.get(self.hash.0..self.hash.1)?;
+        let hash = sec.part(self.hash.0, self.hash.1)?;
         let tag = ((h >> 56) | 1) & 0xff;
         let mut s = (h as usize) & self.mask;
         // Bounded by the table size: a full table would otherwise spin here,
         // and the table is only ever half full, but the bound comes out of a
         // file so it is enforced rather than trusted.
         for _ in 0..self.hash_cap {
-            let packed = rd_u64(hash, s * SLOT)?;
+            let packed = hash.u64_at(s * SLOT)?;
             if packed == 0 {
                 return None;
             }
@@ -2357,7 +2610,7 @@ impl FlatIndex {
     pub const DIR_STATE_AT: usize = 152;
 
     /// The record at `rank` in key order.
-    pub fn at<'a>(&self, sec: &'a [u8], rank: usize) -> Option<(&'a [u8], Exts<'a>)> {
+    pub fn at<'a, S: Sect<'a>>(&self, sec: S, rank: usize) -> Option<(&'a [u8], Exts<'a>)> {
         self.at_full(sec, rank).map(|(k, e, _)| (k, e))
     }
 
@@ -2368,19 +2621,19 @@ impl FlatIndex {
     /// over one level-0 piece at 0.88x of the same scans over full
     /// records, with the instructions level.
     #[inline]
-    pub fn with_record_at<'a, R>(
+    pub fn with_record_at<'a, R, S: Sect<'a>>(
         &self,
-        sec: &'a [u8],
+        sec: S,
         rank: usize,
         f: impl FnOnce(&[Ext], &'a [u8]) -> R,
     ) -> Option<R> {
         if rank >= self.nkeys {
             return None;
         }
-        let recs = sec.get(self.recs.0..self.recs.1)?;
-        let dir = sec.get(self.dir.0..self.dir.1)?;
-        let off = rd_u32(dir, rank * 4)? as usize;
-        let (_, exts, tail, _) = parse_record(recs, off)?;
+        let recs = sec.part(self.recs.0, self.recs.1)?;
+        let dir = sec.part(self.dir.0, self.dir.1)?;
+        let off = dir.u32_at(rank * 4)? as usize;
+        let (_, exts, tail, _) = recs.record(off)?;
         Some(match exts {
             Exts::One(e) => f(std::slice::from_ref(&e), tail),
             Exts::Borrowed(exts) => f(exts, tail),
@@ -2389,20 +2642,20 @@ impl FlatIndex {
 
     /// The key at `rank` alone; see `record_key`.
     #[inline]
-    pub fn key_at<'a>(&self, sec: &'a [u8], rank: usize) -> Option<&'a [u8]> {
+    pub fn key_at<'a, S: Sect<'a>>(&self, sec: S, rank: usize) -> Option<&'a [u8]> {
         if rank >= self.nkeys {
             return None;
         }
-        let recs = sec.get(self.recs.0..self.recs.1)?;
-        let dir = sec.get(self.dir.0..self.dir.1)?;
-        let off = rd_u32(dir, rank * 4)? as usize;
-        record_key(recs, off)
+        let recs = sec.part(self.recs.0, self.recs.1)?;
+        let dir = sec.part(self.dir.0, self.dir.1)?;
+        let off = dir.u32_at(rank * 4)? as usize;
+        recs.key(off)
     }
 
     /// `at`, with the record's tail of inline runs.
-    pub fn at_full<'a>(
+    pub fn at_full<'a, S: Sect<'a>>(
         &self,
-        sec: &'a [u8],
+        sec: S,
         rank: usize,
     ) -> Option<(&'a [u8], Exts<'a>, &'a [u8])> {
         let (recs, dir) = self.regions(sec)?;
@@ -2417,10 +2670,10 @@ impl FlatIndex {
     /// 1.6ns a mapped stride walk of the same bytes takes, and the record
     /// read is not most of it. A caller walking a range slices here once and
     /// calls `at_full_in`; a caller resolving one rank keeps `at_full`.
-    pub fn regions<'a>(&self, sec: &'a [u8]) -> Option<(&'a [u8], &'a [u8])> {
+    pub fn regions<'a, S: Sect<'a>>(&self, sec: S) -> Option<(S, S)> {
         Some((
-            sec.get(self.recs.0..self.recs.1)?,
-            sec.get(self.dir.0..self.dir.1)?,
+            sec.part(self.recs.0, self.recs.1)?,
+            sec.part(self.dir.0, self.dir.1)?,
         ))
     }
 
@@ -2429,6 +2682,11 @@ impl FlatIndex {
     /// (`db::Seg::foot`).
     pub fn hash_bytes(&self) -> usize {
         self.hash.1.saturating_sub(self.hash.0)
+    }
+
+    /// The record region's bytes, the second of the two.
+    pub fn record_bytes(&self) -> usize {
+        self.recs.1.saturating_sub(self.recs.0)
     }
 
     /// Where the hash region and the record region lie in the section, as
@@ -2444,15 +2702,20 @@ impl FlatIndex {
     /// between them streams. Records ascend with rank in a segment; where
     /// a store's index has republished one into the slack the span is
     /// clipped to the first, since this is a hint and not a read.
-    pub fn record_span(&self, dir: &[u8], rank: usize, n: usize) -> Option<(usize, usize)> {
+    pub fn record_span<'a, S: Sect<'a>>(
+        &self,
+        dir: S,
+        rank: usize,
+        n: usize,
+    ) -> Option<(usize, usize)> {
         if rank >= self.nkeys {
             return None;
         }
         // A caller's span can be a scan's whole limit, `usize::MAX`
         // included: the sum saturates rather than wraps.
         let last = rank.saturating_add(n).min(self.nkeys - 1);
-        let a = rd_u32(dir, rank * 4)? as usize;
-        let b = rd_u32(dir, last * 4)? as usize;
+        let a = dir.u32_at(rank * 4)? as usize;
+        let b = dir.u32_at(last * 4)? as usize;
         Some((a, b.max(a)))
     }
 
@@ -2475,11 +2738,11 @@ impl FlatIndex {
     /// Where the record at `rank` lies by the directory: the one word, for
     /// a hint that estimates the span past it rather than reading a second
     /// word for it. `None` past the last rank or off the directory.
-    pub fn record_off(&self, dir: &[u8], rank: usize) -> Option<usize> {
+    pub fn record_off<'a, S: Sect<'a>>(&self, dir: S, rank: usize) -> Option<usize> {
         if rank >= self.nkeys {
             return None;
         }
-        Some(rd_u32(dir, rank * 4)? as usize)
+        Some(dir.u32_at(rank * 4)? as usize)
     }
 
     /// The record region's bytes over its keys, at least one.
@@ -2493,17 +2756,17 @@ impl FlatIndex {
     /// into the section's slack, so a cursor that advanced by record length
     /// would read the wrong bytes there.
     #[inline]
-    pub fn at_full_in<'a>(
+    pub fn at_full_in<'a, S: Sect<'a>>(
         &self,
-        recs: &'a [u8],
-        dir: &'a [u8],
+        recs: S,
+        dir: S,
         rank: usize,
     ) -> Option<(&'a [u8], Exts<'a>, &'a [u8])> {
         if rank >= self.nkeys {
             return None;
         }
-        let off = rd_u32(dir, rank * 4)? as usize;
-        parse_record(recs, off).map(|(k, e, t, _)| (k, e, t))
+        let off = dir.u32_at(rank * 4)? as usize;
+        recs.record(off).map(|(k, e, t, _)| (k, e, t))
     }
 
     /// Where a key that is *not* present would claim a hash slot.
@@ -2543,7 +2806,7 @@ impl FlatIndex {
     }
 
     /// The rank a key sits at, or would be inserted at to keep the order.
-    pub fn rank_for(&self, sec: &[u8], key: &[u8]) -> usize {
+    pub fn rank_for<'a, S: Sect<'a>>(&self, sec: S, key: &[u8]) -> usize {
         self.seek_with(sec, key, true).min(self.nkeys)
     }
 
@@ -2704,18 +2967,18 @@ impl FlatIndex {
 
     /// Position of the first key at or after `key`.
     /// The fence key at entry `i`, borrowed from the blob.
-    fn fence_key<'a>(&self, sec: &'a [u8], i: usize) -> Option<&'a [u8]> {
+    fn fence_key<'a, S: Sect<'a>>(&self, sec: S, i: usize) -> Option<&'a [u8]> {
         if i >= self.fence_n {
             return None;
         }
-        let offs = sec.get(self.fence_offs.0..self.fence_offs.1)?;
-        let a = rd_u32(offs, i * 4)? as usize;
-        let b = rd_u32(offs, (i + 1) * 4)? as usize;
+        let offs = sec.part(self.fence_offs.0, self.fence_offs.1)?;
+        let a = offs.u32_at(i * 4)? as usize;
+        let b = offs.u32_at((i + 1) * 4)? as usize;
         if a > b {
             return None;
         }
-        let blob = sec.get(self.fence_blob.0..self.fence_blob.1)?;
-        blob.get(a..b)
+        let blob = sec.part(self.fence_blob.0, self.fence_blob.1)?;
+        blob.range(a, b)
     }
 
     /// The rank range a key can lie in, according to the fence.
@@ -2724,7 +2987,7 @@ impl FlatIndex {
     /// greater than the target bounds the answer to one stride. The narrowing
     /// is a binary search over a few hundred kilobytes of contiguous keys
     /// rather than over tens of megabytes of scattered records.
-    fn fence_window(&self, sec: &[u8], key: &[u8]) -> (usize, usize) {
+    fn fence_window<'a, S: Sect<'a>>(&self, sec: S, key: &[u8]) -> (usize, usize) {
         if self.fence_n == 0 || self.fence_stride == 0 {
             return (0, self.nkeys);
         }
@@ -2747,7 +3010,7 @@ impl FlatIndex {
     }
 
     /// `fence` selects the arm, so both can be run over one file.
-    pub fn seek_with(&self, sec: &[u8], key: &[u8], fence: bool) -> usize {
+    pub fn seek_with<'a, S: Sect<'a>>(&self, sec: S, key: &[u8], fence: bool) -> usize {
         if fence && self.fence_n > 0 {
             let (lo, hi) = self.fence_window(sec, key);
             let r = self.search(sec, key, lo, hi);
@@ -2766,7 +3029,7 @@ impl FlatIndex {
     }
 
     /// Is `r` the first rank whose key is not less than `key`?
-    fn brackets(&self, sec: &[u8], key: &[u8], r: usize) -> bool {
+    fn brackets<'a, S: Sect<'a>>(&self, sec: S, key: &[u8], r: usize) -> bool {
         if r > self.nkeys {
             return false;
         }
@@ -2786,10 +3049,28 @@ impl FlatIndex {
         true
     }
 
-    fn search(&self, sec: &[u8], key: &[u8], mut lo: usize, mut hi: usize) -> usize {
+    fn search<'a, S: Sect<'a>>(&self, sec: S, key: &[u8], mut lo: usize, mut hi: usize) -> usize {
+        // The two regions once, before the loop, and `key_at`'s body over
+        // them in it: resolved at every probe, the section's base was one
+        // more value the loop kept across each compare's call. A region
+        // that will not resolve is a key that will not read at every
+        // probe, which narrows `hi` to `lo`: the answer is `lo`. (The
+        // parse holds every region inside the section, so this is the
+        // answer `key_at`'s loop gave on a path nothing reaches.)
+        let (Some(recs), Some(dir)) = (
+            sec.part(self.recs.0, self.recs.1),
+            sec.part(self.dir.0, self.dir.1),
+        ) else {
+            return lo;
+        };
         while lo < hi {
             let mid = lo + (hi - lo) / 2;
-            match self.key_at(sec, mid).map(|k| k.cmp(key)) {
+            let at = if mid < self.nkeys {
+                dir.u32_at(mid * 4).and_then(|off| recs.key(off as usize))
+            } else {
+                None
+            };
+            match at.map(|k| k.cmp(key)) {
                 Some(std::cmp::Ordering::Less) => lo = mid + 1,
                 // A record that will not decode sorts as "not less", which
                 // keeps the search terminating on damaged input.
@@ -3164,7 +3445,7 @@ mod tests {
         assert_eq!(ix.len(), all.len());
         assert_eq!(ix.generation, 7);
         for (k, e) in &all {
-            let got = ix.lookup(&sec, k, h).expect("present");
+            let got = ix.lookup(&sec[..], k, h).expect("present");
             assert_eq!(got, e.as_slice(), "extents differ for {k:?}");
         }
     }
@@ -3176,7 +3457,7 @@ mod tests {
         let ix = FlatIndex::parse(&sec).unwrap();
         for i in 0..2000 {
             let k = format!("absent{i:012}").into_bytes();
-            assert!(ix.lookup(&sec, &k, h).is_none());
+            assert!(ix.lookup(&sec[..], &k, h).is_none());
         }
     }
 
@@ -3191,7 +3472,7 @@ mod tests {
         let all = corpus(1000);
         let sec = padded(encode(&refs(&all), 1, None, h, 0, false).unwrap());
         let ix = FlatIndex::parse(&sec).unwrap();
-        let (recs, dir) = ix.regions(&sec).unwrap();
+        let (recs, dir) = ix.regions(&sec[..]).unwrap();
         let nkeys = ix.len();
         assert_eq!(nkeys, all.len());
         for r in [0usize, nkeys / 2, nkeys - 1] {
@@ -3224,16 +3505,16 @@ mod tests {
         let sec = padded(encode(&refs(&all), 1, None, h, 0, false).unwrap());
         let ix = FlatIndex::parse(&sec).unwrap();
         for (i, (k, e)) in all.iter().enumerate() {
-            let (gk, ge) = ix.at(&sec, i).expect("rank present");
+            let (gk, ge) = ix.at(&sec[..], i).expect("rank present");
             assert_eq!(gk, k.as_slice());
             assert_eq!(ge, e.as_slice());
-            assert_eq!(ix.key_at(&sec, i), Some(k.as_slice()));
-            let lent = ix.with_record_at(&sec, i, |exts, _| exts.to_vec());
+            assert_eq!(ix.key_at(&sec[..], i), Some(k.as_slice()));
+            let lent = ix.with_record_at(&sec[..], i, |exts, _| exts.to_vec());
             assert_eq!(lent.as_deref(), Some(e.as_slice()));
         }
-        assert!(ix.at(&sec, all.len()).is_none());
-        assert!(ix.key_at(&sec, all.len()).is_none());
-        assert!(ix.with_record_at(&sec, all.len(), |_, _| ()).is_none());
+        assert!(ix.at(&sec[..], all.len()).is_none());
+        assert!(ix.key_at(&sec[..], all.len()).is_none());
+        assert!(ix.with_record_at(&sec[..], all.len(), |_, _| ()).is_none());
     }
 
     /// The fence is an optimisation, so the only thing that makes it safe is
@@ -3259,8 +3540,8 @@ mod tests {
             probes.push(vec![0xff; 32]);
             for p in &probes {
                 assert_eq!(
-                    ix.seek_with(&sec, p, true),
-                    ix.seek_with(&sec, p, false),
+                    ix.seek_with(&sec[..], p, true),
+                    ix.seek_with(&sec[..], p, false),
                     "n={n} disagreed on {p:?}"
                 );
             }
@@ -3290,7 +3571,7 @@ mod tests {
             .step_by(53)
             .map(|(k, _)| {
                 let ix = FlatIndex::parse(&clean).unwrap();
-                ix.seek_with(&clean, k, false)
+                ix.seek_with(&clean[..], k, false)
             })
             .collect();
         let mut damaged = 0usize;
@@ -3303,7 +3584,7 @@ mod tests {
             damaged += 1;
             for ((k, _), want) in all.iter().step_by(53).zip(&truth) {
                 assert_eq!(
-                    ix.seek_with(&sec, k, true),
+                    ix.seek_with(&sec[..], k, true),
                     *want,
                     "byte {i} of the fence changed a seek"
                 );
@@ -3318,10 +3599,10 @@ mod tests {
         let sec = padded(encode(&refs(&all), 1, None, h, 0, false).unwrap());
         let ix = FlatIndex::parse(&sec).unwrap();
         for (i, (k, _)) in all.iter().enumerate() {
-            assert_eq!(ix.seek_with(&sec, k, true), i);
+            assert_eq!(ix.seek_with(&sec[..], k, true), i);
         }
-        assert_eq!(ix.seek_with(&sec, b"\x00", true), 0);
-        assert_eq!(ix.seek_with(&sec, b"\xff", true), all.len());
+        assert_eq!(ix.seek_with(&sec[..], b"\x00", true), 0);
+        assert_eq!(ix.seek_with(&sec[..], b"\xff", true), all.len());
     }
 
     /// The reason this module exists rather than a struct with a `decode`:
@@ -3336,12 +3617,12 @@ mod tests {
                 d[i] ^= bit;
                 if let Some(ix) = FlatIndex::parse(&d) {
                     for (k, _) in all.iter().take(40) {
-                        let _ = ix.lookup(&sec, k, h);
+                        let _ = ix.lookup(&sec[..], k, h);
                     }
                     for r in 0..ix.len().min(40) {
-                        let _ = ix.at(&sec, r);
+                        let _ = ix.at(&sec[..], r);
                     }
-                    let _ = ix.seek_with(&sec, b"key000000000100", true);
+                    let _ = ix.seek_with(&sec[..], b"key000000000100", true);
                 }
             }
         }
@@ -3354,10 +3635,10 @@ mod tests {
         for cut in 0..sec.len() {
             if let Some(ix) = FlatIndex::parse(&sec[..cut]) {
                 for (k, _) in all.iter().take(20) {
-                    let _ = ix.lookup(&sec, k, h);
+                    let _ = ix.lookup(&sec[..], k, h);
                 }
                 for r in 0..ix.len().min(20) {
-                    let _ = ix.at(&sec, r);
+                    let _ = ix.at(&sec[..], r);
                 }
             }
         }
@@ -3368,8 +3649,8 @@ mod tests {
         let sec = padded(encode(&refs(&[]), 3, None, h, 0, false).unwrap());
         let ix = FlatIndex::parse(&sec).unwrap();
         assert_eq!(ix.len(), 0);
-        assert!(ix.lookup(&sec, b"anything", h).is_none());
-        assert_eq!(ix.seek_with(&sec, b"anything", true), 0);
+        assert!(ix.lookup(&sec[..], b"anything", h).is_none());
+        assert_eq!(ix.seek_with(&sec[..], b"anything", true), 0);
     }
 
     #[test]
@@ -3547,6 +3828,20 @@ impl MappedBlocks {
         Some(MappedBlocks { off: BLK_HEADER, n })
     }
 
+    /// `parse` over a section held by the piece: the header's words and
+    /// the section's length say the same, and the entries' alignment,
+    /// which `parse` checks once, is checked where an entry is read
+    /// (`get`), since asking for the entries here would be asking for the
+    /// table whole.
+    pub fn parse_in<'a, S: Sect<'a>>(sec: S) -> Option<MappedBlocks> {
+        if sec.u32_at(0)? != BLK_MAGIC || sec.u32_at(4)? as usize != BLK_ENTRY {
+            return None;
+        }
+        let n = sec.u64_at(8)? as usize;
+        let end = BLK_HEADER.checked_add(n.checked_mul(BLK_ENTRY)?)?;
+        (end <= sec.size()).then_some(MappedBlocks { off: BLK_HEADER, n })
+    }
+
     pub fn len(&self) -> usize {
         self.n
     }
@@ -3563,7 +3858,7 @@ impl MappedBlocks {
     /// too short to hold the row, or when the chunk is out of range -- each a
     /// reason to fall back to the whole-block checksum rather than to accept
     /// an unverified read.
-    pub fn chunk_crc(&self, sec: &[u8], i: usize, j: usize) -> Option<u32> {
+    pub fn chunk_crc<'a, S: Sect<'a>>(&self, sec: S, i: usize, j: usize) -> Option<u32> {
         if i >= self.n || j >= crate::block::MAX_CHUNK_CRCS {
             return None;
         }
@@ -3571,15 +3866,15 @@ impl MappedBlocks {
         let at = base
             .checked_add(i.checked_mul(CRC_ROW)?)?
             .checked_add(j * 4)?;
-        rd_u32(sec, at)
+        sec.u32_at(at)
     }
 
-    pub fn get(&self, sec: &[u8], i: usize) -> Option<crate::block::BlockLoc> {
+    pub fn get<'a, S: Sect<'a>>(&self, sec: S, i: usize) -> Option<crate::block::BlockLoc> {
         if i >= self.n {
             return None;
         }
         let at = self.off.checked_add(i.checked_mul(BLK_ENTRY)?)?;
-        let bytes = sec.get(at..at.checked_add(BLK_ENTRY)?)?;
+        let bytes = sec.range(at, at.checked_add(BLK_ENTRY)?)?;
         if !(bytes.as_ptr() as usize).is_multiple_of(std::mem::align_of::<BlockRec>()) {
             return None;
         }
@@ -3620,12 +3915,12 @@ mod block_tests {
         assert_eq!(meta.len(), blocks.len());
         for (i, row) in rows.iter().enumerate() {
             assert!(
-                meta.get(&sec, i).expect("block").chunk_crc,
+                meta.get(&sec[..], i).expect("block").chunk_crc,
                 "flag lost at {i}"
             );
             for (j, want) in row.iter().enumerate() {
                 assert_eq!(
-                    meta.chunk_crc(&sec, i, j),
+                    meta.chunk_crc(&sec[..], i, j),
                     Some(*want),
                     "block {i} chunk {j}"
                 );
@@ -3670,7 +3965,7 @@ mod block_tests {
         let m = MappedBlocks::parse(&sec).expect("parse");
         assert_eq!(m.len(), blocks.len());
         for (i, b) in blocks.iter().enumerate() {
-            let g = m.get(&sec, i).expect("present");
+            let g = m.get(&sec[..], i).expect("present");
             assert_eq!(
                 (
                     g.off,
@@ -3693,7 +3988,7 @@ mod block_tests {
                 "block {i}"
             );
         }
-        assert!(m.get(&sec, blocks.len()).is_none());
+        assert!(m.get(&sec[..], blocks.len()).is_none());
     }
 
     /// Why `BlockRec` exists rather than mapping `BlockLoc` directly: a damaged
@@ -3708,7 +4003,7 @@ mod block_tests {
             d[i] ^= 0xff;
             if let Some(m) = MappedBlocks::parse(&d) {
                 for j in 0..m.len().min(200) {
-                    if let Some(b) = m.get(&d, j) {
+                    if let Some(b) = m.get(&d[..], j) {
                         std::hint::black_box((b.solo, b.chunked, b.off));
                     }
                 }

@@ -6,6 +6,13 @@
 //! sizes, and a regression is a row whose error bars lie entirely on the
 //! worse side of the last ten rows' on the same machine class.
 
+// LMDB's two lines define the same C symbols: a binary links one.
+#[cfg(all(feature = "lmdb", feature = "enc"))]
+compile_error!(
+    "the encrypted comparators stand in the released LMDB's place: \
+     build with --no-default-features --features enc"
+);
+
 #[cfg(feature = "alloc-census")]
 pub mod alloc_census;
 pub mod bound;

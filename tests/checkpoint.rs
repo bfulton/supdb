@@ -168,7 +168,8 @@ fn a_checkpoint_reads_what_the_store_read_at_the_call_and_is_a_store_of_its_own(
 #[test]
 fn a_checkpoint_shares_its_segments_and_outlives_the_merges_that_retire_them() {
     let (d, c) = dirs("outlives");
-    let mut db = a_store_with_everything(&d, small(true));
+    // One inode under two names: a store of files (`common::files`).
+    let mut db = a_store_with_everything(&d, common::files(small(true)));
     db.checkpoint(&c).unwrap();
     let at_call = dump(&db);
     let shared = seg_names(&c);
@@ -422,7 +423,8 @@ fn a_checkpoint_on_another_filesystem_is_a_copy() {
     }
     let c = shm.join(format!("supdb-next-checkpoint-copy-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&c);
-    let mut db = a_store_with_everything(&d, small(true));
+    // Each file under its name in both directories: a store of files.
+    let mut db = a_store_with_everything(&d, common::files(small(true)));
     db.checkpoint(&c).unwrap();
     let at_call = dump(&db);
     for name in seg_names(&c) {

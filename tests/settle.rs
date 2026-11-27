@@ -1536,6 +1536,199 @@ fn a_patch_by_its_rank_asks_for_its_lines_by_the_cut() {
     }
 }
 
+/// A copy built over a block's records by updates alone claims its entries
+/// are the records, entry `i` the block's record `lo + i`, and a settle's
+/// patch takes the entry by the key's rank where the claim stands
+/// (`Options::copy_start_at_rank`). The claim was a flag, and the table is
+/// carried across a merge that rewrites the partition over the same blocks
+/// with its copies: a key written into the block and left to the backlog,
+/// sealed and folded in by the merge, is a record at the rank it lands at,
+/// every record after it a rank later, and the patch that filed it after
+/// the rewrite took the entry its rank named -- another key's. The claim
+/// names the partition it was made of now, and is no claim of the one
+/// the merge wrote. A partition of one block keeps its boundaries whatever
+/// is folded in, which is what lets the table be carried.
+#[test]
+fn a_copys_claim_to_its_records_is_no_claim_across_its_partitions_rewrite() {
+    claim_across_rewrite("copy-claim-rewrite", 4096, |i| {
+        format!("k{i:03}").into_bytes()
+    });
+}
+
+/// The same with keys of sixteen bytes, which the patch's compare of the
+/// key at its rank reads as two words (`db::key_eq`).
+#[test]
+fn a_copys_claim_across_its_partitions_rewrite_with_keys_of_sixteen_bytes() {
+    claim_across_rewrite("copy-claim-rewrite-16", 4096, |i| {
+        format!("k{i:015}").into_bytes()
+    });
+}
+
+/// The same with keys of nineteen bytes, four at a time sharing their
+/// first sixteen, which the compare reads as two words that agree and a
+/// tail that decides.
+#[test]
+fn a_copys_claim_across_its_partitions_rewrite_with_keys_past_sixteen_bytes() {
+    claim_across_rewrite("copy-claim-rewrite-19", 4096, |i| {
+        format!("k{:015}{i:03}", i / 8).into_bytes()
+    });
+}
+
+/// The same with keys of seventeen bytes, four at a time sharing their
+/// first sixteen, so that the one byte past the two words decides.
+#[test]
+fn a_copys_claim_across_its_partitions_rewrite_with_keys_of_seventeen_bytes() {
+    claim_across_rewrite("copy-claim-rewrite-17", 4096, |i| {
+        let mut k = format!("k{:015}", i / 8).into_bytes();
+        k.push(b'a' + (i % 8) as u8);
+        k
+    });
+}
+
+/// The same in a partition of more than a block, so that the copy the
+/// fold and the drop fall in is a block's whole sixty-four entries.
+#[test]
+fn a_copys_claim_across_its_partitions_rewrite_in_a_full_block() {
+    claim_across_rewrite("copy-claim-rewrite-full", 16384, |i| {
+        format!("k{i:015}").into_bytes()
+    });
+}
+
+/// A copy over updates alone, carried across a merge that folds one key
+/// into its block and drops another, keeps its block's boundaries and its
+/// claim to the records before the merge; a write filed after it, and one
+/// after that, are read back right by the writer's scan and a handle's.
+/// `key(i)` is the `i`th key, in order; `part` the partitions' bytes,
+/// at most a block of keys a partition at 4096 and more past it.
+fn claim_across_rewrite(name: &str, part: usize, key: impl Fn(usize) -> Vec<u8>) {
+    let dir = scratch(name);
+    let mut db = Db::create(
+        &dir,
+        Options {
+            seal_bytes: 1 << 20,
+            partition_bytes: Some(part),
+            partition_on_flush: true,
+            publish_in_background: true,
+            upkeep: Upkeep::Inline,
+            scan_block_cache: true,
+            // The batches left to the backlog bound and the first scan
+            // after it, which is what leaves the key's write unfiled
+            // across its seal and the merge.
+            forms_settle_every: false,
+            forms_settle_builds: false,
+            l0_trigger: 1,
+            ..common::options()
+        },
+    )
+    .unwrap();
+    let value = [b'v'; 100];
+    let keys: Vec<Vec<u8>> = (0..300).map(|i| key(i * 2)).collect();
+    let mut want = std::collections::BTreeMap::new();
+    for k in &keys {
+        db.put(k, &value);
+        want.insert(k.clone(), vec![value.to_vec()]);
+    }
+    db.commit().unwrap();
+    db.flush().unwrap();
+    db.settle().unwrap();
+    let fences = partition_fences(&dir);
+    assert!(fences.len() >= 3, "partitions: {}", fences.len());
+    let (lo, hi) = {
+        let (lo, hi) = &fences[fences.len() / 2];
+        (lo.clone(), hi.clone().expect("a closed partition"))
+    };
+    let inside: Vec<Vec<u8>> = keys
+        .iter()
+        .filter(|k| **k >= lo && **k < hi)
+        .cloned()
+        .collect();
+    let n = inside.len();
+    if part <= 4096 {
+        assert!(
+            (5..64).contains(&n),
+            "one block of keys inside the range: {n}"
+        );
+    } else {
+        // The fold, the drop and the early record in the first block,
+        // which is whole.
+        assert!(n > 64 && n / 3 < 64, "a whole first block: {n}");
+    }
+    // Every key of the partition updated and scanned, so its block is a
+    // copy over updates alone.
+    for k in &inside {
+        db.put(k, b"updated");
+        want.insert(k.clone(), vec![b"updated".to_vec()]);
+    }
+    db.commit().unwrap();
+    db.scan(&lo, n, kv(&mut |_, _| {})).unwrap();
+    let (_, _, copies, _) = db.block_cache_kinds();
+    assert!(copies >= 1, "the block is a copy: {copies}");
+    // A commit after the scan, which files its batch as the first commit
+    // after a scan does (`Options::upkeep_settle_after_scans`), so that the
+    // batch after it is left to the backlog bound.
+    db.put(b"zz-elsewhere", b"elsewhere");
+    want.insert(b"zz-elsewhere".to_vec(), vec![b"elsewhere".to_vec()]);
+    db.commit().unwrap();
+    // A key between two of the partition's records, written and left
+    // unfiled, then sealed and folded into the partition by a merge.
+    let folded = {
+        let mut k = inside[n / 3].clone();
+        k.push(b'x');
+        k
+    };
+    // A record dropped beside it, so the rewrite keeps the partition's
+    // count and its first and last keys (`same_blocks`).
+    let dropped = inside[1].clone();
+    // A record between the dropped one and the folded one, written first
+    // and left unfiled with them: filed after the rewrite and before the
+    // folded key's insert, its rank names the entry of the record before
+    // it in the copy carried across the drop, so the patch's compare of
+    // the key at the rank is what sends it to the search.
+    let early = inside[2].clone();
+    assert!(early < folded, "the early record is below the folded key");
+    db.put(&early, b"early");
+    want.insert(early.clone(), vec![b"early".to_vec()]);
+    db.put(&folded, b"folded");
+    want.insert(folded.clone(), vec![b"folded".to_vec()]);
+    db.delete(&dropped);
+    want.remove(&dropped);
+    db.commit().unwrap();
+    let rebased_before = db.forms_rebased();
+    db.seal().unwrap();
+    db.settle().unwrap();
+    // The scan files the folded key's write into the copy it was carried
+    // with, and a record past it is written after.
+    let later = inside[2 * n / 3].clone();
+    db.put(&later, b"later");
+    want.insert(later.clone(), vec![b"later".to_vec()]);
+    db.commit().unwrap();
+    let got = scan_model(&db);
+    assert!(
+        db.forms_rebased() > rebased_before,
+        "the rewrite kept the partition's layout: {} before, {} after, kinds {:?}, fences {} then {}",
+        rebased_before,
+        db.forms_rebased(),
+        db.block_cache_kinds(),
+        fences.len(),
+        partition_fences(&dir).len()
+    );
+    assert!(got == want, "the scan answers every write");
+    let r = db.reader().unwrap();
+    let mut via_handle = std::collections::BTreeMap::new();
+    r.scan(
+        b"",
+        usize::MAX,
+        kv(&mut |k, v| {
+            via_handle
+                .entry(k.to_vec())
+                .or_insert_with(Vec::new)
+                .push(v.to_vec());
+        }),
+    )
+    .unwrap();
+    assert!(via_handle == want, "the handle's scan");
+}
+
 /// A store of `n` keys in key order, appended and flushed into partitions,
 /// with its writer's upkeep inline: the stores of the two tests below.
 fn appended(dir: &std::path::Path, n: usize, background: bool, o: Options) -> (Db, Vec<Vec<u8>>) {
@@ -2055,14 +2248,17 @@ fn a_copys_identity_outlives_a_merge_that_kept_its_partitions_keys() {
             "the scan's start in the copy, at its rank and by a search"
         );
         // A patch written where it lies (`Options::settle_patch_in_place`)
-        // is one at its rank, and is made only where the claim stands.
+        // is one at its rank, and is made only where the claim stands; a
+        // patch where it does not takes its entry at its rank all the
+        // same where one compare proves that entry the key in hand
+        // (`key_eq`), which every key a merge kept in place passes.
         let placed = db.settle_lean().0 - placed_before;
         assert_eq!(
             [
                 patches[0] - patches_before[0] + placed,
                 patches[1] - patches_before[1]
             ],
-            if by_keys { [2, 0] } else { [0, 2] },
+            [2, 0],
             "the patches of the copy, at their ranks and by a search"
         );
         // The block's second patch at the least finds the form the
@@ -2571,13 +2767,18 @@ fn a_copy_of_fixed_size_records_is_one_stream_until_a_write_it_cannot_take() {
             db.commit().unwrap();
             db.seal().unwrap();
         }
+        let drops_before = db.forms_drop_reasons();
         db.hold_seal_durable(false);
         merged_past(&mut db, merges_before);
         answers(&db, &want, &from, "across the merges");
         assert_eq!(
             db.block_cache_packed(),
             (p0, n0),
-            "{packed}: carried as they were"
+            "{packed}: carried as they were; drops by site and refusals before {:?}, after {:?}, \
+             merges {}",
+            drops_before,
+            db.forms_drop_reasons(),
+            db.seal_waits().merges - merges_before
         );
         let (claimed, holds) = db.block_cache_identity();
         assert!(claimed == n0 && holds == n0, "{packed}: and their ranks");

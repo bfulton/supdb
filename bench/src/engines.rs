@@ -43,6 +43,11 @@ use std::path::{Path, PathBuf};
 #[path = "dense.rs"]
 mod dense;
 
+/// The encrypted comparators, a build of their own (feature `enc`).
+#[cfg(feature = "enc")]
+#[path = "enc.rs"]
+mod enc;
+
 /// What an engine actually guarantees. Reported beside every number.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize)]
 pub struct Features {
@@ -524,6 +529,28 @@ pub struct Supdb {
     own: Option<supdb::Reader>,
     db: Option<supdb::Db>,
     path: PathBuf,
+    /// The store's directory is under a key (`Policy::dir_key`).
+    dirkey: bool,
+    /// The store is under a cipher of the caller's (`Policy::cipher`).
+    cipher: bool,
+    /// `Policy::cipher_auto`: what the arm pins, which names it.
+    cipher_auto: Option<bool>,
+    /// `Policy::cipher_cache`.
+    cipher_cache: u64,
+    /// `Policy::cipher_log`.
+    cipher_log: bool,
+    /// `Policy::cipher_apart`.
+    cipher_apart: bool,
+    /// `Policy::cipher_half`.
+    cipher_half: bool,
+    /// `Policy::cipher_land_model`.
+    cipher_land_model: bool,
+    /// `Policy::cipher_merge_apart`.
+    cipher_merge_apart: bool,
+    /// `Policy::cipher_merge_stream`.
+    cipher_merge_stream: bool,
+    /// `Policy::cipher_drops_keep`.
+    cipher_drops_keep: bool,
     /// False for the ingest-first arm: a flush stops partitioning what it
     /// sealed and leaves that to the background -- promotion at once, a
     /// merge for the rest (`Options::flush_schedules`). Both arms exist so
@@ -1447,6 +1474,10 @@ pub struct Supdb {
     /// The rewarm made beside merges in flight, the shape before
     /// (`Options::zpages_rewarm_beside_merges` on): `supdb-zrewarmbeside`.
     zrewarmbeside: bool,
+    /// A merge's asks ahead in one window for every input and over its
+    /// records alone, the shape before (`Options::merge_ahead_shares`
+    /// off): `supdb-cipherautoaheadflat`.
+    aheadflat: bool,
     /// The controller's install makes a rewarm due
     /// (`Options::zpages_rewarm_at_install`): `supdb-zrewarminstall`.
     zrewarminstall: bool,
@@ -2010,6 +2041,10 @@ pub struct Supdb {
     /// The jobs' arrays from the allocator, the engine's shape before
     /// (`Options::jobs_mapped` off): `supdb-jobsheap`.
     jobsheap: bool,
+    /// The store's segments, their ordered indexes and their form files
+    /// kept in one data file (`Options::one_file`): `supdb-onefile`, and
+    /// `supdb-ingestonefile` buffered.
+    onefile: bool,
     /// The jobs' mapped arrays kept in a pool between jobs while the
     /// store has room and given back where it reads short
     /// (`Options::jobs_pooled`, with `jobsmapped`): `supdb-jobspooled`.
@@ -2178,6 +2213,75 @@ impl Drop for TallyReader {
 /// one field more.
 #[derive(Clone, Debug, PartialEq)]
 struct Policy {
+    /// The store's directory encrypted by the kernel under a key
+    /// (`Encryption::Kernel`): `supdb-dirkey` and `supdb-ingestdirkey`, the
+    /// default and the buffered arm with nothing else changed. The store
+    /// has to stand on a filesystem that can encrypt
+    /// (`scripts/fscrypt.sh`), and so has the arm it is paired with.
+    dir_key: bool,
+    /// The store under a cipher the caller supplies (`Encryption::Cipher`),
+    /// here AES-256-GCM: `supdb-cipher` and `supdb-ingestcipher`. Its
+    /// directory holds its files' envelopes and it reads them through a
+    /// cache of plaintext of its own. Its pair is `supdb`, or
+    /// `supdb-ingest`, itself: it differs by the cipher alone.
+    cipher: bool,
+    /// The plaintext the store under a cipher may hold, bytes
+    /// (`StoreCipher::cache_bytes`), or zero for the engine's own choice,
+    /// half of what the process may use: `supdb-cipher64` is the store
+    /// under sixty-four mebibytes, which from a million keys up is a
+    /// store several times its cache, read by the chunk it decrypts.
+    cipher_cache: u64,
+    /// The store under a cipher with ordered ingest off
+    /// (`Options::direct_ingest`), so an ordered load goes through the log
+    /// and a hash table to a seal, as every load under a cipher did before
+    /// a run's commits were sealed into the log beside its segment:
+    /// `supdb-cipherlog` and `supdb-ingestcipherlog`, what the run is
+    /// priced against under the cipher.
+    cipher_log: bool,
+    /// The compact form's controller under a cipher
+    /// (`Options::zpages_under_cipher`), where an arm pins it, and the
+    /// engine's otherwise: on in `supdb-cipherauto` and
+    /// `supdb-ingestcipherauto`, the arms that priced it before it was
+    /// shipped on, and off in `supdb-ciphernoauto` and
+    /// `supdb-ingestciphernoauto`, the shape before, a store under a
+    /// cipher left in the raw form.
+    cipher_auto: Option<bool>,
+    /// The store under a cipher with each chunk's ciphertext left to its
+    /// own read of the device (`StoreCipher::chunks_apart`), where the
+    /// store as shipped asks for the ciphertext of an ask's chunks
+    /// together: `supdb-cipherzstrideapart`, beside `supdb-cipherzstride`,
+    /// whose every page is two chunks.
+    cipher_apart: bool,
+    /// The store under a cipher with its cache of plaintext half of what
+    /// the process may use as the store opens, read once
+    /// (`StoreCipher::cache_half_at_open`), where the store as shipped
+    /// follows the room as the process runs: `supdb-cipherzstridehalf`,
+    /// beside `supdb-cipherzstride`.
+    cipher_half: bool,
+    /// The store under a cipher with the controller on and its builds
+    /// ahead at landing started by the controller's budget alone
+    /// (`Options::zpages_land_cache_pct` at zero), where the engine starts
+    /// them past a share of the store's own cache as well:
+    /// `supdb-cipherautolandmodel`, beside `supdb-cipherauto`, the shape
+    /// before.
+    cipher_land_model: bool,
+    /// The store under a cipher with the controller on and its merges
+    /// asking nothing ahead of their walks of their inputs
+    /// (`Options::merge_read_ahead_cipher` at zero), where the engine asks
+    /// a window ahead, a window whole: `supdb-cipherautomergeapart`, beside
+    /// `supdb-cipherauto`, the shape before.
+    cipher_merge_apart: bool,
+    /// The store under a cipher with the controller on and its merges
+    /// reading their inputs beside the store's cache
+    /// (`StoreCipher::merges_beside_cache`): `supdb-cipherautomergestream`,
+    /// beside `supdb-cipherauto`, which reads them through it.
+    cipher_merge_stream: bool,
+    /// The store under a cipher with the controller on and a drop of a
+    /// file's pages leaving the plaintext it covers in the store's cache
+    /// (`StoreCipher::drops_keep_plaintext`), where the store as shipped
+    /// gives the units it covers back: `supdb-cipherautodropskeep`, beside
+    /// `supdb-cipherauto`, the shape before.
+    cipher_drops_keep: bool,
     partition: bool,
     drain: bool,
     advice: Option<supdb::ReadAdvice>,
@@ -3042,6 +3146,9 @@ struct Policy {
     zrewarmwait: bool,
     /// The rewarm beside merges: `supdb-zrewarmbeside`.
     zrewarmbeside: bool,
+    /// A merge's asks in one window, records alone:
+    /// `supdb-cipherautoaheadflat`.
+    aheadflat: bool,
     /// A rewarm at the install: `supdb-zrewarminstall`.
     zrewarminstall: bool,
     /// The fill's resident records first: `supdb-zhotresident`.
@@ -3433,6 +3540,9 @@ struct Policy {
     /// The jobs' arrays from the allocator (`Options::jobs_mapped` off):
     /// `supdb-jobsheap` beside `supdb`.
     jobsheap: bool,
+    /// The store kept in one file (`Options::one_file`): `supdb-onefile`
+    /// beside `supdb`, `supdb-ingestonefile` beside `supdb-ingest`.
+    onefile: bool,
     /// The jobs' mapped arrays from a pool that keeps them between jobs
     /// while the store has room and gives them back where it reads short
     /// of memory (`Options::jobs_pooled`): `supdb-jobspooled` beside
@@ -3566,6 +3676,17 @@ impl Default for Policy {
     /// `supdb`: the shipping configuration.
     fn default() -> Policy {
         Policy {
+            dir_key: false,
+            cipher: false,
+            cipher_auto: None,
+            cipher_cache: 0,
+            cipher_log: false,
+            cipher_apart: false,
+            cipher_half: false,
+            cipher_land_model: false,
+            cipher_merge_apart: false,
+            cipher_merge_stream: false,
+            cipher_drops_keep: false,
             partition: true,
             drain: true,
             advice: None,
@@ -3776,6 +3897,7 @@ impl Default for Policy {
             zhotskewroomhyst: false,
             zrewarmwait: false,
             zrewarmbeside: false,
+            aheadflat: false,
             zrewarminstall: false,
             zhotresident: false,
             settlegated: false,
@@ -3896,6 +4018,7 @@ impl Default for Policy {
             jobsmapped: false,
             jobsshort: false,
             jobsheap: false,
+            onefile: false,
             jobspooled: false,
             zmemoslab: false,
             held: false,
@@ -4076,6 +4199,43 @@ impl Policy {
     }
 }
 
+/// The shapes before a cipher arm keeps of the cipher's own knobs
+/// (`StoreCipher`), each the policy's field of the same name.
+#[derive(Clone, Copy, Default)]
+struct CipherShape {
+    apart: bool,
+    half: bool,
+    merge_stream: bool,
+    drops_keep: bool,
+}
+
+/// The encryption an arm's store is under: the kernel's key for the arm
+/// that asks for it, a cipher of the suite's for the cipher arms (with the
+/// cache the arm bounds it to), and none for the rest. One way or neither:
+/// the engine takes one choice, and no arm is under both.
+fn encryption_of(
+    dir_key: bool,
+    cipher: bool,
+    cipher_cache: u64,
+    shape: CipherShape,
+) -> supdb::Encryption {
+    match (dir_key, cipher) {
+        (true, _) => supdb::Encryption::Kernel(supdb::DirKey::new([0x5a; 32])),
+        (false, true) => {
+            let c = supdb::StoreCipher::new(Gcm::new(), Gcm::of)
+                .chunks_apart(shape.apart)
+                .cache_half_at_open(shape.half)
+                .merges_beside_cache(shape.merge_stream)
+                .drops_keep_plaintext(shape.drops_keep);
+            supdb::Encryption::Cipher(match cipher_cache {
+                0 => c,
+                bytes => c.cache_bytes(bytes),
+            })
+        }
+        (false, false) => supdb::Encryption::None,
+    }
+}
+
 impl Supdb {
     pub fn create(path: &Path) -> Res<Supdb> {
         Supdb::with_policy(path, Policy::default())
@@ -4085,6 +4245,72 @@ impl Supdb {
         Supdb::with_policy(
             path,
             Policy {
+                partition: false,
+                durable: false,
+                ..Policy::default()
+            },
+        )
+    }
+
+    /// `supdb` with its directory under a key: every file the store writes
+    /// encrypted by the kernel (`Encryption::Kernel`). The pair against
+    /// `supdb`, both on a filesystem that can encrypt, differs by the key
+    /// and prices what the kernel's encryption costs a store: nothing
+    /// where a pass reads the page cache, which holds plaintext, and the
+    /// cipher where a page is written back or read in.
+    pub fn create_dirkey(path: &Path) -> Res<Supdb> {
+        Supdb::with_policy(
+            path,
+            Policy {
+                dir_key: true,
+                ..Policy::default()
+            },
+        )
+    }
+
+    /// `supdb` under a cipher the caller supplies (`Encryption::Cipher`).
+    pub fn create_cipher(path: &Path) -> Res<Supdb> {
+        Supdb::with_policy(
+            path,
+            Policy {
+                cipher: true,
+                ..Policy::default()
+            },
+        )
+    }
+
+    /// `supdb-cipher` with a cache of sixty-four mebibytes
+    /// (`Policy::cipher_cache`).
+    pub fn create_cipher64(path: &Path) -> Res<Supdb> {
+        Supdb::with_policy(
+            path,
+            Policy {
+                cipher: true,
+                cipher_cache: 64 << 20,
+                ..Policy::default()
+            },
+        )
+    }
+
+    /// `supdb-cipher` and `supdb-ingestcipher` with an ordered load
+    /// through the log (`Policy::cipher_log`).
+    pub fn create_cipherlog(path: &Path) -> Res<Supdb> {
+        Supdb::with_policy(
+            path,
+            Policy {
+                cipher: true,
+                cipher_log: true,
+                ..Policy::default()
+            },
+        )
+    }
+
+    pub fn create_ingest_cipherlog(path: &Path) -> Res<Supdb> {
+        Supdb::with_policy(
+            path,
+            Policy {
+                cipher: true,
+                cipher_log: true,
                 partition: false,
                 durable: false,
                 ..Policy::default()
@@ -4107,6 +4333,265 @@ impl Supdb {
                 durable: false,
                 held: true,
                 holdcap: cap,
+                ..Policy::default()
+            },
+        )
+    }
+
+    /// `supdb-cipher` and `supdb-ingestcipher` with the compact form's
+    /// controller under a cipher left out (`Policy::cipher_auto`), the
+    /// shape before it shipped on: the raw form whatever the store
+    /// measures.
+    pub fn create_ciphernoauto(path: &Path) -> Res<Supdb> {
+        Supdb::with_policy(
+            path,
+            Policy {
+                cipher: true,
+                cipher_auto: Some(false),
+                ..Policy::default()
+            },
+        )
+    }
+
+    pub fn create_ingest_ciphernoauto(path: &Path) -> Res<Supdb> {
+        Supdb::with_policy(
+            path,
+            Policy {
+                cipher: true,
+                cipher_auto: Some(false),
+                partition: false,
+                durable: false,
+                ..Policy::default()
+            },
+        )
+    }
+
+    /// `supdb-cipher` and `supdb-ingestcipher` with the compact form's
+    /// controller pinned on (`Policy::cipher_auto`), the arms that priced
+    /// it before it shipped on.
+    pub fn create_cipherauto(path: &Path) -> Res<Supdb> {
+        Supdb::with_policy(
+            path,
+            Policy {
+                cipher: true,
+                cipher_auto: Some(true),
+                ..Policy::default()
+            },
+        )
+    }
+
+    /// `supdb-cipherauto` with its builds ahead at landing started by the
+    /// controller's budget alone (`Policy::cipher_land_model`):
+    /// `supdb-cipherautolandmodel`.
+    pub fn create_cipherauto_landmodel(path: &Path) -> Res<Supdb> {
+        Supdb::with_policy(
+            path,
+            Policy {
+                cipher: true,
+                cipher_auto: Some(true),
+                cipher_land_model: true,
+                ..Policy::default()
+            },
+        )
+    }
+
+    /// `supdb-cipherauto` with its merges reading their inputs beside the
+    /// store's cache (`Policy::cipher_merge_stream`):
+    /// `supdb-cipherautomergestream`.
+    pub fn create_cipherauto_mergestream(path: &Path) -> Res<Supdb> {
+        Supdb::with_policy(
+            path,
+            Policy {
+                cipher: true,
+                cipher_auto: Some(true),
+                cipher_merge_stream: true,
+                ..Policy::default()
+            },
+        )
+    }
+
+    /// `supdb-cipherauto` with a drop of a file's pages leaving its
+    /// plaintext in the store's cache (`Policy::cipher_drops_keep`):
+    /// `supdb-cipherautodropskeep`.
+    pub fn create_cipherauto_dropskeep(path: &Path) -> Res<Supdb> {
+        Supdb::with_policy(
+            path,
+            Policy {
+                cipher: true,
+                cipher_auto: Some(true),
+                cipher_drops_keep: true,
+                ..Policy::default()
+            },
+        )
+    }
+
+    /// `supdb-cipherauto` whose rewarm is made beside merges in flight
+    /// (`Options::zpages_rewarm_beside_merges` on, `Policy::zrewarmbeside`):
+    /// `supdb-cipherautorewarmbeside`.
+    pub fn create_cipherauto_rewarmbeside(path: &Path) -> Res<Supdb> {
+        Supdb::with_policy(
+            path,
+            Policy {
+                cipher: true,
+                cipher_auto: Some(true),
+                zrewarmbeside: true,
+                ..Policy::default()
+            },
+        )
+    }
+
+    /// `supdb-cipherauto` with its merges asking ahead in one window for
+    /// every input and over their records alone (`Policy::aheadflat`,
+    /// `Options::merge_ahead_shares` off): `supdb-cipherautoaheadflat`.
+    pub fn create_cipherauto_aheadflat(path: &Path) -> Res<Supdb> {
+        Supdb::with_policy(
+            path,
+            Policy {
+                cipher: true,
+                cipher_auto: Some(true),
+                aheadflat: true,
+                ..Policy::default()
+            },
+        )
+    }
+
+    /// `supdb-cipherauto` with its merges asking nothing ahead of their
+    /// walks (`Policy::cipher_merge_apart`): `supdb-cipherautomergeapart`.
+    pub fn create_cipherauto_mergeapart(path: &Path) -> Res<Supdb> {
+        Supdb::with_policy(
+            path,
+            Policy {
+                cipher: true,
+                cipher_auto: Some(true),
+                cipher_merge_apart: true,
+                ..Policy::default()
+            },
+        )
+    }
+
+    /// `supdb-cipher` with the compact form forced in its block coding
+    /// (`ZPages::Always`, the stride form off): `supdb-cipherzpages`, every
+    /// partition's form file built at its landing and every read of a
+    /// covered partition through it, which is the form priced by itself
+    /// under a cipher where `supdb-cipherauto` prices the controller's
+    /// choice of it.
+    pub fn create_cipher_zpages(path: &Path) -> Res<Supdb> {
+        Supdb::with_policy(
+            path,
+            Policy {
+                cipher: true,
+                zpages: true,
+                ..Policy::default()
+            },
+        )
+    }
+
+    /// `supdb-cipherzpages` with every build asking for the stride form
+    /// (`ZStride::Forced`): `supdb-cipherzstride`, a partition's values
+    /// alone at their stride, read through the store's cache by the page
+    /// each read asks for. The pair against `supdb-cipher` prices the form
+    /// against the raw form under a cipher, and against `supdb-cipherzpages`
+    /// against the block coding there; read by the stride counts
+    /// (`zpage_stride_*`) and the cache's before its rates.
+    pub fn create_cipher_zstride(path: &Path) -> Res<Supdb> {
+        Supdb::with_policy(
+            path,
+            Policy {
+                cipher: true,
+                zpages: true,
+                zstride: Some(supdb::ZStride::Forced),
+                ..Policy::default()
+            },
+        )
+    }
+
+    /// `supdb-cipherzstride` with each chunk's ciphertext left to its own
+    /// read (`StoreCipher::chunks_apart`): `supdb-cipherzstrideapart`. A
+    /// stride page lies across two chunks of its envelope, so the pair
+    /// prices the one read of both against two, read by the cache's count
+    /// of asks made together (`cipher_asked_together`) and the passes'
+    /// major faults before their rates.
+    pub fn create_cipher_zstride_apart(path: &Path) -> Res<Supdb> {
+        Supdb::with_policy(
+            path,
+            Policy {
+                cipher: true,
+                cipher_apart: true,
+                zpages: true,
+                zstride: Some(supdb::ZStride::Forced),
+                ..Policy::default()
+            },
+        )
+    }
+
+    /// `supdb-cipherzstride` with its cache half of what the process may
+    /// use at the open (`StoreCipher::cache_half_at_open`):
+    /// `supdb-cipherzstridehalf`, the cache as it was before it followed
+    /// the room, read by the cache's budget and its readings of the room
+    /// (`cipher_budget_at_end`, `cipher_room_readings`) before its rates.
+    pub fn create_cipher_zstride_half(path: &Path) -> Res<Supdb> {
+        Supdb::with_policy(
+            path,
+            Policy {
+                cipher: true,
+                cipher_half: true,
+                zpages: true,
+                zstride: Some(supdb::ZStride::Forced),
+                ..Policy::default()
+            },
+        )
+    }
+
+    /// `supdb-cipher` with its cache half of what the process may use at
+    /// the open (`StoreCipher::cache_half_at_open`): `supdb-cipherhalf`,
+    /// the store under a cipher as it was before its cache followed the
+    /// room.
+    pub fn create_cipher_half(path: &Path) -> Res<Supdb> {
+        Supdb::with_policy(
+            path,
+            Policy {
+                cipher: true,
+                cipher_half: true,
+                ..Policy::default()
+            },
+        )
+    }
+
+    pub fn create_ingest_cipherauto(path: &Path) -> Res<Supdb> {
+        Supdb::with_policy(
+            path,
+            Policy {
+                cipher: true,
+                cipher_auto: Some(true),
+                partition: false,
+                durable: false,
+                ..Policy::default()
+            },
+        )
+    }
+
+    /// `supdb-ingest` under a cipher.
+    pub fn create_ingest_cipher(path: &Path) -> Res<Supdb> {
+        Supdb::with_policy(
+            path,
+            Policy {
+                cipher: true,
+                partition: false,
+                durable: false,
+                ..Policy::default()
+            },
+        )
+    }
+
+    /// `supdb-ingest` with its directory under a key, as `supdb-dirkey` is
+    /// `supdb` with one: the buffered arm's pair.
+    pub fn create_ingest_dirkey(path: &Path) -> Res<Supdb> {
+        Supdb::with_policy(
+            path,
+            Policy {
+                dir_key: true,
+                partition: false,
+                durable: false,
                 ..Policy::default()
             },
         )
@@ -4862,6 +5347,77 @@ impl Supdb {
             path,
             Policy {
                 jobsheap: true,
+                ..Policy::default()
+            },
+        )
+    }
+
+    /// `supdb` kept in one file (`Options::one_file`): its segments, their
+    /// ordered indexes and their form files extents of one data file,
+    /// which a merge's retired inputs are room in where a store of files
+    /// frees them. `supdb-onefile`.
+    pub fn create_onefile(path: &Path) -> Res<Supdb> {
+        Supdb::with_policy(
+            path,
+            Policy {
+                onefile: true,
+                ..Policy::default()
+            },
+        )
+    }
+
+    /// `supdb-cipher` kept in one file (`Options::one_file` beside
+    /// `Encryption::Cipher`): its envelopes extents of one data file,
+    /// which a merge's retired inputs are room in where a store of files
+    /// frees them. `supdb-cipheronefile`.
+    pub fn create_cipher_onefile(path: &Path) -> Res<Supdb> {
+        Supdb::with_policy(
+            path,
+            Policy {
+                cipher: true,
+                onefile: true,
+                ..Policy::default()
+            },
+        )
+    }
+
+    /// `supdb-cipherauto` kept in one file: `supdb-cipherautoonefile`.
+    pub fn create_cipherauto_onefile(path: &Path) -> Res<Supdb> {
+        Supdb::with_policy(
+            path,
+            Policy {
+                cipher: true,
+                cipher_auto: Some(true),
+                onefile: true,
+                ..Policy::default()
+            },
+        )
+    }
+
+    /// `supdb-ingestcipherauto` kept in one file:
+    /// `supdb-ingestcipherautoonefile`.
+    pub fn create_ingest_cipherauto_onefile(path: &Path) -> Res<Supdb> {
+        Supdb::with_policy(
+            path,
+            Policy {
+                cipher: true,
+                cipher_auto: Some(true),
+                onefile: true,
+                partition: false,
+                durable: false,
+                ..Policy::default()
+            },
+        )
+    }
+
+    /// `supdb-ingest` as `supdb-onefile`.
+    pub fn create_ingest_onefile(path: &Path) -> Res<Supdb> {
+        Supdb::with_policy(
+            path,
+            Policy {
+                partition: false,
+                durable: false,
+                onefile: true,
                 ..Policy::default()
             },
         )
@@ -10565,6 +11121,17 @@ impl Supdb {
 
     fn with_policy(path: &Path, policy: Policy) -> Res<Supdb> {
         let Policy {
+            dir_key,
+            cipher,
+            cipher_auto,
+            cipher_cache,
+            cipher_log,
+            cipher_apart,
+            cipher_half,
+            cipher_land_model,
+            cipher_merge_apart,
+            cipher_merge_stream,
+            cipher_drops_keep,
             partition,
             drain,
             advice,
@@ -10796,6 +11363,7 @@ impl Supdb {
             zhotskewroomhyst,
             zrewarmwait,
             zrewarmbeside,
+            aheadflat,
             zrewarminstall,
             zhotresident,
             settlegated,
@@ -10916,6 +11484,7 @@ impl Supdb {
             jobsmapped,
             jobsshort,
             jobsheap,
+            onefile,
             jobspooled,
             zmemoslab,
             held,
@@ -11482,6 +12051,7 @@ impl Supdb {
             zpages_hot_skew_room: zhotskewroom || zhotskewroomhyst,
             zpages_hot_room_margin_pct: if zhotskewroomhyst { 5 } else { 0 },
             zpages_rewarm_beside_merges: zrewarmbeside,
+            merge_ahead_shares: !aheadflat,
             zpages_rewarm_at_install: zrewarminstall,
             zpages_hot_fill_resident_first: zhotresident,
             forms_settle_past_llc: settlegated,
@@ -11585,6 +12155,7 @@ impl Supdb {
             zpages_stride_step_direct: zstridestep
                 .unwrap_or(supdb::Options::default().zpages_stride_step_direct),
             jobs_mapped: !jobsheap && (jobsmapped || supdb::Options::default().jobs_mapped),
+            one_file: onefile,
             jobs_mapped_when_short: jobsshort,
             jobs_pooled: jobspooled,
             zpages_memo_slab: zmemoslab,
@@ -11691,6 +12262,37 @@ impl Supdb {
             },
             None => opts,
         };
+        // From here each field is set on its own, behind the flags that ask
+        // for it.
+        let mut opts = opts;
+        // The shapes a store under a cipher is priced against itself in:
+        // an ordered load through the log with no run, the shape before,
+        // and the compact form's controller on, the shape not shipped.
+        if cipher {
+            if let Some(on) = cipher_auto {
+                opts.zpages_under_cipher = on;
+            }
+            if cipher_land_model {
+                opts.zpages_land_cache_pct = 0;
+            }
+            if cipher_merge_apart {
+                opts.merge_read_ahead_cipher = 0;
+            }
+            if cipher_log {
+                opts.direct_ingest = false;
+            }
+        }
+        opts.encryption = encryption_of(
+            dir_key,
+            cipher,
+            cipher_cache,
+            CipherShape {
+                apart: cipher_apart,
+                half: cipher_half,
+                merge_stream: cipher_merge_stream,
+                drops_keep: cipher_drops_keep,
+            },
+        );
         let db = if REOPEN.with(|r| r.get()) {
             supdb::Db::open(path, opts)
         } else {
@@ -11700,6 +12302,17 @@ impl Supdb {
         Ok(Supdb {
             db: Some(db),
             path: path.to_path_buf(),
+            dirkey: dir_key,
+            cipher,
+            cipher_auto,
+            cipher_cache,
+            cipher_log,
+            cipher_apart,
+            cipher_half,
+            cipher_land_model,
+            cipher_merge_apart,
+            cipher_merge_stream,
+            cipher_drops_keep,
             partition,
             drain,
             advice,
@@ -11931,6 +12544,7 @@ impl Supdb {
             zhotskewroomhyst,
             zrewarmwait,
             zrewarmbeside,
+            aheadflat,
             zrewarminstall,
             zhotresident,
             settlegated,
@@ -12051,6 +12665,7 @@ impl Supdb {
             jobsmapped,
             jobsshort,
             jobsheap,
+            onefile,
             jobspooled,
             zmemoslab,
             held,
@@ -12332,6 +12947,57 @@ impl ThreadReader for TallyReader {
 
 impl Engine for Supdb {
     fn name(&self) -> &'static str {
+        // A store under a key is the default or the buffered arm with
+        // nothing else changed.
+        if self.dirkey {
+            return if self.durable {
+                "supdb-dirkey"
+            } else {
+                "supdb-ingestdirkey"
+            };
+        }
+        if self.cipher {
+            let zstride = self.zstride == Some(supdb::ZStride::Forced);
+            return match self.durable {
+                true if self.onefile && self.cipher_auto == Some(true) => "supdb-cipherautoonefile",
+                false if self.onefile && self.cipher_auto == Some(true) => {
+                    "supdb-ingestcipherautoonefile"
+                }
+                true if self.onefile => "supdb-cipheronefile",
+                true if self.zpages && zstride && self.cipher_apart => "supdb-cipherzstrideapart",
+                true if self.zpages && zstride && self.cipher_half => "supdb-cipherzstridehalf",
+                true if self.cipher_half => "supdb-cipherhalf",
+                true if self.zpages && zstride => "supdb-cipherzstride",
+                true if self.zpages => "supdb-cipherzpages",
+                true if self.cipher_log => "supdb-cipherlog",
+                false if self.cipher_log => "supdb-ingestcipherlog",
+                true if self.cipher_auto == Some(true) && self.cipher_land_model => {
+                    "supdb-cipherautolandmodel"
+                }
+                true if self.cipher_auto == Some(true) && self.cipher_merge_apart => {
+                    "supdb-cipherautomergeapart"
+                }
+                true if self.cipher_auto == Some(true) && self.cipher_merge_stream => {
+                    "supdb-cipherautomergestream"
+                }
+                true if self.cipher_auto == Some(true) && self.cipher_drops_keep => {
+                    "supdb-cipherautodropskeep"
+                }
+                true if self.cipher_auto == Some(true) && self.zrewarmbeside => {
+                    "supdb-cipherautorewarmbeside"
+                }
+                true if self.cipher_auto == Some(true) && self.aheadflat => {
+                    "supdb-cipherautoaheadflat"
+                }
+                true if self.cipher_auto == Some(true) => "supdb-cipherauto",
+                false if self.cipher_auto == Some(true) => "supdb-ingestcipherauto",
+                true if self.cipher_auto == Some(false) => "supdb-ciphernoauto",
+                false if self.cipher_auto == Some(false) => "supdb-ingestciphernoauto",
+                true if self.cipher_cache != 0 => "supdb-cipher64",
+                true => "supdb-cipher",
+                false => "supdb-ingestcipher",
+            };
+        }
         // The pinned shapes alone name an arm; a field that follows the
         // engine names nothing.
         let zdropraw = self.zdropraw == Some(true);
@@ -12821,6 +13487,13 @@ impl Engine for Supdb {
         }
         if self.jobsheap {
             return "supdb-jobsheap";
+        }
+        if self.onefile {
+            return if self.partition {
+                "supdb-onefile"
+            } else {
+                "supdb-ingestonefile"
+            };
         }
         if self.jobsshort {
             return "supdb-jobsshort";
@@ -14275,6 +14948,18 @@ impl Engine for Supdb {
         // seal and be read as the pass's. The pass's takes come from the
         // store's own life instead.
         let (forms, form_bytes, _, _) = db.canonical_forms();
+        // The cache a store under a cipher reads its files through, and
+        // zeroes for a store under none: a cell out of that cache is read
+        // beside what was decrypted and given back in it, and beside what
+        // its reads waited for a crowded cache.
+        let cc = db.cipher_counts().unwrap_or_default();
+        let pc = cc.cache;
+        // The table of a store kept in one file, zeroes for a store of
+        // files: the files moved for outgrowing their room, each a copy of
+        // what was written of it, the growths in place, the data file's
+        // syncs and its room used again.
+        let oc = db.one_counts();
+        let one = |f: fn(&supdb::OneCounts) -> u64| oc.as_ref().map_or(0, f) as f64;
         let ev = db.forms_events();
         let sd = db.settle_density();
         let bk = db.build_kinds();
@@ -14319,6 +15004,36 @@ impl Engine for Supdb {
             // above: the pair a memory decomposition holds against the
             // process's resident bytes (`lagmem`).
             ("cache_bytes_at_end", db.block_cache_bytes() as f64),
+            ("cipher_held_at_end", pc.held as f64),
+            ("cipher_peak", pc.peak as f64),
+            ("cipher_fills", pc.fills as f64),
+            ("cipher_evicted_units", pc.evicted_units as f64),
+            ("cipher_rescues", pc.rescues as f64),
+            ("cipher_waits", pc.waits as f64),
+            ("cipher_breaths", pc.breaths as f64),
+            ("cipher_evictor_waited_us", pc.waited_us as f64),
+            ("cipher_evictor_longest_wait_us", pc.longest_wait_us as f64),
+            ("cipher_asked_together", pc.together as f64),
+            ("cipher_budget_at_end", pc.budget as f64),
+            ("cipher_room_readings", pc.rooms as f64),
+            ("cipher_gave_way", pc.gave_way as f64),
+            ("cipher_spared_at_end", pc.spared as f64),
+            // What the cache took whole from a file's writer at its
+            // envelope, and what it left to be read from the envelope, by
+            // file, and the plaintext the envelopes were written from.
+            ("cipher_adopted", cc.adopted as f64),
+            ("cipher_left", cc.left as f64),
+            ("cipher_persisted_bytes", cc.persisted_bytes as f64),
+            ("cipher_evictor_passes", pc.passes as f64),
+            ("cipher_dropped_units", pc.dropped_units as f64),
+            ("cipher_dropped_bytes", pc.dropped_bytes as f64),
+            ("one_moves", one(|c| c.moves)),
+            ("one_grown", one(|c| c.grown)),
+            ("one_growths", one(|c| c.growths)),
+            ("one_syncs", one(|c| c.syncs)),
+            ("one_reused", one(|c| c.reused)),
+            ("one_end_at_end", one(|c| c.end)),
+            ("one_free_at_end", one(|c| c.free)),
             ("lazy_scans_done", db.lazy_scans().0 as f64),
             ("lazy_scans_resumed", db.lazy_scans().1 as f64),
             ("seals", db.seal_waits().joins as f64),
@@ -14886,6 +15601,17 @@ impl Engine for Supdb {
             .flatten()
         {
             let name = e.file_name().to_string_lossy().into_owned();
+            // Under a cipher a form file is an envelope under its
+            // segment's token (`x-<token>.z`), written first under that
+            // name and `.tmp`, which is the stray one.
+            if self.cipher {
+                if name.starts_with("x-") && name.ends_with(".z") {
+                    files += 1;
+                } else if name.starts_with("x-") && name.ends_with(".z.tmp") {
+                    stray += 1;
+                }
+                continue;
+            }
             if name.starts_with("zpg-") {
                 if name.ends_with(".zpg") {
                     files += 1;
@@ -15051,12 +15777,18 @@ pub struct Rocks {
     /// load window carries the same drain the engine's default does
     /// and the reads run against a fully compacted tree.
     drain: bool,
+    /// Whether the store's files are encrypted (`rocksdb-tuned-enc`,
+    /// feature `enc`): the tuned arm on RocksDB's encrypted Env under
+    /// AES-256-CTR (`enc.rs`, `shim/rocks_enc.cc`), the WAL and the
+    /// manifest with the tables. Its pair is `rocksdb-tuned`, which it
+    /// differs from in the Env alone.
+    enc: bool,
     read: rocksdb::ReadOptions,
 }
 
 impl Rocks {
     pub fn create(path: &Path, sync: bool) -> Res<Rocks> {
-        Rocks::with(path, sync, false, false, false)
+        Rocks::with(path, sync, false, false, false, false)
     }
 
     /// The deployed shape rather than the shipped one, stated in full so the
@@ -15068,7 +15800,7 @@ impl Rocks {
     /// load (see `with`). Not a tuning contest: one stated configuration a
     /// reader can recognise as a deployment.
     pub fn create_tuned(path: &Path) -> Res<Rocks> {
-        Rocks::with(path, true, true, false, false)
+        Rocks::with(path, true, true, false, false, false)
     }
 
     /// The tuned configuration with commits that do not reach the device:
@@ -15079,7 +15811,7 @@ impl Rocks {
     /// would choose; this is the one stated configuration in both groups,
     /// differing from `rocksdb-tuned` in the sync alone.
     pub fn create_tuned_nosync(path: &Path) -> Res<Rocks> {
-        Rocks::with(path, false, true, false, false)
+        Rocks::with(path, false, true, false, false, false)
     }
 
     /// The tuned configuration with its SSTs LZ4-compressed, the one
@@ -15089,20 +15821,36 @@ impl Rocks {
     /// suite's own values are a hundred bytes of the payload generator's,
     /// so what LZ4 makes of them is the row's `bytes_on_disk_per_byte`.
     pub fn create_tuned_lz4(path: &Path) -> Res<Rocks> {
-        Rocks::with(path, true, true, false, true)
+        Rocks::with(path, true, true, false, true, false)
     }
 
     /// Tuned, and drained at `sync`: memtable flushed, every level
     /// compacted into one, inside the window -- the engine's default
     /// shape, charged to RocksDB.
     pub fn create_tuned_drain(path: &Path) -> Res<Rocks> {
-        Rocks::with(path, true, true, true, false)
+        Rocks::with(path, true, true, true, false, false)
     }
 
-    fn with(path: &Path, sync: bool, tuned: bool, drain: bool, lz4: bool) -> Res<Rocks> {
+    /// The tuned configuration on the encrypted Env, durable
+    /// (`rocksdb-tuned-enc`) or buffered (`rocksdb-tuned-nosync-enc`).
+    #[cfg(feature = "enc")]
+    pub fn create_tuned_enc(path: &Path, sync: bool) -> Res<Rocks> {
+        Rocks::with(path, sync, true, false, false, true)
+    }
+
+    fn with(path: &Path, sync: bool, tuned: bool, drain: bool, lz4: bool, enc: bool) -> Res<Rocks> {
         std::fs::create_dir_all(path).map_err(|e| e.to_string())?;
         let mut o = rocksdb::Options::default();
         o.create_if_missing(true);
+        // The options keep the Env alive for the store they open.
+        #[cfg(feature = "enc")]
+        if enc {
+            o.set_env(&enc::rocks_env());
+        }
+        #[cfg(not(feature = "enc"))]
+        if enc {
+            return Err(NO_ENC.to_string());
+        }
         o.set_compression_type(if lz4 {
             rocksdb::DBCompressionType::Lz4
         } else {
@@ -15138,6 +15886,7 @@ impl Rocks {
             tuned,
             lz4,
             drain,
+            enc,
             read,
         })
     }
@@ -15216,6 +15965,12 @@ impl Engine for Rocks {
     fn name(&self) -> &'static str {
         if self.lz4 {
             return "rocksdb-tuned-lz4";
+        }
+        if self.enc {
+            return match self.sync {
+                true => "rocksdb-tuned-enc",
+                false => "rocksdb-tuned-nosync-enc",
+            };
         }
         match (self.sync, self.tuned, self.drain) {
             (_, true, true) => "rocksdb-tuned-drain",
@@ -15300,6 +16055,7 @@ impl Engine for Rocks {
 
 // ------------------------------------------------------------------- lmdb --
 
+#[cfg(feature = "lmdb")]
 /// LMDB through heed.
 ///
 /// The engine the design document names as the one Supdb had to beat for the
@@ -15338,6 +16094,7 @@ pub struct Lmdb {
     nordahead: bool,
 }
 
+#[cfg(feature = "lmdb")]
 impl Lmdb {
     pub fn create(path: &Path, map_gb: usize) -> Res<Lmdb> {
         Lmdb::with_flags(path, map_gb, true, false)
@@ -15411,6 +16168,7 @@ impl Lmdb {
     }
 }
 
+#[cfg(feature = "lmdb")]
 /// heed keeps every environment it opens in a registry of its own, and an
 /// environment closes only once `prepare_for_closing` has taken the
 /// registry's handle and every other handle is gone. Dropping the arm alone
@@ -15426,8 +16184,10 @@ impl Drop for Lmdb {
     }
 }
 
+#[cfg(feature = "lmdb")]
 type LmdbDb = heed::Database<heed::types::Bytes, heed::types::Bytes>;
 
+#[cfg(feature = "lmdb")]
 /// One read under whichever transaction: the arm's held one or a thread's.
 fn lmdb_get(db: LmdbDb, r: &heed::RoTxn<'_>, key: &[u8]) -> Res<usize> {
     // Lent from the mapping; the caller's copy is `consume`.
@@ -15438,6 +16198,7 @@ fn lmdb_get(db: LmdbDb, r: &heed::RoTxn<'_>, key: &[u8]) -> Res<usize> {
         .unwrap_or(0))
 }
 
+#[cfg(feature = "lmdb")]
 fn lmdb_range(db: LmdbDb, r: &heed::RoTxn<'_>, from: &[u8], n: usize) -> Res<usize> {
     let mut bytes = 0usize;
     let range = (std::ops::Bound::Included(from), std::ops::Bound::Unbounded);
@@ -15448,6 +16209,7 @@ fn lmdb_range(db: LmdbDb, r: &heed::RoTxn<'_>, from: &[u8], n: usize) -> Res<usi
     Ok(bytes)
 }
 
+#[cfg(feature = "lmdb")]
 /// A reader thread's LMDB: a read transaction begun on the thread, over
 /// the shared environment it holds a handle to.
 struct LmdbReader {
@@ -15455,6 +16217,7 @@ struct LmdbReader {
     txn: heed::RoTxn<'static>,
 }
 
+#[cfg(feature = "lmdb")]
 impl ThreadReader for LmdbReader {
     fn get(&mut self, key: &[u8]) -> Res<usize> {
         lmdb_get(self.db, &self.txn, key)
@@ -15469,12 +16232,14 @@ impl ThreadReader for LmdbReader {
 /// write, which is a write transaction of the thread's own. LMDB admits
 /// one write transaction at a time, so a thread's batch waits for the
 /// others'.
+#[cfg(feature = "lmdb")]
 struct LmdbWriter {
     env: heed::Env,
     db: LmdbDb,
     txn: Option<heed::RoTxn<'static>>,
 }
 
+#[cfg(feature = "lmdb")]
 impl ThreadWriter for LmdbWriter {
     fn get(&mut self, key: &[u8]) -> Res<usize> {
         if self.txn.is_none() {
@@ -15497,6 +16262,7 @@ impl ThreadWriter for LmdbWriter {
     }
 }
 
+#[cfg(feature = "lmdb")]
 impl Engine for Lmdb {
     fn name(&self) -> &'static str {
         match (self.nosync, self.nordahead) {
@@ -16014,6 +16780,280 @@ impl Engine for Faster {
 }
 
 // ---------------------------------------------------------------------------
+// A write-once segment, plain and through an envelope.
+
+/// AES-256-GCM for the envelope arms: `ring`'s, behind the hook
+/// `supdb::crypt` takes its cipher through. The engine ships no cipher, so
+/// this is what a caller writes, as `examples/crypt.rs` has it.
+struct Gcm(ring::aead::LessSafeKey);
+
+impl Gcm {
+    fn new() -> Gcm {
+        Gcm::of(&[0x5a; 32])
+    }
+
+    /// The cipher under `key`: what a store under a cipher makes one of for
+    /// each key it draws (`supdb::StoreCipher`).
+    fn of(key: &[u8; 32]) -> Gcm {
+        let key =
+            ring::aead::UnboundKey::new(&ring::aead::AES_256_GCM, key).expect("a 32-byte key");
+        Gcm(ring::aead::LessSafeKey::new(key))
+    }
+}
+
+impl supdb::crypt::Aead for Gcm {
+    fn encrypt(&self, nonce: &[u8; 12], aad: &[u8], buf: &mut [u8]) -> [u8; 16] {
+        let nonce = ring::aead::Nonce::assume_unique_for_key(*nonce);
+        let tag = self
+            .0
+            .seal_in_place_separate_tag(nonce, ring::aead::Aad::from(aad), buf)
+            .expect("a chunk is far under the cipher's limit");
+        tag.as_ref().try_into().expect("a sixteen-byte tag")
+    }
+    fn decrypt(&self, nonce: &[u8; 12], aad: &[u8], buf: &mut [u8], tag: &[u8; 16]) -> bool {
+        let nonce = ring::aead::Nonce::assume_unique_for_key(*nonce);
+        self.0
+            .open_in_place_separate_tag(nonce, ring::aead::Aad::from(aad), (*tag).into(), buf, 0..)
+            .is_ok()
+    }
+}
+
+/// How a segment arm publishes its file and reads it back.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Envelope {
+    /// The segment as it is written, read through a mapping.
+    None,
+    /// Encrypted at the load's `sync`, read through a reader that keeps
+    /// what it decrypts: `supdb::crypt`'s default.
+    Kept,
+    /// The same envelope through a reader that keeps nothing and decrypts
+    /// at each read (`ReadOptions::keep_bytes` of zero).
+    Bounded,
+}
+
+/// A finished segment behind one of its readers. Boxed alike, so that a
+/// read through either reaches its reader by the same steps: the reader
+/// that keeps what it decrypts is three times the plain one's size, and one
+/// boxed beside one not is a load the other arm does not make.
+enum SegBlob {
+    Plain(Box<supdb::Blob<supdb::MmapBytes>>),
+    Enc(Box<supdb::Blob<supdb::crypt::Encrypted<supdb::MmapBytes, Gcm>>>),
+}
+
+fn blob_get<B: supdb::Bytes>(b: &supdb::Blob<B>, key: &[u8]) -> Res<usize> {
+    let mut n = 0usize;
+    b.read_all(key, |v| n += consume(v))
+        .map_err(|e| e.to_string())?;
+    Ok(n)
+}
+
+fn blob_range<B: supdb::Bytes>(b: &supdb::Blob<B>, from: &[u8], n: usize) -> Res<usize> {
+    let mut bytes = 0usize;
+    b.scan(from, n, |_k, v| bytes += consume(v))
+        .map_err(|e| e.to_string())?;
+    Ok(bytes)
+}
+
+impl SegBlob {
+    fn get(&self, key: &[u8]) -> Res<usize> {
+        match self {
+            SegBlob::Plain(b) => blob_get(b, key),
+            SegBlob::Enc(b) => blob_get(b, key),
+        }
+    }
+    fn range(&self, from: &[u8], n: usize) -> Res<usize> {
+        match self {
+            SegBlob::Plain(b) => blob_range(b, from, n),
+            SegBlob::Enc(b) => blob_range(b, from, n),
+        }
+    }
+}
+
+/// A write-once segment: the load's keys through `SegmentWriter` as they
+/// arrive, the file finished at `sync` and read by `Blob` from then on.
+///
+/// The other producer of the format, and the one a published index is made
+/// by: sorted input in, one immutable file out. It takes the ordered load
+/// and nothing after it that writes -- a shuffled load, an update and a mix
+/// with writes are refused by name -- so its passes are `load`, `read` and
+/// `scan`, threaded or not, and it is an arm for a pairing, never the
+/// roster's. What it is here for is the envelope: the same file published
+/// encrypted (`supdb::crypt`) and read through each of the two readers,
+/// beside itself read plain, in one process.
+///
+/// `sync` is where the file is finished and, for an envelope, encrypted,
+/// the plain file removed and the envelope synced, so the load's rate has
+/// the encryption in it; the readers are opened there too, outside every
+/// read pass, as a store's are. An envelope arm writes its plain file to
+/// memory (`/dev/shm`, where there is one) and only the envelope to the
+/// store's directory: a plain file written beside the envelope is the
+/// segment written to the device twice, half the load's rate in the first
+/// pairing of these arms, and it is the plaintext on the device, which is
+/// what the envelope was for. `blocks` writes every value into a block
+/// where the engine's own shape keeps a hundred bytes inline in the index
+/// record: inline, a read touches the index alone, which any reader holds
+/// after its open, and the envelope's cost at a read shows only where the
+/// read reaches a block.
+pub struct Segment {
+    dir: PathBuf,
+    /// Where the writer writes: the store's directory, or memory for a
+    /// segment that is published as an envelope.
+    plain: PathBuf,
+    envelope: Envelope,
+    blocks: bool,
+    writer: Option<supdb::SegmentWriter>,
+    blob: Option<std::sync::Arc<SegBlob>>,
+}
+
+/// Plain files in memory, one a segment, named apart.
+static SEGMENT_TEMPS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+impl Segment {
+    fn create(dir: &Path, envelope: Envelope, blocks: bool) -> Res<Segment> {
+        std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
+        let shm = Path::new("/dev/shm");
+        let plain = if envelope != Envelope::None && shm.is_dir() {
+            let n = SEGMENT_TEMPS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            shm.join(format!(
+                "supdb-bench-segment-{}-{n}.sup",
+                std::process::id()
+            ))
+        } else {
+            dir.join("segment.sup")
+        };
+        let mut writer =
+            supdb::SegmentWriter::create(&plain, &Default::default()).map_err(|e| e.to_string())?;
+        // The engine's own bound on an inline run, or none.
+        let inline = supdb::Options::default().inline_bytes;
+        writer.set_inline_max(if blocks { 0 } else { inline });
+        Ok(Segment {
+            dir: dir.to_path_buf(),
+            plain,
+            envelope,
+            blocks,
+            writer: Some(writer),
+            blob: None,
+        })
+    }
+
+    fn reader(&self) -> Res<&std::sync::Arc<SegBlob>> {
+        self.blob
+            .as_ref()
+            .ok_or_else(|| "a write-once segment is read after its sync".to_string())
+    }
+}
+
+struct SegmentReader(std::sync::Arc<SegBlob>);
+
+impl ThreadReader for SegmentReader {
+    fn get(&mut self, key: &[u8]) -> Res<usize> {
+        self.0.get(key)
+    }
+    fn range(&mut self, from: &[u8], n: usize) -> Res<usize> {
+        self.0.range(from, n)
+    }
+}
+
+impl Engine for Segment {
+    fn name(&self) -> &'static str {
+        match (self.blocks, self.envelope) {
+            (false, Envelope::None) => "supdb-segment",
+            (false, Envelope::Kept) => "supdb-segment-enc",
+            (false, Envelope::Bounded) => "supdb-segment-encbounded",
+            (true, Envelope::None) => "supdb-segmentblocks",
+            (true, Envelope::Kept) => "supdb-segmentblocks-enc",
+            (true, Envelope::Bounded) => "supdb-segmentblocks-encbounded",
+        }
+    }
+    fn features(&self) -> Features {
+        Features {
+            // Nothing is durable, or readable, before the one `sync`.
+            durable_commit: false,
+            transactions: false,
+            checksums: true,
+            reopen_for_write: false,
+            read_your_writes: false,
+            ordered_scan: true,
+        }
+    }
+    fn write_batch(&mut self, items: &[(&[u8], &[u8])]) -> Res<()> {
+        let w = self
+            .writer
+            .as_mut()
+            .ok_or("a write-once segment takes no write after its sync")?;
+        for &(k, v) in items {
+            // The writer refuses a key out of order, which is what a
+            // shuffled load hands it.
+            w.begin(k).map_err(|e| e.to_string())?;
+            w.value(v);
+            w.end().map_err(|e| e.to_string())?;
+        }
+        Ok(())
+    }
+    fn update_batch(&mut self, _items: &[(&[u8], &[u8])]) -> Res<()> {
+        Err("a write-once segment takes no update".into())
+    }
+    fn get(&mut self, key: &[u8]) -> Res<usize> {
+        self.reader()?.get(key)
+    }
+    fn range(&mut self, from: &[u8], n: usize) -> Res<usize> {
+        self.reader()?.range(from, n)
+    }
+    fn thread_reader(&self) -> Res<ReaderOpener> {
+        // One reader, shared: a `Blob` is, and a kept chunk is every
+        // thread's once any of them has decrypted it.
+        let blob = self.reader()?.clone();
+        Ok(Box::new(move || {
+            Ok(Box::new(SegmentReader(blob)) as Box<dyn ThreadReader>)
+        }))
+    }
+    fn sync(&mut self) -> Res<()> {
+        let Some(w) = self.writer.take() else {
+            return Ok(());
+        };
+        let e = |e: std::io::Error| e.to_string();
+        let plain = self.plain.clone();
+        w.finish(1).map_err(e)?;
+        if self.envelope == Envelope::None {
+            let src = supdb::MmapBytes::open(&plain).map_err(e)?;
+            let blob = Box::new(supdb::Blob::open(src).map_err(e)?);
+            self.blob = Some(SegBlob::Plain(blob).into());
+            return Ok(());
+        }
+        let stored = self.dir.join("segment.sup.enc");
+        {
+            let src = supdb::MmapBytes::open(&plain).map_err(e)?;
+            let mut out = std::fs::File::create(&stored).map_err(e)?;
+            supdb::crypt::encrypt(&src, &mut out, &Gcm::new(), &Default::default()).map_err(e)?;
+            out.sync_all().map_err(e)?;
+        }
+        std::fs::remove_file(&plain).map_err(e)?;
+        let mut opts = supdb::crypt::ReadOptions::default();
+        if self.envelope == Envelope::Bounded {
+            opts.keep_bytes = 0;
+        }
+        let src = supdb::MmapBytes::open(&stored).map_err(e)?;
+        let src = supdb::crypt::Encrypted::open_with(src, Gcm::new(), &opts).map_err(e)?;
+        let blob = Box::new(supdb::Blob::open(src).map_err(e)?);
+        self.blob = Some(SegBlob::Enc(blob).into());
+        Ok(())
+    }
+    fn size_bytes(&self) -> u64 {
+        dir_size(&self.dir)
+    }
+}
+
+impl Drop for Segment {
+    fn drop(&mut self) {
+        // A segment dropped before its sync leaves its plain file, and one
+        // in memory is under nobody's directory to be removed with it.
+        if self.writer.take().is_some() {
+            let _ = std::fs::remove_file(&self.plain);
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // The arms.
 use crate::row::Guarantee;
 
@@ -16111,6 +17151,53 @@ pub const OOC_ARMS: [&str; 8] = ooc_roster!();
 /// `ARMS`.
 pub const OOC_ARMS_EVERYWHERE: [&str; 10] = ooc_roster!("supdb-heldpart", "faster");
 
+/// The stores encrypted at rest, each beside the plain store it is the
+/// encryption of: the engine under a cipher of the caller's
+/// (`supdb-cipher`), and the two comparators under theirs (`enc.rs`) --
+/// LMDB's 1.0 line behind its page hook and RocksDB on its encrypted Env.
+/// Never the roster's: they are a build of their own (feature `enc`), and
+/// what they are for is one question, whether the engine under a cipher
+/// reads and writes ahead of what a user who needs a store encrypted would
+/// otherwise pick. `bench run --arms` with this list, in that build, is the
+/// row that answers it; the buffered group is `ENC_BUFFERED_ARMS`.
+pub const ENC_ARMS: [&str; 6] = [
+    "supdb",
+    "supdb-cipher",
+    "lmdb3",
+    "lmdb3-enc",
+    "rocksdb-tuned",
+    "rocksdb-tuned-enc",
+];
+
+/// `ENC_ARMS`' buffered group.
+pub const ENC_BUFFERED_ARMS: [&str; 6] = [
+    "supdb-ingest",
+    "supdb-ingestcipher",
+    "lmdb3-nosync",
+    "lmdb3-nosync-enc",
+    "rocksdb-tuned-nosync",
+    "rocksdb-tuned-nosync-enc",
+];
+
+/// What an encrypted comparator's name answers in a build without them.
+#[cfg(not(feature = "enc"))]
+const NO_ENC: &str = "the encrypted comparators are a build of their own: \
+    cargo build --release --no-default-features --features enc --bin bench";
+
+/// What an `lmdb` arm's name answers in the build of the encrypted
+/// comparators, where LMDB's 1.0 line stands in the released one's place.
+#[cfg(not(feature = "lmdb"))]
+const NO_LMDB: &str = "this build holds LMDB's 1.0 line in the released one's place \
+    (feature enc): lmdb3, lmdb3-nosync, lmdb3-enc, lmdb3-nosync-enc";
+
+/// Whether the arm writes one file, once, from keys in order: the segment
+/// arms. Such an arm has the ordered load and the reads over it and
+/// nothing else, so the runner makes it no second store for a shuffled
+/// load (`run::one_pass`).
+pub fn write_once(arm: &str) -> bool {
+    arm.starts_with("supdb-segment")
+}
+
 pub fn guarantee(arm: &str) -> Option<Guarantee> {
     Some(match arm {
         "supdb"
@@ -16147,6 +17234,25 @@ pub fn guarantee(arm: &str) -> Option<Guarantee> {
         | "supdb-livefirst"
         | "supdb-memfnv"
         | "supdb-nocache"
+        | "supdb-dirkey"
+        | "supdb-cipher"
+        | "supdb-cipher64"
+        | "supdb-cipherlog"
+        | "supdb-cipherauto"
+        | "supdb-ciphernoauto"
+        | "supdb-cipheronefile"
+        | "supdb-cipherautoonefile"
+        | "supdb-cipherautolandmodel"
+        | "supdb-cipherautomergeapart"
+        | "supdb-cipherautomergestream"
+        | "supdb-cipherautodropskeep"
+        | "supdb-cipherautorewarmbeside"
+        | "supdb-cipherautoaheadflat"
+        | "supdb-cipherzpages"
+        | "supdb-cipherzstride"
+        | "supdb-cipherzstrideapart"
+        | "supdb-cipherzstridehalf"
+        | "supdb-cipherhalf"
         | "supdb-nocacheordread"
         | "supdb-nocachezpages"
         | "supdb-nocachezpagesnodrop"
@@ -16534,6 +17640,8 @@ pub fn guarantee(arm: &str) -> Option<Guarantee> {
         | "supdb-zstrideallslab"
         | "supdb-jobsshort"
         | "supdb-jobsheap"
+        | "supdb-onefile"
+        | "supdb-ingestonefile"
         | "supdb-nobuycross"
         | "supdb-drainreadable"
         | "supdb-drainstrict"
@@ -16571,8 +17679,11 @@ pub fn guarantee(arm: &str) -> Option<Guarantee> {
         | "supdb-bglag"
         | "lmdb"
         | "lmdb-nordahead"
+        | "lmdb3"
+        | "lmdb3-enc"
         | "dense"
         | "rocksdb-tuned-lz4"
+        | "rocksdb-tuned-enc"
         | "rocksdb-tuned" => Guarantee::Durable,
         "supdb-ingest"
         | "supdb-ingestleave"
@@ -16683,8 +17794,24 @@ pub fn guarantee(arm: &str) -> Option<Guarantee> {
         | "supdb-ingestbglag"
         | "supdb-ingesthold"
         | "lmdb-nosync"
+        | "lmdb3-nosync"
+        | "lmdb3-nosync-enc"
         | "rocksdb-nosync"
-        | "rocksdb-tuned-nosync" => Guarantee::Buffered,
+        | "rocksdb-tuned-nosync"
+        | "rocksdb-tuned-nosync-enc"
+        | "supdb-ingestdirkey"
+        | "supdb-ingestcipher"
+        | "supdb-ingestcipherlog"
+        | "supdb-ingestcipherauto"
+        | "supdb-ingestciphernoauto"
+        | "supdb-ingestcipherautoonefile"
+        // A write-once segment makes nothing durable before its one sync.
+        | "supdb-segment"
+        | "supdb-segment-enc"
+        | "supdb-segment-encbounded"
+        | "supdb-segmentblocks"
+        | "supdb-segmentblocks-enc"
+        | "supdb-segmentblocks-encbounded" => Guarantee::Buffered,
         // FASTER's promise and no stronger one: a commit is in the process
         // when the call returns and on the device at the next `sync`.
         "supdb-held"
@@ -16740,13 +17867,6 @@ pub fn guarantee(arm: &str) -> Option<Guarantee> {
     })
 }
 
-/// Open an arm on a fresh directory. `map_gb` sizes LMDB's map; the other
-/// engines grow on their own.
-/// A supdb arm opened by its constructor, outside `open`: a `Supdb` is a
-/// few kilobytes, and the match built every arm's in a slot of its own in
-/// `open`'s frame, two megabytes at three hundred arms -- the default
-/// stack of a test's thread, which the first arm past it overflowed.
-#[inline(never)]
 /// The reads a light form takes before its conversion for
 /// `supdb-densefrom`, from `CONVREADS` (none where unset).
 fn conv_reads_env() -> u32 {
@@ -16766,6 +17886,11 @@ fn dense_from_env() -> usize {
         .max(1)
 }
 
+/// A supdb arm opened by its constructor, outside `open`: a `Supdb` is a
+/// few kilobytes, and the match built every arm's in a slot of its own in
+/// `open`'s frame, two megabytes at three hundred arms -- the default
+/// stack of a test's thread, which the first arm past it overflowed.
+#[inline(never)]
 fn supdb_arm(make: fn(&Path) -> Res<Supdb>, dir: &Path) -> Res<Box<dyn Engine>> {
     Ok(Box::new(make(dir)?))
 }
@@ -16831,6 +17956,31 @@ pub fn open(arm: &str, dir: &Path, map_gb: usize) -> Res<Box<dyn Engine>> {
         "supdb-noadvice" => supdb_arm(Supdb::create_noadvice, dir)?,
         "supdb-advicerandom" => supdb_arm(Supdb::create_advicerandom, dir)?,
         "supdb-nocache" => supdb_arm(Supdb::create_nocache, dir)?,
+        "supdb-dirkey" => supdb_arm(Supdb::create_dirkey, dir)?,
+        "supdb-ingestdirkey" => supdb_arm(Supdb::create_ingest_dirkey, dir)?,
+        "supdb-cipher" => supdb_arm(Supdb::create_cipher, dir)?,
+        "supdb-cipher64" => supdb_arm(Supdb::create_cipher64, dir)?,
+        "supdb-cipherlog" => supdb_arm(Supdb::create_cipherlog, dir)?,
+        "supdb-ingestcipherlog" => supdb_arm(Supdb::create_ingest_cipherlog, dir)?,
+        "supdb-cipherauto" => supdb_arm(Supdb::create_cipherauto, dir)?,
+        "supdb-ciphernoauto" => supdb_arm(Supdb::create_ciphernoauto, dir)?,
+        "supdb-cipheronefile" => supdb_arm(Supdb::create_cipher_onefile, dir)?,
+        "supdb-cipherautoonefile" => supdb_arm(Supdb::create_cipherauto_onefile, dir)?,
+        "supdb-ingestcipherautoonefile" => supdb_arm(Supdb::create_ingest_cipherauto_onefile, dir)?,
+        "supdb-cipherautolandmodel" => supdb_arm(Supdb::create_cipherauto_landmodel, dir)?,
+        "supdb-cipherautomergeapart" => supdb_arm(Supdb::create_cipherauto_mergeapart, dir)?,
+        "supdb-cipherautomergestream" => supdb_arm(Supdb::create_cipherauto_mergestream, dir)?,
+        "supdb-cipherautodropskeep" => supdb_arm(Supdb::create_cipherauto_dropskeep, dir)?,
+        "supdb-cipherautorewarmbeside" => supdb_arm(Supdb::create_cipherauto_rewarmbeside, dir)?,
+        "supdb-cipherautoaheadflat" => supdb_arm(Supdb::create_cipherauto_aheadflat, dir)?,
+        "supdb-cipherzpages" => supdb_arm(Supdb::create_cipher_zpages, dir)?,
+        "supdb-cipherzstride" => supdb_arm(Supdb::create_cipher_zstride, dir)?,
+        "supdb-cipherzstrideapart" => supdb_arm(Supdb::create_cipher_zstride_apart, dir)?,
+        "supdb-cipherzstridehalf" => supdb_arm(Supdb::create_cipher_zstride_half, dir)?,
+        "supdb-cipherhalf" => supdb_arm(Supdb::create_cipher_half, dir)?,
+        "supdb-ingestcipher" => supdb_arm(Supdb::create_ingest_cipher, dir)?,
+        "supdb-ingestcipherauto" => supdb_arm(Supdb::create_ingest_cipherauto, dir)?,
+        "supdb-ingestciphernoauto" => supdb_arm(Supdb::create_ingest_ciphernoauto, dir)?,
         "supdb-nocacheordread" => supdb_arm(Supdb::create_nocache_ordread, dir)?,
         "supdb-nocachezpages" => supdb_arm(Supdb::create_nocache_zpages, dir)?,
         "supdb-nocachezpagesnodrop" => supdb_arm(Supdb::create_nocache_zpages_nodrop, dir)?,
@@ -18484,6 +19634,8 @@ pub fn open(arm: &str, dir: &Path, map_gb: usize) -> Res<Box<dyn Engine>> {
         "supdb-zstrideallslab" => supdb_arm(Supdb::create_zstride_all_slab, dir)?,
         "supdb-jobsshort" => supdb_arm(Supdb::create_jobsshort, dir)?,
         "supdb-jobsheap" => supdb_arm(Supdb::create_jobsheap, dir)?,
+        "supdb-onefile" => supdb_arm(Supdb::create_onefile, dir)?,
+        "supdb-ingestonefile" => supdb_arm(Supdb::create_ingest_onefile, dir)?,
         "supdb-nobuycross" => supdb_arm(Supdb::create_nobuycross, dir)?,
         "supdb-drainreadable" => supdb_arm(Supdb::create_drainreadable, dir)?,
         "supdb-drainstrict" => supdb_arm(Supdb::create_drainstrict, dir)?,
@@ -19633,10 +20785,42 @@ pub fn open(arm: &str, dir: &Path, map_gb: usize) -> Res<Box<dyn Engine>> {
         "supdb-shapeidle" => supdb_arm(Supdb::create_shape_idle, dir)?,
         "supdb-ingestadaptloose" => supdb_arm(Supdb::create_ingest_adaptloose, dir)?,
         "supdb-ingestnoseal" => supdb_arm(Supdb::create_ingest_noseal, dir)?,
+        "supdb-segment" => Box::new(Segment::create(dir, Envelope::None, false)?),
+        "supdb-segment-enc" => Box::new(Segment::create(dir, Envelope::Kept, false)?),
+        "supdb-segment-encbounded" => Box::new(Segment::create(dir, Envelope::Bounded, false)?),
+        "supdb-segmentblocks" => Box::new(Segment::create(dir, Envelope::None, true)?),
+        "supdb-segmentblocks-enc" => Box::new(Segment::create(dir, Envelope::Kept, true)?),
+        "supdb-segmentblocks-encbounded" => {
+            Box::new(Segment::create(dir, Envelope::Bounded, true)?)
+        }
+        #[cfg(feature = "lmdb")]
         "lmdb" => Box::new(Lmdb::create(dir, map_gb)?),
+        #[cfg(feature = "lmdb")]
         "lmdb-nordahead" => Box::new(Lmdb::create_nordahead(dir, map_gb)?),
         "dense" => Box::new(dense::Dense::open(dir)?),
+        #[cfg(feature = "lmdb")]
         "lmdb-nosync" => Box::new(Lmdb::create_nosync(dir, map_gb)?),
+        #[cfg(not(feature = "lmdb"))]
+        "lmdb" | "lmdb-nordahead" | "lmdb-nosync" => return Err(NO_LMDB.to_string()),
+        #[cfg(feature = "enc")]
+        "lmdb3" => Box::new(enc::Lmdb3::create(dir, map_gb, true, false)?),
+        #[cfg(feature = "enc")]
+        "lmdb3-nosync" => Box::new(enc::Lmdb3::create(dir, map_gb, false, false)?),
+        #[cfg(feature = "enc")]
+        "lmdb3-enc" => Box::new(enc::Lmdb3::create(dir, map_gb, true, true)?),
+        #[cfg(feature = "enc")]
+        "lmdb3-nosync-enc" => Box::new(enc::Lmdb3::create(dir, map_gb, false, true)?),
+        #[cfg(feature = "enc")]
+        "rocksdb-tuned-enc" => Box::new(Rocks::create_tuned_enc(dir, true)?),
+        #[cfg(feature = "enc")]
+        "rocksdb-tuned-nosync-enc" => Box::new(Rocks::create_tuned_enc(dir, false)?),
+        #[cfg(not(feature = "enc"))]
+        "lmdb3"
+        | "lmdb3-nosync"
+        | "lmdb3-enc"
+        | "lmdb3-nosync-enc"
+        | "rocksdb-tuned-enc"
+        | "rocksdb-tuned-nosync-enc" => return Err(NO_ENC.to_string()),
         "rocksdb-tuned" => Box::new(Rocks::create_tuned(dir)?),
         "rocksdb-tuned-lz4" => Box::new(Rocks::create_tuned_lz4(dir)?),
         "rocksdb-nosync" => Box::new(Rocks::create(dir, false)?),
@@ -20421,6 +21605,7 @@ mod tests {
     /// with exactly `NO_READ_AHEAD` over the flags `lmdb` is opened with.
     /// Copied from the matching test's shape: a difference that is not
     /// the one the arm is for is a second arm nobody declared.
+    #[cfg(feature = "lmdb")]
     #[test]
     fn the_readahead_arm_differs_from_lmdb_in_one_flag() {
         assert_eq!(guarantee("lmdb-nordahead"), Some(Guarantee::Durable));
@@ -20651,6 +21836,7 @@ mod tests {
     /// roster ran before was RocksDB as it ships beside a tuned durable
     /// one: a difference that was not the one the group is for, and the
     /// roster holds the tuned one now.
+    #[cfg(feature = "lmdb")]
     #[test]
     fn the_buffered_comparators_differ_from_the_durable_ones_in_the_sync() {
         assert_eq!(guarantee("rocksdb-tuned-nosync"), Some(Guarantee::Buffered));
@@ -20746,6 +21932,361 @@ mod tests {
             );
         }
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// The cipher arms are `supdb` under a cipher, and each of the two
+    /// shapes they are priced against differs from `supdb-cipher` in its
+    /// one option: `supdb-cipherlog` loads an ordered run through the log
+    /// (`direct_ingest` off), `supdb-cipherauto` lets the compact form's
+    /// controller in (`zpages_under_cipher`). A store under a cipher keeps
+    /// its plaintext in memory files, which Linux alone has.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn the_cipher_arms_differ_from_supdb_cipher_in_their_one_option() {
+        let root =
+            std::env::temp_dir().join(format!("supdb-bench-cipherarms-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let arm = |name: &str, f: fn(&Path) -> Res<Supdb>| {
+            let d = root.join(name);
+            std::fs::create_dir_all(&d).unwrap();
+            let a = f(&d).unwrap();
+            assert_eq!(a.name(), name);
+            a
+        };
+        let plain = arm("supdb", Supdb::create);
+        let cipher = arm("supdb-cipher", Supdb::create_cipher);
+        let log = arm("supdb-cipherlog", Supdb::create_cipherlog);
+        let auto = arm("supdb-cipherauto", Supdb::create_cipherauto);
+        let noauto = arm("supdb-ciphernoauto", Supdb::create_ciphernoauto);
+        let zblock = arm("supdb-cipherzpages", Supdb::create_cipher_zpages);
+        let zstride = arm("supdb-cipherzstride", Supdb::create_cipher_zstride);
+        let o = |a: &Supdb| a.db.as_ref().unwrap().options().clone();
+        let (p, c, l, z) = (o(&plain), o(&cipher), o(&log), o(&auto));
+        assert!(
+            !o(&noauto).zpages_under_cipher,
+            "supdb-ciphernoauto leaves the controller out"
+        );
+        let (zb, zs) = (o(&zblock), o(&zstride));
+        // The store's options give the cipher to the store, which holds it
+        // where the options do not (`Db::cipher_counts` answers for it).
+        let under = |a: &Supdb| a.db.as_ref().unwrap().cipher_counts().is_some();
+        assert!(!under(&plain), "supdb is in the clear");
+        // The arm that keeps its chunks apart is the stride arm in every
+        // option: what it changes is the cipher's, which the options hand
+        // to the store.
+        let apart = arm(
+            "supdb-cipherzstrideapart",
+            Supdb::create_cipher_zstride_apart,
+        );
+        assert!(under(&apart), "supdb-cipherzstrideapart: under a cipher");
+        let za = o(&apart);
+        assert_eq!(za.zpages, zs.zpages, "supdb-cipherzstrideapart");
+        assert_eq!(
+            za.zpages_stride, zs.zpages_stride,
+            "supdb-cipherzstrideapart"
+        );
+        assert_eq!(
+            guarantee("supdb-cipherzstrideapart"),
+            guarantee("supdb-cipher")
+        );
+        drop(apart);
+        // The two with the cache as it was: each its sibling in every
+        // option, the cache's size being the cipher's.
+        for (name, f, sib) in [
+            (
+                "supdb-cipherhalf",
+                Supdb::create_cipher_half as fn(&Path) -> Res<Supdb>,
+                &c,
+            ),
+            (
+                "supdb-cipherzstridehalf",
+                Supdb::create_cipher_zstride_half,
+                &zs,
+            ),
+        ] {
+            let half = arm(name, f);
+            assert!(under(&half), "{name}: under a cipher");
+            let h = o(&half);
+            assert_eq!(h.zpages, sib.zpages, "{name}");
+            assert_eq!(h.zpages_stride, sib.zpages_stride, "{name}");
+            assert_eq!(guarantee(name), guarantee("supdb-cipher"), "{name}");
+        }
+        for (name, a) in [
+            ("supdb-cipher", &cipher),
+            ("supdb-cipherlog", &log),
+            ("supdb-cipherauto", &auto),
+            ("supdb-cipherzpages", &zblock),
+            ("supdb-cipherzstride", &zstride),
+        ] {
+            assert!(under(a), "{name}: under a cipher");
+        }
+        // The forced arms: the form at every build, in the coding each
+        // names, and nothing else of `supdb-cipher` moved.
+        for (name, f) in [("supdb-cipherzpages", &zb), ("supdb-cipherzstride", &zs)] {
+            assert_eq!(f.zpages, supdb::ZPages::Always, "{name}: the form forced");
+            assert!(
+                !f.zpages_stride_room,
+                "{name}: no room asked of a forced form"
+            );
+            assert_eq!(f.direct_ingest, c.direct_ingest, "{name}");
+            assert_eq!(f.scan_cache_bytes, c.scan_cache_bytes, "{name}");
+        }
+        assert_eq!(zb.zpages_stride, supdb::ZStride::Off, "supdb-cipherzpages");
+        assert_eq!(
+            zs.zpages_stride,
+            supdb::ZStride::Forced,
+            "supdb-cipherzstride"
+        );
+        for name in ["supdb-cipherzpages", "supdb-cipherzstride"] {
+            assert_eq!(guarantee(name), guarantee("supdb-cipher"), "{name}");
+        }
+        assert_eq!(
+            c.direct_ingest, p.direct_ingest,
+            "supdb-cipher keeps supdb's ordered ingest"
+        );
+        assert!(p.direct_ingest, "supdb's ordered loads go to a run");
+        assert!(
+            c.zpages_under_cipher,
+            "supdb-cipher lets the controller in, as the engine ships"
+        );
+        assert!(!l.direct_ingest, "supdb-cipherlog loads through the log");
+        assert_eq!(
+            l.zpages_under_cipher, c.zpages_under_cipher,
+            "supdb-cipherlog"
+        );
+        assert!(
+            z.zpages_under_cipher,
+            "supdb-cipherauto lets the controller in"
+        );
+        assert_eq!(z.direct_ingest, c.direct_ingest, "supdb-cipherauto");
+        // The controller's arm with its builds ahead's line as it was:
+        // its sibling but for the one option.
+        let landmodel = arm(
+            "supdb-cipherautolandmodel",
+            Supdb::create_cipherauto_landmodel,
+        );
+        assert!(
+            under(&landmodel),
+            "supdb-cipherautolandmodel: under a cipher"
+        );
+        let m = o(&landmodel);
+        assert!(m.zpages_under_cipher, "supdb-cipherautolandmodel");
+        assert!(
+            z.zpages_land_cache_pct > 0 && m.zpages_land_cache_pct == 0,
+            "supdb-cipherautolandmodel starts its builds ahead by the controller's budget alone"
+        );
+        assert_eq!(m.zpages_land_pct, z.zpages_land_pct);
+        assert_eq!(
+            guarantee("supdb-cipherautolandmodel"),
+            guarantee("supdb-cipher")
+        );
+        drop(landmodel);
+        let apart = arm(
+            "supdb-cipherautomergeapart",
+            Supdb::create_cipherauto_mergeapart,
+        );
+        assert!(under(&apart), "supdb-cipherautomergeapart: under a cipher");
+        let a = o(&apart);
+        assert!(a.zpages_under_cipher, "supdb-cipherautomergeapart");
+        assert!(
+            z.merge_read_ahead_cipher > 0 && a.merge_read_ahead_cipher == 0,
+            "supdb-cipherautomergeapart asks nothing ahead of its merges' walks"
+        );
+        assert_eq!(a.zpages_land_cache_pct, z.zpages_land_cache_pct);
+        assert_eq!(
+            guarantee("supdb-cipherautomergeapart"),
+            guarantee("supdb-cipher")
+        );
+        drop(apart);
+        let stream = arm(
+            "supdb-cipherautomergestream",
+            Supdb::create_cipherauto_mergestream,
+        );
+        assert!(
+            under(&stream),
+            "supdb-cipherautomergestream: under a cipher"
+        );
+        let m = o(&stream);
+        assert!(m.zpages_under_cipher, "supdb-cipherautomergestream");
+        // What it changes is the cipher's, which the options hand to the
+        // store: the arm's policy, held to the cipher it makes below
+        // (`the_dirkey_arm_asks_the_kernel_and_the_cipher_arms_a_cipher`).
+        assert!(
+            !auto.cipher_merge_stream && stream.cipher_merge_stream,
+            "supdb-cipherautomergestream reads its merges' inputs beside the cache"
+        );
+        assert_eq!(m.merge_read_ahead_cipher, z.merge_read_ahead_cipher);
+        assert_eq!(
+            guarantee("supdb-cipherautomergestream"),
+            guarantee("supdb-cipher")
+        );
+        drop(stream);
+        let keep = arm(
+            "supdb-cipherautodropskeep",
+            Supdb::create_cipherauto_dropskeep,
+        );
+        assert!(under(&keep), "supdb-cipherautodropskeep: under a cipher");
+        let k = o(&keep);
+        assert!(k.zpages_under_cipher, "supdb-cipherautodropskeep");
+        assert!(
+            !auto.cipher_drops_keep && keep.cipher_drops_keep,
+            "supdb-cipherautodropskeep leaves a drop's plaintext in the cache"
+        );
+        assert_eq!(k.zpages_drop_raw, z.zpages_drop_raw);
+        assert_eq!(
+            guarantee("supdb-cipherautodropskeep"),
+            guarantee("supdb-cipher")
+        );
+        drop(keep);
+        let beside = arm(
+            "supdb-cipherautorewarmbeside",
+            Supdb::create_cipherauto_rewarmbeside,
+        );
+        assert!(
+            under(&beside),
+            "supdb-cipherautorewarmbeside: under a cipher"
+        );
+        let b = o(&beside);
+        assert!(b.zpages_under_cipher, "supdb-cipherautorewarmbeside");
+        assert!(
+            !z.zpages_rewarm_beside_merges && b.zpages_rewarm_beside_merges,
+            "supdb-cipherautorewarmbeside rewarms beside merges in flight"
+        );
+        assert_eq!(b.zpages_rewarm_quiet_ms, z.zpages_rewarm_quiet_ms);
+        assert_eq!(
+            guarantee("supdb-cipherautorewarmbeside"),
+            guarantee("supdb-cipher")
+        );
+        drop(beside);
+        let flat = arm(
+            "supdb-cipherautoaheadflat",
+            Supdb::create_cipherauto_aheadflat,
+        );
+        assert!(under(&flat), "supdb-cipherautoaheadflat: under a cipher");
+        let f = o(&flat);
+        assert!(
+            z.merge_ahead_shares && !f.merge_ahead_shares,
+            "supdb-cipherautoaheadflat asks its merges' windows whole"
+        );
+        assert_eq!(f.merge_read_ahead_cipher, z.merge_read_ahead_cipher);
+        assert_eq!(
+            guarantee("supdb-cipherautoaheadflat"),
+            guarantee("supdb-cipher")
+        );
+        drop(flat);
+        drop((plain, cipher, log, auto, zblock, zstride));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// The arms' encryption by their policy's two switches: the dirkey arm's
+    /// store asks the kernel (`supdb-dirkey` opens only on a filesystem that
+    /// encrypts, so no test here opens it), the cipher arms' a cipher with
+    /// their cache, and the rest nothing.
+    #[test]
+    fn the_dirkey_arm_asks_the_kernel_and_the_cipher_arms_a_cipher() {
+        use supdb::Encryption;
+        assert!(matches!(
+            encryption_of(true, false, 0, CipherShape::default()),
+            Encryption::Kernel(_)
+        ));
+        assert!(matches!(
+            encryption_of(true, true, 0, CipherShape::default()),
+            Encryption::Kernel(_)
+        ));
+        assert!(matches!(
+            encryption_of(false, true, 0, CipherShape::default()),
+            Encryption::Cipher(_)
+        ));
+        assert!(matches!(
+            encryption_of(false, true, 64 << 20, CipherShape::default()),
+            Encryption::Cipher(_)
+        ));
+        assert!(matches!(
+            encryption_of(false, false, 0, CipherShape::default()),
+            Encryption::None
+        ));
+        // The merges' reads beside the cache are the cipher's knob.
+        let beside = |e: Encryption| match e {
+            Encryption::Cipher(c) => c.merges_beside_cache_set(),
+            _ => false,
+        };
+        assert!(beside(encryption_of(
+            false,
+            true,
+            0,
+            CipherShape {
+                merge_stream: true,
+                ..CipherShape::default()
+            }
+        )));
+        assert!(!beside(encryption_of(
+            false,
+            true,
+            0,
+            CipherShape::default()
+        )));
+        // And a drop's plaintext kept is the cipher's knob too.
+        let keeps = |e: Encryption| match e {
+            Encryption::Cipher(c) => c.drops_keep_plaintext_set(),
+            _ => false,
+        };
+        assert!(keeps(encryption_of(
+            false,
+            true,
+            0,
+            CipherShape {
+                drops_keep: true,
+                ..CipherShape::default()
+            }
+        )));
+        assert!(!keeps(encryption_of(
+            false,
+            true,
+            0,
+            CipherShape::default()
+        )));
+        // And the bound reaches the store: `supdb-cipher64`'s cache is its
+        // policy's sixty-four mebibytes, `supdb-cipher`'s the engine's own.
+        // The stores are opened where a store under a cipher can be, which
+        // is Linux, with the memory files its plaintext is kept in.
+        #[cfg(target_os = "linux")]
+        {
+            let root =
+                std::env::temp_dir().join(format!("supdb-bench-encryption-{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&root);
+            let budget = |name: &str, f: fn(&Path) -> Res<Supdb>| {
+                let d = root.join(name);
+                std::fs::create_dir_all(&d).unwrap();
+                let a = f(&d).unwrap();
+                assert_eq!(a.name(), name);
+                a.db.as_ref().unwrap().cipher_counts().unwrap().cache.budget
+            };
+            assert_eq!(budget("supdb-cipher64", Supdb::create_cipher64), 64 << 20);
+            // Opened for its name; its budget is the room's, of any size the
+            // floor allows, sixty-four mebibytes among them.
+            let _ = budget("supdb-cipher", Supdb::create_cipher);
+            let _ = std::fs::remove_dir_all(&root);
+        }
+        // `supdb-cipher`'s is the engine's own: the cipher its policy makes
+        // sets no size, so its cache follows the room, where
+        // `supdb-cipher64`'s sets its policy's. Held by the cipher and not
+        // by the budget beside a store opened for the comparison: the
+        // budget is a reading of the room, shared between the stores of
+        // the process that follow it, so another test's store under a
+        // cipher open in the same instant halved it -- 6.8 GB against 13.5
+        // in a gate's bench group, where the two were held within a
+        // quarter of each other. A store keeps no cipher in its options
+        // past its open, so the cipher is the policy's.
+        let size = |cache: u64| match encryption_of(false, true, cache, CipherShape::default()) {
+            Encryption::Cipher(c) => c.cache_bytes_set(),
+            _ => panic!("a cipher"),
+        };
+        assert_eq!(size(0), None, "supdb-cipher's cache follows the room");
+        assert_eq!(
+            size(64 << 20),
+            Some(64 << 20),
+            "supdb-cipher64's is its policy's"
+        );
     }
 
     /// `supdb-dirplain` and `supdb-ingestdirplain` are the policy with
@@ -22748,6 +24289,31 @@ mod tests {
                 assert_eq!(z.features(), base.features());
                 let o = z.db.as_ref().unwrap().options();
                 assert!(!o.zpages_buy_crosses && o.jobs_mapped && !o.jobs_pooled);
+                let z = Supdb::create_onefile(&dir("onefile")).unwrap();
+                assert_eq!(z.name(), "supdb-onefile");
+                assert_eq!(z.features(), base.features());
+                assert!(z.db.as_ref().unwrap().options().one_file);
+                let z = Supdb::create_ingest_onefile(&dir("ingestonefile")).unwrap();
+                assert_eq!(z.name(), "supdb-ingestonefile");
+                assert!(z.db.as_ref().unwrap().options().one_file);
+                // And under a cipher, the envelopes in the data file.
+                #[cfg(target_os = "linux")]
+                {
+                    let z = Supdb::create_cipher_onefile(&dir("cipheronefile")).unwrap();
+                    assert_eq!(z.name(), "supdb-cipheronefile");
+                    let o = z.db.as_ref().unwrap().options();
+                    assert!(o.one_file && o.zpages_under_cipher);
+                    assert!(z.db.as_ref().unwrap().one_counts().is_some());
+                    let z = Supdb::create_cipherauto_onefile(&dir("cipherautoonefile")).unwrap();
+                    assert_eq!(z.name(), "supdb-cipherautoonefile");
+                    let o = z.db.as_ref().unwrap().options();
+                    assert!(o.one_file && o.zpages_under_cipher);
+                    let z =
+                        Supdb::create_ingest_cipherauto_onefile(&dir("ingestcipherautoonefile"))
+                            .unwrap();
+                    assert_eq!(z.name(), "supdb-ingestcipherautoonefile");
+                    assert!(z.db.as_ref().unwrap().options().one_file);
+                }
                 // A flush answered at its seal's readable landing, and the
                 // strict one, each differing from the default by that alone.
                 for (z, on) in [
@@ -25720,6 +27286,120 @@ mod tests {
             assert_eq!(e.name(), name, "the dispatch");
         }
         drop(base);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// The segment arms answer alike, plain and through an envelope with
+    /// either reader, inline and in blocks, on the writer's thread and on
+    /// another; an envelope leaves no plain file and no value in the clear;
+    /// and a write-once segment says so of everything it does not take.
+    #[test]
+    fn a_segment_reads_the_same_plain_and_through_an_envelope() {
+        let root = std::env::temp_dir().join(format!("supdb-bench-segment-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let n = 4_000u64;
+        let key = |i: u64| format!("{i:016}").into_bytes();
+        let value = |i: u64| {
+            let mut v = format!("the value of key {i:016}, in the clear.").into_bytes();
+            v.resize(100, b'.');
+            v
+        };
+        let mut answers = Vec::new();
+        for arm in [
+            "supdb-segment",
+            "supdb-segment-enc",
+            "supdb-segment-encbounded",
+            "supdb-segmentblocks",
+            "supdb-segmentblocks-enc",
+            "supdb-segmentblocks-encbounded",
+        ] {
+            assert_eq!(guarantee(arm), Some(Guarantee::Buffered), "{arm}");
+            assert!(write_once(arm), "{arm}");
+            let dir = root.join(arm);
+            let mut e = open(arm, &dir, 1).unwrap();
+            assert_eq!(e.name(), arm);
+            assert!(e.get(&key(0)).is_err(), "{arm}: read before its sync");
+            for chunk in (0..n).collect::<Vec<_>>().chunks(500) {
+                let items: Vec<(Vec<u8>, Vec<u8>)> =
+                    chunk.iter().map(|&i| (key(i), value(i))).collect();
+                let refs: Vec<(&[u8], &[u8])> =
+                    items.iter().map(|(k, v)| (&k[..], &v[..])).collect();
+                e.write_batch(&refs).unwrap();
+            }
+            e.sync().unwrap();
+            e.sync().unwrap();
+            assert!(
+                e.write_batch(&[(&key(n)[..], &value(n)[..])]).is_err(),
+                "{arm}: a write after"
+            );
+            assert!(
+                e.update_batch(&[(&key(1)[..], &value(1)[..])]).is_err(),
+                "{arm}: an update"
+            );
+
+            let mut got = Vec::new();
+            for i in (0..n).step_by(7) {
+                got.push(e.get(&key(i)).unwrap());
+            }
+            assert!(
+                got.iter().all(|&b| b == 100),
+                "{arm}: a hundred bytes a key"
+            );
+            assert_eq!(e.get(b"no such key").unwrap(), 0);
+            got.push(e.range(&key(1_234), 100).unwrap());
+            got.push(e.range(&key(n - 10), 100).unwrap());
+            assert_eq!(got[got.len() - 2..], [10_000, 1_000], "{arm}: scans");
+            let opener = e.thread_reader().unwrap();
+            let (k1, k2) = (key(77), key(3_000));
+            let threaded = std::thread::spawn(move || {
+                let mut r = opener().unwrap();
+                (r.get(&k1).unwrap(), r.range(&k2, 50).unwrap())
+            })
+            .join()
+            .unwrap();
+            assert_eq!(threaded, (100, 5_000), "{arm}: another thread");
+            answers.push(got);
+
+            let files: Vec<String> = std::fs::read_dir(&dir)
+                .unwrap()
+                .map(|f| f.unwrap().file_name().into_string().unwrap())
+                .collect();
+            let enveloped = arm.contains("-enc");
+            assert_eq!(
+                files,
+                [if enveloped {
+                    "segment.sup.enc"
+                } else {
+                    "segment.sup"
+                }],
+                "{arm}"
+            );
+            let bytes = std::fs::read(dir.join(&files[0])).unwrap();
+            let clear = bytes.windows(13).any(|w| w == b"in the clear.");
+            assert_eq!(clear, !enveloped, "{arm}: a value in the clear");
+            assert!(e.size_bytes() >= n * 116, "{arm}: {} bytes", e.size_bytes());
+            drop(e);
+        }
+        assert!(
+            answers.windows(2).all(|w| w[0] == w[1]),
+            "the arms answered differently"
+        );
+        // Nothing of an envelope arm is left in memory: not after its sync,
+        // and not when it is dropped before one.
+        let unsynced = open("supdb-segment-enc", &root.join("unsynced"), 1).unwrap();
+        drop(unsynced);
+        let mine = format!("supdb-bench-segment-{}-", std::process::id());
+        if let Ok(shm) = std::fs::read_dir("/dev/shm") {
+            let left: Vec<_> = shm
+                .map(|f| f.unwrap().file_name().into_string().unwrap())
+                .filter(|f| f.starts_with(&mine))
+                .collect();
+            assert!(left.is_empty(), "plain files left in memory: {left:?}");
+        }
+        assert!(
+            ARMS.iter().chain(&OOC_ARMS).all(|a| !write_once(a)),
+            "a roster arm takes every load"
+        );
         let _ = std::fs::remove_dir_all(&root);
     }
 }

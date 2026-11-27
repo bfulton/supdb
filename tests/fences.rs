@@ -745,6 +745,82 @@ fn a_merge_drops_its_inputs_pages_behind_its_second_pass() {
     }
 }
 
+/// A merge's drops behind its second pass begin at each input's first
+/// record and go on in steps of at least `Options::merge_drop_chunk`, each
+/// to the page a page behind the record the merge reads, so the bytes the
+/// merge counts dropped are what a walk of each input's record offsets
+/// says, input by input: a drop that began anywhere else -- the second
+/// record, a page in -- is a count the walk does not make.
+#[test]
+fn a_merges_drops_behind_begin_at_each_inputs_first_record() {
+    let d = scratch("merge-drop-from");
+    let chunk = 16u64 << 10;
+    let mut db = Db::create(
+        &d,
+        Options {
+            seal_bytes: 1 << 30,
+            partition_bytes: Some(1 << 30),
+            l0_trigger: 2,
+            merge_drop_behind: true,
+            merge_drop_chunk: chunk,
+            // Each input is opened by its name for its records' place: a
+            // store of files (`common::files`).
+            ..common::files(common::options())
+        },
+    )
+    .unwrap();
+    let key = |k: u32| format!("key-{k:05}").into_bytes();
+    let val = |t: u8, k: u32| vec![t; 60 + (k % 50) as usize];
+    for k in 0..3000u32 {
+        db.append(&key(k), &val(b'0', k));
+    }
+    db.commit().unwrap();
+    db.flush().unwrap();
+    assert_eq!(db.levels(), (1, 0), "one partition");
+    db.hold_merge_start(true);
+    for round in 0..2u32 {
+        for k in (round..3000u32).step_by(3) {
+            db.append(&key(k), &val(b'n', k));
+        }
+        db.commit().unwrap();
+        db.seal().unwrap();
+    }
+    wait_for("the merge held at its start", || db.merges_in_flight() == 1);
+    // The merge's inputs are every segment standing: the one partition and
+    // the two pieces over its whole range.
+    let names = seg_names(&d);
+    assert_eq!(names.len(), 3, "the merge's inputs: {names:?}");
+    let mut want = 0u64;
+    for n in &names {
+        let blob = supdb::Blob::open(supdb::bytes::MmapBytes::open(&d.join(n)).unwrap()).unwrap();
+        let first = blob.record_offset(0).expect("an input's first record");
+        let mut to_here = first;
+        let mut drops = 0;
+        for rank in 0..blob.keys() {
+            let to = blob.record_offset(rank).unwrap().saturating_sub(4096) & !4095;
+            if to >= to_here + chunk.max(4096) {
+                want += to - to_here;
+                to_here = to;
+                drops += 1;
+            }
+        }
+        assert!(drops > 0, "{n}: the walk reaches a drop");
+        assert_ne!(first % 4096, 0, "{n}: the first record is inside a page");
+    }
+    let merges = db.seal_waits().merges;
+    db.hold_merge_start(false);
+    wait_for("the merge's landing", || db.seal_waits().merges > merges);
+    db.settle().unwrap();
+    assert_eq!(db.levels(), (1, 0), "the pieces merged");
+    assert_eq!(
+        db.merge_dropped_bytes(),
+        want,
+        "the bytes dropped are each input's, from its first record"
+    );
+    db.close().unwrap();
+    let _ = std::fs::remove_dir_all(&d);
+}
+
 /// A merge's writers sync their output behind them every
 /// `Options::merge_sync_ahead` bytes, on the writer's helper thread, which
 /// the writer starts the first time its output passes the stride: at

@@ -690,7 +690,14 @@ fn a_runs_name_is_behind_a_barrier_before_its_commits_are_acknowledged() {
     // flush is answered behind the landing, whose own directory barrier
     // carries every name in it.
     let d = dir("name-never");
-    let mut db = Db::create(&d, buffered()).unwrap();
+    let mut db = Db::create(
+        &d,
+        Options {
+            run_spare: false,
+            ..buffered()
+        },
+    )
+    .unwrap();
     for b in 0..4 {
         ordered_batch(&mut db, b);
     }
@@ -700,72 +707,160 @@ fn a_runs_name_is_behind_a_barrier_before_its_commits_are_acknowledged() {
     let _ = std::fs::remove_dir_all(&d);
 }
 
-/// The barrier's failure is the commit's: a commit whose run's name could
-/// not be promised is not acknowledged, the next sync owes the barrier
-/// still, and a run that closes owing it is the next sync's as a run that
-/// closed unsynced is.
-#[test]
-fn a_barrier_that_fails_is_owed_until_it_is_made() {
-    let d = dir("name-fails");
-    let mut db = Db::create(
-        &d,
-        inline(Options {
-            sync: SyncPolicy::Always,
-            adaptive_shape: false,
-            run_spare: false,
-            ..common::options()
-        }),
-    )
-    .unwrap();
-    db.fail_next_dir_barrier();
-    for j in 0..BATCH {
-        db.append(&key(j), &VALUE);
-    }
-    let e = db
-        .commit()
-        .expect_err("the barrier failed and the commit was acknowledged");
-    assert!(e.to_string().contains("injected"), "{e}");
-    assert_eq!(db.run_names_unsynced(), (Some(true), 0));
-    assert_eq!(db.seal_waits().run_names, 0);
-    // The next commit of the run makes it.
-    ordered_batch(&mut db, 1);
-    assert_eq!(db.run_names_unsynced(), (Some(false), 0));
-    assert_eq!(db.seal_waits().run_names, 1);
-    db.flush().unwrap();
+fn guard_of(p: &Path) -> PathBuf {
+    let mut g = p.as_os_str().to_os_string();
+    g.push(".guard");
+    PathBuf::from(g)
+}
 
-    // A run whose one commit's barrier failed, closed by a write into the
-    // log: its file is synced and its name is not, and the commit into
-    // the log does not return before the name is promised. Its seal is
-    // held, so the run is under its temp name when the commit looks.
-    db.hold_seal_landing(true);
-    db.fail_next_dir_barrier();
-    for j in 0..BATCH {
-        db.append(&key(2 * BATCH + j), &VALUE);
+fn inode(p: &Path) -> u64 {
+    use std::os::unix::fs::MetadataExt;
+    std::fs::metadata(p).unwrap().ino()
+}
+
+/// The files of `from` copied to `to`, but `leave`, as a power cut that
+/// took `leave`'s directory entry leaves them.
+fn copy_without(from: &Path, to: &Path, leave: &Path) {
+    let _ = std::fs::remove_dir_all(to);
+    std::fs::create_dir_all(to).unwrap();
+    for e in std::fs::read_dir(from).unwrap() {
+        let e = e.unwrap();
+        if e.path() == leave || !e.file_type().unwrap().is_file() {
+            continue;
+        }
+        std::fs::copy(e.path(), to.join(e.file_name())).unwrap();
     }
-    db.commit()
-        .expect_err("the barrier failed and the commit was acknowledged");
-    assert_eq!(db.runs_unsynced(), (Some(false), 0));
-    assert_eq!(db.run_names_unsynced(), (Some(true), 0));
-    db.put(&key(0), b"closes the run");
+}
+
+/// A barrier that fails is never retried: Linux may drop what a failed
+/// sync was to write and answer a later one `Ok`, so the run's temp name
+/// is given a second entry, a guard, and the directory synced again, which
+/// makes the barrier, and the commit is acknowledged. The run's own entry
+/// is no more trusted for that, so the guard stands until the run's file
+/// goes: a power cut that took the entry and kept the guard opens with the
+/// name given back and every commit there; one that kept both opens with
+/// the run recovered, its temp name gone and its guard first.
+#[test]
+fn a_barrier_that_fails_is_made_by_a_guard() {
+    let d = dir("name-guard");
+    let crash = dir("name-guard-crash");
+    let opts = inline(Options {
+        sync: SyncPolicy::Always,
+        adaptive_shape: false,
+        run_spare: false,
+        ..common::options()
+    });
+    let mut db = Db::create(&d, opts.clone()).unwrap();
+    db.fail_next_dir_barrier();
+    ordered_batch(&mut db, 0);
+    let tmp = run_file(&d, 0);
+    assert_eq!(db.dir_guards(), 1, "the run's temp name was guarded");
+    assert!(Db::is_guarded(&tmp));
     assert_eq!(
-        db.run_names_unsynced(),
-        (None, 1),
-        "a run closed with its name unpromised and nothing owes it"
+        inode(&tmp),
+        inode(&guard_of(&tmp)),
+        "a second entry for the run"
     );
-    db.commit().unwrap();
-    assert_eq!(db.runs_unsynced(), (None, 0));
-    assert_eq!(db.run_names_unsynced(), (None, 0));
-    assert_eq!(db.seal_waits().run_names, 2);
+    assert_eq!(db.run_names_unsynced(), (Some(false), 0));
+    ordered_batch(&mut db, 1);
     db.crash();
 
-    let db = Db::open(&d, common::options()).unwrap();
-    assert_eq!(values(&db, &key(0)), vec![b"closes the run".to_vec()]);
-    assert_eq!(values(&db, &key(1)), vec![VALUE.to_vec()]);
-    for b in 1..3 {
-        assert!(holds(&db, b), "batch {b} is gone");
+    // The run's own entry lost, its guard kept.
+    copy_without(&d, &crash, &tmp);
+    let db = Db::open(&crash, common::options()).unwrap();
+    assert!(
+        !guard_of(&run_file(&crash, 0)).exists(),
+        "the guard gave its name back"
+    );
+    for b in 0..2 {
+        assert!(holds(&db, b), "batch {b} after the run's name was lost");
     }
     drop(db);
+
+    // Both kept: the open recovers the run into a piece, and its temp name
+    // goes with its guard before it.
+    let db = Db::open(&d, opts).unwrap();
+    for b in 0..2 {
+        assert!(holds(&db, b), "batch {b} with both entries");
+    }
+    assert!(!tmp.exists(), "the run's temp name went with its recovery");
+    assert!(!guard_of(&tmp).exists(), "and its guard before it");
+    assert!(!Db::is_guarded(&tmp));
+    drop(db);
     let _ = std::fs::remove_dir_all(&d);
+    let _ = std::fs::remove_dir_all(&crash);
+}
+
+/// Where the guard cannot be made either -- its link refused, or the
+/// directory's fsync after the links -- the failure is kept (`Db::lost`):
+/// the commit is not acknowledged, every commit, `sync` and `flush` after
+/// answers it, the reads go on, and the open after a crash finds each
+/// batch whole or not at all.
+#[test]
+fn a_barrier_whose_guard_fails_is_kept() {
+    for link in [true, false] {
+        let d = dir(&format!("name-guard-fails-{link}"));
+        let mut db = Db::create(
+            &d,
+            inline(Options {
+                sync: SyncPolicy::Always,
+                adaptive_shape: false,
+                run_spare: false,
+                ..common::options()
+            }),
+        )
+        .unwrap();
+        logged_batch(&mut db, 0);
+        // A run opens over an empty live table.
+        db.flush().unwrap();
+        db.fail_next_dir_barrier();
+        db.fail_next_dir_guard(link);
+        for j in 0..BATCH {
+            db.append(&key(2_000 * BATCH + j), &VALUE);
+        }
+        let e = db
+            .commit()
+            .expect_err("the barrier and its guard failed and the commit was acknowledged");
+        assert!(e.to_string().contains("guarded"), "link {link}: {e}");
+        assert_eq!(db.seal_waits().run_names, 0, "no barrier made");
+        for j in 0..BATCH {
+            db.append(&key(2_001 * BATCH + j), &VALUE);
+        }
+        assert!(db.commit().is_err(), "link {link}: the kept failure");
+        assert!(db.sync().is_err(), "link {link}: a sync answers it");
+        assert!(db.flush().is_err(), "link {link}: a flush answers it");
+        assert_eq!(
+            values(&db, &key(1_000 * BATCH)),
+            vec![VALUE.to_vec()],
+            "link {link}: the reads go on"
+        );
+        assert!(
+            d.join("dir-lost").exists(),
+            "link {link}: the mark for the next open"
+        );
+        db.crash();
+        let db = Db::open(&d, common::options()).unwrap();
+        // The open in the same boot guards every log file it lists, a new
+        // entry the sync after it covers, and takes the mark away.
+        assert!(!d.join("dir-lost").exists(), "link {link}: the mark taken");
+        let logs = names(&d, "wal-");
+        assert!(!logs.is_empty());
+        for w in &logs {
+            if w.ends_with(".guard") {
+                continue;
+            }
+            assert!(
+                Db::is_guarded(&d.join(w)),
+                "link {link}: {w} guarded by the open after the kept failure"
+            );
+        }
+        assert_eq!(values(&db, &key(1_000 * BATCH)), vec![VALUE.to_vec()]);
+        for b in 2_000..2_002 {
+            let _ = holds(&db, b);
+        }
+        drop(db);
+        let _ = std::fs::remove_dir_all(&d);
+    }
 }
 
 /// The slot of the next run's file (`Db::run_spare_state`): nothing, its
@@ -1361,7 +1456,8 @@ fn frames_a_durable_seal_covers_are_never_written() {
     for slots in [true, false] {
         let opts = || Options {
             manifest_slots: slots,
-            ..explicit()
+            // The renamed manifest is a store of files' alone.
+            ..common::files(explicit())
         };
         let d = dir(&format!("covered-{slots}"));
         let mut db = Db::create(&d, opts()).unwrap();
@@ -1447,7 +1543,8 @@ fn frames_a_durable_seal_covers_are_never_written() {
     let d = dir("covered-pending");
     let opts = || Options {
         manifest_pending: true,
-        ..explicit()
+        // A store in one file keeps no pending name.
+        ..common::files(explicit())
     };
     let mut db = Db::create(&d, opts()).unwrap();
     logged_batch(&mut db, 0);
@@ -1501,7 +1598,9 @@ fn held_frames_wait(pending: bool) {
     let d = dir(&format!("readable-{pending}"));
     let opts = || Options {
         manifest_pending: pending,
-        ..torn(inline(explicit()))
+        // A pending name, and a segment torn in the directory by its
+        // name: a store of files.
+        ..common::files(torn(inline(explicit())))
     };
     let mut db = Db::create(&d, opts()).unwrap();
     db.hold_seal_durable(true);

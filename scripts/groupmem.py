@@ -4,7 +4,9 @@
     python3 scripts/groupmem.py sample OUT          # beside the run, until killed
     python3 scripts/groupmem.py table OUT ERR [PHASE,...]
 
-`sample` reads, every quarter second, the `memory.stat` of every group the
+`sample` reads, every quarter second (`GROUPMEM_INTERVAL_MS` for another
+period: a peak a load makes lasts a tenth of a second), the `memory.stat`
+of every group the
 suite has made for a pass (`supdb-bench-<pid>/pass-<n>` under the cgroup v1
 memory hierarchy, `bound::Bound::pass`), its `memory.usage_in_bytes` and its
 `memory.kmem.usage_in_bytes`, and the kernel's count of a few slab caches
@@ -34,6 +36,7 @@ import time
 STAT = (
     "cache",
     "rss",
+    "shmem",
     "mapped_file",
     "inactive_file",
     "active_file",
@@ -42,6 +45,7 @@ STAT = (
     "writeback",
 )
 COUNTS = ("pgmajfault",)
+INTERVAL = int(os.environ.get("GROUPMEM_INTERVAL_MS", "250")) / 1000.0
 SLABS = ("buffer_head", "radix_tree_node", "ext4_inode_cache", "dentry")
 
 
@@ -105,7 +109,7 @@ def sample(out_path):
                 % (t, os.path.basename(g.rstrip("/")), procs[0], fields, extra, slabs)
             )
         out.flush()
-        time.sleep(0.25)
+        time.sleep(INTERVAL)
 
 
 def table(out_path, err_path, phases):

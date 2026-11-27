@@ -16,6 +16,14 @@
 #        the gate and the renderer work end to end on this host. A timing
 #        run: nothing else may be running on the machine. ARMS=a,b runs
 #        those arms alone, and KEYS=ids the row over random ids
+# enc    the encrypted comparators (Cargo.toml, feature `enc`): the binary
+#        built with LMDB's 1.0 line and RocksDB's encrypted Env in the
+#        released LMDB's place, linted, the arms' own tests run and each
+#        required by name, and every arm of the encrypted roster opened and
+#        run once at the smallest rung. Not in the default set: it is a
+#        second build of RocksDB, in a target directory of its own
+#        (target-enc) so that the default binary is not replaced under a
+#        measurement, and it needs OpenSSL's headers
 #
 # Every gate this repository has broken has broken the same way: a check
 # that was not running, or one reporting a verdict it had not earned. This
@@ -52,6 +60,41 @@ for g in $groups; do
       say figures
       cargo build --release --bin bench
       sh scripts/figures.sh --check
+      ;;
+    enc)
+      say enc
+      # A target directory of its own: the two builds differ in their
+      # features, and one written over the other is `lmdb` refused, or the
+      # encrypted arms refused, in the middle of somebody's pairing.
+      cargo build --release --no-default-features --features enc --target-dir target-enc --bin bench
+      cargo clippy --release --no-default-features --features enc --target-dir target-enc --lib --bins -- -D warnings
+      out=$(cargo test --profile checked --no-default-features --features enc --target-dir target-enc --lib enc:: 2>&1) || {
+        printf '%s\n' "$out"
+        exit 1
+      }
+      printf '%s\n' "$out"
+      # A test renamed is a test this group stopped running, and a run of
+      # none is green: each is asked for by name.
+      for t in \
+        the_encrypted_comparators_keep_their_keys_from_the_device \
+        the_encrypted_rocksdb_reads_its_table_files \
+        the_streams_counter_is_the_iv_plus_the_block \
+        the_lmdb_hook_is_aes_256_gcm_written_from_the_input \
+        reader_threads_over_an_encrypted_lmdb_read_what_was_written; do
+        printf '%s\n' "$out" | grep -q "^test engines::enc::tests::$t \.\.\. ok" || {
+          echo "enc: $t did not run" >&2
+          exit 1
+        }
+      done
+      # Every arm of the encrypted roster opened and run through every pass
+      # once, at the smallest rung: a check that each runs, not a timing --
+      # no rate of it is read or kept.
+      smoke=$(mktemp -d)
+      ./target-enc/release/bench run --scale quick --top 10000 --bottom 10000 --reps 1 --arms enc --out "$smoke" || {
+        rm -rf "$smoke"
+        exit 1
+      }
+      rm -rf "$smoke"
       ;;
     quick)
       say quick

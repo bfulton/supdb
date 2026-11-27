@@ -492,6 +492,112 @@ of its own (`run::rep_order`), so that an arm's pass follows a different
 arm's in each rep, since what a pass leaves behind is a variable of the pass
 after it and a fixed order would make it a constant of the arm.
 
+Two families are arms for a pairing and never the roster's. A write-once
+segment, the format's other producer: `supdb-segment` takes the ordered
+load through the segment writer, finishes the file at `sync` and reads it
+through `Blob`; `supdb-segment-enc` publishes the same file as an
+encrypted envelope and reads it through the reader that keeps what it
+decrypts, and `supdb-segment-encbounded` through the one that keeps
+nothing. The three again with every value in a block
+(`supdb-segmentblocks...`), since the suite's hundred-byte value lies
+inline in the index record and a read there reaches the index alone. They
+take `load`, `read` and `scan`, threaded or not; the shuffled load is left
+out for them and a pass that writes is refused by its first update. And a
+store under a key: `supdb-dirkey` is `supdb`, and `supdb-ingestdirkey`
+`supdb-ingest`, with the kernel encrypting the store's directory
+(`Encryption::Kernel`). Both arms of that pairing stand on a filesystem that
+can encrypt, which `scripts/fscrypt.sh` makes in a file behind a loop
+device, so `ab` names the device at its table's head and its rates are
+read as two arms on one device and not as a disk's. And a store under a
+cipher of the caller's (`Encryption::Cipher`), here AES-256-GCM:
+`supdb-cipher` and `supdb-ingestcipher`. Its pair is `supdb`, or
+`supdb-ingest`, itself, which differs from it by the cipher and the
+store's own cache of plaintext. More price a store under a cipher
+against itself: `supdb-cipherlog` and `supdb-ingestcipherlog`, an
+ordered load through the log with no run, which is the shape before the
+run was kept there; `supdb-ciphernoauto` and `supdb-ingestciphernoauto`,
+the compact form's controller left out under a cipher
+(`Options::zpages_under_cipher` off), the shape before it shipped on;
+and `supdb-cipherauto` and `supdb-ingestcipherauto`, the controller
+pinned on, the arms it was priced by before, with
+`supdb-cipherautolandmodel` the
+first of those with its builds ahead at landing started by the
+controller's budget alone (`Options::zpages_land_cache_pct` at zero),
+where the engine starts them past a share of the store's own cache as
+well. `supdb-cipherautomergeapart` is `supdb-cipherauto` with
+its merges asking nothing ahead of their walks of their inputs
+(`Options::merge_read_ahead_cipher` at zero), the shape before, and
+`supdb-cipherautomergestream` the same with its merges reading their
+inputs beside the store's cache (`StoreCipher::merges_beside_cache`), and
+`supdb-cipherautodropskeep` the same with a drop of a file's pages leaving
+the plaintext it covers in the store's cache
+(`StoreCipher::drops_keep_plaintext`), the shape before, and
+`supdb-cipherautorewarmbeside` the same with its rewarm made beside the
+merges in flight (`Options::zpages_rewarm_beside_merges`), and
+`supdb-cipherautoaheadflat` the same with its merges asking ahead in one
+window for every input and over their records alone
+(`Options::merge_ahead_shares` off), the shape before. And three kept
+in one file (`Options::one_file` beside the cipher), the store's
+envelopes extents of its data file where the arms above keep each a
+file of the directory: `supdb-cipheronefile` beside `supdb-cipher`,
+`supdb-cipherautoonefile` beside `supdb-cipherauto`, and
+`supdb-ingestcipherautoonefile` beside `supdb-ingestcipherauto`; the
+plain store kept so is `supdb-onefile` beside `supdb`, and
+`supdb-ingestonefile` buffered. And
+two that force the compact form
+there, each coding priced by itself: `supdb-cipherzpages`, every
+partition's form file in the block coding, and `supdb-cipherzstride`,
+every build asking for the stride form; `supdb-cipherzstrideapart` is the
+second with each chunk's ciphertext read from the device by itself
+(`StoreCipher::chunks_apart`), where the store asks for the chunks of one
+ask together. That
+cache follows the room the process has, read as the store runs, unless an
+arm says otherwise, which at the suite's in-core rungs is a store that
+fits it; `supdb-cipherhalf` and `supdb-cipherzstridehalf` are
+`supdb-cipher` and `supdb-cipherzstride` with the cache as it was before,
+half of what the process may use as the store opens
+(`StoreCipher::cache_half_at_open`);
+`supdb-cipher64` is the same store with a cache of sixty-four mebibytes,
+which from a million keys up is a store several times its cache, read by
+the chunk it decrypts and gives back. The suite does not reopen a store,
+so an open under a cipher is `cargo run --release --example cipher_store`
+and no cell.
+
+And the comparators encrypted, which is what `supdb-cipher` is for being
+read against: a user who needs a store encrypted at rest would otherwise
+pick one of these, each the comparator's own mechanism under a cipher the
+application supplies, as the engine's is (`src/enc.rs`). LMDB encrypts on
+its 1.0 line alone, a page through a hook: `lmdb3-enc` is that under
+AES-256-GCM, and `lmdb3` the same library with no hook, so the pair prices
+the encryption on LMDB's own side. RocksDB encrypts through an Env that
+wraps every file in a cipher stream: `rocksdb-tuned-enc` is `rocksdb-tuned`
+on that Env under AES-256-CTR, which authenticates nothing where the
+other two stores authenticate every byte, and the arm says so rather than
+being given a tag RocksDB's mechanism does not have. Both ciphers are
+OpenSSL's, a context a thread keyed once, the shape their deployments run;
+each has a buffered twin (`-nosync`). They are a build of their own,
+`--no-default-features --features enc`, since LMDB's two lines define the
+same C symbols and one binary links one of them: in that build the `lmdb`
+arms are refused by name and every other arm is as it is in the default
+one, so a pairing against `supdb-cipher` or the plain arms is one process.
+`bench run --arms enc` is the encrypted roster, both guarantee groups, each
+encrypted store beside its plain twin; its rows are no part of the
+standing series, whose class they would otherwise share, so they are
+written with `--out` somewhere of their own, and `scripts/encrow.py
+ROW.json` reads one cell by cell: the store under a cipher against each
+encrypted comparator and against its plain twin, a cell resolved where
+every rep of one lies on one side of every rep of the other. A pairing
+against one is `scripts/pair.sh` with `BIN` naming that build's binary
+(`BIN=$PWD/target-enc/release/bench`). LMDB's encryption is on a
+line it has not released, and the arm is that line as it stands: its
+sample hook's shape is load-bearing under reader threads
+(`shim/lmdb_enc.c`), and an encrypted environment fails a write
+transaction that reaches across some two thousand of its sixteen-page
+chunks, which the suite's shuffled load does between three hundred
+thousand keys and a million (`src/enc.rs`, with the test that reproduces
+it on LMDB's C API alone). So the encrypted roster runs to the quick
+scale's top, and past it the encrypted comparator is RocksDB's.
+
 Every arm is compiled to one build (`.cargo/config.toml`): one machine level
 and one code-generation policy for the engine's Rust and the comparators'
 C and C++ alike. x86-64 Linux is held at x86-64-v3 with PCLMUL and ARM Linux

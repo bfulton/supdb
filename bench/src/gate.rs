@@ -107,10 +107,16 @@ pub fn is_comparator(arm: &str) -> bool {
         "lmdb"
             | "lmdb-nordahead"
             | "lmdb-nosync"
+            | "lmdb3"
+            | "lmdb3-nosync"
+            | "lmdb3-enc"
+            | "lmdb3-nosync-enc"
             | "rocksdb-tuned"
             | "rocksdb-tuned-lz4"
+            | "rocksdb-tuned-enc"
             | "rocksdb-nosync"
             | "rocksdb-tuned-nosync"
+            | "rocksdb-tuned-nosync-enc"
             | "faster"
     )
 }

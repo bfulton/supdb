@@ -1,0 +1,75 @@
+# The libc functions declared for the door's builds with a string argument
+# (`*const c_char` or `*mut c_char`, the arguments a path is passed in;
+# tests/source.rs, libc_string_calls) that act on no file. Every other one
+# is barred in scripts/door/clippy.toml, and
+# every_libc_call_that_takes_a_string_is_barred_or_said_to_touch_no_file
+# holds the two to the libc source Cargo.lock resolves. Name, a tab, the
+# reason.
+atof	converts a string to a number in memory
+atoi	converts a string to a number in memory
+atol	converts a string to a number in memory
+atoll	converts a string to a number in memory
+strtod	converts a string to a number in memory
+strtof	converts a string to a number in memory
+strtol	converts a string to a number in memory
+strtoll	converts a string to a number in memory
+strtoul	converts a string to a number in memory
+strtoull	converts a string to a number in memory
+stpcpy	copies a string in memory
+stpncpy	copies a string in memory
+strcat	copies a string in memory
+strncat	copies a string in memory
+strcpy	copies a string in memory
+strncpy	copies a string in memory
+strdup	copies a string in memory
+strndup	copies a string in memory
+strcasecmp	compares or transforms strings in memory
+strncasecmp	compares or transforms strings in memory
+strcmp	compares or transforms strings in memory
+strncmp	compares or transforms strings in memory
+strcoll	compares or transforms strings in memory
+strxfrm	compares or transforms strings in memory
+strcasestr	searches or measures a string in memory
+strchr	searches or measures a string in memory
+strchrnul	searches or measures a string in memory
+strcspn	searches or measures a string in memory
+strlen	searches or measures a string in memory
+strnlen	searches or measures a string in memory
+strpbrk	searches or measures a string in memory
+strrchr	searches or measures a string in memory
+strspn	searches or measures a string in memory
+strstr	searches or measures a string in memory
+strtok	searches or measures a string in memory
+strtok_r	searches or measures a string in memory
+snprintf	formats into, or scans from, a string in memory
+sprintf	formats into, or scans from, a string in memory
+sscanf	formats into, or scans from, a string in memory
+wcstombs	converts a wide string in memory
+asctime_r	formats or parses a time held in memory, with no zone file
+strptime	formats or parses a time held in memory, with no zone file
+strerror_r	an error's message, in memory
+confstr	a configuration string the library holds
+ctermid	the name of the terminal, a constant string, opening nothing
+fnmatch	matches a string against a pattern in memory
+regcomp	a regular expression in memory
+regexec	a regular expression in memory
+regerror	a regular expression in memory
+gnu_basename	a component of a path string, in memory, asking nothing of the filesystem
+posix_basename	a component of a path string, in memory, asking nothing of the filesystem
+dirname	a component of a path string, in memory, asking nothing of the filesystem
+getopt	parses the arguments it is handed
+getopt_long	parses the arguments it is handed
+hasmntopt	parses an entry it is handed, in memory
+sgetspent_r	parses an entry it is handed, in memory
+getenv	a variable of the process's environment
+setenv	a variable of the process's environment
+unsetenv	a variable of the process's environment
+putenv	a variable of the process's environment
+gethostname	the kernel's host or domain name, a system call with no file
+sethostname	the kernel's host or domain name, a system call with no file
+getdomainname	the kernel's host or domain name, a system call with no file
+setdomainname	the kernel's host or domain name, a system call with no file
+if_nametoindex	a network interface by name or index, asked of the kernel on a socket
+if_indextoname	a network interface by name or index, asked of the kernel on a socket
+setbuf	a stream's buffer, set on a stream only a barred open makes
+setvbuf	a stream's buffer, set on a stream only a barred open makes

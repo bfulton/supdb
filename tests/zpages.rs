@@ -177,10 +177,8 @@ fn the_images_of_partitions_the_engine_wrote_are_the_streamed_records() {
         }
         db.flush().unwrap();
         db.close().unwrap();
-        let mut segs: Vec<PathBuf> = std::fs::read_dir(&dir)
-            .unwrap()
-            .flatten()
-            .map(|e| e.path())
+        let mut segs: Vec<PathBuf> = common::store_paths(&dir)
+            .into_iter()
             .filter(|p| p.extension().is_some_and(|x| x == "sup"))
             .collect();
         segs.sort();
@@ -255,6 +253,7 @@ fn forced(extra: impl FnOnce(&mut Options)) -> Options {
         zpages: ZPages::Always,
         zpages_min_bytes: 0,
         scan_block_cache: false,
+        one_file: common::one_file_switch(),
         ..Options::default()
     });
     extra(&mut o);
@@ -327,15 +326,15 @@ fn check_scan(r: &Reader, model: &Model, what: &str) {
 
 /// The form files in a store's directory, by name.
 fn form_files(dir: &Path) -> Vec<PathBuf> {
-    let mut v: Vec<PathBuf> = std::fs::read_dir(dir)
-        .unwrap()
-        .flatten()
-        .map(|e| e.path())
-        .filter(|p| {
-            p.file_name()
-                .and_then(|n| n.to_str())
-                .is_some_and(|n| n.starts_with("zpg-"))
-        })
+    // The directory's own, and for a store in one file that is open here
+    // the ones its data file keeps, each under the path it would have in a
+    // store of files: a name to count and to read by (`common::store_file`)
+    // and no file to open, so a test that opens, copies or changes a form
+    // file by its path is a test of a store of files (`forced_files`).
+    let mut v: Vec<PathBuf> = common::store_names(dir)
+        .into_iter()
+        .filter(|n| n.starts_with("zpg-"))
+        .map(|n| dir.join(n))
         .collect();
     v.sort();
     v
@@ -344,7 +343,7 @@ fn form_files(dir: &Path) -> Vec<PathBuf> {
 /// The keys a form file's fence names, read out of its file by the layout's
 /// own decoder.
 fn fence_keys(path: &Path) -> Vec<Vec<u8>> {
-    let bytes = std::fs::read(path).unwrap();
+    let bytes = common::store_file(path);
     let t = Trailer::decode(&bytes[bytes.len() - ZTRAILER..]).unwrap();
     let (fence, _) =
         ZFence::decode_resident(&bytes[t.res_off as usize..bytes.len() - ZTRAILER], &t).unwrap();
@@ -364,6 +363,17 @@ fn apply(model: &mut Model, batch: &mut Vec<(Vec<u8>, Option<Vec<u8>>)>) {
 }
 
 const ORACLE_KEYS: usize = 240;
+
+/// `forced`, as a store of files whatever the one-file switch says
+/// (`common::one_file_switch`): for a test that finds a store's form files
+/// in its directory and opens, copies, changes or maps them by their
+/// paths, which a store in one file has none of.
+fn forced_files(extra: impl FnOnce(&mut Options)) -> Options {
+    forced(|o| {
+        o.one_file = false;
+        extra(o);
+    })
+}
 
 /// The oracle's stores, on the nocache policy as `forced` has them: partitions
 /// of four kilobytes and a seal every eight are where the cache's forms
@@ -681,7 +691,9 @@ fn ordered_load(db: &mut Db, n: usize, seed: u64) -> Model {
 /// its directory, the model, and the keys of the model.
 fn one_partition(name: &str, n: usize, seed: u64) -> (PathBuf, Model, Vec<Vec<u8>>) {
     let dir = scratch(name);
-    let mut db = Db::create(&dir, forced(|_| {})).unwrap();
+    // A store handed over as its directory, for tests that change its one
+    // form file by its path: a store of files.
+    let mut db = Db::create(&dir, forced_files(|_| {})).unwrap();
     let model = ordered_load(&mut db, n, seed);
     db.zpages_settle().unwrap();
     let c = db.zpage_counts();
@@ -939,8 +951,7 @@ fn a_direct_runs_segment_with_markers_inside_its_records_has_a_form_file() {
         "{c:?}"
     );
     let mut markers = 0;
-    for e in std::fs::read_dir(&dir).unwrap().flatten() {
-        let p = e.path();
+    for p in common::store_paths(&dir) {
         if p.extension().is_some_and(|x| x == "sup") {
             markers += check_segment(&p).gap;
         }
@@ -1035,7 +1046,7 @@ fn a_flipped_byte_in_a_form_file_is_never_an_answer() {
     // rejection or the fallback is counted.
     let (dir, model, keys) = one_partition("flips-src", 4500, 0xF11B);
     let file = form_files(&dir).remove(0);
-    let good = std::fs::read(&file).unwrap();
+    let good = common::store_file(&file);
     let t = Trailer::decode(&good[good.len() - ZTRAILER..]).unwrap();
     let pages = t.n_pages as usize;
     assert!(pages > 40, "{pages} pages");
@@ -1224,7 +1235,7 @@ fn every_field_of_the_trailer_wrong_is_refused_and_counted() {
         ("seg_end_seq", Box::new(|t| t.seg_end_seq += 1)),
     ];
     let rewrite = |p: &Path, edit: &dyn Fn(&mut Trailer)| {
-        let mut bytes = std::fs::read(p).unwrap();
+        let mut bytes = common::store_file(p);
         let at = bytes.len() - ZTRAILER;
         let mut t = Trailer::decode(&bytes[at..]).unwrap();
         edit(&mut t);
@@ -1276,7 +1287,7 @@ fn a_form_file_of_another_segment_is_refused() {
         f2.file_name(),
         "the same operations name their segments alike"
     );
-    assert_ne!(std::fs::read(&f1).unwrap(), std::fs::read(&f2).unwrap());
+    assert_ne!(common::store_file(&f1), common::store_file(&f2));
     let mut db = open_changed(&d2, "other-planted", |p| {
         std::fs::copy(&f1, p).unwrap();
     });
@@ -1309,14 +1320,14 @@ fn a_form_file_under_another_partitions_name_is_refused() {
     // Two partitions, and the first's form file planted under the second's
     // name: the trailer names the segment it was made from.
     let dir = scratch("swapped");
-    let mut db = Db::create(&dir, forced(|o| o.partition_bytes = Some(160 << 10))).unwrap();
+    let mut db = Db::create(&dir, forced_files(|o| o.partition_bytes = Some(160 << 10))).unwrap();
     let model = ordered_load(&mut db, 6000, 0x51AB);
     db.zpages_settle().unwrap();
     assert!(db.zpage_counts().form_files >= 2);
     db.close().unwrap();
     let files = form_files(&dir);
     std::fs::copy(&files[0], &files[1]).unwrap();
-    let db = Db::open(&dir, forced(|o| o.zpages_eager = false)).unwrap();
+    let db = Db::open(&dir, forced_files(|o| o.zpages_eager = false)).unwrap();
     let c = db.zpage_counts();
     assert_eq!((c.rejected_identity, c.rejected_damage), (1, 0), "{c:?}");
     assert_eq!(c.form_files, c.partitions - 1);
@@ -1391,7 +1402,7 @@ fn a_build_in_flight_at_a_crash_is_through_or_held_when_the_crash_returns() {
         ("crash-rename-held", true, true, (0, 1)),
     ] {
         let dir = scratch(name);
-        let mut db = Db::create(&dir, forced(|_| {})).unwrap();
+        let mut db = Db::create(&dir, forced_files(|_| {})).unwrap();
         if at_rename {
             db.hold_zpage_rename(true);
         } else {
@@ -1794,38 +1805,70 @@ fn a_promotion_that_closes_a_fence_keeps_the_form_file_of_the_partition_it_renam
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// The file's pages dropped from the page cache, as far as the cache lets a
-/// clean page go.
+/// The pages of the store's file at `path` dropped from the page cache, as
+/// far as the cache lets a clean page go: the whole of a file of the
+/// directory's own, and of a file a store in one file keeps the range of
+/// its data file it lies in (`common::store_place`).
 #[cfg(target_os = "linux")]
 fn evict(path: &Path) {
     use std::os::unix::io::AsRawFd;
-    let f = std::fs::File::open(path).unwrap();
+    let (file, at, len) = common::store_place(path);
+    let f = std::fs::File::open(&file).unwrap();
     f.sync_all().unwrap();
+    // The whole file where it is the path's own; else the pages the file
+    // lies in, which are its alone: a file of the data file begins on a
+    // page and no other begins before the page it ends in is over.
+    let len = if file == path {
+        0
+    } else {
+        len.div_ceil(4096) * 4096
+    };
     // SAFETY: a hint about a file this function holds open.
-    unsafe { libc::posix_fadvise(f.as_raw_fd(), 0, 0, libc::POSIX_FADV_DONTNEED) };
+    unsafe {
+        libc::posix_fadvise(
+            f.as_raw_fd(),
+            at as libc::off_t,
+            len as libc::off_t,
+            libc::POSIX_FADV_DONTNEED,
+        )
+    };
 }
 
 /// The page-table entries of every read-only shared mapping this process has
-/// of `path` dropped, so that the cache is free to drop the pages behind
-/// them: `posix_fadvise(DONTNEED)` leaves a page that is still mapped, and the
-/// store holds its segment mapped for as long as it is live.
+/// of the store's file at `path` dropped, so that the cache is free to drop
+/// the pages behind them: `posix_fadvise(DONTNEED)` leaves a page that is
+/// still mapped, and the store holds its segment mapped for as long as it is
+/// live. A file a store in one file keeps is mapped as a range of the data
+/// file, so the mappings are found by the file and the range
+/// (`common::store_place`).
 #[cfg(target_os = "linux")]
 fn unmap_pages(path: &Path) {
-    let real = std::fs::canonicalize(path).unwrap();
+    let (file, at, len) = common::store_place(path);
+    let whole = file == path;
+    let real = std::fs::canonicalize(&file).unwrap();
+    let (lo, hi) = (at as usize, (at + len) as usize);
     let maps = std::fs::read_to_string("/proc/self/maps").unwrap();
     let mut zapped = 0;
     for line in maps.lines() {
-        let mut f = line.split_whitespace();
-        let (range, perms) = (f.next().unwrap_or(""), f.next().unwrap_or(""));
-        if perms != "r--s" || line.split_whitespace().nth(5).map(Path::new) != Some(real.as_path())
-        {
+        let f: Vec<&str> = line.split_whitespace().collect();
+        if f.len() < 6 || f[1] != "r--s" || Path::new(f[5]) != real.as_path() {
             continue;
         }
-        let (a, b) = range.split_once('-').unwrap();
-        let (a, b) = (
+        let (a, b) = f[0].split_once('-').unwrap();
+        let (mut a, mut b) = (
             usize::from_str_radix(a, 16).unwrap(),
             usize::from_str_radix(b, 16).unwrap(),
         );
+        if !whole {
+            // The part of the mapping that is the file's range.
+            let off = usize::from_str_radix(f[2], 16).unwrap();
+            let (from, to) = (lo.max(off), hi.div_ceil(4096) * 4096);
+            let to = to.min(off + (b - a));
+            if from >= to {
+                continue;
+            }
+            (a, b) = (a + (from - off), a + (to - off));
+        }
         // SAFETY: a read-only shared mapping of a file: the call drops this
         // process's page-table entries for it and nothing else, and the next
         // touch faults the page back in from the cache.
@@ -1833,16 +1876,14 @@ fn unmap_pages(path: &Path) {
         assert_eq!(r, 0, "madvise: {}", std::io::Error::last_os_error());
         zapped += 1;
     }
-    assert!(zapped > 0, "no mapping of {} to zap", real.display());
+    assert!(zapped > 0, "no mapping of {} to zap", path.display());
 }
 
 /// The one partition file of a store's directory.
 #[cfg(target_os = "linux")]
 fn partition_file(dir: &Path) -> PathBuf {
-    std::fs::read_dir(dir)
-        .unwrap()
-        .flatten()
-        .map(|e| e.path())
+    common::store_paths(dir)
+        .into_iter()
         .find(|p| {
             let n = p.file_name().unwrap().to_string_lossy().into_owned();
             n.starts_with("par-") && n.ends_with(".sup")
@@ -3778,8 +3819,7 @@ fn a_look_at_a_partitions_heads_stands_in_for_the_asks_while_they_are_resident()
         }
         check(&db, &model, "a batch settled over resident heads");
         // The indexes out of the page cache, and past the short look's time.
-        for e in std::fs::read_dir(&dir).unwrap() {
-            let path = e.unwrap().path();
+        for path in common::store_paths(&dir) {
             let name = path.file_name().unwrap().to_string_lossy().into_owned();
             if name.starts_with("ord-") {
                 unmap_pages(&path);
@@ -3873,10 +3913,8 @@ fn a_raw_partitions_heads_are_held_in_memory_out_of_core() {
             }
         };
         let ord_files = || -> Vec<PathBuf> {
-            std::fs::read_dir(&dir)
-                .unwrap()
-                .flatten()
-                .map(|e| e.path())
+            common::store_paths(&dir)
+                .into_iter()
                 .filter(|p| {
                     p.file_name()
                         .and_then(|n| n.to_str())
@@ -3884,10 +3922,9 @@ fn a_raw_partitions_heads_are_held_in_memory_out_of_core() {
                 })
                 .collect()
         };
-        let parts = std::fs::read_dir(&dir)
-            .unwrap()
-            .flatten()
-            .filter(|e| e.file_name().to_string_lossy().starts_with("par-"))
+        let parts = common::store_names(&dir)
+            .iter()
+            .filter(|n| n.starts_with("par-"))
             .count() as u64;
         assert!(parts >= 2, "several partitions: {parts}");
         // Out of core with no scan in the store's life nothing is copied,
@@ -4997,18 +5034,13 @@ fn a_merge_takes_the_form_file_of_the_segment_it_retires() {
     // which is waited for, since nothing else collects it before a settle.
     db.settle().unwrap();
     builds_collected(&db);
-    let gone = built.iter().filter(|f| !f.exists()).count();
+    let standing = form_files(&dir);
+    let gone = built.iter().filter(|f| !standing.contains(f)).count();
     assert!(
         gone > 0,
         "a merge retired a partition and its form file stayed: {built:?}"
     );
-    let segments: Vec<String> = std::fs::read_dir(&dir)
-        .unwrap()
-        .flatten()
-        .map(|e| e.file_name().to_string_lossy().into_owned())
-        .filter(|n| n.ends_with(".sup"))
-        .map(|n| zpg_of(&n))
-        .collect();
+    let segments: Vec<String> = common::seg_names(&dir).iter().map(|n| zpg_of(n)).collect();
     // A retired form file is renamed to a dead name by the landing and
     // unlinked at the segment work's idle tick, so a dead name may stand
     // here; a live name must be a live segment's, and so must a temp
@@ -5073,43 +5105,11 @@ fn a_merge_takes_the_form_file_of_the_segment_it_retires() {
 
 // ---- advice, sweeping, and the counters the pairing is read by ---------------------
 
-/// Whether each live mapping of this process whose path contains `needle` is
-/// advised `MADV_RANDOM`, as the kernel says it (`rr` in `VmFlags`): the
-/// mapping is the only thing that can be asked, and a store's own record of
-/// what it last asked of it is a claim the kernel does not have to share. A
-/// mapping of a file that was unlinked (`(deleted)`) is a retired segment's,
-/// held until the last reader that could have it leaves, and is nobody's to
-/// advise any more.
-#[cfg(target_os = "linux")]
-fn mappings_advised_random(needle: &str) -> Vec<(String, bool)> {
-    let smaps = std::fs::read_to_string("/proc/self/smaps").unwrap();
-    let mut out = Vec::new();
-    let mut path: Option<String> = None;
-    for line in smaps.lines() {
-        let first = line.split_whitespace().next().unwrap_or("");
-        if let Some(flags) = line.strip_prefix("VmFlags:") {
-            if let Some(p) = path.take() {
-                out.push((p, flags.split_whitespace().any(|f| f == "rr")));
-            }
-        } else if first.contains('-') && first.bytes().all(|b| b.is_ascii_hexdigit() || b == b'-') {
-            // A mapping's first line: range, permissions, offset, device,
-            // inode and the path, if it has one.
-            let mut f = line.split_whitespace().skip(5);
-            let deleted = line.ends_with("(deleted)");
-            path = f
-                .next()
-                .filter(|p| p.contains(needle) && !deleted)
-                .map(str::to_string);
-        }
-    }
-    out
-}
-
 /// The live mappings under `dir` whose names end in `suffix`, each as the
 /// kernel has it advised.
 #[cfg(target_os = "linux")]
 fn advised(dir: &Path, suffix: &str) -> Vec<bool> {
-    mappings_advised_random(&dir.to_string_lossy())
+    common::mappings_advised_random(&dir.to_string_lossy())
         .into_iter()
         .filter(|(p, _)| p.ends_with(suffix))
         .map(|(_, rr)| rr)
@@ -5128,7 +5128,7 @@ fn a_form_file_is_advised_random_whatever_mode_the_store_was_in_when_it_was_atta
     // and a read of it took a window of pages for the one it asks, which is
     // what the form is for not doing.
     let dir = scratch("advice");
-    let mut db = Db::create(&dir, forced(|o| o.partition_bytes = Some(160 << 10))).unwrap();
+    let mut db = Db::create(&dir, forced_files(|o| o.partition_bytes = Some(160 << 10))).unwrap();
     let mut model = ordered_load(&mut db, 6000, 0xAD71);
     db.zpages_settle().unwrap();
     let first = db.zpage_counts().form_files;
@@ -5190,7 +5190,7 @@ fn a_form_file_is_advised_random_whatever_mode_the_store_was_in_when_it_was_atta
     assert_eq!(advised(&dir, ".zpg"), vec![true; c.form_files as usize]);
     // A reopened store attaches them advised too, in whichever mode.
     db.close().unwrap();
-    let db = Db::open(&dir, forced(|o| o.zpages_eager = false)).unwrap();
+    let db = Db::open(&dir, forced_files(|o| o.zpages_eager = false)).unwrap();
     let c = db.zpage_counts();
     assert_eq!(c.attached, c.partitions, "{c:?}");
     assert_eq!(
@@ -5215,7 +5215,7 @@ fn a_store_that_does_not_advise_its_mappings_does_not_advise_its_form_files() {
         let dir = scratch(&format!("advice-{advice:?}"));
         let mut db = Db::create(
             &dir,
-            forced(|o| {
+            forced_files(|o| {
                 o.partition_bytes = Some(160 << 10);
                 o.read_advice = advice;
             }),
@@ -5238,7 +5238,7 @@ fn a_store_that_does_not_advise_its_mappings_does_not_advise_its_form_files() {
         // started have finished: a warm maps the file it reads on its own,
         // and that mapping, sequential by nature, is not a form file's.
         db.close().unwrap();
-        let mut db = Db::open(&dir, forced(|o| o.read_advice = advice)).unwrap();
+        let mut db = Db::open(&dir, forced_files(|o| o.read_advice = advice)).unwrap();
         db.zpages_settle().unwrap();
         check(&db, &model, &keys, "reopened");
         assert_eq!(advised(&dir, ".zpg"), vec![want; n], "{advice:?}, reopened");
@@ -5256,7 +5256,7 @@ fn a_stale_temp_name_and_a_form_file_no_segment_claims_are_swept_at_open() {
     let (dir, model, keys) = one_partition("sweep-src", 3000, 0x5EE9);
     let live = form_files(&dir).remove(0);
     let name = live.file_name().unwrap().to_string_lossy().into_owned();
-    let good = std::fs::read(&live).unwrap();
+    let good = common::store_file(&live);
     for (setting, opts) in [("Always", forced(|_| {})), ("Off", off())] {
         let copy = scratch(&format!("sweep-{setting}"));
         copy_dir(&dir, &copy);
@@ -5327,7 +5327,7 @@ fn a_refused_file_is_counted_once_however_often_it_is_met() {
     let copy = scratch("once");
     copy_dir(&dir, &copy);
     let file = form_files(&copy).remove(0);
-    let mut bytes = std::fs::read(&file).unwrap();
+    let mut bytes = common::store_file(&file);
     let at = bytes.len() - 100;
     bytes[at] ^= 0xff;
     std::fs::write(&file, bytes).unwrap();
@@ -5365,7 +5365,7 @@ fn a_refused_file_of_a_partition_the_build_declines_does_not_stay_to_be_met_agai
     let copy = scratch("declined");
     copy_dir(&dir, &copy);
     let file = form_files(&copy).remove(0);
-    let mut bytes = std::fs::read(&file).unwrap();
+    let mut bytes = common::store_file(&file);
     let at = bytes.len() - 100;
     bytes[at] ^= 0xff;
     std::fs::write(&file, bytes).unwrap();
@@ -5478,7 +5478,7 @@ fn the_sizes_the_store_reports_are_the_files_it_holds() {
     assert!(c.form_files >= 3 && c.form_files == c.partitions, "{c:?}");
     let (mut file, mut groups, mut pages, mut fence) = (0u64, 0u64, 0u64, 0u64);
     for f in form_files(&dir) {
-        let bytes = std::fs::read(&f).unwrap();
+        let bytes = common::store_file(&f);
         file += bytes.len() as u64;
         let t = Trailer::decode(&bytes[bytes.len() - ZTRAILER..]).unwrap();
         pages += t.n_pages;
@@ -5909,7 +5909,7 @@ fn a_settle_removes_the_form_files_and_temp_names_that_nothing_claims() {
     let (dir, model, keys) = one_partition("settle-sweep", 3000, 0x5EE8);
     let live = form_files(&dir).remove(0);
     let name = live.file_name().unwrap().to_string_lossy().into_owned();
-    let good = std::fs::read(&live).unwrap();
+    let good = common::store_file(&live);
     let mut db = Db::open(&dir, forced(|_| {})).unwrap();
     assert_eq!(db.zpage_counts().swept, 0);
     std::fs::write(dir.join(format!("{name}.tmp")), &good[..good.len() / 3]).unwrap();
@@ -5923,7 +5923,7 @@ fn a_settle_removes_the_form_files_and_temp_names_that_nothing_claims() {
     let c = db.zpage_counts();
     assert_eq!((c.swept, c.form_files, c.builds), (3, 1, 0), "{c:?}");
     // The one the live segment has is the one it had.
-    assert_eq!(std::fs::read(&live).unwrap(), good);
+    assert_eq!(common::store_file(&live), good);
     check(&db, &model, &keys[..300], "after the sweep");
     assert_eq!(db.zpage_counts().reads, 300);
     drop(db);
@@ -5954,7 +5954,7 @@ fn the_empty_key_as_the_first_write_of_a_store() {
 /// this process is still to come, so that a flip in it is met by a read's
 /// own checks and not by an attach's sample.
 fn an_untouched_page(path: &Path, taken: &[usize]) -> usize {
-    let bytes = std::fs::read(path).unwrap();
+    let bytes = common::store_file(path);
     let t = Trailer::decode(&bytes[bytes.len() - ZTRAILER..]).unwrap();
     let pages = t.n_pages as usize;
     assert!(pages > 40, "{pages} pages");
@@ -6245,10 +6245,8 @@ fn fields_of(seg: &str) -> (u64, u64) {
 
 /// The one partition's segment file name in `dir`.
 fn partition_name(dir: &Path) -> String {
-    let mut v: Vec<String> = std::fs::read_dir(dir)
-        .unwrap()
-        .flatten()
-        .map(|e| e.file_name().to_string_lossy().into_owned())
+    let mut v: Vec<String> = common::store_names(dir)
+        .into_iter()
         .filter(|n| n.starts_with("par-") && n.ends_with(".sup"))
         .collect();
     assert_eq!(v.len(), 1, "one partition: {v:?}");
@@ -6612,7 +6610,7 @@ fn a_filter_of_another_layout_cannot_attach_and_never_answers_absent() {
     let (dir, model, keys) = one_partition("filter-src", 4500, 0xF117);
     let probe: Vec<Vec<u8>> = keys.iter().step_by(23).cloned().collect();
     let reverse = |p: &Path| {
-        let mut bytes = std::fs::read(p).unwrap();
+        let mut bytes = common::store_file(p);
         let at = bytes.len() - ZTRAILER;
         let mut t = Trailer::decode(&bytes[at..]).unwrap();
         assert!(
@@ -6708,11 +6706,13 @@ fn an_attached_form_file_is_warmed_once_per_process_unless_the_warm_is_off() {
     let resident = |p: &Path| -> (usize, usize) {
         let m = MmapBytes::open(p).unwrap();
         let len = m.len() as usize;
-        (m.resident_pages(0, len), len.div_ceil(page))
+        let all = len.div_ceil(page);
+        let share = m.resident_share(0, len).expect("the kernel says");
+        ((share * all as f64).round() as usize, all)
     };
     let wide = |o: &mut Options| o.partition_bytes = Some(64 << 20);
     let dir = scratch("warm-src");
-    let mut db = Db::create(&dir, forced(wide)).unwrap();
+    let mut db = Db::create(&dir, forced_files(wide)).unwrap();
     let model = ordered_load(&mut db, 60_000, 0x3A4D);
     db.zpages_settle().unwrap();
     let c = db.zpage_counts();
@@ -6743,7 +6743,7 @@ fn an_attached_form_file_is_warmed_once_per_process_unless_the_warm_is_off() {
         assert!(res < all / 4, "{res} of {all} resident after the eviction");
         let mut db = Db::open(
             &dir,
-            forced(|o| {
+            forced_files(|o| {
                 wide(o);
                 o.publish_in_background = background;
                 o.zpages_eager = false;
@@ -6787,7 +6787,7 @@ fn an_attached_form_file_is_warmed_once_per_process_unless_the_warm_is_off() {
     {
         let mut db = Db::open(
             &dir,
-            forced(|o| {
+            forced_files(|o| {
                 wide(o);
                 o.zpages_warm = false;
             }),
@@ -6810,6 +6810,107 @@ fn an_attached_form_file_is_warmed_once_per_process_unless_the_warm_is_off() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// Under a cipher a warm measures the form file by its length and asks the
+/// kernel for what of its envelope is not in memory, and decrypts nothing:
+/// what is warmed is the ciphertext a first read would wait on the device
+/// for, and the plaintext stays the store's cache's to take when asked. A
+/// warm that measured the file by the bytes its mapping lends unasked saw
+/// a file of none, and warmed and skipped nothing.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_warm_under_a_cipher_asks_for_the_envelope_and_decrypts_nothing() {
+    use std::os::unix::io::AsRawFd;
+    let cipher = || {
+        supdb::Encryption::Cipher(supdb::StoreCipher::new(
+            common::Gcm::new(&[0x5b; 32]),
+            common::Gcm::new,
+        ))
+    };
+    let opts = |eager: bool| {
+        forced(|o| {
+            o.partition_bytes = Some(64 << 20);
+            o.encryption = cipher();
+            o.zpages_eager = eager;
+        })
+    };
+    let dir = scratch("warm-cipher");
+    let mut db = Db::create(&dir, opts(true)).unwrap();
+    let model = ordered_load(&mut db, 60_000, 0x3A4E);
+    db.zpages_settle().unwrap();
+    let c = db.zpage_counts();
+    assert_eq!((c.partitions, c.form_files, c.warms), (1, 1, 1), "{c:?}");
+    let seen = c.warm_bytes + c.warm_skipped;
+    assert!(
+        seen > 0 && seen <= c.file_bytes,
+        "the warm measured the file: {c:?}"
+    );
+    db.close().unwrap();
+    // The envelopes cold, and the store opened again: the warm asks for the
+    // pages the attach did not read, which are most of the file.
+    for p in common::store_paths(&dir) {
+        let f = std::fs::File::open(&p).unwrap();
+        f.sync_all().unwrap();
+        // SAFETY: a hint on an open descriptor.
+        unsafe { libc::posix_fadvise(f.as_raw_fd(), 0, 0, libc::POSIX_FADV_DONTNEED) };
+    }
+    let mut db = Db::open(&dir, opts(false)).unwrap();
+    assert_eq!(db.zpage_counts().attached, 1);
+    let fills = db
+        .cipher_counts()
+        .expect("a store under a cipher")
+        .cache
+        .fills;
+    db.zpages_settle().unwrap();
+    let c = db.zpage_counts();
+    assert_eq!((c.warms, c.builds), (1, 0), "{c:?}");
+    assert!(
+        c.warm_bytes >= c.file_bytes / 2,
+        "the envelope's cold pages measured: {c:?}"
+    );
+    // The ask itself, read off the kernel: the form file's envelope, which
+    // the attach left at most half in the cache (the measure above), is in
+    // it whole once the reads the warm asked for have landed. The ask does
+    // not wait for them, so the cache is polled to a bound.
+    let envelopes: Vec<PathBuf> = common::store_paths(&dir)
+        .into_iter()
+        .filter(|p| {
+            p.file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(|n| n.starts_with("x-") && n.ends_with(".z"))
+        })
+        .collect();
+    assert_eq!(
+        envelopes.len(),
+        1,
+        "one form file's envelope: {envelopes:?}"
+    );
+    // Where its bytes lie: a file of its own, or a range of the store's
+    // data file.
+    let env_len = common::store_len(&envelopes[0]) as usize;
+    let t = std::time::Instant::now();
+    let share = loop {
+        let share =
+            common::cached_pages(&envelopes[0], 0, env_len) as f64 / env_len.div_ceil(4096) as f64;
+        if share >= 0.9 || t.elapsed() > std::time::Duration::from_secs(20) {
+            break share;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    };
+    assert!(
+        share >= 0.9,
+        "the warm asked for the envelope: {share} of it in the cache, {c:?}"
+    );
+    assert_eq!(
+        db.cipher_counts().unwrap().cache.fills,
+        fills,
+        "the warm decrypted nothing"
+    );
+    let keys: Vec<Vec<u8>> = model.keys().cloned().collect();
+    check(&db, &model, &keys[..300], "after the warm");
+    db.close().unwrap();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// Under the eager build a form file the open refuses is built again at
 /// once, by the segment work's first turn after the open and no settle:
 /// the refusal is counted, the new file replaces the refused one, and the
@@ -6822,7 +6923,7 @@ fn a_refused_form_file_is_built_again_at_the_open_without_a_settle() {
     let copy = scratch("refused-eager");
     copy_dir(&dir, &copy);
     let file = form_files(&copy).remove(0);
-    let mut bytes = std::fs::read(&file).unwrap();
+    let mut bytes = common::store_file(&file);
     let at = bytes.len() - 100;
     bytes[at] ^= 0xff;
     std::fs::write(&file, bytes).unwrap();
@@ -7278,8 +7379,7 @@ fn the_samplers_estimate_of_the_form_is_within_a_tenth_of_its_files() {
 #[cfg(target_os = "linux")]
 fn populations_of(dir: &Path) -> (u64, u64, u64) {
     let (mut hash, mut records, mut sections) = (0u64, 0u64, 0u64);
-    for e in std::fs::read_dir(dir).unwrap().flatten() {
-        let p = e.path();
+    for p in common::store_paths(dir) {
         let n = p.file_name().unwrap().to_string_lossy().into_owned();
         if !(n.starts_with("par-") && n.ends_with(".sup")) {
             continue;
@@ -7388,10 +7488,8 @@ fn a_store_whose_hash_and_records_fit_the_budget_is_fits() {
 #[test]
 fn an_auto_store_that_fits_builds_nothing() {
     let files_of = |dir: &Path| -> Vec<String> {
-        let mut v: Vec<String> = std::fs::read_dir(dir)
-            .unwrap()
-            .flatten()
-            .map(|e| e.file_name().to_string_lossy().into_owned())
+        let mut v: Vec<String> = common::store_names(dir)
+            .into_iter()
             .filter(|n| !n.starts_with("wal-"))
             .collect();
         v.sort();
@@ -7706,6 +7804,10 @@ fn auto_store_loaded(
         zpages_stride_convert: false,
         zpages_hot_raw_beside_stride: false,
         zpages_drop_again: false,
+        // In the store's one data file where the tests' stores are
+        // (`common::one_file_switch`): the controller's looks, builds,
+        // attaches and drops over files that are extents of it.
+        one_file: common::one_file_switch(),
         ..Options::default()
     };
     extra(&mut opts);
@@ -8121,9 +8223,8 @@ fn compact_store_with(
 #[test]
 fn a_served_partitions_ordered_index_is_dropped_again_a_second_on() {
     let ords = |dir: &Path| -> Vec<PathBuf> {
-        let mut v: Vec<PathBuf> = std::fs::read_dir(dir)
-            .unwrap()
-            .map(|e| e.unwrap().path())
+        let mut v: Vec<PathBuf> = common::store_paths(dir)
+            .into_iter()
             .filter(|p| {
                 let n = p.file_name().unwrap().to_string_lossy().into_owned();
                 n.starts_with("ord-") && n.ends_with(".oidx")
@@ -8136,7 +8237,7 @@ fn a_served_partitions_ordered_index_is_dropped_again_a_second_on() {
         ords(dir)
             .iter()
             .map(|p| {
-                let len = std::fs::metadata(p).unwrap().len() as usize;
+                let len = common::store_len(p) as usize;
                 common::cached_pages(p, 0, len)
             })
             .sum()
@@ -8163,7 +8264,7 @@ fn a_served_partitions_ordered_index_is_dropped_again_a_second_on() {
             "a second drop for each first: {c0:?}"
         );
         for p in ords(&dir) {
-            std::fs::read(&p).unwrap();
+            common::store_file(&p);
         }
         let held = cached(&dir);
         assert!(
@@ -8250,7 +8351,7 @@ fn a_partition_asked_for_or_released_raw_is_not_dropped_again() {
         db.zpage_counts()
     );
     assert!(
-        tick_until(&db, 400, |c| c.attached >= c.partitions
+        tick_until_built(&db, |c| c.attached >= c.partitions
             && c.warms >= c.partitions),
         "{what}: every file attached and warmed: {:?}",
         db.zpage_counts()
@@ -8268,9 +8369,8 @@ fn a_partition_asked_for_or_released_raw_is_not_dropped_again() {
     inject.set_budget(total * 100 / 75 + 1);
     wait_secs(&db, 3, 1);
     let ords = || -> Vec<PathBuf> {
-        let mut v: Vec<PathBuf> = std::fs::read_dir(&dir)
-            .unwrap()
-            .map(|e| e.unwrap().path())
+        let mut v: Vec<PathBuf> = common::store_paths(&dir)
+            .into_iter()
             .filter(|p| {
                 let n = p.file_name().unwrap().to_string_lossy().into_owned();
                 n.starts_with("ord-") && n.ends_with(".oidx")
@@ -8280,11 +8380,11 @@ fn a_partition_asked_for_or_released_raw_is_not_dropped_again() {
         v
     };
     let cached = |p: &Path| -> (usize, usize) {
-        let len = std::fs::metadata(p).unwrap().len() as usize;
+        let len = common::store_len(p) as usize;
         (common::cached_pages(p, 0, len), len.div_ceil(4096))
     };
     for p in ords() {
-        std::fs::read(&p).unwrap();
+        common::store_file(&p);
     }
     assert!(
         ords().iter().all(|p| cached(p).0 == cached(p).1),
@@ -8663,6 +8763,64 @@ fn the_gate_decides_the_form_under_auto_as_under_always() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// The controller under a cipher (`Encryption::Cipher`): the same store
+/// driven to COMPACT through the seam, its partitions sampled, built and
+/// installed from files read by the piece through the store's cache, and
+/// the gate deciding the form as it does for a plain store -- every answer
+/// the model's, raw and through the form, before and after a reopen that
+/// finds the form files beside their segments.
+#[cfg(target_os = "linux")]
+#[test]
+fn the_controller_buys_builds_and_installs_the_form_under_a_cipher() {
+    let cipher = || {
+        supdb::Encryption::Cipher(supdb::StoreCipher::new(
+            common::Gcm::new(&[0x5a; 32]),
+            common::Gcm::new,
+        ))
+    };
+    let (dir, db, model, _inject, r, keys, _) = compact_store_with("auto-cipher", 1 << 20, |o| {
+        o.encryption = cipher();
+        o.zpages_under_cipher = true;
+    });
+    assert!(db.cipher_counts().is_some(), "the store is under a cipher");
+    let c = db.zpage_counts();
+    assert!(
+        c.model_hash_bytes > 0 && c.model_record_bytes > 0,
+        "a footprint of nothing: {c:?}"
+    );
+    let some: Vec<Vec<u8>> = keys.iter().step_by(101).cloned().collect();
+    for (gate, served) in [(1u8, false), (0, false), (2, true)] {
+        db.zgate_set(gate);
+        let before = db.zpage_counts();
+        check(&r, &model, &some, &format!("auto cipher gate {gate}"));
+        let after = db.zpage_counts();
+        let through = (after.reads + after.counts + after.rawserves)
+            - (before.reads + before.counts + before.rawserves);
+        if served {
+            assert!(after.reads > before.reads, "{after:?}");
+            assert_eq!(after.fallbacks, before.fallbacks, "{after:?}");
+        } else {
+            assert_eq!(through, 0, "gate {gate}: nothing through the form");
+        }
+    }
+    check_scan(&r, &model, "auto cipher scan");
+    let forms = db.zpage_counts().form_files;
+    assert!(forms > 0);
+    // No form file is its writer's memory still: each has its envelope.
+    assert_eq!(db.cipher_counts().unwrap().files, 0);
+    drop(r);
+    // Among the store's files, wherever it keeps them, read while it is
+    // open: a store kept in one file has its envelopes' names to give
+    // then, and in its sealed manifest alone once it is closed.
+    let on_disk = common::store_names(&dir)
+        .iter()
+        .filter(|n| n.ends_with(".z"))
+        .count() as u64;
+    db.close().unwrap();
+    assert_eq!(on_disk, forms, "an envelope a form file");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// Reads through the form over `hot` keys, in stretches whose windows
 /// close through the ticks, for `secs` seconds of the injected clock, each
 /// read with `faults` faults on the seam: what a COMPACT store's handle
@@ -8984,7 +9142,7 @@ fn a_store_far_past_the_cache_still_builds() {
 fn form_files_on_disk_are_dormant_under_auto_and_attached_when_the_form_is_wanted() {
     let dir = scratch("auto-dormant");
     let model = {
-        let mut db = Db::create(&dir, forced(|_| {})).unwrap();
+        let mut db = Db::create(&dir, forced_files(|_| {})).unwrap();
         let model = ordered_load(&mut db, 20_000, 0x4A9);
         db.zpages_settle().unwrap();
         let c = db.zpage_counts();
@@ -9036,6 +9194,334 @@ fn form_files_on_disk_are_dormant_under_auto_and_attached_when_the_form_is_wante
     );
     let some: Vec<Vec<u8>> = keys.iter().step_by(97).cloned().collect();
     check(&r, &model, &some, "dormant attached");
+    assert!(db.zpage_counts().reads > 0);
+    drop(r);
+    db.close().unwrap();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// With `Options::zpages_under_cipher` off the controller leaves a store
+/// under a cipher in the raw form: the same store that is driven to the
+/// compact form with the option on, as shipped, steps no selector, builds
+/// nothing and reads raw with it off, under the same seam and the same
+/// reads.
+#[cfg(target_os = "linux")]
+#[test]
+fn the_controller_leaves_a_store_under_a_cipher_raw_where_it_is_told_to() {
+    let dir = scratch("auto-cipher-off");
+    let inject = std::sync::Arc::new(supdb::ZInject::new());
+    inject.set_budget(1 << 20);
+    inject.set_refault_rate(1_000_000.0);
+    inject.set_fault_cost(FAULT_1MS);
+    inject.set_decode_cost(DECODE_5US);
+    inject.advance(std::time::Duration::from_millis(1));
+    let mut db = Db::create(
+        &dir,
+        Options {
+            zpages: ZPages::Auto,
+            zpages_min_bytes: 0,
+            zpages_inject: Some(inject.clone()),
+            zpages_under_cipher: false,
+            encryption: supdb::Encryption::Cipher(supdb::StoreCipher::new(
+                common::Gcm::new(&[0x5a; 32]),
+                common::Gcm::new,
+            )),
+            ..Options::default()
+        },
+    )
+    .unwrap();
+    assert_eq!(db.options().zpages, ZPages::Off, "the store's own reading");
+    let model = ordered_load(&mut db, 20_000, 0x4A9);
+    db.settle().unwrap();
+    let keys: Vec<Vec<u8>> = model.keys().cloned().collect();
+    let r = db.reader().unwrap();
+    let mut at = 0usize;
+    for _ in 0..20 {
+        reads(&r, &keys, &inject, 640, &mut at, 1);
+        inject.advance(std::time::Duration::from_secs(1));
+        std::thread::sleep(std::time::Duration::from_millis(15));
+    }
+    let c = db.zpage_counts();
+    assert_eq!(
+        (c.sel_steps, c.build_starts, c.form_files, c.reads),
+        (0, 0, 0, 0),
+        "{c:?}"
+    );
+    let some: Vec<Vec<u8>> = keys.iter().step_by(97).cloned().collect();
+    check(&r, &model, &some, "raw under a cipher");
+    drop(r);
+    db.close().unwrap();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Under a cipher a form file is a memory file until it has its envelope,
+/// memory the kernel cannot take back and no count of the store's cache
+/// has, which the cache's room learns of a page at a time as it is
+/// written: so a build says what its file is to hold where it makes it
+/// (`vault::expect`), as a merge says what its outputs are to. A store
+/// of numbered keys, loaded and settled with the form off and opened again
+/// with it forced, so that its builds are the only files written, has every
+/// byte its
+/// builds wrote announced: the stride form's to the byte, its length known
+/// before its first page, and the block form's as the partition's records,
+/// which its groups compress where the values do, and outgrow by a few in a
+/// hundred where they do not.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_form_build_under_a_cipher_says_what_its_file_is_to_hold() {
+    let cipher = || {
+        supdb::Encryption::Cipher(supdb::StoreCipher::new(
+            common::Gcm::new(&[0x5d; 32]),
+            common::Gcm::new,
+        ))
+    };
+    for stride in [ZStride::Forced, ZStride::Off] {
+        let what = format!("{stride:?}");
+        let dir = scratch(&format!("zexpect-cipher-{stride:?}"));
+        let model = {
+            let mut db = Db::create(
+                &dir,
+                Options {
+                    encryption: cipher(),
+                    partition_bytes: Some(400 << 10),
+                    ..Options::default()
+                },
+            )
+            .unwrap();
+            let model = numbered_load(&mut db, 40_000, 100, 0x4AB);
+            db.settle().unwrap();
+            db.close().unwrap();
+            model
+        };
+        let mut db = Db::open(
+            &dir,
+            forced(|o| {
+                o.encryption = cipher();
+                o.zpages_stride = stride;
+                o.partition_bytes = Some(400 << 10);
+            }),
+        )
+        .unwrap();
+        // Counted from the open, which says nothing of its own of a store
+        // settled and closed, since the builds start the moment the store
+        // is open: a baseline read after the open missed a build that had
+        // said its length before it, once on a hosted ARM runner.
+        db.zpages_settle().unwrap();
+        let c = db.zpage_counts();
+        let said = db.cipher_counts().unwrap().expected;
+        assert!(
+            c.builds >= 2 && c.form_files == c.partitions,
+            "{what}: every partition built: {c:?}"
+        );
+        assert_eq!(
+            c.stride_builds > 0,
+            stride == ZStride::Forced,
+            "{what}: the form asked for: {c:?}"
+        );
+        if stride == ZStride::Forced {
+            assert_eq!(
+                said, c.build_bytes,
+                "{what}: a stride file's length said to the byte: {c:?}"
+            );
+        } else {
+            // The values are random bytes, so the groups do not compress
+            // and the file outgrows its records by its pages' headers and
+            // directories and its filter, a few in a hundred: the rest a
+            // reading's to see.
+            assert!(
+                said * 10 >= c.build_bytes * 9 && said < 2 * c.build_bytes,
+                "{what}: the block form's records said, {said} bytes, for {} written: {c:?}",
+                c.build_bytes
+            );
+        }
+        let keys: Vec<Vec<u8>> = model.keys().step_by(97).cloned().collect();
+        let r = db.reader().unwrap();
+        check(&r, &model, &keys, &what);
+        drop(r);
+        db.close().unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+/// Under a cipher a partition's raw pages dropped once its form file serves
+/// it (`Options::zpages_drop_raw`) are the plaintext the store's cache holds
+/// of them as well as the kernel's cache of their envelope: the drop gives
+/// the cache's units back, as a plain store's drop gives back its pages,
+/// where it had dropped the envelope's pages alone and left the plaintext of
+/// every partition the form serves to stand in the cache beside the form
+/// files the reads want. The shape before (`StoreCipher::
+/// drops_keep_plaintext`) gives nothing back, and is run first, so that its
+/// evictor has had the whole of the other store's wait to turn in.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_drop_of_a_partitions_raw_pages_under_a_cipher_gives_its_plaintext_back() {
+    let mut kept = None;
+    for keep in [true, false] {
+        let what = format!("drops keep the plaintext: {keep}");
+        let cipher = supdb::StoreCipher::new(common::Gcm::new(&[0x5e; 32]), common::Gcm::new)
+            .cache_bytes(1 << 30)
+            .drops_keep_plaintext(keep);
+        let dir = scratch(&format!("zdrop-cipher-{keep}"));
+        let mut db = Db::create(
+            &dir,
+            forced(|o| {
+                o.encryption = supdb::Encryption::Cipher(cipher);
+                o.partition_bytes = Some(400 << 10);
+                o.zpages_drop_at_install = false;
+            }),
+        )
+        .unwrap();
+        let model = numbered_load(&mut db, 40_000, 100, 0x4AC);
+        db.zpages_settle().unwrap();
+        let c = db.zpage_counts();
+        assert!(
+            c.partitions >= 2 && c.form_files == c.partitions,
+            "{what}: every partition served: {c:?}"
+        );
+        assert!(
+            c.raw_dropped >= c.partitions,
+            "{what}: every partition's raw pages dropped: {c:?}"
+        );
+        // The segments' envelopes, by their names: an envelope of a
+        // segment carries no kind's suffix.
+        let raw: u64 = common::store_paths(&dir)
+            .into_iter()
+            .filter(|p| {
+                p.file_name()
+                    .and_then(|n| n.to_str())
+                    .is_some_and(|n| n.starts_with("x-") && !n.contains('.'))
+            })
+            .map(common::store_len)
+            .sum();
+        assert!(
+            raw > 2 << 20,
+            "{what}: the segments' envelopes: {raw} bytes"
+        );
+        let dropped = || db.cipher_counts().unwrap().cache.dropped_bytes;
+        if keep {
+            kept = Some((dir, db, model));
+            continue;
+        }
+        let t = std::time::Instant::now();
+        while dropped() < raw / 2 {
+            assert!(
+                t.elapsed() < std::time::Duration::from_secs(20),
+                "{what}: {} bytes given back of {raw}: {:?}",
+                dropped(),
+                db.cipher_counts().unwrap().cache
+            );
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        let keys: Vec<Vec<u8>> = model.keys().step_by(97).cloned().collect();
+        let r = db.reader().unwrap();
+        check(&r, &model, &keys, &what);
+        drop(r);
+        db.close().unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+    let (dir, db, model) = kept.unwrap();
+    let c = db.cipher_counts().unwrap().cache;
+    assert_eq!(
+        c.dropped_bytes, 0,
+        "the shape before gives nothing back: {c:?}"
+    );
+    let keys: Vec<Vec<u8>> = model.keys().step_by(97).cloned().collect();
+    let r = db.reader().unwrap();
+    check(&r, &model, &keys, "the shape before");
+    drop(r);
+    db.close().unwrap();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// The same under a cipher (`Encryption::Cipher`), where a form file an
+/// earlier open left is an envelope beside its segment's that this open's
+/// table of names does not hold until something asks for it: the
+/// controller's probes find it there, so it is neither built again ahead
+/// nor attached before the form is wanted, and the buy is its attach.
+#[cfg(target_os = "linux")]
+#[test]
+fn form_files_an_earlier_open_left_under_a_cipher_are_dormant_and_then_attached() {
+    let cipher = || {
+        supdb::Encryption::Cipher(supdb::StoreCipher::new(
+            common::Gcm::new(&[0x5a; 32]),
+            common::Gcm::new,
+        ))
+    };
+    let dir = scratch("auto-dormant-cipher");
+    // The form files' envelopes among the store's files, wherever it
+    // keeps them, counted while the store is open: a store kept in one
+    // file has their names in its sealed manifest alone once it is
+    // closed.
+    let envelopes = || {
+        common::store_names(&dir)
+            .iter()
+            .filter(|n| n.ends_with(".z"))
+            .count() as u64
+    };
+    let (model, on_disk) = {
+        let mut db = Db::create(&dir, forced(|o| o.encryption = cipher())).unwrap();
+        let model = ordered_load(&mut db, 20_000, 0x4A9);
+        db.zpages_settle().unwrap();
+        let c = db.zpage_counts();
+        assert!(c.form_files >= 1 && c.form_files == c.partitions, "{c:?}");
+        let on_disk = envelopes();
+        db.close().unwrap();
+        (model, on_disk)
+    };
+    assert!(on_disk > 0);
+    let inject = std::sync::Arc::new(supdb::ZInject::new());
+    inject.set_budget(1 << 20);
+    inject.set_refault_rate(1_000_000.0);
+    inject.set_fault_cost(FAULT_1MS);
+    inject.set_decode_cost(DECODE_5US);
+    inject.advance(std::time::Duration::from_millis(1));
+    let db = Db::open(
+        &dir,
+        Options {
+            zpages: ZPages::Auto,
+            zpages_min_bytes: 0,
+            zpages_inject: Some(inject.clone()),
+            encryption: cipher(),
+            zpages_under_cipher: true,
+            ..Options::default()
+        },
+    )
+    .unwrap();
+    let c = db.zpage_counts();
+    assert_eq!((c.form_files, c.attached), (0, 0), "dormant: {c:?}");
+    assert_eq!(envelopes(), on_disk, "and kept");
+    // Past the selector's line from its first tick: the look that first
+    // finds it there swaps the records of every partition with a form
+    // file on disk for the file (`Maint::z_cross`), which is every
+    // partition here, each found by a probe of the store's table of
+    // names that learns of the envelope as it asks.
+    assert!(
+        tick_until(&db, 50, |c| c.ahead_swapped >= c.partitions),
+        "the form files on disk were not found: {:?}",
+        db.zpage_counts()
+    );
+    assert_eq!(db.zpage_counts().build_starts, 0, "{:?}", db.zpage_counts());
+    let keys: Vec<Vec<u8>> = model.keys().cloned().collect();
+    let r = db.reader().unwrap();
+    let mut at = 0usize;
+    assert!(
+        drive_to(&db, &r, &keys, &inject, &mut at, 640, 1, 3, 400),
+        "COMPACT: {:?}",
+        db.zpage_counts()
+    );
+    let c = db.zpage_counts();
+    assert_eq!(
+        (c.builds, c.build_starts),
+        (0, 0),
+        "attached, not built: {c:?}"
+    );
+    assert_eq!(
+        (c.attached, c.form_files),
+        (c.partitions, c.partitions),
+        "{c:?}"
+    );
+    let some: Vec<Vec<u8>> = keys.iter().step_by(97).cloned().collect();
+    check(&r, &model, &some, "dormant attached under a cipher");
     assert!(db.zpage_counts().reads > 0);
     drop(r);
     db.close().unwrap();
@@ -9399,10 +9885,8 @@ fn the_crossing_asks_for_the_raw_pages_of_a_cold_partition_with_no_form_file() {
             db.hold_zpage_build(true);
         }
         let on_disk = named_form_files(&dir).len() as u64;
-        let pars: Vec<PathBuf> = std::fs::read_dir(&dir)
-            .unwrap()
-            .flatten()
-            .map(|e| e.path())
+        let pars: Vec<PathBuf> = common::store_paths(&dir)
+            .into_iter()
             .filter(|p| {
                 p.file_name()
                     .and_then(|n| n.to_str())
@@ -9415,7 +9899,7 @@ fn the_crossing_asks_for_the_raw_pages_of_a_cold_partition_with_no_form_file() {
             "{what}: {on_disk} form files on disk"
         );
         let share = |f: &Path| {
-            let len = std::fs::metadata(f).unwrap().len() as usize;
+            let len = common::store_len(f) as usize;
             cached_pages(f, 0, len) as f64 / len.div_ceil(4096) as f64
         };
         if cold {
@@ -9562,6 +10046,137 @@ fn two_builds_ahead_run_beside_each_other_and_build_each_partition_once() {
             assert!(c.ahead_paired > 0, "no second build ahead ran: {c:?}");
         } else {
             assert_eq!(c.ahead_paired, 0, "{c:?}");
+        }
+        db.close().unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+/// Builds ahead under a cipher (`Encryption::Cipher`): a store past the
+/// percent of its budget builds every partition's form file ahead from
+/// records its cache holds, seals each beside its segment, and attaches
+/// none; and a form file nothing reads yet takes nothing of the store's
+/// cache or of the kernel's -- its plaintext is not taken into the cache,
+/// where it would stand in the raw form's place, and its envelope's pages
+/// are written back and dropped.
+#[cfg(target_os = "linux")]
+#[test]
+fn builds_ahead_under_a_cipher_seal_their_form_files_and_keep_them_cold() {
+    let (dir, db, _model, inject, raw) = land_store_with("auto-ahead-cipher", 50, |o| {
+        o.encryption = supdb::Encryption::Cipher(supdb::StoreCipher::new(
+            common::Gcm::new(&[0x5a; 32]),
+            common::Gcm::new,
+        ));
+        o.zpages_under_cipher = true;
+        o.partition_bytes = Some(400 << 10);
+    });
+    let before = db.cipher_counts().expect("a store under a cipher");
+    inject.set_budget(raw * 3 / 2);
+    assert!(
+        tick_until(&db, 200, |c| c.prebuilt >= c.partitions),
+        "built ahead: {:?}",
+        db.zpage_counts()
+    );
+    let c = db.zpage_counts();
+    assert!(c.partitions >= 3, "{c:?}");
+    assert_eq!(
+        (c.phase, c.prebuilt, c.build_starts, c.attached),
+        (0, c.partitions, c.partitions, 0),
+        "each partition built ahead once: {c:?}"
+    );
+    let after = db.cipher_counts().unwrap();
+    assert_eq!(after.files, 0, "a form file with no envelope: {after:?}");
+    assert_eq!(
+        after.adopted, before.adopted,
+        "the cache took a form file nothing reads: {after:?}"
+    );
+    assert_eq!(after.left - before.left, c.partitions, "{after:?}");
+    let envelopes: Vec<PathBuf> = common::store_paths(&dir)
+        .into_iter()
+        .filter(|p| p.to_string_lossy().ends_with(".z"))
+        .collect();
+    assert_eq!(envelopes.len() as u64, c.partitions, "an envelope each");
+    for z in &envelopes {
+        let len = common::store_len(z) as usize;
+        let cached = cached_pages(z, 0, len);
+        assert!(
+            cached * 4 <= len.div_ceil(4096),
+            "{}: {cached} of its {} pages in the page cache",
+            z.display(),
+            len.div_ceil(4096)
+        );
+    }
+    db.close().unwrap();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Under a cipher the builds ahead start past a percent of the store's
+/// own cache of plaintext as well (`Options::zpages_land_cache_pct`): a
+/// store whose populations are nowhere near the percent of the
+/// controller's budget, and whose partitions' files come to more than the
+/// percent of its cache's, builds their form files ahead. With the percent at zero
+/// it builds none, the controller's budget being the only line; and with
+/// a cache the store is a small part of it builds none either, the
+/// option on. The records a build reads back are the kernel's to answer
+/// for where the store's cache has given them up, so none is cold here.
+#[cfg(target_os = "linux")]
+#[test]
+fn builds_ahead_under_a_cipher_start_past_the_percent_of_the_stores_own_cache() {
+    for (pct, cache, builds) in [
+        (25, 1u64 << 20, true),
+        (0, 1 << 20, false),
+        (25, 1 << 30, false),
+    ] {
+        let what = format!("past {pct} percent of a cache of {} MiB", cache >> 20);
+        let (dir, db, _model, _inject) = auto_store_loaded(
+            &format!("auto-ahead-cipher-by-cache-{pct}-{}", cache >> 20),
+            1 << 40,
+            0.0,
+            FAULT_40US,
+            |o| {
+                o.encryption = supdb::Encryption::Cipher(
+                    supdb::StoreCipher::new(common::Gcm::new(&[0x5b; 32]), common::Gcm::new)
+                        .cache_bytes(cache),
+                );
+                o.zpages_under_cipher = true;
+                o.zpages_land_pct = 50;
+                o.zpages_land_cache_pct = pct;
+                o.partition_bytes = Some(400 << 10);
+            },
+            |_| {},
+            |db| ordered_load(db, 20_000, 0x4AA),
+        );
+        let c = db.zpage_counts();
+        assert!(c.partitions >= 3, "{what}: {c:?}");
+        // The store is several times the small cache and a small part of
+        // the large one, by the populations alone.
+        let raw = c.model_hash_bytes + c.model_record_bytes;
+        assert_eq!(raw > cache, cache == 1 << 20, "{what}: {raw} of raw form");
+        assert_eq!(
+            db.cipher_counts().expect("under a cipher").cache.budget,
+            cache,
+            "{what}"
+        );
+        if builds {
+            assert!(
+                tick_until_built(&db, |c| c.prebuilt >= c.partitions),
+                "{what}: built ahead: {:?}",
+                db.zpage_counts()
+            );
+            let c = db.zpage_counts();
+            assert_eq!(
+                (c.phase, c.attached),
+                (0, 0),
+                "{what}: nothing bought: {c:?}"
+            );
+        } else {
+            wait_steps(&db, 30);
+            let c = db.zpage_counts();
+            assert_eq!(
+                (c.build_starts, c.prebuilt),
+                (0, 0),
+                "{what}: nothing built ahead: {c:?}"
+            );
         }
         db.close().unwrap();
         let _ = std::fs::remove_dir_all(&dir);
@@ -10016,6 +10631,118 @@ fn a_merges_outputs_have_their_form_files_when_it_lands() {
     }
 }
 
+/// A merge that waits for a slot to build its finished output's form file
+/// in (`Options::zpages_build_at_finish`) holds nothing of the store's
+/// cache while it waits (`MergeRest::unheld`), as it holds nothing while
+/// it writes the output's envelope just before: the builds it waits for
+/// read through the cache and breathe at their rests until the evictor
+/// gives back, and the evictor waits for every hold. Under the merge's
+/// hold the three waited on each other, the cache stopped giving back,
+/// and at ten million keys under 1.25 GiB the full rewrite's merges were
+/// killed under the bound in four sweeps of five once their asks covered
+/// their directories and they finished their outputs faster.
+///
+/// One builder and its build held at its start, so that a merge of more
+/// outputs than one finishes its first, starts that build in the one slot
+/// and waits at the next for it; a handle then reads several times the
+/// cache, which has to give back what the handle read past its budget
+/// while the merge waits. Its hold left standing, it gives back nothing.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_merge_waiting_for_a_build_slot_holds_nothing_of_a_ciphers_cache() {
+    let cache: u64 = 256 << 10;
+    let (dir, mut db, mut model, inject, raw) =
+        land_store_with("auto-finish-slot-cipher", 50, |o| {
+            o.encryption = supdb::Encryption::Cipher(
+                supdb::StoreCipher::new(common::Gcm::new(&[0x6b; 32]), common::Gcm::new)
+                    .cache_bytes(cache),
+            );
+            o.zpages_under_cipher = true;
+            o.zpages_build_at_finish = true;
+            o.zpages_ahead_builders = 1;
+            o.partition_bytes = Some(1 << 20);
+            o.l0_trigger = 1;
+            // The builds ahead at landing by the controller's budget alone:
+            // a cache this small is past their line under a cipher from the
+            // load on (`Options::zpages_land_cache_pct`).
+            o.zpages_land_cache_pct = 0;
+        });
+    let mut seen = 0usize;
+    db.scan(b"", 10, kv(&mut |_, _| seen += 1)).unwrap();
+    assert_eq!(seen, 10);
+    inject.set_decode_cost(std::time::Duration::from_micros(1));
+    inject.set_budget(raw / 2);
+    wait_steps(&db, 2);
+    assert!(db.zpage_counts().partitions >= 3, "{:?}", db.zpage_counts());
+    db.hold_zpage_build(true);
+    let mut rng = Rng(0x51D7);
+    let keys: Vec<Vec<u8>> = model.keys().cloned().collect();
+    for chunk in keys.chunks(250) {
+        for k in chunk {
+            let v = suite_value(&mut rng);
+            db.put(k, &v);
+            model.insert(k.clone(), vec![v]);
+        }
+        db.commit().unwrap();
+    }
+    let before = db.seal_waits().merges;
+    db.seal().unwrap();
+    wait_for_merge(&db, before);
+    wait_for(
+        "a build at its hold and a merge waiting for the slot",
+        || {
+            let c = db.zpage_counts();
+            db.zpage_build_waiting() && c.finish_live == 1 && c.finish_waits >= 1
+        },
+    );
+    let pager = |db: &Db| db.cipher_counts().expect("a store under a cipher").cache;
+    let first = pager(&db);
+    // A handle reads the store through the cache, a few times over: by its
+    // keys, which a point read takes to the segments' files, where a scan
+    // may be answered by the block copies in the process's memory.
+    let r = db.reader().unwrap();
+    let keys: Vec<Vec<u8>> = model.keys().cloned().collect();
+    let mut passes = 0;
+    while (pager(&db).fills - first.fills) * 4080 < 6 * cache && passes < 8 {
+        for k in &keys {
+            r.read_all(k, vf(&mut |_| {})).unwrap();
+        }
+        passes += 1;
+    }
+    // A few times the cache at the least: a cache that gives nothing back
+    // fills each chunk once and no more, which stops the loop above short
+    // of its six and is the failure the assertion after this one names.
+    let read = (pager(&db).fills - first.fills) * 4080;
+    assert!(
+        read >= 3 * cache,
+        "the handle read {read} bytes through the cache, which is no test of it"
+    );
+    // The merge waits still, and the cache has given back what the handle
+    // read past the budget, or does so now.
+    let gave = |db: &Db| pager(db).evicted_bytes - first.evicted_bytes;
+    let t = std::time::Instant::now();
+    while gave(&db) < read - 2 * cache && t.elapsed() < std::time::Duration::from_secs(10) {
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+    let (gave, c, z) = (gave(&db), pager(&db), db.zpage_counts());
+    let waiting = z.finish_live == 1 && db.merges_in_flight() >= 1;
+    db.hold_zpage_build(false);
+    assert!(waiting, "the merge stopped waiting for its slot: {z:?}");
+    assert!(
+        gave >= read - 2 * cache,
+        "the cache gave back {gave} bytes of the {read} a handle read while a merge waited for \
+         a build's slot: {c:?}"
+    );
+    wait_for("the builds at the outputs' finish to end", || {
+        db.zpage_counts().finish_live == 0 && db.merges_in_flight() == 0
+    });
+    db.settle().unwrap();
+    check(&r, &model, &keys, "after the merge waited for its slot");
+    drop(r);
+    db.close().unwrap();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// An output being built at its merge's finish is a build in flight
 /// (`Options::zpages_build_at_finish`): the builds ahead at landing, run
 /// beside scans so they would take the landing's outputs, start on none of
@@ -10109,6 +10836,69 @@ fn an_output_being_built_at_its_finish_is_not_built_ahead_again() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// The look at landing asks the kernel of the record region and of
+/// nothing beside it (`Seg::records_resident`): with every partition's
+/// records in the page cache and its record directory out of it, the
+/// store is built ahead whole below the selector's line, where a look at
+/// the directory would leave every partition cold. Quiet as the cold
+/// case below, and the sample left to wait for the builds, so that
+/// nothing reads a partition's directory back before its look.
+#[cfg(target_os = "linux")]
+#[test]
+fn builds_ahead_at_landing_read_the_records_residency_and_not_the_directorys() {
+    use std::os::unix::fs::FileExt;
+    use std::os::unix::io::AsRawFd;
+    let (dir, db, model, inject, raw) = land_store_with("auto-land-recs-warm", 50, |o| {
+        o.zpages_suspect_at_crossing = false;
+        o.zpages_attach_eager = false;
+        o.zpages_cover_resident = false;
+    });
+    let pars: Vec<PathBuf> = common::store_paths(&dir)
+        .into_iter()
+        .filter(|p| {
+            p.file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(|n| n.starts_with("par-") && n.ends_with(".sup"))
+        })
+        .collect();
+    assert!(!pars.is_empty(), "partitions: {pars:?}");
+    let page = 4096usize;
+    let share = |f: &Path, (at, len): (usize, usize)| {
+        let (a, b) = (at / page * page, (at + len).div_ceil(page) * page);
+        cached_pages(f, a, b - a) as f64 / ((b - a) / page) as f64
+    };
+    for f in &pars {
+        let r = regions_of(f);
+        unmap_pages(f);
+        evict(f);
+        let file = std::fs::File::open(f).unwrap();
+        // SAFETY: a hint about a file this test holds open: the reads
+        // below bring in the pages they ask for and no readahead past them.
+        unsafe { libc::posix_fadvise(file.as_raw_fd(), 0, 0, libc::POSIX_FADV_RANDOM) };
+        let mut buf = vec![0u8; r.rec.1];
+        file.read_exact_at(&mut buf, r.rec.0 as u64).unwrap();
+        let (recs, dirs) = (share(f, r.rec), share(f, r.dir));
+        assert!(
+            recs >= 0.9 && dirs < 0.5,
+            "{}: records {recs:.2} and directory {dirs:.2} in the cache",
+            f.display()
+        );
+    }
+    inject.set_budget(raw * 3 / 2);
+    assert!(
+        tick_until(&db, 200, |c| c.prebuilt >= c.partitions),
+        "built ahead from the resident records: {:?}",
+        db.zpage_counts()
+    );
+    assert_eq!(db.zpage_counts().ahead_cold, 0, "none found cold");
+    let keys: Vec<Vec<u8>> = model.keys().step_by(97).cloned().collect();
+    let r = db.reader().unwrap();
+    check(&r, &model, &keys, "raw beside the files built ahead");
+    drop(r);
+    db.close().unwrap();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// The builds ahead at landing (`Options::zpages_land_pct`): a store whose
 /// raw populations pass the percent of its budget and stay under the whole
 /// of it builds every partition's form file ahead, dormant, while the
@@ -10154,13 +10944,11 @@ fn builds_ahead_at_landing_start_past_the_percent_and_only_from_resident_records
     {
         let page = 4096usize;
         for f in form_files(&dir) {
-            let len = std::fs::metadata(&f).unwrap().len() as usize;
+            let len = common::store_len(&f) as usize;
             assert_eq!(cached_pages(&f, 0, len), 0, "{} left cached", f.display());
         }
-        let parts: Vec<PathBuf> = std::fs::read_dir(&dir)
-            .unwrap()
-            .flatten()
-            .map(|e| e.path())
+        let parts: Vec<PathBuf> = common::store_paths(&dir)
+            .into_iter()
             .filter(|p| {
                 p.file_name()
                     .and_then(|n| n.to_str())
@@ -10169,7 +10957,7 @@ fn builds_ahead_at_landing_start_past_the_percent_and_only_from_resident_records
             .collect();
         assert!(!parts.is_empty());
         for f in parts {
-            let len = std::fs::metadata(&f).unwrap().len() as usize;
+            let len = common::store_len(&f) as usize;
             let cached = cached_pages(&f, 0, len);
             assert!(
                 cached * 2 >= len.div_ceil(page),
@@ -10200,7 +10988,15 @@ fn builds_ahead_at_landing_start_past_the_percent_and_only_from_resident_records
     let _ = std::fs::remove_dir_all(&dir);
     // Past the line with the records out of the page cache: each partition
     // looked at once and left; resident again, none looked at again.
-    let (dir, db, _model, inject, raw) = land_store("auto-land-cold", 50);
+    // The selector's own buy at the crossing is off, as for the crossing
+    // below: suspected there, it buys on the prediction a step later and
+    // takes over the build ahead in flight as its own, and the build is
+    // counted the selector's and not built ahead.
+    let quiet = |o: &mut Options| {
+        o.zpages_suspect_at_crossing = false;
+        o.zpages_attach_eager = false;
+    };
+    let (dir, db, _model, inject, raw) = land_store_with("auto-land-cold", 50, quiet);
     inject.set_records_resident(0.0);
     inject.set_budget(raw * 3 / 2);
     assert!(
@@ -10231,6 +11027,7 @@ fn builds_ahead_at_landing_start_past_the_percent_and_only_from_resident_records
     db.close().unwrap();
     let _ = std::fs::remove_dir_all(&dir);
     let (dir, db, _model, inject, raw) = land_store_with("auto-land-cold-skip", 50, |o| {
+        quiet(o);
         o.zpages_land_cold_past = false
     });
     inject.set_records_resident(0.0);
@@ -10286,13 +11083,13 @@ fn builds_ahead_at_landing_start_past_the_percent_and_only_from_resident_records
         );
         let page = 4096usize;
         let (mut cached, mut pages) = (0usize, 0usize);
-        for f in std::fs::read_dir(&dir).unwrap().flatten().map(|e| e.path()) {
+        for f in common::store_paths(&dir) {
             let is_par = f
                 .file_name()
                 .and_then(|n| n.to_str())
                 .is_some_and(|n| n.starts_with("par-") && n.ends_with(".sup"));
             if is_par {
-                let len = std::fs::metadata(&f).unwrap().len() as usize;
+                let len = common::store_len(&f) as usize;
                 cached += cached_pages(&f, 0, len);
                 pages += len.div_ceil(page);
             }
@@ -10346,20 +11143,20 @@ fn builds_ahead_at_landing_start_past_the_percent_and_only_from_resident_records
             });
         inject.set_budget(raw * 3 / 2);
         assert!(
-            tick_until(&db, 200, |c| c.prebuilt >= c.partitions),
+            tick_until_built(&db, |c| c.prebuilt >= c.partitions),
             "{what}: built ahead: {:?}",
             db.zpage_counts()
         );
         let pages_of = |pick: &dyn Fn(&str) -> bool| -> (usize, usize) {
             let (mut cached, mut pages) = (0usize, 0usize);
-            for f in std::fs::read_dir(&dir).unwrap().flatten().map(|e| e.path()) {
+            for f in common::store_paths(&dir) {
                 let name = f
                     .file_name()
                     .and_then(|n| n.to_str())
                     .unwrap_or("")
                     .to_owned();
                 if pick(&name) {
-                    let len = std::fs::metadata(&f).unwrap().len() as usize;
+                    let len = common::store_len(&f) as usize;
                     cached += cached_pages(&f, 0, len);
                     pages += len.div_ceil(4096);
                 }
@@ -10609,6 +11406,9 @@ fn a_buy_attaches_every_form_file_built_ahead_before_any_warm() {
         let what = format!("attach first {first}");
         let (dir, db, model, inject, raw) =
             land_store_with(&format!("auto-land-attach-{first}"), 50, |o| {
+                // A store of files: the builds' order is read off the
+                // files' times.
+                o.one_file = false;
                 o.partition_bytes = Some(160 << 10);
                 o.zpages_attach_first = first;
                 // One builder ahead, whose order the files' times read:
@@ -10715,6 +11515,9 @@ fn a_partition_whose_raw_records_are_resident_counts_as_covered() {
         let what = format!("cover resident {cover}");
         let (dir, db, model, inject, raw) =
             land_store_with(&format!("auto-cover-res-{cover}"), 50, |o| {
+                // A store of files: the test removes a form file by its
+                // path.
+                o.one_file = false;
                 o.partition_bytes = Some(512 << 10);
                 o.zpages_cover_resident = cover;
                 o.zpages_ahead_builders = 1;
@@ -10737,7 +11540,7 @@ fn a_partition_whose_raw_records_are_resident_counts_as_covered() {
         let largest = files
             .into_iter()
             .skip(1)
-            .max_by_key(|f| std::fs::metadata(f).unwrap().len())
+            .max_by_key(|f| common::store_len(f))
             .unwrap();
         std::fs::remove_file(&largest).unwrap();
         db.scan(b"", 10, kv(&mut |_, _| {})).unwrap();
@@ -10839,6 +11642,9 @@ fn a_build_ahead_over_resident_records_holds_no_sample() {
         let what = format!("cover resident {cover}");
         let (dir, db, _model, inject, raw) =
             land_store_with(&format!("auto-held-res-{cover}"), 50, |o| {
+                // A store of files: the test removes a form file by its
+                // path.
+                o.one_file = false;
                 o.zpages_cover_resident = cover;
                 o.zpages_ahead_builders = 1;
                 o.partition_bytes = Some(400 << 10);
@@ -10856,7 +11662,7 @@ fn a_build_ahead_over_resident_records_holds_no_sample() {
         db.hold_zpage_rename(true);
         let largest = form_files(&dir)
             .into_iter()
-            .max_by_key(|f| std::fs::metadata(f).unwrap().len())
+            .max_by_key(|f| common::store_len(f))
             .unwrap();
         std::fs::remove_file(&largest).unwrap();
         inject.set_budget(raw / 2);
@@ -11275,6 +12081,9 @@ fn an_attach_of_form_files_built_ahead_is_bought_on_the_prediction() {
         let what = format!("attach eager {on}, files removed {gone}, near {near}");
         let (dir, db, model, inject, raw) =
             land_store_with(&format!("auto-land-eager-{on}-{gone}-{near}"), 50, |o| {
+                // A store of files: the test removes form files by their
+                // paths.
+                o.one_file = false;
                 o.partition_bytes = Some(160 << 10);
                 o.zpages_attach_eager = on;
                 // The partitions read cold stay the controller's past the
@@ -11300,14 +12109,8 @@ fn an_attach_of_form_files_built_ahead_is_bought_on_the_prediction() {
         let gone = gone.min(n as usize / 3);
         inject.set_records_resident(0.0);
         let files = form_files(&dir);
-        let total: u64 = files
-            .iter()
-            .map(|f| std::fs::metadata(f).unwrap().len())
-            .sum();
-        let removed: u64 = files[..gone]
-            .iter()
-            .map(|f| std::fs::metadata(f).unwrap().len())
-            .sum();
+        let total: u64 = files.iter().map(common::store_len).sum();
+        let removed: u64 = files[..gone].iter().map(common::store_len).sum();
         for f in &files[..gone] {
             std::fs::remove_file(f).unwrap();
         }
@@ -11493,6 +12296,9 @@ fn the_reading_at_the_crossing_comes_from_the_files_on_disk() {
             &format!("auto-reading-files-{from_files}-{gone}"),
             50,
             |o| {
+                // A store of files: the test removes form files by their
+                // paths.
+                o.one_file = false;
                 o.partition_bytes = Some(160 << 10);
                 o.zpages_reading_from_files = from_files;
                 o.zpages_land_cold_past = false;
@@ -12292,34 +13098,20 @@ fn a_block_scans_keep_starting_in_is_held_as_a_copy_under_the_form() {
 fn resident_under(dir: &Path, prefix: &str) -> (u64, u64) {
     let page = 4096u64;
     let (mut size, mut resident) = (0u64, 0u64);
-    for e in std::fs::read_dir(dir).unwrap() {
-        let path = e.unwrap().path();
+    // Each file where it lies: the directory's own, or for a store in one
+    // file that is open here its range of the data file
+    // (`common::store_place`).
+    for path in common::store_paths(dir) {
         let name = path.file_name().unwrap().to_string_lossy().into_owned();
         if !name.starts_with(prefix) {
             continue;
         }
-        let f = std::fs::File::open(&path).unwrap();
-        let len = f.metadata().unwrap().len();
+        let len = common::store_len(&path);
         if len == 0 {
             continue;
         }
-        // SAFETY: a read-only mapping of a file no one truncates while the
-        // test holds it; nothing is read through it.
-        let map = unsafe { memmap2::Mmap::map(&f).unwrap() };
-        let pages = len.div_ceil(page) as usize;
-        let mut vec = vec![0u8; pages];
-        // SAFETY: the vector holds a byte for every page of the mapping.
-        let rc = unsafe {
-            libc::mincore(
-                map.as_ptr() as *mut libc::c_void,
-                map.len(),
-                // `unsigned char` on Linux, `char` on macOS.
-                vec.as_mut_ptr().cast(),
-            )
-        };
-        assert_eq!(rc, 0, "mincore");
         size += len;
-        resident += vec.iter().filter(|b| **b & 1 != 0).count() as u64 * page;
+        resident += common::cached_pages(&path, 0, len as usize) as u64 * page;
     }
     (size, resident)
 }
@@ -12455,7 +13247,7 @@ fn the_controller_recodes_the_hottest_partition_within_the_budget() {
         // Every file attached and warmed: the policy's turn comes once the
         // builder has nothing due.
         assert!(
-            tick_until(&db, 400, |c| c.attached >= c.partitions
+            tick_until_built(&db, |c| c.attached >= c.partitions
                 && c.warms >= c.partitions),
             "{what}: every file attached and warmed: {:?}",
             db.zpage_counts()
@@ -12603,8 +13395,7 @@ fn hot_until(db: &Db, max: u32, cond: impl Fn(&supdb::db::ZCounts) -> bool) -> b
 /// out of the cache where `out`, and read back into the cache otherwise.
 #[cfg(target_os = "linux")]
 fn partitions_cached(dir: &Path, out: bool) {
-    for e in std::fs::read_dir(dir).unwrap() {
-        let p = e.unwrap().path();
+    for p in common::store_paths(dir) {
         if !p.file_name().unwrap().to_string_lossy().starts_with("par-") {
             continue;
         }
@@ -12612,7 +13403,7 @@ fn partitions_cached(dir: &Path, out: bool) {
             unmap_pages(&p);
             evict(&p);
         } else {
-            drop(std::fs::read(&p).unwrap());
+            drop(common::store_file(&p));
         }
     }
 }
@@ -12692,7 +13483,7 @@ fn the_controller_serves_the_hottest_partition_raw_within_the_budget() {
             db.zpage_counts()
         );
         assert!(
-            tick_until(&db, 400, |c| c.attached >= c.partitions
+            tick_until_built(&db, |c| c.attached >= c.partitions
                 && c.warms >= c.partitions),
             "{what}: every file attached and warmed: {:?}",
             db.zpage_counts()
@@ -12818,8 +13609,7 @@ fn the_controller_serves_the_hottest_partition_raw_within_the_budget() {
             // so that only an ask brings its pages before the wait is out
             // (`Options::zpages_hot_back_ask`); the served ones' mapped
             // pages stay.
-            for e in std::fs::read_dir(&dir).unwrap() {
-                let path = e.unwrap().path();
+            for path in common::store_paths(&dir) {
                 if path
                     .file_name()
                     .unwrap()
@@ -12858,9 +13648,8 @@ fn the_controller_serves_the_hottest_partition_raw_within_the_budget() {
                 // the file out of the cache again reads as not in, and
                 // read back as in.
                 let zpgs = || {
-                    std::fs::read_dir(&dir)
-                        .unwrap()
-                        .map(|e| e.unwrap().path())
+                    common::store_paths(&dir)
+                        .into_iter()
                         .filter(|p| p.file_name().unwrap().to_string_lossy().starts_with("zpg-"))
                 };
                 let came = std::time::Instant::now();
@@ -12878,7 +13667,7 @@ fn the_controller_serves_the_hottest_partition_raw_within_the_budget() {
                     "{what}: the asked file out of the cache reads as not in: {:?}",
                     resident_under(&dir, "zpg-")
                 );
-                zpgs().for_each(|p| drop(std::fs::read(&p).unwrap()));
+                zpgs().for_each(|p| drop(common::store_file(&p)));
                 assert!(
                     db.zpage_hot_asks_in(),
                     "{what}: the asked file read back reads as in: {:?}",
@@ -12974,7 +13763,7 @@ fn scans_after_a_quiet_stretch_have_the_cold_form_files_asked_for() {
             db.zpage_counts()
         );
         assert!(
-            tick_until(&db, 400, |c| c.attached >= c.partitions
+            tick_until_built(&db, |c| c.attached >= c.partitions
                 && c.warms >= c.partitions),
             "{what}: every file attached and warmed: {:?}",
             db.zpage_counts()
@@ -13070,6 +13859,35 @@ fn scans_after_a_quiet_stretch_have_the_cold_form_files_asked_for() {
             "{what}: a trim a rewarm: {:?}",
             db.zpage_counts()
         );
+        // A quiet stretch whose scans find every form file in the cache
+        // asks for none: the rewarm reads each file's share resident
+        // (`ZFile::pages_resident`) and leaves a whole one.
+        for p in form_files(&dir) {
+            let _ = common::store_file(&p);
+        }
+        let t = std::time::Instant::now();
+        while form_files(&dir).iter().any(|p| {
+            let len = common::store_len(p) as usize;
+            cached_pages(p, 0, len) < len.div_ceil(4096)
+        }) {
+            assert!(
+                t.elapsed().as_secs() < 30,
+                "{what}: the form files read back whole"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        for _ in 0..5 {
+            advance_tick(&db, std::time::Duration::from_millis(300));
+        }
+        db.scan(b"", 1, kv(&mut |_, _| one += 1)).unwrap();
+        advance_tick(&db, std::time::Duration::from_millis(200));
+        advance_tick(&db, std::time::Duration::from_millis(200));
+        assert_eq!(
+            db.zpage_counts().rewarms,
+            u64::from(on),
+            "{what}: no rewarm over files in the cache: {:?}",
+            db.zpage_counts()
+        );
         check(&r, &model, &keys, &format!("{what}: after"));
         drop(r);
         db.close().unwrap();
@@ -13082,8 +13900,7 @@ fn scans_after_a_quiet_stretch_have_the_cold_form_files_asked_for() {
 /// dropped, and what they hold and what of it the cache holds after.
 #[cfg(target_os = "linux")]
 fn evict_raw(dir: &Path) -> (u64, u64) {
-    for e in std::fs::read_dir(dir).unwrap() {
-        let p = e.unwrap().path();
+    for p in common::store_paths(dir) {
         let name = p.file_name().unwrap().to_string_lossy().into_owned();
         if name.starts_with("par-") || name.starts_with("ord-") {
             unmap_pages(&p);
@@ -13296,20 +14113,18 @@ fn scans_after_a_quiet_stretch_have_the_cold_raw_files_asked_for() {
         );
         // One ordered index read back whole: a file the cache holds is not
         // asked for, nor counted short.
-        let raw_files: Vec<PathBuf> = std::fs::read_dir(&dir)
-            .unwrap()
-            .map(|e| e.unwrap().path())
+        let raw_files: Vec<PathBuf> = common::store_paths(&dir)
+            .into_iter()
             .filter(|p| {
                 let n = p.file_name().unwrap().to_string_lossy().into_owned();
-                (n.starts_with("par-") || n.starts_with("ord-"))
-                    && std::fs::metadata(p).unwrap().len() > 0
+                (n.starts_with("par-") || n.starts_with("ord-")) && common::store_len(p) > 0
             })
             .collect();
         let warm_one = raw_files
             .iter()
             .find(|p| p.file_name().unwrap().to_string_lossy().starts_with("ord-"))
             .unwrap();
-        let _ = std::fs::read(warm_one).unwrap();
+        let _ = common::store_file(warm_one);
         let cold_files = raw_files.len() as u64 - 1;
         // A stretch with no scan, then a scan of one entry.
         for _ in 0..5 {
@@ -13419,6 +14234,179 @@ fn scans_after_a_quiet_stretch_have_the_cold_raw_files_asked_for() {
     }
 }
 
+/// Under a cipher a settle's asks for the raw form's files
+/// (`Options::zpages_rewarm_raw`) are asks for their envelopes: the store's
+/// files are read through its cache from the kernel's cache of the
+/// ciphertext, which is what a first read waits on the device for, so the
+/// asks go through the mapping each file is read by and reach the envelope
+/// behind it. A store reopened with every envelope out of the page cache
+/// and room in the group has them asked for and back as the settle
+/// returns, with nothing decrypted for the asking; with no room every one
+/// is counted short and left; and without the option nothing is asked. An
+/// ask made of the bytes a paged mapping lends unasked measured files of
+/// none and asked for nothing.
+///
+/// And what the ask brought back is mapped
+/// (`Options::zpages_rewarm_raw_maps`), which under a cipher is the
+/// ciphertext a fill reads its chunk through: the envelopes' pages for the
+/// record regions and the ordered indexes are in this process's page
+/// tables as the settle returns, where without the option they are
+/// resident and no more mapped than the open left them, and where nothing
+/// was asked nothing is mapped. A map made of the bytes a paged mapping
+/// lends unasked would have mapped none either; it decrypts nothing.
+///
+/// And the first envelope asked coming in late (`ZInject::ask_first_late`)
+/// is waited for and mapped with the rest: the late ask is a mapping of the
+/// file by its name, which under a cipher is the vault's (`vault::map`),
+/// since a mapping by the path alone opens nothing in a directory that
+/// cannot exist and asks for nothing.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_settles_raw_rewarm_under_a_cipher_asks_for_the_envelopes_and_decrypts_nothing() {
+    for (on, room, maps, late) in [
+        (true, 1u64 << 30, true, false),
+        (true, 1 << 30, true, true),
+        (true, 1 << 30, false, false),
+        (true, 0, true, false),
+        (false, 1 << 30, true, false),
+    ] {
+        let what = format!("raw rewarm under a cipher {on} room {room} maps {maps} late {late}");
+        let dir = scratch(&format!("rawrewarm-cipher-{on}-{room}-{maps}-{late}"));
+        let inject = std::sync::Arc::new(supdb::ZInject::new());
+        inject.set_budget(1 << 30);
+        inject.set_slack(room);
+        let opts = || Options {
+            zpages_inject: Some(inject.clone()),
+            zpages_rewarm_raw: on,
+            zpages_rewarm_raw_maps: maps,
+            partition_bytes: Some(400 << 10),
+            encryption: supdb::Encryption::Cipher(supdb::StoreCipher::new(
+                common::Gcm::new(&[0x5c; 32]),
+                common::Gcm::new,
+            )),
+            ..Options::default()
+        };
+        let mut db = Db::create(&dir, opts()).unwrap();
+        let model = ordered_load(&mut db, 20_000, 0x4A9);
+        db.settle().unwrap();
+        let c = db.zpage_counts();
+        assert_eq!(
+            (c.raw_settles, c.raw_rewarm_files),
+            (0, 0),
+            "{what}: nothing asked of files just written: {c:?}"
+        );
+        db.close().unwrap();
+        // Every envelope out of the page cache, with no mapping of this
+        // process over it: the store is closed.
+        for p in common::store_paths(&dir) {
+            if p.file_name().unwrap().to_string_lossy().starts_with("x-") {
+                evict(&p);
+            }
+        }
+        let (size, cold) = resident_under(&dir, "x-");
+        assert!(
+            size > 0 && cold * 10 < size,
+            "{what}: the envelopes out of the cache: {cold} of {size}"
+        );
+        let mut db = Db::open(&dir, opts()).unwrap();
+        let (_, opened) = resident_under(&dir, "x-");
+        assert!(
+            opened * 2 < size,
+            "{what}: the open read a few chunks a file: {opened} of {size}"
+        );
+        let fills = db
+            .cipher_counts()
+            .expect("a store under a cipher")
+            .cache
+            .fills;
+        // What the open's few reads left a read of the records to fault
+        // on. The ordered indexes of this store are a few chunks each and
+        // the open has read them whole, so nothing is said of them before.
+        let (recs0, _) = db.raw_mapped_share().expect("the page tables are readable");
+        assert!(
+            recs0 < 0.5,
+            "{what}: the records' ciphertext all but out of the page tables: {recs0:.2}"
+        );
+        if late {
+            inject.ask_first_late(80);
+        }
+        db.settle().unwrap();
+        let c = db.zpage_counts();
+        let (_, warm) = resident_under(&dir, "x-");
+        let (recs, ord) = db.raw_mapped_share().unwrap();
+        match (on, room > 0) {
+            (true, true) => {
+                assert_eq!(c.raw_settles, 1, "{what}: the settle's asks: {c:?}");
+                assert!(
+                    c.raw_rewarm_files >= 4 && c.raw_rewarm_bytes * 2 > size,
+                    "{what}: the cold envelopes measured and asked for: {c:?} of {size}"
+                );
+                assert_eq!(c.raw_rewarm_short, 0, "{what}: {c:?}");
+                assert!(
+                    warm * 10 >= size * 8,
+                    "{what}: the envelopes back as the settle returns: {warm} of {size}"
+                );
+                if maps {
+                    assert!(c.raw_maps > 0, "{what}: the settle mapped: {c:?}");
+                    assert!(
+                        recs >= 0.9 && ord >= 0.9,
+                        "{what}: what came back is mapped: records {recs:.2}, indexes {ord:.2}"
+                    );
+                } else {
+                    assert_eq!(c.raw_maps, 0, "{what}: {c:?}");
+                    assert!(
+                        recs <= recs0 + 0.05,
+                        "{what}: back and no more of it mapped: records {recs0:.2} -> {recs:.2}"
+                    );
+                }
+            }
+            (true, false) => {
+                assert_eq!(
+                    (c.raw_settles, c.raw_rewarm_files, c.raw_maps),
+                    (0, 0, 0),
+                    "{what}: nothing asked beyond the room, and nothing mapped: {c:?}"
+                );
+                assert!(
+                    c.raw_rewarm_short >= 4,
+                    "{what}: every cold envelope short: {c:?}"
+                );
+                assert!(
+                    warm * 2 < size && recs <= recs0 + 0.05,
+                    "{what}: the envelopes left out and unmapped: {warm} of {size}, \
+                     records {recs0:.2} -> {recs:.2}"
+                );
+            }
+            (false, _) => {
+                assert_eq!(
+                    (
+                        c.raw_settles,
+                        c.raw_rewarm_files,
+                        c.raw_rewarm_short,
+                        c.raw_maps
+                    ),
+                    (0, 0, 0, 0),
+                    "{what}: {c:?}"
+                );
+                assert!(
+                    warm * 2 < size,
+                    "{what}: the envelopes left out: {warm} of {size}"
+                );
+            }
+        }
+        assert_eq!(
+            db.cipher_counts().unwrap().cache.fills,
+            fills,
+            "{what}: the asks and the mapping decrypted nothing"
+        );
+        let keys: Vec<Vec<u8>> = model.keys().cloned().collect();
+        let r = db.reader().unwrap();
+        check(&r, &model, &keys, &format!("{what}: after"));
+        drop(r);
+        db.close().unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
 /// The rewarm's two gates, each held to firing: a rewarm due while a merge
 /// is in flight is made at once for the cold form files of the partitions
 /// the merge does not hold (`Options::zpages_rewarm_beside_merges`), and
@@ -13459,7 +14447,7 @@ fn a_rewarm_is_made_beside_a_merge_in_flight_after_a_quarter_second() {
             db.zpage_counts()
         );
         assert!(
-            tick_until(&db, 400, |c| c.attached >= c.partitions
+            tick_until_built(&db, |c| c.attached >= c.partitions
                 && c.warms >= c.partitions),
             "{what}: every file attached and warmed: {:?}",
             db.zpage_counts()
@@ -13696,7 +14684,7 @@ fn the_hot_raw_policy_rates_a_partitions_skew_over_the_windows_looks() {
             db.zpage_counts()
         );
         assert!(
-            tick_until(&db, 400, |c| c.attached >= c.partitions
+            tick_until_built(&db, |c| c.attached >= c.partitions
                 && c.warms >= c.partitions),
             "{what}: every file attached and warmed: {:?}",
             db.zpage_counts()
@@ -13797,7 +14785,7 @@ fn the_hot_raw_policy_rates_a_burst_on_the_looks_that_pass_the_floor() {
             db.zpage_counts()
         );
         assert!(
-            tick_until(&db, 400, |c| c.attached >= c.partitions
+            tick_until_built(&db, |c| c.attached >= c.partitions
                 && c.warms >= c.partitions),
             "{what}: every file attached and warmed: {:?}",
             db.zpage_counts()
@@ -13887,7 +14875,7 @@ fn a_raw_partitions_scans_count_the_groups_a_form_walk_would_open() {
         db.zpage_counts()
     );
     assert!(
-        tick_until(&db, 400, |c| c.attached >= c.partitions
+        tick_until_built(&db, |c| c.attached >= c.partitions
             && c.warms >= c.partitions),
         "every file attached and warmed: {:?}",
         db.zpage_counts()
@@ -13978,7 +14966,7 @@ fn a_raw_partition_read_no_more_than_the_median_goes_back_to_its_form() {
             db.zpage_counts()
         );
         assert!(
-            tick_until(&db, 400, |c| c.attached >= c.partitions
+            tick_until_built(&db, |c| c.attached >= c.partitions
                 && c.warms >= c.partitions),
             "{what}: every file attached and warmed: {:?}",
             db.zpage_counts()
@@ -14093,7 +15081,7 @@ fn the_hot_raw_policy_relaxes_its_skew_bar_where_the_candidate_fits_the_room() {
             db.zpage_counts()
         );
         assert!(
-            tick_until(&db, 400, |c| c.attached >= c.partitions
+            tick_until_built(&db, |c| c.attached >= c.partitions
                 && c.warms >= c.partitions),
             "{what}: every file attached and warmed: {:?}",
             db.zpage_counts()
@@ -14198,7 +15186,7 @@ fn the_hot_raw_fill_releases_partitions_read_alike_into_the_room_and_gives_them_
             db.zpage_counts()
         );
         assert!(
-            tick_until(&db, 400, |c| c.attached >= c.partitions
+            tick_until_built(&db, |c| c.attached >= c.partitions
                 && c.warms >= c.partitions),
             "{what}: every file attached and warmed: {:?}",
             db.zpage_counts()
@@ -14216,9 +15204,8 @@ fn the_hot_raw_fill_releases_partitions_read_alike_into_the_room_and_gives_them_
         let raw_one = (c.model_record_bytes + c.model_hash_bytes) / partitions;
         // The raw partitions out of the cache, so that each ask's bytes are
         // the room's to find.
-        let segs: Vec<std::path::PathBuf> = std::fs::read_dir(&dir)
-            .unwrap()
-            .map(|e| e.unwrap().path())
+        let segs: Vec<std::path::PathBuf> = common::store_paths(&dir)
+            .into_iter()
             .filter(|p| {
                 p.file_name()
                     .and_then(|n| n.to_str())
@@ -14390,7 +15377,7 @@ fn the_hot_raw_policy_releases_into_the_groups_unused_memory_where_the_line_woul
             db.zpage_counts()
         );
         assert!(
-            tick_until(&db, 400, |c| c.attached >= c.partitions
+            tick_until_built(&db, |c| c.attached >= c.partitions
                 && c.warms >= c.partitions),
             "{what}: every file attached and warmed: {:?}",
             db.zpage_counts()
@@ -14562,7 +15549,7 @@ fn the_controller_reparses_the_hottest_partition_once() {
             db.zpage_counts()
         );
         assert!(
-            tick_until(&db, 400, |c| c.attached >= c.partitions
+            tick_until_built(&db, |c| c.attached >= c.partitions
                 && c.warms >= c.partitions),
             "{what}: every file attached and warmed: {:?}",
             db.zpage_counts()
@@ -15273,7 +16260,7 @@ fn a_form_stored_whole_answers_as_the_compressed_one_and_decodes_nothing() {
         bytes.push(
             form_files(&dir)
                 .iter()
-                .map(|p| std::fs::metadata(p).unwrap().len())
+                .map(|p| common::store_file(p).len() as u64)
                 .sum::<u64>(),
         );
         drop(db);
@@ -15416,7 +16403,7 @@ fn a_form_the_parsing_encoder_wrote_answers_as_the_greedy_ones_in_fewer_bytes() 
         bytes.push(
             form_files(&dir)
                 .iter()
-                .map(|p| std::fs::metadata(p).unwrap().len())
+                .map(|p| common::store_file(p).len() as u64)
                 .sum::<u64>(),
         );
         drop(db);
@@ -16498,6 +17485,15 @@ fn stride_forced(extra: impl FnOnce(&mut Options)) -> Options {
     })
 }
 
+/// `stride_forced`, as a store of files whatever the one-file switch says
+/// (`forced_files`).
+fn stride_forced_files(extra: impl FnOnce(&mut Options)) -> Options {
+    stride_forced(|o| {
+        o.one_file = false;
+        extra(o);
+    })
+}
+
 fn numbered_key(i: usize) -> Vec<u8> {
     format!("k{i:06}").into_bytes()
 }
@@ -16559,7 +17555,8 @@ const STRIDE_NOT_ONE_VALUE: u8 = 3;
 /// directory, the model and the model's keys, in rank order.
 fn stride_partition(name: &str, n: usize, seed: u64) -> (PathBuf, Model, Vec<Vec<u8>>) {
     let dir = scratch(name);
-    let mut db = Db::create(&dir, stride_forced(|_| {})).unwrap();
+    // As `one_partition`: its directory is what the tests change.
+    let mut db = Db::create(&dir, stride_forced_files(|_| {})).unwrap();
     let model = numbered_load(&mut db, n, 100, seed);
     db.zpages_settle().unwrap();
     let c = db.zpage_counts();
@@ -16575,7 +17572,7 @@ fn stride_partition(name: &str, n: usize, seed: u64) -> (PathBuf, Model, Vec<Vec
 
 /// The stride file at `path`'s trailer and value pages.
 fn stride_of(path: &Path) -> (StrideTrailer, usize) {
-    let b = std::fs::read(path).unwrap();
+    let b = common::store_file(path);
     let t = StrideTrailer::decode(&b[b.len() - ZTRAILER..]).unwrap();
     let v = t.layout().unwrap().v_pages as usize;
     (t, v)
@@ -16698,7 +17695,30 @@ fn the_stride_switch_gives_the_stores_it_reaches_the_stride_form() {
 /// are counted, under a piece among them.
 #[test]
 fn the_oracle_holds_with_the_stride_form_forced() {
-    stride_oracle("stride-oracle", false);
+    stride_oracle("stride-oracle", false, None);
+}
+
+/// The stride oracle with the store under a cipher, in a cache of
+/// plaintext a small part of the store: the stride form built from records
+/// read by the piece, read back, attached and served through the store's
+/// cache, every page of a stride file asked for before it is read and
+/// asked for again once the cache has given it back -- which it has to
+/// have done, a run in a cache that gave nothing back being the test in
+/// the clear. The store beside it stays in the clear and in the raw form.
+#[cfg(target_os = "linux")]
+#[test]
+fn the_oracle_holds_with_the_stride_form_forced_under_a_cipher() {
+    stride_oracle("stride-oracle-cipher", false, Some(64 << 10));
+}
+
+/// The same with the block cache on: its walks, cuts and builds read a
+/// stride partition under a cipher through the cursor's stride position,
+/// and its builders rest between two blocks, after which what they read
+/// is asked for again.
+#[cfg(target_os = "linux")]
+#[test]
+fn the_oracle_holds_with_the_stride_form_forced_and_the_block_cache_on_under_a_cipher() {
+    stride_oracle("stride-oracle-cache-cipher", true, Some(64 << 10));
 }
 
 /// The stride oracle with the block cache on: the scans are the block
@@ -16708,7 +17728,7 @@ fn the_oracle_holds_with_the_stride_form_forced() {
 /// settles of the writes filed by the codec's arithmetic.
 #[test]
 fn the_oracle_holds_with_the_stride_form_forced_and_the_block_cache_on() {
-    stride_oracle("stride-oracle-cache", true);
+    stride_oracle("stride-oracle-cache", true, None);
 }
 
 /// The entries `got` of a window from `start` are the live model's from
@@ -16727,9 +17747,18 @@ fn live_prefix(model: &Model, start: &[u8], got: &Window, least: usize, what: &s
     );
 }
 
-fn stride_oracle(name: &str, cache: bool) {
+fn stride_oracle(name: &str, cache: bool, cipher: Option<u64>) {
     const N: usize = 2400;
     let opts = |on: bool| Options {
+        // The store under test under a cipher, in a cache of `budget`
+        // bytes of plaintext; the store beside it in the clear.
+        encryption: match cipher.filter(|_| on) {
+            Some(budget) => supdb::Encryption::Cipher(
+                supdb::StoreCipher::new(common::Gcm::new(&[0x5d; 32]), common::Gcm::new)
+                    .cache_bytes(budget),
+            ),
+            None => supdb::Encryption::None,
+        },
         zpages: if on { ZPages::Always } else { ZPages::Off },
         zpages_stride: if on { ZStride::Forced } else { ZStride::Off },
         scan_block_cache: cache,
@@ -16963,6 +17992,14 @@ fn stride_oracle(name: &str, cache: bool) {
         c.stride_files > 0 && c.stride_files < c.partitions,
         "both bodies in one store at the end: {c:?}"
     );
+    if cipher.is_some() {
+        let cc = z.cipher_counts().expect("the store is under a cipher");
+        assert!(
+            cc.cache.evicted_units > 0 && cc.cache.fills > cc.cache.evicted_units,
+            "the cache gave nothing back, and the run was the clear one's: {:?}",
+            cc.cache
+        );
+    }
     let _ = std::fs::remove_dir_all(&dz);
     let _ = std::fs::remove_dir_all(&dr);
 }
@@ -17233,7 +18270,7 @@ fn a_kept_stride_files_check_is_of_the_copy_a_pages_first_touch_reads() {
         let what = format!("the device's copy changed after the page's first touch {touched}");
         let what = what.as_str();
         let dir = scratch(&format!("stride-copy-{touched}"));
-        let mut db = Db::create(&dir, stride_forced(|_| {})).unwrap();
+        let mut db = Db::create(&dir, stride_forced_files(|_| {})).unwrap();
         let model = numbered_load(&mut db, 3000, 100, 0x7358);
         db.zpages_settle().unwrap();
         let keys: Vec<Vec<u8>> = model.keys().cloned().collect();
@@ -17303,7 +18340,7 @@ fn a_promotion_keeps_the_stride_file_of_the_partition_it_closes() {
     const N: usize = 3000;
     const MORE: usize = 600;
     let dir = scratch("stride-promote");
-    let opts = || stride_forced(|o| o.partition_bytes = Some(64 << 10));
+    let opts = || stride_forced_files(|o| o.partition_bytes = Some(64 << 10));
     let inodes = || -> BTreeMap<PathBuf, u64> {
         form_files(&dir)
             .into_iter()
@@ -17466,6 +18503,9 @@ fn a_merges_outputs_are_built_in_the_stride_form_at_their_finish() {
             &format!("auto-finish-stride-{past}"),
             50,
             |o| {
+                // The form files and their temp names read by name in the
+                // directory: a store of files.
+                o.one_file = false;
                 o.zpages_stride = ZStride::Forced;
                 o.zpages_build_at_finish = true;
                 o.zpages_ahead_builders = 8;
@@ -17518,7 +18558,7 @@ fn a_merges_outputs_are_built_in_the_stride_form_at_their_finish() {
         let files = form_files(&dir);
         assert!(!files.is_empty(), "{what}");
         for f in &files {
-            let b = std::fs::read(f).unwrap();
+            let b = common::store_file(f);
             assert_eq!(
                 supdb::db::zpages::trailer_magic(&b[b.len() - ZTRAILER..]),
                 Some(supdb::db::zpages::STRIDE_MAGIC),
@@ -18064,6 +19104,9 @@ fn a_build_ahead_in_flight_across_a_promotion_is_the_one_build_of_its_form_file(
     let what = "a build ahead held across a promotion";
     let (dir, mut db, mut model, inject, raw, before) =
         stride_store_with_a_build_ahead_held("auto-ahead-promote", |o| {
+            // A store of files: the held build's file is known again by
+            // its inode.
+            o.one_file = false;
             // Nothing bought before the builds ahead have finished dormant.
             o.zpages_cover_resident = false;
             o.zpages_suspect_at_crossing = false;
@@ -18235,6 +19278,9 @@ fn a_finish_in_flight_at_a_crash_is_through_or_held_when_the_crash_returns() {
             name,
             50,
             |o| {
+                // The form files and their temp names read by name in the
+                // directory: a store of files.
+                o.one_file = false;
                 o.zpages_stride = ZStride::Forced;
                 o.zpages_build_at_finish = true;
                 // Partitions of megabytes, so that an output's build
@@ -18420,7 +19466,7 @@ fn handles_on_threads_read_stride_files_while_merges_retire_them() {
     let dir = scratch("stride-threads");
     let mut db = Db::create(
         &dir,
-        stride_forced(|o| {
+        stride_forced_files(|o| {
             o.partition_bytes = Some(160 << 10);
             o.l0_trigger = 1;
         }),
@@ -18623,7 +19669,7 @@ fn a_checkpoint_of_a_stride_store_shares_its_stride_files() {
     use std::os::unix::fs::MetadataExt;
     let what = "a stride store's checkpoint";
     let dir = scratch("stride-checkpoint");
-    let opts = || stride_forced(|o| o.partition_bytes = Some(160 << 10));
+    let opts = || stride_forced_files(|o| o.partition_bytes = Some(160 << 10));
     let mut db = Db::create(&dir, opts()).unwrap();
     let model = numbered_load(&mut db, 6000, 100, 0xC4E);
     db.zpages_settle().unwrap();
@@ -18638,7 +19684,7 @@ fn a_checkpoint_of_a_stride_store_shares_its_stride_files() {
             (
                 f.file_name().unwrap().to_owned(),
                 std::fs::metadata(f).unwrap().ino(),
-                std::fs::read(f).unwrap(),
+                common::store_file(f),
             )
         })
         .collect();
@@ -18660,7 +19706,7 @@ fn a_checkpoint_of_a_stride_store_shares_its_stride_files() {
     // the test means it whatever switch the run is under
     // (`SUPDB_TEST_STRIDE`).
     let block = || {
-        forced(|o| {
+        forced_files(|o| {
             o.partition_bytes = Some(160 << 10);
             o.zpages_stride = ZStride::Off;
         })
@@ -18675,7 +19721,7 @@ fn a_checkpoint_of_a_stride_store_shares_its_stride_files() {
     );
     for (name, ino, _) in &before {
         let f = dir.join(name);
-        let b = std::fs::read(&f).unwrap();
+        let b = common::store_file(&f);
         assert_ne!(
             supdb::db::zpages::trailer_magic(&b[b.len() - ZTRAILER..]),
             Some(supdb::db::zpages::STRIDE_MAGIC),
@@ -18707,7 +19753,7 @@ fn a_checkpoint_of_a_stride_store_shares_its_stride_files() {
         let f = dest.join(name);
         assert_eq!(
             (
-                &std::fs::read(&f).unwrap(),
+                &common::store_file(&f),
                 std::fs::metadata(&f).unwrap().ino()
             ),
             (bytes, *ino),
@@ -19019,7 +20065,7 @@ fn a_merges_outputs_are_built_in_the_form_their_side_of_the_key_has() {
     let magics: Vec<_> = form_files(&dir)
         .iter()
         .map(|f| {
-            let b = std::fs::read(f).unwrap();
+            let b = common::store_file(f);
             supdb::db::zpages::trailer_magic(&b[b.len() - ZTRAILER..])
                 == Some(supdb::db::zpages::STRIDE_MAGIC)
         })
@@ -19122,7 +20168,7 @@ fn a_merges_outputs_are_built_in_the_block_form_where_the_room_is_short() {
     let stride_on_disk = form_files(&dir)
         .iter()
         .filter(|f| {
-            let b = std::fs::read(f).unwrap();
+            let b = common::store_file(f);
             supdb::db::zpages::trailer_magic(&b[b.len() - ZTRAILER..])
                 == Some(supdb::db::zpages::STRIDE_MAGIC)
         })
@@ -19319,7 +20365,7 @@ fn convert_store_with(
         );
     }
     assert!(
-        tick_until(&db, 400, |c| c.attached >= c.partitions
+        tick_until_built(&db, |c| c.attached >= c.partitions
             && c.warms >= c.partitions),
         "{name}: every file attached and warmed: {:?}",
         db.zpage_counts()
@@ -19484,14 +20530,13 @@ fn a_run_with_gaps_waits_for_a_reader_and_is_converted_at_no_rent_where_it_fits(
         // What the look holds a move to is the forms as the partitions
         // stand: every one in the block form here, its file and the heads
         // its scans seek.
-        let heads: u64 = std::fs::read_dir(&dir)
-            .unwrap()
-            .map(|e| e.unwrap().path())
+        let heads: u64 = common::store_paths(&dir)
+            .into_iter()
             .filter(|p| {
                 let n = p.file_name().unwrap().to_string_lossy().into_owned();
                 n.starts_with("ord-") && n.ends_with(".oidx")
             })
-            .map(|p| std::fs::metadata(p).unwrap().len())
+            .map(common::store_len)
             .sum();
         assert_eq!(
             held,
@@ -20425,13 +21470,12 @@ fn a_conversions_file_is_dropped_as_it_is_written_and_asked_back() {
             db.zpage_build_waiting() && held.build_starts == c0.build_starts + 1,
             "{what}: one conversion started, held before its rename: {held:?}"
         );
-        let tmp: Vec<PathBuf> = std::fs::read_dir(&dir)
-            .unwrap()
-            .map(|e| e.unwrap().path())
+        let tmp: Vec<PathBuf> = common::store_paths(&dir)
+            .into_iter()
             .filter(|p| p.to_string_lossy().ends_with(".zpg.tmp"))
             .collect();
         assert_eq!(tmp.len(), 1, "{what}: the one file being written: {tmp:?}");
-        let len = std::fs::metadata(&tmp[0]).unwrap().len() as usize;
+        let len = common::store_len(&tmp[0]) as usize;
         let pages = len.div_ceil(4096);
         let cached = common::cached_pages(&tmp[0], 0, len);
         assert!(
@@ -20481,7 +21525,7 @@ fn a_conversions_file_is_dropped_as_it_is_written_and_asked_back() {
                 .to_string(),
         );
         assert_eq!(
-            std::fs::metadata(&live).unwrap().len() as usize,
+            common::store_len(&live) as usize,
             len,
             "{what}: the file under its name"
         );
@@ -20992,10 +22036,7 @@ fn the_reading_from_files_prices_a_stride_file_as_on_disk() {
             "{what}: the builds ahead kept each partition's reason: {nos:?} {c:?}"
         );
         inject.set_records_resident(0.0);
-        let on_disk: u64 = form_files(&dir)
-            .iter()
-            .map(|f| std::fs::metadata(f).unwrap().len())
-            .sum();
+        let on_disk: u64 = form_files(&dir).iter().map(common::store_len).sum();
         assert_eq!(form_files(&dir).len() as u64, n, "{what}");
         inject.set_budget(1 << 20);
         inject.set_refault_rate(1_000_000.0);
@@ -21590,7 +22631,7 @@ fn the_stride_form_is_refused_beside_the_recode_policies() {
 fn a_flipped_byte_in_a_stride_file_is_never_an_answer() {
     let (dir, model, keys) = stride_partition("stride-flips-src", 3000, 0x5F11);
     let file = form_files(&dir).remove(0);
-    let good = std::fs::read(&file).unwrap();
+    let good = common::store_file(&file);
     let (_, v) = stride_of(&file);
     let (samples, clear) = stride_samples(v);
     let work = scratch("stride-flips-work");
@@ -21933,7 +22974,7 @@ fn stride_ends(dir: &Path) -> Vec<Vec<u8>> {
     let mut out = Vec::new();
     let mut buf = [0u8; supdb::db::zpages::STRIDE_KEY_MAX];
     for f in form_files(dir) {
-        let bytes = std::fs::read(&f).unwrap();
+        let bytes = common::store_file(&f);
         let Ok(t) = StrideTrailer::decode(&bytes[bytes.len() - ZTRAILER..]) else {
             continue;
         };

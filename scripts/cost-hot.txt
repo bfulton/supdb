@@ -1,0 +1,168 @@
+# Functions a store in the clear runs per key, entry, block or step: a gain
+# in any of them is a cost every operation pays (scripts/cost.sh). A line is
+# a path in the form scripts/cost-diff.py reduces callgrind's names to --
+# generic arguments dropped and an impl's `<T>::f` or `<T as Tr>::f` read as
+# `T::f`, so `<supdb::blob::Blob<supdb::bytes::MmapBytes>>::scan_at_in::<F>`
+# is `supdb::blob::Blob::scan_at_in` -- and matches that function, its
+# closures and its monomorphs, or, ending in `::`, every function of the
+# module or type it names; a line that begins with `!` takes what it matches
+# back out, and one that begins with `~` holds it to a bound of its own (the
+# section below says how). A probe whose functions no line matches fails; a
+# line no probe of a whole run reached (a function inlined everywhere today,
+# or gone) is named at the end of the run.
+#
+# The list is not what the gate holds, only the least of it. In a probe
+# with a toggle (the reads, the scans, the commits, the segment work on the
+# writer's thread, the seal, Blob::scan_at) every function built from
+# source that the toggle collected is hot, at 64 instructions over the
+# probe's whole run; in a probe with none (the loads, the writer's round,
+# the merge) every function of the engine is hot, at a hundredth of an
+# instruction an operation, and so is every line below that names a
+# function outside it. What those last cannot see, as a number: 1,000
+# instructions over the loads' 100,000 keys, 3,000 over the round's 300,000
+# operations, 2,000 over the merge's 200,000, and a `~` line's function its
+# bound; and nothing of libc's or a library's code, whose counts follow the
+# threads' timing there. The commit probes and `land` count the loads' and
+# the segment work's own steps under a toggle, so that a cost of a few
+# instructions a commit, a piece or a landing is red there.
+# The lines name the per-key, per-entry, per-block and per-step functions
+# so that the run says which of them no probe reached.
+#
+# The point read (read, read_z, read_s, work).
+supdb::db::Reader::read_all
+supdb::db::Reader::read_all_in
+supdb::db::Reader::part_read_z
+supdb::db::Reader::enter
+supdb::db::Reader::leave
+supdb::db::Reader::leave_looked
+supdb::db::Reader::advise
+supdb::db::State::pieces_over
+supdb::db::Seg::may_hold_fnv
+supdb::db::key_cmp
+supdb::blob::Blob::read_exts
+supdb::blob::Blob::read_exts_inline
+supdb::index::each_value
+supdb::flatindex::lookup
+supdb::flatindex::parse_record
+supdb::flatindex::parse_record_tail
+# The scan (scan, scan_long, scan_z, work) and the public reader (scan_at).
+supdb::db::Reader::scan
+supdb::db::Reader::scan_seek
+supdb::db::Reader::scan_blocks
+supdb::db::Reader::raw_scan
+supdb::db::Reader::cache_scan
+supdb::db::Reader::build_ctx
+supdb::db::Reader::first_reaching
+supdb::db::Reader::emit_unsealed
+supdb::db::Reader::sync_log
+supdb::db::Reader::refresh_snapshot_to
+supdb::db::Reader::pwalk_seek
+supdb::db::Reader::pwalk_close
+supdb::db::Reader::zmemo_take
+supdb::db::Snapshot::seek
+supdb::db::Snapshot::seek_in
+supdb::blob::Blob::scan_at
+supdb::blob::Blob::scan_at_in
+supdb::blob::Blob::scan_whole
+supdb::blob::Blob::seek
+supdb::flatindex::FlatIndex::search
+# The compact form's read and walk (read_z, scan_z, and the stride form's
+# read_s, scan_s): the form file, its pages and groups, the stride body
+# and the decoder, whole.
+supdb::db::zfile::
+supdb::db::zpages::
+supdb::db::zlz4::
+# Bounds of their own (`~path BOUND`, instructions an operation), for the
+# functions whose counts move between two runs of one build: each the most
+# it was measured to move in two to four self-checks of each probe (the
+# tree against HEAD, and the HEAD builds of the mutant runs beside each
+# other), three times over and rounded up. With no scope a line holds in
+# the probes with no toggle, where they run on the store's own threads or
+# on a clock: the controller's tick and its look at the memory group's
+# budget, a read of a cgroup file (load_buffered: parse_mount +0.98 an op,
+# read_budget +0.84); and the segment work's loop, which polls on its
+# clock while a seal or a merge runs (merge: collect +0.012, sweep_spares
+# +0.010, z_step +0.008; load_durable: join_seal +0.007). Every other
+# function of the segment work and the writer's sweep is held to the
+# mode's slack there, and to the toggle's in `land`, whose toggle runs the
+# segment work on the writer's thread.
+~supdb::db::zfile::read_budget 2.5
+~supdb::db::zselect::parse_mount 3
+~supdb::db::zselect::parse_kb 0.06
+~supdb::db::Maint::z_tick 0.12
+~supdb::db::Maint::collect 0.035
+~supdb::db::Maint::sweep_spares 0.03
+~supdb::db::Maint::z_step 0.025
+~supdb::db::Maint::join_seal 0.02
+# In the merge alone, whose writer's operations end while a background
+# thread's pin holds what they would free, so the sweep at an operation's
+# end walks the reader table for as long as the pin stands (two runs of one
+# build: sweep_retired_states +11.6 an op, oldest_for +2.0, WriterOp::drop
+# +0.38). `land` holds the sweep to the instruction.
+~merge: supdb::db::Reader::sweep_retired_states 35
+~merge: supdb::db::Readers::oldest_for 6
+~merge: supdb::db::WriterOp::drop 1.2
+# Under a toggle: the seal's wait in `land` (join_seal +332 over the run,
+# its clock +64) and the segment writer's look at its helper thread in the
+# commit probes (landed +63). The wait's line was 0.01 on that first pair,
+# and five later counts of one source read 5,752 5,835 5,918 6,001 and
+# 7,080 instructions over the run's 100,000 operations, 1,328 between the
+# least and the most: a bound under what the function moves by itself reads
+# red on no change.
+~land: supdb::db::Maint::join_seal 0.04
+~land: std::sys::pal::unix::time::Timespec::now 0.002
+~commit_durable,commit_buffered: supdb::db::AlignedWriter::landed 0.002
+# The writer (load_durable, load_buffered, work, merge): a commit, its log,
+# the memtable and the ordered run's stream.
+supdb::db::Db::commit
+supdb::db::Db::commit_direct
+supdb::db::Db::append
+supdb::db::Db::append_batch
+supdb::db::Db::put
+supdb::db::Db::delete
+supdb::db::Db::op
+supdb::db::WriterOp
+supdb::db::Wal::write
+supdb::db::Wal::frame
+supdb::db::Wal::put_out
+supdb::db::Db::log_commit
+supdb::db::MemTable::
+supdb::db::ByteArena::
+supdb::db::SnapArena::
+supdb::db::Slab::
+supdb::db::SlotSet::
+supdb::db::StreamKeys
+supdb::db::radix_by_prefix
+supdb::db::pwritev_all
+supdb::db::AlignedWriter
+supdb::db::BloomFill::
+supdb::block::crc32c_hw
+supdb::block::crc32_from
+supdb::flatindex::record_into
+supdb::flatindex::stream_trailer_in
+# The segment writer and a merge (merge, seal).
+supdb::db::SegmentWriter::
+supdb::db::PieceWriter::
+supdb::db::Db::seal_table
+supdb::db::compact_run
+supdb::db::merge_keys
+supdb::db::merge_ranks
+supdb::db::Emitter::
+supdb::db::Slicer::
+supdb::db::Seg::bloom_and_tombs
+supdb::db::blocks::BigVec::
+supdb::db::get_uvarint
+supdb::blob::Blob::key_at
+supdb::blob::Blob::exts_at
+supdb::blob::Blob::values_at
+supdb::blob::Blob::values_at_pieces
+supdb::flatindex::stream_record_tail_at
+supdb::ordindex::Builder::
+supdb::ordindex::OrdIndex::whole_key_at
+# The probes' own toggled functions: their sources are the head's on both
+# sides, so what they gain is engine code inlined into them.
+<supdb_bench::engines::Supdb as supdb_bench::engines::Engine>::get
+supdb_bench::engines::supdb_get
+supdb_bench::engines::supdb_range
+seal_probe::seal
+scan_at_probe::scans

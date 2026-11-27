@@ -5611,7 +5611,10 @@ A patch found its entry in a copy by a binary search over the copy's
 keys, and in a sparse form by one over its keys through a second
 buffer, while the resolve had just computed the key's cut: the copy's
 entry is the cut less the block's first rank where the copy holds the
-block's records and nothing else (`CachedBlock::identity`), and a
+block's records and nothing else (`CachedBlock::identity`; under a
+claim of the partition before a rewrite, which a table carried across
+it keeps, only where one key compare proves the entry is the key's,
+`Reader::splice_run`), and a
 sparse form's entries sort by cut, then the inserts below a record
 before the record's own update, then by key among the inserts at one
 cut, so the search probes the entries alone and reads a key only among
@@ -7012,9 +7015,14 @@ file's fsync and 0.4 for the directory's in the drain's strace at ten
 thousand keys, and the spare's unlink later, a discard of 1.2-3.8 ms of
 device time off the path. The manifest is two slot files now, `manifest`
 and `manifest.alt`: each publish is a sequence past the last and writes
-the slot of the sequence's parity in place, fdatasynced and never
-truncated, and the open takes the newest slot whose checksum holds, a
-torn write being the slot it ignores. Both slots exist from the store's
+in place, fdatasynced and never truncated, the slot that does not hold
+the newest manifest known durable -- the last whose fdatasync returned
+(`SlotChoice`), so a publish before an owed sync writes over the slot
+still owed and never the other, and gives the owed sync up before its
+write, which a sync run after it would cover whole or torn -- and the open takes the newest slot
+whose checksum holds, a torn write being the slot it ignores, and
+fdatasyncs it before it removes a file -- under a cipher, an envelope
+neither slot names included -- or writes over the other. Both slots exist from the store's
 birth or its first open under this, so no publish creates a directory
 entry (`Options::manifest_slots`; the rename shape is
 `supdb-manifestrename` and `supdb-ingestmanifestrename`). The header
@@ -8075,11 +8083,11 @@ every four, the same 0.1-0.4 at 37 ms of flushes.
 So the segment writer hands each piece to the device as it lands
 (`SegmentOptions::early_writeback`) and, once the file is eight
 megabytes long, starts a thread of its own behind the writer
-(`WriterHelper`, `sync_ahead`), woken by each piece: an fdatasync on a
-dup of the descriptor whenever eight megabytes are on the file past what
-is synced, with the writer's own sync, the durable arm's at every batch,
-marking what it synced so that writer's thread syncs nothing. The hint
-had been tried on 2 MB pieces and not kept (above): the run's fsync fell
+(`WriterHelper`, `sync_ahead`), woken by each piece: an fdatasync on an
+open file description of its own whenever eight megabytes are on the
+file past what is synced, with the writer's own sync, the durable arm's
+at every batch, marking what it synced so that writer's thread syncs
+nothing. The hint had been tried on 2 MB pieces and not kept (above): the run's fsync fell
 by the same third and nothing the suite times resolved, because the
 close's other costs stood, and the durable arm read 1.10x slower in
 seven of eight pairs. This time the hint alone, alternated as probes:

@@ -15,22 +15,32 @@
 
 import { openSyncHandle, openMemory, openCached, openSparse, fetchIntoOpfs } from "./supdb.mjs";
 import { CachedBytes, httpRangeFetcher } from "./cache.mjs";
+import { decryptingFetcher, decryptObject, importKey } from "./crypt.mjs";
 
 let reader = null;
 let handle = null;
 let cache = null;
 
-async function open({ wasmUrl, indexUrl, name, source, budgetBytes, pageSize, probeBytes, directory }) {
+// `key`, for an encrypted object (`crypt.mjs`): its AES key, as raw bytes or
+// as a CryptoKey, which crosses a `postMessage` whole. Every source then
+// reads the object's plaintext, decrypted where it is fetched.
+async function open({ wasmUrl, indexUrl, name, source, budgetBytes, pageSize, probeBytes, directory, key }) {
   const wasmBytes = await (await fetch(wasmUrl)).arrayBuffer();
+  const k = key == null ? null : key instanceof CryptoKey ? key : await importKey(key);
+  const ranged = () => {
+    const stored = httpRangeFetcher(indexUrl);
+    return k ? decryptingFetcher(stored, k) : stored;
+  };
   if (source === "memory") {
-    const bytes = new Uint8Array(await (await fetch(indexUrl)).arrayBuffer());
+    let bytes = new Uint8Array(await (await fetch(indexUrl)).arrayBuffer());
+    if (k) bytes = await decryptObject(bytes, k);
     reader = await openMemory(wasmBytes, bytes);
     return { source: "memory", keys: reader.keys };
   }
   if (source === "cached") {
     cache = await CachedBytes.open({
       name,
-      fetcher: httpRangeFetcher(indexUrl),
+      fetcher: ranged(),
       budgetBytes,
     });
     reader = await openCached(wasmBytes, cache);
@@ -48,7 +58,7 @@ async function open({ wasmUrl, indexUrl, name, source, budgetBytes, pageSize, pr
     // than the bytes turned out to be its cost at realistic dictionary sizes.
     cache = await CachedBytes.open({
       name,
-      fetcher: httpRangeFetcher(indexUrl),
+      fetcher: ranged(),
       budgetBytes,
       ...(pageSize ? { pageSize } : {}),
     });
@@ -63,7 +73,7 @@ async function open({ wasmUrl, indexUrl, name, source, budgetBytes, pageSize, pr
       openFetchedBytes: cache.stats.fetchedBytes,
     };
   }
-  handle = await fetchIntoOpfs(indexUrl, name);
+  handle = await fetchIntoOpfs(indexUrl, name, k ? { decrypt: (b) => decryptObject(b, k) } : {});
   reader = await openSyncHandle(wasmBytes, handle);
   return { source: "opfs", keys: reader.keys, size: handle.getSize() };
 }
