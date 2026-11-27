@@ -4,6 +4,7 @@ r"""The options ledger: one CSV row per option, mechanical columns only.
     python3 release/tools/options_ledger.py > release/options.csv
     python3 release/tools/options_ledger.py --sites Options.sync >/dev/null
     python3 release/tools/options_ledger.py --summary release/options.csv
+    python3 release/tools/options_ledger.py --keep release/options.csv > new.csv
 
 Run from the repository root. Standard library only; it reads the files git
 tracks in the working tree (`git ls-files`, or a walk where git is absent)
@@ -18,14 +19,29 @@ a misspelt name is not read as an option with no site. `--summary`
 reads a ledger written earlier and prints its tallies, tab-separated: a
 line a type (`by_type`), and the cross-tabulation of EXPERIMENT,
 `#[doc(hidden)]` and "an arm sets it" (`cross`), for `Options` and for
-every type together; a path that cannot be read, or a file that is no
-ledger, exits 1. In both tables `default_true`, `default_false` and
+every type together; a path that cannot be read, a file that is no
+ledger, a ledger with no row and a ledger that holds a (struct, name)
+twice each exit 1. In both tables `default_true`, `default_false` and
 `default_other` split `rows` by the text of the `default` column. `bool`
 counts the rows whose value is a `bool`: the declared type, or for a
 StoreCipher setter the type of the field it assigns. A default of `true`
 or `false` on any other row exits 1, so `bool` is `default_true` plus
 `default_false` plus `bool_default_other`, the bools whose default is
 another expression.
+
+`--keep LEDGER` is the plain run with one difference: each row's
+`category`, `decision` and `note` are LEDGER's, carried by (struct, name),
+where a plain run writes them empty. LEDGER is read whole before anything
+is written; one that cannot be read, is no ledger, has no row or holds a
+key twice exits 1. Stderr says how many rows carry a judgment, names the
+rows of LEDGER with no row now (an option deleted or renamed: its judgment
+is not carried) and the rows that are new (written empty). It has two
+uses. After the tree has changed, `--keep release/options.csv > new.csv`
+and then move new.csv into place: a redirection onto LEDGER itself empties
+it before the tool reads it, and the tool exits 1 over the empty file. As
+the check that a ledger with its judgment filled is still the tool's
+output for the tree, every mechanical column and every key:
+`--keep release/options.csv | cmp - release/options.csv`.
 
 THE OPTION TYPES. `Options` and `SegmentOptions` (src/db.rs), `BlobOptions`
 (src/blob.rs), `EncryptOptions` and `ReadOptions` (src/crypt.rs): one row a
@@ -157,14 +173,43 @@ bench_arms_setting, bench_arm_names
     parameters and a destructured `SharedShape` substituted from the call.
     A field is changed where its value's text differs from the text of its
     `impl Default for Policy` entry (`supdb::` prefixes and whitespace
-    dropped). For `?x` an arm counts only where it pins `Some(v)` with `v`
-    textually different from the engine's default. For `direct(...)`, the
-    arms whose `open` entry names a path constant the condition tests.
+    dropped). For `?x` an arm counts where it pins `Some(v)` with `v`
+    textually different from the engine's default, and where its value is
+    any expression other than `Some(..)` and `None`, which the tool does
+    not evaluate (those arms are a line of stderr); an arm that pins
+    `None`, or `Some` of the default's own text, is not counted. For
+    `direct(...)`, the arms whose `open` entry names a path constant the
+    condition tests.
     OVER-COUNTS for `fn(...)`: an arm that changes one field the expression
     reads is counted whether or not the expression's value moves (`a && b`
     with `a` alone changed; an `Option` pinned to the engine's own value).
+    OVER-COUNTS for `?x`: an arm whose value comes to `None` or to the
+    engine's own value by an expression of another text: a variable of the
+    environment that is unset (bench_env names it). UNDER-COUNTS where the
+    option's own expression reads the environment (bench_env names a
+    variable with no `@arm`): the count is of arms whose policy changes a
+    field, and under such a variable arms not counted here set the option
+    too (`scan_timers`: every supdb arm).
     The arms `supdb-segment*` are not `Supdb`, have no policy, and are
     counted only through `direct(...)`.
+bench_env
+    The variables of the process environment the suite's setting of the
+    option reads, semicolon-separated; empty where it reads none.
+      VAR        read by the option's own expression in `with_policy`,
+                 directly, through one of the function's `let` locals, or
+                 through a function of engines.rs the expression calls:
+                 what every supdb arm sets depends on VAR
+      VAR@arm    read by the value the arm gives a Policy field the
+                 option's expression reads: what that arm sets depends on
+                 VAR. The arm is counted in bench_arms_setting
+    A read is `env::var("VAR")` or `env::var_os("VAR")` in non-test code of
+    bench/src/engines.rs. Every one is placed or the tool exits 1: in
+    `with_policy` it must stand in a mapped expression or a local one
+    reads; in `open`, a `Supdb::` or a `Policy::` function, in the changed
+    policy of an arm; anywhere else, in a function such an expression or
+    policy calls by its bare name. The reads, by place, are a line of
+    stderr. Only that file is read for this column: a variable the suite's
+    runner, an example, a test or the engine itself reads is not in it.
 tests_setting
     Sets, defined as for write_sites_src, in tests/**/*.rs and in test code
     of src/. The same over-count by name for assignments
@@ -206,13 +251,14 @@ flags
       unread                read_sites_src == 0
       recv_unread           read_sites_src > 0 and read_sites_recv == 0
       no_arm                bench_arms_setting == 0
+      env_dependent         bench_env is not empty
       bench_fixed           bench_policy_field has a `lit(..)` whose text
                             differs from the default's
       policy_unused         bench_policy_field reads Policy fields and no
                             arm changes one
-      never_set             no arm, write_sites_recv == 0, no
-                            other_setting, no bench_fixed, and
-                            tests_setting == 0
+      never_set             no arm, no variable in bench_env,
+                            write_sites_recv == 0, no other_setting, no
+                            bench_fixed, and tests_setting == 0
       tests_only            the same with tests_setting > 0
       doc_default_mismatch  a bool whose default is true with marker Off,
                             or false with marker On
@@ -221,7 +267,8 @@ flags
       doc_arm_missing       arms_in_doc has a name `open` does not
       no_doc                doc_lines == 0
 category, decision, note
-    Empty: the judgment pass fills them.
+    Empty in a plain run: the judgment pass fills them. Under `--keep
+    LEDGER` they are LEDGER's, by (struct, name).
 """
 import bisect
 import csv
@@ -671,6 +718,7 @@ class Opt:
         self.other = {}
         self.fuzz = []
         self.bench = []  # (form, text, [policy fields])
+        self.env = []  # variables the mapping's own expression reads
         self.arms = []
         self.direct = []
 
@@ -862,6 +910,11 @@ def statement_end(src, pos):
 # ------------------------------------------------------------- the suite
 
 IDENT = re.compile(r"(?<![\w.:])([a-z_][a-z_0-9]*)\b(?!\s*(?:\(|::|!|:(?!:)))")
+ENV_READ = re.compile(r"\benv\s*::\s*var(?:_os)?\s*\(")
+ENV_NAME = re.compile(r'\benv\s*::\s*var(?:_os)?\s*\(\s*"([A-Za-z_][A-Za-z0-9_]*)"\s*\)')
+ENV_ALL = re.compile(r"\benv\s*::\s*vars(?:_os)?\b")
+BARE_CALL = re.compile(r"(?<![\w.:])([A-Za-z_]\w*)\s*\(")
+FN_HEAD = re.compile(r"\s*(?:pub(?:\([^)]*\))?\s+)?fn\s+(\w+)")
 
 
 def idents(text):
@@ -897,8 +950,90 @@ class Suite:
                 for k, v in fns_in(src, a, b).items():
                     self.impls.setdefault(f"{t}::{k}", v)
         self.free = fns_in(src, 0, len(src.code))
+        self.env_scan()
         self.mapping()
         self.arms()
+        self.env_check()
+
+    # -- the environment
+
+    def env_scan(self):
+        """Every read of the process environment in non-test code, with
+        the function it stands in: `map` in `with_policy`, `arm` in `open`
+        and in a `Supdb::` or `Policy::` function, `fn` anywhere else."""
+        src = self.src
+        starts = {v["start"]: (k, v["body"]) for k, v in self.free.items()}
+        for k, v in self.impls.items():
+            starts[v["start"]] = (k, v["body"])
+        self.env_sites, self.envfn = [], {}
+        self.env_placed = {"map": set(), "arm": set(), "fn": set()}
+        for m in ENV_ALL.finditer(src.code):
+            if not src.in_test(m.start()):
+                die(f"{ENGINES}:{src.line(m.start())}: a read of the whole environment, which names no variable")
+        for m in ENV_READ.finditer(src.code):
+            if src.in_test(m.start()):
+                continue
+            nm = ENV_NAME.match(src.nocom, m.start())
+            if not nm:
+                die(f"{ENGINES}:{src.line(m.start())}: an environment read whose variable is no string literal")
+            key, body = starts.get(fn_start(src, m.start()), (None, None))
+            if key is None or not body[0] < m.start() < body[1]:
+                die(f"{ENGINES}:{src.line(m.start())}: an environment read in a function the tool cannot name")
+            if key == "Supdb::with_policy":
+                kind, where = "map", nm.group(1)
+            elif key == "open" or key.startswith(("Supdb::", "Policy::")):
+                kind, where = "arm", nm.group(1)
+            else:
+                kind, where = "fn", key
+                self.envfn.setdefault(key, [])
+                if nm.group(1) not in self.envfn[key]:
+                    self.envfn[key].append(nm.group(1))
+            self.env_sites.append((m.start(), nm.group(1), kind, where))
+
+    def env_of(self, text):
+        """What the expression `text` reads of the environment: the
+        variables it names itself, and the functions of this file that
+        read one and that it calls by their bare name."""
+        direct = [m.group(1) for m in ENV_NAME.finditer(text or "")]
+        fns = [m.group(1) for m in BARE_CALL.finditer(text or "") if m.group(1) in self.envfn]
+        return direct, fns
+
+    def env_names(self, kind, direct, fns, mark=True):
+        """The variables behind `direct` and `fns`, each once; with `mark`
+        the reads are placed, which `env_check` asks of every read."""
+        if mark:
+            self.env_placed[kind].update(direct)
+            self.env_placed["fn"].update(fns)
+        return list(dict.fromkeys(direct + [e for f in fns for e in self.envfn[f]]))
+
+    def menv(self, text, mark=True):
+        """The variables an expression of `with_policy` reads, its `let`
+        locals followed. A local's read is placed where a mapped
+        expression reads the local, not where the local is made."""
+        direct, fns = self.env_of(text)
+        for i in idents(text):
+            d, f = self.alias_env.get(i, ([], []))
+            direct, fns = direct + d, fns + f
+        return self.env_names("map", direct, fns, mark)
+
+    def env_check(self):
+        src = self.src
+        for pos, name, kind, where in self.env_sites:
+            if where not in self.env_placed[kind]:
+                what = {
+                    "map": "no mapped expression of with_policy reads it",
+                    "arm": "no arm's changed policy holds it",
+                    "fn": f"no mapped expression and no arm's policy calls {where}()",
+                }[kind]
+                die(f"{ENGINES}:{src.line(pos)}: the read of {name} cannot be placed: {what}")
+        by = {"map": [], "arm": [], "fn": []}
+        for _, name, kind, where in self.env_sites:
+            by[kind].append(name if kind != "fn" else f"{where}():{name}")
+        say(
+            f"environment: {len(self.env_sites)} reads of {len({s[1] for s in self.env_sites})} variables outside test code; "
+            f"in with_policy: {', '.join(by['map']) or '(none)'}; in an arm's policy: {', '.join(by['arm']) or '(none)'}; "
+            f"in a function they call: {', '.join(by['fn']) or '(none)'}"
+        )
 
     # -- the mapping
 
@@ -919,10 +1054,21 @@ class Suite:
         m = re.fullmatch(r"(\w+)\s*\.\s*unwrap_or\(\s*supdb::(\w+)::default\(\)\s*\.\s*(\w+)\s*,?\s*\)", v)
         if m and m.group(1) in self.pset and m.group(2) == struct and m.group(3) == name:
             return ("?", "?" + m.group(1), [m.group(1)])
-        r = self.refs(v)
-        if r:
+        return self.other(v, v)
+
+    def other(self, text, shown):
+        """The form of an expression that is no bare Policy field: `fn`
+        where it reads a Policy field or the environment, else `lit`."""
+        r = self.refs(text)
+        if r or self.menv(text, mark=False):
             return ("fn", "fn(" + ",".join(r) + ")", r)
-        return ("=", "lit(" + v + ")", [])
+        return ("=", "lit(" + shown + ")", [])
+
+    def place(self, o, form, text):
+        o.bench.append(form)
+        for e in self.menv(text):
+            if e not in o.env:
+                o.env.append(e)
 
     def mapping(self):
         src = self.src
@@ -942,9 +1088,14 @@ class Suite:
         lit = re.compile(r"\blet\s+opts\s*=\s*supdb::Options\s*\{").search(src.code, pclose, hi)
         if not lit:
             die("with_policy: no `let opts = supdb::Options {`")
-        self.alias = {}
+        self.alias, self.alias_env = {}, {}
         for m in re.compile(r"\blet\s+(?:mut\s+)?(\w+)\s*=").finditer(src.code, pclose, lit.start()):
             end = statement_end(src, m.end())
+            direct, fns = self.env_of(src.text(m.end(), end))
+            for i in idents(src.text(m.end(), end)):
+                d, f = self.alias_env.get(i, ([], []))
+                direct, fns = direct + d, fns + f
+            self.alias_env[m.group(1)] = (direct, fns)
             self.alias[m.group(1)] = self.refs(src.text(m.end(), end))
         say("with_policy: locals " + ", ".join(f"{k}<-({','.join(v)})" for k, v in self.alias.items()))
         entries, base, lclose = parse_literal(src, lit.end() - 1)
@@ -953,7 +1104,7 @@ class Suite:
             o = self.byname.get(("Options", n))
             if not o or v is None:
                 die(f"{ENGINES}:{src.line(pos)}: the Options literal sets `{n}`, which cannot be placed")
-            o.bench.append(self.form("Options", n, v))
+            self.place(o, self.form("Options", n, v), v)
             n_main += 1
             if n == "segment":
                 inner = re.compile(r"\bsupdb::SegmentOptions\s*\{").search(src.code, pos, lclose)
@@ -962,7 +1113,7 @@ class Suite:
                     o2 = self.byname.get(("SegmentOptions", n2))
                     if not o2 or v2 is None:
                         die(f"{ENGINES}:{src.line(p2)}: the SegmentOptions literal sets `{n2}`, which cannot be placed")
-                    o2.bench.append(self.form("SegmentOptions", n2, v2))
+                    self.place(o2, self.form("SegmentOptions", n2, v2), v2)
                     n_seg += 1
         n_late = 0
         for s, e2, b2, op, cl, is_pat, _ in literals(src, [t for t, _ in TYPES]):
@@ -973,8 +1124,8 @@ class Suite:
                 o2 = self.byname.get((s, n2))
                 if not o2:
                     die(f"{ENGINES}:{src.line(p2)}: a late literal sets `{n2}`, which cannot be placed")
-                r = self.refs((v2 or n2) + " " + (hd[-1] if hd else ""))
-                o2.bench.append(("fn", "fn(" + ",".join(r) + ")", r) if r else ("=", "lit(" + (v2 or n2) + ")", []))
+                text = (v2 or n2) + " " + (hd[-1] if hd else "")
+                self.place(o2, self.other(text, v2 or n2), text)
                 n_late += 1
         for m in re.compile(r"\bopts\s*\.\s*(\w+)\s*=(?![=>])").finditer(src.code, lclose, hi):
             o2 = self.byname.get(("Options", m.group(1)))
@@ -983,8 +1134,8 @@ class Suite:
             end = statement_end(src, m.end())
             hd = headers(src, lo, m.start())
             inner = hd[-1] if len(hd) > 1 else ""
-            r = self.refs(src.text(m.end(), end) + " " + inner)
-            o2.bench.append(("fn", "fn(" + ",".join(r) + ")", r) if r else ("=", "lit(" + src.text(m.end(), end) + ")", []))
+            text = src.text(m.end(), end) + " " + inner
+            self.place(o2, self.other(text, src.text(m.end(), end)), text)
             n_late += 1
         say(f"with_policy: the Options literal sets {n_main} fields, its SegmentOptions literal {n_seg}; {n_late} set after it")
         self.n_mapped = (n_main, n_seg, n_late)
@@ -1012,12 +1163,12 @@ class Suite:
                     mm = list(re.finditer(r"\bmatch\s+(\w+)\s*\{", back))
                     if mm:
                         r = self.refs(mm[-1].group(1))
-                if len(r) == 1:
-                    o2.bench.append(("x", r[0], r))
-                elif r:
-                    o2.bench.append(("fn", "fn(" + ",".join(r) + ")", r))
+                if len(r) == 1 and not self.menv(text, mark=False):
+                    self.place(o2, ("x", r[0], r), text)
+                elif r or self.menv(text, mark=False):
+                    self.place(o2, ("fn", "fn(" + ",".join(r) + ")", r), text)
                 else:
-                    o2.bench.append(("=", "lit(" + arg + ")", []))
+                    self.place(o2, ("=", "lit(" + arg + ")", []), text)
 
     # -- the arms
 
@@ -1132,6 +1283,7 @@ class Suite:
         lo, hi = op["body"]
         marks = list(re.compile(r'^ {8}((?:#\[[^\]\n]*\]\s*)*)((?:"[a-z0-9-]+"\s*\|?\s*)+)=>', re.M).finditer(src.nocom, lo, hi))
         self.arm_text, self.arm_policy, self.all_arms = {}, {}, []
+        self.arm_env, self.loose = {}, {}
         for i, m in enumerate(marks):
             end = marks[i + 1].start() if i + 1 < len(marks) else hi
             names = re.findall(r'"([a-z0-9-]+)"', m.group(2))
@@ -1155,11 +1307,15 @@ class Suite:
                         args = [src.text(a, b) for a, b in src.split(c.end(), pc)][1:]
                     pol = self.create(c.group(1), args)
                 self.arm_policy[n] = {f: v for f, v in pol.items() if norm(v) != norm(self.pdef[f])}
+                env = {f: self.env_names("arm", *self.env_of(v)) for f, v in self.arm_policy[n].items()}
+                self.arm_env[n] = {f: e for f, e in env.items() if e}
         nopol = [n for n in self.arm_text if n not in self.arm_policy]
         say(f"open: {len(self.all_arms)} arms, {len(self.arm_text)} of them supdb arms, {len(self.arm_policy)} with a policy; without one: {', '.join(nopol)}")
 
     def arms_for(self, o):
-        out = []
+        """The arms that set the option, in `open`'s order, and the
+        `VAR@arm` of each value among theirs that reads the environment."""
+        out, env = [], {}
         for n, pol in self.arm_policy.items():
             hit = False
             for form, _, refs in o.bench:
@@ -1167,10 +1323,17 @@ class Suite:
                     if f not in pol:
                         continue
                     if form == "?":
-                        m = re.fullmatch(r"Some\((.*)\)", pol[f].strip(), re.S)
-                        if not m or norm(m.group(1)) == norm(o.default):
+                        v = pol[f].strip()
+                        m = re.fullmatch(r"Some\((.*)\)", v, re.S)
+                        if v == "None" or (m and norm(m.group(1)) == norm(o.default)):
                             continue
+                        if not m:
+                            self.loose[(n, f)] = v
                     hit = True
+                    for e in self.arm_env[n].get(f, []):
+                        env.setdefault(n, [])
+                        if e not in env[n]:
+                            env[n].append(e)
             if hit:
                 out.append(n)
         for cond in o.direct:
@@ -1179,7 +1342,8 @@ class Suite:
                 if consts and any(c in self.src.code[a:b] for c in consts) and n not in out:
                     out.append(n)
         order = {n: i for i, n in enumerate(self.all_arms)}
-        return sorted(out, key=order.get)
+        out.sort(key=order.get)
+        return out, [f"{e}@{n}" for n in out for e in env.get(n, [])]
 
 
 # ---------------------------------------------------------------- the fuzz
@@ -1260,8 +1424,43 @@ SITES = set()
 
 SUMMARY_COLS = [
     "struct", "name", "type", "default", "doc_hidden", "doc_markers", "arms_in_doc", "read_sites_src",
-    "bench_policy_field", "bench_arms_setting", "fuzz_drawn", "fuzz_how", "flags",
+    "bench_policy_field", "bench_arms_setting", "bench_env", "fuzz_drawn", "fuzz_how", "flags",
 ]
+JUDGMENT = ["category", "decision", "note"]
+
+
+def read_ledger(path, mode, need):
+    """The rows of a ledger written earlier. Exit 1 where the file cannot
+    be read, is empty, lacks a column of `need` or names one twice, has a
+    row short or long of its header, has no row, or holds a (struct, name)
+    twice."""
+    try:
+        with open(path, newline="") as f:
+            reader = csv.DictReader(f)
+            head = reader.fieldnames or []
+            rows = list(reader)
+    except (OSError, UnicodeDecodeError, csv.Error) as e:
+        die(f"{mode}: cannot read {path}: {getattr(e, 'strerror', None) or e}")
+    if not head:
+        hint = ": a redirection of stdout onto the ledger empties it first; write to another file and move it" if mode == "--keep" else ""
+        die(f"{mode}: {path} is empty{hint}")
+    missing = [c for c in need if c not in head]
+    if missing:
+        die(f"{mode}: {path} is not a ledger: no column {', '.join(missing)}")
+    twice = sorted({c for c in head if head.count(c) > 1})
+    if twice:
+        die(f"{mode}: {path} is not a ledger: column {', '.join(twice)} twice")
+    seen = {}
+    for n, r in enumerate(rows, 2):
+        if None in r or None in r.values():
+            die(f"{mode}: {path}, line {n}: not a row of the ledger")
+        k = (r["struct"], r["name"])
+        if k in seen:
+            die(f"{mode}: {path}, line {n}: {k[0]}.{k[1]} is a row twice (first at line {seen[k]})")
+        seen[k] = n
+    if not rows:
+        die(f"{mode}: {path} has no row")
+    return rows
 
 
 def value_type(struct, typ):
@@ -1283,19 +1482,10 @@ def value_type(struct, typ):
 
 def summary(path):
     """Tallies of a ledger written earlier, tab-separated."""
-    try:
-        with open(path, newline="") as f:
-            reader = csv.DictReader(f)
-            head = reader.fieldnames or []
-            rows = list(reader)
-    except (OSError, UnicodeDecodeError, csv.Error) as e:
-        die(f"--summary: cannot read {path}: {getattr(e, 'strerror', None) or e}")
-    missing = [c for c in SUMMARY_COLS if c not in head]
-    if missing:
-        die(f"--summary: {path} is not a ledger: no column {', '.join(missing)}")
+    rows = read_ledger(path, "--summary", SUMMARY_COLS)
     order = [t for t, _ in TYPES]
     for n, r in enumerate(rows, 2):
-        if None in r or None in r.values() or not r["bench_arms_setting"].isdigit():
+        if not r["bench_arms_setting"].isdigit():
             die(f"--summary: {path}, line {n}: not a row of the ledger")
         if r["struct"] not in order:
             die(f"--summary: {path}, line {n}: `{r['struct']}` is no option type")
@@ -1339,6 +1529,7 @@ def summary(path):
         ("default_false", lambda r: kind(r) == "false"),
         ("default_other", lambda r: kind(r) == "other"),
         ("bool_default_other", lambda r: is_bool(r) and kind(r) == "other"),
+        ("env_dependent", lambda r: has(r, "flags", "env_dependent")),
     ]
     w = csv.writer(sys.stdout, delimiter="\t", lineterminator="\n")
     w.writerow(["by_type", "type"] + [n for n, _ in tallies])
@@ -1379,12 +1570,22 @@ def main():
         return summary(args[1])
     if not (ROOT / "src/db.rs").is_file() or not (ROOT / ENGINES).is_file():
         die("run from the repository root")
+    keep = None
     while args:
         if args[0] == "--sites" and len(args) > 1:
             SITES.update(args[1].split(","))
             args = args[2:]
+        elif args[0] == "--keep" and len(args) > 1 and keep is None:
+            keep = args[1]
+            args = args[2:]
         else:
-            die("usage: options_ledger.py [--sites Type.name[,Type.name...]] > options.csv | --summary options.csv")
+            die(
+                "usage: options_ledger.py [--sites Type.name[,Type.name...]] [--keep options.csv] > new.csv"
+                " | --summary options.csv"
+            )
+    judged = {}
+    if keep is not None:
+        judged = {(r["struct"], r["name"]): [r[c] for c in JUDGMENT] for r in read_ledger(keep, "--keep", ["struct", "name"] + JUDGMENT)}
     rs = tracked(".rs")
     srcs = {p: Src(p) for p in rs}
     opts, excl, per = load_types(srcs)
@@ -1547,12 +1748,13 @@ def main():
         "struct", "name", "type", "default", "doc_hidden", "doc_markers", "doc_lines", "arms_in_doc",
         "read_sites_src", "read_sites_recv", "read_sites_cfgtest", "read_files", "write_sites_src",
         "write_sites_recv",
-        "bench_policy_field", "bench_arms_setting", "bench_arm_names", "tests_setting", "fuzz_drawn",
-        "fuzz_how", "other_setting", "docs_mentions", "docs_files", "rs_mentions", "gate_mentions",
-        "flags", "category", "decision", "note",
-    ]
+        "bench_policy_field", "bench_arms_setting", "bench_arm_names", "bench_env", "tests_setting",
+        "fuzz_drawn", "fuzz_how", "other_setting", "docs_mentions", "docs_files", "rs_mentions",
+        "gate_mentions", "flags",
+    ] + JUDGMENT
     w.writerow(cols)
     order = {s: i for i, s in enumerate(structs)}
+    written = []
     n_rows = {s: 0 for s in structs}
     off_colon = {"true": 0, "false": 0, "other": 0}
     for o in sorted(opts, key=lambda o: (order[o.struct], o.order)):
@@ -1566,7 +1768,8 @@ def main():
         own = len(re.findall(r"\b%s::%s\b" % (o.struct, o.name), doc))
         if o.direct:
             o.bench.append(("direct", "direct(" + " ; ".join(dict.fromkeys(c or "unconditional" for c in o.direct)) + ")", []))
-        setting = suite.arms_for(o)
+        setting, arm_env = suite.arms_for(o)
+        env = o.env + arm_env
         q, b = dq.get((o.struct, o.name), {}), db_.get(o.name, {})
         files = sorted(set(q) | set(b))
         rsm = sum(rq.get((o.struct, o.name), {}).values()) - own
@@ -1579,12 +1782,14 @@ def main():
             flags.append("recv_unread")
         if not setting:
             flags.append("no_arm")
+        if env:
+            flags.append("env_dependent")
         fixed = any(f == "=" and norm(t[4:-1]) != norm(o.default) for f, t, _ in o.bench)
         if fixed:
             flags.append("bench_fixed")
         if o.bench and not setting and not fixed and any(r for _, _, r in o.bench):
             flags.append("policy_unused")
-        if not setting and not o.writes_recv and not o.other and not fixed:
+        if not setting and not env and not o.writes_recv and not o.other and not fixed:
             flags.append("tests_only" if o.tests else "never_set")
         if o.default in ("true", "false") and ("Off" if o.default == "true" else "On") in markers:
             flags.append("doc_default_mismatch")
@@ -1606,15 +1811,18 @@ def main():
                 " | ".join(dict.fromkeys(t for _, t, _ in o.bench)),
                 len(setting),
                 ";".join(setting[:12]) + (f";+{len(setting) - 12}" if len(setting) > 12 else ""),
+                ";".join(env),
                 o.tests, int(bool(best and best[0] > 0)), best[1] if best else "",
                 ";".join(f"{d}:{n}" for d, n in sorted(o.other.items())),
                 sum(q.values()) + sum(b.values()),
                 ";".join(f"{f}:{q.get(f, 0)}+{b.get(f, 0)}" for f in files),
                 rsm,
                 ";".join(f"{f}:{n}" for f, n in sorted(gm.items())),
-                ";".join(flags), "", "", "",
+                ";".join(flags),
             ]
+            + judged.get((o.struct, o.name), ["", "", ""])
         )
+        written.append((o.struct, o.name))
     for s in structs:
         f, d, r = per[s]
         say(f"{s}: {n_rows[s]} rows ({f} fields, {d} default entries)")
@@ -1624,6 +1832,23 @@ def main():
         "bool options whose rustdoc has `Off:` (\\bOff:), which is no marker: "
         f"{off_colon['true']} default to true, {off_colon['false']} to false, {off_colon['other']} to another expression"
     )
+    loose = [f"{n} {f}: {v[:60]}" for (n, f), v in suite.loose.items()]
+    say(
+        "`?x` arms counted on a value that is no `Some(..)` and no `None`, which the tool does not evaluate: "
+        + ("; ".join(loose) or "(none)")
+    )
+    if keep is not None:
+        now = set(written)
+        held = lambda k: any(judged[k])
+        gone = sorted(k for k in judged if k not in now)
+        new = [k for k in written if k not in judged]
+        dot = lambda ks: ", ".join(f"{s}.{n}" for s, n in ks) or "(none)"
+        say(
+            f"--keep {keep}: {sum(1 for k in written if k in judged)} rows carried by (struct, name), "
+            f"{sum(1 for k in written if k in judged and held(k))} of them with a judgment"
+        )
+        say(f"--keep: rows of it with no row now, not carried: {len(gone)}, {sum(1 for k in gone if held(k))} of them with a judgment: {dot(gone)}")
+        say(f"--keep: rows new since it, written empty: {len(new)}: {dot(new)}")
     for n in sorted(listed):
         say(f"sites listed for {n}: {listed[n]}")
     say(f"{sum(n_rows.values())} rows")

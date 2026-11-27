@@ -10,7 +10,9 @@
 # Without an argument it uses git, awk, grep, wc and sort, and reads the
 # files git tracks in the working tree. Two runs over one tree print the
 # same bytes. `worktree_dirty_paths` says whether the working tree is the
-# commit: at 0 every count is of `tree`.
+# commit: at 0 every count is of `tree`. `worktree_dirty_paths_outside_release`
+# says the same of everything outside release/: at 0 every count but the five
+# that read release/ is of the tree `tree_less_release` fingerprints.
 #
 # What each quantity counts.
 #
@@ -28,6 +30,11 @@
 # worktree_dirty_paths
 #   Lines of `git status --porcelain`: tracked files changed and untracked
 #   files not ignored.
+# worktree_dirty_paths_outside_release
+#   The same lines for paths outside release/ (`git status --porcelain --
+#   . ':(exclude)release'`). The counts are of the working tree and
+#   `tree_less_release` is of HEAD: this line at 0 is what ties the two,
+#   whatever is changed or untracked under release/.
 #
 # options_fields, options_doc_hidden, options_experiment,
 # options_doc_hidden_and_experiment
@@ -178,7 +185,10 @@ case "${1:-}" in
     ;;
 esac
 
-top=$(git rev-parse --show-toplevel)
+top=$(git rev-parse --show-toplevel 2>/dev/null) || {
+  echo "static_counts: run from the repository root (git finds no repository here)" >&2
+  exit 2
+}
 if [ "$top" != "$(pwd -P)" ] || [ ! -f src/db.rs ]; then
   echo "static_counts: run from the repository root ($top)" >&2
   exit 2
@@ -217,6 +227,7 @@ out commit "$(git rev-parse HEAD)"
 out tree "$(git rev-parse 'HEAD^{tree}')"
 out tree_less_release "$(git ls-tree -r HEAD | grep -v "${TAB}release/" | git hash-object --stdin)"
 out worktree_dirty_paths "$(git --no-optional-locks status --porcelain | awk 'END { print NR }')"
+out worktree_dirty_paths_outside_release "$(git --no-optional-locks status --porcelain -- . ':(exclude)release' | awk 'END { print NR }')"
 
 SRC=$(rs_under src)
 
