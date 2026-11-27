@@ -164,6 +164,12 @@ read, every file under the arm's directory at any depth, in allocated
 blocks rather than lengths, since a map file's length can run past what
 was ever written to it.
 
+Bytes on disk is a quantity supdb is willing to lose, and the figures
+show it as measured. A segment keeps its key section, its ordered index
+and its filter beside the records, and out of core the compact form's
+files stand beside the raw ones: that is the price of the reads those
+structures serve.
+
 Neither follows from the other. Ordered ingest cut supdb's device bytes
 from 2.63 to 1.48 and left its 1.44 on disk exactly where it was, because
 what went away was the WAL write and not a byte of the segment. The state
