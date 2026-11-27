@@ -2543,7 +2543,17 @@ twenty thousand where the scan before the burst has not found the
 thread's report of them and nothing where it has; under the gate's load
 it was nothing, the range empty, and a burst that had lent three
 hundred and then nine hundred, as it should, failed. It holds the
-counts themselves now. And as a hold set behind the builds it was for:
+counts themselves now. And as a manifest: the test of a form
+file's build in flight at a crash, written on the main line where a flush
+is answered behind its slot, bet that the manifest named the partition
+once the flush had returned and the build had reached its hold. A durable
+flush is answered at its seal's readable landing on this branch
+(`Options::drain_answers_readable`) and the build starts at that landing
+too, so a crash inside the window left the run under its temp name, the
+open made it a piece, and the reopened store had no partition and no form
+file: one run in twenty in either mode on the merged tree, every run with
+the seal held short of durable, and none of eighty with the test waiting
+for the drain's manifest (`Db::manifest_seq`). And as a hold set behind the builds it was for:
 the test of the crossing's ask for raw pages wants two partitions built
 ahead and the third's build held at its start, and set the hold once it
 had counted two built. The builds ahead follow one another in
