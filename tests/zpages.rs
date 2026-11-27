@@ -2368,14 +2368,17 @@ fn covered_and_uncovered_partitions_agree_across_their_boundaries() {
 }
 
 /// What a scan of `limit` keys from `start` answers, as the model has it,
-/// and how many keys it visited. A scan visits every key an unsealed source
-/// has touched whether or not a value is left to it, and its limit counts
-/// the visit, so the model keeps a deleted key as a key with no values until
-/// a flush drops it.
+/// and how many keys it visited. A scan visits a key and counts it toward
+/// its limit only where the key holds a value, so the model's deleted keys,
+/// kept as keys with no values until a flush drops them, are passed over.
 fn window(model: &Model, start: &[u8], limit: usize) -> Window {
     let mut out = Vec::new();
     let mut visited = 0;
-    for (k, vs) in model.range(start.to_vec()..).take(limit) {
+    for (k, vs) in model
+        .range(start.to_vec()..)
+        .filter(|(_, vs)| !vs.is_empty())
+        .take(limit)
+    {
         visited += 1;
         out.extend(vs.iter().map(|v| (k.clone(), v.clone())));
     }
