@@ -379,9 +379,21 @@ cache's advices under a cipher (`posix_fadvise` and `MADV_POPULATE_READ`,
 in `pager.rs`) were Linux's alone with no guard, from two commits that no
 macOS build had seen, CI having run on no pull request of this branch.
 They are behind `cfg(target_os = "linux")` now, nothing elsewhere, where
-no store under a cipher is made (`pager::memfile`). What is left
-for the hosted runners alone to show is timing on their hardware and the
-tests run, not only type-checked, on ARM and macOS.
+no store under a cipher is made (`pager::memfile`). The third macOS leg
+compiled every test and ran them, and seventy-one of `tests/durable.rs`
+failed at their first line: a store under a cipher there is refused at
+its creation, and nothing had said which tests make one. The same
+refusal made on Linux for one run (`memfile` answering as it does off
+Linux, a scratch change behind a variable, reverted after) named every
+such test of the engine's and the suite's in twenty minutes, those
+already behind the guard among them, so a test of a mode one platform
+alone has is found by that platform's primitive refused and not by a
+hosted run a binary at a time; a test with a plain arm beside the
+cipher's keeps the plain one off Linux. And the `test` group runs every
+binary whichever fails (`--no-fail-fast`), since that leg's log ended at
+the first red one. What is left for the hosted runners alone to show is
+timing on their hardware and the tests run, not only type-checked, on
+ARM and macOS.
 
 The `cross-arm` group died in two runs of five with "QEMU internal
 SIGSEGV" and no test failed, and the first reading put it on the

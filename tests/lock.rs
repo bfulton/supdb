@@ -43,10 +43,14 @@ fn dir(name: &str) -> PathBuf {
 /// a file of the store's own directory either way (`vault::open_lock`),
 /// and a store under a cipher holds more of its directory open across a
 /// close -- its marker, its envelopes and their memory files -- for a
-/// child's copy to keep.
+/// child's copy to keep. The cipher's arm is Linux's alone, which has the
+/// memory files a store under a cipher keeps its plaintext in.
 #[test]
 fn a_store_closed_while_a_forked_child_holds_its_lock_opens_again() {
     for cipher in [false, true] {
+        if cipher && !cfg!(target_os = "linux") {
+            continue;
+        }
         closed_beside_a_forked_child(cipher);
     }
 }

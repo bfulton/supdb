@@ -167,7 +167,10 @@ for g in $groups; do
       ;;
     test)
       say "test"
-      cargo test --profile checked
+      # Every binary, whichever fails: a red one stops a plain `cargo
+      # test` there, and the macOS leg's first run of this branch's tests
+      # showed one binary's failures and nothing of the binaries after it.
+      cargo test --profile checked --no-fail-fast
       # The differential fuzz with handles that write, every seed's log
       # held with no frames: the live table goes to the shared one and
       # back many times a seed, the block cache on in every seed, and a

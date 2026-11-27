@@ -21938,7 +21938,9 @@ mod tests {
     /// shapes they are priced against differs from `supdb-cipher` in its
     /// one option: `supdb-cipherlog` loads an ordered run through the log
     /// (`direct_ingest` off), `supdb-cipherauto` lets the compact form's
-    /// controller in (`zpages_under_cipher`).
+    /// controller in (`zpages_under_cipher`). A store under a cipher keeps
+    /// its plaintext in memory files, which Linux alone has.
+    #[cfg(target_os = "linux")]
     #[test]
     fn the_cipher_arms_differ_from_supdb_cipher_in_their_one_option() {
         let root =
@@ -22245,20 +22247,26 @@ mod tests {
         )));
         // And the bound reaches the store: `supdb-cipher64`'s cache is its
         // policy's sixty-four mebibytes, `supdb-cipher`'s the engine's own.
-        let root =
-            std::env::temp_dir().join(format!("supdb-bench-encryption-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&root);
-        let budget = |name: &str, f: fn(&Path) -> Res<Supdb>| {
-            let d = root.join(name);
-            std::fs::create_dir_all(&d).unwrap();
-            let a = f(&d).unwrap();
-            assert_eq!(a.name(), name);
-            a.db.as_ref().unwrap().cipher_counts().unwrap().cache.budget
-        };
-        assert_eq!(budget("supdb-cipher64", Supdb::create_cipher64), 64 << 20);
-        // Opened for its name; its budget is the room's, of any size the
-        // floor allows, sixty-four mebibytes among them.
-        let _ = budget("supdb-cipher", Supdb::create_cipher);
+        // The stores are opened where a store under a cipher can be, which
+        // is Linux, with the memory files its plaintext is kept in.
+        #[cfg(target_os = "linux")]
+        {
+            let root =
+                std::env::temp_dir().join(format!("supdb-bench-encryption-{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&root);
+            let budget = |name: &str, f: fn(&Path) -> Res<Supdb>| {
+                let d = root.join(name);
+                std::fs::create_dir_all(&d).unwrap();
+                let a = f(&d).unwrap();
+                assert_eq!(a.name(), name);
+                a.db.as_ref().unwrap().cipher_counts().unwrap().cache.budget
+            };
+            assert_eq!(budget("supdb-cipher64", Supdb::create_cipher64), 64 << 20);
+            // Opened for its name; its budget is the room's, of any size the
+            // floor allows, sixty-four mebibytes among them.
+            let _ = budget("supdb-cipher", Supdb::create_cipher);
+            let _ = std::fs::remove_dir_all(&root);
+        }
         // `supdb-cipher`'s is the engine's own: the cipher its policy makes
         // sets no size, so its cache follows the room, where
         // `supdb-cipher64`'s sets its policy's. Held by the cipher and not
@@ -22279,7 +22287,6 @@ mod tests {
             Some(64 << 20),
             "supdb-cipher64's is its policy's"
         );
-        let _ = std::fs::remove_dir_all(&root);
     }
 
     /// `supdb-dirplain` and `supdb-ingestdirplain` are the policy with

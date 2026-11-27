@@ -110,6 +110,9 @@ fn key(k: u32) -> String {
     format!("key-{k:06}")
 }
 
+/// A store under a cipher keeps its plaintext in memory files
+/// (`pager::memfile`), which Linux alone has, so every test of one is
+/// compiled there and the macOS leg runs the rest.
 fn under_cipher() -> Options {
     let c = StoreCipher::new(Gcm::new(&[7; 32]), Gcm::new).key_id(7);
     Options {
@@ -466,6 +469,7 @@ fn a_put_after_a_delete_survives_a_crash_before_the_deletes_seal_writes() {
 /// The same order under a cipher. A run's commits there go to the log as
 /// well, behind the tombstone, so the order holds by the log whatever the
 /// greatest key says; the test holds that it stays so.
+#[cfg(target_os = "linux")]
 #[test]
 fn an_append_after_a_delete_survives_a_crash_under_a_cipher() {
     for held in [SealHeld::BeforeWrite, SealHeld::BetweenPhases] {
@@ -932,6 +936,7 @@ fn a_log_write_that_failed_part_way_in_a_reopened_store_loses_no_commit_acknowle
 
 /// The same under a cipher, whose log takes a commit's frames as one
 /// sealed record: a record cut part way and one never written.
+#[cfg(target_os = "linux")]
 #[test]
 fn a_failed_log_write_loses_no_commit_acknowledged_after_it_under_a_cipher() {
     for after in [0usize, 5, 40] {
@@ -950,6 +955,7 @@ fn a_failed_log_write_loses_no_commit_acknowledged_after_it_under_a_cipher() {
 /// A record that fails to seal under a cipher -- a commit too large for
 /// one record -- is a write that failed whole: the seal's buffer holds
 /// the record before it, and none of it reaches the file.
+#[cfg(target_os = "linux")]
 #[test]
 fn a_log_record_that_fails_to_seal_loses_no_commit_acknowledged_after_it() {
     a_failed_write_is_written_again("cipher-seal", under_cipher(), SEAL, false);
@@ -959,7 +965,11 @@ fn a_log_record_that_fails_to_seal_loses_no_commit_acknowledged_after_it() {
 /// batch, and its `Ok` is that batch's durability.
 #[test]
 fn a_commit_with_nothing_staged_after_a_failed_write_makes_the_batch_durable() {
-    for (tag, opts) in [("plain", Options::default()), ("cipher", under_cipher())] {
+    let mut arms = vec![("plain", Options::default())];
+    if cfg!(target_os = "linux") {
+        arms.push(("cipher", under_cipher()));
+    }
+    for (tag, opts) in arms {
         let d = dir(&format!("dur-walwrite-retry-{tag}"));
         let crash = dir(&format!("dur-walwrite-retry-{tag}-crash"));
         let mut db = Db::create(&d, opts.clone()).unwrap();
@@ -997,6 +1007,7 @@ fn a_commit_with_nothing_staged_after_a_failed_write_makes_the_batch_durable() {
 /// Unlike a batch
 /// of the log alone it is visible from the commit that failed, since the
 /// run marks its table before the log is written (`SyncPolicy`).
+#[cfg(target_os = "linux")]
 fn a_runs_batch_is_written_again(tag: &str, then: u8, opts: Options) {
     {
         let d = dir(&format!("dur-walwrite-run-{tag}"));
@@ -1095,11 +1106,13 @@ fn a_runs_batch_is_written_again(tag: &str, then: u8, opts: Options) {
     }
 }
 
+#[cfg(target_os = "linux")]
 #[test]
 fn a_runs_batch_whose_log_write_failed_under_a_cipher_is_written_by_a_commit_of_nothing() {
     a_runs_batch_is_written_again("commit", 0, under_cipher());
 }
 
+#[cfg(target_os = "linux")]
 #[test]
 fn a_runs_batch_whose_log_write_failed_under_a_cipher_is_written_by_a_sync() {
     a_runs_batch_is_written_again("sync", 1, under_cipher());
@@ -1108,6 +1121,7 @@ fn a_runs_batch_whose_log_write_failed_under_a_cipher_is_written_by_a_sync() {
 /// Under the buffered policy a `sync` is the call whose `Ok` promises
 /// the batch: the write again syncs whatever the policy, since the commit
 /// that failed may have owed the sync and its count is spent.
+#[cfg(target_os = "linux")]
 #[test]
 fn a_runs_batch_whose_log_write_failed_under_a_buffered_cipher_is_written_by_a_sync() {
     a_runs_batch_is_written_again(
@@ -1120,6 +1134,7 @@ fn a_runs_batch_whose_log_write_failed_under_a_buffered_cipher_is_written_by_a_s
     );
 }
 
+#[cfg(target_os = "linux")]
 #[test]
 fn a_runs_batch_whose_log_write_failed_under_a_cipher_is_written_by_the_runs_next_commit() {
     a_runs_batch_is_written_again("next", 2, under_cipher());
@@ -1129,6 +1144,7 @@ fn a_runs_batch_whose_log_write_failed_under_a_cipher_is_written_by_the_runs_nex
 /// with its own and is as durable as that policy makes it: the frames are
 /// on the file and not synced, and the `flush` after it is the call whose
 /// `Ok` promises both (`SyncPolicy`).
+#[cfg(target_os = "linux")]
 #[test]
 fn a_runs_batch_whose_log_write_failed_under_a_buffered_cipher_is_written_by_the_runs_next_commit()
 {
@@ -1144,6 +1160,7 @@ fn a_runs_batch_whose_log_write_failed_under_a_buffered_cipher_is_written_by_the
 
 /// A `flush` writes the run's batch again and syncs it whatever the
 /// policy, before the run closes into a segment.
+#[cfg(target_os = "linux")]
 #[test]
 fn a_runs_batch_whose_log_write_failed_under_a_buffered_cipher_is_written_by_a_flush() {
     a_runs_batch_is_written_again(
@@ -1349,6 +1366,7 @@ fn a_write_that_cannot_be_put_back_is_kept_by_a_seal() {
     a_stray_write_is_kept("seal-rotates", rotates, false, |db| db.seal());
 }
 
+#[cfg(target_os = "linux")]
 #[test]
 fn a_write_that_cannot_be_put_back_is_kept_by_a_runs_commit_under_a_cipher() {
     a_stray_write_is_kept("run", under_cipher(), true, |db| db.commit());
@@ -1414,6 +1432,7 @@ fn a_commit_answered_ok_after_a_failed_log_sync_survives_a_crash() {
     a_commit_after_a_failed_sync("plain", Options::default());
 }
 
+#[cfg(target_os = "linux")]
 #[test]
 fn a_commit_answered_ok_after_a_failed_log_sync_survives_a_crash_under_a_cipher() {
     a_commit_after_a_failed_sync("cipher", under_cipher());
@@ -1646,6 +1665,7 @@ fn a_failed_sync_of_the_log_directory_is_made_by_a_guard() {
 /// under their own names, and their guards with them: a power cut that
 /// took the live log file's entry and kept its guard opens with every
 /// commit after the barrier.
+#[cfg(target_os = "linux")]
 #[test]
 fn a_failed_sync_of_the_log_directory_under_a_cipher_is_made_by_a_guard() {
     let d = dir("dur-walsync-dir-cipher");
@@ -2282,6 +2302,7 @@ fn a_run_whose_fdatasync_failed_is_not_closed_into_a_named_segment() {
 /// owed as in the clear, and the call that writes it again writes the
 /// batch to the log too, so a power cut -- the memory file gone, the log
 /// cut to what a sync covered -- reads it back.
+#[cfg(target_os = "linux")]
 #[test]
 fn a_run_write_that_failed_under_a_cipher_is_written_again() {
     for (tag, again) in [
@@ -2332,6 +2353,7 @@ fn a_run_write_that_failed_under_a_cipher_is_written_again() {
 
 /// Under a cipher a failed fdatasync of the run's memory file is kept as
 /// in the clear: nothing is retried.
+#[cfg(target_os = "linux")]
 #[test]
 fn a_failed_run_fdatasync_is_kept_under_a_cipher() {
     let d = dir("dur-runsync-cipher");
@@ -2836,7 +2858,9 @@ fn a_run_closed_over_a_failed_write(tag: &str, opts: Options, fails: Fails) {
 #[test]
 fn a_run_closed_over_a_failed_write_writes_the_batch_into_its_segment() {
     let mut arms = run_arms();
-    arms.push(("cipher", under_cipher()));
+    if cfg!(target_os = "linux") {
+        arms.push(("cipher", under_cipher()));
+    }
     for (tag, o) in arms {
         for (p, sync) in [
             ("always", SyncPolicy::Always),
@@ -2862,6 +2886,7 @@ fn a_run_closed_over_a_failed_write_writes_the_batch_into_its_segment() {
 /// answers `Ok` has written and synced both, so a crash after it -- which
 /// takes every memory file the store had -- reads the batch back from
 /// the log.
+#[cfg(target_os = "linux")]
 #[test]
 fn a_cipher_runs_batch_owed_to_its_file_and_its_log_is_logged_again() {
     let d = dir("dur-runlog-cipher-both");
@@ -2913,6 +2938,7 @@ fn a_cipher_runs_batch_owed_to_its_file_and_its_log_is_logged_again() {
 /// a test's armed failure of its next fdatasync: the writer's one byte of
 /// attention sends the call to the cold path, which still closes the
 /// frames the log put back, and a crash after its `Ok` reads the batch.
+#[cfg(target_os = "linux")]
 #[test]
 fn a_cipher_runs_unlogged_batch_is_logged_by_a_commit_of_nothing_beside_an_armed_writer() {
     let d = dir("dur-runlog-cipher-armed");
@@ -3178,6 +3204,7 @@ fn a_write_that_failed_inside_a_sync_and_owed_exactly_what_it_synced_is_paid() {
 /// frames are in the file the rotation left loose and the live file holds
 /// none, and the commit of nothing that answers `Ok` has synced the loose
 /// file as a sync by policy would.
+#[cfg(target_os = "linux")]
 #[test]
 fn a_cipher_runs_batch_written_again_is_synced_in_a_log_file_a_rotation_left_loose() {
     let d = dir("dur-runlog-cipher-loose");
@@ -3226,6 +3253,7 @@ fn a_cipher_runs_batch_written_again_is_synced_in_a_log_file_a_rotation_left_loo
 /// the run's batch again and answers `Ok` has synced the log as well, the
 /// batch's one durable form under a cipher, so a crash after it -- which
 /// takes every memory file the store had -- reads the batch back.
+#[cfg(target_os = "linux")]
 #[test]
 fn a_cipher_runs_batch_written_again_by_a_commit_of_nothing_is_synced_in_its_log() {
     let d = dir("dur-runlog-cipher-again");
@@ -3509,6 +3537,7 @@ fn a_sync_after_a_reopen_makes_the_replayed_writes_durable_always() {
 /// The sealed log's header, the kind and the file's wrapped key, is longer
 /// than the plain one's; the power cut keeps all of it or a prefix only
 /// where no sync covered it, and here life 1's sync did.
+#[cfg(target_os = "linux")]
 #[test]
 fn a_sync_after_a_reopen_makes_the_replayed_writes_durable_under_a_cipher() {
     let o = Options {
@@ -3593,6 +3622,7 @@ fn a_flush_after_a_reopen_is_answered_only_once_its_writes_are_durable_always() 
 
 /// The same under a cipher: the drain's segment gets its envelope and its
 /// slot names it, and the log's sealed records are what the flush covers.
+#[cfg(target_os = "linux")]
 #[test]
 fn a_flush_after_a_reopen_is_answered_only_once_its_writes_are_durable_under_a_cipher() {
     let o = Options {
@@ -4134,6 +4164,7 @@ fn a_store_just_created_opens_after_a_power_cut_loses_its_logs_unsynced_header()
     a_store_just_created("plain", Options::default());
 }
 
+#[cfg(target_os = "linux")]
 #[test]
 fn a_store_just_created_opens_after_a_power_cut_loses_its_logs_unsynced_header_under_a_cipher() {
     a_store_just_created("cipher", under_cipher());
@@ -4269,6 +4300,7 @@ fn a_flush_survives_a_power_cut_that_loses_the_first_page_of_a_never_synced_log(
     a_flush_survives_a_lost_first_page("plain", Options::default());
 }
 
+#[cfg(target_os = "linux")]
 #[test]
 fn a_flush_survives_a_power_cut_that_loses_the_first_page_of_a_never_synced_log_under_a_cipher() {
     a_flush_survives_a_lost_first_page("cipher", under_cipher());
@@ -4599,6 +4631,7 @@ fn a_zeroed_older_log_file_before_a_chained_one_is_refused_as_damage() {
     a_zero_older_file_before_a_chained_one("plain", Options::default());
 }
 
+#[cfg(target_os = "linux")]
 #[test]
 fn a_zeroed_older_log_file_before_a_chained_one_is_refused_as_damage_under_a_cipher() {
     a_zero_older_file_before_a_chained_one("cipher", under_cipher());
@@ -4653,6 +4686,7 @@ fn a_reopen_that_cuts_a_torn_tail_makes_the_replayed_writes_durable() {
     a_sync_after_a_reopen_that_cut_a_torn_tail("plain", buffered());
 }
 
+#[cfg(target_os = "linux")]
 #[test]
 fn a_reopen_that_cuts_a_torn_tail_makes_the_replayed_writes_durable_under_a_cipher() {
     let o = Options {
@@ -4728,6 +4762,7 @@ fn a_failed_sync_of_a_loose_log_file_leaves_the_live_header_loose() {
     a_failed_loose_sync_leaves_the_header("plain", Options::default());
 }
 
+#[cfg(target_os = "linux")]
 #[test]
 fn a_failed_sync_of_a_loose_log_file_leaves_the_live_header_loose_under_a_cipher() {
     a_failed_loose_sync_leaves_the_header("cipher", under_cipher());
@@ -5230,6 +5265,7 @@ fn a_sync_that_hands_an_open_run_to_a_seal_has_put_its_commits_on_the_file() {
 /// commit, a `sync` with the run open syncs the frames the run left in
 /// the log: after a power cut -- the memory files gone, the log cut to
 /// what its syncs covered -- every commit before the sync reads back.
+#[cfg(target_os = "linux")]
 #[test]
 fn a_sync_makes_an_open_runs_logged_commits_survive_a_power_cut_under_a_cipher() {
     let mut failures = Vec::new();
@@ -5573,6 +5609,7 @@ fn a_flush_after_a_run_closed_into_a_seal_makes_the_runs_commits_durable() {
 /// covers them: with the seal held, a `sync` answered `Ok`, and a power
 /// cut -- the memory files gone, the log cut to what its syncs covered --
 /// every commit before the sync reads back, under both policies.
+#[cfg(target_os = "linux")]
 #[test]
 fn a_sync_after_a_run_closed_into_a_seal_covers_its_logged_commits_under_a_cipher() {
     let mut failures = Vec::new();
@@ -6375,6 +6412,7 @@ fn a_later_seal_names_no_seal_whose_fsync_failed_and_retires_none_of_its_log() {
 /// readable landing would be made durable, and named, by the next
 /// manifest's own write. No manifest is written from the failure on, so
 /// none writes the envelope late.
+#[cfg(target_os = "linux")]
 #[test]
 fn a_seal_whose_envelope_failed_under_a_cipher_is_made_durable_by_no_manifest() {
     let d = dir("dur-ss-cipher");
@@ -8150,6 +8188,7 @@ fn a_publish_after_a_drains_owed_slot_never_overwrites_the_last_durable_slot() {
 
 /// The same under a cipher, whose slots are sealed and written through the
 /// vault's door.
+#[cfg(target_os = "linux")]
 #[test]
 fn a_publish_after_a_drains_owed_slot_never_overwrites_the_last_durable_slot_under_a_cipher() {
     a_publish_after_an_owed_slot("cipher", under_cipher());
@@ -8181,15 +8220,17 @@ fn every_arm_that_writes_a_slot_keeps_the_last_durable_one() {
         OS_KEYS,
         OsTracker::reached_pending,
     );
-    a_publish_after_a_slot(
-        "pending-cipher",
-        Options {
-            manifest_pending: true,
-            ..under_cipher()
-        },
-        OS_KEYS,
-        OsTracker::reached_pending,
-    );
+    if cfg!(target_os = "linux") {
+        a_publish_after_a_slot(
+            "pending-cipher",
+            Options {
+                manifest_pending: true,
+                ..under_cipher()
+            },
+            OS_KEYS,
+            OsTracker::reached_pending,
+        );
+    }
     a_publish_after_a_slot(
         "inline",
         Options {
@@ -8440,6 +8481,7 @@ fn an_open_that_takes_an_unsynced_slot_never_overwrites_the_durable_one() {
     an_open_over_an_owed_slot("plain", Options::default());
 }
 
+#[cfg(target_os = "linux")]
 #[test]
 fn an_open_that_takes_an_unsynced_slot_never_overwrites_the_durable_one_under_a_cipher() {
     an_open_over_an_owed_slot("cipher", under_cipher());
@@ -8608,6 +8650,7 @@ fn an_open_makes_the_slot_it_takes_durable() {
     an_open_syncs_its_slot("plain", Options::default());
 }
 
+#[cfg(target_os = "linux")]
 #[test]
 fn an_open_makes_the_slot_it_takes_durable_under_a_cipher() {
     an_open_syncs_its_slot("cipher", under_cipher());
@@ -8644,6 +8687,7 @@ fn a_drain_after_an_owed_slot_was_synced_keeps_that_slot() {
     drains_after_an_owed_sync("plain", Options::default());
 }
 
+#[cfg(target_os = "linux")]
 #[test]
 fn a_drain_after_an_owed_slot_was_synced_keeps_that_slot_under_a_cipher() {
     drains_after_an_owed_sync("cipher", under_cipher());
@@ -8798,6 +8842,7 @@ fn a_slot_write_torn_over_an_owed_slot_is_not_named_durable_by_the_owed_sync() {
     a_torn_write_over_an_owed_slot("plain", Options::default());
 }
 
+#[cfg(target_os = "linux")]
 #[test]
 fn a_slot_write_torn_over_an_owed_slot_is_not_named_durable_by_the_owed_sync_under_a_cipher() {
     a_torn_write_over_an_owed_slot("cipher", under_cipher());
@@ -8993,6 +9038,7 @@ fn an_open_whose_slot_sync_fails_leaves_the_directory_as_it_found_it() {
     an_open_whose_slot_sync_fails("plain", Options::default());
 }
 
+#[cfg(target_os = "linux")]
 #[test]
 fn an_open_whose_slot_sync_fails_leaves_the_directory_as_it_found_it_under_a_cipher() {
     an_open_whose_slot_sync_fails("cipher", under_cipher());
@@ -9007,6 +9053,7 @@ fn an_open_under_the_rename_shape_whose_slot_sync_fails_leaves_the_directory_as_
     an_open_whose_slot_sync_fails_in("to-rename", Options::default(), true);
 }
 
+#[cfg(target_os = "linux")]
 #[test]
 fn an_open_under_the_rename_shape_whose_slot_sync_fails_leaves_the_directory_under_a_cipher() {
     an_open_whose_slot_sync_fails_in("to-rename-cipher", under_cipher(), true);
@@ -9203,6 +9250,7 @@ fn a_seals_publish_whose_slot_sync_fails_is_written_again_by_the_next_under_the_
     a_seal_publish_slot_sync_fails_under_the_slots("plain", Options::default());
 }
 
+#[cfg(target_os = "linux")]
 #[test]
 fn a_seals_publish_whose_slot_sync_fails_is_written_again_under_the_slots_and_a_cipher() {
     a_seal_publish_slot_sync_fails_under_the_slots("cipher", under_cipher());
@@ -9213,6 +9261,7 @@ fn a_slot_whose_fdatasync_failed_is_not_the_one_a_publish_keeps_off() {
     a_failed_slot_sync("plain", Options::default(), false);
 }
 
+#[cfg(target_os = "linux")]
 #[test]
 fn a_slot_whose_fdatasync_failed_is_not_the_one_a_publish_keeps_off_under_a_cipher() {
     a_failed_slot_sync("cipher", under_cipher(), false);
@@ -9223,6 +9272,7 @@ fn a_slot_whose_owed_fdatasync_failed_is_not_the_one_a_publish_keeps_off() {
     a_failed_slot_sync("owed-plain", Options::default(), true);
 }
 
+#[cfg(target_os = "linux")]
 #[test]
 fn a_slot_whose_owed_fdatasync_failed_is_not_the_one_a_publish_keeps_off_under_a_cipher() {
     a_failed_slot_sync("owed-cipher", under_cipher(), true);
@@ -9293,6 +9343,7 @@ fn a_second_seals_slot_torn_over_an_owed_slot_is_not_named_durable_by_the_owed_s
     a_torn_second_seal_slot("plain", Options::default());
 }
 
+#[cfg(target_os = "linux")]
 #[test]
 fn a_second_seals_slot_torn_over_an_owed_slot_is_not_named_durable_by_the_owed_sync_under_a_cipher()
 {
@@ -9392,6 +9443,7 @@ fn a_pending_slot_whose_fdatasync_failed_stops_the_slots_until_a_reopen() {
     a_failed_pending_slot_sync("plain", Options::default());
 }
 
+#[cfg(target_os = "linux")]
 #[test]
 fn a_pending_slot_whose_fdatasync_failed_stops_the_slots_until_a_reopen_under_a_cipher() {
     a_failed_pending_slot_sync("cipher", under_cipher());
@@ -9533,6 +9585,7 @@ fn the_first_publish_after_create_keeps_off_the_slot_create_wrote() {
     the_first_publish_after_create("plain", Options::default());
 }
 
+#[cfg(target_os = "linux")]
 #[test]
 fn the_first_publish_after_create_keeps_off_the_slot_create_wrote_under_a_cipher() {
     the_first_publish_after_create("cipher", under_cipher());
@@ -10088,6 +10141,7 @@ fn a_fallback_onto_a_slot_naming_files_gone_is_refused_before_anything_is_remove
     a_fallback_onto_a_slot_naming_files_gone("plain", Options::default());
 }
 
+#[cfg(target_os = "linux")]
 #[test]
 fn a_fallback_onto_a_slot_naming_files_gone_is_refused_under_a_cipher() {
     a_fallback_onto_a_slot_naming_files_gone("cipher", under_cipher());
@@ -10129,6 +10183,7 @@ fn an_open_whose_newest_slot_names_a_file_gone_refuses_and_leaves_every_file() {
 /// opens, takes the pending name (its envelope was written and synced
 /// before the slot that names it), writes the slot naming it durable, and
 /// opens again with every acknowledged write.
+#[cfg(target_os = "linux")]
 #[test]
 fn an_open_under_a_cipher_adopts_a_pending_segment_and_opens_again() {
     let d = dir("oo-pend-cipher");
@@ -10526,6 +10581,7 @@ fn an_open_with_both_slots_zeroed_refuses_and_leaves_every_file() {
 /// and keyed, and an open sweeps every envelope no slot it read names:
 /// with both slots emptied, every envelope of the store. Refused, every
 /// file left.
+#[cfg(target_os = "linux")]
 #[test]
 fn an_open_with_no_readable_slot_beside_envelopes_refuses_under_a_cipher() {
     let d = dir("oo-noslot-cipher");
@@ -11362,6 +11418,7 @@ fn a_torn_publish_over_an_owed_slot_survives_a_power_cut_after_the_reopen() {
     a_torn_publish_over_an_owed_slot("plain", Options::default());
 }
 
+#[cfg(target_os = "linux")]
 #[test]
 fn a_torn_publish_over_an_owed_slot_survives_a_power_cut_after_the_reopen_under_a_cipher() {
     a_torn_publish_over_an_owed_slot("cipher", under_cipher());
@@ -11437,6 +11494,7 @@ fn an_open_makes_no_slot_file_it_does_not_find() {
     an_absent_other_slot("plain", Options::default());
 }
 
+#[cfg(target_os = "linux")]
 #[test]
 fn an_open_makes_no_slot_file_it_does_not_find_under_a_cipher() {
     an_absent_other_slot("cipher", under_cipher());
@@ -11718,6 +11776,7 @@ fn a_rename_shape_publish_leaves_a_whole_manifest_at_every_step() {
     a_rename_publish_at_every_step("plain", Options::default());
 }
 
+#[cfg(target_os = "linux")]
 #[test]
 fn a_rename_shape_publish_leaves_a_whole_manifest_at_every_step_under_a_cipher() {
     a_rename_publish_at_every_step("cipher", under_cipher());
@@ -11829,6 +11888,7 @@ fn a_store_moved_from_the_alt_slot_killed_at_its_rename_open_is_whole() {
     a_kill_at_the_rename_open_of_an_alt_store("plain", Options::default());
 }
 
+#[cfg(target_os = "linux")]
 #[test]
 fn a_store_moved_from_the_alt_slot_killed_at_its_rename_open_is_whole_under_a_cipher() {
     a_kill_at_the_rename_open_of_an_alt_store("cipher", under_cipher());
@@ -11967,6 +12027,7 @@ fn a_kill_between_a_rename_and_its_directory_fsync_survives_a_power_cut_after_th
     a_kill_between_the_rename_and_its_dir_sync("plain", Options::default(), &r);
 }
 
+#[cfg(target_os = "linux")]
 #[test]
 fn a_kill_between_a_rename_and_its_directory_fsync_survives_a_power_cut_under_a_cipher() {
     let r = ra_opts(&Options::default());
@@ -11980,6 +12041,7 @@ fn a_rename_shape_store_killed_before_its_directory_fsync_reopens_under_the_slot
     a_kill_between_the_rename_and_its_dir_sync("to-slots", Options::default(), &s);
 }
 
+#[cfg(target_os = "linux")]
 #[test]
 fn a_rename_shape_store_killed_before_its_directory_fsync_reopens_under_the_slots_cipher() {
     let s = os_opts(&Options::default());
@@ -12066,6 +12128,7 @@ fn a_crossing_slots_open_whose_directory_fsync_fails_removes_nothing() {
     a_crossing_slots_open_whose_dir_sync_fails("plain", Options::default());
 }
 
+#[cfg(target_os = "linux")]
 #[test]
 fn a_crossing_slots_open_whose_directory_fsync_fails_removes_nothing_under_a_cipher() {
     a_crossing_slots_open_whose_dir_sync_fails("cipher", under_cipher());
@@ -12083,6 +12146,7 @@ fn a_store_moved_slots_rename_slots_killed_before_a_directory_fsync_survives_a_p
     a_kill_between_the_rename_and_its_dir_sync_born("srs", Options::default(), Some(false), &s);
 }
 
+#[cfg(target_os = "linux")]
 #[test]
 fn a_store_moved_slots_rename_slots_killed_before_a_directory_fsync_survives_under_a_cipher() {
     let s = os_opts(&Options::default());
@@ -12101,6 +12165,7 @@ fn a_slots_open_after_a_crossing_open_that_failed_survives_a_power_cut() {
     ra_kill_and_reopen("srsf", Options::default(), Some(false), &s, true);
 }
 
+#[cfg(target_os = "linux")]
 #[test]
 fn a_slots_open_after_a_crossing_open_that_failed_survives_a_power_cut_under_a_cipher() {
     let s = os_opts(&Options::default());
@@ -12113,6 +12178,7 @@ fn a_store_moved_from_the_alt_slot_killed_before_a_directory_fsync_survives_a_po
     a_kill_between_the_rename_and_its_dir_sync_born("srs-alt", Options::default(), Some(true), &s);
 }
 
+#[cfg(target_os = "linux")]
 #[test]
 fn a_store_moved_from_the_alt_slot_killed_before_a_directory_fsync_survives_under_a_cipher() {
     let s = os_opts(&Options::default());
@@ -12179,6 +12245,7 @@ fn an_open_under_the_rename_shape_whose_directory_fsync_fails_removes_nothing() 
     an_open_whose_dir_sync_fails("plain", Options::default());
 }
 
+#[cfg(target_os = "linux")]
 #[test]
 fn an_open_under_the_rename_shape_whose_directory_fsync_fails_removes_nothing_under_a_cipher() {
     an_open_whose_dir_sync_fails("cipher", under_cipher());
@@ -12283,6 +12350,7 @@ fn a_rename_publish_whose_directory_fsync_fails_names_nothing_durable_after() {
     a_failed_publish_dir_sync("plain", Options::default());
 }
 
+#[cfg(target_os = "linux")]
 #[test]
 fn a_rename_publish_whose_directory_fsync_fails_names_nothing_durable_after_under_a_cipher() {
     a_failed_publish_dir_sync("cipher", under_cipher());
@@ -12355,6 +12423,7 @@ fn a_rename_publish_that_fails_before_its_rename_stops_the_seal_queue() {
     a_failed_publish_temp("plain", Options::default());
 }
 
+#[cfg(target_os = "linux")]
 #[test]
 fn a_rename_publish_that_fails_before_its_rename_stops_the_seal_queue_under_a_cipher() {
     a_failed_publish_temp("cipher", under_cipher());
@@ -12526,6 +12595,7 @@ fn a_pending_store_reopened_under_the_rename_shape_without_the_option_survives_a
     a_pending_store_reopened_under_the_rename_shape_as("plain-off", Options::default(), false);
 }
 
+#[cfg(target_os = "linux")]
 #[test]
 fn a_pending_store_reopened_under_the_rename_shape_without_the_option_under_a_cipher() {
     a_pending_store_reopened_under_the_rename_shape_as("cipher-off", under_cipher(), false);
@@ -12534,6 +12604,7 @@ fn a_pending_store_reopened_under_the_rename_shape_without_the_option_under_a_ci
 /// Under a cipher a pending seal's envelope is written and synced before
 /// the slot that names it (`manifest_image`), so the reopen has nothing to
 /// make durable; the same states hold.
+#[cfg(target_os = "linux")]
 #[test]
 fn a_pending_store_reopened_under_the_rename_shape_survives_a_power_cut_under_a_cipher() {
     a_pending_store_reopened_under_the_rename_shape("cipher", under_cipher());
@@ -12655,6 +12726,7 @@ fn a_slots_store_killed_over_an_owed_slot_reopens_under_the_rename_shape() {
     a_slots_store_reopened_under_the_rename_shape("plain", Options::default());
 }
 
+#[cfg(target_os = "linux")]
 #[test]
 fn a_slots_store_killed_over_an_owed_slot_reopens_under_the_rename_shape_under_a_cipher() {
     a_slots_store_reopened_under_the_rename_shape("cipher", under_cipher());
@@ -12800,6 +12872,7 @@ fn a_rename_publish_fsyncs_the_directory_before_its_flush_is_answered() {
     a_rename_publish_syncs_its_directory("plain", Options::default());
 }
 
+#[cfg(target_os = "linux")]
 #[test]
 fn a_rename_publish_fsyncs_the_directory_before_its_flush_is_answered_under_a_cipher() {
     a_rename_publish_syncs_its_directory("cipher", under_cipher());
@@ -12907,6 +12980,7 @@ fn a_rename_open_whose_removal_of_the_slots_other_file_fails_answers_it() {
     a_rename_open_whose_alt_removal_fails("plain", Options::default());
 }
 
+#[cfg(target_os = "linux")]
 #[test]
 fn a_rename_open_whose_removal_of_the_slots_other_file_fails_answers_it_under_a_cipher() {
     a_rename_open_whose_alt_removal_fails("cipher", under_cipher());
@@ -13238,6 +13312,7 @@ fn a_runs_due_commit_over_a_log_that_owes_nothing_syncs_no_log() {
 /// syncs the log once, behind them (`Db::log_run`): the frames of the
 /// table frozen before the run are covered with it, and nothing syncs the
 /// log a second time ahead of the run's own frames.
+#[cfg(target_os = "linux")]
 #[test]
 fn a_runs_due_commit_under_a_cipher_syncs_the_log_once_behind_its_frames() {
     let d = dir("dur-duelog-cipher");
@@ -13922,6 +13997,7 @@ fn a_runs_owed_batch_written_again_over_a_log_a_sync_paid_syncs_no_log() {
 /// beside a file a rotation left loose notes nothing: its due commit syncs
 /// the loose file and the live one behind the run's frames (`Db::log_run`),
 /// and a power cut after it keeps every commit before it.
+#[cfg(target_os = "linux")]
 #[test]
 fn a_runs_due_commit_under_a_cipher_beside_a_loose_log_file_syncs_it_behind_its_frames() {
     a_due_commit_beside_a_log_that_owes("loose-cipher", under_cipher(), LogOwes::Loose, false);
@@ -14427,6 +14503,7 @@ fn a_run_commit_beside_a_helper_sync_that_met_an_error_answers_it() {
 /// to fail and whose commits are frames of the log; the helper syncs it on
 /// a description of its own all the same, and a seam's error there is the
 /// commit's.
+#[cfg(target_os = "linux")]
 #[test]
 fn a_run_commit_beside_a_helper_sync_that_met_an_error_answers_it_under_a_cipher() {
     a_run_commit_beside_a_helper_sync_that_met_an_error("cipher", under_cipher());
@@ -15110,6 +15187,7 @@ fn a_drain_names_its_runs_segment_durable_before_it_answers_inline() {
 
 /// Under a cipher the run's job awaits the writer as in the clear; the
 /// slot is sealed, so the flush's work is read back by a reopen.
+#[cfg(target_os = "linux")]
 #[test]
 fn a_drain_lands_its_run_under_a_cipher() {
     let d = dir("dur-do-lands-cipher");
@@ -15582,6 +15660,7 @@ fn an_open_opens_each_slot_file_once() {
     an_open_reads_each_slot_once("plain", Options::default());
 }
 
+#[cfg(target_os = "linux")]
 #[test]
 fn an_open_opens_each_slot_file_once_under_a_cipher() {
     an_open_reads_each_slot_once("cipher", under_cipher());
@@ -15628,6 +15707,7 @@ fn a_plain_open_finds_its_named_segments_in_its_listing() {
 /// Under a cipher the listing is of the store's own names, which the slot
 /// read gave it; whether each envelope is in the directory is asked of the
 /// directory, one by one. Held, not fixed: it passes before and after.
+#[cfg(target_os = "linux")]
 #[test]
 fn an_open_under_a_cipher_looks_for_each_named_envelope() {
     an_open_looks_for_named_segments("cipher", under_cipher(), true);
