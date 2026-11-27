@@ -13,10 +13,10 @@ Main when this was last read: `b3a043dc` (#37), tree `7f58d776`
 
 | Phase | Pass | Owner | Branch or PR | State | Waits on |
 |---|---|---|---|---|---|
-| 0 | Feature freeze | Bright | none | not declared: #37 landed on main on 2026-11-27 at 14:35 ET | Bright (decision 10) |
+| 0 | Feature freeze | Bright | none | not declared: main is still settling, and one other session is in flight that Bright expects to hold until after the tag | Bright's word that main has settled |
 | 0 | History audit (A) | coordinator's subagents | this branch, `release/history.md` | running, read-only | nothing |
 | 0 | History decision (B) | Bright | none | waits for the audit | decision 8 |
-| 0 | Release-candidate branch, C0 | coordinator | not created | not started | the freeze, decisions 8 and 11 |
+| 0 | Release-candidate branch, C0 | coordinator | not created; the coordinator names it when it is cut | not started | the freeze, decision 8 |
 | 0 | Baseline at C0 | measurement agent | `release/baseline.md` | preparation running: static counts, commands, no timing | C0 |
 | 1 | Delete: options ledger, dead code, API surface | not assigned | `release/options.csv` | the ledger's mechanical columns are being generated | C0, decision 1 |
 | 2 | Reshape: split `src/db.rs`, style | not assigned | none | not started | phase 1 |
@@ -28,22 +28,24 @@ Main when this was last read: `b3a043dc` (#37), tree `7f58d776`
 
 ## Decisions needed from Bright
 
-The plan's nine, and three the coordinator adds.
+The plan's nine, and three the coordinator added. Questions of naming, layout
+and convention are the coordinator's to settle by the default; what is
+still open below is what changes what ships.
 
 | # | Decision | Sets | State |
 |---|---|---|---|
 | 1 | Experimental options: stay in the public `Options` type, or move to a sub-struct or a feature | phase 1 | open; the ledger's counts are being prepared for it |
-| 2 | Is encryption in this tag | phase 3's scope | open; encryption is on main since #35, so the default is yes |
+| 2 | Is encryption in this tag | phase 3's scope | yes: the tag is of main, and encryption is on main since #35 |
 | 3 | Version and tag name; whether to publish to crates.io | phases 5 and 7 | open; `Cargo.toml` says 0.1.0 |
 | 4 | The format compatibility promise that starts at the tag | phase 3 | open |
 | 5 | Gate runtime budget and the number of flake-loop runs | phase 4 | open |
 | 6 | Target size of `CLAUDE.md`, and what stays in it | phase 5 | largely made by #37 (24.7 KB of rules); confirm, and the same for `bench/CLAUDE.md` (80 KB) |
 | 7 | Whether to commission the outside crypto review | phase 3 | open |
 | 8 | History: keep and fix forward, re-message main, or publish from a fresh repository | phase 0, before C0 | open; needs `release/history.md`; with no decision the plan's default is to keep and fix forward |
-| 9 | Whether commits on main keep the `Co-Authored-By` and `Claude-Session` trailers | every pull request from the freeze on | open |
-| 10 | Is main frozen at #37, and are `claude/e-recode-auto` and `claude/wal-ahead-beside-wip` parked | C0 | open |
-| 11 | The release-candidate branch's name, and leave for the coordinator to push it and open pull requests into it | every pass | open; this session may push only to its own branch |
-| 12 | Whether `release/` goes into the release candidate or stays on the coordination branch | the tag's contents | open; default: stays on the coordination branch |
+| 9 | Whether commits on main keep the `Co-Authored-By` and `Claude-Session` trailers | every pull request from the freeze on | the default stays, and no rule about trailers is written |
+| 10 | Is main frozen at #37, and are `claude/e-recode-auto` and `claude/wal-ahead-beside-wip` parked | C0 | not frozen yet; Bright says when |
+| 11 | The release-candidate branch's name | every pass | the coordinator's to choose |
+| 12 | Whether `release/` goes into the release candidate or stays on the coordination branch | the tag's contents | stays on the coordination branch, out of main and out of the tag |
 
 ## Where the plan and the repository differ
 
