@@ -32,14 +32,17 @@ pointer elsewhere of the form (`CLAUDE.md`, *entry*) names an entry there.
 - In a fresh container run `sh scripts/deps.sh` first and gate on its
   `all deps ready` line. Every install goes through `scripts/apt.sh`.
 - `sh scripts/check.sh` is the one definition of the checks (build, test,
-  stride, lint, wasm, bench), and CI calls it by the same group names. Never
+  stride, onefile, lint, wasm, bench, lists), and CI calls it by the same
+  group names. Never
   write a second definition. `quick` is a timing run, outside the default
-  set, and needs the machine to itself.
+  set, and needs the machine to itself. Nothing edits the tree until a
+  gate's last line: later groups compile the tree as it stands.
 - Every gate here has broken the same way: a check that was not running, or
   one reporting a verdict it had not earned. A script's verdict is its own
   exit, "differs" is told apart from "did not run", and both fail.
-- Every group denies warnings. No module carries a blanket lint allowance
-  (`block` and `flatindex` allow `dead_code` on wasm only), and nothing is
+- Every group denies warnings. Only the door's seven modules carry a
+  blanket allowance, of the door's two lints; any other allowance is an
+  item's, with its reason, counted in `tests/data/door.txt`. Nothing is
   exempt from the format gate. The suite's own lint runs in the `bench`
   group, not `lint`.
 - The toolchain is `rust-toolchain.toml`, installed and enforced by
@@ -50,21 +53,40 @@ pointer elsewhere of the form (`CLAUDE.md`, *entry*) names an entry there.
 - Tests run under `--profile checked` (release with overflow checks and
   debug assertions). The wasm module and the suite's timed binaries stay on
   `release`.
-- A change to an engine default lands only once `sh scripts/check.sh` has
-  passed with the new default in place. Before a default's quick row, open
-  the whole roster at the smallest rung with one rep.
+- A change to an engine default lands only once the suite has read it
+  better and `sh scripts/check.sh` has passed with it in place. Before a
+  default's quick row, open the whole roster at the smallest rung with one
+  rep.
 - The gate is of the tree, not of the default: a commit that adds a test,
   an arm's included, runs the groups that run it. The `stride` group runs
   every test again with a form file serving the store.
+- Outside the default set: `cost` (`deps.sh profile`), `enc` (`deps.sh
+  openssl`), `cross-arm`, `machine` and `fscrypt`, on the filesystem `sudo
+  sh scripts/fscrypt.sh up DIR "$(id -u):$(id -g)"` makes.
+- `lists` holds `tests/data`'s lists, which only go down, and `cost` counts
+  a store in the clear by function, both against `scripts/base.sh`'s base;
+  a raise is declared in `scripts/raises.txt`. A new toolchain or
+  `bench/.cargo/config.toml` is a new compiler: count again.
+- `lint` type-checks every target for macOS from Linux. A Linux-only call,
+  and a test that makes a store under a cipher, go behind
+  `cfg(target_os = "linux")`.
+- A switch's green (`SUPDB_TEST_STRIDE`, `SUPDB_TEST_ONEFILE`) is read after
+  a count that its mechanism fired. The fuzz runs past the gate's ranges
+  under `ZFUZZ_CIPHER=1` and `ZFUZZ_ONEFILE=1` before a change is called
+  done.
+- A merge clean by text is read for where one side's mechanism answers an
+  ask the other waits on or skips a count the other moves, and then every
+  binary runs whole, with `lists`, `cost` and the fuzz.
 - `cross-arm` runs under qemu, which answers `madvise` without a kernel. A
   test that reads the kernel's answer to advice (`smaps` flags, `mincore`
   after an ask) puts that part behind `cfg(supdb_emulated)`, and is run
-  under qemu before it is pushed.
+  under qemu before it is pushed, with `RUST_BACKTRACE=0`.
 - Every CI job has a `timeout-minutes`. An overdue hosted job is read by its
   groups after it ends before it is called a hang.
 - Use `--no-fail-fast`. A test binary that ends with 101 and no
-  `test result` line is a watchdog's exit. The dev profile is for one test
-  at a time, never the whole `db` binary.
+  `test result` line is a watchdog's exit if it printed the watchdog's
+  line, and a full disk until `df` says otherwise if it did not. The dev
+  profile is for one test at a time, never the whole `db` binary.
 - A test hands its callback to a generic read call through `tests/common`'s
   `kv` or `vf`, never a closure straight in: each closure compiles another
   copy of the read path. A slow compile is measured (`cargo build
@@ -72,7 +94,8 @@ pointer elsewhere of the form (`CLAUDE.md`, *entry*) names an entry there.
 - A worktree gets a target directory of its own and starts with
   `git switch -C <branch> <base>`; a result is believed only after `--list`
   shows the tests it names.
-- Every commit carries a verified signature: `git commit`, `merge` and
+- Every commit carries a verified signature, which `lists` holds for every
+  commit after the base (`scripts/signed.sh`): `git commit`, `merge` and
   `cherry-pick`, never `git commit-tree`. Mutants run in a worktree of their
   own, and a mutant's verdict is taken with nothing else on the machine.
 
@@ -80,7 +103,8 @@ pointer elsewhere of the form (`CLAUDE.md`, *entry*) names an entry there.
 
 - Tests leave stores at `$TMPDIR/supdb-next-<name>-<pid>`; remove them
   between runs. On a shared box give each run a `TMPDIR` of its own, since a
-  glob takes other runs' stores mid-test. A killed `bench ab` leaves
+  glob takes other runs' stores mid-test, spelled as the kernel resolves it
+  (`pwd -P`). A killed `bench ab` leaves
   `$TMPDIR/supdb-ab-<pid>`; remove it by name.
 - `ld terminated with signal 7 [Bus error]` means the disk allowance is
   spent, whatever `df` says. Clear old bench binaries, test stores, the
@@ -139,6 +163,16 @@ pointer elsewhere of the form (`CLAUDE.md`, *entry*) names an entry there.
 - An ask of the kernel (`WILLNEED`, a drop) is held to the kernel's count
   after it (`mincore`, `pagemap`) and repeated where it fell short. Resident
   is not mapped.
+- A stall or a kill is named by who waits on whom before any lever: each
+  thread's state and kernel stack sampled (`scripts/stallwatch.py`), and
+  the group's `memory.stat` every 10 ms up to a kill. Flat memory at the
+  end is a wait.
+- A count that moved with its source unchanged is read by instruction
+  (`--dump-instr=yes`) beside its callers and inlined callees, then
+  bisected, before it is called the compiler's.
+- A bar that names a competitor is paired against it before the design is
+  fixed, and a choice made off is retaken when a mechanism it stood on
+  changes.
 
 ## The suite gates this repository
 
@@ -152,15 +186,24 @@ pointer elsewhere of the form (`CLAUDE.md`, *entry*) names an entry there.
 - A second form of a structure may accompany the records only if the other
   paths never touch it. It is built only when what the store measures calls
   for it, and taken back when the measure turns.
+- An arm kept for pricing is a shape a store can be opened in: its crash
+  states are built as the default's are, under every mode it can be set
+  beside.
+- A feature switched off under a mode is a claim about today's code: the
+  part the mode breaks is given another way before the rest is given up.
+  Two options answering one question are one.
 
 ## Invariants a change must not break
 
 - **The read path is synchronous.** No `async` under `blob`, `flatindex` or
-  `bytes`: the `await` lives in JavaScript. Format knowledge stays in Rust.
+  `bytes`: the `await` lives in JavaScript. Format knowledge stays in Rust;
+  the one exception, the envelope's layout in `web/crypt.mjs`, is held to
+  the record file below.
 - **Two publishers, one pointer.** The writer and the segment work publish
   one `State` by compare-and-swap. Nothing a reader follows moves, except
   what an epoch licenses. Every reader pins; a replaced state is freed only
-  past every pin, and nobody waits for a reader. A read takes the state
+  past every pin, and nobody waits for a reader, except under a cipher,
+  where the evictor waits out pins before it frees. A read takes the state
   once. A `#[cfg(test)]` check holds `State: Send + Sync` and `Reader: Send`,
   which keeps cells out of shared structures.
 - **The writer's upkeep is lent, never shared.** One word says which thread
@@ -199,6 +242,25 @@ pointer elsewhere of the form (`CLAUDE.md`, *entry*) names an entry there.
   shared table stands, nothing is built that a handle's write cannot reach.
 - **A file a store names never changes.** New bytes go to a new file renamed
   over the old one; checkpoints share inodes.
+- **A store in the clear pays nothing for encryption**: not an instruction
+  on any read path or form, counted by function (`cost`). Cipher-only
+  knobs live in `StoreCipher`.
+- **The door and the wall.** No file, mapping, advice, sync or `/proc` read
+  in the library outside `vault`, `bytes`, `pager`, `crypt`, `dirkey`,
+  `blocks` and `onefile` (`scripts/door/`), and no form module names the
+  encryption or the reverse (`tests/data/couplings.txt`).
+- **The envelope is on record.** `tests/crypt.rs` and `web/crypt.test.mjs`
+  hold the writer and the browser's reader to `tests/data/crypt-v1.bin`; a
+  layout change is a new version and a new file beside it.
+- **Under a cipher, pins hold the cache.** The evictor frees a unit only
+  past every pin and `pager::Hold` taken before its mark, so each wait
+  under one says it holds nothing (`Reader::unlent`, `Hold::idle`).
+- **A failure is kept, never retried.** A failed sync, barrier or seal
+  step, or a write that cannot be put back, is kept (`Db::lost`) and
+  answered to every commit, `sync` and `flush` after it until reopen.
+- **An open decides before it removes.** It takes nothing it replayed as
+  durable, reads a zeroed first sector as an empty log, and removes or
+  writes nothing until its slot is checked against the directory.
 
 ## Rules the bugs left
 
@@ -256,6 +318,22 @@ Durability
   this process issued.
 - A recovery path is profiled when a workload first takes it, and tested at
   each of its own crash windows.
+- What the kernel keeps on an open file (readahead, advice, a writeback
+  error) is shared by everything made through it: each reader or syncing
+  thread gets an open of its own, and a file is named only after its
+  writer's handle synced.
+- Of two copies kept so one stands while the other is written, the one
+  written is the one not known durable by a sync that returned, never one
+  chosen by a counter.
+- A durability call is gated on what is unsynced in every log a commit can
+  be in (the WAL, the runs' files), never on which structure is live.
+- A quantity guarding an order between two logs (the greatest key) is kept
+  by every write that reaches either, a delete's included.
+- A step that can be refused is asked before anything it consumes is
+  taken, and a call that fails part way puts back what it changed.
+- Under a cipher a file being written is a memory file, whose fsync makes
+  nothing durable: durability comes from the log, the manifest and an
+  envelope written before a manifest names it.
 
 Performance shapes
 
@@ -280,6 +358,10 @@ Performance shapes
   or the old cost was triggering.
 - A threshold moved for one cell is priced on every cell that crosses it,
   and a cell is read against every fixed count on its path.
+- A new question on a hot path rides a test it already makes. A cold arm
+  is priced in the hot loop beside it, and moved out.
+- An advice reaches every cache its meaning covers, and a reader past a
+  cache asks the cache first.
 
 Bounds and memory
 
@@ -291,6 +373,9 @@ Bounds and memory
   keep their size.
 - Whatever owns a pointer it will free is a type with a `Drop`.
 - A library gives its large transient buffers back itself.
+- A budget near a limit is steered by the platform's reading of what is
+  limited, not the store's own count, and a writer that knows what it will
+  write says so before its first byte (`vault::expect`).
 
 Tests
 
@@ -321,6 +406,12 @@ Tests
   surviving mutant is first a question about the code.
 - A model's prediction is printed beside the measurement of the same
   quantity.
+- A test that passes at its first run is believed once its mutant fails
+  it. A hang is no kill until the test, and every thread it parks, has an
+  end.
+- A failure path's test fails every step of it, those after the publish
+  above all, and a refusal is tested by its words and a directory left as
+  found.
 
 Interfaces
 
