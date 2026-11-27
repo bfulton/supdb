@@ -522,7 +522,9 @@ pub unsafe extern "C" fn supdb_read_concat(h: u32, kptr: *const u8, klen: u32) -
     })
 }
 
-/// Keys in order from `from`, each with its value count.
+/// Keys in order from `from`, each with its value count: a record with no
+/// value is no key of the scan's and counts nothing toward `limit`
+/// (`Blob::scan_counts`).
 ///
 /// Layout: `u32 n`, then `n` records of `u32 klen`, `u32 count_lo`,
 /// `u32 count_hi`, then `klen` key bytes. Returns the framed length, or
@@ -714,8 +716,8 @@ pub unsafe extern "C" fn supdb_dict_plan(
     })
 }
 
-/// Every key in the range with its count, framed like `supdb_scan_counts`.
-/// Both range plans must be resident.
+/// Every key in the range with its count, framed like `supdb_scan_counts`,
+/// a record with no value no key of it. Both range plans must be resident.
 ///
 /// # Safety
 /// As `supdb_dict_plan`.

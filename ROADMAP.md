@@ -8,11 +8,6 @@ a tenth behind its comparator or behind a shape the engine already reaches.
 
 ## High priority
 
-- [ ] **What a segment's readers count.** `Blob::scan`, `SparseBlob` and the
-  wasm ABI's scans count a record toward the limit whether or not it holds
-  a value, and a segment written through `SegmentWriter::end_with(true)`
-  with no value holds one. Done when the readers' contract says which, and
-  the three readers are held to it against each other.
 - [ ] **A cheaper verification at open, and a way to skip it.** Every open
   but a cipher's (`Bytes::authenticated`) verifies each segment's whole key
   section against its checksum row, which with inline records is the whole

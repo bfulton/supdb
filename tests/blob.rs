@@ -434,6 +434,184 @@ fn a_source_that_lends_by_the_piece_answers_the_same() {
     }
 }
 
+/// A segment of sixty-four keys in which every third is a delete with no
+/// value after it (`SegmentWriter::end_with`) and every fifth that holds one
+/// carries the tombstone flag too, and the keys that hold a value, each with
+/// its one value of one width.
+fn build_bare(path: &Path) -> Vec<(Vec<u8>, Vec<Vec<u8>>)> {
+    let mut w = SegmentWriter::create(path, &SegmentOptions::default()).expect("create");
+    let mut want = Vec::new();
+    for k in 0..64u32 {
+        let key = format!("term={k:08}").into_bytes();
+        w.begin(&key).expect("begin");
+        if k % 3 != 0 {
+            let v = format!("{k:04}").into_bytes();
+            w.value(&v);
+            want.push((key, vec![v]));
+        }
+        w.end_with(k % 3 == 0 || k % 5 == 0).expect("end");
+    }
+    w.finish(1).expect("finish");
+    want
+}
+
+/// What a segment's reader counts, through one source: a scan from a key
+/// (`Blob::scan`, `scan_counts`, `scan_counts_fixed`) hands over and counts
+/// only the keys that hold a value, from every key and between them at
+/// every limit, and a walk from a rank (`Blob::scan_at`) counts every record
+/// it walks, so that a walk resumed at the rank plus its answer hands every
+/// value once.
+fn counts_keys_with_a_value<B: Bytes>(
+    blob: &Blob<B>,
+    records: usize,
+    want: &[(Vec<u8>, Vec<Vec<u8>>)],
+    what: &str,
+) {
+    let mut starts: Vec<Vec<u8>> = vec![Vec::new()];
+    for k in 0..64u32 {
+        starts.push(format!("term={k:08}").into_bytes());
+        starts.push(format!("term={k:08}+").into_bytes());
+    }
+    for from in &starts {
+        let i = want.partition_point(|(k, _)| k.as_slice() < from.as_slice());
+        for limit in [1usize, 2, 3, 5, 64] {
+            let expect = &want[i..want.len().min(i + limit)];
+            let mut got: Vec<(Vec<u8>, Vec<Vec<u8>>)> = Vec::new();
+            let n = blob
+                .scan(from, limit, |k, v| match got.last_mut() {
+                    Some((lk, vs)) if lk.as_slice() == k => vs.push(v.to_vec()),
+                    _ => got.push((k.to_vec(), vec![v.to_vec()])),
+                })
+                .unwrap();
+            assert_eq!(
+                (n, got.as_slice()),
+                (expect.len(), expect),
+                "{what}: scan from {from:?} limit {limit}"
+            );
+            let mut listed: Vec<(Vec<u8>, u64)> = Vec::new();
+            let n = blob
+                .scan_counts(from, limit, |k, c| {
+                    listed.push((k.to_vec(), c));
+                    true
+                })
+                .unwrap();
+            let expect_counts: Vec<(Vec<u8>, u64)> = expect
+                .iter()
+                .map(|(k, vs)| (k.clone(), vs.len() as u64))
+                .collect();
+            assert_eq!(
+                (n, listed),
+                (expect.len(), expect_counts.clone()),
+                "{what}: counts from {from:?} limit {limit}"
+            );
+            let mut fixed: Vec<(Vec<u8>, u64)> = Vec::new();
+            let n = blob
+                .scan_counts_fixed(from, limit, 4, |k, c| {
+                    fixed.push((k.to_vec(), c.expect("every value four bytes")));
+                    true
+                })
+                .unwrap();
+            assert_eq!(
+                (n, fixed),
+                (expect.len(), expect_counts),
+                "{what}: fixed counts from {from:?} limit {limit}"
+            );
+        }
+    }
+    // A point read of a key with no value hands nothing and reads nothing,
+    // its record's run of no bytes in a block it named and never wrote
+    // into, and its plan names nothing to fetch.
+    for k in (0..64u32).step_by(3) {
+        let key = format!("term={k:08}").into_bytes();
+        let mut got = 0usize;
+        assert_eq!(
+            blob.read_all(&key, |_| got += 1).unwrap(),
+            0,
+            "{what}: read of {k}"
+        );
+        assert_eq!(
+            (got, blob.count(&key).unwrap()),
+            (0, 0),
+            "{what}: count of {k}"
+        );
+        assert!(
+            blob.ranges_for(&key).unwrap().is_empty(),
+            "{what}: plan of {k}"
+        );
+    }
+    // By the rank: every record counted, a bare one among them handing
+    // nothing, and the walks resumed at the rank plus the answer.
+    assert_eq!(
+        blob.scan_at(0, usize::MAX, |_, _| {}).unwrap(),
+        records,
+        "{what}: records by the rank"
+    );
+    let mut rank = 0usize;
+    let mut values: Vec<Vec<u8>> = Vec::new();
+    loop {
+        let n = blob
+            .scan_at(rank, 7, |_, v| values.push(v.to_vec()))
+            .unwrap();
+        rank += n;
+        if n < 7 {
+            break;
+        }
+    }
+    assert_eq!(
+        rank, records,
+        "{what}: the walks by the rank end at the last record"
+    );
+    let all: Vec<Vec<u8>> = want.iter().flat_map(|(_, vs)| vs.clone()).collect();
+    assert_eq!(
+        values, all,
+        "{what}: the walks by the rank hand every value once"
+    );
+}
+
+/// A record with no value -- a delete a writer wrote for the segments older
+/// than its own -- is no key of a scan from a key's, as it is none of a
+/// store's: held through a mapping, a source that cannot lend, and sources
+/// that lend by the piece (`counts_keys_with_a_value`), the three against
+/// one another by the same expectations, and the sparse reader's dictionary
+/// counts (`SparseBlob::dictionary_counts`) listing the keys that hold one.
+#[test]
+fn a_record_with_no_value_is_no_key_of_a_scan_from_a_key() {
+    let path = scratch("bare-records");
+    let want = build_bare(&path);
+    let raw = std::fs::read(&path).unwrap();
+    let records = 64;
+    assert!(
+        want.len() < records,
+        "the fixture holds records with no value"
+    );
+    let mapped = Blob::open(MmapBytes::open(&path).unwrap()).expect("blob open");
+    counts_keys_with_a_value(&mapped, records, &want, "a mapping");
+    let copying = Blob::open(Copying(raw.clone())).expect("open copying");
+    counts_keys_with_a_value(&copying, records, &want, "a copying source");
+    for piece in [64, 4096] {
+        let by_piece =
+            Blob::open(Piecewise::checked(raw.clone(), piece)).expect("open by the piece");
+        counts_keys_with_a_value(&by_piece, records, &want, &format!("pieces of {piece}"));
+    }
+    let sparse = supdb::SparseBlob::open(VecBytes(raw)).expect("sparse open");
+    let mut listed: Vec<(Vec<u8>, u64)> = Vec::new();
+    let n = sparse
+        .dictionary_counts(b"", None, |k, c| {
+            listed.push((k.to_vec(), c));
+            true
+        })
+        .unwrap();
+    let expect: Vec<(Vec<u8>, u64)> = want
+        .iter()
+        .map(|(k, vs)| (k.clone(), vs.len() as u64))
+        .collect();
+    assert_eq!(
+        (n, listed),
+        (want.len(), expect),
+        "the sparse reader's dictionary"
+    );
+}
+
 /// The source a reader was opened over.
 fn blob_source<B: Bytes>(blob: &Blob<B>) -> &B {
     blob.source()

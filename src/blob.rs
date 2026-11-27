@@ -1007,6 +1007,14 @@ macro_rules! walk_fixed {
 /// over a key section held whole and the one over a section lent by the
 /// piece (`Blob::scan_pieces`), which is a function of its own so that the
 /// first is what it was.
+/// Whether a record's extents hold a value: a record with none is a delete a
+/// writer wrote for the segments older than its own, and no key of a scan
+/// from a key's (`Blob::scan`).
+#[inline]
+fn holds_value(exts: &[Ext]) -> bool {
+    exts.iter().any(|e| e.records() > 0)
+}
+
 macro_rules! emit_record {
     ($self:ident, $f:ident, $cached:ident, $k:ident, $exts:ident, $tail:ident) => {
         for e in $exts.iter() {
@@ -1952,8 +1960,9 @@ impl<B: Bytes> Blob<B> {
     fn plan_exts(&self, exts: &[Ext], out: &mut Vec<(u64, u64)>) -> Result<()> {
         for e in exts {
             // An inline run is in the index, which is resident after open:
-            // it costs the plan nothing and fetches nothing.
-            if e.is_inline() {
+            // it costs the plan nothing and fetches nothing; nor does a run
+            // of no bytes, which a read reads from nothing (`with_extent`).
+            if e.is_inline() || e.len == 0 {
                 continue;
             }
             let loc = self.loc_of(e.block)?;
@@ -2139,6 +2148,13 @@ impl<B: Bytes> Blob<B> {
     fn with_extent<R>(&self, e: Ext, f: impl FnOnce(&[u8]) -> Result<R>) -> Result<R> {
         if e.is_inline() {
             return Err(corrupt("inline run read without its record"));
+        }
+        // A run of no bytes is read from nothing: a delete with no value
+        // after it, which a writer with no inline limit placed in a block
+        // it never wrote a byte of. Its count is held to the empty run by
+        // the walk of it.
+        if e.len == 0 {
+            return f(&[]);
         }
         let loc = self.loc_of(e.block)?;
         let (a, b) = (
@@ -2593,6 +2609,8 @@ impl<B: Bytes> Blob<B> {
     /// count -- this is what a "top paths" or "countries" panel needs.
     ///
     /// Returns how many keys were visited. Stops early when `f` returns false.
+    /// A record with no value is no key of the walk's, and counts nothing
+    /// toward `limit`, as for `scan`.
     pub fn scan_counts<F: FnMut(&[u8], u64) -> bool>(
         &self,
         from: &[u8],
@@ -2614,8 +2632,12 @@ impl<B: Bytes> Blob<B> {
             // Read out of the extent records before the callback so the borrow
             // of the index section does not have to survive it.
             let n: u64 = exts.iter().map(|e| u64::from(e.records())).sum();
-            seen += 1;
             rank += 1;
+            // A record with no value is no key of a scan's (`Blob::scan`).
+            if n == 0 {
+                continue;
+            }
+            seen += 1;
             if !f(k, n) {
                 break;
             }
@@ -2658,9 +2680,13 @@ impl<B: Bytes> Blob<B> {
             }) else {
                 break;
             };
+            rank += 1;
+            // A record with no value is no key of a scan's (`Blob::scan`).
+            if !holds_value(&exts) {
+                continue;
+            }
             let n = fixed_count(&exts, stride, width as u64);
             seen += 1;
-            rank += 1;
             if !f(k, n) {
                 break;
             }
@@ -2729,8 +2755,19 @@ impl<B: Bytes> Blob<B> {
         Ok(asked)
     }
 
+    /// The keys from `from` on, in key order, at most `limit` of them, each
+    /// key's values handed to `f` in order, and how many keys were handed
+    /// over. A key counts toward the limit only where its record holds a
+    /// value: a record with none -- a delete a writer wrote for the
+    /// segments older than this one (`SegmentWriter::end_with`) -- is no key
+    /// of a scan's, as it is none of a store's. A walk from a rank
+    /// (`scan_at`) counts records instead.
     pub fn scan<F: FnMut(&[u8], &[u8])>(&self, from: &[u8], limit: usize, f: F) -> Result<usize> {
-        self.scan_at(self.seek(from), limit, f)
+        let rank = self.seek(from);
+        if B::ASK_PIECES && self.src.piecewise() {
+            return self.scan_pieces::<true, F>(rank, limit, f);
+        }
+        self.scan_at_in::<false, true, F>(self.walk_regions(), rank, limit, 0, f)
     }
 
     /// `scan_at`'s walk of the common record for a reader that holds its
@@ -2745,7 +2782,7 @@ impl<B: Bytes> Blob<B> {
     /// walk there, and the general walk reads on from it by the record,
     /// as `scan_at`'s does. The keys walked.
     #[inline(never)]
-    fn scan_pieces<F: FnMut(&[u8], &[u8])>(
+    fn scan_pieces<const KEYS: bool, F: FnMut(&[u8], &[u8])>(
         &self,
         mut rank: usize,
         limit: usize,
@@ -2758,7 +2795,7 @@ impl<B: Bytes> Blob<B> {
             .and_then(|(sec, idx)| idx.regions(sec).map(|(r, d)| (r, d, idx.len())));
         let (recs, dir, nkeys) = match windows {
             Some(w) => w,
-            None => return self.scan_records(seen, rank, limit, f, cached),
+            None => return self.scan_records::<KEYS, F>(seen, rank, limit, f, cached),
         };
         while seen < limit && rank < nkeys {
             let n = (limit - seen).min(nkeys - rank).min(SCAN_WINDOW);
@@ -2799,12 +2836,14 @@ impl<B: Bytes> Blob<B> {
                 break;
             }
         }
-        self.scan_records(seen, rank, limit, f, cached)
+        self.scan_records::<KEYS, F>(seen, rank, limit, f, cached)
     }
 
     /// A scan's general walk from `rank`, record by record through
-    /// `exts_at_full`, for a reader with no key section held whole.
-    fn scan_records<'a, F: FnMut(&[u8], &[u8])>(
+    /// `exts_at_full`, for a reader with no key section held whole; under
+    /// `KEYS` a record that holds no value walked and not counted
+    /// (`Blob::scan`).
+    fn scan_records<'a, const KEYS: bool, F: FnMut(&[u8], &[u8])>(
         &'a self,
         mut seen: usize,
         mut rank: usize,
@@ -2816,14 +2855,19 @@ impl<B: Bytes> Blob<B> {
             let Some((k, exts, tail)) = self.exts_at_full(rank) else {
                 break;
             };
+            let counts = !KEYS || holds_value(&exts);
             emit_record!(self, f, cached, k, exts, tail);
-            seen += 1;
+            seen += usize::from(counts);
             rank += 1;
         }
         Ok(seen)
     }
 
-    /// `scan`, from a rank a caller already has.
+    /// `scan`, from a rank a caller already has, by the record: `limit`
+    /// records walked, a record with no value among them handing nothing,
+    /// and their count answered, so the rank plus the answer is where the
+    /// next walk starts. `scan` from a key counts the keys that hold a
+    /// value instead.
     ///
     /// `db::Db` has one out of its ordered index and would otherwise pay for
     /// the seek twice. The rank is a position, not a promise: a rank past the
@@ -2841,7 +2885,7 @@ impl<B: Bytes> Blob<B> {
         f: F,
     ) -> Result<usize> {
         if B::ASK_PIECES && self.src.piecewise() {
-            return self.scan_pieces(rank, limit, f);
+            return self.scan_pieces::<false, F>(rank, limit, f);
         }
         self.scan_whole(rank, limit, f)
     }
@@ -2882,7 +2926,7 @@ impl<B: Bytes> Blob<B> {
         // The refusal is made before a record is walked, so the walk by
         // the piece starts where this one was asked to.
         if self.src.piecewise() && e.kind() == ErrorKind::Unsupported {
-            return self.scan_pieces(rank, limit, f);
+            return self.scan_pieces::<false, _>(rank, limit, f);
         }
         Err(e)
     }
@@ -2949,11 +2993,14 @@ impl<B: Bytes> Blob<B> {
         // section and re-slices the directory and the records every call, and
         // that plumbing rather than the record read is most of what resolving
         // a rank costs.
-        self.scan_at_in::<PACE, F>(self.walk_regions(), from_rank, limit, lead, f)
+        self.scan_at_in::<PACE, false, F>(self.walk_regions(), from_rank, limit, lead, f)
     }
 
-    /// `scan_at_with` over regions the caller resolved (`walk_regions`).
-    fn scan_at_in<const PACE: bool, F: FnMut(&[u8], &[u8])>(
+    /// `scan_at_with` over regions the caller resolved (`walk_regions`);
+    /// under `KEYS` the general walk counts only the records that hold a
+    /// value (`Blob::scan`), where the common shape's loop holds one a
+    /// record and counts each.
+    fn scan_at_in<const PACE: bool, const KEYS: bool, F: FnMut(&[u8], &[u8])>(
         &self,
         walk: Option<(&FlatIndex, &[u8], &[u8])>,
         from_rank: usize,
@@ -3054,8 +3101,9 @@ impl<B: Bytes> Blob<B> {
             }) else {
                 break;
             };
+            let counts = !KEYS || holds_value(&exts);
             emit_record!(self, f, cached, k, exts, tail);
-            seen += 1;
+            seen += usize::from(counts);
             rank += 1;
         }
         Ok(seen)
@@ -3081,7 +3129,7 @@ impl<B: Bytes> RunWalk<'_, B> {
         f: F,
     ) -> Result<usize> {
         self.blob
-            .scan_at_in::<false, F>(self.walk, from_rank, limit, 0, f)
+            .scan_at_in::<false, false, F>(self.walk, from_rank, limit, 0, f)
     }
 }
 
@@ -3729,17 +3777,25 @@ impl<B: Bytes> SparseBlob<B> {
     }
 
     /// `dictionary_walk` reduced to what a ranking wants: each key and its
-    /// record count, summed from the extents. No block is touched.
+    /// record count, summed from the extents, and how many keys were handed
+    /// over. A record with no value is no key of it, as for `Blob::scan`.
+    /// No block is touched.
     pub fn dictionary_counts<F: FnMut(&[u8], u64) -> bool>(
         &self,
         lo: &[u8],
         hi: Option<&[u8]>,
         mut f: F,
     ) -> Result<usize> {
+        let mut handed = 0usize;
         self.dictionary_walk(lo, hi, |k, exts, _| {
             let n: u64 = exts.iter().map(|e| u64::from(e.records())).sum();
+            if n == 0 {
+                return true;
+            }
+            handed += 1;
             f(k, n)
-        })
+        })?;
+        Ok(handed)
     }
 
     /// The data ranges a key's extents reach; `read_exts` then reads them.
