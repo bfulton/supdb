@@ -142,7 +142,7 @@ pub(crate) fn mapped_resident_bytes() -> usize {
 /// The bytes of the `len` at `p` that are resident, in whole pages, by
 /// `mincore`; none where the range is not a mapping any more.
 #[cfg(target_os = "linux")]
-fn resident_of(p: *mut u8, len: usize) -> usize {
+pub(crate) fn resident_of(p: *mut u8, len: usize) -> usize {
     // SAFETY: a constant's read.
     let page = unsafe { libc::sysconf(libc::_SC_PAGESIZE) }.max(1) as usize;
     let pages = len.div_ceil(page);
@@ -201,7 +201,7 @@ pub(crate) fn alloc(len: usize, zeroed: bool, mapped: bool) -> *mut u8 {
 /// # Safety
 /// `[p, p + len)` is a writable mapping of zeroed bytes nobody else reads
 /// or writes yet.
-unsafe fn populate_write(p: *mut u8, len: usize) {
+pub(crate) unsafe fn populate_write(p: *mut u8, len: usize) {
     #[cfg(target_os = "linux")]
     {
         // SAFETY: the caller's range; the advice changes no byte's value.
@@ -253,6 +253,10 @@ pub(crate) struct Source {
     /// A zeroed block mapped fresh is populated for writing before it is
     /// handed out (`Options::index_populated`, `populate_write`).
     populate: bool,
+    /// A mapped block of `HUGE` bytes or more is mapped on huge pages
+    /// (`map_huge`, `Options::shared_huge`), and neither taken from the
+    /// pool nor given to it, whose blocks of its length are not.
+    huge: bool,
 }
 
 impl Source {
@@ -261,7 +265,21 @@ impl Source {
             mapped,
             pool,
             populate: false,
+            huge: false,
         }
+    }
+
+    /// This source with its mapped blocks of `HUGE` bytes or more mapped on
+    /// huge pages, or not (`Options::shared_huge`).
+    pub(crate) fn huge(mut self, on: bool) -> Source {
+        self.huge = on;
+        self
+    }
+
+    /// Whether a block of `len` bytes from this source is mapped on huge
+    /// pages.
+    fn maps_huge(&self, len: usize) -> bool {
+        self.huge && maps(len, self.mapped) && len >= HUGE
     }
 
     /// This source with its zeroed mapped blocks populated for writing or
@@ -282,6 +300,14 @@ impl Source {
     /// its pages touched already, and zeroed here where asked, since a
     /// pooled block holds what its last table wrote.
     pub(crate) fn alloc(&self, len: usize, zeroed: bool) -> *mut u8 {
+        if self.maps_huge(len) {
+            let p = alloc_huge(len);
+            if zeroed && self.populate {
+                // SAFETY: the `len` bytes just mapped, nobody's yet.
+                unsafe { populate_write(p, len) };
+            }
+            return p;
+        }
         if maps(len, self.mapped) {
             if let Some(pool) = &self.pool {
                 if let Some(p) = pool.take(len) {
@@ -310,7 +336,7 @@ impl Source {
     /// As `free`: `p` came from this source's `alloc` with this `len`, and
     /// nothing reads it after.
     pub(crate) unsafe fn free(&self, p: *mut u8, len: usize) {
-        if maps(len, self.mapped) {
+        if maps(len, self.mapped) && !self.maps_huge(len) {
             if let Some(pool) = &self.pool {
                 if pool.give(p, len) {
                     return;
@@ -1242,6 +1268,72 @@ fn map(len: usize) -> *mut u8 {
     p as *mut u8
 }
 
+/// A transparent huge page's bytes, the alignment `map_huge` maps at.
+pub(crate) const HUGE: usize = 2 << 20;
+
+/// `len` bytes mapped as `map` maps them, at an address a multiple of
+/// `HUGE` and advised `MADV_HUGEPAGE`, so that the kernel can back every
+/// whole `HUGE` of it with one page, which a mapping at an address the
+/// kernel chose leaves to the extents that happen to be aligned. Mapped
+/// `HUGE` longer and the excess on either side unmapped, so the mapping is
+/// exactly `[p, p + len)` and `unmap` gives it back as `map`'s. The advice
+/// is advice: a kernel without huge pages leaves the pages small.
+#[cfg(unix)]
+fn map_huge(len: usize) -> *mut u8 {
+    // SAFETY: an anonymous private mapping of `len + HUGE` bytes, no file,
+    // no address asked for.
+    let p = unsafe {
+        libc::mmap(
+            std::ptr::null_mut(),
+            len + HUGE,
+            libc::PROT_READ | libc::PROT_WRITE,
+            libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
+            -1,
+            0,
+        )
+    };
+    assert!(p != libc::MAP_FAILED, "block: out of memory (mmap)");
+    let (a, head, tail) = huge_trim(p as usize);
+    // SAFETY: the parts of the mapping just made outside `[a, a + len)`,
+    // which nothing has seen, and the advice over the rest.
+    unsafe {
+        if head > 0 {
+            libc::munmap(p, head);
+        }
+        if tail > 0 {
+            libc::munmap((a + len) as *mut libc::c_void, tail);
+        }
+        #[cfg(target_os = "linux")]
+        libc::madvise(a as *mut libc::c_void, len, libc::MADV_HUGEPAGE);
+    }
+    a as *mut u8
+}
+
+/// Of a mapping `HUGE` bytes longer than the block it is cut for at `p`, the
+/// block's start at the first multiple of `HUGE`, and the bytes before the
+/// block and after it to unmap. A kernel from 6.7 on puts an anonymous
+/// mapping of `HUGE` or more at such a multiple already, and one before it
+/// anywhere a page lands.
+fn huge_trim(p: usize) -> (usize, usize, usize) {
+    let a = p.next_multiple_of(HUGE);
+    let head = a - p;
+    (a, head, HUGE - head)
+}
+
+#[cfg(not(unix))]
+fn map_huge(len: usize) -> *mut u8 {
+    map(len)
+}
+
+/// `alloc(len, true, true)`'s mapping by `map_huge`, counted as `alloc`
+/// counts a mapping and freed by `free` as one.
+fn alloc_huge(len: usize) -> *mut u8 {
+    let p = map_huge(len);
+    MAPPED.fetch_add(len, Ordering::Relaxed);
+    live().push((p as usize, len));
+    p
+}
+
 #[cfg(unix)]
 unsafe fn unmap(p: *mut u8, len: usize) {
     // SAFETY: the caller's, see `free`.
@@ -1263,6 +1355,32 @@ unsafe fn unmap(p: *mut u8, len: usize) {
     let layout = std::alloc::Layout::from_size_align(len, ALIGN).expect("block layout");
     // SAFETY: the caller's, see `free`.
     unsafe { std::alloc::dealloc(p, layout) };
+}
+
+/// The flags the kernel keeps for the mapping that holds `p`, from
+/// `/proc/self/smaps`: `hg` where it was advised onto huge pages.
+#[cfg(all(test, target_os = "linux"))]
+pub(crate) fn vm_flags(p: *const u8) -> String {
+    let smaps = std::fs::read_to_string("/proc/self/smaps").unwrap();
+    let mut inside = false;
+    for line in smaps.lines() {
+        if let Some((range, _)) = line.split_once(' ') {
+            if let Some((lo, hi)) = range.split_once('-') {
+                if let (Ok(lo), Ok(hi)) =
+                    (usize::from_str_radix(lo, 16), usize::from_str_radix(hi, 16))
+                {
+                    inside = (lo..hi).contains(&(p as usize));
+                    continue;
+                }
+            }
+        }
+        if inside {
+            if let Some(f) = line.strip_prefix("VmFlags:") {
+                return f.to_string();
+            }
+        }
+    }
+    panic!("no mapping holds {p:?}");
 }
 
 #[cfg(test)]
@@ -1308,6 +1426,83 @@ mod tests {
         assert!(s.iter().all(|&b| b == 0), "a heap block zeroed");
         // SAFETY: as above.
         unsafe { small.free(p, MAP_FROM / 2) };
+    }
+
+    /// The mapping a huge block is cut from is trimmed to the first multiple
+    /// of `HUGE` in it, whatever address the kernel gave: the bytes kept
+    /// start there, and the bytes before and after them are the excess,
+    /// none past the mapping's end.
+    #[test]
+    fn a_huge_mapping_is_cut_at_the_first_multiple_of_a_huge_page() {
+        let len = 2 * HUGE;
+        for p in [0x4000_0000usize, 0x4000_1000, 0x401f_f000, 0x4010_0000] {
+            let (a, head, tail) = huge_trim(p);
+            assert_eq!(a % HUGE, 0, "{p:#x}");
+            assert!(a >= p && a < p + HUGE, "{p:#x}: the first multiple");
+            assert_eq!(head, a - p, "{p:#x}");
+            assert_eq!(head + len + tail, len + HUGE, "{p:#x}: the whole mapping");
+        }
+    }
+
+    /// A huge source maps a block of `HUGE` bytes or more at an address a
+    /// multiple of `HUGE`, advised onto huge pages, writable to its last
+    /// byte, and neither takes such a block from its pool nor gives one to
+    /// it; a block under `HUGE` from it, and every block of a source that is
+    /// not huge, are as they were. Where the kernel has no huge pages the
+    /// advice is refused and the flag absent, and under qemu-user
+    /// (`supdb_emulated`) the advice is answered and passed to no kernel,
+    /// so the flag is read only where a kernel keeps the setting; where
+    /// the block is cut and what the pool holds are the source's own and
+    /// are held everywhere.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_huge_source_maps_its_large_blocks_aligned_and_advised_and_pools_none() {
+        let thp = !cfg!(supdb_emulated)
+            && std::path::Path::new("/sys/kernel/mm/transparent_hugepage/enabled").exists();
+        let len = 2 * HUGE;
+        let pool = std::sync::Arc::new(BlockPool::new(4 * len, true));
+        let huge = Source::new(true, Some(pool.clone())).huge(true);
+        let plain = Source::new(true, Some(pool.clone()));
+        // A plain block given to the pool, which a huge source must not take.
+        let q = plain.alloc(len, false);
+        // SAFETY: from this source's `alloc` with this length.
+        unsafe { plain.free(q, len) };
+        assert_eq!(pool.held().len(), 1, "a plain block pooled");
+        let p = huge.alloc(len, false);
+        assert_ne!(p, q, "a huge block taken from the pool");
+        assert_eq!(p as usize % HUGE, 0, "a huge block aligned");
+        if thp {
+            assert!(vm_flags(p).split_whitespace().any(|f| f == "hg"), "advised");
+        }
+        // SAFETY: `len` bytes just mapped.
+        let s = unsafe { std::slice::from_raw_parts_mut(p, len) };
+        s[0] = 1;
+        s[len - 1] = 2;
+        assert_eq!((s[0], s[len - 1]), (1, 2));
+        // SAFETY: from this source's `alloc` with this length.
+        unsafe { huge.free(p, len) };
+        assert_eq!(pool.held().len(), 1, "a huge block given to the pool");
+        // A block under `HUGE` from the huge source is the pool's as any.
+        let small = huge.alloc(HUGE / 2, false);
+        if thp {
+            assert!(
+                !vm_flags(small).split_whitespace().any(|f| f == "hg"),
+                "small advised"
+            );
+        }
+        // SAFETY: as above.
+        unsafe { huge.free(small, HUGE / 2) };
+        assert_eq!(pool.held().len(), 2, "a small block pooled");
+        let r = plain.alloc(len, false);
+        assert_eq!(r, q, "the plain block, from the pool");
+        if thp {
+            assert!(
+                !vm_flags(r).split_whitespace().any(|f| f == "hg"),
+                "plain advised"
+            );
+        }
+        // SAFETY: as above.
+        unsafe { plain.free(r, len) };
     }
 
     /// A block of either kind is cache-line aligned, zero where asked,
@@ -1955,8 +2150,13 @@ mod tests {
         );
         // SAFETY: from `alloc` with these arguments, read no more.
         unsafe { free(p, len, true) };
+        // A range no mapping holds is resident nowhere: the page at address
+        // zero, which the kernel gives no mapping (`vm.mmap_min_addr`). Not
+        // the range just freed, which another thread of this binary may be
+        // given by its next mapping before the count is read -- seventeen
+        // pages of someone else's were, once in a gate's stride group.
         assert_eq!(
-            resident_of(p, len),
+            resident_of(std::ptr::null_mut(), 4096),
             0,
             "an unmapped range is resident nowhere"
         );

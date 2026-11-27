@@ -2,7 +2,9 @@
 //! into a row.
 //!
 //! Every arm in one process, interleaved one round at a time, so a machine
-//! that drifts drifts across all of them rather than into one. A rep is one
+//! that drifts drifts across all of them rather than into one, and each
+//! round in an order of its own (`rep_order`), so that no arm's pass
+//! follows the same arm's in every rep. A rep is one
 //! complete pass of every workload for one arm; rep zero is a warmup and is
 //! discarded, because the first touch of a fresh file pays for allocation
 //! and first-fault costs that no steady state repeats -- and a run whose
@@ -152,11 +154,20 @@ pub struct Passes {
     #[serde(default)]
     pub recover: bool,
     /// The threaded mixes, `threads-A` and its kin (`THREADED`): gets and
-    /// puts from several threads at once, on a store of their own. In no
-    /// row of the series: off in `all`, and run where `--passes` names
-    /// them, for what they cost every arm (`DESIGN.md`).
+    /// puts from several threads at once, on a store of their own, for
+    /// every arm. In no row of the series: off in `all`, and run where
+    /// `--passes` names them, for what they cost every arm (`DESIGN.md`).
     #[serde(default)]
     pub mixes_threaded: bool,
+    /// The threaded mixes for the arms of the guarantee FASTER's is
+    /// (`Guarantee::Memory`) alone, whose comparator's own benchmark they
+    /// are and whose commits reach no device, so that they cost a row a
+    /// minute where every arm's cost it as much again as the row
+    /// (`threaded_runs`). A row's in core: on in `all`, off in a pairing,
+    /// which runs them where they are named, and off in a list of passes.
+    /// Absent from a plan written before it, where it reads as off.
+    #[serde(default)]
+    pub threads_held: bool,
 }
 
 impl Passes {
@@ -187,17 +198,27 @@ impl Passes {
             lag: true,
             recover: true,
             mixes_threaded: false,
+            threads_held: true,
         }
     }
 
     /// What a pairing runs where it names no passes (`bench ab`): every
     /// pass but the recovery workloads, which load two stores more an arm
-    /// a rep and are run by the pairing that asks for them.
+    /// a rep and are run by the pairing that asks for them, and the
+    /// threaded mixes, which a pairing names.
     pub fn paired() -> Passes {
         Passes {
             recover: false,
+            threads_held: false,
             ..Passes::all()
         }
+    }
+
+    /// Whether `arm`'s pass runs the threaded mixes: named for every arm,
+    /// or a row's for an arm of FASTER's guarantee (`threads_held`).
+    pub fn threaded_runs(&self, arm: &str) -> bool {
+        self.mixes_threaded
+            || (self.threads_held && engines::guarantee(arm) == Some(Guarantee::Memory))
     }
 
     /// A comma-separated list of `NAMES`; a name not among them is an
@@ -215,6 +236,7 @@ impl Passes {
             lag: false,
             recover: false,
             mixes_threaded: false,
+            threads_held: false,
         };
         let mut any = false;
         for name in list.split(',').map(str::trim).filter(|s| !s.is_empty()) {
@@ -665,7 +687,12 @@ pub fn phase_mark(arm: &str, phase: &str, edge: &str) {
 /// store holds after it (`zs`), so that a stride arm's cell is read by the
 /// form that served it, and the writer's point reads by the path that
 /// answered them, with the ones a tombstone in the live table's chain ended
-/// (`gets`). The lag sweep prints one a point (`SUPDB_LAG_COUNTERS`) and
+/// (`gets`), and the merges landed beside the partitions they rewrote over
+/// the same keys (`keyseqs`, `Options::identity_by_keys`) with the settle's
+/// patches of a copy at a rank and by a search (`patches`) and the copies
+/// packed into one stream and unpacked again (`packs`), and the partitions'
+/// heads the process holds, with those copied under the raw gate at the
+/// group's limit (`heads`, totals). The lag sweep prints one a point (`SUPDB_LAG_COUNTERS`) and
 /// the mixes one a mix (`SUPDB_MIX_COUNTERS`).
 fn counters_line(
     tag: &str,
@@ -679,7 +706,7 @@ fn counters_line(
     let get = |c: &[(&str, f64)], n: &str| c.iter().find(|(k, _)| *k == n).map_or(0.0, |(_, v)| *v);
     let d = |n: &str| get(c1, n) - get(c0, n);
     eprintln!(
-        "{tag} {arm} {point} flt up {flt_up} main {flt_main} memfree_mb {} burst_ms {burst_ms:.1} pass_ms {pass_ms:.1} | ph take {:.2} sync {:.2} settle {:.2} snap {:.2} ahead {:.2} install {:.2} | thread {:.1}ms/{:.0}p holds {:.0}/{:.1}ms maint {:.1}ms | built up {:.0} eng {:.0} rd {:.0} cloned {:.0} | snaps {:.0} refr {:.0} stood {:.0} dropped_mb {:.0} | walks {:.0}/{:.0}/{:.0} starts {:.0}/{:.0} | pieces {:.0} unsealed {:.0} handles-scans {:.0} | z reads {:.0} dec {:.0} scans {:.0} groups {:.0} memo {:.0}/{:.0} pf {:.0} | steps settle {:.1} snap {:.1} fillwalk {:.1} fillbuild {:.1} ms fills {:.0} cuts {:.0} left {:.0} owed {:.0} | zs reads {:.0} checks {:.0} cursor {:.0} builds {:.0} files {:.0} | gets lone {:.0} layers {:.0} placed {:.0} live {:.0}",
+        "{tag} {arm} {point} flt up {flt_up} main {flt_main} memfree_mb {} burst_ms {burst_ms:.1} pass_ms {pass_ms:.1} | ph take {:.2} sync {:.2} settle {:.2} snap {:.2} ahead {:.2} install {:.2} | thread {:.1}ms/{:.0}p holds {:.0}/{:.1}ms maint {:.1}ms | built up {:.0} eng {:.0} rd {:.0} cloned {:.0} | snaps {:.0} refr {:.0} stood {:.0} dropped_mb {:.0} | walks {:.0}/{:.0}/{:.0} starts {:.0}/{:.0} | pieces {:.0} unsealed {:.0} handles-scans {:.0} | z reads {:.0} dec {:.0} scans {:.0} groups {:.0} memo {:.0}/{:.0} pf {:.0} | steps settle {:.1} snap {:.1} fillwalk {:.1} fillbuild {:.1} ms fills {:.0} cuts {:.0} left {:.0} owed {:.0} | zs reads {:.0} checks {:.0} cursor {:.0} builds {:.0} files {:.0} | gets lone {:.0} layers {:.0} placed {:.0} live {:.0} | merges {:.0} keyseqs {:.0} patches {:.0}/{:.0} packs {:.0}/{:.0} heads {:.0}/{:.0}",
         mem_free_mb(),
         d("scan_take_us") / 1e3,
         d("scan_sync_us") / 1e3,
@@ -731,7 +758,15 @@ fn counters_line(
         d("reads_lone"),
         d("reads_layers"),
         d("reads_placed"),
-        d("reads_live_ended")
+        d("reads_live_ended"),
+        d("merges_landed"),
+        d("keyseqs_kept"),
+        d("patch_at_rank"),
+        d("patch_search"),
+        d("copies_packed"),
+        d("copies_unpacked"),
+        get(c1, "heads_owned"),
+        get(c1, "heads_past_fill")
     );
     // The process's memory beside the structures that count their own: the
     // resident bytes, what the allocator has handed out and what it holds
@@ -914,6 +949,10 @@ fn counters_line(
             // chains them through writes (`Options::merge_chains_writes`).
             "merge_plans",
             "merges_landed",
+            // Of the partitions the merges wrote, those that hold the keys
+            // of the partition they rewrote and no others, whose copies
+            // keep their ranks (`Options::identity_by_keys`).
+            "keyseqs_kept",
             // The writer's block forms given up for the merge path and
             // taken back, and of the times taken back, those at a commit
             // for a reading of the scans gone stale
@@ -1236,6 +1275,44 @@ pub struct Resume {
     pub ledger: Ledger,
     pub head: Head,
     pub passes_only: bool,
+}
+
+/// The order a rep runs its arms in, as indices into the plan's arms: a
+/// different one each rep, so that no arm keeps one predecessor.
+///
+/// What a pass leaves is a variable of the pass after it, and in the
+/// plan's order every rep an arm's pass followed the same arm's: `supdb`,
+/// first in the roster, followed the last, which since FASTER joined is
+/// FASTER's, and a load of ten thousand keys straight after FASTER's pass
+/// reads a seventh slower than the same load after any other arm's --
+/// the same code, 9.8 ms against 8.1 to 8.7 with four arms of one load
+/// path set after LMDB's, FASTER's, RocksDB's and each other's passes in
+/// one run, whichever of the four stood where (`bench/CLAUDE.md`, a
+/// predecessor every rep). So a row compared `supdb` after FASTER with
+/// `rocksdb-tuned` after LMDB, in every rep of every rung.
+///
+/// Rep `r` starts at arm `r - 1` and steps by the `r - 1`th of the strides
+/// that share no factor with the arm count, each a permutation: with
+/// distinct strides an arm's predecessor within the rep is a different arm
+/// in each, for as many reps as there are such strides (eight for fifteen
+/// arms), and two arms alternate. The warmup and the first rep run in the
+/// plan's order. A function of the count and the rep alone, so a run
+/// taken up from its ledger orders a rep as the run that was cut did.
+pub fn rep_order(arms: usize, rep: usize) -> Vec<usize> {
+    if arms < 2 || rep == 0 {
+        return (0..arms).collect();
+    }
+    fn gcd(a: usize, b: usize) -> usize {
+        if b == 0 {
+            a
+        } else {
+            gcd(b, a % b)
+        }
+    }
+    let k = rep - 1;
+    let strides: Vec<usize> = (1..arms).filter(|s| gcd(*s, arms) == 1).collect();
+    let stride = strides[k % strides.len()];
+    (0..arms).map(|i| (k + i * stride) % arms).collect()
 }
 
 /// The seam a test cuts a run at: `SUPDB_BENCH_STOP_AFTER=<size>-<rep>`
@@ -1752,7 +1829,8 @@ pub fn run(
                 s.extend(&frag);
                 continue;
             };
-            for arm in &plan.arms {
+            for ai in rep_order(plan.arms.len(), rep) {
+                let arm = &plan.arms[ai];
                 if !arms_to_run.contains(arm) {
                     let l = ledger.as_ref().expect("a pass is kept only in a ledger");
                     replay_arm(l, size, rep, arm, &mut s, &mut killed)?;
@@ -3391,7 +3469,7 @@ fn one_pass(
     // reads' must. In memory only: no count is read around them, so a
     // bounded row carries none.
     let mut mix_threaded = Vec::new();
-    if passes.mixes_threaded && plan.bound.is_none() {
+    if passes.threaded_runs(arm) && plan.bound.is_none() {
         prime_fresh_pool(prime_bytes_for(size, plan.bound_bytes()))?;
         // The lag store's files are still here where that store was built.
         let _ = std::fs::remove_dir_all(dir);
@@ -4907,6 +4985,13 @@ struct ThreadedMixed {
 /// Nothing syncs inside the window. A buffered arm's commit is in the
 /// kernel when it returns, and what an engine promises less than that is
 /// its arm's to say (`Features`).
+///
+/// With `SUPDB_THREADED_COUNTERS` set, each thread's handle's own counts
+/// (`ThreadWriter::counters`), read once its share is done, summed over
+/// the threads and printed as one `threadcounters` line a cell on stderr:
+/// how a supdb handle's reads were answered, and under the shared table
+/// the operations its own probe ended and the first touches it read
+/// below it, which say which regime a cell is in.
 #[allow(clippy::too_many_arguments)]
 fn threaded_mix(
     e: &mut dyn Engine,
@@ -4924,9 +5009,11 @@ fn threaded_mix(
         return Err("a threaded mix needs at least one thread".to_string());
     }
     let name = e.name();
+    let counting = std::env::var_os("SUPDB_THREADED_COUNTERS").is_some();
     let openers = e.thread_writers(threads)?;
     let barrier = std::sync::Barrier::new(threads + 1);
-    type Timed = Result<(Instant, Instant, u64, u64), String>;
+    type Counts = Vec<(&'static str, u64)>;
+    type Timed = Result<(Instant, Instant, u64, u64, Counts), String>;
     let results: Vec<Timed> = std::thread::scope(|s| {
         let workers: Vec<_> = openers
             .into_iter()
@@ -4947,6 +5034,7 @@ fn threaded_mix(
                     let mut wbuf = Batch::with_capacity(YCSB_BATCH, payload.value_size());
                     barrier.wait();
                     let start = Instant::now();
+                    let before = counting.then(thread_usage);
                     let mut w = opened?;
                     let (mut reads, mut bytes) = (0u64, 0u64);
                     for _ in 0..share {
@@ -4978,7 +5066,20 @@ fn threaded_mix(
                     }
                     wbuf.flush_updates_to(w.as_mut())?;
                     let end = Instant::now();
-                    Ok((start, end, reads, bytes))
+                    let mut counts = if counting { w.counters() } else { Vec::new() };
+                    if let Some([user, sys, minflt, majflt]) = before {
+                        // The thread's own clock and faults over its
+                        // share, beside its wall: a thread slower than its
+                        // CPU waited, and one whose kernel share grew with
+                        // its faults paid for fresh pages.
+                        let [u, s, mi, ma] = thread_usage();
+                        counts.push(("wall_us", end.duration_since(start).as_micros() as u64));
+                        counts.push(("user_us", u - user));
+                        counts.push(("sys_us", s - sys));
+                        counts.push(("minflt", mi - minflt));
+                        counts.push(("majflt", ma - majflt));
+                    }
+                    Ok((start, end, reads, bytes, counts))
                 })
             })
             .collect();
@@ -4996,8 +5097,16 @@ fn threaded_mix(
     let (mut reads, mut bytes) = (0u64, 0u64);
     let mut first: Option<Instant> = None;
     let mut last: Option<Instant> = None;
+    // Summed over the threads.
+    let mut counts: Vec<(&'static str, u64)> = Vec::new();
     for r in results {
-        let (start, end, n, b) = r?;
+        let (start, end, n, b, c) = r?;
+        for (k, v) in c {
+            match counts.iter_mut().find(|(n, _)| *n == k) {
+                Some((_, t)) => *t += v,
+                None => counts.push((k, v)),
+            }
+        }
         reads += n;
         bytes += b;
         first = Some(first.map_or(start, |f| f.min(start)));
@@ -5007,7 +5116,38 @@ fn threaded_mix(
         (Some(f), Some(l)) => l.duration_since(f).as_secs_f64(),
         _ => 0.0,
     };
+    if counting {
+        let mut line = format!("threadcounters {name} {pass} threads={threads} ops={ops}");
+        for (k, v) in &counts {
+            line.push_str(&format!(" {k}={v}"));
+        }
+        eprintln!("{line}");
+    }
     Ok(ThreadedMixed { secs, reads, bytes })
+}
+
+/// The calling thread's own user and system time, in microseconds, and
+/// its minor and major faults (`getrusage(RUSAGE_THREAD)`), for the
+/// threaded mixes' counters line.
+#[cfg(target_os = "linux")]
+fn thread_usage() -> [u64; 4] {
+    // SAFETY: `getrusage` fills the struct it is handed and reads nothing.
+    let mut ru: libc::rusage = unsafe { std::mem::zeroed() };
+    // SAFETY: as above; the struct is this frame's own.
+    unsafe { libc::getrusage(libc::RUSAGE_THREAD, &mut ru) };
+    let us = |t: libc::timeval| t.tv_sec as u64 * 1_000_000 + t.tv_usec as u64;
+    [
+        us(ru.ru_utime),
+        us(ru.ru_stime),
+        ru.ru_minflt as u64,
+        ru.ru_majflt as u64,
+    ]
+}
+
+/// Nothing where the host has no per-thread usage.
+#[cfg(not(target_os = "linux"))]
+fn thread_usage() -> [u64; 4] {
+    [0; 4]
 }
 
 /// One YCSB workload over a loaded store: `ops` operations (`ycsb_ops`,
@@ -5027,6 +5167,12 @@ struct MixKinds {
     gets: (u64, f64),
     scans: (u64, f64),
     commits: (u64, f64),
+    /// The mix's first four scans and its longest, in seconds: a mix at
+    /// the smallest rung is a millisecond, and a first scan that settles
+    /// what the mix before left is a share of it no sum over the scans
+    /// names.
+    scan_first: [f64; 4],
+    scan_max: f64,
     irq0: [u64; 2],
     /// The engine's seals and the milliseconds its commits spent freezing
     /// at the mix's start (`seals`, `freeze_ms`; zeros for an engine that
@@ -5050,6 +5196,8 @@ impl MixKinds {
             gets: (0, 0.0),
             scans: (0, 0.0),
             commits: (0, 0.0),
+            scan_first: [0.0; 4],
+            scan_max: 0.0,
             irq0: if on { irq_counts() } else { [0; 2] },
             seals0: if on { seal_counts(e) } else { [0.0; 2] },
         }
@@ -5066,16 +5214,35 @@ impl MixKinds {
         }
     }
 
+    /// A scan's time, into the scans' sum and beside it the first four
+    /// and the longest.
+    fn add_scan(&mut self, t0: Option<Instant>) {
+        if let Some(t0) = t0 {
+            let d = t0.elapsed().as_secs_f64();
+            if let Some(f) = self.scan_first.get_mut(self.scans.0 as usize) {
+                *f = d;
+            }
+            self.scan_max = self.scan_max.max(d);
+            self.scans.0 += 1;
+            self.scans.1 += d;
+        }
+    }
+
     fn report(&self, e: &dyn Engine, arm: &str, mix: &str, size: u64, ops: u64, total: f64) {
         if self.on {
             let irq = irq_counts();
             let seals = seal_counts(e);
             eprintln!(
-                "mixkinds {arm} {mix} size {size} ops {ops} gets {} {:.3} scans {} {:.3} commits {} {:.3} total {:.3} tlb {} cal {} seals {} freeze {:.3}",
+                "mixkinds {arm} {mix} size {size} ops {ops} gets {} {:.3} scans {} {:.3} first_us {:.1} {:.1} {:.1} {:.1} max_us {:.1} commits {} {:.3} total {:.3} tlb {} cal {} seals {} freeze {:.3}",
                 self.gets.0,
                 self.gets.1 * 1e3,
                 self.scans.0,
                 self.scans.1 * 1e3,
+                self.scan_first[0] * 1e6,
+                self.scan_first[1] * 1e6,
+                self.scan_first[2] * 1e6,
+                self.scan_first[3] * 1e6,
+                self.scan_max * 1e6,
                 self.commits.0,
                 self.commits.1 * 1e3,
                 total * 1e3,
@@ -5256,7 +5423,7 @@ fn ycsb(
             km.key_into(existing(&mut keys, committed), &mut kb);
             let t0 = kinds.start();
             e.range(&kb, YCSB_SCAN)?;
-            MixKinds::add(&mut kinds.scans, t0);
+            kinds.add_scan(t0);
         } else if prmw > 0 {
             km.key_into(existing(&mut keys, committed), &mut kb);
             let t0 = kinds.start();
@@ -5893,7 +6060,7 @@ pub fn lmdb_map_gb(size: u64, value_size: usize) -> usize {
 /// was left, and from its third rep the rung read at a tenth to a twentieth
 /// of the reps before, faulting on every page. `malloc_trim(0)` took that
 /// process from 12.9 GB resident to 2.1 GB.
-fn release_freed_memory() {
+pub fn release_freed_memory() {
     #[cfg(all(target_os = "linux", target_env = "gnu"))]
     // SAFETY: takes and returns plain integers; releasing free pages is
     // what it is for, and it takes the allocator's own locks.
@@ -6023,58 +6190,6 @@ mod tests {
         assert_eq!(stop_after("10000"), None);
         assert_eq!(stop_after("ten-1"), None);
         assert_eq!(stop_after(""), None);
-    }
-
-    /// Held between the one test that counts what `release_freed_memory`
-    /// returns and the tests that run a pass, which call it: the release is
-    /// the process's, so a pass's `malloc_trim` in another test's thread
-    /// takes the freed blocks the first is about to count, and the test
-    /// failed -- on blocks that "were not resident to begin with", or on a
-    /// release that returned less than most of them -- in runs of the whole
-    /// binary at the default thread count once a test that runs a pass was
-    /// beside it. A pass takes this shared, and the measurement
-    /// exclusively. The guard is taken through `into_inner`, so a test that
-    /// fails holding it fails nobody else.
-    static TRIM: std::sync::RwLock<()> = std::sync::RwLock::new(());
-
-    /// The shape that filled the full run's memory: a thread allocates
-    /// small blocks in its own arena, frees them, and exits, with one block
-    /// allocated last still live so the arena cannot give its heap back from
-    /// the top. The freed memory stays resident until the runner releases
-    /// it -- the first assertion is that the test reached that case at all,
-    /// the second that the release returns most of it.
-    #[cfg(all(target_os = "linux", target_env = "gnu"))]
-    #[test]
-    fn a_dropped_stores_freed_memory_is_returned_before_the_next_pass() {
-        let _alone = TRIM.write().unwrap_or_else(|e| e.into_inner());
-        const BLOCKS: usize = 3_000_000;
-        const SIZE: usize = 100;
-        let held = BLOCKS * SIZE;
-        let pin = std::thread::spawn(|| {
-            let mut v: Vec<Box<[u8; SIZE]>> = Vec::with_capacity(BLOCKS);
-            for i in 0..BLOCKS {
-                v.push(Box::new([i as u8; SIZE]));
-            }
-            let pin = Box::new([1u8; SIZE]);
-            std::hint::black_box(&v);
-            drop(v);
-            pin
-        })
-        .join()
-        .unwrap();
-        let before = resident_bytes().unwrap();
-        release_freed_memory();
-        let after = resident_bytes().unwrap();
-        assert!(
-            before >= held as u64,
-            "the freed blocks were not resident to begin with: {before} bytes, {held} allocated"
-        );
-        assert!(
-            before - after >= held as u64 / 2,
-            "released {} of the {held} bytes freed ({before} -> {after})",
-            before.saturating_sub(after)
-        );
-        drop(pin);
     }
 
     /// Holm's step-down against hand-worked cases: it stops at the first
@@ -7102,6 +7217,52 @@ mod tests {
             .any(|&(k, _)| k >= size && k < size + committed));
     }
 
+    /// A rep runs every arm once, the warmup and the first rep in the
+    /// plan's order; over as many reps as an arm count has strides, no arm
+    /// follows the same arm twice within its reps, and no two reps start
+    /// with one arm; and two arms alternate.
+    #[test]
+    fn a_reps_order_gives_no_arm_one_predecessor() {
+        for arms in 0..=24usize {
+            for rep in 0..=12 {
+                let mut o = rep_order(arms, rep);
+                o.sort_unstable();
+                assert_eq!(o, (0..arms).collect::<Vec<_>>(), "{arms} arms, rep {rep}");
+            }
+            assert_eq!(rep_order(arms, 0), (0..arms).collect::<Vec<_>>());
+            assert_eq!(rep_order(arms, 1), (0..arms).collect::<Vec<_>>());
+        }
+        assert_eq!(rep_order(2, 2), [1, 0]);
+        assert_eq!(rep_order(2, 3), [0, 1]);
+        // Fifteen arms, the quick roster's count, have eight strides; the
+        // full scale takes seven reps.
+        for (arms, reps) in [(15usize, 8usize), (14, 6), (13, 12), (7, 6), (5, 4), (3, 2)] {
+            let mut before: Vec<Vec<usize>> = vec![Vec::new(); arms];
+            let mut firsts = Vec::new();
+            for rep in 1..=reps {
+                let o = rep_order(arms, rep);
+                firsts.push(o[0]);
+                for w in o.windows(2) {
+                    assert!(
+                        !before[w[1]].contains(&w[0]),
+                        "{arms} arms: arm {} follows arm {} again at rep {rep}",
+                        w[1],
+                        w[0]
+                    );
+                    before[w[1]].push(w[0]);
+                }
+            }
+            let n = firsts.len();
+            firsts.sort_unstable();
+            firsts.dedup();
+            assert_eq!(
+                firsts.len(),
+                n,
+                "{arms} arms: a rep starts where another did"
+            );
+        }
+    }
+
     /// The scrambled mixes read keys that exist and spread their hot keys:
     /// the read-only mix's hottest key is where YCSB's hash puts rank 0,
     /// its lowest hundred keys take about their uniform share, and the
@@ -7151,7 +7312,6 @@ mod tests {
     /// mixes had been in every row and in no pairing.
     #[test]
     fn a_pairing_carries_every_quantity_a_row_carries() {
-        let _pass = TRIM.read().unwrap_or_else(|e| e.into_inner());
         let root = std::env::temp_dir().join(format!("supdb-bench-flat-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
         let mut plan = Plan::new(Scale::Quick, vec![], 30_000, 4);
@@ -7180,7 +7340,6 @@ mod tests {
     /// under its own pass name: a pass without it reports none.
     #[test]
     fn the_second_mix_family_reports_six_rates_under_its_pass() {
-        let _pass = TRIM.read().unwrap_or_else(|e| e.into_inner());
         let root = std::env::temp_dir().join(format!("supdb-bench-ycsbs-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
         let mut plan = Plan::new(Scale::Quick, vec![], 30_000, 4);
@@ -7222,7 +7381,6 @@ mod tests {
     fn the_pass_refuses_a_forced_arm_that_covers_nothing_and_runs_one_that_does() {
         // A pass releases freed memory to the system: not while the test that
         // counts what the release returns is counting.
-        let _pass = TRIM.read().unwrap_or_else(|e| e.into_inner());
         let root = std::env::temp_dir().join(format!("supdb-bench-zpass-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
         let mut plan = Plan::new(Scale::Quick, vec![], 30_000, 4);
@@ -7355,11 +7513,35 @@ mod tests {
             all,
             Passes {
                 mixes_threaded: true,
+                threads_held: false,
                 ..Passes::all()
             }
         );
         assert!(!Passes::all().mixes_threaded && !Passes::paired().mixes_threaded);
         assert!(Passes::parse("mixes-threaded").unwrap().mixes_threaded);
+        // A row runs them for the arms of FASTER's guarantee alone, a
+        // pairing and a list of passes for none unless they are named, and
+        // named they run for every arm.
+        assert!(Passes::all().threads_held && !Passes::paired().threads_held);
+        for (arm, in_a_row) in [
+            ("supdb-heldnoframes", true),
+            ("supdb-heldnoshare", true),
+            ("supdb", false),
+            ("supdb-ingest", false),
+            ("lmdb", false),
+            ("rocksdb-tuned-nosync", false),
+        ] {
+            assert_eq!(Passes::all().threaded_runs(arm), in_a_row, "{arm}, a row");
+            assert!(!Passes::paired().threaded_runs(arm), "{arm}, a pairing");
+            assert!(
+                !Passes::parse("load,mixes").unwrap().threaded_runs(arm),
+                "{arm}"
+            );
+            assert!(
+                Passes::parse("mixes-threaded").unwrap().threaded_runs(arm),
+                "{arm}"
+            );
+        }
         let some = Passes::parse("read, scan-threaded,lag").unwrap();
         assert!(some.read && some.scan_threaded && some.lag);
         assert!(!some.load && !some.read_threaded && !some.scan && !some.mixes);
@@ -7382,6 +7564,7 @@ mod tests {
         assert_eq!(
             Passes {
                 recover: true,
+                threads_held: true,
                 ..Passes::paired()
             },
             Passes::all()
@@ -7389,6 +7572,7 @@ mod tests {
         assert!(Passes::parse("recover").unwrap().recover);
         let mut old = serde_json::to_value(Passes::all()).unwrap();
         old.as_object_mut().unwrap().remove("recover").unwrap();
+        old.as_object_mut().unwrap().remove("threads_held").unwrap();
         let old: Passes = serde_json::from_value(old).unwrap();
         assert_eq!(old, Passes::paired());
     }

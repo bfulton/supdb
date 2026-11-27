@@ -60,7 +60,7 @@ literal	src/db.rs	thread_runq	1	/proc/thread-self/schedstat (G3: Memory)
 literal	src/db/zfile.rs	budget_from	4	/proc meminfo, cgroup, mounts and status, read through read_budget's closure (G3: Memory)
 # Threads, until S1.
 thread	src/crypt.rs	*	1	a reader yields while another thread decrypts its chunk (S1: pin::)
-thread	src/db.rs	*	106	the engine's threads, waits and sleeps (S1: pin::)
+thread	src/db.rs	*	118	the engine's threads, waits and sleeps (S1: pin::)
 thread	src/db/pager.rs	*	9	the cache's evictor and the waits for it (R1 lets the pager spawn and wait)
 thread	src/flatindex.rs	*	3	the writer's helper thread (S1: pin::)
 # Code the door's build compiles out.

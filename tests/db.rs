@@ -12,7 +12,7 @@ use supdb::{Db, Isolation, Options, ReadAdvice, Reader};
 mod common;
 #[cfg(target_os = "linux")]
 use common::cached_pages;
-use common::{kv, manifest_v2_of, vf, without_the_clock};
+use common::{kv, manifest_v2_of, vf, watchdog_exit, without_the_clock, Watchdog};
 
 fn dir(name: &str) -> PathBuf {
     let d = std::env::temp_dir().join(format!("supdb-next-{name}-{}", std::process::id()));
@@ -8480,6 +8480,117 @@ fn a_light_form_converts_on_the_upkeep_thread_and_not_over_a_burst() {
     }
 }
 
+/// A settle that converts the form its batch takes to the dense count
+/// leaves the fill its walk of the tables (`Options::settle_convert_fills`),
+/// as the patch that left a form at the dense count had: the walk is where
+/// the fill meets the light forms, and in a store whose written blocks all
+/// hold a form nothing else starts one. Sixty blocks take a delta a round
+/// for five rounds, light forms past the line and under the dense count,
+/// with no walk after the first round's, whose writes landed in blocks with
+/// no form; then twelve writes take one block's form past the dense count.
+/// With the walk left, the fill converts the light forms behind the settle's
+/// one conversion; without it (`supdb-settleconvertquiet`'s shape) the
+/// settle converts its one form and every light form stays deltas; and with
+/// the conversion left to the fill (`Options::settle_converts` off) the
+/// fill converts them all, the dense one among them. The scans read the
+/// model's answers each way.
+#[test]
+fn a_settles_conversion_leaves_the_fill_its_walk() {
+    for (name, converts, fills) in [
+        ("fills", true, true),
+        ("quiet", true, false),
+        ("left-to-the-fill", false, true),
+    ] {
+        let d = dir(&format!("settle-convert-{name}"));
+        let opts = Options {
+            seal_bytes: 1 << 26,
+            partition_bytes: Some(1 << 20),
+            scan_block_cache: true,
+            settle_converts: converts,
+            settle_convert_fills: fills,
+            // In memory, the controller's FITS: a light form converts
+            // only while the gate is at the raw form.
+            zpages: supdb::ZPages::Auto,
+            ..common::options()
+        };
+        let mut db = Db::create(&d, opts).unwrap();
+        let mut m = ScanModel::default();
+        let key = |k: u32| format!("key-{k:05}");
+        for k in 0..32_000u32 {
+            m.append(&mut db, &key(k), "p");
+        }
+        db.commit().unwrap();
+        db.flush().unwrap();
+        m.flushed();
+        // A scan, so that the commits after it maintain the forms.
+        m.check_one(&db, key(0).as_bytes(), 100, "clean");
+        let events = db.forms_events()[13];
+        for round in 0..5u32 {
+            for b in 0..60u32 {
+                m.append(&mut db, &key(b * 64 + 2 + round * 9), &format!("u{round}"));
+            }
+            db.commit().unwrap();
+            db.settle().unwrap();
+        }
+        // The premise: sixty light forms, and nothing has converted one.
+        let (_, sparse, copies, _) = db.block_cache_kinds();
+        assert!(
+            sparse >= 60 && copies == 0,
+            "{name}: sixty light forms before the crossing: {sparse} sparse, {copies} copies"
+        );
+        assert_eq!(
+            db.forms_events()[13],
+            events,
+            "{name}: a form converted before any reached the dense count"
+        );
+        assert_eq!(db.settle_lean().1, 0, "{name}: a settle converted early");
+        let passes = db.upkeep_counts()[0];
+        // Twelve more keys of the first block: five deltas and twelve.
+        for k in 40..52u32 {
+            m.append(&mut db, &key(k), "dense");
+        }
+        db.commit().unwrap();
+        db.settle().unwrap();
+        assert!(
+            db.upkeep_counts()[0] > passes,
+            "{name}: the thread made no pass, so nothing above tested it"
+        );
+        let by_settle = db.settle_lean().1;
+        let from_form = db.forms_events()[13] - events;
+        let (_, sparse, copies, _) = db.block_cache_kinds();
+        if converts {
+            assert_eq!(
+                by_settle, 1,
+                "{name}: the settle converts the block it grew dense"
+            );
+        } else {
+            assert_eq!(by_settle, 0, "{name}: the settle converts nothing");
+        }
+        if fills {
+            assert!(
+                from_form >= 31 && copies >= 31,
+                "{name}: the walk converts the light forms: {from_form} conversions, \
+                 {copies} copies, {sparse} sparse"
+            );
+        } else {
+            assert_eq!(
+                (from_form, copies),
+                (1, 1),
+                "{name}: no walk, and the light forms stay deltas ({sparse} sparse)"
+            );
+            assert!(sparse >= 59, "{name}: {sparse} sparse");
+        }
+        for b in (0..60u32).step_by(7) {
+            m.check_one(
+                &db,
+                key(b * 64).as_bytes(),
+                200,
+                &format!("{name}: block {b} after the crossing"),
+            );
+        }
+    }
+}
+
 /// A manifest publish keeps the manifest it replaces linked under a spare
 /// name, so that the rename frees no inode on the publish's path, and the
 /// spare is unlinked by the segment work when idle and at open
@@ -10140,20 +10251,16 @@ fn a_value_the_record_cannot_hold_sends_its_batch_through_the_wal() {
             db.commit().unwrap();
         }
         let (_, _, written) = db.wal_durable();
-        let tmp = d.join("direct-00000000.tmp");
+        // Whether a run began: its file holds something. The file alone
+        // says nothing, the first run's being made ahead of it, empty
+        // (`Options::run_spare`).
+        let began = std::fs::metadata(d.join("direct-00000000.tmp")).is_ok_and(|m| m.len() > 0);
         if big {
             assert!(written > 8, "{name}: through the WAL");
-            // The spare stands empty (`Options::run_spare`): no run took it.
-            assert!(
-                !tmp.exists() || std::fs::metadata(&tmp).unwrap().len() == 0,
-                "{name}: no segment opened"
-            );
+            assert!(!began, "{name}: no segment opened");
         } else {
             assert!(written <= 8, "{name}: the WAL untouched");
-            assert!(
-                std::fs::metadata(&tmp).is_ok_and(|m| m.len() > 0),
-                "{name}: a segment open"
-            );
+            assert!(began, "{name}: a segment open");
         }
         db.crash();
         let db = Db::open(&d, common::options()).unwrap();
@@ -10912,6 +11019,9 @@ fn a_reader_under_latest_sees_the_commit_of_a_key_it_settled_uncommitted() {
 /// direct segment an ordered run takes and through the memtable a
 /// shuffled one takes. A piece with a tombstone cannot be a partition as
 /// it is, so that flush publishes twice and still leaves one partition.
+/// The publishes are counted once the segment work is settled: a durable
+/// flush is answered at its seal's readable landing, and the seal's slot
+/// follows (`Options::drain_answers_readable`).
 #[test]
 fn a_first_flush_seals_the_partition_in_one_publish() {
     let key = |k: u32| format!("key-{k:05}").into_bytes();
@@ -10941,6 +11051,7 @@ fn a_first_flush_seals_the_partition_in_one_publish() {
         let before = db.seal_waits().publishes;
         db.flush().unwrap();
         assert_eq!(db.levels(), (1, 0), "{name}: one partition, no piece");
+        db.settle().unwrap();
         assert_eq!(
             db.seal_waits().publishes - before,
             1,
@@ -10967,6 +11078,7 @@ fn a_first_flush_seals_the_partition_in_one_publish() {
     let before = db.seal_waits().publishes;
     db.flush().unwrap();
     assert_eq!(db.levels(), (1, 0));
+    db.settle().unwrap();
     assert!(
         db.seal_waits().publishes - before >= 2,
         "a piece with a tombstone is not a partition as it is"
@@ -12155,6 +12267,222 @@ fn a_buffered_commit_near_reads_files_its_burst_and_lends_a_small_batch() {
     assert!(passes(&db) > p, "the thread took the small batch");
     check(&db, &want, "after the three commits");
     drop(live);
+}
+
+/// Under the held log a burst's batches are lent to the upkeep thread and
+/// never filed by their commits or waited for
+/// (`Options::held_bursts_lend`): with the thread held before its pass,
+/// each commit of a burst returns with its batch lent and unfiled, the one
+/// a scan preceded among them, and no commit holds; the scan after the
+/// burst files what the thread had not, and every key reads as written
+/// through the writer and through a handle. A batch too small to wake the
+/// thread for is handed as under any policy, settled by the commit a scan
+/// preceded and lent to nobody. With the option off the held log's commits
+/// file their bursts themselves, and under a policy that is not the held
+/// log the option lends nothing.
+#[test]
+fn a_held_logs_burst_is_lent_and_never_waited_for() {
+    // The writes lent to the thread and not filed by its report, before
+    // the burst, after its first commit and after its third, and whether
+    // the small batch's commit moved the count. The count is the writer's
+    // own and stands where no commit lends: the load's one commit, with
+    // no scan before it, is lent under every policy, and whether the scan
+    // before the burst found the thread's report of it is the thread's
+    // timing -- the count before the burst is the load's twenty thousand
+    // or nothing. So a burst that lends nothing leaves the count where it
+    // was, whichever that is, and one that lends starts it over at its
+    // first batch: the first version held the first count under the one
+    // before the burst, which under the gate's load was nothing.
+    let run = |name: &str, sync: supdb::SyncPolicy, lend: Option<bool>| -> [u64; 4] {
+        let d = dir(name);
+        let mut opts = Options {
+            upkeep: supdb::Upkeep::Background(1),
+            sync,
+            partition_bytes: Some(256 << 10),
+            // The plain seal, so the few hundred writes below seal nothing.
+            seal_max_pct: 0,
+            ..common::options()
+        };
+        if let Some(lend) = lend {
+            opts.held_bursts_lend = lend;
+        }
+        let mut db = Db::create(&d, opts).unwrap();
+        let keys = 20_000u32;
+        let key = |k: u32| format!("key-{k:06}").into_bytes();
+        for k in 0..keys {
+            db.append(&key(k), b"0");
+        }
+        db.commit().unwrap();
+        db.flush().unwrap();
+        assert!(db.levels().0 > 0, "partitions for the forms to hang on");
+        let live = db.reader().unwrap();
+        let mut want: HashMap<u32, String> = HashMap::new();
+        let check = |db: &Db, want: &HashMap<u32, String>, when: &str| {
+            let verify = |k: &[u8], v: &[u8], who: &str| {
+                let kn: u32 = std::str::from_utf8(&k[4..]).unwrap().parse().unwrap();
+                let got = std::str::from_utf8(v).unwrap();
+                let expect = want.get(&kn).map_or("0", |s| s.as_str());
+                assert_eq!(got, expect, "{name}: key {kn} {when} through {who}");
+            };
+            let mut seen = 0u32;
+            db.scan(
+                &key(0),
+                keys as usize,
+                kv(&mut |k, v| {
+                    verify(k, v, "the writer");
+                    seen += 1;
+                }),
+            )
+            .unwrap();
+            assert_eq!(seen, keys, "{name}: every key {when} through the writer");
+            let r = db.reader().unwrap();
+            let mut seen = 0u32;
+            r.scan(
+                &key(0),
+                keys as usize,
+                kv(&mut |k, v| {
+                    verify(k, v, "a handle");
+                    seen += 1;
+                }),
+            )
+            .unwrap();
+            assert_eq!(seen, keys, "{name}: every key {when} through a handle");
+        };
+        let mut x = 0x2545_F491_4F6C_DD1Du64;
+        let mut write = |db: &mut Db, want: &mut HashMap<u32, String>, n: usize, v: &str| {
+            for _ in 0..n {
+                x ^= x << 13;
+                x ^= x >> 7;
+                x ^= x << 17;
+                let k = (x % keys as u64) as u32;
+                db.put(&key(k), v.as_bytes());
+                want.insert(k, v.to_string());
+            }
+            db.commit().unwrap();
+        };
+        // Reads are around, and the burst's first commit is the one a scan
+        // preceded. The thread is held before its pass, so whatever a
+        // commit lends stands unfiled, and a commit that waited for its
+        // filing would not return.
+        check(&db, &want, "before any write");
+        let watch = Watchdog::arm("a commit of a burst never returned beside a held thread");
+        db.hold_upkeep_pass(true);
+        let holds = db.upkeep_counts()[4];
+        let before = db.upkeep_behind_writes();
+        write(&mut db, &mut want, 300, "a");
+        let first = db.upkeep_behind_writes();
+        write(&mut db, &mut want, 300, "b");
+        write(&mut db, &mut want, 300, "c");
+        let third = db.upkeep_behind_writes();
+        assert_eq!(db.upkeep_counts()[4], holds, "{name}: no commit held");
+        db.hold_upkeep_pass(false);
+        check(&db, &want, "after the burst");
+        db.settle().unwrap();
+        // A batch too small to wake the thread for, behind the scans above.
+        db.hold_upkeep_pass(true);
+        let at = db.upkeep_behind_writes();
+        write(&mut db, &mut want, 100, "d");
+        let small = u64::from(db.upkeep_behind_writes() != at);
+        db.hold_upkeep_pass(false);
+        drop(watch);
+        check(&db, &want, "after the small batch");
+        drop(live);
+        db.close().unwrap();
+        let _ = std::fs::remove_dir_all(&d);
+        [before, first, third, small]
+    };
+    let [before, first, third, small] = run("held-burst-lent", supdb::SyncPolicy::Explicit, None);
+    assert_eq!(
+        (first, third),
+        (300, 900),
+        "every commit of the burst lent its batch, the first among them, from {before}"
+    );
+    assert_eq!(small, 0, "a small batch a scan preceded is the commit's");
+    let [before, first, third, small] =
+        run("held-burst-filed", supdb::SyncPolicy::Explicit, Some(false));
+    assert_eq!(
+        (first, third, small),
+        (before, before, 0),
+        "with the option off the held log's commits file their bursts"
+    );
+    let [before, first, third, small] = run(
+        "buffered-burst-filed",
+        supdb::SyncPolicy::EveryN(u32::MAX),
+        Some(true),
+    );
+    assert_eq!(
+        (first, third, small),
+        (before, before, 0),
+        "the option lends nothing under a policy that is not the held log"
+    );
+}
+
+/// As the options stand, a buffered burst's batches are filed by their
+/// commits, the ones after the first as the first is: none is lent to the
+/// upkeep thread and no commit holds for it, where a share of the store
+/// paced (`Options::upkeep_pace_pct` above zero) lends each batch within
+/// the share and holds for its filing. The batches here are within a
+/// hundredth of the store's keys, which a pace of one would lend.
+#[test]
+fn a_default_burst_is_filed_by_its_commits() {
+    let d = dir("default-burst-filed");
+    let mut db = Db::create(
+        &d,
+        Options {
+            sync: supdb::SyncPolicy::EveryN(u32::MAX),
+            upkeep: supdb::Upkeep::Background(1),
+            partition_bytes: Some(256 << 10),
+            seal_max_pct: 0,
+            ..common::options()
+        },
+    )
+    .unwrap();
+    let keys = 100_000u32;
+    let key = |k: u32| format!("key-{k:06}").into_bytes();
+    for k in 0..keys {
+        db.append(&key(k), b"0");
+    }
+    db.commit().unwrap();
+    db.flush().unwrap();
+    assert!(db.levels().0 > 0, "partitions for the forms to hang on");
+    let mut want: HashMap<u32, String> = HashMap::new();
+    // Reads around: a scan over the store.
+    let mut n = 0u32;
+    db.scan(&key(0), 100, kv(&mut |_, _| n += 1)).unwrap();
+    assert_eq!(n, 100);
+    let (holds, lent) = (db.upkeep_counts()[4], db.upkeep_behind_writes());
+    let mut x = 0x2545_F491_4F6C_DD1Du64;
+    for round in 0..4u32 {
+        for _ in 0..300 {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            let k = (x % keys as u64) as u32;
+            db.put(&key(k), format!("b{round}").as_bytes());
+            want.insert(k, format!("b{round}"));
+        }
+        db.commit().unwrap();
+        assert_eq!(
+            (db.upkeep_counts()[4], db.upkeep_behind_writes()),
+            (holds, lent),
+            "commit {round}: nothing lent and nothing held for"
+        );
+    }
+    let mut seen = 0u32;
+    db.scan(
+        &key(0),
+        keys as usize,
+        kv(&mut |k, v| {
+            let kn: u32 = std::str::from_utf8(&k[4..]).unwrap().parse().unwrap();
+            let expect = want.get(&kn).map_or("0", |s| s.as_str());
+            assert_eq!(std::str::from_utf8(v).unwrap(), expect, "key {kn}");
+            seen += 1;
+        }),
+    )
+    .unwrap();
+    assert_eq!(seen, keys);
+    db.close().unwrap();
+    let _ = std::fs::remove_dir_all(&d);
 }
 
 /// The first batch after a scan, filed in the commit on the writer's own
@@ -15850,6 +16178,11 @@ fn a_replacing_write_patches_a_copy_in_place() {
         // commit a pass files is the thread's timing, and a count read
         // before the pass began counts a table nothing has been filed into.
         upkeep: supdb::Upkeep::Inline,
+        // The three buffers' patch, which this is about: a copy held as
+        // one stream of fixed-size records takes a value of its own length
+        // in place and is made the three buffers by any other, a shorter
+        // run among them (`tests/settle.rs` holds that).
+        copy_packed: false,
         ..common::options()
     };
     let mut db = Db::create(&d, opts).unwrap();
@@ -17452,16 +17785,22 @@ fn tail_readers(
 /// once mid-load, leaving a tail live beside a seal in flight or a
 /// partition: the shape a durable-only `sync` used to leave for good.
 fn load_ordered_with_tail(d: &std::path::Path, n: u32) -> Db {
-    let mut db = Db::create(
-        d,
-        Options {
-            adaptive_shape: true,
-            seal_bytes: 1 << 20,
-            partition_bytes: Some(8 << 20),
-            ..common::options()
-        },
-    )
-    .unwrap();
+    load_ordered_with_tail_opts(d, n, load_ordered_with_tail_options())
+}
+
+/// The options `load_ordered_with_tail` opens its store with.
+fn load_ordered_with_tail_options() -> Options {
+    Options {
+        adaptive_shape: true,
+        seal_bytes: 1 << 20,
+        partition_bytes: Some(8 << 20),
+        ..common::options()
+    }
+}
+
+/// `load_ordered_with_tail` with the store opened under `opts`.
+fn load_ordered_with_tail_opts(d: &std::path::Path, n: u32, opts: Options) -> Db {
+    let mut db = Db::create(d, opts).unwrap();
     for i in 0..n {
         db.append(&tail_key(i), &tail_val(1));
         if i % 500 == 499 {
@@ -17675,65 +18014,6 @@ fn a_write_after_a_handed_seal_takes_a_fresh_table_from_whichever_side_swapped()
     }
 }
 
-/// A watchdog's exit: the message on the process's own stderr, past the
-/// harness's capture, then the exit. The harness captures what a test's
-/// threads print, a watchdog's thread among them, so a watchdog that
-/// printed through `eprintln!` and exited left the whole binary ending with
-/// code 101 after a hundred and sixty-six tests, no failure named and no
-/// summary -- the dev binary under the whole file's load, where a window
-/// a minute holds in the checked profile runs several times longer.
-fn watchdog_exit(what: &str) -> ! {
-    use std::io::Write;
-    let said = std::fs::OpenOptions::new()
-        .write(true)
-        .open("/dev/stderr")
-        .and_then(|mut e| writeln!(e, "watchdog: {what}"));
-    if said.is_err() {
-        eprintln!("watchdog: {what}");
-    }
-    std::process::exit(101);
-}
-
-/// Exits the process unless dropped within a minute: for a test whose
-/// failure is a wait that never returns, so it reports itself rather
-/// than hanging. Dropped as the waits end, or by the unwind of a failure
-/// in them, so an assertion reports itself and not the watchdog.
-struct Watchdog {
-    done: std::sync::Arc<std::sync::atomic::AtomicBool>,
-    watch: Option<std::thread::JoinHandle<()>>,
-}
-
-impl Watchdog {
-    fn arm(what: &'static str) -> Watchdog {
-        let done = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let watch = {
-            let done = done.clone();
-            std::thread::spawn(move || {
-                let t = std::time::Instant::now();
-                while !done.load(std::sync::atomic::Ordering::Relaxed) {
-                    if t.elapsed() > std::time::Duration::from_secs(60) {
-                        watchdog_exit(what);
-                    }
-                    std::thread::sleep(std::time::Duration::from_millis(20));
-                }
-            })
-        };
-        Watchdog {
-            done,
-            watch: Some(watch),
-        }
-    }
-}
-
-impl Drop for Watchdog {
-    fn drop(&mut self) {
-        self.done.store(true, std::sync::atomic::Ordering::Relaxed);
-        if let Some(w) = self.watch.take() {
-            let _ = w.join();
-        }
-    }
-}
-
 /// Partitions under a piece, the store each held-seal test below starts
 /// from: three thousand keys flushed, then updates and tombstones over a
 /// fifth and a thirteenth of them sealed and landed as a piece.
@@ -17934,6 +18214,11 @@ fn a_fourth_freeze_waits_for_the_front_to_land() {
     );
     assert!(w.join_wait_ns > w0.join_wait_ns, "{w:?}");
     assert_eq!(
+        (w.frozen_byte_waits, w.frozen_byte_wait_ns),
+        (w0.frozen_byte_waits, w0.frozen_byte_wait_ns),
+        "for the count, which the bytes' wait is told apart from: {w:?}"
+    );
+    assert_eq!(
         db.frozen_tables(),
         3,
         "the fourth table frozen into the front's room"
@@ -17951,6 +18236,210 @@ fn a_fourth_freeze_waits_for_the_front_to_land() {
         vec![b"c".to_vec()],
         "the fourth table's value over the third's tombstone"
     );
+}
+
+/// The frozen tables are held to bytes as well as to a count
+/// (`Options::frozen_bytes`). One store's shape three times, a table
+/// frozen behind a held seal and a second one committed: bounded by the
+/// count alone the second freezes beside the first and waits for
+/// nothing; bounded at exactly what the two hold it does the same; a byte
+/// under that it waits for the front's landing, freezes with none ahead,
+/// and the wait is counted once, as the bytes'. The first table froze
+/// under every bound, since one is frozen whatever it holds.
+#[test]
+fn a_freeze_past_the_frozen_tables_bytes_waits_for_the_front_to_land() {
+    let key = |k: u32| format!("key-{k:05}");
+    // What the second freeze holds, and whether it waited.
+    let run = |name: &str, bound: usize, waits: bool| -> u64 {
+        let (mut db, mut m, _) = partitions_under_a_piece(
+            name,
+            Options {
+                frozen_bytes: bound,
+                ..common::options()
+            },
+        );
+        let watch = Watchdog::arm("a freeze within the frozen tables' bytes waited, or one past them outlasted the release");
+        db.hold_seal_landing(true);
+        // The durable phase held too, so the front's readable landing
+        // is the one landing the release lets through.
+        db.hold_seal_durable(true);
+        freeze_one_of_three(&mut db, &mut m, 0);
+        assert_eq!(db.frozen_tables(), 1, "{name}: one table frozen");
+        for k in (0..3000u32).step_by(4) {
+            m.append(&mut db, &key(k), "f1");
+        }
+        m.append(&mut db, "key-cross-b", "b");
+        db.commit().unwrap();
+        let (held, resolved) = db.frozen_bytes_held();
+        assert_eq!(resolved, bound as u64, "{name}: the bound as given");
+        // Each table at twice its capacity, the live one with the frozen,
+        // by the census's own count of what the tables hold.
+        let census: BTreeMap<String, u64> = db.memory_census().into_iter().collect();
+        let cap = |k: &str| census.get(k).copied().unwrap_or(0);
+        assert!(
+            cap("mem_live_cap") > 0 && cap("mem_frozen_cap") > 0,
+            "{name}: {census:?}"
+        );
+        assert_eq!(
+            held,
+            2 * (cap("mem_live_cap") + cap("mem_frozen_cap")),
+            "{name}: {census:?}"
+        );
+        let w0 = db.seal_waits();
+        let release =
+            waits.then(|| db.release_seal_landing_after(std::time::Duration::from_millis(500)));
+        db.seal().unwrap();
+        let frozen = db.frozen_tables();
+        let w = db.seal_waits();
+        if let Some(r) = release {
+            r.join().unwrap();
+        }
+        drop(watch);
+        let ahead = |i: usize| w.frozen_ahead[i] - w0.frozen_ahead[i];
+        if waits {
+            assert_eq!(
+                (
+                    w.frozen_byte_waits - w0.frozen_byte_waits,
+                    w.blocked_joins - w0.blocked_joins
+                ),
+                (1, 1),
+                "{name}: the freeze waited once, for the bytes: {w:?}"
+            );
+            assert!(
+                w.frozen_byte_wait_ns > w0.frozen_byte_wait_ns && w.join_wait_ns > w0.join_wait_ns,
+                "{name}: {w:?}"
+            );
+            assert_eq!(frozen, 1, "{name}: frozen once the front had landed");
+            assert_eq!((ahead(0), ahead(1)), (1, 0), "{name}: with none ahead");
+        } else {
+            assert_eq!(
+                (
+                    w.frozen_byte_waits - w0.frozen_byte_waits,
+                    w.blocked_joins - w0.blocked_joins,
+                    w.join_wait_ns - w0.join_wait_ns
+                ),
+                (0, 0, 0),
+                "{name}: the freeze waited for nothing: {w:?}"
+            );
+            assert_eq!(frozen, 2, "{name}: frozen beside the first");
+            assert_eq!((ahead(0), ahead(1)), (0, 1), "{name}: with one ahead");
+        }
+        m.check(&db, &format!("{name}: the writer over the frozen tables"));
+        let r = db.reader().unwrap();
+        m.check(&r, &format!("{name}: a handle over the frozen tables"));
+        db.hold_seal_landing(false);
+        db.hold_seal_durable(false);
+        db.settle().unwrap();
+        assert_eq!(db.frozen_tables(), 0, "{name}: every seal landed");
+        m.check(&db, &format!("{name}: the writer after the landings"));
+        m.check(&r, &format!("{name}: a handle after the landings"));
+        held
+    };
+    let held = run("frozen-bytes-count", usize::MAX, false);
+    assert!(held > 0);
+    let at = run("frozen-bytes-at", held as usize, false);
+    assert_eq!(at, held, "the same writes hold the same bytes");
+    let under = run("frozen-bytes-under", held as usize - 1, true);
+    assert_eq!(under, held, "the same writes hold the same bytes");
+}
+
+/// A store opened with no bound given takes one from the memory
+/// available to the process (`Options::frozen_bytes` at zero): where the
+/// platform says what that is, an eighth of it at most of the machine's,
+/// and no bound where it does not.
+#[test]
+fn the_frozen_tables_bound_is_taken_from_the_memory_available() {
+    let d = dir("frozen-bytes-auto");
+    let db = Db::create(&d, common::options()).unwrap();
+    let (_, bound) = db.frozen_bytes_held();
+    let total = std::fs::read_to_string("/proc/meminfo").ok().and_then(|m| {
+        let line = m.lines().find(|l| l.starts_with("MemTotal:"))?;
+        let kb: u64 = line.split_whitespace().nth(1)?.parse().ok()?;
+        Some(kb * 1024)
+    });
+    match total {
+        Some(total) => assert!(
+            bound > 0 && bound <= total / 8,
+            "an eighth of at most the machine's {total} bytes: {bound}"
+        ),
+        None => assert_eq!(bound, u64::MAX, "no memory to read, no bound"),
+    }
+}
+
+/// A table `sync` handed to a seal is frozen at the writer's next write
+/// once the list has room, and room is the bytes' too: beside one frozen
+/// table whose seal is held, past the bytes, the write waits for the
+/// front's landing and then freezes the handed table with none ahead;
+/// bounded by the count alone it freezes it beside the first at once.
+#[test]
+fn a_handed_tail_past_the_frozen_tables_bytes_waits_for_the_front() {
+    for (name, bound, waits) in [
+        ("handed-bytes", 1usize, true),
+        ("handed-bytes-count", usize::MAX, false),
+    ] {
+        let (mut db, mut m, _) = partitions_under_a_piece(
+            name,
+            Options {
+                adaptive_shape: true,
+                frozen_bytes: bound,
+                ..common::options()
+            },
+        );
+        let watch = Watchdog::arm(
+            "the write after a hand-off waited within the bytes, or past them outlasted the release",
+        );
+        db.hold_seal_landing(true);
+        db.hold_seal_durable(true);
+        freeze_one_of_three(&mut db, &mut m, 0);
+        assert_eq!(db.frozen_tables(), 1, "{name}");
+        // Shuffled, so the tail is hashed and goes to a seal.
+        for i in 0..500u32 {
+            m.append(&mut db, &format!("key-{:05}t", i * 7919 % 500), "t");
+        }
+        db.commit().unwrap();
+        db.sync().unwrap();
+        assert_eq!(db.tail_swaps(), (0, 0), "{name}: handed, not yet replaced");
+        let w0 = db.seal_waits();
+        let release =
+            waits.then(|| db.release_seal_landing_after(std::time::Duration::from_millis(500)));
+        m.append(&mut db, "key-00001", "w");
+        db.commit().unwrap();
+        let frozen = db.frozen_tables();
+        let w = db.seal_waits();
+        if let Some(r) = release {
+            r.join().unwrap();
+        }
+        drop(watch);
+        assert_eq!(
+            db.tail_swaps(),
+            (1, 0),
+            "{name}: the write froze the handed table"
+        );
+        assert_eq!(
+            (
+                w.frozen_byte_waits - w0.frozen_byte_waits,
+                w.blocked_joins - w0.blocked_joins,
+                frozen
+            ),
+            if waits { (1, 1, 1) } else { (0, 0, 2) },
+            "{name}: {w:?}"
+        );
+        let r = db.reader().unwrap();
+        m.check(
+            &r,
+            &format!("{name}: a handle over the handed table frozen"),
+        );
+        m.check(
+            &db,
+            &format!("{name}: the writer over the handed table frozen"),
+        );
+        db.hold_seal_landing(false);
+        db.hold_seal_durable(false);
+        db.settle().unwrap();
+        assert_eq!(db.frozen_tables(), 0, "{name}");
+        m.check(&r, &format!("{name}: a handle after the landings"));
+        m.check(&db, &format!("{name}: the writer after the landings"));
+    }
 }
 
 /// A table `sync` hands to a seal beside two frozen tables whose seals
@@ -18509,6 +18998,12 @@ fn a_handed_tables_log_is_retired_at_its_landing_and_replays_before_it() {
         }
         db.commit().unwrap();
         db.flush().unwrap();
+        // The slot that names the partition written: a durable flush is
+        // answered at its seal's readable landing, before that slot, and
+        // the manifest saved below as the state after the flush was the
+        // empty store's once, beside the whole binary, which no log
+        // replays onto.
+        db.settle().unwrap();
         assert_eq!(db.levels(), (1, 0));
         for i in 0..2000u32 {
             let k = (i as u64 * 7919 % 2000) as u32;
@@ -19297,10 +19792,27 @@ fn a_rotated_wal_torn_in_its_new_file_reopens_to_a_prefix() {
 /// commit seals what grew, and every key reads right.
 #[test]
 fn a_commit_past_the_threshold_keeps_writing_while_the_frozen_list_is_full() {
-    let d = dir("seal-defers");
+    commits_defer_past_room("seal-defers", usize::MAX, 3);
+}
+
+/// The same past the frozen tables' bytes (`Options::frozen_bytes`): with
+/// a bound any second table passes, the first crossing freezes, since one
+/// table is frozen whatever it holds, and the crossing after it finds no
+/// room with one table frozen and defers as at a full list.
+#[test]
+fn a_commit_past_the_frozen_tables_bytes_keeps_writing_too() {
+    commits_defer_past_room("seal-defers-bytes", 1, 1);
+}
+
+/// `seal_defers` with the frozen tables bounded at `bound` bytes: `room`
+/// crossings freeze into room, and the commits past the threshold after
+/// them defer.
+fn commits_defer_past_room(name: &str, bound: usize, room: u32) {
+    let d = dir(name);
     let opts = Options {
         seal_rotates_wal: false,
         seal_defers: true,
+        frozen_bytes: bound,
         seal_bytes: 256 << 10,
         seal_max_pct: 0,
         sync: supdb::SyncPolicy::EveryN(u32::MAX),
@@ -19335,11 +19847,11 @@ fn a_commit_past_the_threshold_keeps_writing_while_the_frozen_list_is_full() {
     };
     db.hold_seal_landing(true);
     let mut want: BTreeMap<Vec<u8>, Vec<Vec<u8>>> = BTreeMap::new();
-    // Past the threshold three times, each sealing into room and held,
+    // Past the threshold `room` times, each sealing into room and held,
     // then past it again and under the ceiling of twice the threshold.
     let per = tail_key(0).len() + tail_val(1).len();
     let crossing = (256 << 10) / per as u32 + 100;
-    let full = 3 * crossing;
+    let full = room * crossing;
     let n = full + (350 << 10) / per as u32;
     for i in 0..n {
         db.append(&tail_key(i), &tail_val(1));
@@ -19349,8 +19861,12 @@ fn a_commit_past_the_threshold_keeps_writing_while_the_frozen_list_is_full() {
         }
         if i + 1 == full {
             db.commit().unwrap();
-            assert_eq!(db.frozen_tables(), 3, "three crossings froze into room");
-            assert_eq!(db.seal_waits().deferred, 0, "and deferred nothing");
+            assert_eq!(
+                db.frozen_tables(),
+                room as usize,
+                "{name}: the crossings froze into room"
+            );
+            assert_eq!(db.seal_waits().deferred, 0, "{name}: and deferred nothing");
         }
     }
     db.commit().unwrap();
@@ -19358,11 +19874,17 @@ fn a_commit_past_the_threshold_keeps_writing_while_the_frozen_list_is_full() {
     watch.join().unwrap();
     let w = db.seal_waits();
     assert!(db.in_flight().0, "the seals are in flight, held");
+    assert_eq!(
+        db.frozen_tables(),
+        room as usize,
+        "{name}: nothing froze past the room"
+    );
     assert!(
         w.deferred > 0,
-        "the commits past the threshold deferred: {w:?}"
+        "{name}: the commits past the threshold deferred: {w:?}"
     );
     assert_eq!(w.join_wait_ns, 0, "and none waited for the slot");
+    assert_eq!(w.frozen_byte_waits, 0, "nor for the bytes: {w:?}");
     holds_all(&db, &want, "beside the held seal");
     db.hold_seal_landing(false);
     // The seals land; the table that grew meanwhile seals at the first
@@ -19634,15 +20156,19 @@ fn a_closed_wal_outlives_a_seal_between_its_phases_and_a_crash_there() {
 /// published to a handle while the flush still waits for the fsyncs.
 /// Joined whole, the flush published nothing until the hold lifted. On
 /// both arms of the segment work, and with every key read back after.
+/// A strict flush waits out the hold (`Options::drain_answers_readable`
+/// off); one whose writes were durable before it returns without, where
+/// the segment work has a thread of its own to land the rest.
 #[test]
 fn a_flush_publishes_its_seal_before_the_seal_is_durable() {
-    for background in [true, false] {
-        let d = dir(&format!("flush-readable-{background}"));
+    for (background, early) in [(true, false), (true, true), (false, true)] {
+        let d = dir(&format!("flush-readable-{background}-{early}"));
         let mut db = Db::create(
             &d,
             Options {
                 publish_in_background: background,
                 direct_ingest: false,
+                drain_answers_readable: early,
                 ..common::options()
             },
         )
@@ -19683,12 +20209,22 @@ fn a_flush_publishes_its_seal_before_the_seal_is_durable() {
         let seen = watcher.join().unwrap();
         assert!(
             seen,
-            "background {background}: the segment was not published while its seal was held"
+            "background {background}, early {early}: the segment was not published while its \
+             seal was held"
         );
-        assert!(
-            answered_after_lift,
-            "background {background}: the flush answered before the held fsyncs were let go"
-        );
+        if background && early {
+            // Answered at the seal's readable landing with its fsyncs held,
+            // which a handle's thread lets go once it has seen the segment:
+            // before the answer or after it.
+            assert_eq!(db.seal_waits().drains_early, 1);
+        } else {
+            assert!(
+                answered_after_lift,
+                "background {background}, early {early}: the flush answered before the held \
+                 fsyncs were let go"
+            );
+            assert_eq!(db.seal_waits().drains_early, 0);
+        }
         holds_all(
             &db,
             &want,
@@ -20240,7 +20776,13 @@ fn a_run_whose_keys_the_table_keeps_leaves_the_segment_the_copies_leave() {
 #[test]
 fn a_failed_presync_is_the_flushs_answer() {
     let d = dir("presyncfail");
-    let opts = common::options();
+    // The close that syncs the records beside the trailer: a run whose
+    // commits are all synced closes on the writer by default and owes no
+    // such sync (`Options::close_readable_inline`, the test after this).
+    let opts = Options {
+        close_readable_inline: false,
+        ..common::options()
+    };
     let mut db = Db::create(&d, opts.clone()).unwrap();
     for c in 0u32..500 {
         db.append(format!("k{c:04}").as_bytes(), &c.to_le_bytes());
@@ -20275,6 +20817,375 @@ fn a_failed_presync_is_the_flushs_answer() {
         );
     }
     assert_eq!(read_vec(&db, b"k9999"), vec![b"z".to_vec()]);
+}
+
+/// A direct run's lean append (`Options::direct_lean_append`) and its close
+/// on the writer (`Options::close_readable_inline`) write the files the walk
+/// and the seal thread wrote, byte for byte but the second each segment was
+/// finished in: keys of every length either side of the records' four-byte
+/// pad, values empty, short, of every length either side of it, and over
+/// the sixty-four kilobytes a slim entry holds, so fat entries among slim
+/// ones, records across the stream's blocks, commits of one key and of
+/// hundreds, under a policy that syncs every commit and one that syncs none.
+#[test]
+fn the_lean_direct_run_writes_the_walks_bytes() {
+    let mut keys: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
+    for i in 0u32..4000 {
+        let klen = 1 + (i % 23) as usize;
+        let mut k = format!("{i:06}").into_bytes();
+        k.resize(6 + klen, b'k');
+        let vlen = match i % 97 {
+            0 => 0,
+            1 => 70_000,
+            n => (n as usize * 13) % 301,
+        };
+        let v: Vec<u8> = (0..vlen).map(|j| (j as u32 ^ i) as u8).collect();
+        keys.push((k, v));
+    }
+    for sync in [
+        supdb::SyncPolicy::Always,
+        supdb::SyncPolicy::EveryN(u32::MAX),
+    ] {
+        let shapes = [(true, true), (false, true), (true, false), (false, false)];
+        let mut files: Vec<Vec<(String, Vec<u8>)>> = Vec::new();
+        for (lean, inline) in shapes {
+            let d = dir(&format!("leanbytes-{sync:?}-{lean}-{inline}"));
+            // Every value inline, so every key is the one run's, the
+            // sixty-four-kilobyte ones among them.
+            let opts = Options {
+                sync,
+                direct_lean_append: lean,
+                close_readable_inline: inline,
+                inline_bytes: 128 << 10,
+                ..common::options()
+            };
+            let mut db = Db::create(&d, opts.clone()).unwrap();
+            let mut c = 0;
+            for (i, (k, v)) in keys.iter().enumerate() {
+                db.append(k, v);
+                if i % (1 + c % 300) == 0 {
+                    db.commit().unwrap();
+                    c += 1;
+                    assert!(
+                        db.runs_unsynced().0.is_some(),
+                        "lean {lean} inline {inline}: key {i} in the one run"
+                    );
+                }
+            }
+            db.commit().unwrap();
+            db.flush().unwrap();
+            db.settle().unwrap();
+            assert_eq!(db.segments(), 1, "lean {lean} inline {inline}");
+            for (k, v) in &keys {
+                assert_eq!(
+                    read_vec(&db, k),
+                    vec![v.clone()],
+                    "lean {lean} inline {inline}"
+                );
+            }
+            drop(db);
+            let mut f: Vec<(String, Vec<u8>)> = std::fs::read_dir(&d)
+                .unwrap()
+                .flatten()
+                .map(|e| e.file_name().to_string_lossy().into_owned())
+                .filter(|n| n.ends_with(".sup") || n.ends_with(".oidx"))
+                .map(|n| {
+                    let b = std::fs::read(d.join(&n)).unwrap();
+                    let b = if n.ends_with(".sup") {
+                        without_the_clock(&b)
+                    } else {
+                        b
+                    };
+                    (n, b)
+                })
+                .collect();
+            f.sort();
+            assert!(f.iter().any(|(n, _)| n.ends_with(".sup")), "{f:?}");
+            files.push(f);
+        }
+        for (i, f) in files.iter().enumerate().skip(1) {
+            assert_eq!(
+                f.iter().map(|(n, _)| n).collect::<Vec<_>>(),
+                files[0].iter().map(|(n, _)| n).collect::<Vec<_>>(),
+                "{sync:?} {:?}: the same files",
+                shapes[i]
+            );
+            for ((n, a), (_, b)) in f.iter().zip(&files[0]) {
+                assert!(a == b, "{sync:?} {:?}: {n} differs", shapes[i]);
+            }
+        }
+    }
+}
+
+/// A drain's close of a direct run whose every commit is synced runs on the
+/// writer up to the readable signal (`Options::close_readable_inline`): it
+/// makes no records' sync, since none is owed, so a sync set to fail is
+/// never asked and the flush answers; the drain is answered at the seal's
+/// readable landing, with the directory's fsync of its name left to the
+/// durable landing every time -- the readable signal comes before the
+/// flush's ask, and the loop leaves the landing to the ask
+/// (`SealJob::early_hint`), where landed first it paid that fsync there;
+/// and every key reads back through a handle and after a reopen. The seal
+/// is held between its phases across the flush: a seal thread whose fsync
+/// ends before the segment work reads the flush's ask is landed whole by
+/// the loop, and the drain answered the strict way, which a loaded host
+/// made once in twelve stores. A store whose run closes with commits
+/// unsynced, and the option off, close on the seal thread as before.
+#[test]
+fn a_synced_runs_drain_closes_on_the_writer_and_defers_its_directory_sync() {
+    let keys = drain_keys(true, 3000);
+    for i in 0..12 {
+        let d = dir(&format!("closeinline-{i}"));
+        let opts = common::options();
+        assert!(opts.close_readable_inline, "the engine's default");
+        let mut db = Db::create(&d, opts.clone()).unwrap();
+        drain_load(&mut db, &keys);
+        db.fail_next_presync();
+        db.hold_seal_durable(true);
+        let release = db.release_seal_durable_after(std::time::Duration::from_secs(30));
+        db.flush().unwrap();
+        let w = db.seal_waits();
+        db.hold_seal_durable(false);
+        drop(release);
+        wait_for("the seal's durable landing", || !db.in_flight().0);
+        assert_eq!(
+            (w.closes_inline, w.drains_early, w.drains_beside),
+            (1, 1, 0),
+            "store {i}: {w:?}"
+        );
+        let r = db.reader().unwrap();
+        drain_check(&r, &keys, "after the flush");
+        drop(r);
+        db.settle().unwrap();
+        let w = db.seal_waits();
+        assert_eq!(
+            w.dir_owed_syncs, 1,
+            "store {i}: the readable landing left the directory's fsync: {w:?}"
+        );
+        assert!(direct_temps(&d).is_empty(), "{:?}", direct_temps(&d));
+        drop(db);
+        let db = Db::open(&d, opts).unwrap();
+        assert_eq!((db.segments(), db.unsealed_keys()), (1, 0));
+        drain_check(&db, &keys, "after the reopen");
+    }
+    for (name, opts) in [
+        (
+            "closeinline-buffered",
+            Options {
+                sync: supdb::SyncPolicy::EveryN(u32::MAX),
+                ..common::options()
+            },
+        ),
+        (
+            "closeinline-off",
+            Options {
+                close_readable_inline: false,
+                ..common::options()
+            },
+        ),
+    ] {
+        let d = dir(name);
+        let mut db = Db::create(&d, opts.clone()).unwrap();
+        drain_load(&mut db, &keys);
+        db.flush().unwrap();
+        db.settle().unwrap();
+        assert_eq!(db.seal_waits().closes_inline, 0, "{name}");
+        drain_check(&db, &keys, name);
+        drop(db);
+        let db = Db::open(&d, opts).unwrap();
+        drain_check(&db, &keys, &format!("{name}, reopened"));
+    }
+}
+
+/// A seal its close can name the store's first partition before the
+/// finish composes no Bloom (`Options::bloom_pieces_only`): a fresh
+/// store's drain, ordered and shuffled, closed on the writer, on the seal
+/// thread, from the writer's key copies, and sealed from a hashed table.
+/// A seal that may be a piece composes it -- one over a partition limit
+/// its finished file passes, and a hashed table's with a tombstone in it
+/// -- and so does every seal with the option off. Every key reads back
+/// through a handle and after a reopen, and each finished file is held to
+/// its bound in a checked build.
+#[test]
+fn a_seal_named_the_first_partition_ahead_composes_no_bloom() {
+    for ordered in [true, false] {
+        let keys = drain_keys(ordered, 3000);
+        for (case, opts, left) in [
+            ("writer", common::options(), 1),
+            (
+                "seal-thread",
+                Options {
+                    close_readable_inline: false,
+                    ..common::options()
+                },
+                1,
+            ),
+            (
+                "key-copies",
+                Options {
+                    direct_derive_keys: false,
+                    ..common::options()
+                },
+                1,
+            ),
+            (
+                "off",
+                Options {
+                    bloom_pieces_only: false,
+                    ..common::options()
+                },
+                0,
+            ),
+            (
+                "over-limit",
+                Options {
+                    partition_bytes: Some(64 << 10),
+                    ..common::options()
+                },
+                0,
+            ),
+        ] {
+            let d = dir(&format!("bloomahead-{case}-{ordered}"));
+            let mut db = Db::create(&d, opts.clone()).unwrap();
+            drain_load(&mut db, &keys);
+            db.flush().unwrap();
+            db.settle().unwrap();
+            let w = db.seal_waits();
+            assert_eq!(w.blooms_left, left, "{case}, ordered {ordered}: {w:?}");
+            let r = db.reader().unwrap();
+            drain_check(&r, &keys, case);
+            drop(r);
+            drop(db);
+            let db = Db::open(&d, opts).unwrap();
+            drain_check(&db, &keys, &format!("{case}, reopened"));
+        }
+        // The bound held to the finished length a byte at a time: the same
+        // keys finish to the same file, so under a limit a byte short of it
+        // the seal may be a piece and composes its Bloom, and under one a
+        // page past it the bound names the partition ahead.
+        let len = {
+            let d = dir(&format!("bloomahead-len-{ordered}"));
+            let mut db = Db::create(&d, common::options()).unwrap();
+            drain_load(&mut db, &keys);
+            db.flush().unwrap();
+            db.settle().unwrap();
+            let parts: Vec<u64> = common::seg_names(&d)
+                .into_iter()
+                .filter(|n| n.starts_with("par-"))
+                .map(|n| common::store_len(d.join(n)))
+                .collect();
+            assert_eq!(parts.len(), 1, "one partition");
+            parts[0]
+        };
+        for (limit, left) in [(len - 1, 0u64), (len + 4096, 1)] {
+            let d = dir(&format!("bloomahead-at-{limit}-{ordered}"));
+            let opts = Options {
+                partition_bytes: Some(limit as usize),
+                ..common::options()
+            };
+            let mut db = Db::create(&d, opts).unwrap();
+            drain_load(&mut db, &keys);
+            db.flush().unwrap();
+            db.settle().unwrap();
+            assert_eq!(
+                db.seal_waits().blooms_left,
+                left,
+                "ordered {ordered}, a file of {len} bytes under a limit of {limit}"
+            );
+            drain_check(&db, &keys, "at the limit");
+        }
+    }
+    // A tombstone in a hashed table's seal: no partition, the Bloom made.
+    let keys = drain_keys(false, 3000);
+    let d = dir("bloomahead-tomb");
+    let opts = common::options();
+    let mut db = Db::create(&d, opts.clone()).unwrap();
+    drain_load(&mut db, &keys);
+    db.delete(&keys[7]);
+    db.commit().unwrap();
+    db.flush().unwrap();
+    db.settle().unwrap();
+    assert_eq!(db.seal_waits().blooms_left, 0, "{:?}", db.seal_waits());
+    let r = db.reader().unwrap();
+    assert!(read_vec(&r, &keys[7]).is_empty(), "the deleted key");
+    drain_check(&r, &keys[8..], "after the delete");
+    drop(r);
+    drop(db);
+    let db = Db::open(&d, opts).unwrap();
+    assert!(
+        read_vec(&db, &keys[7]).is_empty(),
+        "the deleted key, reopened"
+    );
+    drain_check(&db, &keys[8..], "after the delete, reopened");
+}
+
+/// A landing makes an empty live table only for a table it retires that
+/// is still the live one (`Options::land_fresh_lazy`): a drain, whose
+/// writer froze its table, makes none, and a `sync` that hands the live
+/// table and lands before the writer writes again makes the one it
+/// installs; with the option off every landing that retires a table
+/// makes one. The writes after read back either way.
+#[test]
+fn a_landing_makes_a_fresh_table_only_where_it_installs_one() {
+    for (lazy, drained) in [(true, 0u64), (false, 1)] {
+        let keys = drain_keys(true, 3000);
+        let d = dir(&format!("landfresh-drain-{lazy}"));
+        let opts = Options {
+            land_fresh_lazy: lazy,
+            ..common::options()
+        };
+        let mut db = Db::create(&d, opts).unwrap();
+        drain_load(&mut db, &keys);
+        db.flush().unwrap();
+        db.settle().unwrap();
+        assert_eq!(
+            db.seal_waits().landing_tables,
+            drained,
+            "lazy {lazy}: {:?}",
+            db.seal_waits()
+        );
+        drain_check(&db, &keys, "after the drain");
+    }
+    for lazy in [true, false] {
+        let d = dir(&format!("landfresh-handed-{lazy}"));
+        let n = 14_000u32;
+        let mut db = load_ordered_with_tail_opts(
+            &d,
+            n,
+            Options {
+                land_fresh_lazy: lazy,
+                ..load_ordered_with_tail_options()
+            },
+        );
+        // The run's mid-load seal landed first, so the count read here is
+        // every landing's but the sync's.
+        wait_for("the mid-load seal's landing", || !db.in_flight().0);
+        let before = db.seal_waits().landing_tables;
+        db.sync().unwrap();
+        let t = std::time::Instant::now();
+        while db.unsealed_keys() > 0 {
+            assert!(
+                t.elapsed() < std::time::Duration::from_secs(20),
+                "the tail did not land"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        assert_eq!(db.tail_swaps(), (0, 1), "the landing replaced the table");
+        assert_eq!(
+            db.seal_waits().landing_tables - before,
+            1,
+            "lazy {lazy}: the table it installed"
+        );
+        for k in (0..n).step_by(7) {
+            db.put(&tail_key(k), &tail_val(2));
+        }
+        db.commit().unwrap();
+        let r = db.reader().unwrap();
+        for k in 0..n {
+            let want = if k % 7 == 0 { 2 } else { 1 };
+            assert_eq!(read_vec(&r, &tail_key(k)), vec![tail_val(want)], "key {k}");
+        }
+    }
 }
 
 /// A scan's seek hints the directory lines of its stride window and the
@@ -22405,6 +23316,282 @@ fn a_second_open_of_a_store_is_refused_until_the_first_is_gone() {
     let _ = std::fs::remove_dir_all(&d);
 }
 
+/// The directory read twice a third of a second apart, and held to be the
+/// same both times: what a crashed store's directory is from the moment
+/// the crash returns.
+fn stands_still(d: &std::path::Path, what: &str) -> BTreeMap<String, Vec<u8>> {
+    let lens = |m: &BTreeMap<String, Vec<u8>>| -> Vec<(String, usize)> {
+        m.iter().map(|(n, b)| (n.clone(), b.len())).collect()
+    };
+    let a = the_directory(d);
+    std::thread::sleep(std::time::Duration::from_millis(300));
+    let b = the_directory(d);
+    assert_eq!(
+        lens(&a),
+        lens(&b),
+        "{what}: the directory moved after the crash returned"
+    );
+    assert!(
+        a == b,
+        "{what}: a file's bytes changed after the crash returned"
+    );
+    a
+}
+
+/// The segment files among a directory's names.
+fn sup_count(m: &BTreeMap<String, Vec<u8>>) -> usize {
+    m.keys().filter(|n| n.ends_with(".sup")).count()
+}
+
+/// The options of the crash tests below: seals and merges where the test
+/// asks for them, the keys through the memtable, and a first partitioning
+/// at the second piece.
+fn crash_opts() -> Options {
+    Options {
+        seal_bytes: 64 << 20,
+        partition_bytes: Some(64 << 10),
+        l0_trigger: 2,
+        merge_parallel: 1,
+        merge_parallel_quiet: 0,
+        promote: false,
+        merge_chains: false,
+        direct_ingest: false,
+        ..common::options()
+    }
+}
+
+/// Every key of `n` put once, scrambled, and committed.
+fn crash_batch(db: &mut Db, n: u32, tag: &str) {
+    for i in 0..n {
+        db.put(
+            format!("key-{:05}", (i * 7919) % n).as_bytes(),
+            format!("{tag:-<64}").as_bytes(),
+        );
+    }
+    db.commit().unwrap();
+}
+
+/// A crashed store opened again reads every key's last put.
+fn crash_reopens(d: &std::path::Path, n: u32, tag: &str) {
+    let db = Db::open(d, crash_opts()).unwrap();
+    let want = format!("{tag:-<64}").into_bytes();
+    for i in (0..n).step_by(37) {
+        let k = format!("key-{i:05}");
+        let mut got = Vec::new();
+        db.read_all(k.as_bytes(), vf(&mut |v: &[u8]| got.push(v.to_vec())))
+            .unwrap();
+        assert_eq!(got, vec![want.clone()], "{k} after the reopen");
+    }
+    db.close().unwrap();
+    let _ = std::fs::remove_dir_all(d);
+}
+
+/// The tests' crash leaves nothing of the store moving in its directory
+/// (`Db::crash`). It left every thread running: the segment work's went on
+/// landing and retiring, and a seal or a merge in flight wrote its files
+/// under whoever opened the store next. A seal let go as the crash is
+/// called has run to its end when the crash returns -- its piece on disk,
+/// named by no manifest the crash waited for -- and the directory then
+/// stands as it is; a seal held stays held, its piece never written.
+#[test]
+fn a_seal_in_flight_at_a_crash_is_through_before_the_crash_returns() {
+    let n = 3000u32;
+    for held in [false, true] {
+        let d = dir(if held {
+            "crash-seal-held"
+        } else {
+            "crash-seal"
+        });
+        let mut db = Db::create(&d, common::files(crash_opts())).unwrap();
+        crash_batch(&mut db, n, "a");
+        let before = sup_count(&the_directory(&d));
+        db.hold_seal_landing(true);
+        db.seal().unwrap();
+        if !held {
+            db.hold_seal_landing(false);
+        }
+        db.crash();
+        let left = stands_still(&d, "a seal in flight");
+        assert_eq!(
+            sup_count(&left) > before,
+            !held,
+            "held {held}: the seal's piece, {:?}",
+            left.keys().collect::<Vec<_>>()
+        );
+        crash_reopens(&d, n, "a");
+    }
+}
+
+/// And a merge: one held before it reads anything is in flight for as long
+/// as the test says, and let go as the crash is called it has written its
+/// outputs when the crash returns, with nobody to land them, whether or
+/// not a hold stands before its landing, and whether or not the planner
+/// is waiting to join it there (`Db::plan_joins_merge`); held at its
+/// start, it writes none, and the crash does not wait for it.
+#[test]
+fn a_merge_in_flight_at_a_crash_is_through_before_the_crash_returns() {
+    let n = 3000u32;
+    for (name, held, landing, joined) in [
+        ("crash-merge", false, false, false),
+        ("crash-merge-held", true, false, false),
+        ("crash-merge-landing", false, true, false),
+        ("crash-merge-joined", false, true, true),
+    ] {
+        let d = dir(name);
+        let mut db = Db::create(&d, common::files(crash_opts())).unwrap();
+        db.hold_merge_start(true);
+        db.hold_merge_landing(landing);
+        for tag in ["a", "b"] {
+            crash_batch(&mut db, n, tag);
+            db.seal().unwrap();
+        }
+        wait_for("the first partitioning, held at its start", || {
+            db.merges_in_flight() == 1
+        });
+        // The pieces durable, so that the segments written after this
+        // are the merge's alone.
+        wait_for("the seals durable", || !db.in_flight().0);
+        let before = sup_count(&the_directory(&d));
+        if !held {
+            db.hold_merge_start(false);
+        }
+        // A third piece, whose landing plans a merge beside the one held
+        // at its landing and waits to join it first.
+        if joined {
+            crash_batch(&mut db, n, "c");
+            db.plan_joins_merge(true);
+            db.seal().unwrap();
+            wait_for("the planner's join", || db.merge_plan_joining());
+        }
+        db.crash();
+        let left = stands_still(&d, name);
+        assert_eq!(
+            sup_count(&left) > before,
+            !held,
+            "{name}: the merge's outputs, {:?}",
+            left.keys().collect::<Vec<_>>()
+        );
+        crash_reopens(&d, n, if joined { "c" } else { "b" });
+    }
+}
+
+/// And the two threads that wait under a hold of their own: the segment
+/// work's, held between a landing's state and its swap, and the upkeep
+/// thread, held before its pass. A crash that finds either parked leaves
+/// it parked for good and returns, the landing never published and the
+/// pass never run, and the store opens again on what its log holds.
+#[test]
+fn a_thread_parked_under_a_hold_at_a_crash_stays_parked() {
+    let n = 3000u32;
+    // The landing's swap.
+    let d = dir("crash-swap-held");
+    let mut db = Db::create(&d, crash_opts()).unwrap();
+    crash_batch(&mut db, n, "a");
+    db.hold_landing_swap(true);
+    db.seal().unwrap();
+    wait_for("the landing at its swap", || db.landing_holding());
+    db.crash();
+    stands_still(&d, "a landing held at its swap");
+    crash_reopens(&d, n, "a");
+    // The upkeep thread's pass: a scan first, so that a commit's batch is
+    // one the thread is lent.
+    let d = dir("crash-upkeep-held");
+    let mut db = Db::create(
+        &d,
+        Options {
+            upkeep: supdb::Upkeep::Background(1),
+            ..crash_opts()
+        },
+    )
+    .unwrap();
+    crash_batch(&mut db, n, "a");
+    db.flush().unwrap();
+    db.settle().unwrap();
+    let mut seen = 0;
+    db.scan(b"", 100, kv(&mut |_, _| seen += 1)).unwrap();
+    assert!(seen > 0);
+    db.hold_upkeep_pass(true);
+    crash_batch(&mut db, n, "b");
+    wait_for("the upkeep thread at its hold", || db.upkeep_holding());
+    db.crash();
+    stands_still(&d, "an upkeep pass held");
+    crash_reopens(&d, n, "b");
+}
+
+/// The upkeep thread reads the store's files through their mappings, and a
+/// test may cut one back the moment its crash returns: a pass let go as
+/// the crash is called has ended when the crash returns, and none ends
+/// after. The segment work is the writer's own here, so that the pass is
+/// all the crash has to wait for, and the passes are read through a handle,
+/// which a crashed store still answers.
+#[test]
+fn an_upkeep_pass_in_flight_at_a_crash_is_through_before_the_crash_returns() {
+    let n = 3000u32;
+    let d = dir("crash-upkeep");
+    let opts = || Options {
+        upkeep: supdb::Upkeep::Background(1),
+        publish_in_background: false,
+        ..crash_opts()
+    };
+    let mut db = Db::create(&d, opts()).unwrap();
+    crash_batch(&mut db, n, "a");
+    db.flush().unwrap();
+    db.settle().unwrap();
+    let mut seen = 0;
+    db.scan(b"", 100, kv(&mut |_, _| seen += 1)).unwrap();
+    assert!(seen > 0);
+    let r = db.reader().unwrap();
+    db.hold_upkeep_pass(true);
+    crash_batch(&mut db, n, "b");
+    wait_for("the upkeep thread at its hold", || db.upkeep_holding());
+    let before = r.upkeep_passes_ended();
+    db.hold_upkeep_pass(false);
+    db.crash();
+    let at = r.upkeep_passes_ended();
+    assert_eq!(
+        at,
+        before + 1,
+        "the pass let go at the crash, ended when the crash returned"
+    );
+    std::thread::sleep(std::time::Duration::from_millis(200));
+    assert_eq!(r.upkeep_passes_ended(), at, "a pass after the crash");
+    drop(r);
+    let db = Db::open(&d, opts()).unwrap();
+    assert_eq!(db.count(b"key-00037").unwrap(), 1);
+    db.close().unwrap();
+    let _ = std::fs::remove_dir_all(&d);
+}
+
+/// And the segment work's own thread, which a flush is answered ahead of:
+/// the slot's sync, the log's retirement and whatever it starts next were
+/// its to do after the crash had returned. A store crashed straight after
+/// its flush stands still.
+#[test]
+fn the_segment_work_ends_with_a_crash_straight_after_a_flush() {
+    let n = 3000u32;
+    for round in 0..8 {
+        let d = dir("crash-flush");
+        // The keeper's thread in half the rounds: it ends with the store
+        // as the upkeep's does, and a crash that waited for one that ran
+        // on would not return.
+        let mut db = Db::create(
+            &d,
+            Options {
+                snapshot_keeper: round % 2 == 1,
+                ..crash_opts()
+            },
+        )
+        .unwrap();
+        crash_batch(&mut db, n, "a");
+        db.flush().unwrap();
+        crash_batch(&mut db, n, "b");
+        db.flush().unwrap();
+        db.crash();
+        stands_still(&d, &format!("round {round}: a crash after a flush"));
+        crash_reopens(&d, n, "b");
+    }
+}
+
 /// The same refusal from another process: this test binary run again on
 /// this one test, with the store's path in `SUPDB_LOCK_PROBE`, opens the
 /// store and says through its exit code what it got. Refused while the
@@ -23084,4 +24271,543 @@ fn overwriting_store_answers_the_last_put(runs: bool) {
     db.close().unwrap();
     let db = Db::open(&d, opts()).unwrap();
     check(&db, &model, "reopened");
+}
+
+/// The keys of a drain's tests: `n` of them in key order, or in a
+/// permutation of it (the stride coprime to `n`).
+fn drain_keys(ordered: bool, n: u32) -> Vec<Vec<u8>> {
+    (0..n)
+        .map(|i| if ordered { i } else { (i * 7919) % n })
+        .map(|k| format!("key-{k:06}").into_bytes())
+        .collect()
+}
+
+fn drain_value(k: &[u8]) -> Vec<u8> {
+    let mut v = b"v-".to_vec();
+    v.extend_from_slice(k);
+    v
+}
+
+/// `keys` appended and committed in batches of five hundred.
+fn drain_load(db: &mut Db, keys: &[Vec<u8>]) {
+    for (i, k) in keys.iter().enumerate() {
+        db.append(k, &drain_value(k));
+        if i % 500 == 499 {
+            db.commit().unwrap();
+        }
+    }
+    db.commit().unwrap();
+}
+
+fn drain_check(r: &Reader, keys: &[Vec<u8>], what: &str) {
+    for k in keys {
+        assert_eq!(
+            read_vec(r, k),
+            vec![drain_value(k)],
+            "{what}: key {}",
+            String::from_utf8_lossy(k)
+        );
+    }
+}
+
+/// The run of ordered ingest's temp names a store's directory holds: the
+/// files that hold something, an empty one being the next run's, made
+/// ahead of it (`Options::run_spare`).
+fn direct_temps(d: &std::path::Path) -> Vec<PathBuf> {
+    let mut v: Vec<PathBuf> = std::fs::read_dir(d)
+        .unwrap()
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| {
+            p.file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(|n| n.starts_with("direct-") && n.ends_with(".tmp"))
+                && std::fs::metadata(p).is_ok_and(|m| m.len() > 0)
+        })
+        .collect();
+    v.sort();
+    v
+}
+
+/// A flush whose writes were all durable before it -- every commit synced
+/// -- is answered once its seal is readable (`Options::drain_answers_readable`):
+/// with the seal held between its phases (`Db::hold_seal_durable`), where a
+/// strict flush waits for the release, the flush returns, a handle reads
+/// every key, and the seal is still in flight. The store's drop then lands
+/// that seal whole, as a strict flush had before its answer: the run's
+/// temp name retired behind the slot that names its segment, and the
+/// reopen finds the partition and nothing to replay. Both a load's shapes:
+/// the ordered one's direct run and the shuffled one's memtable.
+#[test]
+fn a_durable_flush_is_answered_at_its_seals_readable_landing() {
+    for ordered in [true, false] {
+        let d = dir(&format!("drain-readable-{ordered}"));
+        let opts = Options {
+            drain_answers_readable: true,
+            ..common::options()
+        };
+        let keys = drain_keys(ordered, 3000);
+        let mut db = Db::create(&d, opts.clone()).unwrap();
+        drain_load(&mut db, &keys);
+        db.hold_seal_durable(true);
+        // The release a strict flush would wait for, late enough to tell.
+        let _release = db.release_seal_durable_after(std::time::Duration::from_secs(30));
+        let t = std::time::Instant::now();
+        db.flush().unwrap();
+        assert!(
+            t.elapsed() < std::time::Duration::from_secs(15),
+            "ordered {ordered}: the flush waited for its seal's fsync ({:?})",
+            t.elapsed()
+        );
+        let w = db.seal_waits();
+        assert_eq!(w.drains_early, 1, "ordered {ordered}: {w:?}");
+        assert_eq!(w.drains_beside, 0, "a durable store owes no sync");
+        // Held there, and not by timing: a seal let through lands durable
+        // in a few milliseconds.
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        assert!(
+            db.in_flight().0,
+            "ordered {ordered}: the seal is between its phases"
+        );
+        let r = db.reader().unwrap();
+        drain_check(&r, &keys, "after the flush");
+        drop(r);
+        drop(db);
+        assert!(
+            direct_temps(&d).is_empty(),
+            "ordered {ordered}: the drop left the run's temp name: {:?}",
+            direct_temps(&d)
+        );
+        let db = Db::open(&d, opts.clone()).unwrap();
+        assert_eq!(
+            (db.segments(), db.unsealed_keys()),
+            (1, 0),
+            "ordered {ordered}: the reopen recovered what the drop should have landed"
+        );
+        drain_check(&db, &keys, "after the drop and the reopen");
+        let w = db.seal_waits();
+        assert_eq!(w.drains_early, 0, "a fresh store's count");
+        drop(db);
+
+        // Landed by the loop, with nothing held between the phases: the
+        // slot that names the seal written behind the directory's fsync
+        // the readable landing owed. The seal is held before it writes for
+        // a second, so that the flush's ask is at the segment work before
+        // the seal is readable and the loop cannot land it readable first,
+        // which syncs the directory there.
+        let d2 = dir(&format!("drain-readable-loop-{ordered}"));
+        let mut db = Db::create(&d2, opts.clone()).unwrap();
+        drain_load(&mut db, &keys);
+        db.hold_seal_landing(true);
+        let _release = db.release_seal_landing_after(std::time::Duration::from_secs(1));
+        // And between its phases across the flush: where the close runs
+        // on the writer (`Options::close_readable_inline`) the landing's
+        // hold is the writer's, the ask comes after the readable signal,
+        // and a seal whose fsync ended first would be landed whole by the
+        // loop and the drain answered the strict way.
+        db.hold_seal_durable(true);
+        let durable = db.release_seal_durable_after(std::time::Duration::from_secs(30));
+        db.flush().unwrap();
+        db.hold_seal_durable(false);
+        drop(durable);
+        // Landed as no flush's: its slot synced where it was written and
+        // the run's temp name retired behind it, with no ask to pay a
+        // slot left owed.
+        wait_for("the seal's durable landing", || !db.in_flight().0);
+        assert!(
+            direct_temps(&d2).is_empty(),
+            "ordered {ordered}: the durable landing left the temp name: {:?}",
+            direct_temps(&d2)
+        );
+        db.settle().unwrap();
+        let w = db.seal_waits();
+        assert_eq!(
+            (w.drains_early, w.dir_owed_syncs),
+            (1, 1),
+            "ordered {ordered}: {w:?}"
+        );
+        assert!(direct_temps(&d2).is_empty());
+        drop(db);
+        let db = Db::open(&d2, opts).unwrap();
+        assert_eq!((db.segments(), db.unsealed_keys()), (1, 0));
+        drain_check(&db, &keys, "after the settle and the reopen");
+    }
+}
+
+/// A machine's crash after a flush answered at its seal's readable landing
+/// may take whatever that seal had not made durable -- its trailer, its
+/// names, its segment's pages -- and nothing the flush covers: every commit
+/// was synced before it. Built: the seal held between its phases, the
+/// store crashed, and what the seal wrote taken back -- a direct run's file
+/// cut to the length its last synced commit left, a memtable's segment torn
+/// in half. The reopen finds every key.
+#[test]
+fn a_crash_after_a_flush_answered_at_readable_keeps_every_commit() {
+    for ordered in [true, false] {
+        let d = dir(&format!("drain-readable-crash-{ordered}"));
+        // No form files, which a builder this process still runs after
+        // the crash would read through the segment the test tears
+        // (`a_buffered_flush_syncs_its_log_beside_its_seal_and_answers_readable`).
+        // A segment torn by its name in the directory: a store of files.
+        let opts = Options {
+            drain_answers_readable: true,
+            zpages: supdb::ZPages::Off,
+            ..common::files(common::options())
+        };
+        let keys = drain_keys(ordered, 3000);
+        let mut db = Db::create(&d, opts.clone()).unwrap();
+        drain_load(&mut db, &keys);
+        let synced: Vec<(PathBuf, u64)> = direct_temps(&d)
+            .into_iter()
+            .map(|p| {
+                let n = std::fs::metadata(&p).unwrap().len();
+                (p, n)
+            })
+            .collect();
+        assert_eq!(
+            synced.len(),
+            usize::from(ordered),
+            "a run is the ordered load's"
+        );
+        db.hold_seal_durable(true);
+        db.flush().unwrap();
+        assert_eq!(db.seal_waits().drains_early, 1);
+        assert!(db.in_flight().0);
+        // Held for good: the crashed store's seal thread never syncs.
+        db.crash();
+        if ordered {
+            for (p, n) in &synced {
+                let f = std::fs::OpenOptions::new().write(true).open(p).unwrap();
+                f.set_len(*n).unwrap();
+            }
+        } else {
+            let mut torn = 0;
+            for name in common::seg_names(&d) {
+                let p = d.join(&name);
+                let n = std::fs::metadata(&p).unwrap().len();
+                let f = std::fs::OpenOptions::new().write(true).open(&p).unwrap();
+                f.set_len(n / 2).unwrap();
+                torn += 1;
+            }
+            assert!(torn > 0, "the seal left no segment to tear");
+        }
+        let db = Db::open(&d, opts).unwrap();
+        drain_check(&db, &keys, "after the crash");
+    }
+}
+
+/// A flush with anything behind no sync waits for its seal's fsync, the
+/// slot behind it: a buffered store's, whose log frames and whose run of
+/// ordered ingest no commit synced, where the drain does not pay the sync
+/// beside its seal (`Options::drain_syncs_beside` off); a store whose segment work is inline,
+/// where nothing would land the seal until the writer's next operation;
+/// and a drain that leaves a level-0 piece to merge.
+#[test]
+fn a_flush_owed_anything_waits_for_its_seals_fsync() {
+    for ordered in [true, false] {
+        let keys = drain_keys(ordered, 3000);
+        for case in ["buffered", "inline"] {
+            let d = dir(&format!("drain-strict-{case}-{ordered}"));
+            let opts = Options {
+                drain_answers_readable: true,
+                drain_syncs_beside: false,
+                sync: if case == "buffered" {
+                    supdb::SyncPolicy::EveryN(u32::MAX)
+                } else {
+                    Options::default().sync
+                },
+                publish_in_background: case != "inline",
+                ..common::options()
+            };
+            let mut db = Db::create(&d, opts.clone()).unwrap();
+            drain_load(&mut db, &keys);
+            db.flush().unwrap();
+            assert_eq!(
+                db.seal_waits().drains_early,
+                0,
+                "{case}, ordered {ordered}: answered early"
+            );
+            drain_check(&db, &keys, case);
+            drop(db);
+            let db = Db::open(&d, opts).unwrap();
+            drain_check(&db, &keys, case);
+        }
+        // A seal handed before the drain's and held between its phases:
+        // the drain lands it whole first, as a strict one does, and its
+        // own seal after it. Shaped (`adaptive_shape`), the held seal is
+        // the store's first partition, so that a drain that took it for
+        // its own would find no piece standing and answer.
+        let d = dir(&format!("drain-strict-behind-{ordered}"));
+        let opts = Options {
+            drain_answers_readable: true,
+            adaptive_shape: true,
+            ..common::options()
+        };
+        let mut db = Db::create(&d, opts.clone()).unwrap();
+        let (first, second) = keys.split_at(keys.len() / 2);
+        drain_load(&mut db, first);
+        db.hold_seal_durable(true);
+        db.seal().unwrap();
+        // The published segments, which `segments` also counts frozen
+        // tables among.
+        wait_for("the first seal's readable landing", || {
+            db.levels() != (0, 0)
+        });
+        assert!(db.in_flight().0, "the held seal is between its phases");
+        assert_eq!(db.levels(), (1, 0), "the held seal is the first partition");
+        drain_load(&mut db, second);
+        let _release = db.release_seal_durable_after(std::time::Duration::from_secs(1));
+        db.flush().unwrap();
+        assert_eq!(
+            db.seal_waits().drains_early,
+            0,
+            "ordered {ordered}: answered with a seal before the drain's in flight"
+        );
+        assert!(
+            !db.in_flight().0,
+            "ordered {ordered}: a seal left in flight"
+        );
+        drain_check(&db, &keys, "behind a held seal");
+        drop(db);
+        let db = Db::open(&d, opts).unwrap();
+        assert_eq!(db.unsealed_keys(), 0);
+        drain_check(&db, &keys, "behind a held seal, reopened");
+        drop(db);
+        // A partitioned store's flush over keys inside its range: the seal
+        // leaves a piece over the partition, and the drain merges it.
+        let d = dir(&format!("drain-strict-piece-{ordered}"));
+        let opts = Options {
+            drain_answers_readable: true,
+            ..common::options()
+        };
+        let mut db = Db::create(&d, opts.clone()).unwrap();
+        drain_load(&mut db, &keys);
+        // Held between its phases, as the early answer needs: a seal
+        // whose fsync ends before the segment work reads the flush's ask
+        // is landed whole, and the drain answered the strict way.
+        db.hold_seal_durable(true);
+        let release = db.release_seal_durable_after(std::time::Duration::from_secs(30));
+        db.flush().unwrap();
+        assert_eq!(db.seal_waits().drains_early, 1);
+        db.hold_seal_durable(false);
+        drop(release);
+        wait_for("the seal's durable landing", || !db.in_flight().0);
+        let more: Vec<Vec<u8>> = keys
+            .iter()
+            .step_by(7)
+            .map(|k| {
+                let mut k = k.clone();
+                k.push(b'x');
+                k
+            })
+            .collect();
+        drain_load(&mut db, &more);
+        db.flush().unwrap();
+        assert_eq!(
+            db.seal_waits().drains_early,
+            1,
+            "ordered {ordered}: a drain with a piece to merge answered early"
+        );
+        assert_eq!(db.levels().1, 0, "the drain left a piece");
+        drain_check(&db, &keys, "the first load");
+        drain_check(&db, &more, "the second");
+    }
+}
+
+/// A buffered flush -- its commits synced by no policy -- pays the log's
+/// sync beside its seal and is answered at the seal's readable landing
+/// (`Options::drain_syncs_beside`): with the seal held between its phases,
+/// where the strict drain waits for the release and its slot, the flush
+/// returns, the log is synced to its end and a handle reads every key. The
+/// drop then lands the seal whole, and the reopen finds the partition and
+/// nothing to replay. And a machine's crash in the window takes what the
+/// seal wrote and the log past its sync, which is nothing: built, the store
+/// crashed with the seal held for good, the log cut to its synced length
+/// and the segment torn, and the reopen replays every key from the log.
+#[test]
+fn a_buffered_flush_syncs_its_log_beside_its_seal_and_answers_readable() {
+    let keys = drain_keys(false, 3000);
+    // A segment torn by its name in the directory: a store of files.
+    let opts = Options {
+        drain_answers_readable: true,
+        drain_syncs_beside: true,
+        sync: supdb::SyncPolicy::EveryN(u32::MAX),
+        ..common::files(common::options())
+    };
+    let d = dir("drain-beside");
+    let mut db = Db::create(&d, opts.clone()).unwrap();
+    drain_load(&mut db, &keys);
+    let (_, synced, written) = db.wal_durable();
+    assert!(
+        synced < written,
+        "the load left its frames unsynced: {synced} of {written}"
+    );
+    db.hold_seal_durable(true);
+    let _release = db.release_seal_durable_after(std::time::Duration::from_secs(30));
+    let t = std::time::Instant::now();
+    db.flush().unwrap();
+    assert!(
+        t.elapsed() < std::time::Duration::from_secs(15),
+        "the flush waited for its seal's fsync ({:?})",
+        t.elapsed()
+    );
+    let w = db.seal_waits();
+    assert_eq!((w.drains_early, w.drains_beside), (1, 1), "{w:?}");
+    assert!(db.in_flight().0, "the seal is between its phases");
+    let (_, synced, written) = db.wal_durable();
+    assert_eq!(synced, written, "the log synced to its end");
+    let r = db.reader().unwrap();
+    drain_check(&r, &keys, "after the flush");
+    drop(r);
+    drop(db);
+    let db = Db::open(&d, opts.clone()).unwrap();
+    assert_eq!(
+        (db.segments(), db.unsealed_keys()),
+        (1, 0),
+        "the reopen recovered what the drop should have landed"
+    );
+    drain_check(&db, &keys, "after the drop and the reopen");
+    drop(db);
+
+    let d = dir("drain-beside-crash");
+    // No form files: the crash leaves this process's threads running, as
+    // `Db::crash` says, and a form file's build forced under the stride
+    // switch read the segment this test then tears, through its mapping:
+    // the binary died of SIGBUS, one run in four. A crashed process has no
+    // builder to read anything.
+    let opts = Options {
+        zpages: supdb::ZPages::Off,
+        ..opts
+    };
+    let mut db = Db::create(&d, opts.clone()).unwrap();
+    drain_load(&mut db, &keys);
+    db.hold_seal_durable(true);
+    db.flush().unwrap();
+    assert_eq!(db.seal_waits().drains_early, 1);
+    assert!(db.in_flight().0);
+    let (wal, synced, _) = db.wal_durable();
+    // Held for good: the crashed store's seal thread never syncs.
+    db.crash();
+    let f = std::fs::OpenOptions::new().write(true).open(&wal).unwrap();
+    f.set_len(synced).unwrap();
+    let mut torn = 0;
+    for name in common::seg_names(&d) {
+        let p = d.join(&name);
+        let n = std::fs::metadata(&p).unwrap().len();
+        let f = std::fs::OpenOptions::new().write(true).open(&p).unwrap();
+        f.set_len(n / 2).unwrap();
+        torn += 1;
+    }
+    assert!(torn > 0, "the seal left no segment to tear");
+    let db = Db::open(&d, opts).unwrap();
+    drain_check(&db, &keys, "after the crash");
+}
+
+/// The drains `Options::drain_syncs_beside` leaves to wait for their slot,
+/// each with the option on: one that closed a run of ordered ingest the
+/// policy left unsynced, whose name wants a barrier the seal's own fsync
+/// holds up -- over a log with nothing unsynced, and over one whose frames
+/// from before the run are, so the drain owes the log as well; a log held
+/// in the process (`SyncPolicy::Explicit`); a store whose segment work is
+/// inline; and one whose flush answers only behind its slot
+/// (`drain_answers_readable` off); and a drain whose seal is a piece over
+/// a partition the store holds, which the drain merges. None pays a sync
+/// beside its seal, none is answered early, and each reopens with every
+/// key. A durable store owes nothing and is answered early with nothing
+/// paid beside.
+#[test]
+fn a_drain_the_beside_sync_cannot_answer_pays_nothing_beside() {
+    for case in [
+        "ordered", "owed-run", "held", "inline", "strict", "durable", "piece",
+    ] {
+        let keys = drain_keys(case == "ordered", 3000);
+        let d = dir(&format!("drain-beside-not-{case}"));
+        let opts = Options {
+            drain_answers_readable: case != "strict",
+            drain_syncs_beside: true,
+            sync: match case {
+                "held" => supdb::SyncPolicy::Explicit,
+                "durable" => Options::default().sync,
+                _ => supdb::SyncPolicy::EveryN(u32::MAX),
+            },
+            publish_in_background: case != "inline",
+            ..common::options()
+        };
+        let mut db = Db::create(&d, opts.clone()).unwrap();
+        drain_load(&mut db, &keys);
+        // Keys above every one the log holds frames for, in order, over an
+        // empty live table: a run of ordered ingest the drain closes, with
+        // the frames from before it unsynced in the log.
+        let above: Vec<Vec<u8>> = (0..1000u32)
+            .map(|k| format!("lay-{k:06}").into_bytes())
+            .collect();
+        if case == "owed-run" {
+            db.seal().unwrap();
+            wait_for("the seal's landing", || !db.in_flight().0);
+            drain_load(&mut db, &above);
+            let (_, synced, written) = db.wal_durable();
+            assert!(
+                synced < written,
+                "the log's frames are unsynced: {synced} of {written}"
+            );
+        }
+        // A store's second flush, over keys inside the partition its first
+        // made: the drain's seal is a piece the drain merges, and its first
+        // flush, answered early with the log synced beside its seal, is
+        // the one count.
+        let more: Vec<Vec<u8>> = keys
+            .iter()
+            .step_by(7)
+            .map(|k| {
+                let mut k = k.clone();
+                k.push(b'x');
+                k
+            })
+            .collect();
+        // A flush that can be answered early holds its seal between its
+        // phases, so that the seal cannot be landed whole before the ask
+        // comes: a seal that finished first leaves the drain nothing to
+        // answer early, and the count read 0 once beside the whole binary.
+        let held_flush = |db: &mut Db| {
+            db.hold_seal_durable(true);
+            let release = db.release_seal_durable_after(std::time::Duration::from_secs(30));
+            db.flush().unwrap();
+            let w = db.seal_waits();
+            db.hold_seal_durable(false);
+            drop(release);
+            wait_for("the seal's durable landing", || !db.in_flight().0);
+            w
+        };
+        if case == "piece" {
+            let w = held_flush(&mut db);
+            assert_eq!((w.drains_early, w.drains_beside), (1, 1), "{case}: {w:?}");
+            drain_load(&mut db, &more);
+        }
+        let w = if case == "durable" {
+            held_flush(&mut db)
+        } else {
+            db.flush().unwrap();
+            db.seal_waits()
+        };
+        let early = u64::from(case == "durable" || case == "piece");
+        assert_eq!(
+            (w.drains_early, w.drains_beside),
+            (early, u64::from(case == "piece")),
+            "{case}: {w:?}"
+        );
+        if case == "piece" {
+            assert_eq!(db.levels().1, 0, "the drain left a piece");
+            drain_check(&db, &more, case);
+        }
+        drain_check(&db, &keys, case);
+        if case == "owed-run" {
+            drain_check(&db, &above, case);
+        }
+        drop(db);
+        let db = Db::open(&d, opts).unwrap();
+        drain_check(&db, &keys, case);
+        if case == "owed-run" {
+            drain_check(&db, &above, case);
+        }
+    }
 }

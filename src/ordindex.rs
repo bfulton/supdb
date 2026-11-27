@@ -220,8 +220,36 @@ fn bad(msg: &str) -> Error {
     Error::new(ErrorKind::InvalidData, format!("ordered index: {msg}"))
 }
 
+/// A key's head: the `HEAD` bytes past the prefix, big-endian, zeros
+/// past the key's end. One load for any key of a head's width or more:
+/// the head itself where the key has a whole head past the prefix, and
+/// otherwise the key's last eight bytes shifted up past the prefix's --
+/// the suite's sixteen digits over a prefix of twelve are that, a head of
+/// four bytes and four zeros. The copy below, of a length known only at
+/// run time, was a call into the C library's `memcpy` for every key the
+/// finish's pass composed a head of.
 #[inline]
 fn head_of(key: &[u8], pfx: usize) -> u64 {
+    let len = key.len();
+    let tail = len - pfx.min(len);
+    if tail >= HEAD {
+        return u64::from_be_bytes(
+            key[len - tail..len - tail + HEAD]
+                .try_into()
+                .expect("a head"),
+        );
+    }
+    if tail == 0 {
+        return 0;
+    }
+    if len >= HEAD {
+        let last = u64::from_be_bytes(
+            key[len - HEAD..]
+                .try_into()
+                .expect("a key's last eight bytes"),
+        );
+        return last << ((HEAD - tail) * 8);
+    }
     let mut h = [0u8; HEAD];
     let from = pfx.min(key.len());
     let n = (key.len() - from).min(HEAD);
@@ -337,8 +365,11 @@ impl Composer {
             common_prefix(first, last)
         };
         let len0 = if n == 0 { 0 } else { first.len() };
+        // Laid out whole: every head has its place from here, so a push
+        // is one store of eight bytes where the extend it was, of a
+        // length the compiler did not see, called `memcpy` for each key.
         let mut out = Vec::with_capacity(HEADER + n * HEAD + 4);
-        out.resize(HEADER, 0);
+        out.resize(HEADER + n * HEAD, 0);
         Composer {
             out,
             pfx,
@@ -350,10 +381,15 @@ impl Composer {
     }
 
     /// The next key in key order.
+    #[inline]
     pub fn push(&mut self, key: &[u8]) {
+        assert!(
+            self.pushed < self.n,
+            "an ordered index of the keys it was told of"
+        );
         self.uniform &= key.len() == self.len0;
-        self.out
-            .extend_from_slice(&head_of(key, self.pfx).to_be_bytes());
+        let at = HEADER + self.pushed * HEAD;
+        self.out[at..at + HEAD].copy_from_slice(&head_of(key, self.pfx).to_be_bytes());
         self.pushed += 1;
     }
 
@@ -1660,6 +1696,30 @@ fn lower_bound(a: &[u64], h: u64) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The head read as one word where the key has a whole head past the
+    /// prefix is the head the byte copy makes, at every key length around
+    /// the head's width and every prefix up to past the key's end.
+    #[test]
+    fn a_heads_word_read_is_its_byte_copy() {
+        let copied = |key: &[u8], pfx: usize| -> u64 {
+            let mut h = [0u8; HEAD];
+            let from = pfx.min(key.len());
+            let n = (key.len() - from).min(HEAD);
+            h[..n].copy_from_slice(&key[from..from + n]);
+            u64::from_be_bytes(h)
+        };
+        let key: Vec<u8> = (0..40u8).map(|b| b.wrapping_mul(37) ^ 0xA5).collect();
+        for len in 0..key.len() {
+            for pfx in 0..len + 3 {
+                assert_eq!(
+                    head_of(&key[..len], pfx),
+                    copied(&key[..len], pfx),
+                    "a key of {len} bytes past a prefix of {pfx}"
+                );
+            }
+        }
+    }
 
     #[test]
     fn the_short_compare_answers_as_the_slice_compare_does() {

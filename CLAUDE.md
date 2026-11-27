@@ -395,6 +395,24 @@ filter and the group ran no test and exited 0, so the case holds its run
 to `0 filtered out`. A fix that rests on an input is held where the input
 can be undone, and a group's verdict by exit status is held to the count
 of what it ran.
+One hosted leg can be run here, and the gate does not run it. `cross-arm`
+runs the library's tests for ARM under qemu-user, which answers `madvise`
+advice with success and passes it to no kernel, so a test that reads the
+kernel's answer to advice -- the `hg` flag of a mapping advised onto huge
+pages, `mincore` after a populate or an ask -- cannot pass there, and is
+compiled out of that job alone by `supdb_emulated` (`Cargo.toml`,
+`.github/workflows/ci.yml`), the native ARM leg running it. Two tests of
+the shared table's huge pages were written without it and failed the leg
+at the first hosted run of the pull request that brought them, as the
+populate test had before them: `scripts/check.sh` has no such leg, and
+nothing here had run one. Where the cross compiler and
+`qemu-aarch64-static` are installed the job's own command runs in two
+minutes (its step's three `CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_`
+variables before `cargo test --profile checked --target
+aarch64-unknown-linux-gnu --lib`), and a test that reads
+`/proc/self/smaps` or `mincore` behind an `madvise` is run under it
+before it is pushed. Where only part of a test reads the kernel, that
+part goes behind `cfg!(supdb_emulated)` and the rest runs everywhere.
 
 A hosted job's log cannot be read while the job runs, so one that is
 overdue is read by its groups once it ends before it is called anything:
@@ -472,7 +490,13 @@ in the private temp directories (1.3 GB), and the bench workspace's
 `target` held 14 GB, 3.6 of it the checked profile's example binaries,
 which the gate's bench group rebuilds and nothing reads. Read `df` of
 the temp volume before a timing run, and delete the test stores and the
-checked examples first.
+checked examples first. And `perf record`
+keeps a copy of every binary it sampled, by build id, under `~/.debug`:
+a bench binary is a third of a gigabyte, a session's profiles had left
+twenty-nine of them there, eleven gigabytes, and the gate's links died of
+the bus error above while every directory this file names had been
+cleaned twice. `perf record -N` keeps none; `du` the home directory
+before reading the allowance as the builds'.
 
 The test group's compile was thirty-three minutes of a gate's
 thirty-seven, for four minutes of tests, and the cause was in the
@@ -520,6 +544,17 @@ tests in it, and was read as green. A worktree gets a target of its own,
 and a result is believed after `--list` has shown the tests it names. The
 tooling cuts a worktree from `origin/main` and not from the parent's head,
 so the first command in one is `git switch -C <branch> <base>`.
+
+The main line takes only commits with verified signatures, every commit
+of a pull request and not its head alone. `git commit`, `git merge` and
+`git cherry-pick` sign under the environment's configuration
+(`commit.gpgsign`); `git commit-tree` does not, and one commit made with
+it -- to commit from saved copies while a mutant harness was rewriting
+the working tree in place -- blocked a pull request's merge until it and
+the four commits after it were made again and the branch force-pushed.
+Mutants run in a worktree of their own, with a target of its own, so the
+tree a commit is made from is never the one being rewritten, and a
+commit is made by `git commit`.
 
 Keep it that way. Every gate this repository has broken has broken the same
 way: a check that was not running, or one reporting a verdict it had not
@@ -1186,8 +1221,9 @@ entries the writer is rewriting are the cost, each an ownership the
 next update pays for, and three cache-line separations guessed at
 before the bisect moved nothing and were taken out. The mixes have a
 timer by kind (`SUPDB_MIX_KINDS=1`, a `mixkinds` line per mix on
-stderr for every arm, its reads, scans and commits apart, and the seals
-and the freezes' time inside the commits), which read
+stderr for every arm, its reads, scans and commits apart, its first four
+scans and its longest, and the seals and the freezes' time inside the
+commits), which read
 the E gap as the scans' alone and the tax as the commits' and the
 gets'; `SUPDB_MIX_EVENTS=1` prints each mix's form events, upkeep
 passes and snapshot builds beside its counters; `SUPDB_MIX_CENSUS=1`
@@ -1430,44 +1466,48 @@ behind an atomic would let one in unasked.
 its block tables and scan snapshot -- to a thread of the store's own and
 returns without waiting for it; at level 2 (`supdb-hold`) a commit that
 would leave its batch to the next scan returns only once the thread has
-filed it. A commit with no fsync to work beside files a burst's first
-batch after a scan itself (`Options::upkeep_inline_bursts`): the
-thread's window is the barrier, and a buffered burst of one commit left
-it none, so the burst's whole filing fell to the first scan after it --
-the buffered lag cells read 0.2-0.6x of LMDB with the scans themselves
-at the drained store's rate. The batches after that one, each at most
-a hundredth of the store's keys, it lends paced
-(`Options::upkeep_pace_pct`, `Hand::Pace`): the commit returns once the
-thread trails by at most that hundredth, so the thread's core files
-behind the writer's commits, the writer waits only where the thread has
-fallen that far behind, and the first scan after the burst meets at most
-the share -- filing every batch inline had put the whole fill on the
-writer, a third to half of a buffered burst from a hundred thousand keys
-up, and lending every batch had left the scans after a burst 1.8-3.5x
-slower. The share is the first scan's wait for the pass in flight
-against the pass over the store: at ten thousand keys a batch of a
-thousand is a tenth of the store and its fill several passes, and paced
-there the burst gained a third while its scans after lost two thirds.
-It is the pipeline's depth too: paced a batch deep, every batch was a
-pass of the thread's, whose fixed part doubled the thread's cost a batch
-at three million keys, and the sweep's weighted sum read a third worse
-than lending at a million; and a thread gathering half the share before
-a pass, for longer passes while the writer ran ahead, read level, since
-the trailing thread took several batches a pass already and the share
-bounds the trail that lending's long passes amortise, so a lever on a
-pass's length is read against the passes counted before it is built.
-And the share is the first scan's to pay: a paced batch is held now
-until the thread has filed it (`Options::upkeep_pace_holds`;
-`supdb-ingestpacelends` lends it within the share), since the trail is
-a linear trade -- each write of it saves the burst its filing at every
-batch and costs the first scan after the burst its filing once -- that a
-sum over the burst and the pass reads lending's way at any depth, while
-the cells read it the other way: at a hundred thousand keys the share is
-one batch, the first scan after the full rewrite paid the pass in flight
-and the batch after it, and the pass read 0.9x of `lmdb-nosync` with the
-burst at 2x; held, 1.2-1.3x and 1.5-1.6x.
-`supdb-ingestlendbursts` is the arm that lends every batch and
-`supdb-ingestnopace` the one that files every batch. A syncing commit
+filed it. A commit with no fsync to work beside files a burst's batches
+itself (`Options::upkeep_inline_bursts`, `Options::upkeep_pace_pct` at
+zero): the thread's window is the barrier, and a buffered burst lent to
+it left its filing to the first scan after -- the buffered lag cells read
+0.2-0.6x of LMDB with the scans themselves at the drained store's rate.
+Two shapes stood between that and this, and their order is the lesson.
+The batches after a burst's first, each at most a hundredth of the
+store's keys, were lent paced (`Hand::Pace`), the commit returning once
+the thread trailed by at most the share, so the thread's core filed
+behind the writer's commits: the sweep's weighted sum read 0.64-0.85x of
+the inline fill's from three hundred thousand keys up, and the pass after
+a full rewrite at a hundred thousand 0.9x of `lmdb-nosync`, the first scan
+paying the pass in flight and the batch after it. Then each paced batch
+was held until the thread had filed it (`Options::upkeep_pace_holds`),
+which won that pass back, and was paired with the trail it replaced and
+never with the inline fill it had turned back into: a batch held for is
+the commit's own filing with a hand-over to another core in front of it,
+the writer waiting for all of it. Paired at last, the inline fill read
+the bursts of more than one batch 1.1-1.4x of the hold's and the passes
+after them level or better from a hundred thousand keys to three million
+(`docs/engine.md`, what a burst costs under the held log).
+`supdb-ingestpaced` is the hold, `supdb-ingestpacelends` the trail within
+the share and `supdb-ingestlendbursts` every batch lent. Under the held
+log (`SyncPolicy::Explicit`) a burst's batches are lent and never filed
+by a commit or waited for (`Options::held_bursts_lend`; `supdb-heldfiles`
+files them): filing a write into its block's form costs two to three
+times the write on whichever thread pays, so one thread files at half the
+writer's rate and a store has the burst at the writer's rate or the pass
+after it at the filed store's, not both. The comparator of that policy
+files nothing and scans nothing, so its row reads the burst: lent, 1.2-2.2x
+of FASTER's at three hundred thousand keys where filed it read 0.3-0.6x,
+and the scan pass straight after a burst pays, a sixth to a third of the
+filed store's after a full rewrite once the settle converts the forms a
+burst makes dense (`Options::settle_converts`; a tenth to a fifth before
+it). The share of a lent pace is the first
+scan's wait for the pass in flight against the pass over the store, and
+the pipeline's depth: paced a batch deep, every batch was a pass of the
+thread's, whose fixed part doubled the thread's cost a batch at three
+million keys; and a thread gathering half the share before a pass read
+level, the trailing thread taking several batches a pass already, so a
+lever on a pass's length is read against the passes counted before it is
+built. A syncing commit
 lends every batch, since its thread files through the fsync, and in core
 it is paced too, within a quarter of a percent of the store's keys
 (`Options::upkeep_pace_syncs_bp`; `supdb-nopacesyncs` lends unpaced):
@@ -3655,12 +3695,27 @@ ten-thousand-key drain, and a crash inside it is a torn newest slot, the
 case the slots were made for, since any publish before that fdatasync
 writes the same slot again and never the other, giving the owed sync
 up before its write begins, so a write that fails leaves nothing to
-name the slot durable. A buffered store's flush commits what is
-staged under its policy, with no sync (`Options::drain_syncs_wal` is the
-shape that fsynced the whole log first, `supdb-ingestwalsync`), so its
-drain is answered behind the slot's fdatasync instead: the log's
-durability was what covered that window, and without it the slot's own
-does. The flush's close of a direct run
+name the slot durable. A flush whose writes were all durable
+before it -- every commit synced, nothing owed a sync, the drain's own
+run synced and named -- is answered sooner still, once its seal's
+segments are published, where the seal is the one in flight and leaves
+no piece and no merge, and the directory's fsync of their names, the
+seal's fsyncs and the slot follow in the loop
+(`Options::drain_answers_readable`; `supdb-drainstrict` waits): nothing
+it covers rested on them, the run's temp name and the log being what an
+open recovers from until a slot names the segment, and a store dropped
+with such a seal in flight lands it whole at its stop. A buffered
+store's flush commits what is staged under its policy, with no sync
+(`Options::drain_syncs_wal` is the shape that fsynced the whole log
+first, `supdb-ingestwalsync`), and where its seal is the store's first
+partition -- a load's own drain -- the writer then fdatasyncs the log
+beside the seal and the drain is answered at the readable landing as a
+durable one is (`Options::drain_syncs_beside`; `supdb-ingestsyncafter`
+waits): the log's durability covers the window the slot's otherwise
+would. Elsewhere its drain is answered behind the slot's fdatasync: the
+pieces and merges beside a later drain's seal keep it strict whatever is
+synced, and a drain that closed a run the policy left unsynced would owe
+its temp name a barrier that waits on the seal's own fsync. The flush's close of a direct run
 fdatasyncs the run's records on the writer's thread, which waits for
 the drain anyway, while the seal thread composes the trailer, so the
 seal's fsync flushes the trailer alone (`Options::close_presync`;
@@ -3719,8 +3774,10 @@ one's are durable; the frozen tables are a list in the queue's order,
 up to `FROZEN_CAP`, and a landing retires its front; a table `sync`
 hands without a freeze is a seal in flight beside theirs that joins the
 list's back only when the writer freezes it; the writer freezes into
-room and waits only when the list is full, for the oldest's readable
-landing; and the count of seals
+room, which is the list's count and its tables' bytes against a share
+of the memory available (`Options::frozen_bytes`), one table frozen
+whatever it holds, and waits only where there is none, for the oldest's
+readable landing; and the count of seals
 (`in_seal`) is read before the state whoever decides against it, so a
 count of zero is one whose landings the state shows. A store is held by one open at a time, under an exclusive `flock` of
 its `LOCK` taken before the open reads its directory -- an open sweeps the
@@ -3730,7 +3787,10 @@ unlock and not by the descriptor's close, since a child the process forked
 holds a copy of the descriptor and the lock with it (`StoreLock`); a test
 that emulates a crash calls `Db::crash`, which gives the lock up as a dead
 process's is given up, since a `mem::forget` keeps it and the reopen is
-refused as a second open. A crash between any
+refused as a second open, and which returns only once nothing of the
+store is left in its directory: every thread of it that writes its files
+or reads them through a mapping ended, or parked for good under the
+test's own hold (`Life`). A crash between any
 two of those leaves either a WAL that replays the whole memtable, with a
 segment the manifest never named --
 possibly torn -- swept at open, or a complete, named segment plus a WAL
@@ -3854,17 +3914,17 @@ does not promise the entry that names it, and a run whose name a crash
 took is every commit of it gone. One barrier a run, none where a
 rotation's barrier for its new log file had the name in the directory
 already, and none in a store whose commits never sync, whose landings'
-directory fsyncs carry it. And none where the run opened on a spare
-(`Options::run_spare`): the store makes the next run's temp name empty
-before a directory fsync it makes anyway -- the creation's, the open's
-last, a run's close ahead of the landing its seal fsyncs the directory
-at -- and counts its directory's fsyncs begun and returned
-(`vault::dir_ticket`, `dir_synced_after`), so a run on a spare an fsync begun
-after it has returned from owes its name nothing; a spare no fsync has
-reached yet pays the barrier. An open keeps the empty temp name it finds
-as its own spare and removes the rest only once it has taken the store,
-so a refused open leaves them; an empty temp name is a run that
-acknowledged nothing. A barrier that fails is never tried again:
+directory fsyncs carry it. And none for a run begun in a file made ahead of it
+(`Options::run_spare`): an empty file under the temp name of an id the
+writer reserved as the run before began, made where the directory is
+synced anyway -- by the store's creation ahead of the manifest's, by a
+landing ahead of its own -- and called ready only once that sync has
+returned, so the name is behind a barrier before the run's first record
+is. A run that finds the file made and not yet called ready takes it as
+one it made itself, barrier and all; an empty one a crash leaves is no
+run, and the open removes it once it has taken the store, so a refused open
+leaves it. A store under a cipher makes none, its runs being memory
+files with no name until their envelopes. A barrier that fails is never tried again:
 each name it was for gets a second entry, a hard link under its name and
 `.guard` (`vault::guard`), and the directory is synced again, a new
 operation after the failure that the new fsync covers; the guard stands
@@ -3974,6 +4034,25 @@ flushed at its end writes its log to no file at all. `Db::crash` forgets
 the store without dropping it, so a test's crash takes what the log held,
 and a store dropped without its close writes it.
 
+**A frozen table is one nothing writes, whoever wrote it live.** The one
+writer's table is frozen by the thread that wrote it, so it was never
+said. A shared table (`Options::shared_writers`, and under
+`Options::share_on_write` whenever a handle writes) is written by handles
+that took it before its freeze and are still inside their write: the
+freeze closes it first, each handle's write reading the flag after it has
+pinned and before it writes, waits out the writes that read it open, and
+only then publishes it frozen (`Db::close_shared`); a write that finds it
+closed is answered as a full table's is and made again in the next table.
+Everything that reads a frozen table -- the seal, a scan's sort left on
+the table for the next reader, a block built over it -- takes its length
+once. And while a state holds a shared table, live or frozen, nothing is
+built, kept or lent that a handle's write could not reach: no block form,
+no table for the upkeep's look, no loan to the upkeep thread, no builder,
+no run of ordered ingest in the live table's place (`Reader::sharing`).
+Each of those was an option the shared table refused at the open; they
+are stood down by the state, so a store has them back when the shared
+tables have landed.
+
 **A file a store names never changes.** A segment, its ordered index
 and its form file are each written under a temp name and renamed or
 linked into place, and nothing writes one after that: no patch in place,
@@ -4014,6 +4093,23 @@ so the case is reached every run. The rule: a cache derived from one
 object is keyed by that object's identity, never by its place or its
 range, because a publish that keeps the position and replaces the object
 is exactly what a merge does.
+
+It came again in a writer's own state of the shared table
+(`TableLocal`): its reservation in the value arena and the ranges it keeps
+for reuse, kept with the table they are of by the table's address. A
+freeze's seal frees a table, and the next table can be made where it stood:
+a writer whose state named the old table by that address took its cursor
+and its ranges for the new one's, and the next chunk it laid there wrote
+its raw `prev`, `NO_CHUNK`, over a live record's head, which the next put
+of that key asked a prefetch of and the arena's bounds check refused. One
+run in fifty to a hundred of the threaded writers' test, at every commit
+of the shared table back to its first, read for weeks as a flake beside
+two timing bets in the same tests. An assertion that the state's table
+number matched wherever its address did fired six times in two hundred
+runs and named it; the state is keyed by a number every shared table takes
+at its making now (`SharedTable::uid`), and a unit test makes the second
+table in the first's allocation. An address is a place, and a freed
+object's place is the next object's.
 
 **A replay that builds the thing without the last step of the live
 path.** A reopen replays the WAL into the memtable through the same
@@ -5244,17 +5340,74 @@ pinned beside the rounds, its thread off its core on a loaded runner
 for as long as the reads -- the last round's forms waiting for that pin,
 rightly, once on a hosted macOS runner and one run in a hundred beside
 five others; the pins in the table at the failure named the slot, and
-the test's segment work runs inside the writer's operations now. And
-as builds ahead: the test of the crossing's ask for a cold partition's
-raw pages waited for two of a store's builds ahead and then held the
-builder's start, on the bet that a third was still to start, and in one
-run of the whole binary the builder had built every partition meanwhile,
-no build ever stood at the hold, and the test sat out its five minutes;
-with half a second after the two, every run. It walks the builds by hand
-now, each parked at its rename while the start behind it is held, so
-that two land and the third stands at its start whatever the load
-(`Db::zpage_build_held`, a hold still set beside its waiting bit, tells
-the two places apart where one hold is set at a time). And as a form
+the test's segment work runs inside the writer's operations now. And as a freeze: the test that a
+freeze settles a shared table only once an overwrite in flight is through
+spawned the overwrite and flushed at once, on the bet that the put would
+be inside its record's lock before the freeze closed the table to
+overwrites. A put started late found the table closed, laid its value
+down and was never held, and the thread waiting for the hold waited for
+ever: under the gate's load once, every run with a sleep of 50 ms ahead
+of the put. The flush waits for the hold now, and its sibling, which
+slept 50 ms on the reading that a held write would be inside its hold by
+then, waits for the count of writes the hold has taken
+(`Db::shared_writes_held`). And as frames: the test that a held log
+drops the frames a durable seal covers sealed its first table, committed
+a second batch and read what the log held then as both tables' frames,
+on the bet that the seal would not be durable before that commit. A seal
+that was had its frames dropped by the commit, the count read one
+table's, and the assertion after it compared against nothing held: once
+under the gate's load, none of fifty-five runs alone or as the whole
+binary, and every run with sixty milliseconds slept after the seal. It
+holds the seal short of durable across the batch now
+(`hold_seal_durable`) and asserts what it had assumed. And as a race to
+be met in ten tries: the suite's prototype table's test wants two writers
+racing to make one key's entry, a window of tens of nanoseconds, and made
+its store again until one had raced, ten at most. One store holds no
+race in half the runs on four idle cores and in every run on one, each
+writer through its first round inside a slice of its own, so ten in a
+row came up empty once under the gate's load. The first inserts yield
+their core inside the window now, by a count the test sets
+(`proto::tests::WIDE_INSERTS`), and the first store races on one CPU as
+on four. The base rate was first read off a stale binary of another
+build layout, none of a hundred and thirty runs failing where the
+current one fails half its single stores. That count was the process's,
+and the gate that followed found the test at one run in two: the test
+beside it in the binary makes five hundred inserts of its own and spent
+the count before this one's writers reached theirs, where the test run
+alone, which is how the fix had been held, kept all of it. The whole
+library binary passed four runs of eight with the count the process's
+and eight of eight with the count the table's
+(`Live::wide_inserts`) and the window a wait of two hundred
+microseconds, which a writer released a slice late still reaches. And
+as a baseline: the test of a held log's lent burst held its first count
+of writes lent under the count before the burst, which is the load's
+twenty thousand where the scan before the burst has not found the
+thread's report of them and nothing where it has; under the gate's load
+it was nothing, the range empty, and a burst that had lent three
+hundred and then nine hundred, as it should, failed. It holds the
+counts themselves now. And as a manifest: the test of a form
+file's build in flight at a crash, written on the main line where a flush
+is answered behind its slot, bet that the manifest named the partition
+once the flush had returned and the build had reached its hold. A durable
+flush is answered at its seal's readable landing on this branch
+(`Options::drain_answers_readable`) and the build starts at that landing
+too, so a crash inside the window left the run under its temp name, the
+open made it a piece, and the reopened store had no partition and no form
+file: one run in twenty in either mode on the merged tree, every run with
+the seal held short of durable, and none of eighty with the test waiting
+for the drain's manifest (`Db::manifest_seq`). And as a hold set behind the builds it was for:
+the test of the crossing's ask for raw pages wants two partitions built
+ahead and the third's build held at its start, and set the hold once it
+had counted two built. The builds ahead follow one another in
+milliseconds, each started at the turn the one before wakes
+(`Options::zpages_drive_at_job_end`), so a test thread a few of them
+late found every partition built and waited out its five minutes for a
+build to hold: once on a hosted ARM runner, in the pull request after
+the one that had passed there, and every run with the thread kept 300 ms
+before the hold, seven built of seven by the counts printed at the
+assertion. Both holds are set before the builds are due now, and each
+build is let from its start to its rename with the next one's start held
+behind it, which passes with 300 ms slept at every step. And as a form
 file being built under a count: the test of the raw seek's directory
 hint counts a hint a scan and a hint a partition crossed, and with the
 compact form forced (the stride group's `SUPDB_TEST_STRIDE`) a
@@ -6412,10 +6565,18 @@ the first one's work makes the instrument wrong in both directions.
 `release_freed_memory` is `malloc_trim` of every arena, and the first library
 test to run a pass trimmed under the test that measures what a trim returns:
 two of twenty-five whole-binary runs failed, with 148.6 of 300 MB released.
-A lock now, taken for write by the measurement and for read by every test
-that reaches a pass, through `into_inner` so that a failure holds nobody. The
-rule: a test that counts a process-wide effect excludes every test that can
-cause it. A lock excludes the tests that trim and not the ones that
+A lock held them apart for a while, taken for write by the measurement and
+for read by every test that runs a pass -- every test that remembered to:
+one written later ran a pass without it (`a_bounded_passes_start_enters_the_row`),
+and the measurement failed once in a run of the suite's library tests on
+blocks that "were not resident to begin with". Every `malloc_trim` logged
+with its backtrace by a preloaded shim named that test's pass as the only
+trim near the window, and the pass started inside the window on purpose
+took the blocks from 349 MB resident to 27 before the read, every run. The
+measurement has a binary of its own now (`bench/tests/trim.rs`) and the lock
+is gone. The rule: a test that counts a process-wide effect excludes every
+test that can cause it, by a process boundary where the tests that can are
+any test that might be written next. A lock excludes the tests that trim and not the ones that
 allocate, and the count of anonymous bytes resident beyond the allocator's
 use is lowered by any allocation from a free chunk already resident: a
 dead arena of thirty-two megabytes read as nine in one run of the whole
@@ -10972,10 +11133,961 @@ under a mode runs under every switch its sibling does before the twin
 is called held, since the stride group had passed it once by the coin.
 
 ## Standing limitations
+**One number that meant three things while there was one writer.** A
+memtable's length was the prefix a walk may read, the count a handle's
+lookup is bounded by, and whether the table held anything, and with one
+writer the three are the same number. A table every handle writes at once
+(`Options::shared_writers`) claims an entry's number before it writes the
+entry. Its length waits at the first number claimed and not yet written,
+which is right for a walk and wrong for the other two. A handle's lookup
+bounded by it read past a thread's own put while another thread held an
+entry below it open. A read that took a length of zero for an empty table
+skipped the table while entries above an open entry 0 stood written. And
+the seal's copy, sized by the one writer's byte counts, which the shared
+writers never move, wrote past its buffer. None of it showed in the tests
+that read through the writer, which honours no bound, or in a watcher that
+checked only that a value was whole. The bench's test that each thread reads
+its own write back found the bound; the same check in the engine's test,
+once the bound was fixed, found the emptiness; the seal's panic found the
+buffer.
+The length itself was moved by whichever writer got there, and two writers
+that each stored their own entry's head and then loaded the other's could
+each miss the other's under release and acquire. The length stopped one
+short with both entries written: 26 rounds in 200,000 here, two writers
+released together a round. A sequentially consistent fence between the
+stores and the loads closes it, since whichever writer fences second sees
+everything the first stored (`MemTable::advance_shared`), and the freeze
+asserts the length whole once its writers are out. The rules: when a second
+writer comes to a structure, every quantity the one writer kept is read for
+each thing it is taken to mean, since the writer was what made them one; a
+test of a concurrent structure reads each thread's writes back through the
+reader that thread would use, at once and while the others write; and a
+handoff between writers that each publish and then read the other's
+publication is the store-buffering shape, which release and acquire do not
+order, so it gets a sequentially consistent fence and a litmus test that
+fails without it.
 
-These are the engine's, as opposed to refuted predictions. Each is a curve
-in the suite's figures, at `full` scale where it says so:
+**A reading of who holds a thing, used for a thing made after it.** The
+shared table's writers reuse the ranges their puts replaced once every
+reader is pinned past the epoch the range was tagged at, and the first
+version read the pins when a reuse was refused and kept the answer for the
+asks after it: `u64::MAX` where no reader was pinned. A reader that pinned
+later, and read the head a later put retired, was covered by nothing that
+reading saw, and its bytes were written again under it, which the
+single-writer test's pinned reader showed on its first run. The pins are
+read now at the bump that makes a batch's ranges ready, after every swap
+that retired them, so a reader the walk misses pins after those swaps and
+cannot reach them (`TableLocal::retire`). Bounding the old reading by the
+epoch it was taken at closed the hole too, and once the reading moved to
+the bump that bound was an equivalent mutant, no test able to tell it
+apart, and came out. The rules: an answer to "who can still see this" is an
+answer about the things that existed when it was asked, so it is taken
+where those things are made and not where they are used; and a guard a
+mutant cannot be caught without is read for whether a change elsewhere has
+made it dead.
 
+**A reader's protocol needed only where the writer can still reach.** The
+shared table's overwrites in place made every read of its values a copy
+between two readings of the record's lock, and the audit of the readers
+found the live table's in eight places and the frozen tables' in as many
+again: a table the freeze has published frozen can still be overwritten by
+a writer that took the state before the publish, for as long as the grace
+that waits it out. Closing the table to overwrites before the publish, and
+waiting out the writers that may be making one then, takes the frozen
+tables out of the protocol: by the publish no overwrite is in flight and
+none can start, and the frozen tables read as they always have
+(`Db::close_in_place`). The same audit found a hole in the shape already
+shipped: `sync` under `adaptive_shape` hands the live table to a seal
+without a freeze, and a handle may still be writing it, so the shared mode
+refuses the option. The rules: when a mechanism puts a protocol on readers,
+the writer's side is moved first to shrink the set of states the protocol
+has to cover, since every reader of a state left in the set is a site to
+convert and to test; and an audit of the paths that read a structure is
+also an audit of the paths that hand it to someone else.
+
+**Equal instructions at two thirds the speed, and a sample on the first
+touch of a page.** The shared table's lean path brought a get, a put and a
+read-modify-write to within a sixth of FASTER's instruction counts (442,
+464 and 488 against 378, 416 and 483 at `c75da23`, the record's ask in),
+and before the ask FASTER still ran each in two thirds of the time. Laid
+on its instructions, 85% of a get's samples were two loads, the slot and the
+record's first word, the shape FASTER's operation has too: what differed was
+when the value's lines were asked for, since FASTER's record holds its value
+at a fixed offset and ours names it through its head, and the core could ask
+for them only once the first line had come. With the record's lines asked
+for at the slot, a sixth of the samples moved onto the ask's prefetch
+instruction: the first instruction to touch the record's page, charged for
+the walk the page's translation took, where a table of 81 MB over 4 KiB
+pages is many times what the TLB maps. On huge pages each operation took a
+tenth less, and FASTER's are on small ones. The rules: an operation level
+with a comparator in instructions and behind it in time is laid on its loads
+and asked, of each, which earlier load its address waited for; and a sample
+on the first instruction to touch a page is read as that page's translation
+before it is read as the instruction's.
+
+**A quantity that became work to read, read on every operation.** The
+shared table's inserts carried the slab's length -- a fence and the loads of
+two words every inserting writer writes -- a third of an insert, and three
+threads inserted no faster than one. Left to whoever reads it, the length
+is carried as it is read (`MemTable::len`), and two readers had been reading
+it on every operation: a handle's operation took the table's commit bounds,
+which a shared table's reads have no use for, and its note of the read
+compared the log's position, so every get carried the length the inserts no
+longer did, and the inserts' saving would have been every read's cost. The
+test written to hold a handle's gets and puts to leaving the length alone
+found the second on its first run. The rule: when reading a quantity becomes
+work, every reader of it is listed and each that runs on every operation is
+given a reading that does none, and a test holds the cheap path to doing
+none of it.
+
+**A prefetch refuted in a store that had no miss for it.** A read that
+falls below the shared table waits on three lines in turn, the table's
+slot, the partition's slot and its record, where FASTER's waits on two, so
+a handle whose last read had fallen through was made to ask for its next
+key's partition slot before it probed the table. It was priced in the
+probe's store where every key is a first touch (`SHARED_OPS_FRESH=1`), read
+level, was taken out, and this file then said why: the core runs ahead past
+the predicted branch and issues the partition's load itself. Nothing had
+measured that. The store's live table held no key, so its index, eight
+megabytes mapped and advised for huge pages, had never been written, and a
+read of an untouched anonymous mapping maps the kernel's zero page
+(`use_zero_page` is on here): every slot the probe read was one cached
+page, the table's probe never missed, and the ask had no wait to stand
+beside. In a store whose table holds half the keys and whose reads are of
+the other half (`SHARED_OPS_SPLIT=1`), the same reads took 112-220 ns with
+the ask and 144-262 without it over four sittings of both orders
+(`Options::shared_fall_ahead`, `docs/engine.md`, past FASTER). The rules: a
+probe's store is checked for the misses the suite's store has before a
+lever on a miss is priced in it, and memory nobody has written reads as
+one cached page; and the reason a refutation is given is a claim to
+measure, since the refutation measured only that the lever moved nothing
+in the store it ran in. Beside it, the same day's pairings at ten reps
+read the asymmetric pin 3-11% ahead in one and level in the next two, and
+the shared arm had been given it between the first and the second: a
+verdict is the second sitting's, so the first is not built on.
+
+**An arm that won the cells it was built for, never paired with the arm
+it would replace.** The table every handle writes was paired with FASTER
+on the threaded mixes at every step of its making, twelve cells of twelve
+by the end, and with nothing else: it sat in no roster, the roster's arm
+of FASTER's guarantee was another, and asked which of the two was the
+faster the notes had no answer. Paired over every pass a row runs, it was
+a trade either way -- the threaded mixes at 1.3x to 10x and the bursts at
+2.3x to 3.9x for it, and the ordered load at half, ycsb-E at a sixth and
+the scans after a full rewrite at a tenth against it, with its ordered
+load's recovery gone (`docs/engine.md`, past FASTER). Each loss was an
+option it refuses at the open: the block cache, the upkeep thread,
+ordered ingest. And each refusal was written of the option where the
+hazard is of a table: a form is unsafe over a shared table, not in a
+store that may make one, so the three stand down while a shared table is
+in the state a reader holds and come back when it has landed
+(`Options::share_on_write`, `Reader::sharing`), and one store is each arm
+while the workload is that arm's. The rules: an arm is paired over every
+pass against the arm it would displace before it is called faster, on
+the day it first wins the cells it was built for; and a refusal of one
+option beside another is read for the state it guards against, since
+what is refused for a store's life may need standing down only while the
+state lasts. Beside it: the threaded mixes were in no row, so nothing
+banked said what any arm did in them.
+
+**What the one writer kept without being asked.** Three things held in
+the engine because every write went through one thread, and no line of it
+said so. The store's sequence moved at every write, so no two seals
+ended at one number; the store's greatest key moved at every key, so a
+run of ordered ingest opened only above every key; and a frozen table
+was written by nobody, its writer being the thread that froze it. A
+shared table's writes go through none of the three. Two tables sealed
+with no logged write between them carried one sequence, their pieces
+ordered by name, and a reopened store read the older piece's values over
+a newer put; a run opened under keys the handles had written, the
+partitions promoted from it did not tile, and a merge refused its own
+key and stopped the segment work; and a handle that had taken a table
+before its freeze wrote it after the freeze's publish, inside the wait
+for it, where a scan had already sorted the table and left the order on
+it, short of the write, for the seal and every scan after. The table
+that shared for a store's life had the first and the third and reached
+neither in its tests, and refuses the option the second needs. The
+differential fuzz had no write through a handle in it at all, the shared
+table having been held by threaded tests of its own: given one
+(`ZFUZZ_SHARE`), six seeds of fourteen hundred failed on the first two,
+and a test that held the freeze's wait open for a third of a second
+found the third, as a checked build's assertion in the seal. A shared
+table takes a number of the sequence at its freeze, the greatest key is
+brought up to the shared tables' keys before a run is judged against it
+(`Db::refresh_max_key`), and a table is closed to writes before it is
+published frozen. The rules: when a second path writes a structure, what
+the first path maintained by being the only one -- a counter that moved,
+a maximum, a point past which nothing changes -- is listed and given to
+the second, since nothing names it an invariant; and a mode that only
+its own arm could reach is put under the fuzz the day the default can
+reach it, with the fuzz making the writes the mode exists for.
+
+**A structure made in the middle of a workload, first touched on its
+writers' path at the host's price.** The store that shares on demand
+installed its shared table at the commit a handle's refused write asked
+for, inside that handle's first operation, and the table was memory
+nothing had touched: its index populated there, its arena's huge pages
+zeroed two megabytes a fault by the first writes. The pairings that
+priced the arm ran the load and the threaded mixes alone and read it
+level with the arm whose every table is shared; the first row in the
+row's own pass order read A on one thread at 0.37x to 0.82x of FASTER
+and one cell at ten thousand keys at a quarter, four reps of five. Every
+count of the engine's was the same as the fast reps', and callgrind over
+the probe put the old binary and the new within three instructions an
+operation, so an afternoon went to the sitting before the thread's own
+clock was read: `SUPDB_THREADED_COUNTERS` given each thread's user and
+system time and faults (`getrusage(RUSAGE_THREAD)`) read 19 to 39 ms of
+kernel time over six hundred faults in a cell of fifty, and
+`perf record -e cpu-clock -g` cut to the cell's marks put all of it in
+`clear_page_erms` under `do_huge_pmd_anonymous_page`, from
+`MemTable::write_shared` and from the index's `madvise`. This guest
+reports its free two-megabyte blocks to its host
+(`/sys/module/page_reporting/parameters/page_reporting_order` is 9), so
+a huge page faulted fresh costs 0.2 ms where the guest still backs the
+block and 2 to 10 where it does not, and which it is turns on what the
+passes before freed and when: a pairing of two passes meets a pool the
+runner has just primed, and a row's twelfth pass does not. One fault of
+that kind was a whole cell at the smallest rung. A handle that writes is
+claimed as one now (`Db::writer`), the claim's commit installs the
+table, and the table is made whole before it is published
+(`Options::shared_populates`): the first cell's faults fell from 580 to
+195 at a hundred thousand keys and from 400 to 16 at ten thousand, its
+kernel time to nothing, and the cell reads ahead of FASTER's
+(`docs/engine.md`, a live table that follows who writes it). The rules:
+a pairing is run in the row's whole pass order before its cells are
+believed, for an engine's arm against its sibling as much as against a
+comparator, since what a pass meets in the machine is everything that
+ran before it -- this file said so of a comparator's cache and of a
+policy's state, and the fresh-page price is a third; a cell slow with
+every count level and its instructions level is read on its thread's
+kernel time and faults before the sitting is blamed, the read being one
+`getrusage` a thread; a structure installed in the middle of a workload
+is fresh memory, so who first touches it and where is decided, and the
+place is where the caller says what is coming -- a claim, an open --
+and never the first operation after; and a fault's price on huge pages
+is five hundred pages', so one of them in a cell of a few milliseconds
+is the cell.
+
+**A gain put on the path an arm wrote through, that was the worker the
+path stood down.** The arm whose own updates go through a handle on the
+shared table (`supdb-heldhandle`) read the lag sweep's bursts at 1.45x to
+1.75x of FASTER's where the roster's arm read 0.3x to 0.6x, the docs put
+the difference on the batch a commit publishes, and the next thing to
+build was a store that takes the shared form for its own writer's writes
+and leaves it for its scans. A shared table stands the block cache and
+the upkeep thread down, so the arm differed from the roster's in two
+things, and the one nobody had priced was the second. It was priced by
+accident: the arm built for the plan's other half, the handle given up
+and the table sealed at the first scan (`supdb-heldhandleleaves`, at
+`ccf6455`), printed the lag counters, and they put the roster's full
+rewrite at a hundred thousand keys at 107 ms of wall, 34 of the writer's
+CPU and 73 of holds, beside the handle arm's 35. The arm with the block
+cache off (`supdb-heldnfnocache`), in the tree for weeks, read the bursts
+at 1.05x to 2.58x of FASTER's with the one writer's table and no handle,
+and the handle arm beside it level but for F (`bench/scripts/pair.sh
+supdb-heldnfnocache faster SIZE --passes
+load,read,mixes,mixes-scrambled,lag --reps 5`, and `supdb-heldhandle
+supdb-heldnfnocache`, at `ccf6455`, a hundred and three hundred thousand
+keys). The writer's CPU over a burst is the same in every form the live
+table takes and level with FASTER's. What the burst cells lost by was the
+commits' wait for the forms' filing, which costs two to three times the
+write on whichever thread pays, with no part of it to take out: over a
+full rewrite the upkeep thread is 46% settle, the patches themselves a
+tenth, 27% conversions and 15% the snapshot. And the hold had never been
+paired with what it had become. A paced batch held until the thread has
+filed it is the commit's own filing with a hand-over in front of it, and
+the inline fill the pace had replaced read the bursts 1.06x to 1.45x and
+the passes level or better from a hundred thousand keys to three million
+(`pair.sh supdb-ingestnopace supdb-ingest`, at `ccf6455`); the pace had
+beaten the inline fill while it lent, and the hold added to win a pass
+back took that away unpriced. The leave was refuted on its own cell: its
+seal landed inside no pass after a burst, so the scans merged their
+sources as if the store had never left, 0.09x to 0.11x of the roster's
+after a full rewrite, with E 0.74x to 0.88x for the leave it holds
+(`pair.sh supdb-heldhandleleaves supdb-heldnoframes`, at `ccf6455`). The
+rules: an arm that differs from its base in a path and in what the path
+stands down prices neither, so the arm that removes only the thing stood
+down is paired before the gain is given a cause, and here it was in the
+tree; a burst's wall is read beside the writer's CPU and its holds, which
+the lag counters print, before its rate is put on the write path; a
+mechanism added on top of another is paired against the shape it has
+turned back into, not only against the shape it was added to; and a move
+between forms is priced on the pass it lands in, by whether its work is
+done inside that pass.
+
+**A cost read as one step's, that was three shapes of the step, and
+the rule of another regime that had picked the dearest.** Filing a write
+into its block's form was 3,900 instructions a write and the one thing a
+lent burst's first scan waited on, and the first plan was a lean path for
+"the patch". Counted by the form each patch met, with a scratch counter
+at the splice, a patch over a copy's own record was 340 instructions and
+a patch of a sparse form 2,100 to 2,300, and under a held log's lent
+bursts all but a hundredth of a full rewrite's patches were the second
+kind: the
+fill is what rebuilds a form of sixteen deltas as a copy, the fill is
+left for a later pass while the writer has a commit posted
+(`Options::upkeep_fill_skips_posted`, priced on the syncing pace, where a
+pass a batch paid the fill's walk at every batch), and under a lent burst
+a commit is always posted. Nothing was wrong and nothing raised; the
+forms stayed sparse for the length of the burst, each patch an insert
+into up to sixty-four sorted deltas, and the scans after it walked them.
+The settle converts the form its batch takes to the dense count now, and
+writes a put over a copy's own run where it lies
+(`Options::settle_converts`, `settle_patch_in_place`). Beside it, on the
+thread's samples laid to source lines, two loads held a tenth of its
+time: the batch is sorted by its keys' prefix words with each write's
+place in the pending list carried through the sort, and the resolve read
+the write by that place and the key's bytes from the arena, in key order
+from two structures in arrival order, inside iterations too long for the
+core to overlap (`Options::settle_gathers`). What the change bought is
+written where it is measured (`docs/engine.md`, what filing a write
+costs), and it is not what it was begun for: the thread files no faster,
+since the conversions it now makes cost what the lean patches save, and
+the trade between a burst and the pass after it is narrower and stands.
+The rules: a per-operation cost is laid by the state each operation
+meets before a path is built for the average, and the count that does
+it is a counter at the branch, an hour's work; a step left out under one
+regime's rule is listed for everything else it did and who relied on it,
+since the rule that skipped the fill's walk skipped its conversions with
+it; a sort that carries an index leaves a gather for every reader after
+it, to be made once in a loop the core can overlap, and what the sort's
+own key holds is not read again; and when the levers found are worth a
+quarter where a factor was wanted, that is said, with the lever that
+would be the factor named beside it, before a fifth lever of the same
+kind is built.
+
+Five things the validation of that change found, each a rule this file
+already had. The settle's conversion reused the fill's routine, which
+withdraws the block from the state with a published mark, and a writer
+nobody reads through a handle began publishing a mark a conversion: the
+gate's test of that regime caught it, and the conversion withdraws
+nothing, the form a state publishes being as current as it was to the
+position it was published at -- a routine taken for a new caller is read
+for what it does to the state beside what it returns. It also grew the
+cache without asking its budget, which the fill asks at every block, and
+no test said so; it was found by reading for the first, and the two ask
+through one function now -- when one side effect of a borrowed routine
+turns up, the rest are listed the same hour. A mark the in-place patch
+set for the next publish survived its mutant, and reading for a state
+that reaches it found none: a form the writer alone holds is dirty from
+its build, from the staged patch that cloned it out of a form a reader
+shared, or from the look that found the state publishing another, so the
+mark was dead and is an assertion of that invariant in checked builds --
+an unkillable guard is read for the invariant that makes it dead, and
+the invariant is what gets written down. The dedupe of a key's writes
+survived four mutants of the sort that keeps them together, a key
+resolved twice reading back right in every test, and is an assertion
+too. And one mutant survived a run beside three fuzz processes and died
+alone: the test that would kill it reaches its state by holds that the
+load stretched, so a mutant's verdict is taken with nothing else on the
+machine and a survivor is run again by itself before it is read.
+
+A sixth was found after the change had been written up, by the question
+of whether it was ready to be proposed. Its pairings ran the load, the
+read pass, the mixes and the lag sweep, and the write-up said the mixes
+were not reached at all: far from a scan nothing is filed. A store is
+near reads only once it has been scanned (`reads_around`), a row runs its
+scan passes before its mixes, and in that order the settle placed
+seventeen thousand patches a pass through the mixes at a hundred thousand
+keys. So a sentence true of the pairing's order had been written of the
+row's, and the latest row's mixes beside FASTER, lower than the two rows
+before at one rung, had nothing to be read against. Paired in the row's
+order the mixes read level (`docs/engine.md`, what filing a write costs),
+and the pairing had its own lesson twice: five reps an order read two
+mixes at 0.8 in nineteen pairs of twenty, one of them a mix that runs
+before any write, and fifteen read four scrambled mixes at 0.76 to 0.91
+in both orders, and neither came back at thirty beside the arm paired
+with itself. The rule this file already has is that a pairing runs the
+row's whole order; its corollary is that a statement that a cell is not
+reached names the gate that keeps it out and is made of the order the
+gate was read in, since the gate here was open in the one order that
+matters. And a pairing whose sittings take seconds is run at thirty reps
+before it is read at five, with the cell the option cannot reach read
+first.
+
+**A crash that left the store running in the directory it was opened
+in again.** The tests' crash (`Db::crash`) forgot the store and gave up
+its lock, and its doc said the rest: "its threads run on until the
+process ends". The segment work's thread went on landing, retiring and
+planning in the directory the test then opened; a seal or a merge in
+flight wrote its files there; and where every store's form is forced
+(`SUPDB_TEST_STRIDE`) a builder of the dead store wrote
+`<name>.zpg.tmp` while the store opened again built the same partition
+under the same name, opening the file to truncate, and whichever was
+reading its own pages back through a mapping took a bus error. The
+stride group's run log tests ended so once on a hosted x64 runner, with
+nothing printed but the signal. Alone, the one test the log named
+passed a hundred and fifty runs of a hundred and fifty; the whole binary
+under the switch beside three busy loops died once in sixty to a hundred
+runs, and a core of one named it: the faulting thread a `supdb-zbuild` in a stride file's
+read-back compare, the address inside a mapping of the temp name (`info
+proc mappings`), four builders alive where the test had made two
+stores, and the test's own thread in the close of the store it had
+opened again. The code beside the doc had the rule already, for one
+thread -- "a dead process's threads write nothing after it", of the
+log's helper -- as the close has it for every thread (`Maint::stop`: "a
+seal thread left running would go on mutating the directory under
+whoever reopens it"). A store has a life now (`Life`): every thread of
+it that writes its files or reads them through a mapping is counted by
+whoever spawns it, and a crash marks the store dead and returns once the
+count is nothing -- the segment work's and the upkeep's loops ended at
+their next turn, a job in flight run to its end with nobody to land it,
+a thread under a test's hold left there for good. The readers are
+counted because the tests cut segments and runs back after a crash, and
+a pass or a build reading one through its mapping takes the same fault.
+`tests/db.rs` and `tests/zpages.rs` put each kind of thread a hold can
+reach in flight at a crash, let go or held, and hold the directory to
+standing still from the moment the crash returns; with the seam as it
+was the seal's, the merge's and the build's fail. Thirty-one mutants,
+twenty-six killed: the five left are the counts of four threads no hold
+puts in flight at a crash -- a piece merge, the builder ahead, the
+sampler, a form file's warm -- and the wake of the threads that park
+between turns, without which a crash waits a poll longer. One of the
+twenty-six passed its first test: a finish's build of two hundred
+kilobytes was through before the crash returned whether the crash waited
+for it or not, and the test builds outputs of megabytes now. Run in
+turn two hundred times each beside the busy loops, the binary before
+died twice, both while a build ran beside the loops as well, and the
+binary after not at all; two in two hundred is no rate to rest a fix
+on, two hundred clean runs coming one time in seven at it, and the fix
+rests on the tests that fail on the seam as it was at every run. The
+rules: a seam that stands in for an
+event leaves what the event leaves, and a test double of a dead process
+that keeps its threads is a second store in the first one's directory;
+a limitation a doc states is a defect whose failure has not come yet,
+and is where to look when something near it dies with no message; a
+signal with nothing printed is read from a core -- the faulting
+thread's stack, the address laid to its mapping, and every other
+thread's stack beside it -- before a mechanism is guessed; a failure
+that needs the whole binary is reproduced as the whole binary under the
+switch it failed under, beside load, since the test named in the log is
+the one that was running and not the one that left the thread; and a
+test that waits for a thread is sized so that the thread outlasts
+whatever else the wait covers, or the wait passes without it.
+
+**A stamp read as the end of the step it begins.** The drain's stamps
+name `readable` where the seal thread hands its segments over, and the
+first decomposition of the durable shuffled load at ten thousand keys
+read the 1.9 ms from there to `fsynced` as the seal's fsync, and an
+answer at the readable landing was built to skip it. It saved a
+fortieth of a millisecond on the ordered load and half of one on the
+shuffled: the readable landing ran from `landstart` to `landed`, 0.55 ms
+and 1.3 to 1.8, with the fsync ending inside it. After its publish
+(`readers`) the landing was the directory's fsync of the seal's names,
+which waits on the journal commit the seal thread's own fsync forces.
+Answered at the publish, with that fsync owed to the durable landing
+ahead of its slot (`Options::drain_answers_readable`), the drains read
+1.4 ms against 1.95 and 4.1 against 5.6, in both orders. The rules: a
+stamp is read for where in its step it is taken, the stamps on either
+side of a wait are listed before the wait is named, and an fsync two
+threads issue against one journal commit costs whichever waits for it
+first. Beside it, the price of answering before the store is at rest:
+the load's bytes on disk and device bytes are read at the answer, a
+page short at ten thousand keys, the slot's, which the gate reads as
+better than its window there.
+
+**An ask that undid the drop of a step it did not know was running.** A
+form file's build reads its partition's records once and drops them
+behind it, and a settle's ask for the raw form's files
+(`Options::zpages_rewarm_raw`) passes over the partitions a form file
+serves and asks the rest back where the cache holds under nine tenths of
+them. A partition whose build was in flight had no form file yet, so a
+settle that came while the loop built the partition a drain had just
+landed asked every record back beside the file the build then attached:
+the test of the drop failed three runs in forty once a durable flush was
+answered at its seal's readable landing, and none before, the build
+having started after the settle while the flush waited. The ask leaves
+the records of a partition with a build in flight now, and a test holds
+the build before its rename and settles beside it. The rule: a step that
+puts back what another step gives away asks whether that step is in
+flight, not only whether it has finished, and a change that moves when a
+caller returns is read for the background work it now runs beside.
+
+**A sync bought for an answer the drain could not give.** A buffered
+store's drain was answered behind its slot's fdatasync, since nothing
+before that made its writes durable, and a writer that fdatasyncs the
+log beside the seal lets the drain be answered at the readable landing
+as a durable one is (`Options::drain_syncs_beside`): the shuffled load at
+ten thousand keys read 1.21x of `rocksdb-tuned-nosync` in both orders,
+where the drain alone had lost the cell (`bench/scripts/pair.sh
+supdb-ingestsyncbeside rocksdb-tuned-nosync 10000 --passes load --reps
+24`). The first version paid the sync at every buffered drain. At three
+hundred thousand keys the shuffled load seals before its drain, the
+pieces and merges beside the drain's seal keep it strict whatever is
+synced, and the sync was an fsync of the whole log for nothing, 19 ms of
+one sitting's drain, with no early answer counted in either arm. And a
+drain that closed a run of ordered ingest paid a barrier of the directory
+for the run's temp name, which waited on the journal commit the seal
+thread's own fsync forces and ended two microseconds before the strict
+drain it was to cut short. The sync is paid only where the drain's seal
+is the store's first partition now, which leaves nothing beside it. The
+rules: a step that buys an earlier answer is paid only where the answer
+can follow, judged on the conditions the answer is judged on, since what
+it costs where the answer does not come is added to the strict path's
+price; and a barrier issued beside another thread's fsync is priced by
+that fsync's journal commit, not by what the barrier has to write.
+
+**A walk the table had done, done again at the commit.** A direct run's
+commit handed the segment writer every record of its batch one at a time
+-- the entry looked up, the record's shape computed again, the key
+compared with the last for an order the table had checked at the append,
+and copied as the last key -- and the append hashed every key for an
+ordered table whose slim entries keep no hash. The writer's commits
+counted 930 instructions a record at ten thousand keys under callgrind
+(`bench/examples/load_only.rs`, collection on inside the arm's
+`write_batch`); the batch accounted at once from the stream's own totals
+(`SegmentWriter::put_encoded_run`), the hash taken only for a fat entry,
+and a record's pads laid by one word each where each was a call into the
+C library, two a record with no pad at all, count 496
+(`Options::direct_lean_append`), the commits a seventh faster than
+RocksDB's where they had been level. Two levers beside it lost. The close's
+keys hashed eight at a time side by side, on the reading that the
+finish's FNV chains were serial, moved the trailer by nothing in thirty
+loads a side: the core had overlapped them already. And the stream's
+pages populated by a helper during the commit's fdatasync took the
+writer's faults from 425 a load to 149 and its CPU up by a third, the
+helper's zeroing leaving every line on its own core for the writer to
+pull across, where a page the writer faults is zeroed on the core that
+writes it; populated on the writer, the price of a page in bulk was what
+it saved. The rules: a structure that guarantees a property is not asked
+the question again a record at a time downstream, and a per-record path
+is counted in instructions before its pages are; a fresh page is priced
+on the core that will write it.
+
+**A hand-off that moved a cost and a landing that came first.** The
+close of a drain's run spawned the seal thread at the hand-over, its
+spawn and first turn 120 µs before the finish began, and the finish on
+the writer with the thread spawned after it moved the same cost to
+between the finish and the ordered index. A run whose commits are all
+synced owes no records' sync to work beside, so its close runs on the
+writer up to the readable signal and the thread, spawned first, takes the
+fsyncs alone (`Options::close_readable_inline`). The readable signal
+then reached the segment work before the flush's ask, and the loop's
+readable landing, coming first, fsynced the directory on the drain's path
+where the ask's landing defers it: 0.3 ms in a drain of 1.1, one drain in
+three. The seal carries the ask's early answer as a hint and the loop
+leaves its landing to the ask (`SealJob::early_hint`). The rules: work
+moved to the thread that waits anyway takes with it the hand-off that
+started it, or the hand-off moves to the next step; and where two events
+race to a decision, the one decided first is told what the later one
+would have said.
+
+**Work made ahead of the branch that used it.** The landing that retires
+a table made the empty live table an install would need before it asked
+whether the retired table was the live one, and a drain's is the oldest
+frozen one, the writer having frozen it: every drain's landing zeroed a
+quarter megabyte of slab and arena tables and freed them unused, 394
+thousand of its 451 thousand instructions at ten thousand keys
+(`Options::land_fresh_lazy`). The finish composed a Bloom for every seal
+before the seal had a name, and a partition's open takes none: 56 of the
+finish's 502 instructions a key, for a filter the landing dropped; the
+name is decided ahead of the finish now where an upper bound on the
+finished file's length settles it (`Options::bloom_pieces_only`,
+`SegmentWriter::finished_len_bound`). And the ordered index's head copied
+the key's bytes past the prefix by a length known only at run time, a
+call into `memcpy` a key, for the suite's sixteen digits whose head is
+their last eight bytes shifted. With these, a key source read off the
+slim word and a pass made generic over its source, the finish took 297
+instructions a key where it took 502, and the durable ordered load's
+drain read 0.88 ms under the harness where it read 1.14-1.17. The
+rules: work one branch of a decision needs is done in that branch, since
+work done ahead of the decision is paid by every branch; a decision taken
+after the work it governs moves ahead of the work wherever a bound can
+take it, the bound held to the finished result in every checked build;
+and a copy of a length the compiler cannot see is a call, so the common
+length gets a load of its own.
+
+**A sync made ahead for the next run, beside the commits of this
+one.** A run of ordered ingest made its file at its first commit, and
+that commit paid for it twice: the fdatasync carried the new inode, and
+the first acknowledged sync fsynced the directory for the name -- 0.78
+and 0.29 ms against the 0.45 to 0.57 of the run's later syncs, in a load
+of ten commits (`strace -f -T` over the load at ten thousand keys). So
+the file was made ahead (`Options::run_spare`): the store's first at its
+creation, ahead of the manifest's sync of the directory, and each one
+after by the segment work as the one before was taken. The first commit
+read 0.3 ms shorter in both orders and the load 1% faster: the nine
+commits after it had given 0.2 back, since the segment work's sync of the
+directory for the next file ran beside them and the two wait on one
+journal. The phase column named it, the rate could not. The next file is
+made now where the directory is synced anyway, at a landing, and the
+load reads 9-10% faster at ten thousand keys in both orders
+(`bench/scripts/pair.sh SUPDB_LOAD_PHASES=1 supdb supdb-runcreate 10000
+--passes load --reps 24`, at `11f03c7`). The rule this file had for it: a sync handed
+to a helper is hidden only while nothing needs the device beside it, and
+a saving made by doing a thing early is priced where the early thing is
+done, the phase after the one it leaves. Three things about the tests
+came with it. A run's id is the writer's to reserve, as the run before
+begins, or the second run's file is under one name where the file was
+ready and another where it was not, and every test that names a run's
+file by its number bets on the segment work's turn. A count of the
+files the segment work made is a count of the landings that ran, which
+is the threads' timing: two assertions of it failed nine runs of thirty
+six at a time until they asked for at least the count the test caused.
+And the hunt's worst hour was a store that refused to open after the
+test's crash, "the manifest names a segment which is not in the store",
+with the segment in a copy of the directory taken a line earlier:
+`Db::crash` leaves a store's threads running, the segment work of the
+crashed store retired the segment under the store that opened next, and
+the file's own notes say so of every store it crashes with that work on
+a thread. A test that crashes a store runs its segment work inline or
+holds it, and one written beside a new mechanism is read against the
+file's helpers before its failure is read as the mechanism's.
+
+**A mix a millisecond long, read by its rate for eight rows; and a
+probe whose store was not the suite's.** The buffered scrambled E at ten
+thousand keys read 0.91-0.97x of LMDB's in eight rows of eight, the one
+cell the quick ladder lost every time, and stood in the notes as "the
+scan path". The mix there is 1,585 scans and one commit in 1.1 ms. Timed
+by kind with its first scans apart (`SUPDB_MIX_KINDS`, which had the
+kinds and not the first operation), the scans after the first were
+LMDB's to a twentieth, the one commit was 95 µs to its 27, and the first
+scan was 100-140 µs to its 2.4: the upkeep thread, a commit or four
+behind the write mixes that end a few hundred microseconds earlier, and
+the scan waiting out its pass or settling what it had not filed
+(`docs/engine.md`). Two things went wrong on the way to that. The probe
+that exists for callgrind (`bench/examples/e_scrambled.rs`) was sampled
+over a hundred rounds of the phase and put a sixth of the thread in a
+copy's prefetch, and a span-shaped prefetch was built on it before one
+count was read: the suite's phase is the first round, the rounds after it
+are the store the rounds make, and at ten thousand keys the suite walks
+sparse forms where the profile was of copies. And the probe's first
+round is not the suite's either: it skips the read and threaded passes,
+its upkeep thread stands elsewhere, and its store at thirty thousand
+keys is copies in every run where the harness's is copies in most reps
+and half sparse in others. The profile that stood was the harness's own
+run under `perf record -k CLOCK_MONOTONIC`, cut to the mix's windows by
+its phase marks (`SUPDB_LAG_MARK`) and to the thread, beside the walk
+counts of the same shape (`SUPDB_MIX_COUNTERS`, `walks`). And three
+levers that take instructions off the scans or the commit -- the runs a
+sparse walk makes held by one walker, 5-9% of the phase by callgrind; a
+copy asked for over its walk's span; two searches the settle made for a
+key above the store's end, a fifth of an insert's settle -- moved no
+time a pairing resolved, the first two left as arms and the third
+shipped on its count as work strictly removed. The rules: a pass under a
+few milliseconds is timed by kind and by its first operation before its
+rate is given a cause, and the instrument that times the kinds times the
+first of each; a probe is held to the harness's counts -- the walks by
+form, the passes of the background thread -- before a profile of it is
+read, and a phase repeated for samples is the store the repeats make; and
+where two engines run a phase in the same time over the same instruction
+count, the phase is at the machine's rate for both and the lever is what
+only one of them does -- here a first scan and a commit -- never the
+shared loop.
+
+**A claim held to the file, where it was a claim about the keys; and
+the cost of the fix that held it there, which nobody counted.** A copy
+of a block whose entries are its partition's records starts a scan and
+takes a patch at a rank (`CachedBlock::identity`), and the entry on a
+rank kept across the rewrite that moved it records the fix: a copy
+carried across a merge that dropped a key and folded one into its block
+claimed ranks the merge had moved, so the claim was held to the blob the
+copy's build read. That was right, and it took the rank from every copy
+carried across any merge, for the copy's life, since a merge's output is
+a new blob whatever it holds. Nothing raised and no row moved by more
+than the hosts do. Two things already written down said it: the lag
+counters of the pass after a full rewrite at three hundred thousand
+keys, `starts 0/3000`, every start a search, and this file's own note
+that the upkeep thread's settle ran 5.9 s of a burst against 3.6 with
+twice the merges landed, "every landing leaves its partition's copies
+without their identity", read there as a reason to land fewer merges.
+The claim is about the keys. A merge that folds updates alone writes
+the keys its partition held at the ranks they had, and the merge is the
+one place that knows: it counts, for each output, the keys it writes
+that no partition among its inputs held, and an output with none, at the
+fences of the partition it rewrote and with as many keys, takes that
+partition's key sequence (`Seg::keyseq`, `Options::identity_by_keys`),
+which is what a copy's claim is held to now. Over a full rewrite at
+three million keys every patch and every start is at a rank again, the
+thread's settle a sixth to a fifth shorter, the burst faster in six
+sittings of six (`docs/engine.md` has the pairings). Three things came
+with it. The old-shape arm of the new test passed at first for nothing:
+it read the copies' claims after the merges had landed and before the
+writer had looked across them, tables the carry had not reached, and
+the count it leaned on (`forms_rebased`) is of the forms a landing's
+publish carries, not of the writer's tables; the test scans first now,
+and both shapes are told apart by the copies, the starts, the patches
+and the asks ahead, each counted. The pairings of the mixes read the
+arms apart by up to a quarter, one cell at p .031, in stores where no
+merge kept a key sequence and the two arms ran the same code: the count
+of the mechanism in the cell (`keyseqs_kept`, nothing) is what said
+those cells were the floor's. And two guards written beside the carry
+were taken out as unreachable before a mutant had to say so, the
+output's level and the input's name, the partitions tiling the keys.
+The rules: a fix for a wrong answer that narrows a fast path is
+followed, the same day, by a count of how often the fast path still
+fires in the suite's own passes, since the fix is right either way and
+only the count says what it cost; a derived structure is keyed by the
+identity of the property it depends on, and where whoever makes the next
+object can prove the property carried, it says so there, by counting,
+rather than leave every reader to assume it did not; a note that
+explains a cost by a mechanism is read again for the lever on the
+mechanism before the lever on its frequency is built; and a counter's
+name is read for what increments it before a test leans on it.
+
+**A protection that rode on another mechanism's side effect, lost to a
+saving.** The copy of fixed-size records as one stream
+(`Options::copy_packed`) took a fifth off the block cache, 435 MB to 346
+after a full rewrite at three million keys, and under 1.25 GiB the pass
+after that rewrite then ran two to four times as long in four to seven
+sweeps of twelve by sitting, 40 to 370 major faults on its scans' start
+seeks, with the walk itself faster in the others. The larger process had
+come to its
+group's limit a second before the burst's end, its refaults had taken
+the controller to the census, and at the census a raw partition's heads
+are copied into the process's memory (`heads_owned`); the smaller one
+came to the limit as the burst ended, the store never left the raw gate,
+where the model says the pages a read touches fit and no head is copied,
+and the kernel took the pages written once and never read first, the
+ordered indexes of the partitions the burst's merges had just landed.
+Nobody had decided the heads were to be held through a burst: the census
+had been doing it by being tripped. Three triggers for a copy under the
+raw gate were then built, and the first two read the kernel. The group's
+unused memory less the margin, at the model's reading once a second, saw
+the limit in six sweeps of twelve. The kernel's own count of the limit's
+hits (`memory.failcnt`), latched on its growth since the store opened,
+read as the surer signal and was built with its reader, its seam and its
+tests before one `cat` of the file beside a sweep: zero until the
+burst's last second, and the copies made in four sweeps of twelve. A
+signal that says the kernel is taking pages fires as the pages go. What
+the store knows ahead is what it has written: the model's populations
+are the partitions' two regions, and the burst had put a store's worth
+of level-0 pieces in the cache beside them, which a model of reads does
+not count. The heads are copied under the raw gate once the store's
+files whole, the pieces' with the partitions', have stood past the fill
+share of the budget (`Options::heads_owned_past_fill`,
+`zselect::FORM_FILL`, the line the cache's other tenants are left their
+room by already), which a full rewrite crosses in its middle: the heads
+copied in twelve sweeps of twelve, no pass over 15 ms (`docs/engine.md`
+has the pairings). The rules: when a saving of memory or of time lands,
+the protections the old cost had been triggering are listed -- a census
+tripped by refaults, a budget that bound, a wait that covered a race --
+since the saving takes the trigger away and the protection with it, and
+the cell that then loses is nowhere near the change; a signal for "the
+kernel will take these pages" that reads the kernel is reactive by
+construction, so the one that leads is drawn from what the store itself
+has put in the cache; a counter a trigger is to be built on is read live
+beside the run it is for before its reader is written, a minute against
+an afternoon; and a model's "fits" is a statement about the tenants it
+counts, so a rule that leans on it names the tenants it leaves out.
+Beside it, the pairings' own floor: the pass after the one-percent burst
+read against the arm in six sittings of six, twenty-four pairs of
+thirty-six, with no packed copy built and no head copied by that point
+in any sweep -- the arms had run the same instructions to it -- and the
+five pairings after read it level under one bound and a seventh ahead
+under the other; and at ten million keys the
+first arm listed took the hot-raw policy's releases in both sittings,
+whichever arm it was. A lean with the mechanism's count at zero is the
+floor however many sittings agree, and the count is what says so.
+
+**An arm committed without the gate, and a test that had never run in
+the gate's second mode.** The packed copy went in as an arm, off, with
+its tests green in the binary they live in, and the full gate was left
+for the commit that would make it the default: an arm that is off
+changes no default, and the rule is about defaults. The gate runs every
+test twice, the second time with a form file serving the store
+(`SUPDB_TEST_STRIDE=1`, the `stride` group), and under it the arm's own
+test failed every run: its store wrote three keys of four again, the
+last partition's twenty keys made fifteen deltas, one under the dense
+bound, and a block that light is converted to a copy only on its walks
+and only under the raw gate -- a copy in the mode the test was written
+in and a sparse form in the other, so "a patch a partition, each at its
+rank" counted one short. Two commits stood on the branch with a red
+gate group and nothing had said so. The store writes seven keys of
+eight again now and asserts that every partition is dense with them, a
+premise checked where it is made. The rules: the gate is of the tree
+and not of the default, so a commit that adds a test runs the groups
+that run it, an arm's commit as much as a default's; a test's premise
+about the engine's state -- every block a copy -- is asserted at the
+fixture, where a mode that breaks it fails on the premise and not three
+assertions later on a count; and a fixture that sits one under a
+threshold of the engine's is a fixture on the threshold, so the count
+is drawn clear of it.
+
+**A cap by count on things whose size had been made to grow, and the
+one arm whose pace hid it.** The frozen tables were capped at three
+(`FROZEN_CAP`) when a table froze at `seal_bytes`, thirty-two megabytes.
+The seal's threshold was made to grow with the store later
+(`seal_grows`), a hundred megabytes at ten million keys, and nothing
+went back to the cap; an open target here said the count was no bound in
+bytes and named the lever. No row showed it, because every arm of the
+bounded roster synced its commits, and a writer that waits for its syncs
+seldom has two tables frozen: a freeze found one ahead of it once in the
+medians of eight sittings. The roster's first buffered arm,
+`supdb-heldpart` in FASTER's row, rewrites the store in five seconds, a
+table every half second, and under 1 GiB the group killed it in the lag
+sweep's full rewrite, one sweep in four. Three readings came before the
+count, each true and none the owner: the allocator's free bytes after
+the pass, 240-360 MB, which is what is left and not the peak; the held
+log's buffer, sixty-four megabytes at every point; and the day's new
+defaults, whose counts were nothing in the killed shape. What named it
+was the process's anonymous memory by mapping, sampled from outside it
+through the burst (`/proc/<pid>/smaps` beside the group's `memory.stat`):
+eight hundred megabytes of nine hundred in mappings that were not the
+allocator's; and then the engine's own mapped blocks by length at each
+new peak, a scratch counter in `blocks::alloc`: 101 arena blocks of four
+megabytes, four tables. The kernel merges adjacent anonymous mappings,
+so a mapping's size in `smaps` says allocator or not and no more. The
+writer's wait for room is by the tables' bytes as well now
+(`Options::frozen_bytes`; `docs/engine.md`, the frozen tables' bytes):
+no kill in twenty-four sweeps where the count alone had three in twelve.
+The pairings showed two things the fix was not built for. The bound
+decided which store a sweep began on: with it the compact form was
+serving at the sweep's start in seventeen sweeps of eighteen, by the
+count alone in one of six, and the small bursts ran ten times faster
+where it was, which a cell read at its median would have given to the
+bound's own speed. And the buffered arm's passes at three million keys
+read behind in six pairs of six with every counter level, and the same
+pairing run again with each scan timed read the other arm behind: the
+host's two speeds, a pass at a time. Beside them, the session's own: two
+pairings that differed in `--bound` alone were queued under one output
+name, the second overwrote the first's files, and the first was run
+again before a sentence could cite it. The rules: a limit kept as a
+count is a limit in bytes only while the things counted keep their size,
+so when a size is made to grow, every count that bounded it is read
+again that day; a limit one arm's pace keeps a store under is a limit
+nothing enforces, and a bound is tested by the writer that waits for
+nothing; memory at a kill is read during the burst and from outside the
+process, by mapping first, since that says allocator or engine before
+any owner is guessed, and what a census reads after the pass is what is
+left; a lever on memory moves every decision that reads the process's
+size, so a pairing of one is read for the state each sweep began in
+before its medians; six pairs of six with the counters level is one
+sitting's coin until the pairing is run again; and two runs whose
+commands differ are filed under names that differ.
+
+**A merge that resolved by text, and two conflicts no compiler saw.** The
+main line's settle writes a put over a copy's own run where it lies
+(`Options::settle_patch_in_place`), a seventh of the staged patch's
+instructions, and this branch had made a copy of fixed-size records one
+stream (`Options::copy_packed`) and held a copy's claim to its ranks to
+its partition's keys and not its file (`Options::identity_by_keys`). The
+two lines merged with one conflict in the engine, in another function,
+and type-checked. The in-place patch read the three buffers: a packed
+copy's entries are empty, its bound on the rank declined every one, and
+every copy of the suite's shape is packed. And it asked the copy whether
+its claim stood for the table's blob id, the same word as the key
+sequence the claim is of since the carry: after any merge that kept a
+partition's keys it declined that partition's copies for their lives,
+the loss the carry had been built to take away. Neither raises: a patch
+the fast path declines is staged, every answer right. The gate found the
+first in the main line's own tests, which count the patches written in
+place and read none, and the second only in an assertion written that
+hour, a count of the in-place patches after a merge in the three-buffer
+shape; before it the identity test had passed with the fast path dead,
+its patches at their ranks through the staged path. The in-place patch
+takes a packed copy's value of its records' length in the stream now,
+six mutants of it fail the settle tests, and a key sequence is a type of
+its own (`KeySeq`), so a check against a blob's id does not compile. The
+rules: a merge of two lines is read for each line's fast paths against
+the other line's representations, and each is held to the count that
+says it fired under the merged defaults, since a guard that declines is
+silent and the text and the types agree; a test of a fast path asserts
+its count in every shape a default can hand it, by path, never a sum
+over the path and its fallback; and a word whose meaning one line moved
+is given a type, so that the other line's use of the old meaning stops
+compiling where it would have stopped working.
+
+**A step made earlier, and the walk its lateness had been starting.** The
+main line's settle converts a sparse form its batch takes to the dense
+count before it splices the batch (`Options::settle_converts`). Before
+it the patch left the form at the dense count and marked the tables
+incomplete, which is what has the fill walk them, and that walk is where
+the fill meets the light forms, the ones under the dense count it
+converts on the upkeep thread (`forms_convert_from`). A write into a
+block with no form starts a walk too, and at ten thousand keys every
+block holds a form once the first write mixes are through, so there the
+dense crossings were the only thing starting one. Converted by the
+settle, the form no longer crossed anything: after the scrambled F mix
+98 of 157 blocks stood sparse where one had, the scrambled E walked
+1,747 sparse forms and 1,078 copies where it had walked 22 and 2,803,
+its scans 0.67 µs each against 0.46, and the cell read 0.95x of LMDB in
+both orders where the row before the merge had it at 1.31x. Nothing was
+wrong and nothing raised. The merged head's quick row had the cell at
+0.91x under both policies; a pairing in the row's order confirmed the
+durable one; the main line's four settle options taken away one at a
+time named the conversion, 1.25x and 1.32x without it in thirty-two
+pairs of thirty-two, the other three level and the cell within a
+twentieth for the arm against itself; the mix timed by kind named the
+scans; the walks by
+form named the forms; and the census by kind after each mix named the
+mix that had stopped converting them, 194 builds on the thread there
+against 9. The conversion had been priced in the row's order at a
+hundred thousand keys and up for these arms and at ten thousand for the
+held arm alone, and at a hundred thousand it does not resolve. A settle
+that converts leaves the fill its walk now
+(`Options::settle_convert_fills`; `supdb-settleconvertquiet` is the
+conversion with no walk left): 156 copies after that mix again, the cell
+1.30x and 1.32x of LMDB in twenty-four pairs of twenty-four, 1.34x and
+1.35x of the arm without it, and nothing resolved at thirty, a hundred or
+three hundred thousand keys or on the lag sweep. The rules are ones this
+file has, met from the other side: when a step is moved earlier, what its
+old place had been triggering is listed, the marks it left and who read
+them, as it is for a saving; a change is paired at the smallest rung in
+the row's order for every arm it reaches, since a store small enough
+that every block holds a form is a regime of its own; and a cell a row
+loses that the row before had won is decomposed before the row is
+banked, by removal of what landed between the two. What stays implicit
+is the trigger: a light form is converted only where something else has
+the fill walk the tables.
+
+## Open targets, and the one standing limitation
+
+A cell a comparator wins is a target, never a limit to be written down
+and lived with: each entry below is one still open, with what its
+decomposition has found and the levers it names, and it leaves this list
+when its cells are won. The one standing limitation is the bytes on disk:
+a segment holds its key section, its ordered index and its filter beside
+the records, so the store's files are larger per byte stored than the
+comparators' (`bytes_on_disk_per_byte` in the load's figures), and that is
+the price of the reads those structures serve.
+
+The open targets, each a curve in the suite's figures, at `full` scale
+where it says so:
+
+- Under the held log the scan pass straight after a burst pays for the
+  filing the burst was not held for (`Options::held_bursts_lend`): 0.7x
+  to 0.9x of the pass behind a filed burst after one percent rewritten,
+  0.3x to 0.45x after ten and 0.15x to 0.35x after a hundred, at a hundred
+  and three hundred thousand keys, for bursts 1.7x to 3.4x and a weighted
+  time, the burst and twice its pass, a quarter to a third lower
+  (`pair.sh supdb-heldnoframes supdb-heldfiles SIZE --passes
+  load,read,mixes,mixes-scrambled,lag --reps 5`, at `3f4f23f`). The first
+  scan waits out the upkeep thread's pass in flight and settles its
+  trail, 64 ms of a pass of 74 at three hundred thousand keys where the
+  filed store's whole pass is ten. Filing a write is still several times
+  the write: 3,400 instructions by callgrind, and the thread spends on
+  the conversions it now makes what the lean patches save it
+  (`docs/engine.md`, what filing a write costs). What is left in the
+  filing is a flat tail -- the settle's asks ahead, half of its own
+  instructions, the conversion's read of the partition's records, the
+  snapshot's second sort of the same keys -- and none of it is the
+  factor. The lever is the scan, not built: the first scan after a long
+  trail going on without the whole of it filed, the blocks it walks
+  settled as it reaches them from the batch sorted once, and the thread
+  filing the rest beside the scans, which needs the forms' state shared
+  between the two where it is lent whole to one today.
+- Under the held log the point mixes one thread runs trail FASTER in
+  every row banked with the two, wherever the row's scan passes have left
+  the store near reads: by kind in the row's order, 0.6x to 0.85x on A, B
+  and F at a hundred thousand keys and 0.7x to 0.8x on A and F at three
+  hundred thousand (`docs/engine.md`, the point mixes on one thread, by
+  what is taken away, at `02bab06`). Three things, each by the arm
+  without it. The forms filed beside the writer, four fifths of A's gap
+  and two fifths of F's, which `supdb-heldnfnocache` is without: the
+  upkeep thread's work on another core, and the writer's wait for the
+  lines it read. Puts that append, which `supdb-heldinplace` is without,
+  A ahead of FASTER with it; an overwrite needs nothing else to read the
+  live table's values and the thread reads them to file them, so a store
+  has the first two or neither. And the one writer's get, twenty to
+  thirty nanoseconds over FASTER's at a hundred thousand keys in every
+  arm, C on a clean store among them, which is F at 0.9x with the other
+  two gone. The levers are the roadmap's (`ROADMAP.md`, Engine): the
+  forms stood down through a stretch of point operations, which waits on
+  the scan that goes on without the whole trail filed, since the scans
+  after the stretch pay for what was not kept; the thread's alertness,
+  which is a sixth of A and whose price to E is not resolved; and the one
+  writer's get at the shared table's length.
 - The scan pass after a burst pays its first scan for the burst's end:
   the wait for the upkeep thread's pass in flight, the log read, the
   settle of what the thread trailed by and the snapshot's extension,
@@ -11037,17 +12149,50 @@ in the suite's figures, at `full` scale where it says so:
   rate in the long shape. The lever is the crossing's asks made off that
   thread, so the buy and the install are not held behind them, and is not
   built.
-- The frozen tables are held to a count (`FROZEN_CAP`, three) and not to
-  bytes. A table freezes at the seal's threshold, 109 MB of memtable at
-  ten million keys, and near reads its seal makes a snapshot copy of it,
-  123 MB more: three behind a landing that does not come, with the live
-  table past them, are a gigabyte, and under a bound of that the group
-  kills the process before the writer's wait at a full list holds it.
-  The one landing known to stall so was the bounds walk over keys whose
-  heads are not whole keys, which the heads place now
-  (`Options::bounds_by_heads`, `land_bounds_read`). The lever for any
-  other is the writer's wait drawn from what the bound can spare, and is
-  not built.
+- A store past its budget that is only scanned after its load is bought
+  late or not at all. At ten million keys the buffered arm's lag sweep
+  began with the compact form serving in seventeen sweeps of eighteen
+  under 1 GiB and in three of six under 1.25 GiB (`docs/engine.md`, the
+  frozen tables' bytes; by the count alone, in one of twelve), and where
+  it began raw the one- and ten-percent bursts ran ten times longer, the
+  writer held behind an upkeep thread that resolves its keys through raw
+  records the bound has pushed out. The cells are in FASTER's row, the
+  held arm's small bursts. The controller buys on its point reads'
+  faults and the sweep has none; what decides the purchase before it,
+  the load's builds ahead or the budget as the load ends, has not been
+  read off the controller's trace (`SUPDB_ZPAGES_TRACE=1` over the
+  pairing).
+- The scrambled E in core is the scans at LMDB's rate and two costs of
+  ours beside them (`docs/engine.md`, timed by kind): a commit of a
+  hundred inserts at twice LMDB's, 2,500 instructions an insert of the
+  settle the commit makes for the scans behind it, and at ten thousand
+  keys a first scan of 100-140 µs in a mix of 1.1 ms, the upkeep thread's
+  trail behind the write mixes before it. The thread is on a core nine
+  tenths of the write mixes and files a key in 0.55 µs, most of it lines
+  the writer wrote a moment before fetched from the writer's core, in a
+  profile with nothing over a tenth. The levers: the settle's cost a key,
+  which is the thread's trail, the first scan's residue and the commit
+  at once, and wants its loop made again and not trimmed -- its sort for
+  duplicates, the key read four times a write, a patch's allocations --
+  and a scan that takes its upkeep back from a pass in its fill by a
+  short spin where it parks, fifteen microseconds a hand-off. Neither is
+  built. The third lever was the copy's layout and is the engine's now,
+  a copy of fixed-size records as one stream (`Options::copy_packed`,
+  `docs/engine.md`): the scans' own time an entry fell, the mix read
+  1.10-1.31x of the three buffers' at ten and thirty thousand keys, and
+  the row at `001781d` is the first to read the cell ahead at every
+  rung, 1.03x to 1.34x. At ten and thirty thousand keys that is a cell
+  won by a twentieth with the two costs above standing in it, so it is
+  open until they are gone.
+- A shared table is left only at one of the writer's own commits or
+  seals (`Options::share_on_write`, `Db::share_look`): a store whose
+  handles stop writing and whose writer then only reads keeps the shared
+  form, and its scans merge their sources, a sixth of the block cache's
+  rate on ycsb-E, until the writer commits. And a scan beside handles
+  that write always merges. The levers: the segment work's thread
+  leaving the table for a writer that is idle, which needs the freeze
+  made safe from a second thread; and a form kept current from the
+  shared table's own writes, which needs them logged.
 - Scans on a store with unsealed keys spread through it pay for the path.
   A few unsealed keys in a partition take every scan of it off the bulk
   walk and through the block loop and the form file's cursor, a fifth to

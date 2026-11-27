@@ -50,7 +50,6 @@ src/bytes.rs	Own::<item>	paged	code	2	stays	the seam: Paging, piecewise and the 
 src/bytes.rs	Paging::<item>	paged	code	1	stays	the seam: Paging, piecewise and the paged mapping are R0's allowed vocabulary
 src/db.rs	Db::<item>	vault (field or module word)	code	1	stays	Db.vault field: the open store under a cipher
 src/db.rs	Db::<item>	vault::Held	code	1	stays	Db.vault field: the open store under a cipher
-src/db.rs	Db::adopt_run_spare	pager	code	1	S6	the run spare is a plain directory entry; under the envelope arm a run file is a memory file
 src/db.rs	Db::append_pinned	run logged	code	1	S4 (conditional; else stays)	self.vault.is_some() picks a logged table
 src/db.rs	Db::append_pinned	vault (field or module word)	code	1	S4 (conditional; else stays)	self.vault.is_some() picks a logged table
 src/db.rs	Db::checkpoint	crate-root alias of an encryption item	code	1	stays	a checkpoint is of a store in the clear; the API names the mode (dirkey::DirState, aliased at the crate root)
@@ -61,7 +60,7 @@ src/db.rs	Db::cipher_counts	cipher	code	2	stays	public counters
 src/db.rs	Db::cipher_counts	vault (field or module word)	code	1	stays	public counters
 src/db.rs	Db::cipher_counts	vault/pager method	code	1	stays	public counters
 src/db.rs	Db::cipher_counts	vault::CipherCounts	code	1	stays	public counters
-src/db.rs	Db::close_run	run logged	code	3	S4 (conditional; else stays)	RUN_LOGGED: the logged run
+src/db.rs	Db::close_run	run logged	code	4	S4 (conditional; else stays)	RUN_LOGGED: the logged run; and the close readable on the writer (Options::close_readable_inline, main #33) is never a logged run's, whose envelope is the seal thread's to write
 src/db.rs	Db::close_run	vault::persist	code	1	S6	vault::persist
 src/db.rs	Db::commit_direct	run logged	code	7	S4 (conditional; else stays)	log_run
 src/db.rs	Db::create	cipher	code	4	stays	the open names the mode; S5 takes one cipher token (cipher_controller call)
@@ -83,7 +82,6 @@ src/db.rs	Db::land_seal	unlent/unlend	code	1	S1	a wait under no pin: pin::idle (
 src/db.rs	Db::log_run	run logged	code	2	S4 (conditional; else stays)	
 src/db.rs	Db::log_run_again	run logged	code	2	S4 (conditional; else stays)	
 src/db.rs	Db::maint_request	unlent/unlend	code	1	S1	a wait under no pin: pin::idle (R6)
-src/db.rs	Db::make_run_spare	pager	code	1	S6	the run spare is a plain directory entry; under the envelope arm a run file is a memory file
 src/db.rs	Db::next_wal_file	vault::real	code	1	S6	the log's pass-by-name surfaced in the engine (check 2.3)
 src/db.rs	Db::open	cipher	code	4	stays	the open names the mode; S5 takes one cipher token (cipher_controller call)
 src/db.rs	Db::open	crypt	code	4	stays	the open names the mode; S5 takes one cipher token (cipher_controller call)
@@ -242,6 +240,7 @@ src/db.rs	a_reads_settle_ahead_of_its_walk_gives_the_cache_back	vault::tests	tes
 src/db.rs	announced_inputs	vault::announces	code	1	S6	whether the merge's store has its writers say what they will hold -- under a cipher, or kept in one file -- asked once a merge before its inputs' lengths are; it stands where vault::under stood
 src/db.rs	check_options	cipher	code	2	stays	an unpinned writer is refused under a cipher, by the mode and in the refusal's words: the rule for an unpinned writer, with the store's cache as the party that frees
 src/db.rs	check_options	crypt	code	2	stays	the same refusal reads the mode out of the options (opts.encryption, Encryption::Cipher)
+src/db.rs	check_options	run logged	code	1	stays	main #30's refusal of shared_writers says "nothing logged" in its words: the word, not the cipher's logged run
 src/db.rs	cipher_controller	cipher	code	2	S5	controller off under a cipher
 src/db.rs	compact_job	MergeRest/NoRest	code	1	R4	the hold picks MergeRest: the lease
 src/db.rs	compact_job	vault::hold	code	1	S1	vault::hold -> pin::hold; the MergeRest it picks falls at R4

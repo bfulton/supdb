@@ -372,3 +372,48 @@ Db::wal_held	-	a test seam that reads what a log that holds its commits dropped,
 Reader::point_lean_reads	-	a test seam that counts the point reads the lean reads answered, read by tests, at no key, entry, block or step of an operation
 Reader::point_live_ended_reads	-	a test seam that counts the point reads the live table ended, read by tests, at no key, entry, block or step of an operation
 Reader::point_placed_reads	-	a test seam that counts the point reads whose record was placed by the fixed read, read by tests, at no key, entry, block or step of an operation
+Db::copy_packs	-	main #30-#33: a test seam or a counter: reads or sets the store's bookkeeping, at no key, entry, block or step of an operation
+Db::copy_patches	-	main #30-#33: a test seam or a counter: reads or sets the store's bookkeeping, at no key, entry, block or step of an operation
+Db::fail_next_spare_sync	-	main #30-#33: a test seam or a counter: reads or sets the store's bookkeeping, at no key, entry, block or step of an operation
+Db::frozen_bytes_held	-	main #30-#33: a test seam or a counter: reads or sets the store's bookkeeping, at no key, entry, block or step of an operation
+Db::heads_past_fill	-	main #30-#33: a test seam or a counter: reads or sets the store's bookkeeping, at no key, entry, block or step of an operation
+Db::hold_shared_closed	-	main #30-#33: a test seam or a counter: reads or sets the store's bookkeeping, at no key, entry, block or step of an operation
+Db::hold_shared_grace	-	main #30-#33: a test seam or a counter: reads or sets the store's bookkeeping, at no key, entry, block or step of an operation
+Db::hold_shared_writes	-	main #30-#33: a test seam or a counter: reads or sets the store's bookkeeping, at no key, entry, block or step of an operation
+Db::hold_spare_named	-	main #30-#33: a test seam or a counter: reads or sets the store's bookkeeping, at no key, entry, block or step of an operation
+Db::hold_unshare	-	main #30-#33: a test seam or a counter: reads or sets the store's bookkeeping, at no key, entry, block or step of an operation
+Db::live_shared	-	main #30-#33: a test seam or a counter: reads or sets the store's bookkeeping, at no key, entry, block or step of an operation
+Db::run_spare_look_again	-	main #30-#33: a test seam or a counter: reads or sets the store's bookkeeping, at no key, entry, block or step of an operation
+Db::run_spare_state	-	main #30-#33: a test seam or a counter: reads or sets the store's bookkeeping, at no key, entry, block or step of an operation
+Db::settle_gathered	-	main #30-#33: a test seam or a counter: reads or sets the store's bookkeeping, at no key, entry, block or step of an operation
+Db::settle_lean	-	main #30-#33: a test seam or a counter: reads or sets the store's bookkeeping, at no key, entry, block or step of an operation
+Db::settle_short	-	main #30-#33: a test seam or a counter: reads or sets the store's bookkeeping, at no key, entry, block or step of an operation
+Db::share_counts	-	main #30-#33: a test seam or a counter: reads or sets the store's bookkeeping, at no key, entry, block or step of an operation
+Db::share_populated	-	main #30-#33: a test seam or a counter: reads or sets the store's bookkeeping, at no key, entry, block or step of an operation
+Db::shared_writes_held	-	main #30-#33: a test seam or a counter: reads or sets the store's bookkeeping, at no key, entry, block or step of an operation
+Db::shares	-	main #30-#33: a test seam or a counter: reads or sets the store's bookkeeping, at no key, entry, block or step of an operation
+Db::sharing	-	main #30-#33: a test seam or a counter: reads or sets the store's bookkeeping, at no key, entry, block or step of an operation
+Reader::block_cache_binds	-	main #30-#33: a test seam or a counter: reads or sets the store's bookkeeping, at no key, entry, block or step of an operation
+Reader::block_cache_packed	-	main #30-#33: a test seam or a counter: reads or sets the store's bookkeeping, at no key, entry, block or step of an operation
+Reader::hold_rewrites	-	main #30-#33: a test seam or a counter: reads or sets the store's bookkeeping, at no key, entry, block or step of an operation
+Reader::live_settled	-	main #30-#33: a test seam or a counter: reads or sets the store's bookkeeping, at no key, entry, block or step of an operation
+Reader::placed_live_probes	-	main #30-#33: a test seam or a counter: reads or sets the store's bookkeeping, at no key, entry, block or step of an operation
+Reader::release_shared_closed	-	main #30-#33: a test seam or a counter: reads or sets the store's bookkeeping, at no key, entry, block or step of an operation
+Reader::release_shared_grace	-	main #30-#33: a test seam or a counter: reads or sets the store's bookkeeping, at no key, entry, block or step of an operation
+Reader::release_unshare	-	main #30-#33: a test seam or a counter: reads or sets the store's bookkeeping, at no key, entry, block or step of an operation
+Reader::rewrite_holding	-	main #30-#33: a test seam or a counter: reads or sets the store's bookkeeping, at no key, entry, block or step of an operation
+Reader::rewrites_made	-	main #30-#33: a test seam or a counter: reads or sets the store's bookkeeping, at no key, entry, block or step of an operation
+Reader::shared_closed_holding	-	main #30-#33: a test seam or a counter: reads or sets the store's bookkeeping, at no key, entry, block or step of an operation
+Reader::shared_fall_asks	-	main #30-#33: a test seam or a counter: reads or sets the store's bookkeeping, at no key, entry, block or step of an operation
+Reader::shared_grace_holding	-	main #30-#33: a test seam or a counter: reads or sets the store's bookkeeping, at no key, entry, block or step of an operation
+Reader::shared_lean_ops	-	main #30-#33: a test seam or a counter: reads or sets the store's bookkeeping, at no key, entry, block or step of an operation
+Reader::shared_len_carried	-	main #30-#33: a test seam or a counter: reads or sets the store's bookkeeping, at no key, entry, block or step of an operation
+Reader::shared_rmw_below	-	main #30-#33: a test seam or a counter: reads or sets the store's bookkeeping, at no key, entry, block or step of an operation
+Reader::shared_writes_held	-	main #30-#33: a test seam or a counter: reads or sets the store's bookkeeping, at no key, entry, block or step of an operation
+Reader::unshare_holding	-	main #30-#33: a test seam or a counter: reads or sets the store's bookkeeping, at no key, entry, block or step of an operation
+Reader::upkeep_passes_ended	-	main #30-#33: a test seam or a counter: reads or sets the store's bookkeeping, at no key, entry, block or step of an operation
+Db::writer	-	main #30: claims a handle that writes (Options::shared_writers, share_on_write), once a handle
+Reader::put	-	main #30: a write through a handle under the held log (Options::shared_writers, share_on_write), an operation on no probe of scripts/cost.sh: the gap, owed a probe beside the writer's own put
+Reader::append	-	main #30: a write through a handle under the held log (Options::shared_writers, share_on_write), an operation on no probe of scripts/cost.sh: the gap, owed a probe beside the writer's own put
+Reader::delete	-	main #30: a write through a handle under the held log (Options::shared_writers, share_on_write), an operation on no probe of scripts/cost.sh: the gap, owed a probe beside the writer's own put
+Reader::rmw	-	main #30: a write through a handle under the held log (Options::shared_writers, share_on_write), an operation on no probe of scripts/cost.sh: the gap, owed a probe beside the writer's own put

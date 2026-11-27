@@ -4037,11 +4037,6 @@ pub(crate) fn sync_dir_as(dir: impl AsRef<Path>, kind: DirSync) -> Result<()> {
 #[cold]
 #[inline(never)]
 fn sync_dir_seamed(dir: &Path, kind: DirSync, seams: u8) -> Result<()> {
-    let begun = if seams & SEAM_WATCH != 0 {
-        dir_begin(dir)
-    } else {
-        None
-    };
     if seams & SEAM_HOOK != 0 {
         let hook = {
             let mut hooks = DIR_HOOKS.lock().unwrap_or_else(|e| e.into_inner());
@@ -4063,9 +4058,6 @@ fn sync_dir_seamed(dir: &Path, kind: DirSync, seams: u8) -> Result<()> {
     }
     if seams & SEAM_TRACE != 0 {
         io_trace("sync_dir", dir);
-    }
-    if let Some(b) = begun {
-        dir_done(dir, b);
     }
     Ok(())
 }
@@ -4114,71 +4106,6 @@ pub(crate) fn sync_file(path: impl AsRef<Path>) -> Result<()> {
 static IO_SEAMS: AtomicU8 = AtomicU8::new(0);
 const SEAM_TRACE: u8 = 1;
 const SEAM_HOOK: u8 = 2;
-/// Some directory's fsyncs are counted (`watch_dir`): not a test's, and
-/// in the same word for the same reason, so a directory nobody watches
-/// pays the one load its fsync made already.
-const SEAM_WATCH: u8 = 4;
-
-/// The directories whose fsyncs are counted, each with the count of
-/// fsyncs begun and the highest of them that has returned: what a store
-/// asks to know whether an entry it made is behind a directory fsync that
-/// began after it (`dir_ticket`, `dir_synced_after`), whoever's thread
-/// made the fsync -- the writer's barrier, a seal's landing, a publish.
-static DIR_WATCHES: Mutex<Vec<(PathBuf, u64, u64)>> = Mutex::new(Vec::new());
-
-/// `dir`'s fsyncs counted from here, for the store open on it.
-pub(crate) fn watch_dir(dir: &Path) {
-    let mut w = DIR_WATCHES.lock().unwrap_or_else(|e| e.into_inner());
-    if !w.iter().any(|(d, _, _)| d == dir) {
-        w.push((dir.to_path_buf(), 0, 0));
-    }
-    IO_SEAMS.fetch_or(SEAM_WATCH, Ordering::Relaxed);
-}
-
-/// `dir`'s fsyncs no longer counted.
-pub(crate) fn unwatch_dir(dir: &Path) {
-    let mut w = DIR_WATCHES.lock().unwrap_or_else(|e| e.into_inner());
-    w.retain(|(d, _, _)| d != dir);
-    if w.is_empty() {
-        IO_SEAMS.fetch_and(!SEAM_WATCH, Ordering::Relaxed);
-    }
-}
-
-/// The count of `dir`'s fsyncs begun so far, read after an entry is made
-/// in it: an fsync that returns past this one began after the entry was
-/// made, and promises it. `None` for a directory nobody watches.
-pub(crate) fn dir_ticket(dir: &Path) -> Option<u64> {
-    let w = DIR_WATCHES.lock().unwrap_or_else(|e| e.into_inner());
-    w.iter()
-        .find(|(d, _, _)| d == dir)
-        .map(|&(_, begun, _)| begun)
-}
-
-/// Whether an fsync of `dir` begun after `ticket` was read has returned.
-pub(crate) fn dir_synced_after(dir: &Path, ticket: u64) -> bool {
-    let w = DIR_WATCHES.lock().unwrap_or_else(|e| e.into_inner());
-    w.iter()
-        .find(|(d, _, _)| d == dir)
-        .is_some_and(|&(_, _, done)| done > ticket)
-}
-
-/// The fsync of `dir` about to begin, counted where `dir` is watched: its
-/// number, for `dir_done` once it has returned.
-fn dir_begin(dir: &Path) -> Option<u64> {
-    let mut w = DIR_WATCHES.lock().unwrap_or_else(|e| e.into_inner());
-    w.iter_mut().find(|(d, _, _)| d == dir).map(|e| {
-        e.1 += 1;
-        e.1
-    })
-}
-
-/// The fsync `begun` of `dir` returned.
-fn dir_done(dir: &Path, begun: u64) {
-    let mut w = DIR_WATCHES.lock().unwrap_or_else(|e| e.into_inner());
-    if let Some(e) = w.iter_mut().find(|(d, _, _)| d == dir) {
-        e.2 = e.2.max(begun);
-    }
-}
 
 /// A test's: the directories `trace_io` records for, each with what was
 /// recorded for it in order -- the calls, and beside them the descriptors

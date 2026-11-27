@@ -4203,7 +4203,9 @@ fn acknowledged_direct_run_commits_survive_a_power_cut_that_loses_the_logs_unsyn
 
 /// A buffered store: commits never sync, and a flush acknowledges them by
 /// a segment and a manifest without syncing the log
-/// (`Options::drain_syncs_wal` off). The log's header and frames may then
+/// (`Options::drain_syncs_wal` off; and `drain_syncs_beside` off, which
+/// syncs the log beside a store's first drain and so never leaves this
+/// state there, where a later drain's does). The log's header and frames may then
 /// never be synced in the file's life, and a power cut can leave its first
 /// page zero -- with the later pages written back by the kernel, or with
 /// the whole file zero. Everything the flush acknowledged is in the
@@ -4212,6 +4214,7 @@ fn a_flush_survives_a_lost_first_page(tag: &str, base: Options) {
     let opts = Options {
         sync: SyncPolicy::EveryN(u32::MAX),
         direct_ingest: false,
+        drain_syncs_beside: false,
         ..base
     };
     let k = |i: u32| format!("k{:05}", (i * 7919) % 100_000).into_bytes();
@@ -6661,12 +6664,19 @@ fn a_flush_after_a_failed_inline_presync_is_not_ok_over_the_lost_records() {
 /// durable, after its readable landing: under `Always` every commit of the
 /// run synced its records, so the reopen recovers them from the run's
 /// temp name, which nothing retires; and no later landing names the
-/// run's segment, whose trailer no fsync covered.
-fn ss_run_close_fails(tag: &str, by_flush: bool, inline: bool) {
+/// run's segment, whose trailer no fsync covered. `strict` closes a
+/// flush's run on the seal thread and answers the drain behind its
+/// durable landing (`Options::close_readable_inline` and
+/// `drain_answers_readable` off), so the flush answers the failure; as
+/// shipped the drain is answered at the readable landing, every write it
+/// covers durable before it, and the failure is the next commit's.
+fn ss_run_close_fails(tag: &str, by_flush: bool, inline: bool, strict: bool) {
     let d = dir(&format!("dur-ss-runclose-{tag}"));
     let crash = dir(&format!("dur-ss-runclose-{tag}-crash"));
     let opts = Options {
         close_finish_inline: inline,
+        close_readable_inline: !strict,
+        drain_answers_readable: !strict,
         ..Options::default()
     };
     let mut model = SsModel::new();
@@ -6696,6 +6706,7 @@ fn ss_run_close_fails(tag: &str, by_flush: bool, inline: bool) {
             h.hold_seal_durable_from_handle(false);
         });
         match db.flush() {
+            Ok(()) if !strict => {}
             Ok(()) => panic!("{tag}: the flush answered Ok over its seal's failure"),
             Err(e) => assert!(
                 e.to_string().contains(cause),
@@ -6703,6 +6714,14 @@ fn ss_run_close_fails(tag: &str, by_flush: bool, inline: bool) {
             ),
         }
         lifter.join().unwrap();
+        if !strict {
+            assert_eq!(
+                db.seal_waits().drains_early,
+                1,
+                "{tag}: the drain was answered at its readable landing"
+            );
+            wait_for("the failed seal's end", || !db.in_flight().0);
+        }
     } else {
         db.seal().unwrap();
         wait_for("the run's segment published", || db.levels() != (0, 0));
@@ -6713,7 +6732,7 @@ fn ss_run_close_fails(tag: &str, by_flush: bool, inline: bool) {
     // A write below the run's keys, through the log, acknowledged: the
     // segment work's error, left for the writer where the work met the
     // failure on its own, answered by a commit first.
-    if !by_flush {
+    if !by_flush || !strict {
         let e = ss_commit_answer(&mut db);
         assert!(
             e.to_string().contains(cause),
@@ -6723,7 +6742,7 @@ fn ss_run_close_fails(tag: &str, by_flush: bool, inline: bool) {
     ss_put(&mut db, &mut model, &ss_key(7), "low");
     if db.commit().is_err() {
         assert!(
-            by_flush,
+            by_flush && strict,
             "{tag}: a second commit answered the seal's failure"
         );
         db.commit().unwrap();
@@ -6768,9 +6787,10 @@ fn ss_run_close_fails(tag: &str, by_flush: bool, inline: bool) {
 
 #[test]
 fn a_runs_close_whose_fsync_failed_is_named_by_no_manifest() {
-    ss_run_close_fails("seal", false, false);
-    ss_run_close_fails("flush", true, false);
-    ss_run_close_fails("flushinline", true, true);
+    ss_run_close_fails("seal", false, false, false);
+    ss_run_close_fails("flush", true, false, true);
+    ss_run_close_fails("flushinline", true, true, true);
+    ss_run_close_fails("flushearly", true, false, false);
 }
 
 /// Under `Options::manifest_pending` the slot naming a seal's segments
@@ -7333,9 +7353,14 @@ impl SsWatchdog {
 fn a_presync_that_fails_before_its_seals_publish_stops_every_manifest() {
     let d = dir("dur-ss-presync-early");
     let mut model = SsModel::new();
-    let (mut db, opts) = ss_store_with_a_merge_due(&d, Options::default(), &mut model, |db| {
-        db.hold_merge_landing(true)
-    });
+    // The records' presync is the close on the seal thread's, where a run
+    // is not closed readable on the writer (`Options::close_readable_inline`).
+    let base = Options {
+        close_readable_inline: false,
+        ..Options::default()
+    };
+    let (mut db, opts) =
+        ss_store_with_a_merge_due(&d, base, &mut model, |db| db.hold_merge_landing(true));
     wait_for("the merge at its landing hold", || {
         db.merge_waits_at_landing()
     });
@@ -7417,6 +7442,7 @@ fn a_presync_that_fails_before_its_seals_publish_stops_every_manifest_inline() {
     let d = dir("dur-ss-presync-early-inline");
     let opts = Options {
         publish_in_background: false,
+        close_readable_inline: false,
         partition_on_flush: false,
         flush_schedules: true,
         seal_bytes: 1 << 20,
@@ -7589,7 +7615,16 @@ fn a_stopped_queue_is_answered_by_every_seal_inline() {
 fn a_stopped_queue_answers_the_failure_that_stopped_it() {
     let d = dir("dur-ss-first-cause");
     let mut model = SsModel::new();
-    let mut db = Db::create(&d, Options::default()).unwrap();
+    // The presync is the close on the seal thread's
+    // (`Options::close_readable_inline` off).
+    let mut db = Db::create(
+        &d,
+        Options {
+            close_readable_inline: false,
+            ..Options::default()
+        },
+    )
+    .unwrap();
     // High to low, so the seal is the memtable's.
     for k in (0..3000u32).rev() {
         ss_put(&mut db, &mut model, &ss_key(k), "v");
@@ -14995,13 +15030,23 @@ fn a_merge_whose_helper_sync_failed_lands_nothing() {
 /// the writer's word, and the word is the flush's own ask: when the flush
 /// answers `Ok`, the newest slot names the run's segment durable, with
 /// nothing after the flush to land it. `inline` runs the segment work on
-/// the writer's thread (`Options::publish_in_background` off).
-fn do_drain_lands_its_run(tag: &str, inline: bool) {
+/// the writer's thread (`Options::publish_in_background` off). `strict`
+/// answers no drain at its seal's readable landing
+/// (`Options::drain_answers_readable` off), and `presync` closes the run
+/// on the seal thread with its records synced on the writer
+/// (`Options::close_readable_inline` off), whose job waits for the word:
+/// that drain is answered strictly whatever the option says, since an
+/// early answer gives no word and the loop lands no such job. With
+/// neither the drain is answered early, and its slot follows in the loop.
+fn do_drain_lands_its_run(tag: &str, inline: bool, strict: bool, presync: bool) {
     let d = dir(&format!("dur-do-lands-{tag}"));
     let opts = Options {
         publish_in_background: !inline,
+        drain_answers_readable: !strict,
+        close_readable_inline: !presync,
         ..Options::default()
     };
+    let early = !inline && !strict && !presync;
     let mut db = Db::create(&d, opts).unwrap();
     for k in 0..3000u32 {
         db.append(&ss_key(k), &ss_val(k));
@@ -15010,6 +15055,14 @@ fn do_drain_lands_its_run(tag: &str, inline: bool) {
         }
     }
     db.flush().unwrap();
+    assert_eq!(
+        db.seal_waits().drains_early,
+        u64::from(early),
+        "{tag}: the drain answered early where it may"
+    );
+    if early {
+        db.settle().unwrap();
+    }
     let (_, _, names) = ss_newest(&d).expect("a manifest");
     assert!(
         !names.is_empty() && names.iter().all(|(_, pending)| !pending),
@@ -15031,12 +15084,16 @@ fn do_drain_lands_its_run(tag: &str, inline: bool) {
 
 #[test]
 fn a_drain_names_its_runs_segment_durable_before_it_answers() {
-    do_drain_lands_its_run("background", false);
+    do_drain_lands_its_run("background", false, true, false);
+    do_drain_lands_its_run("background-presync", false, false, true);
+    do_drain_lands_its_run("background-strict-presync", false, true, true);
+    do_drain_lands_its_run("background-early", false, false, false);
 }
 
 #[test]
 fn a_drain_names_its_runs_segment_durable_before_it_answers_inline() {
-    do_drain_lands_its_run("inline", true);
+    do_drain_lands_its_run("inline", true, false, false);
+    do_drain_lands_its_run("inline-presync", true, false, true);
 }
 
 /// Under a cipher the run's job awaits the writer as in the clear; the

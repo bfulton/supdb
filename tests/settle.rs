@@ -36,6 +36,23 @@ fn scan_model(db: &Db) -> std::collections::BTreeMap<Vec<u8>, Vec<Vec<u8>>> {
     m
 }
 
+/// A scan through the writer as it comes: every key with its values, in
+/// the order the scan hands them over. `scan_model` gathers into a map,
+/// which answers the same for a scan that emits a key out of its place.
+fn scan_list(db: &Db) -> Vec<(Vec<u8>, Vec<Vec<u8>>)> {
+    let mut l: Vec<(Vec<u8>, Vec<Vec<u8>>)> = Vec::new();
+    db.scan(
+        b"",
+        usize::MAX,
+        kv(&mut |k, v| match l.last_mut() {
+            Some((last, vals)) if last.as_slice() == k => vals.push(v.to_vec()),
+            _ => l.push((k.to_vec(), vec![v.to_vec()])),
+        }),
+    )
+    .unwrap();
+    l
+}
+
 /// The empty key takes no bytes of the arena, so the key created after it
 /// starts at the same arena offset; folded by offset, that key's creating
 /// write vanished into the empty key's entry and was never filed, and a
@@ -329,6 +346,7 @@ fn a_copys_identity_is_its_partitions_and_not_the_one_a_rewrite_left() {
     };
     let rebased_before = db.forms_rebased();
     let merges_before = db.seal_waits().merges;
+    let kept_before = db.seal_waits().keyseqs_kept;
     db.hold_upkeep_pass(true);
     db.hold_seal_durable(true);
     for _ in 0..2 {
@@ -351,6 +369,14 @@ fn a_copys_identity_is_its_partitions_and_not_the_one_a_rewrite_left() {
         "the rewrite kept the partition's layout: {} before, {} after",
         rebased_before,
         db.forms_rebased()
+    );
+    // The output holds a key its partition did not, as many keys as it
+    // and between the same fences: not that partition's key sequence
+    // (`Options::identity_by_keys`).
+    assert_eq!(
+        db.seal_waits().keyseqs_kept,
+        kept_before,
+        "an output with a key folded in took the key sequence of the partition it rewrote"
     );
     let mut want = std::collections::BTreeMap::new();
     for k in &keys {
@@ -1701,6 +1727,2058 @@ fn claim_across_rewrite(name: &str, part: usize, key: impl Fn(usize) -> Vec<u8>)
     )
     .unwrap();
     assert!(via_handle == want, "the handle's scan");
+}
+
+/// A store of `n` keys in key order, appended and flushed into partitions,
+/// with its writer's upkeep inline: the stores of the two tests below.
+fn appended(dir: &std::path::Path, n: usize, background: bool, o: Options) -> (Db, Vec<Vec<u8>>) {
+    let inject = std::sync::Arc::new(supdb::ZInject::new());
+    inject.set_refault_rate(0.0);
+    inject.set_budget(1 << 50);
+    let mut db = Db::create(
+        dir,
+        Options {
+            seal_bytes: 8 << 20,
+            partition_bytes: Some(64 << 10),
+            partition_on_flush: true,
+            publish_in_background: background,
+            upkeep: Upkeep::Inline,
+            scan_block_cache: true,
+            forms_settle_every: true,
+            forms_settle_builds: true,
+            l0_trigger: 64,
+            zpages_inject: Some(inject),
+            ..o
+        },
+    )
+    .unwrap();
+    let keys: Vec<Vec<u8>> = (0..n).map(|i| format!("k{i:05}").into_bytes()).collect();
+    // Out of key order, so the load goes through the log and the table
+    // and not into a run of ordered ingest.
+    for i in (0..n).rev() {
+        db.append(&keys[i], &[b'v'; 100]);
+    }
+    db.commit().unwrap();
+    db.flush().unwrap();
+    db.settle().unwrap();
+    (db, keys)
+}
+
+/// A settle's patch of a copy appends a key above the copy's last entry on
+/// one compare with that entry (`Options::settle_append_last`), where it
+/// searched the copy's keys for the place: every key inserted past a
+/// store's end lands so, in the copy its last block is held as. A key
+/// below the last entry is searched for as before, and lands in its
+/// place.
+#[test]
+fn a_key_past_a_copys_last_entry_is_appended_without_a_search() {
+    // And under the copy as one stream of fixed-size records
+    // (`Options::copy_packed`), which this store's blocks are: a key
+    // appended finds the three buffers.
+    for (on, packed) in [(true, false), (false, false), (true, true)] {
+        let dir = scratch(&format!("append-last-{on}-{packed}"));
+        let (mut db, keys) = appended(
+            &dir,
+            1000,
+            false,
+            Options {
+                settle_append_last: on,
+                copy_packed: packed,
+                ..common::options()
+            },
+        );
+        let mut want: std::collections::BTreeMap<Vec<u8>, Vec<Vec<u8>>> = keys
+            .iter()
+            .map(|k| (k.clone(), vec![vec![b'v'; 100]]))
+            .collect();
+        let fences = partition_fences(&dir);
+        let near = |db: &Db| {
+            for (lo, _) in &fences {
+                db.scan(lo, 1, kv(&mut |_, _| {})).unwrap();
+            }
+        };
+        // The store's last block as a copy: its keys rewritten, twice,
+        // each commit near reads.
+        for tag in *b"ab" {
+            near(&db);
+            for k in &keys[keys.len() - 64..] {
+                db.put(k, &[tag; 100]);
+                want.insert(k.clone(), vec![vec![tag; 100]]);
+            }
+            db.commit().unwrap();
+        }
+        assert!(scan_model(&db) == want, "{on}: after the rewrites");
+        let (_, _, copies, _) = db.block_cache_kinds();
+        assert!(copies >= 1, "{on}: the last block is held as a copy");
+        // Keys past the store's end, each above the one before. The last
+        // block is a sparse form for the first few and a copy from there:
+        // every insert that finds no sparse form left is a copy's.
+        let mut into_a_copy = 0;
+        for i in 0..16 {
+            near(&db);
+            let copy = db.block_cache_kinds().1 == 0;
+            let before = db.settle_short()[1];
+            let k = format!("k{:05}", 1000 + i).into_bytes();
+            db.append(&k, &[b'n'; 100]);
+            want.insert(k, vec![vec![b'n'; 100]]);
+            db.commit().unwrap();
+            assert!(
+                scan_list(&db) == want.clone().into_iter().collect::<Vec<_>>(),
+                "{on}: after insert {i} past the end, every key in its place"
+            );
+            let appended = db.settle_short()[1] - before;
+            if !on {
+                assert_eq!(appended, 0, "insert {i} searched for with the option off");
+            } else if copy {
+                assert_eq!(appended, 1, "insert {i} past a copy's end, on one compare");
+            }
+            into_a_copy += usize::from(copy);
+        }
+        assert!(
+            into_a_copy >= 8,
+            "{on}: the last block was a copy for most of the inserts: {into_a_copy}"
+        );
+        // A key inside the copy, below its last entry: searched for, and
+        // in its place.
+        let before = db.settle_short()[1];
+        near(&db);
+        let inside = b"k00990x".to_vec();
+        db.append(&inside, b"inside");
+        want.insert(inside, vec![b"inside".to_vec()]);
+        db.commit().unwrap();
+        assert!(
+            scan_list(&db) == want.clone().into_iter().collect::<Vec<_>>(),
+            "{on}: a key inside the copy, in its place"
+        );
+        assert_eq!(
+            db.settle_short()[1],
+            before,
+            "{on}: a key below the last entry is not appended"
+        );
+        db.flush().unwrap();
+        db.settle().unwrap();
+        assert!(scan_model(&db) == want, "{on}: and after the flush");
+        drop(db);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+/// A settle's patch takes a key's run from the key's own chain where no
+/// older source can hold the key (`Options::settle_lone_chain`): a plain
+/// insert of a key the partition has no record of, with no piece over the
+/// partition and no table frozen. A key the partition holds, a key under
+/// a piece and a key under a frozen table keep the walk of the sources,
+/// which is what finds their older values.
+#[test]
+fn a_key_only_its_chain_holds_takes_its_run_from_the_chain() {
+    for on in [true, false] {
+        // No piece and no frozen table.
+        let dir = scratch(&format!("lone-chain-{on}"));
+        let (mut db, keys) = appended(
+            &dir,
+            1000,
+            false,
+            Options {
+                settle_lone_chain: on,
+                ..common::options()
+            },
+        );
+        let mut want: std::collections::BTreeMap<Vec<u8>, Vec<Vec<u8>>> = keys
+            .iter()
+            .map(|k| (k.clone(), vec![vec![b'v'; 100]]))
+            .collect();
+        let fences = partition_fences(&dir);
+        let near = |db: &Db| {
+            for (lo, _) in &fences {
+                db.scan(lo, 1, kv(&mut |_, _| {})).unwrap();
+            }
+        };
+        assert!(scan_model(&db) == want, "{on}: the store as loaded");
+        let lone = |db: &Db| db.settle_short()[0];
+        // A form for the block the keys below fall in, which a patch
+        // needs to have something to patch: one of its keys given a second
+        // value. By an append and not a put, so that the store holds no
+        // tombstone when the fresh key's run is taken: the chain is walked
+        // for the lone key's sake there, and for nothing else.
+        near(&db);
+        db.append(&keys[505], b"again");
+        want.get_mut(&keys[505]).unwrap().push(b"again".to_vec());
+        db.commit().unwrap();
+        assert!(
+            scan_model(&db) == want,
+            "{on}: a key of the block written again"
+        );
+        assert_eq!(lone(&db), 0, "{on}: a key the partition holds is not lone");
+        // A key the store has never held, and a second value for it.
+        let fresh = b"k00500x".to_vec();
+        for (i, v) in [b"one".to_vec(), b"two".to_vec()].into_iter().enumerate() {
+            let before = lone(&db);
+            near(&db);
+            db.append(&fresh, &v);
+            want.entry(fresh.clone()).or_default().push(v);
+            db.commit().unwrap();
+            assert!(scan_model(&db) == want, "{on}: value {i} of a fresh key");
+            let took = lone(&db) - before;
+            if on {
+                assert_eq!(took, 1, "value {i} of a fresh key came from its chain");
+            } else {
+                assert_eq!(took, 0, "the sources walked with the option off");
+            }
+        }
+        // A second value for a key the partition holds: the partition's
+        // value is the run's first, and the chain alone would lose it.
+        let before = lone(&db);
+        near(&db);
+        db.append(&keys[510], b"more");
+        want.get_mut(&keys[510]).unwrap().push(b"more".to_vec());
+        db.commit().unwrap();
+        assert!(
+            scan_model(&db) == want,
+            "{on}: a second value for a sealed key"
+        );
+        assert_eq!(
+            lone(&db),
+            before,
+            "{on}: a key the partition holds is not lone"
+        );
+        // A fresh key written by a put: its tombstone masks, as before.
+        let before = lone(&db);
+        near(&db);
+        db.put(b"k00507x", b"put");
+        want.insert(b"k00507x".to_vec(), vec![b"put".to_vec()]);
+        db.commit().unwrap();
+        assert!(scan_model(&db) == want, "{on}: a fresh key put");
+        assert_eq!(lone(&db), before, "{on}: a masked key is the masked path's");
+        db.flush().unwrap();
+        db.settle().unwrap();
+        assert!(scan_model(&db) == want, "{on}: and after the flush");
+        drop(db);
+        let _ = std::fs::remove_dir_all(&dir);
+
+        // Under a piece: a key sealed into a level-0 piece and written
+        // again holds its first value in the piece.
+        let dir = scratch(&format!("lone-chain-piece-{on}"));
+        let (mut db, keys) = appended(
+            &dir,
+            1000,
+            false,
+            Options {
+                settle_lone_chain: on,
+                ..common::options()
+            },
+        );
+        let mut want: std::collections::BTreeMap<Vec<u8>, Vec<Vec<u8>>> = keys
+            .iter()
+            .map(|k| (k.clone(), vec![vec![b'v'; 100]]))
+            .collect();
+        let under = b"k00700x".to_vec();
+        db.append(&under, b"in the piece");
+        want.insert(under.clone(), vec![b"in the piece".to_vec()]);
+        db.commit().unwrap();
+        db.seal().unwrap();
+        db.settle().unwrap();
+        assert!(
+            db.segments() > partition_fences(&dir).len(),
+            "a piece stands"
+        );
+        assert!(scan_model(&db) == want, "{on}: with the piece standing");
+        db.scan(b"k00690", 20, kv(&mut |_, _| {})).unwrap();
+        db.put(&keys[705], b"rewritten");
+        want.insert(keys[705].clone(), vec![b"rewritten".to_vec()]);
+        db.commit().unwrap();
+        assert!(
+            scan_model(&db) == want,
+            "{on}: a key of the block rewritten"
+        );
+        let before = lone(&db);
+        db.scan(b"k00690", 20, kv(&mut |_, _| {})).unwrap();
+        db.append(&under, b"in the table");
+        want.get_mut(&under).unwrap().push(b"in the table".to_vec());
+        db.commit().unwrap();
+        assert!(
+            scan_model(&db) == want,
+            "{on}: a key a piece holds, written again"
+        );
+        assert_eq!(lone(&db), before, "{on}: a key under a piece is not lone");
+        drop(db);
+        let _ = std::fs::remove_dir_all(&dir);
+
+        // Under a frozen table: a key in a table a held seal keeps frozen,
+        // written again into the live one.
+        let dir = scratch(&format!("lone-chain-frozen-{on}"));
+        let (mut db, keys) = appended(
+            &dir,
+            1000,
+            true,
+            Options {
+                settle_lone_chain: on,
+                ..common::options()
+            },
+        );
+        let mut want: std::collections::BTreeMap<Vec<u8>, Vec<Vec<u8>>> = keys
+            .iter()
+            .map(|k| (k.clone(), vec![vec![b'v'; 100]]))
+            .collect();
+        assert!(scan_model(&db) == want, "{on}: the store as loaded");
+        let held = b"k00800x".to_vec();
+        db.hold_seal_landing(true);
+        db.append(&held, b"frozen");
+        want.insert(held.clone(), vec![b"frozen".to_vec()]);
+        db.commit().unwrap();
+        db.seal().unwrap();
+        assert_eq!(db.frozen_tables(), 1, "the seal's table is frozen");
+        assert!(scan_model(&db) == want, "{on}: with the table frozen");
+        db.scan(b"k00790", 20, kv(&mut |_, _| {})).unwrap();
+        db.put(&keys[805], b"rewritten");
+        want.insert(keys[805].clone(), vec![b"rewritten".to_vec()]);
+        db.commit().unwrap();
+        assert!(
+            scan_model(&db) == want,
+            "{on}: a key of the block rewritten"
+        );
+        let before = lone(&db);
+        db.scan(b"k00790", 20, kv(&mut |_, _| {})).unwrap();
+        db.append(&held, b"live");
+        want.get_mut(&held).unwrap().push(b"live".to_vec());
+        db.commit().unwrap();
+        assert!(
+            scan_model(&db) == want,
+            "{on}: a key a frozen table holds, written again"
+        );
+        assert_eq!(
+            lone(&db),
+            before,
+            "{on}: a key under a frozen table is not lone"
+        );
+        db.hold_seal_landing(false);
+        db.settle().unwrap();
+        assert!(
+            scan_model(&db) == want,
+            "{on}: and once the seal has landed"
+        );
+        drop(db);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+/// A store of partitions a block each, every block held as a copy built
+/// over updates alone, so each copy's entries are its partition's records
+/// (`CachedBlock::identity`): the keys, what a scan answers, and the keys
+/// inside the middle partition.
+#[allow(clippy::type_complexity)]
+fn copies_of_records(
+    dir: &std::path::Path,
+    o: Options,
+) -> (
+    Db,
+    Vec<Vec<u8>>,
+    std::collections::BTreeMap<Vec<u8>, Vec<Vec<u8>>>,
+    Vec<Vec<u8>>,
+) {
+    let mut db = Db::create(
+        dir,
+        Options {
+            seal_bytes: 1 << 20,
+            partition_bytes: Some(4096),
+            partition_on_flush: true,
+            publish_in_background: true,
+            upkeep: Upkeep::Background(1),
+            upkeep_pace_syncs_bp: 0,
+            scan_block_cache: true,
+            l0_trigger: 2,
+            ..o
+        },
+    )
+    .unwrap();
+    let value = [b'v'; 100];
+    let keys: Vec<Vec<u8>> = (0..300).map(|i| format!("k{i:05}").into_bytes()).collect();
+    let mut want = std::collections::BTreeMap::new();
+    for k in &keys {
+        db.put(k, &value);
+        want.insert(k.clone(), vec![value.to_vec()]);
+    }
+    db.commit().unwrap();
+    db.flush().unwrap();
+    db.settle().unwrap();
+    let fences = partition_fences(dir);
+    assert!(fences.len() >= 4, "partitions: {}", fences.len());
+    let (lo, hi) = {
+        let (lo, hi) = &fences[fences.len() / 2];
+        (lo.clone(), hi.clone().expect("a closed partition"))
+    };
+    let inside: Vec<Vec<u8>> = keys
+        .iter()
+        .filter(|k| **k >= lo && **k < hi)
+        .cloned()
+        .collect();
+    assert!(
+        (26..=64).contains(&inside.len()),
+        "keys inside the range: {}",
+        inside.len()
+    );
+    let _ = scan_model(&db);
+    for (i, k) in keys.iter().enumerate() {
+        if i % 4 != 0 {
+            db.put(k, b"updated");
+            want.insert(k.clone(), vec![b"updated".to_vec()]);
+        }
+    }
+    db.commit().unwrap();
+    db.settle().unwrap();
+    assert_eq!(scan_model(&db), want);
+    let (claimed, holds) = db.block_cache_identity();
+    assert!(
+        claimed >= 4 && holds == claimed,
+        "copies of their partitions' records: {claimed} claimed, {holds} of their partitions"
+    );
+    (db, keys, want, inside)
+}
+
+/// The store's merges landed past `before`, and the writer's look across
+/// them made.
+fn merged_past(db: &mut Db, before: u64) {
+    let t = std::time::Instant::now();
+    while db.seal_waits().merges == before {
+        assert!(t.elapsed().as_secs() < 60, "the merge never landed");
+        std::thread::sleep(std::time::Duration::from_millis(2));
+    }
+    db.settle().unwrap();
+    db.settle().unwrap();
+}
+
+/// A copy's claim that its entries are its partition's records is of the
+/// partition's keys, and a merge that folds updates alone into a
+/// partition writes those keys at the ranks they had: the copy carried
+/// across it starts a scan and takes a patch at a rank as before. Held to
+/// the file its build read, the claim was lost at every merge of the
+/// partition for the copy's life, and every scan's start in the block and
+/// every patch of it searched from then on (`Options::identity_by_keys`;
+/// off is that shape, and reads the same answers by the search). Under
+/// either way a merge finds its keys (`Options::cursor_merge`).
+#[test]
+fn a_copys_identity_outlives_a_merge_that_kept_its_partitions_keys() {
+    for (by_keys, cursors) in [(true, true), (true, false), (false, true)] {
+        let dir = scratch(&format!("copy-identity-kept-{by_keys}-{cursors}"));
+        let (mut db, keys, mut want, inside) = copies_of_records(
+            &dir,
+            Options {
+                identity_by_keys: by_keys,
+                cursor_merge: cursors,
+                ..common::options()
+            },
+        );
+        let partitions = partition_fences(&dir).len();
+        // Updates alone in every partition, sealed twice: every range is
+        // due, and each merge writes its partition's keys and no others.
+        let rebased_before = db.forms_rebased();
+        let merges_before = db.seal_waits().merges;
+        let kept_before = db.seal_waits().keyseqs_kept;
+        db.hold_seal_durable(true);
+        for round in 0..2u8 {
+            let v = [b'a' + round; 100];
+            for k in keys.iter().step_by(5) {
+                db.put(k, &v);
+                want.insert(k.clone(), vec![v.to_vec()]);
+            }
+            db.commit().unwrap();
+            db.seal().unwrap();
+        }
+        db.hold_seal_durable(false);
+        merged_past(&mut db, merges_before);
+        // The writer's look across the landings, which carries its tables
+        // to the partitions as they stand, is its next read of the log: a
+        // scan.
+        assert_eq!(scan_model(&db), want, "the writer's scan across the merges");
+        assert!(
+            db.forms_rebased() > rebased_before,
+            "the rewrites kept the partitions' layouts: {} before, {} after",
+            rebased_before,
+            db.forms_rebased()
+        );
+        let kept = db.seal_waits().keyseqs_kept - kept_before;
+        let (claimed, holds) = db.block_cache_identity();
+        if by_keys {
+            assert_eq!(
+                kept, partitions as u64,
+                "every output is of its partition's keys"
+            );
+            assert!(
+                claimed >= 4 && holds == claimed,
+                "the copies carried across: {claimed} claimed, {holds} of their partitions"
+            );
+        } else {
+            assert_eq!(kept, 0, "a claim by the file carries no key sequence");
+            assert!(
+                claimed >= 4 && holds == 0,
+                "the copies carried across: {claimed} claimed, {holds} of their partitions"
+            );
+        }
+        // A write after the rewrites, patched into the carried copy, and
+        // a scan that starts inside it: at the key's rank where the claim
+        // stands, by a search of the copy where it does not, and the same
+        // answer either way.
+        let patches_before = db.copy_patches();
+        let placed_before = db.settle_lean().0;
+        let asks_before = db.patch_asks();
+        for k in [&inside[7], &inside[9]] {
+            db.put(k, b"after");
+            want.insert(k.clone(), vec![b"after".to_vec()]);
+        }
+        db.commit().unwrap();
+        db.settle().unwrap();
+        let before = db.copy_starts();
+        let mut got = Vec::new();
+        db.scan(
+            &inside[4],
+            5,
+            kv(&mut |k, v| got.push((k.to_vec(), v.to_vec()))),
+        )
+        .unwrap();
+        let after = db.copy_starts();
+        let patches = db.copy_patches();
+        let from_model: Vec<(Vec<u8>, Vec<u8>)> = want
+            .range(inside[4].clone()..)
+            .take(5)
+            .map(|(k, v)| (k.clone(), v[0].clone()))
+            .collect();
+        assert_eq!(got, from_model, "the scan from inside the copy");
+        assert_eq!(
+            [after[0] - before[0], after[1] - before[1]],
+            if by_keys { [1, 0] } else { [0, 1] },
+            "the scan's start in the copy, at its rank and by a search"
+        );
+        // A patch written where it lies (`Options::settle_patch_in_place`)
+        // is one at its rank, and is made only where the claim stands; a
+        // patch where it does not takes its entry at its rank all the
+        // same where one compare proves that entry the key in hand
+        // (`key_eq`), which every key a merge kept in place passes.
+        let placed = db.settle_lean().0 - placed_before;
+        assert_eq!(
+            [
+                patches[0] - patches_before[0] + placed,
+                patches[1] - patches_before[1]
+            ],
+            [2, 0],
+            "the patches of the copy, at their ranks and by a search"
+        );
+        // The block's second patch at the least finds the form the
+        // table's own, the first having made it so where it was shared.
+        assert!(
+            if by_keys { placed >= 1 } else { placed == 0 },
+            "{by_keys}: patches in place of the carried copy: {placed}"
+        );
+        // And the lines a patch by its rank asks for ahead of it, the
+        // second key's while the first is patched.
+        assert_eq!(
+            db.patch_asks() - asks_before,
+            u64::from(by_keys),
+            "the asks ahead of a patch by its rank"
+        );
+        let listed: Vec<(Vec<u8>, Vec<Vec<u8>>)> =
+            want.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
+        assert_eq!(scan_list(&db), listed, "the writer's scan");
+        let r = db.reader().unwrap();
+        let mut via_handle = std::collections::BTreeMap::new();
+        r.scan(
+            b"",
+            usize::MAX,
+            kv(&mut |k, v| {
+                via_handle
+                    .entry(k.to_vec())
+                    .or_insert_with(Vec::new)
+                    .push(v.to_vec());
+            }),
+        )
+        .unwrap();
+        assert_eq!(via_handle, want, "the handle's scan");
+        drop(r);
+        // The tables made again over the partitions as the merges left
+        // them, and their copies built again: a table and the copies it
+        // holds name one key sequence, the partition's, inherited or not.
+        db.drop_forms();
+        let _ = scan_model(&db);
+        for (i, k) in keys.iter().enumerate() {
+            if i % 4 != 0 {
+                db.put(k, b"again");
+                want.insert(k.clone(), vec![b"again".to_vec()]);
+            }
+        }
+        db.commit().unwrap();
+        db.settle().unwrap();
+        assert_eq!(
+            scan_model(&db),
+            want,
+            "the writer's scan over the forms made again"
+        );
+        let (claimed, holds) = db.block_cache_identity();
+        assert!(
+            claimed >= 4 && holds == claimed,
+            "the copies built again: {claimed} claimed, {holds} of their partitions"
+        );
+        let before = db.copy_starts();
+        let mut n = 0;
+        db.scan(&inside[4], 5, kv(&mut |_, _| n += 1)).unwrap();
+        let after = db.copy_starts();
+        assert_eq!(n, 5);
+        assert_eq!(
+            [after[0] - before[0], after[1] - before[1]],
+            [1, 0],
+            "the scan's start in a copy built over the partition as it stands"
+        );
+        for (k, v) in &want {
+            let mut got = Vec::new();
+            db.read_all(k, vf(&mut |x| got.push(x.to_vec()))).unwrap();
+            assert_eq!(
+                &got,
+                v,
+                "the point read of {:?}",
+                String::from_utf8_lossy(k)
+            );
+        }
+        drop(db);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+/// An output a key short of the partition it rewrote holds only keys that
+/// partition held, and is not its key sequence: every rank past the key
+/// the merge dropped is another key's. The count is what says so, where
+/// the keys folded in say nothing; and the partition's is the count that
+/// is asked, not that of a piece over its range, which here holds as many
+/// keys as the output does.
+#[test]
+fn a_merge_that_drops_a_key_writes_a_key_sequence_of_its_own() {
+    let dir = scratch("copy-identity-dropped-key");
+    let (mut db, _, mut want, inside) = copies_of_records(&dir, common::options());
+    let merges_before = db.seal_waits().merges;
+    let kept_before = db.seal_waits().keyseqs_kept;
+    db.hold_seal_durable(true);
+    // The first piece drops the key; the second holds every other key of
+    // the range, as many records as the output will.
+    db.delete(&inside[2]);
+    db.put(&inside[3], &[b'a'; 100]);
+    want.remove(&inside[2]);
+    want.insert(inside[3].clone(), vec![vec![b'a'; 100]]);
+    db.commit().unwrap();
+    db.seal().unwrap();
+    for (i, k) in inside.iter().enumerate() {
+        if i != 2 {
+            db.put(k, &[b'b'; 100]);
+            want.insert(k.clone(), vec![vec![b'b'; 100]]);
+        }
+    }
+    db.commit().unwrap();
+    db.seal().unwrap();
+    db.hold_seal_durable(false);
+    merged_past(&mut db, merges_before);
+    assert_eq!(
+        db.seal_waits().keyseqs_kept,
+        kept_before,
+        "an output a key short took a key sequence that is not its own"
+    );
+    db.put(&inside[7], b"after");
+    want.insert(inside[7].clone(), vec![b"after".to_vec()]);
+    db.commit().unwrap();
+    db.settle().unwrap();
+    let listed: Vec<(Vec<u8>, Vec<Vec<u8>>)> =
+        want.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
+    assert_eq!(scan_list(&db), listed, "the writer's scan");
+    let mut got = Vec::new();
+    db.scan(
+        &inside[4],
+        5,
+        kv(&mut |k, v| got.push((k.to_vec(), v.to_vec()))),
+    )
+    .unwrap();
+    let from_model: Vec<(Vec<u8>, Vec<u8>)> = want
+        .range(inside[4].clone()..)
+        .take(5)
+        .map(|(k, v)| (k.clone(), v[0].clone()))
+        .collect();
+    assert_eq!(got, from_model, "the scan from inside the block");
+    drop(db);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A key no partition held is counted against the output it is written
+/// to and no other: one merge over every range, with a key dropped and a
+/// key folded in -- as many keys as before -- in the first partition and
+/// in the last, the last's folded key the store's greatest, the last the
+/// merge writes. Those two outputs are key sequences of their own and
+/// every output between them is its partition's. Under either way a merge
+/// finds its keys (`Options::cursor_merge`).
+#[test]
+fn a_key_folded_in_is_its_own_outputs_and_no_other_outputs() {
+    for cursors in [true, false] {
+        let dir = scratch(&format!("copy-identity-folded-{cursors}"));
+        let (mut db, keys, mut want, _) = copies_of_records(
+            &dir,
+            Options {
+                cursor_merge: cursors,
+                ..common::options()
+            },
+        );
+        let partitions = partition_fences(&dir).len() as u64;
+        let merges_before = db.seal_waits().merges;
+        let kept_before = db.seal_waits().keyseqs_kept;
+        let folded_low = {
+            let mut k = keys[1].clone();
+            k.push(b'x');
+            k
+        };
+        let folded_high = {
+            let mut k = keys[keys.len() - 1].clone();
+            k.push(b'x');
+            k
+        };
+        let (dropped_low, dropped_high) = (keys[3].clone(), keys[keys.len() - 4].clone());
+        db.hold_seal_durable(true);
+        for round in 0..2u8 {
+            let v = [b'a' + round; 100];
+            for k in keys.iter().step_by(5) {
+                db.put(k, &v);
+                want.insert(k.clone(), vec![v.to_vec()]);
+            }
+            db.delete(&dropped_low);
+            db.delete(&dropped_high);
+            db.put(&folded_low, b"folded");
+            db.put(&folded_high, b"folded");
+            want.remove(&dropped_low);
+            want.remove(&dropped_high);
+            want.insert(folded_low.clone(), vec![b"folded".to_vec()]);
+            want.insert(folded_high.clone(), vec![b"folded".to_vec()]);
+            db.commit().unwrap();
+            db.seal().unwrap();
+        }
+        db.hold_seal_durable(false);
+        merged_past(&mut db, merges_before);
+        assert_eq!(
+            db.seal_waits().merges,
+            merges_before + 1,
+            "one merge over every range"
+        );
+        assert_eq!(
+            db.seal_waits().keyseqs_kept - kept_before,
+            partitions - 2,
+            "the outputs of their partitions' keys, of {partitions}"
+        );
+        let listed: Vec<(Vec<u8>, Vec<Vec<u8>>)> =
+            want.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
+        assert_eq!(scan_list(&db), listed, "the writer's scan across the merge");
+        // Patches into the first and the last blocks, between the key each
+        // lost and the key each gained, where every rank moved.
+        db.put(&keys[2], b"after");
+        db.put(&keys[keys.len() - 2], b"after");
+        want.insert(keys[2].clone(), vec![b"after".to_vec()]);
+        want.insert(keys[keys.len() - 2].clone(), vec![b"after".to_vec()]);
+        db.commit().unwrap();
+        db.settle().unwrap();
+        let listed: Vec<(Vec<u8>, Vec<Vec<u8>>)> =
+            want.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
+        assert_eq!(
+            scan_list(&db),
+            listed,
+            "the writer's scan after the patches"
+        );
+        for (k, v) in &want {
+            let mut got = Vec::new();
+            db.read_all(k, vf(&mut |x| got.push(x.to_vec()))).unwrap();
+            assert_eq!(
+                &got,
+                v,
+                "the point read of {:?}",
+                String::from_utf8_lossy(k)
+            );
+        }
+        drop(db);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+/// Every answer a store gives, held to the model: the whole scan in its
+/// order, scans from inside a block for a few entries, across a block's
+/// end and through several blocks, a handle's scan, and every point read.
+/// A scan's limit counts a deleted key for as long as its tombstone
+/// stands in a table or a piece, on every path, so a limited scan is held
+/// to the model's entries in their order, as many keys as the limit less
+/// the `ghosts` -- the keys deleted and not known merged away -- it may
+/// have passed.
+fn answers(
+    db: &Db,
+    want: &std::collections::BTreeMap<Vec<u8>, Vec<Vec<u8>>>,
+    from: &[Vec<u8>],
+    what: &str,
+) {
+    answers_past(db, want, from, &[], what)
+}
+
+fn answers_past(
+    db: &Db,
+    want: &std::collections::BTreeMap<Vec<u8>, Vec<Vec<u8>>>,
+    from: &[Vec<u8>],
+    ghosts: &[Vec<u8>],
+    what: &str,
+) {
+    let listed: Vec<(Vec<u8>, Vec<Vec<u8>>)> =
+        want.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
+    assert!(scan_list(db) == listed, "{what}: the writer's scan");
+    for start in from {
+        for limit in [1usize, 5, 70, 200] {
+            let mut got: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
+            db.scan(
+                start,
+                limit,
+                kv(&mut |k, v| got.push((k.to_vec(), v.to_vec()))),
+            )
+            .unwrap();
+            // The keys the scan answered, and the model's from the same
+            // start: the same entries in the same order for as many keys
+            // as the scan took, which is the limit less the deleted keys
+            // it may have counted.
+            let mut keys_got = 0usize;
+            let mut last: Option<&[u8]> = None;
+            for (k, _) in &got {
+                if last != Some(k.as_slice()) {
+                    keys_got += 1;
+                    last = Some(k.as_slice());
+                }
+            }
+            let model: Vec<(Vec<u8>, Vec<u8>)> = want
+                .range(start.clone()..)
+                .take(keys_got)
+                .flat_map(|(k, vs)| vs.iter().map(move |v| (k.clone(), v.clone())))
+                .collect();
+            let live = want.range(start.clone()..).take(limit).count();
+            let passed = ghosts.iter().filter(|g| *g >= start).count();
+            assert!(
+                got == model && keys_got <= live && keys_got + passed >= live,
+                "{what}: a scan of {limit} from {:?}: {keys_got} keys, {} entries, against the model's {live} keys past {passed} deleted",
+                String::from_utf8_lossy(start),
+                got.len(),
+            );
+        }
+    }
+    let r = db.reader().unwrap();
+    let mut via_handle: Vec<(Vec<u8>, Vec<Vec<u8>>)> = Vec::new();
+    r.scan(
+        b"",
+        usize::MAX,
+        kv(&mut |k, v| match via_handle.last_mut() {
+            Some((last, vals)) if last.as_slice() == k => vals.push(v.to_vec()),
+            _ => via_handle.push((k.to_vec(), vec![v.to_vec()])),
+        }),
+    )
+    .unwrap();
+    assert!(via_handle == listed, "{what}: the handle's scan");
+    drop(r);
+    for (k, v) in want {
+        let mut got = Vec::new();
+        db.read_all(k, vf(&mut |x| got.push(x.to_vec()))).unwrap();
+        assert!(
+            &got == v,
+            "{what}: the point read of {:?}",
+            String::from_utf8_lossy(k)
+        );
+    }
+}
+
+/// A store of partitions a block each, every block held as a copy of
+/// fixed-size records: keys of one length, each with one value of a
+/// hundred bytes, three quarters of them written again at that length.
+#[allow(clippy::type_complexity)]
+fn copies_of_fixed_records(
+    dir: &std::path::Path,
+    o: Options,
+) -> (
+    Db,
+    Vec<Vec<u8>>,
+    std::collections::BTreeMap<Vec<u8>, Vec<Vec<u8>>>,
+    Vec<Vec<Vec<u8>>>,
+) {
+    let mut db = Db::create(
+        dir,
+        Options {
+            seal_bytes: 1 << 20,
+            partition_bytes: Some(4096),
+            partition_on_flush: true,
+            publish_in_background: true,
+            upkeep: Upkeep::Background(1),
+            upkeep_pace_syncs_bp: 0,
+            scan_block_cache: true,
+            l0_trigger: 2,
+            ..o
+        },
+    )
+    .unwrap();
+    let keys: Vec<Vec<u8>> = (0..300).map(|i| format!("k{i:05}").into_bytes()).collect();
+    let mut want = std::collections::BTreeMap::new();
+    for k in &keys {
+        db.put(k, &[b'v'; 100]);
+        want.insert(k.clone(), vec![vec![b'v'; 100]]);
+    }
+    db.commit().unwrap();
+    db.flush().unwrap();
+    db.settle().unwrap();
+    let fences = partition_fences(dir);
+    assert!(fences.len() >= 6, "partitions: {}", fences.len());
+    // The keys by the partition that holds them.
+    let by_part: Vec<Vec<Vec<u8>>> = fences
+        .iter()
+        .map(|(lo, hi)| {
+            keys.iter()
+                .filter(|k| **k >= *lo && hi.as_ref().is_none_or(|h| **k < *h))
+                .cloned()
+                .collect()
+        })
+        .collect();
+    assert!(by_part.iter().all(|p| (12..=64).contains(&p.len())));
+    let _ = scan_model(&db);
+    // Seven keys of eight written again: every partition's block is dense
+    // with them, sixteen keys or more, and so a copy whatever serves the
+    // store. A block with fewer is a light form, converted only on its
+    // walks and only under the raw gate: with three keys of four the last
+    // partition, of twenty keys, stood sparse wherever a form file served
+    // (`common::options` under the stride switch) and was a copy elsewhere.
+    let written = |i: usize| !i.is_multiple_of(8);
+    assert!(
+        by_part.iter().all(|p| p
+            .iter()
+            .filter(|k| written(keys.iter().position(|x| x == *k).unwrap()))
+            .count()
+            >= 16),
+        "every partition dense with the keys written again"
+    );
+    for (i, k) in keys.iter().enumerate() {
+        if written(i) {
+            db.put(k, &[b'u'; 100]);
+            want.insert(k.clone(), vec![vec![b'u'; 100]]);
+        }
+    }
+    db.commit().unwrap();
+    db.settle().unwrap();
+    assert!(scan_model(&db) == want);
+    (db, keys, want, by_part)
+}
+
+/// A copy of a block whose keys are of one length, each with one value of
+/// one length, is one stream of fixed-size records
+/// (`Options::copy_packed`), and answers as the three buffers do: a walk
+/// from its first entry, from a rank inside it and across its end, a
+/// handle's walk of the copy as published, a value of its records' length
+/// written over a key's in place, and across a merge that kept its
+/// partition's keys. A write it cannot take in place -- a value of
+/// another length, a key it does not hold, a delete, a second value --
+/// finds the three buffers, made again first, in that block and no other.
+#[test]
+fn a_copy_of_fixed_size_records_is_one_stream_until_a_write_it_cannot_take() {
+    for packed in [true, false] {
+        let dir = scratch(&format!("copy-packed-{packed}"));
+        let (mut db, keys, mut want, by_part) = copies_of_fixed_records(
+            &dir,
+            Options {
+                copy_packed: packed,
+                ..common::options()
+            },
+        );
+        let parts = by_part.len();
+        let from: Vec<Vec<u8>> = vec![
+            by_part[parts / 2][4].clone(),
+            by_part[1][0].clone(),
+            by_part[parts - 1][2].clone(),
+        ];
+        let (p0, n0) = db.block_cache_packed();
+        assert_eq!(n0, parts, "every partition's block a copy");
+        assert_eq!(
+            p0,
+            if packed { n0 } else { 0 },
+            "{packed}: the copies packed"
+        );
+        // Counted as they were built, by the writer or the thread it lends
+        // its tables to.
+        let built = db.copy_packs()[0];
+        assert!(
+            if packed {
+                built >= p0 as u64
+            } else {
+                built == 0
+            },
+            "{packed}: {built} copies counted packed at their build, {p0} held"
+        );
+        let (claimed, holds) = db.block_cache_identity();
+        assert!(claimed == n0 && holds == n0, "{packed}: copies of records");
+        answers(&db, &want, &from, "as built");
+        // A scan that starts inside a copy takes its entry by the rank.
+        let before = db.copy_starts();
+        let mut n = 0;
+        db.scan(&from[0], 5, kv(&mut |_, _| n += 1)).unwrap();
+        let after = db.copy_starts();
+        assert_eq!(n, 5);
+        assert_eq!([after[0] - before[0], after[1] - before[1]], [1, 0]);
+
+        // A value of the records' length over a key's, in every block:
+        // written where it lies.
+        let unpacked = db.copy_packs()[1];
+        let patches = db.copy_patches();
+        let placed = db.settle_lean().0;
+        let asks = db.patch_asks();
+        for part in &by_part {
+            db.put(&part[3], &[b'p'; 100]);
+            want.insert(part[3].clone(), vec![vec![b'p'; 100]]);
+        }
+        // And a second key of one partition, whose lines the patch before
+        // it asks for by its rank.
+        db.put(&by_part[parts / 2][9], &[b'p'; 100]);
+        want.insert(by_part[parts / 2][9].clone(), vec![vec![b'p'; 100]]);
+        db.commit().unwrap();
+        db.settle().unwrap();
+        answers(&db, &want, &from, "after values written in place");
+        assert_eq!(db.copy_packs()[1], unpacked, "{packed}: no copy unpacked");
+        assert_eq!(db.block_cache_packed(), (p0, n0));
+        // A block's first patch is staged, into a form of the table's own
+        // made from the one a state publishes, and counted at its rank;
+        // the second key of the one partition is written into that form
+        // where it lies (`Options::settle_patch_in_place`), in the stream
+        // as in the three buffers.
+        let now = db.copy_patches();
+        assert_eq!(
+            [
+                now[0] - patches[0],
+                now[1] - patches[1],
+                db.settle_lean().0 - placed
+            ],
+            [parts as u64, 0, 1],
+            "{packed}: each patch at its rank, the block's second in place"
+        );
+        assert_eq!(
+            db.patch_asks() - asks,
+            1,
+            "{packed}: the ask ahead of a patch"
+        );
+
+        // Across a merge that kept every partition's keys: the copies
+        // carried, packed as they were, their ranks with them.
+        let merges_before = db.seal_waits().merges;
+        db.hold_seal_durable(true);
+        for round in 0..2u8 {
+            for k in keys.iter().step_by(5) {
+                db.put(k, &[b'a' + round; 100]);
+                want.insert(k.clone(), vec![vec![b'a' + round; 100]]);
+            }
+            db.commit().unwrap();
+            db.seal().unwrap();
+        }
+        db.hold_seal_durable(false);
+        merged_past(&mut db, merges_before);
+        answers(&db, &want, &from, "across the merges");
+        assert_eq!(
+            db.block_cache_packed(),
+            (p0, n0),
+            "{packed}: carried as they were"
+        );
+        let (claimed, holds) = db.block_cache_identity();
+        assert!(claimed == n0 && holds == n0, "{packed}: and their ranks");
+        assert_eq!(db.copy_packs()[1], unpacked);
+
+        // The writes a stream cannot take in place, each in a block of
+        // its own: that block the three buffers again, and no other.
+        let mut gone = 0;
+        let deleted = vec![by_part[2][5].clone()];
+        let mut step =
+            |db: &mut Db, want: &std::collections::BTreeMap<Vec<u8>, Vec<Vec<u8>>>, what: &str| {
+                db.commit().unwrap();
+                db.settle().unwrap();
+                gone += 1;
+                // The deleted key's tombstone stands from its step on.
+                let ghosts: &[Vec<u8>] = if gone >= 3 { &deleted } else { &[] };
+                answers_past(db, want, &from, ghosts, what);
+                if packed {
+                    assert_eq!(db.copy_packs()[1], unpacked + gone, "{what}: unpacked");
+                    assert_eq!(
+                        db.block_cache_packed(),
+                        (p0 - gone as usize, n0),
+                        "{what}: one block more as three buffers"
+                    );
+                } else {
+                    assert_eq!(db.copy_packs(), [0, 0]);
+                }
+            };
+        let _ = built;
+        // A value of another length.
+        db.put(&by_part[0][5], b"short");
+        want.insert(by_part[0][5].clone(), vec![b"short".to_vec()]);
+        step(&mut db, &want, "a value of another length");
+        // A key the block does not hold, between two it does.
+        let folded = {
+            let mut k = by_part[1][5].clone();
+            k.push(b'x');
+            k
+        };
+        db.put(&folded, &[b'f'; 100]);
+        want.insert(folded.clone(), vec![vec![b'f'; 100]]);
+        step(&mut db, &want, "a key folded in");
+        // A delete.
+        db.delete(&by_part[2][5]);
+        want.remove(&by_part[2][5]);
+        step(&mut db, &want, "a key deleted");
+        // A second value.
+        db.append(&by_part[3][5], &[b's'; 100]);
+        want.get_mut(&by_part[3][5]).unwrap().push(vec![b's'; 100]);
+        step(&mut db, &want, "a second value");
+        // A value of no bytes.
+        db.put(&by_part[4][5], b"");
+        want.insert(by_part[4][5].clone(), vec![Vec::new()]);
+        step(&mut db, &want, "a value of no bytes");
+        // Two values whose run is as many bytes as one value's: forty-eight
+        // bytes each behind their length words, a hundred and four.
+        db.put(&by_part[5][5], &[b'1'; 48]);
+        db.append(&by_part[5][5], &[b'2'; 48]);
+        want.insert(by_part[5][5].clone(), vec![vec![b'1'; 48], vec![b'2'; 48]]);
+        step(&mut db, &want, "two values in one value's bytes");
+        // A value of another length behind one written in place: the
+        // block's first patch leaves the form the table's own, so the
+        // second is the in-place patch's to decline.
+        assert!(parts > 6, "a seventh partition: {parts}");
+        let placed = db.settle_lean().0;
+        db.put(&by_part[6][3], &[b'z'; 100]);
+        want.insert(by_part[6][3].clone(), vec![vec![b'z'; 100]]);
+        db.put(&by_part[6][7], b"other");
+        want.insert(by_part[6][7].clone(), vec![b"other".to_vec()]);
+        step(
+            &mut db,
+            &want,
+            "a value of another length behind one in place",
+        );
+        // In the three buffers the shorter value goes over its run.
+        assert_eq!(
+            db.settle_lean().0 - placed,
+            u64::from(!packed),
+            "{packed}: a stream takes no value of another length in place"
+        );
+        // And a block already the three buffers takes a write as it did.
+        db.put(&by_part[0][6], &[b'q'; 100]);
+        want.insert(by_part[0][6].clone(), vec![vec![b'q'; 100]]);
+        db.commit().unwrap();
+        db.settle().unwrap();
+        answers_past(
+            &db,
+            &want,
+            &from,
+            &deleted,
+            "a write into an unpacked block",
+        );
+        if packed {
+            assert_eq!(db.copy_packs()[1], unpacked + 7);
+        }
+        db.flush().unwrap();
+        db.settle().unwrap();
+        answers_past(&db, &want, &from, &deleted, "after the flush");
+        drop(db);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+/// A packed copy that makes no claim to its ranks -- built over keys the
+/// partition did not hold -- is searched by its records' keys: a scan's
+/// start inside it and a patch of a key it holds find their entry by the
+/// search, the patch written in place, and the answers are the model's.
+#[test]
+fn a_packed_copy_with_no_claim_to_its_ranks_is_searched_by_its_keys() {
+    for packed in [true, false] {
+        let dir = scratch(&format!("copy-packed-searched-{packed}"));
+        let mut db = Db::create(
+            &dir,
+            Options {
+                seal_bytes: 1 << 20,
+                partition_bytes: Some(4096),
+                partition_on_flush: true,
+                publish_in_background: true,
+                upkeep: Upkeep::Background(1),
+                upkeep_pace_syncs_bp: 0,
+                scan_block_cache: true,
+                l0_trigger: 64,
+                copy_packed: packed,
+                ..common::options()
+            },
+        )
+        .unwrap();
+        // The even keys sealed, the odd ones written over them: every
+        // block's copy is built over inserts.
+        let key = |i: usize| format!("k{i:05}").into_bytes();
+        let mut want = std::collections::BTreeMap::new();
+        for i in (0..300).step_by(2) {
+            db.put(&key(i), &[b'v'; 100]);
+            want.insert(key(i), vec![vec![b'v'; 100]]);
+        }
+        db.commit().unwrap();
+        db.flush().unwrap();
+        db.settle().unwrap();
+        let _ = scan_model(&db);
+        for i in (1..300).step_by(2) {
+            db.put(&key(i), &[b'o'; 100]);
+            want.insert(key(i), vec![vec![b'o'; 100]]);
+        }
+        db.commit().unwrap();
+        db.settle().unwrap();
+        let from = vec![key(41), key(150), key(297)];
+        answers(&db, &want, &from, "as built");
+        let (p0, n0) = db.block_cache_packed();
+        assert!(n0 >= 3, "copies: {n0}");
+        assert_eq!(p0, if packed { n0 } else { 0 });
+        let (claimed, _) = db.block_cache_identity();
+        assert_eq!(claimed, 0, "no copy built over inserts claims its ranks");
+        // A scan's start inside a copy, by the search.
+        let before = db.copy_starts();
+        let mut got = Vec::new();
+        db.scan(&key(151), 3, kv(&mut |k, _| got.push(k.to_vec())))
+            .unwrap();
+        let after = db.copy_starts();
+        assert_eq!(got, vec![key(151), key(152), key(153)]);
+        assert_eq!([after[0] - before[0], after[1] - before[1]], [0, 1]);
+        // Patches of keys the copies hold, an old key and a new one, by
+        // the search and in place.
+        let unpacked = db.copy_packs()[1];
+        let patches = db.copy_patches();
+        for i in [40usize, 41, 150, 299] {
+            db.put(&key(i), &[b'p'; 100]);
+            want.insert(key(i), vec![vec![b'p'; 100]]);
+        }
+        db.commit().unwrap();
+        db.settle().unwrap();
+        answers(&db, &want, &from, "after the patches");
+        let now = db.copy_patches();
+        assert_eq!([now[0] - patches[0], now[1] - patches[1]], [0, 4]);
+        assert_eq!(db.copy_packs()[1], unpacked, "in place");
+        assert_eq!(db.block_cache_packed(), (p0, n0));
+        drop(db);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+/// Under `forms_pieces_only` a form takes a landed piece's runs folded
+/// in, which reads a copy's three buffers: no copy is packed there, a
+/// block whose every record is of one shape among them.
+#[test]
+fn no_copy_is_packed_where_pieces_are_folded_into_forms() {
+    let dir = scratch("copy-packed-pieces-only");
+    let mut db = Db::create(
+        &dir,
+        Options {
+            seal_bytes: 1 << 20,
+            partition_bytes: Some(4096),
+            partition_on_flush: true,
+            publish_in_background: true,
+            upkeep: Upkeep::Background(1),
+            upkeep_pace_syncs_bp: 0,
+            scan_block_cache: true,
+            l0_trigger: 64,
+            copy_packed: true,
+            forms_pieces_only: true,
+            ..common::options()
+        },
+    )
+    .unwrap();
+    let keys: Vec<Vec<u8>> = (0..300).map(|i| format!("k{i:05}").into_bytes()).collect();
+    let mut want = std::collections::BTreeMap::new();
+    for k in &keys {
+        db.put(k, &[b'v'; 100]);
+        want.insert(k.clone(), vec![vec![b'v'; 100]]);
+    }
+    db.commit().unwrap();
+    db.flush().unwrap();
+    db.settle().unwrap();
+    let _ = scan_model(&db);
+    // A piece over most of every block, and the forms built again over
+    // it: a form is the pieces' fold here, and a block dense with a
+    // piece's keys a copy.
+    let from = vec![keys[40].clone(), keys[150].clone()];
+    let land =
+        |db: &mut Db, want: &mut std::collections::BTreeMap<Vec<u8>, Vec<Vec<u8>>>, round: u8| {
+            for (i, k) in keys.iter().enumerate() {
+                if i % 4 != round as usize {
+                    db.put(k, &[b'a' + round; 100]);
+                    want.insert(k.clone(), vec![vec![b'a' + round; 100]]);
+                }
+            }
+            db.commit().unwrap();
+            db.seal().unwrap();
+            db.settle().unwrap();
+        };
+    land(&mut db, &mut want, 0);
+    db.drop_forms();
+    answers(&db, &want, &from, "the forms built over a piece");
+    let (packed, copies) = db.block_cache_packed();
+    assert!(
+        copies >= 3,
+        "copies of the pieces' fold: {copies}, kinds {:?}",
+        db.block_cache_kinds()
+    );
+    assert_eq!(packed, 0);
+    assert_eq!(db.copy_packs(), [0, 0]);
+    // A second piece, folded into the copies the first left.
+    land(&mut db, &mut want, 1);
+    answers(&db, &want, &from, "a piece folded into the copies");
+    assert_eq!(db.block_cache_packed().0, 0);
+    assert_eq!(db.copy_packs(), [0, 0]);
+    drop(db);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A scan through a reader handle, as the model it answers.
+fn scan_model_of(r: &supdb::Reader) -> std::collections::BTreeMap<Vec<u8>, Vec<Vec<u8>>> {
+    let mut m = std::collections::BTreeMap::new();
+    r.scan(
+        b"",
+        usize::MAX,
+        kv(&mut |k, v| {
+            m.entry(k.to_vec())
+                .or_insert_with(Vec::new)
+                .push(v.to_vec());
+        }),
+    )
+    .unwrap();
+    m
+}
+
+/// A put over a copy whose entries are its block's records is written
+/// over the run the entry holds, from the key's chain
+/// (`Options::settle_patch_in_place`), where it fits: a value of the
+/// run's length or shorter. Everything else is the staged patch's -- a
+/// longer value, a second value appended, a delete, a put and an append in
+/// one batch, a key the copy does not hold, a copy an insert has taken the
+/// identity of, a form a reader shares -- and every one of them reads
+/// back as it was written under either shape. A copy whose runs the puts
+/// shrank past twice its live bytes is dropped for a build, as the staged
+/// patch drops it.
+#[test]
+fn a_put_over_a_copys_own_record_is_written_where_it_lies() {
+    for in_place in [true, false] {
+        let dir = scratch(&format!("settle-in-place-{in_place}"));
+        let inject = std::sync::Arc::new(supdb::ZInject::new());
+        inject.set_refault_rate(0.0);
+        inject.set_budget(1 << 50);
+        let mut db = Db::create(
+            &dir,
+            Options {
+                seal_bytes: 32 << 20,
+                partition_bytes: Some(64 << 10),
+                partition_on_flush: true,
+                publish_in_background: false,
+                upkeep: Upkeep::Inline,
+                scan_block_cache: true,
+                forms_settle_every: true,
+                forms_settle_builds: true,
+                settle_patch_in_place: in_place,
+                // The fill converts, so the count below is the patches' own.
+                settle_converts: false,
+                zpages_inject: Some(inject.clone()),
+                ..common::options()
+            },
+        )
+        .unwrap();
+        let keys: Vec<Vec<u8>> = (0..4000).map(|i| format!("k{i:05}").into_bytes()).collect();
+        let mut want = std::collections::BTreeMap::new();
+        for k in &keys {
+            db.put(k, &[b'v'; 200]);
+            want.insert(k.clone(), vec![vec![b'v'; 200]]);
+        }
+        db.commit().unwrap();
+        db.flush().unwrap();
+        db.settle().unwrap();
+        let fences = partition_fences(&dir);
+        // A batch near reads, so the commit files it and its fill converts.
+        let near = |db: &mut Db| {
+            for (lo, _) in &fences {
+                db.scan(lo, 1, kv(&mut |_, _| {})).unwrap();
+            }
+        };
+        let puts = |db: &mut Db,
+                    want: &mut std::collections::BTreeMap<Vec<u8>, Vec<Vec<u8>>>,
+                    step: usize,
+                    v: &[u8]| {
+            for chunk in (0..keys.len())
+                .step_by(step)
+                .collect::<Vec<_>>()
+                .chunks(250)
+            {
+                near(db);
+                for &i in chunk {
+                    db.put(&keys[i], v);
+                    want.insert(keys[i].clone(), vec![v.to_vec()]);
+                }
+                db.commit().unwrap();
+            }
+        };
+        // Every key rewritten: the blocks' forms grow dense and the fill
+        // makes them copies whose entries are the blocks' records.
+        puts(&mut db, &mut want, 1, &[b'a'; 200]);
+        assert!(scan_model(&db) == want, "{in_place}: the rewrite");
+        let (_, _, copies, _) = db.block_cache_kinds();
+        assert!(copies >= 50, "{in_place}: the blocks are copies: {copies}");
+        // Every key again, at the length its run holds.
+        let before = db.settle_lean().0;
+        puts(&mut db, &mut want, 1, &[b'b'; 200]);
+        let placed = db.settle_lean().0 - before;
+        if in_place {
+            assert!(
+                placed >= 3600,
+                "the puts over the copies in place: {placed}"
+            );
+        } else {
+            assert_eq!(db.settle_lean().0, 0, "every patch staged");
+        }
+        assert!(scan_model(&db) == want, "{in_place}: the puts in place");
+        // A reader's handle shares the forms it is published: a shared
+        // form is cloned before it is written, never written where the
+        // handle reads it.
+        let r = db.reader().unwrap();
+        assert!(scan_model_of(&r) == want, "{in_place}: the handle's scan");
+        for round in 0..3u8 {
+            near(&mut db);
+            for i in (round as usize..keys.len()).step_by(7) {
+                db.put(&keys[i], &[b'h' + round; 200]);
+                want.insert(keys[i].clone(), vec![vec![b'h' + round; 200]]);
+            }
+            db.commit().unwrap();
+            assert!(
+                scan_model_of(&r) == want,
+                "{in_place}: the handle, round {round}"
+            );
+            assert!(
+                scan_model(&db) == want,
+                "{in_place}: the writer, round {round}"
+            );
+        }
+        drop(r);
+        // With the handle gone a block's form is the writer's alone again
+        // from its first patch, which clones it, and the puts after that
+        // go in place; what they patched is published afresh for the next
+        // handle, which reads no run from before the patch.
+        let before = db.settle_lean().0;
+        near(&mut db);
+        for i in (1..keys.len()).step_by(5) {
+            db.put(&keys[i], &[b'z'; 200]);
+            want.insert(keys[i].clone(), vec![vec![b'z'; 200]]);
+        }
+        db.commit().unwrap();
+        if in_place {
+            assert!(
+                db.settle_lean().0 - before >= 500,
+                "puts in place once the handle is gone: {}",
+                db.settle_lean().0 - before
+            );
+        }
+        let r = db.reader().unwrap();
+        assert!(
+            scan_model_of(&r) == want,
+            "{in_place}: a handle claimed after the patches"
+        );
+        drop(r);
+        // A sealed table takes the chains with it: the copies stand, each
+        // still its partition's records, over a memtable that holds
+        // nothing. A value appended there is one live value with no
+        // tombstone under it, so the key's run is the sealed value and the
+        // appended one, and it is staged; and a key deleted twice has a
+        // tombstone at its head and nothing to write.
+        db.seal().unwrap();
+        db.settle().unwrap();
+        let (claimed, holds) = db.block_cache_identity();
+        assert!(
+            claimed >= 50 && holds == claimed,
+            "{in_place}: the copies are their partitions' records across the seal: {claimed}, {holds}"
+        );
+        let before = db.settle_lean().0;
+        near(&mut db);
+        for i in (0..keys.len()).step_by(9) {
+            db.append(&keys[i], b"+");
+            want.get_mut(&keys[i]).unwrap().push(b"+".to_vec());
+        }
+        for i in (4..keys.len()).step_by(9) {
+            db.delete(&keys[i]);
+            db.delete(&keys[i]);
+            want.remove(&keys[i]);
+        }
+        db.commit().unwrap();
+        assert_eq!(
+            db.settle_lean().0,
+            before,
+            "{in_place}: an append over a sealed value and a second delete are staged"
+        );
+        assert!(
+            scan_model(&db) == want,
+            "{in_place}: the appends and the deletes"
+        );
+        near(&mut db);
+        for i in (4..keys.len()).step_by(9) {
+            db.put(&keys[i], &[b'r'; 200]);
+            want.insert(keys[i].clone(), vec![vec![b'r'; 200]]);
+        }
+        db.commit().unwrap();
+        assert!(
+            scan_model(&db) == want,
+            "{in_place}: the deleted keys put again"
+        );
+        // Shorter values fit the runs they replace; the copies keep their
+        // bytes until the dead ones outweigh the live, and those blocks
+        // are then dropped and built again at what they hold.
+        let built = db.blocks_built().1;
+        let before = db.settle_lean().0;
+        puts(&mut db, &mut want, 1, &[b'c'; 20]);
+        if in_place {
+            // In place until a copy's dead bytes outweigh its live ones,
+            // some forty keys into a block of sixty-four; the rest of the
+            // block's keys find no form.
+            let placed = db.settle_lean().0 - before;
+            assert!(
+                (1500..3000).contains(&placed),
+                "the shorter puts in place until their copies are dropped: {placed}"
+            );
+        }
+        assert!(scan_model(&db) == want, "{in_place}: the shorter values");
+        // Each such copy was dropped, and the fill built its block again.
+        let rebuilt = db.blocks_built().1 - built;
+        assert!(
+            rebuilt >= 50,
+            "{in_place}: the copies past twice their live bytes were dropped and built again: {rebuilt}"
+        );
+        // A longer value than the run it would replace is staged, and so
+        // is each of these: none is written in place.
+        let before = db.settle_lean().0;
+        near(&mut db);
+        for i in (0..keys.len()).step_by(4) {
+            let k = &keys[i];
+            match i % 5 {
+                0 => {
+                    db.put(k, &[b'd'; 90]);
+                    want.insert(k.clone(), vec![vec![b'd'; 90]]);
+                }
+                1 => {
+                    db.append(k, b"more");
+                    want.get_mut(k).unwrap().push(b"more".to_vec());
+                }
+                2 => {
+                    db.delete(k);
+                    want.remove(k);
+                }
+                3 => {
+                    db.put(k, &[b'e'; 20]);
+                    db.append(k, b"tail");
+                    want.insert(k.clone(), vec![vec![b'e'; 20], b"tail".to_vec()]);
+                }
+                _ => {
+                    // A key between two records: the copy's entries are no
+                    // longer its block's records.
+                    let mut ins = k.clone();
+                    ins.push(b'+');
+                    db.put(&ins, &[b'f'; 20]);
+                    want.insert(ins, vec![vec![b'f'; 20]]);
+                }
+            }
+        }
+        db.commit().unwrap();
+        assert_eq!(
+            db.settle_lean().0,
+            before,
+            "{in_place}: a longer value, an append, a delete, two values and an insert are staged"
+        );
+        assert!(scan_model(&db) == want, "{in_place}: the staged shapes");
+        // Puts again, of the first length: in place where a copy still
+        // holds its block's records and the run fits, staged elsewhere,
+        // and right either way.
+        puts(&mut db, &mut want, 3, &[b'g'; 20]);
+        assert!(
+            scan_model(&db) == want,
+            "{in_place}: puts over what the shapes left"
+        );
+        db.flush().unwrap();
+        db.settle().unwrap();
+        assert!(scan_model(&db) == want, "{in_place}: and after the flush");
+        drop(db);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+/// The settle's four lean shapes are the engine's: the tests above name
+/// each option on both sides, so nothing else holds what a store that
+/// names none of them gets.
+#[test]
+fn the_settles_lean_shapes_are_the_engines_defaults() {
+    let o = Options::default();
+    assert!(
+        o.settle_gathers,
+        "the resolve reads its batch from the sorted records"
+    );
+    assert!(o.settle_sorts_once, "the batch is sorted once");
+    assert!(
+        o.settle_patch_in_place,
+        "a put over a copy's own record goes in place"
+    );
+    assert!(
+        o.settle_converts,
+        "the settle converts the form its batch makes dense"
+    );
+}
+
+/// A sparse form a batch takes to the dense count is converted before the
+/// batch's keys are spliced into it (`Options::settle_converts`), so they
+/// patch the copy; a batch that leaves it short of the count converts
+/// nothing. Without the option the fill converts after the splices, and
+/// either way every write is read back.
+#[test]
+fn a_settle_converts_the_form_its_batch_makes_dense() {
+    for converts in [true, false] {
+        let dir = scratch(&format!("settle-converts-{converts}"));
+        let inject = std::sync::Arc::new(supdb::ZInject::new());
+        inject.set_refault_rate(0.0);
+        inject.set_budget(1 << 50);
+        let mut db = Db::create(
+            &dir,
+            Options {
+                seal_bytes: 32 << 20,
+                partition_bytes: Some(64 << 10),
+                partition_on_flush: true,
+                publish_in_background: false,
+                upkeep: Upkeep::Inline,
+                scan_block_cache: true,
+                forms_settle_every: true,
+                forms_settle_builds: true,
+                settle_converts: converts,
+                zpages_inject: Some(inject.clone()),
+                ..common::options()
+            },
+        )
+        .unwrap();
+        let keys: Vec<Vec<u8>> = (0..4000).map(|i| format!("k{i:05}").into_bytes()).collect();
+        let mut want = std::collections::BTreeMap::new();
+        for k in &keys {
+            db.put(k, &[b'v'; 100]);
+            want.insert(k.clone(), vec![vec![b'v'; 100]]);
+        }
+        db.commit().unwrap();
+        db.flush().unwrap();
+        db.settle().unwrap();
+        let fences = partition_fences(&dir);
+        let batch = |db: &mut Db,
+                     want: &mut std::collections::BTreeMap<Vec<u8>, Vec<Vec<u8>>>,
+                     pick: &dyn Fn(usize) -> bool,
+                     tag: u8| {
+            for (lo, _) in &fences {
+                db.scan(lo, 1, kv(&mut |_, _| {})).unwrap();
+            }
+            for (i, k) in keys.iter().enumerate() {
+                if pick(i) {
+                    db.put(k, &[tag; 100]);
+                    want.insert(k.clone(), vec![vec![tag; 100]]);
+                }
+            }
+            db.commit().unwrap();
+        };
+        // Two keys a block of sixty-four: the fill builds each block's
+        // form sparse, and the settle of the next batch, three more a
+        // block, converts none.
+        batch(&mut db, &mut want, &|i| i % 32 == 0, b'a');
+        batch(&mut db, &mut want, &|i| i % 32 == 1, b'b');
+        batch(&mut db, &mut want, &|i| i % 32 == 2 || i % 64 == 3, b'c');
+        let (_, sparse, copies, _) = db.block_cache_kinds();
+        assert!(
+            sparse >= 50 && copies == 0,
+            "{converts}: the forms are sparse: {sparse} sparse, {copies} copies"
+        );
+        assert_eq!(db.settle_lean().1, 0, "{converts}: nothing dense yet");
+        assert!(scan_model(&db) == want, "{converts}: the sparse forms");
+        // Twenty more a block in one batch: with the five it holds each
+        // form is past the dense count.
+        let placed = db.settle_lean().0;
+        batch(&mut db, &mut want, &|i| i % 64 >= 8 && i % 64 < 28, b'd');
+        let (settled, converted) = db.settle_lean();
+        let (_, sparse, copies, _) = db.block_cache_kinds();
+        if converts {
+            assert!(
+                converted >= 50,
+                "the settle converted the forms its batch made dense: {converted}"
+            );
+            // Converted at the block's first key of the batch, so the
+            // batch's puts went over the copy's own runs.
+            assert!(
+                settled - placed >= 1100,
+                "the batch patched the copies in place: {}",
+                settled - placed
+            );
+        } else {
+            assert_eq!(converted, 0, "the conversions left to the fill");
+            assert_eq!(
+                settled, placed,
+                "and the batch spliced into the sparse forms"
+            );
+        }
+        assert!(
+            copies >= 50 && sparse <= 2,
+            "{converts}: the forms are copies: {sparse} sparse, {copies} copies"
+        );
+        assert!(scan_model(&db) == want, "{converts}: the copies");
+        // Nobody reads this store through a handle, and the settle's
+        // conversion withdraws nothing: no form and no mark is published
+        // for it, where the fill's conversion publishes a mark a block.
+        if converts {
+            assert_eq!(
+                db.canonical_forms().0,
+                0,
+                "nothing published for a store with no handle"
+            );
+        }
+        // And a batch over the copies, the keys the form held as deltas
+        // among them.
+        batch(&mut db, &mut want, &|i| i % 3 == 0, b'e');
+        assert!(
+            scan_model(&db) == want,
+            "{converts}: puts over the converted"
+        );
+        db.flush().unwrap();
+        db.settle().unwrap();
+        assert!(scan_model(&db) == want, "{converts}: and after the flush");
+        drop(db);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+/// A copy is larger than the sparse form it replaces, so the settle's
+/// conversion keeps to the cache's budget as the fill's does: under a
+/// budget given, which binds from the start, it converts nothing, and
+/// under the store's own it converts until the cache passes the budget
+/// and binds there. Every write is read back either way, and under its
+/// own budget the cache holds that and a block or two.
+#[test]
+fn a_settles_conversions_keep_to_the_caches_budget() {
+    const BUDGET: usize = 96 << 10;
+    for given in [true, false] {
+        let dir = scratch(&format!("settle-converts-budget-{given}"));
+        let inject = std::sync::Arc::new(supdb::ZInject::new());
+        inject.set_refault_rate(0.0);
+        inject.set_budget(1 << 50);
+        let mut db = Db::create(
+            &dir,
+            Options {
+                seal_bytes: 32 << 20,
+                partition_bytes: Some(64 << 10),
+                partition_on_flush: true,
+                publish_in_background: false,
+                upkeep: Upkeep::Inline,
+                scan_block_cache: true,
+                forms_settle_every: true,
+                forms_settle_builds: true,
+                scan_cache_bytes: if given { BUDGET } else { 0 },
+                scan_cache_auto_bytes: if given { 0 } else { BUDGET },
+                scan_cache_auto_room: false,
+                scan_cache_copies_fit: false,
+                zpages_inject: Some(inject.clone()),
+                ..common::options()
+            },
+        )
+        .unwrap();
+        let keys: Vec<Vec<u8>> = (0..4000).map(|i| format!("k{i:05}").into_bytes()).collect();
+        let mut want = std::collections::BTreeMap::new();
+        for k in &keys {
+            db.put(k, &[b'v'; 100]);
+            want.insert(k.clone(), vec![vec![b'v'; 100]]);
+        }
+        db.commit().unwrap();
+        db.flush().unwrap();
+        db.settle().unwrap();
+        let fences = partition_fences(&dir);
+        let batch = |db: &mut Db,
+                     want: &mut std::collections::BTreeMap<Vec<u8>, Vec<Vec<u8>>>,
+                     pick: &dyn Fn(usize) -> bool,
+                     tag: u8| {
+            for (lo, _) in &fences {
+                db.scan(lo, 1, kv(&mut |_, _| {})).unwrap();
+            }
+            for (i, k) in keys.iter().enumerate() {
+                if pick(i) {
+                    db.put(k, &[tag; 100]);
+                    want.insert(k.clone(), vec![vec![tag; 100]]);
+                }
+            }
+            db.commit().unwrap();
+        };
+        // A key a block, so the forms are small and the cache under its
+        // budget; then twenty more a block in one batch, which without a
+        // budget converts every form (the test above).
+        batch(&mut db, &mut want, &|i| i % 64 == 0, b'a');
+        assert!(
+            db.block_cache_bytes() <= BUDGET,
+            "{given}: the sparse forms fit the budget: {}",
+            db.block_cache_bytes()
+        );
+        assert_eq!(
+            db.block_cache_binds(),
+            given,
+            "a budget given binds from the start, the store's own not yet"
+        );
+        batch(&mut db, &mut want, &|i| i % 64 >= 8 && i % 64 < 28, b'd');
+        let converted = db.settle_lean().1;
+        if given {
+            assert_eq!(
+                converted, 0,
+                "a budget given binds, and nothing is converted"
+            );
+        } else {
+            assert!(
+                (1..40).contains(&converted),
+                "the store's own budget binds where the copies pass it: {converted} converted"
+            );
+        }
+        assert!(
+            db.block_cache_binds(),
+            "{given}: the cache is bound to its budget"
+        );
+        assert!(
+            scan_model(&db) == want,
+            "{given}: every write under the budget"
+        );
+        // The store's own budget is kept at every patch and build; one
+        // given is kept where a scan builds, which this store's patches of
+        // sparse forms are not, so its bytes are the splices' to grow.
+        if !given {
+            assert!(
+                db.block_cache_bytes() <= BUDGET + 2 * db.block_cache_largest(),
+                "the cache holds its budget and a block or two: {} of {BUDGET}, the largest {}",
+                db.block_cache_bytes(),
+                db.block_cache_largest()
+            );
+        }
+        batch(&mut db, &mut want, &|i| i % 3 == 0, b'e');
+        assert!(scan_model(&db) == want, "{given}: puts over what stands");
+        assert_eq!(
+            db.settle_lean().1,
+            converted,
+            "{given}: and a bound cache converts nothing more"
+        );
+        drop(db);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+/// A settle's batch sorted once (`Options::settle_sorts_once`) and read
+/// from the sorted records (`Options::settle_gathers`) files what the
+/// batch sorted by offset first and read by index files: keys of sixteen
+/// bytes and fewer, rebuilt from their prefix words; keys that differ only
+/// past sixteen bytes, and keys that differ only in their length over
+/// zero bytes, whose words tie and whose writes arrive interleaved; the
+/// empty key; each created in the batch and written more than once in it.
+/// A key whose writes the sort left apart would be filed twice.
+#[test]
+fn a_batch_sorted_once_files_keys_that_tie_on_their_prefix_as_one_key_each() {
+    for (once, gathers) in [(true, true), (true, false), (false, true), (false, false)] {
+        let dir = scratch(&format!("settle-sorts-once-{once}-{gathers}"));
+        let mut db = Db::create(
+            &dir,
+            Options {
+                seal_bytes: 32 << 20,
+                partition_bytes: Some(64 << 10),
+                partition_on_flush: true,
+                publish_in_background: false,
+                upkeep: Upkeep::Inline,
+                scan_block_cache: true,
+                forms_settle_every: true,
+                forms_settle_builds: true,
+                settle_sorts_once: once,
+                settle_gathers: gathers,
+                ..common::options()
+            },
+        )
+        .unwrap();
+        let mut want: std::collections::BTreeMap<Vec<u8>, Vec<Vec<u8>>> =
+            std::collections::BTreeMap::new();
+        let base: Vec<Vec<u8>> = (0..3000).map(|i| format!("k{i:05}").into_bytes()).collect();
+        for k in &base {
+            db.put(k, &[b'v'; 100]);
+            want.insert(k.clone(), vec![vec![b'v'; 100]]);
+        }
+        db.commit().unwrap();
+        db.flush().unwrap();
+        db.settle().unwrap();
+        let fences = partition_fences(&dir);
+        assert!(fences.len() >= 3, "several partitions: {}", fences.len());
+        // Families of keys whose first sixteen bytes are the same, among
+        // the store's keys and past them: a tail past the sixteenth byte,
+        // and zero bytes that only the length tells apart.
+        let mut tied: Vec<Vec<Vec<u8>>> = Vec::new();
+        for stem in ["k00100", "k01500", "k02999", "zz"] {
+            let long = format!("{stem:-<16}");
+            tied.push(
+                ["", "a", "b", "ab", "b0"]
+                    .iter()
+                    .map(|t| format!("{long}{t}").into_bytes())
+                    .collect(),
+            );
+            tied.push(
+                (0..4)
+                    .map(|n| {
+                        let mut k = stem.as_bytes().to_vec();
+                        k.extend(std::iter::repeat_n(0u8, n));
+                        k
+                    })
+                    .collect(),
+            );
+        }
+        tied.push(vec![vec![], vec![0], vec![0, 0]]);
+        for round in 0..4u8 {
+            for (lo, _) in &fences {
+                db.scan(lo, 1, kv(&mut |_, _| {})).unwrap();
+            }
+            // A family's keys written in turn, three times round, so that
+            // each key's writes stand apart in the log with the others'
+            // between them; and the store's own keys among them.
+            for turn in 0..3u8 {
+                for family in &tied {
+                    for (n, k) in family.iter().enumerate() {
+                        let v = vec![b'0' + round, b'a' + turn, b'0' + n as u8];
+                        db.append(k, &v);
+                        want.entry(k.clone()).or_default().push(v);
+                    }
+                }
+                for i in (turn as usize..base.len()).step_by(11) {
+                    let v = vec![b'u', b'0' + round, b'a' + turn];
+                    db.append(&base[i], &v);
+                    want.get_mut(&base[i]).unwrap().push(v);
+                }
+            }
+            db.commit().unwrap();
+            assert!(
+                scan_model(&db) == want,
+                "once {once}, gathers {gathers}, round {round}: every key once, its values in order"
+            );
+        }
+        // The gather is a shape and not an answer, so it is counted.
+        if gathers {
+            assert!(
+                db.settle_gathered() >= 3000,
+                "once {once}: the resolves read the gathered records: {}",
+                db.settle_gathered()
+            );
+        } else {
+            assert_eq!(db.settle_gathered(), 0, "once {once}: nothing gathered");
+        }
+        db.flush().unwrap();
+        db.settle().unwrap();
+        assert!(
+            scan_model(&db) == want,
+            "once {once}, gathers {gathers}: and after the flush"
+        );
+        drop(db);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+/// A patch written in place reads the value its commit holds and none
+/// staged since. A batch that takes a sparse form to the dense count is
+/// filed by the upkeep thread: it converts the form, a copy no reader has
+/// yet, and writes the batch's puts over the copy's runs. Held before that
+/// pass while the writer stages a newer value of one of the keys, it files
+/// the committed value, and a handle at that commit reads it through the
+/// form the pass published.
+#[test]
+fn a_patch_in_place_writes_the_value_its_commit_holds() {
+    let dir = scratch("settle-in-place-watermark");
+    let inject = std::sync::Arc::new(supdb::ZInject::new());
+    inject.set_refault_rate(0.0);
+    inject.set_budget(1 << 50);
+    let mut db = Db::create(
+        &dir,
+        Options {
+            seal_bytes: 32 << 20,
+            partition_bytes: Some(64 << 10),
+            partition_on_flush: true,
+            publish_in_background: false,
+            upkeep: Upkeep::Background(1),
+            upkeep_pace_syncs_bp: 0,
+            scan_block_cache: true,
+            forms_settle_every: true,
+            forms_settle_builds: true,
+            zpages_inject: Some(inject.clone()),
+            ..common::options()
+        },
+    )
+    .unwrap();
+    let keys: Vec<Vec<u8>> = (0..2000).map(|i| format!("k{i:05}").into_bytes()).collect();
+    let mut want = std::collections::BTreeMap::new();
+    for k in &keys {
+        db.put(k, &[b'v'; 100]);
+        want.insert(k.clone(), vec![vec![b'v'; 100]]);
+    }
+    db.commit().unwrap();
+    db.flush().unwrap();
+    db.settle().unwrap();
+    let r = db.reader().unwrap();
+    // A few keys a block, so each block's form is sparse.
+    for tag in *b"ab" {
+        let _ = scan_model(&db);
+        for (i, k) in keys.iter().enumerate() {
+            if i % 32 == usize::from(tag - b'a') {
+                db.put(k, &[tag; 100]);
+                want.insert(k.clone(), vec![vec![tag; 100]]);
+            }
+        }
+        db.commit().unwrap();
+        db.settle().unwrap();
+    }
+    let _ = scan_model(&db);
+    assert!(scan_model_of(&r) == want, "the handle before the batch");
+    let (placed, converted) = db.settle_lean();
+    // The batch that makes the forms dense, lent to a thread held before
+    // its pass; and behind it, staged and not committed, a newer value of
+    // every fourth of its keys.
+    db.hold_upkeep_pass(true);
+    let batch: Vec<usize> = (0..keys.len())
+        .filter(|i| (8..28).contains(&(i % 64)))
+        .collect();
+    for &i in &batch {
+        db.put(&keys[i], &[b'c'; 100]);
+        want.insert(keys[i].clone(), vec![vec![b'c'; 100]]);
+    }
+    db.commit().unwrap();
+    for &i in batch.iter().step_by(4) {
+        db.put(&keys[i], &[b'S'; 100]);
+    }
+    db.hold_upkeep_pass(false);
+    let t = std::time::Instant::now();
+    while db.settle_lean().0 == placed {
+        assert!(
+            t.elapsed().as_secs() < 60,
+            "the upkeep thread never filed the batch in place"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    }
+    while db.upkeep_behind_writes() > 0 {
+        assert!(t.elapsed().as_secs() < 60, "the pass never reported");
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    }
+    let (placed_now, converted_now) = db.settle_lean();
+    assert!(
+        converted_now > converted && placed_now - placed >= batch.len() as u64 / 2,
+        "the pass converted the forms and patched the batch in place: {} converted, {} placed of {}",
+        converted_now - converted,
+        placed_now - placed,
+        batch.len()
+    );
+    // The handle reads what was committed, through the forms the pass
+    // published at that commit.
+    assert!(
+        scan_model_of(&r) == want,
+        "the handle reads the committed values, none of the staged"
+    );
+    db.commit().unwrap();
+    for &i in batch.iter().step_by(4) {
+        want.insert(keys[i].clone(), vec![vec![b'S'; 100]]);
+    }
+    db.settle().unwrap();
+    assert!(
+        scan_model_of(&r) == want,
+        "the handle after the staged commit"
+    );
+    assert!(
+        scan_model(&db) == want,
+        "the writer after the staged commit"
+    );
     drop(r);
     drop(db);
     let _ = std::fs::remove_dir_all(&dir);

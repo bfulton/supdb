@@ -112,3 +112,50 @@ tests/data/couplings.txt	src/db.rs vault/pager method code	24	26	stage O4 of the
 tests/data/couplings.txt	src/db.rs vault::under code	6	7	stage O4: the segment work's look at what no manifest lists yet (Maint::one_look) names the files beside a store's segments by the names its table has them under, which under a cipher are their envelopes' (Vault::beside)
 tests/data/couplings.txt	src/db/vault.rs kind of form file code	23	28	stage O4: the vault names its three kinds of envelope where a store kept in one file lists them for a manifest (Vault::places, riders), finds its ordered indexes after its table is made (Vault::adopt_ords), names what stands beside a segment for the segment work's look (Vault::beside), and writes an index's envelope ahead of its segment's (Vault::ord_envelope); persist_with's own count falls by one
 tests/data/couplings.txt	src/db/vault.rs seg/ord/form ident code	49	73	stage O4: the same five functions and persist_with, which writes an ordered index's envelope ahead of its segment's in a store kept in one file so that one sync through the segment's own handle covers both, and behind it in a store of files as before (Vault::ord_envelope, Vault::ord_settled, out of the loop they were written in)
+tests/data/cost-entries.txt	Db::copy_packs	0	1	main #30-#33 (eceb66d's merge): a test seam or a counter of main's, at no key, entry, block or step of an operation
+tests/data/cost-entries.txt	Db::copy_patches	0	1	main #30-#33 (eceb66d's merge): a test seam or a counter of main's, at no key, entry, block or step of an operation
+tests/data/cost-entries.txt	Db::fail_next_spare_sync	0	1	main #30-#33 (eceb66d's merge): a test seam or a counter of main's, at no key, entry, block or step of an operation
+tests/data/cost-entries.txt	Db::frozen_bytes_held	0	1	main #30-#33 (eceb66d's merge): a test seam or a counter of main's, at no key, entry, block or step of an operation
+tests/data/cost-entries.txt	Db::heads_past_fill	0	1	main #30-#33 (eceb66d's merge): a test seam or a counter of main's, at no key, entry, block or step of an operation
+tests/data/cost-entries.txt	Db::hold_shared_closed	0	1	main #30-#33 (eceb66d's merge): a test seam or a counter of main's, at no key, entry, block or step of an operation
+tests/data/cost-entries.txt	Db::hold_shared_grace	0	1	main #30-#33 (eceb66d's merge): a test seam or a counter of main's, at no key, entry, block or step of an operation
+tests/data/cost-entries.txt	Db::hold_shared_writes	0	1	main #30-#33 (eceb66d's merge): a test seam or a counter of main's, at no key, entry, block or step of an operation
+tests/data/cost-entries.txt	Db::hold_spare_named	0	1	main #30-#33 (eceb66d's merge): a test seam or a counter of main's, at no key, entry, block or step of an operation
+tests/data/cost-entries.txt	Db::hold_unshare	0	1	main #30-#33 (eceb66d's merge): a test seam or a counter of main's, at no key, entry, block or step of an operation
+tests/data/cost-entries.txt	Db::live_shared	0	1	main #30-#33 (eceb66d's merge): a test seam or a counter of main's, at no key, entry, block or step of an operation
+tests/data/cost-entries.txt	Db::run_spare_look_again	0	1	main #30-#33 (eceb66d's merge): a test seam or a counter of main's, at no key, entry, block or step of an operation
+tests/data/cost-entries.txt	Db::run_spare_state	0	1	main #30-#33 (eceb66d's merge): a test seam or a counter of main's, at no key, entry, block or step of an operation
+tests/data/cost-entries.txt	Db::settle_gathered	0	1	main #30-#33 (eceb66d's merge): a test seam or a counter of main's, at no key, entry, block or step of an operation
+tests/data/cost-entries.txt	Db::settle_lean	0	1	main #30-#33 (eceb66d's merge): a test seam or a counter of main's, at no key, entry, block or step of an operation
+tests/data/cost-entries.txt	Db::settle_short	0	1	main #30-#33 (eceb66d's merge): a test seam or a counter of main's, at no key, entry, block or step of an operation
+tests/data/cost-entries.txt	Db::share_counts	0	1	main #30-#33 (eceb66d's merge): a test seam or a counter of main's, at no key, entry, block or step of an operation
+tests/data/cost-entries.txt	Db::share_populated	0	1	main #30-#33 (eceb66d's merge): a test seam or a counter of main's, at no key, entry, block or step of an operation
+tests/data/cost-entries.txt	Db::shared_writes_held	0	1	main #30-#33 (eceb66d's merge): a test seam or a counter of main's, at no key, entry, block or step of an operation
+tests/data/cost-entries.txt	Db::shares	0	1	main #30-#33 (eceb66d's merge): a test seam or a counter of main's, at no key, entry, block or step of an operation
+tests/data/cost-entries.txt	Db::sharing	0	1	main #30-#33 (eceb66d's merge): a test seam or a counter of main's, at no key, entry, block or step of an operation
+tests/data/cost-entries.txt	Db::writer	0	1	main #30 (eceb66d's merge): claims a handle that writes, once a handle
+tests/data/cost-entries.txt	Reader::append	0	1	main #30 (eceb66d's merge): a write through a handle under the held log (Options::shared_writers, share_on_write), an operation on no probe of scripts/cost.sh yet: the gap, said on its line
+tests/data/cost-entries.txt	Reader::block_cache_binds	0	1	main #30-#33 (eceb66d's merge): a test seam or a counter of main's, at no key, entry, block or step of an operation
+tests/data/cost-entries.txt	Reader::block_cache_packed	0	1	main #30-#33 (eceb66d's merge): a test seam or a counter of main's, at no key, entry, block or step of an operation
+tests/data/cost-entries.txt	Reader::delete	0	1	main #30 (eceb66d's merge): a write through a handle under the held log (Options::shared_writers, share_on_write), an operation on no probe of scripts/cost.sh yet: the gap, said on its line
+tests/data/cost-entries.txt	Reader::hold_rewrites	0	1	main #30-#33 (eceb66d's merge): a test seam or a counter of main's, at no key, entry, block or step of an operation
+tests/data/cost-entries.txt	Reader::live_settled	0	1	main #30-#33 (eceb66d's merge): a test seam or a counter of main's, at no key, entry, block or step of an operation
+tests/data/cost-entries.txt	Reader::placed_live_probes	0	1	main #30-#33 (eceb66d's merge): a test seam or a counter of main's, at no key, entry, block or step of an operation
+tests/data/cost-entries.txt	Reader::put	0	1	main #30 (eceb66d's merge): a write through a handle under the held log (Options::shared_writers, share_on_write), an operation on no probe of scripts/cost.sh yet: the gap, said on its line
+tests/data/cost-entries.txt	Reader::release_shared_closed	0	1	main #30-#33 (eceb66d's merge): a test seam or a counter of main's, at no key, entry, block or step of an operation
+tests/data/cost-entries.txt	Reader::release_shared_grace	0	1	main #30-#33 (eceb66d's merge): a test seam or a counter of main's, at no key, entry, block or step of an operation
+tests/data/cost-entries.txt	Reader::release_unshare	0	1	main #30-#33 (eceb66d's merge): a test seam or a counter of main's, at no key, entry, block or step of an operation
+tests/data/cost-entries.txt	Reader::rewrite_holding	0	1	main #30-#33 (eceb66d's merge): a test seam or a counter of main's, at no key, entry, block or step of an operation
+tests/data/cost-entries.txt	Reader::rewrites_made	0	1	main #30-#33 (eceb66d's merge): a test seam or a counter of main's, at no key, entry, block or step of an operation
+tests/data/cost-entries.txt	Reader::rmw	0	1	main #30 (eceb66d's merge): a write through a handle under the held log (Options::shared_writers, share_on_write), an operation on no probe of scripts/cost.sh yet: the gap, said on its line
+tests/data/cost-entries.txt	Reader::shared_closed_holding	0	1	main #30-#33 (eceb66d's merge): a test seam or a counter of main's, at no key, entry, block or step of an operation
+tests/data/cost-entries.txt	Reader::shared_fall_asks	0	1	main #30-#33 (eceb66d's merge): a test seam or a counter of main's, at no key, entry, block or step of an operation
+tests/data/cost-entries.txt	Reader::shared_grace_holding	0	1	main #30-#33 (eceb66d's merge): a test seam or a counter of main's, at no key, entry, block or step of an operation
+tests/data/cost-entries.txt	Reader::shared_lean_ops	0	1	main #30-#33 (eceb66d's merge): a test seam or a counter of main's, at no key, entry, block or step of an operation
+tests/data/cost-entries.txt	Reader::shared_len_carried	0	1	main #30-#33 (eceb66d's merge): a test seam or a counter of main's, at no key, entry, block or step of an operation
+tests/data/cost-entries.txt	Reader::shared_rmw_below	0	1	main #30-#33 (eceb66d's merge): a test seam or a counter of main's, at no key, entry, block or step of an operation
+tests/data/cost-entries.txt	Reader::shared_writes_held	0	1	main #30-#33 (eceb66d's merge): a test seam or a counter of main's, at no key, entry, block or step of an operation
+tests/data/cost-entries.txt	Reader::unshare_holding	0	1	main #30-#33 (eceb66d's merge): a test seam or a counter of main's, at no key, entry, block or step of an operation
+tests/data/cost-entries.txt	Reader::upkeep_passes_ended	0	1	main #30-#33 (eceb66d's merge): a test seam or a counter of main's, at no key, entry, block or step of an operation
+tests/data/couplings.txt	src/db.rs run logged code	26	28	the merge of main #33: a logged run's close is never readable on the writer (Options::close_readable_inline), its envelope the seal thread's to write (Db::close_run, one); and main #30's refusal of shared_writers, whose words say "nothing logged" (check_options, one)
+tests/data/door.txt	thread src/db.rs *	106	118	main #30-#33 (eceb66d's merge): the shared table's writers and holds, the crash's count of the store's threads (Life), the run's file made ahead and the drains answered early sleep, park and spawn as the engine's threads do

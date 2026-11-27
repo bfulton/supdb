@@ -646,6 +646,89 @@ fn a_one_file_life(name: &str) {
 /// counted on their own (`Db::mapped_bytes`): zero past every store's
 /// close. The store life runs once with its blocks on the heap too, where
 /// the allocation count is what sees them.
+/// One store's life that shares its live table on demand
+/// (`Options::share_on_write`): scans that build the writer's block
+/// tables, a handle whose writes install a shared table over a table with
+/// writes in it -- the tables dropped at the flip, the frozen table
+/// sealed beside the shared one -- the writer's own writes and scans
+/// beside the handle, the handle gone and the shared table left once its
+/// rent is paid, the block cache built again over what landed, and a
+/// second handle's shared table live at the drop, with `left` a table
+/// frozen and still on its way to a segment beside it.
+fn a_sharing_life(name: &str, left: bool) {
+    let d = std::env::temp_dir().join(format!("supdb-next-leak-{name}-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&d);
+    std::fs::create_dir_all(&d).unwrap();
+    let opts = Options {
+        sync: supdb::SyncPolicy::Explicit,
+        held_frames: false,
+        share_on_write: true,
+        seal_bytes: 1 << 20,
+        seal_max_pct: 0,
+        partition_bytes: Some(256 << 10),
+        scan_block_cache: true,
+        ..common::options()
+    };
+    let mut db = Db::create(&d, opts).unwrap();
+    let keys = 20_000u32;
+    let key = |k: u32| format!("key-{k:08}").into_bytes();
+    let scan_all = |r: &supdb::Reader| {
+        for s in (0..keys).step_by(500) {
+            r.scan(&key(s), 100, kv(&mut |_, _| {})).unwrap();
+        }
+    };
+    for k in 0..keys {
+        db.append(&key(k), &[7u8; 100]);
+    }
+    db.flush().unwrap();
+    db.settle().unwrap();
+    for k in (0..keys).step_by(9) {
+        db.put(&key(k), &[8u8; 100]);
+    }
+    db.commit().unwrap();
+    scan_all(&db);
+    for round in 0..2u32 {
+        let h = db.reader().unwrap();
+        for k in (round..keys).step_by(5) {
+            while !h.put(&key(k), &[round as u8; 100]).unwrap() {
+                db.commit().unwrap();
+            }
+            if k % 400 < 5 {
+                db.put(&key(k + 1), &[9u8; 100]);
+                db.commit().unwrap();
+            }
+        }
+        assert!(db.sharing(), "{name}: the handle's writes shared no table");
+        scan_all(&db);
+        scan_all(&h);
+        drop(h);
+        if round == 1 {
+            break;
+        }
+        // The rent, and the store back to the one writer's table.
+        for i in 0..keys * 4 {
+            if !db.live_shared() {
+                break;
+            }
+            db.put(&key(i % keys), &[10u8; 100]);
+            if i % 100 == 99 {
+                db.commit().unwrap();
+            }
+        }
+        db.commit().unwrap();
+        db.settle().unwrap();
+        assert!(!db.sharing(), "{name}: the store stayed shared");
+        scan_all(&db);
+    }
+    if left {
+        // A shared table frozen, its seal still running, as the store goes.
+        db.commit().unwrap();
+        db.seal().unwrap();
+    }
+    drop(db);
+    let _ = std::fs::remove_dir_all(&d);
+}
+
 #[test]
 fn a_closed_store_gives_back_what_it_allocated() {
     // The first life allocates what lives for the process -- the test
@@ -658,6 +741,8 @@ fn a_closed_store_gives_back_what_it_allocated() {
     a_zpages_life("warm-zpages");
     a_stride_life("warm-stride");
     a_one_file_life("warm-onefile");
+    a_sharing_life("warm-sharing", false);
+    a_sharing_life("warm-sharing-left", true);
     assert_eq!(
         Db::mapped_bytes(),
         0,
@@ -665,7 +750,7 @@ fn a_closed_store_gives_back_what_it_allocated() {
     );
     let before = LIVE.load(Ordering::SeqCst);
     let lives = 4;
-    let kinds = 7;
+    let kinds = 9;
     for i in 0..lives {
         a_store_life(&format!("life-{i}"), true);
         a_store_life(&format!("heap-{i}"), false);
@@ -674,6 +759,8 @@ fn a_closed_store_gives_back_what_it_allocated() {
         a_zpages_life(&format!("zpages-{i}"));
         a_stride_life(&format!("stride-{i}"));
         a_one_file_life(&format!("onefile-{i}"));
+        a_sharing_life(&format!("sharing-{i}"), false);
+        a_sharing_life(&format!("sharing-left-{i}"), true);
     }
     let after = LIVE.load(Ordering::SeqCst);
     let kept = after - before;

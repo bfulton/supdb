@@ -466,6 +466,13 @@ pub trait ThreadWriter {
     fn rmw(&mut self, _key: &[u8], _value: &[u8]) -> Option<Res<usize>> {
         None
     }
+    /// What this handle counted of its own operations, read on its thread
+    /// once its share is done and outside the clock: the threaded mixes'
+    /// `threadcounters` line (`SUPDB_THREADED_COUNTERS`). Nothing for an
+    /// engine that counts nothing a thread.
+    fn counters(&self) -> Vec<(&'static str, u64)> {
+        Vec::new()
+    }
 }
 
 /// Becomes a `ThreadWriter` on the thread that calls it; see
@@ -517,6 +524,9 @@ fn dir_size_into(p: &Path, seen: &mut std::collections::HashSet<(u64, u64)>) -> 
 /// (every segment contributes candidates) until range-partitioned compaction
 /// lands; that cost is the arm's to show, not to hide.
 pub struct Supdb {
+    /// `supdb-heldhandle`'s handle, claimed at its first update; ahead of
+    /// the store, so that it goes first.
+    own: Option<supdb::Reader>,
     db: Option<supdb::Db>,
     path: PathBuf,
     /// The store's directory is under a key (`Policy::dir_key`).
@@ -641,18 +651,22 @@ pub struct Supdb {
     /// and `supdb-lendbursts` durable, where the commits sync and so
     /// lend either way.
     lendbursts: bool,
-    /// A buffered commit near reads files every large batch itself, as
-    /// before the batches after the first were lent a batch behind the
-    /// thread (`Options::upkeep_pace_pct` at zero). `supdb-ingestnopace`;
-    /// a durable store's commits lend either way, so it has no durable
+    /// A buffered commit near reads lends the batches of a burst after
+    /// its first, each at most a hundredth of the store's keys, and holds
+    /// until the thread has filed each, where the engine files them in
+    /// the commit (`Options::upkeep_pace_pct` at one).
+    /// `supdb-ingestpaced`, and `supdb-heldpaced` under the held log; a
+    /// durable store's commits lend either way, so it has no durable
     /// twin.
-    nopace: bool,
-    /// A buffered commit near reads lends a paced batch within the share,
-    /// as before a paced batch was held until the thread had filed it
-    /// (`Options::upkeep_pace_holds` off). `supdb-ingestpacelends`; a
-    /// durable store's commits take the syncing pace, so it has no durable
-    /// twin.
+    paced: bool,
+    /// With `paced`, a paced batch lent within the share and not held
+    /// for (`Options::upkeep_pace_holds` off). `supdb-ingestpacelends`,
+    /// `supdb-heldpacelends`.
     pacelends: bool,
+    /// Under the held log, a burst's batches filed by their commits as
+    /// under any other policy, where the engine lends them
+    /// (`Options::held_bursts_lend` off). `supdb-heldfiles`.
+    heldfiles: bool,
     /// A buffered commit near reads files any batch itself, however
     /// small (`Options::upkeep_inline_min` at one). `supdb-ingestinlineall`,
     /// and `supdb-inlineall` durable, where the commits sync and so lend
@@ -837,6 +851,23 @@ pub struct Supdb {
     /// by its rank among them (`Options::settle_patch_at_cut` off):
     /// `supdb-settlepatchwhole`.
     settlepatchwhole: bool,
+    /// The settle's resolve reading each key's write from the pending list
+    /// and its bytes from the table (`Options::settle_gathers` off):
+    /// `supdb-settleloads`.
+    settleloads: bool,
+    /// The settle's batch sorted by key offset ahead of its sort by prefix
+    /// (`Options::settle_sorts_once` off): `supdb-settlesortstwice`.
+    settlesortstwice: bool,
+    /// Every patch of the settle through `patch_block`
+    /// (`Options::settle_patch_in_place` off): `supdb-settlepatchstaged`.
+    settlestaged: bool,
+    /// A form the settle grew dense left for the fill to convert
+    /// (`Options::settle_converts` off): `supdb-settlenoconvert`.
+    settlenoconvert: bool,
+    /// A settle's conversion that leaves the fill no walk
+    /// (`Options::settle_convert_fills` off): `supdb-settleconvertquiet`,
+    /// and `supdb-ingestsettleconvertquiet` on the buffered arm.
+    settleconvertquiet: bool,
     /// The settle asking for a written chunk's header alone
     /// (`Options::settle_value_ahead` zero): `supdb-settlevaluenear`.
     settlevaluenear: bool,
@@ -1019,10 +1050,6 @@ pub struct Supdb {
     /// `Options::close_presync`. `supdb-latesync`, and
     /// `supdb-ingestlatesync` buffered.
     latesync: bool,
-    /// A run opening on a temp name of its own, made at its first commit
-    /// and promised by a directory barrier of its own, the shape before
-    /// `Options::run_spare`. `supdb-runnospare`.
-    runnospare: bool,
     /// The install of the builder ahead's forms reads each block's bounds
     /// from the partition itself, `Options::ahead_sends_bounds` off.
     /// `supdb-installreads`.
@@ -1116,6 +1143,44 @@ pub struct Supdb {
     /// default. `supdb-chaincovered` chains through a covered burst, and
     /// `supdb-nocopiesfitchain` is both shapes before.
     chainuncovered: Option<bool>,
+    /// A flush whose writes were all durable before it answered once its
+    /// seal is readable, the seal's fsync and its manifest left to the
+    /// segment work's loop (`Options::drain_answers_readable`), `None` for
+    /// the engine's default: `supdb-drainreadable` answers so and
+    /// `supdb-drainstrict` waits for the seal's fsync.
+    drainreadable: Option<bool>,
+    /// A flush over writes no sync has covered pays the sync it owes
+    /// beside its seal and is answered at the seal's readable landing
+    /// (`Options::drain_syncs_beside`), `None` for the engine's default:
+    /// `supdb-ingestsyncbeside` and `supdb-syncbeside` pin it on, and
+    /// `supdb-ingestsyncafter` is the buffered drain that waits for its
+    /// slot, the shape before.
+    syncbeside: Option<bool>,
+    /// A direct run's append and commit without the per-record work the
+    /// records no longer need (`Options::direct_lean_append`), `None` for
+    /// the engine's default: `supdb-directfull` and
+    /// `supdb-ingestdirectfull` are the walk, the shape before.
+    directlean: Option<bool>,
+    /// A drain's close of a synced direct run on the writer up to the
+    /// segment being readable (`Options::close_readable_inline`), `None`
+    /// for the engine's default: `supdb-closeseal` and
+    /// `supdb-ingestcloseseal` leave it to the seal thread.
+    closereadable: Option<bool>,
+    /// A seal's Bloom composed only where it may be named a piece
+    /// (`Options::bloom_pieces_only`), `None` for the engine's default:
+    /// `supdb-bloomalways` and `supdb-ingestbloomalways` compose it for
+    /// every seal.
+    bloompieces: Option<bool>,
+    /// A landing's empty live table made only where the table it retires
+    /// is still live (`Options::land_fresh_lazy`), `None` for the
+    /// engine's default: `supdb-landfresh` and `supdb-ingestlandfresh`
+    /// make it at every landing that retires a table.
+    landfresh: Option<bool>,
+    /// A run of ordered ingest begun in a file made ahead of it
+    /// (`Options::run_spare`), `None` for the engine's default:
+    /// `supdb-runcreate` and `supdb-ingestruncreate` make the file at the
+    /// run's first commit.
+    runspare: Option<bool>,
     /// A scan that starts in a block the writer holds a form for counted
     /// as a reuse by the forms-off rule
     /// (`Options::scan_forms_off_counts_built`), `None` for the engine's
@@ -1443,6 +1508,33 @@ pub struct Supdb {
     /// (`Options::scan_runs_held`): `supdb-runsheld` and
     /// `supdb-ingestrunsheld`.
     runsheld: bool,
+    /// A copy asked for over the entries its walk reads
+    /// (`Options::copy_prefetch_span`): `supdb-copyspan` and
+    /// `supdb-ingestcopyspan`.
+    copyspan: bool,
+    /// A copy's claim to its entries' ranks is of the file its build read
+    /// and lost at every merge of its partition (`Options::identity_by_keys`
+    /// off): `supdb-identityblob` and `supdb-ingestidentityblob`.
+    identityblob: bool,
+    /// Every copy held as its three buffers (`Options::copy_packed`
+    /// off): `supdb-copythree` and `supdb-ingestcopythree`.
+    copythree: bool,
+    /// The raw gate's heads left to the page cache whatever the store's
+    /// files have outgrown (`Options::heads_owned_past_fill` off):
+    /// `supdb-headsgate`.
+    headsgate: bool,
+    /// The frozen tables bounded by their count alone
+    /// (`Options::frozen_bytes` at `usize::MAX`): `supdb-frozencount`, and
+    /// `supdb-heldpartfrozencount` under the held log.
+    frozencount: bool,
+    /// A settle's patch searches a copy for a key above its last entry
+    /// (`Options::settle_append_last` off): `supdb-settlesearch` and
+    /// `supdb-ingestsettlesearch`.
+    settlesearch: bool,
+    /// A settle's patch walks the sources for a key only its chain holds
+    /// (`Options::settle_lone_chain` off): `supdb-settlesources` and
+    /// `supdb-ingestsettlesources`.
+    settlesources: bool,
     /// The three scan levers together: `supdb-scanlevers` and
     /// `supdb-ingestscanlevers`.
     scanlevers: bool,
@@ -2007,6 +2099,79 @@ pub struct Supdb {
     /// store's keys (`Options::upkeep_batch_pct`) under the held log with
     /// no frames: `supdb-heldbatch1`.
     upkeepbatch: Option<usize>,
+    /// EXPERIMENT: the live table written by every thread's handle at once
+    /// (`Options::shared_writers`), under the held log with no frames, the
+    /// block cache off, the upkeep the writer's and ordered ingest off,
+    /// which the option needs: `supdb-heldshared`, beside
+    /// `supdb-heldnfinline`, which differs in the sharing and the ordered
+    /// ingest. Its writer threads write through their own handles and
+    /// take the one writer only to freeze a table they found full.
+    shared: bool,
+    /// The shared table's puts appending, nothing reused
+    /// (`Options::shared_recycles` off): `supdb-heldsharednorecycle`.
+    sharednorecycle: bool,
+    /// The shared table sized from the store's keys, as FASTER's log is
+    /// (`Options::shared_table_bytes`, `faster_sizes`): four times its
+    /// records, where the engine's own cap is the seal's share of the
+    /// store: `supdb-heldsharedbig`.
+    sharedbig: bool,
+    /// The big shared table's probe reading the chain's head only once the
+    /// key has compared (`Options::shared_chunk_ahead` off):
+    /// `supdb-heldsharedbignoahead`.
+    sharednoahead: bool,
+    /// The big shared table's index sized from its cap and not from the
+    /// store's keys (`Options::shared_index_slots` zero):
+    /// `supdb-heldsharedbigcapindex`.
+    sharedcapindex: bool,
+    /// The big shared table's keys as entries and chunks apart, not as
+    /// records (`Options::shared_records` off): `supdb-heldsharedbignorecords`.
+    sharednorecords: bool,
+    /// The big shared table's puts laying their values down where they
+    /// replace one of their length, nothing overwritten in place
+    /// (`Options::shared_in_place` off): `supdb-heldsharedbignoinplace`.
+    sharednoinplace: bool,
+    /// The big shared table's operations all through the layered path,
+    /// none through the record's address (`Options::shared_lean` off):
+    /// `supdb-heldsharedbignolean`.
+    sharednolean: bool,
+    /// The big shared table's value arena and index on small pages
+    /// (`Options::shared_huge` off): `supdb-heldsharedbignohuge`.
+    sharednohuge: bool,
+    /// The big shared table's inserts each carrying the slab's length
+    /// (`Options::shared_len_lazy` off): `supdb-heldsharedbigeagerlen`.
+    sharedeagerlen: bool,
+    /// The big shared table's point reads placing their partition by the
+    /// fences' bytes (`Options::point_fence_words` off):
+    /// `supdb-heldsharedbignowords`.
+    sharednowords: bool,
+    /// The big shared table's reads the lean probe found absent from the
+    /// table taking the placed read (`Options::point_lone_absent` off):
+    /// `supdb-heldsharedbignolone`.
+    sharednolone: bool,
+    /// The big shared table's reads asking for their partition's slot only
+    /// once the live table has said it lacks the key
+    /// (`Options::shared_fall_ahead` off): `supdb-heldsharedbignofall`.
+    sharednofall: bool,
+    /// The big shared table's reads all asking for their partition's slot
+    /// ahead of the live table's probe (`Options::shared_fall_always`):
+    /// `supdb-heldsharedbigfallalways`.
+    sharedfallalways: bool,
+    /// The big shared table's read-modify-writes of a key the table lacks
+    /// probing it again before they read below it
+    /// (`Options::shared_rmw_absent` off): `supdb-heldsharedbigrmwprobes`.
+    sharedrmwprobes: bool,
+    /// The live table never shared with a handle's writes
+    /// (`Options::share_on_write` off): `supdb-heldnoshare`.
+    noshare: bool,
+    /// The shared table the writer installs for its handles made as its
+    /// writers reach it (`Options::shared_populates` off):
+    /// `supdb-heldnopopulate`.
+    nopopulate: bool,
+    /// EXPERIMENT: the arm's own updates and reads made through a handle
+    /// claimed to write (`Db::writer`), a write at a time with no batch
+    /// behind a commit, as FASTER's session makes them:
+    /// `supdb-heldhandle`.
+    ownhandle: bool,
     /// What the reader handles this store gave its threads answered
     /// through the ordered index, summed as each is dropped
     /// (`OrdTally`); only the arm that reads that way hands out handles
@@ -2174,18 +2339,22 @@ struct Policy {
     /// and `supdb-lendbursts` durable, where the commits sync and so
     /// lend either way.
     lendbursts: bool,
-    /// A buffered commit near reads files every large batch itself, as
-    /// before the batches after the first were lent a batch behind the
-    /// thread (`Options::upkeep_pace_pct` at zero). `supdb-ingestnopace`;
-    /// a durable store's commits lend either way, so it has no durable
+    /// A buffered commit near reads lends the batches of a burst after
+    /// its first, each at most a hundredth of the store's keys, and holds
+    /// until the thread has filed each, where the engine files them in
+    /// the commit (`Options::upkeep_pace_pct` at one).
+    /// `supdb-ingestpaced`, and `supdb-heldpaced` under the held log; a
+    /// durable store's commits lend either way, so it has no durable
     /// twin.
-    nopace: bool,
-    /// A buffered commit near reads lends a paced batch within the share,
-    /// as before a paced batch was held until the thread had filed it
-    /// (`Options::upkeep_pace_holds` off). `supdb-ingestpacelends`; a
-    /// durable store's commits take the syncing pace, so it has no durable
-    /// twin.
+    paced: bool,
+    /// With `paced`, a paced batch lent within the share and not held
+    /// for (`Options::upkeep_pace_holds` off). `supdb-ingestpacelends`,
+    /// `supdb-heldpacelends`.
     pacelends: bool,
+    /// Under the held log, a burst's batches filed by their commits as
+    /// under any other policy, where the engine lends them
+    /// (`Options::held_bursts_lend` off). `supdb-heldfiles`.
+    heldfiles: bool,
     /// A buffered commit near reads files any batch itself, however
     /// small (`Options::upkeep_inline_min` at one). `supdb-ingestinlineall`,
     /// and `supdb-inlineall` durable, where the commits sync and so lend
@@ -2370,6 +2539,23 @@ struct Policy {
     /// by its rank among them (`Options::settle_patch_at_cut` off):
     /// `supdb-settlepatchwhole`.
     settlepatchwhole: bool,
+    /// The settle's resolve reading each key's write from the pending list
+    /// and its bytes from the table (`Options::settle_gathers` off):
+    /// `supdb-settleloads`.
+    settleloads: bool,
+    /// The settle's batch sorted by key offset ahead of its sort by prefix
+    /// (`Options::settle_sorts_once` off): `supdb-settlesortstwice`.
+    settlesortstwice: bool,
+    /// Every patch of the settle through `patch_block`
+    /// (`Options::settle_patch_in_place` off): `supdb-settlepatchstaged`.
+    settlestaged: bool,
+    /// A form the settle grew dense left for the fill to convert
+    /// (`Options::settle_converts` off): `supdb-settlenoconvert`.
+    settlenoconvert: bool,
+    /// A settle's conversion that leaves the fill no walk
+    /// (`Options::settle_convert_fills` off): `supdb-settleconvertquiet`,
+    /// and `supdb-ingestsettleconvertquiet` on the buffered arm.
+    settleconvertquiet: bool,
     /// The settle asking for a written chunk's header alone
     /// (`Options::settle_value_ahead` zero): `supdb-settlevaluenear`.
     settlevaluenear: bool,
@@ -2552,10 +2738,6 @@ struct Policy {
     /// `Options::close_presync`. `supdb-latesync`, and
     /// `supdb-ingestlatesync` buffered.
     latesync: bool,
-    /// A run opening on a temp name of its own, made at its first commit
-    /// and promised by a directory barrier of its own, the shape before
-    /// `Options::run_spare`. `supdb-runnospare`.
-    runnospare: bool,
     /// The install of the builder ahead's forms reads each block's bounds
     /// from the partition itself, `Options::ahead_sends_bounds` off.
     /// `supdb-installreads`.
@@ -2649,6 +2831,44 @@ struct Policy {
     /// default. `supdb-chaincovered` chains through a covered burst, and
     /// `supdb-nocopiesfitchain` is both shapes before.
     chainuncovered: Option<bool>,
+    /// A flush whose writes were all durable before it answered once its
+    /// seal is readable, the seal's fsync and its manifest left to the
+    /// segment work's loop (`Options::drain_answers_readable`), `None` for
+    /// the engine's default: `supdb-drainreadable` answers so and
+    /// `supdb-drainstrict` waits for the seal's fsync.
+    drainreadable: Option<bool>,
+    /// A flush over writes no sync has covered pays the sync it owes
+    /// beside its seal and is answered at the seal's readable landing
+    /// (`Options::drain_syncs_beside`), `None` for the engine's default:
+    /// `supdb-ingestsyncbeside` and `supdb-syncbeside` pin it on, and
+    /// `supdb-ingestsyncafter` is the buffered drain that waits for its
+    /// slot, the shape before.
+    syncbeside: Option<bool>,
+    /// A direct run's append and commit without the per-record work the
+    /// records no longer need (`Options::direct_lean_append`), `None` for
+    /// the engine's default: `supdb-directfull` and
+    /// `supdb-ingestdirectfull` are the walk, the shape before.
+    directlean: Option<bool>,
+    /// A drain's close of a synced direct run on the writer up to the
+    /// segment being readable (`Options::close_readable_inline`), `None`
+    /// for the engine's default: `supdb-closeseal` and
+    /// `supdb-ingestcloseseal` leave it to the seal thread.
+    closereadable: Option<bool>,
+    /// A seal's Bloom composed only where it may be named a piece
+    /// (`Options::bloom_pieces_only`), `None` for the engine's default:
+    /// `supdb-bloomalways` and `supdb-ingestbloomalways` compose it for
+    /// every seal.
+    bloompieces: Option<bool>,
+    /// A landing's empty live table made only where the table it retires
+    /// is still live (`Options::land_fresh_lazy`), `None` for the
+    /// engine's default: `supdb-landfresh` and `supdb-ingestlandfresh`
+    /// make it at every landing that retires a table.
+    landfresh: Option<bool>,
+    /// A run of ordered ingest begun in a file made ahead of it
+    /// (`Options::run_spare`), `None` for the engine's default:
+    /// `supdb-runcreate` and `supdb-ingestruncreate` make the file at the
+    /// run's first commit.
+    runspare: Option<bool>,
     /// A scan that starts in a block the writer holds a form for counted
     /// as a reuse by the forms-off rule
     /// (`Options::scan_forms_off_counts_built`), `None` for the engine's
@@ -2945,6 +3165,20 @@ struct Policy {
     sparsespan: bool,
     /// The runs through one raw walker: `...runsheld`.
     runsheld: bool,
+    /// A copy's ask over its walk's entries: `...copyspan`.
+    copyspan: bool,
+    /// A copy's identity by its file: `...identityblob`.
+    identityblob: bool,
+    /// Every copy as its three buffers: `...copythree`.
+    copythree: bool,
+    /// The raw gate's heads left to the page cache: `...headsgate`.
+    headsgate: bool,
+    /// The frozen tables bounded by their count alone: `...frozencount`.
+    frozencount: bool,
+    /// The patch's search for an appended key: `...settlesearch`.
+    settlesearch: bool,
+    /// The patch's walk of the sources for a lone key: `...settlesources`.
+    settlesources: bool,
     /// The three scan levers together: `...scanlevers`.
     scanlevers: bool,
     /// The writer's copy line from `DENSEFROM`: `...densefrom`.
@@ -3356,6 +3590,76 @@ struct Policy {
     /// The upkeep's passes batched (`Options::upkeep_batch_pct`):
     /// `supdb-heldbatch1`.
     upkeepbatch: Option<usize>,
+    /// Every thread's handle writing the live table
+    /// (`Options::shared_writers`): `supdb-heldshared`.
+    shared: bool,
+    /// Its puts appending (`Options::shared_recycles` off):
+    /// `supdb-heldsharednorecycle`.
+    sharednorecycle: bool,
+    /// Its table sized as FASTER's log (`Options::shared_table_bytes`):
+    /// `supdb-heldsharedbig`.
+    sharedbig: bool,
+    /// Its probe asking nothing ahead (`Options::shared_chunk_ahead` off):
+    /// `supdb-heldsharedbignoahead`.
+    sharednoahead: bool,
+    /// The big shared table's index sized from its cap and not from the
+    /// store's keys (`Options::shared_index_slots` zero):
+    /// `supdb-heldsharedbigcapindex`.
+    sharedcapindex: bool,
+    /// The big shared table's keys as entries and chunks apart, not as
+    /// records (`Options::shared_records` off): `supdb-heldsharedbignorecords`.
+    sharednorecords: bool,
+    /// The big shared table's puts laying their values down where they
+    /// replace one of their length, nothing overwritten in place
+    /// (`Options::shared_in_place` off): `supdb-heldsharedbignoinplace`.
+    sharednoinplace: bool,
+    /// The big shared table's operations all through the layered path,
+    /// none through the record's address (`Options::shared_lean` off):
+    /// `supdb-heldsharedbignolean`.
+    sharednolean: bool,
+    /// The big shared table's value arena and index on small pages
+    /// (`Options::shared_huge` off): `supdb-heldsharedbignohuge`.
+    sharednohuge: bool,
+    /// The big shared table's inserts each carrying the slab's length
+    /// (`Options::shared_len_lazy` off): `supdb-heldsharedbigeagerlen`.
+    sharedeagerlen: bool,
+    /// The big shared table's point reads placing their partition by the
+    /// fences' bytes (`Options::point_fence_words` off):
+    /// `supdb-heldsharedbignowords`.
+    sharednowords: bool,
+    /// The big shared table's reads the lean probe found absent from the
+    /// table taking the placed read (`Options::point_lone_absent` off):
+    /// `supdb-heldsharedbignolone`.
+    sharednolone: bool,
+    /// The big shared table's reads asking for their partition's slot only
+    /// once the live table has said it lacks the key
+    /// (`Options::shared_fall_ahead` off): `supdb-heldsharedbignofall`.
+    sharednofall: bool,
+    /// The big shared table's reads all asking for their partition's slot
+    /// ahead of the live table's probe (`Options::shared_fall_always`):
+    /// `supdb-heldsharedbigfallalways`.
+    sharedfallalways: bool,
+    /// The big shared table's read-modify-writes of a key the table lacks
+    /// probing it again before they read below it
+    /// (`Options::shared_rmw_absent` off): `supdb-heldsharedbigrmwprobes`.
+    sharedrmwprobes: bool,
+    /// The live table the one writer's whoever writes, a handle's write
+    /// refused (`Options::share_on_write` off), under the held log with no
+    /// frames: `supdb-heldnoshare`, `supdb-heldnoframes` as it was before
+    /// its table followed its writers, whose threads take the one writer
+    /// in turn. The engine shares on demand, and `supdb-heldnoframes` with
+    /// it: that arm is itself until a thread's handle writes and
+    /// `supdb-heldsharedbig` while one does, its shared table sized from
+    /// the store's keys as that arm's is.
+    noshare: bool,
+    /// `supdb-heldnopopulate`: `supdb-heldnoframes` with the table it
+    /// installs for its handles made as they write it
+    /// (`Options::shared_populates` off), its first touches the writers'.
+    nopopulate: bool,
+    /// EXPERIMENT, `supdb-heldhandle`: `supdb-heldnoframes` with its own
+    /// updates and reads through a handle claimed to write, a write at a
+    /// time and no batch behind a commit, which is FASTER's one level.
+    ownhandle: bool,
 }
 
 /// The conversions a fill makes at most in `supdb-convertcap`: the first
@@ -3411,8 +3715,9 @@ impl Default for Policy {
             refvals: false,
             rowatclose: false,
             lendbursts: false,
-            nopace: false,
+            paced: false,
             pacelends: false,
+            heldfiles: false,
             inlineall: false,
             lazysettle: false,
             walsync: false,
@@ -3455,6 +3760,11 @@ impl Default for Policy {
             settleformnear: false,
             settlegallop: false,
             settlepatchwhole: false,
+            settleloads: false,
+            settlesortstwice: false,
+            settlestaged: false,
+            settlenoconvert: false,
+            settleconvertquiet: false,
             settlevaluenear: false,
             settletablenear: false,
             headslook: false,
@@ -3499,7 +3809,6 @@ impl Default for Policy {
             keycopies: false,
             fillplain: false,
             latesync: false,
-            runnospare: false,
             installreads: false,
             noabandon: false,
             deferbursts: false,
@@ -3522,6 +3831,13 @@ impl Default for Policy {
             zbuycross: None,
             copiesfit: None,
             chainuncovered: None,
+            drainreadable: None,
+            syncbeside: None,
+            directlean: None,
+            closereadable: None,
+            bloompieces: None,
+            landfresh: None,
+            runspare: None,
             formsoffbuilt: None,
             formson: false,
             formsoffkept: false,
@@ -3590,6 +3906,13 @@ impl Default for Policy {
             formahead: false,
             sparsespan: false,
             runsheld: false,
+            copyspan: false,
+            identityblob: false,
+            copythree: false,
+            headsgate: false,
+            frozencount: false,
+            settlesearch: false,
+            settlesources: false,
             scanlevers: false,
             densefrom: 0,
             convert16: false,
@@ -3709,6 +4032,24 @@ impl Default for Policy {
             inplace: false,
             placedpieces: false,
             upkeepbatch: None,
+            shared: false,
+            sharednorecycle: false,
+            sharedbig: false,
+            sharednoahead: false,
+            sharedcapindex: false,
+            sharednorecords: false,
+            sharednoinplace: false,
+            sharednolean: false,
+            sharednohuge: false,
+            sharedeagerlen: false,
+            sharednowords: false,
+            sharednolone: false,
+            sharednofall: false,
+            sharedfallalways: false,
+            sharedrmwprobes: false,
+            noshare: false,
+            nopopulate: false,
+            ownhandle: false,
             defer: false,
             firstfloor: false,
             aheadmin: None,
@@ -4271,6 +4612,57 @@ impl Supdb {
             Policy {
                 durable: false,
                 held: true,
+                ..Policy::default()
+            },
+        )
+    }
+
+    /// `supdb-heldnfinline` with its live table written by every thread's
+    /// handle (`Options::shared_writers`), in the shape `shape` names
+    /// (`SharedShape`).
+    pub fn create_held_shared(path: &Path, shape: SharedShape) -> Res<Supdb> {
+        let SharedShape {
+            norecycle,
+            big,
+            noahead,
+            capindex,
+            norecords,
+            noinplace,
+            nolean,
+            asym,
+            nohuge,
+            eagerlen,
+            nowords,
+            nolone,
+            nofall,
+            fallalways,
+            rmwprobes,
+        } = shape;
+        Supdb::with_policy(
+            path,
+            Policy {
+                partition: false,
+                durable: false,
+                held: true,
+                noframes: true,
+                block_cache: false,
+                upkeep: Some(supdb::Upkeep::Inline),
+                shared: true,
+                sharednorecycle: norecycle,
+                sharedbig: big,
+                sharednoahead: noahead,
+                sharedcapindex: capindex,
+                sharednorecords: norecords,
+                sharednoinplace: noinplace,
+                sharednolean: nolean,
+                sharednohuge: nohuge,
+                sharedeagerlen: eagerlen,
+                sharednowords: nowords,
+                sharednolone: nolone,
+                sharednofall: nofall,
+                sharedfallalways: fallalways,
+                sharedrmwprobes: rmwprobes,
+                asympin: asym,
                 ..Policy::default()
             },
         )
@@ -6597,34 +6989,31 @@ impl Supdb {
         )
     }
 
-    /// `supdb-ingest` with every large batch near reads filed in the
-    /// commit, as before the batches after a scan's first were lent a
-    /// batch behind the thread (`Options::upkeep_pace_pct` at zero):
-    /// against `supdb-ingest` it prices the pace, and against
-    /// `supdb-ingestlendbursts` the pace is read between the two shapes
-    /// it sits between.
-    pub fn create_ingest_nopace(path: &Path) -> Res<Supdb> {
+    /// `supdb-ingest` with the batches of a burst after its first lent to
+    /// the upkeep thread and held for until it has filed each
+    /// (`Options::upkeep_pace_pct` at one), where the engine files them
+    /// in the commit: against `supdb-ingest` it prices the hand-over.
+    pub fn create_ingest_paced(path: &Path) -> Res<Supdb> {
         Supdb::with_policy(
             path,
             Policy {
                 partition: false,
                 durable: false,
-                nopace: true,
+                paced: true,
                 ..Policy::default()
             },
         )
     }
 
-    /// `supdb-ingest` lending a burst's paced batch within the share, the
+    /// `supdb-ingestpaced` lending a paced batch within the share, the
     /// thread left to trail by it (`Options::upkeep_pace_holds` off).
-    /// Against `supdb-ingest` it prices the trail: the burst's overlap
-    /// against the first scan after the burst.
     pub fn create_ingest_pacelends(path: &Path) -> Res<Supdb> {
         Supdb::with_policy(
             path,
             Policy {
                 partition: false,
                 durable: false,
+                paced: true,
                 pacelends: true,
                 ..Policy::default()
             },
@@ -8361,17 +8750,6 @@ impl Supdb {
         )
     }
 
-    /// `supdb` with each run on a temp name of its own and its barrier.
-    pub fn create_runnospare(path: &Path) -> Res<Supdb> {
-        Supdb::with_policy(
-            path,
-            Policy {
-                runnospare: true,
-                ..Policy::default()
-            },
-        )
-    }
-
     /// `supdb` with the install of the builder ahead's forms reading
     /// each block's bounds itself.
     pub fn create_installreads(path: &Path) -> Res<Supdb> {
@@ -8597,6 +8975,228 @@ impl Supdb {
             path,
             Policy {
                 chainuncovered: Some(false),
+                ..Policy::default()
+            },
+        )
+    }
+
+    /// `supdb` answering a flush whose writes were all durable before it
+    /// once its seal's segments are published, the option pinned on
+    /// (`Options::drain_answers_readable`, the engine's default): the
+    /// directory's fsync, the seal's fsyncs and its manifest slot follow in
+    /// the segment work's loop. `supdb-drainreadable`, the arm it was
+    /// priced as.
+    pub fn create_drainreadable(path: &Path) -> Res<Supdb> {
+        Supdb::with_policy(
+            path,
+            Policy {
+                drainreadable: Some(true),
+                ..Policy::default()
+            },
+        )
+    }
+
+    /// `supdb` whose flush pays the sync it owes beside its seal and is
+    /// answered at the seal's readable landing, the option pinned on
+    /// (`Options::drain_syncs_beside`, the engine's default): a durable
+    /// store owes nothing, so against `supdb-syncafter` it prices the
+    /// option's cost where it does nothing. `supdb-syncbeside`.
+    pub fn create_syncbeside(path: &Path) -> Res<Supdb> {
+        Supdb::with_policy(
+            path,
+            Policy {
+                syncbeside: Some(true),
+                ..Policy::default()
+            },
+        )
+    }
+
+    /// `supdb-ingest` as `supdb-syncbeside`: the buffered drain, whose
+    /// writes no sync has covered, pays its log's sync beside its seal
+    /// and is answered at the readable landing, where it waited for its
+    /// slot's fdatasync. `supdb-ingestsyncbeside`, the arm it was priced
+    /// as.
+    pub fn create_ingest_syncbeside(path: &Path) -> Res<Supdb> {
+        Supdb::with_policy(
+            path,
+            Policy {
+                partition: false,
+                durable: false,
+                syncbeside: Some(true),
+                ..Policy::default()
+            },
+        )
+    }
+
+    /// `supdb` whose drain never pays a sync beside its seal
+    /// (`Options::drain_syncs_beside` off), the shape before.
+    /// `supdb-syncafter`.
+    pub fn create_syncafter(path: &Path) -> Res<Supdb> {
+        Supdb::with_policy(
+            path,
+            Policy {
+                syncbeside: Some(false),
+                ..Policy::default()
+            },
+        )
+    }
+
+    /// `supdb-ingest` whose buffered drain waits for its slot's fdatasync
+    /// (`Options::drain_syncs_beside` off), the shape before.
+    /// `supdb-ingestsyncafter`.
+    pub fn create_ingest_syncafter(path: &Path) -> Res<Supdb> {
+        Supdb::with_policy(
+            path,
+            Policy {
+                partition: false,
+                durable: false,
+                syncbeside: Some(false),
+                ..Policy::default()
+            },
+        )
+    }
+
+    /// `supdb` whose direct runs walk every record of a batch at the
+    /// commit and take the memtable hash of every key
+    /// (`Options::direct_lean_append` off), the shape before.
+    /// `supdb-directfull`.
+    pub fn create_directfull(path: &Path) -> Res<Supdb> {
+        Supdb::with_policy(
+            path,
+            Policy {
+                directlean: Some(false),
+                ..Policy::default()
+            },
+        )
+    }
+
+    /// `supdb` whose drain leaves a direct run's close to the seal thread
+    /// (`Options::close_readable_inline` off), the shape before.
+    /// `supdb-closeseal`.
+    pub fn create_closeseal(path: &Path) -> Res<Supdb> {
+        Supdb::with_policy(
+            path,
+            Policy {
+                closereadable: Some(false),
+                ..Policy::default()
+            },
+        )
+    }
+
+    /// `supdb-ingest` as `supdb-closeseal`. `supdb-ingestcloseseal`.
+    pub fn create_ingest_closeseal(path: &Path) -> Res<Supdb> {
+        Supdb::with_policy(
+            path,
+            Policy {
+                partition: false,
+                durable: false,
+                closereadable: Some(false),
+                ..Policy::default()
+            },
+        )
+    }
+
+    /// `supdb` whose every seal composes the Bloom a piece's open takes
+    /// (`Options::bloom_pieces_only` off), the shape before.
+    /// `supdb-bloomalways`.
+    pub fn create_bloomalways(path: &Path) -> Res<Supdb> {
+        Supdb::with_policy(
+            path,
+            Policy {
+                bloompieces: Some(false),
+                ..Policy::default()
+            },
+        )
+    }
+
+    /// `supdb-ingest` as `supdb-bloomalways`. `supdb-ingestbloomalways`.
+    pub fn create_ingest_bloomalways(path: &Path) -> Res<Supdb> {
+        Supdb::with_policy(
+            path,
+            Policy {
+                partition: false,
+                durable: false,
+                bloompieces: Some(false),
+                ..Policy::default()
+            },
+        )
+    }
+
+    /// `supdb` whose every landing that retires a table makes an empty
+    /// live one, installed or not (`Options::land_fresh_lazy` off), the
+    /// shape before. `supdb-landfresh`.
+    pub fn create_landfresh(path: &Path) -> Res<Supdb> {
+        Supdb::with_policy(
+            path,
+            Policy {
+                landfresh: Some(false),
+                ..Policy::default()
+            },
+        )
+    }
+
+    /// `supdb-ingest` as `supdb-landfresh`. `supdb-ingestlandfresh`.
+    pub fn create_ingest_landfresh(path: &Path) -> Res<Supdb> {
+        Supdb::with_policy(
+            path,
+            Policy {
+                partition: false,
+                durable: false,
+                landfresh: Some(false),
+                ..Policy::default()
+            },
+        )
+    }
+
+    /// `supdb` whose runs of ordered ingest make their file at their
+    /// first commit (`Options::run_spare` off), the shape before: the
+    /// first fdatasync carries the new inode and the first sync that
+    /// acknowledges anything fsyncs the directory for the name.
+    /// `supdb-runcreate`.
+    pub fn create_runcreate(path: &Path) -> Res<Supdb> {
+        Supdb::with_policy(
+            path,
+            Policy {
+                runspare: Some(false),
+                ..Policy::default()
+            },
+        )
+    }
+
+    /// `supdb-ingest` as `supdb-runcreate`. `supdb-ingestruncreate`.
+    pub fn create_ingest_runcreate(path: &Path) -> Res<Supdb> {
+        Supdb::with_policy(
+            path,
+            Policy {
+                partition: false,
+                durable: false,
+                runspare: Some(false),
+                ..Policy::default()
+            },
+        )
+    }
+
+    /// `supdb-ingest` as `supdb-directfull`. `supdb-ingestdirectfull`.
+    pub fn create_ingest_directfull(path: &Path) -> Res<Supdb> {
+        Supdb::with_policy(
+            path,
+            Policy {
+                partition: false,
+                durable: false,
+                directlean: Some(false),
+                ..Policy::default()
+            },
+        )
+    }
+
+    /// `supdb` whose every flush waits for its seal's fsyncs and slot
+    /// (`Options::drain_answers_readable` off), the shape before.
+    /// `supdb-drainstrict`.
+    pub fn create_drainstrict(path: &Path) -> Res<Supdb> {
+        Supdb::with_policy(
+            path,
+            Policy {
+                drainreadable: Some(false),
                 ..Policy::default()
             },
         )
@@ -10560,8 +11160,9 @@ impl Supdb {
             refvals,
             rowatclose,
             lendbursts,
-            nopace,
+            paced,
             pacelends,
+            heldfiles,
             inlineall,
             lazysettle,
             walsync,
@@ -10604,6 +11205,11 @@ impl Supdb {
             settleformnear,
             settlegallop,
             settlepatchwhole,
+            settleloads,
+            settlesortstwice,
+            settlestaged,
+            settlenoconvert,
+            settleconvertquiet,
             settlevaluenear,
             settletablenear,
             headslook,
@@ -10648,7 +11254,6 @@ impl Supdb {
             keycopies,
             fillplain,
             latesync,
-            runnospare,
             installreads,
             noabandon,
             deferbursts,
@@ -10671,6 +11276,13 @@ impl Supdb {
             zbuycross,
             copiesfit,
             chainuncovered,
+            drainreadable,
+            syncbeside,
+            directlean,
+            closereadable,
+            bloompieces,
+            landfresh,
+            runspare,
             formsoffbuilt,
             formson,
             formsoffkept,
@@ -10760,6 +11372,13 @@ impl Supdb {
             formahead,
             sparsespan,
             runsheld,
+            copyspan,
+            identityblob,
+            copythree,
+            headsgate,
+            frozencount,
+            settlesearch,
+            settlesources,
             scanlevers,
             densefrom,
             convert16,
@@ -10879,7 +11498,30 @@ impl Supdb {
             inplace,
             placedpieces,
             upkeepbatch,
+            shared,
+            sharednorecycle,
+            sharedbig,
+            sharednoahead,
+            sharedcapindex,
+            sharednorecords,
+            sharednoinplace,
+            sharednolean,
+            sharednohuge,
+            sharedeagerlen,
+            sharednowords,
+            sharednolone,
+            sharednofall,
+            sharedfallalways,
+            sharedrmwprobes,
+            noshare,
+            nopopulate,
+            ownhandle,
         } = policy;
+        // The table a held store with no frames makes for its handles'
+        // writes (`Options::share_on_write`) is sized as the big shared
+        // arm's is, from the store's keys, so that it holds the store as
+        // FASTER's log does.
+        let shares_big = held && noframes && !shared && !noshare && !inplace;
         // What the engine ships, so an arm that pins nothing inherits it
         // rather than restating it and drifting from it.
         let base_seal_max_pct = supdb::Options::default().seal_max_pct;
@@ -11021,12 +11663,13 @@ impl Supdb {
             // The upkeep where the arm puts it, or where the engine does.
             upkeep: upkeep.unwrap_or(supdb::Options::default().upkeep),
             upkeep_inline_bursts: !lendbursts,
-            upkeep_pace_pct: if nopace {
-                0
+            upkeep_pace_pct: if paced {
+                1
             } else {
                 supdb::Options::default().upkeep_pace_pct
             },
             upkeep_pace_holds: !pacelends,
+            held_bursts_lend: !heldfiles,
             upkeep_inline_min: if inlineall {
                 1
             } else {
@@ -11120,6 +11763,11 @@ impl Supdb {
                 supdb::Options::default().settle_seek_ahead
             },
             settle_patch_at_cut: !settlepatchwhole,
+            settle_gathers: !settleloads,
+            settle_sorts_once: !settlesortstwice,
+            settle_patch_in_place: !settlestaged,
+            settle_converts: !settlenoconvert,
+            settle_convert_fills: !settleconvertquiet,
             settle_value_ahead: if settlevaluenear {
                 0
             } else {
@@ -11179,7 +11827,6 @@ impl Supdb {
             manifest_pending: manifestpending,
             flush_waits_manifest: waitmanifest,
             close_presync: !latesync,
-            run_spare: !runnospare,
             ahead_sends_bounds: !installreads,
             upkeep_abandons: !noabandon,
             upkeep_files_bursts: !deferbursts,
@@ -11211,6 +11858,15 @@ impl Supdb {
                 .unwrap_or(supdb::Options::default().scan_cache_copies_fit),
             merge_chains_writes_uncovered: chainuncovered
                 .unwrap_or(supdb::Options::default().merge_chains_writes_uncovered),
+            drain_answers_readable: drainreadable
+                .unwrap_or(supdb::Options::default().drain_answers_readable),
+            drain_syncs_beside: syncbeside.unwrap_or(supdb::Options::default().drain_syncs_beside),
+            direct_lean_append: directlean.unwrap_or(supdb::Options::default().direct_lean_append),
+            close_readable_inline: closereadable
+                .unwrap_or(supdb::Options::default().close_readable_inline),
+            bloom_pieces_only: bloompieces.unwrap_or(supdb::Options::default().bloom_pieces_only),
+            land_fresh_lazy: landfresh.unwrap_or(supdb::Options::default().land_fresh_lazy),
+            run_spare: runspare.unwrap_or(supdb::Options::default().run_spare),
             scan_forms_off_counts_built: formsoffbuilt
                 .unwrap_or(supdb::Options::default().scan_forms_off_counts_built),
             scan_forms_off_unreused: !formson,
@@ -11404,6 +12060,13 @@ impl Supdb {
             scan_form_ahead: formahead || scanlevers,
             scan_prefetch_sparse_span: sparsespan || scanlevers,
             scan_runs_held: runsheld || scanlevers,
+            copy_prefetch_span: copyspan,
+            identity_by_keys: !identityblob,
+            copy_packed: !copythree,
+            heads_owned_past_fill: !headsgate,
+            frozen_bytes: if frozencount { usize::MAX } else { 0 },
+            settle_append_last: !settlesearch,
+            settle_lone_chain: !settlesources,
             forms_convert_from: if densefrom > 0 {
                 densefrom
             } else if convert16 {
@@ -11559,6 +12222,37 @@ impl Supdb {
             mem_hash_fold: !memfnv,
             put_in_place: inplace,
             point_placed_runs: !placedpieces,
+            shared_writers: shared,
+            share_on_write: !noshare,
+            shared_populates: !nopopulate,
+            shared_recycles: !sharednorecycle,
+            // The big table's sizing for the table a held store with no
+            // frames shares on demand too, which holds the store as
+            // FASTER's log does: `shares_big`.
+            shared_table_bytes: if sharedbig || shares_big {
+                shared_table_bytes()
+            } else {
+                0
+            },
+            shared_chunk_ahead: !sharednoahead,
+            shared_records: !sharednorecords,
+            shared_in_place: !sharednoinplace,
+            shared_lean: !sharednolean,
+            shared_huge: !sharednohuge,
+            shared_len_lazy: !sharedeagerlen,
+            point_fence_words: !sharednowords,
+            point_lone_absent: !sharednolone,
+            shared_fall_ahead: !sharednofall,
+            shared_fall_always: sharedfallalways,
+            shared_rmw_absent: !sharedrmwprobes,
+            shared_index_slots: if (sharedbig && !sharedcapindex) || shares_big {
+                shared_index_slots()
+            } else {
+                0
+            },
+            // A run of ordered ingest is the one writer's table, which the
+            // shared mode has none of.
+            direct_ingest: !shared,
             ..Default::default()
         };
         let opts = match advice {
@@ -11647,8 +12341,9 @@ impl Supdb {
             refvals,
             rowatclose,
             lendbursts,
-            nopace,
+            paced,
             pacelends,
+            heldfiles,
             inlineall,
             lazysettle,
             walsync,
@@ -11691,6 +12386,11 @@ impl Supdb {
             settleformnear,
             settlegallop,
             settlepatchwhole,
+            settleloads,
+            settlesortstwice,
+            settlestaged,
+            settlenoconvert,
+            settleconvertquiet,
             settlevaluenear,
             settletablenear,
             headslook,
@@ -11735,7 +12435,6 @@ impl Supdb {
             keycopies,
             fillplain,
             latesync,
-            runnospare,
             installreads,
             noabandon,
             deferbursts,
@@ -11758,6 +12457,13 @@ impl Supdb {
             zbuycross,
             copiesfit,
             chainuncovered,
+            drainreadable,
+            syncbeside,
+            directlean,
+            closereadable,
+            bloompieces,
+            landfresh,
+            runspare,
             formsoffbuilt,
             formson,
             formsoffkept,
@@ -11847,6 +12553,13 @@ impl Supdb {
             formahead,
             sparsespan,
             runsheld,
+            copyspan,
+            identityblob,
+            copythree,
+            headsgate,
+            frozencount,
+            settlesearch,
+            settlesources,
             scanlevers,
             densefrom,
             convert16,
@@ -11966,6 +12679,25 @@ impl Supdb {
             inplace,
             placedpieces,
             upkeepbatch,
+            shared,
+            sharednorecycle,
+            sharedbig,
+            sharednoahead,
+            sharedcapindex,
+            sharednorecords,
+            sharednoinplace,
+            sharednolean,
+            sharednohuge,
+            sharedeagerlen,
+            sharednowords,
+            sharednolone,
+            sharednofall,
+            sharedfallalways,
+            sharedrmwprobes,
+            noshare,
+            nopopulate,
+            ownhandle,
+            own: None,
             ord_threads: Default::default(),
         })
     }
@@ -12095,6 +12827,17 @@ impl ThreadReader for supdb::Reader {
     }
 }
 
+/// A thread handle's own counts of how its point reads were answered
+/// (`Reader::point_lean_reads`, `point_placed_reads`).
+fn handle_counters(r: &supdb::Reader) -> Vec<(&'static str, u64)> {
+    let (lone, layers) = r.point_lean_reads();
+    vec![
+        ("lone", lone),
+        ("layers", layers),
+        ("placed", r.point_placed_reads()),
+    ]
+}
+
 /// A writer thread's supdb: a `Reader` of its own for the reads, and the
 /// store's one writer, shared with the other threads, for the batches.
 struct SupdbWriter<'a> {
@@ -12106,6 +12849,9 @@ impl ThreadWriter for SupdbWriter<'_> {
     fn get(&mut self, key: &[u8]) -> Res<usize> {
         supdb_get(&self.r, key)
     }
+    fn counters(&self) -> Vec<(&'static str, u64)> {
+        handle_counters(&self.r)
+    }
     fn update_batch(&mut self, items: &[(&[u8], &[u8])]) -> Res<()> {
         let mut db = self
             .db
@@ -12113,6 +12859,80 @@ impl ThreadWriter for SupdbWriter<'_> {
             .map_err(|_| "a writer thread panicked holding the store".to_string())?;
         db.put_batch(items);
         db.commit().map_err(|e| e.to_string())
+    }
+}
+
+/// A writer thread's supdb under the shared live table
+/// (`Options::shared_writers`): its `Reader` reads and writes, and the
+/// store's one writer, behind a mutex, is taken only to freeze a table the
+/// handle found full -- the commit that freezes it, after which the write
+/// goes to the fresh table. A batch is its puts: what one put of it
+/// writes, every handle's next read sees, as a commit of the one writer's
+/// shows.
+struct SupdbSharedWriter<'a> {
+    db: std::sync::Arc<std::sync::Mutex<&'a mut supdb::Db>>,
+    r: supdb::Reader,
+    /// The tables this thread found full and froze (`freeze`).
+    freezes: std::cell::Cell<u64>,
+    /// The time those commits took, in microseconds.
+    freeze_us: std::cell::Cell<u64>,
+}
+
+impl ThreadWriter for SupdbSharedWriter<'_> {
+    fn get(&mut self, key: &[u8]) -> Res<usize> {
+        supdb_get(&self.r, key)
+    }
+    fn counters(&self) -> Vec<(&'static str, u64)> {
+        let mut c = handle_counters(&self.r);
+        c.push(("lean", self.r.shared_lean_ops()));
+        c.push(("rmw_below", self.r.shared_rmw_below()));
+        c.push(("fall_asks", self.r.shared_fall_asks()));
+        c.push(("freezes", self.freezes.get()));
+        c.push(("freeze_us", self.freeze_us.get()));
+        c
+    }
+    fn update_batch(&mut self, items: &[(&[u8], &[u8])]) -> Res<()> {
+        for (k, v) in items {
+            while !self.r.put(k, v).map_err(|e| e.to_string())? {
+                self.freeze()?;
+            }
+        }
+        Ok(())
+    }
+    /// The handle's own read-modify-write (`Reader::rmw`): one probe of
+    /// the live table where it holds the key's whole read, as FASTER's
+    /// `Rmw` is one operation.
+    fn rmw(&mut self, key: &[u8], value: &[u8]) -> Option<Res<usize>> {
+        Some((|| loop {
+            // Counted afresh at each try: a try that read through the older
+            // sources before its put was refused reads them again.
+            let mut n = 0usize;
+            if self
+                .r
+                .rmw(key, value, |v| n += consume(v))
+                .map_err(|e| e.to_string())?
+            {
+                return Ok(n);
+            }
+            self.freeze()?;
+        })())
+    }
+}
+
+impl SupdbSharedWriter<'_> {
+    /// The commit that freezes the table this thread's write found full.
+    fn freeze(&self) -> Res<()> {
+        self.freezes.set(self.freezes.get() + 1);
+        let t = std::time::Instant::now();
+        let r = self
+            .db
+            .lock()
+            .map_err(|_| "a writer thread panicked holding the store".to_string())?
+            .commit()
+            .map_err(|e| e.to_string());
+        self.freeze_us
+            .set(self.freeze_us.get() + t.elapsed().as_micros() as u64);
+        r
     }
 }
 
@@ -12189,8 +13009,78 @@ impl Engine for Supdb {
             if self.holdmarch {
                 return "supdb-heldmarch";
             }
+            if self.settleconvertquiet {
+                return if self.partition {
+                    "supdb-heldpartsettleconvertquiet"
+                } else {
+                    "supdb-heldnfsettleconvertquiet"
+                };
+            }
+            if self.noframes
+                && (self.settleloads
+                    || self.settlesortstwice
+                    || self.settlestaged
+                    || self.settlenoconvert)
+            {
+                return match (
+                    self.settleloads,
+                    self.settlesortstwice,
+                    self.settlestaged,
+                    self.settlenoconvert,
+                ) {
+                    (true, false, false, false) => "supdb-heldsettleloads",
+                    (false, true, false, false) => "supdb-heldsettlesortstwice",
+                    (false, false, true, false) => "supdb-heldsettlestaged",
+                    (false, false, false, true) => "supdb-heldsettlenoconvert",
+                    _ => "supdb-heldsettlefat",
+                };
+            }
             if self.noframes {
-                return if self.inplace && self.placedpieces {
+                return if self.noshare {
+                    "supdb-heldnoshare"
+                } else if self.nopopulate {
+                    "supdb-heldnopopulate"
+                } else if self.heldfiles && self.pacelends {
+                    "supdb-heldpacelends"
+                } else if self.heldfiles && self.paced {
+                    "supdb-heldpaced"
+                } else if self.heldfiles {
+                    "supdb-heldfiles"
+                } else if self.ownhandle {
+                    "supdb-heldhandle"
+                } else if self.shared && self.sharednorecycle {
+                    "supdb-heldsharednorecycle"
+                } else if self.shared && self.sharedbig && self.sharednoahead {
+                    "supdb-heldsharedbignoahead"
+                } else if self.shared && self.sharedbig && self.sharedcapindex {
+                    "supdb-heldsharedbigcapindex"
+                } else if self.shared && self.sharedbig && self.sharednorecords {
+                    "supdb-heldsharedbignorecords"
+                } else if self.shared && self.sharedbig && self.sharednoinplace {
+                    "supdb-heldsharedbignoinplace"
+                } else if self.shared && self.sharedbig && self.sharednolean {
+                    "supdb-heldsharedbignolean"
+                } else if self.shared && self.sharedbig && self.asympin {
+                    "supdb-heldsharedbigasym"
+                } else if self.shared && self.sharedbig && self.sharednohuge {
+                    "supdb-heldsharedbignohuge"
+                } else if self.shared && self.sharedbig && self.sharedeagerlen {
+                    "supdb-heldsharedbigeagerlen"
+                } else if self.shared && self.sharedbig && self.sharednowords {
+                    "supdb-heldsharedbignowords"
+                } else if self.shared && self.sharedbig && self.sharednolone {
+                    "supdb-heldsharedbignolone"
+                } else if self.shared && self.sharedbig && self.sharednofall {
+                    "supdb-heldsharedbignofall"
+                } else if self.shared && self.sharedbig && self.sharedfallalways {
+                    "supdb-heldsharedbigfallalways"
+                } else if self.shared && self.sharedbig && self.sharedrmwprobes {
+                    "supdb-heldsharedbigrmwprobes"
+                } else if self.shared && self.sharedbig {
+                    "supdb-heldsharedbig"
+                } else if self.shared {
+                    "supdb-heldshared"
+                } else if self.inplace && self.placedpieces {
                     "supdb-heldinplacepieces"
                 } else if self.inplace {
                     "supdb-heldinplace"
@@ -12217,7 +13107,11 @@ impl Engine for Supdb {
                 };
             }
             if self.partition {
-                return "supdb-heldpart";
+                return if self.frozencount {
+                    "supdb-heldpartfrozencount"
+                } else {
+                    "supdb-heldpart"
+                };
             }
             return match self.holdcap {
                 None => "supdb-held",
@@ -12904,11 +13798,11 @@ impl Engine for Supdb {
                 "supdb-ingestlendbursts"
             };
         }
-        if self.nopace {
-            return "supdb-ingestnopace";
-        }
         if self.pacelends {
             return "supdb-ingestpacelends";
+        }
+        if self.paced {
+            return "supdb-ingestpaced";
         }
         if self.inlineall {
             return if self.partition {
@@ -13054,6 +13948,47 @@ impl Engine for Supdb {
                 "supdb-runsheld"
             } else {
                 "supdb-ingestrunsheld"
+            };
+        }
+        if self.copyspan {
+            return if self.partition {
+                "supdb-copyspan"
+            } else {
+                "supdb-ingestcopyspan"
+            };
+        }
+        if self.headsgate {
+            return "supdb-headsgate";
+        }
+        if self.frozencount {
+            return "supdb-frozencount";
+        }
+        if self.copythree {
+            return if self.partition {
+                "supdb-copythree"
+            } else {
+                "supdb-ingestcopythree"
+            };
+        }
+        if self.identityblob {
+            return if self.partition {
+                "supdb-identityblob"
+            } else {
+                "supdb-ingestidentityblob"
+            };
+        }
+        if self.settlesearch {
+            return if self.partition {
+                "supdb-settlesearch"
+            } else {
+                "supdb-ingestsettlesearch"
+            };
+        }
+        if self.settlesources {
+            return if self.partition {
+                "supdb-settlesources"
+            } else {
+                "supdb-ingestsettlesources"
             };
         }
         if self.settlebuildsfiled {
@@ -13280,6 +14215,33 @@ impl Engine for Supdb {
         }
         if self.settleshedunbound {
             return "supdb-settleshedunbound";
+        }
+        if self.settleconvertquiet {
+            return if self.partition {
+                "supdb-settleconvertquiet"
+            } else {
+                "supdb-ingestsettleconvertquiet"
+            };
+        }
+        if self.settleloads || self.settlesortstwice || self.settlestaged || self.settlenoconvert {
+            return match (
+                self.partition,
+                self.settleloads,
+                self.settlesortstwice,
+                self.settlestaged,
+                self.settlenoconvert,
+            ) {
+                (true, true, false, false, false) => "supdb-settleloads",
+                (true, false, true, false, false) => "supdb-settlesortstwice",
+                (true, false, false, true, false) => "supdb-settlepatchstaged",
+                (true, false, false, false, true) => "supdb-settlenoconvert",
+                (true, ..) => "supdb-settlefat",
+                (false, true, false, false, false) => "supdb-ingestsettleloads",
+                (false, false, true, false, false) => "supdb-ingestsettlesortstwice",
+                (false, false, false, true, false) => "supdb-ingestsettlestaged",
+                (false, false, false, false, true) => "supdb-ingestsettlenoconvert",
+                (false, ..) => "supdb-ingestsettlefat",
+            };
         }
         if self.settleformnear
             && self.settlegallop
@@ -13535,9 +14497,6 @@ impl Engine for Supdb {
                 "supdb-ingestlatesync"
             };
         }
-        if self.runnospare {
-            return "supdb-runnospare";
-        }
         if self.installreads {
             return "supdb-installreads";
         }
@@ -13603,6 +14562,61 @@ impl Engine for Supdb {
         }
         if self.zbuycross == Some(false) {
             return "supdb-nobuycross";
+        }
+        if self.drainreadable == Some(true) {
+            return "supdb-drainreadable";
+        }
+        if self.drainreadable == Some(false) {
+            return "supdb-drainstrict";
+        }
+        if self.syncbeside == Some(true) {
+            return if self.partition {
+                "supdb-syncbeside"
+            } else {
+                "supdb-ingestsyncbeside"
+            };
+        }
+        if self.syncbeside == Some(false) {
+            return if self.partition {
+                "supdb-syncafter"
+            } else {
+                "supdb-ingestsyncafter"
+            };
+        }
+        if self.directlean == Some(false) {
+            return if self.partition {
+                "supdb-directfull"
+            } else {
+                "supdb-ingestdirectfull"
+            };
+        }
+        if self.closereadable == Some(false) {
+            return if self.partition {
+                "supdb-closeseal"
+            } else {
+                "supdb-ingestcloseseal"
+            };
+        }
+        if self.bloompieces == Some(false) {
+            return if self.partition {
+                "supdb-bloomalways"
+            } else {
+                "supdb-ingestbloomalways"
+            };
+        }
+        if self.landfresh == Some(false) {
+            return if self.partition {
+                "supdb-landfresh"
+            } else {
+                "supdb-ingestlandfresh"
+            };
+        }
+        if self.runspare == Some(false) {
+            return if self.partition {
+                "supdb-runcreate"
+            } else {
+                "supdb-ingestruncreate"
+            };
         }
         match (
             self.copiesfit == Some(false),
@@ -13870,7 +14884,9 @@ impl Engine for Supdb {
             // with reads that borrow it, so nothing observes a batch
             // half-applied. That is the axis LMDB held over every Supdb arm
             // and the residual every matched comparison carried.
-            transactions: true,
+            // But for the arm whose writes go a write at a time through a
+            // handle, each visible as it is made: FASTER's one level.
+            transactions: !self.ownhandle,
             // Equalized off, matching lmdb -- see create().
             checksums: false,
             reopen_for_write: true,
@@ -13885,6 +14901,21 @@ impl Engine for Supdb {
     }
     fn update_batch(&mut self, items: &[(&[u8], &[u8])]) -> Res<()> {
         let db = self.db.as_mut().ok_or("db closed")?;
+        if self.ownhandle {
+            // A write at a time through the handle, claimed at the first
+            // of them; a refused write commits and is made again, which
+            // freezes a table that is full.
+            let own = match &self.own {
+                Some(o) => o,
+                None => self.own.insert(db.writer().map_err(|e| e.to_string())?),
+            };
+            for (k, v) in items {
+                while !own.put(k, v).map_err(|e| e.to_string())? {
+                    db.commit().map_err(|e| e.to_string())?;
+                }
+            }
+            return Ok(());
+        }
         // One call for the batch, as `write_batch` makes of a load's: the
         // store pins once for all of it (`Db::put_batch`).
         db.put_batch(items);
@@ -13896,6 +14927,9 @@ impl Engine for Supdb {
         Ok(())
     }
     fn get(&mut self, key: &[u8]) -> Res<usize> {
+        if let Some(own) = &self.own {
+            return supdb_get(own, key);
+        }
         let db = self.db.as_ref().ok_or("db closed")?;
         supdb_get(db, key)
     }
@@ -14006,9 +15040,28 @@ impl Engine for Supdb {
             ("publishes", db.seal_waits().publishes as f64),
             ("seals_deferred", db.seal_waits().deferred as f64),
             ("seals_idle", db.seal_waits().idle_seals as f64),
+            // Flushes answered at their seal's readable landing
+            // (`Options::drain_answers_readable`).
+            ("drains_early", db.seal_waits().drains_early as f64),
+            // Of them, the drains that paid the sync they owed beside their
+            // seal (`Options::drain_syncs_beside`).
+            ("drains_beside", db.seal_waits().drains_beside as f64),
             ("wal_rotations", db.seal_waits().wal_rotations as f64),
             ("freeze_ms", db.seal_waits().freeze_ns as f64 / 1e6),
             ("join_wait_ms", db.seal_waits().join_wait_ns as f64 / 1e6),
+            // Freezes by the tables frozen ahead of them, and the waits for
+            // room the frozen tables' bytes made (`Options::frozen_bytes`).
+            ("frozen_ahead0", db.seal_waits().frozen_ahead[0] as f64),
+            ("frozen_ahead1", db.seal_waits().frozen_ahead[1] as f64),
+            ("frozen_ahead2", db.seal_waits().frozen_ahead[2] as f64),
+            (
+                "frozen_byte_waits",
+                db.seal_waits().frozen_byte_waits as f64,
+            ),
+            (
+                "frozen_byte_wait_ms",
+                db.seal_waits().frozen_byte_wait_ns as f64 / 1e6,
+            ),
             // The manifest publishes' time on the segment work's thread:
             // the slot's write and fdatasync, a device round trip each.
             ("publish_ms", db.seal_waits().publish_ns as f64 / 1e6),
@@ -14067,7 +15120,18 @@ impl Engine for Supdb {
             ("merge_plans", db.seal_waits().plans as f64),
             ("merges_beside", db.seal_waits().merges_beside as f64),
             ("merges_quiet", db.seal_waits().merges_quiet as f64),
+            ("keyseqs_kept", db.seal_waits().keyseqs_kept as f64),
             ("pieces_aligned", db.pieces_aligned() as u8 as f64),
+            // The shared tables installed for handles' writes and left
+            // again, at a commit and at a seal (`Db::share_counts`).
+            ("share_installs", db.share_counts()[0] as f64),
+            (
+                "share_leaves",
+                (db.share_counts()[1] + db.share_counts()[2]) as f64,
+            ),
+            // The bytes of those tables made whole at their install
+            // (`Options::shared_populates`).
+            ("share_populated", db.share_populated() as f64),
             // What the forms' upkeep did: see `Db::forms_events`.
             ("blk_by_upkeep", ev[0] as f64),
             ("table_drops", ev[1] as f64),
@@ -14087,6 +15151,10 @@ impl Engine for Supdb {
             ("walk_copy", wk[0] as f64),
             ("start_at_rank", cs[0] as f64),
             ("start_search", cs[1] as f64),
+            ("patch_at_rank", db.copy_patches()[0] as f64),
+            ("patch_search", db.copy_patches()[1] as f64),
+            ("copies_packed", db.copy_packs()[0] as f64),
+            ("copies_unpacked", db.copy_packs()[1] as f64),
             // The writer's scans whose start seek seeded the partition's
             // reader with its cursor (`Options::zpages_seek_seeds`).
             ("seek_seeds", ss as f64),
@@ -14134,6 +15202,7 @@ impl Engine for Supdb {
             ("heads_disowned", db.heads_owned_counts().1 as f64),
             ("heads_owned_mb", (db.heads_owned_counts().2 >> 20) as f64),
             ("heads_beside_copies", db.heads_beside_copies() as f64),
+            ("heads_past_fill", db.heads_past_fill() as f64),
             // The jobs' pool, process-wide and ever (`Options::jobs_pooled`).
             ("job_pool_takes", supdb::Db::job_pool_counts()[0] as f64),
             ("job_pool_keeps", supdb::Db::job_pool_counts()[1] as f64),
@@ -14187,6 +15256,8 @@ impl Engine for Supdb {
             ("fill_owed_due", db.fill_owed_due() as f64),
             ("ahead_skip_cold", db.ahead_cold() as f64),
             ("forms_cloned", db.forms_cloned() as f64),
+            ("settle_placed", db.settle_lean().0 as f64),
+            ("settle_converted", db.settle_lean().1 as f64),
             ("forms_trims", db.forms_trims() as f64),
             ("forms_trim_looks", db.forms_trim_looks() as f64),
             ("forms_trim_us", db.forms_trim_us() as f64),
@@ -14585,17 +15656,39 @@ impl Engine for Supdb {
         // writes from one handle, so a thread's batch is the handle held
         // for the batch's puts and its commit. The reads take no lock:
         // a `Reader` under `Latest` sees every commit before a read.
+        // A store that shares on demand takes a thread's writes through
+        // its handle as a shared one does, and its handles are claimed as
+        // handles that write (`Db::writer`): the first claim installs the
+        // shared table (`Options::share_on_write`), here, where the
+        // threads are given their handles, as FASTER's log stands from its
+        // open. A refused write still commits and writes again
+        // (`SupdbSharedWriter::freeze`): a table that fills is frozen so.
+        let shared = self.shared || db.shares();
         let mut readers = Vec::with_capacity(n);
         for _ in 0..n {
-            readers.push(db.reader().map_err(|e| e.to_string())?);
+            readers.push(if db.shares() {
+                db.writer().map_err(|e| e.to_string())?
+            } else {
+                db.reader().map_err(|e| e.to_string())?
+            });
         }
         let db = std::sync::Arc::new(std::sync::Mutex::new(db));
         Ok(readers
             .into_iter()
             .map(|r| {
                 let db = db.clone();
-                Box::new(move || Ok(Box::new(SupdbWriter { db, r }) as Box<dyn ThreadWriter + '_>))
-                    as WriterOpener<'_>
+                Box::new(move || {
+                    Ok(if shared {
+                        Box::new(SupdbSharedWriter {
+                            db,
+                            r,
+                            freezes: std::cell::Cell::new(0),
+                            freeze_us: std::cell::Cell::new(0),
+                        }) as Box<dyn ThreadWriter + '_>
+                    } else {
+                        Box::new(SupdbWriter { db, r }) as Box<dyn ThreadWriter + '_>
+                    })
+                }) as WriterOpener<'_>
             })
             .collect())
     }
@@ -15294,6 +16387,80 @@ pub fn set_store_bound(bytes: Option<u64>) {
 /// MiB through the same load where the index and the log were 896
 /// (`POINT_OPS_BOUND`). A bound too small for that is refused rather than
 /// sized into a store that cannot hold its own minimum.
+/// A shared arm's shape beside `supdb-heldshared`'s
+/// (`Supdb::create_held_shared`): its puts appending,
+/// `supdb-heldsharednorecycle`; its table sized as FASTER's log,
+/// `supdb-heldsharedbig`, and that with its probe asking nothing ahead,
+/// `supdb-heldsharedbignoahead`, or its index sized from its cap,
+/// `supdb-heldsharedbigcapindex`, or its keys apart from their chains,
+/// `supdb-heldsharedbignorecords`, or its puts overwriting nothing in
+/// place, `supdb-heldsharedbignoinplace`, or its operations all through
+/// the layered path, `supdb-heldsharedbignolean`; and the big arm with its
+/// pins plain stores the sweep fences for (`Options::asym_pins`),
+/// `supdb-heldsharedbigasym`, or its table on small pages,
+/// `supdb-heldsharedbignohuge`, or its inserts each carrying the slab's
+/// length, `supdb-heldsharedbigeagerlen`, or its point reads placing their
+/// partition by the fences' bytes, `supdb-heldsharedbignowords`, or its
+/// reads the lean probe found absent from the table taking the placed
+/// read, `supdb-heldsharedbignolone`, or its reads asking for their
+/// partition's slot only once the live table lacks the key,
+/// `supdb-heldsharedbignofall`, or all of them asking for it ahead of the
+/// table's probe, `supdb-heldsharedbigfallalways`, or its read-modify-writes
+/// of a key the table lacks probing it again before they read below it,
+/// `supdb-heldsharedbigrmwprobes`.
+#[derive(Clone, Copy, Default)]
+pub struct SharedShape {
+    pub norecycle: bool,
+    pub big: bool,
+    pub noahead: bool,
+    pub capindex: bool,
+    pub norecords: bool,
+    pub noinplace: bool,
+    pub nolean: bool,
+    pub asym: bool,
+    pub nohuge: bool,
+    pub eagerlen: bool,
+    pub nowords: bool,
+    pub nolone: bool,
+    pub nofall: bool,
+    pub fallalways: bool,
+    pub rmwprobes: bool,
+}
+
+/// The slots `supdb-heldsharedbig`'s shared index takes
+/// (`Options::shared_index_slots`): three for each key of the store, which
+/// rounds up to a power of two at most a third loaded once every key is
+/// in, where two a key would put a store of a power of two keys at the
+/// half its table is full at. At three hundred thousand keys it is a
+/// million slots, 8 MiB, half of FASTER's index for the same store.
+fn shared_index_slots() -> usize {
+    let keys = match STORE_KEYS.load(std::sync::atomic::Ordering::Relaxed) {
+        0 => 1 << 20,
+        n => n,
+    };
+    3 * keys as usize
+}
+
+/// The bytes of values `supdb-heldsharedbig`'s shared live table takes
+/// (`Options::shared_table_bytes`): twice the store's records as FASTER's
+/// log counts them (`faster_sizes`), so that a table whose puts reuse what
+/// they replace holds every key of the store, as FASTER's mutable region
+/// does, with room for the ranges its writers have replaced and not yet
+/// reused. Twice and not FASTER's four times, since the table's index is
+/// sized from its cap, a slot of eight bytes for each thirty-two bytes of
+/// values: at twice the records it is twice the bytes of FASTER's index for
+/// the same store (32 MiB against 16 at three hundred thousand keys), and
+/// at four times it would be four. A store whose size the pass did not say
+/// takes the default of a million keys, as FASTER's arm does.
+fn shared_table_bytes() -> usize {
+    let keys = match STORE_KEYS.load(std::sync::atomic::Ordering::Relaxed) {
+        0 => 1 << 20,
+        n => n,
+    };
+    let record = (8 + 16 + 8 + FASTER_VALUE as u64).div_ceil(8) * 8;
+    (keys * record * 2) as usize
+}
+
 pub fn faster_sizes(keys: u64, bound: Option<u64>) -> Res<(u64, u64, f64)> {
     const BUCKET: u64 = 64;
     const PAGE: u64 = 32 << 20;
@@ -15923,9 +17090,13 @@ macro_rules! roster {
     };
 }
 #[cfg(faster)]
-pub const ARMS: [&str; 15] = roster!("supdb-heldnoframes", "faster");
+pub const ARMS: [&str; 15] = ARMS_EVERYWHERE;
 #[cfg(not(faster))]
 pub const ARMS: [&str; 13] = roster!();
+/// `ARMS` as a host that builds FASTER has it, named on every host: the
+/// order the figures draw a row's curves in (`drawn_order`), since a row is
+/// drawn wherever it is read and not only where it was measured.
+pub const ARMS_EVERYWHERE: [&str; 15] = roster!("supdb-heldnoframes", "faster");
 
 /// The arms a bounded run (`Scale::Ooc`) measures by default: the default
 /// and the three shipping options whose difference is what a read past
@@ -15973,9 +17144,12 @@ macro_rules! ooc_roster {
     };
 }
 #[cfg(faster)]
-pub const OOC_ARMS: [&str; 10] = ooc_roster!("supdb-heldpart", "faster");
+pub const OOC_ARMS: [&str; 10] = OOC_ARMS_EVERYWHERE;
 #[cfg(not(faster))]
 pub const OOC_ARMS: [&str; 8] = ooc_roster!();
+/// `OOC_ARMS` as a host that builds FASTER has it, as `ARMS_EVERYWHERE` is
+/// `ARMS`.
+pub const OOC_ARMS_EVERYWHERE: [&str; 10] = ooc_roster!("supdb-heldpart", "faster");
 
 /// The stores encrypted at rest, each beside the plain store it is the
 /// encryption of: the engine under a cipher of the caller's
@@ -16237,6 +17411,12 @@ pub fn guarantee(arm: &str) -> Option<Guarantee> {
         | "supdb-settleformnear"
         | "supdb-settlegallop"
         | "supdb-settlepatchwhole"
+        | "supdb-settleloads"
+        | "supdb-settlesortstwice"
+        | "supdb-settlepatchstaged"
+        | "supdb-settlenoconvert"
+        | "supdb-settleconvertquiet"
+        | "supdb-settlefat"
         | "supdb-settlevaluenear"
         | "supdb-settlenoahead"
         | "supdb-settletablenear"
@@ -16285,7 +17465,6 @@ pub fn guarantee(arm: &str) -> Option<Guarantee> {
         | "supdb-keycopies"
         | "supdb-fillplain"
         | "supdb-latesync"
-        | "supdb-runnospare"
         | "supdb-installreads"
         | "supdb-noabandon"
         | "supdb-deferbursts"
@@ -16383,6 +17562,18 @@ pub fn guarantee(arm: &str) -> Option<Guarantee> {
         | "supdb-ingestsparsespan"
         | "supdb-runsheld"
         | "supdb-ingestrunsheld"
+        | "supdb-copyspan"
+        | "supdb-ingestcopyspan"
+        | "supdb-identityblob"
+        | "supdb-ingestidentityblob"
+        | "supdb-copythree"
+        | "supdb-ingestcopythree"
+        | "supdb-headsgate"
+        | "supdb-frozencount"
+        | "supdb-settlesearch"
+        | "supdb-ingestsettlesearch"
+        | "supdb-settlesources"
+        | "supdb-ingestsettlesources"
         | "supdb-scanlevers"
         | "supdb-ingestscanlevers"
         | "supdb-densefrom"
@@ -16452,6 +17643,15 @@ pub fn guarantee(arm: &str) -> Option<Guarantee> {
         | "supdb-onefile"
         | "supdb-ingestonefile"
         | "supdb-nobuycross"
+        | "supdb-drainreadable"
+        | "supdb-drainstrict"
+        | "supdb-syncbeside"
+        | "supdb-syncafter"
+        | "supdb-directfull"
+        | "supdb-closeseal"
+        | "supdb-bloomalways"
+        | "supdb-landfresh"
+        | "supdb-runcreate"
         | "supdb-jobspooled"
         | "supdb-zslabjobs"
         | "supdb-zstrideallslabjobs"
@@ -16519,7 +17719,13 @@ pub fn guarantee(arm: &str) -> Option<Guarantee> {
         | "supdb-ingestrefvals"
         | "supdb-ingestrowatclose"
         | "supdb-ingestlendbursts"
-        | "supdb-ingestnopace"
+        | "supdb-ingestpaced"
+        | "supdb-ingestsettleloads"
+        | "supdb-ingestsettlesortstwice"
+        | "supdb-ingestsettlestaged"
+        | "supdb-ingestsettlenoconvert"
+        | "supdb-ingestsettleconvertquiet"
+        | "supdb-ingestsettlefat"
         | "supdb-ingestpacelends"
         | "supdb-ingestinlineall"
         | "supdb-ingestlazysettle"
@@ -16554,6 +17760,13 @@ pub fn guarantee(arm: &str) -> Option<Guarantee> {
         | "supdb-ingestwake"
         | "supdb-ingestnoprefetch"
         | "supdb-ingestdirplain"
+        | "supdb-ingestsyncbeside"
+        | "supdb-ingestsyncafter"
+        | "supdb-ingestdirectfull"
+        | "supdb-ingestcloseseal"
+        | "supdb-ingestbloomalways"
+        | "supdb-ingestlandfresh"
+        | "supdb-ingestruncreate"
         | "supdb-ingestsettlefar"
         | "supdb-ingesttofit"
         | "supdb-ingestprefetch1k"
@@ -16606,6 +17819,9 @@ pub fn guarantee(arm: &str) -> Option<Guarantee> {
         | "supdb-held8m"
         | "supdb-heldmarch"
         | "supdb-heldpart"
+        | "supdb-heldpartfrozencount"
+        | "supdb-heldpartsettleconvertquiet"
+        | "supdb-heldnfsettleconvertquiet"
         | "supdb-heldnoframes"
         | "supdb-heldnfnocache"
         | "supdb-heldnorecordahead"
@@ -16617,7 +17833,35 @@ pub fn guarantee(arm: &str) -> Option<Guarantee> {
         | "supdb-heldinplace"
         | "supdb-heldinplacepieces"
         | "supdb-heldnfinline"
+        | "supdb-heldshared"
+        | "supdb-heldsharednorecycle"
+        | "supdb-heldsharedbig"
+        | "supdb-heldsharedbignoahead"
+        | "supdb-heldsharedbigcapindex"
+        | "supdb-heldsharedbignorecords"
+        | "supdb-heldsharedbignoinplace"
+        | "supdb-heldsharedbignolean"
+        | "supdb-heldsharedbigasym"
+        | "supdb-heldsharedbignohuge"
+        | "supdb-heldsharedbigeagerlen"
+        | "supdb-heldsharedbignowords"
+        | "supdb-heldsharedbignolone"
+        | "supdb-heldsharedbignofall"
+        | "supdb-heldsharedbigfallalways"
+        | "supdb-heldsharedbigrmwprobes"
+        | "supdb-heldnoshare"
+        | "supdb-heldnopopulate"
+        | "supdb-heldhandle"
+        | "supdb-heldfiles"
+        | "supdb-heldsettleloads"
+        | "supdb-heldsettlesortstwice"
+        | "supdb-heldsettlestaged"
+        | "supdb-heldsettlenoconvert"
+        | "supdb-heldsettlefat"
+        | "supdb-heldpaced"
+        | "supdb-heldpacelends"
         | "supdb-heldbatch1"
+        | "proto-shared"
         | "faster" => Guarantee::Memory,
         _ => return None,
     })
@@ -17226,6 +18470,311 @@ pub fn open(arm: &str, dir: &Path, map_gb: usize) -> Res<Box<dyn Engine>> {
             },
             dir,
         )?,
+        "supdb-heldshared" => supdb_arm(
+            |d| Supdb::create_held_shared(d, SharedShape::default()),
+            dir,
+        )?,
+        "supdb-heldsharednorecycle" => supdb_arm(
+            |d| {
+                Supdb::create_held_shared(
+                    d,
+                    SharedShape {
+                        norecycle: true,
+                        ..SharedShape::default()
+                    },
+                )
+            },
+            dir,
+        )?,
+        "supdb-heldnoshare" => supdb_arm(
+            |d| {
+                Supdb::with_policy(
+                    d,
+                    Policy {
+                        partition: false,
+                        durable: false,
+                        held: true,
+                        noframes: true,
+                        noshare: true,
+                        ..Policy::default()
+                    },
+                )
+            },
+            dir,
+        )?,
+        "supdb-heldnopopulate" => supdb_arm(
+            |d| {
+                Supdb::with_policy(
+                    d,
+                    Policy {
+                        partition: false,
+                        durable: false,
+                        held: true,
+                        noframes: true,
+                        nopopulate: true,
+                        ..Policy::default()
+                    },
+                )
+            },
+            dir,
+        )?,
+        "supdb-heldhandle" => supdb_arm(
+            |d| {
+                Supdb::with_policy(
+                    d,
+                    Policy {
+                        partition: false,
+                        durable: false,
+                        held: true,
+                        noframes: true,
+                        ownhandle: true,
+                        ..Policy::default()
+                    },
+                )
+            },
+            dir,
+        )?,
+        // The roster's arm with a burst's batches filed by their commits,
+        // as under any policy that is not the held log
+        // (`Options::held_bursts_lend` off).
+        "supdb-heldfiles" => supdb_arm(
+            |d| {
+                Supdb::with_policy(
+                    d,
+                    Policy {
+                        partition: false,
+                        durable: false,
+                        held: true,
+                        noframes: true,
+                        heldfiles: true,
+                        ..Policy::default()
+                    },
+                )
+            },
+            dir,
+        )?,
+        // `supdb-heldfiles` with the batches of a burst after its first
+        // lent and held for until the thread has filed each
+        // (`Options::upkeep_pace_pct` at one).
+        "supdb-heldpaced" => supdb_arm(
+            |d| {
+                Supdb::with_policy(
+                    d,
+                    Policy {
+                        partition: false,
+                        durable: false,
+                        held: true,
+                        noframes: true,
+                        heldfiles: true,
+                        paced: true,
+                        ..Policy::default()
+                    },
+                )
+            },
+            dir,
+        )?,
+        // `supdb-heldpaced` with a paced batch lent within the share and
+        // not held for (`Options::upkeep_pace_holds` off).
+        "supdb-heldpacelends" => supdb_arm(
+            |d| {
+                Supdb::with_policy(
+                    d,
+                    Policy {
+                        partition: false,
+                        durable: false,
+                        held: true,
+                        noframes: true,
+                        heldfiles: true,
+                        paced: true,
+                        pacelends: true,
+                        ..Policy::default()
+                    },
+                )
+            },
+            dir,
+        )?,
+        "supdb-heldsharedbig" => supdb_arm(
+            |d| {
+                Supdb::create_held_shared(
+                    d,
+                    SharedShape {
+                        big: true,
+                        ..SharedShape::default()
+                    },
+                )
+            },
+            dir,
+        )?,
+        "supdb-heldsharedbignoahead" => supdb_arm(
+            |d| {
+                Supdb::create_held_shared(
+                    d,
+                    SharedShape {
+                        big: true,
+                        noahead: true,
+                        ..SharedShape::default()
+                    },
+                )
+            },
+            dir,
+        )?,
+        "supdb-heldsharedbignoinplace" => supdb_arm(
+            |d| {
+                Supdb::create_held_shared(
+                    d,
+                    SharedShape {
+                        big: true,
+                        noinplace: true,
+                        ..SharedShape::default()
+                    },
+                )
+            },
+            dir,
+        )?,
+        "supdb-heldsharedbignolean" => supdb_arm(
+            |d| {
+                Supdb::create_held_shared(
+                    d,
+                    SharedShape {
+                        big: true,
+                        nolean: true,
+                        ..SharedShape::default()
+                    },
+                )
+            },
+            dir,
+        )?,
+        "supdb-heldsharedbigasym" => supdb_arm(
+            |d| {
+                Supdb::create_held_shared(
+                    d,
+                    SharedShape {
+                        big: true,
+                        asym: true,
+                        ..SharedShape::default()
+                    },
+                )
+            },
+            dir,
+        )?,
+        "supdb-heldsharedbignohuge" => supdb_arm(
+            |d| {
+                Supdb::create_held_shared(
+                    d,
+                    SharedShape {
+                        big: true,
+                        nohuge: true,
+                        ..SharedShape::default()
+                    },
+                )
+            },
+            dir,
+        )?,
+        "supdb-heldsharedbigeagerlen" => supdb_arm(
+            |d| {
+                Supdb::create_held_shared(
+                    d,
+                    SharedShape {
+                        big: true,
+                        eagerlen: true,
+                        ..SharedShape::default()
+                    },
+                )
+            },
+            dir,
+        )?,
+        "supdb-heldsharedbignowords" => supdb_arm(
+            |d| {
+                Supdb::create_held_shared(
+                    d,
+                    SharedShape {
+                        big: true,
+                        nowords: true,
+                        ..SharedShape::default()
+                    },
+                )
+            },
+            dir,
+        )?,
+        "supdb-heldsharedbignolone" => supdb_arm(
+            |d| {
+                Supdb::create_held_shared(
+                    d,
+                    SharedShape {
+                        big: true,
+                        nolone: true,
+                        ..SharedShape::default()
+                    },
+                )
+            },
+            dir,
+        )?,
+        "supdb-heldsharedbignofall" => supdb_arm(
+            |d| {
+                Supdb::create_held_shared(
+                    d,
+                    SharedShape {
+                        big: true,
+                        nofall: true,
+                        ..SharedShape::default()
+                    },
+                )
+            },
+            dir,
+        )?,
+        "supdb-heldsharedbigfallalways" => supdb_arm(
+            |d| {
+                Supdb::create_held_shared(
+                    d,
+                    SharedShape {
+                        big: true,
+                        fallalways: true,
+                        ..SharedShape::default()
+                    },
+                )
+            },
+            dir,
+        )?,
+        "supdb-heldsharedbigrmwprobes" => supdb_arm(
+            |d| {
+                Supdb::create_held_shared(
+                    d,
+                    SharedShape {
+                        big: true,
+                        rmwprobes: true,
+                        ..SharedShape::default()
+                    },
+                )
+            },
+            dir,
+        )?,
+
+        "supdb-heldsharedbignorecords" => supdb_arm(
+            |d| {
+                Supdb::create_held_shared(
+                    d,
+                    SharedShape {
+                        big: true,
+                        norecords: true,
+                        ..SharedShape::default()
+                    },
+                )
+            },
+            dir,
+        )?,
+        "supdb-heldsharedbigcapindex" => supdb_arm(
+            |d| {
+                Supdb::create_held_shared(
+                    d,
+                    SharedShape {
+                        big: true,
+                        capindex: true,
+                        ..SharedShape::default()
+                    },
+                )
+            },
+            dir,
+        )?,
         "supdb-heldnfnocache" => supdb_arm(
             |d| {
                 Supdb::with_policy(
@@ -17715,6 +19264,174 @@ pub fn open(arm: &str, dir: &Path, map_gb: usize) -> Res<Box<dyn Engine>> {
             },
             dir,
         )?,
+        "supdb-copyspan" => supdb_arm(
+            |d| {
+                Supdb::with_policy(
+                    d,
+                    Policy {
+                        copyspan: true,
+                        ..Policy::default()
+                    },
+                )
+            },
+            dir,
+        )?,
+        "supdb-ingestcopyspan" => supdb_arm(
+            |d| {
+                Supdb::with_policy(
+                    d,
+                    Policy {
+                        partition: false,
+                        durable: false,
+                        copyspan: true,
+                        ..Policy::default()
+                    },
+                )
+            },
+            dir,
+        )?,
+        "supdb-copythree" => supdb_arm(
+            |d| {
+                Supdb::with_policy(
+                    d,
+                    Policy {
+                        copythree: true,
+                        ..Policy::default()
+                    },
+                )
+            },
+            dir,
+        )?,
+        "supdb-headsgate" => supdb_arm(
+            |d| {
+                Supdb::with_policy(
+                    d,
+                    Policy {
+                        headsgate: true,
+                        ..Policy::default()
+                    },
+                )
+            },
+            dir,
+        )?,
+        "supdb-frozencount" => supdb_arm(
+            |d| {
+                Supdb::with_policy(
+                    d,
+                    Policy {
+                        frozencount: true,
+                        ..Policy::default()
+                    },
+                )
+            },
+            dir,
+        )?,
+        "supdb-heldpartfrozencount" => supdb_arm(
+            |d| {
+                Supdb::with_policy(
+                    d,
+                    Policy {
+                        durable: false,
+                        held: true,
+                        frozencount: true,
+                        ..Policy::default()
+                    },
+                )
+            },
+            dir,
+        )?,
+        "supdb-ingestcopythree" => supdb_arm(
+            |d| {
+                Supdb::with_policy(
+                    d,
+                    Policy {
+                        partition: false,
+                        durable: false,
+                        copythree: true,
+                        ..Policy::default()
+                    },
+                )
+            },
+            dir,
+        )?,
+        "supdb-identityblob" => supdb_arm(
+            |d| {
+                Supdb::with_policy(
+                    d,
+                    Policy {
+                        identityblob: true,
+                        ..Policy::default()
+                    },
+                )
+            },
+            dir,
+        )?,
+        "supdb-ingestidentityblob" => supdb_arm(
+            |d| {
+                Supdb::with_policy(
+                    d,
+                    Policy {
+                        partition: false,
+                        durable: false,
+                        identityblob: true,
+                        ..Policy::default()
+                    },
+                )
+            },
+            dir,
+        )?,
+        "supdb-settlesearch" => supdb_arm(
+            |d| {
+                Supdb::with_policy(
+                    d,
+                    Policy {
+                        settlesearch: true,
+                        ..Policy::default()
+                    },
+                )
+            },
+            dir,
+        )?,
+        "supdb-ingestsettlesearch" => supdb_arm(
+            |d| {
+                Supdb::with_policy(
+                    d,
+                    Policy {
+                        partition: false,
+                        durable: false,
+                        settlesearch: true,
+                        ..Policy::default()
+                    },
+                )
+            },
+            dir,
+        )?,
+        "supdb-settlesources" => supdb_arm(
+            |d| {
+                Supdb::with_policy(
+                    d,
+                    Policy {
+                        settlesources: true,
+                        ..Policy::default()
+                    },
+                )
+            },
+            dir,
+        )?,
+        "supdb-ingestsettlesources" => supdb_arm(
+            |d| {
+                Supdb::with_policy(
+                    d,
+                    Policy {
+                        partition: false,
+                        durable: false,
+                        settlesources: true,
+                        ..Policy::default()
+                    },
+                )
+            },
+            dir,
+        )?,
         "supdb-scanlevers" => supdb_arm(
             |d| {
                 Supdb::with_policy(
@@ -17920,6 +19637,22 @@ pub fn open(arm: &str, dir: &Path, map_gb: usize) -> Res<Box<dyn Engine>> {
         "supdb-onefile" => supdb_arm(Supdb::create_onefile, dir)?,
         "supdb-ingestonefile" => supdb_arm(Supdb::create_ingest_onefile, dir)?,
         "supdb-nobuycross" => supdb_arm(Supdb::create_nobuycross, dir)?,
+        "supdb-drainreadable" => supdb_arm(Supdb::create_drainreadable, dir)?,
+        "supdb-drainstrict" => supdb_arm(Supdb::create_drainstrict, dir)?,
+        "supdb-syncbeside" => supdb_arm(Supdb::create_syncbeside, dir)?,
+        "supdb-ingestsyncbeside" => supdb_arm(Supdb::create_ingest_syncbeside, dir)?,
+        "supdb-syncafter" => supdb_arm(Supdb::create_syncafter, dir)?,
+        "supdb-ingestsyncafter" => supdb_arm(Supdb::create_ingest_syncafter, dir)?,
+        "supdb-directfull" => supdb_arm(Supdb::create_directfull, dir)?,
+        "supdb-closeseal" => supdb_arm(Supdb::create_closeseal, dir)?,
+        "supdb-ingestcloseseal" => supdb_arm(Supdb::create_ingest_closeseal, dir)?,
+        "supdb-bloomalways" => supdb_arm(Supdb::create_bloomalways, dir)?,
+        "supdb-ingestbloomalways" => supdb_arm(Supdb::create_ingest_bloomalways, dir)?,
+        "supdb-landfresh" => supdb_arm(Supdb::create_landfresh, dir)?,
+        "supdb-ingestlandfresh" => supdb_arm(Supdb::create_ingest_landfresh, dir)?,
+        "supdb-runcreate" => supdb_arm(Supdb::create_runcreate, dir)?,
+        "supdb-ingestruncreate" => supdb_arm(Supdb::create_ingest_runcreate, dir)?,
+        "supdb-ingestdirectfull" => supdb_arm(Supdb::create_ingest_directfull, dir)?,
         "supdb-jobspooled" => supdb_arm(Supdb::create_jobspooled, dir)?,
         "supdb-zslabjobs" => supdb_arm(Supdb::create_zslabjobs, dir)?,
         "supdb-zstrideallslabjobs" => supdb_arm(Supdb::create_zstride_all_slab_jobs, dir)?,
@@ -17948,7 +19681,7 @@ pub fn open(arm: &str, dir: &Path, map_gb: usize) -> Res<Box<dyn Engine>> {
         "supdb-ingestbglag" => supdb_arm(Supdb::create_ingest_bglag, dir)?,
         "supdb-lendbursts" => supdb_arm(Supdb::create_lendbursts, dir)?,
         "supdb-ingestlendbursts" => supdb_arm(Supdb::create_ingest_lendbursts, dir)?,
-        "supdb-ingestnopace" => supdb_arm(Supdb::create_ingest_nopace, dir)?,
+        "supdb-ingestpaced" => supdb_arm(Supdb::create_ingest_paced, dir)?,
         "supdb-ingestpacelends" => supdb_arm(Supdb::create_ingest_pacelends, dir)?,
         "supdb-inlineall" => supdb_arm(Supdb::create_inlineall, dir)?,
         "supdb-ingestinlineall" => supdb_arm(Supdb::create_ingest_inlineall, dir)?,
@@ -18187,6 +19920,287 @@ pub fn open(arm: &str, dir: &Path, map_gb: usize) -> Res<Box<dyn Engine>> {
                     d,
                     Policy {
                         settlegallop: true,
+                        ..Policy::default()
+                    },
+                )
+            },
+            dir,
+        )?,
+        // The settle as it stood before its lean path, a part at a time and
+        // all four: the resolve's loads (`Options::settle_gathers` off), the
+        // batch sorted twice (`Options::settle_sorts_once` off),
+        // every patch staged (`Options::settle_patch_in_place` off) and the
+        // dense forms left to the fill (`Options::settle_converts` off),
+        // for the durable arm, the buffered and the held log's.
+        "supdb-settleloads" => supdb_arm(
+            |d| {
+                Supdb::with_policy(
+                    d,
+                    Policy {
+                        settleloads: true,
+                        ..Policy::default()
+                    },
+                )
+            },
+            dir,
+        )?,
+        "supdb-settlepatchstaged" => supdb_arm(
+            |d| {
+                Supdb::with_policy(
+                    d,
+                    Policy {
+                        settlestaged: true,
+                        ..Policy::default()
+                    },
+                )
+            },
+            dir,
+        )?,
+        "supdb-settlenoconvert" => supdb_arm(
+            |d| {
+                Supdb::with_policy(
+                    d,
+                    Policy {
+                        settlenoconvert: true,
+                        ..Policy::default()
+                    },
+                )
+            },
+            dir,
+        )?,
+        "supdb-settlefat" => supdb_arm(
+            |d| {
+                Supdb::with_policy(
+                    d,
+                    Policy {
+                        settleloads: true,
+                        settlesortstwice: true,
+                        settlestaged: true,
+                        settlenoconvert: true,
+                        ..Policy::default()
+                    },
+                )
+            },
+            dir,
+        )?,
+        "supdb-ingestsettleloads" => supdb_arm(
+            |d| {
+                Supdb::with_policy(
+                    d,
+                    Policy {
+                        partition: false,
+                        durable: false,
+                        settleloads: true,
+                        ..Policy::default()
+                    },
+                )
+            },
+            dir,
+        )?,
+        "supdb-ingestsettlestaged" => supdb_arm(
+            |d| {
+                Supdb::with_policy(
+                    d,
+                    Policy {
+                        partition: false,
+                        durable: false,
+                        settlestaged: true,
+                        ..Policy::default()
+                    },
+                )
+            },
+            dir,
+        )?,
+        "supdb-ingestsettlenoconvert" => supdb_arm(
+            |d| {
+                Supdb::with_policy(
+                    d,
+                    Policy {
+                        partition: false,
+                        durable: false,
+                        settlenoconvert: true,
+                        ..Policy::default()
+                    },
+                )
+            },
+            dir,
+        )?,
+        "supdb-heldpartsettleconvertquiet" => supdb_arm(
+            |d| {
+                Supdb::with_policy(
+                    d,
+                    Policy {
+                        durable: false,
+                        held: true,
+                        settleconvertquiet: true,
+                        ..Policy::default()
+                    },
+                )
+            },
+            dir,
+        )?,
+        "supdb-heldnfsettleconvertquiet" => supdb_arm(
+            |d| {
+                Supdb::with_policy(
+                    d,
+                    Policy {
+                        partition: false,
+                        durable: false,
+                        held: true,
+                        noframes: true,
+                        settleconvertquiet: true,
+                        ..Policy::default()
+                    },
+                )
+            },
+            dir,
+        )?,
+        "supdb-settleconvertquiet" => supdb_arm(
+            |d| {
+                Supdb::with_policy(
+                    d,
+                    Policy {
+                        settleconvertquiet: true,
+                        ..Policy::default()
+                    },
+                )
+            },
+            dir,
+        )?,
+        "supdb-ingestsettleconvertquiet" => supdb_arm(
+            |d| {
+                Supdb::with_policy(
+                    d,
+                    Policy {
+                        partition: false,
+                        durable: false,
+                        settleconvertquiet: true,
+                        ..Policy::default()
+                    },
+                )
+            },
+            dir,
+        )?,
+        "supdb-ingestsettlefat" => supdb_arm(
+            |d| {
+                Supdb::with_policy(
+                    d,
+                    Policy {
+                        partition: false,
+                        durable: false,
+                        settleloads: true,
+                        settlesortstwice: true,
+                        settlestaged: true,
+                        settlenoconvert: true,
+                        ..Policy::default()
+                    },
+                )
+            },
+            dir,
+        )?,
+        "supdb-heldsettleloads" => supdb_arm(
+            |d| {
+                Supdb::with_policy(
+                    d,
+                    Policy {
+                        partition: false,
+                        durable: false,
+                        held: true,
+                        noframes: true,
+                        settleloads: true,
+                        ..Policy::default()
+                    },
+                )
+            },
+            dir,
+        )?,
+        "supdb-heldsettlestaged" => supdb_arm(
+            |d| {
+                Supdb::with_policy(
+                    d,
+                    Policy {
+                        partition: false,
+                        durable: false,
+                        held: true,
+                        noframes: true,
+                        settlestaged: true,
+                        ..Policy::default()
+                    },
+                )
+            },
+            dir,
+        )?,
+        "supdb-heldsettlenoconvert" => supdb_arm(
+            |d| {
+                Supdb::with_policy(
+                    d,
+                    Policy {
+                        partition: false,
+                        durable: false,
+                        held: true,
+                        noframes: true,
+                        settlenoconvert: true,
+                        ..Policy::default()
+                    },
+                )
+            },
+            dir,
+        )?,
+        "supdb-heldsettlefat" => supdb_arm(
+            |d| {
+                Supdb::with_policy(
+                    d,
+                    Policy {
+                        partition: false,
+                        durable: false,
+                        held: true,
+                        noframes: true,
+                        settleloads: true,
+                        settlesortstwice: true,
+                        settlestaged: true,
+                        settlenoconvert: true,
+                        ..Policy::default()
+                    },
+                )
+            },
+            dir,
+        )?,
+        "supdb-settlesortstwice" => supdb_arm(
+            |d| {
+                Supdb::with_policy(
+                    d,
+                    Policy {
+                        settlesortstwice: true,
+                        ..Policy::default()
+                    },
+                )
+            },
+            dir,
+        )?,
+        "supdb-ingestsettlesortstwice" => supdb_arm(
+            |d| {
+                Supdb::with_policy(
+                    d,
+                    Policy {
+                        partition: false,
+                        durable: false,
+                        settlesortstwice: true,
+                        ..Policy::default()
+                    },
+                )
+            },
+            dir,
+        )?,
+        "supdb-heldsettlesortstwice" => supdb_arm(
+            |d| {
+                Supdb::with_policy(
+                    d,
+                    Policy {
+                        partition: false,
+                        durable: false,
+                        held: true,
+                        noframes: true,
+                        settlesortstwice: true,
                         ..Policy::default()
                     },
                 )
@@ -18659,7 +20673,6 @@ pub fn open(arm: &str, dir: &Path, map_gb: usize) -> Res<Box<dyn Engine>> {
         "supdb-fillplain" => supdb_arm(Supdb::create_fillplain, dir)?,
         "supdb-ingestfillplain" => supdb_arm(Supdb::create_ingest_fillplain, dir)?,
         "supdb-latesync" => supdb_arm(Supdb::create_latesync, dir)?,
-        "supdb-runnospare" => supdb_arm(Supdb::create_runnospare, dir)?,
         "supdb-installreads" => supdb_arm(Supdb::create_installreads, dir)?,
         "supdb-noabandon" => supdb_arm(Supdb::create_noabandon, dir)?,
         "supdb-deferbursts" => supdb_arm(Supdb::create_deferbursts, dir)?,
@@ -18814,6 +20827,15 @@ pub fn open(arm: &str, dir: &Path, map_gb: usize) -> Res<Box<dyn Engine>> {
         "rocksdb-tuned-nosync" => Box::new(Rocks::create_tuned_nosync(dir)?),
         #[cfg(faster)]
         "faster" => Box::new(Faster::create(dir)?),
+        // The probe's live table shared by every writer thread, over a
+        // read-only base (`proto::Shared`): what a shared live table
+        // costs the threaded writers' mixes, beside FASTER's.
+        "proto-shared" => Box::new(crate::proto::Shared::create(
+            match STORE_KEYS.load(std::sync::atomic::Ordering::Relaxed) {
+                0 => 1 << 20,
+                n => n,
+            },
+        )),
         #[cfg(not(faster))]
         "faster" => return Err("faster: FASTER's C++ store is built on Linux x86-64 alone".into()),
         other => return Err(format!("no such arm: {other}")),
@@ -18903,6 +20925,24 @@ pub fn check_matched(arms: &[String], dir: &Path) -> Res<()> {
 pub fn every_arm() -> Vec<&'static str> {
     let mut v: Vec<&'static str> = ARMS.to_vec();
     for a in OOC_ARMS {
+        if !v.contains(&a) {
+            v.push(a);
+        }
+    }
+    v
+}
+
+/// The rosters' arms in the order the figures draw curves in, each once:
+/// `every_arm` as a host that builds FASTER has it, on every host. The
+/// arms of FASTER's guarantee are in this build's rosters only where
+/// FASTER is built (`cfg(faster)`, Linux on x86-64), and a figure is
+/// drawn from a row wherever the row is read: ordered by this build's
+/// rosters, a row that carried `supdb-heldnoframes` drew it by its place in
+/// the roster on the host that measured it and by its name on ARM and
+/// macOS, and the committed figures failed their check on both.
+pub fn drawn_order() -> Vec<&'static str> {
+    let mut v: Vec<&'static str> = ARMS_EVERYWHERE.to_vec();
+    for a in OOC_ARMS_EVERYWHERE {
         if !v.contains(&a) {
             v.push(a);
         }
@@ -19155,6 +21195,10 @@ mod tests {
         assert!(
             fo.point_record_ahead && fo.scan_block_cache && fo.upkeep_alert && fo.index_populated
         );
+        assert!(
+            fo.share_on_write && fo.shared_table_bytes > 0 && fo.shared_index_slots > 0,
+            "the roster's arm shares its table on demand, sized as the big shared arm's"
+        );
         for (arm, differs) in [
             (
                 "supdb-heldnorecordahead",
@@ -19167,6 +21211,8 @@ mod tests {
             ("supdb-heldlivefirst", |a| a.point_live_first),
             ("supdb-heldmemfnv", |a| !a.mem_hash_fold),
             ("supdb-heldbatch1", |a| a.upkeep_batch_pct == 1),
+            ("supdb-heldnoshare", |a| !a.share_on_write),
+            ("supdb-heldnopopulate", |a| !a.shared_populates),
         ] {
             let e = open(arm, &root.join(arm), 1).unwrap();
             assert_eq!(e.name(), arm);
@@ -19200,6 +21246,14 @@ mod tests {
                 },
                 "supdb-heldbatch1" => Policy {
                     upkeepbatch: Some(1),
+                    ..Policy::default()
+                },
+                "supdb-heldnoshare" => Policy {
+                    noshare: true,
+                    ..Policy::default()
+                },
+                "supdb-heldnopopulate" => Policy {
+                    nopopulate: true,
                     ..Policy::default()
                 },
                 _ => Policy {
@@ -19271,6 +21325,193 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
+    /// The shared arm is `supdb-heldnfinline` with the live table shared
+    /// by every handle's writes, and ordered ingest off, which the sharing
+    /// needs: named, in FASTER's row, and opened with those two options
+    /// set against that arm's and the held log's shape the same.
+    #[test]
+    fn the_shared_arm_is_the_inline_held_arm_with_its_table_shared() {
+        let root =
+            std::env::temp_dir().join(format!("supdb-bench-sharedarm-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let e = open("supdb-heldshared", &root.join("shared"), 1).unwrap();
+        assert_eq!(e.name(), "supdb-heldshared");
+        assert_eq!(guarantee("supdb-heldshared"), Some(Guarantee::Memory));
+        let base = open("supdb-heldnfinline", &root.join("inline"), 1).unwrap();
+        assert_eq!(e.features(), base.features());
+        drop((e, base));
+        let made = |name: &str, shared: bool| {
+            Supdb::with_policy(
+                &root.join(name),
+                Policy {
+                    partition: false,
+                    durable: false,
+                    held: true,
+                    noframes: true,
+                    block_cache: false,
+                    upkeep: Some(supdb::Upkeep::Inline),
+                    shared,
+                    ..Policy::default()
+                },
+            )
+            .unwrap()
+        };
+        let (s, b) = (made("shared-policy", true), made("inline-policy", false));
+        assert_eq!(
+            (s.name(), b.name()),
+            ("supdb-heldshared", "supdb-heldnfinline")
+        );
+        let (so, bo) = (
+            s.db.as_ref().unwrap().options().clone(),
+            b.db.as_ref().unwrap().options().clone(),
+        );
+        assert!(so.shared_writers && !bo.shared_writers);
+        assert!(!so.direct_ingest && bo.direct_ingest);
+        for o in [&so, &bo] {
+            assert!(matches!(o.sync, supdb::SyncPolicy::Explicit));
+            assert!(!o.held_frames && !o.scan_block_cache && !o.put_in_place);
+            assert_eq!(o.upkeep, supdb::Upkeep::Inline);
+        }
+        assert!(so.shared_recycles && so.shared_table_bytes == 0);
+        drop((s, b));
+        // And its siblings, each the arm, or the big arm, but for one
+        // option.
+        let shape = |norecycle, big, noahead, capindex, norecords| SharedShape {
+            norecycle,
+            big,
+            noahead,
+            capindex,
+            norecords,
+            noinplace: false,
+            nolean: false,
+            asym: false,
+            nohuge: false,
+            eagerlen: false,
+            nowords: false,
+            nolone: false,
+            nofall: false,
+            fallalways: false,
+            rmwprobes: false,
+        };
+        for (arm, s) in [
+            (
+                "supdb-heldsharednorecycle",
+                shape(true, false, false, false, false),
+            ),
+            (
+                "supdb-heldsharedbig",
+                shape(false, true, false, false, false),
+            ),
+            (
+                "supdb-heldsharedbignoahead",
+                shape(false, true, true, false, false),
+            ),
+            (
+                "supdb-heldsharedbigcapindex",
+                shape(false, true, false, true, false),
+            ),
+            (
+                "supdb-heldsharedbignorecords",
+                shape(false, true, false, false, true),
+            ),
+            (
+                "supdb-heldsharedbignoinplace",
+                SharedShape {
+                    noinplace: true,
+                    ..shape(false, true, false, false, false)
+                },
+            ),
+            (
+                "supdb-heldsharedbignolean",
+                SharedShape {
+                    nolean: true,
+                    ..shape(false, true, false, false, false)
+                },
+            ),
+            (
+                "supdb-heldsharedbigasym",
+                SharedShape {
+                    asym: true,
+                    ..shape(false, true, false, false, false)
+                },
+            ),
+            (
+                "supdb-heldsharedbignohuge",
+                SharedShape {
+                    nohuge: true,
+                    ..shape(false, true, false, false, false)
+                },
+            ),
+            (
+                "supdb-heldsharedbigeagerlen",
+                SharedShape {
+                    eagerlen: true,
+                    ..shape(false, true, false, false, false)
+                },
+            ),
+            (
+                "supdb-heldsharedbignowords",
+                SharedShape {
+                    nowords: true,
+                    ..shape(false, true, false, false, false)
+                },
+            ),
+            (
+                "supdb-heldsharedbignolone",
+                SharedShape {
+                    nolone: true,
+                    ..shape(false, true, false, false, false)
+                },
+            ),
+            (
+                "supdb-heldsharedbignofall",
+                SharedShape {
+                    nofall: true,
+                    ..shape(false, true, false, false, false)
+                },
+            ),
+            (
+                "supdb-heldsharedbigfallalways",
+                SharedShape {
+                    fallalways: true,
+                    ..shape(false, true, false, false, false)
+                },
+            ),
+            (
+                "supdb-heldsharedbigrmwprobes",
+                SharedShape {
+                    rmwprobes: true,
+                    ..shape(false, true, false, false, false)
+                },
+            ),
+        ] {
+            let e = open(arm, &root.join(arm), 1).unwrap();
+            assert_eq!(e.name(), arm);
+            assert_eq!(guarantee(arm), Some(Guarantee::Memory), "{arm}");
+            drop(e);
+            let a = Supdb::create_held_shared(&root.join(format!("{arm}-policy")), s).unwrap();
+            assert_eq!(a.name(), arm);
+            let ao = a.db.as_ref().unwrap().options().clone();
+            assert!(ao.shared_writers && !ao.direct_ingest, "{arm}");
+            assert_eq!(ao.shared_recycles, !s.norecycle, "{arm}");
+            assert_eq!(ao.shared_table_bytes > 0, s.big, "{arm}");
+            assert_eq!(ao.shared_chunk_ahead, !s.noahead, "{arm}");
+            assert_eq!(ao.shared_index_slots > 0, s.big && !s.capindex, "{arm}");
+            assert_eq!(ao.shared_records, !s.norecords, "{arm}");
+            assert_eq!(ao.shared_in_place, !s.noinplace, "{arm}");
+            assert_eq!(ao.shared_lean, !s.nolean, "{arm}");
+            assert_eq!(ao.asym_pins, s.asym, "{arm}");
+            assert_eq!(ao.shared_huge, !s.nohuge, "{arm}");
+            assert_eq!(ao.shared_len_lazy, !s.eagerlen, "{arm}");
+            assert_eq!(ao.point_fence_words, !s.nowords, "{arm}");
+            assert_eq!(ao.point_lone_absent, !s.nolone, "{arm}");
+            assert_eq!(ao.shared_fall_ahead, !s.nofall, "{arm}");
+            assert_eq!(ao.shared_fall_always, s.fallalways, "{arm}");
+            assert_eq!(ao.shared_rmw_absent, !s.rmwprobes, "{arm}");
+        }
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
     /// The handles a threaded mix gives its threads write the store the
     /// arm opened, and read what they wrote: three threads at once, each
     /// over keys of its own, read every key at the length the load gave it,
@@ -19288,7 +21529,21 @@ mod tests {
             .map(|i| format!("{i:016}").into_bytes())
             .collect();
         let (was, now) = (vec![7u8; 100], vec![9u8; 60]);
-        for arm in ["supdb-ingest", "lmdb-nosync", "rocksdb-tuned-nosync"] {
+        for arm in [
+            "supdb-ingest",
+            "supdb-heldshared",
+            "supdb-heldsharednorecycle",
+            // The table shared on demand: the threads' first writes are
+            // refused by the one writer's table, the commit one of them
+            // makes installs a shared one, and each write is made again.
+            "supdb-heldnoframes",
+            // And the same store with its table the one writer's.
+            "supdb-heldnoshare",
+            // And with its shared table made as the threads write it.
+            "supdb-heldnopopulate",
+            "lmdb-nosync",
+            "rocksdb-tuned-nosync",
+        ] {
             let mut e = open(arm, &root.join(arm), 1).unwrap();
             let pairs: Vec<(&[u8], &[u8])> = keys
                 .iter()
@@ -19300,7 +21555,7 @@ mod tests {
             let barrier = std::sync::Barrier::new(3);
             std::thread::scope(|s| {
                 for (i, open) in openers.into_iter().enumerate() {
-                    let (keys, now, barrier) = (&keys, &now, &barrier);
+                    let (keys, was, now, barrier) = (&keys, &was, &now, &barrier);
                     s.spawn(move || {
                         let mut w = open().unwrap();
                         let mine: Vec<&Vec<u8>> = keys.iter().skip(i).step_by(3).collect();
@@ -19316,6 +21571,17 @@ mod tests {
                             w.update_batch(&pairs).unwrap();
                             for k in batch {
                                 assert_eq!(w.get(k).unwrap(), 60, "{arm}: its own commit");
+                            }
+                            // An arm's own read-modify-write, where it has
+                            // one, reads what the batch left and puts the
+                            // loaded length back, which the batch after
+                            // reads as loaded.
+                            for k in batch {
+                                if let Some(read) = w.rmw(k, was) {
+                                    assert_eq!(read.unwrap(), 60, "{arm}: its rmw's read");
+                                    assert_eq!(w.get(k).unwrap(), 100, "{arm}: its rmw's put");
+                                    w.update_batch(&[(k.as_slice(), now.as_slice())]).unwrap();
+                                }
                             }
                         }
                     });
@@ -21481,6 +23747,174 @@ mod tests {
             }
             {
                 let z = Supdb::with_policy(
+                    &dir("copyspan"),
+                    Policy {
+                        copyspan: true,
+                        ..Policy::default()
+                    },
+                )
+                .unwrap();
+                assert_eq!(z.name(), "supdb-copyspan");
+                assert_eq!(z.features(), base.features());
+                let o = z.db.as_ref().unwrap().options();
+                assert!(o.copy_prefetch_span && !b.copy_prefetch_span);
+            }
+            {
+                let z = Supdb::with_policy(
+                    &dir("copythree"),
+                    Policy {
+                        copythree: true,
+                        ..Policy::default()
+                    },
+                )
+                .unwrap();
+                assert_eq!(z.name(), "supdb-copythree");
+                assert_eq!(z.features(), base.features());
+                let o = z.db.as_ref().unwrap().options();
+                assert!(!o.copy_packed && b.copy_packed);
+                assert!(o.heads_owned_past_fill);
+            }
+            {
+                let z = Supdb::with_policy(
+                    &dir("headsgate"),
+                    Policy {
+                        headsgate: true,
+                        ..Policy::default()
+                    },
+                )
+                .unwrap();
+                assert_eq!(z.name(), "supdb-headsgate");
+                assert_eq!(z.features(), base.features());
+                let o = z.db.as_ref().unwrap().options();
+                assert!(!o.heads_owned_past_fill && b.heads_owned_past_fill);
+                assert!(o.copy_packed);
+            }
+            {
+                let z = Supdb::with_policy(
+                    &dir("frozencount"),
+                    Policy {
+                        frozencount: true,
+                        ..Policy::default()
+                    },
+                )
+                .unwrap();
+                assert_eq!(z.name(), "supdb-frozencount");
+                assert_eq!(z.features(), base.features());
+                let o = z.db.as_ref().unwrap().options();
+                assert!(o.frozen_bytes == usize::MAX && b.frozen_bytes == 0);
+                let z = Supdb::with_policy(
+                    &dir("heldpartfrozencount"),
+                    Policy {
+                        durable: false,
+                        held: true,
+                        frozencount: true,
+                        ..Policy::default()
+                    },
+                )
+                .unwrap();
+                assert_eq!(z.name(), "supdb-heldpartfrozencount");
+                assert_eq!(z.db.as_ref().unwrap().options().frozen_bytes, usize::MAX);
+            }
+            {
+                let z = Supdb::with_policy(
+                    &dir("settleconvertquiet"),
+                    Policy {
+                        settleconvertquiet: true,
+                        ..Policy::default()
+                    },
+                )
+                .unwrap();
+                assert_eq!(z.name(), "supdb-settleconvertquiet");
+                assert_eq!(z.features(), base.features());
+                let o = z.db.as_ref().unwrap().options();
+                assert!(!o.settle_convert_fills && b.settle_convert_fills);
+                assert!(o.settle_converts);
+                let z = Supdb::with_policy(
+                    &dir("ingestsettleconvertquiet"),
+                    Policy {
+                        partition: false,
+                        durable: false,
+                        settleconvertquiet: true,
+                        ..Policy::default()
+                    },
+                )
+                .unwrap();
+                assert_eq!(z.name(), "supdb-ingestsettleconvertquiet");
+                assert!(!z.db.as_ref().unwrap().options().settle_convert_fills);
+                let z = Supdb::with_policy(
+                    &dir("heldpartsettleconvertquiet"),
+                    Policy {
+                        durable: false,
+                        held: true,
+                        settleconvertquiet: true,
+                        ..Policy::default()
+                    },
+                )
+                .unwrap();
+                assert_eq!(z.name(), "supdb-heldpartsettleconvertquiet");
+                assert!(!z.db.as_ref().unwrap().options().settle_convert_fills);
+                let z = Supdb::with_policy(
+                    &dir("heldnfsettleconvertquiet"),
+                    Policy {
+                        partition: false,
+                        durable: false,
+                        held: true,
+                        noframes: true,
+                        settleconvertquiet: true,
+                        ..Policy::default()
+                    },
+                )
+                .unwrap();
+                assert_eq!(z.name(), "supdb-heldnfsettleconvertquiet");
+                assert!(!z.db.as_ref().unwrap().options().settle_convert_fills);
+            }
+            {
+                let z = Supdb::with_policy(
+                    &dir("identityblob"),
+                    Policy {
+                        identityblob: true,
+                        ..Policy::default()
+                    },
+                )
+                .unwrap();
+                assert_eq!(z.name(), "supdb-identityblob");
+                assert_eq!(z.features(), base.features());
+                let o = z.db.as_ref().unwrap().options();
+                assert!(!o.identity_by_keys && b.identity_by_keys);
+                assert!(o.settle_append_last);
+            }
+            {
+                let z = Supdb::with_policy(
+                    &dir("settlesearch"),
+                    Policy {
+                        settlesearch: true,
+                        ..Policy::default()
+                    },
+                )
+                .unwrap();
+                assert_eq!(z.name(), "supdb-settlesearch");
+                assert_eq!(z.features(), base.features());
+                let o = z.db.as_ref().unwrap().options();
+                assert!(!o.settle_append_last && b.settle_append_last);
+                assert!(o.settle_lone_chain);
+            }
+            {
+                let z = Supdb::with_policy(
+                    &dir("settlesources"),
+                    Policy {
+                        settlesources: true,
+                        ..Policy::default()
+                    },
+                )
+                .unwrap();
+                assert_eq!(z.name(), "supdb-settlesources");
+                assert_eq!(z.features(), base.features());
+                let o = z.db.as_ref().unwrap().options();
+                assert!(!o.settle_lone_chain && b.settle_lone_chain);
+                assert!(o.settle_append_last);
+            }
+            {
+                let z = Supdb::with_policy(
                     &dir("convert16"),
                     Policy {
                         convert16: true,
@@ -21872,6 +24306,246 @@ mod tests {
                             .unwrap();
                     assert_eq!(z.name(), "supdb-ingestcipherautoonefile");
                     assert!(z.db.as_ref().unwrap().options().one_file);
+                }
+                // A flush answered at its seal's readable landing, and the
+                // strict one, each differing from the default by that alone.
+                for (z, on) in [
+                    (
+                        Supdb::create_drainreadable(&dir("drainreadable")).unwrap(),
+                        true,
+                    ),
+                    (
+                        Supdb::create_drainstrict(&dir("drainstrict")).unwrap(),
+                        false,
+                    ),
+                ] {
+                    assert_eq!(
+                        z.name(),
+                        if on {
+                            "supdb-drainreadable"
+                        } else {
+                            "supdb-drainstrict"
+                        }
+                    );
+                    assert_eq!(z.features(), base.features());
+                    let o = z.db.as_ref().unwrap().options();
+                    assert_eq!(o.drain_answers_readable, on);
+                    let drain = |o: &supdb::Options| {
+                        (
+                            o.flush_waits_manifest,
+                            o.close_presync,
+                            o.drain_syncs_wal,
+                            o.manifest_slots,
+                            o.drain_names_partition,
+                            o.zpages_buy_crosses,
+                            o.jobs_mapped,
+                        )
+                    };
+                    assert_eq!(drain(o), drain(b));
+                    let arm = z.name();
+                    assert_eq!(
+                        open(arm, &dir(&format!("{arm}-open")), 1).unwrap().name(),
+                        arm
+                    );
+                    assert_eq!(guarantee(arm), guarantee("supdb"), "{arm}");
+                }
+                // A drain that pays the sync it owes beside its seal, pinned
+                // on, and the shape before, durable and buffered, each
+                // differing from its sibling by that alone.
+                let sib = Supdb::create_ingest(&dir("ingestsib")).unwrap();
+                for (z, s, arm, on) in [
+                    (
+                        Supdb::create_syncbeside(&dir("syncbeside")).unwrap(),
+                        &base,
+                        "supdb-syncbeside",
+                        true,
+                    ),
+                    (
+                        Supdb::create_ingest_syncbeside(&dir("ingestsyncbeside")).unwrap(),
+                        &sib,
+                        "supdb-ingestsyncbeside",
+                        true,
+                    ),
+                    (
+                        Supdb::create_syncafter(&dir("syncafter")).unwrap(),
+                        &base,
+                        "supdb-syncafter",
+                        false,
+                    ),
+                    (
+                        Supdb::create_ingest_syncafter(&dir("ingestsyncafter")).unwrap(),
+                        &sib,
+                        "supdb-ingestsyncafter",
+                        false,
+                    ),
+                ] {
+                    assert_eq!(z.name(), arm);
+                    assert_eq!(z.features(), s.features(), "{arm}");
+                    let o = z.db.as_ref().unwrap().options();
+                    let so = s.db.as_ref().unwrap().options();
+                    assert_eq!(o.drain_syncs_beside, on, "{arm}");
+                    assert!(so.drain_syncs_beside, "the engine's default pays beside");
+                    assert_eq!(
+                        (o.drain_answers_readable, o.close_presync, o.drain_syncs_wal),
+                        (
+                            so.drain_answers_readable,
+                            so.close_presync,
+                            so.drain_syncs_wal
+                        ),
+                        "{arm}"
+                    );
+                    assert_eq!(
+                        open(arm, &dir(&format!("{arm}-open")), 1).unwrap().name(),
+                        arm
+                    );
+                    assert_eq!(guarantee(arm), guarantee(s.name()), "{arm}");
+                }
+                // A direct run that walks every record at the commit, the
+                // shape before, durable and buffered, each differing from its
+                // sibling by that alone.
+                for (z, s, arm, lean, inline) in [
+                    (
+                        Supdb::create_directfull(&dir("directfull")).unwrap(),
+                        &base,
+                        "supdb-directfull",
+                        false,
+                        true,
+                    ),
+                    (
+                        Supdb::create_ingest_directfull(&dir("ingestdirectfull")).unwrap(),
+                        &sib,
+                        "supdb-ingestdirectfull",
+                        false,
+                        true,
+                    ),
+                    (
+                        Supdb::create_closeseal(&dir("closeseal")).unwrap(),
+                        &base,
+                        "supdb-closeseal",
+                        true,
+                        false,
+                    ),
+                    (
+                        Supdb::create_ingest_closeseal(&dir("ingestcloseseal")).unwrap(),
+                        &sib,
+                        "supdb-ingestcloseseal",
+                        true,
+                        false,
+                    ),
+                ] {
+                    assert_eq!(z.name(), arm);
+                    assert_eq!(z.features(), s.features(), "{arm}");
+                    let o = z.db.as_ref().unwrap().options();
+                    let so = s.db.as_ref().unwrap().options();
+                    assert_eq!(
+                        (o.direct_lean_append, o.close_readable_inline),
+                        (lean, inline),
+                        "{arm}"
+                    );
+                    assert!(
+                        so.direct_lean_append && so.close_readable_inline,
+                        "the engine's defaults"
+                    );
+                    assert_eq!(
+                        (o.direct_stream, o.direct_derive_keys, o.direct_slim_entries),
+                        (
+                            so.direct_stream,
+                            so.direct_derive_keys,
+                            so.direct_slim_entries
+                        ),
+                        "{arm}"
+                    );
+                    assert_eq!(
+                        open(arm, &dir(&format!("{arm}-open")), 1).unwrap().name(),
+                        arm
+                    );
+                    assert_eq!(guarantee(arm), guarantee(s.name()), "{arm}");
+                }
+                for (z, s, arm, bloom, fresh) in [
+                    (
+                        Supdb::create_bloomalways(&dir("bloomalways")).unwrap(),
+                        &base,
+                        "supdb-bloomalways",
+                        false,
+                        true,
+                    ),
+                    (
+                        Supdb::create_ingest_bloomalways(&dir("ingestbloomalways")).unwrap(),
+                        &sib,
+                        "supdb-ingestbloomalways",
+                        false,
+                        true,
+                    ),
+                    (
+                        Supdb::create_landfresh(&dir("landfresh")).unwrap(),
+                        &base,
+                        "supdb-landfresh",
+                        true,
+                        false,
+                    ),
+                    (
+                        Supdb::create_ingest_landfresh(&dir("ingestlandfresh")).unwrap(),
+                        &sib,
+                        "supdb-ingestlandfresh",
+                        true,
+                        false,
+                    ),
+                ] {
+                    assert_eq!(z.name(), arm);
+                    assert_eq!(z.features(), s.features(), "{arm}");
+                    let o = z.db.as_ref().unwrap().options();
+                    let so = s.db.as_ref().unwrap().options();
+                    assert_eq!(
+                        (o.bloom_pieces_only, o.land_fresh_lazy),
+                        (bloom, fresh),
+                        "{arm}"
+                    );
+                    assert!(
+                        so.bloom_pieces_only && so.land_fresh_lazy,
+                        "the engine's defaults"
+                    );
+                    assert_eq!(
+                        open(arm, &dir(&format!("{arm}-open")), 1).unwrap().name(),
+                        arm
+                    );
+                    assert_eq!(guarantee(arm), guarantee(s.name()), "{arm}");
+                }
+                for (z, s, arm) in [
+                    (
+                        Supdb::create_runcreate(&dir("runcreate")).unwrap(),
+                        &base,
+                        "supdb-runcreate",
+                    ),
+                    (
+                        Supdb::create_ingest_runcreate(&dir("ingestruncreate")).unwrap(),
+                        &sib,
+                        "supdb-ingestruncreate",
+                    ),
+                ] {
+                    assert_eq!(z.name(), arm);
+                    assert_eq!(z.features(), s.features(), "{arm}");
+                    let o = z.db.as_ref().unwrap().options();
+                    let so = s.db.as_ref().unwrap().options();
+                    assert!(!o.run_spare, "{arm}");
+                    assert!(so.run_spare, "the engine's default");
+                    assert_eq!(
+                        (
+                            o.bloom_pieces_only,
+                            o.land_fresh_lazy,
+                            o.close_readable_inline
+                        ),
+                        (
+                            so.bloom_pieces_only,
+                            so.land_fresh_lazy,
+                            so.close_readable_inline
+                        ),
+                        "{arm}: the arm differs in the run's file alone"
+                    );
+                    assert_eq!(
+                        open(arm, &dir(&format!("{arm}-open")), 1).unwrap().name(),
+                        arm
+                    );
+                    assert_eq!(guarantee(arm), guarantee(s.name()), "{arm}");
                 }
                 let z = Supdb::create_jobsheap(&dir("jobsheap")).unwrap();
                 assert_eq!(z.name(), "supdb-jobsheap");

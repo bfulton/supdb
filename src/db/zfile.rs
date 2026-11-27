@@ -6833,6 +6833,10 @@ pub(super) struct ZEvents {
     /// partitions, bytes: the hash regions and the record regions.
     pub model_hash: AtomicU64,
     pub model_records: AtomicU64,
+    /// The store's files whole as the tick last summed them, bytes: every
+    /// segment's hash region, record region and ordered index, the
+    /// level-0 pieces' with the partitions' (`Options::heads_owned_past_fill`).
+    pub model_whole: AtomicU64,
     /// Form files the controller retired: taken out of their cells through
     /// the epoch and given dead names for the idle sweep.
     pub retired: AtomicU64,
@@ -7608,6 +7612,10 @@ pub(super) struct BuildPlan {
     /// rename while the bit is set, so a test can land what it likes
     /// between a build's last look at the cancel and its file's name.
     pub hold: Option<std::sync::Arc<std::sync::atomic::AtomicU8>>,
+    /// Whether the tests' crash has ended the store the build is of
+    /// (`Db::crash`): a build held before its rename in such a store
+    /// leaves its file under the temp name, as a crash there does.
+    pub life: Option<std::sync::Arc<super::Life>>,
     /// The form file's own pages written back and dropped from the page
     /// cache once it is written (`drop_written`): a build ahead the
     /// controller has not bought, beside a raw form that fits its budget,
@@ -7692,6 +7700,7 @@ impl BuildPlan {
             own_decode: false,
             cancel: None,
             hold: None,
+            life: None,
             drop_output: false,
             sync: false,
             stride: StrideAsk::No,
@@ -7725,10 +7734,12 @@ impl BuildPlan {
             .is_some_and(|c| c.load(Ordering::Acquire))
     }
 
-    fn wait_rename(&self) {
-        if let Some(h) = &self.hold {
-            super::zbuild_hold_wait(h, super::ZHOLD_RENAME);
-        }
+    /// The test's hold before the rename waited out, or `true` where the
+    /// store was crashed under it.
+    fn wait_rename(&self) -> bool {
+        self.hold
+            .as_ref()
+            .is_some_and(|h| super::zbuild_hold_wait(h, super::ZHOLD_RENAME, self.life.as_deref()))
     }
 }
 
@@ -8087,7 +8098,11 @@ fn name_built(
         let _ = super::vault::remove_file(tmp);
         return Ok(Outcome::Cancelled);
     }
-    plan.wait_rename();
+    if plan.wait_rename() {
+        // Crashed under the hold: the file stays under its temp name, for
+        // the open after to find as a crash before the rename leaves it.
+        return Ok(Outcome::Cancelled);
+    }
     super::vault::rename(tmp, out).inspect_err(|_| {
         let _ = super::vault::remove_file(tmp);
     })?;

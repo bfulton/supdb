@@ -29,7 +29,9 @@ changed, and because its largest run, at 100 MB, never left the page cache.
 **Interleave the arms.** Every arm in one process, round-robin within a
 rep. Blocked execution confounds a comparison with anything that drifts
 across the run; two runs on instances of the same nominal machine have
-moved untouched comparator arms by half.
+moved untouched comparator arms by half. And each rep in an order of its
+own (`run::rep_order`): round-robin in one order gives every arm one
+predecessor for the whole run (a predecessor every rep, below).
 
 **Never compare two separate runs.** The only comparison is within a row.
 Across rows, a quantity is compared only to its own history in its own
@@ -264,7 +266,9 @@ resident to 2.1 GB. The runner now releases freed memory after every
 store a pass drops, and the pass line prints what the process holds as
 the next pass opens, so a climb shows while it is happening.
 `a_dropped_stores_freed_memory_is_returned_before_the_next_pass`
-reproduces the shape and released 0 of its 300 MB without the release.
+reproduces the shape and released 0 of its 300 MB without the release;
+it has a binary of its own (`tests/trim.rs`), since the release is the
+process's and any test beside it that runs a pass trims its blocks first.
 It came back inside one store's life: the shuffled load's merges at ten
 million keys left 742 MB of freed memory in the arenas with the engine
 holding 11, and under a bound of 1 GiB the lag sweep's full rewrite put
@@ -993,6 +997,64 @@ save step of its own, since the one cache action that does both saves
 only where the job passed, and a job that fails on its table had built
 the tool for nothing.
 
+**A predecessor every rep.** The arms ran in the roster's order in every
+rep, so an arm's pass followed the same arm's pass for the whole run, and
+the rows read the durable ordered load at ten and thirty thousand keys at
+0.88x to 0.92x of RocksDB's where pairings of the two read it 1.04x to
+1.09x in both orders. Neither engine had moved. With four arms of one load
+path set after LMDB's, FASTER's, RocksDB's and each other's passes in one
+run, the load straight after FASTER's pass read 9.80, 9.80 and 9.85 ms
+whichever of the four stood there and the others 8.1 to 8.7 with one at
+9.3, and at thirty thousand keys 26.0 and 24.8 against 21.8 to 23.5
+(`SUPDB_LOAD_PHASES=1 bench run --scale quick --top 10000 --bottom 10000
+--reps 12 --arms
+lmdb,supdb-settle,faster,supdb-nosnap,rocksdb-tuned,supdb-noadvice,supdb-nocache
+--out DIR`, and with the four supdb arms in two other placements, at
+`4c1acb2`). `supdb` is first in the roster and FASTER last, so since
+FASTER joined, every rep of every rung set the shipping arm's load after
+FASTER's pass and RocksDB's after LMDB's. The rows had said so in a cell
+nobody compared: `supdb`'s load at 0.80x to 0.91x of `supdb-nocache`'s at
+ten thousand keys in the last three, the same code seven places on.
+
+By the load's own phases the excess is a third the harness's and two
+thirds the commits': the batches' building 1.3 ms against 0.9, the values
+copied out of a pool of eight megabytes whose lines the pass before left
+cold (the copies were 1.9 ms of a load under `perf` after FASTER's pass,
+1.25 after LMDB's and 0.46 in a run of loads alone), and the commits 7.3
+ms against 6.5, half of that the loop's CPU and half its fdatasyncs'
+waits. What the waits are is not known. Not the discards of FASTER's
+store: the device counted 96 MB discarded in the 50 ms before the load
+and none inside it, with the same writes and flushes in the window after
+either arm (`/sys/block/vda/stat` sampled across the phase marks). Not an
+unlink of that size before the syncs, which a probe of ten synced appends
+read no slower for, nor the memory FASTER frees; not the core's speed
+after FASTER's long waits, a fixed piece of work reading 2% slower after
+300 ms asleep; and the caches flushed before those appends cost them 0.3
+ms of the 1.4.
+
+A rep runs its arms in an order of its own now (`run::rep_order`): it
+starts one arm on from the rep before and steps by a stride of its own, so
+an arm follows a different arm in each rep, and two arms alternate. In the
+first row run so, each arm's slowest load at ten thousand keys was the rep
+that set it after FASTER -- 11.7 ms for `supdb`, 13.3 for `supdb-nocache`,
+11.6 for `supdb-settle`, against 8.0 to 9.9 in their other reps -- and the
+median carried none of it. The first row after it is a definition step,
+banked on its controls: every arm's first phase now follows FASTER's pass
+in one rep of its reps where one arm's did in all of them.
+
+The first test of position ran two arms in both orders, read each arm's
+load the same either way and called position cleared: in a round of two
+each arm follows the other whatever the order. And the first mechanism,
+the discards, was a story about what a large removal does; the device's
+own counter over the window refuted it in one run. The rules: an order
+that repeats makes a pass's predecessor a constant of its arm, which no
+count of reps averages out, so the order is part of what a rep varies; a
+question about position is asked with one code path in several positions
+of one run, never with two arms; identical code in two arms of a row is a
+control the row carries, and it is read when a cell and its pairing
+disagree; and a difference between a row and a pairing of the same two
+arms is the harness's until the row's shape is reproduced in the pairing.
+
 **One profile, two builds.** The engine's Rust and the comparators' C and
 C++ were compiled under one release profile, which was taken for one build,
 and the comparators' objects said otherwise (GCC records what it was handed
@@ -1123,7 +1185,21 @@ clock and no host in it but what the row records, and its test draws the
 same rows twice and holds the bytes equal, since a check that compares a
 drawing to a redrawing is only as good as the drawing's determinism. The
 rule: a derived file may be committed when a check regenerates it and
-fails on a difference, and never otherwise.
+fails on a difference, and never otherwise. The build was a third input
+nobody had listed. The curves were ordered by the rosters, and the
+rosters name the arms of FASTER's guarantee only where FASTER is built
+(`cfg(faster)`, Linux on x86-64): the first rows banked with
+`supdb-heldnoframes` in them drew it by its place in the roster on the
+host that measured them and by its name on ARM and macOS, and the
+committed figures failed their check on both legs of the pull request
+that banked them, with the test that draws the same rows twice green on
+all three, since a host agrees with itself. The order is the rosters' as
+a host that builds every arm has them (`engines::drawn_order`), a test
+holds it on the hosts without FASTER, and the failure was made here
+before the fix by building the suite with the arm off. A function "of
+the rows alone" is held to that by drawing on a build that differs, and
+a check that runs on three hosts is read on all three before a row's
+commit is called drawn.
 
 **Rows from the hosted runners.** `bank-row.yml` runs the quick ladder on
 each hosted runner after a merge to `main` and proposes the rows as one

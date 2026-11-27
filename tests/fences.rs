@@ -1209,6 +1209,10 @@ fn a_burst_the_writers_forms_cover_is_not_chained_through() {
         FormsOff,
         /// Covered, and a point read made before the burst.
         PointRead,
+        /// A shared live table (`Options::share_on_write`), a handle that
+        /// writes alive through the burst: no form is kept over one, so no
+        /// block the pieces overlay is covered.
+        Shared,
     }
     for (opt, store, left, merges) in [
         (false, Store::Covered, 0usize, 2u64),
@@ -1221,6 +1225,7 @@ fn a_burst_the_writers_forms_cover_is_not_chained_through() {
         (true, Store::BudgetBound, 0, 2),
         (true, Store::FormsOff, 0, 2),
         (true, Store::PointRead, 0, 2),
+        (true, Store::Shared, 0, 2),
     ] {
         let d = scratch(&format!("chain-covered-{opt}-{store:?}"));
         let mut db = Db::create(
@@ -1266,6 +1271,13 @@ fn a_burst_the_writers_forms_cover_is_not_chained_through() {
                 scan_forms_off_window: 2,
                 scan_forms_off_flip: store == Store::FormsOff,
                 scan_forms_off_stale_writes: 0,
+                sync: if store == Store::Shared {
+                    supdb::SyncPolicy::Explicit
+                } else {
+                    common::options().sync
+                },
+                held_frames: store != Store::Shared,
+                share_on_write: store == Store::Shared,
                 ..common::options()
             },
         )
@@ -1295,6 +1307,21 @@ fn a_burst_the_writers_forms_cover_is_not_chained_through() {
         if store == Store::PointRead {
             assert_eq!(db.count(&key(7)).unwrap(), 1);
         }
+        // The handle whose write shares the table, held to the test's end.
+        let writing = if store == Store::Shared {
+            let h = db.reader().unwrap();
+            // In a range the burst makes due, so that its piece is merged
+            // with the burst's.
+            let k = [fences[1].0.as_slice(), b"-handle"].concat();
+            assert!(!h.put(&k, b"h").unwrap());
+            db.commit().unwrap();
+            assert!(h.put(&k, b"h").unwrap());
+            assert!(db.live_shared());
+            keys.push(k);
+            Some(h)
+        } else {
+            None
+        };
         let (merges0, plans0) = (db.seal_waits().merges, db.seal_waits().plans);
         let in_range = |r: usize, round: u32, i: u32| -> Vec<u8> {
             let (lo, hi) = &fences[r];
@@ -1375,6 +1402,10 @@ fn a_burst_the_writers_forms_cover_is_not_chained_through() {
             "option {opt} {store:?}: merges landed"
         );
         hold_to(&db, &keys);
+        if store == Store::Shared {
+            assert!(db.live_shared(), "the handle's table was left under it");
+        }
+        drop(writing);
         drop(db);
         let _ = std::fs::remove_dir_all(&d);
     }

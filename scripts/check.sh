@@ -31,7 +31,10 @@
 # Groups:
 #   build    the crate, release
 #   test     cargo test (unit and integration, every target), optimized
-#            with overflow and invariant checks on
+#            with overflow and invariant checks on, and a bounded seed
+#            range of the differential fuzz with handles that write
+#            (ZFUZZ_SHARE), failing a range whose stores never went to the
+#            shared table and back
 #   stride   the tests again with the stride form forced (an EXPERIMENT,
 #            `Options::zpages_stride`): every test that forces the compact
 #            form or names no form, under SUPDB_TEST_STRIDE (tests/common),
@@ -165,6 +168,12 @@ for g in $groups; do
     test)
       say "test"
       cargo test --profile checked
+      # The differential fuzz with handles that write, every seed's log
+      # held with no frames: the live table goes to the shared one and
+      # back many times a seed, the block cache on in every seed, and a
+      # range that reached no flip fails.
+      ZFUZZ_SHARE=all ZFUZZ_CACHE=all ZFUZZ_FROM=0 ZFUZZ_TO=24 \
+        cargo test --profile checked --test fuzz fuzz_range -- --exact
       ;;
     stride)
       say "stride"

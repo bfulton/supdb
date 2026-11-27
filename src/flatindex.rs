@@ -1305,6 +1305,71 @@ pub(crate) fn record_into(
     at
 }
 
+/// `record_into`, the same bytes, with each pad zeroed by one word laid
+/// before the bytes beside it -- a record pads its key and its tail to
+/// four, so a pad is at most three bytes and lies inside the word that
+/// ends where it does -- where `record_into` filled each pad with a call
+/// whatever its length, and a sixteen-byte key copied by a fixed move
+/// (`Options::direct_lean_append`, through `MemTable::push_record`).
+pub(crate) fn record_into_lean(
+    rec: &mut [u8],
+    key: &[u8],
+    exts: &[Ext],
+    tail: &[u8],
+    compact: bool,
+) -> usize {
+    let klen = key.len();
+    let at = align_up(4 + klen, REC_ALIGN);
+    let len = rec.len();
+    let one = compact && compacts(exts);
+    debug_assert_eq!(
+        len,
+        if one {
+            record_len_compact(klen, tail.len())
+        } else {
+            record_len_tail(klen, exts.len(), tail.len())
+        },
+        "a record's slice is its length"
+    );
+    // The pads first: every byte past them is written below, and a pad's
+    // word ends where the pad does. The tail's word may be the key's (no
+    // extent and no tail) or overlap the compact header (no tail), both
+    // written after it.
+    rec[len - 4..len].copy_from_slice(&[0; 4]);
+    rec[at - 4..at].copy_from_slice(&[0; 4]);
+    let count = if one { COMPACT } else { exts.len() as u16 };
+    let mut hdr = [0u8; 4];
+    hdr[0..2].copy_from_slice(&(klen as u16).to_le_bytes());
+    hdr[2..4].copy_from_slice(&count.to_le_bytes());
+    rec[0..4].copy_from_slice(&hdr);
+    if let Ok(k) = <&[u8; 16]>::try_from(key) {
+        rec[RECORD_KEY_AT..RECORD_KEY_AT + 16].copy_from_slice(k);
+    } else {
+        rec[RECORD_KEY_AT..RECORD_KEY_AT + klen].copy_from_slice(key);
+    }
+    if one {
+        debug_assert_eq!(
+            tail.len(),
+            exts[0].len as usize,
+            "a compact run is its tail"
+        );
+        rec[at..at + 4].copy_from_slice(&compact_header(&exts[0]));
+        rec[at + 4..at + 4 + tail.len()].copy_from_slice(tail);
+        return at + 4;
+    }
+    let mut at = at;
+    for e in exts {
+        rec[at..at + 4].copy_from_slice(&e.block.to_le_bytes());
+        rec[at + 4..at + 8].copy_from_slice(&e.off.to_le_bytes());
+        rec[at + 8..at + 12].copy_from_slice(&e.len.to_le_bytes());
+        rec[at + 12..at + 16].copy_from_slice(&e.last.to_le_bytes());
+        rec[at + 16..at + 20].copy_from_slice(&e.count.to_le_bytes());
+        at += EXT_BYTES;
+    }
+    rec[at..at + tail.len()].copy_from_slice(tail);
+    at
+}
+
 pub fn stream_record_tail_at(
     out: &mut Vec<u8>,
     key: &[u8],
@@ -1364,14 +1429,46 @@ impl TrailerBuf for Vec<u8> {
     }
 }
 
+/// The length of the section `stream_trailer_in` composes for `n` keys
+/// over `recs_len` bytes of records, the keys it samples into the fence
+/// coming to `fence_blob` bytes (`fence_blob_len`): the header, the
+/// records, the fence, the directory and the hash slots with the padding
+/// between them, as the composer lays them out, which holds itself to
+/// this answer. For a caller that has to know a finished segment's length
+/// before it composes the trailer (`SegmentWriter::finished_len_bound`).
+pub fn stream_section_len(n: usize, recs_len: usize, fence_blob: usize) -> Option<usize> {
+    if recs_len > MAX_RECS {
+        return None;
+    }
+    let cap = hash_cap_for(n)?;
+    let mut at = align_up(HEADER + recs_len, 4);
+    let fence_n = n.div_ceil(fence_stride(n));
+    if fence_n > 0 {
+        at = at.checked_add((fence_n + 1) * 4)?.checked_add(fence_blob)?;
+    }
+    at = align_up(align_up(at, 4).checked_add(n.checked_mul(4)?)?, 8);
+    at.checked_add(cap.checked_mul(SLOT)?)
+}
+
+/// The bytes of the keys a section of `n` keys samples into its fence,
+/// every `fence_stride(n)`th from the first, `key_len` answering a key's
+/// length by its rank: what `stream_section_len` is told of them.
+pub fn fence_blob_len(n: usize, key_len: impl Fn(usize) -> usize) -> usize {
+    let stride = fence_stride(n);
+    (0..n.div_ceil(stride)).map(|i| key_len(i * stride)).sum()
+}
+
 /// `stream_trailer` into the caller's buffer `t`, handed over empty and
 /// handed back holding the trailer: the same bytes whatever the buffer.
+///
+/// Generic over the two callbacks, so a finish's pass over its keys is one
+/// loop with the source's reads in it, not a call through a pointer a key.
 pub fn stream_trailer_in<'a, B: TrailerBuf>(
     mut t: B,
     n: usize,
     recs_len: usize,
-    key_at: &dyn Fn(usize) -> &'a [u8],
-    each: &mut dyn FnMut(usize) -> (u32, u64),
+    key_at: impl Fn(usize) -> &'a [u8],
+    mut each: impl FnMut(usize) -> (u32, u64),
     generation: u64,
     lookahead: bool,
 ) -> Option<(Vec<u8>, B, usize)> {
@@ -1394,6 +1491,7 @@ pub fn stream_trailer_in<'a, B: TrailerBuf>(
     let stride = fence_stride(n);
     let fence_n = n.div_ceil(stride);
     let fence_offs_off = at;
+    let mut fence_blob = 0usize;
     if fence_n > 0 {
         let offs_len = (fence_n + 1) * 4;
         let mut blob: Vec<u8> = Vec::new();
@@ -1406,6 +1504,7 @@ pub fn stream_trailer_in<'a, B: TrailerBuf>(
         t.extend_from_slice(&offs);
         t.extend_from_slice(&blob);
         at += offs_len + blob.len();
+        fence_blob = blob.len();
     }
     // Directory, then the hash slots, 8-aligned: both regions laid out
     // first and filled in one pass, each key's offset into its directory
@@ -1436,6 +1535,11 @@ pub fn stream_trailer_in<'a, B: TrailerBuf>(
     }
     at += cap * SLOT;
     let total = at;
+    debug_assert_eq!(
+        Some(total),
+        stream_section_len(n, recs_len, fence_blob),
+        "the section is the length `stream_section_len` says"
+    );
 
     let mut h = vec![0u8; HEADER];
     h[0..4].copy_from_slice(&MAGIC.to_ne_bytes());
@@ -3012,6 +3116,93 @@ mod fill_tests {
             }
             assert_eq!(outs[0], outs[1], "{n} keys");
         }
+    }
+
+    /// `stream_section_len` is the length of the section the composer
+    /// lays out, told only the key count, the records' bytes and the
+    /// fence keys' bytes: at the counts where the fence stride, the
+    /// hash's capacity and the padding change, with keys of every
+    /// length from none to forty bytes and records that leave every
+    /// alignment.
+    #[test]
+    fn the_sections_length_is_the_composers() {
+        for n in [
+            0usize, 1, 2, 3, 15, 16, 17, 47, 48, 49, 255, 256, 257, 4097, 20_000,
+        ] {
+            for (spread, recs_pad) in [(1usize, 0usize), (41, 1), (13, 3), (7, 6)] {
+                let keys: Vec<Vec<u8>> = (0..n)
+                    .map(|i| (0..(i * 7 + n) % spread).map(|b| b as u8).collect())
+                    .collect();
+                let recs_len = n * 20 + recs_pad;
+                let (_, trailer, total) = stream_trailer(
+                    n,
+                    recs_len,
+                    &|i| &keys[i][..],
+                    &mut |i| ((i * 20) as u32, key_hash(&keys[i])),
+                    1,
+                    false,
+                )
+                .expect("a section within the limits");
+                let fence = fence_blob_len(n, |i| keys[i].len());
+                assert_eq!(
+                    stream_section_len(n, recs_len, fence),
+                    Some(total),
+                    "{n} keys over {recs_len} bytes of records, fence keys of {fence} bytes"
+                );
+                assert_eq!(total, HEADER + recs_len + trailer.len(), "{n} keys");
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod record_tests {
+    use super::*;
+
+    /// The lean encoder writes `record_into`'s bytes over a slice of any
+    /// prior contents -- every key length either side of the four-byte
+    /// pad, every tail length either side of it, compact and full, no
+    /// extent, one and several -- and reports the same tail offset.
+    #[test]
+    fn the_lean_record_is_record_intos_bytes() {
+        let ext = |len: u32, block: u32, count: u32| Ext {
+            block,
+            off: 0,
+            len,
+            last: 0,
+            count,
+        };
+        let mut cases = 0;
+        for klen in [0usize, 1, 2, 3, 4, 5, 7, 8, 12, 15, 16, 17, 20, 31, 64] {
+            let key: Vec<u8> = (0..klen).map(|i| 0x41 + i as u8).collect();
+            for tlen in [0usize, 1, 2, 3, 4, 5, 99, 100, 101, 102, 103, 4096] {
+                let tail: Vec<u8> = (0..tlen).map(|i| (i * 7 + 3) as u8).collect();
+                let one = [ext(tlen as u32, Ext::INLINE, 1 | Ext::FIXED)];
+                let two = [ext(tlen as u32, Ext::INLINE, 1), ext(9, 4, 2)];
+                let exts: [&[Ext]; 3] = [&[], &one, &two];
+                for e in exts {
+                    for compact in [false, true] {
+                        let Some(len) = record_len_for(klen, e, tlen, compact) else {
+                            continue;
+                        };
+                        for junk in [0x00u8, 0xa5, 0xff] {
+                            let mut a = vec![junk; len];
+                            let mut b = vec![junk ^ 0x5a; len];
+                            let ta = record_into(&mut a, &key, e, &tail, compact);
+                            let tb = record_into_lean(&mut b, &key, e, &tail, compact);
+                            assert_eq!(
+                                (ta, &a),
+                                (tb, &b),
+                                "key {klen}, tail {tlen}, {} extents, compact {compact}",
+                                e.len()
+                            );
+                            cases += 1;
+                        }
+                    }
+                }
+            }
+        }
+        assert!(cases > 1000, "{cases} cases");
     }
 }
 
