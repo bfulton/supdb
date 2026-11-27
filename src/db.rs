@@ -10268,11 +10268,16 @@ impl ZFinish {
         let plan = self.plan.clone();
         let hold = shared.zbuild_hold.clone();
         let (trace, epoch, label) = (self.trace, self.epoch, name.to_string());
+        let live = shared.life.job();
         let spawned = std::thread::Builder::new()
             .name("supdb-zbuild".into())
             .spawn(move || {
-                zbuild_hold_wait(&hold, ZHOLD_START);
-                let r = File::open(&path).and_then(|f| zfile::build_file(f, &out, id, end, &plan));
+                let _live = live;
+                let r = if zbuild_hold_wait(&hold, ZHOLD_START, Some(&shared.life)) {
+                    Ok(zfile::Outcome::Cancelled)
+                } else {
+                    File::open(&path).and_then(|f| zfile::build_file(f, &out, id, end, &plan))
+                };
                 let ev = &shared.z;
                 let stride = r.as_ref().ok().and_then(zfile::Outcome::stride_code);
                 match r {
@@ -24616,6 +24621,10 @@ struct Shared {
     /// A test's holds on the builder's thread (`ZHOLD_START`,
     /// `ZHOLD_RENAME`), shared with the build's plan.
     zbuild_hold: std::sync::Arc<std::sync::atomic::AtomicU8>,
+    /// Whether the tests' crash has ended the store, and the count of its
+    /// threads that write its files or read them through a mapping
+    /// (`Life`), shared with a build's plan.
+    life: std::sync::Arc<Life>,
     /// Builds at a merge's output finish in flight
     /// (`Options::zpages_build_at_finish`), bumped before each starts.
     z_finish_live: std::sync::atomic::AtomicUsize,
@@ -30928,6 +30937,14 @@ impl Reader {
         (self.lone_reads.get(), self.layer_reads.get())
     }
 
+    /// A test's: the passes the store's upkeep thread has ended, read
+    /// through a handle so that it can be read of a store the tests'
+    /// crash has taken (`Db::crash`), whose `Db` is gone.
+    #[doc(hidden)]
+    pub fn upkeep_passes_ended(&self) -> u64 {
+        self.shared.upkeep.passes.load(AtomicOrdering::Relaxed)
+    }
+
     /// Of the layered reads `point_lean_reads` counts, the ones the read
     /// that places its sources first answered
     /// (`Options::point_layers_lean`, `Reader::read_placed`); the rest
@@ -34163,6 +34180,8 @@ impl Reader {
         }
         shared.upkeep_holding.store(true, AtomicOrdering::Release);
         while shared.upkeep_hold_at.load(AtomicOrdering::Acquire) & bit != 0 {
+            // The upkeep thread's, a counted one (`Life::held`).
+            shared.life.held();
             std::thread::sleep(std::time::Duration::from_millis(1));
         }
         shared.upkeep_holding.store(false, AtomicOrdering::Release);
@@ -41959,6 +41978,7 @@ impl Db {
             ],
             next_dead: AtomicU64::new(1),
             zbuild_hold: std::sync::Arc::new(std::sync::atomic::AtomicU8::new(zhold_of(&opts))),
+            life: Life::new(),
             z_finish_live: std::sync::atomic::AtomicUsize::new(0),
             z_finish_names: std::sync::Mutex::new(Vec::new()),
             z_finish_coded: std::sync::Mutex::new(Vec::new()),
@@ -42833,6 +42853,7 @@ impl Db {
             ],
             next_dead: AtomicU64::new(1),
             zbuild_hold: std::sync::Arc::new(std::sync::atomic::AtomicU8::new(zhold_of(&opts))),
+            life: Life::new(),
             z_finish_live: std::sync::atomic::AtomicUsize::new(0),
             z_finish_names: std::sync::Mutex::new(Vec::new()),
             z_finish_coded: std::sync::Mutex::new(Vec::new()),
@@ -46024,6 +46045,10 @@ impl Db {
         }
         shared.kept_holding.fetch_or(bit, AtomicOrdering::AcqRel);
         while shared.kept_hold.load(AtomicOrdering::Acquire) & bit != 0 {
+            // In a store the tests' crash has ended, whoever waits here is
+            // the segment work's thread or the upkeep's, the writer being
+            // the thread that crashed it: a counted one (`Life::held`).
+            shared.life.held();
             std::thread::sleep(std::time::Duration::from_micros(200));
         }
         shared.kept_holding.fetch_and(!bit, AtomicOrdering::AcqRel);
@@ -47132,7 +47157,9 @@ impl Reader {
         let (tx, rx) = std::sync::mpsc::channel();
         let flag = stop.clone();
         let post = posted.clone();
+        let live = self.shared.life.job();
         let handle = std::thread::spawn(move || {
+            let _live = live;
             let at = AtCommit {
                 gen,
                 wm,
@@ -47206,9 +47233,13 @@ impl Db {
             unreachable!("checked above")
         };
         let (tx, rx) = std::sync::mpsc::channel();
+        let live = self.shared.life.job();
         let handle = std::thread::Builder::new()
             .name("supdb-maint".into())
-            .spawn(move || m.run(rx))?;
+            .spawn(move || {
+                let _live = live;
+                m.run(rx)
+            })?;
         self.maint = MaintHome::Away(MaintAway {
             tx: Some(tx),
             thread: Some(handle.thread().clone()),
@@ -47347,7 +47378,9 @@ impl Db {
         });
         let signal = readable.clone();
         let theirs = readable.clone();
+        let live = self.shared.life.job();
         let handle = std::thread::spawn(move || {
+            let _live = live;
             let out = job(&signal);
             if let Some(t) = wake {
                 t.unpark();
@@ -48025,11 +48058,17 @@ impl Db {
     }
 
     /// The store left as a crash leaves it, for the tests and experiments
-    /// that emulate one: nothing committed, joined, flushed or freed -- its
-    /// threads run on until the process ends, as `mem::forget` leaves them
-    /// -- and its lock given up, as the kernel gives up a dead process's, so
-    /// that the store opens again in this process. `mem::forget` alone
-    /// keeps the lock, and the reopen is refused as a second open.
+    /// that emulate one: nothing committed, joined, flushed or freed, and
+    /// nothing of it in its directory once this returns -- the segment
+    /// work's thread ended where it stood, a seal, a merge or a form
+    /// file's build in flight run to its end with nobody to land it, and
+    /// one under a test's hold held for good (`Life`) -- and its lock
+    /// given up, as the kernel gives up a dead process's, so that the
+    /// store opens again in this process. `mem::forget` alone keeps the
+    /// lock, and the reopen is refused as a second open. The upkeep thread
+    /// and the others that read the store's files end with it too, since
+    /// a test may cut a file back once this returns; the trim thread,
+    /// which touches no file, runs on until the process ends.
     #[doc(hidden)]
     pub fn crash(self) {
         let mut me = std::mem::ManuallyDrop::new(self);
@@ -48040,6 +48079,17 @@ impl Db {
         if let Some(h) = me.wal.zeroing.take() {
             let _ = h.join();
         }
+        // And the rest of them, before the lock: whoever opens the store
+        // next shares its directory with nothing.
+        let maint = match &me.maint {
+            MaintHome::Away(a) => a.thread.as_ref(),
+            MaintHome::Here(_) => None,
+        };
+        me.shared.life.end([
+            maint,
+            me.shared.upkeep.thread.get(),
+            me.shared.keeper_thread.get(),
+        ]);
         me.lock.release();
     }
 
@@ -49406,7 +49456,7 @@ impl Reader {
         let mut k = Kept::default();
         let mut idle = KEEPER_POLL_MIN;
         loop {
-            if stop.load(AtomicOrdering::SeqCst) {
+            if stop.load(AtomicOrdering::SeqCst) || self.shared.life.dead() {
                 break;
             }
             let flush = self.shared.keeper_seq.load(AtomicOrdering::SeqCst);
@@ -50456,7 +50506,10 @@ impl Reader {
         // the ones nobody has measured a wake for.
         let mut alert_until = std::time::Instant::now() + UPKEEP_ALERT;
         loop {
-            if stop.load(AtomicOrdering::SeqCst) {
+            // The tests' crash (`Db::crash`) waits for this thread, which
+            // reads the store's files through their mappings: a file a
+            // test cuts back after its crash is one no pass is reading.
+            if stop.load(AtomicOrdering::SeqCst) || shared.life.dead() {
                 break;
             }
             // Short of a batch: wait for more, unless a commit holds for
@@ -50716,9 +50769,18 @@ impl Db {
         let mut r = self.understudy();
         let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let flag = stop.clone();
+        let live = self.shared.life.job();
         let spawned = std::thread::Builder::new()
             .name("supdb-upkeep".into())
-            .spawn(move || r.keep_upkeep(&flag));
+            .spawn(move || {
+                let _live = live;
+                r.keep_upkeep(&flag);
+                // Ended by the tests' crash: nothing of the understudy's
+                // freed, as nothing of the store's is.
+                if r.shared.life.dead() {
+                    std::mem::forget(r);
+                }
+            });
         if let Ok(handle) = spawned {
             self.upkeeper = Some(Upkeeper {
                 handle: Some(handle),
@@ -51595,11 +51657,16 @@ impl Db {
         };
         let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let flag = stop.clone();
+        let live = self.shared.life.job();
         let spawned = std::thread::Builder::new()
             .name("supdb-keeper".into())
             .spawn(move || {
+                let _live = live;
                 idle_cpu_priority();
                 r.keep(&flag);
+                if r.shared.life.dead() {
+                    std::mem::forget(r);
+                }
             });
         if let Ok(handle) = spawned {
             self.keeper = Some(Keeper {
@@ -54510,21 +54577,137 @@ fn zhold_of(opts: &Options) -> u8 {
     })
 }
 
-/// The builder thread's wait under a test's hold bit, if it is set.
-fn zbuild_hold_wait(hold: &std::sync::atomic::AtomicU8, bit: u8) {
+/// What the tests' crash (`Db::crash`) leaves a store's threads to read:
+/// whether the store is dead, and the count of its threads that write its
+/// files or read them through a mapping -- the segment work's own, a
+/// seal's, a merge's, a form file's builder and its warm, the sampler, the
+/// upkeep thread, the builder ahead and the keeper -- each counted by
+/// whoever spawns it, before it exists, to its end. A crash marks the
+/// store dead and returns once the count is nothing, so that nothing of
+/// the store moves in the directory under whoever opens it next, and
+/// nothing of it reads a file a test then cuts back, as nothing of a dead
+/// process does either.
+///
+/// The seam said so of the log's helper alone and left the rest running
+/// "until the process ends". The segment work's thread ran on as it had,
+/// landing, retiring and starting builds, and where every store builds a
+/// form file (`SUPDB_TEST_STRIDE`) a builder of the dead store wrote
+/// `<name>.zpg.tmp` while the reopened store's builder, for the same
+/// partition under the same name, opened it to truncate: whichever was
+/// reading its own pages back through a mapping took a bus error, one run
+/// of the run log's tests in sixty to a hundred beside three busy loops,
+/// and once on a hosted runner.
+#[derive(Debug)]
+pub(crate) struct Life {
+    dead: std::sync::atomic::AtomicBool,
+    jobs: std::sync::atomic::AtomicUsize,
+}
+
+/// One counted thread of a store (`Life::job`), uncounted at its drop.
+pub(crate) struct LifeJob(std::sync::Arc<Life>);
+
+impl Drop for LifeJob {
+    fn drop(&mut self) {
+        self.0.jobs.fetch_sub(1, AtomicOrdering::SeqCst);
+    }
+}
+
+impl Life {
+    fn new() -> std::sync::Arc<Life> {
+        std::sync::Arc::new(Life {
+            dead: std::sync::atomic::AtomicBool::new(false),
+            jobs: std::sync::atomic::AtomicUsize::new(0),
+        })
+    }
+
+    /// One more thread of the store's that touches its files, counted
+    /// here, on the thread that spawns it: counted on the thread itself, a
+    /// crash could read nothing between the spawn and the count. Whoever
+    /// spawns one is counted itself or is the writer, the thread a crash
+    /// is called on, so the count a crash reads as nothing stays nothing.
+    fn job(self: &std::sync::Arc<Life>) -> LifeJob {
+        self.jobs.fetch_add(1, AtomicOrdering::SeqCst);
+        LifeJob(self.clone())
+    }
+
+    /// Whether the store was crashed. A counted thread that reads it so
+    /// starts nothing more and ends where it can.
+    pub(crate) fn dead(&self) -> bool {
+        self.dead.load(AtomicOrdering::SeqCst)
+    }
+
+    /// A counted thread's, each turn of its wait under a test's hold:
+    /// where the store is dead the hold stands for good, as it did while
+    /// the forgotten store was all that could lift it, so the thread
+    /// leaves the count and parks for the process's life, and the work the
+    /// hold kept it from is never done. Only a counted thread calls this.
+    pub(crate) fn held(&self) {
+        if !self.dead() {
+            return;
+        }
+        self.jobs.fetch_sub(1, AtomicOrdering::SeqCst);
+        loop {
+            std::thread::park();
+        }
+    }
+
+    /// `Db::crash`'s: the store marked dead, its threads that park
+    /// between turns woken to find it so, and every counted thread waited
+    /// out. One that never ends is stuck, or waits on something only the
+    /// store's writer would have given it, and is named rather than
+    /// waited for without end.
+    fn end(&self, wake: [Option<&std::thread::Thread>; 3]) {
+        self.dead.store(true, AtomicOrdering::SeqCst);
+        for t in wake.into_iter().flatten() {
+            t.unpark();
+        }
+        let began = std::time::Instant::now();
+        loop {
+            let n = self.jobs.load(AtomicOrdering::SeqCst);
+            if n == 0 {
+                return;
+            }
+            assert!(
+                began.elapsed() < LIFE_END_WALL,
+                "a crashed store's threads did not end: {n} still counted, \
+                 parked under a hold the crash does not know or stuck"
+            );
+            std::thread::park_timeout(MAINT_LAND_POLL);
+        }
+    }
+}
+
+/// How long a crash waits for the store's counted threads before it says
+/// they did not end: a build at the idle CPU class beside a loaded host
+/// has taken tens of seconds of wall for milliseconds of work.
+const LIFE_END_WALL: std::time::Duration = std::time::Duration::from_secs(300);
+
+/// The builder thread's wait under a test's hold bit, if it is set. In a
+/// store that was crashed the hold stands for good (`Life`): answered
+/// `true`, and the builder ends without the work it was held from, a
+/// build's every step past a hold being one it can leave undone.
+fn zbuild_hold_wait(hold: &std::sync::atomic::AtomicU8, bit: u8, life: Option<&Life>) -> bool {
     if hold.load(AtomicOrdering::Acquire) & bit == 0 {
-        return;
+        return false;
     }
     hold.fetch_or(bit << ZHOLD_WAITING, AtomicOrdering::AcqRel);
+    let mut died = false;
     while hold.load(AtomicOrdering::Acquire) & bit != 0 {
+        if life.is_some_and(Life::dead) {
+            died = true;
+            break;
+        }
         std::thread::park_timeout(MAINT_LAND_POLL);
     }
     hold.fetch_and(!(bit << ZHOLD_WAITING), AtomicOrdering::AcqRel);
+    died
 }
 
-/// A seal thread's wait under a test's hold bit, if it is set.
+/// A seal thread's wait under a test's hold bit, if it is set; under one
+/// in a store that was crashed it stays (`Life::held`).
 fn seal_hold_wait(shared: &Shared, bit: u8) {
     while shared.seal_hold.load(AtomicOrdering::Acquire) & bit != 0 {
+        shared.life.held();
         std::thread::park_timeout(MAINT_LAND_POLL);
     }
 }
@@ -55322,6 +55505,13 @@ impl Maint {
             self.shared
                 .maint_cpu_ns
                 .store(thread_cpu_ns(), AtomicOrdering::Relaxed);
+            if self.shared.life.dead() {
+                // The tests' crash (`Db::crash`): nothing more landed,
+                // joined, synced or freed, where the close below does all
+                // four, and the thread ends so that the crash can return.
+                std::mem::forget(self);
+                return;
+            }
             if self.shared.maint_stop.load(AtomicOrdering::Acquire) {
                 break;
             }
@@ -56858,7 +57048,9 @@ impl Maint {
             zfinish: self.z_finish_plan_repicked(),
         };
         let wake = self.wake.clone();
+        let live = self.shared.life.job();
         let handle = std::thread::spawn(move || {
+            let _live = live;
             let out = tier_run(plan);
             if let Some(t) = wake {
                 t.unpark();
@@ -60546,9 +60738,11 @@ impl Maint {
         zfile::ZEvents::add(&self.shared.z.samples, 1);
         let idle = self.opts.zpages_sample_idle;
         let io_idle = idle && self.opts.zpages_io_idle;
+        let live = self.shared.life.job();
         let spawned = std::thread::Builder::new()
             .name("supdb-zsample".into())
             .spawn(move || {
+                let _live = live;
                 if io_idle {
                     idle_io_priority();
                 }
@@ -61942,6 +62136,7 @@ impl Maint {
         (plan.stride, plan.stride_spans) = self.z_stride_ask_finish();
         plan.stride_below = self.opts.zpages_stride_below.clone();
         plan.hold = Some(self.shared.zbuild_hold.clone());
+        plan.life = Some(self.shared.life.clone());
         Some(std::sync::Arc::new(ZFinish {
             dir: self.dir.clone(),
             plan,
@@ -63034,6 +63229,7 @@ impl Maint {
         }
         plan.cancel = Some(cancel.clone());
         plan.hold = Some(shared.zbuild_hold.clone());
+        plan.life = Some(shared.life.clone());
         let fail = shared.fail_zbuild.swap(false, AtomicOrdering::AcqRel);
         let hold = shared.zbuild_hold.clone();
         let wake = self.wake.clone();
@@ -63044,9 +63240,11 @@ impl Maint {
         zfile::ZEvents::add(&ev.build_starts, 1);
         let io_idle = self.opts.zpages_io_idle;
         let io_ev = shared.clone();
+        let live = shared.life.job();
         let spawned = std::thread::Builder::new()
             .name("supdb-zbuild".into())
             .spawn(move || {
+                let _live = live;
                 // Derived data, built when the store is short of memory
                 // and the readers are faulting: the readers' cores first,
                 // and the device's queue too unless the option has the
@@ -63059,8 +63257,9 @@ impl Maint {
                     .build_io_class
                     .store(io_priority_class(), AtomicOrdering::Relaxed);
                 idle_cpu_priority();
-                zbuild_hold_wait(&hold, ZHOLD_START);
-                let r = if fail {
+                let r = if zbuild_hold_wait(&hold, ZHOLD_START, Some(&io_ev.life)) {
+                    Ok(zfile::Outcome::Cancelled)
+                } else if fail {
                     Err(err("the form file's build was made to fail"))
                 } else {
                     zfile::build_file(file, &out, id, end, &plan)
@@ -63520,9 +63719,11 @@ impl Maint {
         // before its wake, as a build is (`ZCounts::job_ends`).
         zfile::ZEvents::add(&self.shared.z.warm_starts, 1);
         let shared = self.shared.clone();
+        let live = self.shared.life.job();
         let spawned = std::thread::Builder::new()
             .name("supdb-zwarm".into())
             .spawn(move || {
+                let _live = live;
                 if io_idle {
                     idle_io_priority();
                 }
@@ -63700,6 +63901,15 @@ impl Maint {
                 self.shared
                     .merge_hold
                     .fetch_or(MERGE_HOLD_JOINING, AtomicOrdering::AcqRel);
+                // The join waits out a merge the test may hold at its
+                // landing, and in a store the tests' crash has ended that
+                // merge is parked for good: so is this wait (`Life::held`),
+                // which blocked in the join had the crash wait for a
+                // thread that could not end.
+                while self.compacting.iter().any(|m| !m.handle.is_finished()) {
+                    self.shared.life.held();
+                    std::thread::park_timeout(MAINT_LAND_POLL);
+                }
                 let joined = self.join_compact();
                 self.shared
                     .merge_hold
@@ -63866,10 +64076,14 @@ impl Maint {
         let kept_fences = fences.clone();
         let wake = self.wake.clone();
         let held = self.shared.clone();
+        let live = self.shared.life.job();
         let handle = std::thread::spawn(move || {
+            let _live = live;
             // A test's hold before the merge reads anything
-            // (`Db::hold_merge_start`): its inputs are named already.
+            // (`Db::hold_merge_start`): its inputs are named already. In
+            // a store that was crashed the hold stands (`Life::held`).
             while held.merge_hold.load(AtomicOrdering::Acquire) & MERGE_HOLD_START != 0 {
+                held.life.held();
                 std::thread::park_timeout(MAINT_LAND_POLL);
             }
             let out = compact_job(MergePlan {
@@ -63898,6 +64112,7 @@ impl Maint {
             });
             // A test's hold before the landing (`Db::hold_merge_landing`).
             while held.merge_hold.load(AtomicOrdering::Acquire) & MERGE_HOLD_LANDING != 0 {
+                held.life.held();
                 std::thread::park_timeout(MAINT_LAND_POLL);
             }
             if let Some(t) = wake {

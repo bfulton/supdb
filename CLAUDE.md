@@ -252,6 +252,17 @@ and a result is believed after `--list` has shown the tests it names. The
 tooling cuts a worktree from `origin/main` and not from the parent's head,
 so the first command in one is `git switch -C <branch> <base>`.
 
+The main line takes only commits with verified signatures, every commit
+of a pull request and not its head alone. `git commit`, `git merge` and
+`git cherry-pick` sign under the environment's configuration
+(`commit.gpgsign`); `git commit-tree` does not, and one commit made with
+it -- to commit from saved copies while a mutant harness was rewriting
+the working tree in place -- blocked a pull request's merge until it and
+the four commits after it were made again and the branch force-pushed.
+Mutants run in a worktree of their own, with a target of its own, so the
+tree a commit is made from is never the one being rewritten, and a
+commit is made by `git commit`.
+
 Keep it that way. Every gate this repository has broken has broken the same
 way: a check that was not running, or one reporting a verdict it had not
 earned. CI never built the wasm module at all, so a link break in
@@ -1377,7 +1388,10 @@ unlock and not by the descriptor's close, since a child the process forked
 holds a copy of the descriptor and the lock with it (`StoreLock`); a test
 that emulates a crash calls `Db::crash`, which gives the lock up as a dead
 process's is given up, since a `mem::forget` keeps it and the reopen is
-refused as a second open. A crash between any
+refused as a second open, and which returns only once nothing of the
+store is left in its directory: every thread of it that writes its files
+or reads them through a mapping ended, or parked for good under the
+test's own hold (`Life`). A crash between any
 two of those leaves either a WAL that replays the whole memtable, with a
 segment the manifest never named --
 possibly torn -- swept at open, or a complete, named segment plus a WAL
@@ -2529,7 +2543,19 @@ twenty thousand where the scan before the burst has not found the
 thread's report of them and nothing where it has; under the gate's load
 it was nothing, the range empty, and a burst that had lent three
 hundred and then nine hundred, as it should, failed. It holds the
-counts themselves now. The
+counts themselves now. And as a hold set behind the builds it was for:
+the test of the crossing's ask for raw pages wants two partitions built
+ahead and the third's build held at its start, and set the hold once it
+had counted two built. The builds ahead follow one another in
+milliseconds, each started at the turn the one before wakes
+(`Options::zpages_drive_at_job_end`), so a test thread a few of them
+late found every partition built and waited out its five minutes for a
+build to hold: once on a hosted ARM runner, in the pull request after
+the one that had passed there, and every run with the thread kept 300 ms
+before the hold, seven built of seven by the counts printed at the
+assertion. Both holds are set before the builds are due now, and each
+build is let from its start to its rename with the next one's start held
+behind it, which passes with 300 ms slept at every step. The
 rule: a test that
 needs a state holds it, and a bet on timing loses the first time the
 thing it bets against gets faster; a state the test needs only to have
@@ -7437,6 +7463,66 @@ gate was read in, since the gate here was open in the one order that
 matters. And a pairing whose sittings take seconds is run at thirty reps
 before it is read at five, with the cell the option cannot reach read
 first.
+
+**A crash that left the store running in the directory it was opened
+in again.** The tests' crash (`Db::crash`) forgot the store and gave up
+its lock, and its doc said the rest: "its threads run on until the
+process ends". The segment work's thread went on landing, retiring and
+planning in the directory the test then opened; a seal or a merge in
+flight wrote its files there; and where every store's form is forced
+(`SUPDB_TEST_STRIDE`) a builder of the dead store wrote
+`<name>.zpg.tmp` while the store opened again built the same partition
+under the same name, opening the file to truncate, and whichever was
+reading its own pages back through a mapping took a bus error. The
+stride group's run log tests ended so once on a hosted x64 runner, with
+nothing printed but the signal. Alone, the one test the log named
+passed a hundred and fifty runs of a hundred and fifty; the whole binary
+under the switch beside three busy loops died once in sixty to a hundred
+runs, and a core of one named it: the faulting thread a `supdb-zbuild` in a stride file's
+read-back compare, the address inside a mapping of the temp name (`info
+proc mappings`), four builders alive where the test had made two
+stores, and the test's own thread in the close of the store it had
+opened again. The code beside the doc had the rule already, for one
+thread -- "a dead process's threads write nothing after it", of the
+log's helper -- as the close has it for every thread (`Maint::stop`: "a
+seal thread left running would go on mutating the directory under
+whoever reopens it"). A store has a life now (`Life`): every thread of
+it that writes its files or reads them through a mapping is counted by
+whoever spawns it, and a crash marks the store dead and returns once the
+count is nothing -- the segment work's and the upkeep's loops ended at
+their next turn, a job in flight run to its end with nobody to land it,
+a thread under a test's hold left there for good. The readers are
+counted because the tests cut segments and runs back after a crash, and
+a pass or a build reading one through its mapping takes the same fault.
+`tests/db.rs` and `tests/zpages.rs` put each kind of thread a hold can
+reach in flight at a crash, let go or held, and hold the directory to
+standing still from the moment the crash returns; with the seam as it
+was the seal's, the merge's and the build's fail. Thirty-one mutants,
+twenty-six killed: the five left are the counts of four threads no hold
+puts in flight at a crash -- a piece merge, the builder ahead, the
+sampler, a form file's warm -- and the wake of the threads that park
+between turns, without which a crash waits a poll longer. One of the
+twenty-six passed its first test: a finish's build of two hundred
+kilobytes was through before the crash returned whether the crash waited
+for it or not, and the test builds outputs of megabytes now. Run in
+turn two hundred times each beside the busy loops, the binary before
+died twice, both while a build ran beside the loops as well, and the
+binary after not at all; two in two hundred is no rate to rest a fix
+on, two hundred clean runs coming one time in seven at it, and the fix
+rests on the tests that fail on the seam as it was at every run. The
+rules: a seam that stands in for an
+event leaves what the event leaves, and a test double of a dead process
+that keeps its threads is a second store in the first one's directory;
+a limitation a doc states is a defect whose failure has not come yet,
+and is where to look when something near it dies with no message; a
+signal with nothing printed is read from a core -- the faulting
+thread's stack, the address laid to its mapping, and every other
+thread's stack beside it -- before a mechanism is guessed; a failure
+that needs the whole binary is reproduced as the whole binary under the
+switch it failed under, beside load, since the test named in the log is
+the one that was running and not the one that left the thread; and a
+test that waits for a thread is sized so that the thread outlasts
+whatever else the wait covers, or the wait passes without it.
 
 **A stamp read as the end of the step it begins.** The drain's stamps
 name `readable` where the seal thread hands its segments over, and the

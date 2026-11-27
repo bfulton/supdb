@@ -1371,6 +1371,105 @@ fn a_reopened_store_attaches_the_form_files_it_finds_and_off_leaves_them_alone()
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// A form file's build in flight at the tests' crash (`Db::crash`) is no
+/// longer in the directory when the crash returns. It was: the dead
+/// store's builder wrote on under its temp name while the store opened
+/// again built the same partition under the same one, and the one reading
+/// its own pages back through a mapping of a file the other had just
+/// truncated took a bus error, one run of the run log's tests in sixty to a
+/// hundred with every store's form forced. Let go as the crash is called,
+/// the build has its file named when the crash returns; held at its start
+/// it has written nothing, and held at its rename its file stays under
+/// the temp name, the two states a crash at either place leaves. The
+/// directory then stands as it is, and the store opened again builds the
+/// partition's form file itself and reads every key.
+#[test]
+fn a_build_in_flight_at_a_crash_is_through_or_held_when_the_crash_returns() {
+    for (name, at_rename, held, want) in [
+        ("crash-build", false, false, (1usize, 0usize)),
+        ("crash-build-held", false, true, (0, 0)),
+        ("crash-rename-held", true, true, (0, 1)),
+    ] {
+        let dir = scratch(name);
+        let mut db = Db::create(&dir, forced(|_| {})).unwrap();
+        if at_rename {
+            db.hold_zpage_rename(true);
+        } else {
+            db.hold_zpage_build(true);
+        }
+        let published = db.manifest_seq();
+        let model = ordered_load(&mut db, 3000, 0xC4A5);
+        let t = std::time::Instant::now();
+        while !db.zpage_build_waiting() {
+            assert!(
+                t.elapsed() < JOB_WALL,
+                "{name}: the build never reached its hold"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+        // The load's flush is answered at its seal's readable landing
+        // (`Options::drain_answers_readable`), ahead of the manifest that
+        // names the partition, and the build starts at that landing too. A
+        // crash inside the window leaves the run under its temp name, which
+        // the open makes a piece: no partition and no form file, one run in
+        // twenty here and every run with the seal held short of durable.
+        // This test is of a build over a partition the manifest names.
+        let t = std::time::Instant::now();
+        while db.manifest_seq() == published {
+            assert!(
+                t.elapsed() < JOB_WALL,
+                "{name}: the drain's manifest was never published"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        if !held {
+            db.hold_zpage_build(false);
+        }
+        db.crash();
+        let listed = || -> Vec<(String, u64)> {
+            let mut v: Vec<(String, u64)> = std::fs::read_dir(&dir)
+                .unwrap()
+                .map(|e| {
+                    let e = e.unwrap();
+                    (
+                        e.file_name().to_string_lossy().into_owned(),
+                        e.metadata().unwrap().len(),
+                    )
+                })
+                .collect();
+            v.sort();
+            v
+        };
+        let left = listed();
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        assert_eq!(
+            listed(),
+            left,
+            "{name}: the directory moved after the crash returned"
+        );
+        let ends = |with: &str| left.iter().filter(|(n, _)| n.ends_with(with)).count();
+        assert_eq!(
+            (ends(".zpg"), ends(".zpg.tmp")),
+            want,
+            "{name}: the form file and its temp name, {left:?}"
+        );
+        let mut db = Db::open(&dir, forced(|_| {})).unwrap();
+        db.zpages_settle().unwrap();
+        let c = db.zpage_counts();
+        assert_eq!((c.partitions, c.form_files), (1, 1), "{name}: {c:?}");
+        let keys: Vec<Vec<u8>> = model.keys().cloned().collect();
+        check(&db, &model, &keys, name);
+        db.close().unwrap();
+        let left = listed();
+        assert_eq!(
+            left.iter().filter(|(n, _)| n.ends_with(".zpg.tmp")).count(),
+            0,
+            "{name}: a temp name past the reopened store's close, {left:?}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
 #[test]
 fn a_build_that_fails_is_counted_and_the_store_reads_raw() {
     let dir = scratch("failed");
@@ -9256,21 +9355,48 @@ fn the_crossing_asks_for_the_raw_pages_of_a_cold_partition_with_no_form_file() {
             });
         if ahead {
             // Two partitions built ahead under the line, their files on
-            // disk, and the third's build held at its start.
+            // disk, and the third's build held at its start. The builds
+            // are let through one at a time, each from its start to its
+            // rename with the next one's start held behind it: the hold
+            // set once two had been counted built was set behind builds
+            // that follow one another in milliseconds, and where the
+            // test's thread was a few of them late every partition had
+            // its file and no build was left to hold -- once on a hosted
+            // ARM runner, and every run with the thread kept 300 ms
+            // before the hold, seven built of seven.
+            db.hold_zpage_build(true);
+            db.hold_zpage_rename(true);
             inject.set_budget(raw * 3 / 2);
-            assert!(
-                tick_until_built(&db, |c| c.prebuilt >= 2),
-                "{what}: built ahead: {:?}",
-                db.zpage_counts()
-            );
-        }
-        db.hold_zpage_build(true);
-        if ahead {
-            let t = std::time::Instant::now();
-            while !db.zpage_build_waiting() && t.elapsed() < JOB_WALL {
-                wait_steps(&db, 1);
+            let held_at = |what: &str, at: &str| {
+                let t = std::time::Instant::now();
+                while !db.zpage_build_held() && t.elapsed() < JOB_WALL {
+                    wait_steps(&db, 1);
+                }
+                assert!(db.zpage_build_held(), "{what}: a build held at its {at}");
+            };
+            for built in 1..=2u64 {
+                held_at(what, "start");
+                db.hold_zpage_build(false);
+                held_at(what, "rename");
+                db.hold_zpage_build(true);
+                db.hold_zpage_rename(false);
+                assert!(
+                    tick_until_built(&db, |c| c.prebuilt >= built),
+                    "{what}: built ahead: {:?}",
+                    db.zpage_counts()
+                );
+                db.hold_zpage_rename(true);
             }
-            assert!(db.zpage_build_waiting(), "{what}: a build held");
+            db.hold_zpage_rename(false);
+            held_at(what, "start");
+            let c = db.zpage_counts();
+            assert_eq!(
+                (c.prebuilt, c.build_starts),
+                (2, 3),
+                "{what}: two built ahead and the third held: {c:?}"
+            );
+        } else {
+            db.hold_zpage_build(true);
         }
         let on_disk = named_form_files(&dir).len() as u64;
         let pars: Vec<PathBuf> = std::fs::read_dir(&dir)
@@ -18090,6 +18216,83 @@ fn a_build_ahead_bought_while_in_flight_is_trusted_at_once_where_its_read_back_r
     );
     db.close().unwrap();
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A build at a merge's output finish in flight at the tests' crash
+/// (`Db::crash`), as a build ahead is in the test of that name: held at
+/// its start it builds nothing, in a store the crash has ended, and let go
+/// as the crash is called its file is named when the crash returns. A
+/// store whose every partition's file was built ahead; its greatest keys
+/// put again, sealed and merged, the outputs' finishes held at their start.
+/// The form files named after the crash that were not there before it are
+/// the finishes': none where they stayed held, one a finish where they
+/// were let go, and the form files stand as they are either way.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_finish_in_flight_at_a_crash_is_through_or_held_when_the_crash_returns() {
+    for (name, held) in [("crash-finish", false), ("crash-finish-held", true)] {
+        let (dir, mut db, _model, inject, raw) = land_store_loaded(
+            name,
+            50,
+            |o| {
+                o.zpages_stride = ZStride::Forced;
+                o.zpages_build_at_finish = true;
+                // Partitions of megabytes, so that an output's build
+                // outlasts the crash's wait for the store's other
+                // threads: a finish nobody waited for built its two
+                // hundred kilobytes before the crash returned anyway.
+                o.partition_bytes = Some(4 << 20);
+                o.zpages_land_cold_past = false;
+                o.l0_trigger = 1;
+            },
+            |db| numbered_load(db, 120_000, 100, 0xF1B0),
+        );
+        inject.set_budget(raw * 3 / 2);
+        assert!(
+            tick_until_built(&db, |c| c.prebuilt >= c.partitions && !building(c)),
+            "{name}: built ahead: {:?}",
+            db.zpage_counts()
+        );
+        let c0 = db.zpage_counts();
+        db.hold_zpage_build(true);
+        let mut rng = Rng(0xF1B1);
+        for i in 120_000 - 200..120_000 {
+            let v: Vec<u8> = (0..100).map(|_| (rng.next() >> 24) as u8).collect();
+            db.put(&numbered_key(i), &v);
+        }
+        db.commit().unwrap();
+        db.seal().unwrap();
+        wait_for("the merge landed with its output's finish held", || {
+            let c = db.zpage_counts();
+            c.finish_starts > c0.finish_starts
+                && db.merges_in_flight() == 0
+                && db.zpage_build_waiting()
+        });
+        let started = (db.zpage_counts().finish_starts - c0.finish_starts) as usize;
+        let before = named_form_files(&dir);
+        if !held {
+            db.hold_zpage_build(false);
+        }
+        db.crash();
+        let left = form_files(&dir);
+        let new = named_form_files(&dir)
+            .iter()
+            .filter(|f| !before.contains(f))
+            .count();
+        // Every finish that had started, and those of the outputs that
+        // waited for a builder's place behind them.
+        assert!(
+            if held { new == 0 } else { new >= started },
+            "{name}: {new} files of {started} finishes held, {before:?} then {left:?}"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        assert_eq!(
+            form_files(&dir),
+            left,
+            "{name}: a form file or a temp name moved after the crash returned"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }
 
 /// A promotion while a build at a merge's output finish is in flight: the

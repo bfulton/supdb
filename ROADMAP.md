@@ -148,6 +148,15 @@ The suite has to be fair before any of its numbers are quoted.
   each thread count; for every arm that is hours more a full row, so the
   rest run them only where `--passes mixes-threaded` asks
   (`bench/DESIGN.md`).
+- [ ] **A `full` row and a bounded row with the held log's changes.**
+  Handles that write, a burst's batches lent under the held log, a
+  buffered burst filed by its own commits and the settle's lean shapes
+  are banked in quick rows alone, to three hundred thousand keys. No
+  `full` row and no bounded row has been taken with them, and under a
+  bound the settle was paired once, at three million keys under 1 GiB,
+  where nothing resolved. Done when a `full` row and a bounded row at a
+  head that has them are banked, and the cells of FASTER's group and the
+  lag sweep's in each are read against the rows before.
 - [ ] **Match the checksum work, or state it.** RocksDB reads with
   `verify_checksums(false)`, under which it verifies no data block it
   reads, from the file or into its cache. supdb verifies a segment's key
@@ -261,7 +270,9 @@ What an engine picker would hit, roughly in order.
   ten-percent burst at ten thousand keys, behind in the same pairing at
   `5df99d6`, is unresolved by it now and sits level with LMDB's without
   sync in the rows. What the filing costs a burst of one commit is not
-  decomposed.
+  decomposed. The held log's arm has the cell too: its one-percent burst
+  at ten thousand keys, one batch of a hundred, read 0.71x of FASTER's in
+  the quick row at `9453537`, the one burst cell of twelve behind.
 - [ ] **The forms shared between the writer's scans and its upkeep
   thread.** The writer's block tables and scan snapshot are lent whole to
   one thread at a time (`CLAUDE.md`, the writer's upkeep is lent, never
@@ -353,6 +364,29 @@ What an engine picker would hit, roughly in order.
   instructions at two thirds the speed). Done when C at a hundred
   thousand keys reads level with FASTER in both orders of the row's
   order, and F's gets do, timed by kind, in `supdb-heldinplace`.
+- [ ] **The threaded mixes at ten thousand keys.** In the quick row at
+  `9453537` the roster's held arm is ahead of FASTER in 39 of the 48
+  cells of the threaded mixes. Six of the nine behind are at ten thousand
+  keys, 0.81x to 0.97x: `threads-A-uniform` on one, two and three
+  threads, `threads-A` on two, and both read-modify-write mixes on one
+  thread. The other three are within a hundredth of level. Nothing of it
+  is decomposed; a cell there is a few milliseconds, and each thread's
+  time and faults are printed (`SUPDB_THREADED_COUNTERS`). Done when
+  those six read level or ahead in both orders of a pairing in the row's
+  pass order, or what they pay is counted and stated.
+- [ ] **A shared table left when its handles stop writing.** The table
+  every handle writes is left for the one writer's only at one of the
+  writer's own commits or seals (`Options::share_on_write`,
+  `Db::share_look`). A store whose handles stop writing and whose writer
+  then only reads keeps the shared form, and its scans merge their
+  sources, a sixth of the block cache's rate on ycsb-E, until the writer
+  commits; and a scan beside handles that write always merges
+  (`CLAUDE.md`, Standing limitations). The levers named there are the
+  segment work's thread leaving the table for an idle writer, which needs
+  the freeze made safe from a second thread, and a form kept current from
+  the shared table's own writes, which needs them logged. Done when a
+  store that has stopped writing through handles scans at the block
+  cache's rate without a commit of the writer's.
 - [x] **Order ordered ingest's runs across a machine's crash.** Under a
   policy that does not sync at every commit (`SyncPolicy::EveryN`), a
   machine's crash could keep a later run, or frames in the log, and take
@@ -603,6 +637,20 @@ off (`docs/engine.md`, "Out of core: the second form").
   its selector (`src/db/zselect.rs`) and the forced form (`src/db/zside.rs`,
   since replaced by `src/db/zfile.rs`), each with its tests. A line count
   is quoted from the tree it was taken at.
+- [ ] **The crash seam's count, for the threads no hold reaches.** The
+  tests' crash (`Db::crash`) returns once every thread of the store that
+  touches its files has ended (`Life`), and the tests put each kind of
+  thread a hold can reach in flight at a crash. Four kinds have no hold:
+  a piece merge, the builder ahead, the sampler and a form file's warm.
+  A mutant without the count of any one of them passes every test. Done
+  when each has a hold or a seam that puts it in flight at a crash and
+  its mutant fails.
+- [ ] **Two states of the settle no test builds.** Of the thirty-nine
+  mutants of the settle's lean shapes two pass: a frozen batch cut by a
+  budget, which no test builds, and the cache's bind at the fill's
+  check, which a staged patch's shed reaches first in every test. Done
+  when a test builds each state and its mutant fails, or the path is
+  shown to be unreachable and taken out.
 
 ## Proposed out of scope
 
