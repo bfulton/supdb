@@ -13,14 +13,14 @@ where there is one. Figures name the row they are read from.
   partition may hold a record with no value, a format change. Done when the
   differential fuzz pages a store end to end with deletes unsealed, in a
   piece and in a partition, and the scan pass and ycsb-E are priced.
-- [ ] **Open in time independent of the store's size.** Every open
-  verifies each segment's whole key section against its checksum row, and
-  with inline records that is the whole segment: four fifths of the open's
-  instructions, about 10 ms at 300 thousand keys and 90 ms at three
-  million, so recovery trails LMDB by more as the store grows. Verify each
-  16 KB piece at first use, as the sparse reader does, or after the open.
-  Done when `open_ms` does not grow with the store and a damaged piece is
-  still refused before any read of it answers.
+- [ ] **A cheaper verification at open, and a way to skip it.** Every
+  open verifies each segment's whole key section against its checksum row,
+  which with inline records is the whole segment: four fifths of the open's
+  instructions, about 90 ms at three million keys. It stays at open. The
+  CRC runs as one dependency chain; verifying several 16 KB pieces at once
+  read twice the rate in a micro-probe, and segments are independent. Add
+  an option that skips it, stating what is then unchecked. Done when the
+  open's verification runs at memory bandwidth and the option is tested.
 - [ ] **A conditional write.** A put or delete that applies only if the
   key is as its caller read it, on the writer and in a `Txn`.
   `Reader::rmw` exists for handles under the held log, and is atomic only

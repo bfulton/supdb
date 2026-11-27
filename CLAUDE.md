@@ -20,9 +20,9 @@ pointer elsewhere of the form (`CLAUDE.md`, *entry*) names an entry there.
   change. A figure belongs in a row; a figure attached to a change belongs in
   the pull request that made it, rounded.
 - Open work goes in `ROADMAP.md` and nowhere else. A cell a comparator wins
-  is an open target there. Nothing is a standing limitation: a cell the
-  design is willing to lose is listed there as an acceptable loss, a price
-  paid for something, never a verdict that it cannot be won.
+  is an open target there. Nothing is a standing limitation: a quantity the
+  design is willing to lose is stated in `bench/DESIGN.md` as an acceptable
+  loss, a price paid for something, never a verdict that it cannot be won.
 - Quote the ordered load and the shuffled load together, never one alone.
 - A duration nobody timed is not written down as measured, in a commit
   message least of all.
