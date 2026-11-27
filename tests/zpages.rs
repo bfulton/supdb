@@ -9302,10 +9302,13 @@ fn a_form_build_under_a_cipher_says_what_its_file_is_to_hold() {
             }),
         )
         .unwrap();
-        let said = db.cipher_counts().unwrap().expected;
+        // Counted from the open, which says nothing of its own of a store
+        // settled and closed, since the builds start the moment the store
+        // is open: a baseline read after the open missed a build that had
+        // said its length before it, once on a hosted ARM runner.
         db.zpages_settle().unwrap();
         let c = db.zpage_counts();
-        let said = db.cipher_counts().unwrap().expected - said;
+        let said = db.cipher_counts().unwrap().expected;
         assert!(
             c.builds >= 2 && c.form_files == c.partitions,
             "{what}: every partition built: {c:?}"
