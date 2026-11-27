@@ -1653,7 +1653,18 @@ turned on neither.
     data file waited for and a drop behind it, the process's mappings
     over the file's range (`/proc/self/maps`), and the table's counts.
     Not seen as a store of files in 860 runs, which at that rate proves
-    nothing.
+    nothing. It came again on the pull request's hosted legs, as the
+    cipher's sibling there: a form file built ahead under a cipher, written
+    back and dropped before its rename, every one of its 56 pages resident
+    at the test's look (`builds_ahead_under_a_cipher_seal_their_form_files_and_keep_them_cold`,
+    the ARM leg's `onefile` group). Here the stride test failed in one
+    whole run of `tests/zpages.rs` of six, two at a time, and with a probe
+    at the third look -- each resident page's flags and its count of
+    mappings, the process's mappings over the range, and the residency
+    after a waited writeback and a drop -- in none of ten. The probe is
+    not in the tree: it reads `/proc/self/maps`, which the library may
+    not (`the_library_reads_no_maps_and_makes_no_backtrace`), so it is
+    the test's to make, at the moment the third look fails.
   - Under a cipher (`supdb-cipherautoonefile` against
     `supdb-cipherauto`, ten million keys under 1.25 GiB;
     `scratch/plan/onefile.md` at `5b81772` has the commands and counts): the scan
