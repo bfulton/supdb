@@ -1,0 +1,60 @@
+name: cost
+
+# What a store in the clear pays an operation, counted by function under
+# callgrind against a base (scripts/check.sh cost: scripts/cost.sh, after
+# the count has been shown red on a known-red input and green on the tree
+# against itself, scripts/cost-red.sh). Run by hand: it builds the suite's
+# probes three times and runs them under valgrind, most of an hour, and a
+# branch that has grown apart from the line it is counted against reads red
+# by function on what the compiler moved as well as on work a change added,
+# so its verdict is one a person reads (ROADMAP.md, a verdict from the
+# count). Instruction counts are the same on any runner, so a hosted one
+# serves. The base left empty is the merge-base of the run's head and main
+# (scripts/base.sh).
+
+on:
+  workflow_dispatch:
+    inputs:
+      base:
+        description: 'The commit the count is against (empty: the merge-base with main)'
+        required: false
+        default: ''
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  cost:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 150
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+      # The toolchain rust-toolchain.toml names, the one the local gate runs
+      # under; no workflow names a version or a channel of its own.
+      - name: The pinned toolchain
+        run: sh scripts/toolchain.sh
+      - name: libclang, for bindgen
+        run: sh bench/scripts/libclang.sh
+      # FASTER is a comparator too, and not a crate: the suite's build needs
+      # its sources, which the script fetches at the pinned commit.
+      - name: FASTER, for the `faster` arm
+        run: sh bench/scripts/faster.sh
+      - name: valgrind
+        run: sh scripts/apt.sh valgrind
+      # `workspace -> target`, the target a path inside its workspace: see
+      # ci.yml's `test` job. The key every job that builds the suite's binary
+      # shares (ci.yml's `quick` job): the probes build on the binary's
+      # dependencies, RocksDB's among them, which the key restores, and
+      # what they build beside it is the job's own each run.
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: bench -> target
+          shared-key: bench
+      # The base the person named, or none, which scripts/base.sh reads as
+      # the merge-base with main.
+      - name: The plain store's cost, by function
+        env:
+          COST_BASE: ${{ inputs.base }}
+        run: sh scripts/check.sh cost

@@ -1641,30 +1641,24 @@ turned on neither.
   - A stride file built ahead and dropped keeps no word for a trusted
     attach where pages of it are in the cache as its read-back begins
     and two more drops do not take them (`zfile::reads_device`), and is
-    checked page by page at its first touches instead. The one cause
-    found, a neighbour's read-around, is what the second drop is for.
-    Another is not found: every page of one file of seventeen resident
-    through three looks and through a drop of the whole data file's
-    cache -- so held, dirty or under writeback -- in 6 runs of 1,540 of
-    `the_words_kept_for_stride_files_are_held_to_the_live_partitions`
-    under `SUPDB_TEST_ONEFILE=1`, four at once, and in none of the 7,200
-    after, 800 of them with the memory group at its limit. What would
-    tell the three apart, at the third look: a writeback of the whole
-    data file waited for and a drop behind it, the process's mappings
-    over the file's range (`/proc/self/maps`), and the table's counts.
-    Not seen as a store of files in 860 runs, which at that rate proves
-    nothing. It came again on the pull request's hosted legs, as the
-    cipher's sibling there: a form file built ahead under a cipher, written
-    back and dropped before its rename, every one of its 56 pages resident
-    at the test's look (`builds_ahead_under_a_cipher_seal_their_form_files_and_keep_them_cold`,
-    the ARM leg's `onefile` group). Here the stride test failed in one
-    whole run of `tests/zpages.rs` of six, two at a time, and with a probe
-    at the third look -- each resident page's flags and its count of
-    mappings, the process's mappings over the range, and the residency
-    after a waited writeback and a drop -- in none of ten. The probe is
-    not in the tree: it reads `/proc/self/maps`, which the library may
-    not (`the_library_reads_no_maps_and_makes_no_backtrace`), so it is
-    the test's to make, at the moment the third look fails.
+    checked page by page at its first touches instead. The cause is the
+    builds ahead beside it (`Options::zpages_ahead_builders`, two): a
+    build's reads through a mapping of its own file or its partition's are
+    read around and ahead by the kernel in the file the mapping is of,
+    and in the data file that runs past the file's end into the next, so
+    a second build reads the first's file back from the device as fast as
+    the first drops it. A probe of every page at the third look found
+    each clean, unmapped and in folios inside the file, and the free page
+    before it resident too; four tests that hold every word at once
+    failed 61 runs of 600 under `SUPDB_TEST_ONEFILE=1`, and none of 800
+    with one build at a time, which those tests now take where the store
+    is in one file (`one_build_ahead_in_one_file`). The read-back advised
+    random alone took it to 15 of 600: the second build's partition walk
+    spills as well. The lever, not built: every read a build makes
+    through a mapping in the data file bounded to its own extent, the
+    mapping advised random and its range asked ahead in pieces, as a
+    store of files has the file's end do; it changes the one-file arm's
+    builds' reads, and is priced before it is the arm's.
   - Under a cipher (`supdb-cipherautoonefile` against
     `supdb-cipherauto`, ten million keys under 1.25 GiB;
     `scratch/plan/onefile.md` at `5b81772` has the commands and counts): the scan

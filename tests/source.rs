@@ -4848,7 +4848,10 @@ const CI_ON: &[(&str, &str, &str)] = &[
 ];
 
 /// Groups of scripts/check.sh no CI job runs, each with why.
-const CI_NOT_RUN: &[(&str, &str)] = &[];
+const CI_NOT_RUN: &[(&str, &str)] = &[(
+    "cost",
+    "most of an hour under valgrind, and red by function against a line the branch has grown apart from: run by hand, cost.yml",
+)];
 
 /// The groups scripts/check.sh's loop knows, by its case's labels (`a)` or
 /// `a | b)`, at the first label's indent, a case inside a group read past
@@ -5262,6 +5265,10 @@ const CI_OTHER: &[(&str, &str)] = &[
     (
         ".github/workflows/bank-row.yml",
         "after a merge to main, proposes the hosted runners' quick rows as a pull request, which ci.yml then checks",
+    ),
+    (
+        ".github/workflows/cost.yml",
+        "the count of what a store in the clear pays, by hand: most of an hour under valgrind, and a verdict by function a person reads",
     ),
     (
         ".github/workflows/comparators.yml",
@@ -6064,19 +6071,19 @@ fn a_ci_step_that_checks_outside_check_sh_fails() {
     // environment the test does not list, a key it does not know, an
     // anchor, and a step that is two things.
     let lists = "        run: sh scripts/check.sh lists\n";
-    let cost = "          SUPDB_PR_BASE: ${{ github.event.pull_request.base.sha }}\n          SUPDB_PUSH_BEFORE: ${{ github.event.before }}\n        run: sh scripts/check.sh cost\n";
+    let based = "          SUPDB_PR_BASE: ${{ github.event.pull_request.base.sha }}\n          SUPDB_PUSH_BEFORE: ${{ github.event.before }}\n        run: sh scripts/check.sh lists\n";
     let cross = "      - name: Build and test under emulation\n";
     let edits: &[(&str, &str, &str)] = &[
         (lists, "        if: false\n        run: sh scripts/check.sh lists\n", "an `if:` the test does not list"),
         ("  lists:\n", "  lists:\n    if: github.event_name == 'workflow_dispatch'\n", "a job's `if:`"),
         ("  wasm:\n", "  wasm:\n    if: false\n", "a job's `if:`"),
         (lists, "        continue-on-error: true\n        run: sh scripts/check.sh lists\n", "continue-on-error"),
-        ("  cost:\n", "  cost:\n    continue-on-error: true\n", "continue-on-error"),
+        ("  lists:\n", "  lists:\n    continue-on-error: true\n", "continue-on-error"),
         (cross, "      - name: Build and test under emulation\n        env:\n          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_RUSTFLAGS: --cfg supdb_emulated\n", "the environment `CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_RUSTFLAGS"),
-        (cost, "          SUPDB_BASE: ${{ github.event.pull_request.base.sha || github.event.before }}\n        run: sh scripts/check.sh cost\n", "the environment `SUPDB_BASE"),
+        (based, "          SUPDB_BASE: ${{ github.event.pull_request.base.sha || github.event.before }}\n        run: sh scripts/check.sh lists\n", "the environment `SUPDB_BASE"),
         (lists, "        env:\n          SUPDB_BASE: HEAD\n        run: sh scripts/check.sh lists\n", "the environment `SUPDB_BASE: HEAD`"),
         (lists, "        env:\n          RATCHET_RED_STEPS: B\n        run: sh scripts/check.sh lists\n", "the environment `RATCHET_RED_STEPS: B`"),
-        (cost, "          SUPDB_PR_BASE: ${{ github.event.pull_request.base.sha }}\n          SUPDB_PUSH_BEFORE: ${{ github.event.before }}\n          COST_PROBES: read\n        run: sh scripts/check.sh cost\n", "the environment `COST_PROBES: read`"),
+        (based, "          SUPDB_PR_BASE: ${{ github.event.pull_request.base.sha }}\n          SUPDB_PUSH_BEFORE: ${{ github.event.before }}\n          COST_PROBES: read\n        run: sh scripts/check.sh lists\n", "the environment `COST_PROBES: read`"),
         ("env:\n  CARGO_TERM_COLOR: always\n", "env:\n  CARGO_TERM_COLOR: always\n  SUPDB_BASE: HEAD\n", "the environment `SUPDB_BASE: HEAD`"),
         ("  wasm:\n", "  wasm:\n    env:\n      COST_BASE: HEAD\n", "the environment `COST_BASE: HEAD`"),
         ("  wasm:\n", "  wasm:\n    defaults:\n      run:\n        working-directory: bench\n", "the key `defaults`"),
@@ -6199,7 +6206,7 @@ fn a_job_that_builds_the_suite_without_faster_fails() {
     assert!(CI_SETUP.iter().any(|(s, _)| *s == CI_FASTER));
     let faster = format!("run: {CI_FASTER}");
     let jobs = yaml.matches(&faster).count();
-    assert!(jobs >= 4, "{jobs} jobs ready FASTER");
+    assert!(jobs >= 3, "{jobs} jobs ready FASTER");
     // Each job's step taken away in turn, a second libclang step in its
     // place so that every other rule still holds.
     for nth in 0..jobs {
@@ -6272,22 +6279,26 @@ fn a_group_no_ci_job_runs_fails() {
         "{e}"
     );
     // A group no job runs, said so with a reason, passes; said so without
-    // one, or said of a group a job runs or of no group, fails.
+    // one, or said of a group a job runs or of no group, fails. Each beside
+    // the groups the test says no job runs already.
+    let with = |g: &'static str, why: &'static str| -> Vec<(&'static str, &'static str)> {
+        CI_NOT_RUN.iter().copied().chain([(g, why)]).collect()
+    };
     let none = ci_edit(
         &yaml,
         "run: sh scripts/check.sh wasm",
         "run: sh bench/scripts/faster.sh",
     );
-    ci_check_with(&none, &sh, &[("wasm", "a reason")])
+    ci_check_with(&none, &sh, &with("wasm", "a reason"))
         .unwrap_or_else(|e| panic!("wasm said not run: {e}"));
-    let e = ci_check_with(&none, &sh, &[("wasm", " ")]).expect_err("no reason");
+    let e = ci_check_with(&none, &sh, &with("wasm", " ")).expect_err("no reason");
     assert!(e.contains("CI_NOT_RUN gives `wasm` no reason"), "{e}");
-    let e = ci_check_with(&yaml, &sh, &[("wasm", "a reason")]).expect_err("run and said not");
+    let e = ci_check_with(&yaml, &sh, &with("wasm", "a reason")).expect_err("run and said not");
     assert!(
         e.contains("the group `wasm` runs in CI and CI_NOT_RUN says it does not"),
         "{e}"
     );
-    let e = ci_check_with(&yaml, &sh, &[("nogroup", "a reason")]).expect_err("no such group");
+    let e = ci_check_with(&yaml, &sh, &with("nogroup", "a reason")).expect_err("no such group");
     assert!(e.contains("CI_NOT_RUN names `nogroup`, no group"), "{e}");
 }
 

@@ -151,49 +151,6 @@ jobs:
           if-no-files-found: ignore
           path: bench/runs-ci/
 
-  cost:
-    # What a store in the clear pays an operation, counted by function under
-    # callgrind against the commit the change is made on (scripts/cost.sh),
-    # after the count has been shown red on a known-red input and green on
-    # the tree against itself (scripts/cost-red.sh). A job of its own
-    # because it builds the suite's probes three times and runs them under
-    # valgrind, most of an hour; instruction counts are the same on any
-    # runner, so a hosted one serves.
-    runs-on: ubuntu-24.04
-    timeout-minutes: 150
-    steps:
-      - uses: actions/checkout@v7
-        with:
-          fetch-depth: 0
-      # The toolchain rust-toolchain.toml names, the one the local gate runs
-      # under; no workflow names a version or a channel of its own.
-      - name: The pinned toolchain
-        run: sh scripts/toolchain.sh
-      - name: libclang, for bindgen
-        run: sh bench/scripts/libclang.sh
-      # FASTER is a comparator too, and not a crate: the suite's build needs
-      # its sources, which the script fetches at the pinned commit.
-      - name: FASTER, for the `faster` arm
-        run: sh bench/scripts/faster.sh
-      - name: valgrind
-        run: sh scripts/apt.sh valgrind
-      # `workspace -> target`, the target a path inside its workspace: see
-      # the `test` job. The key every job that builds the suite's binary
-      # shares (see the `quick` job): the probes build on the binary's
-      # dependencies, RocksDB's among them, which the key restores, and
-      # what they build beside it is the job's own each run.
-      - uses: Swatinem/rust-cache@v2
-        with:
-          workspaces: bench -> target
-          shared-key: bench
-      # The event's values, and nothing decided here: scripts/base.sh takes
-      # the base from them, as it does on a contributor's clone.
-      - name: The plain store's cost, by function
-        env:
-          SUPDB_PR_BASE: ${{ github.event.pull_request.base.sha }}
-          SUPDB_PUSH_BEFORE: ${{ github.event.before }}
-        run: sh scripts/check.sh cost
-
   lists:
     # The lists that only go down (tests/data's, registered in
     # scripts/ratchet.py) against the commit the change is made on: a list
