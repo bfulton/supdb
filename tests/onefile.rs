@@ -973,7 +973,14 @@ fn an_opens_publish_tells_the_table_its_manifest_is_on_the_device_in(
         let mut db = Db::create(&d, small(background)).unwrap();
         load(&mut db, &mut model, 2000, "a");
         db.flush().unwrap();
-        db.settle().unwrap();
+        // At rest in its forms as well: a plain settle joins no form
+        // file's build, and where every build asks for the form
+        // (`SUPDB_TEST_STRIDE`) a partition whose build had not begun by
+        // the close was built by the store opened next, whose listing of
+        // it was a manifest published between the open and the kill, once
+        // on a hosted macOS runner and every run with the test's thread
+        // held a second and a half there.
+        db.zpages_settle().unwrap();
         db.close().unwrap();
         // Opened at rest, the table is of the slot the open took and the
         // open publishes nothing.

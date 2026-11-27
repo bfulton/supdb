@@ -11177,6 +11177,13 @@ build, and a form file built after it was room the open took beside a
 named segment; read behind `zpages_settle`, none in sixty. A twin added
 under a mode runs under every switch its sibling does before the twin
 is called held, since the stride group had passed it once by the coin.
+It came again as a store closed behind `settle`: the test that an open's
+publish tells the table read nothing published between an open at rest
+and a kill, and the store opened next built the form file the close had
+left unbuilt and listed it in that window, once on a hosted macOS
+runner and every run here with the test's thread held a second and a
+half there. A test's "at rest" under the switch is behind
+`zpages_settle`.
 
 **Two lines' answers to one ask, merged by text.** This branch's run
 close lands durable only at the writer's word, the drain's ask
