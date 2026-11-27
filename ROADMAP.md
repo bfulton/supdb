@@ -166,6 +166,14 @@ The suite has to be fair before any of its numbers are quoted.
   RocksDB reads a memtable (`bench/DESIGN.md`, Arms). Either RocksDB reads
   with its default, `verify_checksums(true)`, or the methods say what each
   engine verifies.
+- [ ] **FASTER's rates between two bounded rows.** At three million keys
+  under 1 GiB FASTER's point mixes read 30% to 57% higher in the row at
+  `33bc663` than in the row at `001781d` (`bench/runs/killed/ooc`), with
+  LMDB level to a quarter higher, the engine's default arm level and its
+  held arm a tenth lower, so the held arm's ratio to FASTER there moved
+  mostly by FASTER. Done when the two rows' FASTER arms are held to one
+  configuration, its sizes under the bound among it
+  (`engines::faster_sizes`), or the difference is laid to the host.
 - [ ] **Check the 2026-10-17 run's other flags.** The buffered 1% burst at
   1M keys (185K updates/s, below supdb's own durable rate); buffered
   "device bytes written" equalling bytes on disk exactly, which may not be
@@ -204,6 +212,50 @@ What an engine picker would hit, roughly in order.
   anything (`tests/runlog.rs`). A run that was the last thing written is
   gone with nothing said, as a log's last synced record would be: nothing
   on disk stands after it to say so.
+- [ ] **A scan's limit counts the keys it answers, and a page says where
+  the next one starts.** `scan(from, limit, f)` counts every key it
+  visits, a deleted key among them for as long as any part of the store
+  still records the delete. With eight of a store's first sixteen keys
+  deleted and unsealed, a scan of ten answers ten and hands over the
+  values of five; with those merged away and four of the keys after them
+  deleted, of six, unsealed or sealed in a piece; and of ten once a
+  flush's merge has dropped the deletes (sixty keys put, the deletes,
+  `seal`, `flush`, with partitions and without, at `e577753`). So
+  what a limit buys depends on what the store has merged: a page comes
+  back short, or empty, with keys still ahead of it, a caller that reads
+  "fewer than the limit" as the end stops early, and a page of exactly the
+  limit says nothing of whether another follows. The limit is to count the
+  keys that hold a value, a key deleted and not written again passed over
+  whichever part of the store records the delete, so a scan answers
+  `limit` keys wherever that many stand at or above `from` and fewer only
+  at the store's end. And a paged call, `scan_page(from, limit, f)`,
+  answers where the next page starts, the first key after the page that
+  holds a value, and nothing at the store's end, which a store whose keys
+  are a whole number of pages needs as much as one with deletes; it is a
+  scan of one key more than the page, whose values are read and not handed
+  over. Three things the change has to carry. The merge paths and the
+  overlay's walks count a key where a value of it is handed over. The
+  block path gives each source a window of keys as long as the limit
+  (`overlay_window`, `overlay_mem_window`, and a wide block's under
+  `Options::scan_wide_capped`), and once a deleted key counts for nothing a
+  walk can spend its whole window under the limit: it stops there and the
+  scan goes on from the key after the window's last. And a partition may
+  hold a record with no value: a merge that writes the bottom level drops
+  the deletes, a promotion links a piece as it stands (`Seg::tombs`;
+  `promote_ranges`, `promote_unpartitioned`), and the walks that take a
+  partition's records in bulk count records without asking whether one
+  holds a value. Done when a scan and a page hold to
+  the model in every state of the store, the scan model and the
+  differential fuzz counting keys with values and the fuzz paging a store
+  from end to end, with the deletes unsealed, in a piece, and in a
+  partition a promotion made; when the README shows the paged call; and
+  when the scan pass and ycsb-E are priced against the count before in
+  both orders, since the count is in the scan's innermost loops. Open for
+  the design: whether no partition may hold a record without a value, a
+  promotion leaving such a piece to the merge and a store from before
+  checked or rewritten once at its first open under a new store format
+  version, or whether every record walk says which records hold none and
+  the bulk walks stop for them, with no format change.
 - [ ] **A buffered burst of one commit pays the filing in that commit.** A
   commit near reads files its batch (`Options::forms_settle_every`), and
   where a burst is one commit the filing is in the burst: the buffered
@@ -354,6 +406,80 @@ What an engine picker would hit, roughly in order.
   does by default; a checkpoint that leaves the memtable where it is and
   carries the log would be the cheaper one for a store that writes
   between them.
+- [ ] **The first scan after a burst.** The scan pass after a burst pays
+  its first scan for the burst's end: the wait for the upkeep thread's pass
+  in flight, the log read, the settle of what the thread trailed by and the
+  snapshot's extension, 0.4 to 14 ms at three million keys where the rest
+  of a divided pass is 12 to 15, with a merge the idle plan starts at that
+  scan beside it in a rep in four (`CLAUDE.md`, open targets). It is what
+  the pass after a full rewrite at three million keys under 1 GiB has left
+  against LMDB's, level to a tenth ahead where the same pass in memory is
+  1.8x. Two levers are priced and neither chosen: the share the syncing
+  pace lets the thread trail by (`Options::upkeep_pace_syncs_bp`), which
+  gives the first scan back and takes an eighth to a third of the small
+  bursts, and the idle plan's merge held off or run at the idle I/O class
+  while the writer's forms cover the store and no point read is near, which
+  is not built. Done when the first scan of the pass after each burst costs
+  what the scans behind it do, in both orders of the pairing at three
+  million keys in memory and under both bounds, with no burst slower for it.
+- [ ] **The settle's cost a key.** Filing a write into its block's form is
+  what the upkeep thread trails by, what the first scan after a burst
+  settles and what a commit near reads pays: in the scrambled E a commit of
+  a hundred inserts at twice LMDB's, 2,500 instructions an insert, and at
+  ten thousand keys a first scan of 100 to 140 µs in a mix of 1.1 ms
+  (`docs/engine.md`, timed by kind). The loop wants making again and not
+  trimming: its sort for duplicates, the key read four times a write, a
+  patch's allocations. Beside it, a scan that takes its upkeep back from a
+  pass in its fill by a short spin where it parks, fifteen microseconds a
+  hand-off. Done when E's commit is level with LMDB's and the scrambled E
+  at ten and thirty thousand keys holds ahead in the rows by more than the
+  twentieth it has, under both policies.
+- [ ] **A light form's conversion with a trigger of its own.** The fill
+  converts a form under the dense count only on a walk of the tables, and
+  a walk starts where something else leaves them incomplete: a write into
+  a block with no form, a form left at the dense count, a settle's
+  conversion (`Options::settle_convert_fills`; `CLAUDE.md`, a step made
+  earlier). A store whose every block holds a light form, with no batch
+  taking one to the dense count, converts none, and its scans walk deltas.
+  Done when the conversion is started by what it is about, a form past the
+  line that the scans have read, priced against today's on the scrambled E
+  at every rung and on the write mixes that pay for the walks, with the
+  shape before as an arm.
+- [ ] **The buffered arm's cells under LMDB without sync in the quick
+  row.** The row at `33bc663` reads the buffered arm's scan pass at 0.93x
+  to 0.96x at ten, thirty and three hundred thousand keys, its scrambled E
+  at 0.89x at three hundred thousand and the pass after the full rewrite
+  there at 0.88x. None of these is paired; the pairings of that binary at
+  ten and a hundred thousand keys read the scan pass and E ahead in both
+  orders. Done when each is paired in the row's order in both orders, and
+  won or decomposed.
+- [ ] **The seal's record path.** A seal hands the segment writer its
+  records one at a time, about 830 instructions a key, and the shuffled
+  load's drain at ten thousand keys is the seal's CPU: the durable
+  shuffled load reads 0.94x of RocksDB's there in the row at `33bc663`. A
+  direct run's commit was given its batch at once
+  (`Options::direct_lean_append`); the seal's path was not. Done when the
+  shuffled load at ten and thirty thousand keys is ahead of both
+  comparators in both orders, and the durable ordered load's cells at ten
+  and a hundred thousand keys, which the pairings read ahead and the row
+  0.89x to 0.92x, are reproduced in the row's shape or laid to it.
+- [ ] **Scans on a store with unsealed keys spread through it.** A few
+  unsealed keys in a partition take every scan of it off the bulk walk and
+  through the block loop and the form file's cursor, a fifth to a quarter
+  slower than the same scans on the store folded, whatever form serves
+  (`SUPDB_SCAN_MIXED_FOLD`). Over the suite's numbered keys the inserts
+  land above every key and the stride form's lead covers the rest; over
+  keys that fall anywhere it is the cell lost to LMDB wherever LMDB's file
+  is in memory, the threaded scans after the mixes at ten million random
+  ids, 0.86x to 0.91x under 1.25 GiB. The levers: the block loop's three
+  loads a block, each behind the last; what the values' copies wait on in
+  the cursor's walk, which is not known; and folding the keys in once a
+  store is only read. Done when the scans after the mixes read level with
+  the scan pass before them over ids and over numbered keys.
+- [ ] **The index layouts the study found.** `docs/index-theory.md` has
+  smaller and faster points on the frontier than the layout that ships.
+  Done when one is built behind an option and priced in the suite's shape,
+  or the study's point is refuted there.
 - [ ] **Range delete.** Deleting a key range without a tombstone per key.
 - [ ] **Reverse and bounded scans.** `scan` is forward-only from a start key
   with a count; add an end bound and reverse order.
@@ -397,10 +523,95 @@ off (`docs/engine.md`, "Out of core: the second form").
 - [ ] **The writer's reads in the census.** Counting them while the
   controller decides read the A and F mixes slower in two sittings,
   unresolved; a store that stays undecided pays it. Done when resolved.
-- [ ] **What is not priced yet.** Ten million keys under a gibibyte with
-  the builds ahead, the lag sweep under a bound, and a shuffled load
-  followed by reads. Done when each is paired against LMDB with its
-  readahead off.
+- [x] **What was not priced.** Ten million keys under a gibibyte with the
+  builds ahead, the lag sweep under a bound, and a shuffled load followed
+  by reads: the bounded rosters run three and ten million keys under 1 GiB
+  and 1.25 GiB with the lag sweep and the shuffled load among their
+  passes, against LMDB with its readahead off and RocksDB tuned
+  (`bench/runs/ooc`, `bench/DESIGN.md`).
+- [ ] **The pass after a full rewrite under a bound.** It pays for the
+  burst's merge debt twice: as a merge writing beside it, in the reps
+  where the chain has not drained, and as the working set the burst
+  leaves, which under 1 GiB at ten million keys is about 1.2 GB against
+  the bound: form files that do not fit, the pieces, and the memtables'
+  unsealed keys, whose sort is the pass's first scan. There the pass over
+  random ids reads 0.6x to 0.9x of LMDB and over numbered keys 1.1x to
+  1.3x, a third of it user time, a quarter the kernel's fault handling and
+  the rest device waits (`CLAUDE.md`, open targets). The idle I/O class
+  for the merges and their inputs asked ahead were priced on it and
+  refuted. Done when the pass over ids is ahead of LMDB in both orders
+  under 1 GiB with the burst no slower, by the bytes of that working set
+  or the merge path's user time over them.
+- [ ] **A store past its budget that is only scanned.** The controller
+  buys the compact form on its point reads' faults, and a sweep of bursts
+  and scans has none. At ten million keys the held arm's lag sweep began
+  with the compact form serving in seventeen sweeps of eighteen under 1 GiB
+  and in three of six under 1.25 GiB, and where it began raw the one- and
+  ten-percent bursts ran ten times longer, the writer held behind an
+  upkeep thread that resolves its keys through raw records the bound has
+  pushed out (`docs/engine.md`, the frozen tables' bytes). What decides the
+  purchase before the sweep, the load's builds ahead or the budget as the
+  load ends, has not been read off the controller's trace
+  (`SUPDB_ZPAGES_TRACE=1` over the pairing). Done when it is, and the sweep
+  begins on the form the budget calls for in every rep.
+- [ ] **The builds ahead at the half-budget line.** The builds ahead at
+  landing start where the store's raw bytes pass half its budget
+  (`Options::zpages_land_pct`), and the budget is the limit less the
+  process, so a store that ends its load on that line is bet on or not by
+  what the process happens to hold: at three million keys under 1 GiB one
+  or two builds ran through the first burst, twice its length, in a third
+  of the reps before the jobs' arrays were mapped, which holds that store
+  eighteen megabytes under. A store a tenth larger is on the line again.
+  Done when the bet is called off where scans or commits come while the
+  store is under the selector's line, or the line is drawn against a
+  budget the engine's own transient memory does not move, and which
+  syscall of a build stalls a commit beside it has been traced.
+- [ ] **The crossing off the thread every landing goes through.** The
+  one-thread read pass straight after a load under a bound reads in two
+  shapes by when the load's last partitions land: at ten million keys
+  under 1.25 GiB the last five land in one burst at the load's end in half
+  the reps, and the crossing's third of a second on the segment work's
+  thread runs with the reads already going, 1.4 to 1.7 s for a million
+  reads against 0.9 to 1.1. Twice LMDB's rate in the long shape. Done when
+  the crossing's asks are made off that thread and the pass reads one
+  shape.
+- [ ] **The full rewrite's burst at three million keys under 1 GiB.** The
+  upkeep thread takes 8,000 to 46,000 major faults a burst building copies
+  from raw records the cache had let go, the burst 6.9 s at the first
+  count and 9.3 at the second, and the controller's sampler 2,800 to 4,300
+  more, sampling at every landing for a purchase no read is near to make
+  (`CLAUDE.md`, a reservation in a budget's arithmetic). Done when the
+  burst takes the faults of its fast count in every rep, with the pass
+  after it no slower.
+- [ ] **The memos of decoded groups in slabs.** The memos keep their
+  memory after their readers end, in arenas the allocator does not return,
+  and where the block form misses its fit by that much the store faults
+  for it. In slabs (`Options::zpages_memo_slab`) they return it, the
+  scrambled mixes 1.19x to 1.85x at ten million random ids under 1 GiB
+  before the heads placed the bounds, and the option is off: over numbered
+  keys at that bound the slab has nothing to return, and the hot-raw
+  policy's one release, asked into memory that stands unused at a look, is
+  never asked under it. Done when that policy's room is drawn from
+  something the slab does not move, and the slab is priced again beside
+  the heads, six reps a sitting over numbered keys at both ten-million
+  bounds, with the quick row and the gate.
+- [ ] **Keys that are no run of numbers.** Three things are owed over
+  random ids. The sparse stride form is priced where it fits, 1.5 GiB at
+  ten million keys, and is not the default anywhere: its pricing over ids
+  and numbered keys at the roster's bounds, and the decision. The block
+  form serves ids wherever that form does not fit, and its three-thread
+  scan pass at ten million ids under 1.25 GiB is 0.94x of LMDB's. And
+  `supdb-nocache` was killed at ten million ids under 1 GiB in the lag
+  sweep after its ten-percent point, the cause not read. Done when each
+  has its pairing or its count, and the scan pass is ahead.
+- [ ] **A budget read where the load ends.** The controller reads its
+  budget as the load ends, the process at its smallest. A store whose raw
+  form fits that budget by less than the process then grows, ten million
+  random ids under 1.5 GiB by a hundredth, is served raw until its reads'
+  faults have paid for the form, four cells of a divided row, and a form
+  built ahead for it is dropped as it is written and read back under the
+  first reads. Done when the budget counts what the engine's own
+  structures are set to hold.
 - [x] **Whether `Auto` ships on.** It does: `ZPages::Auto` is the default
   and the raw form alone is the arm (`supdb-nozpages`), in both rosters
   in the controller arm's place. What the controller cost a read in

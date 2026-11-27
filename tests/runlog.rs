@@ -48,6 +48,20 @@ fn buffered() -> Options {
     }
 }
 
+/// The options of a store whose files a test cuts after its crash: the
+/// compact form off. `Db::crash` leaves a store's threads running, and
+/// under the stride switch (`SUPDB_TEST_STRIDE`) a form file's build reads
+/// a landed segment through a mapping, so a segment cut under it ends the
+/// binary in a SIGBUS -- once in a gate's stride group, in none of ten
+/// runs of the binary or thirty-six of its tests alone, the shape the
+/// `db` tests' tears were given the same answer for.
+fn torn(o: Options) -> Options {
+    Options {
+        zpages: supdb::ZPages::Off,
+        ..o
+    }
+}
+
 /// The options of a store that is read and then stopped as a crash stops
 /// it: its segment work inline, since `Db::crash` leaves a store's threads
 /// running, and a thread that shapes what the reads touched would go on
@@ -93,6 +107,28 @@ fn run_file(d: &Path, id: u64) -> PathBuf {
     d.join(format!("direct-{id:08}.tmp"))
 }
 
+/// The files under a run's temp name, empty or not.
+fn run_files(d: &Path) -> Vec<String> {
+    names(d, "direct-")
+}
+
+/// The runs under their temp names: the files that hold something. An
+/// empty one is the next run's, made ahead of it (`Options::run_spare`),
+/// and no run.
+fn begun_runs(d: &Path) -> Vec<String> {
+    run_files(d)
+        .into_iter()
+        .filter(|n| std::fs::metadata(d.join(n)).is_ok_and(|m| m.len() > 0))
+        .collect()
+}
+
+/// Whether the run of id `id` has begun: its file holds something. The
+/// file alone says nothing, since the next run's is made ahead of it,
+/// empty (`Options::run_spare`).
+fn run_began(d: &Path, id: u64) -> bool {
+    std::fs::metadata(run_file(d, id)).is_ok_and(|m| m.len() > 0)
+}
+
 fn names(d: &Path, prefix: &str) -> Vec<String> {
     let mut v: Vec<String> = std::fs::read_dir(d)
         .unwrap()
@@ -109,7 +145,7 @@ fn names(d: &Path, prefix: &str) -> Vec<String> {
 fn two_runs(db: &mut Db, d: &Path, more: u64) -> (u64, u64) {
     db.hold_seal_landing(true);
     let mut b = 0;
-    while !run_file(d, 1).exists() {
+    while !run_began(d, 1) {
         assert!(b < 64, "no second run after {b} batches");
         ordered_batch(db, b);
         b += 1;
@@ -119,7 +155,7 @@ fn two_runs(db: &mut Db, d: &Path, more: u64) -> (u64, u64) {
         ordered_batch(db, b);
         b += 1;
     }
-    assert!(run_file(d, 0).exists(), "the first run's seal was held");
+    assert!(run_began(d, 0), "the first run's seal was held");
     (b, second)
 }
 
@@ -131,7 +167,7 @@ fn two_runs(db: &mut Db, d: &Path, more: u64) -> (u64, u64) {
 #[test]
 fn a_run_cut_short_ends_the_history_before_the_run_after_it() {
     let d = dir("short");
-    let mut db = Db::create(&d, buffered()).unwrap();
+    let mut db = Db::create(&d, torn(buffered())).unwrap();
     let (n, second) = two_runs(&mut db, &d, 3);
     db.crash();
     // The first run's end, lost: a quarter of a megabyte, two batches.
@@ -161,9 +197,9 @@ fn a_run_cut_short_ends_the_history_before_the_run_after_it() {
     let db = Db::open(&d, inline(buffered())).unwrap();
     let kept = check(&db);
     assert!(
-        names(&d, "direct-").is_empty(),
+        begun_runs(&d).is_empty(),
         "a run the history never reached is still there: {:?}",
-        names(&d, "direct-")
+        begun_runs(&d)
     );
     // The store goes on from where its history ends, and what it writes
     // next stands there: the lost batches again, a crash, and all of it.
@@ -251,10 +287,7 @@ fn a_run_behind_frames_that_are_gone_is_not_served() {
     for b in 11..14 {
         ordered_batch(&mut db, b);
     }
-    assert!(
-        run_file(&d, 1).exists() || run_file(&d, 0).exists(),
-        "a run opened"
-    );
+    assert!(run_began(&d, 1) || run_began(&d, 0), "a run opened");
     let (wal, _, written) = db.wal_durable();
     assert!(written > 8, "the log holds the three frames");
     db.crash();
@@ -273,7 +306,7 @@ fn a_run_behind_frames_that_are_gone_is_not_served() {
     for i in [900u64, 800, 700] {
         assert!(values(&db, &key(10 * BATCH + i)).is_empty());
     }
-    assert!(names(&d, "direct-").is_empty(), "the run is still there");
+    assert!(begun_runs(&d).is_empty(), "the run is still there");
     drop(db);
     let _ = std::fs::remove_dir_all(&d);
 }
@@ -335,7 +368,7 @@ fn runs_and_frames_come_back_whole_and_stay_so() {
         };
         let db = Db::open(&d, inline(opts())).unwrap();
         check(&db, "the first open");
-        assert!(names(&d, "direct-").is_empty(), "{sync:?}: a run was left");
+        assert!(begun_runs(&d).is_empty(), "{sync:?}: a run was left");
         assert_eq!(
             names(&d, "cov-").len(),
             1,
@@ -475,7 +508,9 @@ fn a_sync_covers_the_runs_as_well_as_the_log() {
 /// syncs every commit, the policy's sync falling in the run, the policy's
 /// sync falling after the run has closed, and `sync`. No test can lose a
 /// name, so this one counts what each acknowledgement left unpromised and
-/// the barriers the writer made.
+/// the barriers the writer made. Of runs that make their own files
+/// (`Options::run_spare` off): one begun in a file made ahead has its name
+/// behind a sync before its first commit, which the test after this holds.
 #[test]
 fn a_runs_name_is_behind_a_barrier_before_its_commits_are_acknowledged() {
     // Every commit synced: the run's first commit carries the barrier, and
@@ -486,6 +521,7 @@ fn a_runs_name_is_behind_a_barrier_before_its_commits_are_acknowledged() {
         Options {
             sync: SyncPolicy::Always,
             adaptive_shape: false,
+            run_spare: false,
             ..common::options()
         },
     )
@@ -527,6 +563,7 @@ fn a_runs_name_is_behind_a_barrier_before_its_commits_are_acknowledged() {
         Options {
             sync: SyncPolicy::EveryN(4),
             adaptive_shape: false,
+            run_spare: false,
             ..common::options()
         },
     )
@@ -597,6 +634,7 @@ fn a_runs_name_is_behind_a_barrier_before_its_commits_are_acknowledged() {
         Options {
             sync: SyncPolicy::EveryN(4),
             adaptive_shape: false,
+            run_spare: false,
             ..common::options()
         },
     )
@@ -627,6 +665,7 @@ fn a_runs_name_is_behind_a_barrier_before_its_commits_are_acknowledged() {
         &d,
         Options {
             adaptive_shape: false,
+            run_spare: false,
             ..buffered()
         },
     )
@@ -673,6 +712,7 @@ fn a_barrier_that_fails_is_owed_until_it_is_made() {
         inline(Options {
             sync: SyncPolicy::Always,
             adaptive_shape: false,
+            run_spare: false,
             ..common::options()
         }),
     )
@@ -722,6 +762,309 @@ fn a_barrier_that_fails_is_owed_until_it_is_made() {
     assert_eq!(values(&db, &key(0)), vec![b"closes the run".to_vec()]);
     assert_eq!(values(&db, &key(1)), vec![VALUE.to_vec()]);
     for b in 1..3 {
+        assert!(holds(&db, b), "batch {b} is gone");
+    }
+    drop(db);
+    let _ = std::fs::remove_dir_all(&d);
+}
+
+/// The slot of the next run's file (`Db::run_spare_state`): nothing, its
+/// id reserved, the file made ahead, the file tried and not made.
+const SPARE_OFF: u8 = 0;
+const SPARE_WANTED: u8 = 1;
+const SPARE_READY: u8 = 2;
+const SPARE_FAILED: u8 = 3;
+const SPARE_MADE: u8 = 4;
+
+/// Waits for the segment work's thread to have left the next run's file
+/// in `state`.
+fn wait_for_spare(db: &Db, state: u8) {
+    let t = std::time::Instant::now();
+    while db.run_spare_state() != state {
+        assert!(
+            t.elapsed().as_secs() < 60,
+            "the next run's file never came to state {state}; it stands at {}",
+            db.run_spare_state()
+        );
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    }
+}
+
+/// A run begun in a file made ahead of it has its name behind a directory
+/// sync before its first commit (`Options::run_spare`), so that commit is
+/// acknowledged with no barrier of the writer's: the store's first run in
+/// the file its creation made, and each run after in the one the segment
+/// work made as the run before began, under the id the writer reserved
+/// then, at a landing's sync of the directory and never beside the run's
+/// commits, or at its first turn in a store opened. A run that finds no
+/// file ready makes its own and its own barrier, as every run did: one
+/// whose file's sync failed, which leaves no file behind. A store closed
+/// keeps none, and without the option none is made.
+#[test]
+fn a_run_begun_in_a_file_made_ahead_asks_for_no_barrier() {
+    let always = || Options {
+        sync: SyncPolicy::Always,
+        adaptive_shape: false,
+        ..common::options()
+    };
+    // The store's first run, with the segment work on the writer's
+    // thread: the file is there as the store is returned, empty, and none
+    // is made after it.
+    let d = dir("spare-first");
+    let mut db = Db::create(&d, inline(always())).unwrap();
+    assert_eq!(db.run_spare_state(), SPARE_READY);
+    assert_eq!(std::fs::metadata(run_file(&d, 0)).unwrap().len(), 0);
+    // A barrier of the writer's would fail: none is asked for.
+    db.fail_next_dir_barrier();
+    ordered_batch(&mut db, 1);
+    assert_eq!(
+        db.run_names_unsynced(),
+        (Some(false), 0),
+        "the run's name was behind a sync before it began"
+    );
+    let w = db.seal_waits();
+    assert_eq!((w.run_names, w.run_spares, w.run_spares_made), (0, 1, 0));
+    assert!(run_began(&d, 0), "the run is in the file made for it");
+    assert_eq!(db.run_spare_state(), SPARE_WANTED);
+    ordered_batch(&mut db, 2);
+    // The run closes and lands, and the landing's sync of the directory
+    // has the next run's file behind it, under the id reserved as the
+    // first began: the second run begins in it with no barrier either.
+    db.put(&key(0), b"closes the run");
+    db.commit().unwrap();
+    db.seal().unwrap();
+    assert_eq!(db.run_spare_state(), SPARE_READY);
+    assert_eq!(std::fs::metadata(run_file(&d, 1)).unwrap().len(), 0);
+    ordered_batch(&mut db, 3);
+    assert!(
+        run_began(&d, 1),
+        "the second run took the id reserved for it"
+    );
+    assert_eq!(db.run_names_unsynced(), (Some(false), 0));
+    // A file for each landing whose sync found one asked for: the run's,
+    // and the log's table's after the second run had reserved the next.
+    let w = db.seal_waits();
+    assert_eq!((w.run_names, w.run_spares), (0, 2));
+    assert!(w.run_spares_made >= 1);
+    db.crash();
+    // Every batch acknowledged is there, each run's from a file made
+    // ahead of it.
+    let db = Db::open(&d, inline(always())).unwrap();
+    assert_eq!(values(&db, &key(0)), vec![b"closes the run".to_vec()]);
+    for b in 1..=3 {
+        assert!(holds(&db, b), "batch {b} is gone");
+    }
+    drop(db);
+    let _ = std::fs::remove_dir_all(&d);
+
+    // The segment work on a thread of its own makes the next run's file
+    // where it syncs the directory anyway, at a landing, and nowhere
+    // before: the run after a landing begins in it.
+    let d = dir("spare-next");
+    let mut db = Db::create(&d, always()).unwrap();
+    ordered_batch(&mut db, 1);
+    std::thread::sleep(std::time::Duration::from_millis(50));
+    assert_eq!(
+        db.run_spare_state(),
+        SPARE_WANTED,
+        "a file was made beside the run's commits"
+    );
+    db.put(&key(0), b"closes the run");
+    db.commit().unwrap();
+    db.seal().unwrap();
+    wait_for_spare(&db, SPARE_READY);
+    assert_eq!(std::fs::metadata(run_file(&d, 1)).unwrap().len(), 0);
+    assert_eq!(db.seal_waits().run_spares_made, 1);
+    ordered_batch(&mut db, 2);
+    assert!(run_began(&d, 1));
+    assert_eq!(db.run_names_unsynced(), (Some(false), 0));
+    let w = db.seal_waits();
+    assert_eq!((w.run_names, w.run_spares), (0, 2));
+    db.put(&key(1), b"closes the run");
+    db.commit().unwrap();
+    db.seal().unwrap();
+    wait_for_spare(&db, SPARE_READY);
+    ordered_batch(&mut db, 3);
+    // A file for each landing whose sync found one asked for, which is
+    // one a run and the log's table's where it lands after a run began.
+    let w = db.seal_waits();
+    assert_eq!((w.run_names, w.run_spares), (0, 3));
+    assert!(w.run_spares_made >= 2);
+    db.close().unwrap();
+    assert_eq!(
+        run_files(&d),
+        Vec::<String>::new(),
+        "a closed store keeps no run's file, made ahead or not"
+    );
+
+    // A store opened has no landing to make one at: the segment work
+    // makes it at its first turn, with a sync of the directory of its own.
+    let mut db = Db::open(&d, always()).unwrap();
+    wait_for_spare(&db, SPARE_READY);
+    assert_eq!(run_files(&d).len(), 1);
+    assert!(begun_runs(&d).is_empty());
+    let made = db.seal_waits().run_spares_made;
+    ordered_batch(&mut db, 4);
+    let w = db.seal_waits();
+    assert_eq!((w.run_names, w.run_spares), (0, 1));
+    assert_eq!(db.run_spare_state(), SPARE_WANTED);
+    // That sync failing: the file it made is no spare and is gone, and
+    // the run after makes its own, with its own barrier.
+    db.fail_next_spare_sync();
+    db.run_spare_look_again();
+    wait_for_spare(&db, SPARE_FAILED);
+    assert_eq!(
+        run_files(&d),
+        begun_runs(&d),
+        "the file that is no spare was left"
+    );
+    assert_eq!(db.seal_waits().run_spares_made, made);
+    db.put(&key(2), b"closes the run");
+    db.commit().unwrap();
+    // The run closed into the log's table, which holds that write: a key
+    // above everything opens a run only once it is sealed. The landing
+    // that follows makes no file, the slot holding one tried and not
+    // made until the run it was for has begun.
+    db.hold_seal_landing(true);
+    db.seal().unwrap();
+    ordered_batch(&mut db, 5);
+    let w = db.seal_waits();
+    assert_eq!(
+        (w.run_names, w.run_spares),
+        (1, 1),
+        "the run with no file made ahead made its own barrier"
+    );
+    db.hold_seal_landing(false);
+    db.close().unwrap();
+    assert_eq!(run_files(&d), Vec::<String>::new());
+    let db = Db::open(&d, always()).unwrap();
+    for b in 1..=5 {
+        assert!(holds(&db, b), "batch {b} is gone");
+    }
+    db.close().unwrap();
+    let _ = std::fs::remove_dir_all(&d);
+
+    // A drain of runs whose commits were all synced is answered before
+    // its landing's sync of the directory, which the durable landing then
+    // makes: the next run's file is behind that one.
+    let d = dir("spare-drain");
+    let mut db = Db::create(&d, always()).unwrap();
+    ordered_batch(&mut db, 1);
+    db.flush().unwrap();
+    wait_for_spare(&db, SPARE_READY);
+    assert_eq!(db.seal_waits().run_spares_made, 1);
+    ordered_batch(&mut db, 2);
+    let w = db.seal_waits();
+    assert_eq!((w.run_names, w.run_spares), (0, 2));
+    db.close().unwrap();
+    let _ = std::fs::remove_dir_all(&d);
+
+    // A run that begins while a landing has made the next file and not
+    // yet called it ready takes the file as its own, with its own barrier,
+    // and the landing's word for it comes to nothing: the run after does
+    // not begin in the file of a run in progress.
+    let d = dir("spare-raced");
+    let mut db = Db::create(&d, always()).unwrap();
+    ordered_batch(&mut db, 1);
+    // Held before the run closes: its close is a seal, whose landing is
+    // the first to sync the directory.
+    db.hold_spare_named(true);
+    db.put(&key(0), b"closes the run");
+    db.commit().unwrap();
+    db.seal().unwrap();
+    wait_for_spare(&db, SPARE_MADE);
+    ordered_batch(&mut db, 2);
+    assert!(run_began(&d, 1), "the run took the id reserved for it");
+    assert_eq!(db.run_names_unsynced(), (Some(false), 0));
+    let w = db.seal_waits();
+    assert_eq!(
+        (w.run_names, w.run_spares, w.run_spares_made),
+        (1, 1, 0),
+        "a file whose name no sync was known to stand behind was begun in as ready"
+    );
+    db.hold_spare_named(false);
+    // The landing goes on; whatever it leaves, the slot is the next
+    // run's and never this one's.
+    db.settle().unwrap();
+    ordered_batch(&mut db, 3);
+    db.put(&key(1), b"closes the run");
+    db.commit().unwrap();
+    db.seal().unwrap();
+    ordered_batch(&mut db, 4);
+    // Closed and not crashed: a crash leaves this store's segment work
+    // running on its thread, under the store that opens next.
+    db.close().unwrap();
+    let db = Db::open(&d, always()).unwrap();
+    for b in 1..=4 {
+        assert!(holds(&db, b), "batch {b} is gone");
+    }
+    db.close().unwrap();
+    let _ = std::fs::remove_dir_all(&d);
+
+    // Without the option: nothing made ahead, and the run's own barrier.
+    let d = dir("spare-off");
+    let mut db = Db::create(
+        &d,
+        Options {
+            run_spare: false,
+            ..always()
+        },
+    )
+    .unwrap();
+    assert_eq!(db.run_spare_state(), SPARE_OFF);
+    assert_eq!(run_files(&d), Vec::<String>::new());
+    db.hold_seal_landing(true);
+    ordered_batch(&mut db, 0);
+    // Several turns of the segment work, which makes nothing.
+    std::thread::sleep(std::time::Duration::from_millis(50));
+    assert_eq!(run_files(&d), vec!["direct-00000000.tmp".to_string()]);
+    assert_eq!(db.run_spare_state(), SPARE_OFF);
+    let w = db.seal_waits();
+    assert_eq!((w.run_names, w.run_spares, w.run_spares_made), (1, 0, 0));
+    db.crash();
+    let _ = std::fs::remove_dir_all(&d);
+}
+
+/// A file made ahead that no run began in is nothing to the store that
+/// opens over it: a crash leaves it under its temp name, empty, and the
+/// open removes it as it removes a run with no committed record. The run
+/// that begins after the reopen is whole, in a file of its own. A store
+/// closed leaves none.
+#[test]
+fn a_file_made_ahead_that_no_run_took_is_removed() {
+    let d = dir("spare-unused");
+    let db = Db::create(&d, buffered()).unwrap();
+    assert_eq!(run_files(&d), vec!["direct-00000000.tmp".to_string()]);
+    db.close().unwrap();
+    assert_eq!(run_files(&d), Vec::<String>::new());
+    let _ = std::fs::remove_dir_all(&d);
+
+    let d = dir("spare-crashed");
+    let mut db = Db::create(&d, inline(buffered())).unwrap();
+    logged_batch(&mut db, 0);
+    db.sync().unwrap();
+    db.crash();
+    assert_eq!(run_files(&d), vec!["direct-00000000.tmp".to_string()]);
+    let mut db = Db::open(&d, inline(buffered())).unwrap();
+    assert_eq!(
+        run_files(&d),
+        Vec::<String>::new(),
+        "the open kept a file no run began in"
+    );
+    assert_eq!(db.run_spare_state(), SPARE_WANTED);
+    assert!(holds(&db, 1_000), "the log's batch is gone");
+    // The table sealed, so the next key above the store's greatest finds
+    // it empty and opens a run.
+    db.seal().unwrap();
+    for b in 2_000..2_003 {
+        ordered_batch(&mut db, b);
+    }
+    assert_eq!(begun_runs(&d).len(), 1, "the run's own file");
+    db.sync().unwrap();
+    db.crash();
+    let db = Db::open(&d, inline(buffered())).unwrap();
+    assert!(holds(&db, 1_000));
+    for b in 2_000..2_003 {
         assert!(holds(&db, b), "batch {b} is gone");
     }
     drop(db);
@@ -1158,7 +1501,7 @@ fn held_frames_wait(pending: bool) {
     let d = dir(&format!("readable-{pending}"));
     let opts = || Options {
         manifest_pending: pending,
-        ..inline(explicit())
+        ..torn(inline(explicit()))
     };
     let mut db = Db::create(&d, opts()).unwrap();
     db.hold_seal_durable(true);
@@ -1277,7 +1620,7 @@ fn frames_held_before_a_run_go_to_their_own_file() {
         for b in 1_001..1_004 {
             ordered_batch(&mut db, b);
         }
-        assert_eq!(names(&d, "direct-").len(), 1, "no run opened");
+        assert_eq!(begun_runs(&d).len(), 1, "no run opened");
         assert_eq!(log_frames(&d), 0, "the first batch is held");
         let files = names(&d, "wal-").len();
         // A key under the run's greatest: the run closes, loose, and the
@@ -1382,7 +1725,7 @@ fn a_run_begun_behind_a_sync_refuses_a_gap_before_it() {
     ordered_batch(&mut db, 2);
     ordered_batch(&mut db, 3);
     db.crash();
-    let runs = names(&d, "direct-");
+    let runs = begun_runs(&d);
     assert_eq!(runs.len(), 2, "{runs:?}");
     std::fs::remove_file(d.join(&runs[0])).unwrap();
     let e = match Db::open(&d, always()) {
@@ -1391,7 +1734,7 @@ fn a_run_begun_behind_a_sync_refuses_a_gap_before_it() {
     };
     assert!(e.to_string().contains("a record is lost"), "{e}");
     assert_eq!(
-        names(&d, "direct-"),
+        begun_runs(&d),
         vec![runs[1].clone()],
         "the refusal changed what it refused"
     );
@@ -1423,7 +1766,7 @@ fn a_run_begun_behind_a_sync_refuses_a_gap_before_it() {
     db.seal().unwrap();
     ordered_batch(&mut db, 4);
     db.crash();
-    let runs = names(&d, "direct-");
+    let runs = begun_runs(&d);
     assert_eq!(runs.len(), 3, "{runs:?}");
     std::fs::remove_file(d.join(&runs[0])).unwrap();
     let e = match Db::open(&d, everyn()) {
@@ -1432,7 +1775,7 @@ fn a_run_begun_behind_a_sync_refuses_a_gap_before_it() {
     };
     assert!(e.to_string().contains("a record is lost"), "{e}");
     assert_eq!(
-        names(&d, "direct-"),
+        begun_runs(&d),
         runs[1..].to_vec(),
         "the refusal removed a run before it refused"
     );
@@ -1626,10 +1969,7 @@ fn a_run_an_open_takes_is_finished_where_it_lies() {
         assert_eq!(values(&db, long.as_bytes()), vec![VALUE[..7].to_vec()]);
         db.crash();
         let (name, taken) = one_segment(&killed, "the killed store");
-        assert!(
-            names(&killed, "direct-").is_empty(),
-            "the run's name stayed"
-        );
+        assert!(begun_runs(&killed).is_empty(), "the run's name stayed");
         assert_eq!(
             std::fs::metadata(killed.join(&name)).unwrap().ino(),
             inode,
@@ -1758,7 +2098,7 @@ fn an_open_cut_short_in_a_runs_finish_is_made_again() {
             bytes.len(),
             piece.len()
         );
-        assert!(names(&d, "direct-").is_empty(), "{what}: the run's name");
+        assert!(begun_runs(&d).is_empty(), "{what}: the run's name");
         assert_eq!(names(&d, "cov-").len(), 1, "{what}: the run's range");
         let _ = std::fs::remove_dir_all(&d);
     }
@@ -1780,7 +2120,7 @@ fn an_open_cut_short_in_a_runs_finish_is_made_again() {
         bytes == piece,
         "a file the manifest names was written again"
     );
-    assert!(names(&d, "direct-").is_empty(), "the run's second name");
+    assert!(begun_runs(&d).is_empty(), "the run's second name");
     assert_eq!(names(&d, "cov-").len(), 1, "the run's range, noted");
     let _ = std::fs::remove_dir_all(&d);
     let _ = std::fs::remove_dir_all(&made);
@@ -2016,7 +2356,7 @@ fn oracle_child(spec: &str) -> ! {
 fn tear(d: &Path, rng: &mut Stream) -> Vec<String> {
     use std::os::unix::fs::MetadataExt;
     let mut did = Vec::new();
-    for name in names(d, "wal-").into_iter().chain(names(d, "direct-")) {
+    for name in names(d, "wal-").into_iter().chain(begun_runs(d)) {
         let p = d.join(&name);
         let md = std::fs::metadata(&p).unwrap();
         let run = name.starts_with("direct-");

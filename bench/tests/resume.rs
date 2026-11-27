@@ -274,6 +274,32 @@ fn a_rep_cut_between_arms_is_taken_again_whole_unless_passes_are_kept() {
     let _ = std::fs::remove_dir_all(&kept_base);
 }
 
+/// A rep runs its arms in the rep's own order (`run::rep_order`): the
+/// first in the plan's, and of two arms the second rep the other way, so
+/// that neither follows the other's pass in every rep.
+#[test]
+fn a_rep_runs_its_arms_in_its_own_order() {
+    let base = scratch("order");
+    let (out, tmp) = (base.join("out"), base.join("tmp"));
+    std::fs::create_dir_all(&tmp).unwrap();
+    let o = run(&out, &tmp, "supdb,lmdb", "2", &[], &["--passes", "load"]);
+    let (_, err) = text(&o);
+    assert!(o.status.success(), "{err}");
+    let at = |what: &str| {
+        err.find(what)
+            .unwrap_or_else(|| panic!("no {what:?} in {err}"))
+    };
+    assert!(
+        at("rep 1  supdb") < at("rep 1  lmdb"),
+        "the first rep in the plan's order: {err}"
+    );
+    assert!(
+        at("rep 2  lmdb") < at("rep 2  supdb"),
+        "the second rep the other way: {err}"
+    );
+    let _ = std::fs::remove_dir_all(&base);
+}
+
 /// A resume is held to the ledger's binary and refuses a plan of its own.
 #[test]
 fn a_resume_refuses_another_binary_and_a_plan_of_its_own() {

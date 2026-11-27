@@ -5531,10 +5531,12 @@ exists to warm. After a burst of updates every copy's entries are the
 block's records and nothing else -- an update patches an entry in place
 and inserts none -- and the copy knows it (`CachedBlock::identity`,
 set by the build over updates at known cuts, cleared by an insert for
-good, and held of the partition the build read: a table carried across
-a merge that rewrites its partition over the same blocks keeps copies
-whose entries are the old partition's records, so they are searched
-there, `CachedBlock::identity_for`), so the walk starts at the seek's
+good, and held of the partition's keys: a table carried across a merge
+that rewrites its partition over the same blocks keeps its copies, and
+a copy's entries are the rewritten partition's records only where the
+merge wrote the old one's keys and no others, so any other is searched
+there, `CachedBlock::identity_for` and the claim's own paragraph
+below), so the walk starts at the seek's
 rank less the block's first (`Options::copy_start_at_rank`;
 `supdb-copysearch` searches). On the
 probe, eighteen passes a shape over nine rotated rounds, the start at
@@ -5626,6 +5628,78 @@ p=0.006), the scan mix 1.05x (10/12, p=0.039), the thread's time 0.96x
 on the durable arm (10/12, p=0.039), and the buffered rewritten point
 1.3-1.4x by median at both sizes in nine pairs of twelve, which its
 bimodality keeps from significance. Nothing read against either.
+
+A third is the claim itself. A copy's entries are its partition's
+records by the keys the partition holds, and the claim was kept by the
+file: once a copy carried across a rewrite was stopped from claiming
+ranks that a key dropped and a key folded into its block had moved,
+every copy carried across any merge of its partition searched, for the
+copy's life. A merge knows which it was. It counts, for each output,
+the keys it writes that no partition among its inputs held; an output
+with none, at the fences of the partition it rewrote and with as many
+keys, holds that partition's keys at the ranks they had, and takes its
+key sequence (`Seg::keyseq`), which is what a copy's claim is held to
+(`Options::identity_by_keys`; `supdb-identityblob` and
+`supdb-ingestidentityblob` hold it to the file). The lag sweep's full
+rewrite folds updates alone, so every merge inside it keeps its
+partition's keys: at three million keys every patch of the burst and
+every start of the pass after it is at a rank, where a quarter to a
+third of the patches and a third of the starts searched, the upkeep
+thread's settle is a sixth to a fifth shorter on its own clock, and the
+burst is faster in both orders in core and under both bounds
+(`bench/scripts/pair.sh SUPDB_LAG_COUNTERS=1 supdb supdb-identityblob
+3000000 --reps 3 --passes load,lag`, and with `--bound 1073741824
+--reps 4 --ops-div 10` and `--bound 1342177280 --reps 4 --ops-div 10`,
+at `d317c79`; `patches`, `starts`, `keyseqs` and the pass's `steps
+settle` on the counters lines). The pass after the burst does not
+resolve, and at three hundred thousand keys, where the rewrite has one
+merge, nothing does. The mixes are out of its reach at the sizes paired:
+no merge inside them keeps a key sequence (`keyseqs_kept` in the
+pairing's counts), their update mixes sealing nothing and the pieces
+their merges fold holding inserts.
+
+A fourth is the copy's layout. A copy was three buffers -- sixteen
+bytes of entry a record, the keys, and the values each behind its length
+-- so a walk started three streams in a block it had not touched lately
+and three more in the block after, 136 bytes an entry of the suite's
+shape. Where a block's keys are of one length and each has one value of
+one length the copy is one stream of fixed-size records, key then value,
+116 bytes an entry with no entry to decode and no length to read
+(`Options::copy_packed`, `CachedBlock::fixed`; `supdb-copythree` and
+`supdb-ingestcopythree` keep the three buffers). The build writes the
+stream itself and falls back to the three buffers at the first entry of
+another shape (`CopyBuild`); a patch that writes a value of the block's
+length over its key's writes it in place, and any other write -- an
+insert, a delete, a second value, another length -- makes the block the
+three buffers again first, for as long as it stands; where the pieces
+are folded into the forms (`forms_pieces_only`) no copy is packed. With
+no engine in it the one stream, asked for over the lines its walk reads,
+walks 1.4-1.7x faster at every working set
+(`bench/examples/blockwalk.rs`). In the engine, paired at `eb589ec` with
+the arms as they were then named (`bench/scripts/pair.sh
+supdb-ingestcopypacked supdb-ingest 300000 --passes load,lag --reps 10`,
+the same with `supdb-copypacked supdb`, and `supdb-ingestcopypacked
+supdb-ingest` at 10000 and at 30000 with `--reps 8`): the pass after the
+full rewrite, every walk of it a copy's, 1.15-1.58x in eight sittings of
+eight, the E mix 1.09-1.17x and the scrambled E 1.10-1.31x at ten and
+thirty thousand keys, the threaded scans after the mixes 1.03-1.12x, and
+the bursts level. Against `lmdb-nosync` at ten thousand keys
+(`supdb-ingestcopypacked lmdb-nosync 10000 --reps 8`) the scrambled E
+read 1.16x and 1.10x. The cells that walk no copy do not move. The
+write mixes at ten and thirty thousand keys read 0.85-1.05x in those
+sittings, which read the read-only C mix, a mix that holds no copy,
+0.83-1.11x; at twenty-four reps a sitting and timed by kind
+(`SUPDB_MIX_KINDS=1 bench/scripts/pair.sh supdb-ingest
+supdb-ingestcopythree 30000 --passes load,mixes --reps 24`, and `supdb
+supdb-copythree`, at `001781d`) A and F read 0.97-1.00x buffered, forty
+pairs ahead of ninety-six, beside C at 0.98x and 0.99x with twenty of
+forty-eight, and E 1.08x in both sittings, forty pairs of forty-eight,
+1.10x and 1.11x durable. A copy
+is a fifth smaller, 346 MB of block cache where the three buffers held
+435 after a full rewrite at three million keys, which under a bound is
+page cache the store has back -- and was first a loss there, the smaller
+process leaving the raw gate's heads uncopied (the heads past the fill
+line, below).
 
 Refuted, and kept as an arm: dropping a block from six keys of it in a
 batch and building it once (`forms_settle_rebuild_from`,
@@ -7591,7 +7665,7 @@ The frozen tables are a list, oldest first and in the order their seals
 were handed, of up to three (`FROZEN_CAP`): the writer freezes into room
 at a seal, at a commit past the threshold and at its first write after a
 `sync`'s hand-off, and waits for the oldest's readable landing only when
-the list is full. A landing retires the front, and a table a `sync`
+the list is full, by its count or by its tables' bytes (below). A landing retires the front, and a table a `sync`
 handed without a freeze joins the back when the writer freezes it. Every
 read folds the frozen tables by age, each through its own snapshot as a
 base of the live one.
@@ -7611,6 +7685,123 @@ sittings, puts the 1% point at 0.29x and 0.52x of the one-table binary
 summed (faster in every pair of both), the 10% point at 0.84x and 0.91x
 (4 and 5 of 6), the 0% point at 0.88x and 0.91x (4 of 6 each), the 100%
 point level, and nothing at 100k on one side.
+
+#### A settle's conversion leaves the fill its walk
+
+The fill converts a light form, one under the dense count, only on a walk
+of the tables, and a walk starts where a patch leaves the tables
+incomplete: a write into a block with no form, or a form left at the dense
+count. A settle that converts the form its batch grows dense
+(`Options::settle_converts`) leaves no such form, so in a store whose every
+block holds a form no walk started and the light forms stayed deltas. The
+settle marks the tables for the fill where it converts
+(`Options::settle_convert_fills`; `supdb-settleconvertquiet` and
+`supdb-ingestsettleconvertquiet` convert and leave no walk).
+
+At ten thousand keys, in the row's pass order (`P` is
+`load,read,read-threaded,scan,scan-threaded,mixes,scan-mixed,mixes-scrambled`;
+the first arm's rate over the second's, the sitting that lists it first
+and then the other):
+
+| scrambled E | |
+|---|---|
+| `supdb` over `supdb-settleconvertquiet`, 10k | 1.34, 1.35 (30 pairs of 32) |
+| `supdb-ingest` over `supdb-ingestsettleconvertquiet`, 10k | 1.11, 1.28 (26 of 32) |
+| `supdb` over `lmdb`, 10k | 1.32, 1.30 (24 of 24) |
+| `supdb-ingest` over `lmdb-nosync`, 10k | 1.10, 1.13 (21 of 24) |
+| `supdb` over `supdb-settleconvertquiet`, 30k | 1.13, 1.00 |
+| 100k | 1.06, 1.01 |
+| 300k | 0.94, 1.00 |
+
+(`pair.sh supdb-settleconvertquiet supdb 10000 --passes P --reps 16`, the
+buffered pair the same, `pair.sh supdb lmdb 10000 --passes P --reps 12`,
+and the rungs above with `--reps 12`, `16` and `8`, at `3b419ea9`.) By the counts of one
+rep an arm (`SUPDB_MIX_COUNTERS=1 SUPDB_MIX_CENSUS=1 bench ab --arms
+supdb-settleconvertquiet,supdb --size 10000 --passes P --reps 1`): after
+the scrambled F mix the writer's tables hold 156 copies and one sparse
+form with the walk left and 59 and 98 without it, the upkeep thread
+having built 185 and 186 forms in that mix against 10 and none, and the
+scrambled E walks
+2,803 copies and 22 sparse forms against 1,078 and 1,747. Timed by kind
+with the conversion and without it (`pair.sh SUPDB_MIX_KINDS=1
+supdb-settlenoconvert supdb 10000 --passes P --reps 16`, before the
+option), a scan of the scrambled E took 0.67 µs over the sparse forms and
+0.46 over the copies, with its commit and its first scan level. Nothing
+else resolves: the other mixes at every rung read within what the arm
+reads against itself (`pair.sh supdb supdb 100000 --passes P --reps 16`:
+0.94 to 1.12), and the lag sweep at a hundred thousand keys is level under
+both policies (`pair.sh supdb-settleconvertquiet supdb 100000 --passes
+load,lag --reps 8`).
+
+Under the held log nothing resolves either way, at `44ed27e3`. In memory at a
+hundred thousand keys the mixes and the lag sweep read 0.89 to 1.23 between
+the arms with the read and the scan pass, which run before any settle,
+reading 0.89 to 1.18 beside them (`pair.sh supdb-heldnfsettleconvertquiet
+supdb-heldnoframes 100000 --passes P --reps 12`, and `--passes load,lag
+--reps 8`). At three million keys under 1 GiB the mixes read 0.75 to 1.13
+(`pair.sh supdb-heldpartsettleconvertquiet supdb-heldpart 3000000 --bound
+1073741824 --passes P --ops-div 10 --reps 8`), where the arm paired with
+itself reads them 0.84 to 1.20 and its scrambled A, B and C at 0.84 to
+0.89 for whichever is listed second (`pair.sh supdb-heldpart
+supdb-heldpart`, the same options, `--reps 6`).
+
+#### The frozen tables' bytes
+
+The list is held to bytes as well as to a count (`Options::frozen_bytes`):
+a commit whose seal would freeze the live table past them waits for the
+oldest frozen table's readable landing first, as it waits at three, and
+one table is frozen whatever it holds. A table counts as one kept for the
+upkeep's look counts (`upkeep_keep_bytes`), at twice its capacity, the
+table and the snapshot copy a seal near reads makes of it, and the bound
+is an eighth of the memory available where none is given. The count had
+bounded them alone from when a table froze at `seal_bytes`. The seal's
+threshold grows with the store since (`seal_grows`), a hundred megabytes
+at ten million keys, and a writer whose commits wait for no sync fills
+one in half a second where its seal takes longer. The bounded roster's
+buffered arm, `supdb-heldpart`, was killed under 1 GiB in the lag sweep's
+full rewrite: the engine's mapped blocks counted by length at each new
+peak, from a scratch build, read 618 MB two seconds into the burst, 101
+arena blocks of four megabytes among them, the live table and three
+frozen ones.
+
+Paired against the count alone at ten million keys
+(`SUPDB_LAG_COUNTERS=1 bench/scripts/pair.sh supdb-heldpart
+supdb-heldpartfrozencount 10000000 --bound 1073741824 --reps 3 --ops-div
+10 --passes load,lag`, twice, and `pair.sh supdb-heldpart supdb-heldpart`
+in the same shape, at `a22f7eb`): the count alone was killed in three
+sweeps of twelve and the bound in none of twenty-four. The process's
+anonymous memory at the full rewrite's end read 334-550 MB against
+478-884 in the sweeps that lived, and 26-35 freezes a sweep waited,
+1.6-1.9 s between them. The passes after the bursts read level or ahead
+in both sittings of both runs: the clean store's 1.02-2.1x, after the
+one-percent burst 1.16-3.3x, after the full rewrite 1.0-1.48x. The full
+rewrite's burst read 0.92x and 1.43x in one run and 1.15x and 0.78x in
+the other: 5.2-6.8 s with the bound in every sweep, against 4.6-5.0 s by
+the count alone in the sweeps that began as the bound's did.
+
+The sweeps did not begin alike. With the bound the compact form was
+serving as the sweep began in seventeen sweeps of eighteen, and by the
+count alone in one of six, by the form's scans in the lag counters of the
+clean store's pass. Where it was not, the one- and ten-percent bursts ran
+0.4-0.6 s and 3.3-4.5 s against 33-43 ms and 0.4-0.6 s, the writer held
+behind an upkeep thread that resolves its keys through raw records the
+bound has pushed out. Under 1.25 GiB (`--bound 1342177280`) neither arm
+was killed, the count alone ended the full rewrite at 641-961 MB against
+346-682, and the form was serving at the sweep's start in three of the
+bound's six sweeps and in none of the other's. Why the purchase comes
+late there has not been read off the controller's trace.
+
+The durable arm does not meet the bound. Its commits wait for their
+syncs, a table is seconds filling, and the list seldom holds two
+(`pair.sh supdb supdb-frozencount 10000000 --bound 1073741824 --reps 2
+--ops-div 10 --passes load,lag`, and `3000000` at three reps): no wait or
+one a sweep, 21-134 ms, and no cell that holds a side across the
+sittings. At three million keys the buffered arm waits three to five
+times a sweep, 70-130 ms, and two pairings there disagree
+(`pair.sh supdb-heldpart supdb-heldpartfrozencount 3000000 ...`, and
+again with `SUPDB_SCAN_OPS=1`): the passes move by the host's two speeds,
+a median scan of 2.8-3.0 µs or 3.6-3.8 with the thread's CPU at its
+wall, whichever arm.
 
 #### Seals whenever the sealer is idle
 
@@ -8908,6 +9099,8 @@ The sweep's first pass, over the store as the load left it, is the other cell th
 
 The first bounded row at those defaults read the pass after the full rewrite at 0.52x of LMDB all the same, two reps of three at 57-70 ms, and the cause was the ordered indexes of the partitions the burst's merges land. A scan's start seeks an index's heads, eight bytes a key; away from the raw gate the segment work copies them into the process's memory for a partition the controller leaves raw (`Options::heads_owned`), and at the census that is every partition while the controller's model says the raw form fits. The cache's grant moves 265 MB into the anonymous memory the model's budget subtracts while the records the copies stand in for stay in the populations it is held against: the model read 0.39-0.43 faults a read under a budget of 262-276 MB, no copy was made for a partition landed after the grant, and those indexes, about eight megabytes at the pass, were read through mappings the burst's writes push out. Every major fault of the scanning thread in six traced passes but one was `Reader::scan_seek` on one such index (`perf record -e major-faults -c 1 -d` over `bench ab --arms supdb,supdb --size 3000000 --bound 1073741824 --reps 3 --ops-div 10`, at `b2d0dfc`), nine to thirty-six a pass in that sitting, up to a hundred and ninety in the pairings and a hundred and fifty to a hundred and eighty in the row's slow reps, each a wait of a hundred to three hundred microseconds behind a merge's reads. A grant standing reads as the store left raw (`Options::heads_owned_beside_copies`; `supdb-headsmodel` is the model's word alone), since the grant stands only far from the point reads whose faults would buy a form. Paired at `15178d9` with the arm as it was then named (`SUPDB_LAG_COUNTERS=1 bench/scripts/pair.sh supdb-headscopies supdb 3000000 --bound 1073741824 --reps 8 --ops-div 10 --passes load,lag`, and without `--passes` at four reps): seven copies a sweep made for the grant alone, the scanning thread's major faults one at most in twenty-four passes, and the lag-only pass 12.6-22.6 ms against 15.1-33.2, 16.5 against 22 at the median. Under 1.25 GiB at the same rung and at ten million keys under either bound no grant is made and the option does nothing, by its count. With the jobs' arrays mapped that grant is not made at three million keys under 1 GiB, the cache's budget growing into the room a smaller process leaves, and the heads' copies are keyed on the state itself now: the misfit the model reads being the cache's own bytes, far from point reads (`Maint::z_misfit_is_the_caches`). Keyed on the grant, the default of `a4dc700` copied thirteen partitions' heads of twenty and read that pass 0.76x of the allocator's arm in both orders (`SUPDB_LAG_COUNTERS=1 bench/scripts/pair.sh supdb supdb-jobsheap 3000000 --bound 1073741824 --reps 3 --ops-div 10`). With it, and nothing read between a burst and its pass, the four passes of that sweep stood level with the allocator's arm and the bursts ahead (`SUPDB_SCAN_OPS=1 bench/scripts/pair.sh supdb supdb-jobsheap 3000000 --bound 1073741824 --reps 8 --ops-div 10 --passes load,lag`, at `4ee0b3e`): medians of sixteen at 12.7 and 13.0 ms, 21.1 and 21.4, 28.4 and 30.8, 17.1 and 16.8, the one-percent burst 1.28x and 1.44x and the full rewrite's 1.16x and 1.05x. Over random ids at ten million keys the mapped arrays read the pass after the full rewrite 1.53x and 1.74x under 1 GiB and 1.55x and 1.68x under 1.25 GiB, no cell behind in both orders under the first and the one-thread read pass and the D mix 0.90-0.94x under the second (`SUPDB_LAG_COUNTERS=1 bench/scripts/pair.sh supdb supdb-jobsheap 10000000 --bound 1073741824 --reps 2 --ops-div 10 --keys ids`, and under 1342177280, at `a4dc700`).
 
+The copies of fixed-size records a fifth smaller (`Options::copy_packed`) took that protection away one bound up. Under 1.25 GiB at three million keys the larger process had come to the group's limit a second before the full rewrite's end, its refaults had taken the controller to the census, and at the census the heads are copied; ninety megabytes smaller, the store stayed at the raw gate through the burst, the model reading the pages a read touches as fitting, no head was copied, and the group came to its limit as the burst ended: the kernel took the pages written once and never read first, the ordered indexes of the partitions the burst's merges had just landed, and a pass in three after it took eighty to three hundred major faults on its scans' seeks, 18-43 ms where a pass with its heads copied runs 8-12. The model's fit is of the partitions' two populations, and a burst puts a store's worth of level-0 pieces in the cache beside them. Under the raw gate the heads are copied now once the store's files whole -- every segment's two regions and its ordered index, the pieces' with the partitions' -- have stood past the fill share of the budget at a reading of the model, and those of every partition landed after (`Options::heads_owned_past_fill`, `Maint::z_model`; `supdb-headsgate` leaves the raw gate's heads to the page cache). The line is the store's own arithmetic, crossed in the middle of the burst, seconds ahead of the limit. Two readings of the group came first and neither is in the tree: its unused memory less the margin, read once a second, saw the limit in six sweeps of twelve, and the kernel's own count of the times the limit was met (`memory.failcnt`, read live beside a sweep at zero until the burst's last second) in four. The line alone, at `001781d` (`SUPDB_LAG_COUNTERS=1 SUPDB_SCAN_OPS=1 bench/scripts/pair.sh supdb supdb-headsgate 3000000 --bound 1342177280 --reps 6 --ops-div 10 --passes load,lag`): with it every sweep of twelve copied fourteen to eighteen partitions' heads and no pass ran over 15 ms; with the raw gate's heads left to the cache four passes of twelve took 80 to 300 major faults and ran 18 to 43. The medians are level, 10.6 ms and 10.3, so the line buys the pass's tail and not its middle, and the burst read 0.96x and 0.93x for it with five pairs ahead of twelve, the copies made on the thread the burst's merges land through. Paired at `a71258f` with the packed copy and the line as one arm, as they were then named (`SUPDB_LAG_COUNTERS=1 SUPDB_SCAN_OPS=1 bench/scripts/pair.sh supdb-copypackedheads supdb 3000000 --bound 1342177280 --reps 6 --ops-div 10 --passes load,lag`): every partition's heads copied in twelve sweeps of twelve, no pass over 15.4 ms, the pass 1.55x and 1.14x of the three buffers' by sitting and the burst level; under 1 GiB (`--bound 1073741824`, twice) 1.07x and 1.51x, 1.26x and 1.27x. In the row's whole order at three reps (`--passes load,read,read-threaded,scan,scan-threaded,mixes,scan-mixed,mixes-scrambled,lag`, three pairings under 1.25 GiB and two under 1 GiB) the pass read ahead in twenty-six pairs of thirty, 1.32x and 1.34x by geometric mean, and E in twenty-six, 1.13x and 1.17x; the line was crossed in no mix. One cell leaned against under both bounds, the scrambled A mix at 0.95x and 0.93x with twelve pairs ahead of thirty, in sittings whose read-only C mixes, which hold no copy, read 0.73x to 1.15x; the F mixes read 0.93x and 0.91x under 1.25 GiB and 1.01x and 1.02x under 1 GiB. The one- and ten-percent passes of those sweeps lean a tenth against in some sittings and for in others with no copy packed by the first of them, fourteen at most by the second, and no head copied by either (`packs` and `heads` on the counters lines), the arms having run the same code to that point. At ten million keys under either bound (the same shape at `--reps 2`) the writer's forms are given up through the sweep and no copy is packed in it, the mixes pack some six hundred, the line is crossed in no pass with scans near, and nothing resolves: the first arm listed took the hot-raw policy's releases in both sittings, whichever arm it was.
+
 At ten million keys the passes after the bursts are another regime: the form files serve, the writer has given its block forms up for the merge path, and a pass is the read-back of what the burst pushed out of the cache -- after the ten-percent burst under 1 GiB about 330 MB, every byte of it a refault, 4,200 major faults on the scanning thread in a divided pass of ten thousand scans -- with the first scan's sort of the unsealed keys in front of it, 45-115 ms of a pass of 520-830. Keeping that snapshot at the commits (`Options::forms_off_snapshot_kept`; `supdb-snapkept`) took the sort out of the scan and lost the pass, 0.82x and 0.84x after the full rewrite under 1 GiB and 0.62x and 0.44x under 1.25 GiB (`SUPDB_LAG_COUNTERS=1 bench/scripts/pair.sh supdb-snapkept supdb 10000000 --bound 1073741824 --reps 3 --ops-div 10 --passes load,lag`, and under 1342177280, at `8876f01`): 173 snapshot builds a sweep where the scans make three, and 70-80 MB more anonymous memory at the pass. It is off. The quantity that decides these passes is the process's anonymous memory beyond what it uses: the default held 110-150 MB of it at every lag point under 1 GiB, and with the allocator returning every allocation of 128 KB or more (`supdb-mmapthr`, in the same shape at the same commit) the scanning thread's major faults fell from 4,300 to 460 after the ten-percent burst and from 10,200 to 4,300 after the full rewrite, and that pass read 1.22x in both orders.
 
 The memory in question is the jobs' large per-key arrays, which the allocator keeps in the arenas of threads that have ended, and they are mapped by the engine and unmapped at the job's end now (`Options::jobs_mapped`; `supdb-jobsheap` keeps the allocator's). Priced as `supdb-jobsmapped` at `ca2306e` (`SUPDB_LAG_COUNTERS=1 bench/scripts/pair.sh supdb-jobsmapped supdb 10000000 --bound 1073741824 --reps 2 --ops-div 10`, the same under 1342177280, and at three million keys with `--reps 6 --passes load,lag` under each bound): under 1 GiB at ten million keys the pass after the ten-percent burst read 1.58x and 0.92x and the pass after the full rewrite 1.27x and 1.62x in the row's whole order, 1.47x and 1.30x and 1.20x and 1.16x in the lag sweep alone; under 1.25 GiB the B mix 1.75x and 2.08x, the hot-raw policy having room for its release, and the one-thread read pass 0.70x and 0.89x, which was the crossing below and not the arrays; at three million keys the bursts level or ahead and the process at 21-30 MB after the load against 45-108. In memory at three hundred thousand and three million keys nothing resolved against the default paired with itself (`pair.sh supdb-jobsmapped supdb 300000 --reps 6`, `pair.sh supdb supdb 300000 --reps 6`, `pair.sh supdb-jobsmapped supdb 3000000 --reps 3 --ops-div 10`, at `c7570a9`): loads 0.98-1.08x, where identical arms stood 0.83-1.19x apart within a sitting. A pool that keeps a job's mapped buffers for the next job while the store's raw form fits its budget (`Options::jobs_pooled`; `supdb-jobspooled`) was built against an in-memory cost that pricing did not find, and at three million keys under 1 GiB it held 110-140 MB after the load, where the one-percent burst then ran 78-97 ms in nine reps of twelve against 39-56 (`pair.sh supdb-jobspooledbuycross supdb 3000000 --bound 1073741824 --reps 6 --ops-div 10 --passes load,lag`, at `c7570a9`); it is off. What that burst's long shape is, in the default as well, is the builds ahead at landing: the store's raw bytes are half its budget there, the line those builds start past, and one or two of them ran through the clean store's pass and the burst after it in a third of the default's reps, none with the jobs mapped and none with the builds off (`pair.sh supdb-noland supdb 3000000 --bound 1073741824 --reps 6 --ops-div 10 --passes load,lag`, at `c7570a9`: twelve bursts of twelve at 39-60 ms against seven, the other five at 80-98).
@@ -8915,6 +9108,12 @@ The memory in question is the jobs' large per-key arrays, which the allocator ke
 The crossing -- the look that drops the records of the partitions built ahead and asks their form files back -- runs where the land look's model reads the store past the selector's line to enter as the priors price it, and the selector buys by the line as a reading of the files prices it, which for stride files is a quarter of that. A store between the two was bought and attached first and crossed a tick later, when a crossing finds no partition without a form to swap: at ten million keys under 1.25 GiB with the jobs mapped, four reps of six, the twenty-four files attached cold and the one-thread read pass at 3.8-4.8 s for a million reads. The selector's first buy makes the crossing itself where the look has not (`Options::zpages_buy_crosses`; `supdb-nobuycross` leaves it to the look): the same six reps read 1.0-1.8 s with no file warmed, and on the default of that commit, which crosses first, the option fired in no rep (`SUPDB_ZPAGES_TRACE=1 SUPDB_LAG_MARK=1 SUPDB_LAG_COUNTERS=1 bench/scripts/pair.sh supdb-jobsmappedbuycross supdb-jobsmapped 10000000 --bound 1342177280 --reps 3 --ops-div 10 --passes load,read,read-threaded`, and `pair.sh supdb-zbuycross supdb` in the same shape, at `c7570a9`). The pass's two shapes that are left, 0.9-1.1 s and 1.4-1.7, follow when the load's last five partitions land.
 
 The scrambled E at three million keys under 1.25 GiB, a store in core, read 0.84x of LMDB in the row at `8028e78`. With the counters on (`SUPDB_MIX_KINDS=1 SUPDB_MIX_COUNTERS=1 SUPDB_MIX_EVENTS=1 bench ab --arms supdb,lmdb-nordahead --size 3000000 --bound 1342177280 --passes load,read,read-threaded,scan,scan-threaded,mixes,scan-mixed,mixes-scrambled --ops-div 10 --reps 1` at `7310dd0`) its scans took 235 ms against LMDB's 145, the settle 43 ms of them for 40,827 writes the scrambled write mixes left scattered over 24,459 blocks, against 14 ms for the unscrambled E's 30,030 over 10,807, and the walks were 445 copies, 55,351 sparse and 22,882 others against 45,470, 19,455 and 8,099. A filing of a raw partition's writes by the ordered index's samples, their cuts left to the builds (`Options::settle_lazy_raw`), filed 44,000 keys a sitting and read the scrambled E 1.06x and 1.02x in two sittings (`bench ab --arms supdb-settlelazyraw,supdb --size 3000000 --bound 1342177280 --passes load,read,read-threaded,scan,scan-threaded,mixes,scan-mixed,mixes-scrambled --ops-div 10 --reps 2` at `0deae36`, every rep its way), and the lag sweep level: an arm. Undivided the mix read 0.92x (`--ops-div 1 --reps 1` at `0deae36`, profiled with `perf record -a -e cpu-clock -F 1999 -g` over the mix's window): the scanning thread's CPU was 1.84 s in a window of 2.47 s against LMDB's 1.88 in 2.29, with 2,310 samples of the merge threads beside it, and its run-queue wait 11 ms by `/proc/<tid>/schedstat`. Timed by kind (`SUPDB_MIX_KINDS=1`, the same pairing undivided at `0deae36`), its 249 commits took 710 ms against LMDB's 244 and its scans 1,503 against 1,437; the unscrambled E's commits took 228 against 258. `strace -f --seccomp-bpf -e trace=fdatasync,fsync,sync_file_range -T` attached for the mix's window read the commit thread's fdatasync at 0.81 ms in the unscrambled E, at most 1.5, and in the scrambled one 119 under a millisecond, 63 of 1-3, 57 of 3-10 and 10 longer, with the merges' writer helpers syncing 8 MB every 20 ms or so in 1-4.5 ms each. A merge's writers syncing every megabyte (`Options::merge_sync_ahead`; `bench ab --arms supdb-mergesync1m,supdb` at `8fa06a4` in the same order undivided, two sittings, and `--passes load,lag` at three and ten million keys) made 1,203-1,228 merge syncs against 167 and read the scrambled E's commits at 638 ms against 631 and 520 against 597, and the lag sweep at three million keys 12% worse by its weighted sum in both reps: refuted, an arm. The seals' and merges' threads at the idle I/O class on a device scheduled by `mq-deadline`, which honours the classes (`--arms supdb,supdb-bgidle` in the same order undivided at `8fa06a4`'s tree, both orders), read the scrambled E's commits at 863 ms against 724 and 756 against 673: what the commits wait on beside the merges is neither the device cache's backlog of their output nor the queue's order, and is open.
+
+At the quick ladder's rungs the buffered scrambled E is the one cell under a comparator in every row, 0.91-0.97x of LMDB's at ten thousand keys in eight rows of eight and either side of it from thirty to three hundred thousand, so the mix was timed by kind there with its first scans apart (`SUPDB_MIX_KINDS=1`, whose `mixkinds` line carries the first four scans and the longest: `pair.sh SUPDB_MIX_KINDS=1 supdb-ingest lmdb-nosync N --passes load,read,read-threaded,scan,scan-threaded,mixes,scan-mixed,mixes-scrambled --reps 8`, at `16d68eb`). The scans after the first are LMDB's at the two small rungs and ahead above them: 1.00 ms against 1.05 for the mix's 1,585 scans at ten thousand keys, 4.4 and 4.1 against 4.2 and 4.5 by sitting at thirty, 17.0 and 15.1 against 18.4 and 16.2 at a hundred, 52.9 and 48.8 against 61.1 and 53.6 at three hundred. Every commit of the mix, a hundred inserts above the store's last key, is twice LMDB's: 70-95 µs against 27-42 at every rung, one commit at ten thousand keys and twenty-five at three hundred thousand, two percent of the mix (read on the tree before the two settle options below, which that commit turns on and which take nine microseconds of it by their count). And at ten thousand keys the first scan takes 41-242 µs, 100-140 at the median of a sitting, where LMDB's takes 2.4 and the mix is 1.1 ms: at thirty thousand and up it takes 15-25. The probe with the scan's timers on, its counters read four mixes ahead of E and after its first scan and never between (`bench/examples/e_scrambled.rs`, `e_scrambled 10000 supdb-ingesttimers first`), says what it is: 17-30 µs to take the upkeep back from a pass that yields in its fill, or 94-277 where the pass is in its settle, and then 0-160 µs settling what the thread had not filed, 110-400 of the 1,830 writes the four write mixes before it make in two and a half milliseconds; the thread makes three to six passes over them and files the rest at 0.55 µs a key. A profile of the harness cut to those mixes' windows (`SUPDB_LAG_MARK=1 perf record -N -e cpu-clock -F 19999 -k CLOCK_MONOTONIC` around `bench ab --arms supdb-ingest,lmdb-nosync --size 30000 --reps 24` in the same order, the samples laid to the windows by the phase marks) has the store's background threads at 6,482 samples to the writer's 5,648, the upkeep thread on a core nine tenths of the time, and nothing in it over a tenth: the settle's loop 9%, the copy of each value 7.5%, the load of each written chunk's header 6%, the allocator and the first touches of its pages a fifth between them -- lines the writer wrote a moment before, fetched from its core.
+
+The scans are counted and sampled the same way. Under callgrind toggled on the phase (`valgrind --tool=callgrind --collect-atstart=no --toggle-collect='e_scrambled::e_phase' target/release/examples/e_scrambled 10000 ARM`) a scan of fifty is 9,300 instructions against LMDB's 9,200, with the first scan's settle of 1,449 keys beside them at 2,700 a key, since valgrind runs the upkeep thread's turn on the scan. In the harness's own windows at thirty thousand keys the writer's thread is 43% in the block walk, 16% in a copy's prefetch (`CachedBlock::prefetch`) and 12% in the seek, where LMDB's is 31% in its cursor's step, 17% in the harness's callback, 14% in its node search and 5% in its page search; and the walks are copies there, 6,100-7,400 to 1,000-4,200 sparse by rep and 27,000 to 300 at a hundred thousand, where at ten thousand, whose store no seal has reached, they are 150 copies to 2,700 sparse (`SUPDB_MIX_COUNTERS=1`, the `walks` field). The probe's store is not the harness's -- it walks copies at thirty thousand keys in every run, and a profile of a hundred rounds of the phase is of the store the rounds make -- so nothing above is read off the probe but a count a native run confirms. Three levers on the scans were priced and none is the default. The runs a sparse walk makes through one raw walker (`Options::scan_runs_held`) take 9.3% of the phase's instructions at ten thousand keys and 5.3% at thirty, and by kind read the scans level: 1.07 ms against 1.02 and 0.95 against 0.93 at ten thousand keys, level at a hundred and three hundred thousand, with cells it cannot reach a tenth apart in both orders of the same sittings (`pair.sh SUPDB_MIX_KINDS=1 supdb-ingestrunsheld supdb-ingest N --reps 8`, and `supdb-runsheld supdb`, at `16d68eb`). The scan's prefetches taken away altogether (`supdb-ingestnoprefetch`, the same command in the row's order) read the scrambled E's scans 6% faster in both sittings at thirty thousand keys and 4% and 14% at a hundred, and the unscrambled E's 3% slower at thirty. And a copy asked for over the entries its walk reads (`Options::copy_prefetch_span`, `supdb-ingestcopyspan`: the entries from the walk's first, their keys and a kilobyte of their values, where the whole ask is every entry and key and the block's first kilobyte of values wherever the walk starts) read the scrambled E's scans ahead in three sittings of four, by a twentieth to an eighth, and the unscrambled E's 3% behind at thirty thousand keys; profiled arm against arm in the harness the samples on the prefetch were 594 of 3,429 against 608 of 3,608, so what they are is the wait for lines the walk needs and not the asks it does not, and the arm is off.
+
+The commit is counted on its own (`--toggle-collect='e_scrambled::e_tail'`): 335,000 instructions for its eighty inserts against LMDB's 183,000, 262,000 of them the settle the commit makes for the scans behind it (`Options::upkeep_settle_after_scans`), 3,270 an insert. Two parts of that answered a question the insert's place had answered. The patch searched the copy the last block is held as for the key's place, ten compares through its entries and keys, where one compare with the last entry says the key goes after it (`Options::settle_append_last`): 614 instructions an insert. And it took the key's run by the walk of the sources -- a context, an overlay of one key, the pieces and the frozen tables asked -- where the key is the live table's, the partition has no record of it at its cut, no piece meets the partition and no table is frozen, so that its chain is the one source that can hold it (`Options::settle_lone_chain`): 150 an insert, the chain's own walk taking most of what the sources' had. With both the settle is 201,000, 2,510 an insert; `supdb-settlesearch`, `supdb-settlesources` and their buffered arms are the shapes before, and a checked build holds each lone key's run to the sources' walk. Timed by kind against the searching arm the commits read 78-108 µs against 84-88 at ten thousand keys and 65-81 against 72-75 at a hundred thousand, the arm listed first the slower in every sitting (`pair.sh SUPDB_MIX_KINDS=1 supdb-ingest supdb-ingestsettlesearch N --passes load,read,read-threaded,scan,scan-threaded,mixes,scan-mixed,mixes-scrambled --reps 10`, at `16d68eb`): nine microseconds a commit is under what the pairing resolves, and the count is the verdict.
 
 The full-rewrite pass at three million keys after the room-sized budget is a first scan and a steady walk: the scans after the first at 4.6-5.5 µs a scan against LMDB's 8, and the first at 44-69 ms, which waits for the upkeep thread's last fill of the burst or settles the residue the thread had not filed, 38-58 ms of settle by the phase timers (`SUPDB_LAG_COUNTERS=1 SUPDB_SCAN_OPS=1 SUPDB_MIX_EVENTS=1 bench ab --arms supdb,supdb-passyield --size 3000000 --bound 1342177280 --passes load,lag --ops-div 10 --reps 2` at `8fa06a4`'s tree, both orders). The pass that yields between its steps (`supdb-passyield`) read that pass at 0.82-1.20 s against 62-92 ms in both orders, its scans settling and building what the thread had: refuted again, in core. The row divides the pass by ten, so the first scan is weighed ten times in the cell, and a settle that files only the blocks a scan reaches is the lever left.
 

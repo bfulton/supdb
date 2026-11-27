@@ -1071,6 +1071,9 @@ pub struct ZCounts {
     /// (`zselect::model_raw`).
     pub model_hash_bytes: u64,
     pub model_record_bytes: u64,
+    /// The store's files whole as the tick last summed them, the level-0
+    /// pieces' with the partitions' (`Options::heads_owned_past_fill`).
+    pub model_whole_bytes: u64,
     /// Form files the controller retired.
     pub retired: u64,
     /// Stride files built, and the builds that asked for the stride form
@@ -1786,7 +1789,9 @@ pub struct Options {
     /// A test's: a settle of the form, once its segment work has answered,
     /// holds the builds after it before their renames and returns only
     /// once the next has parked there (`Db::hold_zpage_after_settle`), so a
-    /// test can stand a build in flight at the instant a settle ends.
+    /// test can stand a build in flight at the instant a settle ends; and no
+    /// spare (`zpages_both`) starts before the first such settle has
+    /// answered, so the build that parks is a spare started as it ended.
     #[doc(hidden)]
     pub zpages_hold_after_settle: bool,
     /// Under `ZPages::Always`, a partition's form file is built as soon as
@@ -1866,6 +1871,65 @@ pub struct Options {
     /// `supdb-settlelazyraw` is the arm.
     #[doc(hidden)]
     pub settle_lazy_raw: bool,
+    /// A settle's patch of a copy finds a key above the copy's last entry
+    /// by one compare with that entry and appends it, where it searched
+    /// the copy's keys for its place (`Reader::splice_run`): the last block
+    /// of the last partition collects every key inserted past the store's
+    /// end, each above the one before, and each insert's patch was a
+    /// binary search of the copy -- ten compares through the entries and
+    /// the keys, a sixth of the patch's instructions -- for the answer
+    /// "after the last". Off searches, the shape before;
+    /// `supdb-settlesearch` and `supdb-ingestsettlesearch` are the arms.
+    #[doc(hidden)]
+    pub settle_append_last: bool,
+    /// A copy's claim that its entries are its partition's records
+    /// (`CachedBlock::identity`) is of the partition's keys and not of its
+    /// file: a merge that rewrites a partition over the same keys -- every
+    /// key it wrote there one the partition held, and as many of them --
+    /// gives its output the partition's key sequence (`Seg::keyseq`), and
+    /// a copy carried across it (`Db::same_blocks`) starts a scan and takes
+    /// a patch at a rank as it did before the merge. The claim was of the
+    /// blob the copy's build read, since a carry over the same block
+    /// boundaries can move the keys between them (a delete and an insert
+    /// in one block), so every copy carried across any merge searched its
+    /// entries for a scan's start and for every patch from then on: after
+    /// the lag sweep's full rewrite at three hundred thousand keys, whose
+    /// merges fold updates alone, all three thousand of the pass's starts
+    /// were searches, and each landing of a burst's merges left the
+    /// settle's patches searching where they had indexed. Off is the claim
+    /// by blob, the shape before; `supdb-identityblob` and
+    /// `supdb-ingestidentityblob` are the arms.
+    #[doc(hidden)]
+    pub identity_by_keys: bool,
+    /// A copy of a block whose keys are of one length, each with one value
+    /// of one length, is held as one stream of fixed-size records, key then
+    /// value (`CachedBlock::fixed`), where it is three buffers: sixteen
+    /// bytes of entry a record, the keys, and the values each behind a
+    /// length word. A walk of the three reads three streams in each block
+    /// it crosses and 136 bytes an entry of the suite's shape; of the one,
+    /// one stream and 116, with no entry to decode and no length to read.
+    /// A patch that writes a value of the block's length over its key's
+    /// writes it in place; any other -- an insert, a delete, a second
+    /// value, another length -- makes the block the three buffers again
+    /// first (`CachedBlock::unpack`), and it stays so until it is built
+    /// again. On; off is the three buffers for every copy,
+    /// `supdb-copythree` and `supdb-ingestcopythree`.
+    #[doc(hidden)]
+    pub copy_packed: bool,
+    /// A settle's patch takes a key's run from the key's own chain where
+    /// no older source can hold the key (`Reader::patch_block`): the write
+    /// is the live table's, the partition has no record of the key at its
+    /// cut, no level-0 piece meets the partition and no table is frozen.
+    /// A `put` leaves a tombstone in the chain, which masks every older
+    /// source, and its run has been written from the chain since the
+    /// masked path; a plain insert leaves none, so it took the general
+    /// path -- a context made, an overlay of one key allocated, the
+    /// sources walked for a key none of them holds -- about seven hundred
+    /// instructions to learn that the run is the chain's. Off takes the
+    /// general path, the shape before; `supdb-settlesources` and
+    /// `supdb-ingestsettlesources` are the arms.
+    #[doc(hidden)]
+    pub settle_lone_chain: bool,
     /// A covered partition's settle files a written key under the block the
     /// ordered index's samples name (`OrdIndex::floor_stride`, one sample a
     /// block, in memory) before it asks the form file, its cut left for the
@@ -4815,6 +4879,26 @@ pub struct Options {
     /// bounds them. A look further behind than the tables kept drops the
     /// writer's tables, as it does past the count.
     pub upkeep_keep_bytes: usize,
+    /// The bytes the frozen tables may take, each counted as
+    /// `upkeep_keep_bytes` counts a kept one, at twice its capacity, the
+    /// table and the snapshot copy a seal near reads makes of it: a
+    /// commit whose seal would freeze the live table past them waits for
+    /// the oldest frozen table's readable landing first, as it waits
+    /// where `FROZEN_CAP` tables are frozen, and one table is frozen
+    /// whatever it holds. Zero, the default, is an eighth of the memory
+    /// available to the process (`zfile::read_budget`'s limit), and where
+    /// that cannot be read the count alone bounds them; `usize::MAX` is
+    /// the count alone. A table freezes at the seal's threshold, which
+    /// grows with the store, a hundred megabytes at ten million keys, and
+    /// a writer whose commits wait for no sync fills one in half a
+    /// second where its seal takes longer: under 1 GiB the live table and
+    /// three frozen ones stood at 140 MB each with the seals' sorts and
+    /// copies beside them, 620 MB of mapped blocks two seconds into a
+    /// full rewrite, and the group killed the process in one sweep of
+    /// four. `supdb-frozencount` and `supdb-heldpartfrozencount` are the
+    /// arms bounded by the count alone.
+    #[doc(hidden)]
+    pub frozen_bytes: usize,
     /// Whether the upkeep thread gives its forms up when the writes have
     /// outrun it: it drops its tables wherever it is in its pass, and
     /// nothing is filed into forms, no seal makes a snapshot copy for
@@ -5459,6 +5543,80 @@ pub struct Options {
     /// the owed slot first. Kept for pricing as `supdb-waitmanifest` and
     /// `supdb-ingestwaitmanifest`. Only with `manifest_slots`.
     pub flush_waits_manifest: bool,
+    /// A flush whose writes were all durable before it -- every commit
+    /// synced, by `SyncPolicy::Always`, so that nothing is owed a sync
+    /// (`Db::owes_sync`) and the drain's own run of ordered ingest, if it
+    /// closed one, has every commit synced and its name behind a barrier
+    /// -- is answered once its seal's segments are published, and the
+    /// rest of the seal's landing follows in the segment work's loop: the
+    /// directory's fsync of the segments' names, the seal's fsyncs, its
+    /// manifest slot and the retirement of the log and the temp name it
+    /// covers. Its durability never rested on them: a run of ordered
+    /// ingest synced its records and markers at every commit and keeps its
+    /// temp name until a slot names its segment, so an open after a crash
+    /// finishes the run again from it, and a memtable's frames were synced
+    /// in the log, which retires only behind that slot and replays where it
+    /// was not. What the strict drain waited for after the publish was the
+    /// directory's fsync at the readable landing, which waits on the
+    /// journal commit the seal's own fsync forces, and then the join: at
+    /// ten thousand keys 1.1 to 1.8 ms of the shuffled load's drain of 5.6
+    /// and 0.5 of the ordered load's 1.9, with the fsync done inside it.
+    /// Only where the segment work has a thread of its own (inline, nothing
+    /// would land the seal until the writer's next operation), where the
+    /// drain's seal is the one in flight and leaves no level-0 piece and no
+    /// merge to join -- a load's own drain, whose seal is named the
+    /// partition -- and for a flush alone: a checkpoint, a settle and a
+    /// close land every seal whole, and a store dropped with such a seal in
+    /// flight lands it whole at its stop. Off, every flush waits for its
+    /// seal's fsync and slot, as before: `supdb-drainstrict`.
+    pub drain_answers_readable: bool,
+    /// A flush over writes no sync has covered pays the sync it owes on
+    /// the writer's thread while the seal thread writes the segment --
+    /// the frames of the log, the files and runs left loose before it and
+    /// the directory's barrier, by `sync_wal` -- and is then answered as
+    /// `drain_answers_readable` answers a flush whose writes were durable
+    /// before it. Without it a buffered store's drain is answered behind
+    /// its slot's fdatasync, since nothing before that makes its writes
+    /// durable, and at ten thousand keys the shuffled load's drain read
+    /// 6.5 ms, its seal 3.8 of it, where RocksDB's sync is an fdatasync of
+    /// its log alone; the writer waits for the drain anyway, so the sync
+    /// it pays runs beside the seal's work. Not where the drain closed a
+    /// run of ordered ingest the policy left unsynced: the close presyncs
+    /// the run's records already (`close_presync`), and its temp name
+    /// wants a barrier of the directory, which waits on the journal commit
+    /// the seal thread's own fsync forces and ended with the strict drain
+    /// it was to cut short. Nor where the drain's seal is not the store's
+    /// first partition: the pieces and merges beside it keep the drain
+    /// strict whatever is synced, and at three hundred thousand keys,
+    /// where the shuffled load seals before its drain, the sync paid beside
+    /// such a seal was a fsync of the whole log for nothing. Nor under
+    /// `SyncPolicy::Explicit`, whose log is held in the process and a
+    /// frameless drain writes to no file. On by default; off, a buffered
+    /// drain waits for its slot as before, `supdb-ingestsyncafter`.
+    pub drain_syncs_beside: bool,
+    /// A direct run's writer path without the work its records need no
+    /// longer: an ordered table's append takes no memtable hash for a key
+    /// whose entry is a slim word, which carries none -- the hash is
+    /// taken only for the fat entry that does -- and the commit accounts
+    /// for its batch's records in the segment writer in one call
+    /// (`SegmentWriter::put_encoded_run`), from the batch's first and last
+    /// entries and the stream's own byte counts, where it walked every
+    /// entry, rebuilt its record's shape and handed each key over for an
+    /// order check and a copy the table had made already. The file is the
+    /// same byte for byte: what the writer counts of a batch is the sum
+    /// of what it counted of each record, held to it entry by entry in a
+    /// checked build. And a record's pads are laid by one word each
+    /// (`flatindex::record_into_lean`), where a fill of each pad was a
+    /// call into the C library whatever its length, two a record of the
+    /// suite's shape with no pad at all. The commits' path counted 930
+    /// instructions a record at ten thousand keys and counts 496, the
+    /// writer's CPU over the commits a quarter lower, and the ordered load
+    /// reads 1.04-1.14x of the walk in both orders at ten and three
+    /// hundred thousand keys, buffered and durable, but for one sitting of
+    /// the durable load at ten thousand, level. On; off,
+    /// `supdb-directfull` and `supdb-ingestdirectfull`, the walk.
+    #[doc(hidden)]
+    pub direct_lean_append: bool,
     /// A flush's commit of what is staged fsyncs the WAL whatever the
     /// policy, before the seal is handed over: the buffered arm's drain
     /// at ten thousand keys began with a 2.4 ms fdatasync of a log the
@@ -5487,6 +5645,81 @@ pub struct Options {
     /// composes the trailer while the writer syncs the records. On,
     /// `supdb-closeinline` and `supdb-ingestcloseinline`.
     pub close_finish_inline: bool,
+    /// A drain's close of a direct run whose every commit is synced runs
+    /// on the writer up to the segment being readable -- the trailer, the
+    /// ordered index, the link, the readable signal -- with the seal's
+    /// thread spawned before it starts and left the fsyncs alone. The
+    /// writer waits for the drain anyway, the run owes no records' sync to
+    /// work beside, and the seal thread spawned at the hand-over cost the
+    /// close its spawn and its first turn ahead of the finish, 120 µs of a
+    /// 1.2 ms drain at ten thousand keys, where the finish inline with the
+    /// thread spawned after it (`close_finish_inline`) moved the same cost
+    /// to between the finish and the ordered index. Its readable signal
+    /// comes before the flush's ask for the drain, so the seal carries the
+    /// ask's early answer as a hint and the loop leaves its readable
+    /// landing to the ask (`SealJob::early_hint`). The drain is answered
+    /// 0.12 ms sooner at ten thousand keys, and the ordered load reads
+    /// 1.03-1.05x of the seal thread's in both orders. On; off,
+    /// `supdb-closeseal` and `supdb-ingestcloseseal`, the seal thread's.
+    #[doc(hidden)]
+    pub close_readable_inline: bool,
+    /// A seal composes the Bloom a landing's open takes only where it may
+    /// be named a piece: a seal its close can name the store's first
+    /// partition before the finish, by an upper bound on the finished
+    /// file's length (`SegmentWriter::finished_len_bound`), composes none,
+    /// since a partition's open takes no Bloom, and is named as before.
+    /// Every drain of a fresh store's load is such a seal, and its finish
+    /// had added every key to a filter the landing dropped: 56 of the
+    /// finish's 502 instructions a key at ten thousand keys, and the
+    /// durable ordered load's drain reads 1.03-1.05 ms against 1.09-1.12
+    /// for the arm in both orders. On; off, `supdb-bloomalways` and
+    /// `supdb-ingestbloomalways`, the Bloom for every seal.
+    #[doc(hidden)]
+    pub bloom_pieces_only: bool,
+    /// A landing makes the empty live table it installs only where the
+    /// table it retires is still the live one, the one branch that
+    /// installs it; a landing that retires the oldest frozen table, which
+    /// is a drain's after the writer's freeze, makes none. The table had
+    /// been made for every landing that retired one and dropped unused by
+    /// all of those, on the landing's path: its three slabs' and three
+    /// arenas' tables of blocks, a quarter megabyte zeroed and freed, 394
+    /// thousand of a drain's landing's 451 thousand instructions at ten
+    /// thousand keys, and the durable ordered load's drain reads 1.05-1.06
+    /// ms against 1.13-1.15 for the arm in both orders. On; off,
+    /// `supdb-landfresh` and `supdb-ingestlandfresh`, the table for every
+    /// landing.
+    #[doc(hidden)]
+    pub land_fresh_lazy: bool,
+    /// A run of ordered ingest begins in a file made ahead of it: an empty
+    /// file under the run's temp name whose entry in the directory is
+    /// behind a sync before the run asks for it, so the run's first commit
+    /// is a commit like the rest. Without one a run made its file at that
+    /// commit, whose fdatasync then carried the new inode, and the first
+    /// sync that acknowledged anything fsynced the directory for the name
+    /// (`Db::dir_barrier`): 0.78 ms and 0.29 against the 0.45 to 0.57 ms
+    /// of a run's later fdatasyncs at ten thousand keys under `strace -T`.
+    /// The store's first is made as the store is created, ahead of the
+    /// manifest's own sync of the directory. The writer reserves the next
+    /// run's id as each run begins and the segment work makes that file
+    /// where it syncs the directory anyway, at a landing, or once at its
+    /// first turn in a store opened (`RunSpare`): made as the last one
+    /// was taken, its sync ran beside the run's first commits, which wait
+    /// on the same journal, and gave back there two thirds of what the
+    /// file had saved the first -- 0.3 ms off the first commit and 0.2
+    /// back over the nine after it, the load 1% faster in both orders. A
+    /// run that finds no file ready makes its own, with its own barrier.
+    /// A file nobody began in is an empty file under a temp name, which
+    /// the open removes as it removes a run with no committed record, and
+    /// a store closed removes behind the segment work's join. The durable
+    /// ordered load reads 6.7-6.9 ms against 7.4-7.6 for the arm at ten
+    /// thousand keys in both orders, its first commit 0.72-0.75 ms
+    /// against 1.00-1.04, and 3-9% faster at thirty thousand
+    /// (`bench/scripts/pair.sh SUPDB_LOAD_PHASES=1 supdb supdb-runcreate
+    /// 10000 --passes load --reps 24`); the buffered load, whose commits
+    /// sync nothing, reads level. On; off, the file made at the run's
+    /// first commit, `supdb-runcreate` and `supdb-ingestruncreate`.
+    #[doc(hidden)]
+    pub run_spare: bool,
     /// EXPERIMENT, refuted and kept as an arm: a drain's seal copies the
     /// frozen table's chains into a snapshot for the scans over the
     /// store while the seal runs, as any seal does (`seal_snapshot`),
@@ -6104,6 +6337,22 @@ pub struct Options {
     /// beside point-read mixes, which it never touches, at 0.84x, a sitting
     /// that resolves nothing. Off; `supdb-leancopyprefetch` is the arm.
     pub copy_prefetch_from_start: bool,
+    /// EXPERIMENT: a copy's prefetch asks for the lines its walk reads and
+    /// no others: the entries from the one the walk starts at, as many as
+    /// the scan still wants, and the keys and the first kilobyte of values
+    /// of those entries, placed by the block's mean lengths so that no
+    /// entry is loaded to place them (`CachedBlock::prefetch_span`). The
+    /// whole prefetch asks for every entry and key of the block and the
+    /// first kilobyte of its values, wherever the walk starts: a scan of
+    /// fifty that starts at a copy's fortieth entry by rank
+    /// (`copy_start_at_rank`) was asked for thirty-two lines of entries
+    /// and keys of which it reads twelve, and for the values of the
+    /// block's first ten entries, none of which it reads, while the value
+    /// it reads first was left to a miss; and the block it walks into
+    /// next was asked for whole where the scan wants its first few
+    /// entries. A copy the walk searches is asked for whole as before.
+    /// Off; `supdb-copyspan` and `supdb-ingestcopyspan` are the arms.
+    pub copy_prefetch_span: bool,
     /// EXPERIMENT: the prefetch of the copy block a copy walk reaches next
     /// paced through the walk -- four lines of each of its three buffers
     /// every sixteen entries, the whole of it by the forty-eighth
@@ -6725,6 +6974,18 @@ pub struct Options {
     /// run of up to sixty-four deltas, and the scans after it walked them.
     /// `supdb-settlenoconvert` leaves the conversions to the fill.
     pub settle_converts: bool,
+    /// Whether a settle that converted a form (`settle_converts`) leaves
+    /// the fill its walk of the tables, as the patch that left a form at
+    /// the dense count had. That walk is where the fill meets the light
+    /// forms (`forms_convert_from`), and in a store whose every block
+    /// holds a form nothing else starts one: a write into a block with no
+    /// form does, and there is none. Converted by the settle with no walk
+    /// left, the forms the scrambled write mixes leave under the dense
+    /// count stayed deltas -- 98 of 157 blocks at ten thousand keys, where
+    /// the walk a dense form started had left one -- and the scrambled E
+    /// walked them. `supdb-settleconvertquiet` is the conversion with no
+    /// walk left.
+    pub settle_convert_fills: bool,
     /// EXPERIMENT: how long a look at whether a partition's heads are all
     /// in the page cache stands, in milliseconds, for the asks a settle
     /// makes ahead of its resolves out of core (`heads_willneed`): while a
@@ -6797,6 +7058,34 @@ pub struct Options {
     /// none. On; `supdb-headsmodel` is the model's word alone.
     #[doc(hidden)]
     pub heads_owned_beside_copies: bool,
+    /// The heads of a partition the raw form serves are copied while the
+    /// controller's model says the raw form fits and it is asking nothing
+    /// -- the raw gate, where `z_heads_look` made no copy -- wherever the
+    /// store's files whole -- every segment's hash region, record region
+    /// and ordered index, the level-0 pieces' with the partitions' --
+    /// have stood past the fill share of its budget (`zselect::FORM_FILL`,
+    /// the share that leaves the cache's other tenants theirs) at a
+    /// reading of the model, and from then on. The model's fit is of the
+    /// pages a read touches, the partitions' two populations, and a burst
+    /// puts a store's worth of pieces in the cache beside them: the group
+    /// comes to its limit, and the kernel takes the pages written once
+    /// and never read first, the ordered indexes of the partitions the
+    /// burst's merges had just landed. With the copies of fixed-size
+    /// records a fifth smaller (`Options::copy_packed`) a store of three
+    /// million keys under 1.25 GiB never left the raw gate through a full
+    /// rewrite, no head was copied, and half the passes after it took two
+    /// hundred major faults on their scans' seeks, three times a pass's
+    /// length, where the larger process had tripped the census and had
+    /// its seventeen partitions' heads copied. The line is the store's own
+    /// arithmetic and not a reading of the group, so it is crossed in the
+    /// middle of the burst, seconds ahead of the limit: read as the
+    /// group's unused memory less the margin, once a second, the limit
+    /// was seen in half the sweeps, and read as the kernel's count of the
+    /// times the limit was met (`memory.failcnt`) in a third, the group
+    /// first meeting its limit as the burst ends. On; off leaves the raw
+    /// gate's heads the page cache's, `supdb-headsgate`.
+    #[doc(hidden)]
+    pub heads_owned_past_fill: bool,
     /// The hot-raw policy's skew bar read against the room
     /// (`Maint::z_hot_look`): the candidate partition is asked for where its
     /// raw bytes fit the group's unused memory and it is read more a key
@@ -7751,6 +8040,10 @@ impl Default for Options {
             zpages_memo_hash: true,
             zpages_settle_span: true,
             settle_lazy_raw: false,
+            settle_append_last: true,
+            identity_by_keys: true,
+            copy_packed: true,
+            settle_lone_chain: true,
             settle_covered_samples: true,
             zpages_trusted_views: true,
             zpages_memo_bytes: 8 << 20,
@@ -7930,6 +8223,7 @@ impl Default for Options {
             ahead_converts: false,
             ahead_sends_bounds: true,
             upkeep_keep_bytes: 0,
+            frozen_bytes: 0,
             upkeep_abandons: true,
             upkeep_files_bursts: true,
             upkeep_yields: false,
@@ -7969,8 +8263,15 @@ impl Default for Options {
             manifest_slots: true,
             manifest_pending: false,
             flush_waits_manifest: false,
+            drain_answers_readable: true,
+            drain_syncs_beside: true,
+            direct_lean_append: true,
             drain_syncs_wal: false,
             close_finish_inline: false,
+            close_readable_inline: true,
+            bloom_pieces_only: true,
+            land_fresh_lazy: true,
+            run_spare: true,
             drain_snapshot: true,
             seal_snapshot_far: false,
             land_ranks_far: false,
@@ -8010,6 +8311,7 @@ impl Default for Options {
             forms_rebase: true,
             copy_start_at_rank: true,
             copy_prefetch_from_start: false,
+            copy_prefetch_span: false,
             scan_prefetch_paced: false,
             piece_ranks_by_heads: true,
             forms_to_writer: false,
@@ -8054,9 +8356,11 @@ impl Default for Options {
             settle_sorts_once: true,
             settle_patch_in_place: true,
             settle_converts: true,
+            settle_convert_fills: true,
             heads_look_ms: 0,
             heads_owned: true,
             heads_owned_beside_copies: true,
+            heads_owned_past_fill: true,
             zpages_hot_skew_room: false,
             zpages_hot_room_margin_pct: 0,
             zpages_walk_owns_decodes: false,
@@ -9434,6 +9738,10 @@ struct Direct {
     /// With `Options::direct_stream`, where the table's record stream is
     /// written to from here: its end at the last commit, marker included.
     stream_from: usize,
+    /// The table's stream payload (`MemTable::stream_payload`) at the last
+    /// commit, with `Options::direct_lean_append`: what the next batch
+    /// holds is the count less this.
+    payload_from: u64,
     /// Whether the file holds commits no sync has covered: every commit
     /// under a policy that did not sync it, until one that does. A run
     /// that closes so is loose (`Db::loose_runs`).
@@ -9443,6 +9751,25 @@ struct Direct {
     /// makes it so (`Db::sync_run`), since a sync of the file does not
     /// promise the entry that names it.
     named: bool,
+}
+
+/// The file made ahead for the next run of ordered ingest
+/// (`Options::run_spare`), by the segment id reserved for that run. The
+/// writer reserves the id as the run before it begins, so a run's id does
+/// not turn on whether its file was ready, and the segment work makes the
+/// file: `Wanted` until it has, `Made` once the empty file is under the
+/// run's temp name, `Ready` once a sync of the directory stands behind
+/// that, and `Failed` where it could not be made. A run begins in a
+/// `Ready` file with no barrier of its own; any other it takes as it
+/// took none, making the file and its barrier itself. `Off` in a store
+/// without the option.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RunSpare {
+    Off,
+    Wanted(u64),
+    Made(u64),
+    Ready(u64),
+    Failed(u64),
 }
 
 /// A run of ordered ingest that closed with commits no sync had covered,
@@ -9768,7 +10095,7 @@ type Compaction = (Vec<String>, std::thread::JoinHandle<Result<Vec<String>>>);
 struct Merging {
     inputs: Vec<String>,
     fences: Option<Vec<Fence>>,
-    handle: std::thread::JoinHandle<Result<Vec<String>>>,
+    handle: std::thread::JoinHandle<Result<MergeOut>>,
     why: (usize, bool),
     began: Option<std::time::Instant>,
 }
@@ -10244,8 +10571,25 @@ impl SegBlob {
 /// and whatever routing it carries. L0 segments come straight from a seal,
 /// overlap each other freely, and are gated by a Bloom; L1 segments come
 /// from a partitioning merge, are disjoint, and are gated by their fence.
+/// The identity of a partition's key sequence (`Seg::keyseq`): what a copy's
+/// claim to its entries' ranks is held to. A type of its own because a
+/// blob's id is the same word and names another thing: a check written
+/// against the file's id compiled against the keys' and declined every
+/// copy a merge had carried, with every answer right and nothing raised.
+#[derive(Default, Clone, Copy, PartialEq, Eq, Debug)]
+struct KeySeq(u64);
+
 struct Seg {
     blob: SegBlob,
+    /// The identity of this partition's key sequence: its own blob's id,
+    /// or the key sequence of the partition a merge rewrote it from where
+    /// the merge wrote that partition's keys and no others
+    /// (`Options::identity_by_keys`, `Maint::join_merge`). Two partitions
+    /// of one key sequence hold the same key at every rank, which is what
+    /// a copy's claim to its entries' ranks is of
+    /// (`CachedBlock::identity_for`). In memory alone: a store opened
+    /// again holds no copy to claim anything.
+    keyseq: KeySeq,
     /// Touches of the raw form through `Seg::raw` while a form file is
     /// installed, under debug assertions; `Reader::raw_touches` sums it.
     raw_touches: AtomicU64,
@@ -11673,9 +12017,18 @@ pub(crate) trait KeySource {
     fn at(&self, i: usize) -> (&[u8], u32, u64);
 }
 
-/// A finish's walk over deferred keys: their source, and the caller's
-/// hook told each key in order as the pass takes it.
-type KeyWalk<'s, 'k> = (&'s dyn KeySource, &'k mut dyn FnMut(&[u8]));
+/// What a finish's composition of the trailer makes: the section's header,
+/// the trailer, the section's length and the Bloom where one was asked for.
+type Composed = (Vec<u8>, blocks::BigVec<u8>, usize, Option<BlockedBloom>);
+
+/// The composition a finish asks for where its writer's keys were
+/// deferred (`SegmentWriter::finish_unsynced_from`).
+type ComposeFn<'a> = dyn FnMut(&SegmentWriter) -> Result<Composed> + 'a;
+
+/// What a piece writer's finish from a key source hands back: the
+/// segment's file, the ordered index's bytes and the landing's facts where
+/// they were composed (`PieceWriter::finish_unsynced_from`).
+type PieceFinished = (File, Vec<u8>, Option<(BlockedBloom, bool)>);
 
 /// What the file of a run of ordered ingest holds up to its last good
 /// commit marker (`SegmentWriter::walk_run`): where each committed record
@@ -12264,6 +12617,77 @@ impl SegmentWriter {
             }
         }
         self.recs_len += rec_len;
+        if self.recs_len > flatindex::MAX_RECS {
+            return Err(err(
+                "segment writer: key section exceeds the flat index's limits",
+            ));
+        }
+        Ok(())
+    }
+
+    /// `put_encoded` over a batch of `n` records laid one after another in
+    /// the caller's stream, accounted at once: `first` and `last` the
+    /// batch's first and last keys, `rec_bytes` and `payload` the sums of
+    /// its records' lengths and of their keys' and values' bytes, and
+    /// `last_rec` the last record's length, its tail's offset in it and
+    /// its value's length. What `put_encoded` counts of each record, the
+    /// count and the last key kept and nothing else of a key, summed: for
+    /// a writer whose keys are deferred (`set_deferred_keys`) alone, and a
+    /// caller whose batch holds its keys in increasing order -- the table
+    /// a direct run streams from, which takes each key above its last
+    /// (`Options::direct_lean_append`).
+    pub(crate) fn put_encoded_run(
+        &mut self,
+        first: &[u8],
+        last: &[u8],
+        n: usize,
+        rec_bytes: usize,
+        payload: u64,
+        last_rec: (usize, usize, u32),
+    ) -> Result<()> {
+        if n == 0 {
+            return Ok(());
+        }
+        if self.open_key.is_some() {
+            return Err(err("segment writer: begin while a key is open"));
+        }
+        let Some(had) = self.deferred else {
+            return Err(err(
+                "segment writer: a batch accounted at once needs its keys deferred",
+            ));
+        };
+        if first.len() > u16::MAX as usize || last.len() > u16::MAX as usize {
+            return Err(err("segment writer: key longer than 65,535 bytes"));
+        }
+        if (had > 0 && first <= self.last_key.as_slice())
+            || if n == 1 { first != last } else { first >= last }
+        {
+            return Err(err(
+                "segment writer: keys must arrive in strictly increasing order",
+            ));
+        }
+        if self.layout()? != Layout::RecordsFirst {
+            return Err(err(
+                "segment writer: a streamed record needs the records-first layout",
+            ));
+        }
+        let (last_len, last_tail_at, last_value_len) = last_rec;
+        if last_len > rec_bytes {
+            return Err(err(
+                "segment writer: a batch's last record longer than the batch",
+            ));
+        }
+        self.last = 0;
+        self.payload += payload;
+        self.last_value = (
+            self.pos + (rec_bytes - last_len) as u64 + last_tail_at as u64,
+            last_value_len,
+        );
+        self.pos += rec_bytes as u64;
+        self.last_key.clear();
+        self.last_key.extend_from_slice(last);
+        self.deferred = Some(had + n);
+        self.recs_len += rec_bytes;
         if self.recs_len > flatindex::MAX_RECS {
             return Err(err(
                 "segment writer: key section exceeds the flat index's limits",
@@ -13070,34 +13494,133 @@ impl SegmentWriter {
         self.finish_unsynced_with(generation, None).map(|(f, _)| f)
     }
 
+    /// The buffer a finish composes its trailer in, for `n` keys whose
+    /// fence keys come to `fence` bytes: room for the whole trailer from
+    /// the start (`flatindex::stream_section_len`), a mapping where it is
+    /// large, so the composer's steps -- the fence, the directory, the hash
+    /// slots -- grow nothing. Grown a step at a time, the buffer went from
+    /// the heap to a mapping partway and copied what it held, the pages
+    /// of both first touched for one trailer.
+    fn trailer_buf(&self, n: usize, fence: usize) -> blocks::BigVec<u8> {
+        let len = flatindex::stream_section_len(n, self.recs_len, fence)
+            .map_or(0, |total| total - flatindex::HEADER - self.recs_len);
+        blocks::BigVec::with_capacity(len, blocks::Site::Trailer, self.buffers_mapped)
+    }
+
+    /// An upper bound on the file's length once the finish has run, for a
+    /// writer of inline records alone: the section the trailer completes
+    /// (`flatindex::stream_section_len`), its checksum row, and the block
+    /// table at the file's end, where the finish may put it in the head's
+    /// reserve instead. The fence's keys are `src`'s where the keys were
+    /// deferred and the writer's own copies otherwise. `None` for a writer
+    /// with value blocks, which the finish writes after the row, and for
+    /// one whose keys it cannot see. For a caller that decides by the
+    /// finished length before the finish (`Options::bloom_pieces_only`).
+    pub(crate) fn finished_len_bound(&self, src: Option<&dyn KeySource>) -> Option<u64> {
+        if self.mode != Some(Layout::RecordsFirst)
+            || self.open_key.is_some()
+            || !self.builder.is_empty()
+            || !self.blocks.is_empty()
+            || !self.pending_blocks.is_empty()
+        {
+            return None;
+        }
+        let (n, fence) = match (self.deferred, src) {
+            (Some(n), Some(s)) if s.len() == n => {
+                (n, flatindex::fence_blob_len(n, |i| s.key_at(i).len()))
+            }
+            (None, _) => {
+                let n = self.spans.len();
+                (n, flatindex::fence_blob_len(n, |i| self.spans[i].1))
+            }
+            _ => return None,
+        };
+        let key_off = self.key_start();
+        let total = flatindex::stream_section_len(n, self.recs_len, fence)?;
+        let row = flatindex::checksum_row_len(total, flatindex::PIECE_SHIFT, key_off);
+        let table = flatindex::encode_blocks(&self.blocks, &self.chunk_rows).len();
+        Some(key_off + (total + row + 8 + table) as u64)
+    }
+
     /// `finish_unsynced` for a writer whose keys were deferred
     /// (`set_deferred_keys`): `src` answers the keys in order, and the
     /// Bloom a landing would build from them is composed in the same pass
     /// that fills the hash slots, so the keys are hashed once. The record
     /// offsets the source answers are the section's -- the stream the
     /// writer was fed is the record section byte for byte.
-    pub(crate) fn finish_unsynced_from(
+    ///
+    /// `bloom` false composes none, for a segment whose open takes none.
+    /// Generic over the source and the hook, so the pass is one loop with
+    /// both in it (`compose_from`): through a pointer a key, the source's
+    /// answer and the hook were three calls a key, and the finish at ten
+    /// thousand keys took 335 instructions a key where it takes 297 with
+    /// this, its trailer's buffer made whole (`trailer_buf`) and the
+    /// ordered index's push inlined.
+    pub(crate) fn finish_unsynced_from<S: KeySource + ?Sized>(
         self,
         generation: u64,
-        src: &dyn KeySource,
-        on_key: &mut dyn FnMut(&[u8]),
-    ) -> Result<(File, BlockedBloom)> {
-        let (file, bloom) = self.finish_unsynced_with(generation, Some((src, on_key)))?;
-        Ok((
-            file,
-            bloom.expect("a finish from a source composes the Bloom"),
-        ))
+        src: &S,
+        on_key: &mut impl FnMut(&[u8]),
+        bloom: bool,
+    ) -> Result<(File, Option<BlockedBloom>)> {
+        let mut compose = |w: &SegmentWriter| w.compose_from(src, on_key, generation, bloom);
+        let (file, made) = self.finish_unsynced_with(generation, Some(&mut compose))?;
+        debug_assert_eq!(made.is_some(), bloom, "a Bloom where one was asked for");
+        Ok((file, made))
     }
 
+    /// The trailer of a writer whose keys were deferred, composed from
+    /// `src` in one pass: each key read once for its offset and hash, the
+    /// Bloom where `want_bloom` asks for one and `on_key` told of the key
+    /// as it goes. The header, the trailer, the section's length and the
+    /// Bloom.
+    fn compose_from<S: KeySource + ?Sized>(
+        &self,
+        src: &S,
+        on_key: &mut impl FnMut(&[u8]),
+        generation: u64,
+        want_bloom: bool,
+    ) -> Result<Composed> {
+        let n = src.len();
+        if self.deferred != Some(n) {
+            return Err(err(
+                "segment writer: the key source holds a different count of keys than were written",
+            ));
+        }
+        let mut b =
+            want_bloom.then(|| BloomFill::new(BlockedBloom::with_capacity(n), self.lookahead));
+        let fence = flatindex::fence_blob_len(n, |i| src.key_at(i).len());
+        let (header, trailer, total) = flatindex::stream_trailer_in(
+            self.trailer_buf(n, fence),
+            n,
+            self.recs_len,
+            |i| src.key_at(i),
+            |i| {
+                let (key, off, h) = src.at(i);
+                if let Some(b) = b.as_mut() {
+                    b.add(h);
+                }
+                on_key(key);
+                (off, h)
+            },
+            generation,
+            self.lookahead,
+        )
+        .ok_or_else(|| err("segment writer: key section exceeds the flat index's limits"))?;
+        Ok((header, trailer, total, b.map(BloomFill::finish)))
+    }
+
+    /// The finish, with `compose` making the trailer of a writer whose
+    /// keys were deferred and the writer's own copies making it otherwise.
     fn finish_unsynced_with(
         mut self,
         generation: u64,
-        src: Option<KeyWalk<'_, '_>>,
+        compose: Option<&mut ComposeFn<'_>>,
     ) -> Result<(File, Option<BlockedBloom>)> {
         if self.open_key.is_some() {
             return Err(err("segment writer: finish with a key still open"));
         }
-        if src.is_none() && self.deferred.is_some() {
+        if compose.is_none() && self.deferred.is_some() {
             return Err(err(
                 "segment writer: deferred keys need their source at the finish",
             ));
@@ -13123,35 +13646,11 @@ impl SegmentWriter {
             Layout::RecordsFirst => {
                 let key_off = self.key_start();
                 let limits = || err("segment writer: key section exceeds the flat index's limits");
-                let (header, trailer, total) = match src {
-                    Some((src, on_key)) => {
-                        let n = src.len();
-                        if self.deferred != Some(n) {
-                            return Err(err(
-                                "segment writer: the key source holds a different count of keys than were written",
-                            ));
-                        }
-                        // One pass over the source: each key read once
-                        // for its offset and hash, the Bloom and the
-                        // caller's own composition told of it as it goes.
-                        let mut b = BloomFill::new(BlockedBloom::with_capacity(n), self.lookahead);
-                        let r = flatindex::stream_trailer_in(
-                            blocks::BigVec::new(blocks::Site::Trailer, self.buffers_mapped),
-                            n,
-                            self.recs_len,
-                            &|i| src.key_at(i),
-                            &mut |i| {
-                                let (key, off, h) = src.at(i);
-                                b.add(h);
-                                on_key(key);
-                                (off, h)
-                            },
-                            generation,
-                            self.lookahead,
-                        )
-                        .ok_or_else(limits)?;
-                        bloom = Some(b.finish());
-                        r
+                let (header, trailer, total) = match compose {
+                    Some(compose) => {
+                        let (header, trailer, total, made) = compose(&self)?;
+                        bloom = made;
+                        (header, trailer, total)
                     }
                     None => {
                         let arena = &self.key_arena;
@@ -13161,12 +13660,13 @@ impl SegmentWriter {
                             let (s, l) = spans[i];
                             &arena[s..s + l]
                         };
+                        let fence = flatindex::fence_blob_len(spans.len(), |i| spans[i].1);
                         flatindex::stream_trailer_in(
-                            blocks::BigVec::new(blocks::Site::Trailer, self.buffers_mapped),
+                            self.trailer_buf(spans.len(), fence),
                             spans.len(),
                             self.recs_len,
-                            &key_at,
-                            &mut |i| (rec_offs[i], hashes[i]),
+                            key_at,
+                            |i| (rec_offs[i], hashes[i]),
                             generation,
                             self.lookahead,
                         )
@@ -13717,6 +14217,26 @@ impl PieceWriter {
         self.0.put_encoded(k, rec_len, tail_at, value_len)
     }
 
+    /// `SegmentWriter::put_encoded_run`, for a writer whose keys are
+    /// deferred: the ordered index takes them at the finish.
+    fn put_encoded_run(
+        &mut self,
+        first: &[u8],
+        last: &[u8],
+        n: usize,
+        rec_bytes: usize,
+        payload: u64,
+        last_rec: (usize, usize, u32),
+    ) -> Result<()> {
+        if !self.3 {
+            return Err(err(
+                "segment writer: a batch accounted at once needs its keys deferred",
+            ));
+        }
+        self.0
+            .put_encoded_run(first, last, n, rec_bytes, payload, last_rec)
+    }
+
     fn stream_out(&mut self, from: usize, to: usize) -> Result<()> {
         self.0.stream_out(from, to)
     }
@@ -13777,11 +14297,13 @@ impl PieceWriter {
     /// `finish_unsynced` for deferred keys (`set_deferred_keys`): the
     /// segment's file, the ordered index composed from `src`'s keys, and
     /// the landing's facts -- the Bloom the finish composed in its pass
-    /// over the keys, and the tombstone flag.
-    fn finish_unsynced_from(
+    /// over the keys, and the tombstone flag -- where `bloom` asks for
+    /// them, for a segment whose open takes a Bloom.
+    fn finish_unsynced_from<S: KeySource + ?Sized>(
         self,
-        src: &dyn KeySource,
-    ) -> Result<(File, Vec<u8>, (BlockedBloom, bool))> {
+        src: &S,
+        bloom: bool,
+    ) -> Result<PieceFinished> {
         debug_assert!(self.3, "a finish from a source is for deferred keys");
         let tombs = self.2;
         let n = src.len();
@@ -13792,8 +14314,14 @@ impl PieceWriter {
         } else {
             crate::ordindex::Composer::new(n, src.key_at(0), src.key_at(n - 1))
         };
-        let (file, bloom) = (*self.0).finish_unsynced_from(1, src, &mut |k| ord.push(k))?;
-        Ok((file, ord.finish(), (bloom, tombs)))
+        let (file, made) = (*self.0).finish_unsynced_from(1, src, &mut |k| ord.push(k), bloom)?;
+        Ok((file, ord.finish(), made.map(|b| (b, tombs))))
+    }
+
+    /// `SegmentWriter::finished_len_bound`, the fence's keys from `src`
+    /// where the keys were deferred.
+    fn finished_len_bound(&self, src: Option<&dyn KeySource>) -> Option<u64> {
+        self.0.finished_len_bound(src)
     }
 }
 
@@ -14116,6 +14644,7 @@ impl Seg {
                 None => Seg::bloom_and_tombs(&blob)?,
             };
             return Ok(Seg {
+                keyseq: KeySeq(blob.id()),
                 blob: SegBlob(blob),
                 raw_touches: AtomicU64::new(0),
                 name: name.to_string(),
@@ -14165,6 +14694,7 @@ impl Seg {
                 Some(unhex(f[3]).ok_or_else(|| err("segment fence is malformed"))?)
             };
             return Ok(Seg {
+                keyseq: KeySeq(blob.id()),
                 blob: SegBlob(blob),
                 raw_touches: AtomicU64::new(0),
                 name: name.to_string(),
@@ -14206,6 +14736,7 @@ impl Seg {
             None => Seg::bloom_and_tombs(&blob)?,
         };
         Ok(Seg {
+            keyseq: KeySeq(blob.id()),
             blob: SegBlob(blob),
             raw_touches: AtomicU64::new(0),
             name: name.to_string(),
@@ -14510,9 +15041,18 @@ struct MemTable {
     stream: bool,
     /// `SegmentOptions::compact_records` of the run the stream is for.
     stream_compact: bool,
+    /// `stream` with `Options::direct_lean_append`: a record laid in the
+    /// stream by `flatindex::record_into_lean`, the same bytes.
+    stream_lean: bool,
     /// The stream's end at the last commit, past its marker: where a
     /// truncation of the uncommitted tail rewinds the stream to.
     stream_committed: AtomicUsize,
+    /// Writer-only: the key and value bytes of every record laid in the
+    /// stream, and their sum at the last commit, where a truncation
+    /// rewinds it to: what a commit's batch holds is the difference
+    /// (`Options::direct_lean_append`).
+    stream_payload: AtomicU64,
+    stream_payload_committed: AtomicU64,
     /// The mapping of the run's segment the committed references read
     /// through, published by the writer once the run has a file and
     /// replaced by a larger one when the file outgrows it; the one
@@ -16721,7 +17261,10 @@ impl MemTable {
             refs: false,
             stream: false,
             stream_compact: false,
+            stream_lean: false,
             stream_committed: AtomicUsize::new(0),
+            stream_payload: AtomicU64::new(0),
+            stream_payload_committed: AtomicU64::new(0),
             run: AtomicPtr::new(std::ptr::null_mut()),
             run_flushed: AtomicU64::new(0),
             retired_runs: UnsafeCell::new(Vec::new()),
@@ -16954,7 +17497,10 @@ impl MemTable {
             refs,
             stream: stream.is_some(),
             stream_compact: stream.unwrap_or(false),
+            stream_lean: false,
             stream_committed: AtomicUsize::new(0),
+            stream_payload: AtomicU64::new(0),
+            stream_payload_committed: AtomicU64::new(0),
             run: AtomicPtr::new(std::ptr::null_mut()),
             run_flushed: AtomicU64::new(0),
             retired_runs: UnsafeCell::new(Vec::new()),
@@ -16985,6 +17531,15 @@ impl MemTable {
             settled: std::sync::atomic::AtomicBool::new(false),
             rewrite_hold: std::sync::atomic::AtomicU8::new(0),
         }
+    }
+
+    /// The table with a stream's records laid by
+    /// `flatindex::record_into_lean` where `on`
+    /// (`Options::direct_lean_append`): the same bytes. Before the table
+    /// is shared.
+    fn with_lean_records(mut self, on: bool) -> MemTable {
+        self.stream_lean = self.stream && on;
+        self
     }
 
     /// The writes so far, for a handle's `log_at`: the entry count where
@@ -17214,6 +17769,10 @@ impl MemTable {
             // back to the last commit's marker.
             self.vals
                 .rewind(self.stream_committed.load(AtomicOrdering::Acquire));
+            self.stream_payload.store(
+                self.stream_payload_committed.load(AtomicOrdering::Relaxed),
+                AtomicOrdering::Relaxed,
+            );
         }
         if self.refs {
             for i in n..self.len() {
@@ -17450,6 +18009,27 @@ impl MemTable {
     /// Writer: a new entry, its key and first chunk written, published by
     /// the slab's length; the index is the caller's.
     fn new_entry(&self, hash: u64, key: &[u8], value: Option<&[u8]>) -> usize {
+        self.new_entry_by(|| hash, key, value)
+    }
+
+    /// Writer: an ordered table's entry for `key` above its last, its
+    /// record laid in the stream, where the memtable's hash is taken only
+    /// for an entry that keeps it -- a fat one; a slim word carries none
+    /// (`Options::direct_lean_append`). The entry `write` makes of it,
+    /// hash and all.
+    fn append_ordered(&self, key: &[u8], value: &[u8]) {
+        debug_assert!(self.ordered, "an ordered table's append");
+        debug_assert!(
+            self.is_empty() || self.key_of(self.entry(self.len() - 1)) < key,
+            "an ordered memtable takes each key above its last"
+        );
+        let id = self.new_entry_by(|| self.hash(key), key, Some(value));
+        self.log_write(id, true);
+    }
+
+    /// `new_entry` with the hash asked for only where the entry keeps it.
+    #[inline(always)]
+    fn new_entry_by(&self, hash: impl FnOnce() -> u64, key: &[u8], value: Option<&[u8]>) -> usize {
         let copy = || self.copy_key(key);
         let (off, count, key_off) = match value {
             Some(v) if self.stream => {
@@ -17482,7 +18062,7 @@ impl MemTable {
                 return self.slim.push(w);
             }
             let fat = self.entries.push(MemEntry {
-                hash: (hash >> 32) as u32,
+                hash: (hash() >> 32) as u32,
                 key_off,
                 klen: key.len() as u16,
                 head: AtomicU64::new(off + 1),
@@ -17491,7 +18071,7 @@ impl MemTable {
             return self.slim.push(SLIM_FAT | fat as u64);
         }
         self.entries.push(MemEntry {
-            hash: (hash >> 32) as u32,
+            hash: (hash() >> 32) as u32,
             key_off,
             klen: key.len() as u16,
             head: AtomicU64::new(off + 1),
@@ -17688,6 +18268,11 @@ impl MemTable {
     /// the record starts in the stream.
     fn push_record(&self, key: &[u8], value: &[u8]) -> (u64, usize) {
         debug_assert!(self.stream);
+        // Writer-only, so a load and a store.
+        self.stream_payload.store(
+            self.stream_payload.load(AtomicOrdering::Relaxed) + (key.len() + value.len()) as u64,
+            AtomicOrdering::Relaxed,
+        );
         let (ext, tail_len) = MemTable::stream_ext(value.len());
         let rec_len = flatindex::record_len_for(key.len(), &[ext], tail_len, self.stream_compact)
             .expect("a direct run takes keys and values a record holds");
@@ -17701,9 +18286,15 @@ impl MemTable {
             at
         } else {
             let compact = self.stream_compact;
-            self.vals.write_with(off, rec_len, |rec| {
-                flatindex::record_into(rec, key, &[ext], tail, compact)
-            })
+            if self.stream_lean {
+                self.vals.write_with(off, rec_len, |rec| {
+                    flatindex::record_into_lean(rec, key, &[ext], tail, compact)
+                })
+            } else {
+                self.vals.write_with(off, rec_len, |rec| {
+                    flatindex::record_into(rec, key, &[ext], tail, compact)
+                })
+            }
         };
         let voff = off + tail_at;
         if value.is_empty() {
@@ -17850,6 +18441,39 @@ impl MemTable {
         self.stream_rec_off_of(i, self.entry(i))
     }
 
+    /// `stream` only: entry `i`'s key and where its record starts, what a
+    /// finish's pass asks of every key (`StreamKeys`). A slim word that is
+    /// no fat entry's (`Options::direct_slim_entries`) holds both, the
+    /// record's offset and the key's length, the key being at
+    /// `RECORD_KEY_AT` in its record, so they are read off the word: the
+    /// entry's view decoded the value's head and its place in the record
+    /// as well, for a pass that reads neither: the source's answer for a
+    /// key, its hash among it, took 204 instructions and takes 140. Every
+    /// other entry goes the view's way.
+    #[inline]
+    fn stream_key_rec(&self, i: usize) -> (&[u8], usize) {
+        debug_assert!(self.stream);
+        if self.slim_entries && self.keys_in_stream {
+            let w = *self.slim.get(i);
+            if w & SLIM_FAT == 0 {
+                let rec = (w >> SLIM_REC_SHIFT) as usize;
+                let klen = ((w >> SLIM_KLEN_SHIFT) & 0xffff) as usize;
+                let key = self.stream_bytes(rec + flatindex::RECORD_KEY_AT, klen);
+                #[cfg(debug_assertions)]
+                {
+                    let e = self.entry(i);
+                    debug_assert!(
+                        key == self.key_of(e) && rec == self.stream_rec_off_of(i, e),
+                        "a slim word's key and record are its entry's"
+                    );
+                }
+                return (key, rec);
+            }
+        }
+        let e = self.entry(i);
+        (self.key_of(e), self.stream_rec_off_of(i, e))
+    }
+
     /// `stream_rec_off` with entry `i` in hand.
     fn stream_rec_off_of(&self, i: usize, e: Entry<'_>) -> usize {
         debug_assert!(self.stream);
@@ -17891,6 +18515,16 @@ impl MemTable {
     /// included.
     fn set_stream_committed(&self, at: usize) {
         self.stream_committed.store(at, AtomicOrdering::Release);
+        self.stream_payload_committed.store(
+            self.stream_payload.load(AtomicOrdering::Relaxed),
+            AtomicOrdering::Relaxed,
+        );
+    }
+
+    /// `stream` only, writer: the key and value bytes of the records the
+    /// stream holds, committed or not.
+    fn stream_payload(&self) -> u64 {
+        self.stream_payload.load(AtomicOrdering::Relaxed)
     }
 
     fn push_tomb(&self, prev: u64) -> u64 {
@@ -19385,10 +20019,8 @@ impl KeySource for StreamKeys<'_> {
     }
 
     fn at(&self, i: usize) -> (&[u8], u32, u64) {
-        let e = self.0.entry(i);
-        let key = self.0.key_of(e);
-        let off = u32::try_from(self.0.stream_rec_off_of(i, e))
-            .expect("a record section the flat index addresses");
+        let (key, rec) = self.0.stream_key_rec(i);
+        let off = u32::try_from(rec).expect("a record section the flat index addresses");
         (key, off, flatindex::key_hash(key))
     }
 }
@@ -20404,7 +21036,7 @@ impl Drop for MergeAhead {
     }
 }
 
-fn compact_job(plan: MergePlan) -> Result<Vec<String>> {
+fn compact_job(plan: MergePlan) -> Result<MergeOut> {
     compact_run(plan)
 }
 
@@ -20865,6 +21497,12 @@ struct Emitter<'a> {
     r: usize,
     w: Option<PieceWriter>,
     out: Vec<String>,
+    /// Keys written to the output in hand that no partition among the
+    /// inputs held (`Emitter::fresh`), and the outputs finished with none:
+    /// with a partition's fences and its key count, such an output holds
+    /// that partition's keys and no others (`Options::identity_by_keys`).
+    fresh: u64,
+    kept_keys: Vec<String>,
     /// Each output's form file built as it is finished
     /// (`Options::zpages_build_at_finish`).
     zfinish: Option<std::sync::Arc<ZFinish>>,
@@ -20954,6 +21592,9 @@ impl Emitter<'_> {
             write_ord(self.dir, &p.name, &ord, self.ord_durable)?;
             std::fs::rename(&p.tmp, self.dir.join(&p.name))?;
             self.out.push(p.name.clone());
+            if std::mem::take(&mut self.fresh) == 0 {
+                self.kept_keys.push(p.name.clone());
+            }
             // Its form file, from the pages just written, while the merge
             // goes on to the next output.
             if let Some(z) = &self.zfinish {
@@ -20994,15 +21635,33 @@ impl Emitter<'_> {
         self.leave(to)
     }
 
-    fn finish(self, total: usize) -> Result<Vec<String>> {
+    /// The key about to be written is one no partition among the inputs
+    /// held: the output it goes to holds a key its range's partition did
+    /// not.
+    fn fresh(&mut self) {
+        self.fresh += 1;
+    }
+
+    fn finish(self, total: usize) -> Result<MergeOut> {
         if self.r != total || self.pi != self.pieces.len() {
             return Err(err("merge ended with a piece still open"));
         }
-        Ok(self.out)
+        Ok(MergeOut {
+            names: self.out,
+            kept_keys: self.kept_keys,
+        })
     }
 }
 
-fn compact_run(plan: MergePlan) -> Result<Vec<String>> {
+/// A merge's outputs, and those of them it wrote no key into but keys a
+/// partition among its inputs held (`Emitter::fresh`).
+#[derive(Default)]
+struct MergeOut {
+    names: Vec<String>,
+    kept_keys: Vec<String>,
+}
+
+fn compact_run(plan: MergePlan) -> Result<MergeOut> {
     let MergePlan {
         dir,
         inputs,
@@ -21095,7 +21754,7 @@ fn compact_run(plan: MergePlan) -> Result<Vec<String>> {
         all
     };
     let Some((slices, given, total)) = slicer.finish() else {
-        return Ok(Vec::new());
+        return Ok(MergeOut::default());
     };
     steps.step("keys");
 
@@ -21147,6 +21806,8 @@ fn compact_run(plan: MergePlan) -> Result<Vec<String>> {
         r: 0,
         w: None,
         out: Vec::new(),
+        fresh: 0,
+        kept_keys: Vec::new(),
         zfinish: zfinish.clone(),
         syncs: 0,
         helpers: 0,
@@ -21199,6 +21860,9 @@ fn compact_run(plan: MergePlan) -> Result<Vec<String>> {
         dropped_to[i] = to;
     };
     let mut ahead = MergeAhead::new(&blobs, read_ahead, counts.clone());
+    // The inputs that are partitions: a key none of them holds is one the
+    // output's range did not have (`Emitter::fresh`).
+    let from_partition: Vec<bool> = inputs.iter().map(|n| n.starts_with("par-")).collect();
     if cursors {
         merge_ranks(&blobs, walk_cached, |k, tied| {
             let mut start = 0usize;
@@ -21219,6 +21883,9 @@ fn compact_run(plan: MergePlan) -> Result<Vec<String>> {
             }
             if live == 0 {
                 return em.skip();
+            }
+            if !tied.iter().any(|&(i, _)| from_partition[i]) {
+                em.fresh();
             }
             em.key(k, |w| {
                 for &(i, rank) in &tied[start..] {
@@ -21250,6 +21917,9 @@ fn compact_run(plan: MergePlan) -> Result<Vec<String>> {
                 em.skip()?;
                 continue;
             }
+            if !found.iter().any(|&(i, ..)| from_partition[i]) {
+                em.fresh();
+            }
             em.key(k, |w| {
                 for &(i, exts, tail) in &found[start..] {
                     blobs[i]
@@ -21271,7 +21941,7 @@ fn compact_run(plan: MergePlan) -> Result<Vec<String>> {
             .fetch_add(em.helpers, AtomicOrdering::Relaxed);
     }
     let mut out = em.finish(total)?;
-    out.extend(empties);
+    out.names.extend(empties);
     File::open(&dir)?.sync_all()?;
     steps.step("finish");
     if steps.on {
@@ -21432,6 +22102,8 @@ fn tier_run(plan: TierPlan) -> Result<Vec<String>> {
         r: 0,
         w: None,
         out: Vec::new(),
+        fresh: 0,
+        kept_keys: Vec::new(),
         zfinish: zfinish.clone(),
         syncs: 0,
         helpers: 0,
@@ -21472,7 +22144,7 @@ fn tier_run(plan: TierPlan) -> Result<Vec<String>> {
         c.merge_helpers
             .fetch_add(em.helpers, AtomicOrdering::Relaxed);
     }
-    let out = em.finish(total)?;
+    let out = em.finish(total)?.names;
     File::open(&dir)?.sync_all()?;
     Ok(out)
 }
@@ -21586,11 +22258,13 @@ struct DrainSteps {
 }
 
 /// What a direct run's finish hands the rest of its close: whether the
-/// run holds a tombstone, the segment's file, the ordered index's bytes
-/// and the landing's facts where the finish took them.
-type DirectFinished = (bool, File, Vec<u8>, Option<(BlockedBloom, bool)>);
+/// run holds a tombstone, whether the close named it the store's first
+/// partition before the finish (`Options::bloom_pieces_only`), the
+/// segment's file, the ordered index's bytes and the landing's facts
+/// where the finish took them.
+type DirectFinished = (bool, bool, File, Vec<u8>, Option<(BlockedBloom, bool)>);
 
-const DRAIN_STEP_NAMES: [&str; 18] = [
+const DRAIN_STEP_NAMES: [&str; 19] = [
     "flush",
     "handed",
     "jobstart",
@@ -21609,6 +22283,7 @@ const DRAIN_STEP_NAMES: [&str; 18] = [
     "sorted",
     "snapped",
     "readers",
+    "beside",
 ];
 
 impl DrainSteps {
@@ -21697,6 +22372,25 @@ struct SealCounts {
     /// Seals a commit under the threshold started because no seal was
     /// writing (`Options::seal_idle`).
     idle_seals: AtomicU64,
+    /// Drains answered once their seal was readable, with its fsync and
+    /// its manifest left to the segment work's loop
+    /// (`Options::drain_answers_readable`).
+    drains_early: AtomicU64,
+    /// Drains that paid the sync they owed beside their seal
+    /// (`Options::drain_syncs_beside`).
+    drains_beside: AtomicU64,
+    /// Drains whose direct run closed on the writer up to its readable
+    /// signal (`Options::close_readable_inline`).
+    closes_inline: AtomicU64,
+    /// Seals named the store's first partition before their finish,
+    /// which composed no Bloom (`Options::bloom_pieces_only`).
+    blooms_left: AtomicU64,
+    /// Empty live tables a landing made, for the table it retired where
+    /// that one was still live (`Options::land_fresh_lazy`).
+    landing_tables: AtomicU64,
+    /// The directory fsyncs such a drain's readable landing left to the
+    /// seal's durable landing, paid there ahead of the slot.
+    dir_owed_syncs: AtomicU64,
     /// WAL rotations, at seals or by size; the bytes a rotation left
     /// unsynced in the file it closed, none under a policy that syncs
     /// every commit, which a test holds it to, and the file's tail under
@@ -21710,9 +22404,23 @@ struct SealCounts {
     /// acknowledges a commit of it, and none where a rotation's barrier
     /// had carried the name already (`Db::dir_barrier`).
     run_names: AtomicU64,
+    /// Runs of ordered ingest that began in a file made ahead of them
+    /// (`Options::run_spare`), and the files so made after the store's
+    /// first, by the segment work.
+    run_spares: AtomicU64,
+    run_spares_made: AtomicU64,
+    /// Merge outputs given the key sequence of the partition they rewrote
+    /// (`Options::identity_by_keys`).
+    keyseqs_kept: AtomicU64,
     /// Time the writer spent in the seals its commits started: the wait
     /// for room, the freeze, and the seal's writer half.
     freeze_ns: AtomicU64,
+    /// Freezes by the tables frozen ahead of them, and of the waits for
+    /// room the ones the frozen tables' bytes made where their count had
+    /// room (`Options::frozen_bytes`), with their time.
+    frozen_ahead: [AtomicU64; FROZEN_CAP],
+    frozen_byte_waits: AtomicU64,
+    frozen_byte_wait_ns: AtomicU64,
 }
 
 impl SealCounts {
@@ -21737,11 +22445,23 @@ impl SealCounts {
             seal_sorts: get(&self.seal_sorts),
             deferred: get(&self.deferred),
             idle_seals: get(&self.idle_seals),
+            drains_early: get(&self.drains_early),
+            drains_beside: get(&self.drains_beside),
+            closes_inline: get(&self.closes_inline),
+            blooms_left: get(&self.blooms_left),
+            landing_tables: get(&self.landing_tables),
+            dir_owed_syncs: get(&self.dir_owed_syncs),
             wal_rotations: get(&self.wal_rotations),
             rotated_unsynced: get(&self.rotated_unsynced),
             loose_synced: get(&self.loose_synced),
             run_names: get(&self.run_names),
+            run_spares: get(&self.run_spares),
+            run_spares_made: get(&self.run_spares_made),
+            keyseqs_kept: get(&self.keyseqs_kept),
             freeze_ns: get(&self.freeze_ns),
+            frozen_ahead: std::array::from_fn(|i| get(&self.frozen_ahead[i])),
+            frozen_byte_waits: get(&self.frozen_byte_waits),
+            frozen_byte_wait_ns: get(&self.frozen_byte_wait_ns),
         }
     }
 
@@ -21793,13 +22513,45 @@ pub struct SealWaits {
     /// Seals started by a commit under the threshold because no seal was
     /// writing (`Options::seal_idle`).
     pub idle_seals: u64,
+    /// Drains answered once their seal was readable
+    /// (`Options::drain_answers_readable`).
+    pub drains_early: u64,
+    /// Drains that paid the sync they owed beside their seal
+    /// (`Options::drain_syncs_beside`).
+    pub drains_beside: u64,
+    /// Drains whose direct run closed on the writer up to its readable
+    /// signal (`Options::close_readable_inline`).
+    pub closes_inline: u64,
+    /// Seals named the store's first partition before their finish,
+    /// which composed no Bloom (`Options::bloom_pieces_only`).
+    pub blooms_left: u64,
+    /// Empty live tables a landing made, for the table it retired
+    /// (`Options::land_fresh_lazy`).
+    pub landing_tables: u64,
+    /// The directory fsyncs their readable landings left owed, paid at
+    /// the durable landing.
+    pub dir_owed_syncs: u64,
     pub wal_rotations: u64,
     pub rotated_unsynced: u64,
     pub loose_synced: u64,
     /// Directory barriers made for the temp names of runs of ordered
     /// ingest (`SealCounts`).
     pub run_names: u64,
+    /// Runs that began in a file made ahead of them, and the files the
+    /// segment work made so (`Options::run_spare`).
+    pub run_spares: u64,
+    pub run_spares_made: u64,
+    /// Merge outputs given the key sequence of the partition they rewrote
+    /// (`Options::identity_by_keys`).
+    pub keyseqs_kept: u64,
     pub freeze_ns: u64,
+    /// Freezes by the tables frozen ahead of them, none to
+    /// `FROZEN_CAP - 1`, and the waits for room the frozen tables' bytes
+    /// made where their count had room (`Options::frozen_bytes`), with
+    /// their time.
+    pub frozen_ahead: [u64; FROZEN_CAP],
+    pub frozen_byte_waits: u64,
+    pub frozen_byte_wait_ns: u64,
 }
 
 /// PROTOTYPE: records of one partition block a scan reads over unsealed
@@ -21821,8 +22573,10 @@ struct CachedBlock {
     /// holds. True only of the partition `identity_of` names
     /// (`CachedBlock::identity_for`).
     identity: bool,
-    /// The blob id of the partition whose records the entries are where
-    /// `identity` holds. A table is carried across a merge that rewrites
+    /// The key sequence (`Seg::keyseq`) of the partition whose records the
+    /// entries are where `identity` holds: that partition's blob id, which
+    /// a partition a merge rewrote over the same keys carries on
+    /// (`Options::identity_by_keys`). A table is carried across a merge that rewrites
     /// its partition over the same block boundaries (`Db::same_blocks`:
     /// the same key count and the same key at every block's first rank),
     /// and its copies with it; a delete and an insert in one block that a
@@ -21836,7 +22590,7 @@ struct CachedBlock {
     /// the patch, one run in a hundred of the differential fuzz's seed
     /// 1050, and in a release build a patch written over another key's
     /// entry and a scan started past keys, nothing raised.
-    identity_of: u64,
+    identity_of: KeySeq,
     /// A copy of a block wide by its count (`Options::forms_copy_hot_wide`),
     /// kept past the wide bound: the settle that grows its overlay past the
     /// bound appends to it where it drops any other form for a wide build.
@@ -21846,14 +22600,248 @@ struct CachedBlock {
     /// where it summed every entry's run at every patch -- a copy kept past
     /// the wide bound holds thousands, and each insert into it paid the sum.
     dead: usize,
+    /// The copy as one stream of fixed-size records
+    /// (`Options::copy_packed`): the key's length and the value's, with
+    /// `vals` every entry's key and then its value, in the entries' order
+    /// and nothing between them, and `ents` and `keys` empty. Whatever
+    /// reads the three buffers reads the entries through `len`, `key_i`
+    /// and `values_i`, which answer for either shape, or has the block
+    /// unpacked first.
+    fixed: Option<(u32, u32)>,
+}
+
+/// A copy as its build fills it: every key once, then its values
+/// (`begin`, `push`, `end`), into one stream of fixed-size records for as
+/// long as every entry is one key of the first's length with one value of
+/// the first's length (`Options::copy_packed`), and into the three buffers
+/// from the first entry that is not -- the entries before it moved there,
+/// in their order. A block of the suite's shape never leaves the stream,
+/// and its build writes each record once where it wrote the three buffers
+/// and then the stream from them.
+struct CopyBuild {
+    blk: CachedBlock,
+    /// Still one stream: `blk.vals` holds the records, and `blk.keys` and
+    /// `blk.ents` nothing.
+    packing: bool,
+    klen: u32,
+    vlen: u32,
+    /// Entries begun, and the values the last of them holds so far.
+    n: u32,
+    open: u32,
+    /// What the three buffers' keys and entries are sized for where the
+    /// build falls back to them.
+    caps: (usize, usize),
+}
+
+impl CopyBuild {
+    /// A build of a copy of the key sequence `identity_of`, its buffers
+    /// sized `caps` -- keys, values, entries -- and packed where `packed`.
+    fn new(identity_of: KeySeq, caps: (usize, usize, usize), packed: bool) -> CopyBuild {
+        let (keys, vals, ents) = caps;
+        CopyBuild {
+            blk: CachedBlock {
+                keys: if packed {
+                    Vec::new()
+                } else {
+                    Vec::with_capacity(keys)
+                },
+                vals: Vec::with_capacity(vals),
+                ents: if packed {
+                    Vec::new()
+                } else {
+                    Vec::with_capacity(ents)
+                },
+                identity: false,
+                identity_of,
+                wide: false,
+                dead: 0,
+                fixed: None,
+            },
+            packing: packed,
+            klen: 0,
+            vlen: 0,
+            n: 0,
+            open: 0,
+            caps: (keys, ents),
+        }
+    }
+    fn begin(&mut self, key: &[u8]) {
+        if self.packing {
+            // The first key sets the length; a later one follows an entry
+            // of one value and is of that length.
+            if self.n == 0 || (self.open == 1 && key.len() as u32 == self.klen) {
+                if self.n == 0 {
+                    self.klen = key.len() as u32;
+                }
+                self.blk.vals.extend_from_slice(key);
+                self.n += 1;
+                self.open = 0;
+                return;
+            }
+            self.unpack();
+        }
+        self.blk.begin(key);
+    }
+    fn push(&mut self, v: &[u8]) {
+        if self.packing {
+            // The first entry's value sets the length; a later entry's one
+            // value is of that length, and a second value is no record.
+            let first = self.n == 1;
+            if self.n > 0 && self.open == 0 && (first || v.len() as u32 == self.vlen) {
+                if first {
+                    self.vlen = v.len() as u32;
+                }
+                self.blk.vals.extend_from_slice(v);
+                self.open = 1;
+                return;
+            }
+            self.unpack();
+        }
+        self.blk.push(v);
+    }
+    fn end(&mut self) {
+        if !self.packing {
+            self.blk.end();
+        }
+    }
+    /// The entries so far moved into the three buffers, the last left as
+    /// open as it is: its key and no value yet, or its one value with the
+    /// next still to come.
+    fn unpack(&mut self) {
+        self.packing = false;
+        let recs = std::mem::take(&mut self.blk.vals);
+        let (k, v, n) = (self.klen as usize, self.vlen as usize, self.n as usize);
+        let whole = if self.open == 1 {
+            n
+        } else {
+            n.saturating_sub(1)
+        };
+        self.blk.keys.reserve(self.caps.0.max(n * k));
+        self.blk.ents.reserve(self.caps.1.max(n));
+        self.blk.vals.reserve(recs.capacity() + 4 * n);
+        let mut at = 0;
+        for _ in 0..whole {
+            self.blk.begin(&recs[at..at + k]);
+            self.blk.push(&recs[at + k..at + k + v]);
+            self.blk.end();
+            at += k + v;
+        }
+        if whole < n {
+            self.blk.begin(&recs[at..]);
+        }
+    }
+    /// The copy: one stream where every entry was a record of the first's
+    /// shape and a record has a byte to it, the three buffers otherwise.
+    fn finish(mut self) -> CachedBlock {
+        if self.packing {
+            // The last entry holds its one value -- and so there is an
+            // entry -- and a record has a byte to it.
+            if self.open == 1 && self.klen + self.vlen > 0 {
+                self.blk.fixed = Some((self.klen, self.vlen));
+            } else {
+                self.unpack();
+            }
+        }
+        self.blk
+    }
 }
 
 impl CachedBlock {
-    /// Whether entry `i` is record `lo + i` of the partition `blob` names:
-    /// the identity holds, and of that partition.
+    /// The entries the copy holds.
     #[inline]
-    fn identity_for(&self, blob: u64) -> bool {
-        self.identity && self.identity_of == blob
+    fn len(&self) -> usize {
+        match self.fixed {
+            Some((k, v)) => self.vals.len() / (k + v) as usize,
+            None => self.ents.len(),
+        }
+    }
+    /// Entry `i`'s key.
+    #[inline]
+    fn key_i(&self, i: usize) -> &[u8] {
+        match self.fixed {
+            Some((k, v)) => {
+                let at = i * (k + v) as usize;
+                &self.vals[at..at + k as usize]
+            }
+            None => self.key(&self.ents[i]),
+        }
+    }
+    /// Entry `i`'s values, in order.
+    #[inline]
+    fn values_i(&self, i: usize, mut f: impl FnMut(&[u8])) {
+        match self.fixed {
+            Some((k, v)) => {
+                let at = i * (k + v) as usize + k as usize;
+                f(&self.vals[at..at + v as usize])
+            }
+            None => self.each_value(&self.ents[i], f),
+        }
+    }
+    /// The one stream made the three buffers again, for a write the
+    /// stream cannot take in place.
+    fn unpack(&mut self) {
+        let Some((k, v)) = self.fixed.take() else {
+            return;
+        };
+        let (k, v) = (k as usize, v as usize);
+        let n = self.vals.len() / (k + v);
+        let mut keys = Vec::with_capacity(n * k);
+        let mut vals = Vec::with_capacity(n * (4 + v));
+        let mut ents = Vec::with_capacity(n);
+        for r in self.vals.chunks_exact(k + v) {
+            ents.push([
+                keys.len() as u32,
+                k as u32,
+                vals.len() as u32,
+                (4 + v) as u32,
+            ]);
+            keys.extend_from_slice(&r[..k]);
+            vals.extend_from_slice(&(v as u32).to_le_bytes());
+            vals.extend_from_slice(&r[k..]);
+        }
+        self.keys = keys;
+        self.vals = vals;
+        self.ents = ents;
+        self.dead = 0;
+    }
+    /// This copy as the three buffers, whichever shape it is held in: what
+    /// the checks that compare two copies entry for entry read.
+    #[cfg(debug_assertions)]
+    fn unpacked(&self) -> std::borrow::Cow<'_, CachedBlock> {
+        if self.fixed.is_none() {
+            return std::borrow::Cow::Borrowed(self);
+        }
+        let mut c = self.clone();
+        c.unpack();
+        std::borrow::Cow::Owned(c)
+    }
+    /// Entry `j`'s line, ahead of a patch that finds it by its rank.
+    fn prefetch_entry(&self, j: usize) {
+        match self.fixed {
+            Some((k, v)) => prefetch_lines(self.vals[j * (k + v) as usize..].as_ptr(), 16),
+            None => prefetch_lines(self.ents[j..].as_ptr() as *const u8, 16),
+        }
+    }
+    /// The run entry `j` names, ahead of the patch that writes it.
+    fn prefetch_run(&self, j: usize) {
+        match self.fixed {
+            Some((k, v)) => {
+                let at = j * (k + v) as usize + k as usize;
+                prefetch_lines(self.vals[at..].as_ptr(), v as usize);
+            }
+            None => {
+                let e = self.ents[j];
+                let from = (e[2] as usize).min(self.vals.len());
+                let len = (e[3] as usize + 63).min(self.vals.len() - from);
+                prefetch_lines(self.vals[from..].as_ptr(), len);
+            }
+        }
+    }
+    /// Whether entry `i` is record `lo + i` of a partition of the key
+    /// sequence `keyseq`: the identity holds, and of those keys.
+    #[inline]
+    fn identity_for(&self, keyseq: KeySeq) -> bool {
+        self.identity && self.identity_of == keyseq
     }
     /// The three buffers shrunk to what they hold, where a build asked
     /// for more than it filled (`Options::forms_to_fit`).
@@ -21890,10 +22878,11 @@ impl CachedBlock {
     /// in the checked profile (`Options::convert_from_form`).
     #[cfg(debug_assertions)]
     fn agrees(&self, other: &CachedBlock) -> bool {
-        self.keys == other.keys
-            && self.vals == other.vals
-            && self.ents == other.ents
-            && (self.identity || !other.identity)
+        let (this, other) = (self.unpacked(), other.unpacked());
+        this.keys == other.keys
+            && this.vals == other.vals
+            && this.ents == other.ents
+            && (this.identity || !other.identity)
     }
     /// Whether a walk of this copy emits what a walk of `other` emits:
     /// the keys that hold a value, each with its run, an entry of no
@@ -21907,12 +22896,16 @@ impl CachedBlock {
                 .filter(|e| e[3] != 0)
                 .map(|e| (c.key(e), &c.vals[e[2] as usize..(e[2] + e[3]) as usize]))
         }
-        live(self).eq(live(other))
+        let (this, other) = (self.unpacked(), other.unpacked());
+        live(&this).eq(live(&other))
     }
     /// Where this copy and `other` first part: the entry, its keys and
     /// its values' lengths on each side, for the check above to name.
     #[cfg(debug_assertions)]
     fn disagreement(&self, other: &CachedBlock) -> String {
+        if self.fixed.is_some() || other.fixed.is_some() {
+            return self.unpacked().disagreement(&other.unpacked());
+        }
         let n = self.ents.len().min(other.ents.len());
         for i in 0..n {
             let (a, b) = (&self.ents[i], &other.ents[i]);
@@ -21945,8 +22938,8 @@ impl CachedBlock {
     }
     /// First entry whose key is not below `from`.
     fn lower_bound(&self, from: &[u8]) -> usize {
-        select_lower_bound(self.ents.len(), |i| {
-            key_cmp(self.key(&self.ents[i]), from) == Ordering::Less
+        select_lower_bound(self.len(), |i| {
+            key_cmp(self.key_i(i), from) == Ordering::Less
         })
     }
     /// PROTOTYPE: pull the entries and the keys toward the core, and the
@@ -21964,6 +22957,18 @@ impl CachedBlock {
             self.prefetch_from(0);
             return;
         }
+        // One stream: as many lines of it as the three buffers' asks came
+        // to, from its first, and the whole of it where the values' whole
+        // is asked for.
+        if self.fixed.is_some() {
+            let n = if whole {
+                self.vals.len()
+            } else {
+                self.vals.len().min(48 * 64)
+            };
+            prefetch_lines(self.vals.as_ptr(), n);
+            return;
+        }
         prefetch_lines(self.ents.as_ptr() as *const u8, self.ents.len() * 16);
         prefetch_lines(self.keys.as_ptr(), self.keys.len());
         // The whole of the values (`Options::copy_prefetch_whole`), or
@@ -21979,6 +22984,11 @@ impl CachedBlock {
     /// that starts there and streams on (`Options::copy_prefetch_from_start`):
     /// two lines of entries, two of keys and four of values.
     fn prefetch_from(&self, i: usize) {
+        if let Some((k, v)) = self.fixed {
+            let at = (i * (k + v) as usize).min(self.vals.len());
+            prefetch_lines(self.vals[at..].as_ptr(), (self.vals.len() - at).min(512));
+            return;
+        }
         let Some(e) = self.ents.get(i) else {
             return;
         };
@@ -21990,6 +23000,42 @@ impl CachedBlock {
         prefetch_lines(self.keys[k..].as_ptr(), (self.keys.len() - k).min(128));
         let r = (e[2] as usize).min(self.vals.len());
         prefetch_lines(self.vals[r..].as_ptr(), (self.vals.len() - r).min(256));
+    }
+    /// The lines a walk of `n` entries from entry `i` reads
+    /// (`Options::copy_prefetch_span`): those entries, their keys, and the
+    /// head of their values, a kilobyte as the whole prefetch asks for of
+    /// the block's first. The keys and the values are placed by the block's
+    /// mean lengths -- exact where the keys and the runs are each of one
+    /// length and lie in the entries' order, which a copy's are until a
+    /// longer run is appended past them -- since the entry that names them
+    /// is a load the asks would wait for. Each buffer is asked for from
+    /// the line its first byte is on.
+    fn prefetch_span(&self, i: usize, n: usize) {
+        let len = self.len();
+        if i >= len || n == 0 {
+            return;
+        }
+        let m = n.min(len - i);
+        let lines = |ptr: *const u8, bytes: usize| {
+            let lead = ptr as usize & 63;
+            prefetch_lines(ptr.wrapping_sub(lead), bytes + lead);
+        };
+        // One stream: the head of the records the walk reads, the rest
+        // the hardware's once the stream is running.
+        if let Some((k, v)) = self.fixed {
+            let stride = (k + v) as usize;
+            lines(
+                self.vals[i * stride..].as_ptr(),
+                (m * stride).min(PACKED_ASK),
+            );
+            return;
+        }
+        lines(self.ents[i..].as_ptr() as *const u8, m * 16);
+        let part = |total: usize, at: usize| (total as u64 * at as u64 / len as u64) as usize;
+        let (k0, k1) = (part(self.keys.len(), i), part(self.keys.len(), i + m));
+        lines(self.keys[k0..].as_ptr(), k1 - k0);
+        let (v0, v1) = (part(self.vals.len(), i), part(self.vals.len(), i + m));
+        lines(self.vals[v0..].as_ptr(), (v1 - v0).min(1024));
     }
     fn each_value(&self, e: &[u32; 4], mut f: impl FnMut(&[u8])) {
         let run = &self.vals[e[2] as usize..(e[2] + e[3]) as usize];
@@ -22119,7 +23165,7 @@ fn copy_entry_at(table: &BlockTable, b: u32, cut: u32) -> Option<(&CachedBlock, 
         return None;
     };
     let j = ((cut >> 1) as usize).checked_sub(b as usize * CACHE_BLOCK)?;
-    (blk.identity_for(table.blob) && j < blk.ents.len()).then_some((blk, j))
+    (blk.identity_for(table.keyseq) && j < blk.len()).then_some((blk, j))
 }
 
 /// The lines a walk of `form` over the partition's ranks `from` to `n`
@@ -22138,6 +23184,11 @@ struct Pace {
     at: usize,
 }
 
+/// What a walk asks for of a packed copy from the entry it starts at
+/// (`CachedBlock::prefetch_span`): a kilobyte and a half, a dozen records
+/// of the suite's shape, behind which the stream runs on its own.
+const PACKED_ASK: usize = 1536;
+
 /// Four lines of each buffer a step.
 const PACE_BYTES: usize = 256;
 /// Entries of the walk between steps: a block's sixty-four entries take
@@ -22146,6 +23197,16 @@ const PACE_STEP: usize = 16;
 
 impl Pace {
     fn of(blk: &CachedBlock) -> Pace {
+        if blk.fixed.is_some() {
+            return Pace {
+                spans: [
+                    (blk.vals.as_ptr(), blk.vals.len().min(48 * 64)),
+                    (std::ptr::null(), 0),
+                    (std::ptr::null(), 0),
+                ],
+                at: 0,
+            };
+        }
         Pace {
             spans: [
                 (blk.ents.as_ptr() as *const u8, blk.ents.len() * 16),
@@ -22189,6 +23250,8 @@ fn prefetch_block(
     estimate: bool,
     whole: bool,
     sparse_span: bool,
+    copy_span: Option<bool>,
+    packed_at: Option<(usize, bool)>,
 ) {
     // The partition's records are asked for only where the walk will read
     // them raw: under the form file the walk's pages are the form's, which
@@ -22206,8 +23269,23 @@ fn prefetch_block(
         // An identity copy walked from the entry `at` names is prefetched
         // from there (`Options::copy_prefetch_from_start`); a copy the walk
         // will search, whole.
-        Cached::Block(blk) => match at {
-            Some(i) if blk.identity => blk.prefetch_from(i),
+        // By span (`Options::copy_prefetch_span`) where the walk takes
+        // its entry without a search: by rank in an identity copy, or at
+        // the block's first where it walks in from the block before
+        // (`copy_span` says which).
+        // A packed copy by the span from the entry its walk starts at
+        // (`packed_at`, and whether the walk takes that entry only where
+        // the copy's entries are its block's records): one stream, so the
+        // lines the walk reads first are the whole of the ask.
+        Cached::Block(blk) if blk.fixed.is_some() => match packed_at {
+            Some((i, by_rank)) if blk.identity || !by_rank => blk.prefetch_span(i, n),
+            _ => blk.prefetch(whole),
+        },
+        Cached::Block(blk) => match (at, copy_span) {
+            (Some(i), Some(enters)) if (blk.identity || enters) && !blk.wide => {
+                blk.prefetch_span(i, n)
+            }
+            (Some(i), None) if blk.identity => blk.prefetch_from(i),
             _ => blk.prefetch(whole),
         },
         Cached::Sparse(sb) => {
@@ -22734,6 +23812,11 @@ struct BlockTable {
     /// it was built against.
     layout: u64,
     blob: u64,
+    /// The key sequence of the partition the table stands over
+    /// (`Seg::keyseq`): what a copy's claim to its entries' ranks is held
+    /// to (`CachedBlock::identity_for`). The blob's own id unless a merge
+    /// rewrote the partition over its keys (`Options::identity_by_keys`).
+    keyseq: KeySeq,
 }
 
 impl BlockTable {
@@ -23532,7 +24615,7 @@ struct Shared {
     /// those made for a grant of the records' place alone, the model
     /// saying the raw form does not fit
     /// (`Options::heads_owned_beside_copies`).
-    heads_events: [AtomicU64; 3],
+    heads_events: [AtomicU64; 4],
     /// The dead names given to retired form files (`zfile::zpg_dead_name`).
     next_dead: AtomicU64,
     /// A test's holds on the builder's thread (`ZHOLD_START`,
@@ -23846,6 +24929,9 @@ struct Shared {
     /// A test's: the writer's next directory barrier fails
     /// (`Db::fail_next_dir_barrier`).
     fail_dir_barrier: std::sync::atomic::AtomicBool,
+    /// A test's: the segment work's next sync of the directory for a run's
+    /// file made ahead fails (`Db::fail_next_spare_sync`).
+    fail_spare_sync: std::sync::atomic::AtomicBool,
     /// An error of the segment work's, for the writer's next commit to
     /// return: one slot, the first error kept.
     maint_err: AtomicPtr<std::io::Error>,
@@ -23857,6 +24943,23 @@ struct Shared {
     /// the manifest covers the WAL, taken by the writer. One slot and a
     /// swap each way, since one spare is enough.
     spare_wal: AtomicPtr<PathBuf>,
+    /// The file made ahead for the next run of ordered ingest
+    /// (`RunSpare`). Behind a lock the writer takes where a run begins and
+    /// the segment work takes for each step it moves the slot by, so the
+    /// writer never makes the file the other thread is making. No commit
+    /// takes it.
+    spare_run: std::sync::Mutex<RunSpare>,
+    /// A test's: a landing's sync of the directory waits here before it
+    /// calls the file it made ready (`Db::hold_spare_named`).
+    spare_named_hold: std::sync::atomic::AtomicBool,
+    /// A store opened, whose first spare the segment work makes at its
+    /// first turn with a sync of the directory for it alone: there is no
+    /// landing to make it at, and the open is no place for the sync.
+    spare_run_first: std::sync::atomic::AtomicBool,
+    /// The store was closed, which leaves no run's file made ahead: the
+    /// drop removes the one that waits, behind the segment work's join
+    /// (`Db::close_inner`).
+    spare_run_off: std::sync::atomic::AtomicBool,
     keeper_seq: AtomicU64,
     keeper_done: AtomicU64,
     snap_kept: AtomicU64,
@@ -23885,6 +24988,10 @@ struct Shared {
     /// tables kept for the upkeep's look may take, `u64::MAX` where
     /// nothing bounds them but the count.
     keep_bytes: u64,
+    /// `Options::frozen_bytes` as resolved at open: the bytes the frozen
+    /// tables may take before a freeze waits for a landing, more than any
+    /// tables hold where nothing bounds them but the count.
+    frozen_bytes: u64,
     /// The block cache's automatic budget as resolved at open
     /// (`Options::scan_cache_auto`), zero for none.
     auto_cache_bytes: usize,
@@ -24842,6 +25949,12 @@ impl Shared {
         (!p.is_null()).then(|| *unsafe { Box::from_raw(p) })
     }
 
+    /// The run's spare slot, whatever a panic under the lock left of it:
+    /// the slot is a word, whole at every instant.
+    fn run_spare(&self) -> std::sync::MutexGuard<'_, RunSpare> {
+        self.spare_run.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
     /// The spare waiting, if one is.
     fn take_spare(&self) -> Option<PathBuf> {
         let p = self
@@ -25487,6 +26600,12 @@ struct FormsState {
     /// Scans that started a copy walk at the seek's rank, and that
     /// searched the copy (`Options::copy_start_at_rank`).
     copy_starts: Counts<2>,
+    /// The settle's patches of a copy by how each found its entry: at the
+    /// key's rank, and by a search of the copy (`Db::copy_patches`).
+    copy_patches: Counts<2>,
+    /// Copies packed at their build (`Options::copy_packed`), and packed
+    /// copies a patch made the three buffers again.
+    copy_packs: Counts<2>,
     /// Scans whose start seek seeded the partition's reader with its cursor
     /// (`Options::zpages_seek_seeds`).
     seek_seeds: std::cell::Cell<u64>,
@@ -25506,6 +26625,11 @@ struct FormsState {
     /// under `Options::zpages_block_cursor` resolves them where its walk
     /// stops and counts none.
     lazy_cuts: Counts<2>,
+    /// Patches that took a key's run from its own chain as the one source
+    /// that can hold it (`Options::settle_lone_chain`), and patches that
+    /// appended a key past a copy's last entry on one compare
+    /// (`Options::settle_append_last`).
+    settle_short: Counts<2>,
     /// The settle's resolves whose stride was planned ahead
     /// (`Options::settle_seek_ahead`).
     seeks_planned: std::cell::Cell<u64>,
@@ -25687,12 +26811,15 @@ impl FormsState {
             sheds: std::cell::Cell::new(0),
             dir_prefetches: std::cell::Cell::new(0),
             copy_starts: Counts::new(),
+            copy_patches: Counts::new(),
+            copy_packs: Counts::new(),
             seek_seeds: std::cell::Cell::new(0),
             hot_starts: Counts::new(),
             prefetch_paces: std::cell::Cell::new(0),
             span_starts: std::cell::Cell::new(0),
             start_cache: std::cell::RefCell::new(StartCache::new()),
             lazy_cuts: Counts::new(),
+            settle_short: Counts::new(),
             seeks_planned: std::cell::Cell::new(0),
             heads_looks: std::cell::RefCell::new(Vec::new()),
             patch_asks: std::cell::Cell::new(0),
@@ -25881,6 +27008,14 @@ pub struct Db {
     /// descriptors are one open file description, and an fsync error
     /// is reported once per description.
     presync_failed: Option<std::io::Error>,
+    /// The seal `hand_seal` hands next is a drain's whose answer will be
+    /// asked early (`SealJob::early_hint`), read and cleared by it.
+    hand_early: bool,
+    /// The drain's own seal of a hashed table was named the store's first
+    /// partition (`seals_first_partition`), so that nothing stands beside
+    /// it once it lands -- no piece, no merge -- and the drain can be
+    /// answered at its readable landing (`Options::drain_syncs_beside`).
+    drain_first: bool,
     /// PROTOTYPE: the run keeper, once the first commit has started it.
     keeper: Option<Keeper>,
     /// EXPERIMENT: the upkeep thread, once a commit has had something
@@ -29710,6 +30845,7 @@ impl Reader {
             footprint_held: get(&ev.footprint_held),
             model_hash_bytes: get(&ev.model_hash),
             model_record_bytes: get(&ev.model_records),
+            model_whole_bytes: get(&ev.model_whole),
             retired: get(&ev.retired),
             stride_builds: get(&ev.stride_builds),
             stride_declines: std::array::from_fn(|i| get(&ev.stride_declines[i])),
@@ -32797,6 +33933,7 @@ impl Reader {
             t.piece_ranks = piece_ranks;
             if rebased {
                 t.blob = seg.blob.id();
+                t.keyseq = seg.keyseq;
                 // The keys filed since the snapshot carry the cut each
                 // resolved to -- its rank in the partition -- and the
                 // rewrite the carry crosses keeps the block boundaries
@@ -36634,17 +37771,14 @@ impl Reader {
                 if let Some(&(at2, b2, cut2, ..)) = resolved.get(i + 3) {
                     if at2 == at as u32 {
                         if let Some((blk, j)) = copy_entry_at(table, b2, cut2) {
-                            prefetch_lines(blk.ents[j..].as_ptr() as *const u8, 16);
+                            blk.prefetch_entry(j);
                         }
                     }
                 }
                 if let Some(&(at1, b1, cut1, ..)) = resolved.get(i + 1) {
                     if at1 == at as u32 {
                         if let Some((blk, j)) = copy_entry_at(table, b1, cut1) {
-                            let e = blk.ents[j];
-                            let from = (e[2] as usize).min(blk.vals.len());
-                            let len = (e[3] as usize + 63).min(blk.vals.len() - from);
-                            prefetch_lines(blk.vals[from..].as_ptr(), len);
+                            blk.prefetch_run(j);
                             asked += 1;
                         }
                     }
@@ -36726,6 +37860,16 @@ impl Reader {
                     && !self.cache_over_binds()
                 {
                     self.convert_settled(at, b, table)?;
+                    // The walk a patch left the fill where it left a form
+                    // at the dense count (`patch_block`), which the form
+                    // converted here no longer does: the fill meets the
+                    // light forms on it (`Options::settle_convert_fills`).
+                    if self.opts.settle_convert_fills
+                        && self.opts.commit_forms
+                        && self.slot.is_none()
+                    {
+                        self.fs().tables_complete.set(false);
+                    }
                 }
                 if in_place && self.patch_in_place(at, b, table, key, cut, (src, slot)) {
                     placed += 1;
@@ -36797,6 +37941,8 @@ impl Reader {
     /// key's own record, the form is this table's alone, and the key's
     /// chain in `from` is one value above a tombstone, no longer than the
     /// run the entry holds: the value goes over that run from the chain.
+    /// A copy packed into one stream takes a value of its records' length
+    /// the same way, over the value in the key's record.
     /// Anything else is `patch_block`'s, which answers the same bytes for
     /// this case through a scratch run, the form's bytes counted before
     /// and after, and `Arc::make_mut`: about nine hundred instructions a
@@ -36813,7 +37959,7 @@ impl Reader {
         if slot == u32::MAX || cut == LAZY_CUT || cut & 1 == 0 {
             return false;
         }
-        let blob = table.blob;
+        let keyseq = table.keyseq;
         let Some(form) = table.slots[b].as_mut() else {
             return false;
         };
@@ -36825,7 +37971,7 @@ impl Reader {
         let Some(i) = ((cut >> 1) as usize).checked_sub(b * CACHE_BLOCK) else {
             return false;
         };
-        if !blk.identity_for(blob) || i >= blk.ents.len() {
+        if !blk.identity_for(keyseq) || i >= blk.len() {
             return false;
         }
         let live_src = std::ptr::eq(from, &**self.mem());
@@ -36834,6 +37980,28 @@ impl Reader {
             return false;
         };
         let v = from.value_at(off as usize);
+        // A copy held as one stream of fixed-size records
+        // (`Options::copy_packed`) takes a value of its records' length
+        // over its key's, behind the key in the record, and holds no run
+        // to shorten and no dead byte; a value of any other length is
+        // `patch_block`'s, which makes the three buffers again first.
+        if let Some((kl, vl)) = blk.fixed {
+            if v.len() != vl as usize {
+                return false;
+            }
+            debug_assert!(
+                key_cmp(blk.key_i(i), key) == Ordering::Equal,
+                "a packed copy's identity entry disagrees with the key patched in place"
+            );
+            let o = i * (kl + vl) as usize + kl as usize;
+            blk.vals[o..o + v.len()].copy_from_slice(v);
+            debug_assert!(
+                !(self.opts.commit_forms && self.slot.is_none())
+                    || (table.dirty[b] && self.fs().dirty_any.get()),
+                "a form the writer alone holds, patched in place, was not marked for the next publish"
+            );
+            return true;
+        }
         let run = 4 + v.len();
         let [_, _, run_at, held] = blk.ents[i];
         if run > held as usize {
@@ -36978,15 +38146,38 @@ impl Reader {
         // values, the same chain was walked twice a write, two dependent
         // misses each, a twelfth of the settle's instructions.
         let mut offs = self.fs().settle_offs.borrow_mut();
-        let masked = tombs
-            && slot != u32::MAX
-            && from.live_offs_into(from.entry(slot as usize), &mut offs, from_wm);
         let (c, at_eq) = BuildCtx::cut_known(cut, lo, hi);
         let same = c < hi && at_eq == Ordering::Equal;
+        // A key no source older than its table can hold: the write is the
+        // live table's, the partition has no record of the key at its cut,
+        // no piece meets the partition and no table is frozen. Its run is
+        // its chain's, as a masked key's is, whether or not a tombstone
+        // ends the chain (`Options::settle_lone_chain`): a plain insert
+        // leaves none, and took the general path below to learn that
+        // nothing older held it. The live table's writes alone: a write
+        // read from a table frozen since names that table's chain, and
+        // whether the claim holds of it is nothing an answer shows -- with
+        // no piece, no frozen table and no record, whatever that table
+        // held has gone, the sources' walk writes the key no run, and a
+        // write settled after this one writes the run again -- so it
+        // keeps the walk, which is the one that is right at every step.
+        let lone = self.opts.settle_lone_chain
+            && live_src
+            && slot != u32::MAX
+            && !same
+            && table.pieces.is_empty()
+            && self.frozen().is_empty();
+        let masked = (tombs || lone)
+            && slot != u32::MAX
+            && from.live_offs_into(from.entry(slot as usize), &mut offs, from_wm);
         let mut run_scratch = self.fs().settle_run.borrow_mut();
         let run: &mut Vec<u8> = &mut run_scratch;
         run.clear();
-        if masked {
+        if masked || lone {
+            // Counted where the chain is the run for the lone key's sake.
+            if !masked {
+                self.fs().settle_short.add(0, 1);
+            }
             // The masked key's run, written from its chain: every older
             // source is masked, so this is the whole run and none of the
             // machinery the general path needs -- an `Over` allocated
@@ -37000,6 +38191,44 @@ impl Reader {
                 let v = from.value_at(off);
                 run.extend_from_slice(&(v.len() as u32).to_le_bytes());
                 run.extend_from_slice(v);
+            }
+            // A lone key's run held to what the sources' walk makes of it,
+            // in a checked build: the claim is that no older source holds
+            // the key, and the walk is what would find one.
+            #[cfg(debug_assertions)]
+            if lone && !masked {
+                let mut check: Vec<u8> = Vec::new();
+                let ctx = self.build_ctx();
+                let ov = Overlay {
+                    over: vec![Over {
+                        key,
+                        sk: Some(UKey::live(slot, NO_RUN)),
+                        cut,
+                        pieces: 0..0,
+                    }],
+                    held: Vec::new(),
+                    snap: &NO_SNAPSHOT,
+                    stale: &ctx.stale,
+                };
+                let mut em = Emit {
+                    tombs,
+                    scratch: Vec::new(),
+                };
+                ctx.emit_over(
+                    &mut |_, v: &[u8]| {
+                        check.extend_from_slice(&(v.len() as u32).to_le_bytes());
+                        check.extend_from_slice(v);
+                    },
+                    &mut em,
+                    &ov,
+                    0,
+                    None::<(usize, &mut PartReader<'_>)>,
+                    src,
+                )?;
+                debug_assert_eq!(
+                    *run, check,
+                    "a lone key's run from its chain disagrees with the sources' walk"
+                );
             }
         } else {
             let mut held: Vec<(&[u8], usize, usize, u32)> = Vec::new();
@@ -37105,23 +38334,59 @@ impl Reader {
                 // answered (`Options::copy_start_at_rank`).
                 let lo = b * CACHE_BLOCK;
                 let at_rank = self.opts.copy_start_at_rank
-                    && blk.identity_for(table.blob)
+                    && blk.identity_for(table.keyseq)
                     && same
                     && c >= lo
-                    && c - lo < blk.ents.len();
+                    && c - lo < blk.len();
+                self.fs().copy_patches.add(usize::from(!at_rank), 1);
                 let (i, found) = if at_rank {
                     debug_assert!(
-                        key_cmp(blk.key(&blk.ents[c - lo]), key) == Ordering::Equal,
+                        key_cmp(blk.key_i(c - lo), key) == Ordering::Equal,
                         "a copy's identity entry disagrees with its search"
                     );
                     (c - lo, true)
                 } else {
-                    let i = blk.lower_bound(key);
-                    (
-                        i,
-                        i < blk.ents.len()
-                            && key_cmp(blk.key(&blk.ents[i]), key) == Ordering::Equal,
-                    )
+                    // A key above the copy's last entry goes after it:
+                    // one compare, where the search made ten to say so
+                    // (`Options::settle_append_last`).
+                    let n = blk.len();
+                    let past = self.opts.settle_append_last
+                        && n > 0
+                        && key_cmp(blk.key_i(n - 1), key) == Ordering::Less;
+                    if past {
+                        debug_assert_eq!(
+                            blk.lower_bound(key),
+                            n,
+                            "a key above a copy's last entry is searched to another place"
+                        );
+                        self.fs().settle_short.add(1, 1);
+                        (n, false)
+                    } else {
+                        let i = blk.lower_bound(key);
+                        (i, i < n && key_cmp(blk.key_i(i), key) == Ordering::Equal)
+                    }
+                };
+                // A packed copy takes one value of its records' length over
+                // its key's in place, and nothing else: any other write --
+                // a key it does not hold, a run of no value or of two, a
+                // value of another length -- finds the three buffers, made
+                // again first (`Options::copy_packed`).
+                let in_place = match blk.fixed {
+                    Some((kl, vl))
+                        if found
+                            && run.len() == 4 + vl as usize
+                            && run[..4] == vl.to_le_bytes() =>
+                    {
+                        let at = i * (kl + vl) as usize + kl as usize;
+                        blk.vals[at..at + vl as usize].copy_from_slice(&run[4..]);
+                        true
+                    }
+                    Some(_) => {
+                        blk.unpack();
+                        self.fs().copy_packs.add(1, 1);
+                        false
+                    }
+                    None => false,
                 };
                 // A run no longer than the one it replaces is written
                 // over it: the values stay where a build laid them and
@@ -37131,7 +38396,8 @@ impl Reader {
                 // build makes 13, and the blocks past twice their live
                 // bytes unlisted and built again in the pass that
                 // followed, half of them in one round.
-                if found && run.len() <= blk.ents[i][3] as usize {
+                if in_place {
+                } else if found && run.len() <= blk.ents[i][3] as usize {
                     let at = blk.ents[i][2] as usize;
                     blk.vals[at..at + run.len()].copy_from_slice(run);
                     blk.dead += blk.ents[i][3] as usize - run.len();
@@ -37161,7 +38427,8 @@ impl Reader {
                 }
                 // Bloated only past twice the floor: below that the sum
                 // over the entries, a load an entry a write, cannot say so.
-                if blk.vals.len() > 2 * 4096 {
+                // A packed copy holds no dead byte.
+                if !in_place && blk.vals.len() > 2 * 4096 {
                     let live = blk.vals.len() - blk.dead;
                     debug_assert_eq!(
                         live,
@@ -37360,6 +38627,9 @@ impl Reader {
                         })
                     }
                     Some(Cached::Block(blk)) => {
+                        // No copy is packed under `pieces_only`, the one
+                        // shape that folds a piece into a form.
+                        debug_assert!(blk.fixed.is_none());
                         let i = blk.lower_bound(key);
                         (i < blk.ents.len() && blk.key(&blk.ents[i]) == key).then(|| {
                             let e = &blk.ents[i];
@@ -37470,6 +38740,7 @@ impl Reader {
             dirty: vec![false; nblocks],
             layout: self.layout_of_seg(seg),
             blob: seg.blob.id(),
+            keyseq: seg.keyseq,
         })
     }
 
@@ -38102,10 +39373,21 @@ impl Reader {
                 };
                 // The entry a copy's walk starts at, where the walk takes
                 // it by rank: this block's start less its first rank.
-                let copy_at = (self.opts.copy_prefetch_from_start
+                let copy_at = ((self.opts.copy_prefetch_from_start
+                    || self.opts.copy_prefetch_span)
                     && self.opts.copy_start_at_rank
                     && rank != usize::MAX)
                     .then(|| start - lo);
+                let copy_span = self.opts.copy_prefetch_span;
+                // The entry a packed copy's walk starts at: the first of a
+                // block after the scan's first, and in the first the
+                // seek's rank less the block's, taken only by a copy whose
+                // entries are the block's records.
+                let packed_at = if !first {
+                    Some((0, false))
+                } else {
+                    (self.opts.copy_start_at_rank && rank != usize::MAX).then(|| (start - lo, true))
+                };
                 let mut pace: Option<Pace> = None;
                 if !fetched && self.opts.scan_prefetch {
                     prefetch_block(
@@ -38118,6 +39400,10 @@ impl Reader {
                         self.opts.seek_prefetch_dir,
                         self.opts.copy_prefetch_whole,
                         self.opts.scan_prefetch_sparse_span,
+                        // A block after the scan's first is walked from
+                        // its first entry, whatever its copy holds.
+                        copy_span.then_some(!first),
+                        packed_at,
                     );
                 }
                 fetched = false;
@@ -38147,6 +39433,8 @@ impl Reader {
                                 self.opts.seek_prefetch_dir,
                                 self.opts.copy_prefetch_whole,
                                 self.opts.scan_prefetch_sparse_span,
+                                copy_span.then_some(true),
+                                Some((0, false)),
                             ),
                         }
                         fetched = true;
@@ -38265,12 +39553,12 @@ impl Reader {
                         // above record `start - 1` and not above `start`,
                         // so no entry between them is skipped.
                         let at_rank = self.opts.copy_start_at_rank
-                            && blk.identity_for(src.seg.blob.id())
+                            && blk.identity_for(src.seg.keyseq)
                             && rank != usize::MAX;
                         let i = if !first {
                             0
                         } else if at_rank {
-                            let i = (start - lo).min(blk.ents.len());
+                            let i = (start - lo).min(blk.len());
                             debug_assert_eq!(
                                 i,
                                 blk.lower_bound(cursor),
@@ -38287,18 +39575,37 @@ impl Reader {
                                 fs.span_starts.set(fs.span_starts.get() + 1);
                             }
                         }
-                        for (n, e) in blk.ents[i..].iter().enumerate() {
-                            if seen >= limit {
-                                break;
-                            }
-                            if let Some(p) = pace.as_mut() {
-                                if n.is_multiple_of(PACE_STEP) {
-                                    p.step();
+                        if let Some((kl, vl)) = blk.fixed {
+                            // One stream of records, key then value: no
+                            // entry to decode and no length to read.
+                            let (kl, stride) = (kl as usize, (kl + vl) as usize);
+                            let recs = blk.vals[i * stride..].chunks_exact(stride);
+                            for (n, r) in recs.enumerate() {
+                                if seen >= limit {
+                                    break;
                                 }
+                                if let Some(p) = pace.as_mut() {
+                                    if n.is_multiple_of(PACE_STEP) {
+                                        p.step();
+                                    }
+                                }
+                                f(&r[..kl], &r[kl..]);
+                                seen += 1;
                             }
-                            let k = blk.key(e);
-                            blk.each_value(e, |v| f(k, v));
-                            seen += 1;
+                        } else {
+                            for (n, e) in blk.ents[i..].iter().enumerate() {
+                                if seen >= limit {
+                                    break;
+                                }
+                                if let Some(p) = pace.as_mut() {
+                                    if n.is_multiple_of(PACE_STEP) {
+                                        p.step();
+                                    }
+                                }
+                                let k = blk.key(e);
+                                blk.each_value(e, |v| f(k, v));
+                                seen += 1;
+                            }
                         }
                         if pace.is_some() {
                             let fs = self.fs();
@@ -38650,6 +39957,23 @@ impl Reader {
     /// A test's: the writer's copies that claim their entries are their
     /// partition's records, and of those the ones whose claim is of the
     /// partition their table now stands over (`CachedBlock::identity_for`).
+    /// A test's: the writer's copies held as one stream of fixed-size
+    /// records, and its copies (`Options::copy_packed`).
+    #[doc(hidden)]
+    pub fn block_cache_packed(&self) -> (usize, usize) {
+        let _e = self.enter();
+        let (mut packed, mut copies) = (0usize, 0usize);
+        for t in self.fs().tables.borrow().iter() {
+            for c in t.borrow().iter().flat_map(|t| t.slots.iter()).flatten() {
+                if let Cached::Block(b) = &**c {
+                    copies += 1;
+                    packed += b.fixed.is_some() as usize;
+                }
+            }
+        }
+        (packed, copies)
+    }
+
     #[doc(hidden)]
     pub fn block_cache_identity(&self) -> (usize, usize) {
         let _e = self.enter();
@@ -38659,7 +39983,7 @@ impl Reader {
                 for c in t.slots.iter().flatten() {
                     if let Cached::Block(b) = &**c {
                         claimed += b.identity as usize;
-                        holds += b.identity_for(t.blob) as usize;
+                        holds += b.identity_for(t.keyseq) as usize;
                     }
                 }
             }
@@ -38678,6 +40002,12 @@ impl Reader {
         for t in self.fs().tables.borrow().iter() {
             for c in t.borrow().iter().flat_map(|t| t.slots.iter()).flatten() {
                 if let Cached::Block(b) = &**c {
+                    // A packed copy is its entries in order and no dead
+                    // byte.
+                    if b.fixed.is_some() {
+                        ents += b.len();
+                        continue;
+                    }
                     let live: usize = b.ents.iter().map(|e| e[3] as usize).sum();
                     dead += b.vals.len() - live;
                     ents += b.ents.len();
@@ -40242,9 +41572,7 @@ impl Db {
         // segment work published meanwhile may have made room. A stale
         // full list only defers, so no order against the count.
         self.rehold();
-        if self.state().frozen.len() < FROZEN_CAP
-            || self.shared.seal_wedged.load(AtomicOrdering::Acquire)
-        {
+        if self.frozen_room().1 || self.shared.seal_wedged.load(AtomicOrdering::Acquire) {
             return true;
         }
         if self.mem_bytes >= threshold.saturating_mul(2) {
@@ -40405,6 +41733,12 @@ impl Db {
     /// covers. A crash between the rename and the WAL reset then leaves a
     /// WAL whose covered prefix is skipped by sequence on replay instead of
     /// replayed into duplicates.
+    /// The temp name a run of ordered ingest keeps its records under until
+    /// the manifest names its segment.
+    fn direct_tmp(dir: &Path, id: u64) -> PathBuf {
+        dir.join(format!("direct-{id:08}.tmp"))
+    }
+
     fn seg_name(n: u64, end_seq: u64) -> String {
         format!("seg-{n:08}-{end_seq:016}.sup")
     }
@@ -40521,7 +41855,18 @@ impl Db {
             wal.set_hold(cap, reuses, frames);
         }
         let mut spare_wal: *mut PathBuf = std::ptr::null_mut();
-        let next_seg = 0u64;
+        let mut next_seg = 0u64;
+        // The first run's file, made ahead (`Options::run_spare`): before
+        // the manifest below, whose writing ends in a sync of the
+        // directory in either shape, so the name is behind one when the
+        // store is returned.
+        let mut spare_run = RunSpare::Off;
+        let spare_run_first = false;
+        if opts.run_spare {
+            File::create(Db::direct_tmp(dir, next_seg))?;
+            spare_run = RunSpare::Ready(next_seg);
+            next_seg += 1;
+        }
         if let Some((ahead, runs, cap)) = wal_ahead(&opts) {
             // Pre-written as the commits reach it, and no spare until a
             // retired file is one.
@@ -40625,7 +41970,12 @@ impl Db {
             z: zfile::ZEvents::default(),
             retired_z: RetireList::new(),
             retired_heads: RetireList::new(),
-            heads_events: [AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0)],
+            heads_events: [
+                AtomicU64::new(0),
+                AtomicU64::new(0),
+                AtomicU64::new(0),
+                AtomicU64::new(0),
+            ],
             next_dead: AtomicU64::new(1),
             zbuild_hold: std::sync::Arc::new(std::sync::atomic::AtomicU8::new(zhold_of(&opts))),
             life: Life::new(),
@@ -40703,9 +42053,14 @@ impl Db {
             fail_landing: std::sync::atomic::AtomicBool::new(false),
             fail_presync: std::sync::atomic::AtomicBool::new(false),
             fail_dir_barrier: std::sync::atomic::AtomicBool::new(false),
+            fail_spare_sync: std::sync::atomic::AtomicBool::new(false),
             maint_err: AtomicPtr::new(std::ptr::null_mut()),
             maint_stop: std::sync::atomic::AtomicBool::new(false),
             spare_wal: AtomicPtr::new(spare_wal),
+            spare_run: std::sync::Mutex::new(spare_run),
+            spare_run_first: std::sync::atomic::AtomicBool::new(spare_run_first),
+            spare_named_hold: std::sync::atomic::AtomicBool::new(false),
+            spare_run_off: std::sync::atomic::AtomicBool::new(false),
             keeper_seq: AtomicU64::new(0),
             keeper_done: AtomicU64::new(0),
             snap_kept: AtomicU64::new(0),
@@ -40717,6 +42072,7 @@ impl Db {
             upkeep: Lend::default(),
             upkeep_lives: AtomicU64::new(u64::MAX),
             keep_bytes: Db::resolve_keep_bytes(&opts),
+            frozen_bytes: Db::resolve_frozen_bytes(&opts),
             auto_cache_bytes: Db::resolve_auto_cache(&opts),
             cache_bindings: AtomicU64::new(0),
             cache_growths: AtomicU64::new(0),
@@ -40864,6 +42220,8 @@ impl Db {
             phase_ns: [0; 3],
             draining: false,
             presync_failed: None,
+            hand_early: false,
+            drain_first: false,
             lock,
         };
         db.go_away()?;
@@ -41401,7 +42759,16 @@ impl Db {
                 opts.wal_ahead_beside,
             );
         }
-        let next_seg = seg_ids.iter().map(|&(n, _)| n + 1).max().unwrap_or(0);
+        let mut next_seg = seg_ids.iter().map(|&(n, _)| n + 1).max().unwrap_or(0);
+        // The next run's id reserved and its file left to the segment
+        // work's first turn (`Maint::run_spare_look`): made here it would
+        // put a sync of the directory on every open.
+        let mut spare_run = RunSpare::Off;
+        let spare_run_first = opts.run_spare;
+        if opts.run_spare {
+            spare_run = RunSpare::Wanted(next_seg);
+            next_seg += 1;
+        }
         let spare_wal = spare_wals
             .into_iter()
             .next()
@@ -41478,7 +42845,12 @@ impl Db {
             z: zev,
             retired_z: RetireList::new(),
             retired_heads: RetireList::new(),
-            heads_events: [AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0)],
+            heads_events: [
+                AtomicU64::new(0),
+                AtomicU64::new(0),
+                AtomicU64::new(0),
+                AtomicU64::new(0),
+            ],
             next_dead: AtomicU64::new(1),
             zbuild_hold: std::sync::Arc::new(std::sync::atomic::AtomicU8::new(zhold_of(&opts))),
             life: Life::new(),
@@ -41556,9 +42928,14 @@ impl Db {
             fail_landing: std::sync::atomic::AtomicBool::new(false),
             fail_presync: std::sync::atomic::AtomicBool::new(false),
             fail_dir_barrier: std::sync::atomic::AtomicBool::new(false),
+            fail_spare_sync: std::sync::atomic::AtomicBool::new(false),
             maint_err: AtomicPtr::new(std::ptr::null_mut()),
             maint_stop: std::sync::atomic::AtomicBool::new(false),
             spare_wal: AtomicPtr::new(spare_wal),
+            spare_run: std::sync::Mutex::new(spare_run),
+            spare_run_first: std::sync::atomic::AtomicBool::new(spare_run_first),
+            spare_named_hold: std::sync::atomic::AtomicBool::new(false),
+            spare_run_off: std::sync::atomic::AtomicBool::new(false),
             keeper_seq: AtomicU64::new(0),
             keeper_done: AtomicU64::new(0),
             snap_kept: AtomicU64::new(0),
@@ -41570,6 +42947,7 @@ impl Db {
             upkeep: Lend::default(),
             upkeep_lives: AtomicU64::new(u64::MAX),
             keep_bytes: Db::resolve_keep_bytes(&opts),
+            frozen_bytes: Db::resolve_frozen_bytes(&opts),
             auto_cache_bytes: Db::resolve_auto_cache(&opts),
             cache_bindings: AtomicU64::new(0),
             cache_growths: AtomicU64::new(0),
@@ -41721,6 +43099,8 @@ impl Db {
             phase_ns: [0; 3],
             draining: false,
             presync_failed: None,
+            hand_early: false,
+            drain_first: false,
             lock,
         };
         db.go_away()?;
@@ -41763,17 +43143,20 @@ impl Db {
                 if !self.mem().ordered {
                     let old = self.mem().clone();
                     self.set_mem_with(
-                        std::sync::Arc::new(MemTable::new_ordered(
-                            self.opts.direct_table_refs,
-                            self.opts.block_shape(&self.shared.block_pool),
-                            self.opts
-                                .direct_stream
-                                .then_some(self.opts.segment.compact_records),
-                            self.opts.direct_recycle,
-                            self.opts.direct_keys_in_stream,
-                            self.opts.direct_log_range,
-                            self.opts.direct_slim_entries,
-                        )),
+                        std::sync::Arc::new(
+                            MemTable::new_ordered(
+                                self.opts.direct_table_refs,
+                                self.opts.block_shape(&self.shared.block_pool),
+                                self.opts
+                                    .direct_stream
+                                    .then_some(self.opts.segment.compact_records),
+                                self.opts.direct_recycle,
+                                self.opts.direct_keys_in_stream,
+                                self.opts.direct_log_range,
+                                self.opts.direct_slim_entries,
+                            )
+                            .with_lean_records(self.opts.direct_lean_append),
+                        ),
                         true,
                     );
                     self.carry_switch(&old);
@@ -41781,7 +43164,11 @@ impl Db {
                 self.max_key.clear();
                 self.max_key.extend_from_slice(key);
                 let mem = self.mem();
-                mem.append(mem.hash(key), key, value, &self.shared.readers);
+                if self.opts.direct_lean_append {
+                    mem.append_ordered(key, value);
+                } else {
+                    mem.append(mem.hash(key), key, value, &self.shared.readers);
+                }
                 self.mem_bytes += key.len() + value.len();
                 return;
             }
@@ -41937,7 +43324,9 @@ impl Db {
             None => Db::seg_name(id, sealed),
         };
         let w = PieceWriter::resume_run(tmp, &Db::segment_opts(opts), run, run_start)?;
-        let (seg, ord, fact) = w.finish_unsynced_from(run)?;
+        // A piece, whose open takes the Bloom the finish composes.
+        let (seg, ord, fact) = w.finish_unsynced_from(run, true)?;
+        let fact = fact.expect("a Bloom asked for");
         seg.sync_all()?;
         drop(seg);
         write_ord(dir, &name, &ord, true)?;
@@ -42523,9 +43912,40 @@ impl Db {
             return Ok(());
         }
         if self.direct.is_none() {
-            let id = self.shared.next_seg.fetch_add(1, AtomicOrdering::Relaxed);
-            let tmp = self.dir.join(format!("direct-{id:08}.tmp"));
-            let _ = std::fs::remove_file(&tmp);
+            // In the file made ahead where it is ready (`Options::run_spare`):
+            // its name is behind a directory sync already, so the run asks
+            // for no barrier of its own, and the writer below opens the
+            // file it finds, empty, where it would have made one. The id
+            // was reserved as the run before began, and the next run's is
+            // reserved here, for the segment work to make the file of.
+            let (id, tmp, named) = if self.opts.run_spare {
+                let next = self.shared.next_seg.fetch_add(1, AtomicOrdering::Relaxed);
+                let was = std::mem::replace(&mut *self.shared.run_spare(), RunSpare::Wanted(next));
+                match was {
+                    RunSpare::Ready(id) => {
+                        SealCounts::add(&self.shared.seal_counts.run_spares, 1);
+                        (id, Db::direct_tmp(&self.dir, id), true)
+                    }
+                    RunSpare::Wanted(id) | RunSpare::Made(id) | RunSpare::Failed(id) => {
+                        let tmp = Db::direct_tmp(&self.dir, id);
+                        let _ = std::fs::remove_file(&tmp);
+                        (id, tmp, false)
+                    }
+                    // A store opened without the option holds no
+                    // reservation; none is made for one.
+                    RunSpare::Off => {
+                        let tmp = Db::direct_tmp(&self.dir, next);
+                        let _ = std::fs::remove_file(&tmp);
+                        *self.shared.run_spare() = RunSpare::Off;
+                        (next, tmp, false)
+                    }
+                }
+            } else {
+                let id = self.shared.next_seg.fetch_add(1, AtomicOrdering::Relaxed);
+                let tmp = Db::direct_tmp(&self.dir, id);
+                let _ = std::fs::remove_file(&tmp);
+                (id, tmp, false)
+            };
             let mut opts = Db::segment_opts(&self.opts);
             self.shared.job_buffers(&self.opts, &mut opts);
             let mut w = PieceWriter::create(&tmp, &opts, 0, self.opts.inline_bytes)?;
@@ -42557,8 +43977,9 @@ impl Db {
                 committed: 0,
                 pending: std::collections::VecDeque::new(),
                 stream_from: 0,
+                payload_from: 0,
                 unsynced: false,
-                named: false,
+                named,
             });
         }
         let mem = self.r.mem().clone();
@@ -42568,6 +43989,7 @@ impl Db {
         };
         let shared = self.shared.clone();
         let put_one = self.opts.direct_put_one;
+        let lean = self.opts.direct_lean_append;
         let d = self.direct.as_mut().expect("opened above");
         let refs = mem.refs;
         if (refs || mem.recycle) && mem.run().is_none() {
@@ -42583,11 +44005,52 @@ impl Db {
             // batch goes to the file from the arena, its marker behind it.
             if d.committed == 0 && d.stream_from == 0 {
                 d.w.set_stream_source(mem.clone());
+                d.payload_from = 0;
             }
-            for i in d.committed..mem.len() {
-                let e = mem.entry(i);
-                let (rec_len, tail_at, vlen) = mem.stream_record_shape(e);
-                d.w.put_encoded(mem.key_of(e), rec_len, tail_at, vlen)?;
+            if lean && d.w.3 {
+                // The batch at once: its records lie one after another in
+                // the stream from where the last commit's marker ended,
+                // each key above the last (`Options::direct_lean_append`).
+                let (a, b) = (d.committed, mem.len());
+                let to = mem.stream_tail();
+                let payload = mem.stream_payload() - d.payload_from;
+                let first = mem.entry(a);
+                let last = mem.entry(b - 1);
+                let shape = mem.stream_record_shape(last);
+                #[cfg(debug_assertions)]
+                {
+                    let (mut bytes, mut pay) = (0usize, 0u64);
+                    for i in a..b {
+                        let e = mem.entry(i);
+                        let (rec_len, _, vlen) = mem.stream_record_shape(e);
+                        bytes += rec_len;
+                        pay += (e.key_len() + vlen) as u64;
+                        debug_assert!(
+                            i == a || mem.key_of(mem.entry(i - 1)) < mem.key_of(e),
+                            "a direct run's batch holds its keys in increasing order"
+                        );
+                    }
+                    debug_assert_eq!(
+                        (bytes, pay),
+                        (to - d.stream_from, payload),
+                        "a batch's records are the stream from the last marker, and their bytes"
+                    );
+                }
+                d.w.put_encoded_run(
+                    mem.key_of(first),
+                    mem.key_of(last),
+                    b - a,
+                    to - d.stream_from,
+                    payload,
+                    shape,
+                )?;
+                d.payload_from = mem.stream_payload();
+            } else {
+                for i in d.committed..mem.len() {
+                    let e = mem.entry(i);
+                    let (rec_len, tail_at, vlen) = mem.stream_record_shape(e);
+                    d.w.put_encoded(mem.key_of(e), rec_len, tail_at, vlen)?;
+                }
             }
             let to = mem.stream_tail();
             d.w.stream_out(d.stream_from, to)?;
@@ -42783,6 +44246,7 @@ impl Db {
         // run's durable landing; the run is kept aside for the one that
         // fails (`drain_run`).
         let owed = (d.unsynced || !d.named).then(|| (d.tmp.clone(), d.named));
+        let synced = owed.is_none();
         let loose = if self.draining {
             self.drain_run = owed;
             None
@@ -42807,15 +44271,113 @@ impl Db {
         let dir = self.dir.clone();
         let tmp = d.tmp;
         let w = d.w;
-        let presync = (self.draining && self.opts.close_presync)
+        let inline_readable = self.draining && self.opts.close_readable_inline && synced && w.3;
+        let presync = (self.draining && self.opts.close_presync && !inline_readable)
             .then(|| w.file_clone().ok())
             .flatten();
         let limit = self.partition_limit();
+        // A seal the close can name the store's first partition before
+        // its finish, by an upper bound on the finished file's length,
+        // composes no Bloom: a partition's open takes none
+        // (`Options::bloom_pieces_only`). Any other is named after the
+        // finish as before, with its Bloom.
+        // The bound is taken in every checked build as well, and the
+        // finished file held to it.
+        let bloom_pieces_only = self.opts.bloom_pieces_only;
+        let partition_ahead = move |w: &PieceWriter, src: Option<&dyn KeySource>, tombs: bool| {
+            let wanted = bloom_pieces_only && first_partition && !tombs;
+            let bound = (wanted || cfg!(debug_assertions))
+                .then(|| w.finished_len_bound(src))
+                .flatten();
+            (wanted && bound.is_some_and(|b| b <= limit), bound)
+        };
         let (id, seq) = (d.id, end_seq);
         let retiring = tmp.clone();
         let shared = self.shared.clone();
         let ord_durable = self.opts.ord_durable;
         let keys = table.clone();
+        if inline_readable {
+            // The seal registered and its thread spawned first, waiting
+            // for the files to sync; the close up to the readable signal on
+            // this thread, which waits for the drain anyway
+            // (`Options::close_readable_inline`). The run's commits are
+            // synced, so it owes no records' sync, and the seal's fsync
+            // covers the trailer. The holds a test sets are taken where
+            // the seal thread took them: the landing's before the finish,
+            // the durable one before the fsyncs.
+            let wals = std::mem::take(&mut self.closed_wals);
+            type Synced = Result<(File, File, Vec<String>)>;
+            let (tx, rx) = std::sync::mpsc::sync_channel::<Synced>(1);
+            let job = {
+                let shared = shared.clone();
+                move |_: &SealReadable| -> Result<Vec<String>> {
+                    let (seg, ordf, names) = rx
+                        .recv()
+                        .map_err(|_| err("the writer's close of the run went away"))??;
+                    seal_hold_wait(&shared, SEAL_HOLD_DURABLE);
+                    seg.sync_all()?;
+                    shared.drain_steps.stamp(7);
+                    if ord_durable {
+                        ordf.sync_all()?;
+                    }
+                    Ok(names)
+                }
+            };
+            // The early answer the flush will ask for, as it asks it: the
+            // run's own close owes nothing (`drain_run`, kept for a run
+            // owed a sync, is clear for this one).
+            self.hand_early = self.opts.drain_answers_readable
+                && matches!(self.maint, MaintHome::Away(_))
+                && !self.owes_sync();
+            let readable = self.hand_seal(job, table, wals, Some(retiring));
+            self.shared.drain_steps.stamp(1);
+            let closed = (|| -> Synced {
+                seal_hold_wait(&shared, SEAL_HOLD_LANDING);
+                shared.drain_steps.stamp(2);
+                let tombs = w.tombs();
+                let src = StreamKeys(&keys);
+                let (ahead, bound) = partition_ahead(&w, Some(&src as &dyn KeySource), tombs);
+                let (seg, ord, fact) = w
+                    .finish_unsynced_from(&src, !ahead)
+                    .map_err(|e| err(&format!("direct finish: {e}")))?;
+                shared.drain_steps.stamp(3);
+                debug_assert!(
+                    bound.is_none_or(|b| std::fs::metadata(&tmp).is_ok_and(|m| m.len() <= b)),
+                    "a finished file within its bound"
+                );
+                if ahead {
+                    SealCounts::add(&shared.seal_counts.blooms_left, 1);
+                }
+                let name = if ahead
+                    || (first_partition && !tombs && std::fs::metadata(&tmp)?.len() <= limit)
+                {
+                    debug_assert!(
+                        !ahead || std::fs::metadata(&tmp).is_ok_and(|m| m.len() <= limit),
+                        "a seal named ahead is within the partition's limit"
+                    );
+                    Db::first_partition_name(id, seq)
+                } else {
+                    name
+                };
+                let ordf = write_ord_unsynced(&dir, &name, &ord)?;
+                shared.drain_steps.stamp(4);
+                std::fs::hard_link(&tmp, dir.join(&name))?;
+                shared.drain_steps.stamp(5);
+                let names = vec![name];
+                let _ = readable.facts.set(vec![fact]);
+                let _ = readable.names.set(names.clone());
+                if let Some(t) = &readable.wake {
+                    t.unpark();
+                }
+                shared.drain_steps.stamp(6);
+                SealCounts::add(&shared.seal_counts.closes_inline, 1);
+                Ok((seg, ordf, names))
+            })();
+            // The seal thread takes the error as its answer where the
+            // close failed, as it took the finish's own.
+            let _ = tx.send(closed);
+            return Ok(());
+        }
         // The finish: the trailer composed and written, the Bloom and the
         // ordered index with it, from the table where the writer kept no
         // key copies and from its own copies otherwise. Run on the writer's
@@ -42826,20 +44388,28 @@ impl Db {
             move |w: PieceWriter, keys: &MemTable| {
                 shared.drain_steps.stamp(2);
                 let tombs = w.tombs();
+                let src = StreamKeys(keys);
+                let (ahead, bound) =
+                    partition_ahead(&w, w.3.then_some(&src as &dyn KeySource), tombs);
                 let (seg, ord, fact) = if w.3 {
-                    let (seg, ord, fact) = w
-                        .finish_unsynced_from(&StreamKeys(keys))
-                        .map_err(|e| err(&format!("direct finish: {e}")))?;
-                    (seg, ord, Some(fact))
+                    w.finish_unsynced_from(&src, !ahead)
+                        .map_err(|e| err(&format!("direct finish: {e}")))?
                 } else {
-                    let fact = w.landing_facts();
+                    let fact = if ahead { None } else { w.landing_facts() };
                     let (seg, ord) = w
                         .finish_unsynced()
                         .map_err(|e| err(&format!("direct finish: {e}")))?;
                     (seg, ord, fact)
                 };
                 shared.drain_steps.stamp(3);
-                Ok::<_, std::io::Error>((tombs, seg, ord, fact))
+                debug_assert!(
+                    bound.is_none_or(|b| seg.metadata().is_ok_and(|m| m.len() <= b)),
+                    "a finished file within its bound"
+                );
+                if ahead {
+                    SealCounts::add(&shared.seal_counts.blooms_left, 1);
+                }
+                Ok::<_, std::io::Error>((tombs, ahead, seg, ord, fact))
             }
         };
         // The rest, on the seal thread: the ordered index, the link, the
@@ -42851,8 +44421,14 @@ impl Db {
                   done: Result<DirectFinished>,
                   presynced: Option<std::thread::JoinHandle<std::io::Result<()>>>|
                   -> Result<Vec<String>> {
-                let (tombs, seg, ord, fact) = done?;
-                let name = if first_partition && !tombs && std::fs::metadata(&tmp)?.len() <= limit {
+                let (tombs, ahead, seg, ord, fact) = done?;
+                let name = if ahead
+                    || (first_partition && !tombs && std::fs::metadata(&tmp)?.len() <= limit)
+                {
+                    debug_assert!(
+                        !ahead || std::fs::metadata(&tmp).is_ok_and(|m| m.len() <= limit),
+                        "a seal named ahead is within the partition's limit"
+                    );
                     Db::first_partition_name(id, seq)
                 } else {
                     name
@@ -43283,6 +44859,7 @@ impl Db {
         // First, since it moves the held state to the latest, and the
         // fences below are taken from the same state.
         let first_partition = self.seals_first_partition();
+        self.drain_first = self.draining && first_partition;
         // The live partition fences, if any. A seal splits the memtable at
         // them and writes one piece per range, so every piece overlaps only
         // its own range and a later merge touches one partition instead of
@@ -43365,6 +44942,7 @@ impl Db {
             near || self.opts.seal_snapshot_far
         };
         let put_one = self.opts.seal_put_one;
+        let bloom_pieces_only = self.opts.bloom_pieces_only;
         // As the seal's writer has them (`Shared::job_buffers`, above).
         let jobs_mapped = opts.maps();
         let job = move |readable: &SealReadable| -> Result<Vec<String>> {
@@ -43539,10 +45117,12 @@ impl Db {
                 let id = first_id + ri as u64;
                 let tmp = dir.join(format!("seal-{id:08}.tmp"));
                 let _ = std::fs::remove_file(&tmp);
+                let whole = ranges.len() == 1 && lo.is_empty() && hi.is_none();
                 let ord;
                 let seg;
                 let tombs;
                 let fact;
+                let ahead;
                 {
                     let mut w = PieceWriter::create(&tmp, &opts, sync_every, inline_max)
                         .map_err(|e| err(&format!("seal create: {e}")))?;
@@ -43620,18 +45200,38 @@ impl Db {
                     }
                     SealCounts::add(&counts.seal_records_ns, t_recs.elapsed().as_nanos() as u64);
                     tombs = w.tombs();
-                    fact = w.landing_facts();
+                    // Named the store's first partition before the finish,
+                    // by an upper bound on the finished file's length, a
+                    // seal composes no Bloom, which a partition's open
+                    // takes none of (`Options::bloom_pieces_only`).
+                    let wanted = bloom_pieces_only && whole && first_partition && !tombs;
+                    let bound = (wanted || cfg!(debug_assertions))
+                        .then(|| w.finished_len_bound(None))
+                        .flatten();
+                    ahead = wanted && bound.is_some_and(|b| b <= limit);
+                    fact = if ahead { None } else { w.landing_facts() };
+                    if ahead {
+                        SealCounts::add(&counts.blooms_left, 1);
+                    }
                     (seg, ord) = w
                         .finish_unsynced()
                         .map_err(|e| err(&format!("seal finish: {e}")))?;
+                    debug_assert!(
+                        bound.is_none_or(|b| seg.metadata().is_ok_and(|m| m.len() <= b)),
+                        "a finished file within its bound"
+                    );
                 }
                 shared.drain_steps.stamp(3);
-                let whole = ranges.len() == 1 && lo.is_empty() && hi.is_none();
-                let name = if whole
-                    && first_partition
-                    && !tombs
-                    && std::fs::metadata(&tmp)?.len() <= limit
+                let name = if ahead
+                    || (whole
+                        && first_partition
+                        && !tombs
+                        && std::fs::metadata(&tmp)?.len() <= limit)
                 {
+                    debug_assert!(
+                        !ahead || std::fs::metadata(&tmp).is_ok_and(|m| m.len() <= limit),
+                        "a seal named ahead is within the partition's limit"
+                    );
                     Db::first_partition_name(id, end_seq)
                 } else if whole {
                     Db::seg_name(id, end_seq)
@@ -43869,22 +45469,19 @@ impl Db {
         }
         let t = std::time::Instant::now();
         let mut waited = false;
+        let mut by_bytes = false;
         loop {
             // The count before the state: a count of zero read after the
             // landing's publish sees that publish, so a table still live
             // beside a count of zero has a seal that failed to land.
             let seals = self.shared.in_seal.load(AtomicOrdering::Acquire);
             self.rehold();
-            let (replaced, room) = {
-                let st = self.state();
-                (
-                    !std::sync::Arc::ptr_eq(&st.mem, &handed),
-                    st.frozen.len() < FROZEN_CAP,
-                )
-            };
+            let replaced = !std::sync::Arc::ptr_eq(&self.state().mem, &handed);
             if replaced {
                 break;
             }
+            let (ahead, room) = self.frozen_room();
+            by_bytes |= !room && ahead < FROZEN_CAP;
             // Before the freeze, not only before the wait: frozen under a
             // fresh table with its seal failed, the handed table would sit
             // in the list for no landing to retire, and every later seal
@@ -43910,8 +45507,13 @@ impl Db {
         self.mem_handed = None;
         if waited {
             let c = &self.shared.seal_counts;
-            SealCounts::add(&c.join_wait_ns, t.elapsed().as_nanos() as u64);
+            let ns = t.elapsed().as_nanos() as u64;
+            SealCounts::add(&c.join_wait_ns, ns);
             SealCounts::add(&c.blocked_joins, 1);
+            if by_bytes {
+                SealCounts::add(&c.frozen_byte_waits, 1);
+                SealCounts::add(&c.frozen_byte_wait_ns, ns);
+            }
         }
         Ok(())
     }
@@ -43929,6 +45531,7 @@ impl Db {
         self.commit_staged()?;
         self.unsynced = 0;
         self.draining = true;
+        self.drain_first = false;
         // Reads come after a drain: its landings, and whatever lands
         // before the next seal says otherwise, take their pieces' ranks
         // (`Options::land_ranks_far`), whichever path the drain's own
@@ -43936,7 +45539,36 @@ impl Db {
         self.shared.reads_near.store(true, AtomicOrdering::Release);
         let sealed = self.seal().and_then(|_| {
             self.shared.drain_steps.stamp(1);
-            self.maint_request(MaintAsk::Drain)
+            // Asked once the seal is handed: a drain owed nothing here --
+            // no frame, file or run behind no sync (`owes_sync`), and the
+            // drain's own run, which its close keeps aside rather than
+            // loose (`drain_run`), with every commit synced and its name
+            // behind a barrier -- covers writes that were all durable
+            // before it.
+            let away = matches!(self.maint, MaintHome::Away(_));
+            // What the drain owes a sync, paid here beside the seal where
+            // that is all that keeps it from the early answer
+            // (`Options::drain_syncs_beside`): the log and what was left
+            // loose before it, where the drain's seal is the store's first
+            // partition and nothing will stand beside it to merge. That
+            // seal is a hashed table's, so the drain closed no run of its
+            // own, which the answer below asks after as well.
+            if self.opts.drain_syncs_beside
+                && self.opts.drain_answers_readable
+                && away
+                && self.drain_first
+                && !matches!(self.opts.sync, SyncPolicy::Explicit)
+                && self.owes_sync()
+            {
+                self.sync_wal()?;
+                SealCounts::add(&self.shared.seal_counts.drains_beside, 1);
+                self.shared.drain_steps.stamp(18);
+            }
+            let early = self.opts.drain_answers_readable
+                && away
+                && !self.owes_sync()
+                && self.drain_run.is_none();
+            self.maint_request(MaintAsk::Drain { early })
         });
         self.draining = false;
         self.shared.drain_steps.stamp(13);
@@ -43960,8 +45592,11 @@ impl Db {
         }
         if sealed.is_ok() {
             // Every seal handed before the drain has landed with its
-            // fsyncs done: no run is loose, and a handle kept on one would
-            // keep its file's blocks past the merge that retires it.
+            // fsyncs done, or the drain was answered at its seal's readable
+            // landing with nothing owed a sync, no run loose among it
+            // (`Options::drain_answers_readable`): no run is loose, and a
+            // handle kept on one would keep its file's blocks past the
+            // merge that retires it.
             self.loose_runs.clear();
         }
         sealed
@@ -44441,6 +46076,23 @@ impl Db {
         zfile::read_budget().map_or(u64::MAX, |b| b.limit / 8)
     }
 
+    /// `Options::frozen_bytes` resolved against the memory available.
+    fn resolve_frozen_bytes(opts: &Options) -> u64 {
+        Db::frozen_bytes_of(opts.frozen_bytes, zfile::read_budget().map(|b| b.limit))
+    }
+
+    /// `Options::frozen_bytes` as `given`, with `limit` the memory
+    /// available to the process where it can be read: the bytes given, or
+    /// for zero an eighth of the limit, and no bound where zero finds no
+    /// limit. `usize::MAX` given is more than any tables hold, which is
+    /// the count alone.
+    fn frozen_bytes_of(given: usize, limit: Option<u64>) -> u64 {
+        match given {
+            0 => limit.map_or(u64::MAX, |l| l / 8),
+            n => n as u64,
+        }
+    }
+
     /// After a publish that kept tables for the upkeep's look: where it
     /// kept fewer than the upkeep is behind, the upkeep thread asked to
     /// give its forms up (`Options::upkeep_abandons`), at the store's
@@ -44834,6 +46486,23 @@ impl Db {
         self.r.fs().copy_starts.get()
     }
 
+    /// The writer's own settles' patches of a copy by how each found its
+    /// entry: at the key's rank, where the copy's entries are its
+    /// partition's records, and by a search of the copy
+    /// (`Options::copy_start_at_rank`, `Options::identity_by_keys`).
+    pub fn copy_patches(&self) -> [u64; 2] {
+        self.take_back_upkeep();
+        self.r.fs().copy_patches.get()
+    }
+
+    /// The writer's own copies packed into one stream of fixed-size
+    /// records at their build, and the packed copies a patch made the
+    /// three buffers again (`Options::copy_packed`).
+    pub fn copy_packs(&self) -> [u64; 2] {
+        self.take_back_upkeep();
+        self.r.fs().copy_packs.get()
+    }
+
     /// The writer's scans whose start seek seeded the partition's reader
     /// with its cursor (`Options::zpages_seek_seeds`).
     pub fn seek_seeds(&self) -> u64 {
@@ -44949,6 +46618,16 @@ impl Db {
     pub fn lazy_cuts(&self) -> [u64; 2] {
         self.take_back_upkeep();
         self.r.fs().lazy_cuts.get()
+    }
+
+    /// The writer's own settles' patches that took a key's run from its
+    /// chain alone (`Options::settle_lone_chain`) and that appended a key
+    /// past a copy's last entry without a search
+    /// (`Options::settle_append_last`).
+    #[doc(hidden)]
+    pub fn settle_short(&self) -> [u64; 2] {
+        self.take_back_upkeep();
+        self.r.fs().settle_short.get()
     }
 
     /// The writer's own settles' resolves whose stride of heads was
@@ -45604,13 +47283,17 @@ impl Db {
         }
         let t = std::time::Instant::now();
         let mut waited = false;
+        let mut by_bytes = false;
         loop {
             // The count before the state, as in `take_fresh_mem`.
             let seals = self.shared.in_seal.load(AtomicOrdering::Acquire);
             self.rehold();
-            if self.state().frozen.len() < FROZEN_CAP {
+            let (ahead, room) = self.frozen_room();
+            if room {
+                SealCounts::add(&self.shared.seal_counts.frozen_ahead[ahead], 1);
                 break;
             }
+            by_bytes |= ahead < FROZEN_CAP;
             if let Some(e) = self.shared.take_maint_err() {
                 return Err(e);
             }
@@ -45632,9 +47315,40 @@ impl Db {
                 SealCounts::add(&c.join_wait_ns, ns);
                 SealCounts::add(&c.blocked_joins, 1);
             }
+            if by_bytes {
+                SealCounts::add(&c.frozen_byte_waits, 1);
+                SealCounts::add(&c.frozen_byte_wait_ns, ns);
+            }
         }
         self.rehold();
         Ok(())
+    }
+
+    /// The tables frozen in the state the writer holds, and whether the
+    /// list has room for the live one: fewer than `FROZEN_CAP` frozen,
+    /// and either none, or their bytes with the live table's within
+    /// `Options::frozen_bytes`, each table at what keeping it costs
+    /// (`MemTable::kept_bytes`). The one definition of room for the
+    /// writer's waits and its deferral; the publish that freezes holds
+    /// the count alone, since the list only shrinks between this and it.
+    fn frozen_room(&self) -> (usize, bool) {
+        let st = self.state();
+        let ahead = st.frozen.len();
+        if ahead >= FROZEN_CAP {
+            return (ahead, false);
+        }
+        if ahead == 0 {
+            return (ahead, true);
+        }
+        (ahead, Db::frozen_held(st) <= self.shared.frozen_bytes)
+    }
+
+    /// What `Options::frozen_bytes` is held against: the frozen tables'
+    /// bytes with the live table's, each at what keeping it costs.
+    fn frozen_held(st: &State) -> u64 {
+        st.frozen
+            .iter()
+            .fold(st.mem.kept_bytes(), |b, t| b.saturating_add(t.kept_bytes()))
     }
 
     /// A seal's work started on a thread of its own and handed to the
@@ -45651,7 +47365,7 @@ impl Db {
         table: std::sync::Arc<MemTable>,
         wal: Vec<PathBuf>,
         tmp: Option<PathBuf>,
-    ) {
+    ) -> std::sync::Arc<SealReadable> {
         let draining = self.draining;
         let wake = match &self.maint {
             MaintHome::Away(a) => a.thread.clone(),
@@ -45663,6 +47377,7 @@ impl Db {
             wake: wake.clone(),
         });
         let signal = readable.clone();
+        let theirs = readable.clone();
         let live = self.shared.life.job();
         let handle = std::thread::spawn(move || {
             let _live = live;
@@ -45680,6 +47395,9 @@ impl Db {
             wal,
             tmp,
             draining,
+            early: false,
+            early_hint: std::mem::take(&mut self.hand_early),
+            dir_owed: false,
             wal_unsynced: self.log_unsynced() || !self.loose_wals.is_empty(),
         };
         // Counted before it is sent, so the count never reads zero with a
@@ -45696,6 +47414,7 @@ impl Db {
                 }
             }
         }
+        theirs
     }
 
     /// `ask` answered by the segment work, inline or on its thread, and
@@ -45780,6 +47499,15 @@ impl Db {
     pub fn frozen_tables(&self) -> usize {
         let _op = self.op();
         self.state().frozen.len()
+    }
+
+    /// A test's: the bytes `Options::frozen_bytes` is held against as the
+    /// store stands, the frozen tables' with the live table's, and the
+    /// bound as the open resolved it.
+    #[doc(hidden)]
+    pub fn frozen_bytes_held(&self) -> (u64, u64) {
+        let _op = self.op();
+        (Db::frozen_held(self.state()), self.shared.frozen_bytes)
     }
 
     /// A test's: `hold_seal_landing(false)` after `after`, from a thread
@@ -46271,6 +47999,52 @@ impl Db {
         )
     }
 
+    /// A test's: the segment work's next sync of the directory for a
+    /// run's file made ahead fails, so that file is no spare
+    /// (`Options::run_spare`).
+    #[doc(hidden)]
+    pub fn fail_next_spare_sync(&self) {
+        self.shared
+            .fail_spare_sync
+            .store(true, AtomicOrdering::Release);
+    }
+
+    /// A test's: a landing that has made the next run's file and synced
+    /// the directory waits before it calls the file ready, for as long as
+    /// this is set (`Options::run_spare`).
+    #[doc(hidden)]
+    pub fn hold_spare_named(&self, on: bool) {
+        self.shared
+            .spare_named_hold
+            .store(on, AtomicOrdering::Release);
+    }
+
+    /// A test's: the segment work makes the next run's file at its next
+    /// turn with a sync of the directory for it alone, as it does once
+    /// for a store opened (`Maint::run_spare_look`).
+    #[doc(hidden)]
+    pub fn run_spare_look_again(&self) {
+        self.shared
+            .spare_run_first
+            .store(true, AtomicOrdering::Release);
+    }
+
+    /// A test's: what stands for the next run of ordered ingest's file
+    /// (`Options::run_spare`) -- 0 nothing, the option off; 1 its id
+    /// reserved and the file not made; 2 the file made ahead and its name
+    /// synced; 3 the file tried and not made; 4 the file made and its
+    /// name behind no sync yet.
+    #[doc(hidden)]
+    pub fn run_spare_state(&self) -> u8 {
+        match *self.shared.run_spare() {
+            RunSpare::Off => 0,
+            RunSpare::Wanted(_) => 1,
+            RunSpare::Ready(_) => 2,
+            RunSpare::Failed(_) => 3,
+            RunSpare::Made(_) => 4,
+        }
+    }
+
     /// A test's: whether the temp name of the run of ordered ingest in
     /// progress is behind no directory barrier yet, none where no run is
     /// open; and the count of runs that closed loose whose names are
@@ -46337,6 +48111,14 @@ impl Db {
         if let Some(spare) = self.shared.take_spare() {
             let _ = std::fs::remove_file(spare);
         }
+        // Nor begin a run in one (`Options::run_spare`): the one that
+        // waits, or that a turn of the segment work is still making, is
+        // removed by the drop once that thread is joined. Taken here, a
+        // file the thread made a moment later outlived the close, as the
+        // log's spare once did.
+        self.shared
+            .spare_run_off
+            .store(true, AtomicOrdering::Release);
         Ok(())
     }
 }
@@ -47506,6 +49288,7 @@ impl Reader {
                 dirty: vec![false; nblocks],
                 layout: 0,
                 blob: seg.blob.id(),
+                keyseq: seg.keyseq,
             };
             if table.clean_throughout() {
                 continue;
@@ -48249,6 +50032,153 @@ impl PaceRuns {
     fn hold_pays(&self) -> bool {
         let (ended, reached) = self.ends_here();
         PACE_READ_WEIGHT * ended > reached
+    }
+}
+
+#[cfg(test)]
+mod frozen_bytes_tests {
+    use super::Db;
+
+    /// `Options::frozen_bytes` resolved: zero is an eighth of the memory
+    /// available and no bound where that cannot be read, and anything
+    /// else is itself whatever the memory, `usize::MAX` among them.
+    #[test]
+    fn the_frozen_tables_bound_is_an_eighth_of_the_memory_available() {
+        assert_eq!(Db::frozen_bytes_of(0, Some(1 << 30)), 128 << 20);
+        assert_eq!(Db::frozen_bytes_of(0, Some(1342177280)), 167772160);
+        assert_eq!(Db::frozen_bytes_of(0, None), u64::MAX);
+        assert_eq!(
+            Db::frozen_bytes_of(usize::MAX, Some(1 << 30)),
+            usize::MAX as u64
+        );
+        assert_eq!(Db::frozen_bytes_of(usize::MAX, None), usize::MAX as u64);
+        assert_eq!(Db::frozen_bytes_of(1, Some(1 << 30)), 1);
+        assert_eq!(Db::frozen_bytes_of(7 << 20, None), 7 << 20);
+    }
+}
+
+#[cfg(test)]
+mod copy_build_tests {
+    use super::{CachedBlock, CopyBuild};
+
+    /// A build fed `entries`, each a key with its values, as the builders
+    /// feed one: an entry opened at a key, its values pushed, and closed at
+    /// the next key or the end.
+    fn build(entries: &[(&[u8], &[&[u8]])], packed: bool) -> CachedBlock {
+        let mut b = CopyBuild::new(super::KeySeq(7), (64, 256, 8), packed);
+        let mut open = false;
+        for (k, vals) in entries {
+            if open {
+                b.end();
+            }
+            b.begin(k);
+            open = true;
+            for v in vals.iter() {
+                b.push(v);
+            }
+        }
+        if open {
+            b.end();
+        }
+        b.finish()
+    }
+
+    /// What a copy holds, read through the accessors either shape answers.
+    fn read(c: &CachedBlock) -> Vec<(Vec<u8>, Vec<Vec<u8>>)> {
+        (0..c.len())
+            .map(|i| {
+                let mut vals = Vec::new();
+                c.values_i(i, |v| vals.push(v.to_vec()));
+                (c.key_i(i).to_vec(), vals)
+            })
+            .collect()
+    }
+
+    fn held(entries: &[(&[u8], &[&[u8]])], packs: bool) {
+        let want: Vec<(Vec<u8>, Vec<Vec<u8>>)> = entries
+            .iter()
+            .map(|(k, vs)| (k.to_vec(), vs.iter().map(|v| v.to_vec()).collect()))
+            .collect();
+        let plain = build(entries, false);
+        assert!(plain.fixed.is_none());
+        assert_eq!(read(&plain), want, "the three buffers");
+        let packed = build(entries, true);
+        assert_eq!(packed.fixed.is_some(), packs, "packed: {entries:?}");
+        assert_eq!(read(&packed), want, "the build under the stream");
+        if packs {
+            assert!(packed.keys.is_empty() && packed.ents.is_empty());
+            let stride: usize = entries[0].0.len() + entries[0].1[0].len();
+            assert_eq!(packed.vals.len(), entries.len() * stride);
+        }
+        // Unpacked, the stream is the three buffers the plain build made,
+        // byte for byte; and a search answers alike in either shape.
+        let mut un = packed.clone();
+        un.unpack();
+        assert!(un.fixed.is_none());
+        assert_eq!(
+            (&un.keys, &un.vals, &un.ents),
+            (&plain.keys, &plain.vals, &plain.ents)
+        );
+        for (k, _) in entries {
+            assert_eq!(packed.lower_bound(k), plain.lower_bound(k));
+            let mut past = k.to_vec();
+            past.push(0);
+            assert_eq!(packed.lower_bound(&past), plain.lower_bound(&past));
+        }
+        assert_eq!(packed.lower_bound(b""), 0);
+    }
+
+    #[test]
+    fn records_of_one_shape_are_one_stream() {
+        held(
+            &[
+                (b"k01", &[b"aaaa"]),
+                (b"k02", &[b"bbbb"]),
+                (b"k03", &[b"cccc"]),
+            ],
+            true,
+        );
+        held(&[(b"k01", &[b"aaaa"])], true);
+        // A key of no bytes with a value, and keys with a value of none.
+        held(&[(b"", &[b"aaaa"])], true);
+        held(&[(b"k1", &[b""]), (b"k2", &[b""])], true);
+    }
+
+    #[test]
+    fn an_entry_of_another_shape_makes_the_three_buffers() {
+        let a: &[u8] = b"aaaa";
+        // A key of another length: the first, one inside, the last.
+        held(&[(b"k1", &[a]), (b"k02", &[a]), (b"k03", &[a])], false);
+        held(&[(b"k01", &[a]), (b"k2", &[a]), (b"k03", &[a])], false);
+        held(&[(b"k01", &[a]), (b"k02", &[a]), (b"k3", &[a])], false);
+        // A value of another length.
+        held(
+            &[(b"k01", &[b"aaa"]), (b"k02", &[a]), (b"k03", &[a])],
+            false,
+        );
+        held(
+            &[(b"k01", &[a]), (b"k02", &[b"aaaaa"]), (b"k03", &[a])],
+            false,
+        );
+        held(&[(b"k01", &[a]), (b"k02", &[a]), (b"k03", &[b""])], false);
+        // Two values, of the records' length and of half of it each less
+        // the length word, which is as many bytes of run as one value's.
+        held(&[(b"k01", &[a, a]), (b"k02", &[a]), (b"k03", &[a])], false);
+        held(&[(b"k01", &[a]), (b"k02", &[a, a]), (b"k03", &[a])], false);
+        held(&[(b"k01", &[a]), (b"k02", &[a]), (b"k03", &[a, a])], false);
+        held(
+            &[(b"k01", &[b"12345678"]), (b"k02", &[b"12", b"34"])],
+            false,
+        );
+        // A key with no value: the first, one inside, the last, the only.
+        held(&[(b"k01", &[]), (b"k02", &[a]), (b"k03", &[a])], false);
+        held(&[(b"k01", &[a]), (b"k02", &[]), (b"k03", &[a])], false);
+        held(&[(b"k01", &[a]), (b"k02", &[a]), (b"k03", &[])], false);
+        held(&[(b"k01", &[])], false);
+        // A record of no bytes has no stride to count the entries by.
+        held(&[(b"", &[b""])], false);
+        // And no entry at all.
+        held(&[], false);
     }
 }
 
@@ -49429,6 +51359,14 @@ impl Db {
         )
     }
 
+    /// The copies of heads made under the raw gate, the store's files
+    /// whole past the fill share of its budget
+    /// (`Options::heads_owned_past_fill`).
+    #[doc(hidden)]
+    pub fn heads_past_fill(&self) -> u64 {
+        self.shared.heads_events[3].load(AtomicOrdering::Relaxed)
+    }
+
     /// The copies of heads made for a grant of the records' place alone,
     /// the controller's model saying the raw form does not fit
     /// (`Options::heads_owned_beside_copies`).
@@ -50187,6 +52125,21 @@ struct BuildCtx<'s> {
 }
 
 impl<'s> BuildCtx<'s> {
+    /// Whether a copy this context builds is one stream of fixed-size
+    /// records where its entries allow it (`Options::copy_packed`). Not
+    /// under `pieces_only`, whose forms take a landed piece's runs folded
+    /// in, which reads the three buffers.
+    fn packs(&self) -> bool {
+        self.rd.opts.copy_packed && !self.pieces_only
+    }
+    /// A copy as its build finished it, counted where it came out packed.
+    fn built(&self, build: CopyBuild) -> CachedBlock {
+        let blk = build.finish();
+        if blk.fixed.is_some() {
+            self.rd.fs().copy_packs.add(0, 1);
+        }
+        blk
+    }
     /// PROTOTYPE: where a partition's block boundaries fall in every
     /// level-0 piece meeting its range, and in the snapshot of unsealed
     /// keys: the two source maps a table starts from.
@@ -51834,18 +53787,18 @@ impl<'s> BuildCtx<'s> {
             tombs: self.tombs,
             scratch: self.take_offs(),
         };
+        let n = blk.len();
         while seen < limit {
-            let order = match (blk.ents.get(i), ov.over.get(oi)) {
-                (None, None) => break,
-                (Some(_), None) => Ordering::Less,
-                (None, Some(_)) => Ordering::Greater,
-                (Some(e), Some(o)) => blk.key(e).cmp(o.key),
+            let order = match (i < n, ov.over.get(oi)) {
+                (false, None) => break,
+                (true, None) => Ordering::Less,
+                (false, Some(_)) => Ordering::Greater,
+                (true, Some(o)) => blk.key_i(i).cmp(o.key),
             };
             match order {
                 Ordering::Less => {
-                    let e = &blk.ents[i];
-                    let k = blk.key(e);
-                    blk.each_value(e, |v| f(k, v));
+                    let k = blk.key_i(i);
+                    blk.values_i(i, |v| f(k, v));
                     i += 1;
                 }
                 Ordering::Greater => {
@@ -51853,9 +53806,8 @@ impl<'s> BuildCtx<'s> {
                     oi += 1;
                 }
                 Ordering::Equal => {
-                    let e = &blk.ents[i];
                     self.emit_both(&mut f, &mut em, ov, oi, src, |f| {
-                        blk.each_value(e, |v| f(blk.key(e), v))
+                        blk.values_i(i, |v| f(blk.key_i(i), v))
                     })?;
                     i += 1;
                     oi += 1;
@@ -51990,15 +53942,11 @@ impl<'s> BuildCtx<'s> {
         self.prefetch_overlay(ov);
         let n = ranks.len() + ov.over.len();
         let (lo, hi) = (ranks.start, ranks.end);
-        let blk = std::cell::RefCell::new(CachedBlock {
-            keys: Vec::with_capacity(n * 16),
-            vals: Vec::with_capacity(n * 128),
-            ents: Vec::with_capacity(n),
-            identity: false,
-            identity_of: src.seg.blob.id(),
-            wide: false,
-            dead: 0,
-        });
+        let blk = std::cell::RefCell::new(CopyBuild::new(
+            src.seg.keyseq,
+            (n * 16, n * 128, n),
+            self.packs(),
+        ));
         let mut current: Vec<u8> = Vec::with_capacity(32);
         let mut open = false;
         let (_, all_same) = self.walk_block(
@@ -52021,10 +53969,11 @@ impl<'s> BuildCtx<'s> {
             },
             |_k, v| blk.borrow_mut().push(v),
         )?;
-        let mut blk = blk.into_inner();
+        let mut build = blk.into_inner();
         if open {
-            blk.end();
+            build.end();
         }
+        let mut blk = self.built(build);
         // Every overlay key an update of a record at its cut, and a key
         // emitted per record: a tombstone that took a record out leaves the
         // copy searched. The walk answers each key's cut exactly, carried or
@@ -52032,7 +53981,7 @@ impl<'s> BuildCtx<'s> {
         // off) also left a copy searched where a cut had to be searched for.
         let updates = all_same
             && (self.rd.opts.zpages_block_cursor || ov.over.iter().all(|o| o.cut != u32::MAX));
-        blk.identity = updates && blk.ents.len() == hi - lo;
+        blk.identity = updates && blk.len() == hi - lo;
         if self.fit {
             blk.fit();
         }
@@ -52060,15 +54009,15 @@ impl<'s> BuildCtx<'s> {
         } else {
             hi - lo
         };
-        let mut blk = CachedBlock {
-            keys: Vec::with_capacity(sb.keys.len() + kept * 16),
-            vals: Vec::with_capacity(sb.vals.len() + kept * 128),
-            ents: Vec::with_capacity(sb.ents.len() + kept),
-            identity: false,
-            identity_of: seg.blob.id(),
-            wide: false,
-            dead: 0,
-        };
+        let mut blk = CopyBuild::new(
+            seg.keyseq,
+            (
+                sb.keys.len() + kept * 16,
+                sb.vals.len() + kept * 128,
+                sb.ents.len() + kept,
+            ),
+            self.packs(),
+        );
         // Every key once, then its values, as `copy_block` opens them: an
         // entry opens on a key change, and a key without values -- a
         // record a delta deleted -- still gets one.
@@ -52077,7 +54026,7 @@ impl<'s> BuildCtx<'s> {
         let mut rank = lo;
         let mut updates = true;
         let mut pr = PartReader::new(self.rd, seg);
-        let mut stream = |blk: &mut CachedBlock,
+        let mut stream = |blk: &mut CopyBuild,
                           current: &mut Vec<u8>,
                           open: &mut bool,
                           from: usize,
@@ -52127,9 +54076,10 @@ impl<'s> BuildCtx<'s> {
         if open {
             blk.end();
         }
+        let mut blk = self.built(blk);
         // Every delta an update of a record, and a key emitted per record:
         // `copy_block`'s rule, which the form's cuts answer exactly.
-        blk.identity = updates && blk.ents.len() == hi - lo;
+        blk.identity = updates && blk.len() == hi - lo;
         if self.fit {
             blk.fit();
         }
@@ -52806,6 +54756,25 @@ struct SealJob {
     wal: Vec<PathBuf>,
     tmp: Option<PathBuf>,
     draining: bool,
+    /// A drain answered at this seal's readable landing
+    /// (`Options::drain_answers_readable`), its durable landing left to
+    /// the loop: landed whole at the stop where the loop has not come to
+    /// it (`Maint::stop`), as a strict drain's is before its answer.
+    early: bool,
+    /// A drain's seal whose writer signals it readable before the drain's
+    /// request is sent (`Options::close_readable_inline`), with the
+    /// request to ask its answer at that landing: the loop leaves the
+    /// readable landing to the request (`Maint::drain_readable`), which
+    /// lands it with the directory's fsync deferred, where the loop's own
+    /// landing, coming first, paid that fsync on the drain's path -- 0.3
+    /// ms of a 1.1 ms drain at ten thousand keys, one drain in three. A
+    /// request that never comes leaves it to the seal's whole landing at
+    /// its thread's return, as a strict drain's is.
+    early_hint: bool,
+    /// The readable landing left the directory's fsync of the segments'
+    /// names to the durable landing, ahead of the slot that names them
+    /// (`Maint::drain_readable`).
+    dir_owed: bool,
     /// The log held frames not yet synced when the seal was handed over:
     /// a drain of such a seal is answered only behind a durable slot,
     /// since nothing else covers them (`Options::drain_syncs_wal`).
@@ -52815,8 +54784,10 @@ struct SealJob {
 /// What the writer waits for.
 enum MaintAsk {
     /// A flush's: the seal landed, then the store left partitioned or its
-    /// partitioning scheduled (`Maint::drain`).
-    Drain,
+    /// partitioning scheduled (`Maint::drain`). `early` where the flush
+    /// may be answered once its seal is readable
+    /// (`Options::drain_answers_readable`, `Maint::drain_readable`).
+    Drain { early: bool },
     /// A settle's: the seal and every merge in flight landed.
     Settle,
     /// A settle of the second form's (`Db::zpages_settle`): every live
@@ -53200,6 +55171,14 @@ struct Maint {
     /// Inside a `ZSettle` answer: every kind of build is due, where the
     /// loop's own turns start only the builds of partitions with none.
     z_settling: bool,
+    /// A test's seam (`Options::zpages_hold_after_settle`): no spare is
+    /// started (`Options::zpages_both`) until a settle of the form has
+    /// answered, so that the first spare is the one that starts as a settle
+    /// ends. Spares start whenever no settle runs, and a store whose
+    /// served form files were built during its load had every spare built
+    /// before the test's settle, on a runner that gave the segment work
+    /// the time first, and nothing was left to stand at the rename.
+    z_spares_after_settle: bool,
     /// The controller (`ZPages::Auto`): the selector, whether it runs under
     /// these options, whether its decisions are traced
     /// (`SUPDB_ZPAGES_TRACE`), the epoch its clock counts from, when it
@@ -53261,6 +55240,11 @@ struct Maint {
     /// bytes (`z_misfit_is_the_caches`): with no point read near, the
     /// store reads as left raw for `z_heads_look` all the same.
     z_misfit_caches: bool,
+    /// Whether the store's files whole have stood past the fill share of
+    /// its budget at a reading of the model (`z_model`): what
+    /// `z_heads_look` copies heads on under the raw gate
+    /// (`Options::heads_owned_past_fill`).
+    z_past_fill: bool,
     /// The coding the selector chose at its last reading
     /// (`Options::zpages_coding_auto`, `zselect::choose_coding`), which the
     /// builds after it are planned in; none until a reading with both
@@ -53545,6 +55529,7 @@ impl Maint {
             self.z_step();
             self.short_look();
             self.sweep_spares();
+            self.run_spare_look();
             std::thread::park_timeout(MAINT_POLL);
         }
         self.sweep_spares();
@@ -53599,7 +55584,12 @@ impl Maint {
     /// What the writer waits for; see `MaintAsk`.
     fn answer(&mut self, ask: MaintAsk) -> Result<()> {
         match ask {
-            MaintAsk::Drain => {
+            MaintAsk::Drain { early } => {
+                if early && self.drain_readable()? {
+                    self.shared.drain_steps.stamp(12);
+                    SealCounts::add(&self.shared.seal_counts.drains_early, 1);
+                    return Ok(());
+                }
                 self.join_seal(true)?;
                 let out = self.drain();
                 self.shared.drain_steps.stamp(12);
@@ -53665,6 +55655,7 @@ impl Maint {
                 if self.shared.zsettle_hold.load(AtomicOrdering::Acquire) {
                     Db::set_zhold(&self.shared.zbuild_hold, ZHOLD_RENAME, true);
                 }
+                self.z_spares_after_settle = false;
                 self.z_settling = false;
                 swept?;
                 self.sync_owed_slot()
@@ -53771,7 +55762,7 @@ impl Maint {
                 self.land_front(draining)?;
                 continue;
             }
-            if readable {
+            if readable && !self.sealing.front().is_some_and(|j| j.early_hint) {
                 self.land_front_readable()?;
             }
             return Ok(());
@@ -53782,6 +55773,13 @@ impl Maint {
     /// published for readers and its table retired (`land_readable`); the
     /// seal is between its phases from here until its thread returns.
     fn land_front_readable(&mut self) -> Result<()> {
+        self.land_front_readable_as(false)
+    }
+
+    /// `land_front_readable`, with the directory's fsync of the segments'
+    /// names left to the durable landing where `defer_dir` asks
+    /// (`land_readable`).
+    fn land_front_readable_as(&mut self, defer_dir: bool) -> Result<()> {
         let Some(front) = self.sealing.front() else {
             return Ok(());
         };
@@ -53790,11 +55788,12 @@ impl Maint {
         let table = front.table.clone();
         let t = std::time::Instant::now();
         self.shared.drain_steps.stamp(8);
-        match self.land_readable(&names, &facts, &table) {
-            Ok(()) => {
+        match self.land_readable(&names, &facts, &table, defer_dir) {
+            Ok(owed) => {
                 self.shared.drain_steps.stamp(9);
                 if let Some(s) = self.sealing.front_mut() {
                     s.landed = true;
+                    s.dir_owed = owed;
                 }
                 SealCounts::add(
                     &self.shared.seal_counts.seal_ns,
@@ -53920,6 +55919,20 @@ impl Maint {
         if let Some(s) = self.z_sampling.take() {
             let _ = s.handle.join();
         }
+        // A drain answered at its seal's readable landing left the rest of
+        // that landing to the loop (`Options::drain_answers_readable`): a
+        // store dropped before the loop came to it lands it here, so that
+        // a flush followed by a drop leaves what a strict flush's did, the
+        // segments named by a synced slot and nothing for the open to
+        // recover. The seals handed after it are joined and left, as every
+        // seal in flight at a drop is.
+        if self.sealing.front().is_some_and(|j| j.early) {
+            let op = self.op();
+            if let Err(e) = self.land_front(false) {
+                self.shared.put_maint_err(e);
+            }
+            drop(op);
+        }
         for job in self.sealing.drain(..) {
             let _ = job.handle.join();
         }
@@ -53953,6 +55966,7 @@ impl Maint {
             .manifest_seq
             .store(manifest_seq, AtomicOrdering::Release);
         let z_auto = r.opts.zpages == ZPages::Auto && !z_auto_inert(&r.opts);
+        let z_spares_after_settle = r.opts.zpages_hold_after_settle;
         let z_eager = r.opts.zpages_build_eager;
         let z_attach_eager = r.opts.zpages_attach_eager;
         let z_suspect_crossing = r.opts.zpages_suspect_at_crossing;
@@ -53985,6 +55999,7 @@ impl Maint {
             zahead: None,
             z_last_d: None,
             z_settling: false,
+            z_spares_after_settle,
             zsel: {
                 let mut sel = zselect::ZSelect::default();
                 sel.set_eager(z_eager);
@@ -54016,6 +56031,7 @@ impl Maint {
             z_refresh_due: false,
             z_leaves_raw: false,
             z_misfit_caches: false,
+            z_past_fill: false,
             z_coding_pick: None,
             z_pick_size: None,
             z_ops_life: 0,
@@ -54197,6 +56213,53 @@ impl Maint {
         Ok(())
     }
 
+    /// A drain answered at its seal's readable landing
+    /// (`Options::drain_answers_readable`): the drain's own seal, the one
+    /// seal in flight, landed readable with the directory's fsync of its
+    /// names left to its durable landing (`land_readable`), and true where
+    /// that leaves the drain nothing to do -- no level-0 piece and no merge
+    /// in flight -- so that the seal's fsyncs and its durable landing
+    /// follow in the loop (`collect_seal`), which lands it as no flush's:
+    /// the slot it writes is synced there, since nobody waits for it to
+    /// be. False, and the drain goes on as a strict one from where this
+    /// left the queue, where the drain still has work, where the seal's
+    /// thread returned before it was readable, and where a seal handed
+    /// before the drain's is still in flight. The work is what `drain`
+    /// does, named as it names it: a merge or a piece merge to join, and a
+    /// level-0 piece to partition. Either merge holds a level-0 input
+    /// while it runs, so the piece is what a store reaching here shows,
+    /// and the two are asked apart all the same, as the joins they are.
+    fn drain_readable(&mut self) -> Result<bool> {
+        if self.sealing.len() != 1 || self.shared.seal_wedged.load(AtomicOrdering::Acquire) {
+            return Ok(false);
+        }
+        if self.sealing.front().is_some_and(|f| !f.landed) {
+            loop {
+                let (readable, sealed) = self.seal_phases_due();
+                if sealed || self.shared.seal_wedged.load(AtomicOrdering::Acquire) {
+                    break;
+                }
+                if readable {
+                    self.land_front_readable_as(true)?;
+                    break;
+                }
+                std::thread::park_timeout(MAINT_LAND_POLL);
+            }
+        }
+        if !self.sealing.front().is_some_and(|f| f.landed)
+            || !self.compacting.is_empty()
+            || self.tiering.is_some()
+            || self.segs().iter().any(|s| s.level == 0)
+        {
+            return Ok(false);
+        }
+        if let Some(front) = self.sealing.front_mut() {
+            front.draining = false;
+            front.early = true;
+        }
+        Ok(true)
+    }
+
     /// The oldest seal in flight landed whole: its thread joined first if
     /// it is still writing, its segments published for readers if the
     /// poll has not done that (`land_readable`), then the durable landing
@@ -54219,6 +56282,7 @@ impl Maint {
             tmp,
             readable,
             wal_unsynced,
+            dir_owed,
             ..
         } = job;
         let t = std::time::Instant::now();
@@ -54254,11 +56318,23 @@ impl Maint {
         };
         if !landed {
             let facts = readable.facts.get().cloned().unwrap_or_default();
-            if let Err(e) = self.land_readable(&names, &facts, &table) {
+            if let Err(e) = self.land_readable(&names, &facts, &table, false) {
                 self.shared.in_seal.fetch_sub(1, AtomicOrdering::AcqRel);
                 self.shared.seal_wedged.store(true, AtomicOrdering::Release);
                 return Err(e);
             }
+        }
+        // The directory's fsync the readable landing left owed, before the
+        // slot that names the segments: a failure is the readable
+        // landing's, the segments published and unnamed, and wedges the
+        // queue as one there does.
+        if dir_owed {
+            if let Err(e) = self.sync_dir_and_spare() {
+                self.shared.in_seal.fetch_sub(1, AtomicOrdering::AcqRel);
+                self.shared.seal_wedged.store(true, AtomicOrdering::Release);
+                return Err(e);
+            }
+            SealCounts::add(&self.shared.seal_counts.dir_owed_syncs, 1);
         }
         let defer =
             draining && !self.opts.flush_waits_manifest && !self.pending_on() && !wal_unsynced;
@@ -54286,7 +56362,8 @@ impl Maint {
         names: &[String],
         facts: &[Option<(BlockedBloom, bool)>],
         table: &std::sync::Arc<MemTable>,
-    ) -> Result<()> {
+        defer_dir: bool,
+    ) -> Result<bool> {
         if self.shared.fail_landing.swap(false, AtomicOrdering::AcqRel) {
             return Err(err("a test failed this landing"));
         }
@@ -54382,10 +56459,17 @@ impl Maint {
             // own directory fsync does this. An fsync that fails here
             // leaves the segments published and unnamed, which is the
             // state a crash before the publish leaves: the WAL holds the
-            // writes, and the seal is wedged by the caller.
-            File::open(&self.dir)?.sync_all()?;
+            // writes, and the seal is wedged by the caller. Left to the
+            // durable landing where the caller asks (`defer_dir`): a drain
+            // answered here, whose writes no name of the seal's covers,
+            // returns without waiting on that journal commit, and the
+            // landing that writes the slot syncs the directory first.
+            if defer_dir {
+                return Ok(true);
+            }
+            self.sync_dir_and_spare()?;
         }
-        Ok(())
+        Ok(false)
     }
 
     /// Whether a seal's manifest rides its fsync (`Options::manifest_pending`
@@ -54736,13 +56820,23 @@ impl Maint {
         let l0_aligned = sort_segs(&mut segs);
         let (parts, piece_runs, fence_words) = State::placing(&segs, l0_aligned);
         // One fresh table for every attempt: a landing that lost the swap
-        // installs the same empty table on its retry.
-        let fresh = landed.map(|_| {
-            std::sync::Arc::new(self.opts.live_table(
-                &self.shared.block_pool,
-                self.shared.shared_cap.load(AtomicOrdering::Relaxed),
+        // installs the same empty table on its retry. Made where an attempt
+        // finds the table it retires still live, the one branch that
+        // installs it (`Options::land_fresh_lazy`): a landing that retires
+        // the oldest frozen table installs none, and the table made for it
+        // anyway was built and dropped on the landing's path, which is a
+        // drain's.
+        let make_fresh = |m: &Self| {
+            SealCounts::add(&m.shared.seal_counts.landing_tables, 1);
+            std::sync::Arc::new(m.opts.live_table(
+                &m.shared.block_pool,
+                m.shared.shared_cap.load(AtomicOrdering::Relaxed),
             ))
-        });
+        };
+        let mut fresh: Option<std::sync::Arc<MemTable>> = None;
+        if landed.is_some() && !self.opts.land_fresh_lazy {
+            fresh = Some(make_fresh(self));
+        }
         debug_assert!(
             Self::partitions_tile(&segs),
             "a segment publish left partitions that do not tile the key space: {:?}",
@@ -54788,10 +56882,8 @@ impl Maint {
                     );
                     swapped_live = true;
                     retired_table = true;
-                    (
-                        fresh.clone().expect("made for a landing"),
-                        cur.frozen.clone(),
-                    )
+                    let made = fresh.get_or_insert_with(|| make_fresh(self));
+                    (made.clone(), cur.frozen.clone())
                 }
                 Some(t)
                     if cur
@@ -55725,7 +57817,13 @@ impl Maint {
             return;
         }
         let gate = self.shared.zgate.load();
-        if gate == zselect::GATE_RAW {
+        // Under the raw gate the heads are the page cache's, which holds
+        // them while the store fits -- and does not once the store's
+        // files whole have outgrown the cache's share of the budget,
+        // whatever the model says of the pages a read touches
+        // (`Options::heads_owned_past_fill`).
+        let past_fill = self.opts.heads_owned_past_fill && self.z_past_fill;
+        if gate == zselect::GATE_RAW && !past_fill {
             return;
         }
         let near = self.scans_near();
@@ -55753,6 +57851,9 @@ impl Maint {
                     !served && seg.z_declined.load(AtomicOrdering::Relaxed) != 0,
                     false,
                 )
+            } else if gate == zselect::GATE_RAW {
+                // Every partition is the raw form's here.
+                (true, false)
             } else {
                 (census_raw, !model_raw)
             };
@@ -55768,6 +57869,9 @@ impl Maint {
                 self.shared.heads_events[0].fetch_add(1, AtomicOrdering::Relaxed);
                 if by_place {
                     self.shared.heads_events[2].fetch_add(1, AtomicOrdering::Relaxed);
+                }
+                if gate == zselect::GATE_RAW {
+                    self.shared.heads_events[3].fetch_add(1, AtomicOrdering::Relaxed);
                 }
                 // The mapping's pages are no seek's now: out of this
                 // process's tables, and out of the cache where it lets
@@ -55833,7 +57937,7 @@ impl Maint {
         self.z_convert_asked();
         if self.opts.zpages_recode && !self.z_settling {
             self.z_recode_tick();
-            if self.zbuild.is_none() && self.opts.zpages_both {
+            if self.zbuild.is_none() && self.opts.zpages_both && !self.z_spares_after_settle {
                 let next = {
                     let _op = self.op();
                     self.z_next_spare()
@@ -57989,6 +60093,20 @@ impl Maint {
     fn raw_rewarm_files(&self, merging: bool) -> Vec<PathBuf> {
         let raw_gate = self.shared.zgate.load() == zselect::GATE_RAW;
         let _op = self.op();
+        // A partition with its form file's build in flight is the build's:
+        // the build reads its records once and drops them behind it
+        // (`Options::zpages_drop_behind`), and asked back before the build
+        // was collected they stood whole beside the form file it then
+        // attached -- a settle that came while the loop built the partition
+        // a drain had just landed asked every page of the records back, in
+        // a test of the drop three runs in forty once a durable flush was
+        // answered at its seal's readable landing, and none before.
+        let building: Vec<&str> = [self.zbuild.as_ref(), self.zahead.as_ref()]
+            .into_iter()
+            .flatten()
+            .filter(|b| matches!(b.job, ZJob::Build(_)))
+            .map(|b| b.seg.name.as_str())
+            .collect();
         let (mut files, mut parts, mut pieces) = (Vec::new(), Vec::new(), Vec::new());
         for s in self.segs().iter() {
             if merging && self.in_flight_input(&s.name) {
@@ -57999,6 +60117,9 @@ impl Maint {
             }
             if let Some(n) = Db::ord_name_for(&s.name) {
                 files.push(self.dir.join(n));
+            }
+            if s.level > 0 && building.contains(&s.name.as_str()) {
+                continue;
             }
             if s.level > 0 {
                 parts.push(self.dir.join(&s.name));
@@ -60553,15 +62674,19 @@ impl Maint {
                 rate
             }
         };
-        let (hash, records) = {
+        // The populations a read touches, the partitions', and beside
+        // them the store's files whole: every segment's two regions and
+        // its ordered index, the level-0 pieces' with the partitions'.
+        let (hash, records, whole) = {
             let _op = self.op();
-            self.segs()
-                .iter()
-                .filter(|s| s.level > 0)
-                .fold((0u64, 0u64), |(h, r), s| {
-                    let (sh, sr) = s.foot();
-                    (h.saturating_add(sh), r.saturating_add(sr))
-                })
+            self.segs().iter().fold((0u64, 0u64, 0u64), |(h, r, w), s| {
+                let w = w.saturating_add(s.raw_bytes());
+                if s.level == 0 {
+                    return (h, r, w);
+                }
+                let (sh, sr) = s.foot();
+                (h.saturating_add(sh), r.saturating_add(sr), w)
+            })
         };
         self.shared
             .z
@@ -60571,7 +62696,19 @@ impl Maint {
             .z
             .model_records
             .store(records, AtomicOrdering::Relaxed);
+        self.shared
+            .z
+            .model_whole
+            .store(whole, AtomicOrdering::Relaxed);
         self.z_past_budget = hash.saturating_add(records) > budget;
+        // The store whole past the fill share of its budget
+        // (`Options::heads_owned_past_fill`): the cache then holds more of
+        // the store's than the budget leaves it, whatever the model says
+        // of the pages a read touches, and the kernel is taking some. Once
+        // past, the store is one whose cache the kernel shrinks: a merge
+        // that folds the pieces away takes the sum back under the line
+        // while the pages it wrote stand in the cache still.
+        self.z_past_fill |= whole > zselect::form_fill(budget);
         let (phi_z, phi_z_scan) = match self.z_sample_size {
             Some((w_z, resident, pages_per_key)) => {
                 let z = zselect::model_z(budget, resident, w_z);
@@ -61630,6 +63767,112 @@ impl Maint {
         }
     }
 
+    /// The next run's file made, where the writer has reserved its id and
+    /// it is not made yet (`Options::run_spare`): the empty file under
+    /// the run's temp name, its name behind no sync. Under the slot's
+    /// lock, so the writer never makes the file this is making. A file
+    /// that cannot be made is no spare, and is not tried again until the
+    /// run that would have had it has begun. The id made, for
+    /// `run_spare_named`.
+    fn run_spare_make(&mut self) -> Option<u64> {
+        if !self.opts.run_spare {
+            return None;
+        }
+        let mut slot = self.shared.run_spare();
+        let RunSpare::Wanted(id) = *slot else {
+            return None;
+        };
+        let tmp = Db::direct_tmp(&self.dir, id);
+        let _ = std::fs::remove_file(&tmp);
+        match File::create(&tmp) {
+            Ok(_) => {
+                *slot = RunSpare::Made(id);
+                Some(id)
+            }
+            Err(_) => {
+                let _ = std::fs::remove_file(&tmp);
+                *slot = RunSpare::Failed(id);
+                None
+            }
+        }
+    }
+
+    /// The file `run_spare_make` made is behind a sync of the directory:
+    /// ready for a run to begin in with no barrier of its own, unless the
+    /// writer has taken it meanwhile, as a file it made itself.
+    fn run_spare_named(&mut self, made: Option<u64>) {
+        let Some(id) = made else {
+            return;
+        };
+        let mut slot = self.shared.run_spare();
+        if *slot == RunSpare::Made(id) {
+            *slot = RunSpare::Ready(id);
+            SealCounts::add(&self.shared.seal_counts.run_spares_made, 1);
+        }
+    }
+
+    /// The directory synced for a landing's names, and the next run's
+    /// file with them (`Options::run_spare`): made just ahead of the sync
+    /// and ready once it has returned, so the file's name costs no sync of
+    /// its own. Made at the moment the writer took the last one it was a
+    /// sync of the directory beside the run's first commits, which wait on
+    /// the same journal, and gave back there two thirds of what the file
+    /// saved the first.
+    fn sync_dir_and_spare(&mut self) -> Result<()> {
+        let made = self.run_spare_make();
+        File::open(&self.dir)?.sync_all()?;
+        // A test's hold between the sync and the slot's step
+        // (`Db::hold_spare_named`): the window a run may begin in, taking
+        // the file as one it made itself.
+        while self.shared.spare_named_hold.load(AtomicOrdering::Acquire) {
+            std::thread::park_timeout(std::time::Duration::from_millis(1));
+        }
+        self.run_spare_named(made);
+        Ok(())
+    }
+
+    /// A store opened has no landing to make its first spare at: made
+    /// here, at the segment work's first turn, with a sync of the
+    /// directory for it alone (`Options::run_spare`). A sync that fails
+    /// leaves no spare and no file. No test can lose a name, so the sync
+    /// is held only as far as a failure injected in its place is
+    /// (`tests/runlog.rs`).
+    fn run_spare_look(&mut self) {
+        if !self.opts.run_spare
+            || !self
+                .shared
+                .spare_run_first
+                .swap(false, AtomicOrdering::AcqRel)
+        {
+            return;
+        }
+        let Some(id) = self.run_spare_make() else {
+            return;
+        };
+        let synced = if self
+            .shared
+            .fail_spare_sync
+            .swap(false, AtomicOrdering::AcqRel)
+        {
+            // A test's failure of the directory's sync
+            // (`Db::fail_next_spare_sync`).
+            Err(std::io::Error::other(
+                "the directory's sync failed (injected)",
+            ))
+        } else {
+            File::open(&self.dir).and_then(|d| d.sync_all())
+        };
+        if synced.is_ok() {
+            self.run_spare_named(Some(id));
+            return;
+        }
+        let mut slot = self.shared.run_spare();
+        if *slot == RunSpare::Made(id) {
+            let _ = std::fs::remove_file(Db::direct_tmp(&self.dir, id));
+            *slot = RunSpare::Failed(id);
+        }
+    }
+
     /// The spares the publishes left, unlinked: an inode freed is a
     /// discard round trip here, paid where nobody waits.
     fn sweep_spares(&mut self) {
@@ -61938,7 +64181,10 @@ impl Maint {
             self.flush_merge = false;
         }
         let t = std::time::Instant::now();
-        let outputs = handle
+        let MergeOut {
+            names: outputs,
+            kept_keys,
+        } = handle
             .join()
             .map_err(|_| err("compaction thread panicked"))??;
         if self.merge_trace {
@@ -61965,15 +64211,40 @@ impl Maint {
             .cloned()
             .collect();
         let mut merged = Vec::with_capacity(outputs.len() + kept.len());
+        let mut kept_seqs = 0u64;
         for name in &outputs {
-            merged.push(std::sync::Arc::new(Seg::open(
+            let mut out = Seg::open(
                 &self.dir,
                 name,
                 self.advice_random(),
                 self.opts.read_advice != ReadAdvice::Normal,
                 self.opts.segment.checksums,
                 true,
-            )?));
+            )?;
+            // The key sequence of the partition this output rewrote, where
+            // the merge wrote it no key that partition did not hold and it
+            // holds as many: within one partition's fences every key a
+            // partition held was that partition's, so the output's keys are
+            // among its keys, and as many of them are all of them
+            // (`Options::identity_by_keys`). The partition at the output's
+            // fences is the one it rewrote, the partitions tiling the keys;
+            // a piece cut at the same fences is not a partition.
+            if self.opts.identity_by_keys && kept_keys.contains(name) {
+                let rewrote = self.segs().iter().find(|a| {
+                    a.level > 0
+                        && a.lo == out.lo
+                        && a.hi == out.hi
+                        && a.blob.keys() == out.blob.keys()
+                });
+                if let Some(a) = rewrote {
+                    out.keyseq = a.keyseq;
+                    kept_seqs += 1;
+                }
+            }
+            merged.push(std::sync::Arc::new(out));
+        }
+        if kept_seqs > 0 {
+            SealCounts::add(&self.shared.seal_counts.keyseqs_kept, kept_seqs);
         }
         // Partitions first (older, disjoint), then whatever L0 arrived
         // while the merge ran, oldest to newest.
@@ -62011,6 +64282,9 @@ impl Drop for Db {
         self.shared.zbuild_hold.store(0, AtomicOrdering::Release);
         self.shared.upkeep_hold_at.store(0, AtomicOrdering::Release);
         self.shared.kept_hold.store(0, AtomicOrdering::Release);
+        self.shared
+            .spare_named_hold
+            .store(false, AtomicOrdering::Release);
         self.stop_upkeep();
         self.stop_keeper();
         self.stop_trimmer();
@@ -62029,6 +64303,15 @@ impl Drop for Db {
                 if let Some(h) = a.handle.take() {
                     let _ = h.join();
                 }
+            }
+        }
+        // A store closed leaves no file made ahead for a run
+        // (`Options::run_spare`): behind the join above, after which no
+        // turn of the segment work can offer one.
+        if self.shared.spare_run_off.load(AtomicOrdering::Acquire) {
+            let was = std::mem::replace(&mut *self.shared.run_spare(), RunSpare::Off);
+            if let RunSpare::Ready(id) | RunSpare::Made(id) = was {
+                let _ = std::fs::remove_file(Db::direct_tmp(&self.dir, id));
             }
         }
         // Behind the segment work's last landing: what the log still
@@ -62214,7 +64497,7 @@ mod streaming_writes {
     /// the head where the key is the copy.
     #[test]
     fn a_streamed_tables_keys_read_in_place_and_across_a_seam() {
-        for compact in [false, true] {
+        for (compact, lean) in [(false, false), (true, false), (false, true), (true, true)] {
             let rd = Readers::new(false, true);
             let mem = MemTable::new_ordered(
                 false,
@@ -62230,7 +64513,8 @@ mod streaming_writes {
                 true,
                 true,
                 true,
-            );
+            )
+            .with_lean_records(lean);
             let block = mem.vals.block_len();
             let value = vec![b'v'; 10];
             let (ext, tail) = MemTable::stream_ext(value.len());

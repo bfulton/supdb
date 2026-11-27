@@ -6618,6 +6618,10 @@ pub(super) struct ZEvents {
     /// partitions, bytes: the hash regions and the record regions.
     pub model_hash: AtomicU64,
     pub model_records: AtomicU64,
+    /// The store's files whole as the tick last summed them, bytes: every
+    /// segment's hash region, record region and ordered index, the
+    /// level-0 pieces' with the partitions' (`Options::heads_owned_past_fill`).
+    pub model_whole: AtomicU64,
     /// Form files the controller retired: taken out of their cells through
     /// the epoch and given dead names for the idle sweep.
     pub retired: AtomicU64,

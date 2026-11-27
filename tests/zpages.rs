@@ -1397,6 +1397,7 @@ fn a_build_in_flight_at_a_crash_is_through_or_held_when_the_crash_returns() {
         } else {
             db.hold_zpage_build(true);
         }
+        let published = db.manifest_seq();
         let model = ordered_load(&mut db, 3000, 0xC4A5);
         let t = std::time::Instant::now();
         while !db.zpage_build_waiting() {
@@ -1405,6 +1406,21 @@ fn a_build_in_flight_at_a_crash_is_through_or_held_when_the_crash_returns() {
                 "{name}: the build never reached its hold"
             );
             std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+        // The load's flush is answered at its seal's readable landing
+        // (`Options::drain_answers_readable`), ahead of the manifest that
+        // names the partition, and the build starts at that landing too. A
+        // crash inside the window leaves the run under its temp name, which
+        // the open makes a piece: no partition and no form file, one run in
+        // twenty here and every run with the seal held short of durable.
+        // This test is of a build over a partition the manifest names.
+        let t = std::time::Instant::now();
+        while db.manifest_seq() == published {
+            assert!(
+                t.elapsed() < JOB_WALL,
+                "{name}: the drain's manifest was never published"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(1));
         }
         if !held {
             db.hold_zpage_build(false);
@@ -2013,6 +2029,63 @@ fn the_build_drops_the_raw_records_it_passed_when_asked_to_and_not_otherwise() {
         check(&db, &model, &keys, "after the build");
         let _ = std::fs::remove_dir_all(&dir);
     }
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn a_settle_asks_nothing_back_of_a_partition_its_build_has_in_flight() {
+    // A build drops its partition's records behind it, and a settle's ask
+    // for the raw form's files (`Options::zpages_rewarm_raw`) passes over the
+    // partitions a form file serves; a partition whose build is in flight is
+    // the build's, and the ask leaves its records where the drop left them.
+    // Built: the build held before its rename, past its drop, with the room
+    // the ask is made in given by the seam so that it is made on any host,
+    // and a settle beside it, where the race had a settle come by chance.
+    let dir = scratch("settle-beside-build");
+    let inject = std::sync::Arc::new(supdb::ZInject::new());
+    inject.set_budget(1 << 30);
+    inject.set_slack(1 << 30);
+    let mut db = Db::create(
+        &dir,
+        forced(|o| {
+            o.zpages_drop_behind = true;
+            o.zpages_drop_raw = false;
+            o.zpages_rewarm_raw = true;
+            o.zpages_inject = Some(inject.clone());
+        }),
+    )
+    .unwrap();
+    db.hold_zpage_rename(true);
+    let model = ordered_load(&mut db, 8000, 0xD21);
+    let seg = partition_file(&dir);
+    let r = regions_of(&seg);
+    let pages = r.rec.1.div_ceil(4096);
+    assert!(pages > 150, "{pages} pages of records");
+    let t = std::time::Instant::now();
+    while !db.zpage_build_waiting() {
+        assert!(
+            t.elapsed() < std::time::Duration::from_secs(120),
+            "no build reached its rename"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    }
+    let dropped = cached_pages(&seg, r.rec.0, r.rec.1);
+    assert!(
+        dropped * 4 < pages,
+        "the build held at its rename left {dropped} of {pages} pages: the case was not reached"
+    );
+    db.settle().unwrap();
+    let kept = cached_pages(&seg, r.rec.0, r.rec.1);
+    assert!(
+        kept * 4 < pages,
+        "a settle beside the build asked back {kept} of {pages} pages of its partition's records"
+    );
+    db.hold_zpage_rename(false);
+    db.zpages_settle().unwrap();
+    assert_eq!(db.zpage_counts().form_files, 1);
+    let keys: Vec<Vec<u8>> = model.keys().step_by(13).cloned().collect();
+    check(&db, &model, &keys, "after the build");
+    let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[cfg(target_os = "linux")]
@@ -4255,6 +4328,215 @@ fn a_cache_in_the_records_place_has_the_heads_copied_at_the_census() {
     run("heads-beside-not-the-caches", Case::NotTheCaches);
 }
 
+/// Under the raw gate the controller is asking nothing, its model saying
+/// the pages a read touches fit, and the heads are the page cache's to
+/// hold -- which it does not once the store's files whole, every segment's
+/// regions and its ordered index, have outgrown the share of the budget
+/// that leaves the cache's other tenants theirs: the group then comes to
+/// its limit whatever the model says, and the kernel takes the pages
+/// written once and never read first, the ordered indexes of partitions
+/// just landed. So past that line the heads of a scanned store are copied
+/// under the raw gate too (`Options::heads_owned_past_fill`), and of every
+/// partition landed after, the line crossed back or not; at the line, or
+/// with the option off, none is.
+#[cfg(target_os = "linux")]
+#[test]
+fn under_the_raw_gate_heads_are_copied_once_the_stores_files_outgrow_the_fill() {
+    // The fill share, written out: 0.85 of the budget.
+    let fill = |budget: u64| (budget as f64 * 0.85) as u64;
+    let scan = |db: &Db, model: &Model, what: &str| {
+        let first = model.keys().next().unwrap().clone();
+        same_window(&scanned(db, &first, 50), &window(model, &first, 50), what);
+    };
+    let raw_gate = |db: &Db, what: &str| {
+        let c = db.zpage_counts();
+        assert_eq!(
+            (c.phase, c.gate),
+            (0, 0),
+            "{what}: FITS, the raw gate: {c:?}"
+        );
+    };
+    for on in [true, false] {
+        let (dir, mut db, mut model, inject) = auto_store_with(
+            &format!("heads-past-fill-{on}"),
+            1 << 40,
+            0.0,
+            FAULT_40US,
+            |o| o.heads_owned_past_fill = on,
+            |_| {},
+        );
+        let parts = db.zpage_counts().partitions;
+        // Scanned, the budget far over the store: nothing.
+        scan(&db, &model, "the raw gate, scanned");
+        wait_secs(&db, 3, 1);
+        raw_gate(&db, "a budget far over the store");
+        assert_eq!(db.heads_owned_counts(), (0, 0, 0), "far under the line");
+        // The store whole is more than the pages a read touches: the
+        // ordered indexes are in it.
+        let c = db.zpage_counts();
+        let whole = c.model_whole_bytes;
+        let touched = c.model_hash_bytes + c.model_record_bytes;
+        assert!(
+            whole >= touched + 8 * model.len() as u64,
+            "the store whole holds its indexes: {whole} over {touched}"
+        );
+        // The budget whose fill share is the store whole, to the byte: at
+        // the line and not past it, and the model's populations well
+        // inside it. Nothing.
+        let mut at = whole * 100 / 85;
+        while fill(at) < whole {
+            at += 1;
+        }
+        assert_eq!(fill(at), whole);
+        assert!(fill(at - 1) < whole && touched < at - 1);
+        inject.set_budget(at);
+        scan(&db, &model, "at the line");
+        wait_secs(&db, 3, 1);
+        raw_gate(&db, "at the line");
+        assert_eq!(db.heads_owned_counts(), (0, 0, 0), "at the line, not past");
+        // One byte less of budget: past the line, and every partition's
+        // heads are copied, where the option says so.
+        inject.set_budget(at - 1);
+        scan(&db, &model, "past the line");
+        let t = std::time::Instant::now();
+        while on && db.heads_owned_counts().0 < parts && t.elapsed().as_secs() < 20 {
+            wait_secs(&db, 1, 1);
+        }
+        if !on {
+            wait_secs(&db, 3, 1);
+        }
+        raw_gate(&db, "past the line");
+        let (made, given, bytes) = db.heads_owned_counts();
+        if on {
+            assert_eq!((made, given), (parts, 0), "every partition's heads copied");
+            assert_eq!(bytes, 8 * model.len() as u64);
+            assert_eq!(db.heads_past_fill(), parts, "each for the line");
+        } else {
+            assert_eq!((made, given, bytes), (0, 0, 0), "the mapping throughout");
+            assert_eq!(db.heads_past_fill(), 0);
+        }
+        assert_eq!(db.heads_beside_copies(), 0);
+        scan(&db, &model, "after the look");
+        // Past once, the store is one whose cache the kernel shrinks: with
+        // the budget far over it again, the partitions a rewrite lands
+        // have their heads copied all the same, and none is given back.
+        inject.set_budget(1 << 40);
+        wait_secs(&db, 3, 1);
+        rewrite_every_key(&mut db, &mut model, "after");
+        scan(&db, &model, "rewritten");
+        let landed = db.zpage_counts().partitions;
+        let t = std::time::Instant::now();
+        while on && db.heads_owned_counts().2 < 8 * model.len() as u64 && t.elapsed().as_secs() < 20
+        {
+            wait_secs(&db, 1, 1);
+        }
+        if !on {
+            wait_secs(&db, 3, 1);
+        }
+        raw_gate(&db, "rewritten");
+        let (made2, given2, bytes2) = db.heads_owned_counts();
+        if on {
+            assert_eq!(
+                bytes2,
+                8 * model.len() as u64,
+                "the landed partitions' heads"
+            );
+            assert_eq!((made2, given2), (made + landed, 0));
+            assert_eq!(db.heads_past_fill(), made2);
+        } else {
+            assert_eq!((made2, given2, bytes2), (0, 0, 0));
+        }
+        scan(&db, &model, "the copies of the landed partitions");
+        drop(db);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+/// The store whole is the level-0 pieces' files with the partitions': a
+/// burst seals pieces into the cache beside partitions the model goes on
+/// reading as fitting, the pieces being in neither population a read
+/// touches, and it is they that carry the store past the line
+/// (`Options::heads_owned_past_fill`).
+#[cfg(target_os = "linux")]
+#[test]
+fn a_bursts_pieces_carry_a_store_past_the_fill_line() {
+    let fill = |budget: u64| (budget as f64 * 0.85) as u64;
+    let scan = |db: &Db, model: &Model, what: &str| {
+        let first = model.keys().next().unwrap().clone();
+        same_window(&scanned(db, &first, 50), &window(model, &first, 50), what);
+    };
+    let (dir, mut db, mut model, inject) = auto_store_with(
+        "heads-past-fill-pieces",
+        1 << 40,
+        0.0,
+        FAULT_40US,
+        |o| {
+            o.heads_owned_past_fill = true;
+            // The burst's piece stands until the test is done with it.
+            o.l0_trigger = 1 << 20;
+        },
+        |_| {},
+    );
+    let parts = db.zpage_counts().partitions;
+    scan(&db, &model, "the store as loaded");
+    wait_secs(&db, 3, 1);
+    let c = db.zpage_counts();
+    let whole = c.model_whole_bytes;
+    let touched = c.model_hash_bytes + c.model_record_bytes;
+    // A budget whose fill share leaves the store whole a quarter of a
+    // mebibyte to grow by: under the line, and nothing copied.
+    let room = 256u64 << 10;
+    let mut budget = (whole + room) * 100 / 85;
+    while fill(budget) < whole + room {
+        budget += 1;
+    }
+    inject.set_budget(budget);
+    scan(&db, &model, "under the line");
+    wait_secs(&db, 3, 1);
+    let c = db.zpage_counts();
+    assert_eq!((c.phase, c.gate), (0, 0), "FITS, the raw gate: {c:?}");
+    assert_eq!(db.heads_owned_counts(), (0, 0, 0), "under the line");
+    // A burst of more than that, sealed to a piece no merge folds: a
+    // quarter of the keys written again.
+    let keys: Vec<Vec<u8>> = model.keys().step_by(4).cloned().collect();
+    for chunk in keys.chunks(250) {
+        for k in chunk {
+            let v = vec![b'p'; 100];
+            db.put(k, &v);
+            model.insert(k.clone(), vec![v]);
+        }
+        db.commit().unwrap();
+    }
+    db.seal().unwrap();
+    db.settle().unwrap();
+    scan(&db, &model, "the piece standing");
+    let t = std::time::Instant::now();
+    while db.heads_owned_counts().0 < parts && t.elapsed().as_secs() < 20 {
+        wait_secs(&db, 1, 1);
+    }
+    let c = db.zpage_counts();
+    assert_eq!((c.phase, c.gate), (0, 0), "FITS, the raw gate: {c:?}");
+    assert_eq!(c.partitions, parts, "no merge has folded the piece: {c:?}");
+    assert_eq!(
+        c.model_hash_bytes + c.model_record_bytes,
+        touched,
+        "the piece is in neither population a read touches"
+    );
+    assert!(
+        c.model_whole_bytes > whole + room,
+        "and in the store whole: {} over {whole}",
+        c.model_whole_bytes
+    );
+    assert_eq!(
+        (db.heads_owned_counts().0, db.heads_past_fill()),
+        (parts, parts),
+        "every partition's heads copied for the line the piece crossed"
+    );
+    scan(&db, &model, "the copies");
+    drop(db);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// At the census under the controller a copy is for a store the model says
 /// fits, whose census is the group's pressure: such a store sits there for
 /// as long as its writes make the group refault, every seek of it reads
@@ -4291,6 +4573,11 @@ fn at_the_census_the_controller_copies_heads_only_where_the_model_says_the_store
         db.heads_beside_copies(),
         0,
         "by the model's word, none for a grant of the records' place"
+    );
+    assert_eq!(
+        db.heads_past_fill(),
+        0,
+        "and none for the fill line, which is the raw gate's"
     );
     scan(&db, &model, "the heads copied");
     drop(db);
@@ -14377,6 +14664,17 @@ fn recode_store_with(
     budget: u64,
     extra: impl FnOnce(&mut Options),
 ) -> (PathBuf, Db, Model, std::sync::Arc<supdb::ZInject>) {
+    recode_store_before_settle(name, budget, extra, |_| {})
+}
+
+/// `recode_store_with`, with `before` called on the loaded store ahead of
+/// its settle.
+fn recode_store_before_settle(
+    name: &str,
+    budget: u64,
+    extra: impl FnOnce(&mut Options),
+    before: impl FnOnce(&Db),
+) -> (PathBuf, Db, Model, std::sync::Arc<supdb::ZInject>) {
     let dir = scratch(name);
     let inject = std::sync::Arc::new(supdb::ZInject::new());
     inject.set_budget(budget);
@@ -14403,6 +14701,7 @@ fn recode_store_with(
     )
     .unwrap();
     let model = ordered_load(&mut db, 20_000, 0x2EC0);
+    before(&db);
     db.zpages_settle().unwrap();
     // A look over the settled form files, whose decode time the next look
     // differences against: the looks during the load saw none of them.
@@ -14601,12 +14900,41 @@ fn a_spare_started_as_a_settle_ends_is_not_the_settles_to_sweep() {
     // counted `spare_failed` and never given its spare, which the test
     // below waited a minute for. The seam stands the spare there every
     // time: the builds after the answer held before their renames, and the
-    // settle returning only once one is parked.
-    let (_dir, db, _model, _inject) = recode_store_with("sparesweep", 1 << 40, |o| {
-        o.zpages_recode_keep = true;
-        o.zpages_both = true;
-        o.zpages_hold_after_settle = true;
-    });
+    // settle returning only once one is parked. A spare starts whenever no
+    // settle runs, and the forced store's served form files are built
+    // during its load, so on a runner that gave the segment work the time
+    // before the test's settle every spare was built and none was left to
+    // park (once on a hosted x86 runner, every run with the settle half a
+    // second late): the seam starts none until a settle has answered, and
+    // the store is held to that before its settle -- its served files in,
+    // the segment work given the time, and no spare started.
+    let (_dir, db, _model, _inject) = recode_store_before_settle(
+        "sparesweep",
+        1 << 40,
+        |o| {
+            o.zpages_recode_keep = true;
+            o.zpages_both = true;
+            o.zpages_hold_after_settle = true;
+        },
+        |db| {
+            let t = std::time::Instant::now();
+            while db.zpage_counts().form_files < db.zpage_counts().partitions {
+                assert!(
+                    t.elapsed() < JOB_WALL,
+                    "the served form files built during the load: {:?}",
+                    db.zpage_counts()
+                );
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+            std::thread::sleep(std::time::Duration::from_millis(200));
+            let c = db.zpage_counts();
+            assert_eq!(
+                (c.spare_builds, c.spare_files),
+                (0, 0),
+                "no spare before the settle under the seam: {c:?}"
+            );
+        },
+    );
     assert!(
         db.zpage_build_waiting(),
         "a spare parked at its rename as the settle ended: {:?}",

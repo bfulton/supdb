@@ -486,7 +486,11 @@ comparator is read against the arm on the same memory. An option that is never b
 is a question the series answers.
 
 All arms in one process, interleaved one round at a time, so a machine that
-drifts drifts across all of them.
+drifts drifts across all of them. The rounds differ in their order: a rep
+starts one arm on from the rep before and steps through the arms by a stride
+of its own (`run::rep_order`), so that an arm's pass follows a different
+arm's in each rep, since what a pass leaves behind is a variable of the pass
+after it and a fixed order would make it a constant of the arm.
 
 Every arm is compiled to one build (`.cargo/config.toml`): one machine level
 and one code-generation policy for the engine's Rust and the comparators'
@@ -1020,7 +1024,7 @@ out-of-core regime is where an embedded store on a small VM lives, and the
 old suite's largest run (100 MB) never entered it.
 
 A rep is one complete pass of a workload for one arm. Arms are round-robined
-within a rep; one warmup pass is discarded where the arms share the process,
+within a rep, in the rep's own order; one warmup pass is discarded where the arms share the process,
 and none is run where each pass has a process of its own.
 
 `bench ab` is the instrument for choosing between two arms; the series is

@@ -2,7 +2,9 @@
 //! into a row.
 //!
 //! Every arm in one process, interleaved one round at a time, so a machine
-//! that drifts drifts across all of them rather than into one. A rep is one
+//! that drifts drifts across all of them rather than into one, and each
+//! round in an order of its own (`rep_order`), so that no arm's pass
+//! follows the same arm's in every rep. A rep is one
 //! complete pass of every workload for one arm; rep zero is a warmup and is
 //! discarded, because the first touch of a fresh file pays for allocation
 //! and first-fault costs that no steady state repeats -- and a run whose
@@ -685,7 +687,12 @@ pub fn phase_mark(arm: &str, phase: &str, edge: &str) {
 /// store holds after it (`zs`), so that a stride arm's cell is read by the
 /// form that served it, and the writer's point reads by the path that
 /// answered them, with the ones a tombstone in the live table's chain ended
-/// (`gets`). The lag sweep prints one a point (`SUPDB_LAG_COUNTERS`) and
+/// (`gets`), and the merges landed beside the partitions they rewrote over
+/// the same keys (`keyseqs`, `Options::identity_by_keys`) with the settle's
+/// patches of a copy at a rank and by a search (`patches`) and the copies
+/// packed into one stream and unpacked again (`packs`), and the partitions'
+/// heads the process holds, with those copied under the raw gate at the
+/// group's limit (`heads`, totals). The lag sweep prints one a point (`SUPDB_LAG_COUNTERS`) and
 /// the mixes one a mix (`SUPDB_MIX_COUNTERS`).
 fn counters_line(
     tag: &str,
@@ -699,7 +706,7 @@ fn counters_line(
     let get = |c: &[(&str, f64)], n: &str| c.iter().find(|(k, _)| *k == n).map_or(0.0, |(_, v)| *v);
     let d = |n: &str| get(c1, n) - get(c0, n);
     eprintln!(
-        "{tag} {arm} {point} flt up {flt_up} main {flt_main} memfree_mb {} burst_ms {burst_ms:.1} pass_ms {pass_ms:.1} | ph take {:.2} sync {:.2} settle {:.2} snap {:.2} ahead {:.2} install {:.2} | thread {:.1}ms/{:.0}p holds {:.0}/{:.1}ms maint {:.1}ms | built up {:.0} eng {:.0} rd {:.0} cloned {:.0} | snaps {:.0} refr {:.0} stood {:.0} dropped_mb {:.0} | walks {:.0}/{:.0}/{:.0} starts {:.0}/{:.0} | pieces {:.0} unsealed {:.0} handles-scans {:.0} | z reads {:.0} dec {:.0} scans {:.0} groups {:.0} memo {:.0}/{:.0} pf {:.0} | steps settle {:.1} snap {:.1} fillwalk {:.1} fillbuild {:.1} ms fills {:.0} cuts {:.0} left {:.0} owed {:.0} | zs reads {:.0} checks {:.0} cursor {:.0} builds {:.0} files {:.0} | gets lone {:.0} layers {:.0} placed {:.0} live {:.0}",
+        "{tag} {arm} {point} flt up {flt_up} main {flt_main} memfree_mb {} burst_ms {burst_ms:.1} pass_ms {pass_ms:.1} | ph take {:.2} sync {:.2} settle {:.2} snap {:.2} ahead {:.2} install {:.2} | thread {:.1}ms/{:.0}p holds {:.0}/{:.1}ms maint {:.1}ms | built up {:.0} eng {:.0} rd {:.0} cloned {:.0} | snaps {:.0} refr {:.0} stood {:.0} dropped_mb {:.0} | walks {:.0}/{:.0}/{:.0} starts {:.0}/{:.0} | pieces {:.0} unsealed {:.0} handles-scans {:.0} | z reads {:.0} dec {:.0} scans {:.0} groups {:.0} memo {:.0}/{:.0} pf {:.0} | steps settle {:.1} snap {:.1} fillwalk {:.1} fillbuild {:.1} ms fills {:.0} cuts {:.0} left {:.0} owed {:.0} | zs reads {:.0} checks {:.0} cursor {:.0} builds {:.0} files {:.0} | gets lone {:.0} layers {:.0} placed {:.0} live {:.0} | merges {:.0} keyseqs {:.0} patches {:.0}/{:.0} packs {:.0}/{:.0} heads {:.0}/{:.0}",
         mem_free_mb(),
         d("scan_take_us") / 1e3,
         d("scan_sync_us") / 1e3,
@@ -751,7 +758,15 @@ fn counters_line(
         d("reads_lone"),
         d("reads_layers"),
         d("reads_placed"),
-        d("reads_live_ended")
+        d("reads_live_ended"),
+        d("merges_landed"),
+        d("keyseqs_kept"),
+        d("patch_at_rank"),
+        d("patch_search"),
+        d("copies_packed"),
+        d("copies_unpacked"),
+        get(c1, "heads_owned"),
+        get(c1, "heads_past_fill")
     );
     // The process's memory beside the structures that count their own: the
     // resident bytes, what the allocator has handed out and what it holds
@@ -914,6 +929,10 @@ fn counters_line(
             // chains them through writes (`Options::merge_chains_writes`).
             "merge_plans",
             "merges_landed",
+            // Of the partitions the merges wrote, those that hold the keys
+            // of the partition they rewrote and no others, whose copies
+            // keep their ranks (`Options::identity_by_keys`).
+            "keyseqs_kept",
             // The writer's block forms given up for the merge path and
             // taken back, and of the times taken back, those at a commit
             // for a reading of the scans gone stale
@@ -1236,6 +1255,44 @@ pub struct Resume {
     pub ledger: Ledger,
     pub head: Head,
     pub passes_only: bool,
+}
+
+/// The order a rep runs its arms in, as indices into the plan's arms: a
+/// different one each rep, so that no arm keeps one predecessor.
+///
+/// What a pass leaves is a variable of the pass after it, and in the
+/// plan's order every rep an arm's pass followed the same arm's: `supdb`,
+/// first in the roster, followed the last, which since FASTER joined is
+/// FASTER's, and a load of ten thousand keys straight after FASTER's pass
+/// reads a seventh slower than the same load after any other arm's --
+/// the same code, 9.8 ms against 8.1 to 8.7 with four arms of one load
+/// path set after LMDB's, FASTER's, RocksDB's and each other's passes in
+/// one run, whichever of the four stood where (`bench/CLAUDE.md`, a
+/// predecessor every rep). So a row compared `supdb` after FASTER with
+/// `rocksdb-tuned` after LMDB, in every rep of every rung.
+///
+/// Rep `r` starts at arm `r - 1` and steps by the `r - 1`th of the strides
+/// that share no factor with the arm count, each a permutation: with
+/// distinct strides an arm's predecessor within the rep is a different arm
+/// in each, for as many reps as there are such strides (eight for fifteen
+/// arms), and two arms alternate. The warmup and the first rep run in the
+/// plan's order. A function of the count and the rep alone, so a run
+/// taken up from its ledger orders a rep as the run that was cut did.
+pub fn rep_order(arms: usize, rep: usize) -> Vec<usize> {
+    if arms < 2 || rep == 0 {
+        return (0..arms).collect();
+    }
+    fn gcd(a: usize, b: usize) -> usize {
+        if b == 0 {
+            a
+        } else {
+            gcd(b, a % b)
+        }
+    }
+    let k = rep - 1;
+    let strides: Vec<usize> = (1..arms).filter(|s| gcd(*s, arms) == 1).collect();
+    let stride = strides[k % strides.len()];
+    (0..arms).map(|i| (k + i * stride) % arms).collect()
 }
 
 /// The seam a test cuts a run at: `SUPDB_BENCH_STOP_AFTER=<size>-<rep>`
@@ -1752,7 +1809,8 @@ pub fn run(
                 s.extend(&frag);
                 continue;
             };
-            for arm in &plan.arms {
+            for ai in rep_order(plan.arms.len(), rep) {
+                let arm = &plan.arms[ai];
                 if !arms_to_run.contains(arm) {
                     let l = ledger.as_ref().expect("a pass is kept only in a ledger");
                     replay_arm(l, size, rep, arm, &mut s, &mut killed)?;
@@ -5086,6 +5144,12 @@ struct MixKinds {
     gets: (u64, f64),
     scans: (u64, f64),
     commits: (u64, f64),
+    /// The mix's first four scans and its longest, in seconds: a mix at
+    /// the smallest rung is a millisecond, and a first scan that settles
+    /// what the mix before left is a share of it no sum over the scans
+    /// names.
+    scan_first: [f64; 4],
+    scan_max: f64,
     irq0: [u64; 2],
     /// The engine's seals and the milliseconds its commits spent freezing
     /// at the mix's start (`seals`, `freeze_ms`; zeros for an engine that
@@ -5109,6 +5173,8 @@ impl MixKinds {
             gets: (0, 0.0),
             scans: (0, 0.0),
             commits: (0, 0.0),
+            scan_first: [0.0; 4],
+            scan_max: 0.0,
             irq0: if on { irq_counts() } else { [0; 2] },
             seals0: if on { seal_counts(e) } else { [0.0; 2] },
         }
@@ -5125,16 +5191,35 @@ impl MixKinds {
         }
     }
 
+    /// A scan's time, into the scans' sum and beside it the first four
+    /// and the longest.
+    fn add_scan(&mut self, t0: Option<Instant>) {
+        if let Some(t0) = t0 {
+            let d = t0.elapsed().as_secs_f64();
+            if let Some(f) = self.scan_first.get_mut(self.scans.0 as usize) {
+                *f = d;
+            }
+            self.scan_max = self.scan_max.max(d);
+            self.scans.0 += 1;
+            self.scans.1 += d;
+        }
+    }
+
     fn report(&self, e: &dyn Engine, arm: &str, mix: &str, size: u64, ops: u64, total: f64) {
         if self.on {
             let irq = irq_counts();
             let seals = seal_counts(e);
             eprintln!(
-                "mixkinds {arm} {mix} size {size} ops {ops} gets {} {:.3} scans {} {:.3} commits {} {:.3} total {:.3} tlb {} cal {} seals {} freeze {:.3}",
+                "mixkinds {arm} {mix} size {size} ops {ops} gets {} {:.3} scans {} {:.3} first_us {:.1} {:.1} {:.1} {:.1} max_us {:.1} commits {} {:.3} total {:.3} tlb {} cal {} seals {} freeze {:.3}",
                 self.gets.0,
                 self.gets.1 * 1e3,
                 self.scans.0,
                 self.scans.1 * 1e3,
+                self.scan_first[0] * 1e6,
+                self.scan_first[1] * 1e6,
+                self.scan_first[2] * 1e6,
+                self.scan_first[3] * 1e6,
+                self.scan_max * 1e6,
                 self.commits.0,
                 self.commits.1 * 1e3,
                 total * 1e3,
@@ -5315,7 +5400,7 @@ fn ycsb(
             km.key_into(existing(&mut keys, committed), &mut kb);
             let t0 = kinds.start();
             e.range(&kb, YCSB_SCAN)?;
-            MixKinds::add(&mut kinds.scans, t0);
+            kinds.add_scan(t0);
         } else if prmw > 0 {
             km.key_into(existing(&mut keys, committed), &mut kb);
             let t0 = kinds.start();
@@ -7107,6 +7192,52 @@ mod tests {
         assert!(asked_after
             .iter()
             .any(|&(k, _)| k >= size && k < size + committed));
+    }
+
+    /// A rep runs every arm once, the warmup and the first rep in the
+    /// plan's order; over as many reps as an arm count has strides, no arm
+    /// follows the same arm twice within its reps, and no two reps start
+    /// with one arm; and two arms alternate.
+    #[test]
+    fn a_reps_order_gives_no_arm_one_predecessor() {
+        for arms in 0..=24usize {
+            for rep in 0..=12 {
+                let mut o = rep_order(arms, rep);
+                o.sort_unstable();
+                assert_eq!(o, (0..arms).collect::<Vec<_>>(), "{arms} arms, rep {rep}");
+            }
+            assert_eq!(rep_order(arms, 0), (0..arms).collect::<Vec<_>>());
+            assert_eq!(rep_order(arms, 1), (0..arms).collect::<Vec<_>>());
+        }
+        assert_eq!(rep_order(2, 2), [1, 0]);
+        assert_eq!(rep_order(2, 3), [0, 1]);
+        // Fifteen arms, the quick roster's count, have eight strides; the
+        // full scale takes seven reps.
+        for (arms, reps) in [(15usize, 8usize), (14, 6), (13, 12), (7, 6), (5, 4), (3, 2)] {
+            let mut before: Vec<Vec<usize>> = vec![Vec::new(); arms];
+            let mut firsts = Vec::new();
+            for rep in 1..=reps {
+                let o = rep_order(arms, rep);
+                firsts.push(o[0]);
+                for w in o.windows(2) {
+                    assert!(
+                        !before[w[1]].contains(&w[0]),
+                        "{arms} arms: arm {} follows arm {} again at rep {rep}",
+                        w[1],
+                        w[0]
+                    );
+                    before[w[1]].push(w[0]);
+                }
+            }
+            let n = firsts.len();
+            firsts.sort_unstable();
+            firsts.dedup();
+            assert_eq!(
+                firsts.len(),
+                n,
+                "{arms} arms: a rep starts where another did"
+            );
+        }
     }
 
     /// The scrambled mixes read keys that exist and spread their hot keys:

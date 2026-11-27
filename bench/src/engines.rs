@@ -837,6 +837,10 @@ pub struct Supdb {
     /// A form the settle grew dense left for the fill to convert
     /// (`Options::settle_converts` off): `supdb-settlenoconvert`.
     settlenoconvert: bool,
+    /// A settle's conversion that leaves the fill no walk
+    /// (`Options::settle_convert_fills` off): `supdb-settleconvertquiet`,
+    /// and `supdb-ingestsettleconvertquiet` on the buffered arm.
+    settleconvertquiet: bool,
     /// The settle asking for a written chunk's header alone
     /// (`Options::settle_value_ahead` zero): `supdb-settlevaluenear`.
     settlevaluenear: bool,
@@ -1112,6 +1116,44 @@ pub struct Supdb {
     /// default. `supdb-chaincovered` chains through a covered burst, and
     /// `supdb-nocopiesfitchain` is both shapes before.
     chainuncovered: Option<bool>,
+    /// A flush whose writes were all durable before it answered once its
+    /// seal is readable, the seal's fsync and its manifest left to the
+    /// segment work's loop (`Options::drain_answers_readable`), `None` for
+    /// the engine's default: `supdb-drainreadable` answers so and
+    /// `supdb-drainstrict` waits for the seal's fsync.
+    drainreadable: Option<bool>,
+    /// A flush over writes no sync has covered pays the sync it owes
+    /// beside its seal and is answered at the seal's readable landing
+    /// (`Options::drain_syncs_beside`), `None` for the engine's default:
+    /// `supdb-ingestsyncbeside` and `supdb-syncbeside` pin it on, and
+    /// `supdb-ingestsyncafter` is the buffered drain that waits for its
+    /// slot, the shape before.
+    syncbeside: Option<bool>,
+    /// A direct run's append and commit without the per-record work the
+    /// records no longer need (`Options::direct_lean_append`), `None` for
+    /// the engine's default: `supdb-directfull` and
+    /// `supdb-ingestdirectfull` are the walk, the shape before.
+    directlean: Option<bool>,
+    /// A drain's close of a synced direct run on the writer up to the
+    /// segment being readable (`Options::close_readable_inline`), `None`
+    /// for the engine's default: `supdb-closeseal` and
+    /// `supdb-ingestcloseseal` leave it to the seal thread.
+    closereadable: Option<bool>,
+    /// A seal's Bloom composed only where it may be named a piece
+    /// (`Options::bloom_pieces_only`), `None` for the engine's default:
+    /// `supdb-bloomalways` and `supdb-ingestbloomalways` compose it for
+    /// every seal.
+    bloompieces: Option<bool>,
+    /// A landing's empty live table made only where the table it retires
+    /// is still live (`Options::land_fresh_lazy`), `None` for the
+    /// engine's default: `supdb-landfresh` and `supdb-ingestlandfresh`
+    /// make it at every landing that retires a table.
+    landfresh: Option<bool>,
+    /// A run of ordered ingest begun in a file made ahead of it
+    /// (`Options::run_spare`), `None` for the engine's default:
+    /// `supdb-runcreate` and `supdb-ingestruncreate` make the file at the
+    /// run's first commit.
+    runspare: Option<bool>,
     /// A scan that starts in a block the writer holds a form for counted
     /// as a reuse by the forms-off rule
     /// (`Options::scan_forms_off_counts_built`), `None` for the engine's
@@ -1435,6 +1477,33 @@ pub struct Supdb {
     /// (`Options::scan_runs_held`): `supdb-runsheld` and
     /// `supdb-ingestrunsheld`.
     runsheld: bool,
+    /// A copy asked for over the entries its walk reads
+    /// (`Options::copy_prefetch_span`): `supdb-copyspan` and
+    /// `supdb-ingestcopyspan`.
+    copyspan: bool,
+    /// A copy's claim to its entries' ranks is of the file its build read
+    /// and lost at every merge of its partition (`Options::identity_by_keys`
+    /// off): `supdb-identityblob` and `supdb-ingestidentityblob`.
+    identityblob: bool,
+    /// Every copy held as its three buffers (`Options::copy_packed`
+    /// off): `supdb-copythree` and `supdb-ingestcopythree`.
+    copythree: bool,
+    /// The raw gate's heads left to the page cache whatever the store's
+    /// files have outgrown (`Options::heads_owned_past_fill` off):
+    /// `supdb-headsgate`.
+    headsgate: bool,
+    /// The frozen tables bounded by their count alone
+    /// (`Options::frozen_bytes` at `usize::MAX`): `supdb-frozencount`, and
+    /// `supdb-heldpartfrozencount` under the held log.
+    frozencount: bool,
+    /// A settle's patch searches a copy for a key above its last entry
+    /// (`Options::settle_append_last` off): `supdb-settlesearch` and
+    /// `supdb-ingestsettlesearch`.
+    settlesearch: bool,
+    /// A settle's patch walks the sources for a key only its chain holds
+    /// (`Options::settle_lone_chain` off): `supdb-settlesources` and
+    /// `supdb-ingestsettlesources`.
+    settlesources: bool,
     /// The three scan levers together: `supdb-scanlevers` and
     /// `supdb-ingestscanlevers`.
     scanlevers: bool,
@@ -2379,6 +2448,10 @@ struct Policy {
     /// A form the settle grew dense left for the fill to convert
     /// (`Options::settle_converts` off): `supdb-settlenoconvert`.
     settlenoconvert: bool,
+    /// A settle's conversion that leaves the fill no walk
+    /// (`Options::settle_convert_fills` off): `supdb-settleconvertquiet`,
+    /// and `supdb-ingestsettleconvertquiet` on the buffered arm.
+    settleconvertquiet: bool,
     /// The settle asking for a written chunk's header alone
     /// (`Options::settle_value_ahead` zero): `supdb-settlevaluenear`.
     settlevaluenear: bool,
@@ -2654,6 +2727,44 @@ struct Policy {
     /// default. `supdb-chaincovered` chains through a covered burst, and
     /// `supdb-nocopiesfitchain` is both shapes before.
     chainuncovered: Option<bool>,
+    /// A flush whose writes were all durable before it answered once its
+    /// seal is readable, the seal's fsync and its manifest left to the
+    /// segment work's loop (`Options::drain_answers_readable`), `None` for
+    /// the engine's default: `supdb-drainreadable` answers so and
+    /// `supdb-drainstrict` waits for the seal's fsync.
+    drainreadable: Option<bool>,
+    /// A flush over writes no sync has covered pays the sync it owes
+    /// beside its seal and is answered at the seal's readable landing
+    /// (`Options::drain_syncs_beside`), `None` for the engine's default:
+    /// `supdb-ingestsyncbeside` and `supdb-syncbeside` pin it on, and
+    /// `supdb-ingestsyncafter` is the buffered drain that waits for its
+    /// slot, the shape before.
+    syncbeside: Option<bool>,
+    /// A direct run's append and commit without the per-record work the
+    /// records no longer need (`Options::direct_lean_append`), `None` for
+    /// the engine's default: `supdb-directfull` and
+    /// `supdb-ingestdirectfull` are the walk, the shape before.
+    directlean: Option<bool>,
+    /// A drain's close of a synced direct run on the writer up to the
+    /// segment being readable (`Options::close_readable_inline`), `None`
+    /// for the engine's default: `supdb-closeseal` and
+    /// `supdb-ingestcloseseal` leave it to the seal thread.
+    closereadable: Option<bool>,
+    /// A seal's Bloom composed only where it may be named a piece
+    /// (`Options::bloom_pieces_only`), `None` for the engine's default:
+    /// `supdb-bloomalways` and `supdb-ingestbloomalways` compose it for
+    /// every seal.
+    bloompieces: Option<bool>,
+    /// A landing's empty live table made only where the table it retires
+    /// is still live (`Options::land_fresh_lazy`), `None` for the
+    /// engine's default: `supdb-landfresh` and `supdb-ingestlandfresh`
+    /// make it at every landing that retires a table.
+    landfresh: Option<bool>,
+    /// A run of ordered ingest begun in a file made ahead of it
+    /// (`Options::run_spare`), `None` for the engine's default:
+    /// `supdb-runcreate` and `supdb-ingestruncreate` make the file at the
+    /// run's first commit.
+    runspare: Option<bool>,
     /// A scan that starts in a block the writer holds a form for counted
     /// as a reuse by the forms-off rule
     /// (`Options::scan_forms_off_counts_built`), `None` for the engine's
@@ -2947,6 +3058,20 @@ struct Policy {
     sparsespan: bool,
     /// The runs through one raw walker: `...runsheld`.
     runsheld: bool,
+    /// A copy's ask over its walk's entries: `...copyspan`.
+    copyspan: bool,
+    /// A copy's identity by its file: `...identityblob`.
+    identityblob: bool,
+    /// Every copy as its three buffers: `...copythree`.
+    copythree: bool,
+    /// The raw gate's heads left to the page cache: `...headsgate`.
+    headsgate: bool,
+    /// The frozen tables bounded by their count alone: `...frozencount`.
+    frozencount: bool,
+    /// The patch's search for an appended key: `...settlesearch`.
+    settlesearch: bool,
+    /// The patch's walk of the sources for a lone key: `...settlesources`.
+    settlesources: bool,
     /// The three scan levers together: `...scanlevers`.
     scanlevers: bool,
     /// The writer's copy line from `DENSEFROM`: `...densefrom`.
@@ -3518,6 +3643,7 @@ impl Default for Policy {
             settlesortstwice: false,
             settlestaged: false,
             settlenoconvert: false,
+            settleconvertquiet: false,
             settlevaluenear: false,
             settletablenear: false,
             headslook: false,
@@ -3584,6 +3710,13 @@ impl Default for Policy {
             zbuycross: None,
             copiesfit: None,
             chainuncovered: None,
+            drainreadable: None,
+            syncbeside: None,
+            directlean: None,
+            closereadable: None,
+            bloompieces: None,
+            landfresh: None,
+            runspare: None,
             formsoffbuilt: None,
             formson: false,
             formsoffkept: false,
@@ -3651,6 +3784,13 @@ impl Default for Policy {
             formahead: false,
             sparsespan: false,
             runsheld: false,
+            copyspan: false,
+            identityblob: false,
+            copythree: false,
+            headsgate: false,
+            frozencount: false,
+            settlesearch: false,
+            settlesources: false,
             scanlevers: false,
             densefrom: 0,
             convert16: false,
@@ -8284,6 +8424,228 @@ impl Supdb {
         )
     }
 
+    /// `supdb` answering a flush whose writes were all durable before it
+    /// once its seal's segments are published, the option pinned on
+    /// (`Options::drain_answers_readable`, the engine's default): the
+    /// directory's fsync, the seal's fsyncs and its manifest slot follow in
+    /// the segment work's loop. `supdb-drainreadable`, the arm it was
+    /// priced as.
+    pub fn create_drainreadable(path: &Path) -> Res<Supdb> {
+        Supdb::with_policy(
+            path,
+            Policy {
+                drainreadable: Some(true),
+                ..Policy::default()
+            },
+        )
+    }
+
+    /// `supdb` whose flush pays the sync it owes beside its seal and is
+    /// answered at the seal's readable landing, the option pinned on
+    /// (`Options::drain_syncs_beside`, the engine's default): a durable
+    /// store owes nothing, so against `supdb-syncafter` it prices the
+    /// option's cost where it does nothing. `supdb-syncbeside`.
+    pub fn create_syncbeside(path: &Path) -> Res<Supdb> {
+        Supdb::with_policy(
+            path,
+            Policy {
+                syncbeside: Some(true),
+                ..Policy::default()
+            },
+        )
+    }
+
+    /// `supdb-ingest` as `supdb-syncbeside`: the buffered drain, whose
+    /// writes no sync has covered, pays its log's sync beside its seal
+    /// and is answered at the readable landing, where it waited for its
+    /// slot's fdatasync. `supdb-ingestsyncbeside`, the arm it was priced
+    /// as.
+    pub fn create_ingest_syncbeside(path: &Path) -> Res<Supdb> {
+        Supdb::with_policy(
+            path,
+            Policy {
+                partition: false,
+                durable: false,
+                syncbeside: Some(true),
+                ..Policy::default()
+            },
+        )
+    }
+
+    /// `supdb` whose drain never pays a sync beside its seal
+    /// (`Options::drain_syncs_beside` off), the shape before.
+    /// `supdb-syncafter`.
+    pub fn create_syncafter(path: &Path) -> Res<Supdb> {
+        Supdb::with_policy(
+            path,
+            Policy {
+                syncbeside: Some(false),
+                ..Policy::default()
+            },
+        )
+    }
+
+    /// `supdb-ingest` whose buffered drain waits for its slot's fdatasync
+    /// (`Options::drain_syncs_beside` off), the shape before.
+    /// `supdb-ingestsyncafter`.
+    pub fn create_ingest_syncafter(path: &Path) -> Res<Supdb> {
+        Supdb::with_policy(
+            path,
+            Policy {
+                partition: false,
+                durable: false,
+                syncbeside: Some(false),
+                ..Policy::default()
+            },
+        )
+    }
+
+    /// `supdb` whose direct runs walk every record of a batch at the
+    /// commit and take the memtable hash of every key
+    /// (`Options::direct_lean_append` off), the shape before.
+    /// `supdb-directfull`.
+    pub fn create_directfull(path: &Path) -> Res<Supdb> {
+        Supdb::with_policy(
+            path,
+            Policy {
+                directlean: Some(false),
+                ..Policy::default()
+            },
+        )
+    }
+
+    /// `supdb` whose drain leaves a direct run's close to the seal thread
+    /// (`Options::close_readable_inline` off), the shape before.
+    /// `supdb-closeseal`.
+    pub fn create_closeseal(path: &Path) -> Res<Supdb> {
+        Supdb::with_policy(
+            path,
+            Policy {
+                closereadable: Some(false),
+                ..Policy::default()
+            },
+        )
+    }
+
+    /// `supdb-ingest` as `supdb-closeseal`. `supdb-ingestcloseseal`.
+    pub fn create_ingest_closeseal(path: &Path) -> Res<Supdb> {
+        Supdb::with_policy(
+            path,
+            Policy {
+                partition: false,
+                durable: false,
+                closereadable: Some(false),
+                ..Policy::default()
+            },
+        )
+    }
+
+    /// `supdb` whose every seal composes the Bloom a piece's open takes
+    /// (`Options::bloom_pieces_only` off), the shape before.
+    /// `supdb-bloomalways`.
+    pub fn create_bloomalways(path: &Path) -> Res<Supdb> {
+        Supdb::with_policy(
+            path,
+            Policy {
+                bloompieces: Some(false),
+                ..Policy::default()
+            },
+        )
+    }
+
+    /// `supdb-ingest` as `supdb-bloomalways`. `supdb-ingestbloomalways`.
+    pub fn create_ingest_bloomalways(path: &Path) -> Res<Supdb> {
+        Supdb::with_policy(
+            path,
+            Policy {
+                partition: false,
+                durable: false,
+                bloompieces: Some(false),
+                ..Policy::default()
+            },
+        )
+    }
+
+    /// `supdb` whose every landing that retires a table makes an empty
+    /// live one, installed or not (`Options::land_fresh_lazy` off), the
+    /// shape before. `supdb-landfresh`.
+    pub fn create_landfresh(path: &Path) -> Res<Supdb> {
+        Supdb::with_policy(
+            path,
+            Policy {
+                landfresh: Some(false),
+                ..Policy::default()
+            },
+        )
+    }
+
+    /// `supdb-ingest` as `supdb-landfresh`. `supdb-ingestlandfresh`.
+    pub fn create_ingest_landfresh(path: &Path) -> Res<Supdb> {
+        Supdb::with_policy(
+            path,
+            Policy {
+                partition: false,
+                durable: false,
+                landfresh: Some(false),
+                ..Policy::default()
+            },
+        )
+    }
+
+    /// `supdb` whose runs of ordered ingest make their file at their
+    /// first commit (`Options::run_spare` off), the shape before: the
+    /// first fdatasync carries the new inode and the first sync that
+    /// acknowledges anything fsyncs the directory for the name.
+    /// `supdb-runcreate`.
+    pub fn create_runcreate(path: &Path) -> Res<Supdb> {
+        Supdb::with_policy(
+            path,
+            Policy {
+                runspare: Some(false),
+                ..Policy::default()
+            },
+        )
+    }
+
+    /// `supdb-ingest` as `supdb-runcreate`. `supdb-ingestruncreate`.
+    pub fn create_ingest_runcreate(path: &Path) -> Res<Supdb> {
+        Supdb::with_policy(
+            path,
+            Policy {
+                partition: false,
+                durable: false,
+                runspare: Some(false),
+                ..Policy::default()
+            },
+        )
+    }
+
+    /// `supdb-ingest` as `supdb-directfull`. `supdb-ingestdirectfull`.
+    pub fn create_ingest_directfull(path: &Path) -> Res<Supdb> {
+        Supdb::with_policy(
+            path,
+            Policy {
+                partition: false,
+                durable: false,
+                directlean: Some(false),
+                ..Policy::default()
+            },
+        )
+    }
+
+    /// `supdb` whose every flush waits for its seal's fsyncs and slot
+    /// (`Options::drain_answers_readable` off), the shape before.
+    /// `supdb-drainstrict`.
+    pub fn create_drainstrict(path: &Path) -> Res<Supdb> {
+        Supdb::with_policy(
+            path,
+            Policy {
+                drainreadable: Some(false),
+                ..Policy::default()
+            },
+        )
+    }
+
     /// `supdb-nocopiesfit` and `supdb-chaincovered` together, the shape
     /// before both: the budget that binds beside the raw form, and the
     /// chain through a burst the forms cover.
@@ -10280,6 +10642,7 @@ impl Supdb {
             settlesortstwice,
             settlestaged,
             settlenoconvert,
+            settleconvertquiet,
             settlevaluenear,
             settletablenear,
             headslook,
@@ -10346,6 +10709,13 @@ impl Supdb {
             zbuycross,
             copiesfit,
             chainuncovered,
+            drainreadable,
+            syncbeside,
+            directlean,
+            closereadable,
+            bloompieces,
+            landfresh,
+            runspare,
             formsoffbuilt,
             formson,
             formsoffkept,
@@ -10434,6 +10804,13 @@ impl Supdb {
             formahead,
             sparsespan,
             runsheld,
+            copyspan,
+            identityblob,
+            copythree,
+            headsgate,
+            frozencount,
+            settlesearch,
+            settlesources,
             scanlevers,
             densefrom,
             convert16,
@@ -10821,6 +11198,7 @@ impl Supdb {
             settle_sorts_once: !settlesortstwice,
             settle_patch_in_place: !settlestaged,
             settle_converts: !settlenoconvert,
+            settle_convert_fills: !settleconvertquiet,
             settle_value_ahead: if settlevaluenear {
                 0
             } else {
@@ -10911,6 +11289,15 @@ impl Supdb {
                 .unwrap_or(supdb::Options::default().scan_cache_copies_fit),
             merge_chains_writes_uncovered: chainuncovered
                 .unwrap_or(supdb::Options::default().merge_chains_writes_uncovered),
+            drain_answers_readable: drainreadable
+                .unwrap_or(supdb::Options::default().drain_answers_readable),
+            drain_syncs_beside: syncbeside.unwrap_or(supdb::Options::default().drain_syncs_beside),
+            direct_lean_append: directlean.unwrap_or(supdb::Options::default().direct_lean_append),
+            close_readable_inline: closereadable
+                .unwrap_or(supdb::Options::default().close_readable_inline),
+            bloom_pieces_only: bloompieces.unwrap_or(supdb::Options::default().bloom_pieces_only),
+            land_fresh_lazy: landfresh.unwrap_or(supdb::Options::default().land_fresh_lazy),
+            run_spare: runspare.unwrap_or(supdb::Options::default().run_spare),
             scan_forms_off_counts_built: formsoffbuilt
                 .unwrap_or(supdb::Options::default().scan_forms_off_counts_built),
             scan_forms_off_unreused: !formson,
@@ -11103,6 +11490,13 @@ impl Supdb {
             scan_form_ahead: formahead || scanlevers,
             scan_prefetch_sparse_span: sparsespan || scanlevers,
             scan_runs_held: runsheld || scanlevers,
+            copy_prefetch_span: copyspan,
+            identity_by_keys: !identityblob,
+            copy_packed: !copythree,
+            heads_owned_past_fill: !headsgate,
+            frozen_bytes: if frozencount { usize::MAX } else { 0 },
+            settle_append_last: !settlesearch,
+            settle_lone_chain: !settlesources,
             forms_convert_from: if densefrom > 0 {
                 densefrom
             } else if convert16 {
@@ -11383,6 +11777,7 @@ impl Supdb {
             settlesortstwice,
             settlestaged,
             settlenoconvert,
+            settleconvertquiet,
             settlevaluenear,
             settletablenear,
             headslook,
@@ -11449,6 +11844,13 @@ impl Supdb {
             zbuycross,
             copiesfit,
             chainuncovered,
+            drainreadable,
+            syncbeside,
+            directlean,
+            closereadable,
+            bloompieces,
+            landfresh,
+            runspare,
             formsoffbuilt,
             formson,
             formsoffkept,
@@ -11537,6 +11939,13 @@ impl Supdb {
             formahead,
             sparsespan,
             runsheld,
+            copyspan,
+            identityblob,
+            copythree,
+            headsgate,
+            frozencount,
+            settlesearch,
+            settlesources,
             scanlevers,
             densefrom,
             convert16,
@@ -11934,6 +12343,13 @@ impl Engine for Supdb {
             if self.holdmarch {
                 return "supdb-heldmarch";
             }
+            if self.settleconvertquiet {
+                return if self.partition {
+                    "supdb-heldpartsettleconvertquiet"
+                } else {
+                    "supdb-heldnfsettleconvertquiet"
+                };
+            }
             if self.noframes
                 && (self.settleloads
                     || self.settlesortstwice
@@ -12025,7 +12441,11 @@ impl Engine for Supdb {
                 };
             }
             if self.partition {
-                return "supdb-heldpart";
+                return if self.frozencount {
+                    "supdb-heldpartfrozencount"
+                } else {
+                    "supdb-heldpart"
+                };
             }
             return match self.holdcap {
                 None => "supdb-held",
@@ -12857,6 +13277,47 @@ impl Engine for Supdb {
                 "supdb-ingestrunsheld"
             };
         }
+        if self.copyspan {
+            return if self.partition {
+                "supdb-copyspan"
+            } else {
+                "supdb-ingestcopyspan"
+            };
+        }
+        if self.headsgate {
+            return "supdb-headsgate";
+        }
+        if self.frozencount {
+            return "supdb-frozencount";
+        }
+        if self.copythree {
+            return if self.partition {
+                "supdb-copythree"
+            } else {
+                "supdb-ingestcopythree"
+            };
+        }
+        if self.identityblob {
+            return if self.partition {
+                "supdb-identityblob"
+            } else {
+                "supdb-ingestidentityblob"
+            };
+        }
+        if self.settlesearch {
+            return if self.partition {
+                "supdb-settlesearch"
+            } else {
+                "supdb-ingestsettlesearch"
+            };
+        }
+        if self.settlesources {
+            return if self.partition {
+                "supdb-settlesources"
+            } else {
+                "supdb-ingestsettlesources"
+            };
+        }
         if self.settlebuildsfiled {
             return if self.partition {
                 "supdb-settlebuildsfiled"
@@ -13081,6 +13542,13 @@ impl Engine for Supdb {
         }
         if self.settleshedunbound {
             return "supdb-settleshedunbound";
+        }
+        if self.settleconvertquiet {
+            return if self.partition {
+                "supdb-settleconvertquiet"
+            } else {
+                "supdb-ingestsettleconvertquiet"
+            };
         }
         if self.settleloads || self.settlesortstwice || self.settlestaged || self.settlenoconvert {
             return match (
@@ -13421,6 +13889,61 @@ impl Engine for Supdb {
         }
         if self.zbuycross == Some(false) {
             return "supdb-nobuycross";
+        }
+        if self.drainreadable == Some(true) {
+            return "supdb-drainreadable";
+        }
+        if self.drainreadable == Some(false) {
+            return "supdb-drainstrict";
+        }
+        if self.syncbeside == Some(true) {
+            return if self.partition {
+                "supdb-syncbeside"
+            } else {
+                "supdb-ingestsyncbeside"
+            };
+        }
+        if self.syncbeside == Some(false) {
+            return if self.partition {
+                "supdb-syncafter"
+            } else {
+                "supdb-ingestsyncafter"
+            };
+        }
+        if self.directlean == Some(false) {
+            return if self.partition {
+                "supdb-directfull"
+            } else {
+                "supdb-ingestdirectfull"
+            };
+        }
+        if self.closereadable == Some(false) {
+            return if self.partition {
+                "supdb-closeseal"
+            } else {
+                "supdb-ingestcloseseal"
+            };
+        }
+        if self.bloompieces == Some(false) {
+            return if self.partition {
+                "supdb-bloomalways"
+            } else {
+                "supdb-ingestbloomalways"
+            };
+        }
+        if self.landfresh == Some(false) {
+            return if self.partition {
+                "supdb-landfresh"
+            } else {
+                "supdb-ingestlandfresh"
+            };
+        }
+        if self.runspare == Some(false) {
+            return if self.partition {
+                "supdb-runcreate"
+            } else {
+                "supdb-ingestruncreate"
+            };
         }
         match (
             self.copiesfit == Some(false),
@@ -13802,9 +14325,28 @@ impl Engine for Supdb {
             ("publishes", db.seal_waits().publishes as f64),
             ("seals_deferred", db.seal_waits().deferred as f64),
             ("seals_idle", db.seal_waits().idle_seals as f64),
+            // Flushes answered at their seal's readable landing
+            // (`Options::drain_answers_readable`).
+            ("drains_early", db.seal_waits().drains_early as f64),
+            // Of them, the drains that paid the sync they owed beside their
+            // seal (`Options::drain_syncs_beside`).
+            ("drains_beside", db.seal_waits().drains_beside as f64),
             ("wal_rotations", db.seal_waits().wal_rotations as f64),
             ("freeze_ms", db.seal_waits().freeze_ns as f64 / 1e6),
             ("join_wait_ms", db.seal_waits().join_wait_ns as f64 / 1e6),
+            // Freezes by the tables frozen ahead of them, and the waits for
+            // room the frozen tables' bytes made (`Options::frozen_bytes`).
+            ("frozen_ahead0", db.seal_waits().frozen_ahead[0] as f64),
+            ("frozen_ahead1", db.seal_waits().frozen_ahead[1] as f64),
+            ("frozen_ahead2", db.seal_waits().frozen_ahead[2] as f64),
+            (
+                "frozen_byte_waits",
+                db.seal_waits().frozen_byte_waits as f64,
+            ),
+            (
+                "frozen_byte_wait_ms",
+                db.seal_waits().frozen_byte_wait_ns as f64 / 1e6,
+            ),
             // The manifest publishes' time on the segment work's thread:
             // the slot's write and fdatasync, a device round trip each.
             ("publish_ms", db.seal_waits().publish_ns as f64 / 1e6),
@@ -13863,6 +14405,7 @@ impl Engine for Supdb {
             ("merge_plans", db.seal_waits().plans as f64),
             ("merges_beside", db.seal_waits().merges_beside as f64),
             ("merges_quiet", db.seal_waits().merges_quiet as f64),
+            ("keyseqs_kept", db.seal_waits().keyseqs_kept as f64),
             ("pieces_aligned", db.pieces_aligned() as u8 as f64),
             // The shared tables installed for handles' writes and left
             // again, at a commit and at a seal (`Db::share_counts`).
@@ -13893,6 +14436,10 @@ impl Engine for Supdb {
             ("walk_copy", wk[0] as f64),
             ("start_at_rank", cs[0] as f64),
             ("start_search", cs[1] as f64),
+            ("patch_at_rank", db.copy_patches()[0] as f64),
+            ("patch_search", db.copy_patches()[1] as f64),
+            ("copies_packed", db.copy_packs()[0] as f64),
+            ("copies_unpacked", db.copy_packs()[1] as f64),
             // The writer's scans whose start seek seeded the partition's
             // reader with its cursor (`Options::zpages_seek_seeds`).
             ("seek_seeds", ss as f64),
@@ -13940,6 +14487,7 @@ impl Engine for Supdb {
             ("heads_disowned", db.heads_owned_counts().1 as f64),
             ("heads_owned_mb", (db.heads_owned_counts().2 >> 20) as f64),
             ("heads_beside_copies", db.heads_beside_copies() as f64),
+            ("heads_past_fill", db.heads_past_fill() as f64),
             // The jobs' pool, process-wide and ever (`Options::jobs_pooled`).
             ("job_pool_takes", supdb::Db::job_pool_counts()[0] as f64),
             ("job_pool_keeps", supdb::Db::job_pool_counts()[1] as f64),
@@ -15761,6 +16309,7 @@ pub fn guarantee(arm: &str) -> Option<Guarantee> {
         | "supdb-settlesortstwice"
         | "supdb-settlepatchstaged"
         | "supdb-settlenoconvert"
+        | "supdb-settleconvertquiet"
         | "supdb-settlefat"
         | "supdb-settlevaluenear"
         | "supdb-settlenoahead"
@@ -15907,6 +16456,18 @@ pub fn guarantee(arm: &str) -> Option<Guarantee> {
         | "supdb-ingestsparsespan"
         | "supdb-runsheld"
         | "supdb-ingestrunsheld"
+        | "supdb-copyspan"
+        | "supdb-ingestcopyspan"
+        | "supdb-identityblob"
+        | "supdb-ingestidentityblob"
+        | "supdb-copythree"
+        | "supdb-ingestcopythree"
+        | "supdb-headsgate"
+        | "supdb-frozencount"
+        | "supdb-settlesearch"
+        | "supdb-ingestsettlesearch"
+        | "supdb-settlesources"
+        | "supdb-ingestsettlesources"
         | "supdb-scanlevers"
         | "supdb-ingestscanlevers"
         | "supdb-densefrom"
@@ -15974,6 +16535,15 @@ pub fn guarantee(arm: &str) -> Option<Guarantee> {
         | "supdb-jobsshort"
         | "supdb-jobsheap"
         | "supdb-nobuycross"
+        | "supdb-drainreadable"
+        | "supdb-drainstrict"
+        | "supdb-syncbeside"
+        | "supdb-syncafter"
+        | "supdb-directfull"
+        | "supdb-closeseal"
+        | "supdb-bloomalways"
+        | "supdb-landfresh"
+        | "supdb-runcreate"
         | "supdb-jobspooled"
         | "supdb-zslabjobs"
         | "supdb-zstrideallslabjobs"
@@ -16043,6 +16613,7 @@ pub fn guarantee(arm: &str) -> Option<Guarantee> {
         | "supdb-ingestsettlesortstwice"
         | "supdb-ingestsettlestaged"
         | "supdb-ingestsettlenoconvert"
+        | "supdb-ingestsettleconvertquiet"
         | "supdb-ingestsettlefat"
         | "supdb-ingestpacelends"
         | "supdb-ingestinlineall"
@@ -16078,6 +16649,13 @@ pub fn guarantee(arm: &str) -> Option<Guarantee> {
         | "supdb-ingestwake"
         | "supdb-ingestnoprefetch"
         | "supdb-ingestdirplain"
+        | "supdb-ingestsyncbeside"
+        | "supdb-ingestsyncafter"
+        | "supdb-ingestdirectfull"
+        | "supdb-ingestcloseseal"
+        | "supdb-ingestbloomalways"
+        | "supdb-ingestlandfresh"
+        | "supdb-ingestruncreate"
         | "supdb-ingestsettlefar"
         | "supdb-ingesttofit"
         | "supdb-ingestprefetch1k"
@@ -16114,6 +16692,9 @@ pub fn guarantee(arm: &str) -> Option<Guarantee> {
         | "supdb-held8m"
         | "supdb-heldmarch"
         | "supdb-heldpart"
+        | "supdb-heldpartfrozencount"
+        | "supdb-heldpartsettleconvertquiet"
+        | "supdb-heldnfsettleconvertquiet"
         | "supdb-heldnoframes"
         | "supdb-heldnfnocache"
         | "supdb-heldnorecordahead"
@@ -17533,6 +18114,174 @@ pub fn open(arm: &str, dir: &Path, map_gb: usize) -> Res<Box<dyn Engine>> {
             },
             dir,
         )?,
+        "supdb-copyspan" => supdb_arm(
+            |d| {
+                Supdb::with_policy(
+                    d,
+                    Policy {
+                        copyspan: true,
+                        ..Policy::default()
+                    },
+                )
+            },
+            dir,
+        )?,
+        "supdb-ingestcopyspan" => supdb_arm(
+            |d| {
+                Supdb::with_policy(
+                    d,
+                    Policy {
+                        partition: false,
+                        durable: false,
+                        copyspan: true,
+                        ..Policy::default()
+                    },
+                )
+            },
+            dir,
+        )?,
+        "supdb-copythree" => supdb_arm(
+            |d| {
+                Supdb::with_policy(
+                    d,
+                    Policy {
+                        copythree: true,
+                        ..Policy::default()
+                    },
+                )
+            },
+            dir,
+        )?,
+        "supdb-headsgate" => supdb_arm(
+            |d| {
+                Supdb::with_policy(
+                    d,
+                    Policy {
+                        headsgate: true,
+                        ..Policy::default()
+                    },
+                )
+            },
+            dir,
+        )?,
+        "supdb-frozencount" => supdb_arm(
+            |d| {
+                Supdb::with_policy(
+                    d,
+                    Policy {
+                        frozencount: true,
+                        ..Policy::default()
+                    },
+                )
+            },
+            dir,
+        )?,
+        "supdb-heldpartfrozencount" => supdb_arm(
+            |d| {
+                Supdb::with_policy(
+                    d,
+                    Policy {
+                        durable: false,
+                        held: true,
+                        frozencount: true,
+                        ..Policy::default()
+                    },
+                )
+            },
+            dir,
+        )?,
+        "supdb-ingestcopythree" => supdb_arm(
+            |d| {
+                Supdb::with_policy(
+                    d,
+                    Policy {
+                        partition: false,
+                        durable: false,
+                        copythree: true,
+                        ..Policy::default()
+                    },
+                )
+            },
+            dir,
+        )?,
+        "supdb-identityblob" => supdb_arm(
+            |d| {
+                Supdb::with_policy(
+                    d,
+                    Policy {
+                        identityblob: true,
+                        ..Policy::default()
+                    },
+                )
+            },
+            dir,
+        )?,
+        "supdb-ingestidentityblob" => supdb_arm(
+            |d| {
+                Supdb::with_policy(
+                    d,
+                    Policy {
+                        partition: false,
+                        durable: false,
+                        identityblob: true,
+                        ..Policy::default()
+                    },
+                )
+            },
+            dir,
+        )?,
+        "supdb-settlesearch" => supdb_arm(
+            |d| {
+                Supdb::with_policy(
+                    d,
+                    Policy {
+                        settlesearch: true,
+                        ..Policy::default()
+                    },
+                )
+            },
+            dir,
+        )?,
+        "supdb-ingestsettlesearch" => supdb_arm(
+            |d| {
+                Supdb::with_policy(
+                    d,
+                    Policy {
+                        partition: false,
+                        durable: false,
+                        settlesearch: true,
+                        ..Policy::default()
+                    },
+                )
+            },
+            dir,
+        )?,
+        "supdb-settlesources" => supdb_arm(
+            |d| {
+                Supdb::with_policy(
+                    d,
+                    Policy {
+                        settlesources: true,
+                        ..Policy::default()
+                    },
+                )
+            },
+            dir,
+        )?,
+        "supdb-ingestsettlesources" => supdb_arm(
+            |d| {
+                Supdb::with_policy(
+                    d,
+                    Policy {
+                        partition: false,
+                        durable: false,
+                        settlesources: true,
+                        ..Policy::default()
+                    },
+                )
+            },
+            dir,
+        )?,
         "supdb-scanlevers" => supdb_arm(
             |d| {
                 Supdb::with_policy(
@@ -17736,6 +18485,22 @@ pub fn open(arm: &str, dir: &Path, map_gb: usize) -> Res<Box<dyn Engine>> {
         "supdb-jobsshort" => supdb_arm(Supdb::create_jobsshort, dir)?,
         "supdb-jobsheap" => supdb_arm(Supdb::create_jobsheap, dir)?,
         "supdb-nobuycross" => supdb_arm(Supdb::create_nobuycross, dir)?,
+        "supdb-drainreadable" => supdb_arm(Supdb::create_drainreadable, dir)?,
+        "supdb-drainstrict" => supdb_arm(Supdb::create_drainstrict, dir)?,
+        "supdb-syncbeside" => supdb_arm(Supdb::create_syncbeside, dir)?,
+        "supdb-ingestsyncbeside" => supdb_arm(Supdb::create_ingest_syncbeside, dir)?,
+        "supdb-syncafter" => supdb_arm(Supdb::create_syncafter, dir)?,
+        "supdb-ingestsyncafter" => supdb_arm(Supdb::create_ingest_syncafter, dir)?,
+        "supdb-directfull" => supdb_arm(Supdb::create_directfull, dir)?,
+        "supdb-closeseal" => supdb_arm(Supdb::create_closeseal, dir)?,
+        "supdb-ingestcloseseal" => supdb_arm(Supdb::create_ingest_closeseal, dir)?,
+        "supdb-bloomalways" => supdb_arm(Supdb::create_bloomalways, dir)?,
+        "supdb-ingestbloomalways" => supdb_arm(Supdb::create_ingest_bloomalways, dir)?,
+        "supdb-landfresh" => supdb_arm(Supdb::create_landfresh, dir)?,
+        "supdb-ingestlandfresh" => supdb_arm(Supdb::create_ingest_landfresh, dir)?,
+        "supdb-runcreate" => supdb_arm(Supdb::create_runcreate, dir)?,
+        "supdb-ingestruncreate" => supdb_arm(Supdb::create_ingest_runcreate, dir)?,
+        "supdb-ingestdirectfull" => supdb_arm(Supdb::create_ingest_directfull, dir)?,
         "supdb-jobspooled" => supdb_arm(Supdb::create_jobspooled, dir)?,
         "supdb-zslabjobs" => supdb_arm(Supdb::create_zslabjobs, dir)?,
         "supdb-zstrideallslabjobs" => supdb_arm(Supdb::create_zstride_all_slab_jobs, dir)?,
@@ -18102,6 +18867,62 @@ pub fn open(arm: &str, dir: &Path, map_gb: usize) -> Res<Box<dyn Engine>> {
                         partition: false,
                         durable: false,
                         settlenoconvert: true,
+                        ..Policy::default()
+                    },
+                )
+            },
+            dir,
+        )?,
+        "supdb-heldpartsettleconvertquiet" => supdb_arm(
+            |d| {
+                Supdb::with_policy(
+                    d,
+                    Policy {
+                        durable: false,
+                        held: true,
+                        settleconvertquiet: true,
+                        ..Policy::default()
+                    },
+                )
+            },
+            dir,
+        )?,
+        "supdb-heldnfsettleconvertquiet" => supdb_arm(
+            |d| {
+                Supdb::with_policy(
+                    d,
+                    Policy {
+                        partition: false,
+                        durable: false,
+                        held: true,
+                        noframes: true,
+                        settleconvertquiet: true,
+                        ..Policy::default()
+                    },
+                )
+            },
+            dir,
+        )?,
+        "supdb-settleconvertquiet" => supdb_arm(
+            |d| {
+                Supdb::with_policy(
+                    d,
+                    Policy {
+                        settleconvertquiet: true,
+                        ..Policy::default()
+                    },
+                )
+            },
+            dir,
+        )?,
+        "supdb-ingestsettleconvertquiet" => supdb_arm(
+            |d| {
+                Supdb::with_policy(
+                    d,
+                    Policy {
+                        partition: false,
+                        durable: false,
+                        settleconvertquiet: true,
                         ..Policy::default()
                     },
                 )
@@ -21392,6 +22213,174 @@ mod tests {
             }
             {
                 let z = Supdb::with_policy(
+                    &dir("copyspan"),
+                    Policy {
+                        copyspan: true,
+                        ..Policy::default()
+                    },
+                )
+                .unwrap();
+                assert_eq!(z.name(), "supdb-copyspan");
+                assert_eq!(z.features(), base.features());
+                let o = z.db.as_ref().unwrap().options();
+                assert!(o.copy_prefetch_span && !b.copy_prefetch_span);
+            }
+            {
+                let z = Supdb::with_policy(
+                    &dir("copythree"),
+                    Policy {
+                        copythree: true,
+                        ..Policy::default()
+                    },
+                )
+                .unwrap();
+                assert_eq!(z.name(), "supdb-copythree");
+                assert_eq!(z.features(), base.features());
+                let o = z.db.as_ref().unwrap().options();
+                assert!(!o.copy_packed && b.copy_packed);
+                assert!(o.heads_owned_past_fill);
+            }
+            {
+                let z = Supdb::with_policy(
+                    &dir("headsgate"),
+                    Policy {
+                        headsgate: true,
+                        ..Policy::default()
+                    },
+                )
+                .unwrap();
+                assert_eq!(z.name(), "supdb-headsgate");
+                assert_eq!(z.features(), base.features());
+                let o = z.db.as_ref().unwrap().options();
+                assert!(!o.heads_owned_past_fill && b.heads_owned_past_fill);
+                assert!(o.copy_packed);
+            }
+            {
+                let z = Supdb::with_policy(
+                    &dir("frozencount"),
+                    Policy {
+                        frozencount: true,
+                        ..Policy::default()
+                    },
+                )
+                .unwrap();
+                assert_eq!(z.name(), "supdb-frozencount");
+                assert_eq!(z.features(), base.features());
+                let o = z.db.as_ref().unwrap().options();
+                assert!(o.frozen_bytes == usize::MAX && b.frozen_bytes == 0);
+                let z = Supdb::with_policy(
+                    &dir("heldpartfrozencount"),
+                    Policy {
+                        durable: false,
+                        held: true,
+                        frozencount: true,
+                        ..Policy::default()
+                    },
+                )
+                .unwrap();
+                assert_eq!(z.name(), "supdb-heldpartfrozencount");
+                assert_eq!(z.db.as_ref().unwrap().options().frozen_bytes, usize::MAX);
+            }
+            {
+                let z = Supdb::with_policy(
+                    &dir("settleconvertquiet"),
+                    Policy {
+                        settleconvertquiet: true,
+                        ..Policy::default()
+                    },
+                )
+                .unwrap();
+                assert_eq!(z.name(), "supdb-settleconvertquiet");
+                assert_eq!(z.features(), base.features());
+                let o = z.db.as_ref().unwrap().options();
+                assert!(!o.settle_convert_fills && b.settle_convert_fills);
+                assert!(o.settle_converts);
+                let z = Supdb::with_policy(
+                    &dir("ingestsettleconvertquiet"),
+                    Policy {
+                        partition: false,
+                        durable: false,
+                        settleconvertquiet: true,
+                        ..Policy::default()
+                    },
+                )
+                .unwrap();
+                assert_eq!(z.name(), "supdb-ingestsettleconvertquiet");
+                assert!(!z.db.as_ref().unwrap().options().settle_convert_fills);
+                let z = Supdb::with_policy(
+                    &dir("heldpartsettleconvertquiet"),
+                    Policy {
+                        durable: false,
+                        held: true,
+                        settleconvertquiet: true,
+                        ..Policy::default()
+                    },
+                )
+                .unwrap();
+                assert_eq!(z.name(), "supdb-heldpartsettleconvertquiet");
+                assert!(!z.db.as_ref().unwrap().options().settle_convert_fills);
+                let z = Supdb::with_policy(
+                    &dir("heldnfsettleconvertquiet"),
+                    Policy {
+                        partition: false,
+                        durable: false,
+                        held: true,
+                        noframes: true,
+                        settleconvertquiet: true,
+                        ..Policy::default()
+                    },
+                )
+                .unwrap();
+                assert_eq!(z.name(), "supdb-heldnfsettleconvertquiet");
+                assert!(!z.db.as_ref().unwrap().options().settle_convert_fills);
+            }
+            {
+                let z = Supdb::with_policy(
+                    &dir("identityblob"),
+                    Policy {
+                        identityblob: true,
+                        ..Policy::default()
+                    },
+                )
+                .unwrap();
+                assert_eq!(z.name(), "supdb-identityblob");
+                assert_eq!(z.features(), base.features());
+                let o = z.db.as_ref().unwrap().options();
+                assert!(!o.identity_by_keys && b.identity_by_keys);
+                assert!(o.settle_append_last);
+            }
+            {
+                let z = Supdb::with_policy(
+                    &dir("settlesearch"),
+                    Policy {
+                        settlesearch: true,
+                        ..Policy::default()
+                    },
+                )
+                .unwrap();
+                assert_eq!(z.name(), "supdb-settlesearch");
+                assert_eq!(z.features(), base.features());
+                let o = z.db.as_ref().unwrap().options();
+                assert!(!o.settle_append_last && b.settle_append_last);
+                assert!(o.settle_lone_chain);
+            }
+            {
+                let z = Supdb::with_policy(
+                    &dir("settlesources"),
+                    Policy {
+                        settlesources: true,
+                        ..Policy::default()
+                    },
+                )
+                .unwrap();
+                assert_eq!(z.name(), "supdb-settlesources");
+                assert_eq!(z.features(), base.features());
+                let o = z.db.as_ref().unwrap().options();
+                assert!(!o.settle_lone_chain && b.settle_lone_chain);
+                assert!(o.settle_append_last);
+            }
+            {
+                let z = Supdb::with_policy(
                     &dir("convert16"),
                     Policy {
                         convert16: true,
@@ -21759,6 +22748,246 @@ mod tests {
                 assert_eq!(z.features(), base.features());
                 let o = z.db.as_ref().unwrap().options();
                 assert!(!o.zpages_buy_crosses && o.jobs_mapped && !o.jobs_pooled);
+                // A flush answered at its seal's readable landing, and the
+                // strict one, each differing from the default by that alone.
+                for (z, on) in [
+                    (
+                        Supdb::create_drainreadable(&dir("drainreadable")).unwrap(),
+                        true,
+                    ),
+                    (
+                        Supdb::create_drainstrict(&dir("drainstrict")).unwrap(),
+                        false,
+                    ),
+                ] {
+                    assert_eq!(
+                        z.name(),
+                        if on {
+                            "supdb-drainreadable"
+                        } else {
+                            "supdb-drainstrict"
+                        }
+                    );
+                    assert_eq!(z.features(), base.features());
+                    let o = z.db.as_ref().unwrap().options();
+                    assert_eq!(o.drain_answers_readable, on);
+                    let drain = |o: &supdb::Options| {
+                        (
+                            o.flush_waits_manifest,
+                            o.close_presync,
+                            o.drain_syncs_wal,
+                            o.manifest_slots,
+                            o.drain_names_partition,
+                            o.zpages_buy_crosses,
+                            o.jobs_mapped,
+                        )
+                    };
+                    assert_eq!(drain(o), drain(b));
+                    let arm = z.name();
+                    assert_eq!(
+                        open(arm, &dir(&format!("{arm}-open")), 1).unwrap().name(),
+                        arm
+                    );
+                    assert_eq!(guarantee(arm), guarantee("supdb"), "{arm}");
+                }
+                // A drain that pays the sync it owes beside its seal, pinned
+                // on, and the shape before, durable and buffered, each
+                // differing from its sibling by that alone.
+                let sib = Supdb::create_ingest(&dir("ingestsib")).unwrap();
+                for (z, s, arm, on) in [
+                    (
+                        Supdb::create_syncbeside(&dir("syncbeside")).unwrap(),
+                        &base,
+                        "supdb-syncbeside",
+                        true,
+                    ),
+                    (
+                        Supdb::create_ingest_syncbeside(&dir("ingestsyncbeside")).unwrap(),
+                        &sib,
+                        "supdb-ingestsyncbeside",
+                        true,
+                    ),
+                    (
+                        Supdb::create_syncafter(&dir("syncafter")).unwrap(),
+                        &base,
+                        "supdb-syncafter",
+                        false,
+                    ),
+                    (
+                        Supdb::create_ingest_syncafter(&dir("ingestsyncafter")).unwrap(),
+                        &sib,
+                        "supdb-ingestsyncafter",
+                        false,
+                    ),
+                ] {
+                    assert_eq!(z.name(), arm);
+                    assert_eq!(z.features(), s.features(), "{arm}");
+                    let o = z.db.as_ref().unwrap().options();
+                    let so = s.db.as_ref().unwrap().options();
+                    assert_eq!(o.drain_syncs_beside, on, "{arm}");
+                    assert!(so.drain_syncs_beside, "the engine's default pays beside");
+                    assert_eq!(
+                        (o.drain_answers_readable, o.close_presync, o.drain_syncs_wal),
+                        (
+                            so.drain_answers_readable,
+                            so.close_presync,
+                            so.drain_syncs_wal
+                        ),
+                        "{arm}"
+                    );
+                    assert_eq!(
+                        open(arm, &dir(&format!("{arm}-open")), 1).unwrap().name(),
+                        arm
+                    );
+                    assert_eq!(guarantee(arm), guarantee(s.name()), "{arm}");
+                }
+                // A direct run that walks every record at the commit, the
+                // shape before, durable and buffered, each differing from its
+                // sibling by that alone.
+                for (z, s, arm, lean, inline) in [
+                    (
+                        Supdb::create_directfull(&dir("directfull")).unwrap(),
+                        &base,
+                        "supdb-directfull",
+                        false,
+                        true,
+                    ),
+                    (
+                        Supdb::create_ingest_directfull(&dir("ingestdirectfull")).unwrap(),
+                        &sib,
+                        "supdb-ingestdirectfull",
+                        false,
+                        true,
+                    ),
+                    (
+                        Supdb::create_closeseal(&dir("closeseal")).unwrap(),
+                        &base,
+                        "supdb-closeseal",
+                        true,
+                        false,
+                    ),
+                    (
+                        Supdb::create_ingest_closeseal(&dir("ingestcloseseal")).unwrap(),
+                        &sib,
+                        "supdb-ingestcloseseal",
+                        true,
+                        false,
+                    ),
+                ] {
+                    assert_eq!(z.name(), arm);
+                    assert_eq!(z.features(), s.features(), "{arm}");
+                    let o = z.db.as_ref().unwrap().options();
+                    let so = s.db.as_ref().unwrap().options();
+                    assert_eq!(
+                        (o.direct_lean_append, o.close_readable_inline),
+                        (lean, inline),
+                        "{arm}"
+                    );
+                    assert!(
+                        so.direct_lean_append && so.close_readable_inline,
+                        "the engine's defaults"
+                    );
+                    assert_eq!(
+                        (o.direct_stream, o.direct_derive_keys, o.direct_slim_entries),
+                        (
+                            so.direct_stream,
+                            so.direct_derive_keys,
+                            so.direct_slim_entries
+                        ),
+                        "{arm}"
+                    );
+                    assert_eq!(
+                        open(arm, &dir(&format!("{arm}-open")), 1).unwrap().name(),
+                        arm
+                    );
+                    assert_eq!(guarantee(arm), guarantee(s.name()), "{arm}");
+                }
+                for (z, s, arm, bloom, fresh) in [
+                    (
+                        Supdb::create_bloomalways(&dir("bloomalways")).unwrap(),
+                        &base,
+                        "supdb-bloomalways",
+                        false,
+                        true,
+                    ),
+                    (
+                        Supdb::create_ingest_bloomalways(&dir("ingestbloomalways")).unwrap(),
+                        &sib,
+                        "supdb-ingestbloomalways",
+                        false,
+                        true,
+                    ),
+                    (
+                        Supdb::create_landfresh(&dir("landfresh")).unwrap(),
+                        &base,
+                        "supdb-landfresh",
+                        true,
+                        false,
+                    ),
+                    (
+                        Supdb::create_ingest_landfresh(&dir("ingestlandfresh")).unwrap(),
+                        &sib,
+                        "supdb-ingestlandfresh",
+                        true,
+                        false,
+                    ),
+                ] {
+                    assert_eq!(z.name(), arm);
+                    assert_eq!(z.features(), s.features(), "{arm}");
+                    let o = z.db.as_ref().unwrap().options();
+                    let so = s.db.as_ref().unwrap().options();
+                    assert_eq!(
+                        (o.bloom_pieces_only, o.land_fresh_lazy),
+                        (bloom, fresh),
+                        "{arm}"
+                    );
+                    assert!(
+                        so.bloom_pieces_only && so.land_fresh_lazy,
+                        "the engine's defaults"
+                    );
+                    assert_eq!(
+                        open(arm, &dir(&format!("{arm}-open")), 1).unwrap().name(),
+                        arm
+                    );
+                    assert_eq!(guarantee(arm), guarantee(s.name()), "{arm}");
+                }
+                for (z, s, arm) in [
+                    (
+                        Supdb::create_runcreate(&dir("runcreate")).unwrap(),
+                        &base,
+                        "supdb-runcreate",
+                    ),
+                    (
+                        Supdb::create_ingest_runcreate(&dir("ingestruncreate")).unwrap(),
+                        &sib,
+                        "supdb-ingestruncreate",
+                    ),
+                ] {
+                    assert_eq!(z.name(), arm);
+                    assert_eq!(z.features(), s.features(), "{arm}");
+                    let o = z.db.as_ref().unwrap().options();
+                    let so = s.db.as_ref().unwrap().options();
+                    assert!(!o.run_spare, "{arm}");
+                    assert!(so.run_spare, "the engine's default");
+                    assert_eq!(
+                        (
+                            o.bloom_pieces_only,
+                            o.land_fresh_lazy,
+                            o.close_readable_inline
+                        ),
+                        (
+                            so.bloom_pieces_only,
+                            so.land_fresh_lazy,
+                            so.close_readable_inline
+                        ),
+                        "{arm}: the arm differs in the run's file alone"
+                    );
+                    assert_eq!(
+                        open(arm, &dir(&format!("{arm}-open")), 1).unwrap().name(),
+                        arm
+                    );
+                    assert_eq!(guarantee(arm), guarantee(s.name()), "{arm}");
+                }
                 let z = Supdb::create_jobsheap(&dir("jobsheap")).unwrap();
                 assert_eq!(z.name(), "supdb-jobsheap");
                 assert_eq!(z.features(), base.features());
