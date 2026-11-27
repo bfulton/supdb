@@ -10876,6 +10876,69 @@ the cache's room, which nothing had priced, under a comment that said
 for a new case is read at every caller before the change is built on,
 and where the callers split, so does the function.
 
+**A file written with no word of its size, in a file of files; and a
+cell lost to the cell beside it won.** The first pairing of a store
+under a cipher kept in one file read its loads at 1.3x to 1.5x the
+default's device bytes and the full rewrite's burst level, against a
+prediction of the burst ahead. An envelope was written into the table
+with nothing said of its length, so it was given a step of room and
+grown or moved, its bytes copied, a megabyte piece at a time, where a
+file of the directory just gets longer; the envelope's header knows the
+stored length before the first byte, and says it now
+(`Vault::write_envelope_at`, `One::expect`), no file moved or grown
+since. With it the burst read 1.2x ahead and the scan pass after it
+0.3x to 0.4x, and the pass's cause was looked for in the layout for an
+afternoon: its faults, its mappings, the kernel's memory for the group.
+Two counts already printed said it was not there. The pass's time over
+twenty-two reps of both arms is one line through the megabytes the
+device is written inside it (`lagdev`), the arms' residuals a twentieth
+of a second either side; and the merges' trace laid to the sweep's marks
+has them retire the same megabytes a second of their wall and of their
+CPU in both arms, three in flight in each. The burst that is four
+seconds shorter ends a gigabyte of merging further behind, and the pass
+reads beside it. It is this file's rule on a stall taken off a writer's
+path, met from the side of the thing that removed the stall, and it is
+recorded open in `ROADMAP.md` with its two levers. The rules: a writer
+into a shared file says its size before its first byte wherever
+anything it holds knows it, and a counter of what the table had to move
+or grow is read at the first pairing before any rate; a cell lost
+behind a cell won in the same sweep is first laid against what the won
+phase left undone, by the counts the sweep prints, before the mechanism
+under test is searched for a cost; and both arms' reps on one line
+against a third quantity is the reading that says the arms differ by
+that quantity alone.
+
+**A step ahead capped where the cap made it no step, and an ask of the
+filesystem on whatever thread wanted room.** The data file is made
+longer by what is asked for and an eighth of itself, "a few times a
+doubling" by the comment over it, and the eighth was held to 64 MiB:
+past half a gigabyte every growth was a file's worth and a constant,
+and a store of seven gigabytes asked the filesystem eighty times in a
+row of the suite. Each ask is a `fallocate` under the table's lock on
+the thread that wanted the room, and ext4 reads a block bitmap from the
+device for each group it has not looked at. Beside a load that is
+milliseconds. In the read pass after a load under a bound, where the
+crossing has just asked half a gigabyte of form files back and every
+small read waits behind megabytes of read-ahead, it was 0.72 s of one
+pass on the thread building the form files the reads were waiting for.
+Nothing in the engine's counters or the pass's faults by file showed
+it: both arms' faults fell on the same kinds of file in the same
+numbers. What showed it was every thread's state and kernel stack fifty
+times a second (`/proc/<pid>/task/*/stat` and `stack`), the samples
+summed by thread and by the frame they waited in. The eighth is held to
+a gibibyte (`onefile::AHEAD_MOST`), and a device with no room for the
+step ahead is asked for the file's alone: forty-six growths a row, and
+nothing in the allocator in three sampled passes. It is a dilution: a
+growth can still fall on a busy moment, and the log's, when the log is
+an extent of the file, cannot be an ask on a commit's path. The rules:
+a cap on a proportional step is read at the sizes the suite's largest
+rung reaches, against the comment that says what the step is for; a
+call into the filesystem made under a lock is priced where the device
+is busiest, not where the call was first timed; and where two arms'
+faults and counters agree and their rates do not, the next instrument
+is what each thread waits in, sampled, since a wait in the kernel that
+is not a fault is in no fault count.
+
 ## Standing limitations
 
 These are the engine's, as opposed to refuted predictions. Each is a curve

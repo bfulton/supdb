@@ -222,9 +222,11 @@ file a store that mobile wants) after them.
   it had in the directory (`x-<token>`, `.o`, `.z`). The manifest is the
   one-file format's with the table's section behind it, the whole sealed
   as a slot is; the log, the slots, the marker and the lock are files of
-  the directory still. A call that writes envelopes writes them with no
-  sync of their own and syncs the data file once at its end
-  (`Vault::persist_with`), a segment's and its index's under one flush.
+  the directory still. A segment's envelope is synced through its own
+  handle, which answers its writes' errors, and its index's envelope is
+  written ahead of it with no sync and rides that one
+  (`Vault::persist_with`, `ord_envelope`): a segment and its index under
+  one flush (`CLAUDE.md`, one sync for a call's envelopes).
   What Pagefile's S2-S3 drew larger -- chunks of whole pages with the
   tags apart, the classes -- waits for the stage that needs it: O5, where
   a run sealed as it is written cannot have a header that holds its
@@ -256,6 +258,96 @@ file a store that mobile wants) after them.
     extents converted at each sync (`ROADMAP.md`, what leans); (4) the
     group killed -- a memory file and its envelope's pages in the data
     file both standing where the files layout had dropped one.
+  - **Read: an envelope written with no word of its size.** The first
+    pairing (`SUPDB_LAG_COUNTERS=1 sh scripts/pair.sh
+    supdb-cipherautoonefile supdb-cipherauto 10000000 --bound 1342177280
+    --passes load,lag --reps 2 --ops-div 10`, at `c624353`) read the
+    loads' device bytes a byte stored 1.3x to 1.5x the default's and the
+    full rewrite's burst level, neither predicted: an envelope was
+    written into the table with nothing said of its length, so it was
+    given a step of room and grown or moved, its bytes copied, as its
+    megabyte pieces came. The header knows the stored length before the
+    first byte, and says it now (`Vault::write_envelope_at`, `One::expect`;
+    `an_envelope_is_given_the_room_it_fills`). The same command at
+    `e9e63f3`: device bytes a byte stored 3.1 against 3.1, no file moved
+    or grown in either sitting (`one_moves`, `one_grown`), the ordered
+    load 1.06x and 0.97x, the shuffled load 1.16x and 1.24x in four pairs
+    of four, the full rewrite's burst 1.17x and 1.24x in four pairs of
+    four -- the prediction's top.
+  - **Read: the first three lag points are a coin, in both arms.** The
+    clean store's pass and the passes after the one- and ten-percent
+    bursts read up to twice apart between reps of one arm, and a table
+    of two reps a sitting read them for or against by which reps it
+    held. By the pass's own counts (`lagcounters`, `groups`) each rep is
+    served by stride files (no group decoded) or by block files (eighty
+    thousand groups a pass), by whether the store in the stride form
+    fitted the conversion's room at the load's end (`zconvert room`,
+    980 to 1,010 MB against a block form of 842): the default in the
+    stride form in six reps of ten and the one-file arm in three, and
+    shape by shape the arms level (the pass after the one-percent burst
+    about 120 ms in the stride form and 205 in the block form, in
+    either arm).
+  - **Read: the pass after the full rewrite behind, refuted as (1)
+    named it and not by its mechanism.** 0.43x and 0.32x, no pair of
+    four, the scanning thread at 7,800 to 17,000 major faults against
+    900 to 6,000, with the pieces standing the same (21 to 37 against
+    26 to 37). Over eleven reps an arm (the pairings and three traced
+    reps) the pass's time is one line through the megabytes the device
+    is written inside it, in both arms: 684 ms and 1.78 ms a megabyte,
+    the arms' mean residuals 45 ms either side of it; the default
+    writes 85 to 290 MB there in ten reps of eleven, a last seal's
+    envelope, and read 1.5 s in the one rep it wrote 500; the one-file
+    arm writes 650 to 1,270 in its seven reps at `e9e63f3`. A merge trace of one rep an arm
+    (`SUPDB_MERGE_TRACE=1 SUPDB_LAG_MARK=1 SUPDB_LAG_COUNTERS=1 bench ab
+    --arms supdb-cipherautoonefile,supdb-cipherauto --size 10000000
+    --bound 1342177280 --passes lag --reps 1 --ops-div 10`, each
+    `mergejob` laid to the `lagmark` windows) says whose megabytes: the
+    merges retire the same input a second in both arms, 127 and 132 MB a
+    second of a merge's wall and 278 and 281 a second of its CPU, three
+    in flight for most of the burst in each; the one-file burst is
+    18.1 s against 22.2, so 4.5 GB is merged inside it against 5.35, and
+    eight merges of 600 MB end inside the pass where the default has one
+    of 75. The writer is 5 s of CPU in either burst and waits for the
+    rest on its commits' fdatasyncs of the log, which is where the frees
+    the one file does not make come back as a faster burst. So the
+    layout costs the pass nothing a count shows, and the burst it makes
+    faster ends a gigabyte of merging earlier in the debt. What the
+    merges wait on, half their wall in their value pass in both arms, is
+    the next reading (`ROADMAP.md`).
+  - **Read: the row's passes, and the read pass after the load.** The
+    row's order at `e9e63f3` (`sh scripts/pair.sh supdb-cipherautoonefile
+    supdb-cipherauto 10000000 --bound 1342177280 --passes
+    load,read,read-threaded,scan,scan-threaded,mixes,scan-mixed,mixes-scrambled
+    --reps 2 --ops-div 10`): both arms end in the stride form, the
+    shuffled load 1.08x and 1.26x in four pairs of four, the scrambled D
+    and E ahead in both orders, and most other cells with whichever arm
+    was listed second; the one-thread read pass after the load 0.64x and
+    1.05x, at 1.7x the major faults a read in both orders. Six reps an
+    order of that pass alone (`SUPDB_ZPAGES_TRACE=1 SUPDB_LAG_MARK=1 ...
+    --passes load,read --reps 6 --pairs "read "`): 0.87x in six pairs of
+    six, then 1.03x in three of six; over the twelve reps an arm the
+    medians 187 and 203 thousand reads a second, ahead in three pairs of
+    twelve. Not resolved, and what the traces say of the pass is both
+    arms': the crossing asks 380 to 570 MB of form files back a quarter
+    second before the reads begin or half a second after (six reps of
+    twelve after for this arm, three for the default), the form is
+    installed 0.55 to 1.1 s into the pass, a thousand reads made before
+    it, and the last two form files, 64 MB each, take 2 to 4.6 s of wall
+    for 0.3 s of CPU to build inside the pass, their thread 70% of its
+    samples in a page's read from the device
+    (`filemap_read_folio`) behind that read-back, while the reads of
+    their partitions fault on the raw form. Every major fault of one
+    rep's pass laid to its file (`perf record -a -e major-faults -c 1 -d
+    -k CLOCK_MONOTONIC`, the envelopes by `pagerback`'s place) is the
+    same in both arms: 20 thousand on form files, 17 thousand on the
+    load's pieces. One thing was the layout's: every thread's state
+    sampled fifty times a second (`/proc/<pid>/task/*/stat` and `stack`)
+    had the builder 0.72 s of one pass in `fallocate`, waiting for block
+    bitmaps behind the same read-back -- the data file made longer, 80
+    times a row, since the eighth it grows by was held to 64 MiB. Held
+    to a gibibyte (`onefile::AHEAD_MOST`): 46 growths a row, and none,
+    none and 0.02 s in the allocator over three reps' read passes. The
+    pass's rate with it is not paired yet.
 - **O5 -- the run its own log under a cipher, the controller on.**
   Pagefile's S4-S5 (the Log class, `finish`), E4's model first; and with
   it the sealing O4 left as it was: chunks of whole pages, the tags

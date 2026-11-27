@@ -1258,11 +1258,18 @@ turned on neither.
 - [ ] **The store in one file: what is built, and what leans.** Built:
   the plain store's segments, ordered indexes and form files as extents
   of one data file (`Options::one_file`, off; `src/db/onefile.rs`; the
-  arms `supdb-onefile` and `supdb-ingestonefile`). The log, the
-  manifest's slots, the lock and an ordered run are files of the
-  directory still, and a store under a cipher ignores the option. Held
-  by `tests/onefile.rs`, the suite's tests with their stores in it
-  (`SUPDB_TEST_ONEFILE=1`), the differential fuzz (`ZFUZZ_ONEFILE=1`) and
+  arms `supdb-onefile` and `supdb-ingestonefile`), and a store under a
+  cipher's envelopes as files of the same kind of table
+  (`Vault::one`; `supdb-cipheronefile`, `supdb-cipherautoonefile`,
+  `supdb-ingestcipherautoonefile`), the envelope and the cache over it
+  as they were. The log, the manifest's slots, the lock and an ordered
+  run are files of the directory still, and a checkpoint of an
+  encrypted store is refused as it was, until the full copy is built.
+  Held
+  by `tests/onefile.rs`, each test of it under a cipher beside the
+  plain one, the suite's tests with their stores in it
+  (`SUPDB_TEST_ONEFILE=1`, `tests/cipher.rs` among them), the
+  differential fuzz (`ZFUZZ_ONEFILE=1`, with `ZFUZZ_CIPHER=1`) and
   the `onefile` group. Paired against the default
   (`scratch/plan/onefile.md` has each command and table): level in
   memory at three hundred thousand and three million keys; at ten
@@ -1311,6 +1318,39 @@ turned on neither.
     over the file's range (`/proc/self/maps`), and the table's counts.
     Not seen as a store of files in 860 runs, which at that rate proves
     nothing.
+  - Under a cipher (`supdb-cipherautoonefile` against
+    `supdb-cipherauto`, ten million keys under 1.25 GiB;
+    `scratch/plan/onefile.md` has the commands and counts): the scan
+    pass after the lag sweep's full rewrite, 0.43x and 0.32x in no pair
+    of four, with the burst before it 1.17x and 1.24x ahead in every
+    pair. The pass's time is one line through the megabytes merges write
+    inside it in both arms, the merges retire the same megabytes a
+    second in both, and the faster burst ends with a gigabyte more to
+    merge: understood, and not taken back. The levers, neither built:
+    what a merge under a cipher waits on for half its wall in its value
+    pass, in both layouts, which the thread-state sampler of that plan
+    reads in one run of the sweep (the merges' threads have no name, so
+    they are told from the seals' by the `mergejob` lines' times); and a
+    writer held to what the merges retire where nothing else holds it,
+    which gives the burst's gain back. Read it again once an envelope is
+    sealed as it is written, which changes what a merge costs.
+  - Under a cipher, the one-thread read pass after the load: 0.92x at
+    the median of twelve reps an arm, ahead in three pairs of twelve,
+    not resolved. One cause was found and taken out, the data file made
+    longer on the form builder's thread inside the pass
+    (`onefile::AHEAD_MOST`), by its count and not yet by a pairing of
+    the rate. What the pass pays in both layouts is the larger thing:
+    the crossing's read-back of four to six hundred megabytes of form
+    files as the reads begin, behind which the last two form files take
+    two to four seconds to build and the form is installed half a
+    second to a second into the pass (the standing limitation on the
+    read pass after a load, in `CLAUDE.md`).
+  - Under a cipher, the first three points of the lag sweep are served
+    by stride files or by block files rep by rep, in both arms, by
+    whether the store in the stride form fits the conversion's room at
+    the load's end; level shape by shape, and a pairing of two reps a
+    sitting reads the coin. Whether the layout moves the coin is not
+    known: three reps of ten in the stride form against six.
   The row's passes under 1.25 GiB, paired at `b22446f` with each mapping
   on an open of its own (`pair.sh supdb-onefile supdb 10000000 --bound
   1342177280 --passes
@@ -1319,11 +1359,21 @@ turned on neither.
   shuffled load, 1.06x and 1.03x ahead in six pairs of six; the scrambled
   F mix, 0.81x and 0.96x before the mappings' own opens, read 0.94x in
   one order and 1.15x in the other.
-  Then the stages left, in the order agreed: the sealing over extents,
-  for a store under a cipher in one file; a run its own log under a
-  cipher, with the controller on; the log, the slots and the run into
-  the file, and the full-copy checkpoint; the defaults, each only where
-  the suite reads it better and the gate passes with it on.
+  Owed on the cipher's stage before it is called closed, none of it run
+  on the tree with the growth's step changed: the differential fuzz's
+  ranges under `ZFUZZ_ONEFILE=1 ZFUZZ_CIPHER=1`, the count
+  (`sh scripts/cost.sh`), the lists against both bases, the whole gate
+  with the `onefile` group, mutants of the step and its fall back
+  (`scratch/onefile/mutants-o4.txt`), a pairing of the read pass with
+  the step, the row in memory, and the lost cells against
+  `rocksdb-tuned-enc`.
+  Then the stages left, in the order agreed: a run its own log under a
+  cipher, with the controller on, and with it an envelope of whole pages
+  sealed as it is written; the log, the slots and the run into the
+  file, and the full-copy checkpoint, where the log's growth cannot be a
+  `fallocate` on a commit's path (the entry on the growth's step in
+  `CLAUDE.md`); the defaults, each only where the suite reads it better
+  and the gate passes with it on.
 
 ### Before a pull request
 

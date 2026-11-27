@@ -1292,8 +1292,11 @@ unsafe impl Send for Paged {}
 unsafe impl Sync for Paged {}
 
 /// `SUPDB_PAGER_TRACE=1`: a `pagerback` line on stderr where a view is
-/// given its envelope, the file's name beside the envelope's, so that a
-/// fault laid to an envelope by its address is laid to the file it holds.
+/// given its envelope, the file's name beside the envelope's and the
+/// envelope's place in the file it lies in, so that a fault laid to an
+/// envelope by its address is laid to the file it holds: by the
+/// envelope's name where it is a file of the directory, and by its place
+/// where every envelope is a range of one data file.
 fn trace_back(label: &str, back: &Back) {
     static ON: OnceLock<bool> = OnceLock::new();
     if *ON.get_or_init(|| std::env::var_os("SUPDB_PAGER_TRACE").is_some()) {
@@ -1301,7 +1304,12 @@ fn trace_back(label: &str, back: &Back) {
             .path
             .file_name()
             .map(|n| n.to_string_lossy().into_owned());
-        eprintln!("pagerback {label} {}", env.unwrap_or_default());
+        eprintln!(
+            "pagerback {label} {} at {} len {}",
+            env.unwrap_or_default(),
+            back.at,
+            back.map.len()
+        );
     }
 }
 

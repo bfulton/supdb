@@ -86,6 +86,14 @@ const BIG: u64 = 1 << 20;
 /// one run of them, and the test binary that ran next died of a full
 /// disk.
 const STEP: u64 = 16 * GRAIN;
+/// The most the data file is made longer by beyond what is asked for: a
+/// gibibyte, the eighth of a store of eight (`One::room`).
+const AHEAD_MOST: u64 = 1024 * BIG;
+/// What a data file of `end` bytes is made longer by beyond what is asked
+/// for: an eighth of it, a step at the least and `AHEAD_MOST` at the most.
+fn ahead(end: u64) -> u64 {
+    (end / 8).clamp(STEP, AHEAD_MOST)
+}
 /// The magic of the section a manifest carries behind its own bytes.
 const SECTION: &[u8; 8] = b"SUPDBEXT";
 
@@ -409,6 +417,10 @@ pub(crate) struct One {
     /// outgrows its room at its second.
     #[cfg(test)]
     tight: AtomicBool,
+    /// A test's: the device has no room for the step ahead of what is
+    /// asked for (`room`), as a nearly full one has not.
+    #[cfg(test)]
+    no_room_ahead: AtomicBool,
     /// A test's: run inside a file's sync, after the sync has read how
     /// many writes the file has had and before it returns, which is where
     /// a write beside the sync falls.
@@ -499,6 +511,8 @@ impl One {
             #[cfg(test)]
             tight: AtomicBool::new(false),
             #[cfg(test)]
+            no_room_ahead: AtomicBool::new(false),
+            #[cfg(test)]
             mid_sync: Mutex::new(None),
         })
     }
@@ -539,16 +553,43 @@ impl One {
     /// them, from the data file made longer: by what is asked for and an
     /// eighth of the file besides, so a store that is growing asks the
     /// filesystem a few times a doubling, and a small one reserves little
-    /// (`STEP`).
+    /// (`STEP`). The eighth is held to `AHEAD_MOST`, and where the device
+    /// has no room for it the file is made longer by what is asked for
+    /// alone.
+    ///
+    /// The ask is `fallocate` under the table's lock, on whichever thread
+    /// wanted the room, and the filesystem reads a block bitmap from the
+    /// device for each group it has not looked at: a few milliseconds
+    /// beside a load, and a third of a second an ask where every small
+    /// read waits behind megabytes of read-ahead. The eighth was held to
+    /// 64 MiB for a while, which past half a gigabyte is no eighth: a
+    /// store of seven gigabytes asked eighty times in a row of the suite,
+    /// twice of them in the read pass after its load on the thread
+    /// building the form files those reads were waiting for.
     fn room(&self, s: &mut Inner, len: u64, align: u64) -> Result<u64> {
         debug_assert!(len.is_multiple_of(GRAIN) && len > 0);
         if let Some(at) = s.space.take(len, align) {
             return Ok(at);
         }
         let at = up(s.end, align);
-        let more = (s.end / 8).clamp(STEP, 64 * BIG);
-        let end = up(at + len + more, if more < BIG { STEP } else { BIG });
-        self.reserve(s.end, end)?;
+        let more = ahead(s.end);
+        let mut end = up(at + len + more, if more < BIG { STEP } else { BIG });
+        #[cfg(test)]
+        let ahead = if self.no_room_ahead.load(Ordering::Relaxed) {
+            Err(Error::from_raw_os_error(libc::ENOSPC))
+        } else {
+            self.reserve(s.end, end)
+        };
+        #[cfg(not(test))]
+        let ahead = self.reserve(s.end, end);
+        if let Err(e) = ahead {
+            // No room for the step ahead is not no room for the file.
+            if e.raw_os_error() != Some(libc::ENOSPC) {
+                return Err(e);
+            }
+            end = up(at + len, GRAIN);
+            self.reserve(s.end, end)?;
+        }
         self.growths.fetch_add(1, Ordering::Relaxed);
         s.space.give(s.end, end - s.end);
         s.end = end;
@@ -1949,6 +1990,68 @@ mod tests {
         assert!(c.grown > 0, "{c:?}");
         drop(g);
         assert_eq!(read(&one, "seal-2.tmp"), a);
+    }
+
+    #[test]
+    fn the_data_file_is_made_longer_by_an_eighth_a_few_times_a_doubling() {
+        // The step itself, at the sizes no test can write: an eighth from
+        // a step to a gibibyte, where a cap of 64 MiB had a store of four
+        // gibibytes ask the filesystem sixty times for its next four.
+        assert_eq!(ahead(0), STEP);
+        assert_eq!(ahead(8 * STEP), STEP);
+        assert_eq!(ahead(512 << 20), 64 << 20);
+        assert_eq!(ahead(4 << 30), 512 << 20);
+        assert_eq!(ahead(8 << 30), AHEAD_MOST);
+        assert_eq!(ahead(64 << 30), AHEAD_MOST);
+        // And a table's: the second file's room is found by making the
+        // data file longer by its length and an eighth of what stood.
+        let d = scratch("ahead");
+        let one = One::create(&d).unwrap();
+        let f = one.make("seal-1.tmp").unwrap();
+        one.expect("seal-1.tmp", 16 << 20);
+        f.write_all_at(&bytes(4096, 1), 0).unwrap();
+        let before = one.counts();
+        let g = one.make("seal-2.tmp").unwrap();
+        one.expect("seal-2.tmp", 8 << 20);
+        g.write_all_at(&bytes(4096, 2), 0).unwrap();
+        let c = one.counts();
+        assert_eq!(c.growths, before.growths + 1, "{c:?}");
+        let beyond = c.end - before.end - (8 << 20);
+        assert!(
+            (before.end / 8..=before.end / 8 + 2 * BIG).contains(&beyond),
+            "an eighth of {} beyond what was asked for: {beyond}",
+            before.end
+        );
+        // A third file of a mebibyte finds its room in that eighth, and
+        // the filesystem is asked nothing.
+        let h = one.make("seal-3.tmp").unwrap();
+        one.expect("seal-3.tmp", 1 << 20);
+        h.write_all_at(&bytes(4096, 3), 0).unwrap();
+        assert_eq!(one.counts().growths, c.growths);
+    }
+
+    #[test]
+    fn a_device_with_no_room_for_the_step_ahead_gives_what_is_asked_for() {
+        let d = scratch("ahead-none");
+        let one = One::create(&d).unwrap();
+        put(&one, "seal-1.tmp", &bytes(4 << 20, 1));
+        let before = one.counts();
+        one.no_room_ahead.store(true, Ordering::Relaxed);
+        let a = bytes(2 << 20, 2);
+        let f = one.make("seal-2.tmp").unwrap();
+        one.expect("seal-2.tmp", a.len() as u64);
+        f.write_all_at(&a, 0).unwrap();
+        f.sync().unwrap();
+        drop(f);
+        let c = one.counts();
+        assert_eq!(c.growths, before.growths + 1, "{c:?}");
+        assert_eq!(
+            c.end,
+            up(before.end, BIG) + a.len() as u64,
+            "longer by the file and nothing ahead of it: {c:?}"
+        );
+        assert_eq!(read(&one, "seal-2.tmp"), a);
+        assert_eq!(read(&one, "seal-1.tmp"), bytes(4 << 20, 1));
     }
 
     #[test]
