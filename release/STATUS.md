@@ -20,7 +20,7 @@ and merges that branch to main for the tag.
 | 0 | History decision (B) | Bright | none | keep history and fix forward, the plan's default; the audit finds nothing for a rewrite (`release/history.md`) | nothing, unless Bright overrules |
 | 0 | Release-candidate branch, C0 | coordinator | `release-candidate`, cut at C0 = `b3a043dc` (tree `7f58d776`) | done; `ci` was green on all nine legs at that commit (push run 46057759527) | nothing |
 | 0 | Baseline at C0 | measurement agent, cloud session `supdb: baseline measurement at C0` | `release/baseline.md`; rows on `release-measure` | prepared and verified; static counts measured; the cost count of C0 against itself running here; the measurement session started at 17:59 ET on the rows and the floor | nothing |
-| 1 | Delete: options ledger, dead code, API surface | coordinator's subagents | `release/options.csv` | mechanical columns done and verified; the judgment pass running, five agents over a fifth each | decision 1, defaulted to hidden fields and `#[non_exhaustive]` unless Bright overrules |
+| 1 | Delete: options ledger, dead code, API surface | coordinator's subagents | `release/options.csv`, `release/phase1.md` | ledger judged and reviewed twice: 260 of 453 options go, in thirty pull requests | the cost gate's fix (`rc/cost-floor`), then PR1 |
 | 2 | Reshape: split `src/db.rs`, style | not assigned | none | not started | phase 1 |
 | 3 | Verify: audits, then fixes | not assigned | `release/findings/` | not started; inputs from the history audit: `bank-row.yml`'s write token, unpinned actions, five workflows without `permissions:` | phase 2, decisions 4 and 7 |
 | 4 | Tests: flake loop, runtime, coverage | not assigned | none | not started | the last fix of phase 3, decision 5 |
@@ -36,7 +36,7 @@ still open below is what changes what ships.
 
 | # | Decision | Sets | State |
 |---|---|---|---|
-| 1 | Experimental options: stay in the public `Options` type, or move to a sub-struct or a feature | phase 1 | default taken: they stay in `Options`, hidden from the docs, and `Options` becomes `#[non_exhaustive]`; Bright may overrule |
+| 1 | Experimental options: stay in the public `Options` type, or move to a sub-struct or a feature | phase 1 | default taken: they stay in `Options`, hidden from the docs; no `#[non_exhaustive]`, which would break 667 struct literals in the tests, the suite and the examples; Bright may overrule |
 | 2 | Is encryption in this tag | phase 3's scope | yes: the tag is of main, and encryption is on main since #35 |
 | 3 | Version and tag name; whether to publish to crates.io | phases 5 and 7 | open; `Cargo.toml` says 0.1.0 |
 | 4 | The format compatibility promise that starts at the tag | phase 3 | open |
