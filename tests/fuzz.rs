@@ -503,6 +503,10 @@ struct Cfg {
     settle_twice: bool,
     settle_staged: bool,
     settle_noconvert: bool,
+    /// A settle's conversion that leaves the fill no walk
+    /// (`Options::settle_convert_fills` off): in a quarter of the seeds
+    /// under `ZFUZZ_OPTVARY`, the side generator's draw after those.
+    settle_quiet: bool,
     /// Under `ZFUZZ_STRIDE`, the stride form's steer; `None` without it.
     stride: Option<StrideSteer>,
 }
@@ -813,6 +817,7 @@ fn pick_cfg(rng: &mut Rng, want_cache: bool) -> Cfg {
     let (bursts_all, held_files) = (side.chance(25), side.chance(25));
     let (settle_loads, settle_twice) = (side.chance(25), side.chance(25));
     let (settle_staged, settle_noconvert) = (side.chance(25), side.chance(25));
+    let settle_quiet = side.chance(25);
     // A generator of its own, as `side` is, so that the switch moves none
     // of the draws below.
     let stride =
@@ -899,6 +904,7 @@ fn pick_cfg(rng: &mut Rng, want_cache: bool) -> Cfg {
         settle_twice: vary && settle_twice,
         settle_staged: vary && settle_staged,
         settle_noconvert: vary && settle_noconvert,
+        settle_quiet: vary && settle_quiet,
         stride,
     }
 }
@@ -1086,6 +1092,7 @@ fn opts_z(c: &Cfg) -> Options {
     o.settle_sorts_once = !c.settle_twice;
     o.settle_patch_in_place = !c.settle_staged;
     o.settle_converts = !c.settle_noconvert;
+    o.settle_convert_fills = !c.settle_quiet;
     // Last, over whatever the flags set: the overwrite and what it needs.
     if c.in_place {
         o.put_in_place = true;

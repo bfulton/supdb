@@ -8435,6 +8435,117 @@ fn a_light_form_converts_on_the_upkeep_thread_and_not_over_a_burst() {
     }
 }
 
+/// A settle that converts the form its batch takes to the dense count
+/// leaves the fill its walk of the tables (`Options::settle_convert_fills`),
+/// as the patch that left a form at the dense count had: the walk is where
+/// the fill meets the light forms, and in a store whose written blocks all
+/// hold a form nothing else starts one. Sixty blocks take a delta a round
+/// for five rounds, light forms past the line and under the dense count,
+/// with no walk after the first round's, whose writes landed in blocks with
+/// no form; then twelve writes take one block's form past the dense count.
+/// With the walk left, the fill converts the light forms behind the settle's
+/// one conversion; without it (`supdb-settleconvertquiet`'s shape) the
+/// settle converts its one form and every light form stays deltas; and with
+/// the conversion left to the fill (`Options::settle_converts` off) the
+/// fill converts them all, the dense one among them. The scans read the
+/// model's answers each way.
+#[test]
+fn a_settles_conversion_leaves_the_fill_its_walk() {
+    for (name, converts, fills) in [
+        ("fills", true, true),
+        ("quiet", true, false),
+        ("left-to-the-fill", false, true),
+    ] {
+        let d = dir(&format!("settle-convert-{name}"));
+        let opts = Options {
+            seal_bytes: 1 << 26,
+            partition_bytes: Some(1 << 20),
+            scan_block_cache: true,
+            settle_converts: converts,
+            settle_convert_fills: fills,
+            // In memory, the controller's FITS: a light form converts
+            // only while the gate is at the raw form.
+            zpages: supdb::ZPages::Auto,
+            ..common::options()
+        };
+        let mut db = Db::create(&d, opts).unwrap();
+        let mut m = ScanModel::default();
+        let key = |k: u32| format!("key-{k:05}");
+        for k in 0..32_000u32 {
+            m.append(&mut db, &key(k), "p");
+        }
+        db.commit().unwrap();
+        db.flush().unwrap();
+        m.flushed();
+        // A scan, so that the commits after it maintain the forms.
+        m.check_one(&db, key(0).as_bytes(), 100, "clean");
+        let events = db.forms_events()[13];
+        for round in 0..5u32 {
+            for b in 0..60u32 {
+                m.append(&mut db, &key(b * 64 + 2 + round * 9), &format!("u{round}"));
+            }
+            db.commit().unwrap();
+            db.settle().unwrap();
+        }
+        // The premise: sixty light forms, and nothing has converted one.
+        let (_, sparse, copies, _) = db.block_cache_kinds();
+        assert!(
+            sparse >= 60 && copies == 0,
+            "{name}: sixty light forms before the crossing: {sparse} sparse, {copies} copies"
+        );
+        assert_eq!(
+            db.forms_events()[13],
+            events,
+            "{name}: a form converted before any reached the dense count"
+        );
+        assert_eq!(db.settle_lean().1, 0, "{name}: a settle converted early");
+        let passes = db.upkeep_counts()[0];
+        // Twelve more keys of the first block: five deltas and twelve.
+        for k in 40..52u32 {
+            m.append(&mut db, &key(k), "dense");
+        }
+        db.commit().unwrap();
+        db.settle().unwrap();
+        assert!(
+            db.upkeep_counts()[0] > passes,
+            "{name}: the thread made no pass, so nothing above tested it"
+        );
+        let by_settle = db.settle_lean().1;
+        let from_form = db.forms_events()[13] - events;
+        let (_, sparse, copies, _) = db.block_cache_kinds();
+        if converts {
+            assert_eq!(
+                by_settle, 1,
+                "{name}: the settle converts the block it grew dense"
+            );
+        } else {
+            assert_eq!(by_settle, 0, "{name}: the settle converts nothing");
+        }
+        if fills {
+            assert!(
+                from_form >= 31 && copies >= 31,
+                "{name}: the walk converts the light forms: {from_form} conversions, \
+                 {copies} copies, {sparse} sparse"
+            );
+        } else {
+            assert_eq!(
+                (from_form, copies),
+                (1, 1),
+                "{name}: no walk, and the light forms stay deltas ({sparse} sparse)"
+            );
+            assert!(sparse >= 59, "{name}: {sparse} sparse");
+        }
+        for b in (0..60u32).step_by(7) {
+            m.check_one(
+                &db,
+                key(b * 64).as_bytes(),
+                200,
+                &format!("{name}: block {b} after the crossing"),
+            );
+        }
+    }
+}
+
 /// A manifest publish keeps the manifest it replaces linked under a spare
 /// name, so that the rename frees no inode on the publish's path, and the
 /// spare is unlinked by the segment work when idle and at open

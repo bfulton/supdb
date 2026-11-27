@@ -6974,6 +6974,18 @@ pub struct Options {
     /// run of up to sixty-four deltas, and the scans after it walked them.
     /// `supdb-settlenoconvert` leaves the conversions to the fill.
     pub settle_converts: bool,
+    /// Whether a settle that converted a form (`settle_converts`) leaves
+    /// the fill its walk of the tables, as the patch that left a form at
+    /// the dense count had. That walk is where the fill meets the light
+    /// forms (`forms_convert_from`), and in a store whose every block
+    /// holds a form nothing else starts one: a write into a block with no
+    /// form does, and there is none. Converted by the settle with no walk
+    /// left, the forms the scrambled write mixes leave under the dense
+    /// count stayed deltas -- 98 of 157 blocks at ten thousand keys, where
+    /// the walk a dense form started had left one -- and the scrambled E
+    /// walked them. `supdb-settleconvertquiet` is the conversion with no
+    /// walk left.
+    pub settle_convert_fills: bool,
     /// EXPERIMENT: how long a look at whether a partition's heads are all
     /// in the page cache stands, in milliseconds, for the asks a settle
     /// makes ahead of its resolves out of core (`heads_willneed`): while a
@@ -8344,6 +8356,7 @@ impl Default for Options {
             settle_sorts_once: true,
             settle_patch_in_place: true,
             settle_converts: true,
+            settle_convert_fills: true,
             heads_look_ms: 0,
             heads_owned: true,
             heads_owned_beside_copies: true,
@@ -37828,6 +37841,16 @@ impl Reader {
                     && !self.cache_over_binds()
                 {
                     self.convert_settled(at, b, table)?;
+                    // The walk a patch left the fill where it left a form
+                    // at the dense count (`patch_block`), which the form
+                    // converted here no longer does: the fill meets the
+                    // light forms on it (`Options::settle_convert_fills`).
+                    if self.opts.settle_convert_fills
+                        && self.opts.commit_forms
+                        && self.slot.is_none()
+                    {
+                        self.fs().tables_complete.set(false);
+                    }
                 }
                 if in_place && self.patch_in_place(at, b, table, key, cut, (src, slot)) {
                     placed += 1;
