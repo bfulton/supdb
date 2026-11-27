@@ -6,7 +6,7 @@ and FASTER. This file is the rules for working on it. `bench/CLAUDE.md` has
 the suite's, `bench/DESIGN.md` says how a thing is measured, `ROADMAP.md`
 holds the open work, and `docs/engine.md` the design and its measurements.
 
-The incident behind each rule is in this file as it stood at `99d44af`. A
+The incident behind each rule is in this file as it stood at `09cadec0`. A
 pointer elsewhere of the form (`CLAUDE.md`, *entry*) names an entry there.
 
 ## Writing
