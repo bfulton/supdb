@@ -31,8 +31,9 @@ another expression.
 
 `--keep LEDGER` is the plain run with one difference: each row's
 `category`, `decision` and `note` are LEDGER's, carried by (struct, name),
-where a plain run writes them empty. LEDGER is read whole before anything
-is written; one that cannot be read, is no ledger, has no row or holds a
+where a plain run writes them empty. Once the three are filled the ledger
+is re-made with `--keep`, never by the plain run, whose output would
+erase them. LEDGER is read whole before anything is written; one that cannot be read, is no ledger, has no row or holds a
 key twice exits 1. Stderr says how many rows carry a judgment, names the
 rows of LEDGER with no row now (an option deleted or renamed: its judgment
 is not carried) and the rows that are new (written empty). It has two
