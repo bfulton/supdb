@@ -8485,6 +8485,7 @@ fn os_page_unwritten(path: &Path) -> Option<bool> {
 /// after the drop and never touched). The drop starts the writeback, so a
 /// file is asked once, after the state it is asked of. `None` where a
 /// call fails.
+#[cfg(target_os = "linux")]
 fn os_page_kept_unwritten(path: &Path) -> Option<bool> {
     use std::os::fd::AsRawFd;
     let f = std::fs::File::open(path).ok()?;
@@ -8538,6 +8539,7 @@ fn an_open_syncs_its_slot(tag: &str, base: Options) {
         f.write_all_at(&bytes[j], 0).unwrap();
     }
     std::fs::write(&control, &bytes[newest]).unwrap();
+    #[cfg(target_os = "linux")]
     let before = [0, 1].map(|j| os_page_unwritten(&d.join(OS_SLOTS[j])));
     let from = Db::trace_dir_io(&d, true).len();
     let db = Db::open(&d, opts.clone()).unwrap();
@@ -8552,6 +8554,10 @@ fn an_open_syncs_its_slot(tag: &str, base: Options) {
             "{tag}: the open fdatasynced {slot}: {calls:?}"
         );
     }
+    // Without the kernel's page flags, the page cache asked whether each
+    // page was written, which is Linux's alone (a drop of clean pages and
+    // `mincore` after it); elsewhere the calls' record above is the test.
+    #[cfg(target_os = "linux")]
     if before.iter().any(|b| b.is_none()) {
         // Without the kernel's page flags, the page cache asked whether
         // each page was written: the control, written and synced by
@@ -14666,6 +14672,7 @@ fn a_helpers_failed_sync_is_not_tried_again() {
 }
 
 /// The descriptors this process holds open on `path`.
+#[cfg(target_os = "linux")]
 fn fds_on(path: &Path) -> Vec<i32> {
     let want = std::fs::canonicalize(path).unwrap();
     let mut out = Vec::new();
@@ -14681,6 +14688,7 @@ fn fds_on(path: &Path) -> Vec<i32> {
 }
 
 /// A descriptor's open flags, as `/proc/self/fdinfo` reads them.
+#[cfg(target_os = "linux")]
 fn fd_flags(fd: i32) -> u32 {
     let info = std::fs::read_to_string(format!("/proc/self/fdinfo/{fd}")).unwrap();
     let line = info
@@ -14694,6 +14702,7 @@ fn fd_flags(fd: i32) -> u32 {
 /// (`O_RDONLY | O_CLOEXEC`), as `/proc/self/fdinfo` reads them with what
 /// the kernel adds to every open (`O_LARGEFILE`): what the helper's own
 /// open of the file reads as, flag for flag.
+#[cfg(target_os = "linux")]
 fn open_flags(path: &Path) -> u32 {
     use std::os::unix::io::AsRawFd;
     let f = std::fs::File::open(path).unwrap();
@@ -14708,6 +14717,7 @@ fn open_flags(path: &Path) -> u32 {
 
 /// Whether two of this process's descriptors are one open file
 /// description.
+#[cfg(target_os = "linux")]
 fn one_description(a: i32, b: i32) -> bool {
     let pid = std::process::id() as libc::pid_t;
     // SAFETY: compares two of this process's descriptors; no memory.
@@ -14728,6 +14738,7 @@ fn one_description(a: i32, b: i32) -> bool {
 /// process's, and the tests beside it in this one hold and free numbers
 /// of their own, every two-digit one at times, so that no writer here
 /// could be given one.
+#[cfg(target_os = "linux")]
 #[test]
 fn a_helpers_description_is_its_own_at_every_width_of_the_writers_descriptor() {
     const ALONE: &str = "SUPDB_TEST_DESCRIPTOR_WIDTHS";
@@ -14843,6 +14854,7 @@ fn a_helpers_description_is_its_own_at_every_width_of_the_writers_descriptor() {
 /// read-only and closed on exec, held while the helper runs and closed
 /// with it at the finish. Both kinds of writer, as the helper's row is
 /// handed over by one and not the other.
+#[cfg(target_os = "linux")]
 #[test]
 fn a_helper_with_no_seam_syncs_on_a_description_of_its_own() {
     let d = dir("dur-hrace-noseam");

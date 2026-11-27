@@ -365,15 +365,15 @@ to run (`lz4-sys`'s) hands the host's `cc` `-arch arm64`, and a Linux
 branch the engine's tests and examples are in the same case: their
 cipher (`ring`, a dev-dependency) compiles C and assembly for the target
 in its build script, and clang here, given the target, wants Apple's
-headers (`TargetConditionals.h`, then the C library's), so the check from
-a Linux host is of the library, its binaries and its unit tests, which
-take no dev-dependency, the last compiled as their test binary and linked
-by a linker that does nothing (`cargo rustc --lib --target
-aarch64-apple-darwin --profile checked -- --test -C linker=true`), and
-every target is linted on the macOS leg of CI, where the host is the
-target. The unit tests were left out of it until a pull request's first
-macOS leg failed at them: two test seams in `vault` under `cfg(test)`
-alone called a module only Linux compiles. Its first
+headers (`TargetConditionals.h`, then the C library's). Clang builds it
+for the target here against stand-ins for the four such headers it reads
+(`scripts/macos-headers`), freestanding and never linked, so the lint
+group lints every target for macOS from a Linux host as the macOS leg of
+CI does, the tests and the examples among them. It linted the library and
+its binaries alone for a while, and the pull request's first two macOS
+legs failed on what that left out: two test seams in `vault` under
+`cfg(test)` alone that call a module only Linux compiles, then an
+example's and two test files' Linux calls with no guard. Its first
 run here found the library itself not compiling for macOS: two of the
 cache's advices under a cipher (`posix_fadvise` and `MADV_POPULATE_READ`,
 in `pager.rs`) were Linux's alone with no guard, from two commits that no

@@ -216,26 +216,32 @@ for g in $groups; do
     lint)
       say "lint"
       cargo clippy --release --all-targets -- -D warnings
-      # The macOS side of the tree's cfg guards, type-checked: three test
-      # helpers only Linux's tests call were dead code there, and no Linux
-      # lint could say so. Clippy links nothing, so the target's rust-std,
-      # which rust-toolchain.toml lists, is all it needs. Skipped where the
-      # host is that target and the line above was this one. The library
-      # and its binaries alone from any other host: the tests' and the
-      # examples' cipher (`ring`, a dev-dependency) compiles C and assembly
-      # in its build script, which this host's compilers cannot make for
-      # macOS without Apple's headers, and every target of the tree is
-      # linted on the macOS leg of CI, where the line above is that host's.
+      # The macOS side of the tree's cfg guards, type-checked: every target
+      # -- the library, its binaries, its unit and integration tests, its
+      # examples -- as the macOS leg of CI lints them, which no Linux lint
+      # can stand in for. Clippy links nothing, so the target's rust-std,
+      # which rust-toolchain.toml lists, is what Rust needs; the tests' and
+      # the examples' cipher (`ring`, a dev-dependency) compiles C in its
+      # build script, which clang builds for the target here against
+      # stand-ins for the four headers it reads of Apple's and the C
+      # library's (scripts/macos-headers), freestanding, its objects never
+      # linked. The library and its binaries alone were checked here for a
+      # while, and the pull request's first macOS legs failed on what that
+      # left out: two test seams in `vault` under `cfg(test)` alone that
+      # call a module only Linux compiles, then an example's and two test
+      # files' Linux calls (`posix_fadvise`, `syncfs`, `kcmp`, a thread's
+      # rusage) with no guard. Skipped where the host is that target and
+      # the line above was this one.
       mac=aarch64-apple-darwin
       if [ "$(rustc -vV | sed -n 's/^host: //p')" != "$mac" ]; then
-        cargo clippy --release --lib --bins --target "$mac" -- -D warnings
-        # ... and the library's unit tests for it, which use no cipher of
-        # a dev-dependency: compiled as the test binary they are and linked
-        # by a linker that does nothing, there being no Apple linker here.
-        # Two test seams in `vault` called a module only Linux compiles, under
-        # `cfg(test)` alone, and four helpers only Linux's tests call were
-        # dead code there: the macOS leg of CI was the first to compile them.
-        cargo rustc --lib --target "$mac" --profile checked -- --test -C linker=true -D warnings
+        cc_mac=$(command -v clang || ls -d /usr/lib/llvm-*/bin/clang 2>/dev/null | sort -V | tail -1)
+        [ -n "$cc_mac" ] || {
+          echo "lint: no clang to build the macOS target's C with (apt: clang)" >&2
+          exit 1
+        }
+        CC_aarch64_apple_darwin="$cc_mac" \
+          CFLAGS_aarch64_apple_darwin="-ffreestanding -I$PWD/scripts/macos-headers" \
+          cargo clippy --release --all-targets --target "$mac" -- -D warnings
       fi
       sh scripts/fmt.sh --check
       # The door, by symbol, and its red input (scripts/door/run.sh).

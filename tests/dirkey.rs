@@ -181,6 +181,7 @@ fn on_the_filesystem(name: &str) -> PathBuf {
 }
 
 /// Everything the filesystem holds, written through to its file.
+#[cfg(target_os = "linux")]
 fn written_through(dir: &Path) {
     use std::os::fd::AsRawFd;
     let d = std::fs::File::open(dir).unwrap();
@@ -192,6 +193,7 @@ fn written_through(dir: &Path) {
 /// them. Read a megabyte at a time, each piece with the tail of the one
 /// before it, and a piece of nothing but zeroes, which is most of a
 /// filesystem in a sparse file, is not searched.
+#[cfg(target_os = "linux")]
 fn on_the_device(needles: &[&[u8]]) -> Vec<bool> {
     use std::io::Read;
     let longest = needles.iter().map(|n| n.len()).max().unwrap();
@@ -220,6 +222,7 @@ fn on_the_device(needles: &[&[u8]]) -> Vec<bool> {
 /// its keys or its values. Beside it, a file written in the clear on the
 /// same filesystem, which the same search of the device does find: the
 /// search can see.
+#[cfg(target_os = "linux")]
 #[test]
 #[ignore = "needs a filesystem that can encrypt: scripts/check.sh fscrypt"]
 fn a_store_under_a_key_is_ciphertext_on_the_device_and_reads_as_itself() {

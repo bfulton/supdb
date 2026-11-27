@@ -180,6 +180,7 @@ fn arm<B: Bytes>(
 
 /// The file's pages out of the page cache: nothing maps it when this is
 /// called, and it was synced when it was written.
+#[cfg(target_os = "linux")]
 fn evict(path: &Path) {
     use std::os::fd::AsRawFd;
     let f = std::fs::File::open(path).expect("open");
@@ -189,6 +190,7 @@ fn evict(path: &Path) {
 }
 
 /// This thread's major faults so far.
+#[cfg(target_os = "linux")]
 fn major_faults() -> i64 {
     // SAFETY: a query that fills the struct handed to it.
     unsafe {
@@ -201,6 +203,7 @@ fn major_faults() -> i64 {
 /// Reads from cold: the reader opened over a file with no page in the
 /// cache, random advice, and each key read once. Major faults at the open,
 /// major faults a read, and microseconds a read.
+#[cfg(target_os = "linux")]
 fn cold<B: Bytes>(path: &Path, open: &dyn Fn() -> Blob<B>, keys: &[Vec<u8>]) -> (i64, f64, f64) {
     evict(path);
     let f0 = major_faults();
@@ -364,46 +367,54 @@ fn main() {
         println!();
     }
 
-    // Out of the page cache: distinct keys, each read once.
-    let mut once = probes(keys, &[3, 6], 3_000);
-    once.sort();
-    once.dedup();
-    println!(
-        "\nfrom cold, random advice: major faults at the open, major faults a read, us a read"
-    );
-    let nothing = ReadOptions {
-        keep_bytes: 0,
-        ..ReadOptions::default()
-    };
-    let row = |name: &str, (at_open, a_read, us): (i64, f64, f64)| {
-        println!("{name:<14}{at_open:>8}{a_read:>10.2}{us:>10.1}");
-    };
-    row(
-        "plain-mmap",
-        cold(
-            &plain,
-            &|| Blob::open(MmapBytes::open(&plain).unwrap()).unwrap(),
-            &once,
-        ),
-    );
-    for s in shifts {
-        let (path, stored) = (enc(s), || MmapBytes::open(&enc(s)).unwrap());
+    // Out of the page cache: distinct keys, each read once. Linux's alone:
+    // the drop of a file's pages and a thread's own fault count have no
+    // call on macOS.
+    #[cfg(target_os = "linux")]
+    {
+        let mut once = probes(keys, &[3, 6], 3_000);
+        once.sort();
+        once.dedup();
+        println!(
+            "\nfrom cold, random advice: major faults at the open, major faults a read, us a read"
+        );
+        let nothing = ReadOptions {
+            keep_bytes: 0,
+            ..ReadOptions::default()
+        };
+        let row = |name: &str, (at_open, a_read, us): (i64, f64, f64)| {
+            println!("{name:<14}{at_open:>8}{a_read:>10.2}{us:>10.1}");
+        };
         row(
-            &format!("enc-copy@{s}"),
+            "plain-mmap",
             cold(
-                &path,
-                &|| Blob::open(Encrypted::open_with(stored(), gcm(), &nothing).unwrap()).unwrap(),
+                &plain,
+                &|| Blob::open(MmapBytes::open(&plain).unwrap()).unwrap(),
                 &once,
             ),
         );
-        row(
-            &format!("enc-kept@{s}"),
-            cold(
-                &path,
-                &|| Blob::open(Encrypted::open(stored(), gcm()).unwrap()).unwrap(),
-                &once,
-            ),
-        );
+        for s in shifts {
+            let (path, stored) = (enc(s), || MmapBytes::open(&enc(s)).unwrap());
+            row(
+                &format!("enc-copy@{s}"),
+                cold(
+                    &path,
+                    &|| {
+                        Blob::open(Encrypted::open_with(stored(), gcm(), &nothing).unwrap())
+                            .unwrap()
+                    },
+                    &once,
+                ),
+            );
+            row(
+                &format!("enc-kept@{s}"),
+                cold(
+                    &path,
+                    &|| Blob::open(Encrypted::open(stored(), gcm()).unwrap()).unwrap(),
+                    &once,
+                ),
+            );
+        }
     }
     let _ = std::fs::remove_dir_all(&dir);
 }
