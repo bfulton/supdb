@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""The options ledger: one CSV row per option, mechanical columns only.
+r"""The options ledger: one CSV row per option, mechanical columns only.
 
     python3 release/tools/options_ledger.py > release/options.csv
     python3 release/tools/options_ledger.py --sites Options.sync >/dev/null
@@ -198,8 +198,9 @@ flags
                             differs from the default's
       policy_unused         bench_policy_field reads Policy fields and no
                             arm changes one
-      never_set             no arm, no src write, no other_setting, no
-                            bench_fixed, and tests_setting == 0
+      never_set             no arm, write_sites_recv == 0, no
+                            other_setting, no bench_fixed, and
+                            tests_setting == 0
       tests_only            the same with tests_setting > 0
       doc_default_mismatch  a bool whose default is true with marker Off,
                             or false with marker On
@@ -276,7 +277,12 @@ class Src:
         self.nocom = "".join(nocom)
         self.code = "".join(code)
         self.starts = [0] + [m.end() for m in re.finditer(r"\n", self.raw)]
-        self._tests = None
+        self._tests = self._lines = None
+
+    def lines(self):
+        if self._lines is None:
+            self._lines = self.raw.split("\n")
+        return self._lines
 
     def line(self, pos):
         return bisect.bisect_right(self.starts, pos)
@@ -601,8 +607,7 @@ def fns_in(src, lo, hi):
             params.append((pm.group(1), pm.group(2)) if pm else (p, ""))
         ls = src.raw.rfind("\n", 0, m.start()) + 1
         doc, attrs, k = [], [], src.line(ls) - 2
-        lines = src.raw.split("\n") if not hasattr(src, "_lines") else src._lines
-        src._lines = lines
+        lines = src.lines()
         while k >= 0:
             s = lines[k].strip()
             if s.startswith("///"):
@@ -1513,7 +1518,7 @@ def main():
             flags.append("bench_fixed")
         if o.bench and not setting and not fixed and any(r for _, _, r in o.bench):
             flags.append("policy_unused")
-        if not setting and not o.writes and not o.other and not fixed:
+        if not setting and not o.writes_recv and not o.other and not fixed:
             flags.append("tests_only" if o.tests else "never_set")
         if o.default in ("true", "false") and ("Off" if o.default == "true" else "On") in markers:
             flags.append("doc_default_mismatch")
