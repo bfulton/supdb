@@ -52,8 +52,8 @@
 #      line of the hot list -- begins with the load and the branch of B,
 #      against HEAD: exit 1, `cost: RED`, the gain reported in
 #      install_ahead. A toggle's whole engine is hot, not the list's.
-#   K. the job's durable ordered load over a scratch copy whose run commit
-#      calls a new helper of its own, out of line, at every key, against
+#   K. the job's durable ordered load over a scratch copy whose run's
+#      append calls a new helper of its own, out of line, at every key, against
 #      HEAD: exit 1, `cost: RED`, the gain reported in the helper. A probe
 #      with no toggle holds the engine's every function, not the list's.
 #   T. the job over a scratch copy whose every commit runs a thousand-step
@@ -72,6 +72,14 @@
 # COST_RED_STEPS (default `A G V S B U K T C`) runs the steps it names, in the order
 # named, and each step's checks are the ones above whichever runs. The last
 # line is `cost-red: ok` or names the step that went wrong; exit 0 or 1.
+#
+# COST_RED_ANCHORS=1 makes every step's edit of the tree as it stands and
+# builds nothing: each edit's text found once, the job not run, in the time
+# a copy of the tree takes. The `lint` group runs it, since the whole job
+# runs only where CI runs it, on a pull request: two edits of db.rs named
+# text a change and a merge had replaced, and the group read red at a pull
+# request's first run, two days after the first of them, where the gate had
+# passed every day.
 set -eu
 ROOT=$(git rev-parse --show-toplevel)
 R=${COST_RED_DIR:-${TMPDIR:-/tmp}/supdb-cost-red-$$}
@@ -286,11 +294,17 @@ RT=${COST_RED_TARGET:-$R/t}
 # S, B, T and C count copies of this tree against HEAD, so the engine and the
 # suite in the tree have to be HEAD's: an uncommitted change to either would
 # read as the job's fault in S and hide behind it in B.
+anchored() { [ -n "${COST_RED_ANCHORS:-}" ]; }
 same_as_head() {
+    anchored && return 0
     git -C "$ROOT" diff --quiet HEAD -- src Cargo.toml Cargo.lock bench/src bench/Cargo.toml bench/Cargo.lock ||
         fail "$1: the engine or the suite differs from HEAD in the tree; commit it, or count it with cost.sh"
 }
 job() { # copy step [probe] -> the job's exit status; its output in $R/<step>.log
+    if anchored; then
+        echo anchored
+        return 0
+    fi
     st=0
     COST_DIR="$R/w" COST_HEAD="$1" COST_HEAD_TARGET="$RT" COST_BASE_TARGET="$RT" \
         sh "$ROOT/scripts/cost.sh" HEAD "${3:-read}" >"$R/$2.log" 2>&1 || st=$?
@@ -319,14 +333,15 @@ same_as_head B
 # B. A load and a branch at the top of the point read.
 copy "$R/h"
 edit "$R/h/src/db.rs" \
-    '        let entered = self.enter();
-        let r = self.read_all_in(key, f);' \
+    '        let _entered = self.enter();
+        self.read_all_in::<F, false>(key, f)' \
     '        if std::hint::black_box(&self.shared.pager).is_some() {
             std::hint::black_box(());
         }
-        let entered = self.enter();
-        let r = self.read_all_in(key, f);'
+        let _entered = self.enter();
+        self.read_all_in::<F, false>(key, f)'
 st=$(job "$R/h" B)
+if anchored; then echo "cost-red: B's edits apply"; rm -rf "$R/h"; return 0; fi
 shown B
 [ "$st" = 1 ] || fail "B: the job exited $st over a read that pays a load and a branch"
 tail -1 "$R/B.log" | grep -qx 'cost: RED' || fail "B: the verdict line is not cost: RED"
@@ -348,6 +363,7 @@ edit "$R/h/src/db.rs" \
         }
         let _op = self.op();'
 st=$(job "$R/h" T)
+if anchored; then echo "cost-red: T's edits apply"; rm -rf "$R/h"; return 0; fi
 shown T
 [ "$st" = 0 ] || fail "T: the job exited $st over a cost the point read's probe pays outside its toggle"
 tail -1 "$R/T.log" | grep -qx 'cost: green' || fail "T: the verdict line is not cost: green"
@@ -389,10 +405,12 @@ edit "$R/h/bench/src/engines.rs" \
     '    r.read_all(key, |v| n += consume(v))' \
     '    r.read_all(key, |v| n += v.len())'
 st=$(job "$R/h" V)
+if ! anchored; then
 shown V
 [ "$st" = 2 ] || fail "V: the job exited $st over a suite whose per-read code differs from the base's"
 grep -q "the suite's \`fn supdb_get(\` differs" "$R/V.log" || fail "V: the suite's change was not named"
 grep -q 'Compiling' "$R/w/out/build-base.log" 2>/dev/null && fail "V: the job built before it refused"
+fi
 rm -rf "$R/h"
 # An attribute is the item's: the sink taken out of line is a step of every
 # read added in the suite.
@@ -401,6 +419,7 @@ edit "$R/h/bench/src/engines.rs" '#[inline]
 fn consume(' '#[inline(never)]
 fn consume('
 st=$(job "$R/h" V2)
+if anchored; then echo "cost-red: V's edits apply"; rm -rf "$R/h"; return 0; fi
 shown V2
 [ "$st" = 2 ] && grep -q "the suite's \`fn consume(\` differs" "$R/V2.log" ||
     fail "V: the job exited $st over a suite whose sink changed its attribute"
@@ -423,6 +442,7 @@ edit "$R/h/src/db.rs" \
 '
 grep -q '^supdb::db::Reader::install_ahead$' "$ROOT/scripts/cost-hot.txt" && hotted=1 || hotted=0
 st=$(job "$R/h" U scan)
+if anchored; then echo "cost-red: U's edits apply"; rm -rf "$R/h"; return 0; fi
 shown U
 [ "$st" = 1 ] || fail "U: the job exited $st over a scan that pays a load and a branch"
 tail -1 "$R/U.log" | grep -qx 'cost: RED' || fail "U: the verdict line is not cost: RED"
@@ -435,19 +455,19 @@ rm -rf "$R/h"
 step_K() {
 same_as_head K
 # K. A step of every key in a helper of its own, on no line, in the
-# ordered load's commit: a probe with no toggle holds every function of
-# the engine, and a new one most of all.
+# ordered load's append to its run, the one step of every key a run's
+# lean commit leaves (`Options::direct_lean_append`): a probe with no
+# toggle holds every function of the engine, and a new one most of all.
 copy "$R/h"
 edit "$R/h/src/db.rs" \
-    '            for i in d.committed..mem.len() {
-                let e = mem.entry(i);
-                let (rec_len, tail_at, vlen) = mem.stream_record_shape(e);' \
-    '            for i in d.committed..mem.len() {
-                let e = mem.entry(i);
-                cost_red_step(i);
-                let (rec_len, tail_at, vlen) = mem.stream_record_shape(e);'
+    '                if self.opts.direct_lean_append {
+                    mem.append_ordered(key, value);' \
+    '                if self.opts.direct_lean_append {
+                    cost_red_step(key.len());
+                    mem.append_ordered(key, value);'
 printf '\n/// cost-red step K: a step of every key, out of line.\n#[inline(never)]\nfn cost_red_step(i: usize) {\n    std::hint::black_box(i);\n}\n' >>"$R/h/src/db.rs"
 st=$(job "$R/h" K load_durable)
+if anchored; then echo "cost-red: K's edits apply"; rm -rf "$R/h"; return 0; fi
 shown K
 [ "$st" = 1 ] || fail "K: the job exited $st over an ordered load that pays a helper a key"
 tail -1 "$R/K.log" | grep -qx 'cost: RED' || fail "K: the verdict line is not cost: RED"
@@ -470,6 +490,7 @@ edit "$R/h/bench/examples/read_only.rs" \
 
 fn real_main() {'
 st=$(job "$R/h" C)
+if anchored; then echo "cost-red: C's edits apply"; rm -rf "$R/h"; return 0; fi
 shown C
 [ "$st" = 0 ] || fail "C: the job exited $st over a probe that changed with the engine untouched"
 tail -1 "$R/C.log" | grep -qx 'cost: green' || fail "C: the verdict line is not cost: green"
@@ -477,7 +498,9 @@ echo "cost-red: C ok"
 rm -rf "$R/h"
 }
 
-for step in ${COST_RED_STEPS:-A G V S B U K T C}; do
+# The steps with no edit of the tree have nothing to anchor.
+anchored && default="V B U K T C" || default="A G V S B U K T C"
+for step in ${COST_RED_STEPS:-$default}; do
     case $step in
     A | G | V | S | B | U | K | T | C) "step_$step" ;;
     *) fail "no step $step" ;;

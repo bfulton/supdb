@@ -627,7 +627,7 @@ impl OrdIndex {
     }
 
     /// Whether the top level is in memory: read at the open, or since.
-    #[cfg(test)]
+    #[cfg(all(test, target_os = "linux"))]
     pub(crate) fn top_is_read(&self) -> bool {
         self.n == 0 || !self.top_eager.is_empty() || self.top_late.get().is_some()
     }

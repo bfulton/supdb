@@ -483,6 +483,9 @@ pub(crate) struct Pager {
     files: Mutex<Vec<Weak<Paged>>>,
     /// The era the holds stand in (`Hold`), and the holds.
     era: AtomicU64,
+    /// The latest era whose pass gave a unit back: a test's way to tell a
+    /// pass begun before a reader pinned from one begun after it.
+    freed_era: AtomicU64,
     holds: Mutex<Vec<Arc<AtomicU64>>>,
     /// Where the evictor's pass stands: a file's place in `files` and a
     /// unit of it.
@@ -539,6 +542,7 @@ impl Pager {
             given_gone: Mutex::new(Vec::new()),
             files: Mutex::new(Vec::new()),
             era: AtomicU64::new(1),
+            freed_era: AtomicU64::new(0),
             holds: Mutex::new(Vec::new()),
             hand: Mutex::new((0, 0)),
             grace: RwLock::new(None),
@@ -767,6 +771,21 @@ impl Pager {
             dropped_units: r(&c.dropped_units),
             dropped_bytes: r(&c.dropped_bytes),
         }
+    }
+
+    /// A test's: the era the next pass of the evictor will stand in is
+    /// past this one, and `freed_era` is the latest whose pass gave a unit
+    /// back. A pass that began after a reader pinned gives nothing back
+    /// while it stands, where one begun before may give back what the
+    /// reader never took.
+    #[cfg(all(test, target_os = "linux"))]
+    pub(crate) fn era_now(&self) -> u64 {
+        self.era.load(Ordering::SeqCst)
+    }
+
+    #[cfg(all(test, target_os = "linux"))]
+    pub(crate) fn freed_era(&self) -> u64 {
+        self.freed_era.load(Ordering::Relaxed)
     }
 
     /// The evictor stopped and joined: for the store's close. What the
@@ -1055,6 +1074,7 @@ impl Pager {
         for (f, u) in marked {
             let freed = f.free(*u);
             if freed > 0 {
+                self.freed_era.fetch_max(era, Ordering::Relaxed);
                 Counts::bump(&self.counts.evicted_units);
                 self.counts
                     .evicted_bytes
@@ -1904,7 +1924,7 @@ impl Paged {
     }
 
     /// Chunks present now.
-    #[cfg(test)]
+    #[cfg(all(test, target_os = "linux"))]
     pub(crate) fn present_chunks(&self) -> usize {
         self.present.load(Ordering::Relaxed)
     }
@@ -3918,7 +3938,7 @@ mod tests {
     /// Whether the live mapping of `path` this process holds is advised
     /// for reads far apart, by the kernel's own word (`rr` in its
     /// `VmFlags`); `None` where nothing maps it.
-    #[cfg(target_os = "linux")]
+    #[cfg(all(target_os = "linux", not(supdb_emulated)))]
     fn mapped_random(path: &std::path::Path) -> Option<bool> {
         let want = path.to_string_lossy().into_owned();
         let smaps = std::fs::read_to_string("/proc/self/smaps").unwrap();
@@ -3942,8 +3962,11 @@ mod tests {
     /// read in order wherever its store is in a scan's phase, before the
     /// seal has written its envelope -- left random, the plain store's
     /// default being to read around a fault. And an advice given after the
-    /// envelope is the envelope's at once, both ways.
-    #[cfg(target_os = "linux")]
+    /// envelope is the envelope's at once, both ways. It reads the
+    /// kernel's answer to the advice, which qemu-user accepts and passes
+    /// to no kernel: not under it (`supdb_emulated`), and run on the
+    /// native ARM leg.
+    #[cfg(all(target_os = "linux", not(supdb_emulated)))]
     #[test]
     fn an_advice_given_before_the_envelope_is_the_envelopes_when_it_comes() {
         let dir = scratch("advice-before");

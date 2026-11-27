@@ -366,8 +366,14 @@ branch the engine's tests and examples are in the same case: their
 cipher (`ring`, a dev-dependency) compiles C and assembly for the target
 in its build script, and clang here, given the target, wants Apple's
 headers (`TargetConditionals.h`, then the C library's), so the check from
-a Linux host is of the library and its binaries, and every target is
-linted on the macOS leg of CI, where the host is the target. Its first
+a Linux host is of the library, its binaries and its unit tests, which
+take no dev-dependency, the last compiled as their test binary and linked
+by a linker that does nothing (`cargo rustc --lib --target
+aarch64-apple-darwin --profile checked -- --test -C linker=true`), and
+every target is linted on the macOS leg of CI, where the host is the
+target. The unit tests were left out of it until a pull request's first
+macOS leg failed at them: two test seams in `vault` under `cfg(test)`
+alone called a module only Linux compiles. Its first
 run here found the library itself not compiling for macOS: two of the
 cache's advices under a cipher (`posix_fadvise` and `MADV_POPULATE_READ`,
 in `pager.rs`) were Linux's alone with no guard, from two commits that no
@@ -417,7 +423,11 @@ minutes (its step's three `CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_`
 variables before `cargo test --profile checked --target
 aarch64-unknown-linux-gnu --lib`), and a test that reads
 `/proc/self/smaps` or `mincore` behind an `madvise` is run under it
-before it is pushed. Where only part of a test reads the kernel, that
+before it is pushed. A test of an advice kept for an envelope to come
+was not, and failed the leg at the next pull request's first run; the
+group run here then found a second, of the cache under a cipher, betting
+that the evictor had no pass in flight begun before a reader pinned,
+which under the emulator's pace it had (`Pager::era_now`). Where only part of a test reads the kernel, that
 part goes behind `cfg!(supdb_emulated)` and the rest runs everywhere.
 
 A hosted job's log cannot be read while the job runs, so one that is
@@ -1841,7 +1851,11 @@ from this tree's example sources and at the tree, each under callgrind,
 every function's own instructions side by side, and a failure where a
 hot function gains past its slack (`scripts/cost-diff.py`, below);
 `sh scripts/cost-red.sh` is its red input, and `sh scripts/check.sh cost`
-runs the two. The first version of the list named
+runs the two. Its edits name text in the tree, and two of them named
+text a change and then a merge had replaced, for two days before a pull
+request's first run of the group read red: the `lint` group holds every
+edit's text in place in a second (`COST_RED_ANCHORS=1`), since the group
+itself runs on a pull request and nowhere else. The first version of the list named
 its functions as paths, `supdb::db::Reader::read_all`, matched as
 substrings of callgrind's names, which print a method as
 `<supdb::db::Reader>::read_all_in::<G>::{closure#5}`: no line named an

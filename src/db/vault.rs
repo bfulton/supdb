@@ -2014,7 +2014,7 @@ impl Vault {
                         _ => None,
                     };
                     let keep = self.keeps(&mem);
-                    #[cfg(test)]
+                    #[cfg(all(test, target_os = "linux"))]
                     tests::persist_gate(&self.real);
                     // A write that fails here leaves the index's envelope
                     // under a token no segment has: no manifest lists it,
@@ -3646,7 +3646,7 @@ pub(crate) fn sync_slot(
 }
 
 /// `std::fs::read`: the file's bytes. The tests' only.
-#[cfg(test)]
+#[cfg(all(test, target_os = "linux"))]
 pub(crate) fn read(path: impl AsRef<Path>) -> Result<Vec<u8>> {
     use crate::bytes::Bytes;
     let path = path.as_ref();
@@ -3903,7 +3903,7 @@ pub(crate) fn remove_file(path: impl AsRef<Path>) -> Result<()> {
     if GUARDED.load(Ordering::Relaxed) != 0 {
         unguard(path)?;
     }
-    #[cfg(test)]
+    #[cfg(all(test, target_os = "linux"))]
     if tests::fails_after_unguard(path) {
         return Err(Error::other(
             "a test's failure between the guard's unlink and the file's",

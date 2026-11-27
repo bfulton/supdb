@@ -608,7 +608,7 @@ impl MmapBytes {
 
     /// How many bytes from the start the mapping lends whole: a test's
     /// look, which holds a paged mapping to none whatever its bytes are.
-    #[cfg(test)]
+    #[cfg(all(test, target_os = "linux"))]
     pub(crate) fn lends(&self) -> u64 {
         self.lend
     }

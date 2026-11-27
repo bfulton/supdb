@@ -72075,6 +72075,11 @@ mod cipher_looks {
                 .unwrap();
             });
             here.recv().unwrap();
+            // A pass the evictor began before the reader's last pin may
+            // still give back what the reader never took, a nap after the
+            // reader parks; every pass begun from here stands in a later
+            // era and has the reader pinned before it.
+            let era = pager.era_now();
             let before = pager.counts();
             assert_eq!(db.scan(&key(1), 10, |_, _| {}).unwrap(), 10);
             let c = pager.counts();
@@ -72084,9 +72089,11 @@ mod cipher_looks {
                 "the scan's settle read {read} bytes through the cache, which is no test of \
                  it: {c:?}"
             );
-            assert_eq!(
-                c.evicted_units, before.evicted_units,
-                "the cache gave back under a reader that held it: {c:?}"
+            assert!(
+                pager.freed_era() <= era,
+                "the cache gave back under a reader that held it, in the evictor's era {}, \
+                 past the era {era} the reader had parked in: {c:?}",
+                pager.freed_era()
             );
             assert!(
                 c.breaths > before.breaths,

@@ -229,6 +229,13 @@ for g in $groups; do
       mac=aarch64-apple-darwin
       if [ "$(rustc -vV | sed -n 's/^host: //p')" != "$mac" ]; then
         cargo clippy --release --lib --bins --target "$mac" -- -D warnings
+        # ... and the library's unit tests for it, which use no cipher of
+        # a dev-dependency: compiled as the test binary they are and linked
+        # by a linker that does nothing, there being no Apple linker here.
+        # Two test seams in `vault` called a module only Linux compiles, under
+        # `cfg(test)` alone, and four helpers only Linux's tests call were
+        # dead code there: the macOS leg of CI was the first to compile them.
+        cargo rustc --lib --target "$mac" --profile checked -- --test -C linker=true -D warnings
       fi
       sh scripts/fmt.sh --check
       # The door, by symbol, and its red input (scripts/door/run.sh).
@@ -242,6 +249,12 @@ for g in $groups; do
       # ... and the red input of that red input: each of its checks made to
       # fail by a line of its own (scripts/seal-red-red.sh).
       sh scripts/seal-red-red.sh || exit 1
+      # The cost group's red input edits the tree at named text; that each
+      # text is still there is read here, in a second, since the group
+      # itself runs where CI runs it and nowhere a change is gated before
+      # it is pushed (scripts/cost-red.sh, COST_RED_ANCHORS).
+      say "cost-red anchors"
+      COST_RED_ANCHORS=1 sh scripts/cost-red.sh || exit 1
       ;;
     wasm)
       say "wasm"

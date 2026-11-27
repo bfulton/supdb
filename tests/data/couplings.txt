@@ -231,7 +231,7 @@ src/db.rs	a_merge_writing_an_envelope_holds_nothing_of_the_cache	pager	test	7	st
 src/db.rs	a_merge_writing_an_envelope_holds_nothing_of_the_cache	vault::tests	test	4	stays	cipher_looks: a merge parked at its output's envelope, the cache read through its own handle while it stands there
 src/db.rs	a_reads_rest_waits_for_a_cache_another_reader_holds	cipher	test	4	stays	cipher_looks: a read's rest counted as a breath where another reader holds the cache
 src/db.rs	a_reads_rest_waits_for_a_cache_another_reader_holds	crypt	test	2	stays	cipher_looks: a read's rest counted as a breath where another reader holds the cache
-src/db.rs	a_reads_rest_waits_for_a_cache_another_reader_holds	pager	test	5	stays	cipher_looks: a read's rest counted as a breath where another reader holds the cache
+src/db.rs	a_reads_rest_waits_for_a_cache_another_reader_holds	pager	test	8	stays	cipher_looks: a read's rest counted as a breath where another reader holds the cache, and the evictor's era read where the other reader has parked
 src/db.rs	a_reads_rest_waits_for_a_cache_another_reader_holds	vault::tests	test	1	stays	cipher_looks: a read's rest counted as a breath where another reader holds the cache
 src/db.rs	a_reads_settle_ahead_of_its_walk_gives_the_cache_back	cipher	test	4	stays	cipher_looks: one scan's settle of a backlog, the cache's peak read through its own handle
 src/db.rs	a_reads_settle_ahead_of_its_walk_gives_the_cache_back	crypt	test	2	stays	cipher_looks: one scan's settle of a backlog, the cache's peak read through its own handle
