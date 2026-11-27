@@ -16,13 +16,13 @@ and merges that branch to main for the tag.
 | Phase | Pass | Owner | Branch or PR | State | Waits on |
 |---|---|---|---|---|---|
 | 0 | Feature freeze | Bright | none | declared by Bright on 2026-11-27 with main at `b3a043dc`; a redo is accepted if main moves | nothing |
-| 0 | History audit (A) | coordinator's subagents | this branch, `release/history.md` | running, read-only | nothing |
-| 0 | History decision (B) | Bright | none | the plan's default is taken: keep history and fix forward; the audit's costs for the other two go to Bright with it | nothing, unless Bright overrules |
+| 0 | History audit (A) | coordinator's subagents | `release/history.md`, evidence under `release/history/` | done: no credential in any ref, nothing to rotate | nothing |
+| 0 | History decision (B) | Bright | none | keep history and fix forward, the plan's default; the audit finds nothing for a rewrite (`release/history.md`) | nothing, unless Bright overrules |
 | 0 | Release-candidate branch, C0 | coordinator | `release-candidate`, cut at C0 = `b3a043dc` (tree `7f58d776`) | done; `ci` was green on all nine legs at that commit (push run 46057759527) | nothing |
 | 0 | Baseline at C0 | measurement agent, in a cloud session of its own | `release/baseline.md` | static counts and commands prepared; the rows and the noise floor are about 39 hours of runs that need a machine to themselves, so they run apart from the passes | the run sheet's verification |
 | 1 | Delete: options ledger, dead code, API surface | not assigned | `release/options.csv` | the ledger's mechanical columns are being generated | C0, decision 1 |
 | 2 | Reshape: split `src/db.rs`, style | not assigned | none | not started | phase 1 |
-| 3 | Verify: audits, then fixes | not assigned | `release/findings/` | not started | phase 2, decisions 2, 4, 7 |
+| 3 | Verify: audits, then fixes | not assigned | `release/findings/` | not started; inputs from the history audit: `bank-row.yml`'s write token, unpinned actions, five workflows without `permissions:` | phase 2, decisions 4 and 7 |
 | 4 | Tests: flake loop, runtime, coverage | not assigned | none | not started | the last fix of phase 3, decision 5 |
 | 5 | Words: roadmap, docs, release files | not assigned | none | begun on main by #37 (`CLAUDE.md` as rules, the roadmap as short items) | the last fix of phase 3, decision 6 |
 | 6 | Measure at the last code commit | measurement agent | none | not started | phase 5 |
@@ -43,7 +43,7 @@ still open below is what changes what ships.
 | 5 | Gate runtime budget and the number of flake-loop runs | phase 4 | open |
 | 6 | Target size of `CLAUDE.md`, and what stays in it | phase 5 | largely made by #37 (24.7 KB of rules); confirm, and the same for `bench/CLAUDE.md` (80 KB) |
 | 7 | Whether to commission the outside crypto review | phase 3 | open |
-| 8 | History: keep and fix forward, re-message main, or publish from a fresh repository | phase 0, before C0 | the default, keep and fix forward, unless Bright overrules after reading `release/history.md` |
+| 8 | History: keep and fix forward, re-message main, or publish from a fresh repository | phase 0, before C0 | keep and fix forward; Bright may overrule after `release/history.md` |
 | 9 | Whether commits on main keep the `Co-Authored-By` and `Claude-Session` trailers | every pull request from the freeze on | the default stays, and no rule about trailers is written |
 | 10 | Is main frozen at #37, and are `claude/e-recode-auto` and `claude/wal-ahead-beside-wip` parked | C0 | frozen at `b3a043dc`; both branches carry nothing main lacks (the audit's finding) and are left for Bright to delete |
 | 11 | The release-candidate branch's name | every pass | `release-candidate` |
@@ -79,4 +79,5 @@ where they differ, and each difference is listed once here.
 
 ## Escalations
 
-None yet.
+None. The history audit found no credential. Four questions for Bright
+are in `release/history.md`, "For the owner"; none blocks a pass.
