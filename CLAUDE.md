@@ -459,7 +459,12 @@ process read in the library outside the six modules above, by symbol --
 clippy's barred calls over the library under the checked profile on Linux
 (`scripts/door/run.sh`, config `scripts/door/clippy.toml`), red first by
 `scripts/door/red.sh`, which writes a barred call of each family into a
-copy of `zfile.rs` and requires each refused by its own entry. It
+copy of `zfile.rs` and requires each refused by its own entry, read off
+clippy's output by pattern and so in no colour (`--color never`): CI sets
+`CARGO_TERM_COLOR=always`, a diagnostic's first line then starts with an
+escape, and the red input read all eleven of its lines as missing on both
+Linux legs of the pull request's first run, as the seal's red input would
+have next, with every test of the run passed before it. It
 replaced a unit test that read `db.rs` for the calls by text, which never
 read `zfile.rs`'s `File::open`, `File::options()` and `fs::read_to_string`:
 a check by text over one file passes the next file and every alias, where

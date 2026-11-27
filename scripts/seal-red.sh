@@ -78,9 +78,11 @@ listed=$(wc -l < "$copy/lines")
 
 # check: `cargo check` of the library of the copy, under the profile the
 # tests build with (the code under `cfg(debug_assertions)` included), its
-# output on stdout and its status returned.
+# output on stdout and its status returned, in no colour whatever the
+# environment asks, since each error is found by the start of its line
+# (CI's CARGO_TERM_COLOR=always put an escape there).
 check() {
-  (cd "$copy" && cargo check --profile checked --lib --target-dir "$copy/target" \
+  (cd "$copy" && cargo check --color never --profile checked --lib --target-dir "$copy/target" \
     --message-format short 2>&1)
 }
 

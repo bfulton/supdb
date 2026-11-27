@@ -5,9 +5,13 @@
 # door_lint CRATE CONFDIR TARGETDIR: the door over the library of the crate
 # at CRATE, under the checked profile (the code under
 # `cfg(debug_assertions)` is linted too), with the config in CONFDIR. The
-# output, stdout and stderr, is the caller's; the status is clippy's.
+# output, stdout and stderr, is the caller's; the status is clippy's. The
+# output is read by pattern (door_config_diag, red.sh's `missing`), so it is
+# in no colour whatever the environment asks: CI sets CARGO_TERM_COLOR to
+# always, a diagnostic's first line then starts with an escape and not with
+# `error`, and red.sh read every line it had placed as missing.
 door_lint() {
-  (cd "$1" && CLIPPY_CONF_DIR="$2" cargo clippy --profile checked --lib \
+  (cd "$1" && CLIPPY_CONF_DIR="$2" cargo clippy --color never --profile checked --lib \
     --target-dir "$3" -- -D warnings 2>&1)
 }
 
