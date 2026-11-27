@@ -12343,6 +12343,13 @@ impl Engine for Supdb {
             if self.holdmarch {
                 return "supdb-heldmarch";
             }
+            if self.settleconvertquiet {
+                return if self.partition {
+                    "supdb-heldpartsettleconvertquiet"
+                } else {
+                    "supdb-heldnfsettleconvertquiet"
+                };
+            }
             if self.noframes
                 && (self.settleloads
                     || self.settlesortstwice
@@ -16686,6 +16693,8 @@ pub fn guarantee(arm: &str) -> Option<Guarantee> {
         | "supdb-heldmarch"
         | "supdb-heldpart"
         | "supdb-heldpartfrozencount"
+        | "supdb-heldpartsettleconvertquiet"
+        | "supdb-heldnfsettleconvertquiet"
         | "supdb-heldnoframes"
         | "supdb-heldnfnocache"
         | "supdb-heldnorecordahead"
@@ -18858,6 +18867,36 @@ pub fn open(arm: &str, dir: &Path, map_gb: usize) -> Res<Box<dyn Engine>> {
                         partition: false,
                         durable: false,
                         settlenoconvert: true,
+                        ..Policy::default()
+                    },
+                )
+            },
+            dir,
+        )?,
+        "supdb-heldpartsettleconvertquiet" => supdb_arm(
+            |d| {
+                Supdb::with_policy(
+                    d,
+                    Policy {
+                        durable: false,
+                        held: true,
+                        settleconvertquiet: true,
+                        ..Policy::default()
+                    },
+                )
+            },
+            dir,
+        )?,
+        "supdb-heldnfsettleconvertquiet" => supdb_arm(
+            |d| {
+                Supdb::with_policy(
+                    d,
+                    Policy {
+                        partition: false,
+                        durable: false,
+                        held: true,
+                        noframes: true,
+                        settleconvertquiet: true,
                         ..Policy::default()
                     },
                 )
@@ -22267,6 +22306,32 @@ mod tests {
                 )
                 .unwrap();
                 assert_eq!(z.name(), "supdb-ingestsettleconvertquiet");
+                assert!(!z.db.as_ref().unwrap().options().settle_convert_fills);
+                let z = Supdb::with_policy(
+                    &dir("heldpartsettleconvertquiet"),
+                    Policy {
+                        durable: false,
+                        held: true,
+                        settleconvertquiet: true,
+                        ..Policy::default()
+                    },
+                )
+                .unwrap();
+                assert_eq!(z.name(), "supdb-heldpartsettleconvertquiet");
+                assert!(!z.db.as_ref().unwrap().options().settle_convert_fills);
+                let z = Supdb::with_policy(
+                    &dir("heldnfsettleconvertquiet"),
+                    Policy {
+                        partition: false,
+                        durable: false,
+                        held: true,
+                        noframes: true,
+                        settleconvertquiet: true,
+                        ..Policy::default()
+                    },
+                )
+                .unwrap();
+                assert_eq!(z.name(), "supdb-heldnfsettleconvertquiet");
                 assert!(!z.db.as_ref().unwrap().options().settle_convert_fills);
             }
             {
