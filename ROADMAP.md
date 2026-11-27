@@ -8,15 +8,6 @@ a tenth behind its comparator or behind a shape the engine already reaches.
 
 ## High priority
 
-- [ ] **A cheaper verification at open, and a way to skip it.** Every open
-  but a cipher's (`Bytes::authenticated`) verifies each segment's whole key
-  section against its checksum row, which with inline records is the whole
-  segment: four fifths of the open's instructions, about 90 ms at three
-  million keys. It stays at open. The CRC runs as one dependency chain;
-  verifying several 16 KB pieces at once read twice the rate in a
-  micro-probe. Add an option that skips it, stating what is then unchecked.
-  Done when the open's verification runs at memory bandwidth and the option
-  is tested.
 - [ ] **A conditional write.** A put or delete that applies only if the
   key is as its caller read it, on the writer and in a `Txn`.
   `Reader::rmw` exists for handles under the held log, and is atomic only

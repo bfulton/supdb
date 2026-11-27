@@ -402,10 +402,22 @@ pub fn verify_pieces_with(
     let row = sec
         .get(crc_off..crc_off.checked_add(n).ok_or(usize::MAX)?)
         .ok_or(usize::MAX)?;
-    for (i, (a, b)) in pieces(crc_off, shift, base).enumerate() {
-        each(a, b);
-        if crate::block::crc32(&sec[a..b]) != piece_crc(row, i).ok_or(usize::MAX)? {
-            return Err(i);
+    // Four pieces a turn, hashed together (`block::crc32_x4`): one piece
+    // hashed at a time was one chain of the instruction's latency, half the
+    // rate four reach, over a walk that is most of an open's work.
+    let all: Vec<(usize, usize)> = pieces(crc_off, shift, base).collect();
+    for (t, four) in all.chunks(4).enumerate() {
+        for &(a, b) in four {
+            each(a, b);
+        }
+        let ins: [&[u8]; 4] =
+            std::array::from_fn(|j| four.get(j).map_or(&[][..], |&(a, b)| &sec[a..b]));
+        let got = crate::block::crc32_x4(ins);
+        for (j, &crc) in got.iter().take(four.len()).enumerate() {
+            let i = t * 4 + j;
+            if crc != piece_crc(row, i).ok_or(usize::MAX)? {
+                return Err(i);
+            }
         }
     }
     Ok(())
@@ -427,13 +439,21 @@ pub fn verify_pieces_in<'a, S: Sect<'a>>(
     let row = sec
         .range(crc_off, crc_off.saturating_add(n))
         .ok_or(usize::MAX)?;
-    for (i, ((a, b), word)) in pieces(crc_off, shift, base)
+    // Four pieces a turn, as `verify_pieces_with` hashes them, each asked
+    // for on its own.
+    let all: Vec<((usize, usize), &[u8; 4])> = pieces(crc_off, shift, base)
         .zip(row.as_chunks::<4>().0)
-        .enumerate()
-    {
-        let got = sec.range(a, b).ok_or(i)?;
-        if crate::block::crc32(got).to_le_bytes() != *word {
-            return Err(i);
+        .collect();
+    for (t, four) in all.chunks(4).enumerate() {
+        let mut ins: [&[u8]; 4] = [&[]; 4];
+        for (j, &((a, b), _)) in four.iter().enumerate() {
+            ins[j] = sec.range(a, b).ok_or(t * 4 + j)?;
+        }
+        let got = crate::block::crc32_x4(ins);
+        for (j, &(_, word)) in four.iter().enumerate() {
+            if got[j].to_le_bytes() != *word {
+                return Err(t * 4 + j);
+            }
         }
     }
     Ok(())
@@ -3078,6 +3098,62 @@ impl FlatIndex {
             }
         }
         lo
+    }
+}
+
+#[cfg(test)]
+mod verify_tests {
+    use super::*;
+
+    /// The row's pieces verified four at a time name the first piece that
+    /// differs, wherever it falls among the four, through a section held
+    /// whole and through one asked for by the piece; a section whose first
+    /// piece is short of the object's page, as one written at an offset
+    /// is, and whose count of pieces is no multiple of four, verifies whole.
+    #[test]
+    fn a_damaged_piece_is_named_wherever_it_falls_among_the_four() {
+        let base = 1234u64;
+        let piece = 1usize << PIECE_SHIFT;
+        let len = piece * 10 + 777;
+        let mut body: Vec<u8> = (0..len as u32)
+            .map(|i| (i.wrapping_mul(2654435761) >> 13) as u8)
+            .collect();
+        set_checksum_words(&mut body, len);
+        let row = checksum_row(&body, PIECE_SHIFT, base);
+        let mut sec = body.clone();
+        sec.extend_from_slice(&row);
+        let n = row.len() / 4;
+        assert_eq!(n, 11, "eleven pieces, the first short of a page");
+        assert_eq!(verify_pieces(&sec, len, PIECE_SHIFT, base), Ok(()));
+        assert_eq!(verify_pieces_in(&sec[..], len, PIECE_SHIFT, base), Ok(()));
+        let starts: Vec<(usize, usize)> = pieces(len, PIECE_SHIFT, base).collect();
+        for (k, &(a, b)) in starts.iter().enumerate() {
+            // Past the header words, which name the row.
+            let at = if k == 0 { b - 1 } else { (a + b) / 2 };
+            let mut bad = sec.clone();
+            bad[at] ^= 0x10;
+            assert_eq!(
+                verify_pieces(&bad, len, PIECE_SHIFT, base),
+                Err(k),
+                "piece {k}"
+            );
+            assert_eq!(
+                verify_pieces_in(&bad[..], len, PIECE_SHIFT, base),
+                Err(k),
+                "piece {k}, by the piece"
+            );
+            // Two pieces damaged: the first is named.
+            if k + 2 < n {
+                let (c, d) = starts[k + 2];
+                bad[(c + d) / 2] ^= 0x01;
+                assert_eq!(
+                    verify_pieces(&bad, len, PIECE_SHIFT, base),
+                    Err(k),
+                    "pieces {k} and {}",
+                    k + 2
+                );
+            }
+        }
     }
 }
 

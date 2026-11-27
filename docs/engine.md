@@ -185,7 +185,16 @@ checkpoint.
   of CRC32C words, one per 16 KiB object page it touches, named by two
   spare header words; `Blob::open` verifies every piece once -- 26 ms for a
   million-key segment, more than predicted, because with inline runs the
-  index is the data -- and no read pays after. The sparse reader rounds its
+  index is the data -- and no read pays after. The pieces are hashed four
+  at a time (`block::crc32_x4`): one piece at a time was one chain of the
+  CRC instruction's latency, and over a key section of 418 MB held in
+  memory, three million keys of the suite's shape, the verification took
+  70-71 ms at 5.9-6.0 GB/s, and takes 38 ms at 11.0-11.1 GB/s four at a
+  time, where one core sums the same bytes a word at a time at 9.8-10.2
+  (`cargo run --release --example verify_rate -- 3000000 9`, over the
+  engine at `b3a043d` and with the change, two rounds each alternated).
+  `Options::verify_at_open` off skips it, and its doc says what is then
+  unchecked. The sparse reader rounds its
   plans to the same pages and verifies each on first use. A store's
   in-place-editable index carries no row. `tests/segwriter.rs` flips every
   seventh byte of a segment's key section and requires the open to fail.

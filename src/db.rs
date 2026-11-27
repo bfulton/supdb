@@ -1470,6 +1470,21 @@ pub struct Options {
     /// once and never reopened for writing, and a 4 MiB redo arena in a
     /// write-once file is pure waste.
     pub segment: SegmentOptions,
+    /// Whether the open verifies each segment's key section against its
+    /// checksum row (`BlobOptions::verify_index`): the CRC-32C of every 16
+    /// KiB piece of the section, four pieces hashed at a time
+    /// (`block::crc32_x4`), which with inline values is the whole segment
+    /// and most of an open's work. On by default. Off, what the section
+    /// holds is read unchecked for the store's life: its keys, each
+    /// record's extents and every value held inline in a record, so damage
+    /// there is answered as the store's -- a key or a value that was not
+    /// written -- or refused only where a read's bounds check meets it.
+    /// What stays checked: a value in a block against its block's checksum
+    /// at every read (`SegmentOptions::checksums`), the superblock, the
+    /// manifest and the log; and a store under a cipher, whose envelopes
+    /// are checked as they are read, verifies no key section either way
+    /// (`Bytes::authenticated`).
+    pub verify_at_open: bool,
     /// How many overlapping L0 segments to tolerate before a partitioning
     /// merge. The brief's open "partitioned compaction policy" question in
     /// one number; it was chosen by sweeping it.
@@ -8351,6 +8366,7 @@ impl Default for Options {
             direct_ingest: true,
             segment: SegmentOptions::default(),
             l0_trigger: 4,
+            verify_at_open: true,
             tier_pieces: 0,
             compact: true,
             partition_on_flush: true,
@@ -47595,7 +47611,7 @@ impl Db {
                     starts_random,
                     advise_ord,
                     opts.segment.checksums,
-                    true,
+                    opts.verify_at_open,
                 )?,
             });
             // A partition the slot says nothing of may be one an older

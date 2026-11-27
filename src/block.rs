@@ -204,42 +204,90 @@ fn crc32c_shift_matrices() -> Vec<[u32; 32]> {
     out
 }
 
-fn crc32_from(init: u32, data: &[u8]) -> u32 {
+/// Whether the CPU has the CRC-32C instruction, asked once: SSE4.2 on
+/// x86-64, the CRC extension on ARM, and neither elsewhere.
+#[inline]
+fn crc_hw() -> bool {
     #[allow(unused_imports)]
     use std::sync::atomic::Ordering;
-    #[cfg(target_arch = "aarch64")]
+    #[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
     {
         let mut which = CRC_IMPL.load(Ordering::Relaxed);
         if which == 0 {
-            which = if std::arch::is_aarch64_feature_detected!("crc") {
-                1
-            } else {
-                2
-            };
+            #[cfg(target_arch = "aarch64")]
+            let hw = std::arch::is_aarch64_feature_detected!("crc");
+            #[cfg(target_arch = "x86_64")]
+            let hw = std::arch::is_x86_feature_detected!("sse4.2");
+            which = if hw { 1 } else { 2 };
             CRC_IMPL.store(which, Ordering::Relaxed);
         }
-        if which == 1 {
-            // SAFETY: only reached once the CPU has advertised the CRC extension.
-            return unsafe { crc32c_hw(init, data) };
-        }
+        which == 1
     }
-    #[cfg(target_arch = "x86_64")]
+    #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
     {
-        let mut which = CRC_IMPL.load(Ordering::Relaxed);
-        if which == 0 {
-            which = if std::arch::is_x86_feature_detected!("sse4.2") {
-                1
-            } else {
-                2
-            };
-            CRC_IMPL.store(which, Ordering::Relaxed);
-        }
-        if which == 1 {
-            // SAFETY: only reached once the CPU has advertised SSE4.2.
-            return unsafe { crc32c_hw(init, data) };
-        }
+        false
+    }
+}
+
+fn crc32_from(init: u32, data: &[u8]) -> u32 {
+    #[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
+    if crc_hw() {
+        // SAFETY: only reached once the CPU has advertised the instruction.
+        return unsafe { crc32c_hw(init, data) };
     }
     crc32c_scalar(init, data)
+}
+
+/// The CRC-32C of each of four inputs, as `crc32` answers it for each: on
+/// the hardware path the four are hashed a word of each a round, four
+/// instructions that depend on none of the others, where one input's are
+/// one chain, each word waiting on the last for the instruction's latency
+/// -- three cycles on x86-64, a word of eight bytes, where the core issues
+/// one a cycle. The open's verification of a key section hashes its pieces
+/// four at a time (`flatindex::verify_pieces_with`).
+pub fn crc32_x4(data: [&[u8]; 4]) -> [u32; 4] {
+    #[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
+    if crc_hw() {
+        // SAFETY: only reached once the CPU has advertised the instruction.
+        return unsafe { crc32c_hw_x4(data) };
+    }
+    data.map(crc32)
+}
+
+/// `crc32_x4` on the instruction: the words the four inputs have in common
+/// hashed a word of each a round, and what each has past the shortest
+/// hashed on alone, from where its chain stood.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "sse4.2")]
+unsafe fn crc32c_hw_x4(data: [&[u8]; 4]) -> [u32; 4] {
+    use core::arch::x86_64::_mm_crc32_u64;
+    let words = data.map(|d| d.as_chunks::<8>().0);
+    let n = words.iter().map(|w| w.len()).min().unwrap_or(0);
+    let mut c = [u64::from(u32::MAX); 4];
+    for i in 0..n {
+        c[0] = _mm_crc32_u64(c[0], u64::from_le_bytes(words[0][i]));
+        c[1] = _mm_crc32_u64(c[1], u64::from_le_bytes(words[1][i]));
+        c[2] = _mm_crc32_u64(c[2], u64::from_le_bytes(words[2][i]));
+        c[3] = _mm_crc32_u64(c[3], u64::from_le_bytes(words[3][i]));
+    }
+    std::array::from_fn(|j| crc32c_hw(c[j] as u32, &data[j][n * 8..]))
+}
+
+/// `crc32_x4` on the ARM CRC extension, as on x86-64.
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "crc")]
+unsafe fn crc32c_hw_x4(data: [&[u8]; 4]) -> [u32; 4] {
+    use core::arch::aarch64::__crc32cd;
+    let words = data.map(|d| d.as_chunks::<8>().0);
+    let n = words.iter().map(|w| w.len()).min().unwrap_or(0);
+    let mut c = [u32::MAX; 4];
+    for i in 0..n {
+        c[0] = __crc32cd(c[0], u64::from_le_bytes(words[0][i]));
+        c[1] = __crc32cd(c[1], u64::from_le_bytes(words[1][i]));
+        c[2] = __crc32cd(c[2], u64::from_le_bytes(words[2][i]));
+        c[3] = __crc32cd(c[3], u64::from_le_bytes(words[3][i]));
+    }
+    std::array::from_fn(|j| crc32c_hw(c[j], &data[j][n * 8..]))
 }
 
 /// Where a block lives and how big it is in each form.
@@ -525,6 +573,35 @@ pub fn read_chunked_range(
 #[cfg(test)]
 mod checksum_tests {
     use super::*;
+
+    /// Four inputs hashed together answer what each answers alone, on the
+    /// path the CPU takes and on the tables, for every mix of lengths: equal
+    /// and unequal, empty, short of a word, and a word's remainder past the
+    /// shortest.
+    #[test]
+    fn four_crcs_at_once_are_each_ones_crc() {
+        let data: Vec<u8> = (0..70_000u32).map(|i| (i * 131 + i / 13) as u8).collect();
+        let lens = [0usize, 1, 7, 8, 9, 255, 16_384, 16_389, 40_001];
+        for (i, &a) in lens.iter().enumerate() {
+            for (j, &b) in lens.iter().enumerate() {
+                let c = lens[(i + j) % lens.len()];
+                let d = lens[(i * 3 + j) % lens.len()];
+                let ins = [
+                    &data[..a],
+                    &data[3..3 + b],
+                    &data[11..11 + c],
+                    &data[29..29 + d],
+                ];
+                let want = ins.map(crc32);
+                assert_eq!(crc32_x4(ins), want, "lengths {a} {b} {c} {d}");
+                assert_eq!(
+                    ins.map(|x| crc32c_scalar(u32::MAX, x)),
+                    want,
+                    "the tables, lengths {a} {b} {c} {d}"
+                );
+            }
+        }
+    }
 
     #[test]
     fn a_combined_crc_is_the_concatenation_s_crc() {

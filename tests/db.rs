@@ -6377,6 +6377,72 @@ fn a_slot_an_older_release_writes_has_the_partitions_walked() {
     let _ = std::fs::remove_dir_all(&d);
 }
 
+/// The open verifies each segment's key section against its checksum row
+/// (`Options::verify_at_open`): a byte of a value held inline in a
+/// partition's record changed on the device is refused at the default's
+/// open, in the checksum's words and with the directory left as found;
+/// with the option off the same store opens, the section unchecked, and
+/// the key answers the value its damaged record holds. Through the raw
+/// form, a store of files whose segment is changed by its path.
+#[test]
+fn an_open_verifies_the_key_sections_unless_told_not_to() {
+    let d = dir("verify-at-open");
+    let o = common::files(Options {
+        zpages: supdb::ZPages::Off,
+        ..common::options()
+    });
+    let mut db = Db::create(&d, o.clone()).unwrap();
+    for k in 0..2000u32 {
+        db.append(
+            format!("key-{k:05}").as_bytes(),
+            format!("value-{k:05}").as_bytes(),
+        );
+    }
+    db.commit().unwrap();
+    db.flush().unwrap();
+    assert_eq!(db.levels(), (1, 0), "one partition");
+    db.close().unwrap();
+    let seg = common::store_names(&d)
+        .into_iter()
+        .find(|n| n.starts_with("par-") && n.ends_with(".sup"))
+        .expect("the partition's file");
+    let path = d.join(&seg);
+    let mut bytes = std::fs::read(&path).unwrap();
+    let at = bytes
+        .windows(11)
+        .position(|w| w == b"value-01000")
+        .expect("the value inline in its record");
+    bytes[at] = b'w';
+    std::fs::write(&path, &bytes).unwrap();
+    let before = common::store_names(&d);
+    let e = Db::open(&d, o.clone()).err().expect("the damage refused");
+    assert!(
+        e.to_string().contains("key index checksum mismatch"),
+        "the refusal names the checksum: {e}"
+    );
+    assert_eq!(
+        common::store_names(&d),
+        before,
+        "the directory left as found"
+    );
+    let db = Db::open(
+        &d,
+        Options {
+            verify_at_open: false,
+            ..o
+        },
+    )
+    .unwrap();
+    assert_eq!(
+        read_vec(&db, b"key-01000"),
+        vec![b"walue-01000".to_vec()],
+        "the damaged record read unchecked"
+    );
+    assert_eq!(read_vec(&db, b"key-01001"), vec![b"value-01001".to_vec()]);
+    db.close().unwrap();
+    let _ = std::fs::remove_dir_all(&d);
+}
+
 /// The bulk walk over partitions with unsealed keys laid over it, held to
 /// the merge it stands in for, in every state the store passes through.
 ///
