@@ -56,8 +56,9 @@ where there is one. Figures name the row they are read from.
   and settles its trail: the pass after a full rewrite reads 0.15x to 0.35x
   of the filed store's. Let the scan settle only the blocks it walks while
   the thread files the rest. Done when that pass reads level with the
-  filed store's in both orders, with the bursts at the lent rate. Design: `docs/engine.md`, "What
-  a burst costs under the held log" and "What filing a write costs".
+  filed store's in both orders, with the bursts at the lent rate. Design:
+  `docs/engine.md`, "What a burst costs under the held log" and "What
+  filing a write costs".
 - [ ] **The forms stood down through point operations.** Under the held log
   the point mixes on one thread trail FASTER (A, B, F and the scrambled
   mixes, in the quick row at `33bc663`), because the scans' forms are kept
