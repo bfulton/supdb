@@ -24,3 +24,19 @@ rustc 1.100.0. Built with `cd bench && cargo build --release --bin bench`
   2026-11-27T23:09:21Z to 23:09:41Z: every arm opened once, row
   `measure/smoke-quick-20261127T230922Z-b3a043d.json` (a smoke, not a row
   of the series).
+
+Rows are kept at the run sheet's `$BASE/rows/...` paths (`BASE=/home/user/base`)
+and copied here under `measure/rows/` at the same relative path.
+
+## 1. Quick row, numbered keys
+
+- Command: `cd /home/user/c0 && TMPDIR=/home/user/base/tmp/quick sh scripts/check.sh quick`
+- Start 2026-11-27T23:10:15Z, row written 23:32:07Z, verdict line
+  `all checks passed: quick` at 23:32:14Z (about 22 minutes, build included).
+  No kill.
+- Row: `measure/rows/quick/20261127T231015Z-b3a043d.json` (15 arms, to 300,000 keys, 5 reps).
+- Gate (`measure/logs/quick-gate.txt`): 10 prior rows of this class.
+  `host: OUT OF BAND` — the mem-floor read below the window, so quantities
+  that move with the machine get no verdict; 3 of 2228 quantities
+  no-verdict (supdb-heldnoframes recover-shuffled open_ms at 30k, 100k, 300k),
+  37 flagged better, none of the engine's regressed.
