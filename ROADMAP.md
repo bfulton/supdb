@@ -583,6 +583,16 @@ off (`docs/engine.md`, "Out of core: the second form").
   (`CLAUDE.md`, a reservation in a budget's arithmetic). Done when the
   burst takes the faults of its fast count in every rep, with the pass
   after it no slower.
+- [ ] **The held arm through a full rewrite at ten million keys under a
+  bound.** `supdb-heldpart` was killed under 1.25 GiB in one rep of three
+  in the row at `5fea7c0`, in the lag sweep's full rewrite. The 1 GiB
+  row at `33bc663`, which has the same engine, killed it in no rep of
+  three. The row keeps the group's memory only at the end of the pass
+  before, 241 MB anonymous and 798 MB of cache, so the owner at the kill
+  has not been read. Done when a run sampled from outside the process
+  through the full rewrite (`scripts/groupmem.py`, the engine's mapped
+  blocks by length) names the owner, and the arm runs every rep at both
+  bounds.
 - [ ] **The memos of decoded groups in slabs.** The memos keep their
   memory after their readers end, in arenas the allocator does not return,
   and where the block form misses its fit by that much the store faults
