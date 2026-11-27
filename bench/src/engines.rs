@@ -13918,7 +13918,8 @@ impl Engine for Supdb {
         // zeroes for a store under none: a cell out of that cache is read
         // beside what was decrypted and given back in it, and beside what
         // its reads waited for a crowded cache.
-        let pc = db.cipher_counts().map(|c| c.cache).unwrap_or_default();
+        let cc = db.cipher_counts().unwrap_or_default();
+        let pc = cc.cache;
         // The table of a store kept in one file, zeroes for a store of
         // files: the files moved for outgrowing their room, each a copy of
         // what was written of it, the growths in place, the data file's
@@ -13983,6 +13984,12 @@ impl Engine for Supdb {
             ("cipher_room_readings", pc.rooms as f64),
             ("cipher_gave_way", pc.gave_way as f64),
             ("cipher_spared_at_end", pc.spared as f64),
+            // What the cache took whole from a file's writer at its
+            // envelope, and what it left to be read from the envelope, by
+            // file, and the plaintext the envelopes were written from.
+            ("cipher_adopted", cc.adopted as f64),
+            ("cipher_left", cc.left as f64),
+            ("cipher_persisted_bytes", cc.persisted_bytes as f64),
             ("cipher_evictor_passes", pc.passes as f64),
             ("cipher_dropped_units", pc.dropped_units as f64),
             ("cipher_dropped_bytes", pc.dropped_bytes as f64),

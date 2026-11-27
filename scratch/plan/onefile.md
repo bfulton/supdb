@@ -407,6 +407,14 @@ file a store that mobile wants) after them.
     0.20-0.31x, the full rewrite's burst 0.49-0.51x. Every cell resolved
     in both orders. Shipped on; the loads and the lighter lag passes are
     the roadmap's two items under the controller under a cipher.
+  - *Read before O5b is built*: of the files a store under a cipher
+    gave envelopes through a load and a lag sweep at five million keys
+    under 640 MiB, the cache took 177 whole from their writers and left
+    146 to be read from their envelopes (`cipher_adopted`, `cipher_left`,
+    at `be368e4`), 10 GB of plaintext persisted. The memory file O5b
+    takes away is wasted for the second kind alone, about half the files,
+    so its saving is about half the fifth the merges' profile put in the
+    memory file: built on that, or not at all.
   - **O5b, an envelope written beside its file.** A file under a cipher
     is written whole into a memory file and sealed at its end
     (`Vault::write_envelope_at`), since every chunk's check covers the

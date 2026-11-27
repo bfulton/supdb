@@ -927,7 +927,13 @@ until the run is its own log). What it loses:
   and ten million under 1 GiB and 1.25 GiB; `scratch/plan/onefile.md`,
   O5a, has the cells): every read, scan and mix cell ahead at every bound
   in both orders, by 1.3x to 62x, and in core nothing built and nothing
-  resolved but the read pass at 0.97x in both orders. What it costs is
+  resolved but the read pass at 0.97x in both orders: the census's hooks,
+  11.6 instructions a read of 1,220 (`valgrind --tool=callgrind
+  --collect-atstart=no --toggle-collect='<supdb_bench::engines::Supdb as
+  supdb_bench::engines::Engine>::get' bench/target/release/examples/read_only
+  ARM 100000 1 n-none`, `supdb-cipher` against `supdb-ciphernoauto`:
+  `Reader::begin_slow` four, `leave_slow` and `read_all_paged` two each),
+  what the plain store's controller costs its reads in its own hooks. What it costs is
   the two items below. Against encrypted RocksDB with it shipped, at
   five million keys under 640 MiB (`BIN=$PWD/target-enc/release/bench sh
   scripts/pair.sh supdb-cipher rocksdb-tuned-enc 5000000 --bound
