@@ -166,6 +166,13 @@ The suite has to be fair before any of its numbers are quoted.
   RocksDB reads a memtable (`bench/DESIGN.md`, Arms). Either RocksDB reads
   with its default, `verify_checksums(true)`, or the methods say what each
   engine verifies.
+- [ ] **A kill in a rep that is taken again.** A cut rep is taken again
+  whole, and the ledger forgets every pass and kill of it first
+  (`Ledger::forget_rep`), so a row whose rep was cut after an arm was
+  killed reads as if no arm was. The roster under 1.25 GiB at `5fea7c0`
+  lost a kill of `supdb-heldpart` that way. Done when the row keeps the
+  kills of the sittings it forgot, apart from its reps, and the gate and
+  the bank read them.
 - [ ] **FASTER's rates between two bounded rows.** At three million keys
   under 1 GiB FASTER's point mixes read 30% to 57% higher in the row at
   `33bc663` than in the row at `001781d` (`bench/runs/killed/ooc`), with
@@ -584,12 +591,14 @@ off (`docs/engine.md`, "Out of core: the second form").
   burst takes the faults of its fast count in every rep, with the pass
   after it no slower.
 - [ ] **The held arm through a full rewrite at ten million keys under a
-  bound.** `supdb-heldpart` was killed under 1.25 GiB in one rep of three
-  in the row at `5fea7c0`, in the lag sweep's full rewrite. The 1 GiB
-  row at `33bc663`, which has the same engine, killed it in no rep of
-  three. The row keeps the group's memory only at the end of the pass
-  before, 241 MB anonymous and 798 MB of cache, so the owner at the kill
-  has not been read. Done when a run sampled from outside the process
+  bound.** `supdb-heldpart` was killed under 1.25 GiB in the lag sweep's
+  full rewrite, at ten million keys, in the third rep of the roster at
+  `5fea7c0`. A worker restart then cut that rep, and the rep taken again
+  ran the arm through, so the row carries no kill (the entry below). The
+  1 GiB row at `33bc663`, which has the same engine, killed it in no rep
+  of three. The ledger kept the group's memory only at the end of the
+  pass before, 241 MB anonymous and 798 MB of cache, so the owner at the
+  kill has not been read. Done when a run sampled from outside the process
   through the full rewrite (`scripts/groupmem.py`, the engine's mapped
   blocks by length) names the owner, and the arm runs every rep at both
   bounds.
