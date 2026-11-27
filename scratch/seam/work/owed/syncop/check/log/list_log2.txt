@@ -1,3 +1,0 @@
-syncop.py fail maxlen=6 R=5 wait=True sync_rule=max err_later_only=True secs=550
-syncop.py tail maxlen=4 R=8 wait=True sync_rule=max pin_inflight=False secs=550
-syncop.py tail maxlen=4 R=8 wait=False sync_rule=max pin_inflight=False secs=550

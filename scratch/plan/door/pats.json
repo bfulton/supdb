@@ -1,9 +1,0 @@
-{"fs": "\\bfs::|\\bOpenOptions\\b|\\bFile::",
- "Filetype": "\\bFile\\b(?!::)",
- "fsmeth": "\\.(sync_data|sync_all|set_len|read_exact_at|write_all_at|write_at|try_clone|metadata|as_raw_fd|into_raw_fd|from_raw_fd|exists|is_dir|is_file|canonicalize|read_to_end|read_to_string|symlink_metadata|read_link|try_exists)\\(",
- "fileext": "FileExt|MetadataExt|AsRawFd|FromRawFd|AsFd|OwnedFd|BorrowedFd|RawFd",
- "mmap": "memmap2::|\\bMmap(Mut|Options|Raw)?\\b",
- "libc": "libc::(open|openat|mmap|munmap|madvise|posix_fadvise|sync_file_range|mincore|getrusage|fallocate|ftruncate|memfd_create|mprotect|pwritev|ioctl|syscall|sysconf|clock_gettime|sched_setscheduler|mallopt|malloc_trim|mallinfo2|dlsym|getrandom)\\b",
- "procsys": "\"/(proc|sys)/",
- "thread": "thread::spawn|thread::Builder|\\bBuilder::new\\(\\)|\\.spawn(_scoped)?\\(|thread::scope|thread::park|park_timeout|thread::sleep|\\bsleep\\(|\\.join\\(\\)|\\bCondvar\\b|\\.wait(_timeout|_while|_timeout_while)?\\(|\\.recv(_timeout)?\\(|try_recv|mpsc::|thread::yield_now"
-}

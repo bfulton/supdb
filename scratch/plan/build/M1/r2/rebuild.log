@@ -1,3 +1,0 @@
-   Compiling supdb v0.1.0 (/home/user/supdb)
-    Finished `checked` profile [optimized + debuginfo] target(s) in 23.03s
-  Executable tests/fuzz.rs (target/checked/deps/fuzz-b95676fc811c3756)

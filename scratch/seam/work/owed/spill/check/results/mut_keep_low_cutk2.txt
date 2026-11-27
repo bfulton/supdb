@@ -1,6 +1,0 @@
-   refused opens 0 skipped ops 978 slot table full 0
-== spill n=4 alpha=CTDPRUXLctdpru {'cutk': 2, 'keep': 'low', 'open_sync': True} runs 4735 blocked 0 states {'proc': 140666, 'any': 385626} violations 3 secs 2.3
-    ('any', 'AMBIG') 3
-  first ('any', 'AMBIG') ('AMBIG', 'n0', 'equal ns')
-     ops RLXR
-     trace [('create', 'n0'), ('data', 'i0'), ('fsync', 'i0'), ('sync_dir',), ('man write', ('n0',)), ('man sync',), '--', 'R', ('create', 't6'), ('data', 'i4'), ('fsync', 'i4'), ('rename', 'n0'), ('sync_dir',), ('unlink', 'n0'), 'L', ('sync_dir',), ('unlink', ('sweep', 'n0')), 'X', 'R', ('create', 't14'), ('data', 'i12'), ('fsync', 'i12'), ('rename', 'n0')]

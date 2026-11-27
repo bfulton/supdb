@@ -1,2 +1,0 @@
-M1 (eager on in both variants) exit 101 : thread 'the_compact_form_is_built_and_read_within_a_cache_the_store_does_not_fit' (4658) panicked at tests/cipher.rs:1833:13: assertion `left == right` failed: a build before the form's settle, with the builds left to it test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 25 filtered out
-M2 (a build that does not rest) exit 0 : test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 25 filtered out; finished in 2.91s 

@@ -1,8 +1,0 @@
-{
- "base": "ea6352181f342b7bffd75ec8c88df92bc7b78ff6",
- "only": [
-  "G1-8"
- ],
- "tail": false,
- "since": "THE LAUNCHER'S NOTE IS A FILE: /tmp/claude-0/-home-user-supdb/2fecfb3d-3630-50b2-b9c5-2a19705f39b6/scratchpad/plan/build/G1-8/since.txt (about eighteen thousand characters, nine numbered points). Read all of it before anything else and again before you answer: it binds this launch as the plan's section \"What every unit inherits\" does, and it stands where the plan and it differ. Its outline: 0, what landed after the plan (G1-4 to G1-7, a merge of upstream's head 7c62153e and its later rows, fixes of the lists' check and of two durable helpers), what each made, and THIS UNIT'S OWN LIST of docs items the earlier units left for it, lettered (a) to (g): the plan's section and CLAUDE.md's stale statements of how the gates are held, the docs G1-5, G1-6, G1-7 and the merge left untrue or with history in them, what the store does under a cipher said as checked facts, and that no compiled code changes; 1, the earlier units; 2, the count; 3, the gates that bind (tests/source.rs holds lines of src by their text: run it after every edit under src/); 4, the unit gate; 5, tests hand callbacks through kv and vf; 6, the disk; 7, no timing; 8, how an agent waits (a foreground until-loop on the log's EXIT line with the call's timeout at 600000, never the Monitor tool, never a turn ended to wait)."
-}

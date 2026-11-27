@@ -1,6 +1,0 @@
-a file of its own      scan:    28.1 ms,     1 major faults   points:   177.1 ms,  3557 major faults
-an extent of one file  scan:    31.0 ms,     1 major faults   points:   183.3 ms,  3557 major faults
-a file of its own      scan:    29.3 ms,     1 major faults   points:   171.1 ms,  3557 major faults
-an extent of one file  scan:    29.2 ms,     1 major faults   points:   177.2 ms,  3557 major faults
-a file of its own      scan:    27.2 ms,     1 major faults   points:   174.7 ms,  3557 major faults
-an extent of one file  scan:    29.4 ms,     1 major faults   points:   178.2 ms,  3557 major faults

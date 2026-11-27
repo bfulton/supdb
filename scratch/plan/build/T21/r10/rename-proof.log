@@ -1,7 +1,0 @@
-src/blob.rs code identical modulo rename
-src/bytes.rs code identical modulo rename
-src/db.rs code identical modulo rename
-src/db/pager.rs code identical modulo rename
-src/db/zfile.rs code identical modulo rename
-src/lib.rs code identical modulo rename
-src/ordindex.rs code identical modulo rename

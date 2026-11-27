@@ -1,1 +1,0 @@
-src/db/zfile.rs src/db/zpages.rs src/db/zselect.rs src/db/zlz4.rs src/ordindex.rs src/flatindex.rs src/blob.rs src/block.rs src/index.rs src/format.rs src/reserve.rs src/db/blocks.rs src/bytes.rs src/lib.rs src/wasmapi.rs src/db.rs src/db/vault.rs src/db/pager.rs src/crypt.rs src/db/dirkey.rs

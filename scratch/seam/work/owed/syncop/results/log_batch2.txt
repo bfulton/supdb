@@ -1,9 +1,0 @@
-### syncop.py fail maxlen=6 R=5 wait=True sync_rule=max err_later_only=True secs=550
-sequences 5893 time 25.1s complete
-== syncop fail {'R': 5, 'wait': True, 'sync_rule': 'max', 'err_later_only': True} maxlen=6 inf=2 runs 5877 blocked 16 states {'proc': 40834, 'any': 2057623} violations 0 secs 25.1
-### syncop.py tail maxlen=4 R=8 wait=True sync_rule=max pin_inflight=False secs=550
-sequences 810 time 16.3s complete
-== syncop tail {'R': 8, 'wait': True, 'sync_rule': 'max', 'pin_inflight': False} maxlen=4 inf=2 runs 810 blocked 0 states {'proc': 8857, 'any': 673482} violations 0 secs 16.3
-### syncop.py tail maxlen=4 R=8 wait=False sync_rule=max pin_inflight=False secs=550
-sequences 810 time 25.9s complete
-== syncop tail {'R': 8, 'wait': False, 'sync_rule': 'max', 'pin_inflight': False} maxlen=4 inf=2 runs 810 blocked 0 states {'proc': 8857, 'any': 975456} violations 0 secs 25.9

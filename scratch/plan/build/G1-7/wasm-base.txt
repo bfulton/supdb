@@ -1,4 +1,0 @@
-wasm_bytes 130094
-wasm_gzip 53426
-floor_bytes 29292
-floor_gzip 13032

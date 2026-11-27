@@ -1,7 +1,0 @@
-# SYNCOP failed syncs (the family named 'fail' is the original failed-write family)
-stream.py sfail maxlen=6 chain=1 wait=False sync_rule=max
-stream.py sfail maxlen=6 chain=1 wait=True sync_rule=assign
-stream.py sfail maxlen=6 chain=1 wait=False sync_rule=assign
-stream.py sfail maxlen=6 chain=1 wait=False sync_rule=max keep_err=0
-stream.py sfail maxlen=6 chain=1 wait=False sync_rule=max err_later_only=1
-stream.py sfail maxlen=6 chain=1 wait=True sync_rule=max keep_err=0

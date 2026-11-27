@@ -1,7 +1,0 @@
-1226:---- a_seal_of_a_run_whose_close_cannot_be_made_leaves_the_run_open stdout ----
-1227-
-1228-thread 'a_seal_of_a_run_whose_close_cannot_be_made_leaves_the_run_open' (12324) panicked at tests/durable.rs:6952:19:
-1229-called `Result::unwrap()` on an `Err` value: Custom { kind: InvalidData, error: "a test failed this landing" }
-1230-stack backtrace:
-1231-   0: __rustc::rust_begin_unwind
-1232-             at /rustc/2d8144b7880597b6e6d3dfd63a9a9efae3f533d3/library/std/src/panicking.rs:689:5

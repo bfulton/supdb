@@ -1,6 +1,0 @@
-== slots lens=2,4 open_read=device maxlen=5 alpha=WUOBEFwVsKXP runs 246974 states {'proc': 1517189, 'any': 2743516} violations 0 secs 70.9
-== slots NSEC=4 SU=1 lens=4,3,2 open_read=device maxlen=5 alpha=WUOBEFwVsKXP runs 246974 states {'proc': 2017149, 'any': 8062750} violations 0 secs 130.6
-== slots maxP=2 open_read=device maxlen=5 alpha=WUOBEFwVsKXP runs 260964 states {'proc': 1043001, 'any': 1902325} violations 0 secs 53.3
-== slots chain=cross open_read=device maxlen=5 alpha=WUOBEFwVsKXP runs 246974 states {'proc': 990040, 'any': 1785777} violations 0 secs 50.8
-
-[killed]

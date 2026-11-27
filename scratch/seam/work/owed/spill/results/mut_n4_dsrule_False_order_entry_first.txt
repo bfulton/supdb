@@ -1,6 +1,0 @@
-   refused opens 918 skipped ops 1161 slot table full 0
-== spill n=4 alpha=CTDPRUXLctdpru {'order': 'entry_first', 'dsrule': False} runs 4735 blocked 0 states {'proc': 173408, 'any': 897987} violations 113899 secs 4.7
-    ('any', 'UNNAMED') 113899
-  first ('any', 'UNNAMED') ('UNNAMED', 'L4')
-     ops P
-     trace [('create', 'n0'), ('data', 'i0'), ('fsync', 'i0'), ('sync_dir',), ('man write', ('n0',)), ('man sync',), '--', 'P', ('link', 'L4'), ('rec', 'L4'), ('sync_dir',), ('man write', ('L4',))]

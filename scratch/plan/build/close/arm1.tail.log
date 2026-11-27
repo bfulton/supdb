@@ -1,6 +1,0 @@
-test reserve::tests::the_planner_and_the_slice_agree ... ok
-test reserve::tests::the_planner_holds_aggregates_rather_than_the_input ... ok
-
-test result: ok. 530 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 639.38s
-
-EXIT 0

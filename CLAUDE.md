@@ -65,8 +65,12 @@ owner's:
   was. Fetch it, merge it into this branch, build it and count against
   it; never push to it or to another line. Push here whenever there is
   a commit: the gate is for what a commit claims, not for the push. No
-  pull request until the owner asks for one. "Stay wholly off of
-  upstream" was read for half a day as never fetch, merge or count
+  pull request until the owner asks for one; the owner asked on
+  2026-11-27 -- "rebase on main after a merge then put anything not done
+  which is important in the roadmap and open a pr" -- and the rebase was
+  read as the merge below again, the branch holding six hundred commits
+  that its docs cite, and done as one, main's #30 to #33. "Stay wholly
+  off of upstream" was read for half a day as never fetch, merge or count
   against it, where it meant never modify it: an instruction about
   another line is said back as the operations it forbids before the
   widest reading is acted on. "Let's also rebase on main" was the same
@@ -167,9 +171,11 @@ owner's:
   same hour, "Try to stay focused and efficient though": a stage is
   built in the least form that its cells call for, and a form the plan
   drew larger waits for the pairing that asks for it.
-- **`scratch/` is this branch's working records, and comes off before a
-  merge or a pull request**, as it came off PR #6. The layer's design
-  (`scratch/seam/design.md`, its decisions and the forms' contract
+- **`scratch/` was this branch's working records, and came off for the
+  pull request**, as it came off PR #6: every `scratch/` path this file
+  and `ROADMAP.md` cite is of the tree at `3442b07`, the last commit
+  that holds it (`git show 3442b07:scratch/plan/onefile.md`). The
+  layer's design (`scratch/seam/design.md`, its decisions and the forms' contract
   beside it); the stage plans (`scratch/plan/g1.md`, closed, with a
   critic's account of what each gate holds and a way to write past it
   in `scratch/plan/build/close/g1-built.md`, to be read before a gate is
@@ -11131,6 +11137,47 @@ build, and a form file built after it was room the open took beside a
 named segment; read behind `zpages_settle`, none in sixty. A twin added
 under a mode runs under every switch its sibling does before the twin
 is called held, since the stride group had passed it once by the coin.
+
+**Two lines' answers to one ask, merged by text.** This branch's run
+close lands durable only at the writer's word, the drain's ask
+(`SealJob::awaits_writer`), since a presync the writer makes after the
+hand-over can fail where the seal's own fsync would not see it; main's
+drain answers its ask at the seal's readable landing where every write it
+covers was durable before it (`Options::drain_answers_readable`), and
+leaves the durable landing to the segment work's loop. The two merged
+clean in text. With the run closed on the seal thread
+(`close_readable_inline` off, the `supdb-closeseal` arm), the drain's ask
+was answered early, the loop lands no job that awaits the word, and every
+seal behind it waited at the queue for the next flush or settle: a store
+that drains and then only commits fills its frozen list and waits for a
+landing nobody makes. Seven tests of `tests/durable.rs` failed over the
+merged tree, every one a test of the strict drain or of the presync, and
+reading each for the shape it was written for is what found this eighth
+state, on which no test failed. The early answer refuses a job that
+awaits the word now (`Maint::drain_readable`), and
+`a_drain_names_its_runs_segment_durable_before_it_answers` builds it,
+red without the refusal. Three more of the same merge, each where a
+mechanism of one side met a shortcut of the other's. Main's packed copy
+unpacks itself before a write it cannot take in place, and this branch's
+patch then wrote the run over the old one and called the form's bytes
+unchanged, skipping their count: the checked build's assertion in the
+upkeep thread, once in a gate's `settle`. A test's crash
+(`Db::crash`) shut a store in one file's table before main's `Life` had
+waited out the store's threads; the table's registration gone, a landing
+the segment work was in the middle of wrote its slot in the layout of a
+store of files, and the reopen refused a partition it called missing,
+once in twelve runs of `tests/onefile.rs`: the table is shut after the
+threads end. And a helper of `tests/runlog.rs` that this branch had made
+skip empty temp names hid the file main makes ahead of a run from main's
+own tests of it. Both lines had made that file, under one option's name
+(`run_spare`), by two mechanisms: main's is kept, and makes none under a
+cipher. The rules: a merge is read for where each side's mechanism
+answers an ask the other's waits on, or skips a count the other's change
+moves, since a word one side waits for is a word the other side's
+shortcut does not give; a test that fails over a merge is sorted by the
+shape it was written for before it is changed, pinned to that shape,
+with the shipped shape held beside it; and two mechanisms built apart
+for one purpose are one, the shipped line's.
 
 ## Standing limitations
 **One number that meant three things while there was one writer.** A

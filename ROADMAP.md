@@ -780,7 +780,27 @@ What an engine picker would hit, roughly in order.
   slower, and a merge's landing later. Done when the segment writer hands
   finished pieces to the cipher as it writes them, which wants an
   envelope whose chunks do not bind the length, and a last chunk that says
-  it is the last.
+  it is the last. The shape drawn for it: a second layout for a store's
+  own files (the published `crypt` envelope stays version 1), in which a
+  chunk's check covers the header less the length and a byte that says
+  whether it is the last, and the last chunk's covers the length too, so
+  every chunk but the last is sealed once a byte past it is written and
+  an open checks the last chunk with the first. The writer's three writes
+  behind its frontier -- the superblock page, the head reserve, the key
+  section's header (`SegmentWriter::finish`) -- are chunks held back to
+  the finish, and a write into a chunk already sealed is refused, its
+  nonce being spent. What it is worth, read before it is built: a merge's
+  CPU over the full rewrite's burst at ten million keys under 1.25 GiB is
+  a fifth the output's trip through its memory file (`shmem_get_folio`,
+  `copy_folio_from_iter`, the charge, the unmap's shootdowns) and AES-GCM
+  a twentieth; and of the files a store under a cipher gave envelopes
+  through a load and a lag sweep at five million keys under 640 MiB the
+  cache took 177 whole from their writers and left 146 to be read back
+  (`cipher_adopted`, `cipher_left`), so the memory file is wasted for
+  about half of them. Built on that half or not at all: the files the
+  cache has no room for written with no memory file, priced on the pass
+  after the full rewrite against `rocksdb-tuned-enc`, which is 0.55-0.82x
+  there at five million keys under 640 MiB.
 - [x] **A store under a cipher larger than memory.** The store's cache of
   plaintext has a budget (`StoreCipher::cache_bytes`), gives back what has
   not been read lately once it is past it, and decrypts a chunk again
@@ -819,8 +839,19 @@ What an engine picker would hit, roughly in order.
   envelope is written whole at the close, where a plain run's bytes
   reach the device commit by commit. It wants the streamed envelope
   above, with a commit's chunks sealed as the commit is made and a
-  recovery that reads the run's envelope to its last whole commit. Done
-  when a run under a cipher writes no frame to the log.
+  recovery that reads the run's envelope to its last whole commit. A
+  commit's partial chunk is not sealed as its chunk, which the next
+  commit would seal again under the same nonce, but as a record behind
+  the run's frontier that the next commit's whole chunks replace, and the
+  open reads the run's envelope to its last whole commit where it replays
+  the log's frames now (`Db::log_run`, gone under it). It is the last
+  cell of the durable roster at five million keys under 640 MiB: the
+  ordered load at 0.89-0.97x of `rocksdb-tuned-enc` in both orders, the
+  rest of the row ahead. Done when a run under a cipher writes no frame
+  to the log, and its crash states -- a commit's partial chunk torn, the
+  record behind the frontier torn, a run cut between two commits -- are
+  built by hand in `tests/cipher.rs` as `tests/runlog.rs` builds a plain
+  run's.
 - [ ] **A log file retired off the drain.** A drain whose promotion or
   merge publishes a manifest retires the closed log files behind it
   before it answers, and a file retired is an inode freed, a device
@@ -838,16 +869,18 @@ What an engine picker would hit, roughly in order.
   envelope is a stored page less its tag, so a page of plaintext lies
   across two chunks, and a form page, which is a page, is two pages of
   ciphertext to a cold read: under a bound the form the controller buys
-  read at 0.73x of the raw form it replaced, and the controller is off
-  under a cipher for it. With the tags kept apart, at the envelope's end
+  read at 0.73x of the raw form it replaced, which kept the controller
+  off under a cipher until the stride form and a cache that follows the
+  room made the buy pay without it. With the tags kept apart, at the envelope's end
   or in a file beside it, a chunk is a page, a form page is one page of
   ciphertext and a tag's page serves a megabyte of them; the store's
   cache then gives back by the page and not by the megabyte a run of
   chunks comes to. It is a second layout of an envelope, for a store's
-  own files, with the first on record for a published one. Done when
-  `pair.sh supdb-cipherauto supdb-cipher 5000000 --bound 671088640
-  --passes read` reads the form ahead in both sittings, and the
-  controller is on under a cipher.
+  own files, with the first on record for a published one, and the same
+  second layout as the envelope sealed as it is written above. Done when
+  the block form under a cipher (`ZPages::Always`, the stride form off)
+  reads ahead of the raw form under a cipher at five million keys under
+  640 MiB in both sittings.
 - [x] **A form file's damage taken as the form's alone.** A chunk of a
   form file that fails its tag was a read of the store that failed, and
   the store refused every read after it. The pager keeps such a failure
@@ -1177,9 +1210,9 @@ until the run is its own log). What it loses:
   supdb-cipher SIZE --bound B --passes
   load,read,read-threaded,scan,scan-threaded,mixes,scan-mixed,mixes-scrambled,lag
   --reps 2 --ops-div 10` at `9ef998b`, five million keys under 640 MiB
-  and ten million under 1 GiB and 1.25 GiB; `scratch/plan/onefile.md`,
-  O5a, has the cells): every read, scan and mix cell ahead at every bound
-  in both orders, by 1.3x to 62x, and in core nothing built and nothing
+  and ten million under 1 GiB and 1.25 GiB; the stage plan,
+  `scratch/plan/onefile.md` at `3442b07`, O5a, has the cells): every
+  read, scan and mix cell ahead at every bound in both orders, by 1.3x to 62x, and in core nothing built and nothing
   resolved but the read pass at 0.97x in both orders: the census's hooks,
   11.6 instructions a read of 1,220 (`valgrind --tool=callgrind
   --collect-atstart=no --toggle-collect='<supdb_bench::engines::Supdb as
@@ -1547,8 +1580,10 @@ turned on neither.
   million keys under 1.25 GiB, every directory sync, open and close, and
   by a probe 44% of a segment's write and sync -- and the sealing then
   sits on extents where the design had a stored file a logical file, with
-  no sealed names. `scratch/plan/onefile.md` has the stages and what each
-  is held to; `scratch/onefile/design.md` the decisions.
+  no sealed names. The stages and what each was held to were
+  `scratch/plan/onefile.md`, and the decisions with the probe behind each
+  `scratch/onefile/design.md` and `notes.md`, at `3442b07`, the last commit
+  that holds `scratch/`; what is left of them is the item below.
 - [ ] **The store in one file: what is built, and what leans.** Built:
   the plain store's segments, ordered indexes and form files as extents
   of one data file (`Options::one_file`, off; `src/db/onefile.rs`; the
@@ -1565,7 +1600,7 @@ turned on neither.
   (`SUPDB_TEST_ONEFILE=1`, `tests/cipher.rs` among them), the
   differential fuzz (`ZFUZZ_ONEFILE=1`, with `ZFUZZ_CIPHER=1`) and
   the `onefile` group. Paired against the default
-  (`scratch/plan/onefile.md` has each command and table): level in
+  (`scratch/plan/onefile.md` at `3442b07` has each command and table): level in
   memory at three hundred thousand and three million keys; at ten
   million keys under 1.25 GiB and 1 GiB every burst of the lag sweep
   ahead, the full rewrite's 1.2x in every pair, for the frees it no
@@ -1614,7 +1649,7 @@ turned on neither.
     nothing.
   - Under a cipher (`supdb-cipherautoonefile` against
     `supdb-cipherauto`, ten million keys under 1.25 GiB;
-    `scratch/plan/onefile.md` has the commands and counts): the scan
+    `scratch/plan/onefile.md` at `3442b07` has the commands and counts): the scan
     pass after the lag sweep's full rewrite, 0.43x and 0.32x in no pair
     of four, with the burst before it 1.17x and 1.24x ahead in every
     pair. The pass's time is one line through the megabytes merges write
@@ -1658,16 +1693,55 @@ turned on neither.
   count (`sh scripts/cost.sh`), the lists against both bases, the whole
   gate with the `onefile` group, the row in memory, and the cells
   against `rocksdb-tuned-enc`.
-  Then the stages left, in the order agreed: a run its own log under a
-  cipher, with the controller on, and with it an envelope of whole pages
-  sealed as it is written; the log, the slots and the run into the
-  file, and the full-copy checkpoint, where the log's growth cannot be a
+  Then the stages left, in the order agreed. The controller on under a
+  cipher is done (`Options::zpages_under_cipher`, above). A run its own
+  log under a cipher, and with it an envelope of whole pages sealed as it
+  is written: the two items of that name above. The log, the manifest's
+  slots and an ordered run into the file -- the log as extents with its
+  rotation, retirement and first extent's pre-write, the slots at the
+  file's head, a run an extent with its marker in the log -- and the
+  full-copy checkpoint (`copy_to`, in `checkpoint`'s place, "Okay, let's
+  go with full copy checkpoints"), where the log's growth cannot be a
   `fallocate` on a commit's path (the entry on the growth's step in
-  `CLAUDE.md`); the defaults, each only where the suite reads it better
-  and the gate passes with it on.
+  `CLAUDE.md`), held by the crash oracle, the kill tests and
+  `tests/runlog.rs` under the option, with the states a rotation and a
+  run's close leave built by hand, and paired with the loads' phases
+  (`SUPDB_LOAD_PHASES`, `SUPDB_DRAIN_STEPS`); a pass of the suite that
+  makes a checkpoint, opens it and reads through it, so the links have a
+  number before the copy replaces them. Then the defaults, each only
+  where the suite reads it better and the gate passes with it on: the
+  plain store's layout and the cipher's, an old store's rewrite at its
+  first open, the docs and the arms of the shapes before. And owed from
+  the plain store's stage: the mechanical operator flips over
+  `src/db/onefile.rs` beside its listed mutants, since a list finds only
+  what its author thought of.
 
-### Before a pull request
+### Before the pull request merges
 
+- [ ] **Main's #30 to #33 held under a cipher.** The merge of `eceb66d`
+  brought handles that write a shared live table
+  (`Options::shared_writers`, `share_on_write`), drains answered at their
+  seal's readable landing (`drain_answers_readable`,
+  `drain_syncs_beside`), a close of a direct run readable on the writer
+  (`close_readable_inline`), copies whose claim is a key sequence carried
+  across merges (`identity_by_keys`, `KeySeq`), packed copies
+  (`copy_packed`), the frozen tables held to bytes (`frozen_bytes`) and a
+  run's file made ahead of it (`run_spare`). Two were reconciled in the
+  merge: this branch's own run spare, a second mechanism for the same
+  thing, was taken out for main's, and makes none under a cipher, whose
+  runs have no name in the directory; and a logged run's close is never
+  readable on the writer, its envelope being the seal thread's. Done when
+  each is read for which bytes it reads and through what, and held under
+  a cipher by a test where it reads a file -- a shared table's seal and
+  a drain answered early beside a crash in `tests/cipher.rs` first, since
+  an early answer under a cipher rests on the log's frames and not on a
+  run's temp name. The differential fuzz's ranges past the gate's were
+  run at the merge (`ZFUZZ_CACHE=all ZFUZZ_OPTVARY=1`: seeds 24 to 344
+  under a cipher in a cache of sixteen kilobytes, 24 to 184 in the clear
+  and with the compact form forced under a cipher), main's defaults on
+  in every seed and packed copies drawn in half of them; handles that
+  write (`ZFUZZ_SHARE`) were not run past the gate's range, and under a
+  cipher not at all.
 - [ ] **Timing rows against the line this is built on.** "No impact for
   a store with no encryption" is held by instruction count, change by
   change, and a count sees no stall. Done when the quick, full and

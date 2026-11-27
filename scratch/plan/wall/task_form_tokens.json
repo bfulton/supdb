@@ -1,7 +1,0 @@
-{
-"seg-": "seg-", "pcs-": "pcs-", "par-": "par-", ".sup": "\\.sup", ".oidx": "\\.oidx", "ord-": "ord-",
-"zpg": "zpg", ".zpg": "\\.zpg", "wal-": "wal-", "spare-": "spare-", "manifest": "manifest",
-"direct-": "direct-", "compact-": "compact-", "tier-": "tier-", "seal-": "seal-",
-"Blob": "\\bBlob\\b", "SegmentWriter": "\\bSegmentWriter\\b", "ZFile": "\\bZFile\\b", "OrdIndex": "\\bOrdIndex\\b",
-"Wal": "\\bWal\\b", "Db::": "\\bDb::", "MemTable": "\\bMemTable\\b", "Manifest": "\\bManifest\\b"
-}

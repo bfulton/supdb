@@ -1,3 +1,0 @@
-start 2026-11-22T18:30:53Z check.sh sha=fc2cad1c5913
-run 1 exit 1 segv 0 test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 530 filtered out; finished in 0.01s 0
-EXIT done 2026-11-22T18:30:53Z

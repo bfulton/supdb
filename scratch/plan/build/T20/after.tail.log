@@ -1,5 +1,0 @@
-test every_arm_that_writes_a_slot_keeps_the_last_durable_one ... ok
-
-test result: ok. 283 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 45.79s
-
-EXIT 0

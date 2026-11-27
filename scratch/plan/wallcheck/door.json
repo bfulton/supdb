@@ -1,1 +1,0 @@
-{"door":"\\bvault::(create|create_rw|open|open_write|open_append|open_slot|open_dir|map|rename|hard_link|remove_file|names|len|exists|is_file|read|sync_dir|real)\\b","beyondR0":"\\bvault::(create_rw|open_write|open_append|open_slot|open_dir|len|exists|is_file|read|real)\\b","real":"\\bvault::real\\b"}
