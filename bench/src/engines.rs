@@ -13874,6 +13874,12 @@ impl Engine for Supdb {
         // beside what was decrypted and given back in it, and beside what
         // its reads waited for a crowded cache.
         let pc = db.cipher_counts().map(|c| c.cache).unwrap_or_default();
+        // The table of a store kept in one file, zeroes for a store of
+        // files: the files moved for outgrowing their room, each a copy of
+        // what was written of it, the growths in place, the data file's
+        // syncs and its room used again.
+        let oc = db.one_counts();
+        let one = |f: fn(&supdb::OneCounts) -> u64| oc.as_ref().map_or(0, f) as f64;
         let ev = db.forms_events();
         let sd = db.settle_density();
         let bk = db.build_kinds();
@@ -13935,6 +13941,13 @@ impl Engine for Supdb {
             ("cipher_evictor_passes", pc.passes as f64),
             ("cipher_dropped_units", pc.dropped_units as f64),
             ("cipher_dropped_bytes", pc.dropped_bytes as f64),
+            ("one_moves", one(|c| c.moves)),
+            ("one_grown", one(|c| c.grown)),
+            ("one_growths", one(|c| c.growths)),
+            ("one_syncs", one(|c| c.syncs)),
+            ("one_reused", one(|c| c.reused)),
+            ("one_end_at_end", one(|c| c.end)),
+            ("one_free_at_end", one(|c| c.free)),
             ("lazy_scans_done", db.lazy_scans().0 as f64),
             ("lazy_scans_resumed", db.lazy_scans().1 as f64),
             ("seals", db.seal_waits().joins as f64),

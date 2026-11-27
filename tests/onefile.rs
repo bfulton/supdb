@@ -884,6 +884,49 @@ fn a_store_under_a_cipher_is_kept_in_one_file_and_reads_as_itself() {
     assert!(on_device(&d, b"key-000017") && on_device(&d, b"a-3999"));
 }
 
+/// An envelope is given the room it fills, said to the table before its
+/// first byte (`Vault::write_envelope_at`). An envelope is written a
+/// megabyte at a time, and one written with no word of its size is given
+/// its first piece's room and outgrows it at the second: grown where it
+/// stands while the room behind it is free, and moved, every byte of it
+/// written again, where another file has been placed there. Here a
+/// segment of three megabytes, alone in its store: with nothing said it
+/// grows twice.
+#[cfg(target_os = "linux")]
+#[test]
+fn an_envelope_is_given_the_room_it_fills() {
+    let d = dir("sealed-room");
+    let opts = Options {
+        seal_bytes: 16 << 20,
+        partition_bytes: Some(16 << 20),
+        ..sealed(false, 23)
+    };
+    let mut db = Db::create(&d, opts).unwrap();
+    let mut model = BTreeMap::new();
+    for i in 0..3000u32 {
+        let v = vec![b'a' + (i % 23) as u8; 1000];
+        db.put(&key(i), &v);
+        model.insert(key(i), v);
+        if i % 200 == 199 {
+            db.commit().unwrap();
+        }
+    }
+    db.commit().unwrap();
+    db.flush().unwrap();
+    db.settle().unwrap();
+    let c = db.one_counts().unwrap();
+    assert!(
+        c.held > 2 << 20,
+        "the premise: an envelope of several megabytes: {c:?}"
+    );
+    assert_eq!(
+        (c.moves, c.grown),
+        (0, 0),
+        "an envelope outgrew the room it was given: {c:?}"
+    );
+    assert_eq!(dump(&db), model);
+}
+
 /// An open that publishes tells the table its manifest is on the device,
 /// as the segment work's publishes do (`SlotChoice::write_shape`). Here
 /// the open names the piece a killed writer's run became, so the slot it

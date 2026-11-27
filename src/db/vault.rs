@@ -1814,8 +1814,24 @@ impl Vault {
         let len = mem.metadata()?.len();
         // Under a key of the file's own, which has no name of the caller's.
         let opts = EncryptOptions::default();
+        let file = self.env_create(name)?;
+        // In the store's data file the envelope's room is said before its
+        // first byte: its length is its plaintext's and its chunks' tags,
+        // known here. A file written there with no word of its size is
+        // given its first write's room, and each time it outgrows what
+        // stands free behind it -- which beside three merges and the
+        // builds is most times -- it is moved, its bytes copied
+        // (`onefile::ExtFile::placed`): a load of ten million keys sent
+        // the device a third to a half more bytes than a store of files'
+        // and its merges were still writing a gigabyte and a half inside
+        // the scan pass after a full rewrite, a third of that pass's rate.
+        if let Some(one) = self.one() {
+            if let Ok(h) = crypt::Header::new(len, opts.chunk_shift, [0; 16], opts.key_id) {
+                one.expect(name, h.stored_len());
+            }
+        }
         let mut out = Ahead {
-            file: self.env_create(name)?,
+            file,
             at: 0,
             hint: sync,
         };
