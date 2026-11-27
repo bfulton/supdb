@@ -1,9 +1,11 @@
 # Supdb roadmap
 
 Open work, one item each: what it is, when it is done, and the design note
-where there is one. Figures name the row they are read from.
+where there is one. Figures name the row they are read from. High priority
+is a wrong answer, an API or format that is harder to change later, a
+number not yet fair to publish, or an arm the bound kills.
 
-## Engine: API and correctness
+## High priority
 
 - [ ] **A scan's limit counts the keys it answers.** `scan(from, limit)`
   counts deleted keys the store still records, so a page comes back
@@ -29,27 +31,23 @@ where there is one. Figures name the row they are read from.
   read-modify-writing a few hot keys lose no update, and `threads-RMW` runs
   every arm through it. Design: `docs/engine.md`, "A live table every
   writer writes".
-- [ ] **Concurrent writers with conflict detection.** Transactions from
-  several threads that commit or are refused on a conflict, as RocksDB's
-  `TransactionDB` does, where today one writer applies every batch.
-  Builds on the conditional write.
-- [ ] **Reverse and bounded scans.** `scan` is forward from a start key
-  with a count. Add an end bound and reverse order, beside `scan_page`.
-- [ ] **Range delete.** Deleting a key range without a tombstone per key.
-- [ ] **Batched point reads (`MultiGet`).** Several keys in one call, and a
-  workload for it.
-- [ ] **Column families.** Independent key spaces in one store, sharing
-  its log and committed together.
-- [ ] **Wide columns.** Named columns within a key's value, read and
-  written apart.
-- [ ] **User-defined timestamps.** A version a caller supplies, readable as
-  of a timestamp.
-- [ ] **TTL and compaction filters.** Values that expire, and a hook that
-  drops or rewrites records as merges pass over them.
-- [ ] **Tracing and replay.** Record a store's operations and replay them
-  against another store or engine.
+- [ ] **The held arm through a full rewrite at ten million keys.**
+  `supdb-heldpart` was killed once under 1.25 GiB, and the kill's owner was
+  never read. Done when a run sampled from outside the process names it,
+  which needs a count of the engine's mapped blocks by length.
+- [ ] **What each engine's checksums verify.** RocksDB reads with
+  `verify_checksums(false)`, in memory and from its files out of core.
+  Done when RocksDB reads with its default, or the methods say what each
+  engine verifies.
+- [ ] **A kill in a rep taken again.** `Ledger::forget_rep` deletes a cut
+  rep's kills with its passes, so a row can lose a kill. Done when the row
+  keeps them and the gate reads them.
+- [ ] **Device bytes measured at the device.** "Device bytes written" is
+  the process's `/proc/self/io` count, which equals bytes on disk for
+  buffered arms, while `bench/DESIGN.md` calls it the device's counter.
+  Done when it reads the device, or is renamed.
 
-## Engine: performance
+## Low priority
 
 - [ ] **The scan pass after a lent burst.** Under the held log a burst is
   lent to the upkeep thread, and the first scan waits for the thread's pass
@@ -128,9 +126,6 @@ where there is one. Figures name the row they are read from.
 - [ ] **The index layouts the study found.** Done when one is built behind
   an option and priced in the suite's shape, or refuted there. Design:
   `docs/index-theory.md`.
-
-## Out of core
-
 - [ ] **The ordered load beside the builds ahead.** It reads 0.85x to
   0.88x of `supdb-nozpages` at ten million keys under both bounds. Done when
   it reads level, or the trade is priced against `supdb-noland` in the
@@ -160,10 +155,6 @@ where there is one. Figures name the row they are read from.
   sampler samples for a purchase no read is near. Done when the burst takes
   the faults of its fast reps in every rep, with the pass after it no
   slower.
-- [ ] **The held arm through a full rewrite at ten million keys.**
-  `supdb-heldpart` was killed once under 1.25 GiB, and the kill's owner was
-  never read. Done when a run sampled from outside the process names it,
-  which needs a count of the engine's mapped blocks by length.
 - [ ] **The memos of decoded groups in slabs.** `zpages_memo_slab`
   returns the memos' memory and is off, since the hot-raw policy's room is
   drawn from memory the slab moves. Done when the room is drawn from
@@ -180,33 +171,16 @@ where there is one. Figures name the row they are read from.
 - [ ] **The trim under a bound.** `forms_to_fit`'s trim returns freed
   memory while the store runs. Done when it is priced under a bound and
   made the default there or refuted.
-
-## Benchmark
-
 - [ ] **The full ladder past memory.** `bench/DESIGN.md` promises `full`
   to 1.5x the machine's memory; its rows stop at three million keys. Done
   when a `full` row reaches it.
 - [ ] **A full row with the held log's changes.** No `full` row since
   `a728c4c`, and none carries the held arm or FASTER. Done when one is
   banked and FASTER's group is read against the quick rows.
-- [ ] **What each engine's checksums verify.** RocksDB reads with
-  `verify_checksums(false)`, in memory and from its files out of core.
-  Done when RocksDB reads with its default, or the methods say what each
-  engine verifies.
-- [ ] **A kill in a rep taken again.** `Ledger::forget_rep` deletes a cut
-  rep's kills with its passes, so a row can lose a kill. Done when the row
-  keeps them and the gate reads them.
-- [ ] **Device bytes measured at the device.** "Device bytes written" is
-  the process's `/proc/self/io` count, which equals bytes on disk for
-  buffered arms, while `bench/DESIGN.md` calls it the device's counter.
-  Done when it reads the device, or is renamed.
 - [ ] **FASTER's rates between two bounded rows.** FASTER's point mixes
   read a third to a half higher at `33bc663` than at `001781d` with its
   configuration unchanged. Done when the move is laid to the host, and the
   held arm's to the engine changes between the rows.
-
-## Housekeeping
-
 - [ ] **The crash seam's threads with no hold.** A piece merge, the
   builder ahead, the sampler and a form file's warm have no hold to put
   them in flight at a crash, and the wake of the threads that park between
@@ -214,3 +188,22 @@ where there is one. Figures name the row they are read from.
 - [ ] **Two states of the settle no test builds.** A frozen batch cut by a
   budget, and the cache's bind at the fill's check. Done when a test builds
   each and its mutant fails, or the path is shown unreachable and removed.
+- [ ] **Concurrent writers with conflict detection.** Transactions from
+  several threads that commit or are refused on a conflict, as RocksDB's
+  `TransactionDB` does, where today one writer applies every batch.
+  Builds on the conditional write.
+- [ ] **Reverse and bounded scans.** `scan` is forward from a start key
+  with a count. Add an end bound and reverse order, beside `scan_page`.
+- [ ] **Range delete.** Deleting a key range without a tombstone per key.
+- [ ] **Batched point reads (`MultiGet`).** Several keys in one call, and a
+  workload for it.
+- [ ] **Column families.** Independent key spaces in one store, sharing
+  its log and committed together.
+- [ ] **Wide columns.** Named columns within a key's value, read and
+  written apart.
+- [ ] **User-defined timestamps.** A version a caller supplies, readable as
+  of a timestamp.
+- [ ] **TTL and compaction filters.** Values that expire, and a hook that
+  drops or rewrites records as merges pass over them.
+- [ ] **Tracing and replay.** Record a store's operations and replay them
+  against another store or engine.
