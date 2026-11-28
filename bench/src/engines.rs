@@ -977,13 +977,6 @@ pub struct Supdb {
     /// A pass on the upkeep thread gives the writer its upkeep back at
     /// its next step, `Options::upkeep_yields` on. `supdb-passyield`.
     passyield: bool,
-    /// No budget of the cache's own, `Options::scan_cache_auto` off.
-    /// `supdb-cachenoauto`.
-    cachenoauto: bool,
-    /// The cache's own budget an eighth of the limit, binding where the
-    /// cache passes it whatever room the partitions leave, the shape
-    /// before `Options::scan_cache_auto_room`. `supdb-cacheeighth`.
-    cacheeighth: bool,
     /// A raw partition's settle filing a written key by the ordered index's
     /// samples, its cut left for the build (`Options::settle_lazy_raw` on).
     /// `supdb-settlelazyraw`.
@@ -1017,7 +1010,6 @@ pub struct Supdb {
     /// The block cache granted the raw records' place where its own budget
     /// would bind and no point read is near
     /// (`Options::scan_cache_copies_fit`), `None` for the engine's default.
-    /// `supdb-nocopiesfit` is the budget that binds beside the raw form.
     copiesfit: Option<bool>,
     /// The chain through a write-only stretch only where the writer's
     /// forms do not cover the store
@@ -1343,10 +1335,6 @@ pub struct Supdb {
     /// before the next group's were asked for at the open
     /// (`Options::zpages_group_ahead` off): `supdb-znogroupahead`.
     znogroupahead: bool,
-    /// The block walk's clean run stopping at a block no walk has built,
-    /// the shape before the run built the blocks it reaches
-    /// (`Options::scan_run_builds` off): `supdb-norunbuilds`.
-    norunbuilds: bool,
     /// A cursor placed for each block's walk and each block's build, and
     /// a clean run dispatched afresh, the shape before a scan's blocks over
     /// a covered partition read through one cursor
@@ -2305,13 +2293,6 @@ struct Policy {
     /// A pass on the upkeep thread gives the writer its upkeep back at
     /// its next step, `Options::upkeep_yields` on. `supdb-passyield`.
     passyield: bool,
-    /// No budget of the cache's own, `Options::scan_cache_auto` off.
-    /// `supdb-cachenoauto`.
-    cachenoauto: bool,
-    /// The cache's own budget an eighth of the limit, binding where the
-    /// cache passes it whatever room the partitions leave, the shape
-    /// before `Options::scan_cache_auto_room`. `supdb-cacheeighth`.
-    cacheeighth: bool,
     /// A raw partition's settle filing a written key by the ordered index's
     /// samples, its cut left for the build (`Options::settle_lazy_raw` on).
     /// `supdb-settlelazyraw`.
@@ -2345,7 +2326,6 @@ struct Policy {
     /// The block cache granted the raw records' place where its own budget
     /// would bind and no point read is near
     /// (`Options::scan_cache_copies_fit`), `None` for the engine's default.
-    /// `supdb-nocopiesfit` is the budget that binds beside the raw form.
     copiesfit: Option<bool>,
     /// The chain through a write-only stretch only where the writer's
     /// forms do not cover the store
@@ -2620,8 +2600,6 @@ struct Policy {
     zviewperopen: bool,
     /// No group's lines asked ahead: `supdb-znogroupahead`.
     znogroupahead: bool,
-    /// The clean run stopping at an unbuilt block: `supdb-norunbuilds`.
-    norunbuilds: bool,
     /// A cursor a block: `supdb-blockcursors`.
     blockcursors: bool,
     /// The background work as the cost model orders it: `supdb-bg`, and
@@ -3115,8 +3093,6 @@ impl Default for Policy {
             noabandon: false,
             deferbursts: false,
             passyield: false,
-            cachenoauto: false,
-            cacheeighth: false,
             settlelazyraw: false,
             mergesync1m: false,
             zbacknow: false,
@@ -3191,7 +3167,6 @@ impl Default for Policy {
             zwalkowns: false,
             zviewperopen: false,
             znogroupahead: false,
-            norunbuilds: false,
             blockcursors: false,
             bg: false,
             bglag: false,
@@ -4994,19 +4969,6 @@ impl Supdb {
             path,
             Policy {
                 znogroupahead: true,
-                ..Policy::default()
-            },
-        )
-    }
-
-    /// `supdb` whose block walk's clean run stops at a block no walk of
-    /// the handle's has built (`Options::scan_run_builds` off): the shape
-    /// before the run built the blocks it reaches and took the clean ones.
-    pub fn create_norunbuilds(path: &Path) -> Res<Supdb> {
-        Supdb::with_policy(
-            path,
-            Policy {
-                norunbuilds: true,
                 ..Policy::default()
             },
         )
@@ -7205,30 +7167,6 @@ impl Supdb {
         )
     }
 
-    /// `supdb` with no budget of the cache's own.
-    pub fn create_cachenoauto(path: &Path) -> Res<Supdb> {
-        Supdb::with_policy(
-            path,
-            Policy {
-                cachenoauto: true,
-                ..Policy::default()
-            },
-        )
-    }
-
-    /// `supdb` whose own cache budget is the eighth of the limit as it
-    /// was, binding where the cache passes it
-    /// (`Options::scan_cache_auto_room` off).
-    pub fn create_cacheeighth(path: &Path) -> Res<Supdb> {
-        Supdb::with_policy(
-            path,
-            Policy {
-                cacheeighth: true,
-                ..Policy::default()
-            },
-        )
-    }
-
     /// `supdb` whose settle files a raw partition's written key by the
     /// ordered index's samples (`Options::settle_lazy_raw` on).
     pub fn create_settlelazyraw(path: &Path) -> Res<Supdb> {
@@ -7301,20 +7239,6 @@ impl Supdb {
             path,
             Policy {
                 formsoffbuilt: Some(true),
-                ..Policy::default()
-            },
-        )
-    }
-
-    /// `supdb` with its block cache's own budget binding where there is no
-    /// room for it beside the raw form, whatever the store's reads
-    /// (`Options::scan_cache_copies_fit` off), the shape before. The pair
-    /// against `supdb` differs by that one option.
-    pub fn create_nocopiesfit(path: &Path) -> Res<Supdb> {
-        Supdb::with_policy(
-            path,
-            Policy {
-                copiesfit: Some(false),
                 ..Policy::default()
             },
         )
@@ -9177,8 +9101,6 @@ impl Supdb {
             noabandon,
             deferbursts,
             passyield,
-            cachenoauto,
-            cacheeighth,
             settlelazyraw,
             mergesync1m,
             zbacknow,
@@ -9270,7 +9192,6 @@ impl Supdb {
             zwalkowns,
             zviewperopen,
             znogroupahead,
-            norunbuilds,
             blockcursors,
             bg,
             bglag,
@@ -9636,8 +9557,6 @@ impl Supdb {
             upkeep_abandons: !noabandon,
             upkeep_files_bursts: !deferbursts,
             upkeep_yields: passyield,
-            scan_cache_auto: !cachenoauto,
-            scan_cache_auto_room: !cacheeighth,
             settle_lazy_raw: settlelazyraw,
             merge_sync_ahead: if mergesync1m { 1 << 20 } else { 0 },
             zpages_hot_back_ask: !zbacknow,
@@ -9825,7 +9744,6 @@ impl Supdb {
             zpages_walk_owns_decodes: zwalkowns,
             zpages_cursor_view: !zviewperopen,
             zpages_group_ahead: !znogroupahead,
-            scan_run_builds: !norunbuilds,
             zpages_scan_cursor: !blockcursors,
             zpages_memo_ahead: !zmemonoahead,
             scan_start_cache: if zstartcache { 4096 } else { 0 },
@@ -10121,8 +10039,6 @@ impl Supdb {
             noabandon,
             deferbursts,
             passyield,
-            cachenoauto,
-            cacheeighth,
             settlelazyraw,
             mergesync1m,
             zbacknow,
@@ -10214,7 +10130,6 @@ impl Supdb {
             zwalkowns,
             zviewperopen,
             znogroupahead,
-            norunbuilds,
             blockcursors,
             bg,
             bglag,
@@ -11074,9 +10989,6 @@ impl Engine for Supdb {
         if self.znogroupahead {
             return "supdb-znogroupahead";
         }
-        if self.norunbuilds {
-            return "supdb-norunbuilds";
-        }
         if self.blockcursors {
             return "supdb-blockcursors";
         }
@@ -11737,12 +11649,6 @@ impl Engine for Supdb {
         if self.passyield {
             return "supdb-passyield";
         }
-        if self.cachenoauto {
-            return "supdb-cachenoauto";
-        }
-        if self.cacheeighth {
-            return "supdb-cacheeighth";
-        }
         if self.settlelazyraw {
             return "supdb-settlelazyraw";
         }
@@ -11830,9 +11736,8 @@ impl Engine for Supdb {
             self.chainuncovered == Some(false),
         ) {
             (true, true) => return "supdb-nocopiesfitchain",
-            (true, false) => return "supdb-nocopiesfit",
             (false, true) => return "supdb-chaincovered",
-            (false, false) => {}
+            (true, false) | (false, false) => {}
         }
         if self.formsoffbuilt == Some(true) {
             return "supdb-formsoffbuilt";
@@ -14580,8 +14485,6 @@ pub fn guarantee(arm: &str) -> Option<Guarantee> {
         | "supdb-noabandon"
         | "supdb-deferbursts"
         | "supdb-passyield"
-        | "supdb-cachenoauto"
-        | "supdb-cacheeighth"
         | "supdb-settlelazyraw"
         | "supdb-mergesync1m"
         | "supdb-zbacknow"
@@ -14592,7 +14495,6 @@ pub fn guarantee(arm: &str) -> Option<Guarantee> {
         | "supdb-zbuycross"
         | "supdb-jobsmappedbuycross"
         | "supdb-jobspooledbuycross"
-        | "supdb-nocopiesfit"
         | "supdb-chaincovered"
         | "supdb-nocopiesfitchain"
         | "supdb-formsoffbuilt"
@@ -14722,7 +14624,6 @@ pub fn guarantee(arm: &str) -> Option<Guarantee> {
         | "supdb-zwalkowns"
         | "supdb-zviewperopen"
         | "supdb-znogroupahead"
-        | "supdb-norunbuilds"
         | "supdb-blockcursors"
         | "supdb-bg"
         | "supdb-bglag"
@@ -16125,7 +16026,6 @@ pub fn open(arm: &str, dir: &Path, map_gb: usize) -> Res<Box<dyn Engine>> {
         "supdb-zwalkowns" => supdb_arm(Supdb::create_zwalkowns, dir)?,
         "supdb-zviewperopen" => supdb_arm(Supdb::create_zviewperopen, dir)?,
         "supdb-znogroupahead" => supdb_arm(Supdb::create_znogroupahead, dir)?,
-        "supdb-norunbuilds" => supdb_arm(Supdb::create_norunbuilds, dir)?,
         "supdb-blockcursors" => supdb_arm(Supdb::create_blockcursors, dir)?,
         "supdb-bg" => supdb_arm(Supdb::create_bg, dir)?,
         "supdb-ingestbg" => supdb_arm(Supdb::create_ingest_bg, dir)?,
@@ -16807,8 +16707,6 @@ pub fn open(arm: &str, dir: &Path, map_gb: usize) -> Res<Box<dyn Engine>> {
         "supdb-noabandon" => supdb_arm(Supdb::create_noabandon, dir)?,
         "supdb-deferbursts" => supdb_arm(Supdb::create_deferbursts, dir)?,
         "supdb-passyield" => supdb_arm(Supdb::create_passyield, dir)?,
-        "supdb-cachenoauto" => supdb_arm(Supdb::create_cachenoauto, dir)?,
-        "supdb-cacheeighth" => supdb_arm(Supdb::create_cacheeighth, dir)?,
         "supdb-settlelazyraw" => supdb_arm(Supdb::create_settlelazyraw, dir)?,
         "supdb-mergesync1m" => supdb_arm(Supdb::create_mergesync1m, dir)?,
         "supdb-zbacknow" => supdb_arm(Supdb::create_zbacknow, dir)?,
@@ -16819,7 +16717,6 @@ pub fn open(arm: &str, dir: &Path, map_gb: usize) -> Res<Box<dyn Engine>> {
         "supdb-zbuycross" => supdb_arm(Supdb::create_zbuycross, dir)?,
         "supdb-jobsmappedbuycross" => supdb_arm(Supdb::create_jobsmapped_buycross, dir)?,
         "supdb-jobspooledbuycross" => supdb_arm(Supdb::create_jobspooled_buycross, dir)?,
-        "supdb-nocopiesfit" => supdb_arm(Supdb::create_nocopiesfit, dir)?,
         "supdb-chaincovered" => supdb_arm(Supdb::create_chaincovered, dir)?,
         "supdb-nocopiesfitchain" => supdb_arm(Supdb::create_nocopiesfitchain, dir)?,
         "supdb-formsoffbuilt" => supdb_arm(Supdb::create_formsoffbuilt, dir)?,
@@ -19388,13 +19285,6 @@ mod tests {
                 assert!(!o.zpages_scan_cursor && b.zpages_scan_cursor);
             }
             {
-                let z = Supdb::create_norunbuilds(&dir("norunbuilds")).unwrap();
-                assert_eq!(z.name(), "supdb-norunbuilds");
-                assert_eq!(z.features(), base.features());
-                let o = z.db.as_ref().unwrap().options();
-                assert!(!o.scan_run_builds && b.scan_run_builds);
-            }
-            {
                 let z = Supdb::create_zhotline(&dir("zhotline")).unwrap();
                 assert_eq!(z.name(), "supdb-zhotline");
                 assert_eq!(z.features(), base.features());
@@ -19750,13 +19640,6 @@ mod tests {
                 assert!(!o.zpages_hot_fill && b.zpages_hot_fill);
             }
             {
-                let z = Supdb::create_cacheeighth(&dir("cacheeighth")).unwrap();
-                assert_eq!(z.name(), "supdb-cacheeighth");
-                assert_eq!(z.features(), base.features());
-                let o = z.db.as_ref().unwrap().options();
-                assert!(!o.scan_cache_auto_room && b.scan_cache_auto_room);
-            }
-            {
                 let z = Supdb::create_settlelazyraw(&dir("settlelazyraw")).unwrap();
                 assert_eq!(z.name(), "supdb-settlelazyraw");
                 assert_eq!(z.features(), base.features());
@@ -20084,17 +19967,6 @@ mod tests {
                 assert_eq!(z.features(), base.features());
                 let o = z.db.as_ref().unwrap().options();
                 assert!(o.zpages_buy_crosses && o.jobs_mapped && o.jobs_pooled);
-            }
-            {
-                let z = Supdb::create_nocopiesfit(&dir("nocopiesfit")).unwrap();
-                assert_eq!(z.name(), "supdb-nocopiesfit");
-                assert_eq!(z.features(), base.features());
-                let o = z.db.as_ref().unwrap().options();
-                assert!(!o.scan_cache_copies_fit && b.scan_cache_copies_fit);
-                assert_eq!(
-                    o.merge_chains_writes_uncovered,
-                    b.merge_chains_writes_uncovered
-                );
             }
             {
                 let z = Supdb::create_chaincovered(&dir("chaincovered")).unwrap();

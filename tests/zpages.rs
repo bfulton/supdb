@@ -15917,25 +15917,22 @@ fn the_census_stamps_a_long_windows_wall_on_one_operation_in_sixteen() {
 }
 
 /// A scan over a covered partition's blocks that no walk of the handle's
-/// has built is one dispatch into the form file with the clean run
-/// building the blocks it reaches (`Options::scan_run_builds`), and a
-/// dispatch a block without. A partition with no unsealed key over it
-/// takes the bulk walk, one dispatch either way, so a few of the lowest
-/// keys are written first, far below the scan, as the write mixes leave
-/// a few in every cold partition; a fresh handle, whose table holds no
-/// form, then scans four blocks and a bit from a key in the middle, and
-/// the form's scan count moves by one with the option and by at least
-/// four without. The handle builds its own table here (`commit_forms`
-/// off), since a canonical table complete at the handle's commit reads
-/// every null form as clean already.
+/// has built is one dispatch into the form file, the clean run building
+/// the blocks it reaches. A partition with no unsealed key over it takes
+/// the bulk walk, one dispatch either way, so a few of the lowest keys are
+/// written first, far below the scan, as the write mixes leave a few in
+/// every cold partition; a fresh handle, whose table holds no form, then
+/// scans four blocks and a bit from a key in the middle, and the form's
+/// scan count moves by one. The handle builds its own table here
+/// (`commit_forms` off), since a canonical table complete at the handle's
+/// commit reads every null form as clean already.
 #[cfg(target_os = "linux")]
 #[test]
 fn a_scan_over_unvisited_clean_blocks_is_one_dispatch_into_the_form() {
-    for on in [true, false] {
-        let what = format!("run builds {on}");
+    {
+        let what = "run builds";
         let (dir, mut db, model, _inject, r, keys, _at) =
-            compact_store_with(&format!("run-builds-{on}"), 1 << 20, |o| {
-                o.scan_run_builds = on;
+            compact_store_with("run-builds-true", 1 << 20, |o| {
                 o.commit_forms = false;
                 // A cursor a block (`Options::zpages_scan_cursor` off), so
                 // the dispatches count the runs; held across the scan, one
@@ -15968,11 +15965,7 @@ fn a_scan_over_unvisited_clean_blocks_is_one_dispatch_into_the_form() {
             "{what}: the keys in order"
         );
         let dispatches = c.scans - before.scans;
-        if on {
-            assert_eq!(dispatches, 1, "{what}: one dispatch for the run: {c:?}");
-        } else {
-            assert!(dispatches >= 4, "{what}: a dispatch a block: {dispatches}");
-        }
+        assert_eq!(dispatches, 1, "{what}: one dispatch for the run: {c:?}");
         drop(r);
         db.close().unwrap();
         let _ = std::fs::remove_dir_all(&dir);

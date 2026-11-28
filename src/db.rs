@@ -3342,8 +3342,8 @@ pub struct Options {
     /// rate in core, at sizes where it never bound, which is why this one
     /// waits; unbounded, the default's cache after the sweep's tenth
     /// rewrite at ten million keys was the store's own size and the group
-    /// of 1.5 GiB killed the process for it. Off: no budget, as before.
-    /// `supdb-cachenoauto` is the arm that has none.
+    /// of 1.5 GiB killed the process for it. Off, a test's: no budget.
+    #[doc(hidden)]
     pub scan_cache_auto: bool,
     /// The automatic budget (`scan_cache_auto`), or 0, the default, for an
     /// eighth of the memory available, and no budget where that cannot be
@@ -3365,7 +3365,8 @@ pub struct Options {
     /// the threads, 450-560 ms where the arm with no budget read the pass in
     /// 36-38 (`docs/engine.md`). A budget given (`scan_cache_auto_bytes`) is
     /// held as given unless the test's seam gives the page cache's budget
-    /// (`zpages_inject`). `supdb-cacheeighth` is the eighth as it was.
+    /// (`zpages_inject`). Off, a test's: the eighth as it was.
+    #[doc(hidden)]
     pub scan_cache_auto_room: bool,
     /// Where the store's own budget would bind for want of room
     /// beside the raw form, a store no point read is near may hold its
@@ -3386,8 +3387,8 @@ pub struct Options {
     /// copy does not replace, so the grant waits for a store far from them
     /// (`Shared::points_far`: none in its life, or two stores' worth of
     /// writes since the last) and is taken back at the first that comes,
-    /// the budget returning to what it was before the grant. On;
-    /// `supdb-nocopiesfit` is the budget that binds beside the raw form.
+    /// the budget returning to what it was before the grant. Off, a
+    /// test's: the budget binds beside the raw form.
     #[doc(hidden)]
     pub scan_cache_copies_fit: bool,
     /// PROTOTYPE: with the block cache, build ahead of the reader on a
@@ -3404,21 +3405,6 @@ pub struct Options {
     /// `scan_cache_ahead_min_blocks` gets none. `false` is the arm
     /// without the thread.
     pub scan_cache_ahead: bool,
-    /// A clean run of the block walk builds the blocks it reaches that no
-    /// walk of this handle's has built, where it has the snapshot, and
-    /// takes each into the run that comes out clean; off, the run stops at
-    /// the first block with no form in the table and the walk builds it at
-    /// its next turn, one dispatch into the partition a block. The run was
-    /// written for a store with nothing unsealed, where every block is
-    /// clean and the snapshot is empty, and extended over the blocks
-    /// already built; the cold partitions of a Zipfian mix are blocks no
-    /// scan has visited, so a scan of fifty there made 2.5 dispatches into
-    /// the form file -- the fence's rank search, the group opened again,
-    /// the page header checked, each time -- 75,000 for the 30,000 of
-    /// ycsb-E's scans that start past the hot partitions at ten million
-    /// keys under 1.25 GiB, 6.5 groups opened a scan where the scan spans
-    /// 2.7. `supdb-norunbuilds` is the run that stops.
-    pub scan_run_builds: bool,
     /// A block wide by its count of keys above the partition -- the last
     /// block, where every insert past the store's greatest key lands --
     /// copied once its walks have paid for the copy, and the copy kept past
@@ -7186,7 +7172,6 @@ impl Default for Options {
             scan_cache_auto_room: true,
             scan_cache_copies_fit: true,
             scan_cache_ahead: true,
-            scan_run_builds: true,
             forms_convert_from: 4,
             forms_convert_reads: 0,
             forms_convert_at_walk: false,
@@ -40255,16 +40240,15 @@ impl Reader {
                         };
                         // A block the run reaches with no form yet is built
                         // here, as the walk would build it at its next turn,
-                        // and joins the run when it comes out clean
-                        // (`Options::scan_run_builds`): the cold partitions
-                        // of a Zipfian mix are blocks no scan has visited,
-                        // and a run that stopped at each paid the form
-                        // file's dispatch per block. A walk without the
-                        // snapshot cannot build, and stops as before.
+                        // and joins the run when it comes out clean: the
+                        // cold partitions of a Zipfian mix are blocks no
+                        // scan has visited, and a run that stopped at each
+                        // paid the form file's dispatch per block. A walk
+                        // without the snapshot cannot build, and stops as
+                        // before.
                         while b + 1 < nblocks && run_hi - start < limit - seen {
                             let next = b + 1;
-                            if self.opts.scan_run_builds
-                                && table.slots[next].is_none()
+                            if table.slots[next].is_none()
                                 && !(canonical && complete)
                                 && (!canonical
                                     || st.forms[pi][next].load(AtomicOrdering::Acquire).is_null())
