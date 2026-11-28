@@ -12924,6 +12924,47 @@ fn a_partition_its_form_serves_drops_its_raw_pages_when_asked() {
     );
 }
 
+/// A store opened over form files attaches them at the open
+/// (`Db::z_attach`), and drops the raw pages of the partitions they serve
+/// there only when asked (`Options::zpages_drop_raw`): every attach dropped
+/// with the option and none without it, whatever else the options time.
+/// The attach's flags were a tuple read by position, and the drop read the
+/// decode timer's slot once a flag before them went, so a store opened
+/// without the drop dropped every partition (the settle's own attaches,
+/// which pass no tuple, were right).
+#[cfg(target_os = "linux")]
+#[test]
+fn an_open_drops_the_raw_pages_of_the_partitions_its_forms_serve_only_when_asked() {
+    for cold in [false, true] {
+        let what = format!("open drop raw {cold}");
+        let dir = scratch(&format!("open-drop-raw-{cold}"));
+        let opts = |o: &mut Options| {
+            o.partition_bytes = Some(160 << 10);
+            o.zpages_drop_raw = cold;
+        };
+        let mut db = Db::create(&dir, forced(opts)).unwrap();
+        let model = ordered_load(&mut db, 5000, 0x0DD5);
+        db.zpages_settle().unwrap();
+        drop(db);
+        let db = Db::open(&dir, forced(opts)).unwrap();
+        assert!(
+            db.options().zpages_hot_raw || db.options().zpages_stride_convert,
+            "{what}: the premise, the form files' decodes are timed"
+        );
+        let c = db.zpage_counts();
+        assert!(c.form_files >= 3, "{what}: the form files attached: {c:?}");
+        assert_eq!(
+            c.raw_dropped,
+            if cold { c.form_files } else { 0 },
+            "{what}: the open's attaches drop as asked: {c:?}"
+        );
+        let keys: Vec<Vec<u8>> = model.keys().cloned().collect();
+        check(&db, &model, &keys, &what);
+        drop(db);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
 /// The keys of the `i`th partition by key order, as the model has them.
 #[cfg(target_os = "linux")]
 fn keys_of_partition(db: &Db, model: &Model, i: usize) -> Vec<Vec<u8>> {
