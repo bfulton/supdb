@@ -3014,7 +3014,11 @@ fn a_put_over_a_copys_own_record_is_written_where_it_lies() {
         assert!(scan_model(&db) == want, "the rewrite");
         let (_, _, copies, _) = db.block_cache_kinds();
         assert!(copies >= 50, "the blocks are copies: {copies}");
-        // Every key again, at the length its run holds.
+        // Every key again, at the length its run holds. The count read
+        // here and below, `settle_lean().0`, is the patches' own: it moves
+        // only for a put written over the run it replaces, and a
+        // conversion the settle makes counts in `.1` alone, so a settle
+        // that converts and writes nothing in place leaves it where it was.
         let before = db.settle_lean().0;
         puts(&mut db, &mut want, 1, &[b'b'; 200]);
         let placed = db.settle_lean().0 - before;
