@@ -4426,29 +4426,6 @@ pub struct Options {
     /// one rung is the whole burst at the rung below. `supdb-bglag` and
     /// `supdb-ingestbglag` set it.
     pub upkeep_lag_pct: usize,
-    /// EXPERIMENT: a commit that lends wakes the upkeep thread not only
-    /// for a batch worth waking it for but also when the thread is parked
-    /// for longer than the wait it grants a short batch before it begins
-    /// a pass anyway (`UPKEEP_BATCH_WAIT`). The thread doubles its poll to
-    /// twenty milliseconds while nothing is lent, and a run of commits
-    /// too small to wake it for -- the mixes' hundred-write batches --
-    /// then lies lent for the whole run: at ten thousand keys it made no
-    /// pass through four mixes, and the first scan of the fifth filed
-    /// their whole backlog and built every block they had dirtied, a
-    /// sixth of ycsb-E. The thread publishes its park timeout and the
-    /// commit reads it. Priced three ways against the shape that never
-    /// wakes for a small batch, 24 pairs at ten thousand keys: woken past
-    /// its shortest poll, or past this wait, the thread filed the mixes'
-    /// writes beside them -- its passes 12 to 21, the blocks it built 0
-    /// to 149 -- and ycsb-E read 1.18-1.19x, but ycsb-A 0.84-0.86x,
-    /// ycsb-F 0.82-0.85x and B 0.95x; woken only at its full back-off it
-    /// was never woken there, since the reads before the mixes are
-    /// shorter than the climb to it. At three hundred thousand keys
-    /// nothing moved. A wake is a VM exit on this guest, and the passes
-    /// run on a sibling of the writer's core; whichever of the two it is,
-    /// the mixes that write pay more than the mix that scans gains, so
-    /// this is off: `supdb-wake` and `supdb-ingestwake` price it.
-    pub upkeep_wake_parked: bool,
     /// The upkeep thread stays alert after work: for `UPKEEP_ALERT` after
     /// its last pass or hand-over it parks for at most `UPKEEP_ALERT_POLL`
     /// at a time, and climbs its back-off to `UPKEEP_POLL_MAX` only once
@@ -4458,13 +4435,13 @@ pub struct Options {
     /// writer wakes nobody: the thread's own timer runs on its own core,
     /// where a wake from the writer was a VM exit on this guest, seven
     /// microseconds a commit, and the mixes that write paid more than the
-    /// mix that scans gained (`upkeep_wake_parked`). Before this the
-    /// back-off, climbed during the read passes, slept through two
-    /// milliseconds of mixes, and ycsb-E's first scans filed seventeen
-    /// hundred writes and built a hundred and fifty blocks at ten thousand
-    /// keys, 0.93x of the comparator where the durable store, whose
-    /// fsyncs gave the thread its window, read 1.3x. Off, the arm
-    /// `supdb-noalert` and `supdb-ingestnoalert`: the back-off as it was.
+    /// mix that scans gained. Before this the back-off, climbed during the
+    /// read passes, slept through two milliseconds of mixes, and ycsb-E's
+    /// first scans filed seventeen hundred writes and built a hundred and
+    /// fifty blocks at ten thousand keys, 0.93x of the comparator where
+    /// the durable store, whose fsyncs gave the thread its window, read
+    /// 1.3x. Off, the arm `supdb-noalert` and `supdb-ingestnoalert`: the
+    /// back-off as it was.
     pub upkeep_alert: bool,
     /// The longest the alert thread parks for, in microseconds: how soon
     /// after a lent batch it files and builds, against how often its
@@ -8443,7 +8420,6 @@ impl Default for Options {
             forms_settle_keys_all: false,
             upkeep: Upkeep::default(),
             upkeep_lag_pct: 0,
-            upkeep_wake_parked: false,
             upkeep_alert: true,
             upkeep_alert_poll_us: 200,
             upkeep_inline_bursts: true,
@@ -55358,7 +55334,7 @@ struct Lend {
     partial: AtomicU64,
     /// The thread's park timeout in microseconds while it is parked
     /// between polls, zero while it is awake: what a commit reads to
-    /// wake a thread that has backed off (`Options::upkeep_wake_parked`).
+    /// wake a thread parked past its alert poll (`Options::upkeep_alert`).
     parked_us: std::sync::atomic::AtomicU32,
     /// Whether reads were around at the last hand-over: what the thread
     /// stays alert for (`Options::upkeep_alert`), since a pass beside a
@@ -56586,13 +56562,8 @@ impl Db {
             Some(fs) => self.shared.upkeep.lend(fs, to),
             None => self.shared.upkeep.post(to),
         }
-        // Woken for a batch worth waking for, or for any batch while the
-        // thread is parked longer than a short batch's wait: see
-        // `Options::upkeep_wake_parked`.
-        let parked = self.shared.upkeep.parked_us.load(AtomicOrdering::Acquire);
-        if batch >= UPKEEP_WAKE_WRITES
-            || (self.opts.upkeep_wake_parked && parked > UPKEEP_BATCH_WAIT.as_micros() as u32)
-        {
+        // Woken for a batch worth waking for.
+        if batch >= UPKEEP_WAKE_WRITES {
             self.shared.upkeep.wake();
         }
         // Lent as a batch of a burst: the commit waits at its end until

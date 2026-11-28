@@ -967,10 +967,6 @@ pub struct Supdb {
     /// were gated (`Options::scan_timers`). `supdb-timers`, and
     /// `supdb-ingesttimers` buffered.
     timers: bool,
-    /// A lend wakes the upkeep thread when it is parked past a short
-    /// batch's wait (`Options::upkeep_wake_parked`). `supdb-wake`, and
-    /// `supdb-ingestwake` buffered.
-    wake: bool,
     /// The block walk issues no prefetches (`Options::scan_prefetch`
     /// off). `supdb-noprefetch`, and `supdb-ingestnoprefetch` buffered.
     noprefetch: bool,
@@ -2627,10 +2623,6 @@ struct Policy {
     /// were gated (`Options::scan_timers`). `supdb-timers`, and
     /// `supdb-ingesttimers` buffered.
     timers: bool,
-    /// A lend wakes the upkeep thread when it is parked past a short
-    /// batch's wait (`Options::upkeep_wake_parked`). `supdb-wake`, and
-    /// `supdb-ingestwake` buffered.
-    wake: bool,
     /// The block walk issues no prefetches (`Options::scan_prefetch`
     /// off). `supdb-noprefetch`, and `supdb-ingestnoprefetch` buffered.
     noprefetch: bool,
@@ -3735,7 +3727,6 @@ impl Default for Policy {
             sealrun: false,
             closeinline: false,
             timers: false,
-            wake: false,
             noprefetch: false,
             dirplain: false,
             settlefar: false,
@@ -7697,31 +7688,6 @@ impl Supdb {
         )
     }
 
-    /// `supdb` whose lends wake the upkeep thread when it is parked past a
-    /// short batch's wait (`Options::upkeep_wake_parked`).
-    pub fn create_wake(path: &Path) -> Res<Supdb> {
-        Supdb::with_policy(
-            path,
-            Policy {
-                wake: true,
-                ..Policy::default()
-            },
-        )
-    }
-
-    /// `supdb-ingest` as `supdb-wake`.
-    pub fn create_ingest_wake(path: &Path) -> Res<Supdb> {
-        Supdb::with_policy(
-            path,
-            Policy {
-                partition: false,
-                durable: false,
-                wake: true,
-                ..Policy::default()
-            },
-        )
-    }
-
     /// `supdb` whose block walks issue no prefetches
     /// (`Options::scan_prefetch` off).
     pub fn create_noprefetch(path: &Path) -> Res<Supdb> {
@@ -10970,7 +10936,6 @@ impl Supdb {
             sealrun,
             closeinline,
             timers,
-            wake,
             noprefetch,
             dirplain,
             settlefar,
@@ -11531,7 +11496,6 @@ impl Supdb {
             merge_plan_idle: !noidleplan,
             seal_put_one: !sealrun,
             close_finish_inline: closeinline,
-            upkeep_wake_parked: wake,
             scan_prefetch: !noprefetch,
             seek_prefetch_dir: !dirplain,
             forms_settle_far: settlefar,
@@ -12126,7 +12090,6 @@ impl Supdb {
             sealrun,
             closeinline,
             timers,
-            wake,
             noprefetch,
             dirplain,
             settlefar,
@@ -14073,13 +14036,6 @@ impl Engine for Supdb {
                 "supdb-timers"
             } else {
                 "supdb-ingesttimers"
-            };
-        }
-        if self.wake {
-            return if self.partition {
-                "supdb-wake"
-            } else {
-                "supdb-ingestwake"
             };
         }
         if self.noprefetch {
@@ -17108,7 +17064,6 @@ pub fn guarantee(arm: &str) -> Option<Guarantee> {
         | "supdb-sealrun"
         | "supdb-closeinline"
         | "supdb-timers"
-        | "supdb-wake"
         | "supdb-noprefetch"
         | "supdb-dirplain"
         | "supdb-settlefar"
@@ -17411,7 +17366,6 @@ pub fn guarantee(arm: &str) -> Option<Guarantee> {
         | "supdb-ingestsealrun"
         | "supdb-ingestcloseinline"
         | "supdb-ingesttimers"
-        | "supdb-ingestwake"
         | "supdb-ingestnoprefetch"
         | "supdb-ingestdirplain"
         | "supdb-ingestsyncbeside"
@@ -20274,8 +20228,6 @@ pub fn open(arm: &str, dir: &Path, map_gb: usize) -> Res<Box<dyn Engine>> {
         "supdb-ingestcloseinline" => supdb_arm(Supdb::create_ingest_closeinline, dir)?,
         "supdb-timers" => supdb_arm(Supdb::create_timers, dir)?,
         "supdb-ingesttimers" => supdb_arm(Supdb::create_ingest_timers, dir)?,
-        "supdb-wake" => supdb_arm(Supdb::create_wake, dir)?,
-        "supdb-ingestwake" => supdb_arm(Supdb::create_ingest_wake, dir)?,
         "supdb-noprefetch" => supdb_arm(Supdb::create_noprefetch, dir)?,
         "supdb-ingestnoprefetch" => supdb_arm(Supdb::create_ingest_noprefetch, dir)?,
         "supdb-dirplain" => supdb_arm(Supdb::create_dirplain, dir)?,
