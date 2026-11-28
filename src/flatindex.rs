@@ -80,7 +80,7 @@ thread_local! {
 }
 
 /// The records this thread's point reads asked for ahead of their headers
-/// (`FlatIndex::ask_record`, `Options::point_record_ahead`), counted in a
+/// (`FlatIndex::ask_record`), counted in a
 /// build with debug assertions -- the tests' -- and zero in every other,
 /// so that a read pays nothing for the count: what holds the option to
 /// firing, since an ask changes no answer.
@@ -2473,8 +2473,7 @@ impl FlatIndex {
     /// a fixed run (`compact_fixed_tomb_at`): its run where it lies, the
     /// count of values in it and its tombstone flag. `Some(None)` for a
     /// key the index does not hold. `None` where a record the probe has to
-    /// judge is any other shape, which `with_lookup_hashed` reads, as it
-    /// reads every record with this off (`Options::point_fixed`).
+    /// judge is any other shape, which `with_lookup_hashed` reads.
     ///
     /// The same record `with_lookup_hashed` finds, without the extent it
     /// rebuilds from the record's header for `Blob::read_exts` to walk the
@@ -2483,18 +2482,17 @@ impl FlatIndex {
     /// (`bench/examples/point_ops.rs`), for one slot, one key compare and
     /// one slice.
     ///
-    /// With `ahead`, the record's lines past its first are asked for the
-    /// moment its slot names it, out to the region's mean record length
-    /// (`ask_record`): the value's place is the header's arithmetic, so
-    /// without the ask the value's lines are a third miss behind the
-    /// slot's and the header's (`Options::point_record_ahead`).
+    /// The record's lines past its first are asked for the moment its slot
+    /// names it, out to the region's mean record length (`ask_record`):
+    /// the value's place is the header's arithmetic, so without the ask the
+    /// value's lines are a third miss behind the slot's and the header's,
+    /// and the clean read pass read a fifth to a third faster with it.
     #[inline(always)]
     pub(crate) fn find_fixed_hashed<'a>(
         &self,
         sec: &'a [u8],
         key: &[u8],
         h: u64,
-        ahead: bool,
     ) -> Option<Option<CompactFixed<'a>>> {
         let hash = sec.get(self.hash.0..self.hash.1)?;
         let recs = sec.get(self.recs.0..self.recs.1)?;
@@ -2507,9 +2505,7 @@ impl FlatIndex {
             }
             if packed >> 56 == tag {
                 let off = (packed & 0x00ff_ffff_ffff_ffff) as usize;
-                if ahead {
-                    self.ask_record(recs, off);
-                }
+                self.ask_record(recs, off);
                 let c = compact_fixed_tomb_at(recs, off)?;
                 if key_eq(c.key, key) {
                     return Some(Some(c));
@@ -2534,10 +2530,9 @@ impl FlatIndex {
         sec: &[u8],
         key: &[u8],
         h: u64,
-        ahead: bool,
         f: &mut impl FnMut(&[u8]),
     ) -> Option<u64> {
-        Some(match self.find_fixed_hashed(sec, key, h, ahead)? {
+        Some(match self.find_fixed_hashed(sec, key, h)? {
             Some(c) => each_fixed(c.run, c.records, f),
             None => 0,
         })

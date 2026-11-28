@@ -1275,27 +1275,24 @@ fn the_builder_ahead_leaves_the_partitions_whose_pages_are_not_in_memory() {
 }
 
 /// The complete-table fill of a pass on the upkeep thread gives the writer
-/// its upkeep back at the fill's next block once the writer wants it
-/// (`Options::upkeep_fill_yields`), the settle before it standing and the
-/// pass published. The store: reads around from one short scan, so no
-/// block holds a form but the one it walked; a burst over every block is
-/// lent, and the thread's pass holds inside until the scan asks for the
-/// upkeep, so the pass settles the burst whole and begins its fill -- a
-/// form for every block of the store -- with the writer wanting it, and
-/// the scan reads every key as written. With the fill's yield the fill
-/// stops at a block and the pass is whole; without it the scan waits the
-/// fill out over every block, the pass whole too, since the fill's yield
+/// its upkeep back at the fill's next block once the writer wants it, the
+/// settle before it standing and the pass published. The store: reads
+/// around from one short scan, so no block holds a form but the one it
+/// walked; a burst over every block is lent, and the thread's pass holds
+/// inside until the scan asks for the upkeep, so the pass settles the
+/// burst whole and begins its fill -- a form for every block of the store
+/// -- with the writer wanting it, and the scan reads every key as written.
+/// The fill stops at a block and the pass is whole, since the fill's yield
 /// is not the pass's (`upkeep_yields`).
 #[test]
 fn a_fill_the_writer_wants_its_upkeep_back_from_stops_at_its_next_block() {
     const KEYS: u32 = 300_000;
-    let run = |name: &str, yields: bool| {
+    let run = |name: &str| {
         let d = dir(name);
         let mut db = Db::create(
             &d,
             Options {
                 upkeep: supdb::Upkeep::Background(1),
-                upkeep_fill_yields: yields,
                 // The fill is the commit's where no builder ahead runs, as
                 // out of core (`Options::ahead_out_of_core`).
                 scan_cache_ahead: false,
@@ -1367,50 +1364,36 @@ fn a_fill_the_writer_wants_its_upkeep_back_from_stops_at_its_next_block() {
         // microseconds, and the passes cut short.
         (cuts, walked, steps[3], c[8])
     };
-    let (cuts_on, walked_on, build_on, short_on) = run("fill-yield-on", true);
-    let (cuts_off, walked_off, build_off, short_off) = run("fill-yield-off", false);
-    eprintln!(
-        "fill yield: cut {cuts_on} walked {walked_on} built {build_on} us; \
-         holds: cut {cuts_off} walked {walked_off} built {build_off} us"
-    );
-    let blocks = u64::from(KEYS / 64);
+    let (cuts, walked, build, short) = run("fill-yield");
+    eprintln!("fill yield: cut {cuts} walked {walked} built {build} us");
     assert!(
-        cuts_on >= 1 && walked_on < walked_off,
-        "the fill stopped at a block for the writer: cut {cuts_on}, walked {walked_on} of {walked_off}"
-    );
-    assert_eq!(cuts_off, 0, "the fill that holds is never cut");
-    assert!(
-        walked_off >= blocks && build_off > 0,
-        "the fill that holds walked the store: walked {walked_off} of {blocks} blocks, built {build_off} us"
+        cuts >= 1,
+        "the fill stopped at a block for the writer: cut {cuts}, walked {walked}"
     );
     assert_eq!(
-        (short_on, short_off),
-        (0, 0),
-        "neither pass is cut short: the fill's yield is not the pass's"
+        short, 0,
+        "the pass is not cut short: the fill's yield is not the pass's"
     );
 }
 
 /// The upkeep thread's fill is left for a later pass while the writer has
-/// posted a newer commit (`Options::upkeep_fill_skips_posted`): a burst
-/// over every block is lent and the thread's pass holds inside, a second
-/// burst is posted behind it, and the held pass, released, settles the
-/// first burst and leaves its fill (`Db::fill_deferred`); the pass after,
-/// caught up with nothing posted, fills the store, every block walked. The
-/// scans read every key as the second burst wrote it, through the writer
-/// and through a handle. Without the option the held pass fills with the
-/// second burst waiting and defers nothing. The syncing pace is off here,
-/// so that the second commit posts and returns where the paced one would
-/// wait for the held thread.
+/// posted a newer commit: a burst over every block is lent and the
+/// thread's pass holds inside, a second burst is posted behind it, and the
+/// held pass, released, settles the first burst and leaves its fill
+/// (`Db::fill_deferred`); the pass after, caught up with nothing posted,
+/// fills the store, every block walked. The scans read every key as the
+/// second burst wrote it, through the writer and through a handle. The
+/// syncing pace is off here, so that the second commit posts and returns
+/// where the paced one would wait for the held thread.
 #[test]
 fn a_fill_with_a_newer_commit_posted_is_left_for_the_pass_caught_up() {
     const KEYS: u32 = 300_000;
-    let run = |name: &str, skips: bool| {
+    let run = |name: &str| {
         let d = dir(name);
         let mut db = Db::create(
             &d,
             Options {
                 upkeep: supdb::Upkeep::Background(1),
-                upkeep_fill_skips_posted: skips,
                 upkeep_pace_syncs_bp: 0,
                 scan_cache_ahead: false,
                 partition_bytes: Some(256 << 10),
@@ -1488,17 +1471,15 @@ fn a_fill_with_a_newer_commit_posted_is_left_for_the_pass_caught_up() {
         check(&h, &want, "through a handle after the bursts");
         deferred
     };
-    let deferred_on = run("fill-skip-on", true);
-    let deferred_off = run("fill-skip-off", false);
+    let deferred = run("fill-skip");
     assert!(
-        deferred_on >= 1,
-        "the held pass left its fill with a newer commit posted: {deferred_on}"
+        deferred >= 1,
+        "the held pass left its fill with a newer commit posted: {deferred}"
     );
-    assert_eq!(deferred_off, 0, "without the option no fill is left");
 }
 
 /// A fill the upkeep thread leaves for a later pass
-/// (`Options::upkeep_fill_skips_posted`) is that pass's to make whatever
+/// (`Reader::fill_deferred`) is that pass's to make whatever
 /// it has to file. A commit's writes are lent and the thread's pass holds
 /// inside it; a commit with nothing staged, which adds nothing to the
 /// log, is posted behind the held pass; released, the pass settles the
@@ -1814,95 +1795,85 @@ fn a_lone_piece_holding_a_tombstone_still_merges() {
 /// A point read over a store with tombstones in every kind of source --
 /// level-0 pieces carrying puts, a frozen table held short of its landing
 /// with deletes and appends, and the live table over both -- answers the
-/// model with the tombstone pass's probes kept for the reads after it
-/// (`Options::read_probes_once`) and with every source probed again, the
-/// shape before: through the writer, whose reads honour no watermark, and
+/// model with the tombstone pass's probes kept for the reads after it:
+/// through the writer, whose reads honour no watermark, and
 /// through a handle, whose live table is bounded by its mark; `read_all`
 /// and `count` both, every key the model has touched and one no source
 /// holds.
 #[test]
 fn a_point_read_over_tombstones_in_every_source_answers_from_one_probe_of_each() {
-    for once in [true, false] {
-        let name = if once { "probes-once" } else { "probes-twice" };
-        let d = dir(name);
-        let mut db = Db::create(
-            &d,
-            Options {
-                read_probes_once: once,
-                ..common::options()
-            },
-        )
-        .unwrap();
-        let mut m = ScanModel::default();
-        for k in 0u32..3000 {
-            m.append(&mut db, &format!("key-{k:05}"), &format!("v0-{k}"));
-        }
-        db.commit().unwrap();
-        db.flush().unwrap();
-        m.flushed();
-        // Two pieces of puts, each a delete and an append.
-        for round in 1..=2u32 {
-            for k in (round..3000u32).step_by(7) {
-                let key = format!("key-{k:05}");
-                m.delete(&mut db, &key);
-                m.append(&mut db, &key, &format!("v{round}-{k}"));
-            }
-            db.commit().unwrap();
-            db.seal().unwrap();
-            db.settle().unwrap();
-        }
-        let pieces = seg_names(&d)
-            .iter()
-            .filter(|n| !n.starts_with("par-"))
-            .count();
-        assert!(pieces >= 2, "{name}: the pieces: {:?}", seg_names(&d));
-        // A frozen table with deletes and appends, its landing held.
-        db.hold_seal_landing(true);
-        for k in (0..3000u32).step_by(11) {
-            m.delete(&mut db, &format!("key-{k:05}"));
-        }
-        for k in (5..3000u32).step_by(13) {
-            m.append(&mut db, &format!("key-{k:05}"), &format!("v3-{k}"));
+    let name = "probes-once";
+    let d = dir(name);
+    let mut db = Db::create(&d, common::options()).unwrap();
+    let mut m = ScanModel::default();
+    for k in 0u32..3000 {
+        m.append(&mut db, &format!("key-{k:05}"), &format!("v0-{k}"));
+    }
+    db.commit().unwrap();
+    db.flush().unwrap();
+    m.flushed();
+    // Two pieces of puts, each a delete and an append.
+    for round in 1..=2u32 {
+        for k in (round..3000u32).step_by(7) {
+            let key = format!("key-{k:05}");
+            m.delete(&mut db, &key);
+            m.append(&mut db, &key, &format!("v{round}-{k}"));
         }
         db.commit().unwrap();
         db.seal().unwrap();
-        assert_eq!(db.frozen_tables(), 1, "{name}: the frozen table");
-        // The live table over it: puts, second values and a key nothing
-        // older holds.
-        for k in (3..3000u32).step_by(5) {
-            let key = format!("key-{k:05}");
-            m.delete(&mut db, &key);
-            m.append(&mut db, &key, &format!("v4-{k}"));
-        }
-        for k in (1..3000u32).step_by(17) {
-            m.append(&mut db, &format!("key-{k:05}"), &format!("v5-{k}"));
-        }
-        m.append(&mut db, "key-99999", "past-the-end");
-        db.commit().unwrap();
-        let h = db.reader().unwrap();
-        let mut keys: Vec<Vec<u8>> = m.vals.keys().cloned().collect();
-        keys.push(b"key-77777x".to_vec());
-        for k in &keys {
-            let want = m.vals.get(k).cloned().unwrap_or_default();
-            let lossy = String::from_utf8_lossy(k);
-            assert_eq!(read_vec(&db, k), want, "{name}: the writer reads {lossy}");
-            assert_eq!(read_vec(&h, k), want, "{name}: the handle reads {lossy}");
-            assert_eq!(
-                db.count(k).unwrap(),
-                want.len() as u64,
-                "{name}: the writer counts {lossy}"
-            );
-            assert_eq!(
-                h.count(k).unwrap(),
-                want.len() as u64,
-                "{name}: the handle counts {lossy}"
-            );
-        }
-        drop(h);
-        db.hold_seal_landing(false);
         db.settle().unwrap();
-        db.close().unwrap();
     }
+    let pieces = seg_names(&d)
+        .iter()
+        .filter(|n| !n.starts_with("par-"))
+        .count();
+    assert!(pieces >= 2, "{name}: the pieces: {:?}", seg_names(&d));
+    // A frozen table with deletes and appends, its landing held.
+    db.hold_seal_landing(true);
+    for k in (0..3000u32).step_by(11) {
+        m.delete(&mut db, &format!("key-{k:05}"));
+    }
+    for k in (5..3000u32).step_by(13) {
+        m.append(&mut db, &format!("key-{k:05}"), &format!("v3-{k}"));
+    }
+    db.commit().unwrap();
+    db.seal().unwrap();
+    assert_eq!(db.frozen_tables(), 1, "{name}: the frozen table");
+    // The live table over it: puts, second values and a key nothing
+    // older holds.
+    for k in (3..3000u32).step_by(5) {
+        let key = format!("key-{k:05}");
+        m.delete(&mut db, &key);
+        m.append(&mut db, &key, &format!("v4-{k}"));
+    }
+    for k in (1..3000u32).step_by(17) {
+        m.append(&mut db, &format!("key-{k:05}"), &format!("v5-{k}"));
+    }
+    m.append(&mut db, "key-99999", "past-the-end");
+    db.commit().unwrap();
+    let h = db.reader().unwrap();
+    let mut keys: Vec<Vec<u8>> = m.vals.keys().cloned().collect();
+    keys.push(b"key-77777x".to_vec());
+    for k in &keys {
+        let want = m.vals.get(k).cloned().unwrap_or_default();
+        let lossy = String::from_utf8_lossy(k);
+        assert_eq!(read_vec(&db, k), want, "{name}: the writer reads {lossy}");
+        assert_eq!(read_vec(&h, k), want, "{name}: the handle reads {lossy}");
+        assert_eq!(
+            db.count(k).unwrap(),
+            want.len() as u64,
+            "{name}: the writer counts {lossy}"
+        );
+        assert_eq!(
+            h.count(k).unwrap(),
+            want.len() as u64,
+            "{name}: the handle counts {lossy}"
+        );
+    }
+    drop(h);
+    db.hold_seal_landing(false);
+    db.settle().unwrap();
+    db.close().unwrap();
 }
 
 fn ord_names(d: &std::path::Path) -> Vec<String> {
@@ -2314,24 +2285,23 @@ fn ord_probes(shape: OrdShape) -> Vec<Vec<u8>> {
     v
 }
 
-/// `Options::point_record_ahead` changes what a point read asks for ahead
-/// of a segment's record and nothing it returns: the fixture's store -- a
-/// partition, a piece with tombstones and a live table over both -- read
-/// with the option on and off through the writer and through a handle,
-/// answers every probe as the model does over the piece, with a table
+/// A point read asks for a segment's record's lines past its header as the
+/// slot names it, and the ask changes nothing it returns: the fixture's
+/// store -- a partition, a piece with tombstones and a live table over
+/// both -- read through the writer and through a handle answers every
+/// probe as the model does over the piece, with a table
 /// frozen in a held seal, after the seal lands, folded into the partition
 /// and under a live table after that; and under each of the settings that
 /// send those states to the four reads that read a segment's record where
 /// it lies -- the layered read that places its sources first, the one
 /// that does not, the two-source read and the general read. The asks this
-/// thread made say the option fired in each state: some with it on, none
-/// with it off (`flatindex::records_asked`, which counts in a build with
-/// debug assertions alone), since a read that never asked and one that
-/// always did answer the same; and a total over the states would not see
-/// one read that stopped asking beside another that still did.
+/// thread made say the ask was made in each state
+/// (`flatindex::records_asked`, which counts in a build with debug
+/// assertions alone), since a read that never asked and one that always
+/// did answer the same; and a total over the states would not see one
+/// read that stopped asking beside another that still did.
 #[test]
-fn a_point_read_that_asks_for_its_record_answers_as_one_that_does_not() {
-    assert!(Options::default().point_record_ahead, "the default");
+fn a_point_read_that_asks_for_its_record_answers_as_the_model() {
     for shape in [
         OrdShape::Short,
         OrdShape::Mixed,
@@ -2339,186 +2309,26 @@ fn a_point_read_that_asks_for_its_record_answers_as_one_that_does_not() {
         OrdShape::Binary,
     ] {
         for (lone, first) in [(true, true), (true, false), (false, true)] {
-            for ahead in [true, false] {
-                let name = format!("recordahead-{shape:?}-{lone}-{first}-{ahead}");
-                let mut fx = ord_fixture_with(
-                    &name,
-                    shape,
-                    Options {
-                        point_record_ahead: ahead,
-                        point_lone: lone,
-                        point_layers_lean: first,
-                        ..common::options()
-                    },
-                );
-                let key = |k: u32| ord_key(shape, k);
-                let show = |p: &[u8]| String::from_utf8_lossy(p).into_owned();
-                let probes = ord_probes(shape);
-                // Every probe through the writer and through a handle, the
-                // asks they made, and that the option fired as it is set:
-                // not where the compact form is forced, as the stride
-                // switch forces it, whose partitions the general read
-                // dispatches to their form files.
-                let check = |fx: &OrdFixture, when: &str| {
-                    let h = fx.db.reader().unwrap();
-                    let before = supdb::flatindex::records_asked();
-                    for p in &probes {
-                        let want = fx.model.get(p).cloned().unwrap_or_default();
-                        assert_eq!(read_vec(&fx.db, p), want, "{name} {when}: {}", show(p));
-                        assert_eq!(
-                            read_vec(&h, p),
-                            want,
-                            "{name} {when}, a handle: {}",
-                            show(p)
-                        );
-                    }
-                    let asked = supdb::flatindex::records_asked() - before;
-                    if cfg!(debug_assertions) && !common::stride_switch() {
-                        if ahead {
-                            assert!(asked > 0, "{name} {when}: the reads asked for no record");
-                        } else {
-                            assert_eq!(asked, 0, "{name} {when}: asks with the option off");
-                        }
-                    }
-                };
-                check(&fx, "over a piece");
-                // The layered reads ask at two sites, a piece's record and
-                // the partition's, and a total over the probes sees one
-                // site stop asking beside the other: so keys the partition
-                // alone holds (even, no piece's and no table's, by the
-                // fixture's moduli), whose reads only the partition's site
-                // can ask for, and keys whose newest source is the piece's
-                // tombstone and a value, whose reads only the piece's site
-                // can, each read through the writer and a handle.
-                if lone && cfg!(debug_assertions) && !common::stride_switch() {
-                    let h = fx.db.reader().unwrap();
-                    let only_part: Vec<u32> = (0u32..4_000)
-                        .step_by(2)
-                        .filter(|k| {
-                            [2, 4, 8, 10].contains(&(k % 12)) && ![4, 8].contains(&(k % 16))
-                        })
-                        .take(40)
-                        .collect();
-                    // A tombstone and a value after it: a tombstone alone
-                    // is no fixed record, which the placed read declines
-                    // to the read after it, whose site would ask for it.
-                    let piece_tomb: Vec<u32> = (0u32..4_000)
-                        .step_by(24)
-                        .filter(|k| ![4, 8].contains(&(k % 16)))
-                        .take(40)
-                        .collect();
-                    for (what, keys) in [
-                        ("the partition's", &only_part),
-                        ("the piece's", &piece_tomb),
-                    ] {
-                        let before = supdb::flatindex::records_asked();
-                        for &k in keys.iter() {
-                            let want = fx.model.get(&key(k)).cloned().unwrap_or_default();
-                            assert_eq!(read_vec(&fx.db, &key(k)), want, "{name}: {k}");
-                            assert_eq!(read_vec(&h, &key(k)), want, "{name}, a handle: {k}");
-                        }
-                        let asked = supdb::flatindex::records_asked() - before;
-                        let reads = 2 * keys.len() as u64;
-                        if ahead {
-                            assert!(
-                                asked >= reads,
-                                "{name}: {asked} asks at {what} site over {reads} reads"
-                            );
-                        } else {
-                            assert_eq!(asked, 0, "{name}: asks at {what} site with the option off");
-                        }
-                    }
-                }
-                fx.db.hold_seal_landing(true);
-                fx.db.seal().unwrap();
-                assert!(fx.db.frozen_tables() >= 1, "{name}: a frozen table");
-                for k in (3u32..4_010).step_by(11) {
-                    if k.is_multiple_of(3) {
-                        fx.db.delete(&key(k));
-                        fx.model.insert(key(k), Vec::new());
-                    } else {
-                        let v = format!("v5-{k}").into_bytes();
-                        fx.db.append(&key(k), &v);
-                        fx.model.entry(key(k)).or_default().push(v);
-                    }
-                }
-                fx.db.commit().unwrap();
-                check(&fx, "with the seal held");
-                fx.db.hold_seal_landing(false);
-                fx.db.settle().unwrap();
-                check(&fx, "after the landing");
-                fx.db.flush().unwrap();
-                fx.db.settle().unwrap();
-                assert_eq!(fx.db.levels().1, 0, "{name}: no piece after the flush");
-                check(&fx, "over the partitions alone");
-                for k in (0u32..4_020).step_by(7) {
-                    if k.is_multiple_of(2) {
-                        let v = format!("v6-{k}").into_bytes();
-                        fx.db.put(&key(k), &v);
-                        fx.model.insert(key(k), vec![v]);
-                    } else {
-                        fx.db.delete(&key(k));
-                        fx.model.insert(key(k), Vec::new());
-                    }
-                }
-                fx.db.commit().unwrap();
-                check(&fx, "under a live table");
-                fx.db.close().unwrap();
-            }
-        }
-    }
-}
-
-/// `Options::read_hash_once` and `Options::read_lines_ahead` change how a
-/// point read hashes its key and what it asks for ahead, and nothing it
-/// returns: the fixture's store -- a partition, a piece with tombstones and
-/// a live table over both -- with a table frozen in a held seal between
-/// the piece and the live table, read with each of the four settings
-/// through the writer and through a handle, answers every probe as the
-/// model does, held and after the seal lands; and the count with it.
-#[test]
-fn a_point_read_hashed_once_answers_as_one_hashed_per_source() {
-    let d = Options::default();
-    assert!(d.read_hash_once && d.read_lines_ahead, "the default");
-    for shape in [
-        OrdShape::Short,
-        OrdShape::Mixed,
-        OrdShape::Wide,
-        OrdShape::Binary,
-    ] {
-        for (once, ahead) in [(true, true), (true, false), (false, true), (false, false)] {
-            let name = format!("hashonce-{shape:?}-{once}-{ahead}");
+            let name = format!("recordahead-{shape:?}-{lone}-{first}");
             let mut fx = ord_fixture_with(
                 &name,
                 shape,
                 Options {
-                    read_hash_once: once,
-                    read_lines_ahead: ahead,
+                    point_lone: lone,
+                    point_layers_lean: first,
                     ..common::options()
                 },
             );
             let key = |k: u32| ord_key(shape, k);
-            // The table the fixture left live, frozen in a seal that does
-            // not land, and a live table over it with tombstones over all
-            // four sources and values after some.
-            fx.db.hold_seal_landing(true);
-            fx.db.seal().unwrap();
-            assert!(fx.db.frozen_tables() >= 1, "{name}: a frozen table");
-            for k in (1u32..4_010).step_by(9) {
-                if k.is_multiple_of(2) {
-                    fx.db.delete(&key(k));
-                    fx.model.insert(key(k), Vec::new());
-                } else {
-                    let v = format!("v4-{k}").into_bytes();
-                    fx.db.append(&key(k), &v);
-                    fx.model.entry(key(k)).or_default().push(v);
-                }
-            }
-            fx.db.commit().unwrap();
             let show = |p: &[u8]| String::from_utf8_lossy(p).into_owned();
             let probes = ord_probes(shape);
+            // Every probe through the writer and through a handle, the
+            // asks they made, and that the reads asked: not where the compact form is forced, as the stride
+            // switch forces it, whose partitions the general read
+            // dispatches to their form files.
             let check = |fx: &OrdFixture, when: &str| {
                 let h = fx.db.reader().unwrap();
+                let before = supdb::flatindex::records_asked();
                 for p in &probes {
                     let want = fx.model.get(p).cloned().unwrap_or_default();
                     assert_eq!(read_vec(&fx.db, p), want, "{name} {when}: {}", show(p));
@@ -2528,20 +2338,153 @@ fn a_point_read_hashed_once_answers_as_one_hashed_per_source() {
                         "{name} {when}, a handle: {}",
                         show(p)
                     );
-                    assert_eq!(
-                        fx.db.count(p).unwrap(),
-                        want.len() as u64,
-                        "{name} {when}: the count of {}",
-                        show(p)
-                    );
+                }
+                let asked = supdb::flatindex::records_asked() - before;
+                if cfg!(debug_assertions) && !common::stride_switch() {
+                    assert!(asked > 0, "{name} {when}: the reads asked for no record");
                 }
             };
+            check(&fx, "over a piece");
+            // The layered reads ask at two sites, a piece's record and
+            // the partition's, and a total over the probes sees one
+            // site stop asking beside the other: so keys the partition
+            // alone holds (even, no piece's and no table's, by the
+            // fixture's moduli), whose reads only the partition's site
+            // can ask for, and keys whose newest source is the piece's
+            // tombstone and a value, whose reads only the piece's site
+            // can, each read through the writer and a handle.
+            if lone && cfg!(debug_assertions) && !common::stride_switch() {
+                let h = fx.db.reader().unwrap();
+                let only_part: Vec<u32> = (0u32..4_000)
+                    .step_by(2)
+                    .filter(|k| [2, 4, 8, 10].contains(&(k % 12)) && ![4, 8].contains(&(k % 16)))
+                    .take(40)
+                    .collect();
+                // A tombstone and a value after it: a tombstone alone
+                // is no fixed record, which the placed read declines
+                // to the read after it, whose site would ask for it.
+                let piece_tomb: Vec<u32> = (0u32..4_000)
+                    .step_by(24)
+                    .filter(|k| ![4, 8].contains(&(k % 16)))
+                    .take(40)
+                    .collect();
+                for (what, keys) in [
+                    ("the partition's", &only_part),
+                    ("the piece's", &piece_tomb),
+                ] {
+                    let before = supdb::flatindex::records_asked();
+                    for &k in keys.iter() {
+                        let want = fx.model.get(&key(k)).cloned().unwrap_or_default();
+                        assert_eq!(read_vec(&fx.db, &key(k)), want, "{name}: {k}");
+                        assert_eq!(read_vec(&h, &key(k)), want, "{name}, a handle: {k}");
+                    }
+                    let asked = supdb::flatindex::records_asked() - before;
+                    let reads = 2 * keys.len() as u64;
+                    assert!(
+                        asked >= reads,
+                        "{name}: {asked} asks at {what} site over {reads} reads"
+                    );
+                }
+            }
+            fx.db.hold_seal_landing(true);
+            fx.db.seal().unwrap();
+            assert!(fx.db.frozen_tables() >= 1, "{name}: a frozen table");
+            for k in (3u32..4_010).step_by(11) {
+                if k.is_multiple_of(3) {
+                    fx.db.delete(&key(k));
+                    fx.model.insert(key(k), Vec::new());
+                } else {
+                    let v = format!("v5-{k}").into_bytes();
+                    fx.db.append(&key(k), &v);
+                    fx.model.entry(key(k)).or_default().push(v);
+                }
+            }
+            fx.db.commit().unwrap();
             check(&fx, "with the seal held");
             fx.db.hold_seal_landing(false);
             fx.db.settle().unwrap();
             check(&fx, "after the landing");
+            fx.db.flush().unwrap();
+            fx.db.settle().unwrap();
+            assert_eq!(fx.db.levels().1, 0, "{name}: no piece after the flush");
+            check(&fx, "over the partitions alone");
+            for k in (0u32..4_020).step_by(7) {
+                if k.is_multiple_of(2) {
+                    let v = format!("v6-{k}").into_bytes();
+                    fx.db.put(&key(k), &v);
+                    fx.model.insert(key(k), vec![v]);
+                } else {
+                    fx.db.delete(&key(k));
+                    fx.model.insert(key(k), Vec::new());
+                }
+            }
+            fx.db.commit().unwrap();
+            check(&fx, "under a live table");
             fx.db.close().unwrap();
         }
+    }
+}
+
+/// A point read hashes its key once for every source and asks for their
+/// first lines ahead, and nothing it returns moves: the fixture's store --
+/// a partition, a piece with tombstones and a live table over both -- with
+/// a table frozen in a held seal between the piece and the live table,
+/// read through the writer and through a handle, answers every probe as
+/// the model does, held and after the seal lands; and the count with it.
+#[test]
+fn a_point_read_hashed_once_answers_as_the_model() {
+    for shape in [
+        OrdShape::Short,
+        OrdShape::Mixed,
+        OrdShape::Wide,
+        OrdShape::Binary,
+    ] {
+        let name = format!("hashonce-{shape:?}");
+        let mut fx = ord_fixture_with(&name, shape, common::options());
+        let key = |k: u32| ord_key(shape, k);
+        // The table the fixture left live, frozen in a seal that does
+        // not land, and a live table over it with tombstones over all
+        // four sources and values after some.
+        fx.db.hold_seal_landing(true);
+        fx.db.seal().unwrap();
+        assert!(fx.db.frozen_tables() >= 1, "{name}: a frozen table");
+        for k in (1u32..4_010).step_by(9) {
+            if k.is_multiple_of(2) {
+                fx.db.delete(&key(k));
+                fx.model.insert(key(k), Vec::new());
+            } else {
+                let v = format!("v4-{k}").into_bytes();
+                fx.db.append(&key(k), &v);
+                fx.model.entry(key(k)).or_default().push(v);
+            }
+        }
+        fx.db.commit().unwrap();
+        let show = |p: &[u8]| String::from_utf8_lossy(p).into_owned();
+        let probes = ord_probes(shape);
+        let check = |fx: &OrdFixture, when: &str| {
+            let h = fx.db.reader().unwrap();
+            for p in &probes {
+                let want = fx.model.get(p).cloned().unwrap_or_default();
+                assert_eq!(read_vec(&fx.db, p), want, "{name} {when}: {}", show(p));
+                assert_eq!(
+                    read_vec(&h, p),
+                    want,
+                    "{name} {when}, a handle: {}",
+                    show(p)
+                );
+                assert_eq!(
+                    fx.db.count(p).unwrap(),
+                    want.len() as u64,
+                    "{name} {when}: the count of {}",
+                    show(p)
+                );
+            }
+        };
+        check(&fx, "with the seal held");
+        fx.db.hold_seal_landing(false);
+        fx.db.settle().unwrap();
+        check(&fx, "after the landing");
+        fx.db.close().unwrap();
     }
 }
 
@@ -2725,10 +2668,10 @@ fn a_placed_read_takes_a_range_under_more_pieces_than_its_frame_keeps() {
     }
 }
 
-/// `Options::point_fixed` and `Options::point_lone` change the path a point
-/// read takes and nothing it returns: the fixture's store -- a partition, a
-/// piece with tombstones and a live table over both -- read with each of
-/// the four settings through the writer and through a handle answers every
+/// `Options::point_lone` changes the path a point read takes and nothing it
+/// returns: the fixture's store -- a partition, a piece with tombstones and
+/// a live table over both -- read with it and without through the writer
+/// and through a handle answers every
 /// probe as the model does, with a table frozen in a held seal between the
 /// piece and the live table, after the seal lands, and after a flush has
 /// folded everything into the partition, with nothing unsealed and then
@@ -2749,29 +2692,19 @@ fn a_placed_read_takes_a_range_under_more_pieces_than_its_frame_keeps() {
 #[test]
 fn a_lean_point_read_answers_as_the_general_one() {
     let d = Options::default();
-    assert!(
-        d.point_fixed && d.point_lone && d.point_layers_lean,
-        "the default"
-    );
+    assert!(d.point_lone && d.point_layers_lean, "the default");
     for shape in [
         OrdShape::Short,
         OrdShape::Mixed,
         OrdShape::Wide,
         OrdShape::Binary,
     ] {
-        for (fixed, lone, first) in [
-            (true, true, true),
-            (true, true, false),
-            (true, false, true),
-            (false, true, true),
-            (false, false, true),
-        ] {
-            let name = format!("leanread-{shape:?}-{fixed}-{lone}-{first}");
+        for (lone, first) in [(true, true), (true, false), (false, true)] {
+            let name = format!("leanread-{shape:?}-{lone}-{first}");
             let mut fx = ord_fixture_with(
                 &name,
                 shape,
                 Options {
-                    point_fixed: fixed,
                     point_lone: lone,
                     point_layers_lean: first,
                     ..common::options()
@@ -2819,12 +2752,12 @@ fn a_lean_point_read_answers_as_the_general_one() {
                 (after.0 - before.0, after.1 - before.1)
             };
             let reads = probes.len() as u64;
-            // Which read a store may take: both options, or neither path.
-            // And neither where the compact form is forced, as the stride
+            // Which read a store may take: with the option, and with it
+            // off neither path. And neither where the compact form is forced, as the stride
             // switch forces it (`common::stride_switch`): a partition a
             // form file may serve is dispatched by the general read, so
-            // there the four settings are held to the model alone.
-            let lean = fixed && lone && !common::stride_switch();
+            // there the settings are held to the model alone.
+            let lean = lone && !common::stride_switch();
             // A partition, a piece and the live table: the layered read,
             // for every key whose records are the common shape.
             let (two, layered) = check(&fx, "over a piece");
@@ -8138,8 +8071,8 @@ fn fold_model_with(block_cache: bool, pieces_only: bool, hot_copy: bool) {
 /// and reads hold each result to the merge.
 /// A copy built over updates alone starts a scan at the rank the
 /// partition's seek found, instead of searching its entries for the
-/// cursor, and streams what the search streamed
-/// (`Options::copy_start_at_rank`). One partition of several blocks, every
+/// cursor, and streams what the search streamed. One partition of several
+/// blocks, every
 /// key updated once: every block is dense with overlay keys that are all
 /// updates, so its copy's entries are its records. The model's scans start
 /// at every key and between keys, where the two starts could differ. Then
@@ -8188,54 +8121,6 @@ fn a_copy_of_updates_starts_a_scan_at_the_seeks_rank() {
         "the blocks without the insert still start at the rank"
     );
     assert!(searched2 > 0, "the block with the insert is searched");
-}
-
-/// A copy walk paces the prefetch of the copy block it reaches next through
-/// itself (`Options::scan_prefetch_paced`): over a partition of several
-/// blocks, every one a copy, the model's scans across block boundaries pace
-/// one with the option and none without, and read the same entries either
-/// way.
-#[test]
-fn a_copy_walk_paces_the_next_blocks_prefetch_through_itself() {
-    for on in [true, false] {
-        let d = dir(&format!("copy-prefetch-paced-{on}"));
-        let opts = Options {
-            seal_bytes: 1 << 20,
-            partition_bytes: Some(64 << 10),
-            scan_block_cache: true,
-            scan_prefetch_paced: on,
-            ..common::options()
-        };
-        let mut db = Db::create(&d, opts).unwrap();
-        let mut m = ScanModel::default();
-        let key = |k: u32| format!("key-{k:05}");
-        for k in (0..1200).step_by(3) {
-            m.append(&mut db, &key(k), &format!("p{k}"));
-        }
-        db.commit().unwrap();
-        db.flush().unwrap();
-        m.flushed();
-        assert_eq!(db.levels(), (1, 0), "one partition of several blocks");
-        for k in (0..1200).step_by(3) {
-            m.append(&mut db, &key(k), &format!("u{k}"));
-        }
-        db.commit().unwrap();
-        m.check(
-            &db,
-            &format!("paced {on}: every key updated once, copies of the records"),
-        );
-        let [at_rank, _] = db.copy_starts();
-        assert!(at_rank > 0, "paced {on}: the scans walked copies");
-        let paces = db.prefetch_paces();
-        if on {
-            assert!(
-                paces > 0,
-                "paced {on}: walks across a block paced the next's prefetch"
-            );
-        } else {
-            assert_eq!(paces, 0, "paced {on}: the burst paces nothing");
-        }
-    }
 }
 
 /// A dense sparse form is converted into a copy from its own deltas and the
@@ -9105,93 +8990,87 @@ fn a_key_held_by_many_pieces_counts_once_toward_a_wide_block() {
 }
 
 /// A wide block's walk takes at most a scan's limit of the overlay's keys,
-/// and the window that merges its sources for the scan stops there
-/// (`Options::scan_wide_capped`); a key one source holds is emitted without
-/// the tombstone search (`Options::emit_lone_unsearched`). Each held to the
-/// model, and so to the shape before it, over a block whose keys past the
-/// end sit in four pieces interleaved key by key, every seventh in two
-/// pieces, every eleventh deleted in another, and the live memtable over
-/// some of them and between them.
+/// and the window that merges its sources for the scan stops there; a key
+/// one source holds is emitted without the tombstone search. Held to the
+/// model, over a block whose keys past the end sit in four pieces
+/// interleaved key by key, every seventh in two pieces, every eleventh
+/// deleted in another, and the live memtable over some of them and between
+/// them.
 #[test]
 fn a_wide_blocks_window_stops_at_the_scans_limit() {
-    for (capped, lone) in [(true, true), (false, true), (true, false), (false, false)] {
-        let d = dir(&format!("wide-window-{capped}-{lone}"));
-        let opts = Options {
-            seal_bytes: 1 << 20,
-            partition_bytes: Some(2 << 10),
-            l0_trigger: 64,
-            scan_block_cache: true,
-            // Four pieces over the last range, none merged.
-            tier_pieces: 0,
-            scan_wide_capped: capped,
-            emit_lone_unsearched: lone,
-            // The window is what is tested: the block stays wide.
-            forms_copy_hot_wide: false,
-            ..common::options()
-        };
-        let mut db = Db::create(&d, opts).unwrap();
-        let mut m = ScanModel::default();
-        let key = |k: u32| format!("key-{k:05}");
-        for k in (0..600).step_by(3) {
-            m.append(&mut db, &key(k), &format!("p{k}"));
-        }
-        db.commit().unwrap();
-        db.flush().unwrap();
-        m.flushed();
-        let tail = |k: u32| format!("key-00600x{k:04}");
-        for round in 0..4u32 {
-            for k in 0..1280u32 {
-                if k % 4 == round || (k % 7 == 0 && (k + 1) % 4 == round) {
-                    m.append(&mut db, &tail(k), &format!("r{round}"));
-                }
-                if k % 11 == 0 && (k + 2) % 4 == round {
-                    m.delete(&mut db, &tail(k));
-                }
-            }
-            db.commit().unwrap();
-            db.seal().unwrap();
-            db.settle().unwrap();
-        }
-        assert!(db.levels().1 >= 4, "the tail's four pieces stand");
-        for k in (0..1280u32).step_by(5) {
-            m.append(&mut db, &tail(k), "live");
-        }
-        for k in (0..1280u32).step_by(13) {
-            m.append(&mut db, &format!("{}+", tail(k)), "live-new");
-        }
-        m.delete(&mut db, &tail(40));
-        db.commit().unwrap();
-        let state = format!("pieces and the live table past the end, capped {capped} lone {lone}");
-        m.check(&db, &state);
-        held(&db, 0);
-        assert!(
-            db.block_cache_wide() > 0,
-            "{state}: the tail's block is wide"
-        );
-        // That table frozen and held, and a live one over it and between
-        // its keys: the window's memtable sources are a base and the live
-        // run, a key in both folded from both, a live tombstone over a
-        // frozen key.
-        db.hold_seal_landing(true);
-        db.seal().unwrap();
-        for k in (0..1280u32).step_by(10) {
-            m.append(&mut db, &tail(k), "over-frozen");
-        }
-        for k in (3..1280u32).step_by(17) {
-            m.append(&mut db, &format!("{}-", tail(k)), "live-between");
-        }
-        m.delete(&mut db, &tail(65));
-        db.commit().unwrap();
-        assert!(db.in_flight().0, "the seal is held");
-        let state =
-            format!("a frozen table and a live one past the end, capped {capped} lone {lone}");
-        m.check(&db, &state);
-        held(&db, 0);
-        db.hold_seal_landing(false);
-        db.settle().unwrap();
-        m.check(&db, &format!("{state}, landed"));
-        held(&db, 0);
+    let d = dir("wide-window");
+    let opts = Options {
+        seal_bytes: 1 << 20,
+        partition_bytes: Some(2 << 10),
+        l0_trigger: 64,
+        scan_block_cache: true,
+        // Four pieces over the last range, none merged.
+        tier_pieces: 0,
+        // The window is what is tested: the block stays wide.
+        forms_copy_hot_wide: false,
+        ..common::options()
+    };
+    let mut db = Db::create(&d, opts).unwrap();
+    let mut m = ScanModel::default();
+    let key = |k: u32| format!("key-{k:05}");
+    for k in (0..600).step_by(3) {
+        m.append(&mut db, &key(k), &format!("p{k}"));
     }
+    db.commit().unwrap();
+    db.flush().unwrap();
+    m.flushed();
+    let tail = |k: u32| format!("key-00600x{k:04}");
+    for round in 0..4u32 {
+        for k in 0..1280u32 {
+            if k % 4 == round || (k % 7 == 0 && (k + 1) % 4 == round) {
+                m.append(&mut db, &tail(k), &format!("r{round}"));
+            }
+            if k % 11 == 0 && (k + 2) % 4 == round {
+                m.delete(&mut db, &tail(k));
+            }
+        }
+        db.commit().unwrap();
+        db.seal().unwrap();
+        db.settle().unwrap();
+    }
+    assert!(db.levels().1 >= 4, "the tail's four pieces stand");
+    for k in (0..1280u32).step_by(5) {
+        m.append(&mut db, &tail(k), "live");
+    }
+    for k in (0..1280u32).step_by(13) {
+        m.append(&mut db, &format!("{}+", tail(k)), "live-new");
+    }
+    m.delete(&mut db, &tail(40));
+    db.commit().unwrap();
+    let state = "pieces and the live table past the end";
+    m.check(&db, state);
+    held(&db, 0);
+    assert!(
+        db.block_cache_wide() > 0,
+        "{state}: the tail's block is wide"
+    );
+    // That table frozen and held, and a live one over it and between
+    // its keys: the window's memtable sources are a base and the live
+    // run, a key in both folded from both, a live tombstone over a
+    // frozen key.
+    db.hold_seal_landing(true);
+    db.seal().unwrap();
+    for k in (0..1280u32).step_by(10) {
+        m.append(&mut db, &tail(k), "over-frozen");
+    }
+    for k in (3..1280u32).step_by(17) {
+        m.append(&mut db, &format!("{}-", tail(k)), "live-between");
+    }
+    m.delete(&mut db, &tail(65));
+    db.commit().unwrap();
+    assert!(db.in_flight().0, "the seal is held");
+    let state = "a frozen table and a live one past the end";
+    m.check(&db, state);
+    held(&db, 0);
+    db.hold_seal_landing(false);
+    db.settle().unwrap();
+    m.check(&db, &format!("{state}, landed"));
+    held(&db, 0);
 }
 
 /// A block wide by its count of keys past the end is copied once its walks
@@ -9199,7 +9078,9 @@ fn a_wide_blocks_window_stops_at_the_scans_limit() {
 /// inserts after it are appended to it, a delete and an update of keys in it
 /// are spliced in, and every scan answers what the model holds
 /// (`Options::forms_copy_hot_wide`). Without the option the block stays
-/// wide.
+/// wide. The copy is bought when its walks have paid for it: the block's
+/// eight records and the six hundred keys past the end are 608 entries,
+/// and walks of fifty pay for them by the fourteenth.
 #[test]
 fn a_hot_wide_block_is_copied_and_kept_past_the_bound() {
     for on in [true, false] {
@@ -9209,9 +9090,6 @@ fn a_hot_wide_block_is_copied_and_kept_past_the_bound() {
             partition_bytes: Some(2 << 10),
             scan_block_cache: true,
             forms_copy_hot_wide: on,
-            // The walk at which the copy pays by the fixed ratio; the
-            // priced rule has a test of its own.
-            forms_copy_wide_priced: false,
             ..common::options()
         };
         let mut db = Db::create(&d, opts).unwrap();
@@ -9232,15 +9110,10 @@ fn a_hot_wide_block_is_copied_and_kept_past_the_bound() {
         }
         db.commit().unwrap();
         let state = format!("hot wide {on}");
-        // Six hundred keys past the end: the block is copied at its eighth
-        // walk.
-        for i in 0..12u32 {
-            m.check_one(
-                &db,
-                tail(i * 37).as_bytes(),
-                1 + (i as usize * 7) % 60,
-                &state,
-            );
+        // Six hundred keys past the end and the block's eight records: the
+        // copy pays at the fourteenth walk of fifty.
+        for i in 0..14u32 {
+            m.check_one(&db, tail(i * 37).as_bytes(), 50, &state);
         }
         let (_, recopies, _) = db.build_kinds();
         if on {
@@ -9281,13 +9154,11 @@ fn a_hot_wide_block_is_copied_and_kept_past_the_bound() {
 
 /// A hot wide block's copy is bought once the keys its earlier walks
 /// merged reach the entries the copy will merge, every source's run over
-/// the block and its records (`Options::forms_copy_wide_priced`): six
+/// the block and its records (`Reader::wide_copy_pays`): six
 /// hundred keys past the end and the block's eight records are 608
 /// entries, a scan of fifty from the tail merges fifty, and the fourteenth
 /// walk copies -- the keys all in the live table, or half of them in a
-/// frozen table under it, where the largest source's run alone would have
-/// copied at the eighth. The fixed ratio copies at the eighth
-/// (`a_hot_wide_block_is_copied_and_kept_past_the_bound`).
+/// frozen table under it.
 #[test]
 fn a_hot_wide_blocks_copy_is_bought_once_its_walks_have_paid() {
     for frozen in [false, true] {
@@ -9298,7 +9169,7 @@ fn a_hot_wide_blocks_copy_is_bought_once_its_walks_have_paid() {
             scan_block_cache: true,
             ..common::options()
         };
-        assert!(opts.forms_copy_hot_wide && opts.forms_copy_wide_priced);
+        assert!(opts.forms_copy_hot_wide);
         let mut db = Db::create(&d, opts).unwrap();
         let mut m = ScanModel::default();
         let key = |k: u32| format!("key-{k:05}");
@@ -14554,7 +14425,7 @@ fn same_blocks_carries(long: bool, from_index: bool) -> (u64, u64, u64, [u64; 2]
 /// keeps the commit's fill for a scan, so a publish after a write moves
 /// the forms' position without building the written block again: the
 /// publish the upkeep thread's pass makes when it leaves its fill for a
-/// commit the writer has posted (`Options::upkeep_fill_skips_posted`).
+/// commit the writer has posted.
 fn forms_published_for_a_handle(name: &str) -> (Db, Reader, ScanModel, PathBuf) {
     let d = dir(name);
     let opts = Options {
@@ -17405,11 +17276,10 @@ fn a_live_write_over_the_frozen_table_is_one_key_on_every_scan_path() {
 }
 
 /// The scan paths a frozen table's keys reach a scan through, each the
-/// arm that keeps it: the block cache's, the cursor merge's, the merge
-/// over unrouted sources, the lazy snapshot, the snapshot's runs, a
+/// arm that keeps it: the block cache's, the merge over unrouted sources, the lazy snapshot, the snapshot's runs, a
 /// snapshot each handle builds alone, and frozen tables with no snapshot
 /// of their own.
-fn scan_path_arms() -> [(&'static str, Options); 10] {
+fn scan_path_arms() -> [(&'static str, Options); 9] {
     [
         ("default", common::options()),
         // The compact form forced, with the block cache and without it: the
@@ -17440,14 +17310,6 @@ fn scan_path_arms() -> [(&'static str, Options); 10] {
                 zpages_min_bytes: 0,
                 scan_block_cache: false,
                 zpages_walk_cursor: false,
-                ..common::options()
-            },
-        ),
-        (
-            "cursormerge",
-            Options {
-                scan_merge: false,
-                scan_block_cache: false,
                 ..common::options()
             },
         ),
@@ -20859,22 +20721,18 @@ fn a_landing_makes_a_fresh_table_only_where_it_installs_one() {
 }
 
 /// A scan's seek hints the directory lines of its stride window and the
-/// record hint estimates its span (`Options::seek_prefetch_dir`); both
-/// are hints, so every answer is the same with them and without, over the
-/// starts that put the window at the index's edges: a key in the last
-/// stride, the last key, above every key, below every key, and from the
-/// empty key, on a partitioned run of many strides, a one-key partition
-/// and an empty store, at a limit of `usize::MAX` -- the span a hint once
-/// wrapped on. Through the writer and through a handle.
+/// record hint estimates its span; both are hints, so every answer is the
+/// store's own, over the starts that put the window at the index's edges:
+/// a key in the last stride, the last key, above every key, below every
+/// key, and from the empty key, on a partitioned run of many strides, a
+/// one-key partition and an empty store, at a limit of `usize::MAX` --
+/// the span a hint once wrapped on. Through the writer and through a
+/// handle.
 #[test]
-fn a_scans_answers_are_the_same_with_the_directory_hint_and_without() {
-    let build = |name: &str, hint: bool, keys: u32| -> (PathBuf, Db) {
-        let d = dir(&format!("{name}-{}", if hint { "hint" } else { "plain" }));
-        let opts = Options {
-            seek_prefetch_dir: hint,
-            ..common::options()
-        };
-        let mut db = Db::create(&d, opts).unwrap();
+fn a_scans_answers_from_its_seeks_window_edges_are_the_stores_own() {
+    let build = |name: &str, keys: u32| -> (PathBuf, Db) {
+        let d = dir(name);
+        let mut db = Db::create(&d, common::options()).unwrap();
         for k in 0..keys {
             db.append(format!("key-{k:06}").as_bytes(), format!("v{k}").as_bytes());
         }
@@ -20904,8 +20762,7 @@ fn a_scans_answers_are_the_same_with_the_directory_hint_and_without() {
         ("dirhint-one", 1),
         ("dirhint-empty", 0),
     ] {
-        let (_da, a) = build(name, true, keys);
-        let (_db, b) = build(name, false, keys);
+        let (_d, a) = build(name, keys);
         let last = keys.saturating_sub(1);
         let starts: Vec<Vec<u8>> = vec![
             Vec::new(),
@@ -20917,34 +20774,24 @@ fn a_scans_answers_are_the_same_with_the_directory_hint_and_without() {
             b"zzz".to_vec(),
         ];
         let ra = a.reader().unwrap();
-        let rb = b.reader().unwrap();
         for from in &starts {
-            let want = (0..keys)
-                .filter(|k| format!("key-{k:06}").as_bytes() >= from.as_slice())
-                .count();
-            let (na, ga) = scan_all(&a, from.as_slice());
-            let (nb, gb) = scan_all(&b, from.as_slice());
+            let want: Seen = (0..keys)
+                .map(|k| {
+                    (
+                        format!("key-{k:06}").into_bytes(),
+                        format!("v{k}").into_bytes(),
+                    )
+                })
+                .filter(|(k, _)| k.as_slice() >= from.as_slice())
+                .collect();
+            let (n, got) = scan_all(&a, from.as_slice());
             assert_eq!(
-                na,
-                want,
-                "{name}: the count from {:?}",
+                (n, &got),
+                (want.len(), &want),
+                "{name}: the writer from {:?}",
                 String::from_utf8_lossy(from)
             );
-            assert_eq!(
-                (na, &ga),
-                (nb, &gb),
-                "{name}: the writer, hint against none"
-            );
-            assert_eq!(
-                scan_all(&ra, from.as_slice()),
-                (na, ga.clone()),
-                "{name}: a handle with the hint"
-            );
-            assert_eq!(
-                scan_all(&rb, from.as_slice()),
-                (nb, gb),
-                "{name}: a handle without"
-            );
+            assert_eq!(scan_all(&ra, from.as_slice()), (n, got), "{name}: a handle");
         }
     }
 }
@@ -21065,76 +20912,6 @@ fn a_seek_counts_its_directory_hint_once_a_scan_and_the_threads_pass_none() {
     );
     assert_eq!(live.dir_prefetches(), crossed, "and none on the handle");
     std::hint::black_box(sink);
-}
-
-/// The directory hint is the reader's: a store written with it and one
-/// without leave the same segment and the same ordered index, byte for
-/// byte, so the magic does not move (`Options::seek_prefetch_dir`).
-#[test]
-fn the_directory_hint_writes_the_segment_and_the_ordered_index_the_default_does() {
-    let mut files: Vec<BTreeMap<String, Vec<u8>>> = Vec::new();
-    for hint in [true, false] {
-        let d = dir(if hint {
-            "dirhint-files"
-        } else {
-            "dirplain-files"
-        });
-        let opts = Options {
-            seek_prefetch_dir: hint,
-            ..common::files(common::options())
-        };
-        let mut db = Db::create(&d, opts).unwrap();
-        for c in 0u32..3000 {
-            let k = format!("k{:04}", (c * 7919) % 2500);
-            db.append(k.as_bytes(), &c.to_le_bytes());
-            if c % 97 == 0 {
-                db.delete(k.as_bytes());
-            }
-            if c % 50 == 49 {
-                db.commit().unwrap();
-            }
-        }
-        db.flush().unwrap();
-        // A scan each way, so the hint ran over what it reads.
-        let mut n = 0usize;
-        db.scan(b"k1000", 100, kv(&mut |_, _| n += 1)).unwrap();
-        assert!(n > 0);
-        drop(db);
-        let mut m = BTreeMap::new();
-        for e in std::fs::read_dir(&d).unwrap() {
-            let p = e.unwrap().path();
-            let name = p.file_name().unwrap().to_str().unwrap().to_string();
-            if name.ends_with(".sup") || name.ends_with(".oidx") || name.starts_with("ord-") {
-                m.insert(name, std::fs::read(&p).unwrap());
-            }
-        }
-        assert!(
-            m.keys().any(|n| n.ends_with(".sup")),
-            "the flush sealed a segment"
-        );
-        assert!(
-            m.keys()
-                .any(|n| n.ends_with(".oidx") || n.starts_with("ord-")),
-            "with its ordered index"
-        );
-        files.push(m);
-    }
-    let (a, b) = (&files[0], &files[1]);
-    assert_eq!(
-        a.keys().collect::<Vec<_>>(),
-        b.keys().collect::<Vec<_>>(),
-        "the same files"
-    );
-    // A segment's superblock carries the second its finish landed in, and
-    // a checksum over it, in each slot: two seals that straddle a second
-    // differ in those and nowhere else (`without_the_clock`).
-    for (name, bytes) in a {
-        let first = first_difference(name, bytes, &b[name]);
-        assert!(
-            first.is_none(),
-            "{name} differs between the two, first at {first:?}"
-        );
-    }
 }
 
 /// Under the idle seals (`seal_idle`) a commit in a stretch nobody reads

@@ -6759,8 +6759,7 @@ pub(super) struct ZEvents {
     /// form files on disk, in place of a sample (`Maint::z_sample_refresh`).
     pub sample_refreshed: AtomicU64,
     /// Readings made from the form files on disk at the crossing, in place
-    /// of a fill sample (`Maint::z_reading_from_files`,
-    /// `Options::zpages_reading_from_files`).
+    /// of a fill sample (`Maint::z_reading_from_files`).
     pub sample_from_files: AtomicU64,
     /// The price of a fault the last reading carried, nanoseconds, zero
     /// where its timed decodes took none: their wait over their faults, or
@@ -7635,12 +7634,6 @@ pub(super) struct BuildPlan {
     /// Whether the build asks for the stride form, and what it builds
     /// where the partition does not qualify.
     pub stride: StrideAsk,
-    /// The key at and above which a partition is not asked for the stride
-    /// form whatever `stride` says (`Options::zpages_stride_below`): one
-    /// whose first key is at or above it is built in the block form as a
-    /// plan that asks nothing builds it, with no reason kept, since none was
-    /// found -- the partition was not asked. `None` asks every partition.
-    pub stride_below: Option<std::sync::Arc<[u8]>>,
     /// The key ranges a partition is asked for the stride form in, each a
     /// first key and the key it ends before, empty for no end: a partition
     /// whose first key lies in none is built in the block form as a plan
@@ -7704,7 +7697,6 @@ impl BuildPlan {
             drop_output: false,
             sync: false,
             stride: StrideAsk::No,
-            stride_below: None,
             stride_spans: None,
             stride_sparse: false,
             stride_sparse_later: false,
@@ -8137,19 +8129,13 @@ fn name_built(
 }
 
 /// What `plan` asks of a segment whose first key is `first`: the stride
-/// form as the plan asks it, or not at all for a partition the plan keeps
-/// in the block form by its keys' place (`BuildPlan::stride_below`) or
-/// whose first key lies in no range the plan asks in
-/// (`BuildPlan::stride_spans`). One rule for a mapped segment and a kept
-/// one.
+/// form as the plan asks it, or not at all for a partition whose first key
+/// lies in no range the plan asks in (`BuildPlan::stride_spans`). One rule
+/// for a mapped segment and a kept one.
 fn stride_asked(plan: &BuildPlan, first: Option<&[u8]>) -> StrideAsk {
-    let ask = match plan.stride_below.as_deref() {
-        Some(cut) if first.is_some_and(|first| first >= cut) => StrideAsk::No,
-        _ => plan.stride,
-    };
     match plan.stride_spans.as_deref() {
         Some(spans) if !first.is_some_and(|first| in_spans(spans, first)) => StrideAsk::No,
-        _ => ask,
+        _ => plan.stride,
     }
 }
 
@@ -16731,57 +16717,6 @@ mod tests {
             assert!(want(&made), "{name}: {made:?}");
             made.note_stride(&cell);
             assert_eq!(cell.load(Ordering::Relaxed), kept, "{name}");
-        }
-    }
-
-    /// A plan that keeps the partitions at and above a key in the block
-    /// form (`BuildPlan::stride_below`) asks the stride form of a partition
-    /// whose first key is below the key, and nothing of one whose first key
-    /// is the key or above it: the block body with no reason, as a plan
-    /// that asks nothing builds it, the reason a segment keeps left as it
-    /// was. Under either ask, a conversion's too.
-    #[test]
-    fn a_partition_at_or_above_the_plans_key_is_not_asked_for_the_stride_form() {
-        let fx = Fixture::new("stride-below", stride_recs(600, 100, 0x61), 1 << 16);
-        assert!(
-            precheck_of(&fx).is_ok(),
-            "a partition the stride form would take, so that nothing keeps it out but the key"
-        );
-        let first = fx.blob.key_at(0).unwrap().to_vec();
-        // The run's second key, above the first; and the first key less its
-        // last byte, which sorts below it.
-        let second = fx.blob.key_at(1).unwrap().to_vec();
-        let under = first[..first.len() - 1].to_vec();
-        let kept = StrideNo::Holes.code();
-        for ask in [StrideAsk::OrBlock, StrideAsk::Only] {
-            for (name, cut, stride) in [
-                ("the key above the first", &second, true),
-                ("the key the first", &first, false),
-                ("the key below the first", &under, false),
-            ] {
-                let what = format!("{ask:?}, {name}");
-                let _ = std::fs::remove_file(&fx.out);
-                let plan = BuildPlan {
-                    stride_below: Some(cut.as_slice().into()),
-                    ..stride_plan(ask)
-                };
-                let cell = AtomicU8::new(kept);
-                let made = build(&fx.seg, &fx.out, ID, END, &plan).unwrap();
-                made.note_stride(&cell);
-                let Outcome::Built(b) = made else {
-                    panic!("{what}: {made:?}")
-                };
-                assert_eq!(b.stride_no, None, "{what}: no reason either way");
-                if stride {
-                    assert_eq!(b.coding, FileCoding::Stride, "{what}");
-                    assert_eq!(cell.load(Ordering::Relaxed), 0, "{what}: held");
-                } else {
-                    assert_eq!(b.coding, FileCoding::Block, "{what}");
-                    assert_eq!(cell.load(Ordering::Relaxed), kept, "{what}: not asked");
-                    let zfile = fx.attach().expect("the block file attaches");
-                    agree(&fx.memo, &zfile, &fx.blob, &fx.recs);
-                }
-            }
         }
     }
 

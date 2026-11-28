@@ -698,18 +698,6 @@ pub struct Supdb {
     /// (`Options::piece_ranks_whole`). `supdb-ingestrankswhole`, and
     /// `supdb-rankswhole` durable.
     rankswhole: bool,
-    /// A block's build reads each piece's records over it as it meets
-    /// them, one fault at a time, where the default asks the kernel for
-    /// every piece's run before any is read once the store is out of core
-    /// (`Options::pieces_willneed` off). `supdb-ingestnowillneed`, and
-    /// `supdb-nowillneed` durable.
-    nowillneed: bool,
-    /// A scan reads a raw partition's records as it meets them, a fault a
-    /// page, where the default asks the kernel for the span it is about
-    /// to walk once the store is out of core (`Options::blocks_willneed`
-    /// off). `supdb-ingestnoblockwillneed`, and `supdb-noblockwillneed`
-    /// durable.
-    noblockwillneed: bool,
     /// A merge's first pass reads its inputs' keys off the records, as
     /// before the heads carried them (`Options::merge_keys_by_heads` off).
     /// `supdb-ingestmergerecordkeys`, and `supdb-mergerecordkeys` durable.
@@ -732,11 +720,6 @@ pub struct Supdb {
     /// second pass (`Options::merge_drop_behind`, refuted and off).
     /// `supdb-ingestmergedropbehind`, and `supdb-mergedropbehind` durable.
     mergedropbehind: bool,
-    /// A settle's resolves read the heads they seek as they meet them,
-    /// where the default asks for them ahead once the store is out of core
-    /// (`Options::heads_willneed` off). `supdb-ingestnoheadwillneed`, and
-    /// `supdb-noheadwillneed` durable.
-    noheadwillneed: bool,
     /// A merge's landing plans nothing, as a seal's landing alone did, so a
     /// store nothing writes keeps its pieces however long it is read
     /// (`Options::merge_chains` off). `supdb-ingestnomergechain`, and
@@ -764,19 +747,6 @@ pub struct Supdb {
     /// drops them a megabyte at a time (`Options::wal_drop_bytes` zero).
     /// `supdb-walkeep`, durable.
     walkeep: bool,
-    /// One of the controller's builds ahead at a time, where the default
-    /// runs two (`Options::zpages_ahead_builders`). `supdb-zahead1`,
-    /// durable.
-    zahead1: bool,
-    /// The controller's sample asked for between builds ahead
-    /// (`Options::zpages_sample_between`). `supdb-zsamplegap`, durable.
-    zsamplegap: bool,
-    /// The install as it was before it came at the load's end: no
-    /// partition counted as covered but by its form file, and the
-    /// controller suspecting on two hot readings
-    /// (`Options::zpages_cover_resident`, `Options::zpages_suspect_at_crossing`
-    /// off). `supdb-zinstallwaits`, durable.
-    zinstallwaits: bool,
     /// The controller's re-code of its hottest partitions to the raw tails
     /// once the form is installed (`Options::zpages_recode_auto`).
     /// `supdb-zrecodeauto`, durable.
@@ -805,15 +775,6 @@ pub struct Supdb {
     /// (`Options::boundary_keys_from_top`). `supdb-ingestboundarytop`, and
     /// `supdb-boundarytop` durable.
     boundarytop: bool,
-    /// A block's build asks for its pieces' records without asking for
-    /// their directory words first (`Options::pieces_dir_willneed` off).
-    /// `supdb-ingestnodirwillneed`, and `supdb-nodirwillneed` durable.
-    nodirwillneed: bool,
-    /// A bounds walk reads a piece's heads as it meets them
-    /// (`Options::bounds_heads_willneed` off).
-    /// `supdb-ingestnoboundsheadwillneed`, and `supdb-noboundsheadwillneed`
-    /// durable.
-    noboundsheadwillneed: bool,
     /// The builder ahead starts in core alone, the shape before it ran out
     /// of core for the partitions in memory (`Options::ahead_out_of_core`
     /// off). `supdb-ingestaheadincore`, and `supdb-aheadincore` durable.
@@ -967,14 +928,6 @@ pub struct Supdb {
     /// were gated (`Options::scan_timers`). `supdb-timers`, and
     /// `supdb-ingesttimers` buffered.
     timers: bool,
-    /// The block walk issues no prefetches (`Options::scan_prefetch`
-    /// off). `supdb-noprefetch`, and `supdb-ingestnoprefetch` buffered.
-    noprefetch: bool,
-    /// A scan's seek without the stride window's directory hint, and the
-    /// record hint reading its span's two directory words
-    /// (`Options::seek_prefetch_dir` off). `supdb-dirplain`, and
-    /// `supdb-ingestdirplain` buffered.
-    dirplain: bool,
     /// The commit's maintenance filing its backlog into the forms far
     /// from any scan (`Options::forms_settle_far`), the shape before a
     /// stretch nobody reads filed nothing. `supdb-settlefar`, and
@@ -1001,10 +954,6 @@ pub struct Supdb {
     /// alone it prices what the sweep returns.
     /// `supdb-cache256tofitnosweep`.
     nosweep: bool,
-    /// A walk's prefetch reaching a kilobyte into the records rather than
-    /// four (`Options::scan_prefetch_bytes`). `supdb-prefetch1k`, and
-    /// `supdb-ingestprefetch1k` buffered.
-    prefetch1k: bool,
     /// The manifest published by a temp file, a rename and a directory
     /// fsync, as before the two slots (`Options::manifest_slots` off).
     /// `supdb-manifestrename`, and `supdb-ingestmanifestrename` buffered.
@@ -1223,9 +1172,6 @@ pub struct Supdb {
     /// form is installed alone (`Options::out_of_core_installed`).
     /// `supdb-oocz`.
     oocz: bool,
-    /// The upkeep thread's fill run whatever the writer has posted, the
-    /// shape before `Options::upkeep_fill_skips_posted`. `supdb-fillposted`.
-    fillposted: bool,
     /// The WAL grown by its appends and a retired file removed, the shape
     /// before `Options::recycle_wal`. `supdb-walappend`.
     walappend: bool,
@@ -1322,10 +1268,6 @@ pub struct Supdb {
     /// The segment work driven inline by the writer, as before
     /// `Options::publish_in_background`. `supdb-inlinemaint`.
     inlinemaint: bool,
-    /// A scan and a settle search a copy for their key, as before
-    /// `Options::copy_start_at_rank`. `supdb-copysearch`, and
-    /// `supdb-ingestcopysearch` buffered.
-    copysearch: bool,
     /// A dense sparse form converted by a build from the sources, as
     /// before `Options::convert_from_form`. `supdb-convertsources`, and
     /// `supdb-ingestconvertsources` buffered.
@@ -1364,7 +1306,6 @@ pub struct Supdb {
     rotate: bool,
     nofrozen: bool,
     idle: bool,
-    sortover: bool,
     /// Segments written in 2 MB pieces, `SegmentOptions::write_piece`.
     /// `supdb-pmd`, and `supdb-ingestpmd` buffered.
     pmd: bool,
@@ -1387,19 +1328,9 @@ pub struct Supdb {
     /// off), the shape before. `supdb-noyield`, and `supdb-ingestnoyield`
     /// buffered.
     noyield: bool,
-    /// The upkeep thread's complete-table fill holding the writer's
-    /// upkeep until the fill is done (`Options::upkeep_fill_yields` off),
-    /// the shape before the fill gave it back at a block.
-    /// `supdb-fillholds`, and `supdb-ingestfillholds` buffered.
-    fillholds: bool,
     /// A form file's fence searched over its keys, the shape before the
     /// flat words (`Options::zpages_fence_words` off): `supdb-fencekeys`.
     fencekeys: bool,
-    /// The controller's reading at the crossing taken by a fill sample of
-    /// every partition however many form files are on disk, the shape
-    /// before the reading from the files (`Options::zpages_reading_from_files`
-    /// off): `supdb-zsamplefills`.
-    zsamplefills: bool,
     /// Every covered partition served from its form file, the shape before
     /// the hot-raw policy (`Options::zpages_hot_raw` off): `supdb-znohotraw`.
     znohotraw: bool,
@@ -1422,16 +1353,6 @@ pub struct Supdb {
     /// The fill's quiet looks take the growth share too
     /// (`Options::zpages_hot_fill_quiet`): `supdb-zhotfillquiet`.
     zhotfillquiet: bool,
-    /// A raw walk's records asked for ahead of it on every store, within
-    /// the cache or past it (`Options::scan_raw_ahead_past_llc` off):
-    /// `supdb-scanrawahead`.
-    scanrawahead: bool,
-    /// A raw walk asks for nothing ahead of it (`Options::scan_raw_ahead`
-    /// off): `supdb-noscanrawahead`.
-    noscanrawahead: bool,
-    /// The same records asked for paced through the walk, a kilobyte ahead
-    /// (`Options::scan_raw_ahead_lead`): `supdb-scanrawpaced`.
-    scanrawpaced: bool,
     /// A covered scan's start placed once, the seek's cursor kept as the
     /// partition's reader's (`Options::zpages_seek_seeds` on):
     /// `supdb-zseekseed`.
@@ -1448,9 +1369,6 @@ pub struct Supdb {
     /// end a pin holds it, the shape before the sweep remembered the pin
     /// (`Options::sweep_remembers_pin` off): `supdb-sweepwalks`.
     sweepwalks: bool,
-    /// A copy block's prefetch asking for the whole of its values
-    /// (`Options::copy_prefetch_whole` on): `supdb-copyprefetchwhole`.
-    copyprefetchwhole: bool,
     /// The hot-raw policy's skew bar relaxed to the median where the
     /// candidate fits the room (`Options::zpages_hot_skew_room` on):
     /// `supdb-zhotskewroom`.
@@ -1480,26 +1398,6 @@ pub struct Supdb {
     /// (`Options::forms_settle_past_llc`): `supdb-settlegated` and
     /// `supdb-ingestsettlegated`.
     settlegated: bool,
-    /// A point read hashing its key in each source, the shape before one
-    /// hash a read (`Options::read_hash_once` off): `supdb-readhashes` and
-    /// `supdb-ingestreadhashes`.
-    readhashes: bool,
-    /// A point read asking for the memtable's slot alone ahead of its
-    /// probes (`Options::read_lines_ahead` off): `supdb-readnoahead` and
-    /// `supdb-ingestreadnoahead`.
-    readnoahead: bool,
-    /// The seek asking for the first two blocks' form headers
-    /// (`Options::scan_form_ahead`): `supdb-formahead` and
-    /// `supdb-ingestformahead`.
-    formahead: bool,
-    /// A sparse form asked for over the walk's share of it
-    /// (`Options::scan_prefetch_sparse_span`): `supdb-sparsespan` and
-    /// `supdb-ingestsparsespan`.
-    sparsespan: bool,
-    /// A partition walk's runs through one raw walker
-    /// (`Options::scan_runs_held`): `supdb-runsheld` and
-    /// `supdb-ingestrunsheld`.
-    runsheld: bool,
     /// A copy asked for over the entries its walk reads
     /// (`Options::copy_prefetch_span`): `supdb-copyspan` and
     /// `supdb-ingestcopyspan`.
@@ -1527,29 +1425,10 @@ pub struct Supdb {
     /// (`Options::settle_lone_chain` off): `supdb-settlesources` and
     /// `supdb-ingestsettlesources`.
     settlesources: bool,
-    /// The three scan levers together: `supdb-scanlevers` and
-    /// `supdb-ingestscanlevers`.
-    scanlevers: bool,
     /// The fills' conversion to a copy at the dense count alone, the shape
     /// before light forms converted (`Options::forms_convert_from`):
     /// `supdb-convert16` and `supdb-ingestconvert16`.
     convert16: bool,
-    /// A wide block's overlay merged from every source in full for a scan
-    /// (`Options::scan_wide_capped` off): `supdb-widefull` and
-    /// `supdb-ingestwidefull`.
-    widefull: bool,
-    /// The tombstone search for every overlay key, a lone source's too
-    /// (`Options::emit_lone_unsearched` off): `supdb-lonetombs` and
-    /// `supdb-ingestlonetombs`.
-    lonetombs: bool,
-    /// A block wide by its count walked wide for as long as it is
-    /// (`Options::forms_copy_hot_wide` off): `supdb-widewalks` and
-    /// `supdb-ingestwidewalks`.
-    widewalks: bool,
-    /// A hot wide block copied at the walk the fixed ratio of a walk to a
-    /// hundred copied keys names (`Options::forms_copy_wide_priced` off):
-    /// `supdb-widecopyfixed` and `supdb-ingestwidecopyfixed`.
-    widecopyfixed: bool,
     /// A syncing commit's paced batch held within the share or the batch,
     /// the larger (`Options::upkeep_pace_syncs_model` and
     /// `upkeep_pace_syncs_to_share` off): `supdb-pacesyncsbatch`.
@@ -1558,15 +1437,6 @@ pub struct Supdb {
     /// (`Options::upkeep_pace_syncs_model` off):
     /// `supdb-pacesyncsthresholds`.
     pacesyncsthresholds: bool,
-    /// A point read over a store with tombstones probing every source
-    /// again after its tombstone pass (`Options::read_probes_once` off):
-    /// `supdb-probestwice` and `supdb-ingestprobestwice`.
-    probestwice: bool,
-    /// A point read of every record through its extents, the common
-    /// record rebuilt as one too (`Options::point_fixed` off, which takes
-    /// the reads that stand on it with it): `supdb-pointexts` and
-    /// `supdb-ingestpointexts`.
-    pointexts: bool,
     /// A point read of every store by the general read of its sources,
     /// the two-source and the layered reads off (`Options::point_lone`
     /// off): `supdb-pointsources` and `supdb-ingestpointsources`.
@@ -1604,12 +1474,6 @@ pub struct Supdb {
     /// a covered partition read through one cursor
     /// (`Options::zpages_scan_cursor` off): `supdb-blockcursors`.
     blockcursors: bool,
-    /// A copy prefetched from the entry its walk starts at and not whole
-    /// (`Options::copy_prefetch_from_start`): `supdb-leancopyprefetch`.
-    leancopyprefetch: bool,
-    /// The next copy block's prefetch paced through the walk before it
-    /// (`Options::scan_prefetch_paced` on): `supdb-pacedprefetch`.
-    pacedprefetch: bool,
     /// The fill yielding its conversions at any posted commit
     /// (`Options::forms_convert_behind` zero), the shape before it
     /// converted in the thread's slack. `supdb-postedyield`, and
@@ -1925,10 +1789,6 @@ pub struct Supdb {
     /// one that starts a re-code (`with_policy`); every other arm that
     /// pins nothing follows the engine. `supdb-zblock` pins `Off`.
     zstride: Option<supdb::ZStride>,
-    /// The key number from which the partitions are not asked for the
-    /// stride form (`Options::zpages_stride_below`), or none where every
-    /// partition is asked: `supdb-cache64tofitzstridedrop2m` to `...7m`.
-    zstride_first: Option<u64>,
     /// The stride form asked for only where the store in it fits the room
     /// (`Options::zpages_stride_room`), the engine's where `None`:
     /// `supdb-zstrideroom` pins it on over `supdb-zblock`.
@@ -2035,21 +1895,11 @@ pub struct Supdb {
     holdcap: Option<usize>,
     holdmarch: bool,
     noframes: bool,
-    /// A point read that reads a segment's record as it reaches it, no
-    /// line asked ahead of the header (`Options::point_record_ahead`
-    /// off): `supdb-norecordahead`, and `supdb-heldnorecordahead` under
-    /// the held log with no frames.
-    norecordahead: bool,
     /// A memtable's hash index left to fault as it is probed, its pages'
     /// first touches loads of the zero page (`Options::index_populated`
     /// off): `supdb-indexzeropage`, and `supdb-heldindexzeropage` under
     /// the held log with no frames.
     indexzeropage: bool,
-    /// The placed read's live table asked before its partition is found
-    /// and its lines asked for (`Options::point_live_first` on):
-    /// `supdb-livefirst`, and `supdb-heldlivefirst` under the held log
-    /// with no frames.
-    livefirst: bool,
     /// Every memtable key hashed by its FNV word and a finish, sixteen
     /// bytes or not (`Options::mem_hash_fold` off): `supdb-memfnv`, and
     /// `supdb-heldmemfnv` under the held log with no frames.
@@ -2354,18 +2204,6 @@ struct Policy {
     /// (`Options::piece_ranks_whole`). `supdb-ingestrankswhole`, and
     /// `supdb-rankswhole` durable.
     rankswhole: bool,
-    /// A block's build reads each piece's records over it as it meets
-    /// them, one fault at a time, where the default asks the kernel for
-    /// every piece's run before any is read once the store is out of core
-    /// (`Options::pieces_willneed` off). `supdb-ingestnowillneed`, and
-    /// `supdb-nowillneed` durable.
-    nowillneed: bool,
-    /// A scan reads a raw partition's records as it meets them, a fault a
-    /// page, where the default asks the kernel for the span it is about
-    /// to walk once the store is out of core (`Options::blocks_willneed`
-    /// off). `supdb-ingestnoblockwillneed`, and `supdb-noblockwillneed`
-    /// durable.
-    noblockwillneed: bool,
     /// A merge's first pass reads its inputs' keys off the records, as
     /// before the heads carried them (`Options::merge_keys_by_heads` off).
     /// `supdb-ingestmergerecordkeys`, and `supdb-mergerecordkeys` durable.
@@ -2388,11 +2226,6 @@ struct Policy {
     /// second pass (`Options::merge_drop_behind`, refuted and off).
     /// `supdb-ingestmergedropbehind`, and `supdb-mergedropbehind` durable.
     mergedropbehind: bool,
-    /// A settle's resolves read the heads they seek as they meet them,
-    /// where the default asks for them ahead once the store is out of core
-    /// (`Options::heads_willneed` off). `supdb-ingestnoheadwillneed`, and
-    /// `supdb-noheadwillneed` durable.
-    noheadwillneed: bool,
     /// A merge's landing plans nothing, as a seal's landing alone did, so a
     /// store nothing writes keeps its pieces however long it is read
     /// (`Options::merge_chains` off). `supdb-ingestnomergechain`, and
@@ -2420,19 +2253,6 @@ struct Policy {
     /// drops them a megabyte at a time (`Options::wal_drop_bytes` zero).
     /// `supdb-walkeep`, durable.
     walkeep: bool,
-    /// One of the controller's builds ahead at a time, where the default
-    /// runs two (`Options::zpages_ahead_builders`). `supdb-zahead1`,
-    /// durable.
-    zahead1: bool,
-    /// The controller's sample asked for between builds ahead
-    /// (`Options::zpages_sample_between`). `supdb-zsamplegap`, durable.
-    zsamplegap: bool,
-    /// The install as it was before it came at the load's end: no
-    /// partition counted as covered but by its form file, and the
-    /// controller suspecting on two hot readings
-    /// (`Options::zpages_cover_resident`, `Options::zpages_suspect_at_crossing`
-    /// off). `supdb-zinstallwaits`, durable.
-    zinstallwaits: bool,
     /// The controller's re-code of its hottest partitions to the raw tails
     /// once the form is installed (`Options::zpages_recode_auto`).
     /// `supdb-zrecodeauto`, durable.
@@ -2461,15 +2281,6 @@ struct Policy {
     /// (`Options::boundary_keys_from_top`). `supdb-ingestboundarytop`, and
     /// `supdb-boundarytop` durable.
     boundarytop: bool,
-    /// A block's build asks for its pieces' records without asking for
-    /// their directory words first (`Options::pieces_dir_willneed` off).
-    /// `supdb-ingestnodirwillneed`, and `supdb-nodirwillneed` durable.
-    nodirwillneed: bool,
-    /// A bounds walk reads a piece's heads as it meets them
-    /// (`Options::bounds_heads_willneed` off).
-    /// `supdb-ingestnoboundsheadwillneed`, and `supdb-noboundsheadwillneed`
-    /// durable.
-    noboundsheadwillneed: bool,
     /// The builder ahead starts in core alone, the shape before it ran out
     /// of core for the partitions in memory (`Options::ahead_out_of_core`
     /// off). `supdb-ingestaheadincore`, and `supdb-aheadincore` durable.
@@ -2623,14 +2434,6 @@ struct Policy {
     /// were gated (`Options::scan_timers`). `supdb-timers`, and
     /// `supdb-ingesttimers` buffered.
     timers: bool,
-    /// The block walk issues no prefetches (`Options::scan_prefetch`
-    /// off). `supdb-noprefetch`, and `supdb-ingestnoprefetch` buffered.
-    noprefetch: bool,
-    /// A scan's seek without the stride window's directory hint, and the
-    /// record hint reading its span's two directory words
-    /// (`Options::seek_prefetch_dir` off). `supdb-dirplain`, and
-    /// `supdb-ingestdirplain` buffered.
-    dirplain: bool,
     /// The commit's maintenance filing its backlog into the forms far
     /// from any scan (`Options::forms_settle_far`), the shape before a
     /// stretch nobody reads filed nothing. `supdb-settlefar`, and
@@ -2657,10 +2460,6 @@ struct Policy {
     /// alone it prices what the sweep returns.
     /// `supdb-cache256tofitnosweep`.
     nosweep: bool,
-    /// A walk's prefetch reaching a kilobyte into the records rather than
-    /// four (`Options::scan_prefetch_bytes`). `supdb-prefetch1k`, and
-    /// `supdb-ingestprefetch1k` buffered.
-    prefetch1k: bool,
     /// The manifest published by a temp file, a rename and a directory
     /// fsync, as before the two slots (`Options::manifest_slots` off).
     /// `supdb-manifestrename`, and `supdb-ingestmanifestrename` buffered.
@@ -2879,9 +2678,6 @@ struct Policy {
     /// form is installed alone (`Options::out_of_core_installed`).
     /// `supdb-oocz`.
     oocz: bool,
-    /// The upkeep thread's fill run whatever the writer has posted, the
-    /// shape before `Options::upkeep_fill_skips_posted`. `supdb-fillposted`.
-    fillposted: bool,
     /// The WAL grown by its appends and a retired file removed, the shape
     /// before `Options::recycle_wal`. `supdb-walappend`.
     walappend: bool,
@@ -2977,10 +2773,6 @@ struct Policy {
     /// The segment work driven inline by the writer, as before
     /// `Options::publish_in_background`. `supdb-inlinemaint`.
     inlinemaint: bool,
-    /// A scan and a settle search a copy for their key, as before
-    /// `Options::copy_start_at_rank`. `supdb-copysearch`, and
-    /// `supdb-ingestcopysearch` buffered.
-    copysearch: bool,
     /// A dense sparse form converted by a build from the sources, as
     /// before `Options::convert_from_form`. `supdb-convertsources`, and
     /// `supdb-ingestconvertsources` buffered.
@@ -3027,10 +2819,6 @@ struct Policy {
     /// (`Options::seal_idle`). `supdb-idle`, and `supdb-shapeidle` under
     /// the shape.
     idle: bool,
-    /// A block over pieces sorts the pieces' keys whole rather than
-    /// merging their runs: `Options::overlay_merge` off. `supdb-sortover`,
-    /// and `supdb-shapesortover` under the shape.
-    sortover: bool,
     /// Segments written in 2 MB pieces at 2 MB offsets, the page cache's
     /// PMD-sized folios, where the engine writes a megabyte:
     /// `SegmentOptions::write_piece`. `supdb-pmd`, and `supdb-ingestpmd`
@@ -3050,13 +2838,8 @@ struct Policy {
     /// The upkeep thread's fill never yielding its conversions:
     /// `supdb-noyield`, and `supdb-ingestnoyield` buffered.
     noyield: bool,
-    /// The complete-table fill holding the writer until it is done:
-    /// `supdb-fillholds`, and `supdb-ingestfillholds` buffered.
-    fillholds: bool,
     /// The fence searched over its keys: `supdb-fencekeys`.
     fencekeys: bool,
-    /// The reading at the crossing by a fill sample: `supdb-zsamplefills`.
-    zsamplefills: bool,
     /// No hot-raw policy: `supdb-znohotraw`.
     znohotraw: bool,
     /// Every operation's wall stamped onto the census window:
@@ -3071,13 +2854,6 @@ struct Policy {
     /// The fill's quiet looks with the growth share in their room:
     /// `supdb-zhotfillquiet`.
     zhotfillquiet: bool,
-    /// A raw walk's records asked for ahead of it on every store:
-    /// `supdb-scanrawahead`.
-    scanrawahead: bool,
-    /// A raw walk asks for nothing ahead of it: `supdb-noscanrawahead`.
-    noscanrawahead: bool,
-    /// Asked for paced through the walk: `supdb-scanrawpaced`.
-    scanrawpaced: bool,
     /// The start placed once: `supdb-zseekseed`.
     zseekseed: bool,
     /// The record coding where a compressed form is picked: `supdb-zrecord`.
@@ -3086,8 +2862,6 @@ struct Policy {
     zhotcoldback: bool,
     /// The reader table walked at every end: `supdb-sweepwalks`.
     sweepwalks: bool,
-    /// The values prefetched whole: `supdb-copyprefetchwhole`.
-    copyprefetchwhole: bool,
     /// The skew bar relaxed where the room fits: `supdb-zhotskewroom`.
     zhotskewroom: bool,
     /// The room's bar under a margin: `supdb-zhotskewroomhyst`.
@@ -3105,16 +2879,6 @@ struct Policy {
     zhotresident: bool,
     /// Write-time filing past the cache alone: `...settlegated`.
     settlegated: bool,
-    /// A hash a source in the point read: `...readhashes`.
-    readhashes: bool,
-    /// No sources' lines asked ahead of the point read: `...readnoahead`.
-    readnoahead: bool,
-    /// The seek's ask for the first forms: `...formahead`.
-    formahead: bool,
-    /// The sparse form's ask over the walk's share: `...sparsespan`.
-    sparsespan: bool,
-    /// The runs through one raw walker: `...runsheld`.
-    runsheld: bool,
     /// A copy's ask over its walk's entries: `...copyspan`.
     copyspan: bool,
     /// A copy's identity by its file: `...identityblob`.
@@ -3129,28 +2893,14 @@ struct Policy {
     settlesearch: bool,
     /// The patch's walk of the sources for a lone key: `...settlesources`.
     settlesources: bool,
-    /// The three scan levers together: `...scanlevers`.
-    scanlevers: bool,
     /// The writer's copy line from `DENSEFROM`: `...densefrom`.
     densefrom: usize,
     /// Conversions at the dense count alone: `...convert16`.
     convert16: bool,
-    /// A wide block's overlay merged in full: `...widefull`.
-    widefull: bool,
-    /// Every overlay key's tombstone search: `...lonetombs`.
-    lonetombs: bool,
-    /// A hot wide block walked wide: `...widewalks`.
-    widewalks: bool,
-    /// A hot wide block copied by the fixed ratio: `...widecopyfixed`.
-    widecopyfixed: bool,
     /// Syncing batches held within the batch: `supdb-pacesyncsbatch`.
     pacesyncsbatch: bool,
     /// The syncing pace by cut-offs: `supdb-pacesyncsthresholds`.
     pacesyncsthresholds: bool,
-    /// Every source probed again after the tombstone pass: `...probestwice`.
-    probestwice: bool,
-    /// Every record read through its extents: `...pointexts`.
-    pointexts: bool,
     /// Every point read the general one: `...pointsources`.
     pointsources: bool,
     /// The layered read as one pass over every source: `...layersasone`.
@@ -3167,10 +2917,6 @@ struct Policy {
     norunbuilds: bool,
     /// A cursor a block: `supdb-blockcursors`.
     blockcursors: bool,
-    /// A copy prefetched from its start entry: `supdb-leancopyprefetch`.
-    leancopyprefetch: bool,
-    /// The next block's prefetch paced through the walk: `supdb-pacedprefetch`.
-    pacedprefetch: bool,
     /// The fill yielding at any posted commit: `supdb-postedyield`, and
     /// `supdb-ingestpostedyield` buffered.
     postedyield: bool,
@@ -3373,16 +3119,6 @@ struct Policy {
     /// (`with_policy`): `supdb-nocachezstride`,
     /// `supdb-cache64tofitzstride`, and `supdb-zblock`, which pins `Off`.
     zstride: Option<supdb::ZStride>,
-    /// Under the forced stride form, the store's first keys alone asked for
-    /// it, by number: a partition whose first key is this key number or
-    /// above is built in the block form (`Options::zpages_stride_below`),
-    /// so the store is in two forms by its keys' place. `None` asks every
-    /// partition. A number and not a share, since a policy is made before
-    /// its store has a size: `supdb-cache64tofitzstridedrop2m`, `...3m`,
-    /// `...5m` and `...7m` are the first two, three, five and seven million
-    /// keys, shares of the ten-million rung they are for and every key of a
-    /// rung under them.
-    zstride_first: Option<u64>,
     /// A build asks for the stride form only where the store in that form
     /// fits the room at the build (`Options::zpages_stride_room`), the
     /// engine's where `None`, and off for an arm that forces the compact
@@ -3504,17 +3240,10 @@ struct Policy {
     /// builds none, and the arm's `sync`, its drain, is the store's.
     /// `supdb-heldnoframes`.
     noframes: bool,
-    /// No record asked ahead of its header (`Options::point_record_ahead`
-    /// off): `supdb-norecordahead`, `supdb-heldnorecordahead`.
-    norecordahead: bool,
     /// The hash index left to its zero-page faults
     /// (`Options::index_populated` off): `supdb-indexzeropage`,
     /// `supdb-heldindexzeropage`.
     indexzeropage: bool,
-    /// The live table before the partition in the placed read
-    /// (`Options::point_live_first` on): `supdb-livefirst`,
-    /// `supdb-heldlivefirst`.
-    livefirst: bool,
     /// The memtable's hash taken from FNV for every key
     /// (`Options::mem_hash_fold` off): `supdb-memfnv`, `supdb-heldmemfnv`.
     memfnv: bool,
@@ -3643,7 +3372,6 @@ impl Default for Policy {
             piecesonly: false,
             latewb: false,
             inlinemaint: false,
-            copysearch: false,
             convertsources: false,
             copyslack: false,
             drainpromote: false,
@@ -3662,23 +3390,17 @@ impl Default for Policy {
             sealcopyfar: false,
             ranksfar: false,
             rankswhole: false,
-            nowillneed: false,
-            noblockwillneed: false,
             mergerecordkeys: false,
             mergewalkrescan: false,
             mergenoverify: false,
             mmapthr: false,
             mergedropbehind: false,
-            noheadwillneed: false,
             nomergechain: false,
             mergeuncapped: false,
             mergeone: false,
             sealfloorooc: false,
             nofitshort: false,
             walkeep: false,
-            zahead1: false,
-            zsamplegap: false,
-            zinstallwaits: false,
             zrecodeauto: false,
             zreparse: false,
             zaheadscans: false,
@@ -3686,8 +3408,6 @@ impl Default for Policy {
             bgidle: false,
             mergeahead: false,
             boundarytop: false,
-            nodirwillneed: false,
-            noboundsheadwillneed: false,
             aheadincore: false,
             aheadcold: false,
             aheadeager: false,
@@ -3727,14 +3447,11 @@ impl Default for Policy {
             sealrun: false,
             closeinline: false,
             timers: false,
-            noprefetch: false,
-            dirplain: false,
             settlefar: false,
             tofit: false,
             notrim: false,
             noshed: false,
             nosweep: false,
-            prefetch1k: false,
             manifestrename: false,
             manifestpending: false,
             waitmanifest: false,
@@ -3786,7 +3503,6 @@ impl Default for Policy {
             pacesyncsraw: false,
             pacesyncs5: false,
             oocz: false,
-            fillposted: false,
             walappend: false,
             walprefill: false,
             walaheadflat: false,
@@ -3804,29 +3520,22 @@ impl Default for Policy {
             rotate: false,
             nofrozen: false,
             idle: false,
-            sortover: false,
             pmd: false,
             settlefreeze: false,
             convertcap: false,
             shortpass: false,
             noyield: false,
-            fillholds: false,
             fencekeys: false,
-            zsamplefills: false,
             znohotraw: false,
             zbusyevery: false,
             zhotline: false,
             zhotaskidle: false,
             zhotgrowth5: false,
             zhotfillquiet: false,
-            scanrawahead: false,
-            noscanrawahead: false,
-            scanrawpaced: false,
             zseekseed: false,
             zrecorddefault: false,
             zhotcoldback: false,
             sweepwalks: false,
-            copyprefetchwhole: false,
             zhotskewroom: false,
             zhotskewroomhyst: false,
             zrewarmwait: false,
@@ -3835,11 +3544,6 @@ impl Default for Policy {
             zrewarminstall: false,
             zhotresident: false,
             settlegated: false,
-            readhashes: false,
-            readnoahead: false,
-            formahead: false,
-            sparsespan: false,
-            runsheld: false,
             copyspan: false,
             identityblob: false,
             copythree: false,
@@ -3847,17 +3551,10 @@ impl Default for Policy {
             frozencount: false,
             settlesearch: false,
             settlesources: false,
-            scanlevers: false,
             densefrom: 0,
             convert16: false,
-            widefull: false,
-            lonetombs: false,
-            widewalks: false,
-            widecopyfixed: false,
             pacesyncsbatch: false,
             pacesyncsthresholds: false,
-            probestwice: false,
-            pointexts: false,
             pointsources: false,
             layersasone: false,
             settlebuildsfiled: false,
@@ -3866,8 +3563,6 @@ impl Default for Policy {
             znogroupahead: false,
             norunbuilds: false,
             blockcursors: false,
-            leancopyprefetch: false,
-            pacedprefetch: false,
             postedyield: false,
             behindyield: false,
             bg: false,
@@ -3927,7 +3622,6 @@ impl Default for Policy {
             zperrun: false,
             zmemo_mib: 0,
             zstride: None,
-            zstride_first: None,
             zstride_room: None,
             zstride_convert: None,
             zaskdropped: None,
@@ -3955,9 +3649,7 @@ impl Default for Policy {
             holdcap: None,
             holdmarch: false,
             noframes: false,
-            norecordahead: false,
             indexzeropage: false,
-            livefirst: false,
             memfnv: false,
             inplace: false,
             placedpieces: false,
@@ -4112,17 +3804,6 @@ impl Policy {
         Policy {
             zstride: Some(supdb::ZStride::Forced),
             ..Policy::cache64_tofit_zpages_drop()
-        }
-    }
-
-    /// `supdb-cache64tofitzstridedrop2m`, `...3m`, `...5m` and `...7m`: that
-    /// arm with the
-    /// stride form for the partitions under key number `first` alone and
-    /// the block form from it up.
-    fn cache64_tofit_zstride_drop_first(first: u64) -> Policy {
-        Policy {
-            zstride_first: Some(first),
-            ..Policy::cache64_tofit_zstride_drop()
         }
     }
 }
@@ -4684,18 +4365,6 @@ impl Supdb {
         )
     }
 
-    /// `supdb` whose blocks over pieces sort the pieces' keys whole
-    /// (`Options::overlay_merge` off), the shape before the merge.
-    pub fn create_sortover(path: &Path) -> Res<Supdb> {
-        Supdb::with_policy(
-            path,
-            Policy {
-                sortover: true,
-                ..Policy::default()
-            },
-        )
-    }
-
     /// `supdb` whose segments are written in 2 MB pieces, the shape
     /// before `SegmentOptions::write_piece` was a megabyte.
     pub fn create_pmd(path: &Path) -> Res<Supdb> {
@@ -4851,19 +4520,6 @@ impl Supdb {
         )
     }
 
-    /// `supdb` whose upkeep thread's complete-table fill holds the writer's
-    /// upkeep until the fill is done (`Options::upkeep_fill_yields` off):
-    /// the shape before the fill gave it back at a block.
-    pub fn create_fillholds(path: &Path) -> Res<Supdb> {
-        Supdb::with_policy(
-            path,
-            Policy {
-                fillholds: true,
-                ..Policy::default()
-            },
-        )
-    }
-
     /// DIAGNOSTIC: `supdb` with no trim thread (`Options::forms_trim_bytes`
     /// zero), so the forms the block cache sheds stay with the allocator and
     /// the builds after them fault no fresh page -- the bound on what the
@@ -4874,20 +4530,6 @@ impl Supdb {
             path,
             Policy {
                 notrim: true,
-                ..Policy::default()
-            },
-        )
-    }
-
-    /// `supdb` whose controller takes its reading at the crossing by a fill
-    /// sample of every partition, the form files on disk notwithstanding
-    /// (`Options::zpages_reading_from_files` off): the shape before the
-    /// reading from the files.
-    pub fn create_zsamplefills(path: &Path) -> Res<Supdb> {
-        Supdb::with_policy(
-            path,
-            Policy {
-                zsamplefills: true,
                 ..Policy::default()
             },
         )
@@ -5080,18 +4722,6 @@ impl Supdb {
             path,
             Policy {
                 sweepwalks: true,
-                ..Policy::default()
-            },
-        )
-    }
-
-    /// `supdb` whose copy blocks' prefetch asks for the whole of the
-    /// values (`Options::copy_prefetch_whole` on).
-    pub fn create_copyprefetchwhole(path: &Path) -> Res<Supdb> {
-        Supdb::with_policy(
-            path,
-            Policy {
-                copyprefetchwhole: true,
                 ..Policy::default()
             },
         )
@@ -5897,32 +5527,6 @@ impl Supdb {
         )
     }
 
-    /// `supdb` whose identity copies are prefetched from the entry the
-    /// walk starts at, eight lines, and not whole
-    /// (`Options::copy_prefetch_from_start`).
-    pub fn create_leancopyprefetch(path: &Path) -> Res<Supdb> {
-        Supdb::with_policy(
-            path,
-            Policy {
-                leancopyprefetch: true,
-                ..Policy::default()
-            },
-        )
-    }
-
-    /// `supdb` whose copy walks pace the next copy block's prefetch through
-    /// themselves (`Options::scan_prefetch_paced` on), against the burst at
-    /// a block's start.
-    pub fn create_pacedprefetch(path: &Path) -> Res<Supdb> {
-        Supdb::with_policy(
-            path,
-            Policy {
-                pacedprefetch: true,
-                ..Policy::default()
-            },
-        )
-    }
-
     /// `supdb` whose form files' fences are searched over their keys
     /// (`Options::zpages_fence_words` off): the shape before the flat
     /// words.
@@ -5931,19 +5535,6 @@ impl Supdb {
             path,
             Policy {
                 fencekeys: true,
-                ..Policy::default()
-            },
-        )
-    }
-
-    /// `supdb-ingest` whose fill holds the writer, as `supdb-fillholds`.
-    pub fn create_ingest_fillholds(path: &Path) -> Res<Supdb> {
-        Supdb::with_policy(
-            path,
-            Policy {
-                partition: false,
-                durable: false,
-                fillholds: true,
                 ..Policy::default()
             },
         )
@@ -6020,23 +5611,6 @@ impl Supdb {
                 partition: false,
                 durable: false,
                 bglag: true,
-                ..Policy::default()
-            },
-        )
-    }
-
-    /// `supdb-ingestshape` whose blocks over pieces sort the pieces' keys
-    /// whole, as `supdb-sortover`: the arm that keeps its pieces until a
-    /// read shapes the store.
-    pub fn create_shape_sortover(path: &Path) -> Res<Supdb> {
-        Supdb::with_policy(
-            path,
-            Policy {
-                partition: false,
-                drain: false,
-                durable: false,
-                shape: true,
-                sortover: true,
                 ..Policy::default()
             },
         )
@@ -6574,32 +6148,6 @@ impl Supdb {
         )
     }
 
-    /// `supdb` whose scans and settles search a copy for their key, as
-    /// before `Options::copy_start_at_rank`: against `supdb` it prices
-    /// finding the entry by the rank the seek or the resolve found.
-    pub fn create_copysearch(path: &Path) -> Res<Supdb> {
-        Supdb::with_policy(
-            path,
-            Policy {
-                copysearch: true,
-                ..Policy::default()
-            },
-        )
-    }
-
-    /// `supdb-ingest` with the copies searched, as `supdb-copysearch`.
-    pub fn create_ingest_copysearch(path: &Path) -> Res<Supdb> {
-        Supdb::with_policy(
-            path,
-            Policy {
-                partition: false,
-                durable: false,
-                copysearch: true,
-                ..Policy::default()
-            },
-        )
-    }
-
     /// `supdb` converting a dense sparse form by a build from the sources,
     /// as before `Options::convert_from_form`: against `supdb` it prices
     /// the conversion from the form's own deltas.
@@ -7002,64 +6550,6 @@ impl Supdb {
         )
     }
 
-    /// `supdb` whose block builds read each piece's records as they meet
-    /// them, one fault at a time, where the default asks the kernel for
-    /// every piece's run over the block first once the store is out of
-    /// core (`Options::pieces_willneed`): against `supdb` under a bound it
-    /// prices the asking.
-    pub fn create_nowillneed(path: &Path) -> Res<Supdb> {
-        Supdb::with_policy(
-            path,
-            Policy {
-                nowillneed: true,
-                ..Policy::default()
-            },
-        )
-    }
-
-    /// `supdb-ingest` reading its pieces as it meets them, as
-    /// `supdb-nowillneed`.
-    pub fn create_ingest_nowillneed(path: &Path) -> Res<Supdb> {
-        Supdb::with_policy(
-            path,
-            Policy {
-                partition: false,
-                durable: false,
-                nowillneed: true,
-                ..Policy::default()
-            },
-        )
-    }
-
-    /// `supdb` whose scans read a raw partition's records as they meet
-    /// them, a fault a page, where the default asks the kernel for the
-    /// span first once the store is out of core
-    /// (`Options::blocks_willneed`): against `supdb` under a bound it
-    /// prices the asking.
-    pub fn create_noblockwillneed(path: &Path) -> Res<Supdb> {
-        Supdb::with_policy(
-            path,
-            Policy {
-                noblockwillneed: true,
-                ..Policy::default()
-            },
-        )
-    }
-
-    /// `supdb-ingest` reading a raw partition's records as it meets them,
-    /// as `supdb-noblockwillneed`.
-    pub fn create_ingest_noblockwillneed(path: &Path) -> Res<Supdb> {
-        Supdb::with_policy(
-            path,
-            Policy {
-                partition: false,
-                durable: false,
-                noblockwillneed: true,
-                ..Policy::default()
-            },
-        )
-    }
-
     /// `supdb` whose merges read their inputs' keys off the records in the
     /// first pass, as before the heads carried them
     /// (`Options::merge_keys_by_heads`): against `supdb` under a bound it
@@ -7170,34 +6660,6 @@ impl Supdb {
         )
     }
 
-    /// `supdb` whose settles read the heads they seek as they meet them,
-    /// where the default asks for them ahead once the store is out of core
-    /// (`Options::heads_willneed`): against `supdb` under a bound it
-    /// prices the asking.
-    pub fn create_noheadwillneed(path: &Path) -> Res<Supdb> {
-        Supdb::with_policy(
-            path,
-            Policy {
-                noheadwillneed: true,
-                ..Policy::default()
-            },
-        )
-    }
-
-    /// `supdb-ingest` reading its heads as it meets them, as
-    /// `supdb-noheadwillneed`.
-    pub fn create_ingest_noheadwillneed(path: &Path) -> Res<Supdb> {
-        Supdb::with_policy(
-            path,
-            Policy {
-                partition: false,
-                durable: false,
-                noheadwillneed: true,
-                ..Policy::default()
-            },
-        )
-    }
-
     /// `supdb` whose merge landings plan nothing, where the default plans
     /// the next merge at each (`Options::merge_chains`): against `supdb`
     /// under a bound it prices the pieces a read pass meets.
@@ -7288,45 +6750,6 @@ impl Supdb {
             path,
             Policy {
                 nofitshort: true,
-                ..Policy::default()
-            },
-        )
-    }
-
-    /// `supdb` with one of the controller's builds ahead at a time
-    /// (`Options::zpages_ahead_builders` 1): against `supdb` it prices the
-    /// load's last partitions built in pace with it under a bound.
-    pub fn create_zahead1(path: &Path) -> Res<Supdb> {
-        Supdb::with_policy(
-            path,
-            Policy {
-                zahead1: true,
-                ..Policy::default()
-            },
-        )
-    }
-
-    /// `supdb` whose controller asks for its sample between builds ahead
-    /// (`Options::zpages_sample_between`).
-    pub fn create_zsamplegap(path: &Path) -> Res<Supdb> {
-        Supdb::with_policy(
-            path,
-            Policy {
-                zsamplegap: true,
-                ..Policy::default()
-            },
-        )
-    }
-
-    /// `supdb` whose controller counts a partition as covered by its form
-    /// file alone and suspects on two hot readings a second apart
-    /// (`Options::zpages_cover_resident`, `Options::zpages_suspect_at_crossing`
-    /// off): against `supdb` it prices the install brought to the load's end.
-    pub fn create_zinstallwaits(path: &Path) -> Res<Supdb> {
-        Supdb::with_policy(
-            path,
-            Policy {
-                zinstallwaits: true,
                 ..Policy::default()
             },
         )
@@ -7683,58 +7106,6 @@ impl Supdb {
                 partition: false,
                 durable: false,
                 timers: true,
-                ..Policy::default()
-            },
-        )
-    }
-
-    /// `supdb` whose block walks issue no prefetches
-    /// (`Options::scan_prefetch` off).
-    pub fn create_noprefetch(path: &Path) -> Res<Supdb> {
-        Supdb::with_policy(
-            path,
-            Policy {
-                noprefetch: true,
-                ..Policy::default()
-            },
-        )
-    }
-
-    /// `supdb-ingest` as `supdb-noprefetch`.
-    pub fn create_ingest_noprefetch(path: &Path) -> Res<Supdb> {
-        Supdb::with_policy(
-            path,
-            Policy {
-                partition: false,
-                durable: false,
-                noprefetch: true,
-                ..Policy::default()
-            },
-        )
-    }
-
-    /// `supdb` whose scans seek without the stride window's directory
-    /// hint and whose record hint reads its span's two directory words
-    /// (`Options::seek_prefetch_dir` off): against `supdb` it prices
-    /// the fill taken off a scan's start.
-    pub fn create_dirplain(path: &Path) -> Res<Supdb> {
-        Supdb::with_policy(
-            path,
-            Policy {
-                dirplain: true,
-                ..Policy::default()
-            },
-        )
-    }
-
-    /// `supdb-ingest` as `supdb-dirplain`.
-    pub fn create_ingest_dirplain(path: &Path) -> Res<Supdb> {
-        Supdb::with_policy(
-            path,
-            Policy {
-                partition: false,
-                durable: false,
-                dirplain: true,
                 ..Policy::default()
             },
         )
@@ -8295,32 +7666,6 @@ impl Supdb {
                 partition: false,
                 durable: false,
                 settlefar: true,
-                ..Policy::default()
-            },
-        )
-    }
-
-    /// `supdb` whose walks prefetch a kilobyte of records rather than
-    /// four: against `supdb` it prices the span.
-    pub fn create_prefetch1k(path: &Path) -> Res<Supdb> {
-        Supdb::with_policy(
-            path,
-            Policy {
-                prefetch1k: true,
-                ..Policy::default()
-            },
-        )
-    }
-
-    /// `supdb-ingest` whose walks prefetch a kilobyte of records rather
-    /// than four: against `supdb-ingest` it prices the span.
-    pub fn create_ingest_prefetch1k(path: &Path) -> Res<Supdb> {
-        Supdb::with_policy(
-            path,
-            Policy {
-                partition: false,
-                durable: false,
-                prefetch1k: true,
                 ..Policy::default()
             },
         )
@@ -9321,18 +8666,6 @@ impl Supdb {
         )
     }
 
-    /// `supdb` whose upkeep thread fills whatever the writer has posted
-    /// (`Options::upkeep_fill_skips_posted` off).
-    pub fn create_fillposted(path: &Path) -> Res<Supdb> {
-        Supdb::with_policy(
-            path,
-            Policy {
-                fillposted: true,
-                ..Policy::default()
-            },
-        )
-    }
-
     /// `supdb` whose mechanisms for a store out of core read it so where the
     /// compact form is installed (`Options::out_of_core_installed` on).
     pub fn create_oocz(path: &Path) -> Res<Supdb> {
@@ -9718,8 +9051,8 @@ impl Supdb {
 
     /// `supdb` with the read advice pinned to `MADV_RANDOM` for the store's
     /// life (`ReadAdvice::Random`): out of core a scan asks the kernel for
-    /// the spans it will walk (`Options::blocks_willneed`,
-    /// `Options::pieces_willneed`), which the kernel reads whatever the
+    /// the spans it will walk (`Reader::blocks_willneed`,
+    /// `Reader::pieces_willneed`), which the kernel reads whatever the
     /// advice, and the random advice takes away the read-around each fault
     /// adds beside them.
     pub fn create_advicerandom(path: &Path) -> Res<Supdb> {
@@ -10028,32 +9361,6 @@ impl Supdb {
     /// want of the room.
     pub fn create_cache64_tofit_zstride_drop(path: &Path) -> Res<Supdb> {
         Supdb::with_policy(path, Policy::cache64_tofit_zstride_drop())
-    }
-
-    /// `supdb-cache64tofitzstridedrop5m`: `supdb-cache64tofitzstridedrop`
-    /// with the stride form for the store's first five million keys and the
-    /// block form for the rest (`Options::zpages_stride_below`), a store in
-    /// two forms by its keys' place. The pair against the stride arm and
-    /// against `supdb-cache64tofitzpagesdrop` at ten million keys under a
-    /// bound the stride form does not fit whole measures what
-    /// `examples/formfit.rs` models: as much of the stride form as fits.
-    pub fn create_cache64_tofit_zstride_drop_5m(path: &Path) -> Res<Supdb> {
-        Supdb::with_policy(path, Policy::cache64_tofit_zstride_drop_first(5_000_000))
-    }
-
-    /// `supdb-cache64tofitzstridedrop7m`: the first seven million keys.
-    pub fn create_cache64_tofit_zstride_drop_7m(path: &Path) -> Res<Supdb> {
-        Supdb::with_policy(path, Policy::cache64_tofit_zstride_drop_first(7_000_000))
-    }
-
-    /// `supdb-cache64tofitzstridedrop2m`: the first two million keys.
-    pub fn create_cache64_tofit_zstride_drop_2m(path: &Path) -> Res<Supdb> {
-        Supdb::with_policy(path, Policy::cache64_tofit_zstride_drop_first(2_000_000))
-    }
-
-    /// `supdb-cache64tofitzstridedrop3m`: the first three million keys.
-    pub fn create_cache64_tofit_zstride_drop_3m(path: &Path) -> Res<Supdb> {
-        Supdb::with_policy(path, Policy::cache64_tofit_zstride_drop_first(3_000_000))
     }
 
     /// `supdb-cache64tofitzpagesdrop` with its block-coded groups written by
@@ -10852,7 +10159,6 @@ impl Supdb {
             piecesonly,
             latewb,
             inlinemaint,
-            copysearch,
             convertsources,
             copyslack,
             drainpromote,
@@ -10871,23 +10177,17 @@ impl Supdb {
             sealcopyfar,
             ranksfar,
             rankswhole,
-            nowillneed,
-            noblockwillneed,
             mergerecordkeys,
             mergewalkrescan,
             mergenoverify,
             mmapthr,
             mergedropbehind,
-            noheadwillneed,
             nomergechain,
             mergeuncapped,
             mergeone,
             sealfloorooc,
             nofitshort,
             walkeep,
-            zahead1,
-            zsamplegap,
-            zinstallwaits,
             zrecodeauto,
             zreparse,
             zaheadscans,
@@ -10895,8 +10195,6 @@ impl Supdb {
             bgidle,
             mergeahead,
             boundarytop,
-            nodirwillneed,
-            noboundsheadwillneed,
             aheadincore,
             aheadcold,
             aheadeager,
@@ -10936,14 +10234,11 @@ impl Supdb {
             sealrun,
             closeinline,
             timers,
-            noprefetch,
-            dirplain,
             settlefar,
             tofit,
             notrim,
             noshed,
             nosweep,
-            prefetch1k,
             manifestrename,
             manifestpending,
             waitmanifest,
@@ -10995,7 +10290,6 @@ impl Supdb {
             pacesyncsraw,
             pacesyncs5,
             oocz,
-            fillposted,
             walappend,
             walprefill,
             walaheadflat,
@@ -11032,29 +10326,22 @@ impl Supdb {
             rotate,
             nofrozen,
             idle,
-            sortover,
             pmd,
             settlefreeze,
             convertcap,
             shortpass,
             noyield,
-            fillholds,
             fencekeys,
-            zsamplefills,
             znohotraw,
             zbusyevery,
             zhotline,
             zhotaskidle,
             zhotgrowth5,
             zhotfillquiet,
-            scanrawahead,
-            noscanrawahead,
-            scanrawpaced,
             zseekseed,
             zrecorddefault,
             zhotcoldback,
             sweepwalks,
-            copyprefetchwhole,
             zhotskewroom,
             zhotskewroomhyst,
             zrewarmwait,
@@ -11063,11 +10350,6 @@ impl Supdb {
             zrewarminstall,
             zhotresident,
             settlegated,
-            readhashes,
-            readnoahead,
-            formahead,
-            sparsespan,
-            runsheld,
             copyspan,
             identityblob,
             copythree,
@@ -11075,17 +10357,10 @@ impl Supdb {
             frozencount,
             settlesearch,
             settlesources,
-            scanlevers,
             densefrom,
             convert16,
-            widefull,
-            lonetombs,
-            widewalks,
-            widecopyfixed,
             pacesyncsbatch,
             pacesyncsthresholds,
-            probestwice,
-            pointexts,
             pointsources,
             layersasone,
             settlebuildsfiled,
@@ -11094,8 +10369,6 @@ impl Supdb {
             znogroupahead,
             norunbuilds,
             blockcursors,
-            leancopyprefetch,
-            pacedprefetch,
             postedyield,
             behindyield,
             bg,
@@ -11155,7 +10428,6 @@ impl Supdb {
             zperrun,
             zmemo_mib,
             zstride,
-            zstride_first,
             zstride_room,
             zstride_convert,
             zaskdropped,
@@ -11183,9 +10455,7 @@ impl Supdb {
             holdcap,
             holdmarch,
             noframes,
-            norecordahead,
             indexzeropage,
-            livefirst,
             memfnv,
             inplace,
             placedpieces,
@@ -11304,7 +10574,6 @@ impl Supdb {
             // afresh at every publish as it was.
             forms_carry: carry,
             freeze_settles: settlefreeze,
-            copy_start_at_rank: !copysearch,
             convert_from_form: !convertsources,
             copy_exact: !copyslack,
             drain_names_partition: !drainpromote,
@@ -11373,8 +10642,6 @@ impl Supdb {
             seal_snapshot_far: sealcopyfar,
             land_ranks_far: ranksfar,
             piece_ranks_whole: rankswhole,
-            pieces_willneed: !nowillneed,
-            blocks_willneed: !noblockwillneed,
             merge_keys_by_heads: !mergerecordkeys,
             merge_walk_cached: !mergewalkrescan,
             merge_verifies_inputs: !mergenoverify,
@@ -11382,7 +10649,6 @@ impl Supdb {
             merge_drop_behind: mergedropbehind,
             merge_drops_covered: mergedropscovered,
             same_blocks_from_index: !sameblocksrecords,
-            heads_willneed: !noheadwillneed,
             merge_chains: !nomergechain,
             merge_bytes_cap: if mergeuncapped {
                 0
@@ -11396,14 +10662,6 @@ impl Supdb {
             },
             seal_floor_out_of_core: sealfloorooc,
             forms_fit_when_short: !nofitshort,
-            zpages_ahead_builders: if zahead1 {
-                1
-            } else {
-                supdb::Options::default().zpages_ahead_builders
-            },
-            zpages_sample_between: zsamplegap,
-            zpages_cover_resident: !zinstallwaits,
-            zpages_suspect_at_crossing: !zinstallwaits,
             zpages_recode_auto: zrecodeauto,
             zpages_reparse: zreparse,
             zpages_ahead_past_scans: zaheadscans,
@@ -11424,8 +10682,6 @@ impl Supdb {
                 supdb::Options::default().wal_drop_bytes
             },
             boundary_keys_from_top: boundarytop,
-            pieces_dir_willneed: !nodirwillneed,
-            bounds_heads_willneed: !noboundsheadwillneed,
             ahead_out_of_core: !aheadincore,
             ahead_resident_pct: if aheadcold {
                 0
@@ -11496,8 +10752,6 @@ impl Supdb {
             merge_plan_idle: !noidleplan,
             seal_put_one: !sealrun,
             close_finish_inline: closeinline,
-            scan_prefetch: !noprefetch,
-            seek_prefetch_dir: !dirplain,
             forms_settle_far: settlefar,
             forms_to_fit: tofit,
             forms_trim_bytes: if notrim {
@@ -11507,7 +10761,6 @@ impl Supdb {
             },
             forms_fit_shed: !noshed,
             forms_fit_sweep: !nosweep,
-            scan_prefetch_bytes: if prefetch1k { 1024 } else { 4096 },
             manifest_slots: !manifestrename,
             manifest_pending: manifestpending,
             flush_waits_manifest: waitmanifest,
@@ -11516,7 +10769,6 @@ impl Supdb {
             upkeep_abandons: !noabandon,
             upkeep_files_bursts: !deferbursts,
             upkeep_yields: passyield,
-            upkeep_fill_yields: !fillholds,
             scan_cache_auto: !cachenoauto,
             scan_cache_auto_room: !cacheeighth,
             settle_lazy_raw: settlelazyraw,
@@ -11571,7 +10823,6 @@ impl Supdb {
             },
             upkeep_pace_syncs_census: !pacesyncsraw,
             out_of_core_installed: oocz,
-            upkeep_fill_skips_posted: !fillposted,
             recycle_wal: !walappend,
             wal_ahead_bytes: if walprefill { 0 } else { 1 << 20 },
             wal_ahead_small_runs: !walaheadflat,
@@ -11711,24 +10962,15 @@ impl Supdb {
             zpages_memo_first: zmemofirst,
             zpages_fence_tree: zfencetree,
             zpages_fence_words: !fencekeys,
-            zpages_reading_from_files: !zsamplefills,
             zpages_hot_raw: !znohotraw,
             zpages_census_sample: !zbusyevery,
             zpages_hot_raw_slack: !zhotline,
             zpages_hot_ask_idle: zhotaskidle,
             zpages_hot_growth_pct: if zhotgrowth5 { 5 } else { 10 },
             zpages_hot_fill_quiet: zhotfillquiet,
-            scan_raw_ahead: !noscanrawahead,
-            scan_raw_ahead_past_llc: !(scanrawahead || scanrawpaced),
-            scan_raw_ahead_lead: if scanrawpaced {
-                1024
-            } else {
-                supdb::Options::default().scan_raw_ahead_lead
-            },
             zpages_seek_seeds: zseekseed,
             zpages_hot_cold_back: zhotcoldback,
             sweep_remembers_pin: !sweepwalks,
-            copy_prefetch_whole: copyprefetchwhole,
             zpages_hot_skew_room: zhotskewroom || zhotskewroomhyst,
             zpages_hot_room_margin_pct: if zhotskewroomhyst { 5 } else { 0 },
             zpages_rewarm_beside_merges: zrewarmbeside,
@@ -11736,11 +10978,6 @@ impl Supdb {
             zpages_rewarm_at_install: zrewarminstall,
             zpages_hot_fill_resident_first: zhotresident,
             forms_settle_past_llc: settlegated,
-            read_hash_once: !readhashes,
-            read_lines_ahead: !readnoahead,
-            scan_form_ahead: formahead || scanlevers,
-            scan_prefetch_sparse_span: sparsespan || scanlevers,
-            scan_runs_held: runsheld || scanlevers,
             copy_prefetch_span: copyspan,
             identity_by_keys: !identityblob,
             copy_packed: !copythree,
@@ -11761,14 +10998,8 @@ impl Supdb {
                 && std::env::var("CONVWRITER").as_deref() == Ok("1"),
             forms_convert_light_yields: densefrom > 0
                 && std::env::var("CONVSTRICT").as_deref() == Ok("1"),
-            scan_wide_capped: !widefull,
-            emit_lone_unsearched: !lonetombs,
-            forms_copy_hot_wide: !widewalks,
-            forms_copy_wide_priced: !widecopyfixed,
             upkeep_pace_syncs_to_share: !pacesyncsbatch,
             upkeep_pace_syncs_model: !pacesyncsbatch && !pacesyncsthresholds,
-            read_probes_once: !probestwice,
-            point_fixed: !pointexts,
             point_lone: !pointsources,
             point_layers_lean: !layersasone,
             forms_settle_builds_filed: settlebuildsfiled,
@@ -11782,8 +11013,6 @@ impl Supdb {
             zpages_group_ahead: !znogroupahead,
             scan_run_builds: !norunbuilds,
             zpages_scan_cursor: !blockcursors,
-            copy_prefetch_from_start: leancopyprefetch,
-            scan_prefetch_paced: pacedprefetch,
             zpages_memo_ahead: !zmemonoahead,
             scan_start_cache: if zstartcache { 4096 } else { 0 },
             zpages_block_cursor: !zperrun,
@@ -11802,11 +11031,6 @@ impl Supdb {
                 supdb::ZStride::Off
             } else {
                 supdb::Options::default().zpages_stride
-            }),
-            zpages_stride_below: zstride_first.map(|n| {
-                let mut key = [0u8; 16];
-                crate::workload::db_key_into(n, &mut key);
-                std::sync::Arc::from(&key[..])
             }),
             zpages_stride_room: zstride_room
                 .unwrap_or(!zpages && supdb::Options::default().zpages_stride_room),
@@ -11867,7 +11091,6 @@ impl Supdb {
             adaptive_shape: shape,
             seal_rotates_wal: rotate,
             frozen_snaps: !nofrozen,
-            overlay_merge: !sortover,
             seal_idle: idle,
             // Below this the builder declines and the writer fills the
             // forms inline on the commit path instead, which is the
@@ -11890,9 +11113,7 @@ impl Supdb {
             wal_hold_bytes: holdcap.unwrap_or(supdb::Options::default().wal_hold_bytes),
             wal_hold_reuses: !holdmarch,
             held_frames: !noframes,
-            point_record_ahead: !norecordahead,
             index_populated: !indexzeropage,
-            point_live_first: livefirst,
             mem_hash_fold: !memfnv,
             put_in_place: inplace,
             point_placed_runs: !placedpieces,
@@ -12006,7 +11227,6 @@ impl Supdb {
             piecesonly,
             latewb,
             inlinemaint,
-            copysearch,
             convertsources,
             copyslack,
             drainpromote,
@@ -12025,23 +11245,17 @@ impl Supdb {
             sealcopyfar,
             ranksfar,
             rankswhole,
-            nowillneed,
-            noblockwillneed,
             mergerecordkeys,
             mergewalkrescan,
             mergenoverify,
             mmapthr,
             mergedropbehind,
-            noheadwillneed,
             nomergechain,
             mergeuncapped,
             mergeone,
             sealfloorooc,
             nofitshort,
             walkeep,
-            zahead1,
-            zsamplegap,
-            zinstallwaits,
             zrecodeauto,
             zreparse,
             zaheadscans,
@@ -12049,8 +11263,6 @@ impl Supdb {
             bgidle,
             mergeahead,
             boundarytop,
-            nodirwillneed,
-            noboundsheadwillneed,
             aheadincore,
             aheadcold,
             aheadeager,
@@ -12090,14 +11302,11 @@ impl Supdb {
             sealrun,
             closeinline,
             timers,
-            noprefetch,
-            dirplain,
             settlefar,
             tofit,
             notrim,
             noshed,
             nosweep,
-            prefetch1k,
             manifestrename,
             manifestpending,
             waitmanifest,
@@ -12149,7 +11358,6 @@ impl Supdb {
             pacesyncsraw,
             pacesyncs5,
             oocz,
-            fillposted,
             walappend,
             walprefill,
             walaheadflat,
@@ -12186,29 +11394,22 @@ impl Supdb {
             rotate,
             nofrozen,
             idle,
-            sortover,
             pmd,
             settlefreeze,
             convertcap,
             shortpass,
             noyield,
-            fillholds,
             fencekeys,
-            zsamplefills,
             znohotraw,
             zbusyevery,
             zhotline,
             zhotaskidle,
             zhotgrowth5,
             zhotfillquiet,
-            scanrawahead,
-            noscanrawahead,
-            scanrawpaced,
             zseekseed,
             zrecorddefault,
             zhotcoldback,
             sweepwalks,
-            copyprefetchwhole,
             zhotskewroom,
             zhotskewroomhyst,
             zrewarmwait,
@@ -12217,11 +11418,6 @@ impl Supdb {
             zrewarminstall,
             zhotresident,
             settlegated,
-            readhashes,
-            readnoahead,
-            formahead,
-            sparsespan,
-            runsheld,
             copyspan,
             identityblob,
             copythree,
@@ -12229,17 +11425,10 @@ impl Supdb {
             frozencount,
             settlesearch,
             settlesources,
-            scanlevers,
             densefrom,
             convert16,
-            widefull,
-            lonetombs,
-            widewalks,
-            widecopyfixed,
             pacesyncsbatch,
             pacesyncsthresholds,
-            probestwice,
-            pointexts,
             pointsources,
             layersasone,
             settlebuildsfiled,
@@ -12248,8 +11437,6 @@ impl Supdb {
             znogroupahead,
             norunbuilds,
             blockcursors,
-            leancopyprefetch,
-            pacedprefetch,
             postedyield,
             behindyield,
             bg,
@@ -12309,7 +11496,6 @@ impl Supdb {
             zperrun,
             zmemo_mib,
             zstride,
-            zstride_first,
             zstride_room,
             zstride_convert,
             zaskdropped,
@@ -12337,9 +11523,7 @@ impl Supdb {
             holdcap,
             holdmarch,
             noframes,
-            norecordahead,
             indexzeropage,
-            livefirst,
             memfnv,
             inplace,
             placedpieces,
@@ -12753,12 +11937,8 @@ impl Engine for Supdb {
                     "supdb-heldnfinline"
                 } else if !self.block_cache {
                     "supdb-heldnfnocache"
-                } else if self.norecordahead {
-                    "supdb-heldnorecordahead"
                 } else if self.indexzeropage {
                     "supdb-heldindexzeropage"
-                } else if self.livefirst {
-                    "supdb-heldlivefirst"
                 } else if self.memfnv {
                     "supdb-heldmemfnv"
                 } else if self.upkeepbatch.is_some() {
@@ -12784,14 +11964,8 @@ impl Engine for Supdb {
                 Some(_) => "supdb-held8m",
             };
         }
-        if self.norecordahead {
-            return "supdb-norecordahead";
-        }
         if self.indexzeropage {
             return "supdb-indexzeropage";
-        }
-        if self.livefirst {
-            return "supdb-livefirst";
         }
         if self.memfnv {
             return "supdb-memfnv";
@@ -12889,15 +12063,7 @@ impl Engine for Supdb {
         // The stride form's before every other forced shape, since each of
         // them would also match a store that forces the stride form.
         if self.budget == 64 << 20 && self.tofit && self.zpages && zstride {
-            return if zdropraw && self.zstride_first == Some(2_000_000) {
-                "supdb-cache64tofitzstridedrop2m"
-            } else if zdropraw && self.zstride_first == Some(3_000_000) {
-                "supdb-cache64tofitzstridedrop3m"
-            } else if zdropraw && self.zstride_first == Some(5_000_000) {
-                "supdb-cache64tofitzstridedrop5m"
-            } else if zdropraw && self.zstride_first == Some(7_000_000) {
-                "supdb-cache64tofitzstridedrop7m"
-            } else if zdropraw {
+            return if zdropraw {
                 "supdb-cache64tofitzstridedrop"
             } else if self.zpages_prefetch {
                 "supdb-cache64tofitzstrideprefetch"
@@ -13000,21 +12166,11 @@ impl Engine for Supdb {
                 "supdb-ingestnoyield"
             };
         }
-        if self.fillholds {
-            return if self.partition {
-                "supdb-fillholds"
-            } else {
-                "supdb-ingestfillholds"
-            };
-        }
         if self.notrim {
             return "supdb-notrim";
         }
         if self.fencekeys {
             return "supdb-fencekeys";
-        }
-        if self.zsamplefills {
-            return "supdb-zsamplefills";
         }
         if self.znohotraw {
             return "supdb-znohotraw";
@@ -13037,15 +12193,6 @@ impl Engine for Supdb {
         if self.zhotfillquiet {
             return "supdb-zhotfillquiet";
         }
-        if self.scanrawahead {
-            return "supdb-scanrawahead";
-        }
-        if self.noscanrawahead {
-            return "supdb-noscanrawahead";
-        }
-        if self.scanrawpaced {
-            return "supdb-scanrawpaced";
-        }
         if self.zseekseed {
             return "supdb-zseekseed";
         }
@@ -13057,9 +12204,6 @@ impl Engine for Supdb {
         }
         if self.sweepwalks {
             return "supdb-sweepwalks";
-        }
-        if self.copyprefetchwhole {
-            return "supdb-copyprefetchwhole";
         }
         if self.zhotskewroom {
             return "supdb-zhotskewroom";
@@ -13193,7 +12337,7 @@ impl Engine for Supdb {
         {
             return "supdb-zstrideconv";
         }
-        if zstride && !self.zpages && self.zstride_first.is_none() {
+        if zstride && !self.zpages {
             return match (on(self.zstride_room), on(self.zstride_convert)) {
                 (true, true)
                     if on(self.zaskdropped)
@@ -13227,12 +12371,6 @@ impl Engine for Supdb {
         if self.blockcursors {
             return "supdb-blockcursors";
         }
-        if self.leancopyprefetch {
-            return "supdb-leancopyprefetch";
-        }
-        if self.pacedprefetch {
-            return "supdb-pacedprefetch";
-        }
         if self.postedyield {
             return if self.partition {
                 "supdb-postedyield"
@@ -13259,13 +12397,6 @@ impl Engine for Supdb {
                 "supdb-bglag"
             } else {
                 "supdb-ingestbglag"
-            };
-        }
-        if self.sortover {
-            return if self.shape {
-                "supdb-shapesortover"
-            } else {
-                "supdb-sortover"
             };
         }
         if self.nofrozen {
@@ -13385,13 +12516,6 @@ impl Engine for Supdb {
                 "supdb-ingestlatewb"
             };
         }
-        if self.copysearch {
-            return if self.partition {
-                "supdb-copysearch"
-            } else {
-                "supdb-ingestcopysearch"
-            };
-        }
         if self.convertsources {
             return if self.partition {
                 "supdb-convertsources"
@@ -13478,46 +12602,11 @@ impl Engine for Supdb {
                 "supdb-ingestsettlegated"
             };
         }
-        if self.readhashes {
-            return if self.partition {
-                "supdb-readhashes"
-            } else {
-                "supdb-ingestreadhashes"
-            };
-        }
-        if self.readnoahead {
-            return if self.partition {
-                "supdb-readnoahead"
-            } else {
-                "supdb-ingestreadnoahead"
-            };
-        }
-        if self.widefull {
-            return if self.partition {
-                "supdb-widefull"
-            } else {
-                "supdb-ingestwidefull"
-            };
-        }
         if self.pacesyncsbatch {
             return "supdb-pacesyncsbatch";
         }
         if self.pacesyncsthresholds {
             return "supdb-pacesyncsthresholds";
-        }
-        if self.probestwice {
-            return if self.partition {
-                "supdb-probestwice"
-            } else {
-                "supdb-ingestprobestwice"
-            };
-        }
-        if self.pointexts {
-            return if self.partition {
-                "supdb-pointexts"
-            } else {
-                "supdb-ingestpointexts"
-            };
         }
         if self.pointsources {
             return if self.partition {
@@ -13533,27 +12622,6 @@ impl Engine for Supdb {
                 "supdb-ingestlayersasone"
             };
         }
-        if self.widewalks {
-            return if self.partition {
-                "supdb-widewalks"
-            } else {
-                "supdb-ingestwidewalks"
-            };
-        }
-        if self.widecopyfixed {
-            return if self.partition {
-                "supdb-widecopyfixed"
-            } else {
-                "supdb-ingestwidecopyfixed"
-            };
-        }
-        if self.lonetombs {
-            return if self.partition {
-                "supdb-lonetombs"
-            } else {
-                "supdb-ingestlonetombs"
-            };
-        }
         if self.convert16 {
             return if self.partition {
                 "supdb-convert16"
@@ -13566,34 +12634,6 @@ impl Engine for Supdb {
                 "supdb-densefrom"
             } else {
                 "supdb-ingestdensefrom"
-            };
-        }
-        if self.scanlevers {
-            return if self.partition {
-                "supdb-scanlevers"
-            } else {
-                "supdb-ingestscanlevers"
-            };
-        }
-        if self.formahead {
-            return if self.partition {
-                "supdb-formahead"
-            } else {
-                "supdb-ingestformahead"
-            };
-        }
-        if self.sparsespan {
-            return if self.partition {
-                "supdb-sparsespan"
-            } else {
-                "supdb-ingestsparsespan"
-            };
-        }
-        if self.runsheld {
-            return if self.partition {
-                "supdb-runsheld"
-            } else {
-                "supdb-ingestrunsheld"
             };
         }
         if self.copyspan {
@@ -13679,20 +12719,6 @@ impl Engine for Supdb {
                 "supdb-ingestrankswhole"
             };
         }
-        if self.nowillneed {
-            return if self.partition {
-                "supdb-nowillneed"
-            } else {
-                "supdb-ingestnowillneed"
-            };
-        }
-        if self.noblockwillneed {
-            return if self.partition {
-                "supdb-noblockwillneed"
-            } else {
-                "supdb-ingestnoblockwillneed"
-            };
-        }
         if self.mergerecordkeys {
             return if self.partition {
                 "supdb-mergerecordkeys"
@@ -13728,13 +12754,6 @@ impl Engine for Supdb {
                 "supdb-ingestmergedropbehind"
             };
         }
-        if self.noheadwillneed {
-            return if self.partition {
-                "supdb-noheadwillneed"
-            } else {
-                "supdb-ingestnoheadwillneed"
-            };
-        }
         if self.nomergechain {
             return if self.partition {
                 "supdb-nomergechain"
@@ -13754,12 +12773,6 @@ impl Engine for Supdb {
         }
         if self.walkeep {
             return "supdb-walkeep";
-        }
-        if self.zahead1 {
-            return "supdb-zahead1";
-        }
-        if self.zinstallwaits {
-            return "supdb-zinstallwaits";
         }
         if self.zrecodeauto {
             return "supdb-zrecodeauto";
@@ -13794,9 +12807,6 @@ impl Engine for Supdb {
         if self.znohotfill {
             return "supdb-znohotfill";
         }
-        if self.zsamplegap {
-            return "supdb-zsamplegap";
-        }
         if self.nofitshort {
             return if self.zpages_off {
                 "supdb-nozpagesnofitshort"
@@ -13821,20 +12831,6 @@ impl Engine for Supdb {
                 "supdb-boundarytop"
             } else {
                 "supdb-ingestboundarytop"
-            };
-        }
-        if self.nodirwillneed {
-            return if self.partition {
-                "supdb-nodirwillneed"
-            } else {
-                "supdb-ingestnodirwillneed"
-            };
-        }
-        if self.noboundsheadwillneed {
-            return if self.partition {
-                "supdb-noboundsheadwillneed"
-            } else {
-                "supdb-ingestnoboundsheadwillneed"
             };
         }
         if self.aheadincore {
@@ -14038,20 +13034,6 @@ impl Engine for Supdb {
                 "supdb-ingesttimers"
             };
         }
-        if self.noprefetch {
-            return if self.partition {
-                "supdb-noprefetch"
-            } else {
-                "supdb-ingestnoprefetch"
-            };
-        }
-        if self.dirplain {
-            return if self.partition {
-                "supdb-dirplain"
-            } else {
-                "supdb-ingestdirplain"
-            };
-        }
         if self.settlefar {
             return if self.partition {
                 "supdb-settlefar"
@@ -14064,13 +13046,6 @@ impl Engine for Supdb {
                 "supdb-tofit"
             } else {
                 "supdb-ingesttofit"
-            };
-        }
-        if self.prefetch1k {
-            return if self.partition {
-                "supdb-prefetch1k"
-            } else {
-                "supdb-ingestprefetch1k"
             };
         }
         if self.manifestrename {
@@ -14307,9 +13282,6 @@ impl Engine for Supdb {
         }
         if self.pacesyncs5 {
             return "supdb-pacesyncs5";
-        }
-        if self.fillposted {
-            return "supdb-fillposted";
         }
         if self.walappend {
             return "supdb-walappend";
@@ -16851,9 +15823,7 @@ pub fn guarantee(arm: &str) -> Option<Guarantee> {
         | "supdb-nosnap"
         | "supdb-noadvice"
         | "supdb-advicerandom"
-        | "supdb-norecordahead"
         | "supdb-indexzeropage"
-        | "supdb-livefirst"
         | "supdb-memfnv"
         | "supdb-nocache"
         | "supdb-dirkey"
@@ -16908,10 +15878,6 @@ pub fn guarantee(arm: &str) -> Option<Guarantee> {
         | "supdb-cache64tofitzstride"
         | "supdb-cache64tofitzstrideprefetch"
         | "supdb-cache64tofitzstridedrop"
-        | "supdb-cache64tofitzstridedrop2m"
-        | "supdb-cache64tofitzstridedrop3m"
-        | "supdb-cache64tofitzstridedrop5m"
-        | "supdb-cache64tofitzstridedrop7m"
         | "supdb-nocachezpagesrankwalk"
         | "supdb-nocachezpagesonegroup"
         | "supdb-nocachezpagesgroup1k"
@@ -16973,7 +15939,6 @@ pub fn guarantee(arm: &str) -> Option<Guarantee> {
         | "supdb-extsval"
         | "supdb-piecesonly"
         | "supdb-latewb"
-        | "supdb-copysearch"
         | "supdb-convertsources"
         | "supdb-copyslack"
         | "supdb-manifestfree"
@@ -16989,14 +15954,11 @@ pub fn guarantee(arm: &str) -> Option<Guarantee> {
         | "supdb-sealcopyfar"
         | "supdb-ranksfar"
         | "supdb-rankswhole"
-        | "supdb-nowillneed"
-        | "supdb-noblockwillneed"
         | "supdb-mergerecordkeys"
         | "supdb-mergewalkrescan"
         | "supdb-mergenoverify"
         | "supdb-mmapthr"
         | "supdb-mergedropbehind"
-        | "supdb-noheadwillneed"
         | "supdb-nomergechain"
         | "supdb-mergeuncapped"
         | "supdb-mergeone"
@@ -17004,9 +15966,6 @@ pub fn guarantee(arm: &str) -> Option<Guarantee> {
         | "supdb-cacheraw"
         | "supdb-nofitshort"
         | "supdb-walkeep"
-        | "supdb-zahead1"
-        | "supdb-zsamplegap"
-        | "supdb-zinstallwaits"
         | "supdb-zrecodeauto"
         | "supdb-zreparse"
         | "supdb-zaheadscans"
@@ -17017,8 +15976,6 @@ pub fn guarantee(arm: &str) -> Option<Guarantee> {
         | "supdb-nozpagesnofitshort"
         | "supdb-nozpagesmergeone"
         | "supdb-boundarytop"
-        | "supdb-nodirwillneed"
-        | "supdb-noboundsheadwillneed"
         | "supdb-aheadincore"
         | "supdb-aheadcold"
         | "supdb-aheadeager"
@@ -17064,15 +16021,12 @@ pub fn guarantee(arm: &str) -> Option<Guarantee> {
         | "supdb-sealrun"
         | "supdb-closeinline"
         | "supdb-timers"
-        | "supdb-noprefetch"
-        | "supdb-dirplain"
         | "supdb-settlefar"
         | "supdb-tofit"
         | "supdb-cache256tofit"
         | "supdb-cache256tofitnotrim"
         | "supdb-cache256tofitnoshed"
         | "supdb-cache256tofitnosweep"
-        | "supdb-prefetch1k"
         | "supdb-manifestrename"
         | "supdb-manifestpending"
         | "supdb-populate"
@@ -17125,7 +16079,6 @@ pub fn guarantee(arm: &str) -> Option<Guarantee> {
         | "supdb-pacesyncsraw"
         | "supdb-pacesyncs5"
         | "supdb-oocz"
-        | "supdb-fillposted"
         | "supdb-walappend"
         | "supdb-walprefill"
         | "supdb-walaheadflat"
@@ -17143,17 +16096,14 @@ pub fn guarantee(arm: &str) -> Option<Guarantee> {
         | "supdb-rotate"
         | "supdb-nofrozen"
         | "supdb-idle"
-        | "supdb-sortover"
         | "supdb-pmd"
         | "supdb-hold"
         | "supdb-settlefreeze"
         | "supdb-convertcap"
         | "supdb-shortpass"
         | "supdb-noyield"
-        | "supdb-fillholds"
         | "supdb-notrim"
         | "supdb-fencekeys"
-        | "supdb-zsamplefills"
         | "supdb-znohotraw"
         | "supdb-zbusyevery"
         | "supdb-zhotline"
@@ -17161,21 +16111,10 @@ pub fn guarantee(arm: &str) -> Option<Guarantee> {
         | "supdb-zhotaskidle"
         | "supdb-zhotgrowth5"
         | "supdb-zhotfillquiet"
-        | "supdb-scanrawahead"
         | "supdb-zrewarminstall"
         | "supdb-zhotresident"
         | "supdb-settlegated"
         | "supdb-ingestsettlegated"
-        | "supdb-readhashes"
-        | "supdb-ingestreadhashes"
-        | "supdb-readnoahead"
-        | "supdb-ingestreadnoahead"
-        | "supdb-formahead"
-        | "supdb-ingestformahead"
-        | "supdb-sparsespan"
-        | "supdb-ingestsparsespan"
-        | "supdb-runsheld"
-        | "supdb-ingestrunsheld"
         | "supdb-copyspan"
         | "supdb-ingestcopyspan"
         | "supdb-identityblob"
@@ -17188,26 +16127,12 @@ pub fn guarantee(arm: &str) -> Option<Guarantee> {
         | "supdb-ingestsettlesearch"
         | "supdb-settlesources"
         | "supdb-ingestsettlesources"
-        | "supdb-scanlevers"
-        | "supdb-ingestscanlevers"
         | "supdb-densefrom"
         | "supdb-ingestdensefrom"
         | "supdb-convert16"
         | "supdb-ingestconvert16"
-        | "supdb-widefull"
-        | "supdb-ingestwidefull"
-        | "supdb-lonetombs"
-        | "supdb-ingestlonetombs"
-        | "supdb-widewalks"
-        | "supdb-ingestwidewalks"
-        | "supdb-widecopyfixed"
-        | "supdb-ingestwidecopyfixed"
         | "supdb-pacesyncsbatch"
         | "supdb-pacesyncsthresholds"
-        | "supdb-probestwice"
-        | "supdb-ingestprobestwice"
-        | "supdb-pointexts"
-        | "supdb-ingestpointexts"
         | "supdb-pointsources"
         | "supdb-ingestpointsources"
         | "supdb-layersasone"
@@ -17215,13 +16140,10 @@ pub fn guarantee(arm: &str) -> Option<Guarantee> {
         | "supdb-settlebuildsfiled"
         | "supdb-ingestsettlebuildsfiled"
         | "supdb-ingestpromote"
-        | "supdb-scanrawpaced"
-        | "supdb-noscanrawahead"
         | "supdb-zseekseed"
         | "supdb-zrecord"
         | "supdb-zhotcoldback"
         | "supdb-sweepwalks"
-        | "supdb-copyprefetchwhole"
         | "supdb-zhotskewroom"
         | "supdb-zhotskewroomhyst"
         | "supdb-zrewarmwait"
@@ -17285,8 +16207,6 @@ pub fn guarantee(arm: &str) -> Option<Guarantee> {
         | "supdb-znogroupahead"
         | "supdb-norunbuilds"
         | "supdb-blockcursors"
-        | "supdb-leancopyprefetch"
-        | "supdb-pacedprefetch"
         | "supdb-postedyield"
         | "supdb-behindyield"
         | "supdb-bg"
@@ -17308,18 +16228,15 @@ pub fn guarantee(arm: &str) -> Option<Guarantee> {
         | "supdb-shaperotate"
         | "supdb-shapenofrozen"
         | "supdb-shapeidle"
-        | "supdb-shapesortover"
         | "supdb-ingestpmd"
         | "supdb-ingestsettlefreeze"
         | "supdb-ingestconvertcap"
         | "supdb-ingestshortpass"
         | "supdb-ingestnoyield"
-        | "supdb-ingestfillholds"
         | "supdb-ingestpostedyield"
         | "supdb-ingestbehindyield"
         | "supdb-ingestpiecesonly"
         | "supdb-ingestlatewb"
-        | "supdb-ingestcopysearch"
         | "supdb-ingestconvertsources"
         | "supdb-ingestcopyslack"
         | "supdb-ingestdrainpromote"
@@ -17344,20 +16261,15 @@ pub fn guarantee(arm: &str) -> Option<Guarantee> {
         | "supdb-ingestsealcopyfar"
         | "supdb-ingestranksfar"
         | "supdb-ingestrankswhole"
-        | "supdb-ingestnowillneed"
-        | "supdb-ingestnoblockwillneed"
         | "supdb-ingestmergerecordkeys"
         | "supdb-ingestmergewalkrescan"
         | "supdb-ingestmergenoverify"
         | "supdb-ingestmmapthr"
         | "supdb-ingestmergedropbehind"
-        | "supdb-ingestnoheadwillneed"
         | "supdb-ingestnomergechain"
         | "supdb-ingestmergeuncapped"
         | "supdb-ingestmergeone"
         | "supdb-ingestboundarytop"
-        | "supdb-ingestnodirwillneed"
-        | "supdb-ingestnoboundsheadwillneed"
         | "supdb-ingestaheadincore"
         | "supdb-ingestnochainwrites"
         | "supdb-ingestnoland"
@@ -17366,8 +16278,6 @@ pub fn guarantee(arm: &str) -> Option<Guarantee> {
         | "supdb-ingestsealrun"
         | "supdb-ingestcloseinline"
         | "supdb-ingesttimers"
-        | "supdb-ingestnoprefetch"
-        | "supdb-ingestdirplain"
         | "supdb-ingestsyncbeside"
         | "supdb-ingestsyncafter"
         | "supdb-ingestdirectfull"
@@ -17377,7 +16287,6 @@ pub fn guarantee(arm: &str) -> Option<Guarantee> {
         | "supdb-ingestruncreate"
         | "supdb-ingestsettlefar"
         | "supdb-ingesttofit"
-        | "supdb-ingestprefetch1k"
         | "supdb-ingestmanifestrename"
         | "supdb-ingestmanifestpending"
         | "supdb-ingestpopulate"
@@ -17432,11 +16341,9 @@ pub fn guarantee(arm: &str) -> Option<Guarantee> {
         | "supdb-heldnfsettleconvertquiet"
         | "supdb-heldnoframes"
         | "supdb-heldnfnocache"
-        | "supdb-heldnorecordahead"
         | "supdb-heldnoalert"
         | "supdb-heldinline"
         | "supdb-heldindexzeropage"
-        | "supdb-heldlivefirst"
         | "supdb-heldmemfnv"
         | "supdb-heldinplace"
         | "supdb-heldinplacepieces"
@@ -17646,18 +16553,6 @@ pub fn open(arm: &str, dir: &Path, map_gb: usize) -> Res<Box<dyn Engine>> {
         "supdb-cache64tofitzstridedrop" => {
             supdb_arm(Supdb::create_cache64_tofit_zstride_drop, dir)?
         }
-        "supdb-cache64tofitzstridedrop2m" => {
-            supdb_arm(Supdb::create_cache64_tofit_zstride_drop_2m, dir)?
-        }
-        "supdb-cache64tofitzstridedrop3m" => {
-            supdb_arm(Supdb::create_cache64_tofit_zstride_drop_3m, dir)?
-        }
-        "supdb-cache64tofitzstridedrop5m" => {
-            supdb_arm(Supdb::create_cache64_tofit_zstride_drop_5m, dir)?
-        }
-        "supdb-cache64tofitzstridedrop7m" => {
-            supdb_arm(Supdb::create_cache64_tofit_zstride_drop_7m, dir)?
-        }
         "supdb-cache64tofitzpagesstored" => {
             supdb_arm(Supdb::create_cache64_tofit_zpages_stored, dir)?
         }
@@ -17849,22 +16744,6 @@ pub fn open(arm: &str, dir: &Path, map_gb: usize) -> Res<Box<dyn Engine>> {
             },
             dir,
         )?,
-        "supdb-heldnorecordahead" => supdb_arm(
-            |d| {
-                Supdb::with_policy(
-                    d,
-                    Policy {
-                        partition: false,
-                        durable: false,
-                        held: true,
-                        noframes: true,
-                        norecordahead: true,
-                        ..Policy::default()
-                    },
-                )
-            },
-            dir,
-        )?,
         "supdb-heldbatch1" => supdb_arm(
             |d| {
                 Supdb::with_policy(
@@ -17909,22 +16788,6 @@ pub fn open(arm: &str, dir: &Path, map_gb: usize) -> Res<Box<dyn Engine>> {
             },
             dir,
         )?,
-        "supdb-heldlivefirst" => supdb_arm(
-            |d| {
-                Supdb::with_policy(
-                    d,
-                    Policy {
-                        partition: false,
-                        durable: false,
-                        held: true,
-                        noframes: true,
-                        livefirst: true,
-                        ..Policy::default()
-                    },
-                )
-            },
-            dir,
-        )?,
         "supdb-heldmemfnv" => supdb_arm(
             |d| {
                 Supdb::with_policy(
@@ -17947,30 +16810,6 @@ pub fn open(arm: &str, dir: &Path, map_gb: usize) -> Res<Box<dyn Engine>> {
                     d,
                     Policy {
                         memfnv: true,
-                        ..Policy::default()
-                    },
-                )
-            },
-            dir,
-        )?,
-        "supdb-livefirst" => supdb_arm(
-            |d| {
-                Supdb::with_policy(
-                    d,
-                    Policy {
-                        livefirst: true,
-                        ..Policy::default()
-                    },
-                )
-            },
-            dir,
-        )?,
-        "supdb-norecordahead" => supdb_arm(
-            |d| {
-                Supdb::with_policy(
-                    d,
-                    Policy {
-                        norecordahead: true,
                         ..Policy::default()
                     },
                 )
@@ -18394,14 +17233,12 @@ pub fn open(arm: &str, dir: &Path, map_gb: usize) -> Res<Box<dyn Engine>> {
         "supdb-piecesonly" => supdb_arm(Supdb::create_piecesonly, dir)?,
         "supdb-ingestpiecesonly" => supdb_arm(Supdb::create_ingest_piecesonly, dir)?,
         "supdb-latewb" => supdb_arm(Supdb::create_latewb, dir)?,
-        "supdb-copysearch" => supdb_arm(Supdb::create_copysearch, dir)?,
         "supdb-convertsources" => supdb_arm(Supdb::create_convertsources, dir)?,
         "supdb-copyslack" => supdb_arm(Supdb::create_copyslack, dir)?,
         "supdb-manifestfree" => supdb_arm(Supdb::create_manifestfree, dir)?,
         "supdb-oidxsync" => supdb_arm(Supdb::create_oidxsync, dir)?,
         "supdb-refvals" => supdb_arm(Supdb::create_refvals, dir)?,
         "supdb-rowatclose" => supdb_arm(Supdb::create_rowatclose, dir)?,
-        "supdb-ingestcopysearch" => supdb_arm(Supdb::create_ingest_copysearch, dir)?,
         "supdb-ingestconvertsources" => supdb_arm(Supdb::create_ingest_convertsources, dir)?,
         "supdb-ingestcopyslack" => supdb_arm(Supdb::create_ingest_copyslack, dir)?,
         "supdb-ingestdrainpromote" => supdb_arm(Supdb::create_ingest_drainpromote, dir)?,
@@ -18420,36 +17257,20 @@ pub fn open(arm: &str, dir: &Path, map_gb: usize) -> Res<Box<dyn Engine>> {
         "supdb-nofrozen" => supdb_arm(Supdb::create_nofrozen, dir)?,
         "supdb-shaperotate" => supdb_arm(Supdb::create_shape_rotate, dir)?,
         "supdb-shapenofrozen" => supdb_arm(Supdb::create_shape_nofrozen, dir)?,
-        "supdb-sortover" => supdb_arm(Supdb::create_sortover, dir)?,
-        "supdb-shapesortover" => supdb_arm(Supdb::create_shape_sortover, dir)?,
         "supdb-pmd" => supdb_arm(Supdb::create_pmd, dir)?,
         "supdb-ingestpmd" => supdb_arm(Supdb::create_ingest_pmd, dir)?,
         "supdb-settlefreeze" => supdb_arm(Supdb::create_settlefreeze, dir)?,
         "supdb-convertcap" => supdb_arm(Supdb::create_convertcap, dir)?,
         "supdb-shortpass" => supdb_arm(Supdb::create_shortpass, dir)?,
         "supdb-noyield" => supdb_arm(Supdb::create_noyield, dir)?,
-        "supdb-fillholds" => supdb_arm(Supdb::create_fillholds, dir)?,
         "supdb-notrim" => supdb_arm(Supdb::create_notrim, dir)?,
         "supdb-fencekeys" => supdb_arm(Supdb::create_fencekeys, dir)?,
-        "supdb-zsamplefills" => supdb_arm(Supdb::create_zsamplefills, dir)?,
         "supdb-znohotraw" => supdb_arm(Supdb::create_znohotraw, dir)?,
         "supdb-zbusyevery" => supdb_arm(Supdb::create_zbusyevery, dir)?,
         "supdb-zhotline" => supdb_arm(Supdb::create_zhotline, dir)?,
         "supdb-memo64" => supdb_arm(Supdb::create_memo64, dir)?,
         "supdb-zhotaskidle" => supdb_arm(Supdb::create_zhotaskidle, dir)?,
         "supdb-zhotgrowth5" => supdb_arm(Supdb::create_zhotgrowth5, dir)?,
-        "supdb-noscanrawahead" => supdb_arm(
-            |d| {
-                Supdb::with_policy(
-                    d,
-                    Policy {
-                        noscanrawahead: true,
-                        ..Policy::default()
-                    },
-                )
-            },
-            dir,
-        )?,
         "supdb-ingestpromote" => supdb_arm(
             |d| {
                 Supdb::with_policy(
@@ -18484,162 +17305,6 @@ pub fn open(arm: &str, dir: &Path, map_gb: usize) -> Res<Box<dyn Engine>> {
                         partition: false,
                         durable: false,
                         settlebuildsfiled: true,
-                        ..Policy::default()
-                    },
-                )
-            },
-            dir,
-        )?,
-        "supdb-readhashes" => supdb_arm(
-            |d| {
-                Supdb::with_policy(
-                    d,
-                    Policy {
-                        readhashes: true,
-                        ..Policy::default()
-                    },
-                )
-            },
-            dir,
-        )?,
-        "supdb-ingestreadhashes" => supdb_arm(
-            |d| {
-                Supdb::with_policy(
-                    d,
-                    Policy {
-                        partition: false,
-                        durable: false,
-                        readhashes: true,
-                        ..Policy::default()
-                    },
-                )
-            },
-            dir,
-        )?,
-        "supdb-readnoahead" => supdb_arm(
-            |d| {
-                Supdb::with_policy(
-                    d,
-                    Policy {
-                        readnoahead: true,
-                        ..Policy::default()
-                    },
-                )
-            },
-            dir,
-        )?,
-        "supdb-ingestreadnoahead" => supdb_arm(
-            |d| {
-                Supdb::with_policy(
-                    d,
-                    Policy {
-                        partition: false,
-                        durable: false,
-                        readnoahead: true,
-                        ..Policy::default()
-                    },
-                )
-            },
-            dir,
-        )?,
-        "supdb-widefull" => supdb_arm(
-            |d| {
-                Supdb::with_policy(
-                    d,
-                    Policy {
-                        widefull: true,
-                        ..Policy::default()
-                    },
-                )
-            },
-            dir,
-        )?,
-        "supdb-ingestwidefull" => supdb_arm(
-            |d| {
-                Supdb::with_policy(
-                    d,
-                    Policy {
-                        partition: false,
-                        durable: false,
-                        widefull: true,
-                        ..Policy::default()
-                    },
-                )
-            },
-            dir,
-        )?,
-        "supdb-lonetombs" => supdb_arm(
-            |d| {
-                Supdb::with_policy(
-                    d,
-                    Policy {
-                        lonetombs: true,
-                        ..Policy::default()
-                    },
-                )
-            },
-            dir,
-        )?,
-        "supdb-ingestlonetombs" => supdb_arm(
-            |d| {
-                Supdb::with_policy(
-                    d,
-                    Policy {
-                        partition: false,
-                        durable: false,
-                        lonetombs: true,
-                        ..Policy::default()
-                    },
-                )
-            },
-            dir,
-        )?,
-        "supdb-probestwice" => supdb_arm(
-            |d| {
-                Supdb::with_policy(
-                    d,
-                    Policy {
-                        probestwice: true,
-                        ..Policy::default()
-                    },
-                )
-            },
-            dir,
-        )?,
-        "supdb-ingestprobestwice" => supdb_arm(
-            |d| {
-                Supdb::with_policy(
-                    d,
-                    Policy {
-                        partition: false,
-                        durable: false,
-                        probestwice: true,
-                        ..Policy::default()
-                    },
-                )
-            },
-            dir,
-        )?,
-        "supdb-pointexts" => supdb_arm(
-            |d| {
-                Supdb::with_policy(
-                    d,
-                    Policy {
-                        pointexts: true,
-                        ..Policy::default()
-                    },
-                )
-            },
-            dir,
-        )?,
-        "supdb-ingestpointexts" => supdb_arm(
-            |d| {
-                Supdb::with_policy(
-                    d,
-                    Policy {
-                        partition: false,
-                        durable: false,
-                        pointexts: true,
                         ..Policy::default()
                     },
                 )
@@ -18716,136 +17381,6 @@ pub fn open(arm: &str, dir: &Path, map_gb: usize) -> Res<Box<dyn Engine>> {
                     d,
                     Policy {
                         pacesyncsbatch: true,
-                        ..Policy::default()
-                    },
-                )
-            },
-            dir,
-        )?,
-        "supdb-widewalks" => supdb_arm(
-            |d| {
-                Supdb::with_policy(
-                    d,
-                    Policy {
-                        widewalks: true,
-                        ..Policy::default()
-                    },
-                )
-            },
-            dir,
-        )?,
-        "supdb-ingestwidewalks" => supdb_arm(
-            |d| {
-                Supdb::with_policy(
-                    d,
-                    Policy {
-                        partition: false,
-                        durable: false,
-                        widewalks: true,
-                        ..Policy::default()
-                    },
-                )
-            },
-            dir,
-        )?,
-        "supdb-widecopyfixed" => supdb_arm(
-            |d| {
-                Supdb::with_policy(
-                    d,
-                    Policy {
-                        widecopyfixed: true,
-                        ..Policy::default()
-                    },
-                )
-            },
-            dir,
-        )?,
-        "supdb-ingestwidecopyfixed" => supdb_arm(
-            |d| {
-                Supdb::with_policy(
-                    d,
-                    Policy {
-                        partition: false,
-                        durable: false,
-                        widecopyfixed: true,
-                        ..Policy::default()
-                    },
-                )
-            },
-            dir,
-        )?,
-        "supdb-formahead" => supdb_arm(
-            |d| {
-                Supdb::with_policy(
-                    d,
-                    Policy {
-                        formahead: true,
-                        ..Policy::default()
-                    },
-                )
-            },
-            dir,
-        )?,
-        "supdb-ingestformahead" => supdb_arm(
-            |d| {
-                Supdb::with_policy(
-                    d,
-                    Policy {
-                        partition: false,
-                        durable: false,
-                        formahead: true,
-                        ..Policy::default()
-                    },
-                )
-            },
-            dir,
-        )?,
-        "supdb-sparsespan" => supdb_arm(
-            |d| {
-                Supdb::with_policy(
-                    d,
-                    Policy {
-                        sparsespan: true,
-                        ..Policy::default()
-                    },
-                )
-            },
-            dir,
-        )?,
-        "supdb-ingestsparsespan" => supdb_arm(
-            |d| {
-                Supdb::with_policy(
-                    d,
-                    Policy {
-                        partition: false,
-                        durable: false,
-                        sparsespan: true,
-                        ..Policy::default()
-                    },
-                )
-            },
-            dir,
-        )?,
-        "supdb-runsheld" => supdb_arm(
-            |d| {
-                Supdb::with_policy(
-                    d,
-                    Policy {
-                        runsheld: true,
-                        ..Policy::default()
-                    },
-                )
-            },
-            dir,
-        )?,
-        "supdb-ingestrunsheld" => supdb_arm(
-            |d| {
-                Supdb::with_policy(
-                    d,
-                    Policy {
-                        partition: false,
-                        durable: false,
-                        runsheld: true,
                         ..Policy::default()
                     },
                 )
@@ -19020,32 +17555,6 @@ pub fn open(arm: &str, dir: &Path, map_gb: usize) -> Res<Box<dyn Engine>> {
             },
             dir,
         )?,
-        "supdb-scanlevers" => supdb_arm(
-            |d| {
-                Supdb::with_policy(
-                    d,
-                    Policy {
-                        scanlevers: true,
-                        ..Policy::default()
-                    },
-                )
-            },
-            dir,
-        )?,
-        "supdb-ingestscanlevers" => supdb_arm(
-            |d| {
-                Supdb::with_policy(
-                    d,
-                    Policy {
-                        partition: false,
-                        durable: false,
-                        scanlevers: true,
-                        ..Policy::default()
-                    },
-                )
-            },
-            dir,
-        )?,
         "supdb-convert16" => supdb_arm(
             |d| {
                 Supdb::with_policy(
@@ -19148,30 +17657,6 @@ pub fn open(arm: &str, dir: &Path, map_gb: usize) -> Res<Box<dyn Engine>> {
             },
             dir,
         )?,
-        "supdb-scanrawpaced" => supdb_arm(
-            |d| {
-                Supdb::with_policy(
-                    d,
-                    Policy {
-                        scanrawpaced: true,
-                        ..Policy::default()
-                    },
-                )
-            },
-            dir,
-        )?,
-        "supdb-scanrawahead" => supdb_arm(
-            |d| {
-                Supdb::with_policy(
-                    d,
-                    Policy {
-                        scanrawahead: true,
-                        ..Policy::default()
-                    },
-                )
-            },
-            dir,
-        )?,
         "supdb-zhotfillquiet" => supdb_arm(
             |d| {
                 Supdb::with_policy(
@@ -19188,7 +17673,6 @@ pub fn open(arm: &str, dir: &Path, map_gb: usize) -> Res<Box<dyn Engine>> {
         "supdb-zrecord" => supdb_arm(Supdb::create_zrecord, dir)?,
         "supdb-zhotcoldback" => supdb_arm(Supdb::create_zhotcoldback, dir)?,
         "supdb-sweepwalks" => supdb_arm(Supdb::create_sweepwalks, dir)?,
-        "supdb-copyprefetchwhole" => supdb_arm(Supdb::create_copyprefetchwhole, dir)?,
         "supdb-zhotskewroom" => supdb_arm(Supdb::create_zhotskewroom, dir)?,
         "supdb-zhotskewroomhyst" => supdb_arm(Supdb::create_zhotskewroomhyst, dir)?,
         "supdb-zrewarmwait" => supdb_arm(Supdb::create_zrewarmwait, dir)?,
@@ -19259,8 +17743,6 @@ pub fn open(arm: &str, dir: &Path, map_gb: usize) -> Res<Box<dyn Engine>> {
         "supdb-znogroupahead" => supdb_arm(Supdb::create_znogroupahead, dir)?,
         "supdb-norunbuilds" => supdb_arm(Supdb::create_norunbuilds, dir)?,
         "supdb-blockcursors" => supdb_arm(Supdb::create_blockcursors, dir)?,
-        "supdb-leancopyprefetch" => supdb_arm(Supdb::create_leancopyprefetch, dir)?,
-        "supdb-pacedprefetch" => supdb_arm(Supdb::create_pacedprefetch, dir)?,
         "supdb-postedyield" => supdb_arm(Supdb::create_postedyield, dir)?,
         "supdb-behindyield" => supdb_arm(Supdb::create_behindyield, dir)?,
         "supdb-bg" => supdb_arm(Supdb::create_bg, dir)?,
@@ -19287,10 +17769,6 @@ pub fn open(arm: &str, dir: &Path, map_gb: usize) -> Res<Box<dyn Engine>> {
         "supdb-ingestranksfar" => supdb_arm(Supdb::create_ingest_ranksfar, dir)?,
         "supdb-rankswhole" => supdb_arm(Supdb::create_rankswhole, dir)?,
         "supdb-ingestrankswhole" => supdb_arm(Supdb::create_ingest_rankswhole, dir)?,
-        "supdb-nowillneed" => supdb_arm(Supdb::create_nowillneed, dir)?,
-        "supdb-ingestnowillneed" => supdb_arm(Supdb::create_ingest_nowillneed, dir)?,
-        "supdb-noblockwillneed" => supdb_arm(Supdb::create_noblockwillneed, dir)?,
-        "supdb-ingestnoblockwillneed" => supdb_arm(Supdb::create_ingest_noblockwillneed, dir)?,
         "supdb-mergerecordkeys" => supdb_arm(Supdb::create_mergerecordkeys, dir)?,
         "supdb-ingestmergerecordkeys" => supdb_arm(Supdb::create_ingest_mergerecordkeys, dir)?,
         "supdb-mergewalkrescan" => supdb_arm(Supdb::create_mergewalkrescan, dir)?,
@@ -19325,8 +17803,6 @@ pub fn open(arm: &str, dir: &Path, map_gb: usize) -> Res<Box<dyn Engine>> {
         "supdb-ingestmergenoverify" => supdb_arm(Supdb::create_ingest_mergenoverify, dir)?,
         "supdb-mergedropbehind" => supdb_arm(Supdb::create_mergedropbehind, dir)?,
         "supdb-ingestmergedropbehind" => supdb_arm(Supdb::create_ingest_mergedropbehind, dir)?,
-        "supdb-noheadwillneed" => supdb_arm(Supdb::create_noheadwillneed, dir)?,
-        "supdb-ingestnoheadwillneed" => supdb_arm(Supdb::create_ingest_noheadwillneed, dir)?,
         "supdb-nomergechain" => supdb_arm(Supdb::create_nomergechain, dir)?,
         "supdb-ingestnomergechain" => supdb_arm(Supdb::create_ingest_nomergechain, dir)?,
         "supdb-mergeuncapped" => supdb_arm(Supdb::create_mergeuncapped, dir)?,
@@ -19336,9 +17812,6 @@ pub fn open(arm: &str, dir: &Path, map_gb: usize) -> Res<Box<dyn Engine>> {
         "supdb-cacheraw" => supdb_arm(Supdb::create_cacheraw, dir)?,
         "supdb-nofitshort" => supdb_arm(Supdb::create_nofitshort, dir)?,
         "supdb-walkeep" => supdb_arm(Supdb::create_walkeep, dir)?,
-        "supdb-zahead1" => supdb_arm(Supdb::create_zahead1, dir)?,
-        "supdb-zsamplegap" => supdb_arm(Supdb::create_zsamplegap, dir)?,
-        "supdb-zinstallwaits" => supdb_arm(Supdb::create_zinstallwaits, dir)?,
         "supdb-zrecodeauto" => supdb_arm(Supdb::create_zrecodeauto, dir)?,
         "supdb-zreparse" => supdb_arm(Supdb::create_zreparse, dir)?,
         "supdb-zaheadscans" => supdb_arm(Supdb::create_zaheadscans, dir)?,
@@ -19366,58 +17839,6 @@ pub fn open(arm: &str, dir: &Path, map_gb: usize) -> Res<Box<dyn Engine>> {
         "supdb-ingestmergeone" => supdb_arm(Supdb::create_ingest_mergeone, dir)?,
         "supdb-boundarytop" => supdb_arm(Supdb::create_boundarytop, dir)?,
         "supdb-ingestboundarytop" => supdb_arm(Supdb::create_ingest_boundarytop, dir)?,
-        "supdb-nodirwillneed" => supdb_arm(
-            |d| {
-                Supdb::with_policy(
-                    d,
-                    Policy {
-                        nodirwillneed: true,
-                        ..Policy::default()
-                    },
-                )
-            },
-            dir,
-        )?,
-        "supdb-ingestnodirwillneed" => supdb_arm(
-            |d| {
-                Supdb::with_policy(
-                    d,
-                    Policy {
-                        partition: false,
-                        durable: false,
-                        nodirwillneed: true,
-                        ..Policy::default()
-                    },
-                )
-            },
-            dir,
-        )?,
-        "supdb-noboundsheadwillneed" => supdb_arm(
-            |d| {
-                Supdb::with_policy(
-                    d,
-                    Policy {
-                        noboundsheadwillneed: true,
-                        ..Policy::default()
-                    },
-                )
-            },
-            dir,
-        )?,
-        "supdb-ingestnoboundsheadwillneed" => supdb_arm(
-            |d| {
-                Supdb::with_policy(
-                    d,
-                    Policy {
-                        partition: false,
-                        durable: false,
-                        noboundsheadwillneed: true,
-                        ..Policy::default()
-                    },
-                )
-            },
-            dir,
-        )?,
         "supdb-aheadincore" => supdb_arm(
             |d| {
                 Supdb::with_policy(
@@ -20228,10 +18649,6 @@ pub fn open(arm: &str, dir: &Path, map_gb: usize) -> Res<Box<dyn Engine>> {
         "supdb-ingestcloseinline" => supdb_arm(Supdb::create_ingest_closeinline, dir)?,
         "supdb-timers" => supdb_arm(Supdb::create_timers, dir)?,
         "supdb-ingesttimers" => supdb_arm(Supdb::create_ingest_timers, dir)?,
-        "supdb-noprefetch" => supdb_arm(Supdb::create_noprefetch, dir)?,
-        "supdb-ingestnoprefetch" => supdb_arm(Supdb::create_ingest_noprefetch, dir)?,
-        "supdb-dirplain" => supdb_arm(Supdb::create_dirplain, dir)?,
-        "supdb-ingestdirplain" => supdb_arm(Supdb::create_ingest_dirplain, dir)?,
         "supdb-settlefar" => supdb_arm(Supdb::create_settlefar, dir)?,
         "supdb-ingestsettlefar" => supdb_arm(Supdb::create_ingest_settlefar, dir)?,
         "supdb-tofit" => supdb_arm(Supdb::create_tofit, dir)?,
@@ -20240,8 +18657,6 @@ pub fn open(arm: &str, dir: &Path, map_gb: usize) -> Res<Box<dyn Engine>> {
         "supdb-cache256tofitnotrim" => supdb_arm(Supdb::create_cache256_tofit_notrim, dir)?,
         "supdb-cache256tofitnoshed" => supdb_arm(Supdb::create_cache256_tofit_noshed, dir)?,
         "supdb-cache256tofitnosweep" => supdb_arm(Supdb::create_cache256_tofit_nosweep, dir)?,
-        "supdb-prefetch1k" => supdb_arm(Supdb::create_prefetch1k, dir)?,
-        "supdb-ingestprefetch1k" => supdb_arm(Supdb::create_ingest_prefetch1k, dir)?,
         "supdb-manifestrename" => supdb_arm(Supdb::create_manifestrename, dir)?,
         "supdb-manifestpending" => supdb_arm(Supdb::create_manifestpending, dir)?,
         "supdb-ingestmanifestrename" => supdb_arm(Supdb::create_ingest_manifestrename, dir)?,
@@ -20302,7 +18717,6 @@ pub fn open(arm: &str, dir: &Path, map_gb: usize) -> Res<Box<dyn Engine>> {
         "supdb-pacesyncsraw" => supdb_arm(Supdb::create_pacesyncsraw, dir)?,
         "supdb-pacesyncs5" => supdb_arm(Supdb::create_pacesyncs5, dir)?,
         "supdb-oocz" => supdb_arm(Supdb::create_oocz, dir)?,
-        "supdb-fillposted" => supdb_arm(Supdb::create_fillposted, dir)?,
         "supdb-walappend" => supdb_arm(Supdb::create_walappend, dir)?,
         "supdb-walprefill" => supdb_arm(Supdb::create_walprefill, dir)?,
         "supdb-walaheadflat" => supdb_arm(Supdb::create_walaheadflat, dir)?,
@@ -20364,7 +18778,6 @@ pub fn open(arm: &str, dir: &Path, map_gb: usize) -> Res<Box<dyn Engine>> {
         "supdb-ingestconvertcap" => supdb_arm(Supdb::create_ingest_convertcap, dir)?,
         "supdb-ingestshortpass" => supdb_arm(Supdb::create_ingest_shortpass, dir)?,
         "supdb-ingestnoyield" => supdb_arm(Supdb::create_ingest_noyield, dir)?,
-        "supdb-ingestfillholds" => supdb_arm(Supdb::create_ingest_fillholds, dir)?,
         "supdb-ingestpostedyield" => supdb_arm(Supdb::create_ingest_postedyield, dir)?,
         "supdb-ingestbehindyield" => supdb_arm(Supdb::create_ingest_behindyield, dir)?,
         "supdb-idle" => supdb_arm(Supdb::create_idle, dir)?,
@@ -20777,23 +19190,19 @@ mod tests {
         )
         .unwrap();
         let fo = nof.db.as_ref().unwrap().options().clone();
-        assert!(
-            fo.point_record_ahead && fo.scan_block_cache && fo.upkeep_alert && fo.index_populated
-        );
+        assert!(fo.scan_block_cache && fo.upkeep_alert && fo.index_populated);
         assert!(
             fo.share_on_write && fo.shared_table_bytes > 0 && fo.shared_index_slots > 0,
             "the roster's arm shares its table on demand, sized as the big shared arm's"
         );
         for (arm, differs) in [
             (
-                "supdb-heldnorecordahead",
-                (|a: &supdb::Options| !a.point_record_ahead) as fn(&supdb::Options) -> bool,
+                "supdb-heldnfnocache",
+                (|a: &supdb::Options| !a.scan_block_cache) as fn(&supdb::Options) -> bool,
             ),
-            ("supdb-heldnfnocache", |a| !a.scan_block_cache),
             ("supdb-heldnoalert", |a| !a.upkeep_alert),
             ("supdb-heldinline", |a| a.upkeep == supdb::Upkeep::Inline),
             ("supdb-heldindexzeropage", |a| !a.index_populated),
-            ("supdb-heldlivefirst", |a| a.point_live_first),
             ("supdb-heldmemfnv", |a| !a.mem_hash_fold),
             ("supdb-heldbatch1", |a| a.upkeep_batch_pct == 1),
             ("supdb-heldnoshare", |a| !a.share_on_write),
@@ -20805,10 +19214,6 @@ mod tests {
             assert_eq!(e.features(), base.features(), "{arm}");
             drop(e);
             let a = match arm {
-                "supdb-heldnorecordahead" => Policy {
-                    norecordahead: true,
-                    ..Policy::default()
-                },
                 "supdb-heldnfnocache" => Policy {
                     block_cache: false,
                     ..Policy::default()
@@ -20819,10 +19224,6 @@ mod tests {
                 },
                 "supdb-heldindexzeropage" => Policy {
                     indexzeropage: true,
-                    ..Policy::default()
-                },
-                "supdb-heldlivefirst" => Policy {
-                    livefirst: true,
                     ..Policy::default()
                 },
                 "supdb-heldmemfnv" => Policy {
@@ -20865,30 +19266,11 @@ mod tests {
                 "{arm}"
             );
         }
-        // And the default arm's: the record read as it is reached.
-        let e = open("supdb-norecordahead", &root.join("norecordahead"), 1).unwrap();
-        assert_eq!(e.name(), "supdb-norecordahead");
-        assert_eq!(guarantee("supdb-norecordahead"), guarantee("supdb"));
-        drop(e);
+        // And the default arm's: the index left to its zero-page faults.
         let e = open("supdb-indexzeropage", &root.join("indexzeropage"), 1).unwrap();
         assert_eq!(e.name(), "supdb-indexzeropage");
         assert_eq!(guarantee("supdb-indexzeropage"), guarantee("supdb"));
         drop(e);
-        let e = open("supdb-livefirst", &root.join("livefirst"), 1).unwrap();
-        assert_eq!(e.name(), "supdb-livefirst");
-        assert_eq!(guarantee("supdb-livefirst"), guarantee("supdb"));
-        drop(e);
-        let ll = Supdb::with_policy(
-            &root.join("livefirst-policy"),
-            Policy {
-                livefirst: true,
-                ..Policy::default()
-            },
-        )
-        .unwrap();
-        assert_eq!(ll.name(), "supdb-livefirst");
-        assert!(ll.db.as_ref().unwrap().options().point_live_first);
-        drop(ll);
         let mf = Supdb::with_policy(
             &root.join("memfnv-policy"),
             Policy {
@@ -20900,7 +19282,7 @@ mod tests {
         assert_eq!(mf.name(), "supdb-memfnv");
         assert!(!mf.db.as_ref().unwrap().options().mem_hash_fold);
         drop(mf);
-        let e = open("supdb", &root.join("livefirst"), 1).unwrap();
+        let e = open("supdb", &root.join("supdb"), 1).unwrap();
         drop((e, nof));
         assert!(
             matches!(mo.sync, supdb::SyncPolicy::Explicit) && mo.wal_hold_bytes == o.wal_hold_bytes
@@ -21874,60 +20256,6 @@ mod tests {
         );
     }
 
-    /// `supdb-dirplain` and `supdb-ingestdirplain` are the policy with
-    /// `dirplain` alone set over their row's default, open under that
-    /// name, and the options they open the engine with differ from the
-    /// default's in `seek_prefetch_dir` alone on the scan's prefetch
-    /// path -- an arm sound only beside the default it is priced with
-    /// keeps that default's other settings (`CLAUDE.md`).
-    #[test]
-    fn the_dirplain_arms_differ_from_their_defaults_in_the_directory_hint_alone() {
-        let root =
-            std::env::temp_dir().join(format!("supdb-bench-dirplain-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&root);
-        for (name, buffered) in [("supdb-dirplain", false), ("supdb-ingestdirplain", true)] {
-            let d = root.join(name);
-            std::fs::create_dir_all(&d).unwrap();
-            let arm = if buffered {
-                Supdb::create_ingest_dirplain(&d)
-            } else {
-                Supdb::create_dirplain(&d)
-            }
-            .unwrap();
-            assert_eq!(arm.name(), name);
-            assert!(arm.dirplain && !arm.noprefetch && !arm.prefetch1k, "{name}");
-            let base_d = root.join(format!("{name}-base"));
-            std::fs::create_dir_all(&base_d).unwrap();
-            let base = if buffered {
-                Supdb::create_ingest(&base_d)
-            } else {
-                Supdb::create(&base_d)
-            }
-            .unwrap();
-            assert_eq!(arm.partition, base.partition, "{name}: the row's shape");
-            assert_eq!(arm.durable, base.durable, "{name}: the row's guarantee");
-            assert_eq!(arm.features(), base.features(), "{name}");
-            let (a, b) = (
-                arm.db.as_ref().unwrap().options(),
-                base.db.as_ref().unwrap().options(),
-            );
-            assert!(
-                !a.seek_prefetch_dir && b.seek_prefetch_dir,
-                "{name}: the one option"
-            );
-            assert_eq!(a.scan_prefetch, b.scan_prefetch, "{name}");
-            assert_eq!(a.scan_prefetch_bytes, b.scan_prefetch_bytes, "{name}");
-            drop(arm);
-            drop(base);
-            // The dispatch opens the arm by its name.
-            let opened_d = root.join(format!("{name}-open"));
-            std::fs::create_dir_all(&opened_d).unwrap();
-            let e = open(name, &opened_d, 1).unwrap();
-            assert_eq!(e.name(), name, "the dispatch");
-        }
-        let _ = std::fs::remove_dir_all(&root);
-    }
-
     /// `supdb-nocacheordread` is the nocache policy with `ordread` alone
     /// set over `supdb-nocache`: named, durable like it, opened under its
     /// name by the dispatch, and opened on options that differ from
@@ -21970,7 +20298,7 @@ mod tests {
         assert_eq!(arm.budget, base.budget);
         assert_eq!(arm.advice, base.advice);
         assert_eq!(arm.features(), base.features());
-        assert!(!arm.extsval && !arm.dirplain && !arm.forms && !arm.lazyforms);
+        assert!(!arm.extsval && !arm.forms && !arm.lazyforms);
         let (a, b) = (
             arm.db.as_ref().unwrap().options(),
             base.db.as_ref().unwrap().options(),
@@ -21980,8 +20308,6 @@ mod tests {
         assert_eq!(a.scan_block_cache, b.scan_block_cache);
         assert_eq!(a.scan_cache_bytes, b.scan_cache_bytes);
         assert_eq!(a.read_advice, b.read_advice);
-        assert_eq!(a.seek_prefetch_dir, b.seek_prefetch_dir);
-        assert_eq!(a.scan_prefetch, b.scan_prefetch);
         assert_eq!(a.inline_bytes, b.inline_bytes);
         assert_eq!(a.partition_bytes, b.partition_bytes);
         assert_eq!(a.seal_bytes, b.seal_bytes);
@@ -22105,7 +20431,7 @@ mod tests {
         assert_eq!(arm.budget, base.budget);
         assert_eq!(arm.advice, base.advice);
         assert_eq!(arm.features(), base.features());
-        assert!(!arm.ordread && !arm.extsval && !arm.dirplain && !arm.forms && !arm.lazyforms);
+        assert!(!arm.ordread && !arm.extsval && !arm.forms && !arm.lazyforms);
         let (a, b) = (
             arm.db.as_ref().unwrap().options(),
             base.db.as_ref().unwrap().options(),
@@ -22125,8 +20451,6 @@ mod tests {
         assert_eq!(a.scan_block_cache, b.scan_block_cache);
         assert_eq!(a.scan_cache_bytes, b.scan_cache_bytes);
         assert_eq!(a.read_advice, b.read_advice);
-        assert_eq!(a.seek_prefetch_dir, b.seek_prefetch_dir);
-        assert_eq!(a.scan_prefetch, b.scan_prefetch);
         assert_eq!(a.inline_bytes, b.inline_bytes);
         assert_eq!(a.partition_bytes, b.partition_bytes);
         assert_eq!(a.seal_bytes, b.seal_bytes);
@@ -22984,9 +21308,6 @@ mod tests {
             "supdb-cacheraw",
             "supdb-nofitshort",
             "supdb-walkeep",
-            "supdb-zahead1",
-            "supdb-zsamplegap",
-            "supdb-zinstallwaits",
             "supdb-zrecodeauto",
             "supdb-zparse",
             "supdb-zreparse",
@@ -23006,36 +21327,6 @@ mod tests {
         let raw = Supdb::create_cacheraw(&dir("raw")).unwrap();
         let short = Supdb::create_nofitshort(&dir("short")).unwrap();
         {
-            for (make, builders, between) in [
-                (Supdb::create_zahead1 as fn(&Path) -> Res<Supdb>, 1, false),
-                (Supdb::create_zsamplegap, 2, true),
-            ] {
-                let z = make(&dir(&format!("zahead{builders}{between}"))).unwrap();
-                assert_eq!(z.features(), base.features());
-                let o = z.db.as_ref().unwrap().options();
-                assert_eq!(
-                    (o.zpages_ahead_builders, o.zpages_sample_between),
-                    (builders, between)
-                );
-                assert_eq!(
-                    (b.zpages_ahead_builders, b.zpages_sample_between),
-                    (2, false)
-                );
-                assert_eq!(
-                    (
-                        o.zpages,
-                        o.zpages_land_pct,
-                        o.wal_drop_bytes,
-                        o.forms_fit_when_short
-                    ),
-                    (
-                        b.zpages,
-                        b.zpages_land_pct,
-                        b.wal_drop_bytes,
-                        b.forms_fit_when_short
-                    )
-                );
-            }
             {
                 let z = Supdb::create_mergeahead(&dir("mergeahead")).unwrap();
                 assert_eq!(z.features(), base.features());
@@ -23069,27 +21360,6 @@ mod tests {
                 );
             }
             {
-                let z = Supdb::create_zinstallwaits(&dir("zinstallwaits")).unwrap();
-                assert_eq!(z.features(), base.features());
-                let o = z.db.as_ref().unwrap().options();
-                assert!(b.zpages_cover_resident && b.zpages_suspect_at_crossing);
-                assert!(!o.zpages_cover_resident && !o.zpages_suspect_at_crossing);
-                assert_eq!(
-                    (
-                        o.zpages_ahead_builders,
-                        o.zpages,
-                        o.wal_drop_bytes,
-                        o.zpages_sample_between
-                    ),
-                    (
-                        b.zpages_ahead_builders,
-                        b.zpages,
-                        b.wal_drop_bytes,
-                        b.zpages_sample_between
-                    )
-                );
-            }
-            {
                 let z = Supdb::create_zrecodeauto(&dir("zrecodeauto")).unwrap();
                 assert_eq!(z.features(), base.features());
                 let o = z.db.as_ref().unwrap().options();
@@ -23099,20 +21369,6 @@ mod tests {
                     (o.zpages, o.zpages_cover_resident, o.wal_drop_bytes),
                     (b.zpages, b.zpages_cover_resident, b.wal_drop_bytes)
                 );
-            }
-            {
-                let z = Supdb::create_leancopyprefetch(&dir("leancopyprefetch")).unwrap();
-                assert_eq!(z.name(), "supdb-leancopyprefetch");
-                assert_eq!(z.features(), base.features());
-                let o = z.db.as_ref().unwrap().options();
-                assert!(o.copy_prefetch_from_start && !b.copy_prefetch_from_start);
-            }
-            {
-                let z = Supdb::create_pacedprefetch(&dir("pacedprefetch")).unwrap();
-                assert_eq!(z.name(), "supdb-pacedprefetch");
-                assert_eq!(z.features(), base.features());
-                let o = z.db.as_ref().unwrap().options();
-                assert!(o.scan_prefetch_paced && !b.scan_prefetch_paced);
             }
             {
                 let z = Supdb::create_blockcursors(&dir("blockcursors")).unwrap();
@@ -23180,35 +21436,6 @@ mod tests {
             }
             {
                 let z = Supdb::with_policy(
-                    &dir("scanrawahead"),
-                    Policy {
-                        scanrawahead: true,
-                        ..Policy::default()
-                    },
-                )
-                .unwrap();
-                assert_eq!(z.name(), "supdb-scanrawahead");
-                assert_eq!(z.features(), base.features());
-                let o = z.db.as_ref().unwrap().options();
-                assert!(o.scan_raw_ahead && !o.scan_raw_ahead_past_llc);
-                assert!(b.scan_raw_ahead && b.scan_raw_ahead_past_llc);
-            }
-            {
-                let z = Supdb::with_policy(
-                    &dir("noscanrawahead"),
-                    Policy {
-                        noscanrawahead: true,
-                        ..Policy::default()
-                    },
-                )
-                .unwrap();
-                assert_eq!(z.name(), "supdb-noscanrawahead");
-                assert_eq!(z.features(), base.features());
-                let o = z.db.as_ref().unwrap().options();
-                assert!(!o.scan_raw_ahead && b.scan_raw_ahead);
-            }
-            {
-                let z = Supdb::with_policy(
                     &dir("zrewarminstall"),
                     Policy {
                         zrewarminstall: true,
@@ -23249,78 +21476,6 @@ mod tests {
                 let o = z.db.as_ref().unwrap().options();
                 assert!(o.forms_settle_past_llc && !b.forms_settle_past_llc);
                 assert!(o.forms_settle_every && o.forms_settle_builds);
-            }
-            {
-                let z = Supdb::with_policy(
-                    &dir("readhashes"),
-                    Policy {
-                        readhashes: true,
-                        ..Policy::default()
-                    },
-                )
-                .unwrap();
-                assert_eq!(z.name(), "supdb-readhashes");
-                assert_eq!(z.features(), base.features());
-                let o = z.db.as_ref().unwrap().options();
-                assert!(!o.read_hash_once && b.read_hash_once);
-                assert!(o.read_lines_ahead);
-            }
-            {
-                let z = Supdb::with_policy(
-                    &dir("readnoahead"),
-                    Policy {
-                        readnoahead: true,
-                        ..Policy::default()
-                    },
-                )
-                .unwrap();
-                assert_eq!(z.name(), "supdb-readnoahead");
-                assert_eq!(z.features(), base.features());
-                let o = z.db.as_ref().unwrap().options();
-                assert!(!o.read_lines_ahead && b.read_lines_ahead);
-                assert!(o.read_hash_once);
-            }
-            {
-                let z = Supdb::with_policy(
-                    &dir("formahead"),
-                    Policy {
-                        formahead: true,
-                        ..Policy::default()
-                    },
-                )
-                .unwrap();
-                assert_eq!(z.name(), "supdb-formahead");
-                assert_eq!(z.features(), base.features());
-                let o = z.db.as_ref().unwrap().options();
-                assert!(o.scan_form_ahead && !b.scan_form_ahead);
-            }
-            {
-                let z = Supdb::with_policy(
-                    &dir("sparsespan"),
-                    Policy {
-                        sparsespan: true,
-                        ..Policy::default()
-                    },
-                )
-                .unwrap();
-                assert_eq!(z.name(), "supdb-sparsespan");
-                assert_eq!(z.features(), base.features());
-                let o = z.db.as_ref().unwrap().options();
-                assert!(o.scan_prefetch_sparse_span && !b.scan_prefetch_sparse_span);
-            }
-            {
-                let z = Supdb::with_policy(
-                    &dir("runsheld"),
-                    Policy {
-                        runsheld: true,
-                        ..Policy::default()
-                    },
-                )
-                .unwrap();
-                assert_eq!(z.name(), "supdb-runsheld");
-                assert_eq!(z.features(), base.features());
-                let o = z.db.as_ref().unwrap().options();
-                assert!(o.scan_runs_held && !b.scan_runs_held);
             }
             {
                 let z = Supdb::with_policy(
@@ -23506,50 +21661,6 @@ mod tests {
             }
             {
                 let z = Supdb::with_policy(
-                    &dir("widefull"),
-                    Policy {
-                        widefull: true,
-                        ..Policy::default()
-                    },
-                )
-                .unwrap();
-                assert_eq!(z.name(), "supdb-widefull");
-                assert_eq!(z.features(), base.features());
-                let o = z.db.as_ref().unwrap().options();
-                assert!(!o.scan_wide_capped && b.scan_wide_capped);
-                assert!(o.emit_lone_unsearched);
-            }
-            {
-                let z = Supdb::with_policy(
-                    &dir("probestwice"),
-                    Policy {
-                        probestwice: true,
-                        ..Policy::default()
-                    },
-                )
-                .unwrap();
-                assert_eq!(z.name(), "supdb-probestwice");
-                assert_eq!(z.features(), base.features());
-                let o = z.db.as_ref().unwrap().options();
-                assert!(!o.read_probes_once && b.read_probes_once);
-            }
-            {
-                let z = Supdb::with_policy(
-                    &dir("pointexts"),
-                    Policy {
-                        pointexts: true,
-                        ..Policy::default()
-                    },
-                )
-                .unwrap();
-                assert_eq!(z.name(), "supdb-pointexts");
-                assert_eq!(z.features(), base.features());
-                let o = z.db.as_ref().unwrap().options();
-                assert!(!o.point_fixed && b.point_fixed);
-                assert!(o.point_lone, "the one option moved");
-            }
-            {
-                let z = Supdb::with_policy(
                     &dir("pointsources"),
                     Policy {
                         pointsources: true,
@@ -23561,7 +21672,6 @@ mod tests {
                 assert_eq!(z.features(), base.features());
                 let o = z.db.as_ref().unwrap().options();
                 assert!(!o.point_lone && b.point_lone);
-                assert!(o.point_fixed, "the one option moved");
             }
             {
                 let z = Supdb::with_policy(
@@ -23591,7 +21701,7 @@ mod tests {
                 assert_eq!(z.features(), base.features());
                 let o = z.db.as_ref().unwrap().options();
                 assert!(!o.point_layers_lean && b.point_layers_lean);
-                assert!(o.point_lone && o.point_fixed, "the one option moved");
+                assert!(o.point_lone, "the one option moved");
             }
             {
                 let z = Supdb::with_policy(
@@ -23625,64 +21735,6 @@ mod tests {
             }
             {
                 let z = Supdb::with_policy(
-                    &dir("widewalks"),
-                    Policy {
-                        widewalks: true,
-                        ..Policy::default()
-                    },
-                )
-                .unwrap();
-                assert_eq!(z.name(), "supdb-widewalks");
-                assert_eq!(z.features(), base.features());
-                let o = z.db.as_ref().unwrap().options();
-                assert!(!o.forms_copy_hot_wide && b.forms_copy_hot_wide);
-            }
-            {
-                let z = Supdb::with_policy(
-                    &dir("widecopyfixed"),
-                    Policy {
-                        widecopyfixed: true,
-                        ..Policy::default()
-                    },
-                )
-                .unwrap();
-                assert_eq!(z.name(), "supdb-widecopyfixed");
-                assert_eq!(z.features(), base.features());
-                let o = z.db.as_ref().unwrap().options();
-                assert!(!o.forms_copy_wide_priced && b.forms_copy_wide_priced);
-                assert!(o.forms_copy_hot_wide);
-            }
-            {
-                let z = Supdb::with_policy(
-                    &dir("lonetombs"),
-                    Policy {
-                        lonetombs: true,
-                        ..Policy::default()
-                    },
-                )
-                .unwrap();
-                assert_eq!(z.name(), "supdb-lonetombs");
-                assert_eq!(z.features(), base.features());
-                let o = z.db.as_ref().unwrap().options();
-                assert!(!o.emit_lone_unsearched && b.emit_lone_unsearched);
-                assert!(o.scan_wide_capped);
-            }
-            {
-                let z = Supdb::with_policy(
-                    &dir("scanlevers"),
-                    Policy {
-                        scanlevers: true,
-                        ..Policy::default()
-                    },
-                )
-                .unwrap();
-                assert_eq!(z.name(), "supdb-scanlevers");
-                assert_eq!(z.features(), base.features());
-                let o = z.db.as_ref().unwrap().options();
-                assert!(o.scan_form_ahead && o.scan_prefetch_sparse_span && o.scan_runs_held);
-            }
-            {
-                let z = Supdb::with_policy(
                     &dir("settlebuildsfiled"),
                     Policy {
                         settlebuildsfiled: true,
@@ -23694,21 +21746,6 @@ mod tests {
                 assert_eq!(z.features(), base.features());
                 let o = z.db.as_ref().unwrap().options();
                 assert!(o.forms_settle_builds_filed && !b.forms_settle_builds_filed);
-            }
-            {
-                let z = Supdb::with_policy(
-                    &dir("scanrawpaced"),
-                    Policy {
-                        scanrawpaced: true,
-                        ..Policy::default()
-                    },
-                )
-                .unwrap();
-                assert_eq!(z.name(), "supdb-scanrawpaced");
-                assert_eq!(z.features(), base.features());
-                let o = z.db.as_ref().unwrap().options();
-                assert!(o.scan_raw_ahead && o.scan_raw_ahead_lead == 1024);
-                assert!(!o.scan_raw_ahead_past_llc && b.scan_raw_ahead_lead == 0);
             }
             {
                 let z = Supdb::create_zfilterahead(&dir("zfilterahead")).unwrap();
@@ -24365,13 +22402,6 @@ mod tests {
                 assert!(o.out_of_core_installed && !b.out_of_core_installed);
             }
             {
-                let z = Supdb::create_fillposted(&dir("fillposted")).unwrap();
-                assert_eq!(z.name(), "supdb-fillposted");
-                assert_eq!(z.features(), base.features());
-                let o = z.db.as_ref().unwrap().options();
-                assert!(!o.upkeep_fill_skips_posted && b.upkeep_fill_skips_posted);
-            }
-            {
                 let z = Supdb::create_walappend(&dir("walappend")).unwrap();
                 assert_eq!(z.name(), "supdb-walappend");
                 assert_eq!(z.features(), base.features());
@@ -24420,13 +22450,6 @@ mod tests {
                 assert_eq!(z.features(), base.features());
                 let o = z.db.as_ref().unwrap().options();
                 assert!(!o.sweep_remembers_pin && b.sweep_remembers_pin);
-            }
-            {
-                let z = Supdb::create_copyprefetchwhole(&dir("copyprefetchwhole")).unwrap();
-                assert_eq!(z.name(), "supdb-copyprefetchwhole");
-                assert_eq!(z.features(), base.features());
-                let o = z.db.as_ref().unwrap().options();
-                assert!(o.copy_prefetch_whole && !b.copy_prefetch_whole);
             }
             {
                 let z = Supdb::create_zhotskewroom(&dir("zhotskewroom")).unwrap();
@@ -24574,10 +22597,7 @@ mod tests {
                     assert_eq!(z.features(), base.features(), "{name}");
                     let o = z.db.as_ref().unwrap().options();
                     assert_eq!(seven(o), want, "{name}");
-                    assert!(
-                        o.zpages == b.zpages && o.zpages_stride_below.is_none(),
-                        "{name}"
-                    );
+                    assert!(o.zpages == b.zpages, "{name}");
                     assert!(o.zpages_hot_raw == b.zpages_hot_raw, "{name}");
                     let beside = if name == "supdb" {
                         two(b)
@@ -24870,8 +22890,8 @@ mod tests {
                 let o = z.db.as_ref().unwrap().options();
                 assert!(!o.zpages_hot_raw && b.zpages_hot_raw);
                 assert_eq!(
-                    (o.zpages, o.zpages_recode_auto, o.zpages_reading_from_files),
-                    (b.zpages, b.zpages_recode_auto, b.zpages_reading_from_files)
+                    (o.zpages, o.zpages_recode_auto),
+                    (b.zpages, b.zpages_recode_auto)
                 );
             }
             {
@@ -26250,87 +24270,6 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
-    /// The two-form arms are the stride arm with one field moved, the key
-    /// number their names say, and open with the key of that number as the
-    /// line the stride form is asked under (`Options::zpages_stride_below`)
-    /// where the stride arm opens with none; nothing else of the options the
-    /// stride arm's own test holds moves, and the dispatch reaches each.
-    #[test]
-    fn each_two_form_arm_is_the_stride_arm_and_the_key_its_name_says() {
-        let root =
-            std::env::temp_dir().join(format!("supdb-bench-ztwoform-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&root);
-        assert!(supdb::Options::default().zpages_stride_below.is_none());
-        type Make = fn(&Path) -> Res<Supdb>;
-        let cases: [(&str, u64, Make); 4] = [
-            (
-                "supdb-cache64tofitzstridedrop2m",
-                2_000_000,
-                Supdb::create_cache64_tofit_zstride_drop_2m,
-            ),
-            (
-                "supdb-cache64tofitzstridedrop3m",
-                3_000_000,
-                Supdb::create_cache64_tofit_zstride_drop_3m,
-            ),
-            (
-                "supdb-cache64tofitzstridedrop5m",
-                5_000_000,
-                Supdb::create_cache64_tofit_zstride_drop_5m,
-            ),
-            (
-                "supdb-cache64tofitzstridedrop7m",
-                7_000_000,
-                Supdb::create_cache64_tofit_zstride_drop_7m,
-            ),
-        ];
-        let sib = "supdb-cache64tofitzstridedrop";
-        for (name, first, make) in cases {
-            let mut p = Policy::cache64_tofit_zstride_drop();
-            assert_ne!(p, Policy::cache64_tofit_zstride_drop_first(first));
-            p.zstride_first = Some(first);
-            assert_eq!(p, Policy::cache64_tofit_zstride_drop_first(first), "{name}");
-            let new = |which: &str, make: Make| {
-                let d = root.join(format!("{name}-{which}"));
-                std::fs::create_dir_all(&d).unwrap();
-                make(&d).unwrap()
-            };
-            let arm = new("arm", make);
-            let base = new("base", Supdb::create_cache64_tofit_zstride_drop);
-            assert_eq!((arm.name(), base.name()), (name, sib));
-            assert_eq!(guarantee(name), guarantee(sib));
-            assert_eq!(arm.features(), base.features(), "{name}");
-            let (a, b) = (
-                arm.db.as_ref().unwrap().options(),
-                base.db.as_ref().unwrap().options(),
-            );
-            let mut key = [0u8; 16];
-            crate::workload::db_key_into(first, &mut key);
-            assert_eq!(a.zpages_stride_below.as_deref(), Some(&key[..]), "{name}");
-            assert!(b.zpages_stride_below.is_none(), "{sib}");
-            assert!(
-                a.zpages_stride == supdb::ZStride::Forced && b.zpages_stride == a.zpages_stride
-            );
-            assert!(a.zpages == supdb::ZPages::Always && b.zpages == supdb::ZPages::Always);
-            assert_eq!(a.scan_block_cache, b.scan_block_cache);
-            assert_eq!(a.scan_cache_bytes, b.scan_cache_bytes);
-            assert_eq!(a.zpages_drop_raw, b.zpages_drop_raw);
-            assert_eq!(a.zpages_scan_prefetch, b.zpages_scan_prefetch);
-            assert_eq!(a.zpages_stride_trust_built, b.zpages_stride_trust_built);
-            drop(arm);
-            drop(base);
-            let opened = root.join(format!("{name}-open"));
-            std::fs::create_dir_all(&opened).unwrap();
-            let e = open(name, &opened, 1).unwrap();
-            assert_eq!(e.name(), name, "the dispatch");
-            assert_eq!(
-                e.zpages_state().map(|z| (z.forced, z.stride)),
-                Some((true, true))
-            );
-        }
-        let _ = std::fs::remove_dir_all(&root);
-    }
-
     /// What the stride arm builds and serves, as its counters and its state
     /// say, beside the block arm it is priced against: keys of the suite's
     /// shape in key order are one run of numbers with one value of one width
@@ -26596,7 +24535,7 @@ mod tests {
             }
             .unwrap();
             assert_eq!(arm.name(), name);
-            assert!(arm.settlefar && !arm.dirplain && !arm.lazyforms, "{name}");
+            assert!(arm.settlefar && !arm.lazyforms, "{name}");
             let base_d = root.join(format!("{name}-base"));
             std::fs::create_dir_all(&base_d).unwrap();
             let base = if buffered {

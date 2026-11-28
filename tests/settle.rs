@@ -1538,8 +1538,8 @@ fn a_patch_by_its_rank_asks_for_its_lines_by_the_cut() {
 
 /// A copy built over a block's records by updates alone claims its entries
 /// are the records, entry `i` the block's record `lo + i`, and a settle's
-/// patch takes the entry by the key's rank where the claim stands
-/// (`Options::copy_start_at_rank`). The claim was a flag, and the table is
+/// patch takes the entry by the key's rank where the claim stands. The
+/// claim was a flag, and the table is
 /// carried across a merge that rewrites the partition over the same blocks
 /// with its copies: a key written into the block and left to the backlog,
 /// sealed and folded in by the merge, is a record at the rank it lands at,

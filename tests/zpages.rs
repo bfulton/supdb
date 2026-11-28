@@ -3440,303 +3440,273 @@ fn the_heads_arm_seeks_through_the_raw_form_and_scans_the_same() {
 }
 
 /// Out of core a block's build asks the kernel for every piece's records
-/// over the block before it reads any (`Options::pieces_willneed`). With
+/// over the block before it reads any (`Reader::pieces_willneed`). With
 /// no form published (`commit_forms` off) a handle builds every block its
 /// scans touch from the partition and the piece standing over it: under
 /// the forced form the gate is away from raw and the builds over the
 /// piece ask; with the gate set to raw by hand, as a store in core has
-/// it, or with the option off, they ask nothing. The scans answer the
+/// it, they ask nothing. The scans answer the
 /// same either way.
 #[test]
 fn a_build_asks_for_its_pieces_pages_together_only_out_of_core() {
-    for on in [true, false] {
-        let dir = scratch(&format!("willneed-{on}"));
-        let mut db = Db::create(
-            &dir,
-            forced(|o| {
-                o.partition_bytes = Some(160 << 10);
-                // One seal's pieces stand until the test is done with them.
-                o.seal_bytes = 1 << 30;
-                o.l0_trigger = 1 << 20;
-                // The block path, which `forced` leaves off: the builds
-                // over the piece are its.
-                o.scan_block_cache = true;
-                o.commit_forms = false;
-                o.pieces_willneed = on;
-                o.pieces_dir_willneed = on;
-                o.bounds_heads_willneed = on;
-            }),
-        )
-        .unwrap();
-        let mut model = ordered_load(&mut db, 4000, 0x11EED);
-        db.zpages_settle().unwrap();
-        // A scan first, so the seal after it lands near reads; then a piece
-        // of updates over every partition.
-        let _ = scanned(&db, b"", 5);
-        let keys: Vec<Vec<u8>> = model.keys().cloned().collect();
-        let mut rng = Rng(0x11EED1);
-        for k in keys.iter().step_by(7) {
-            let v = suite_value(&mut rng);
-            db.append(k, &v);
-            model.entry(k.clone()).or_default().push(v);
-        }
-        db.commit().unwrap();
-        db.seal().unwrap();
-        db.settle().unwrap();
-        assert!(db.levels().1 > 0, "a piece stands");
-        let c = db.zpage_counts();
-        assert_eq!(c.gate, 2, "the forced form's gate: {c:?}");
-        let check = |r: &supdb::Reader, what: &str| {
-            for start in [b"".to_vec(), spaced_key(1000), spaced_key(2500)] {
-                for limit in [1usize, 57, 300] {
-                    same_window(
-                        &scanned(r, &start, limit),
-                        &window(&model, &start, limit),
-                        &format!(
-                            "{what}, from {:?} for {limit}",
-                            String::from_utf8_lossy(&start)
-                        ),
-                    );
-                }
-            }
-        };
-        // A handle builds its own blocks, from the partition and the piece,
-        // with the gate at the form.
-        let r = db.reader().unwrap();
-        check(&r, "a handle, the gate at the form");
-        drop(r);
-        let asked = db.zpage_counts().piece_willneeds;
-        assert_eq!(
-            asked > 0,
-            on,
-            "the builds asked for the piece's pages only with the option: {asked}"
-        );
-        // The pieces' directory words, asked before their records; and the
-        // piece's heads, asked whole before a bounds walk read them -- at
-        // the seal's landing near reads, or at the handle's table.
-        let dirs = db.zpage_counts().dir_willneeds;
-        assert_eq!(
-            dirs > 0,
-            on,
-            "the directory words asked for only with the option: {dirs}"
-        );
-        let heads = db.zpage_counts().bounds_head_asks;
-        assert_eq!(
-            heads > 0,
-            on,
-            "the bounds walks' heads asked for only with the option: {heads}"
-        );
-        assert_eq!(
-            db.zpage_counts().block_willneeds,
-            0,
-            "a partition a form file serves is never asked for raw"
-        );
-        // The gate at the raw form, as a store in core has it: another
-        // handle builds the same blocks afresh, and asks nothing.
-        db.zgate_set(0);
-        let r = db.reader().unwrap();
-        check(&r, "a handle, the gate at raw");
-        drop(r);
-        assert_eq!(
-            db.zpage_counts().piece_willneeds,
-            asked,
-            "with the gate at raw the builds ask nothing"
-        );
-        assert_eq!(
-            db.zpage_counts().dir_willneeds,
-            dirs,
-            "nor for the directory words"
-        );
-        db.close().unwrap();
-        let _ = std::fs::remove_dir_all(&dir);
+    let dir = scratch("willneed");
+    let mut db = Db::create(
+        &dir,
+        forced(|o| {
+            o.partition_bytes = Some(160 << 10);
+            // One seal's pieces stand until the test is done with them.
+            o.seal_bytes = 1 << 30;
+            o.l0_trigger = 1 << 20;
+            // The block path, which `forced` leaves off: the builds
+            // over the piece are its.
+            o.scan_block_cache = true;
+            o.commit_forms = false;
+        }),
+    )
+    .unwrap();
+    let mut model = ordered_load(&mut db, 4000, 0x11EED);
+    db.zpages_settle().unwrap();
+    // A scan first, so the seal after it lands near reads; then a piece
+    // of updates over every partition.
+    let _ = scanned(&db, b"", 5);
+    let keys: Vec<Vec<u8>> = model.keys().cloned().collect();
+    let mut rng = Rng(0x11EED1);
+    for k in keys.iter().step_by(7) {
+        let v = suite_value(&mut rng);
+        db.append(k, &v);
+        model.entry(k.clone()).or_default().push(v);
     }
+    db.commit().unwrap();
+    db.seal().unwrap();
+    db.settle().unwrap();
+    assert!(db.levels().1 > 0, "a piece stands");
+    let c = db.zpage_counts();
+    assert_eq!(c.gate, 2, "the forced form's gate: {c:?}");
+    let check = |r: &supdb::Reader, what: &str| {
+        for start in [b"".to_vec(), spaced_key(1000), spaced_key(2500)] {
+            for limit in [1usize, 57, 300] {
+                same_window(
+                    &scanned(r, &start, limit),
+                    &window(&model, &start, limit),
+                    &format!(
+                        "{what}, from {:?} for {limit}",
+                        String::from_utf8_lossy(&start)
+                    ),
+                );
+            }
+        }
+    };
+    // A handle builds its own blocks, from the partition and the piece,
+    // with the gate at the form.
+    let r = db.reader().unwrap();
+    check(&r, "a handle, the gate at the form");
+    drop(r);
+    let asked = db.zpage_counts().piece_willneeds;
+    assert!(asked > 0, "the builds asked for the piece's pages: {asked}");
+    // The pieces' directory words, asked before their records; and the
+    // piece's heads, asked whole before a bounds walk read them -- at
+    // the seal's landing near reads, or at the handle's table.
+    let dirs = db.zpage_counts().dir_willneeds;
+    assert!(dirs > 0, "the directory words asked for: {dirs}");
+    let heads = db.zpage_counts().bounds_head_asks;
+    assert!(heads > 0, "the bounds walks' heads asked for: {heads}");
+    assert_eq!(
+        db.zpage_counts().block_willneeds,
+        0,
+        "a partition a form file serves is never asked for raw"
+    );
+    // The gate at the raw form, as a store in core has it: another
+    // handle builds the same blocks afresh, and asks nothing.
+    db.zgate_set(0);
+    let r = db.reader().unwrap();
+    check(&r, "a handle, the gate at raw");
+    drop(r);
+    assert_eq!(
+        db.zpage_counts().piece_willneeds,
+        asked,
+        "with the gate at raw the builds ask nothing"
+    );
+    assert_eq!(
+        db.zpage_counts().dir_willneeds,
+        dirs,
+        "nor for the directory words"
+    );
+    db.close().unwrap();
+    let _ = std::fs::remove_dir_all(&dir);
 }
 
 /// Out of core a scan asks the kernel for the raw partition records it is
-/// about to walk (`Options::blocks_willneed`): a clean block's records from
+/// about to walk (`Reader::blocks_willneed`): a clean block's records from
 /// the seek, and a block's records ahead of its build. A store with no
 /// form file (`ZPages::Off`) and the gate set away from raw by hand, as
 /// the census leaves it, asks on every walk; with the gate at raw, as a
-/// store in core has it, or with the option off, it asks nothing. The
+/// store in core has it, it asks nothing. The
 /// scans answer the same either way, over a drained store and over one
 /// with unsealed keys.
 #[test]
 fn a_scan_asks_for_the_raw_records_it_is_about_to_walk_only_out_of_core() {
-    for on in [true, false] {
-        let dir = scratch(&format!("block-willneed-{on}"));
-        let mut db = Db::create(
-            &dir,
-            Options {
-                zpages: ZPages::Off,
-                partition_bytes: Some(160 << 10),
-                scan_block_cache: true,
-                commit_forms: false,
-                blocks_willneed: on,
-                ..Options::default()
-            },
-        )
-        .unwrap();
-        let mut model = ordered_load(&mut db, 4000, 0x3B10C);
-        let check = |r: &supdb::Reader, model: &Model, what: &str| {
-            for start in [b"".to_vec(), spaced_key(1000), spaced_key(2500)] {
-                for limit in [1usize, 57, 300] {
-                    same_window(
-                        &scanned(r, &start, limit),
-                        &window(model, &start, limit),
-                        &format!(
-                            "{what}, from {:?} for {limit}",
-                            String::from_utf8_lossy(&start)
-                        ),
-                    );
-                }
+    let dir = scratch("block-willneed");
+    let mut db = Db::create(
+        &dir,
+        Options {
+            zpages: ZPages::Off,
+            partition_bytes: Some(160 << 10),
+            scan_block_cache: true,
+            commit_forms: false,
+            ..Options::default()
+        },
+    )
+    .unwrap();
+    let mut model = ordered_load(&mut db, 4000, 0x3B10C);
+    let check = |r: &supdb::Reader, model: &Model, what: &str| {
+        for start in [b"".to_vec(), spaced_key(1000), spaced_key(2500)] {
+            for limit in [1usize, 57, 300] {
+                same_window(
+                    &scanned(r, &start, limit),
+                    &window(model, &start, limit),
+                    &format!(
+                        "{what}, from {:?} for {limit}",
+                        String::from_utf8_lossy(&start)
+                    ),
+                );
             }
-        };
-        // The gate as the census leaves it: the drained store's walks ask.
-        db.zgate_set(1);
-        let r = db.reader().unwrap();
-        check(&r, &model, "drained, the gate at the census");
-        drop(r);
-        let drained = db.zpage_counts().block_willneeds;
-        assert_eq!(
-            drained > 0,
-            on,
-            "the drained walks asked for their records only with the option: {drained}"
-        );
-        // Unsealed keys over every block: the builds ask too.
-        let keys: Vec<Vec<u8>> = model.keys().cloned().collect();
-        let mut rng = Rng(0x3B10C1);
-        for k in keys.iter().step_by(5) {
-            let v = suite_value(&mut rng);
-            db.append(k, &v);
-            model.entry(k.clone()).or_default().push(v);
         }
-        db.commit().unwrap();
-        let r = db.reader().unwrap();
-        check(&r, &model, "unsealed keys, the gate at the census");
-        drop(r);
-        let built = db.zpage_counts().block_willneeds;
-        assert_eq!(
-            built > drained,
-            on,
-            "the builds asked for their records only with the option: {built}"
-        );
-        // The gate at raw: the same walks and builds afresh, nothing asked.
-        db.zgate_set(0);
-        let r = db.reader().unwrap();
-        check(&r, &model, "the gate at raw");
-        drop(r);
-        assert_eq!(
-            db.zpage_counts().block_willneeds,
-            built,
-            "with the gate at raw nothing is asked"
-        );
-        db.close().unwrap();
-        let _ = std::fs::remove_dir_all(&dir);
+    };
+    // The gate as the census leaves it: the drained store's walks ask.
+    db.zgate_set(1);
+    let r = db.reader().unwrap();
+    check(&r, &model, "drained, the gate at the census");
+    drop(r);
+    let drained = db.zpage_counts().block_willneeds;
+    assert!(
+        drained > 0,
+        "the drained walks asked for their records: {drained}"
+    );
+    // Unsealed keys over every block: the builds ask too.
+    let keys: Vec<Vec<u8>> = model.keys().cloned().collect();
+    let mut rng = Rng(0x3B10C1);
+    for k in keys.iter().step_by(5) {
+        let v = suite_value(&mut rng);
+        db.append(k, &v);
+        model.entry(k.clone()).or_default().push(v);
     }
+    db.commit().unwrap();
+    let r = db.reader().unwrap();
+    check(&r, &model, "unsealed keys, the gate at the census");
+    drop(r);
+    let built = db.zpage_counts().block_willneeds;
+    assert!(
+        built > drained,
+        "the builds asked for their records: {built}"
+    );
+    // The gate at raw: the same walks and builds afresh, nothing asked.
+    db.zgate_set(0);
+    let r = db.reader().unwrap();
+    check(&r, &model, "the gate at raw");
+    drop(r);
+    assert_eq!(
+        db.zpage_counts().block_willneeds,
+        built,
+        "with the gate at raw nothing is asked"
+    );
+    db.close().unwrap();
+    let _ = std::fs::remove_dir_all(&dir);
 }
 
 /// A settle's resolve seeks one stride of a partition's heads, a page cold
 /// under a bound: out of core the heads are asked for ahead of the
-/// resolves (`Options::heads_willneed`), runs of them where the batch is
+/// resolves (`OrdIndex::willneed_heads`), runs of them where the batch is
 /// dense in the partition and the strides of the keys a window ahead
 /// where it is sparse, and the scans agree with the model either way. A
 /// block's build asks nothing, since its one page of heads faults beside
 /// the records' ask already; the gate at raw asks nothing.
 #[test]
 fn a_settle_asks_for_the_heads_its_resolves_will_seek_only_out_of_core() {
-    for on in [true, false] {
-        let dir = scratch(&format!("head-willneed-{on}"));
-        let mut db = Db::create(
-            &dir,
-            Options {
-                zpages: ZPages::Off,
-                partition_bytes: Some(160 << 10),
-                scan_block_cache: true,
-                upkeep: supdb::Upkeep::Inline,
-                publish_in_background: false,
-                heads_willneed: on,
-                // Every ask its own look: what is counted here is the asks.
-                heads_look_ms: 0,
-                ..Options::default()
-            },
-        )
-        .unwrap();
-        let mut model = ordered_load(&mut db, 4000, 0x3B10D);
-        let check = |db: &Db, model: &Model, what: &str| {
-            for start in [b"".to_vec(), spaced_key(1000), spaced_key(2500)] {
-                for limit in [1usize, 57, 300] {
-                    same_window(
-                        &scanned(db, &start, limit),
-                        &window(model, &start, limit),
-                        &format!(
-                            "{what}, from {:?} for {limit}",
-                            String::from_utf8_lossy(&start)
-                        ),
-                    );
-                }
+    let dir = scratch("head-willneed");
+    let mut db = Db::create(
+        &dir,
+        Options {
+            zpages: ZPages::Off,
+            partition_bytes: Some(160 << 10),
+            scan_block_cache: true,
+            upkeep: supdb::Upkeep::Inline,
+            publish_in_background: false,
+            // Every ask its own look: what is counted here is the asks.
+            heads_look_ms: 0,
+            ..Options::default()
+        },
+    )
+    .unwrap();
+    let mut model = ordered_load(&mut db, 4000, 0x3B10D);
+    let check = |db: &Db, model: &Model, what: &str| {
+        for start in [b"".to_vec(), spaced_key(1000), spaced_key(2500)] {
+            for limit in [1usize, 57, 300] {
+                same_window(
+                    &scanned(db, &start, limit),
+                    &window(model, &start, limit),
+                    &format!(
+                        "{what}, from {:?} for {limit}",
+                        String::from_utf8_lossy(&start)
+                    ),
+                );
             }
-        };
-        db.zgate_set(1);
-        // A scan first: the commit after it files its batch into the forms
-        // (`Options::forms_settle_far`), and that settle is what asks. The
-        // drained store's scans build their blocks and ask for no heads.
-        check(&db, &model, "drained, the gate at the census");
-        assert_eq!(
-            db.zpage_counts().head_asks,
-            0,
-            "a drained store's builds ask for no heads"
-        );
-        let keys: Vec<Vec<u8>> = model.keys().cloned().collect();
-        let mut rng = Rng(0x3B10D1);
-        // Dense: every fifth key, the pages of heads shared, runs asked.
-        for k in keys.iter().step_by(5) {
-            let v = suite_value(&mut rng);
-            db.append(k, &v);
-            model.entry(k.clone()).or_default().push(v);
         }
-        db.commit().unwrap();
-        let dense = db.zpage_counts().head_asks;
-        assert_eq!(
-            dense > 0,
-            on,
-            "a dense batch's settle asked for heads only with the option: {dense}"
-        );
-        check(&db, &model, "a dense batch settled, the gate at the census");
-        // Sparse: three keys pages apart, a stride each ahead of its turn.
-        for i in [100usize, 2000, 3900] {
-            let v = suite_value(&mut rng);
-            db.append(&keys[i], &v);
-            model.entry(keys[i].clone()).or_default().push(v);
-        }
-        db.commit().unwrap();
-        let sparse = db.zpage_counts().head_asks;
-        assert_eq!(
-            sparse > dense,
-            on,
-            "a sparse batch's settle asked for heads only with the option: {dense} then {sparse}"
-        );
-        check(
-            &db,
-            &model,
-            "a sparse batch settled, the gate at the census",
-        );
-        // The gate at raw: the same settle asks nothing.
-        db.zgate_set(0);
-        for k in keys.iter().skip(2).step_by(7) {
-            let v = suite_value(&mut rng);
-            db.append(k, &v);
-            model.entry(k.clone()).or_default().push(v);
-        }
-        db.commit().unwrap();
-        assert_eq!(
-            db.zpage_counts().head_asks,
-            sparse,
-            "with the gate at raw no heads are asked for"
-        );
-        check(&db, &model, "the gate at raw");
-        db.close().unwrap();
-        let _ = std::fs::remove_dir_all(&dir);
+    };
+    db.zgate_set(1);
+    // A scan first: the commit after it files its batch into the forms
+    // (`Options::forms_settle_far`), and that settle is what asks. The
+    // drained store's scans build their blocks and ask for no heads.
+    check(&db, &model, "drained, the gate at the census");
+    assert_eq!(
+        db.zpage_counts().head_asks,
+        0,
+        "a drained store's builds ask for no heads"
+    );
+    let keys: Vec<Vec<u8>> = model.keys().cloned().collect();
+    let mut rng = Rng(0x3B10D1);
+    // Dense: every fifth key, the pages of heads shared, runs asked.
+    for k in keys.iter().step_by(5) {
+        let v = suite_value(&mut rng);
+        db.append(k, &v);
+        model.entry(k.clone()).or_default().push(v);
     }
+    db.commit().unwrap();
+    let dense = db.zpage_counts().head_asks;
+    assert!(dense > 0, "a dense batch's settle asked for heads: {dense}");
+    check(&db, &model, "a dense batch settled, the gate at the census");
+    // Sparse: three keys pages apart, a stride each ahead of its turn.
+    for i in [100usize, 2000, 3900] {
+        let v = suite_value(&mut rng);
+        db.append(&keys[i], &v);
+        model.entry(keys[i].clone()).or_default().push(v);
+    }
+    db.commit().unwrap();
+    let sparse = db.zpage_counts().head_asks;
+    assert!(
+        sparse > dense,
+        "a sparse batch's settle asked for heads: {dense} then {sparse}"
+    );
+    check(
+        &db,
+        &model,
+        "a sparse batch settled, the gate at the census",
+    );
+    // The gate at raw: the same settle asks nothing.
+    db.zgate_set(0);
+    for k in keys.iter().skip(2).step_by(7) {
+        let v = suite_value(&mut rng);
+        db.append(k, &v);
+        model.entry(k.clone()).or_default().push(v);
+    }
+    db.commit().unwrap();
+    assert_eq!(
+        db.zpage_counts().head_asks,
+        sparse,
+        "with the gate at raw no heads are asked for"
+    );
+    check(&db, &model, "the gate at raw");
+    db.close().unwrap();
+    let _ = std::fs::remove_dir_all(&dir);
 }
 
 /// An ask for a run or a stride of heads is refused where its first page
@@ -3762,7 +3732,6 @@ fn a_look_at_a_partitions_heads_stands_in_for_the_asks_while_they_are_resident()
                 scan_block_cache: true,
                 upkeep: supdb::Upkeep::Inline,
                 publish_in_background: false,
-                heads_willneed: true,
                 heads_look_ms: look_ms,
                 ..Options::default()
             },
@@ -10240,109 +10209,6 @@ fn a_build_ahead_that_declines_is_collected_and_no_build_is_in_flight_after_it()
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// The sample asked for between builds ahead
-/// (`Options::zpages_sample_between`): past its budget a store's controller
-/// wants a sample while its builds ahead go on, and with the option the
-/// sample starts while builds ahead remain due, at a tick that collected
-/// one and before the next takes the builder; without it the next build
-/// ahead starts first and the sample waits for the last.
-#[cfg(target_os = "linux")]
-#[test]
-fn the_sample_starts_between_builds_ahead_when_told_to() {
-    for between in [true, false] {
-        let (dir, db, _model, inject, raw) =
-            land_store_with(&format!("auto-sample-gap-{between}"), 50, |o| {
-                o.zpages_sample_between = between;
-                o.zpages_ahead_builders = 1;
-                o.partition_bytes = Some(400 << 10);
-                // The fill sample, whose order between the builds ahead is
-                // the test: with the files on disk the reading comes from
-                // them and no sample starts.
-                o.zpages_reading_from_files = false;
-                // The sample's wait for a build ahead, which a store whose
-                // resident and in-flight partitions count as covered never
-                // makes, and the build ahead started before the sample,
-                // which a controller suspecting at the crossing does not
-                // give it time for.
-                o.zpages_cover_resident = false;
-                o.zpages_suspect_at_crossing = false;
-            });
-        // Past the whole budget the builds ahead run, and the model calls
-        // for the controller's sample: the first build ahead is held at its
-        // rename until the controller is past FITS, so the sample is wanted
-        // while builds ahead are still due, and the hold is then lifted.
-        db.hold_zpage_rename(true);
-        inject.set_budget(raw / 2);
-        assert!(
-            tick_until(&db, 400, |c| c.phase >= 1 && c.build_starts >= 1),
-            "past FITS with a build ahead in flight: {:?}",
-            db.zpage_counts()
-        );
-        let t = std::time::Instant::now();
-        while !db.zpage_build_waiting() {
-            assert!(t.elapsed() < JOB_WALL, "the build never reached its hold");
-            std::thread::sleep(std::time::Duration::from_millis(5));
-        }
-        wait_steps(&db, 3);
-        assert_eq!(
-            db.zpage_counts().samples,
-            0,
-            "a sample beside a build ahead in flight"
-        );
-        // The next build ahead held at its start and the first let go: the
-        // turn that takes the first in chooses between the sample and the
-        // next build, and the choice is read with the next one held, since
-        // read at the next tick it is read after however many builds the
-        // chain ran meanwhile -- on a loaded host a race the test lost both
-        // ways.
-        db.hold_zpage_build(true);
-        db.hold_zpage_rename(false);
-        assert!(
-            tick_until(&db, 400, |c| c.build_collected >= 1 && c.build_starts >= 2),
-            "the first build ahead in, the next started: {:?}",
-            db.zpage_counts()
-        );
-        let t = std::time::Instant::now();
-        while !db.zpage_build_waiting() {
-            assert!(
-                t.elapsed() < JOB_WALL,
-                "the next build never reached its hold"
-            );
-            std::thread::sleep(std::time::Duration::from_millis(2));
-        }
-        let f = db.zpage_counts();
-        assert!(f.partitions >= 3, "{f:?}");
-        let left = f.partitions - (f.prebuilt + f.ahead_cold).min(f.partitions);
-        assert!(left > 0, "builds ahead still due: {f:?}");
-        if between {
-            assert!(
-                f.samples > 0,
-                "the sample started at the first build's end, before the next: {f:?}"
-            );
-            db.hold_zpage_build(false);
-        } else {
-            assert_eq!(
-                f.samples, 0,
-                "a sample between builds ahead without the option: {f:?}"
-            );
-            // Without the option the sample waits for the last build ahead.
-            db.hold_zpage_build(false);
-            assert!(
-                tick_until(&db, 400, |c| c.samples > 0),
-                "no sample: {:?}",
-                db.zpage_counts()
-            );
-            let c = db.zpage_counts();
-            assert!(
-                c.prebuilt + c.ahead_cold >= c.partitions,
-                "the sample after the last build ahead: {c:?}"
-            );
-        }
-        db.close().unwrap();
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-}
-
 /// The builds ahead at landing wait while scans are near
 /// (`Options::zpages_land_scans_far`): a store scanned, its raw
 /// populations past the percent of its budget, builds nothing ahead, and
@@ -12304,30 +12170,24 @@ fn a_buy_before_the_crossing_makes_the_crossing() {
 }
 
 /// The reading at the crossing comes from the form files on disk where
-/// they cover the keys the install needs (`Options::zpages_reading_from_files`):
-/// no fill sample runs, the reading stands in the tick that wanted it, and
-/// the buy on the prediction follows within a few steps -- the model
-/// recomputed at the step after the reading, not at its period. With the
-/// option off the fill sample runs as before and the install still comes;
-/// and where a third of the files are gone the files do not cover, so the
-/// fill sample runs under both.
+/// they cover the keys the install needs: no fill sample runs, the reading
+/// stands in the tick that wanted it, and the buy on the prediction follows
+/// within a few steps -- the model recomputed at the step after the
+/// reading, not at its period; and where a third of the files are gone the
+/// files do not cover, so the fill sample runs.
 #[cfg(target_os = "linux")]
 #[test]
 fn the_reading_at_the_crossing_comes_from_the_files_on_disk() {
-    for (from_files, gone) in [(true, 0usize), (false, 0), (true, usize::MAX)] {
-        let what = format!("reading from files {from_files}, files removed {gone}");
-        let (dir, db, model, inject, raw) = land_store_with(
-            &format!("auto-reading-files-{from_files}-{gone}"),
-            50,
-            |o| {
+    for gone in [0usize, usize::MAX] {
+        let what = format!("files removed {gone}");
+        let (dir, db, model, inject, raw) =
+            land_store_with(&format!("auto-reading-files-{gone}"), 50, |o| {
                 // A store of files: the test removes form files by their
                 // paths.
                 o.one_file = false;
                 o.partition_bytes = Some(160 << 10);
-                o.zpages_reading_from_files = from_files;
                 o.zpages_land_cold_past = false;
-            },
-        );
+            });
         inject.set_budget(raw * 3 / 2);
         assert!(
             tick_until(&db, 400, |c| c.prebuilt >= c.partitions),
@@ -12390,28 +12250,20 @@ fn the_reading_at_the_crossing_comes_from_the_files_on_disk() {
             db.zpage_counts()
         );
         let c = db.zpage_counts();
-        if from_files {
-            assert_eq!(
-                (c.sample_from_files, c.samples),
-                (1, 0),
-                "{what}: the reading from the files, no fill sample: {c:?}"
-            );
-            // The reading stands in the tick that wanted it and the model is
-            // recomputed at the next step: the buy within a few steps of the
-            // crossing, where a model recomputed at its period alone bought
-            // up to ten steps after the reading.
-            assert!(
-                c.sel_steps - before.sel_steps <= 6,
-                "{what}: bought within a few steps of the crossing: {} steps: {c:?}",
-                c.sel_steps - before.sel_steps
-            );
-        } else {
-            assert_eq!(
-                c.sample_from_files, 0,
-                "{what}: no reading from files: {c:?}"
-            );
-            assert!(c.samples >= 1, "{what}: the fill sample ran: {c:?}");
-        }
+        assert_eq!(
+            (c.sample_from_files, c.samples),
+            (1, 0),
+            "{what}: the reading from the files, no fill sample: {c:?}"
+        );
+        // The reading stands in the tick that wanted it and the model is
+        // recomputed at the next step: the buy within a few steps of the
+        // crossing, where a model recomputed at its period alone bought up
+        // to ten steps after the reading.
+        assert!(
+            c.sel_steps - before.sel_steps <= 6,
+            "{what}: bought within a few steps of the crossing: {} steps: {c:?}",
+            c.sel_steps - before.sel_steps
+        );
         assert!(
             tick_until(&db, 400, |c| c.attached >= n),
             "{what}: every partition attached: {:?}",
@@ -19831,294 +19683,6 @@ fn partitions_keep_why_the_stride_form_does_not_hold_them(background: bool) {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// A store held in two forms by its keys' place
-/// (`Options::zpages_stride_below`): the partitions whose first key is under
-/// the key are asked for the stride form and hold it, the partitions from
-/// the key up are not asked and hold the block form, and none keeps a
-/// reason, since none that was asked was declined. Under the forced form the
-/// builds are the segment work's where it has a thread of its own and the
-/// writer's where it runs inline, so the store is made both ways, and every
-/// key reads as the model has it through whichever file holds it.
-#[test]
-fn a_store_holds_the_stride_form_under_a_key_and_the_block_form_from_it_up() {
-    for background in [true, false] {
-        let what = &format!("two forms by a key, segment work on its own thread {background}");
-        let dir = scratch(&format!("stride-below-{background}"));
-        let cut = numbered_key(3000);
-        let mut db = Db::create(
-            &dir,
-            stride_forced(|o| {
-                o.partition_bytes = Some(160 << 10);
-                o.publish_in_background = background;
-                o.zpages_stride_below = Some(cut.as_slice().into());
-            }),
-        )
-        .unwrap();
-        let model = numbered_load(&mut db, 6000, 100, 0x5EA6);
-        db.zpages_settle().unwrap();
-        let c = db.zpage_counts();
-        assert_eq!(
-            c.form_files, c.partitions,
-            "{what}: a form file each: {c:?}"
-        );
-        // A partition's lower fence is its first key but the first's, which
-        // is open: the partitions under the key are the fences under it.
-        let under = db
-            .zpage_heat()
-            .iter()
-            .filter(|h| h.lo.as_slice() < cut.as_slice())
-            .count() as u64;
-        assert!(
-            under > 0 && under < c.partitions,
-            "{what}: partitions on both sides of the key: {under} of {c:?}"
-        );
-        assert_eq!(
-            c.stride_files, under,
-            "{what}: the stride form under the key and nowhere else: {c:?}"
-        );
-        let nos = db.zpage_stride_nos();
-        assert!(
-            nos.iter().all(|&n| n == 0),
-            "{what}: a partition not asked keeps no reason: {nos:?}"
-        );
-        let keys: Vec<Vec<u8>> = model.keys().cloned().collect();
-        check(&db, &model, &keys, what);
-        let c = db.zpage_counts();
-        assert!(
-            c.stride_reads > 0 && c.reads > c.stride_reads,
-            "{what}: reads through both files: {c:?}"
-        );
-        assert_eq!(c.fallbacks, 0, "{what}: {c:?}");
-        db.close().unwrap();
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-}
-
-/// The stride form asked for only where the store in it fits the room
-/// (`Options::zpages_stride_room`): a store written with no form and opened
-/// under the forced stride form, so that every partition is built with the
-/// store whole and no piece beside it, against an injected budget. The
-/// stride form of the store is its values alone, six thousand of a hundred
-/// bytes: at a budget of exactly that every partition is asked and holds the
-/// stride form, and a byte under it none is asked, each is built in the
-/// block form with no reason kept, and the builds that asked nothing are
-/// counted. A budget of the payload's size would pass both, and a rule that
-/// counted the keys would refuse the first. A store the room moved under
-/// between its builds is in two forms, the files on disk attached as they
-/// are.
-#[cfg(target_os = "linux")]
-#[test]
-fn a_build_asks_for_the_stride_form_only_where_the_store_in_it_fits_the_room() {
-    const KEYS: usize = 6000;
-    const WIDTH: usize = 100;
-    let values = (KEYS * WIDTH) as u64;
-    let room = |budget: u64| {
-        let inject = std::sync::Arc::new(supdb::ZInject::new());
-        inject.set_budget(budget);
-        let handle = inject.clone();
-        let opts = stride_forced(move |o| {
-            o.partition_bytes = Some(160 << 10);
-            o.publish_in_background = true;
-            o.zpages_stride_room = true;
-            o.zpages_inject = Some(inject);
-        });
-        (opts, handle)
-    };
-    for (budget, fits) in [(values, true), (values - 1, false)] {
-        let what = &format!("the stride form held to a room of {budget} bytes");
-        let dir = scratch(&format!("stride-room-{fits}"));
-        let model = {
-            let mut db = Db::create(
-                &dir,
-                Options {
-                    partition_bytes: Some(160 << 10),
-                    ..off()
-                },
-            )
-            .unwrap();
-            let model = numbered_load(&mut db, KEYS, WIDTH, 0x5EA7);
-            db.settle().unwrap();
-            db.close().unwrap();
-            model
-        };
-        let mut db = Db::open(&dir, room(budget).0).unwrap();
-        db.zpages_settle().unwrap();
-        let c = db.zpage_counts();
-        assert!(c.partitions > 2, "{what}: several partitions: {c:?}");
-        assert_eq!(
-            c.form_files, c.partitions,
-            "{what}: a form file each: {c:?}"
-        );
-        if fits {
-            assert_eq!(
-                (c.stride_files, c.stride_no_room),
-                (c.partitions, 0),
-                "{what}: every partition asked and held in the stride form: {c:?}"
-            );
-        } else {
-            assert_eq!(c.stride_files, 0, "{what}: none in the stride form: {c:?}");
-            assert!(
-                c.stride_no_room >= c.partitions,
-                "{what}: every build asked nothing, counted: {c:?}"
-            );
-        }
-        let nos = db.zpage_stride_nos();
-        assert!(
-            nos.iter().all(|&n| n == 0),
-            "{what}: a partition not asked keeps no reason: {nos:?}"
-        );
-        let keys: Vec<Vec<u8>> = model.keys().cloned().collect();
-        check(&db, &model, &keys, what);
-        let c = db.zpage_counts();
-        assert_eq!(c.fallbacks, 0, "{what}: {c:?}");
-        assert_eq!(
-            c.stride_reads > 0,
-            fits,
-            "{what}: reads through the form the room chose: {c:?}"
-        );
-        db.close().unwrap();
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-    // The room gone between a store's builds: the first half built with
-    // room for it, the second written after the budget fell to a byte (the
-    // seam reads zero as no budget injected).
-    let what = "the room gone between a store's builds";
-    let dir = scratch("stride-room-moved");
-    let (opts, inject) = room(u64::MAX);
-    let mut db = Db::create(&dir, opts).unwrap();
-    let mut model = numbered_load(&mut db, KEYS / 2, WIDTH, 0x5EA8);
-    db.zpages_settle().unwrap();
-    let first = db.zpage_counts();
-    assert!(
-        first.stride_files > 0 && first.stride_files == first.form_files,
-        "{what}: the first half in the stride form: {first:?}"
-    );
-    inject.set_budget(1);
-    let mut rng = Rng(0x5EA9);
-    for i in KEYS / 2..KEYS {
-        let v: Vec<u8> = (0..WIDTH).map(|_| (rng.next() >> 24) as u8).collect();
-        let k = numbered_key(i);
-        db.append(&k, &v);
-        model.insert(k, vec![v]);
-    }
-    db.commit().unwrap();
-    db.flush().unwrap();
-    db.zpages_settle().unwrap();
-    let c = db.zpage_counts();
-    assert_eq!(
-        c.form_files, c.partitions,
-        "{what}: a form file each: {c:?}"
-    );
-    assert!(
-        c.stride_files > 0 && c.stride_files < c.form_files && c.stride_no_room > 0,
-        "{what}: a store in two forms: {c:?}"
-    );
-    let keys: Vec<Vec<u8>> = model.keys().cloned().collect();
-    check(&db, &model, &keys, what);
-    let c = db.zpage_counts();
-    assert!(
-        c.stride_reads > 0 && c.reads > c.stride_reads && c.fallbacks == 0,
-        "{what}: reads through both files: {c:?}"
-    );
-    db.close().unwrap();
-    let _ = std::fs::remove_dir_all(&dir);
-}
-
-/// The same line at a merge's output finish, the third site a partition's
-/// form is built at: every key put again, the pieces merged, and each output
-/// built at its finish in the stride form where its first key is under the
-/// key and in the block form from the key up. The files on disk are of both
-/// kinds, and installed they serve the partitions as the line has them.
-#[cfg(target_os = "linux")]
-#[test]
-fn a_merges_outputs_are_built_in_the_form_their_side_of_the_key_has() {
-    let what = "two forms by a key at the outputs' finish";
-    let cut = numbered_key(10_000);
-    let (dir, mut db, mut model, inject, raw) = land_store_loaded(
-        "auto-finish-stride-below",
-        50,
-        |o| {
-            o.zpages_stride = ZStride::Forced;
-            o.zpages_stride_below = Some(cut.as_slice().into());
-            o.zpages_build_at_finish = true;
-            o.zpages_ahead_builders = 8;
-            o.partition_bytes = Some(1 << 20);
-            o.l0_trigger = 1;
-        },
-        |db| numbered_load(db, 20_000, 100, 0x5F2),
-    );
-    let mut seen = 0usize;
-    db.scan(b"", 10, kv(&mut |_, _| seen += 1)).unwrap();
-    assert_eq!(seen, 10);
-    inject.set_decode_cost(std::time::Duration::from_micros(1));
-    inject.set_budget(raw / 2);
-    wait_steps(&db, 2);
-    let mut rng = Rng(0x5EEE);
-    let keys: Vec<Vec<u8>> = model.keys().cloned().collect();
-    for chunk in keys.chunks(250) {
-        for k in chunk {
-            let v: Vec<u8> = (0..100).map(|_| (rng.next() >> 24) as u8).collect();
-            db.put(k, &v);
-            model.insert(k.clone(), vec![v]);
-        }
-        db.commit().unwrap();
-    }
-    db.seal().unwrap();
-    db.settle().unwrap();
-    wait_for("the builds at the outputs' finish to end", || {
-        let c = db.zpage_counts();
-        c.finish_builds >= 1 && c.finish_live == 0 && db.merges_in_flight() == 0
-    });
-    let c = db.zpage_counts();
-    assert!(
-        c.stride_builds > 0 && c.stride_builds < c.finish_builds,
-        "{what}: outputs built in both forms: {c:?}"
-    );
-    let magics: Vec<_> = form_files(&dir)
-        .iter()
-        .map(|f| {
-            let b = common::store_file(f);
-            supdb::db::zpages::trailer_magic(&b[b.len() - ZTRAILER..])
-                == Some(supdb::db::zpages::STRIDE_MAGIC)
-        })
-        .collect();
-    assert!(
-        magics.iter().any(|&m| m) && magics.iter().any(|&m| !m),
-        "{what}: files of both kinds on disk: {magics:?}"
-    );
-    assert!(
-        tick_until(&db, 400, |c| c.sel_installs >= 1
-            && c.form_files == c.partitions),
-        "{what}: the files on disk not installed: {:?}",
-        db.zpage_counts()
-    );
-    let c = db.zpage_counts();
-    let under = db
-        .zpage_heat()
-        .iter()
-        .filter(|h| h.lo.as_slice() < cut.as_slice())
-        .count() as u64;
-    assert!(
-        under > 0 && under < c.partitions,
-        "{what}: {under} of {c:?}"
-    );
-    assert_eq!(
-        (c.stride_files, c.build_starts),
-        (under, 0),
-        "{what}: the finishes' files installed as built, the stride form under the key: {c:?}"
-    );
-    let nos = db.zpage_stride_nos();
-    assert!(nos.iter().all(|&n| n == 0), "{what}: no reason: {nos:?}");
-    let r = db.reader().unwrap();
-    check(&r, &model, &keys, what);
-    drop(r);
-    let c = db.zpage_counts();
-    assert!(c.stride_reads > 0, "{what}: {c:?}");
-    assert_eq!(c.fallbacks, 0, "{what}: {c:?}");
-    db.close().unwrap();
-    let _ = std::fs::remove_dir_all(&dir);
-}
-
 /// The room at a merge's output finish (`Options::zpages_stride_room`): the
 /// store past a budget its values alone fit with fifty kilobytes to spare,
 /// every key put again and the pieces merged. The finish's plan is made
@@ -22011,7 +21575,6 @@ fn the_reading_from_files_prices_a_stride_file_as_on_disk() {
             |o| {
                 o.zpages_stride = ZStride::Forced;
                 o.partition_bytes = Some(160 << 10);
-                o.zpages_reading_from_files = true;
                 o.zpages_land_cold_past = false;
             },
             |db| {

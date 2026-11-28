@@ -961,20 +961,10 @@ fence searched at every page and the memo asked twice a group
 (`Options::zpages_bulk_steps` off), and `supdb-zflatshort` with the flat
 LZ4 decoder lent the fast loop's slack alone, so each group's last
 sequences go the fast loop's way (`Options::zpages_flat_slack` off);
-`supdb-noscanrawahead` is `supdb` with a walk of a partition's raw
-records asking for none of them ahead of it (`Options::scan_raw_ahead`
-off), `supdb-scanrawahead` with the ask made on every store, within the
-last-level cache or past it (`Options::scan_raw_ahead_past_llc` off), and
-`supdb-scanrawpaced` with it made a kilobyte ahead as the walk goes
-(`Options::scan_raw_ahead_lead`); `supdb-settlegated` and `supdb-ingestsettlegated` are `supdb` and
+`supdb-settlegated` and `supdb-ingestsettlegated` are `supdb` and
 `supdb-ingest` filing a commit's batch at the write only where the
 partitions' data passes the last-level cache
-(`Options::forms_settle_past_llc`); `supdb-readhashes` and
-`supdb-ingestreadhashes` are `supdb` and `supdb-ingest` with a point read
-hashing its key in each source it consults (`Options::read_hash_once`
-off), and `supdb-readnoahead` and `supdb-ingestreadnoahead` with it asking
-for the memtable's slot alone ahead of its probes
-(`Options::read_lines_ahead` off); `supdb-settlebuildsfiled` and
+(`Options::forms_settle_past_llc`); `supdb-settlebuildsfiled` and
 `supdb-ingestsettlebuildsfiled` are `supdb` and `supdb-ingest` with a
 burst's batch filed in the commit building the forms its settle filed into
 (`Options::forms_settle_builds_filed`); `supdb-ingestpromote` is
@@ -989,25 +979,7 @@ or more converted (`Options::forms_convert_from`), and
 writer's fills, the yields and the walk's crossing from `CONVWRITER`,
 `CONVSTRICT` and `CONVWALK` (`Options::forms_convert_reads`,
 `forms_convert_light_writer`, `forms_convert_light_yields`,
-`forms_convert_at_walk`); `supdb-formahead`, `supdb-sparsespan` and
-`supdb-runsheld`, with their `supdb-ingest` siblings, are the scan's seek
-asking for the first two blocks' form headers
-(`Options::scan_form_ahead`), a sparse form asked for over the walk's share
-of it (`Options::scan_prefetch_sparse_span`) and a partition walk's raw
-runs through one walker (`Options::scan_runs_held`), and
-`supdb-scanlevers` and `supdb-ingestscanlevers` the three together;
-`supdb-widefull` and `supdb-ingestwidefull` merge a wide block's sources
-whole for a scan, where the default stops at the scan's limit
-(`Options::scan_wide_capped`), `supdb-lonetombs` and
-`supdb-ingestlonetombs` search every overlay key's sources for its newest
-tombstone, a lone source's too (`Options::emit_lone_unsearched`), and
-`supdb-widewalks` and `supdb-ingestwidewalks` walk a block wide by its
-count of keys past the end for as long as it is, where the default copies
-it once its walks have paid (`Options::forms_copy_hot_wide`), and
-`supdb-widecopyfixed` and `supdb-ingestwidecopyfixed` copy it at the walk a
-fixed ratio of a walk to a hundred copied keys names, where the default
-copies it once the keys its walks merged reach the entries the copy will
-merge (`Options::forms_copy_wide_priced`);
+`forms_convert_at_walk`);
 `supdb-pacesyncsbatch` holds a syncing commit's paced batch within the
 share or the batch, the larger, and `supdb-pacesyncsthresholds` holds a
 batch of a twentieth of the store and at most 2048 writes within the share
@@ -1020,14 +992,6 @@ other batch within the backlog bound (`Options::upkeep_pace_syncs_model`);
 buying commit has synced, where the default writes it ahead of the
 commit's frames on the writer's path (`Options::wal_ahead_beside`,
 refuted);
-`supdb-probestwice` and `supdb-ingestprobestwice` have a point read over a
-store with tombstones probe every source again after its tombstone pass,
-where the default keeps what the pass found of each source
-(`Options::read_probes_once`);
-`supdb-pointexts` and `supdb-ingestpointexts` have a point read rebuild
-the extent of every record it reads and walk the run by it, where the
-default takes the values of the common record, the compact record with a
-fixed run, from the record where it lies (`Options::point_fixed`), and
 `supdb-pointsources` and `supdb-ingestpointsources` have every point read
 take the general read of its sources, where the default reads a partition
 and the live table alone, or the partition, its pieces, the frozen tables
