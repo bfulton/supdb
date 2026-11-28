@@ -15153,6 +15153,11 @@ fn a_merge_whose_helper_sync_failed_lands_nothing() {
 /// that drain is answered strictly whatever the option says, since an
 /// early answer gives no word and the loop lands no such job. With
 /// neither the drain is answered early, and its slot follows in the loop.
+/// The early answer is the drain meeting its seal readable and not yet
+/// sealed, which a loaded machine's seal thread can pass before the ask
+/// comes, so where the answer may be early the seal's fsyncs are held over
+/// the flush; a handle's thread lets them go should the flush not answer
+/// within its bound, which then fails at the count instead of hanging.
 fn do_drain_lands_its_run(tag: &str, inline: bool, strict: bool, presync: bool) {
     let d = dir(&format!("dur-do-lands-{tag}"));
     let opts = Options {
@@ -15169,13 +15174,36 @@ fn do_drain_lands_its_run(tag: &str, inline: bool, strict: bool, presync: bool) 
             db.commit().unwrap();
         }
     }
+    let flushed = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let watchdog = early.then(|| {
+        let h = db.reader().unwrap();
+        db.hold_seal_durable(true);
+        let flushed = flushed.clone();
+        std::thread::spawn(move || {
+            let t = std::time::Instant::now();
+            while !flushed.load(std::sync::atomic::Ordering::Acquire) {
+                if t.elapsed() > std::time::Duration::from_secs(60) {
+                    h.hold_seal_durable_from_handle(false);
+                    return true;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+            false
+        })
+    });
     db.flush().unwrap();
+    flushed.store(true, std::sync::atomic::Ordering::Release);
     assert_eq!(
         db.seal_waits().drains_early,
         u64::from(early),
         "{tag}: the drain answered early where it may"
     );
-    if early {
+    if let Some(w) = watchdog {
+        assert!(
+            !w.join().unwrap(),
+            "{tag}: the flush waited on the seal's held fsyncs"
+        );
+        db.hold_seal_durable(false);
         db.settle().unwrap();
     }
     let (_, _, names) = ss_newest(&d).expect("a manifest");
