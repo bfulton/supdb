@@ -1,0 +1,16 @@
+diff --git a/src/db.rs b/src/db.rs
+index 4d2bd5c5..6aede68b 100644
+--- a/src/db.rs
++++ b/src/db.rs
+@@ -70046,6 +70046,11 @@ mod shared_table {
+                 .map(|_| {
+                     let (m, stop) = (&m, &stop);
+                     s.spawn(move || {
++                        // PROBE (not for commit): the reader's thread first
++                        // runs after the writers are done.
++                        if std::env::var_os("PROBE_LATE_READER").is_some() {
++                            std::thread::sleep(std::time::Duration::from_secs(1));
++                        }
+                         let mut seen = 0u64;
+                         while !stop.load(Relaxed) {
+                             for i in 0..KEYS {

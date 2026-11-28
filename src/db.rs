@@ -70041,13 +70041,23 @@ mod shared_table {
             }
         }
         let stop = std::sync::atomic::AtomicBool::new(false);
+        // Each reader's rounds so far. The writers go on past their puts
+        // until every reader has read whole rounds beside them, and the
+        // readers read their first round before the writers start: a reader
+        // whose thread first ran after the writers had done looked at the
+        // stop before its first read and read nothing, beside busy loops.
+        let rounds = [
+            std::sync::atomic::AtomicU64::new(0),
+            std::sync::atomic::AtomicU64::new(0),
+        ];
+        let started = std::sync::Barrier::new(4);
         std::thread::scope(|s| {
             let readers: Vec<_> = (0..2)
-                .map(|_| {
-                    let (m, stop) = (&m, &stop);
+                .map(|me| {
+                    let (m, stop, rounds, started) = (&m, &stop, &rounds, &started);
                     s.spawn(move || {
-                        let mut seen = 0u64;
-                        while !stop.load(Relaxed) {
+                        let mut first = true;
+                        while first || !stop.load(Relaxed) {
                             for i in 0..KEYS {
                                 let (r, vs) = lean(m, &key(i));
                                 assert_eq!((r, vs.len()), ("done", 1), "key {i}");
@@ -70056,25 +70066,32 @@ mod shared_table {
                                     v.len() == 256 && v.iter().all(|&b| b == v[0]),
                                     "a value torn by an overwrite"
                                 );
-                                seen += 1;
+                            }
+                            rounds[me].fetch_add(1, Relaxed);
+                            if std::mem::take(&mut first) {
+                                started.wait();
                             }
                         }
-                        seen
                     })
                 })
                 .collect();
             let writers: Vec<_> = (0..2u64)
                 .map(|w| {
-                    let m = &m;
+                    let (m, rounds, started) = (&m, &rounds, &started);
                     s.spawn(move || {
+                        started.wait();
+                        let at = [rounds[0].load(Relaxed), rounds[1].load(Relaxed)];
+                        let beside = || (0..2).all(|r| rounds[r].load(Relaxed) >= at[r] + 2);
                         let mut l = TableLocal::default();
-                        for n in 0..PUTS {
+                        let mut n = 0u64;
+                        while n < PUTS || !beside() {
                             let k = key((n + w) % KEYS);
                             let v = [(2 + (n * 2 + w) % 250) as u8; 256];
                             assert_eq!(
                                 m.lean_overwrite(&mut l, m.hash(&k), &k, &v, None),
                                 LeanWrite::Done
                             );
+                            n += 1;
                         }
                     })
                 })
@@ -70084,9 +70101,16 @@ mod shared_table {
             }
             stop.store(true, Relaxed);
             for h in readers {
-                assert!(h.join().unwrap() > 0, "a reader read nothing");
+                h.join().unwrap();
             }
         });
+        for r in &rounds {
+            assert!(
+                r.load(Relaxed) >= 3,
+                "a reader read {} rounds, one before the writes and not two beside them",
+                r.load(Relaxed)
+            );
+        }
     }
 
     /// A read of a table that rewrites in place through the plain value
