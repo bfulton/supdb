@@ -78,14 +78,24 @@ not on each piece.
   the suite and the examples hold 667 of them. Kept experimental and
   test-seam fields are hidden from the docs, and that is all the last
   cluster does.
-- `CLAUDE.md`'s sentence that the comparison arms are not dead code names
-  four options that go (`cursor_merge` stays as a test seam;
-  `scan_merge`, `scan_snapshot_arena`, `flush_ranges` go). The pull request
-  that removes the last of them rewrites the sentence.
+- `CLAUDE.md` at C0 names no option in its sentence that the comparison
+  arms are not dead code (#37 rewrote it), so phase 1 does not edit
+  `CLAUDE.md`.
 
 ## Batches
 
 | batch | clusters (the reviewer's grouping) | branch | state |
 |---|---|---|---|
 | 1 | PR1: adaptive-lag, fit-trim, zpages-drop, seal-shape, upkeep-wake | `rc/phase1-pr1`, `2eca03bd` to `31c90d38` | full gate green; cost read by function (one spill, net -3 a read); an independent review passed every removal as keeping the default's behaviour; merged onto the working branch at `98e4e8f4` |
-| 2 | PR2, PR3, PR4 | the same branch, `9fc05328` to `08b28998` | written; in its gate and cost count. Removing the held walker let the compiler inline the raw scan walk into `scan_whole`, a twentieth more a scan record; `08b28998` keeps the walk out of line, as at the base |
+| 2 | PR2, PR3, PR4 | the same branch, `9fc05328` to `08b28998` | full gate green; cost read by function (reds in `Blob::scan_at_in`, `Reader::scan`, `settle_each`, `overlay_all`, each read as inlining or register allocation, every probe total down but `merge`'s clock-driven sweep); merged onto the working branch at `8e3f9d71`; the independent review and the merged tree's gate, count and fuzz are running here. Removing the held walker let the compiler inline the raw scan walk into `scan_whole`, a twentieth more a scan record; `08b28998` keeps the walk out of line, as at the base. `zpages_buy_crosses` is held for PR7, since three roster arms pin it |
+| 3 | A: PR5, PR6, PR7, PR8, PR19 | `claude/supdb-pretag-p1-a`, a session of its own | started 2026-11-28 |
+| 3 | B: PR9, PR10, PR11, PR12, PR20, PR21 | `claude/supdb-pretag-p1-b`, a session of its own | started 2026-11-28 |
+| 3 | C: PR13 to PR18, the compact form's chain | `claude/supdb-pretag-p1-c`, a session of its own | started 2026-11-28 |
+| 3 | D: PR22 to PR29, the seal to the encryption | `claude/supdb-pretag-p1-d`, a session of its own | started 2026-11-28 |
+| 4 | PR30, the API | the working branch | after the four tracks are merged and their merged gate is green |
+
+The four tracks of batch 3 start from `8e3f9d71` at once, each on a VM of
+its own, each pushing a gated and counted head after every group. Each
+track's branch is merged here as it comes, and the merged tree runs whole
+(the gate, the count against the head before the merge, and the fuzz past
+the gate's ranges) before the next is merged.

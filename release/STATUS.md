@@ -18,8 +18,9 @@ here, and both are Bright's to close and delete.
 Sessions with VMs of their own, each pushing a branch the coordinator
 merges here: the measurement (`release-measure`), the hostile-input and
 `unsafe` audits (`claude/supdb-pretag-audits`), the supply-chain fixes
-(`claude/supdb-pretag-supply-chain`) and the flakes
-(`claude/supdb-pretag-flakes`).
+(`claude/supdb-pretag-supply-chain`), the flakes
+(`claude/supdb-pretag-flakes`), and phase 1's four tracks
+(`claude/supdb-pretag-p1-a` to `-d`).
 
 ## Passes
 
@@ -30,7 +31,7 @@ merges here: the measurement (`release-measure`), the hostile-input and
 | 0 | History decision (B) | Bright | none | keep history and fix forward, the plan's default; the audit finds nothing for a rewrite (`release/history.md`) | nothing, unless Bright overrules |
 | 0 | Release-candidate branch, C0 | coordinator | `release-candidate`, cut at C0 = `b3a043dc` (tree `7f58d776`) | done; `ci` was green on all nine legs at that commit (push run 46057759527) | nothing |
 | 0 | Baseline at C0 | measurement agent, cloud session `supdb: baseline measurement at C0` | `release/baseline.md`; rows on `release-measure` | prepared and verified; static counts measured; the cost count of C0 against itself running here; the measurement session started at 17:59 ET on the rows and the floor | nothing |
-| 1 | Delete: options ledger, dead code, API surface | coordinator's subagents | written on `rc/phase1-pr1`, merged here by batch | the gate's fix (#38's `2fc48db0`) and the first batch (11 options and 15 arms in five commits, gate green, cost read by function, reviewed) are merged here; the second batch (PR2 to PR4 clusters, 11 commits) is in its gate and cost count | the second batch's report, then its review; the merged tree's whole gate runs when it comes on |
+| 1 | Delete: options ledger, dead code, API surface | coordinator's subagents | batches 1 and 2 written on `rc/phase1-pr1`; batch 3 in four tracks, `claude/supdb-pretag-p1-{a,b,c,d}`; all merged here | the gate's fix (#38's `2fc48db0`) and batches 1 and 2 (the reviewer's groups PR1 to PR4) are merged here at `8e3f9d71`; batch 2's review and the merged tree's gate run on this machine; PR5 to PR29 are being written in four sessions of their own since 2026-11-28 (`release/phase1.md`, Batches) | batch 2's review; each track's groups; then PR30 |
 | 2 | Reshape: split `src/db.rs`, style | not assigned | none | not started | phase 1 |
 | 3 | Verify: audits, then fixes | coordinator's subagents | `release/findings/` | four read-only audits done (guarantees, format, encryption, supply chain); the hostile-input and `unsafe` audits, and the supply-chain fixes, started on 2026-11-28 in sessions of their own; the engine's fixes wait for phase 1 | phase 1, then decision 4 (default: format 2 promised, one-file and cipher stores experimental) |
 | 4 | Tests: flake loop, runtime, coverage | the flakes session | `claude/supdb-pretag-flakes` | the three known flakes (ARM durable, macOS settle, cipher room) being diagnosed since 2026-11-28; the loop itself not started | the last fix of phase 3, decision 5 |
