@@ -64,7 +64,6 @@ thread	src/db.rs	*	118	the engine's threads, waits and sleeps (S1: pin::)
 thread	src/db/pager.rs	*	9	the cache's evictor and the waits for it (R1 lets the pager spawn and wait)
 thread	src/flatindex.rs	*	3	the writer's helper thread (S1: pin::)
 # Code the door's build compiles out.
-cfgout	src/blob.rs	Blob::scan_at_in	1	wasm: a lead nobody reads
 cfgout	src/block.rs	crc32_from	1	aarch64: the CRC instructions' dispatch
 cfgout	src/block.rs	crc32c_hw	1	aarch64: the CRC instructions
 cfgout	src/db.rs	Reader::convert_walked	1	not debug_assertions: a binding the check below uses
