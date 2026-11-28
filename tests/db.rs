@@ -1192,7 +1192,7 @@ fn a_pass_the_writer_wants_its_upkeep_back_from_yields_at_its_next_step() {
 }
 
 /// The builder ahead builds a partition's blocks only where the page cache
-/// holds at least `Options::ahead_resident_pct` of the pages a build reads
+/// holds at least nine tenths of the pages a build reads
 /// (the kernel's answer, or the test's seam `ZInject::set_records_resident`):
 /// out of core a partition the bound has pushed out is read from the
 /// device, a round trip a page, for scans that read a few of its blocks.
@@ -1285,8 +1285,7 @@ fn a_fill_the_writer_wants_its_upkeep_back_from_stops_at_its_next_block() {
             &d,
             Options {
                 upkeep: supdb::Upkeep::Background(1),
-                // The fill is the commit's where no builder ahead runs, as
-                // out of core (`Options::ahead_out_of_core`).
+                // The fill is the commit's where no builder ahead runs.
                 scan_cache_ahead: false,
                 partition_bytes: Some(256 << 10),
                 seal_max_pct: 0,
@@ -14723,108 +14722,24 @@ fn the_forms_survive_a_direct_runs_start() {
     std::hint::black_box(sink);
 }
 
-/// EXPERIMENT: a publish starts the builder and the next commit installs
-/// what it posted, with no scan asking: after a seal the table is empty,
-/// and with `build_ahead_on_publish` a commit with no scan before it
-/// fills it. Held to the model through a handle and the writer.
-#[test]
-fn a_publish_starts_the_builder_and_a_commit_installs_its_forms() {
-    a_publish_starts_the_builder_and_a_commit_installs_its_forms_with(supdb::Upkeep::Inline);
-}
-
-/// The same with the commit's upkeep lent to the thread, which installs
-/// the builder's forms at its pass: the builder's check at the commit
-/// takes the upkeep home, and the commit it dropped is handed back.
-#[test]
-fn a_publish_starts_the_builder_and_the_upkeep_thread_installs_its_forms() {
-    a_publish_starts_the_builder_and_a_commit_installs_its_forms_with(supdb::Upkeep::Background(1));
-}
-
-fn a_publish_starts_the_builder_and_a_commit_installs_its_forms_with(upkeep: supdb::Upkeep) {
-    let d = dir(&format!("ahead-publish-{upkeep:?}"));
-    let opts = Options {
-        seal_bytes: 1 << 20,
-        partition_bytes: Some(2 << 10),
-        l0_trigger: 64,
-        scan_block_cache: true,
-        // The builder on a store this small.
-        scan_cache_ahead_min_blocks: 0,
-        forms_settle_backlog_pct: 0,
-        commit_forms: true,
-        build_ahead_on_publish: true,
-        upkeep,
-        // In memory, as `a_builder_ahead_of_the_reader_fills_the_cache`.
-        zpages: supdb::ZPages::Auto,
-        ..common::options()
-    };
-    let mut db = Db::create(&d, opts).unwrap();
-    let mut m = ScanModel::default();
-    let key = |k: u32| format!("key-{k:05}");
-    for k in 0..1500u32 {
-        m.append(&mut db, &key(k), "v0");
-    }
-    db.commit().unwrap();
-    db.flush().unwrap();
-    m.flushed();
-    db.settle().unwrap();
-    assert!(db.levels().0 > 1, "several partitions");
-    for k in (0..1500u32).step_by(5) {
-        m.append(&mut db, &key(k), "v1");
-    }
-    db.commit().unwrap();
-    // A handle the forms are published for. The seal: a publish, and
-    // `settle` joins the builder it started.
-    let _handle = db.reader().unwrap();
-    db.seal().unwrap();
-    db.settle().unwrap();
-    assert_eq!(db.canonical_forms().0, 0, "the seal emptied the table");
-    // A commit with no scan before it: the builder's forms installed and
-    // published, the batch settled into them.
-    for k in (1..1500u32).step_by(11) {
-        m.append(&mut db, &key(k), "v2");
-    }
-    let passes = db.upkeep_counts()[0];
-    db.commit().unwrap();
-    if upkeep != supdb::Upkeep::Inline {
-        db.settle().unwrap();
-        assert!(
-            db.upkeep_counts()[0] > passes,
-            "the thread made no pass, so nothing here tested it"
-        );
-    }
-    let (forms, _, _, _) = db.canonical_forms();
-    assert!(
-        forms > 0,
-        "the commit installed the builder's forms: {forms}"
-    );
-    assert_ne!(db.forms_position(), usize::MAX, "and published them");
-    let r = db.reader().unwrap();
-    m.check(&r, "a reader over the installed forms");
-    m.check(&db, "the writer over its own");
-}
-
 /// The builder ahead starts while the store is in core, the controller's
-/// gate at the raw form, and out of core only under the option
-/// (`Options::ahead_out_of_core`, on as shipped for the partitions whose
-/// pages are in memory; off is the shape before, `supdb-aheadincore`) and
-/// once the state has been scanned `Options::ahead_out_of_core_scans`
-/// times: a burst out of core dirties every block, and the builder built
-/// each from pages the bound pushed out for scans that read a few. A
-/// publish over a piece starts the builder and the next
-/// commit installs its forms with the gate at raw, installs nothing with
-/// the gate away from it, installs them again under the option where the
-/// scans are counted enough, and nothing where they are not; the model
-/// holds through a handle and the writer in every case.
+/// gate at the raw form, and out of core once the state has been scanned
+/// `Options::ahead_out_of_core_scans` times: a burst out of core dirties
+/// every block, and the builder built each from pages the bound pushed out
+/// for scans that read a few. A scan of the state a seal over a piece
+/// publishes starts the builder with the gate at raw, and out of core
+/// where the scans are counted enough, and none where they are not; the
+/// next commit installs its forms, and the model holds through a handle
+/// and the writer in every case.
 #[test]
-fn the_builder_ahead_starts_in_core_and_out_of_core_only_under_the_option() {
-    for (gate, ooc, scans, builds) in [
-        (0u8, false, 0u64, true),
-        (1, false, 0, false),
-        (1, true, 0, true),
-        (1, true, 3, true),
-        (1, true, u64::MAX, false),
+fn the_builder_ahead_starts_out_of_core_once_the_state_is_scanned() {
+    for (gate, scans, builds) in [
+        (0u8, 0u64, true),
+        (1, 0, true),
+        (1, 3, true),
+        (1, u64::MAX, false),
     ] {
-        let d = dir(&format!("ahead-gate-{gate}-{ooc}-{scans}"));
+        let d = dir(&format!("ahead-gate-{gate}-{scans}"));
         let opts = Options {
             seal_bytes: 1 << 20,
             partition_bytes: Some(2 << 10),
@@ -14833,11 +14748,11 @@ fn the_builder_ahead_starts_in_core_and_out_of_core_only_under_the_option() {
             scan_cache_ahead_min_blocks: 0,
             forms_settle_backlog_pct: 0,
             commit_forms: true,
-            build_ahead_on_publish: true,
             upkeep: supdb::Upkeep::Inline,
             zpages: supdb::ZPages::Off,
-            ahead_out_of_core: ooc,
             ahead_out_of_core_scans: scans,
+            // In core, the builder at the state's first scan.
+            ahead_in_core_scans_div: 0,
             ..common::options()
         };
         let mut db = Db::create(&d, opts).unwrap();
@@ -14860,24 +14775,28 @@ fn the_builder_ahead_starts_in_core_and_out_of_core_only_under_the_option() {
         db.settle().unwrap();
         assert_eq!(db.canonical_forms().0, 0, "the seal emptied the table");
         // Scans over the published state, one more than the count the
-        // builder waits for where it waits for one it can reach.
-        if scans > 0 && scans < u64::MAX {
-            let mut sink = 0usize;
-            for _ in 0..=scans {
-                db.scan(key(7).as_bytes(), 1, kv(&mut |_k, v| sink += v.len()))
-                    .unwrap();
-            }
-            db.settle().unwrap();
+        // builder waits for where it waits for one it can reach, and four
+        // where it never starts.
+        let started = db.forms_events()[2];
+        let mut sink = 0usize;
+        for _ in 0..=scans.min(3) {
+            db.scan(key(7).as_bytes(), 1, kv(&mut |_k, v| sink += v.len()))
+                .unwrap();
         }
+        db.settle().unwrap();
+        assert_eq!(
+            db.forms_events()[2] > started,
+            builds,
+            "gate {gate}, scans {scans}: the scans started the builder"
+        );
         for k in (1..1500u32).step_by(11) {
             m.append(&mut db, &key(k), "v2");
         }
         db.commit().unwrap();
         let forms = db.canonical_forms().0;
-        assert_eq!(
-            forms > 0,
-            builds,
-            "gate {gate}, out of core {ooc}, scans {scans}: the builder's forms installed: {forms}"
+        assert!(
+            !builds || forms > 0,
+            "gate {gate}, scans {scans}: the builder's forms installed: {forms}"
         );
         let r = db.reader().unwrap();
         m.check(&r, "a reader");

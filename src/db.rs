@@ -3507,38 +3507,8 @@ pub struct Options {
     /// 598k-699k ops/s; at thirty thousand, 470 blocks, 588k-635k against
     /// 529k-772k; at a hundred thousand, 1,560 blocks, 702k-773k against
     /// 682k-758k. A test that wants the builder on a small store sets 0.
+    #[doc(hidden)]
     pub scan_cache_ahead_min_blocks: usize,
-    /// The builder ahead starts while the store is out of core too -- the
-    /// controller's gate away from the raw form -- for the partitions
-    /// whose pages the cache holds (`ahead_resident_pct`). Off, it starts
-    /// in core alone, the shape before: a burst out of core dirties every
-    /// block of the store, and the builder built every one of them from
-    /// partition pages the bound had pushed out, for scans that read a few
-    /// of them -- at ten million keys under 1.25 GiB the ten-percent lag
-    /// pass took 69,000-83,000 major faults with the builder and 31,000
-    /// without, and the scanning thread paid its install of the forms
-    /// besides. That is the shape the residency gate is for; where the
-    /// pages are in memory the builder's work is what it is in core, and
-    /// at ten million keys under 1.25 GiB E, the one mix that scans, had
-    /// built its whole block cache inside its own window, 137,000 forms:
-    /// with the builder it found 100,000 of them built on the builder's
-    /// thread and read 1.07-1.10x in two sittings (`docs/engine.md`). On;
-    /// `supdb-aheadincore` and `supdb-ingestaheadincore` start it in core
-    /// alone.
-    pub ahead_out_of_core: bool,
-    /// The share of a partition's pages, percent, the page cache must hold
-    /// for the builder ahead to build its blocks: the form file's where
-    /// one serves, else the record region's, read by `mincore` at the
-    /// builder's turn to the partition (the test's seam
-    /// `ZInject::set_records_resident` stands in for the kernel). A build
-    /// reads every block's records, and out of core a partition the bound
-    /// has pushed out is read from the device, a round trip a page, for
-    /// scans that read a few of its blocks -- the shape that refuted the
-    /// builder out of core (`ahead_out_of_core`); a partition in memory is
-    /// built from memory. A partition under the share is left to the scans
-    /// that want its blocks, counted (`Db::ahead_cold`). Zero builds
-    /// whatever the cache holds; `supdb-aheadcold` is that arm.
-    pub ahead_resident_pct: u32,
     /// Out of core the builder ahead starts only once this many scans have
     /// been made over the state it would build for; in core it starts at
     /// the first, as before. Its forms repay their build through the
@@ -3551,7 +3521,8 @@ pub struct Options {
     /// while E, 1.6 million scans over one state, read 1.07-1.10x. A state
     /// scanned a hundred thousand times is one being scanned, and the
     /// builder's bet is placed where the scans that pay it are
-    /// (`docs/engine.md`). `supdb-aheadeager` starts it at the first scan.
+    /// (`docs/engine.md`). A test sets zero to start it at the first scan.
+    #[doc(hidden)]
     pub ahead_out_of_core_scans: u64,
     /// In core the builder ahead starts at a scan once the scans over the
     /// state number its blocks over this: by then the scans have walked
@@ -3568,9 +3539,8 @@ pub struct Options {
     /// the builder moved no lag pass either way, and what it buys is E,
     /// a hundred thousand scans over one state and 1.22x at a million
     /// keys (`docs/engine.md`). Out of core `ahead_out_of_core_scans` is
-    /// the count, and a commit that starts the builder starts it as
-    /// before. Zero starts it at a state's first scan;
-    /// `supdb-aheadfirst` is that arm.
+    /// the count. Zero starts it at a state's first scan, a seam the tests
+    /// start the builder with.
     #[doc(hidden)]
     pub ahead_in_core_scans_div: u64,
     /// EXPERIMENT: the range-read structure written at ingest. The writer
@@ -3759,40 +3729,6 @@ pub struct Options {
     /// decoded four groups each from starts half of which a scan had
     /// started at before (`docs/engine.md`).
     pub promote_starts: u32,
-    /// EXPERIMENT: unsealed entries written since the last builder that
-    /// start another from a commit, rather than waiting for a scan to
-    /// ask. The builder organises what the writes left -- a snapshot of
-    /// the unsealed keys and a form for every block they overlay -- and
-    /// that work is what the first read after a write burst pays for
-    /// today: measured on the lag sweep at a hundred thousand keys, a
-    /// scan pass over a store with every key rewritten costs 33 µs a
-    /// scan the first time and 1.3 µs after, and the fault count goes
-    /// from five to five thousand with it. Zero waits for the scan,
-    /// which is where the builder started before. A builder already
-    /// running is left alone.
-    pub build_ahead_on_commit: usize,
-    /// EXPERIMENT: a builder started at the first commit after a publish
-    /// -- a seal, a join, a merge -- whether or not a scan has asked,
-    /// and its forms installed at the commits they arrive at rather than
-    /// at the first scan after; a commit a builder has posted forms to
-    /// installs them and settles its batch as a scan-preceded commit
-    /// does. Built for the fully-unmerged lag point, where a publish
-    /// empties the table and the first reads after the burst build every
-    /// block they walk: nine hundred blocks at 13-20 µs each across a
-    /// thousand scans at a hundred thousand keys, a tenth of LMDB.
-    ///
-    /// Off, because the burst outruns the builder. That point seals a
-    /// dozen times and merges between, every publish restarts the
-    /// builder over the whole overlay, and the commits it posts to file
-    /// their batches: 63,000 of the burst's 100,000 writes were filed at
-    /// the commits, the writes ran 2.7x slower, and the scans still met
-    /// an empty table, since the last seal restarted the builder just
-    /// before them -- the point read 1.16x at a hundred thousand keys
-    /// and 0.92x at three hundred thousand. In the mixes the builder
-    /// restarted at each of F's seals reads ycsb-E at 0.84x-0.87x and F
-    /// at 0.80x-0.97x. `supdb-aheadpub` prices it. The count above,
-    /// which restarts by writes, is the other trigger and is also off.
-    pub build_ahead_on_publish: bool,
     /// EXPERIMENT: the canonical forms published only while a handle the
     /// caller made is live to take them, and all at once when one is
     /// claimed. A publish is an `Arc` clone of the writer's own form, so
@@ -4449,20 +4385,6 @@ pub struct Options {
     /// first scan about what the copies returned over the pass. The arms
     /// that cap the conversions turn it on.
     pub ahead_converts: bool,
-    /// Whether the builder ahead sends each form with the keys that bound
-    /// its block -- the block's first record's key and the next block's,
-    /// or the partition's fences at the ends -- read on its own thread
-    /// beside the records the build has just walked, so that the install
-    /// splices the keys written since the builder's commit by them and
-    /// reads nothing of the partition. Off: the install reads the two
-    /// keys from the partition's records itself, as it did. Out of core
-    /// those were two cold pages a form: at ten million keys under 2 GiB
-    /// the install of a builder's forms was one pass of the upkeep thread
-    /// of twelve seconds and eighty thousand major faults, pinned, and
-    /// every table a publish retired meanwhile waited behind the pin with
-    /// its snapshot copy until the process was killed. `supdb-installreads`
-    /// is the arm that reads them at the install.
-    pub ahead_sends_bounds: bool,
     /// The bytes the live tables kept for the writer's upkeep's next look
     /// (`State::replaced`) may take, each counted at twice its capacity,
     /// the table and the snapshot copy a seal near reads makes of it; the
@@ -5434,8 +5356,7 @@ pub struct Options {
     /// one-gibibyte bound where the arm that filed nothing ran in a
     /// third of the memory, and the scans after the drain settling
     /// stale forms. `supdb-settlefar` and `supdb-ingestsettlefar` are
-    /// the shape that filed; `build_ahead_on_publish`, which asks for
-    /// the forms before any read by design, files as it did too.
+    /// the shape that filed.
     pub forms_settle_far: bool,
     /// EXPERIMENT: the canonical forms carried across a seal. A form is
     /// the merged content of a partition's block and everything unsealed
@@ -7108,8 +7029,6 @@ impl Default for Options {
             forms_convert_light_yields: false,
             forms_copy_hot_wide: true,
             scan_cache_ahead_min_blocks: 1024,
-            ahead_out_of_core: true,
-            ahead_resident_pct: 90,
             ahead_out_of_core_scans: 100_000,
             ahead_in_core_scans_div: 8,
             commit_forms: true,
@@ -7124,8 +7043,6 @@ impl Default for Options {
             snapshot_keeper_recent_pct: 100,
             promote_entries: 0,
             promote_starts: 0,
-            build_ahead_on_commit: 0,
-            build_ahead_on_publish: false,
             forms_publish_lazily: true,
             forms_max_unsealed_pct: 0,
             forms_settle_backlog_pct: 2,
@@ -7164,7 +7081,6 @@ impl Default for Options {
             forms_convert_unread: true,
             forms_convert_cap: 0,
             ahead_converts: false,
-            ahead_sends_bounds: true,
             upkeep_keep_bytes: 0,
             frozen_bytes: 0,
             upkeep_abandons: true,
@@ -25510,7 +25426,7 @@ struct Shared {
     /// (`FormsState::fill_owed`): the passes that had filed nothing.
     fill_owed_due: AtomicU64,
     /// Partitions the builder ahead left to the scans for the page cache
-    /// holding too few of their pages (`Options::ahead_resident_pct`).
+    /// holding too few of their pages.
     ahead_cold: AtomicU64,
     /// Ordered indexes the open rebuilt from their segments
     /// (`Seg::open_ord`); see `Db::ord_rebuilt`.
@@ -27886,12 +27802,6 @@ pub struct Db {
     share_flip: std::cell::Cell<bool>,
     /// Scratch for the run a value would encode as, measured at `append`
     /// against the inline limit.
-    /// EXPERIMENT: the memtable's entry count when the last builder was
-    /// started from a commit, so the next starts a burst later and not a
-    /// batch later, and the state's generation then, since a publish
-    /// stops the builder and retires what it had organised.
-    built_ahead_len: usize,
-    built_ahead_gen: u64,
     /// An error from leaving order mid-batch, which `append` and `delete`
     /// cannot return: the next `commit` does. Also a rotation's, which
     /// comes after its commit's batch is written and must not be read as
@@ -37274,15 +37184,8 @@ impl Reader {
         // it (`Options::forms_settle_far`): what a commit files here is
         // dropped at the next landing before anything reads it, and the
         // one-shot reasons below keep until a scan comes around, when the
-        // commit after it files the lot. The arm that builds ahead at
-        // every publish (`Options::build_ahead_on_publish`) asks for the
-        // forms before any read by design, and keeps the shape it was
-        // priced in.
-        if far
-            && !self.opts.forms_settle_far
-            && !self.opts.build_ahead_on_publish
-            && !self.force_due.get()
-        {
+        // commit after it files the lot.
+        if far && !self.opts.forms_settle_far && !self.force_due.get() {
             self.settle_refuse(consume, 1);
             return Some(false);
         }
@@ -37298,7 +37201,7 @@ impl Reader {
                     <= (keys / 100 * self.opts.forms_settle_recent_pct) as u64);
         // Forms the builder has posted are installed now, and the batch
         // settled with them, so the first read after finds them in
-        // place; see `Options::build_ahead_on_publish`.
+        // place.
         let posted =
             self.fs().ahead.borrow().as_ref().is_some_and(|a| {
                 !a.done.get() && a.posted.load(std::sync::atomic::Ordering::Acquire)
@@ -43820,8 +43723,6 @@ impl Db {
             max_key_stale: false,
             share_quiet: false,
             share_flip: std::cell::Cell::new(false),
-            built_ahead_len: 0,
-            built_ahead_gen: 0,
             pending_err: None,
             lost: None,
             fail_log_sync: 0,
@@ -45235,8 +45136,6 @@ impl Db {
             max_key_stale: false,
             share_quiet: false,
             share_flip: std::cell::Cell::new(false),
-            built_ahead_len: 0,
-            built_ahead_gen: 0,
             pending_err: None,
             lost: None,
             fail_log_sync: 0,
@@ -46342,11 +46241,9 @@ impl Db {
             self.maintain_forms()?;
             false
         };
-        self.build_ahead_if_due();
-        // The builder's check reads the upkeep, and taking it home drops
-        // the commit no pass has begun on: handed back, or what the
-        // thread was given waits for the first read, and an arm that
-        // builds ahead at every publish had none of its commits filed.
+        // Taking the upkeep home drops the commit no pass has begun on:
+        // handed back, or what the thread was given waits for the first
+        // read.
         if lent && self.fs_home() {
             self.hand_over_upkeep(false);
         }
@@ -48087,59 +47984,6 @@ impl Db {
         Ok(())
     }
 
-    /// EXPERIMENT: a builder started from a commit once the writes have
-    /// piled up, so the organisation the first read would otherwise
-    /// build -- the snapshot of the unsealed keys and a form per block
-    /// they overlay -- is made on a core the writer is not using, before
-    /// a read asks. A builder still running is left to finish; the
-    /// count is the memtable's, so a seal's fresh table starts the next
-    /// one over.
-    fn build_ahead_if_due(&mut self) {
-        let due = self.opts.build_ahead_on_commit;
-        let on_publish = self.opts.build_ahead_on_publish;
-        if (due == 0 && !on_publish) || !self.cache_on() {
-            return;
-        }
-        // Nor one whose forms wait for the maintenance that installs them,
-        // which their posting made due: a builder started over it threw
-        // them away and the reason with them. The commit's own maintenance
-        // runs before this and never left them waiting; a pass on the
-        // upkeep thread that had not begun did.
-        let running = self.fs().ahead.borrow().as_ref().is_some_and(|a| {
-            a.handle.as_ref().is_some_and(|h| !h.is_finished())
-                || (!a.done.get() && a.posted.load(std::sync::atomic::Ordering::Acquire))
-        });
-        if running {
-            return;
-        }
-        let len = self.mem().len();
-        if len < self.built_ahead_len {
-            // A seal: the memtable is new and the count starts over.
-            self.built_ahead_len = 0;
-        }
-        // A publish stops the builder and retires the forms it made, so
-        // the state that replaces it has none and the writes it carries
-        // are nobody's: a generation this handle has not organised is
-        // due whatever the memtable has taken since. Without this the
-        // builder started at a commit, the seal's own publish killed it,
-        // and no later commit was a burst away from the last -- a store
-        // with a hundred pieces reached its reads with one block built.
-        let gen = self.state().gen;
-        let fresh = gen != self.built_ahead_gen;
-        if fresh && !on_publish && self.built_ahead_gen != 0 {
-            // Restarted by the count alone: the publish only resets it.
-            self.built_ahead_gen = gen;
-            self.built_ahead_len = len;
-            return;
-        }
-        if !fresh && (due == 0 || len - self.built_ahead_len < due) {
-            return;
-        }
-        self.built_ahead_gen = gen;
-        self.built_ahead_len = len;
-        self.start_ahead();
-    }
-
     /// Wait for whatever seal and merge are in flight, starting nothing new
     /// (a joined seal may still trigger a merge when compaction is on and
     /// the level-0 count says so). For an experiment that wants a store in a
@@ -48154,29 +47998,6 @@ impl Db {
         self.join_upkeep();
         self.maint_request(MaintAsk::Settle)?;
         self.join_ahead();
-        // The arm that builds ahead at every publish
-        // (`Options::build_ahead_on_publish`): a builder the writer started
-        // over a state the segment work has since replaced -- a seal's
-        // freeze, whose landing publishes after it -- built forms the next
-        // install drops, and the builder for the state that stands started
-        // only at the next commit, after the commit had lent its upkeep, so
-        // whether the commit's pass installed its forms was a race the
-        // builder lost one run in sixty. The stale one goes, and the one
-        // for the state as it stands is started and joined here.
-        if self.opts.build_ahead_on_publish {
-            let gen = self.state().gen;
-            if self
-                .fs()
-                .ahead
-                .borrow()
-                .as_ref()
-                .is_some_and(|a| a.gen != gen)
-            {
-                self.stop_ahead();
-            }
-            self.build_ahead_if_due();
-            self.join_ahead();
-        }
         self.settle_keeper();
         Ok(())
     }
@@ -48593,22 +48414,19 @@ impl Db {
     }
 
     /// The end of the writer's publish: `old` retired, the forms it
-    /// replaced swept, the keeper told, and the state organised.
+    /// replaced swept, and the keeper told.
     fn published(&mut self, old: *const State) {
         retire_state(&self.shared, old as *mut State);
         self.sweep_retired_forms();
         self.wake_keeper();
-        self.build_ahead_if_due();
     }
 
     /// `published` for a publish made with the upkeep away: nothing swept
-    /// while it is lent, since only its holder sweeps, and the builder
-    /// left to the commit's own look.
+    /// while it is lent, since only its holder sweeps.
     fn published_away(&mut self, old: *const State) {
         retire_state(&self.shared, old as *mut State);
         if self.fs_home() {
             self.sweep_retired_forms();
-            self.build_ahead_if_due();
         }
         self.wake_keeper();
     }
@@ -49961,12 +49779,10 @@ impl Reader {
             return;
         }
         // Out of core the builder builds every block a burst dirtied from
-        // pages the bound pushed out, for scans that read a few of them
-        // (`Options::ahead_out_of_core`).
+        // pages the bound pushed out, for scans that read a few of them,
+        // only for the partitions whose pages are in memory
+        // (`ahead_partition_resident`).
         if self.shared.zgate.load() != zselect::GATE_RAW {
-            if !self.opts.ahead_out_of_core {
-                return;
-            }
             // Out of core the builder's forms repay their build through the
             // scans after it, so it waits for a state that is being scanned
             // (`Options::ahead_out_of_core_scans`); a pass of a few thousand
@@ -52695,7 +52511,7 @@ struct AheadForm {
     bytes: usize,
     form: Cached,
     /// The keys that bound the block (`Reader::block_bounds`), read by
-    /// the builder under `Options::ahead_sends_bounds`, and none
+    /// the builder under and none
     /// otherwise, for the install to read itself.
     bounds: Option<BlockBounds>,
 }
@@ -52732,13 +52548,10 @@ impl Reader {
     /// Whether the builder ahead builds a partition's blocks: the share of
     /// the pages a build reads -- the form file's where one serves, else
     /// the record region's -- that the page cache holds is at least
-    /// `Options::ahead_resident_pct`, by the kernel's answer or the test's
-    /// seam (`ZInject::set_records_resident`). Zero builds whatever is held.
+    /// `AHEAD_RESIDENT_PCT`, by the kernel's answer or the test's seam
+    /// (`ZInject::set_records_resident`).
     fn ahead_partition_resident(&self, seg: &Seg) -> bool {
-        let pct = self.opts.ahead_resident_pct;
-        if pct == 0 {
-            return true;
-        }
+        let pct = AHEAD_RESIDENT_PCT;
         let share = match self
             .opts
             .zpages_inject
@@ -52787,7 +52600,7 @@ impl Reader {
         for (pi, seg) in self.segs()[..np].iter().enumerate() {
             // A partition whose pages the page cache does not hold is the
             // scans' to build from, block by block, not the builder's to
-            // read whole from the device (`Options::ahead_resident_pct`).
+            // read whole from the device.
             if !self.ahead_partition_resident(seg) {
                 self.shared.ahead_cold.fetch_add(1, AtomicOrdering::Relaxed);
                 continue;
@@ -52875,10 +52688,7 @@ impl Reader {
                 self.shared.forms_events[9].fetch_add(1, AtomicOrdering::Relaxed);
                 let bytes = self.fbytes(&form);
                 sent += bytes;
-                let bounds = self
-                    .opts
-                    .ahead_sends_bounds
-                    .then(|| self.block_bounds(seg, b));
+                let bounds = Some(self.block_bounds(seg, b));
                 forms.push(AheadForm {
                     block: b as u32,
                     bytes,
@@ -53484,6 +53294,13 @@ const UPKEEP_POLL_MAX: std::time::Duration = std::time::Duration::from_millis(20
 /// `Options::upkeep_alert_poll_us`.
 const UPKEEP_ALERT: std::time::Duration = std::time::Duration::from_millis(100);
 const UPKEEP_WAKE_WRITES: usize = 256;
+
+/// The share of a partition's pages, in percent, the page cache holds for
+/// the builder ahead to build its blocks out of core
+/// (`Reader::ahead_partition_resident`): without the gate the builder read
+/// every dirtied block from pages the bound had pushed out, 69,000-83,000
+/// major faults a sweep against 31,000.
+const AHEAD_RESIDENT_PCT: u32 = 90;
 
 /// The weight the syncing pace's model (`PaceRuns`) gives the scan's wait
 /// against the commit's: the suite's `weighted_ms`, which trades a burst
@@ -54779,7 +54596,7 @@ impl Db {
     }
 
     /// Partitions the builder ahead left to the scans for the page cache
-    /// holding too few of their pages (`Options::ahead_resident_pct`), over
+    /// holding too few of their pages, over
     /// the store's life.
     #[doc(hidden)]
     pub fn ahead_cold(&self) -> u64 {

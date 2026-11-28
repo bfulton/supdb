@@ -311,15 +311,15 @@ fn nothing_is_built_lent_or_kept_while_a_shared_table_stands() {
     stood_down("stood-down", options());
 }
 
-/// The same with a builder started ahead at every publish
-/// (`Options::build_ahead_on_publish`), which reads the state's tables on
-/// a thread of its own: none is started over a shared table.
+/// The same with a builder started ahead at a state's first scan
+/// (`Options::ahead_in_core_scans_div` at zero), which reads the state's
+/// tables on a thread of its own: none is started over a shared table.
 #[test]
 fn no_builder_is_started_ahead_over_a_shared_table() {
     stood_down(
         "stood-down-ahead",
         Options {
-            build_ahead_on_publish: true,
+            ahead_in_core_scans_div: 0,
             scan_cache_ahead_min_blocks: 0,
             forms_settle_backlog_pct: 0,
             commit_forms: true,
@@ -334,18 +334,20 @@ fn stood_down(name: &str, o: Options) {
     // Under the stride switch the compact form is forced, a store read out
     // of core, where no builder is started ahead at all: the variant is
     // then the test above.
-    let ahead = o.build_ahead_on_publish && !common::stride_switch();
+    let ahead = o.ahead_in_core_scans_div == 0 && !common::stride_switch();
     let (d, mut db, mut model) = loaded(name, o);
     if ahead {
-        // A publish beside a handle the forms are for starts one, in the
-        // store as it opens.
+        // A seal beside a handle the forms are for, and the first scan of
+        // the state it publishes starts one, in the store as it opens.
         let h = db.reader().unwrap();
         db.seal().unwrap();
+        db.settle().unwrap();
+        db.scan(b"", 1, kv(&mut |_, _| {})).unwrap();
         db.settle().unwrap();
         drop(h);
         assert!(
             db.forms_events()[2] > 0,
-            "a seal of the loaded store started no builder: the test has none to see stood down"
+            "a scan of the sealed store started no builder: the test has none to see stood down"
         );
         db.scan(b"", usize::MAX, kv(&mut |_, _| {})).unwrap();
         for i in (0..3000).step_by(11) {

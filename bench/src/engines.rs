@@ -733,22 +733,6 @@ pub struct Supdb {
     /// window ahead of its walk (`Options::merge_read_ahead` at
     /// `MERGE_AHEAD_WINDOW`). `supdb-mergeahead`, durable.
     mergeahead: bool,
-    /// The builder ahead starts in core alone, the shape before it ran out
-    /// of core for the partitions in memory (`Options::ahead_out_of_core`
-    /// off). `supdb-ingestaheadincore`, and `supdb-aheadincore` durable.
-    aheadincore: bool,
-    /// The builder ahead out of core builds a partition whatever share of
-    /// its pages the cache holds (`Options::ahead_resident_pct` zero): the
-    /// shape refuted on the lag sweep. `supdb-aheadcold`.
-    aheadcold: bool,
-    /// The builder ahead out of core starting at a state's first scan
-    /// (`Options::ahead_out_of_core_scans` zero), the shape the lag sweep
-    /// priced against: `supdb-aheadeager`.
-    aheadeager: bool,
-    /// The builder ahead in core starting at a state's first scan
-    /// (`Options::ahead_in_core_scans_div` zero), the shape before it
-    /// waited for a state that is being scanned: `supdb-aheadfirst`.
-    aheadfirst: bool,
     /// A sparse form dropped at the look that carries its table across a
     /// partition's rewrite, where the default resolves its cuts again and
     /// keeps it (`Options::rebase_recuts_sparse` off): `supdb-rebasedrops`.
@@ -945,10 +929,6 @@ pub struct Supdb {
     /// `Options::close_presync`. `supdb-latesync`, and
     /// `supdb-ingestlatesync` buffered.
     latesync: bool,
-    /// The install of the builder ahead's forms reads each block's bounds
-    /// from the partition itself, `Options::ahead_sends_bounds` off.
-    /// `supdb-installreads`.
-    installreads: bool,
     /// The upkeep thread files on however far the writes have outrun it,
     /// `Options::upkeep_abandons` off. `supdb-noabandon`.
     noabandon: bool,
@@ -1153,18 +1133,12 @@ pub struct Supdb {
     /// The run keeper beside the runs: a thread at idle priority keeps
     /// the published snapshot current from the commits. `supdb-keeper`.
     keeper: bool,
-    /// Whether a publish starts the builder and a commit installs its
-    /// forms. `supdb-aheadpub`.
-    aheadpub: bool,
     /// Whether the forms are published at every maintained commit, as
     /// they were before they waited for a handle. `supdb-pubalways`.
     pubalways: bool,
     /// A flush that does not partition leaves its pieces as they are,
     /// as before `Options::flush_schedules`. `supdb-ingestleave`.
     leave: bool,
-    /// The partitions' blocks below which no builder starts, or none for
-    /// the engine's own. `supdb-ahead`.
-    aheadmin: Option<usize>,
     /// The seal cap this arm pins, or none for the engine's own;
     /// `supdb-noseal` pins zero. `Option` and not a number, because the
     /// shipping arm must inherit a default rather than restate it.
@@ -2069,22 +2043,6 @@ struct Policy {
     /// window ahead of its walk (`Options::merge_read_ahead` at
     /// `MERGE_AHEAD_WINDOW`). `supdb-mergeahead`, durable.
     mergeahead: bool,
-    /// The builder ahead starts in core alone, the shape before it ran out
-    /// of core for the partitions in memory (`Options::ahead_out_of_core`
-    /// off). `supdb-ingestaheadincore`, and `supdb-aheadincore` durable.
-    aheadincore: bool,
-    /// The builder ahead out of core builds a partition whatever share of
-    /// its pages the cache holds (`Options::ahead_resident_pct` zero): the
-    /// shape refuted on the lag sweep. `supdb-aheadcold`.
-    aheadcold: bool,
-    /// The builder ahead out of core starting at a state's first scan
-    /// (`Options::ahead_out_of_core_scans` zero), the shape the lag sweep
-    /// priced against: `supdb-aheadeager`.
-    aheadeager: bool,
-    /// The builder ahead in core starting at a state's first scan
-    /// (`Options::ahead_in_core_scans_div` zero), the shape before it
-    /// waited for a state that is being scanned: `supdb-aheadfirst`.
-    aheadfirst: bool,
     /// A sparse form dropped at the look that carries its table across a
     /// partition's rewrite, where the default resolves its cuts again and
     /// keeps it (`Options::rebase_recuts_sparse` off): `supdb-rebasedrops`.
@@ -2281,10 +2239,6 @@ struct Policy {
     /// `Options::close_presync`. `supdb-latesync`, and
     /// `supdb-ingestlatesync` buffered.
     latesync: bool,
-    /// The install of the builder ahead's forms reads each block's bounds
-    /// from the partition itself, `Options::ahead_sends_bounds` off.
-    /// `supdb-installreads`.
-    installreads: bool,
     /// The upkeep thread files on however far the writes have outrun it,
     /// `Options::upkeep_abandons` off. `supdb-noabandon`.
     noabandon: bool,
@@ -2489,18 +2443,12 @@ struct Policy {
     /// The run keeper beside the runs: a thread at idle priority keeps
     /// the published snapshot current from the commits. `supdb-keeper`.
     keeper: bool,
-    /// Whether a publish starts the builder and a commit installs its
-    /// forms. `supdb-aheadpub`.
-    aheadpub: bool,
     /// Whether the forms are published at every maintained commit, as
     /// they were before they waited for a handle. `supdb-pubalways`.
     pubalways: bool,
     /// A flush that does not partition leaves its pieces as they are,
     /// as before `Options::flush_schedules`. `supdb-ingestleave`.
     leave: bool,
-    /// The builder's minimum blocks, or none for the engine's own.
-    /// `supdb-ahead`.
-    aheadmin: Option<usize>,
     /// The seal cap this arm pins, or none for the engine's own.
     /// `supdb-noseal`.
     sealcap: Option<usize>,
@@ -3069,10 +3017,6 @@ impl Default for Policy {
             nozfinish: false,
             bgidle: false,
             mergeahead: false,
-            aheadincore: false,
-            aheadcold: false,
-            aheadeager: false,
-            aheadfirst: false,
             rebasedrops: false,
             settleshedunbound: false,
             settleformnear: false,
@@ -3121,7 +3065,6 @@ impl Default for Policy {
             keycopies: false,
             fillplain: false,
             latesync: false,
-            installreads: false,
             noabandon: false,
             passyield: false,
             cachenoauto: false,
@@ -3301,7 +3244,6 @@ impl Default for Policy {
             sharedfallalways: false,
             noshare: false,
             ownhandle: false,
-            aheadmin: None,
             lazyforms: false,
             eager: None,
             recent: None,
@@ -3317,7 +3259,6 @@ impl Default for Policy {
             tier: None,
             runs: false,
             keeper: false,
-            aheadpub: false,
             pubalways: false,
             leave: false,
         }
@@ -5419,20 +5360,6 @@ impl Supdb {
         )
     }
 
-    /// `supdb` with the builder started at the first commit after a
-    /// publish and its forms installed at the commits they arrive at.
-    /// Against `supdb` it prices what a table filled before the first
-    /// read is worth against the filing the posting commits do.
-    pub fn create_aheadpub(path: &Path) -> Res<Supdb> {
-        Supdb::with_policy(
-            path,
-            Policy {
-                aheadpub: true,
-                ..Policy::default()
-            },
-        )
-    }
-
     /// `supdb` publishing the forms at every maintained commit whether
     /// or not a handle is live to take them, as it did before. Against
     /// `supdb` it prices the copy every publish forces on the next patch
@@ -5496,36 +5423,6 @@ impl Supdb {
             path,
             Policy {
                 lazyforms: true,
-                ..Policy::default()
-            },
-        )
-    }
-
-    /// `supdb` with no builder ahead at any size
-    /// (`Options::scan_cache_ahead_min_blocks` past every store): against
-    /// `supdb` under a bound it prices the forms the builder posts against
-    /// the scanning thread's install of them.
-    pub fn create_noahead(path: &Path) -> Res<Supdb> {
-        Supdb::with_policy(
-            path,
-            Policy {
-                aheadmin: Some(usize::MAX),
-                ..Policy::default()
-            },
-        )
-    }
-
-    /// `supdb` with the builder starting on any store. Below
-    /// `scan_cache_ahead_min_blocks` the builder declines and the writer
-    /// fills the forms inline at the commit instead; the threshold was
-    /// measured as the builder against no builder at all, never against
-    /// that inline fill, and at ten and thirty thousand keys the inline
-    /// fill is what ycsb-E pays for.
-    pub fn create_ahead(path: &Path) -> Res<Supdb> {
-        Supdb::with_policy(
-            path,
-            Policy {
-                aheadmin: Some(0),
                 ..Policy::default()
             },
         )
@@ -7127,18 +7024,6 @@ impl Supdb {
             path,
             Policy {
                 latesync: true,
-                ..Policy::default()
-            },
-        )
-    }
-
-    /// `supdb` with the install of the builder ahead's forms reading
-    /// each block's bounds itself.
-    pub fn create_installreads(path: &Path) -> Res<Supdb> {
-        Supdb::with_policy(
-            path,
-            Policy {
-                installreads: true,
                 ..Policy::default()
             },
         )
@@ -9258,10 +9143,6 @@ impl Supdb {
             nozfinish,
             bgidle,
             mergeahead,
-            aheadincore,
-            aheadcold,
-            aheadeager,
-            aheadfirst,
             rebasedrops,
             settleshedunbound,
             settleformnear,
@@ -9310,7 +9191,6 @@ impl Supdb {
             keycopies,
             fillplain,
             latesync,
-            installreads,
             noabandon,
             passyield,
             cachenoauto,
@@ -9358,7 +9238,6 @@ impl Supdb {
             ordlog,
             fatentries,
             shape,
-            aheadmin,
             lazyforms,
             eager,
             recent,
@@ -9374,7 +9253,6 @@ impl Supdb {
             tier,
             runs,
             keeper,
-            aheadpub,
             pubalways,
             leave,
             rotate,
@@ -9696,22 +9574,6 @@ impl Supdb {
             } else {
                 supdb::Options::default().wal_drop_bytes
             },
-            ahead_out_of_core: !aheadincore,
-            ahead_resident_pct: if aheadcold {
-                0
-            } else {
-                supdb::Options::default().ahead_resident_pct
-            },
-            ahead_out_of_core_scans: if aheadeager {
-                0
-            } else {
-                supdb::Options::default().ahead_out_of_core_scans
-            },
-            ahead_in_core_scans_div: if aheadfirst {
-                0
-            } else {
-                supdb::Options::default().ahead_in_core_scans_div
-            },
             rebase_recuts_sparse: !rebasedrops,
             forms_settle_sheds_unbound: settleshedunbound,
             settle_form_ahead: if settleformnear {
@@ -9774,7 +9636,6 @@ impl Supdb {
             manifest_pending: manifestpending,
             flush_waits_manifest: waitmanifest,
             close_presync: !latesync,
-            ahead_sends_bounds: !installreads,
             upkeep_abandons: !noabandon,
             upkeep_yields: passyield,
             scan_cache_auto: !cachenoauto,
@@ -9856,7 +9717,6 @@ impl Supdb {
             snapshot_keeper: keeper,
             // The builder started by a publish and installed by a commit,
             // or started by a scan as it is.
-            build_ahead_on_publish: aheadpub,
             // The forms published for a handle, or at every maintained
             // commit as they were.
             forms_publish_lazily: !pubalways,
@@ -10083,8 +9943,6 @@ impl Supdb {
             // Below this the builder declines and the writer fills the
             // forms inline on the commit path instead, which is the
             // comparison the threshold was never measured against.
-            scan_cache_ahead_min_blocks: aheadmin
-                .unwrap_or(supdb::Options::default().scan_cache_ahead_min_blocks),
             // The guarantee the arm's row names, not the engine's default:
             // durable per batch, or frames written per commit and fsynced
             // at `sync`, which is how `lmdb-nosync` and `rocksdb-nosync`
@@ -10228,10 +10086,6 @@ impl Supdb {
             nozfinish,
             bgidle,
             mergeahead,
-            aheadincore,
-            aheadcold,
-            aheadeager,
-            aheadfirst,
             rebasedrops,
             settleshedunbound,
             settleformnear,
@@ -10280,7 +10134,6 @@ impl Supdb {
             keycopies,
             fillplain,
             latesync,
-            installreads,
             noabandon,
             passyield,
             cachenoauto,
@@ -10328,7 +10181,6 @@ impl Supdb {
             ordlog,
             fatentries,
             shape,
-            aheadmin,
             lazyforms,
             eager,
             recent,
@@ -10344,7 +10196,6 @@ impl Supdb {
             tier,
             runs,
             keeper,
-            aheadpub,
             pubalways,
             leave,
             rotate,
@@ -11320,9 +11171,6 @@ impl Engine for Supdb {
         if self.runs {
             return "supdb-runs";
         }
-        if self.aheadpub {
-            return "supdb-aheadpub";
-        }
         if self.leave {
             return "supdb-ingestleave";
         }
@@ -11339,12 +11187,6 @@ impl Engine for Supdb {
         }
         if self.lazyforms {
             return "supdb-lazyforms";
-        }
-        if self.aheadmin == Some(usize::MAX) {
-            return "supdb-noahead";
-        }
-        if self.aheadmin.is_some() {
-            return "supdb-ahead";
         }
         if self.l0.is_some() {
             return "supdb-l0";
@@ -11615,22 +11457,6 @@ impl Engine for Supdb {
                 "supdb-ingestmergeone"
             };
         }
-        if self.aheadincore {
-            return if self.partition {
-                "supdb-aheadincore"
-            } else {
-                "supdb-ingestaheadincore"
-            };
-        }
-        if self.aheadcold {
-            return "supdb-aheadcold";
-        }
-        if self.aheadeager {
-            return "supdb-aheadeager";
-        }
-        if self.aheadfirst {
-            return "supdb-aheadfirst";
-        }
         if self.rebasedrops && self.settleshedunbound {
             return "supdb-rebasedropsshed";
         }
@@ -11882,9 +11708,6 @@ impl Engine for Supdb {
             } else {
                 "supdb-ingestlatesync"
             };
-        }
-        if self.installreads {
-            return "supdb-installreads";
         }
         if self.noabandon {
             return "supdb-noabandon";
@@ -14501,8 +14324,6 @@ pub fn guarantee(arm: &str) -> Option<Guarantee> {
         | "supdb-wforms"
         | "supdb-regime"
         | "supdb-noseal"
-        | "supdb-ahead"
-        | "supdb-noahead"
         | "supdb-lazyforms"
         | "supdb-eager"
         | "supdb-nosettle"
@@ -14519,7 +14340,6 @@ pub fn guarantee(arm: &str) -> Option<Guarantee> {
         | "supdb-tier"
         | "supdb-runs"
         | "supdb-keeper"
-        | "supdb-aheadpub"
         | "supdb-pubalways"
         | "supdb-nosnap"
         | "supdb-noadvice"
@@ -14669,10 +14489,6 @@ pub fn guarantee(arm: &str) -> Option<Guarantee> {
         | "supdb-zparse"
         | "supdb-nozpagesnofitshort"
         | "supdb-nozpagesmergeone"
-        | "supdb-aheadincore"
-        | "supdb-aheadcold"
-        | "supdb-aheadeager"
-        | "supdb-aheadfirst"
         | "supdb-rebasedrops"
         | "supdb-settleshedunbound"
         | "supdb-rebasedropsshed"
@@ -14727,7 +14543,6 @@ pub fn guarantee(arm: &str) -> Option<Guarantee> {
         | "supdb-keycopies"
         | "supdb-fillplain"
         | "supdb-latesync"
-        | "supdb-installreads"
         | "supdb-noabandon"
         | "supdb-passyield"
         | "supdb-cachenoauto"
@@ -14928,7 +14743,6 @@ pub fn guarantee(arm: &str) -> Option<Guarantee> {
         | "supdb-ingestnomergechain"
         | "supdb-ingestmergeuncapped"
         | "supdb-ingestmergeone"
-        | "supdb-ingestaheadincore"
         | "supdb-ingestnochainwrites"
         | "supdb-ingestnoland"
         | "supdb-ingestlandnearscans"
@@ -15096,11 +14910,8 @@ pub fn open(arm: &str, dir: &Path, map_gb: usize) -> Res<Box<dyn Engine>> {
         "supdb-tier" => supdb_arm(Supdb::create_tier, dir)?,
         "supdb-runs" => supdb_arm(Supdb::create_runs, dir)?,
         "supdb-keeper" => supdb_arm(Supdb::create_keeper, dir)?,
-        "supdb-aheadpub" => supdb_arm(Supdb::create_aheadpub, dir)?,
         "supdb-pubalways" => supdb_arm(Supdb::create_pubalways, dir)?,
         "supdb-lazyforms" => supdb_arm(Supdb::create_lazyforms, dir)?,
-        "supdb-ahead" => supdb_arm(Supdb::create_ahead, dir)?,
-        "supdb-noahead" => supdb_arm(Supdb::create_noahead, dir)?,
         "supdb-noseal" => supdb_arm(Supdb::create_noseal, dir)?,
         "supdb-regime" => supdb_arm(Supdb::create_regime, dir)?,
         "supdb-wforms" => supdb_arm(Supdb::create_wforms, dir)?,
@@ -16116,54 +15927,6 @@ pub fn open(arm: &str, dir: &Path, map_gb: usize) -> Res<Box<dyn Engine>> {
         "supdb-nozpagesnofitshort" => supdb_arm(Supdb::create_nozpages_nofitshort, dir)?,
         "supdb-nozpagesmergeone" => supdb_arm(Supdb::create_nozpages_mergeone, dir)?,
         "supdb-ingestmergeone" => supdb_arm(Supdb::create_ingest_mergeone, dir)?,
-        "supdb-aheadincore" => supdb_arm(
-            |d| {
-                Supdb::with_policy(
-                    d,
-                    Policy {
-                        aheadincore: true,
-                        ..Policy::default()
-                    },
-                )
-            },
-            dir,
-        )?,
-        "supdb-aheadcold" => supdb_arm(
-            |d| {
-                Supdb::with_policy(
-                    d,
-                    Policy {
-                        aheadcold: true,
-                        ..Policy::default()
-                    },
-                )
-            },
-            dir,
-        )?,
-        "supdb-aheadeager" => supdb_arm(
-            |d| {
-                Supdb::with_policy(
-                    d,
-                    Policy {
-                        aheadeager: true,
-                        ..Policy::default()
-                    },
-                )
-            },
-            dir,
-        )?,
-        "supdb-aheadfirst" => supdb_arm(
-            |d| {
-                Supdb::with_policy(
-                    d,
-                    Policy {
-                        aheadfirst: true,
-                        ..Policy::default()
-                    },
-                )
-            },
-            dir,
-        )?,
         "supdb-rebasedrops" => supdb_arm(
             |d| {
                 Supdb::with_policy(
@@ -16790,20 +16553,6 @@ pub fn open(arm: &str, dir: &Path, map_gb: usize) -> Res<Box<dyn Engine>> {
             },
             dir,
         )?,
-        "supdb-ingestaheadincore" => supdb_arm(
-            |d| {
-                Supdb::with_policy(
-                    d,
-                    Policy {
-                        partition: false,
-                        durable: false,
-                        aheadincore: true,
-                        ..Policy::default()
-                    },
-                )
-            },
-            dir,
-        )?,
         "supdb-nochainwrites" => supdb_arm(
             |d| {
                 Supdb::with_policy(
@@ -16937,7 +16686,6 @@ pub fn open(arm: &str, dir: &Path, map_gb: usize) -> Res<Box<dyn Engine>> {
         "supdb-fillplain" => supdb_arm(Supdb::create_fillplain, dir)?,
         "supdb-ingestfillplain" => supdb_arm(Supdb::create_ingest_fillplain, dir)?,
         "supdb-latesync" => supdb_arm(Supdb::create_latesync, dir)?,
-        "supdb-installreads" => supdb_arm(Supdb::create_installreads, dir)?,
         "supdb-noabandon" => supdb_arm(Supdb::create_noabandon, dir)?,
         "supdb-passyield" => supdb_arm(Supdb::create_passyield, dir)?,
         "supdb-cachenoauto" => supdb_arm(Supdb::create_cachenoauto, dir)?,
