@@ -3582,8 +3582,8 @@ pub(super) struct ZFile {
     /// write on every decode from every reader thread.
     pub(super) decodes16: AtomicU64,
     /// The time those counted decodes took, nanoseconds, where this form
-    /// file times them (`ZFile::time_decodes`): the heat a re-code prices
-    /// (`Options::zpages_recode`), since a decode the predictor and the
+    /// file times them (`ZFile::time_decodes`): the heat the hot-raw policy
+    /// prices (`Options::zpages_hot_raw`), since a decode the predictor and the
     /// cache have warm costs a tenth of a cold one and the count reads them
     /// alike -- the first partition's decodes at five million keys were
     /// worth 0.13 µs each to a raw tail, the next three's 1.4.
@@ -3592,7 +3592,7 @@ pub(super) struct ZFile {
     /// record, a seek over the heads, a walk in place -- counted in
     /// sixteens per thread where the decodes are timed: a raw-tailed form
     /// file decodes nothing, so its heat is the groups it opens, priced at
-    /// what a decode costs (`Options::zpages_recode`).
+    /// what a decode costs (`Options::zpages_hot_raw`).
     pub(super) opens16: AtomicU64,
     /// The ranks a block form's group of this stride file's partition would
     /// hold, `ZGROUP_BYTES` of values, as a shift: the power of two at or
@@ -3620,7 +3620,7 @@ pub(super) struct ZFile {
     /// form's records passed every test that held the store to no touch.
     /// `Reader::raw_touches` sums it beside them.
     raw_reads: AtomicU64,
-    /// The counted decodes are timed (`Options::zpages_recode`).
+    /// The counted decodes are timed (`Options::z_times_decodes`).
     pub(super) time_decodes: bool,
     /// The sampled pages' groups are record-coded ([`ZCODING_RECORD`]):
     /// the coding this form file was built in, read from its own
@@ -5884,23 +5884,14 @@ impl ZFile {
 
     /// This form file's pages out of the cache: the mapping's entries
     /// dropped (`MADV_DONTNEED`), then the file's clean pages
-    /// (`POSIX_FADV_DONTNEED`), which a drop of a mapped page skips. For the
-    /// form file a re-code took out of service and kept
-    /// (`Options::zpages_recode_keep`): a reader still walking it faults the
-    /// page back, and the bytes are the same.
+    /// (`POSIX_FADV_DONTNEED`), which a drop of a mapped page skips. A
+    /// reader still walking it faults the page back, and the bytes are the
+    /// same.
     pub(super) fn drop_cache(&self) {
         self.map.advise_dontneed();
         if let Some(f) = &self.file {
             f.drop_all();
         }
-    }
-
-    /// The whole file asked for in the background, in the pieces the
-    /// kernel reads whole (`MmapBytes::advise_willneed`): the form file a
-    /// re-code put back in service, whose pages its drop took. The bytes
-    /// submitted.
-    pub(super) fn prefetch_all(&self) -> u64 {
-        self.map.advise_willneed(0, self.map.len() as usize) as u64
     }
 
     /// The decoded bytes of every group the file holds, as its trailer says;
@@ -6485,29 +6476,6 @@ impl ZCell {
         self.p.swap(Box::into_raw(Box::new(z)), Ordering::AcqRel)
     }
 
-    /// The cell's form file and `kept`'s exchanged, where `kept` holds one:
-    /// a reader finds the old or the new, never an empty cell, and one that
-    /// loaded the old keeps it, since `kept` holds it on and frees nothing.
-    /// A cell of kept form files is never read by a reader, and only the
-    /// segment work's thread changes one, so the two stores need not be
-    /// one. Whether there was one to exchange.
-    pub(super) fn flip(&self, kept: &ZCell) -> bool {
-        let k = kept.p.load(Ordering::Acquire);
-        if k.is_null() {
-            return false;
-        }
-        let old = self.p.swap(k, Ordering::AcqRel);
-        kept.p.store(old, Ordering::Release);
-        true
-    }
-
-    /// `p`, a form file taken out of another cell, kept in this one; what
-    /// this one held is handed back for the caller to retire through the
-    /// epoch, as `take`'s is.
-    pub(super) fn keep(&self, p: *mut ZFile) -> *mut ZFile {
-        self.p.swap(p, Ordering::AcqRel)
-    }
-
     /// `z` installed if the cell is empty; whether it was.
     pub(super) fn install(&self, z: ZFile) -> bool {
         let p = Box::into_raw(Box::new(z));
@@ -6562,17 +6530,10 @@ pub(super) struct ZEvents {
     pub build_retries: AtomicU64,
     pub rebuilds: AtomicU64,
     pub declined_damage: AtomicU64,
-    /// Partitions re-coded while served (`Options::zpages_recode`): to the
-    /// raw tails, back to the block coding, and re-codes that built nothing
-    /// to install -- failed, declined, cancelled or outrun.
-    pub recodes: AtomicU64,
-    pub recodes_back: AtomicU64,
+    /// Re-codes of a served partition into the other form
+    /// (`Options::zpages_stride_convert`) that built nothing to install --
+    /// failed, declined, cancelled or outrun.
     pub recode_failed: AtomicU64,
-    /// Block-coded partitions built again by the parsing encoder while
-    /// served (`Options::zpages_reparse`), and swapped in.
-    pub reparses: AtomicU64,
-    /// The re-code policy's looks, one a period it read the heat at.
-    pub recode_looks: AtomicU64,
     /// The hot-raw policy's (`Options::zpages_hot_raw`): partitions released
     /// to the raw form, partitions whose form file it attached again, and
     /// its looks, one a period it read the heat at.
@@ -6621,12 +6582,6 @@ pub(super) struct ZEvents {
     /// milliseconds the mapping took.
     pub raw_maps: AtomicU64,
     pub raw_map_ms: AtomicU64,
-    /// Re-codes made by exchanging the served form file with the kept one.
-    pub recode_flips: AtomicU64,
-    /// Spares built and kept (`Options::zpages_both`), and spares that kept
-    /// nothing.
-    pub spare_builds: AtomicU64,
-    pub spare_failed: AtomicU64,
     /// Builds started on the builder's thread, and builds its cancel flag
     /// stopped: a merge took the target as an input, or the store closed.
     pub build_starts: AtomicU64,
@@ -10131,9 +10086,9 @@ impl ZInject {
     }
 
     /// The decode of a page the sampler prices the compact form by, in
-    /// place of the one it times; and the decode the re-code policy prices
-    /// a form file's decodes at, in place of the time they took
-    /// (`Options::zpages_recode`).
+    /// place of the one it times; and the decode the policies that read the
+    /// heat price a form file's decodes at, in place of the time they took
+    /// (`Options::zpages_hot_raw`).
     pub fn set_decode_cost(&self, d: Duration) {
         let ns = u64::try_from(d.as_nanos()).unwrap_or(u64::MAX).max(1);
         self.decode_cost_ns.store(ns, Ordering::Release);

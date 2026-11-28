@@ -479,7 +479,7 @@ pub struct FormSize {
 /// the next sample subtracts and the pick's sample cannot: at ten million
 /// keys under 1.25 GiB the budget read 1.2 GB at the load's end and 0.87
 /// through E. One line for the coding's pick ([`choose_coding`]) and the
-/// re-code policy's fill (`Options::zpages_recode_auto`).
+/// policies that hold the form to it.
 pub const FORM_FILL: f64 = 0.85;
 
 /// [`FORM_FILL`] of a budget, in bytes.

@@ -1107,13 +1107,9 @@ pub struct ZCounts {
     pub stride_convert_held: u64,
     pub stride_convert_fill: u64,
     pub builds_raw_tails: u64,
-    /// Partitions re-coded while served (`Options::zpages_recode`): to the
-    /// raw tails, back to the block coding, and re-codes that installed
-    /// nothing.
-    pub recodes: u64,
-    pub recodes_back: u64,
+    /// Re-codes of a served partition into the other form
+    /// (`Options::zpages_stride_convert`) that installed nothing.
     pub recode_failed: u64,
-    pub recode_looks: u64,
     /// The hot-raw policy's (`Options::zpages_hot_raw`): partitions released
     /// to the raw form, form files attached again, its looks, and the
     /// partitions it holds raw now.
@@ -1165,20 +1161,6 @@ pub struct ZCounts {
     /// (`Options::zpages_rewarm_raw_maps`).
     pub raw_maps: u64,
     pub raw_map_ms: u64,
-    /// Block-coded partitions re-parsed while served
-    /// (`Options::zpages_reparse`).
-    pub reparses: u64,
-    /// Re-codes made by exchanging the served form file with the kept one
-    /// (`Options::zpages_recode_keep`), counted among `recodes` and
-    /// `recodes_back` by the coding they served; the kept form files now,
-    /// and their bytes on disk.
-    pub recode_flips: u64,
-    pub spare_files: u64,
-    pub spare_bytes: u64,
-    /// Form files built in the other coding to be kept beside the served
-    /// one (`Options::zpages_both`), and such builds that kept nothing.
-    pub spare_builds: u64,
-    pub spare_failed: u64,
     /// The partitions whose raw pages were dropped at their form file's
     /// install (`Options::zpages_drop_raw`).
     pub raw_dropped: u64,
@@ -1266,7 +1248,7 @@ pub struct ZCounts {
 /// One partition's form file as `Db::zpage_heat` reports it: the partition's
 /// lower fence and keys, the file's bytes, the groups decoded from it over
 /// its life, counted in sixteens (`zfile::ZFile::decodes16`), the time those
-/// decodes took where the form file times them (`Options::zpages_recode`),
+/// decodes took where the form file times them (`Options::z_times_decodes`),
 /// and whether it is the record coding's.
 #[doc(hidden)]
 #[derive(Clone, Debug)]
@@ -1914,9 +1896,7 @@ pub struct Options {
     /// A test's: a settle of the form, once its segment work has answered,
     /// holds the builds after it before their renames and returns only
     /// once the next has parked there (`Db::hold_zpage_after_settle`), so a
-    /// test can stand a build in flight at the instant a settle ends; and no
-    /// spare (`zpages_both`) starts before the first such settle has
-    /// answered, so the build that parks is a spare started as it ended.
+    /// test can stand a build in flight at the instant a settle ends.
     #[doc(hidden)]
     pub zpages_hold_after_settle: bool,
     /// Under `ZPages::Always`, a partition's form file is built as soon as
@@ -3143,23 +3123,6 @@ pub struct Options {
     /// shape before.
     #[doc(hidden)]
     pub zpages_flat_slack: bool,
-    /// EXPERIMENT: the first this many partitions by key order are built
-    /// in the record coding with raw tails, and the rest as the options say
-    /// (`zpages_raw_tails` off). The upper bound of a coding chosen per
-    /// partition by its heat: under the suite's unscrambled Zipfian half of
-    /// the E mix's decodes at five million keys fall in the first of
-    /// nineteen partitions and three quarters in the first four, so raw
-    /// tails there cost tens of megabytes over the block form where the
-    /// whole raw-tail form overran the budget by about its seventh. Key
-    /// order stands in for a heat no build can know before the reads; the
-    /// shipping choice would be the measured one. With four, the Zipfian
-    /// mixes read 12-21% faster, D level, and the uniform read pass a fifth
-    /// slower on the faults of 44 MB past the fit; with one, the point-read
-    /// mixes 10-15% faster, the read pass level, and E level, since the
-    /// first partition's decodes run warm and a raw tail saves the cold
-    /// ones. Zero, off.
-    #[doc(hidden)]
-    pub zpages_raw_tails_first: usize,
     /// Once a form file serves a partition, the partition's raw
     /// file and its ordered index are dropped from the page cache: the
     /// store's own mappings of them unmapped (`MADV_DONTNEED`), since a cache
@@ -3194,52 +3157,6 @@ pub struct Options {
     /// beside the form it returned to.
     #[doc(hidden)]
     pub zpages_drop_at_install: bool,
-    /// EXPERIMENT: under the forced form (`ZPages::Always`), a partition's
-    /// form file is built again in the other coding while it serves, by
-    /// what its decodes cost: once a second the segment work reads each
-    /// form file's decode time (one decode in sixteen timed,
-    /// `ZFile::decode_ns16`) and a raw-tailed one's group opens priced at a
-    /// decode (`ZFile::opens16`), into a heat decayed over ten seconds; it
-    /// re-codes the hottest block-coded partition to the raw-tail record
-    /// coding, where its decodes would be in-place walks, while the form
-    /// files' bytes with the raw tails' extra stay within the budget the
-    /// platform gives (`zfile::read_budget`), and where they would not,
-    /// gives the coldest raw-tailed one back to make the room if the hot
-    /// one is twice as hot; and when the group's file refaults pass a
-    /// floor, the coldest raw-tailed partition goes back to the block
-    /// coding and the form files' bytes are held where that leaves them for
-    /// a while. The new form file is built beside the old under the same
-    /// name and swapped into the cell, the old retired under the epoch.
-    /// The budget counts the form files alone, so it is the shape for a
-    /// store whose raw pages go (`zpages_drop_raw`). Off.
-    #[doc(hidden)]
-    pub zpages_recode: bool,
-    /// EXPERIMENT: with `zpages_recode`, a partition keeps the form file a
-    /// re-code replaced, attached and unserved beside the one it serves, so
-    /// that every re-code of the partition after its first is the two
-    /// exchanged in the cell -- no build, no bytes written, no device flush
-    /// for the durable commits beside it -- with the incoming file's pages
-    /// asked for and the outgoing one's dropped from the cache. The kept
-    /// file has no name once the build's rename replaced it, and goes with
-    /// the segment; a reopen serves whichever coding holds the name. Off.
-    #[doc(hidden)]
-    pub zpages_recode_keep: bool,
-    /// EXPERIMENT: with `zpages_recode` and `zpages_recode_keep`, every
-    /// served partition gets its form file in the other coding too, built
-    /// on the builder's thread at idle priority once the served ones are in,
-    /// the hottest partition first, and kept attached and unserved with its
-    /// pages dropped: the store holds both codings of every partition from
-    /// write time, and the policy never builds while it serves. It chooses
-    /// the raw-tailed set whole once a period -- the hottest partitions
-    /// whose raw tails fit the budget, a served raw-tailed partition's heat
-    /// counted `RECODE_SWAP` times so that it does not flip on noise -- and
-    /// exchanges each partition whose coding differs, at most
-    /// `RECODE_FLIP_BYTES` of incoming pages a look, a look every
-    /// `RECODE_PERIOD_BOTH` whether or not a build is in flight, since a flip
-    /// costs a prefetch and not a build; and a partition's heat rises to the
-    /// rate it shows at once and fades over `RECODE_TAU`. Off.
-    #[doc(hidden)]
-    pub zpages_both: bool,
     /// Under `ZPages::Auto`, the coding the form files are built in is the
     /// selector's to choose (`zselect::choose_coding`): the sampler sizes
     /// the record coding with raw tails beside the block coding, and the raw
@@ -6508,48 +6425,6 @@ pub struct Options {
     /// ticks.
     #[doc(hidden)]
     pub zpages_suspect_at_crossing: bool,
-    /// EXPERIMENT: under the controller (`ZPages::Auto`), once the form is
-    /// installed, the re-code policy (`zpages_recode`) re-codes the hottest
-    /// partitions to the raw tails while they serve, where their decodes
-    /// would be walks in place: a partition holding at least
-    /// `RECODE_AUTO_SHARE` of the store's decode time, while the form with
-    /// its raw tails' extra stays within `zselect::FORM_FILL` of the budget,
-    /// the rest of the budget left to the page cache's other tenants -- the
-    /// partitions the form does not cover yet, the files a write mix lands,
-    /// the indexes; and a raw-tailed partition goes back, coldest first,
-    /// only once the form passes `RECODE_AUTO_EVICT` of it. Under the forced
-    /// form the policy filled the budget to its edge with the form's bytes
-    /// alone and gave raw tails back at the group's refaults: the budget
-    /// falls a tenth through a write mix as the process's memory grows, the
-    /// write mixes refault whatever the form does, and at ten million keys
-    /// under 1.25 GiB the policy made 77 re-codes and 229 give-backs over
-    /// the mixes, E 0.68x and D 0.64x. Refuted there too: the policy took
-    /// the raw tails of the three hottest partitions in B and of two more in
-    /// D and gave those two back in E, with no flip after, and E read 0.87x
-    /// in both reps with the major faults the default does not take, since
-    /// E's own memory takes a fifth of the budget from the page cache and
-    /// the 36 MB the raw tails added were past what was left
-    /// (`docs/engine.md`). Off; `supdb-zrecodeauto` is the arm.
-    #[doc(hidden)]
-    pub zpages_recode_auto: bool,
-    /// EXPERIMENT: under the controller (`ZPages::Auto`), once the form is
-    /// installed and the builder has nothing due, the hottest block-coded
-    /// partitions are built again by the parsing encoder (`zpages_parse`)
-    /// and swapped into their cells while they serve (`ZKind::Reparse`):
-    /// the builds the install waits for keep the greedy encoder, whose CPU
-    /// keeps the builds ahead level with the load, and the decodes the
-    /// parse makes cheaper are bought where the builder is free. A
-    /// partition holding at least `RECODE_AUTO_SHARE` of the store's decode
-    /// time, timed as the re-code policy times it, is re-parsed once while
-    /// its segment lives; the form only shrinks, so no budget is checked,
-    /// and no build starts while a seal or a merge runs. Refuted at ten
-    /// million keys under 1.25 GiB: eight partitions re-parsed a rep took
-    /// E's scans 1.4% faster, and the write mixes they were built in paid
-    /// for their bytes at the durable commits' fsyncs, D's commits a fifth
-    /// slower and A's a tenth (`docs/engine.md`). Off; `supdb-zreparse` is
-    /// the arm.
-    #[doc(hidden)]
-    pub zpages_reparse: bool,
     /// Under the controller (`ZPages::Auto`), once the form is installed,
     /// the hot-raw policy: the partitions whose reads cost the most are
     /// served from the raw form, their pages held in the page cache beside
@@ -6575,8 +6450,7 @@ pub struct Options {
     /// under a bound LMDB's B-tree fits whole the form that fits the bound
     /// lost the mixes to the decode (`docs/engine.md`). On as shipped;
     /// `supdb-znohotraw` is the shape with every covered partition served
-    /// from its form file. Stands down where the re-code policy runs
-    /// (`zpages_recode_auto`, `zpages_reparse`), and beside the stride form
+    /// from its form file. Stands down beside the stride form
     /// (`zpages_stride`), whose files count no decode or open: rated at no
     /// heat, each was a partition of the median a block file's skew is read
     /// against at nothing, until the heat and the median are counted by form.
@@ -7300,13 +7174,7 @@ pub struct Options {
     /// sum level and the pass after the one-percent burst 0.88x and 0.82x.
     /// In core nothing of it acts (`docs/engine.md` has the commands).
     /// `supdb-zloadend` is the engine before them, `supdb-zstridealldropagain`
-    /// and `supdb-zstrideallcdrop` each take one back. Refused beside a re-code policy under the
-    /// mode it starts builds in, each of which builds over a served file's
-    /// name on its own -- `zpages_recode` under `ZPages::Always`, and
-    /// `zpages_recode_auto` and `zpages_reparse` under `ZPages::Auto` --
-    /// and not beside any of the three under the other mode, where it starts
-    /// none, nor beside `zpages_recode_keep` or `zpages_both`, which act only
-    /// on the paths those start (`check_options` says why). Every read
+    /// and `supdb-zstrideallcdrop` each take one back. Every read
     /// path serves a stride partition from its file: the point reads, the
     /// counts and a scan's walks by rank by its arms (`ZFile::stride`), and
     /// the block cache's reads, the merge path's walks and the covered walk
@@ -7505,13 +7373,9 @@ impl Options {
 
     /// Whether a form file times one decode in sixteen and counts a
     /// raw-tailed group's opens (`zfile::ZFile::time_decodes`): the heat the
-    /// re-code policy reads, under the forced form or the controller.
+    /// hot-raw policy and the conversion read.
     pub(crate) fn z_times_decodes(&self) -> bool {
-        self.zpages_recode
-            || self.zpages_recode_auto
-            || self.zpages_reparse
-            || self.zpages_hot_raw
-            || self.zpages_stride_convert
+        self.zpages_hot_raw || self.zpages_stride_convert
     }
 
     /// The form file's group coding the options ask for
@@ -7529,8 +7393,8 @@ impl Options {
     /// partition's form takes its `stride` from (`zfile::BuildPlan::stride`)
     /// -- `z_give`'s, `z_start`'s builds and rebuilds and its builds ahead,
     /// the builds at a merge's output finish -- so that no site restates
-    /// the option. A re-code's, a spare's and a re-parse's plans build the
-    /// other block coding of a served block file and ask nothing.
+    /// the option. A conversion's plan asks for the form its partition is
+    /// not served in (`Maint::z_start`).
     fn z_stride_ask(&self) -> zfile::StrideAsk {
         match self.zpages_stride {
             ZStride::Off | ZStride::Chosen => zfile::StrideAsk::No,
@@ -7859,12 +7723,8 @@ impl Default for Options {
             zpages_own_decoder: true,
             zpages_flat_decode: true,
             zpages_flat_slack: true,
-            zpages_raw_tails_first: 0,
             zpages_drop_raw: true,
             zpages_drop_at_install: true,
-            zpages_recode: false,
-            zpages_recode_keep: false,
-            zpages_both: false,
             zpages_coding_auto: true,
             zpages_inplace_walk: true,
             zpages_build_eager: false,
@@ -8059,8 +7919,6 @@ impl Default for Options {
             zpages_cover_resident: true,
             zpages_under_cipher: true,
             zpages_suspect_at_crossing: true,
-            zpages_recode_auto: false,
-            zpages_reparse: false,
             zpages_hot_raw: true,
             zpages_hot_raw_slack: true,
             zpages_hot_raw_evidence: false,
@@ -10353,17 +10211,9 @@ struct ZBuild {
     /// unless the controller wants builds by the time it is collected, and
     /// a decision that wants none does not cancel it.
     dormant: bool,
-    /// A re-code of a served partition (`ZKind::Recode`): collected by a
-    /// swap of the cell, and a build that installs nothing leaves the
-    /// partition as it was served.
-    recode: bool,
-    /// A re-code collected into the cell of kept form files and not the
-    /// served one (`ZKind::Spare`).
-    spare: bool,
-    /// A re-code in the served coding by the parsing encoder
-    /// (`ZKind::Reparse`).
-    reparse: bool,
-    /// A re-code into the other form (`ZKind::Convert`).
+    /// A re-code of a served partition into the other form
+    /// (`ZKind::Convert`): collected by a swap of the cell, and a build that
+    /// installs nothing leaves the partition as it was served.
     convert: bool,
 }
 
@@ -10633,22 +10483,13 @@ impl ZJob {
 /// Why a partition is given a job: it has no form file, its last build
 /// failed and the backoff has passed, or its form file failed a check; or its
 /// form file is attached and cold to this process, and is to be warmed; or
-/// its form file serves and is to be built again in the other coding.
+/// its form file serves and is to be built again in the other form.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum ZKind {
     Build,
     Retry,
     Rebuild,
     Warm,
-    /// The served form file built again in the other coding
-    /// (`Options::zpages_recode`).
-    Recode,
-    /// The served form file built in the other coding to be kept beside
-    /// it, unserved (`Options::zpages_both`).
-    Spare,
-    /// The served block-coded form file built again in its coding by the
-    /// parsing encoder and swapped in (`Options::zpages_reparse`).
-    Reparse,
     /// The served form file built again in the other form, the stride form
     /// for a block file and the block form for a stride file, and swapped
     /// in (`Options::zpages_stride_convert`).
@@ -10684,16 +10525,6 @@ fn z_take_cell(shared: &Shared, seg: &Seg, drop: bool) -> bool {
         unsafe { &*p }.drop_cache();
     }
     shared.retired_z.push(tag, RetiredZ(p));
-    // The kept form file goes with the served one: it was served once, and
-    // a reader pinned then may still be walking it.
-    let k = seg.z_spare.take();
-    if !k.is_null() {
-        if drop {
-            // SAFETY: as above.
-            unsafe { &*k }.drop_cache();
-        }
-        shared.retired_z.push(tag, RetiredZ(k));
-    }
     shared.retired_z.sweep(|low| shared.readers.oldest_for(low));
     true
 }
@@ -10880,12 +10711,6 @@ struct Seg {
     /// with an empty cell, and its reads go to the raw form until the
     /// form file is attached again.
     z: zfile::ZCell,
-    /// The form file a re-code took out of `z`, in the other coding, kept
-    /// attached and unserved (`Options::zpages_recode_keep`): the next
-    /// re-code of the partition exchanges the two (`ZCell::flip`). Read by
-    /// no reader but one that loaded it while it served, changed only by
-    /// the segment work's thread, and freed with the segment.
-    z_spare: zfile::ZCell,
     /// Why a partition was given no form file, for the life of the segment,
     /// as `zfile::Decline::code` numbers the reasons (`zfile::DECLINED_FAILED`
     /// a build that failed), or zero: what keeps a settle from looking
@@ -15680,7 +15505,6 @@ impl Seg {
                 tombs,
                 data,
                 z: zfile::ZCell::new(),
-                z_spare: zfile::ZCell::new(),
                 hot_reads16: AtomicU64::new(0),
                 z_declined: std::sync::atomic::AtomicU8::new(0),
                 z_hot_asked: std::sync::atomic::AtomicU8::new(0),
@@ -15730,7 +15554,6 @@ impl Seg {
                 tombs: false,
                 data,
                 z: zfile::ZCell::new(),
-                z_spare: zfile::ZCell::new(),
                 hot_reads16: AtomicU64::new(0),
                 z_declined: std::sync::atomic::AtomicU8::new(0),
                 z_hot_asked: std::sync::atomic::AtomicU8::new(0),
@@ -15772,7 +15595,6 @@ impl Seg {
             tombs,
             data,
             z: zfile::ZCell::new(),
-            z_spare: zfile::ZCell::new(),
             hot_reads16: AtomicU64::new(0),
             z_declined: std::sync::atomic::AtomicU8::new(0),
             z_hot_asked: std::sync::atomic::AtomicU8::new(0),
@@ -21384,38 +21206,6 @@ fn check_options(opts: &Options) -> Result<()> {
         return Err(err(
             "zpages Always needs writer_pins: a form file is freed with its segment \
              under the epoch, and an unpinned writer reads it unpinned",
-        ));
-    }
-    // The re-code policies tell a served form file's coding by
-    // `ZFile::coded`, one of the block body's two, and a stride file reads
-    // there as the block coding: the re-code's and the re-parse's looks take
-    // it for a block-coded candidate, the spare builder (`zpages_both`) for
-    // a served file with no spare -- the first by key order among equal
-    // heats, and a stride file's heat is its decodes, none -- and each
-    // builds the other block coding of the file under the name, renamed
-    // over it. Held back from a stride file, the same look picks it again
-    // at every turn and the spares of the partitions after it are never
-    // built. What each moves is the block body, so the stride form waits
-    // until their records tell the bodies apart. Three of them start those
-    // builds, each under one mode and on its own (`Maint::z_recode_tick`):
-    // `zpages_recode` under the forced form (`Maint::z_step`), and
-    // `zpages_recode_auto` and `zpages_reparse` under the controller
-    // (`Maint::z_tick`). Each under the other mode, and `zpages_recode_keep`
-    // and `zpages_both` under either, start none -- the last two keep what a
-    // re-code's collect replaced and shape the look and the spares, read
-    // only on the paths the three start -- so beside the stride form they do
-    // nothing and are not refused: the refusal is of what acts.
-    let recodes = match opts.zpages {
-        ZPages::Always => opts.zpages_recode,
-        ZPages::Auto => opts.zpages_recode_auto || opts.zpages_reparse,
-        ZPages::Off => false,
-    };
-    if opts.zpages_stride != ZStride::Off && recodes {
-        return Err(err(
-            "zpages_stride Forced is refused beside a re-code policy that starts \
-             builds (zpages_recode under ZPages::Always, zpages_recode_auto or \
-             zpages_reparse under ZPages::Auto): each reads a stride file as the \
-             block coding and builds a block coding over its name",
         ));
     }
     Ok(())
@@ -32888,10 +32678,7 @@ impl Reader {
             stride_convert_held: get(&ev.stride_convert_held),
             stride_convert_fill: get(&ev.stride_convert_fill),
             builds_raw_tails: get(&ev.builds_raw_tails),
-            recodes: get(&ev.recodes),
-            recodes_back: get(&ev.recodes_back),
             recode_failed: get(&ev.recode_failed),
-            recode_looks: get(&ev.recode_looks),
             hot_raw: get(&ev.hot_raw),
             hot_back: get(&ev.hot_back),
             hot_looks: get(&ev.hot_looks),
@@ -32915,10 +32702,6 @@ impl Reader {
             raw_settle_ms: get(&ev.raw_settle_ms),
             raw_maps: get(&ev.raw_maps),
             raw_map_ms: get(&ev.raw_map_ms),
-            reparses: get(&ev.reparses),
-            recode_flips: get(&ev.recode_flips),
-            spare_builds: get(&ev.spare_builds),
-            spare_failed: get(&ev.spare_failed),
             raw_dropped: get(&ev.raw_dropped),
             raw_dropped_at_install: get(&ev.raw_dropped_at_install),
             build_wall_us: get(&ev.build_wall_us),
@@ -32960,11 +32743,6 @@ impl Reader {
                 c.resident_bytes += z.resident_bytes() as u64;
                 c.file_bytes += z.file_bytes();
                 c.group_bytes += z.group_bytes();
-                if let Some(k) = seg.z_spare.get() {
-                    c.spare_files += 1;
-                    c.spare_bytes += k.file_bytes();
-                    c.resident_bytes += k.resident_bytes() as u64;
-                }
             } else {
                 match seg.z_declined.load(AtomicOrdering::Relaxed) {
                     zfile::DECLINED_SMALL => c.small_partitions += 1,
@@ -59391,46 +59169,16 @@ const SLOT_TOLD_ONE: u8 = 2;
 const ONE_RIDE_WAIT: std::time::Duration = std::time::Duration::from_secs(1);
 const MAINT_LAND_POLL: std::time::Duration = std::time::Duration::from_micros(100);
 
-/// The re-code policy's period (`Options::zpages_recode`); the decode time
-/// a second below which a partition is not re-coded, two milliseconds, a
-/// fifth of a percent of a core; the group's file refaults a second over
-/// which the last re-code is given back, fifty, which at the 0.1-0.2 ms a
-/// refault costs this device is the decode time a few hot partitions'
-/// raw tails save; and how long the ceiling a give-back sets on the form
-/// files' bytes stands once the refaults fall under that floor.
-const RECODE_PERIOD: std::time::Duration = std::time::Duration::from_secs(1);
+/// The heat the hot-raw policy reads (`Options::zpages_hot_raw`): the
+/// decode time a second below which a partition is not hot, two
+/// milliseconds, a fifth of a percent of a core; the time its decay takes a
+/// partition's heat down by e; how much hotter a partition has to be than
+/// the coldest raw one to take its room; and the decode's price a raw
+/// partition's reads are read at before any form file has counted one.
 const RECODE_FLOOR_NS: f64 = 2.0e6;
-const RECODE_REFAULTS: f64 = 50.0;
-const RECODE_HOLD: std::time::Duration = std::time::Duration::from_secs(60);
-/// The re-code policy's heat: the time its decay takes a partition's heat
-/// down by e, so a uniform pass of a few seconds does not settle where the
-/// raw tails go; how much hotter a block-coded partition has to be than the
-/// coldest raw-tailed one to take its room; and the decode's price a
-/// raw-tailed partition's opens are read at before any block-coded form
-/// file has counted one.
 const RECODE_TAU: std::time::Duration = std::time::Duration::from_secs(10);
-/// The policy's period where every partition keeps both codings
-/// (`Options::zpages_both`): a flip costs the prefetch of the incoming
-/// file, a partition's 20-30 MB at the device's 150 MB/s here, about a
-/// fifth of a second, so a look a fifth of a second.
-const RECODE_PERIOD_BOTH: std::time::Duration = std::time::Duration::from_millis(200);
-/// The incoming pages a look asks for at most, beyond its first flip: what
-/// the device reads in one period.
-const RECODE_FLIP_BYTES: u64 = 32 << 20;
 const RECODE_SWAP: f64 = 2.0;
 const RECODE_DECODE_NS: f64 = 1000.0;
-/// The re-code policy under the controller (`Options::zpages_recode_auto`):
-/// the share of the store's decode time a partition holds before its raw
-/// tails are built -- at ten million keys the suite's Zipfian put a fifth
-/// to a quarter of E's decode time on each of its two hottest partitions
-/// and a fiftieth on each of the tail's -- and the share of the budget
-/// past which raw tails are given back. The share the form with its raw
-/// tails may fill is `zselect::FORM_FILL`, the coding pick's line too, the
-/// rest left to the page cache's other tenants; the budget falls a tenth
-/// through a write mix, so the gap between the two is the hold that keeps
-/// a raw-tailed set from flipping at each move.
-const RECODE_AUTO_SHARE: f64 = 0.05;
-const RECODE_AUTO_EVICT: f64 = 0.95;
 /// The conversion between the block and the stride forms
 /// (`Options::zpages_stride_convert`): its period; what a build costs a
 /// byte of the form it writes before any build has been timed, seconds --
@@ -59796,14 +59544,6 @@ struct Maint {
     /// Inside a `ZSettle` answer: every kind of build is due, where the
     /// loop's own turns start only the builds of partitions with none.
     z_settling: bool,
-    /// A test's seam (`Options::zpages_hold_after_settle`): no spare is
-    /// started (`Options::zpages_both`) until a settle of the form has
-    /// answered, so that the first spare is the one that starts as a settle
-    /// ends. Spares start whenever no settle runs, and a store whose
-    /// served form files were built during its load had every spare built
-    /// before the test's settle, on a runner that gave the segment work
-    /// the time first, and nothing was left to stand at the rename.
-    z_spares_after_settle: bool,
     /// The controller (`ZPages::Auto`): the selector, whether it runs under
     /// these options, whether its decisions are traced
     /// (`SUPDB_ZPAGES_TRACE`), the epoch its clock counts from, when it
@@ -59926,14 +59666,6 @@ struct Maint {
     /// (`Seg::z_stride_no`), which was not live while it was built. Held to
     /// the live partitions' names as the codings' record is.
     z_finish_stride: std::collections::HashMap<String, u8>,
-    /// The re-code policy's (`Options::zpages_recode`): when it last
-    /// looked; each form file's decode time and opens then, by its attach's
-    /// identity; each partition's decayed heat, by its name; the group's
-    /// file refaults then; and the ceiling a give-back set on the form
-    /// files' bytes, with when refaults last held it.
-    z_recode_last: Option<std::time::Duration>,
-    z_recode_seen: std::collections::HashMap<u64, (u64, u64)>,
-    z_recode_heat: std::collections::HashMap<String, f64>,
     /// The conversion between the two forms' (`Options::zpages_stride_convert`):
     /// when it last looked; each form file's decodes and opens then, with
     /// its decode time and its decodes, by its attach's identity; each
@@ -59983,21 +59715,10 @@ struct Maint {
     /// file, and the next merge's plan, made at the landing, takes it for
     /// the form its range had.
     z_stride_spans: Vec<(Vec<u8>, Vec<u8>)>,
-    z_recode_refaults: Option<u64>,
-    z_recode_ceiling: Option<(u64, std::time::Duration)>,
-    /// Partitions whose spare build kept nothing (`Options::zpages_both`),
-    /// not built a spare again.
-    z_spare_failed: std::collections::HashSet<String>,
-    /// The partitions re-parsed while served (`Options::zpages_reparse`),
-    /// by segment name, so that each is re-parsed once while it lives.
-    z_reparsed: std::collections::HashSet<String>,
     /// The builds at a merge's output finish counted at the last tick
     /// (`Options::zpages_build_at_finish`): a tick that finds more asks
     /// the selector for a fresh reading where their files cover the keys.
     z_finish_seen: u64,
-    /// The last look's refaults were past `RECODE_REFAULTS`: a flip asks
-    /// for none of the incoming file's pages.
-    z_recode_pressed: bool,
     /// The hot-raw policy's (`Options::zpages_hot_raw`): when it last
     /// looked; each served form file's decodes and opens then, by its
     /// attach's identity, and each raw partition's counted reads, by its
@@ -60281,7 +60002,7 @@ impl Maint {
                 }
                 // Swept here, where nothing is building and nothing starts
                 // before the answer, and not by the caller after it, which
-                // met the spare this thread started next in flight
+                // could meet a build this thread started next in flight
                 // (`Maint::z_sweep_settled`).
                 let swept = if self.shared.maint_stop.load(AtomicOrdering::Acquire) {
                     Ok(())
@@ -60291,7 +60012,6 @@ impl Maint {
                 if self.shared.zsettle_hold.load(AtomicOrdering::Acquire) {
                     Db::set_zhold(&self.shared.zbuild_hold, ZHOLD_RENAME, true);
                 }
-                self.z_spares_after_settle = false;
                 self.z_settling = false;
                 swept?;
                 self.sync_owed_slot()
@@ -60713,7 +60433,6 @@ impl Maint {
             .manifest_seq
             .store(manifest_seq, AtomicOrdering::Release);
         let z_auto = r.opts.zpages == ZPages::Auto && !z_auto_inert(&r.opts);
-        let z_spares_after_settle = r.opts.zpages_hold_after_settle;
         let z_eager = r.opts.zpages_build_eager;
         let z_attach_eager = r.opts.zpages_attach_eager;
         let z_suspect_crossing = r.opts.zpages_suspect_at_crossing;
@@ -60758,7 +60477,6 @@ impl Maint {
             zahead: None,
             z_last_d: None,
             z_settling: false,
-            z_spares_after_settle,
             zsel: {
                 let mut sel = zselect::ZSelect::default();
                 sel.set_eager(z_eager);
@@ -60805,9 +60523,6 @@ impl Maint {
             z_land_due: false,
             z_ahead_coding: std::collections::HashMap::new(),
             z_finish_stride: std::collections::HashMap::new(),
-            z_recode_last: None,
-            z_recode_seen: std::collections::HashMap::new(),
-            z_recode_heat: std::collections::HashMap::new(),
             z_conv_last: None,
             z_conv_seen: std::collections::HashMap::new(),
             z_conv_heat: std::collections::HashMap::new(),
@@ -60819,12 +60534,7 @@ impl Maint {
             z_anon_peak: std::cell::Cell::new(zselect::WindowMax::new(zselect::RETAIN_FLOOR)),
             z_conv_decode: None,
             z_stride_spans: Vec::new(),
-            z_recode_refaults: None,
-            z_recode_ceiling: None,
-            z_spare_failed: std::collections::HashSet::new(),
-            z_reparsed: std::collections::HashSet::new(),
             z_finish_seen: 0,
-            z_recode_pressed: false,
             z_hot_last: None,
             z_hot_seen: std::collections::HashMap::new(),
             z_hot_raw_seen: std::collections::HashMap::new(),
@@ -62895,18 +62605,14 @@ impl Maint {
     /// of a partition that has none, the retry of one that failed once
     /// its backoff has passed, the rebuild of a form file a check took out
     /// of service; the loop's own turns build only for partitions with
-    /// none, and only under `Options::zpages_eager`; and outside a settle,
-    /// with nothing else to build, the re-code policy has its turn
-    /// (`Options::zpages_recode`).
+    /// none, and only under `Options::zpages_eager`.
     fn z_step(&mut self) {
         self.z_heads_look();
         if self.z_auto {
             self.z_tick();
             return;
         }
-        if self.opts.zpages != ZPages::Always
-            || !(self.z_settling || self.opts.zpages_eager || self.opts.zpages_recode)
-        {
+        if self.opts.zpages != ZPages::Always || !(self.z_settling || self.opts.zpages_eager) {
             return;
         }
         if self.zbuild.as_ref().is_some_and(|b| b.job.is_finished()) {
@@ -62916,13 +62622,6 @@ impl Maint {
             drop(op);
         }
         if self.zbuild.is_some() {
-            // A look needs no builder where the policy only exchanges files
-            // (`Options::zpages_both`): with the spares' builds holding the
-            // builder for most of a pass, the looks it waited on came seven
-            // seconds apart.
-            if self.opts.zpages_both && self.opts.zpages_recode && !self.z_settling {
-                self.z_recode_tick();
-            }
             return;
         }
         if self.z_settling || self.opts.zpages_eager {
@@ -62936,30 +62635,13 @@ impl Maint {
             }
         }
         self.z_convert_asked();
-        if self.opts.zpages_recode && !self.z_settling {
-            self.z_recode_tick();
-            if self.zbuild.is_none() && self.opts.zpages_both && !self.z_spares_after_settle {
-                let next = {
-                    let _op = self.op();
-                    self.z_next_spare()
-                };
-                if let Some(seg) = next {
-                    self.z_start(seg, ZKind::Spare, false);
-                }
-            }
-        }
     }
 
     /// The form files no live segment claims swept (`Db::z_sweep`) at the
     /// end of a settle of the form, by the side that starts the builds: a
     /// build in flight is finished and collected first, and none starts
     /// before this returns, so no temp name it removes is a build's in
-    /// flight. Swept by the settle's caller once the segment work had
-    /// answered, it met the spare that work started next
-    /// (`Options::zpages_both`) with its temp name written, removed the
-    /// name, and the spare's rename failed: a partition counted
-    /// `spare_failed` and never given its spare, on a runner slow enough to
-    /// start the spare first.
+    /// flight.
     fn z_sweep_settled(&mut self) -> Result<()> {
         for b in [self.zbuild.take(), self.zahead.take()]
             .into_iter()
@@ -62976,517 +62658,6 @@ impl Maint {
         let swept = Db::z_sweep(&self.dir, names.iter().map(String::as_str))?;
         zfile::ZEvents::add(&self.shared.z.swept, swept);
         Ok(())
-    }
-
-    /// The served partition to build a spare for next (`Options::zpages_both`):
-    /// one with no kept form file, the hottest by the policy's heat and the
-    /// first by key order among equals, none while a seal or a merge is
-    /// rewriting the partitions.
-    fn z_next_spare(&self) -> Option<std::sync::Arc<Seg>> {
-        if !self.compacting.is_empty() || self.tiering.is_some() || !self.sealing.is_empty() {
-            return None;
-        }
-        let mut best: Option<(f64, std::sync::Arc<Seg>)> = None;
-        for s in self.segs().iter().filter(|s| s.level > 0) {
-            if self.in_flight_input(&s.name)
-                || s.z_spare.get().is_some()
-                || !s.z.get().is_some_and(|z| !z.damaged())
-                || self.z_spare_failed.contains(&s.name)
-            {
-                continue;
-            }
-            let heat = self.z_recode_heat.get(&s.name).copied().unwrap_or(0.0);
-            if best.as_ref().is_none_or(|(h, _)| heat > *h) {
-                best = Some((heat, s.clone()));
-            }
-        }
-        best.map(|(_, s)| s)
-    }
-
-    /// The re-code policy's turn (`Options::zpages_recode`), with no build
-    /// in flight: once a `RECODE_PERIOD`, each served form file's decode
-    /// time a second over the period, the group's file refaults a second,
-    /// and the platform's budget; then at most one re-code. A partition's
-    /// heat is its decode time a second, or for a raw-tailed one its opens
-    /// priced at a decode, decayed over `RECODE_TAU`. Over the refault
-    /// floor, the coldest raw-tailed partition goes back to the block
-    /// coding and the form files' bytes are held where that leaves them
-    /// until `RECODE_HOLD` passes under the floor; under it, the hottest
-    /// block-coded partition, past `RECODE_FLOOR_NS`, is re-coded to the
-    /// raw tails if the form files' bytes with its estimated extra stay
-    /// within the budget and the ceiling, and where they would not, the
-    /// coldest raw-tailed one goes back to make the room if the hot one is
-    /// `RECODE_SWAP` times hotter. Nothing is decided while a seal or a
-    /// merge is rewriting the partitions, and nothing without a budget.
-    fn z_recode_tick(&mut self) {
-        let now = self.z_now();
-        let period = if self.opts.zpages_both {
-            RECODE_PERIOD_BOTH
-        } else {
-            RECODE_PERIOD
-        };
-        if self
-            .z_recode_last
-            .is_some_and(|t| now.saturating_sub(t) < period)
-        {
-            return;
-        }
-        let dt = self.z_recode_last.map(|t| now.saturating_sub(t));
-        self.z_recode_last = Some(now);
-        self.z_recode_look(now, dt);
-        // Counted once the look is done, so that a test that waits for a
-        // look reads the decision it made.
-        zfile::ZEvents::add(&self.shared.z.recode_looks, 1);
-    }
-
-    /// One look of the re-code policy at `now`, `dt` after the last one
-    /// (none at the first): see `z_recode_tick`.
-    fn z_recode_look(&mut self, now: std::time::Duration, dt: Option<std::time::Duration>) {
-        let inject = self.opts.zpages_inject.clone();
-        let platform = zfile::read_budget();
-        let budget = inject
-            .as_ref()
-            .and_then(|i| i.budget())
-            .or(platform.map(|b| b.budget));
-        let refault_rate = match inject.as_ref().and_then(|i| i.refault_rate()) {
-            Some(r) => r,
-            None => {
-                let refaults = platform.and_then(|b| b.refaults);
-                let rate = match (refaults, self.z_recode_refaults, dt) {
-                    (Some(r), Some(r0), Some(d)) if !d.is_zero() => {
-                        r.saturating_sub(r0) as f64 / d.as_secs_f64()
-                    }
-                    _ => 0.0,
-                };
-                self.z_recode_refaults = refaults;
-                rate
-            }
-        };
-        self.z_recode_pressed = refault_rate > RECODE_REFAULTS;
-        // Each served partition by its form file: its coding, its bytes, its
-        // records' bytes, and what its form file has counted -- the decode
-        // time, the decodes and the record-coded groups opened in place.
-        struct Served {
-            seg: std::sync::Arc<Seg>,
-            coded: bool,
-            bytes: u64,
-            records: u64,
-            heat: f64,
-        }
-        type Row = (std::sync::Arc<Seg>, u64, bool, u64, u64, u64, u64, u64);
-        let rows: Vec<Row> = {
-            let _op = self.op();
-            self.segs()
-                .iter()
-                .filter(|s| s.level > 0 && !self.in_flight_input(&s.name))
-                .filter_map(|s| {
-                    let z = s.z.get().filter(|z| !z.damaged())?;
-                    Some((
-                        s.clone(),
-                        z.id(),
-                        z.coded(),
-                        z.file_bytes(),
-                        s.foot().1,
-                        16 * z.decode_ns16.load(AtomicOrdering::Relaxed),
-                        16 * z.decodes16.load(AtomicOrdering::Relaxed),
-                        16 * z.opens16.load(AtomicOrdering::Relaxed),
-                    ))
-                })
-                .collect()
-        };
-        // A decode's time where a test has priced one through the seam: a
-        // form file's decode time is then its decodes at that price, since
-        // the time a decode takes is the build profile's and a test does not
-        // choose it.
-        let priced = inject
-            .as_ref()
-            .and_then(|i| i.decode_cost())
-            .map(|c| c.as_nanos().min(u64::MAX as u128) as u64);
-        let rows: Vec<Row> = match priced {
-            Some(c) => rows
-                .into_iter()
-                .map(|mut r| {
-                    r.5 = r.6.saturating_mul(c);
-                    r
-                })
-                .collect(),
-            None => rows,
-        };
-        // What a decode costs, from the block-coded files' counts: the price
-        // a raw-tailed file's opens are read at, since it decodes nothing.
-        let (ns_all, decodes_all) = rows
-            .iter()
-            .filter(|r| !r.2)
-            .fold((0u64, 0u64), |(n, d), r| (n + r.5, d + r.6));
-        let per_decode = if decodes_all == 0 {
-            RECODE_DECODE_NS
-        } else {
-            ns_all as f64 / decodes_all as f64
-        };
-        // A partition's heat, kept by its name across its re-codes: the
-        // period's rate folded into what the periods before left, decayed
-        // over `RECODE_TAU`, so that a pass a few seconds long does not
-        // settle where the decodes are; a form file first seen gives no rate
-        // and its partition's heat only decays.
-        let keep = dt.map(|d| (-d.as_secs_f64() / RECODE_TAU.as_secs_f64()).exp());
-        let mut seen = std::collections::HashMap::with_capacity(rows.len());
-        let mut heats = std::collections::HashMap::with_capacity(rows.len());
-        let mut parts = Vec::with_capacity(rows.len());
-        for (seg, id, coded, bytes, records, ns, _decodes, opens) in rows {
-            let rate = match (self.z_recode_seen.get(&id), dt) {
-                (Some(&(ns0, opens0)), Some(d)) if !d.is_zero() => Some(if coded {
-                    opens.saturating_sub(opens0) as f64 * per_decode / d.as_secs_f64()
-                } else {
-                    ns.saturating_sub(ns0) as f64 / d.as_secs_f64()
-                }),
-                _ => None,
-            };
-            let old = self.z_recode_heat.get(&seg.name).copied().unwrap_or(0.0);
-            // Where both codings are kept a flip is a prefetch, and the heat
-            // rises to the rate a partition shows at once and fades over
-            // `RECODE_TAU`: the suite's mixes are a quarter to three quarters
-            // of a second each, so an average over seconds gave the head of
-            // a Zipfian mix its raw tails after the mix, and a uniform mix
-            // between two Zipfian ones took them away. Elsewhere a flip is a
-            // build, and the heat is the average.
-            let heat = match (rate, keep) {
-                (Some(r), Some(a)) if self.opts.zpages_both => (a * old).max(r),
-                (Some(r), Some(a)) => a * old + (1.0 - a) * r,
-                (None, Some(a)) => a * old,
-                _ => old,
-            };
-            seen.insert(id, (ns, opens));
-            heats.insert(seg.name.clone(), heat);
-            parts.push(Served {
-                seg,
-                coded,
-                bytes,
-                records,
-                heat,
-            });
-        }
-        self.z_recode_seen = seen;
-        self.z_recode_heat = heats;
-        let rewriting =
-            !self.compacting.is_empty() || self.tiering.is_some() || !self.sealing.is_empty();
-        let (Some(budget), Some(_)) = (budget, dt) else {
-            return;
-        };
-        if rewriting {
-            if self.z_trace {
-                eprintln!("zrecode t={:.1} busy", now.as_secs_f64());
-            }
-            return;
-        }
-        let total: u64 = parts.iter().map(|p| p.bytes).sum();
-        // A record's bytes in each coding, from the form files built in it:
-        // until a raw-tail one is, the records' own bytes, which the raw
-        // tails come to within a few percent at the suite's shape.
-        let ratio = |coded: bool, none: f64| {
-            let (b, r) = parts
-                .iter()
-                .filter(|p| p.coded == coded)
-                .fold((0u64, 0u64), |(b, r), p| (b + p.bytes, r + p.records));
-            if r == 0 {
-                none
-            } else {
-                b as f64 / r as f64
-            }
-        };
-        let (raw_ratio, block_ratio) = (ratio(true, 1.0), ratio(false, 0.6));
-        let trace = |what: &str, p: Option<&Served>, ceiling: Option<u64>| {
-            eprintln!(
-                "zrecode t={:.1} {what} seg={} heat_ms_s={:.2} total={} budget={budget} ceiling={} refaults_s={refault_rate:.1}",
-                now.as_secs_f64(),
-                p.map_or("-", |p| p.seg.name.as_str()),
-                p.map_or(0.0, |p| p.heat / 1e6),
-                total,
-                ceiling.map_or_else(|| "-".to_string(), |c| c.to_string()),
-            );
-        };
-        let coldest_raw = parts
-            .iter()
-            .filter(|p| p.coded)
-            .min_by(|a, b| a.heat.total_cmp(&b.heat));
-        // The re-parse under the controller (`Options::zpages_reparse`):
-        // the hottest block-coded partition not yet re-parsed, at least
-        // `RECODE_AUTO_SHARE` of the decode time, built again by the
-        // parsing encoder. The form shrinks by it, so no budget is checked.
-        if self.opts.zpages == ZPages::Auto
-            && self.opts.zpages_reparse
-            && !self.opts.zpages_recode_auto
-        {
-            let live: std::collections::HashSet<&str> =
-                parts.iter().map(|p| p.seg.name.as_str()).collect();
-            self.z_reparsed.retain(|n| live.contains(n.as_str()));
-            let heat_all: f64 = parts.iter().map(|p| p.heat).sum();
-            let Some(p) = parts
-                .iter()
-                .filter(|p| !p.coded && !self.z_reparsed.contains(&p.seg.name))
-                .max_by(|a, b| a.heat.total_cmp(&b.heat))
-            else {
-                return;
-            };
-            if p.heat < RECODE_FLOOR_NS || p.heat < RECODE_AUTO_SHARE * heat_all {
-                if self.z_trace {
-                    trace("cold", Some(p), None);
-                }
-                return;
-            }
-            if self.z_trace {
-                trace("reparse", Some(p), None);
-            }
-            let seg = p.seg.clone();
-            self.z_reparsed.insert(seg.name.clone());
-            self.z_start(seg, ZKind::Reparse, false);
-            return;
-        }
-        // Under the controller (`Options::zpages_recode_auto`): the hottest
-        // block-coded partition, at least `RECODE_AUTO_SHARE` of the decode
-        // time, re-coded to the raw tails where the form with their extra
-        // stays within `zselect::FORM_FILL` of the budget, else the room made
-        // by the coldest raw-tailed one if the hot one is `RECODE_SWAP`
-        // times hotter; and past `RECODE_AUTO_EVICT` of the budget the
-        // coldest raw-tailed partition given back. The refaults decide
-        // nothing: the write mixes raise them whatever the form does.
-        if self.opts.zpages == ZPages::Auto {
-            let heat_all: f64 = parts.iter().map(|p| p.heat).sum();
-            let fill = zselect::form_fill(budget);
-            let evict = (budget as f64 * RECODE_AUTO_EVICT) as u64;
-            if total > evict {
-                if self.z_trace {
-                    trace("back", coldest_raw, Some(evict));
-                }
-                if let Some(p) = coldest_raw {
-                    let seg = p.seg.clone();
-                    self.z_recode(seg);
-                }
-                return;
-            }
-            let Some(p) = parts
-                .iter()
-                .filter(|p| !p.coded)
-                .max_by(|a, b| a.heat.total_cmp(&b.heat))
-            else {
-                return;
-            };
-            if p.heat < RECODE_FLOOR_NS || p.heat < RECODE_AUTO_SHARE * heat_all {
-                if self.z_trace {
-                    trace("cold", Some(p), Some(fill));
-                }
-                return;
-            }
-            let extra = ((p.records as f64 * raw_ratio) as u64).saturating_sub(p.bytes);
-            if total.saturating_add(extra) <= fill {
-                if self.z_trace {
-                    trace("raw", Some(p), Some(fill));
-                }
-                let seg = p.seg.clone();
-                self.z_recode(seg);
-                return;
-            }
-            match coldest_raw {
-                Some(q) if q.heat * RECODE_SWAP < p.heat => {
-                    if self.z_trace {
-                        trace("swap", Some(q), Some(fill));
-                    }
-                    let seg = q.seg.clone();
-                    self.z_recode(seg);
-                }
-                _ => {
-                    if self.z_trace {
-                        trace("full", Some(p), Some(fill));
-                    }
-                }
-            }
-            return;
-        }
-        if refault_rate > RECODE_REFAULTS {
-            let ceiling = match coldest_raw {
-                Some(p) => total.saturating_sub(p.bytes).saturating_add(
-                    p.seg
-                        .z_spare
-                        .get()
-                        .map_or((p.records as f64 * block_ratio) as u64, |k| k.file_bytes()),
-                ),
-                None => total,
-            };
-            self.z_recode_ceiling = Some((ceiling, now));
-            if self.z_trace {
-                trace("back", coldest_raw, Some(ceiling));
-            }
-            if let Some(p) = coldest_raw {
-                let seg = p.seg.clone();
-                self.z_recode(seg);
-            }
-            return;
-        }
-        if self
-            .z_recode_ceiling
-            .is_some_and(|(_, since)| now.saturating_sub(since) >= RECODE_HOLD)
-        {
-            self.z_recode_ceiling = None;
-        }
-        if self.opts.zpages_both {
-            // The raw-tailed set chosen whole among the partitions that keep
-            // both codings, the rest held at the coding they serve: the
-            // hottest whose raw tails fit, by heat with a served raw-tailed
-            // partition's counted `RECODE_SWAP` times, against the order and
-            // the floor alike, so that one serving its raw tails keeps them
-            // until it is that much colder than what would take them; then
-            // each partition whose coding differs exchanged, the ones going
-            // back first since they make the room, at most
-            // `RECODE_FLIP_BYTES` of incoming pages a look and one at least.
-            // Nothing moves while nothing reads: a store at rest would give
-            // its raw tails back as the heat decays and take them again at
-            // the next pass, a prefetch each way for nothing.
-            let limit = self.z_recode_ceiling.map_or(budget, |(c, _)| c.min(budget));
-            let heat_all: f64 = parts.iter().map(|p| p.heat).sum();
-            if heat_all < RECODE_FLOOR_NS {
-                if self.z_trace {
-                    trace("idle", None, self.z_recode_ceiling.map(|c| c.0));
-                }
-                return;
-            }
-            // (index into parts, raw-tailed bytes, block-coded bytes)
-            let mut two: Vec<(usize, u64, u64)> = Vec::new();
-            let mut fixed = 0u64;
-            for (i, p) in parts.iter().enumerate() {
-                match p.seg.z_spare.get() {
-                    Some(k) if p.coded => two.push((i, p.bytes, k.file_bytes())),
-                    Some(k) => two.push((i, k.file_bytes(), p.bytes)),
-                    None => fixed += p.bytes,
-                }
-            }
-            let rank = |t: &(usize, u64, u64)| {
-                let p = &parts[t.0];
-                p.heat * if p.coded { RECODE_SWAP } else { 1.0 }
-            };
-            two.sort_by(|a, b| rank(b).total_cmp(&rank(a)));
-            let mut total = fixed + two.iter().map(|t| t.2).sum::<u64>();
-            let want: Vec<bool> = two
-                .iter()
-                .map(|t| {
-                    let extra = t.1.saturating_sub(t.2);
-                    let ok = rank(t) >= RECODE_FLOOR_NS && total.saturating_add(extra) <= limit;
-                    if ok {
-                        total += extra;
-                    }
-                    ok
-                })
-                .collect();
-            let mut moved = 0u64;
-            for to_raw in [false, true] {
-                for (t, &w) in two.iter().zip(&want) {
-                    let p = &parts[t.0];
-                    if p.coded == w || w != to_raw {
-                        continue;
-                    }
-                    let incoming = if w { t.1 } else { t.2 };
-                    if moved > 0 && moved.saturating_add(incoming) > RECODE_FLIP_BYTES {
-                        continue;
-                    }
-                    moved = moved.saturating_add(incoming);
-                    if self.z_trace {
-                        trace(
-                            if w { "raw" } else { "back" },
-                            Some(p),
-                            self.z_recode_ceiling.map(|c| c.0),
-                        );
-                    }
-                    self.z_recode(p.seg.clone());
-                }
-            }
-            return;
-        }
-        let Some(p) = parts
-            .iter()
-            .filter(|p| !p.coded)
-            .max_by(|a, b| a.heat.total_cmp(&b.heat))
-        else {
-            return;
-        };
-        if p.heat < RECODE_FLOOR_NS {
-            if self.z_trace {
-                trace("cold", Some(p), self.z_recode_ceiling.map(|c| c.0));
-            }
-            return;
-        }
-        // The raw tails' extra: the kept file's own bytes where the
-        // partition keeps one, else the estimate.
-        let extra = match p.seg.z_spare.get() {
-            Some(k) => k.file_bytes().saturating_sub(p.bytes),
-            None => ((p.records as f64 * raw_ratio) as u64).saturating_sub(p.bytes),
-        };
-        let limit = self.z_recode_ceiling.map_or(budget, |(c, _)| c.min(budget));
-        if total.saturating_add(extra) <= limit {
-            if self.z_trace {
-                trace("raw", Some(p), self.z_recode_ceiling.map(|c| c.0));
-            }
-            let seg = p.seg.clone();
-            self.z_recode(seg);
-            return;
-        }
-        // No room: made by the coldest raw-tailed partition where the
-        // hottest block-coded one is `RECODE_SWAP` times hotter, and taken
-        // by it at a later look. A swap sets no ceiling: the room is made,
-        // not found wanting.
-        match coldest_raw {
-            Some(q) if q.heat * RECODE_SWAP < p.heat => {
-                if self.z_trace {
-                    trace("swap", Some(q), self.z_recode_ceiling.map(|c| c.0));
-                }
-                let seg = q.seg.clone();
-                self.z_recode(seg);
-            }
-            _ => {
-                if self.z_trace {
-                    trace("full", Some(p), self.z_recode_ceiling.map(|c| c.0));
-                }
-            }
-        }
-    }
-
-    /// `seg` re-coded: its kept form file exchanged with the served one
-    /// where it keeps one (`Options::zpages_recode_keep`) -- the incoming
-    /// file's pages asked for and the outgoing one's dropped, no build --
-    /// else built again in the other coding (`ZKind::Recode`).
-    fn z_recode(&mut self, seg: std::sync::Arc<Seg>) {
-        let shared = self.shared.clone();
-        let ev = &shared.z;
-        // A kept file a check failed in while it served is retired, not
-        // put back: the partition is built again instead.
-        if seg.z_spare.get().is_some_and(|k| k.damaged()) {
-            let k = seg.z_spare.take();
-            let tag = shared.readers.bump();
-            shared.retired_z.push(tag, RetiredZ(k));
-            shared.retired_z.sweep(|low| shared.readers.oldest_for(low));
-        }
-        if seg.z.flip(&seg.z_spare) {
-            // Both live while the segment does, and the kept one is this
-            // thread's alone.
-            if let Some(k) = seg.z_spare.get() {
-                k.drop_cache();
-            }
-            if let Some(z) = seg.z.get() {
-                // Under refaults the reads fault in only the pages they
-                // touch: a whole file asked for there queues behind the
-                // faults on the device it is short of.
-                if !self.z_recode_pressed {
-                    z.prefetch_all();
-                }
-                if z.coded() {
-                    zfile::ZEvents::add(&ev.recodes, 1);
-                } else {
-                    zfile::ZEvents::add(&ev.recodes_back, 1);
-                }
-            }
-            zfile::ZEvents::add(&ev.recode_flips, 1);
-            return;
-        }
-        if self.zbuild.is_none() {
-            self.z_start(seg, ZKind::Recode, false);
-        }
     }
 
     /// The conversion's turn (`Options::zpages_stride_convert`), with the
@@ -64247,7 +63418,7 @@ impl Maint {
                             Some((
                                 z.id(),
                                 z.coded(),
-                                z.file_bytes() + s.z_spare.get().map_or(0, |k| k.file_bytes()),
+                                z.file_bytes(),
                                 16 * z.decode_ns16.load(AtomicOrdering::Relaxed),
                                 16 * z.decodes16.load(AtomicOrdering::Relaxed),
                                 16 * z.opens16.load(AtomicOrdering::Relaxed),
@@ -64272,7 +63443,7 @@ impl Maint {
             (rows, live)
         };
         // A decode priced through the seam: a form file's decode time is
-        // then its decodes at that price, as the re-code policy reads it.
+        // then its decodes at that price.
         let priced = inject
             .as_ref()
             .and_then(|i| i.decode_cost())
@@ -65413,13 +64584,11 @@ impl Maint {
     }
 
     /// Whether the hot-raw policy is this store's: on, under the controller,
-    /// and standing down where the re-code policy runs and, but under
-    /// `Options::zpages_hot_raw_beside_stride`, beside the stride form
-    /// (`Options::zpages_hot_raw`).
+    /// and standing down, but under `Options::zpages_hot_raw_beside_stride`,
+    /// beside the stride form (`Options::zpages_hot_raw`).
     fn z_hot_runs(&self) -> bool {
         self.opts.zpages_hot_raw
             && self.opts.zpages == ZPages::Auto
-            && !(self.opts.zpages_recode_auto || self.opts.zpages_reparse)
             && (self.opts.zpages_stride == ZStride::Off || self.opts.zpages_hot_raw_beside_stride)
     }
 
@@ -66455,9 +65624,7 @@ impl Maint {
         // the form installed, whatever the builder is at: it starts a
         // build only with the builder free and nothing of the store's own
         // due it.
-        let recode = self.opts.zpages_recode_auto || self.opts.zpages_reparse;
-        let converts = !recode
-            && self.opts.zpages_stride_convert
+        let converts = self.opts.zpages_stride_convert
             && self.opts.zpages_stride != ZStride::Off
             && d.build
             && self.zsel.phase() == zselect::Phase::Compact
@@ -66530,41 +65697,28 @@ impl Maint {
             self.z_finish_seen = finished;
             self.z_prebuilt_landed();
         }
-        // Once the form is installed and the builder has nothing due, the
-        // re-code policy's turn (`Options::zpages_recode_auto`,
-        // `Options::zpages_reparse`); or, where it does not run, the hot-raw
-        // policy's (`Options::zpages_hot_raw`) at every tick with the form
-        // installed, since a release builds nothing and a build in flight for
+        // Once the form is installed, the hot-raw policy's turn
+        // (`Options::zpages_hot_raw`) at every tick, since a release builds nothing and a build in flight for
         // another partition is no reason to wait -- the mixes at the bounded
         // rung run beside the builds of the files the load's drain left, and
         // a policy that waited for the builder never looked through them.
         if d.build && self.zsel.phase() == zselect::Phase::Compact && !self.z_settling {
-            if recode {
+            if converts {
+                // A test's request, taken with the builder free and
+                // nothing due it: the policy's own look is above.
                 let idle = self.zbuild.is_none() && {
                     let _op = self.op();
                     self.z_next().is_none()
                 };
                 if idle {
-                    self.z_recode_tick();
+                    self.z_convert_asked();
                 }
-            } else {
-                if converts {
-                    // A test's request, taken with the builder free and
-                    // nothing due it: the policy's own look is above.
-                    let idle = self.zbuild.is_none() && {
-                        let _op = self.op();
-                        self.z_next().is_none()
-                    };
-                    if idle {
-                        self.z_convert_asked();
-                    }
-                }
-                // The hot-raw policy's turn, beside the conversion's where
-                // the option has it run beside the stride form: a release
-                // builds nothing.
-                if self.z_hot_runs() {
-                    self.z_hot_raw_tick();
-                }
+            }
+            // The hot-raw policy's turn, beside the conversion's where
+            // the option has it run beside the stride form: a release
+            // builds nothing.
+            if self.z_hot_runs() {
+                self.z_hot_raw_tick();
             }
         }
         // The sample after the next build ahead, which leaves it waiting
@@ -68071,29 +67225,18 @@ impl Maint {
                 zfile::ZEvents::add(&ev.rebuilds, 1);
             }
             ZKind::Retry => zfile::ZEvents::add(&ev.build_retries, 1),
-            ZKind::Build
-            | ZKind::Warm
-            | ZKind::Recode
-            | ZKind::Spare
-            | ZKind::Reparse
-            | ZKind::Convert => {}
+            ZKind::Build | ZKind::Warm | ZKind::Convert => {}
         }
         let refused = seg.z_declined.load(AtomicOrdering::Relaxed) == zfile::DECLINED_REFUSED;
-        // A re-code's partition is served by the file under the name, which
-        // is the one being replaced.
-        // A spare is built as a re-code is, the other coding of the served
-        // file, and kept where a re-code swaps.
-        let spare = kind == ZKind::Spare;
-        let reparse = kind == ZKind::Reparse;
-        // A conversion is a re-code into the other form: started, collected
-        // and failed as one, with the body its plan asks for its own.
+        // A conversion re-codes the served partition into the other form:
+        // the partition is served by the file under the name, which is the
+        // one being replaced.
         let convert = kind == ZKind::Convert;
-        let recode = kind == ZKind::Recode || spare || reparse || convert;
-        if !recode && self.z_attach_on_disk(&seg, id, end, dormant, refused) {
+        if !convert && self.z_attach_on_disk(&seg, id, end, dormant, refused) {
             return;
         }
         let failed = |why: u8| {
-            if recode {
+            if convert {
                 // The partition is served as it was.
                 zfile::ZEvents::add(&ev.recode_failed, 1);
                 return;
@@ -68159,70 +67302,26 @@ impl Maint {
         plan.sync = self.opts.zpages_build_sync && plan.drop_output;
         plan.ahead = self.opts.zpages_build_ahead;
         plan.group_bytes = self.opts.zpages_group_bytes;
-        // The coding: the other one for a re-code, the selector's pick where
-        // it chooses one (`Options::zpages_coding_auto`), taken again
-        // against the partitions as they stand (`Maint::z_repick`), else the
-        // options'.
-        if !(reparse || recode) || convert {
-            self.z_repick();
-        }
-        // A re-code, a spare and a re-parse build the other block coding of
-        // the block file the partition serves, and a stride file has none:
-        // the policies that start them are refused beside the stride form
-        // (`check_options`), which is what this rests on.
-        let stride_served = recode && seg.z.get().is_some_and(|z| z.is_stride());
-        debug_assert!(
-            convert || !stride_served,
-            "a re-code, spare or re-parse of a stride file, which check_options refuses"
-        );
-        if stride_served && !convert {
-            return;
-        }
+        // The coding: the selector's pick where it chooses one
+        // (`Options::zpages_coding_auto`), taken again against the
+        // partitions as they stand (`Maint::z_repick`), else the options'.
+        self.z_repick();
+        let stride_served = convert && seg.z.get().is_some_and(|z| z.is_stride());
         // Nothing serves it any more: nothing to convert.
         if convert && seg.z.get().is_none() {
             return;
         }
-        let served_coded = seg.z.get().map(|z| z.coded());
+        // A conversion out of the stride form builds the block body a build
+        // of the partition's own would; into it the body is the stride
+        // form's and no coding is read.
         let (coding, raw_tails) = match self.z_coding_pick {
-            // A re-parse keeps the served block coding.
-            _ if reparse => match served_coded {
-                Some(false) => (zpages::ZCODING_BLOCK, false),
-                _ => return,
-            },
-            // A conversion out of the stride form builds the block body a
-            // build of the partition's own would, by the arms below; into
-            // it the body is the stride form's and no coding is read.
-            _ if recode && !convert => match served_coded {
-                Some(true) => (zpages::ZCODING_BLOCK, false),
-                Some(false) => (zpages::ZCODING_RECORD, true),
-                // Nothing serves it any more: nothing to re-code.
-                None => return,
-            },
             Some(zselect::Coding::RawTails) if self.opts.zpages_coding_auto => {
                 (zpages::ZCODING_RECORD, true)
             }
             Some(zselect::Coding::Block) if self.opts.zpages_coding_auto => {
                 (self.opts.z_coding(), false)
             }
-            _ => {
-                // The first partitions by key order raw-tailed
-                // (`Options::zpages_raw_tails_first`), the rest as the
-                // options say.
-                let first = self.opts.zpages_raw_tails_first;
-                let hot = first > 0 && !self.opts.zpages_raw_tails && {
-                    let _op = self.op();
-                    self.segs()
-                        .iter()
-                        .filter(|s| s.level > 0 && s.lo < seg.lo)
-                        .count()
-                        < first
-                };
-                if hot {
-                    (zpages::ZCODING_RECORD, true)
-                } else {
-                    (self.opts.z_coding(), self.opts.zpages_raw_tails)
-                }
-            }
+            _ => (self.opts.z_coding(), self.opts.zpages_raw_tails),
         };
         plan.coding = coding;
         plan.store_all = self.opts.zpages_store_all;
@@ -68231,19 +67330,11 @@ impl Maint {
             self.z_ahead_coding
                 .insert(zfile::zpg_name(id, end), z_coded_record(&plan));
         }
-        plan.parse = self.opts.zpages_parse || reparse;
-        // A re-parse is the shipped lazy parse whatever the builds' search,
-        // since it is bought for the decode alone.
-        plan.parse_chains = if reparse {
-            0
-        } else {
-            self.opts.zpages_parse_chains
-        };
+        plan.parse = self.opts.zpages_parse;
+        plan.parse_chains = self.opts.zpages_parse_chains;
         plan.own_decode = self.opts.zpages_own_decoder;
         // A partition's own build -- its first, a retry, a rebuild, a build
-        // ahead -- asks what the options ask of the stride form; a re-code,
-        // a spare and a re-parse build the other block coding of the block
-        // file they replace or keep beside, and ask nothing.
+        // ahead -- asks what the options ask of the stride form.
         // A conversion's file is kept, serves at once and was written whole
         // into the page cache beside the mixes it is bought under: synced
         // here, on the builder's thread, where the builds sync theirs, or
@@ -68257,7 +67348,7 @@ impl Maint {
         // form declines serves on as it was, and nothing of a stride file's.
         plan.stride = if convert && !stride_served {
             zfile::StrideAsk::Only
-        } else if recode {
+        } else if convert {
             zfile::StrideAsk::No
         } else {
             self.z_stride_ask_now()
@@ -68319,9 +67410,6 @@ impl Maint {
                     cancel,
                     refused,
                     dormant,
-                    recode,
-                    spare,
-                    reparse,
                     convert,
                 });
             }
@@ -68347,9 +67435,6 @@ impl Maint {
             started,
             refused,
             dormant,
-            recode,
-            spare,
-            reparse,
             convert,
             ..
         } = b;
@@ -68427,7 +67512,7 @@ impl Maint {
             .find(|s| zfile::zpg_fields(&s.name) == Some((id, end)))
             .cloned();
         let failed = |why: u8| {
-            if recode {
+            if convert {
                 // The partition is served as it was.
                 zfile::ZEvents::add(&ev.recode_failed, 1);
                 return;
@@ -68435,13 +67520,6 @@ impl Maint {
             zfile::ZEvents::add(&ev.build_failed, 1);
             seg.z_declined.store(why, AtomicOrdering::Relaxed);
             seg.z_schedule_retry(retry_ms);
-        };
-        // A spare that kept nothing: counted, and its partition not built
-        // a spare again, so that a build that cannot succeed is not retried
-        // at every turn.
-        let spare_failed = |me: &mut Self| {
-            zfile::ZEvents::add(&ev.spare_failed, 1);
-            me.z_spare_failed.insert(seg.name.clone());
         };
         if let Ok(o) = &outcome {
             o.note_stride(&seg.z_stride_no);
@@ -68461,64 +67539,12 @@ impl Maint {
             }
         }
         match outcome {
-            // A spare: attached beside the served file and kept, its pages
-            // dropped -- the served one is unchanged, though the build's
-            // rename gave the spare its name -- and the raw pages the build
-            // read dropped again where the store drops them.
-            Ok(zfile::Outcome::Built(built)) if spare && live.is_some() => {
-                let target = live.expect("checked");
-                match zfile::ZFile::attach(
-                    &out,
-                    target.blob.for_zfile(),
-                    id,
-                    end,
-                    Db::z_advise(&self.opts),
-                    Db::z_memo(&self.opts),
-                    self.opts.zpages_scan_prefetch,
-                    self.opts.zpages_trusted_views,
-                    self.opts.zpages_memo_first,
-                    Db::fence_search(&self.opts),
-                    self.opts.zpages_memo_ahead,
-                    &self.opts.z_stride_attach(),
-                ) {
-                    Ok(mut side) => {
-                        side.inplace = self.opts.zpages_inplace_walk;
-                        side.time_decodes = self.opts.z_times_decodes();
-                        side.own_decoder = self.opts.zpages_own_decoder;
-                        side.flat_decoder = self.opts.zpages_flat_decode;
-                        side.flat_slack = self.opts.zpages_flat_slack;
-                        side.cursor_view = self.opts.zpages_cursor_view;
-                        side.group_ahead = self.opts.zpages_group_ahead;
-                        side.walk_owns = self.opts.zpages_walk_owns_decodes;
-                        side.drop_cache();
-                        let old = target.z_spare.keep(Box::into_raw(Box::new(side)));
-                        if !old.is_null() {
-                            let tag = shared.readers.bump();
-                            shared.retired_z.push(tag, RetiredZ(old));
-                            shared.retired_z.sweep(|low| shared.readers.oldest_for(low));
-                        }
-                        ev.built(&built);
-                        zfile::ZEvents::add(&ev.attached, 1);
-                        zfile::ZEvents::add(&ev.spare_builds, 1);
-                        if z_drop_now(&self.opts, &self.shared) {
-                            target.drop_raw_pages(&self.dir, ev);
-                        }
-                    }
-                    Err(_) => spare_failed(self),
-                }
-            }
-            Ok(zfile::Outcome::Cancelled) if spare => {
-                zfile::ZEvents::add(&ev.build_cancelled, 1);
-            }
-            // A spare whose partition a merge retired meanwhile falls to the
-            // dead name below, as a re-code's does.
-            Ok(zfile::Outcome::Declined(_)) | Err(_) if spare => spare_failed(self),
             // A re-code: the new form file attached and swapped into the
             // cell, the old one retired through the epoch -- the build's
             // rename unlinked its name, so there is nothing to rename -- and
             // the raw pages the build read dropped again where the store
             // drops them.
-            Ok(zfile::Outcome::Built(built)) if recode && live.is_some() => {
+            Ok(zfile::Outcome::Built(built)) if convert && live.is_some() => {
                 let target = live.expect("checked");
                 // A file its build dropped as it wrote it
                 // (`Options::zpages_convert_drops_output`) is asked of the
@@ -68561,20 +67587,8 @@ impl Maint {
                         side.cursor_view = self.opts.zpages_cursor_view;
                         side.group_ahead = self.opts.zpages_group_ahead;
                         side.walk_owns = self.opts.zpages_walk_owns_decodes;
-                        let coded = side.coded();
                         let stride = side.is_stride();
-                        let mut old = target.z.replace(side);
-                        // Kept where the option keeps it, its pages dropped,
-                        // and whatever the cell kept before retired in its
-                        // place: a build starts only where none is kept.
-                        if self.opts.zpages_recode_keep && !old.is_null() {
-                            // SAFETY: the form file just taken out of
-                            // service, alive until retired or freed with
-                            // the segment; the cell of kept files is this
-                            // thread's alone.
-                            unsafe { &*old }.drop_cache();
-                            old = target.z_spare.keep(old);
-                        }
+                        let old = target.z.replace(side);
                         if !old.is_null() {
                             let tag = shared.readers.bump();
                             shared.retired_z.push(tag, RetiredZ(old));
@@ -68582,18 +67596,10 @@ impl Maint {
                         }
                         ev.built(&built);
                         zfile::ZEvents::add(&ev.attached, 1);
-                        if convert {
-                            if stride {
-                                zfile::ZEvents::add(&ev.stride_converts, 1);
-                            } else {
-                                zfile::ZEvents::add(&ev.stride_converts_back, 1);
-                            }
-                        } else if reparse {
-                            zfile::ZEvents::add(&ev.reparses, 1);
-                        } else if coded {
-                            zfile::ZEvents::add(&ev.recodes, 1);
+                        if stride {
+                            zfile::ZEvents::add(&ev.stride_converts, 1);
                         } else {
-                            zfile::ZEvents::add(&ev.recodes_back, 1);
+                            zfile::ZEvents::add(&ev.stride_converts_back, 1);
                         }
                         if z_drop_now(&self.opts, &self.shared) {
                             target.drop_raw_pages(&self.dir, ev);
@@ -68608,11 +67614,11 @@ impl Maint {
                     }
                 }
             }
-            Ok(zfile::Outcome::Cancelled) if recode => {
+            Ok(zfile::Outcome::Cancelled) if convert => {
                 zfile::ZEvents::add(&ev.build_cancelled, 1);
                 zfile::ZEvents::add(&ev.recode_failed, 1);
             }
-            Ok(zfile::Outcome::Declined(_)) | Err(_) if recode => {
+            Ok(zfile::Outcome::Declined(_)) | Err(_) if convert => {
                 zfile::ZEvents::add(&ev.recode_failed, 1);
             }
             // Built ahead and not wanted yet: on disk, dormant, for the
@@ -68785,9 +67791,6 @@ impl Maint {
                 cancel,
                 refused: false,
                 dormant: false,
-                recode: false,
-                spare: false,
-                reparse: false,
                 convert: false,
             });
         }
