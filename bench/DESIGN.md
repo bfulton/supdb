@@ -763,15 +763,14 @@ form file out of service refuses the pass),
 counts (a pass refuses it unless every partition has its form file and the
 reads went through the form files), and `supdb-nocachezpagesnodrop`,
 `supdb-nocachezpagesnowarm`, `supdb-nocachezpagessettle`,
-`supdb-nocachezpagesnomemo`, `supdb-nocachezpagesheads`,
-`supdb-nocachezpagesprefetch` and `supdb-nocachezpagesrankwalk` are that
+`supdb-nocachezpagesnomemo`, `supdb-nocachezpagesheads` and
+`supdb-nocachezpagesprefetch` are that
 arm with one of its options moved: the build's release of the raw
 records off, the warm of a form file after its attach off, every
 build left to the settle of the form rather than started as its
 partition lands, the memo of decoded groups off, a scan's seeks by the
-ordered index's heads instead of the form file's fence, a scan's prefetch
-of the pages it will cross on, and the overlay walk of a covered
-partition cut by rank rather than carried through a cursor; and
+ordered index's heads instead of the form file's fence, and a scan's
+prefetch of the pages it will cross on; and
 `supdb-nocacheautozpagesfairio` is `supdb-nocacheautozpages` with the
 form's threads at the readers' I/O class rather than the device's idle
 class, for a build under a bound that shares the device with the faults it
@@ -790,10 +789,7 @@ cache under a bound: what the short scans of the Zipfian head gain from
 the merged forms against what the point reads lose to the page cache the
 cache displaces (a cache of 256 MB beside the form did not fit a 640 MiB
 bound at five million keys: the cgroup killed the harness in the shuffled
-load), and `supdb-cache64tofitautozpagesraw` is that arm with the cache's
-reads of a partition through the raw records rather than the form file
-(`Options::zpages_block_cache` off), the shape the combined arm was first
-priced in, and `supdb-cache64tofitautozpagespromote` is the combined arm
+load), and `supdb-cache64tofitautozpagespromote` is the combined arm
 with a block that reads have walked a block's worth of entries held as a
 merged copy in its slot under the form, a clean block included
 (`Options::zpages_promote_copies`), so the hot blocks are walked without
@@ -880,14 +876,9 @@ held in the process's own memory out of core (`Options::heads_owned`
 off);
 `supdb-znopointkeys` is `supdb` with no table of where the keys read
 through a form file's memo lie (`Options::zpages_point_keys` off);
-`supdb-zwalkwhole` is `supdb` with every group
-a walk opens through a form file decoded whole, none only as far as the
-walk reads (`Options::zpages_walk_part` off);
 `supdb-zbulknoahead` is `supdb` with the bulk walk through a form file
 (`ZFile::scan_at`) asking for no group's lines ahead
-of its open (`Options::zpages_bulk_ahead` off), `supdb-zbulkpart` with
-its own decode of the group it ends inside made only as far as it reads
-(`Options::zpages_bulk_part` on), and `supdb-zbulkaheadwithin` with its
+of its open (`Options::zpages_bulk_ahead` off), and `supdb-zbulkaheadwithin` with its
 ask made for the next group of a page as well as the next page's head
 (`Options::zpages_bulk_ahead_within`);
 `supdb-settlegated` and `supdb-ingestsettlegated` are `supdb` and
@@ -961,11 +952,7 @@ reading, however old (`Options::forms_settle_room_pressure` off);
 `supdb-snapdrops` is `supdb` whose handles, and whose writer on the merge
 paths, drop their scan snapshot at every publish their look has no tables
 to carry across, a merge's or a seal's landing among them
-(`Options::snapshot_stands` off);
-`supdb-cache64tofitautozpagesperrun` is the combined arm with a block read
-through a cursor a run, a seek a cut and a read by rank a replaced record
-(`Options::zpages_block_cursor` off), where the default reads a block through
-one cursor held across it. The
+(`Options::snapshot_stands` off). The
 forced arm's
 `sync` builds the form files, so its load carries the build, and in memory
 it reads slower than the raw form: it is an arm for the bound, not a

@@ -2077,76 +2077,6 @@ pub struct Options {
     /// 1.5 GiB. Off; `supdb-zsparsestep` is the arm.
     #[doc(hidden)]
     pub zpages_stride_step_direct: bool,
-    /// EXPERIMENT: the bulk walk's own decode of the group it ends inside
-    /// -- a first touch, decoded into the thread's buffer
-    /// (`zpages_bulk_admit`) -- goes only as far as the records it reads,
-    /// and on a step at a time where the guess fell short
-    /// (`zfile::ZFile::walk_last_part`), as a cursor's last group does
-    /// (`zpages_walk_part`). It fired four and a half million times in a
-    /// pairing at ten million keys under 1.25 GiB and read the
-    /// single-thread scan 0.99x in two sittings and the threaded scans
-    /// 1.01-1.05x, under what the pairing resolves: it decodes less and
-    /// asks whether each record lies whole, so the count is no verdict.
-    /// Off; `supdb-zbulkpart` is the arm.
-    pub zpages_bulk_part: bool,
-    /// EXPERIMENT: a walk's own decode of a group through a form file -- a
-    /// first touch under `zpages_scan_admit`, any under
-    /// `zpages_walk_owns_decodes` -- goes only as far as the walk reads.
-    /// Where the walk wants fewer records of the group than it holds, the
-    /// decode is begun and taken to their share of the group's bytes and a
-    /// record more (`zpages::open_group_partly`), and on from there where
-    /// a record the walk reaches is not decoded yet
-    /// (`zpages::decode_group_more`); the group the walk reads to its end
-    /// is decoded whole in one call, as before. A scan's last group is read
-    /// half way at the mean and was decoded to its end, by a decoder that
-    /// is sequential and whose cost is its tokens. For a page already
-    /// verified, as the point read's partial decode is
-    /// (`zpages_point_part`), for the engine's own decoder, and for a cursor that holds its page's view
-    /// across the page's groups (`zpages_cursor_view`).
-    /// `supdb-zwalkwhole` decodes every group a walk opens whole.
-    pub zpages_walk_part: bool,
-    /// EXPERIMENT: the block path's cursor over a form file
-    /// (`zfile::ZCursor`) keeps the page's view across the page's groups:
-    /// a view was built at every open --
-    /// the header parsed and checked, the directory's keys walked -- and
-    /// twice more where the cursor was placed by rank, for a page the cursor
-    /// had the view of already, a tenth of a covered scan's time beside the
-    /// decodes in E at ten million keys under 1.25 GiB; paired in the row's
-    /// shape the views over the row fell by half and E read 1.07x in both
-    /// reps (`docs/engine.md`). Off is a view an open, the shape before;
-    /// `supdb-zviewperopen` is the arm.
-    pub zpages_cursor_view: bool,
-    /// EXPERIMENT: at a group's open the cursor asks for the lines of the
-    /// group the walk reaches next -- the next group of the page by the
-    /// directory, else the first `zfile::ZGROUP_AHEAD` bytes of the next
-    /// entry's page, its header, directory and the start of its first
-    /// group -- so the decode after finds its input in the cache: the
-    /// decoder's copy of its compressed input took half the decode's
-    /// samples in E's covered scans, the input's lines cold at every
-    /// group, where a group's walk is lead enough to bring the next's;
-    /// paired in the row's shape E read 1.21x in both reps
-    /// (`docs/engine.md`). Off asks for nothing; `supdb-znogroupahead` is
-    /// the arm.
-    pub zpages_group_ahead: bool,
-    /// A block's reads of its covered partition through one cursor
-    /// (`PartReader`, `zfile::ZCursor`): a build or a walk reads the
-    /// records between the overlay's keys, each key's cut where the walk
-    /// stops at it or where the cursor moved to it from the group it holds
-    /// stands (`ZCursor::skip_to`), and the record an overlay key replaces
-    /// from the cursor standing on it, so a block opens each group it
-    /// crosses once; the cuts of its memtable keys are left to it
-    /// (`SnapBounds::cuts_of` and `BuildCtx::filed_cuts` resolve nothing
-    /// under it). Off is the shape before: a cursor opened for every run
-    /// between two keys (`Reader::cache_scan`), a seek from the fence for
-    /// every cut (`cache_cut`, the cuts of a block's snapshot keys taken by
-    /// the first build and the filed keys' by each) and a read by rank for
-    /// every replaced record (`cache_values`), each opening the key's group
-    /// again -- on the E mix's main thread at five million keys under
-    /// 640 MiB the cuts alone were 5.9%, and the builds' walks and the
-    /// replaced records' reads opened a group a run and a key besides.
-    /// `supdb-cache64tofitautozpagesperrun` is the arm.
-    #[doc(hidden)]
-    pub zpages_block_cursor: bool,
     /// A scan's blocks over a covered partition read through one cursor
     /// held across the blocks the scan walks in that partition
     /// (`PartReader`): the clean runs, the sparse blocks' runs between
@@ -2161,7 +2091,8 @@ pub struct Options {
     /// crossed a sparse block in two of three and placed 2.5 cursors or
     /// dispatches, 66,000 for 26,000 scans, and opened 7.5 groups where it
     /// spans 2.7 -- the decode of the groups opened twice was a tenth of
-    /// its thread. `supdb-blockcursors` is the arm.
+    /// its thread. On; off is a test's seam, for counting a scan's
+    /// dispatches a block (`tests/zpages.rs`).
     #[doc(hidden)]
     pub zpages_scan_cursor: bool,
     /// EXPERIMENT: a scan's seek of a covered partition, and the cut where
@@ -2224,35 +2155,6 @@ pub struct Options {
     /// reads ahead of its walk but the ask (`zfile::ZFile::attach`).
     #[doc(hidden)]
     pub zpages_scan_prefetch: bool,
-    /// The overlay walk of a covered partition (`scan_partitions`) through
-    /// a cursor that keeps its group and position across the unsealed keys
-    /// it meets (`zfile::ZCursor::walk_until`): the cut at an unsealed key
-    /// is a forward walk from where the cursor stands and the emit's
-    /// values are the record under it, one group open a group crossed.
-    /// Off, the walk is cut by rank as it first was: a seek, a fresh walk
-    /// and a values read at every unsealed key, each opening the group
-    /// again, which at the E mix's hot head of unsealed keys was most of a
-    /// scan's time. `supdb-nocachezpagesrankwalk` is that arm.
-    #[doc(hidden)]
-    pub zpages_walk_cursor: bool,
-    /// The block cache's reads of a covered partition through its form file
-    /// while the gate serves the form: a block's merged form is built from
-    /// the form file's records, the walks between a form's keys and over a
-    /// clean block go through it, and a block's boundary keys, the cuts of
-    /// the unsealed keys and the block a written key belongs to are
-    /// answered by its fence and one group (`Reader::cache_scan`,
-    /// `cache_values`, `cache_cut`, `cache_seek_exact`, `cache_key_at`),
-    /// so that with the cache on no path of the store touches the raw
-    /// records under the bound but a piece's side of a join and a record
-    /// no page holds. Off, the cache's machinery reads the raw records
-    /// through the door whatever the gate says: its scans dragged the raw
-    /// records through the page cache and evicted the form the point reads
-    /// needed, 0.21 faults a read in the C mix against 0.001 under the
-    /// controller's arm without the cache (`docs/engine.md`), which is why
-    /// a second form may sit beside the records only when the other paths
-    /// never touch them. `supdb-cache64tofitautozpagesraw` is that arm.
-    #[doc(hidden)]
-    pub zpages_block_cache: bool,
     /// EXPERIMENT: under the form file, a block that reads have walked
     /// `promote_entries` entries' worth is held as a merged copy in place
     /// of its form, a clean block included, with the copy the block's one
@@ -7014,8 +6916,8 @@ impl Options {
             .point(self.zpages_point_part, self.zpages_point_keys)
             .point_filter(self.zpages_point_filter)
             .filter_ahead(self.zpages_filter_ahead)
-            .scans(true, self.zpages_walk_part)
-            .bulk(true, self.zpages_bulk_ahead, self.zpages_bulk_part)
+            .scans(true, true)
+            .bulk(true, self.zpages_bulk_ahead)
             .bulk_within(self.zpages_bulk_ahead_within)
             .bulk_steps(true)
             .cursor_steps(self.zpages_cursor_steps)
@@ -7202,18 +7104,11 @@ impl Default for Options {
             zpages_point_filter: true,
             zpages_filter_ahead: false,
             zpages_bulk_ahead: true,
-            zpages_bulk_part: false,
             zpages_bulk_ahead_within: false,
             zpages_cursor_steps: false,
             zpages_stride_step_direct: false,
-            zpages_walk_part: true,
-            zpages_cursor_view: true,
-            zpages_group_ahead: true,
-            zpages_block_cursor: true,
             zpages_scan_cursor: true,
             zpages_scan_prefetch: false,
-            zpages_walk_cursor: true,
-            zpages_block_cache: true,
             zpages_promote_copies: false,
             zpages_io_idle: true,
             zpages_sample_idle: false,
@@ -32735,7 +32630,7 @@ impl Reader {
     /// and its cursor stands at a rank (`zfile::ZCursor`, `Group::Stride`).
     #[inline]
     fn zc<'a>(&self, seg: &'a Seg) -> Option<&'a zfile::ZFile> {
-        if !self.opts.zpages_block_cache || !self.z_on() {
+        if !self.z_on() {
             return None;
         }
         seg.z.get().filter(|z| !z.damaged())
@@ -40398,8 +40293,8 @@ impl Reader {
             }
             let src = Sources { seg, l0 };
             // One cursor for the blocks this scan walks in the partition
-            // (`Options::zpages_scan_cursor`); under the arm each block
-            // places its own below.
+            // (`Options::zpages_scan_cursor`); under the seam's off each
+            // block places its own below.
             let mut shared = PartReader::new(self, seg);
             // The scan's first partition: the one whose start is the
             // scan's own key, which the start cache answers for.
@@ -40947,7 +40842,7 @@ impl Reader {
                             let want = (run_hi - start).min(limit - seen);
                             // The run through the scan's cursor, which
                             // stands where the last run ended; the
-                            // dispatch afresh under the arm.
+                            // dispatch afresh under the seam's off.
                             seen += if self.opts.zpages_scan_cursor {
                                 pr.scan(start, want, &mut *f)?
                             } else {
@@ -42042,13 +41937,9 @@ impl Reader {
             cursor = seg.cursor_from(cursor);
             // A covered partition walks through a cursor that keeps its
             // group across the unsealed keys it meets
-            // (`Options::zpages_walk_cursor`); the heads arm and the walk
-            // cut by rank take the loop below.
-            if self.opts.zpages_walk_cursor
-                && !self.opts.zpages_seek_ord
-                && self.z_on()
-                && seg.z.get().is_some()
-            {
+            // (`zfile::ZCursor::walk_until`); the heads arm takes the loop
+            // below.
+            if !self.opts.zpages_seek_ord && self.z_on() && seg.z.get().is_some() {
                 if let PWalk::Z(c) = self.pwalk_seek(seg, cursor) {
                     seen = self.scan_partition_cursor(
                         seg,
@@ -44999,8 +44890,6 @@ impl Db {
                     ZAttachLines {
                         drop_raw: opts.zpages_drop_raw,
                         time_decodes: opts.z_times_decodes(),
-                        cursor_view: opts.zpages_cursor_view,
-                        group_ahead: opts.zpages_group_ahead,
                     },
                     &opts.z_stride_attach(),
                     &zev,
@@ -51821,8 +51710,6 @@ const ZPARSE_CHAINS: u32 = 4;
 struct ZAttachLines {
     drop_raw: bool,
     time_decodes: bool,
-    cursor_view: bool,
-    group_ahead: bool,
 }
 
 /// Rounds `zpages_settle` makes at most over the partitions that lack a
@@ -51909,8 +51796,8 @@ impl Db {
                 side.own_decoder = true;
                 side.flat_decoder = true;
                 side.flat_slack = true;
-                side.cursor_view = lines.cursor_view;
-                side.group_ahead = lines.group_ahead;
+                side.cursor_view = true;
+                side.group_ahead = true;
                 let installed = seg.z.install(side);
                 if installed {
                     zfile::ZEvents::add(&ev.attached, 1);
@@ -51963,8 +51850,6 @@ impl Db {
                 ZAttachLines {
                     drop_raw: z_drop_now(&self.opts, &self.shared),
                     time_decodes: self.opts.z_times_decodes(),
-                    cursor_view: self.opts.zpages_cursor_view,
-                    group_ahead: self.opts.zpages_group_ahead,
                 },
                 &self.opts.z_stride_attach(),
                 ev,
@@ -52019,8 +51904,8 @@ impl Db {
                         side.own_decoder = true;
                         side.flat_decoder = true;
                         side.flat_slack = true;
-                        side.cursor_view = self.opts.zpages_cursor_view;
-                        side.group_ahead = self.opts.zpages_group_ahead;
+                        side.cursor_view = true;
+                        side.group_ahead = true;
                         if seg.z.install(side) {
                             ev.built(&b);
                             zfile::ZEvents::add(&ev.attached, 1);
@@ -52604,13 +52489,12 @@ impl SnapBounds {
         if self.ready[b].load(AtomicOrdering::Acquire) {
             return Ok(&self.cuts);
         }
-        // Under `Options::zpages_block_cursor` a covered partition's cuts
-        // are the build's, found where its one cursor stops at each key
+        // A covered partition's cuts are the build's, found where its one cursor stops at each key
         // (`PartReader::scan_until`, `PartReader::cut`): left unresolved
         // here, which `Over::cut` reads as "the build searches", and the
         // block not marked ready, so a build that reads the raw form later
         // takes them this way as before.
-        if rd.opts.zpages_block_cursor && rd.zc(seg).is_some() {
+        if rd.zc(seg).is_some() {
             return Ok(&self.cuts);
         }
         let lo = self.at[b] as usize;
@@ -56537,13 +56421,10 @@ impl<'s> BuildCtx<'s> {
         b: usize,
         filed: &'f [(u32, u32)],
     ) -> std::borrow::Cow<'f, [(u32, u32)]> {
-        // Under `Options::zpages_block_cursor` a covered partition's filed
-        // cuts are found where the build's cursor stops at each key, as the
+        // A covered partition's filed cuts are found where the build's cursor stops at each key, as the
         // snapshot keys' are (`SnapBounds::cuts_of`); `LAZY_CUT` is the
         // search the overlay asks for.
-        if !filed.iter().any(|&(_, c)| c == LAZY_CUT)
-            || (self.rd.opts.zpages_block_cursor && self.rd.zc(src.seg).is_some())
-        {
+        if !filed.iter().any(|&(_, c)| c == LAZY_CUT) || self.rd.zc(src.seg).is_some() {
             return std::borrow::Cow::Borrowed(filed);
         }
         let mut n = 0u64;
@@ -57620,10 +57501,8 @@ impl<'s> BuildCtx<'s> {
         // Every overlay key an update of a record at its cut, and a key
         // emitted per record: a tombstone that took a record out leaves the
         // copy searched. The walk answers each key's cut exactly, carried or
-        // searched for; the shape before (`Options::zpages_block_cursor`
-        // off) also left a copy searched where a cut had to be searched for.
-        let updates = all_same
-            && (self.rd.opts.zpages_block_cursor || ov.over.iter().all(|o| o.cut != u32::MAX));
+        // searched for.
+        let updates = all_same;
         blk.identity = updates && blk.len() == hi - lo;
         if self.fit {
             blk.fit();
@@ -57803,7 +57682,7 @@ struct PartReader<'a> {
 
 impl<'a> PartReader<'a> {
     fn new(rd: &'a Reader, seg: &'a Seg) -> PartReader<'a> {
-        let on = rd.opts.zpages_block_cursor && rd.zc(seg).is_some();
+        let on = rd.zc(seg).is_some();
         PartReader {
             rd,
             seg,
@@ -66414,8 +66293,6 @@ impl Maint {
                 ZAttachLines {
                     drop_raw: z_drop_now(&self.opts, &self.shared),
                     time_decodes: self.opts.z_times_decodes(),
-                    cursor_view: self.opts.zpages_cursor_view,
-                    group_ahead: self.opts.zpages_group_ahead,
                 },
                 &self.opts.z_stride_attach_sealed(seal),
                 ev,
@@ -66807,8 +66684,8 @@ impl Maint {
                         side.own_decoder = true;
                         side.flat_decoder = true;
                         side.flat_slack = true;
-                        side.cursor_view = self.opts.zpages_cursor_view;
-                        side.group_ahead = self.opts.zpages_group_ahead;
+                        side.cursor_view = true;
+                        side.group_ahead = true;
                         let stride = side.is_stride();
                         let old = target.z.replace(side);
                         if !old.is_null() {
@@ -66906,8 +66783,8 @@ impl Maint {
                             side.own_decoder = true;
                             side.flat_decoder = true;
                             side.flat_slack = true;
-                            side.cursor_view = self.opts.zpages_cursor_view;
-                            side.group_ahead = self.opts.zpages_group_ahead;
+                            side.cursor_view = true;
+                            side.group_ahead = true;
                             if target.z.install(side) {
                                 ev.built(&built);
                                 zfile::ZEvents::add(&ev.attached, 1);

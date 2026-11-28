@@ -355,10 +355,6 @@ struct Cfg {
     big: bool,
     compact: bool,
     promote: bool,
-    /// A block of a covered partition read through one cursor
-    /// (`Options::zpages_block_cursor`); off in some seeds under
-    /// `ZFUZZ_OPTVARY`, so the shape before is read against the model too.
-    block_cursor: bool,
     /// The scans' start keys kept with their blocks
     /// (`Options::scan_start_cache`, off); on in some seeds under
     /// `ZFUZZ_OPTVARY`, so a scan that takes its block from the cache is
@@ -378,10 +374,6 @@ struct Cfg {
     /// when these were added.
     point_part: bool,
     point_keys: bool,
-    /// A walk's own decode of a group taken only as far as the walk reads
-    /// (`Options::zpages_walk_part`): off in a quarter of the seeds under
-    /// `ZFUZZ_OPTVARY`, the side generator's next draw.
-    walk_part: bool,
     /// The scans started in a block before its scans hold the blocks they
     /// walk as copies under the form (`Options::promote_starts`): two in
     /// a quarter of the seeds under `ZFUZZ_OPTVARY`, the side generator's
@@ -799,7 +791,9 @@ fn pick_cfg(rng: &mut Rng, want_cache: bool) -> Cfg {
     // The third is the draw `zpages_scan_admit` took, kept so that the
     // draws after it stand.
     let (part_off, keys_off, _) = (side.chance(25), side.chance(25), side.chance(25));
-    let walk_off = side.chance(25);
+    // The draw `zpages_walk_part` took, kept so that the draws after it
+    // stand.
+    let _ = side.chance(25);
     let hot_two = side.chance(25);
     let (steps_on, direct_on) = (side.chance(50), side.chance(50));
     let (heads_on, land_on) = (side.chance(50), side.chance(50));
@@ -874,15 +868,14 @@ fn pick_cfg(rng: &mut Rng, want_cache: bool) -> Cfg {
         big: rng.chance(25),
         compact: !(std::env::var("ZFUZZ_OPTVARY").is_ok() && rng.chance(15)),
         promote: !(std::env::var("ZFUZZ_OPTVARY").is_ok() && rng.chance(15)),
-        block_cursor: {
-            // The draws the checked views and the memo asked first took
-            // (`Options::zpages_trusted_views`, `Options::zpages_memo_first`,
+        start_cache: {
+            // The draws the checked views, the memo asked first and the
+            // block's one cursor took (`Options::zpages_trusted_views`,
+            // `Options::zpages_memo_first`, `Options::zpages_block_cursor`,
             // gone), kept so that no seed's draws after them move.
             let _ = !(std::env::var("ZFUZZ_OPTVARY").is_ok() && rng.chance(15));
             let _ = std::env::var("ZFUZZ_OPTVARY").is_ok() && rng.chance(15);
-            !(std::env::var("ZFUZZ_OPTVARY").is_ok() && rng.chance(15))
-        },
-        start_cache: {
+            let _ = !(std::env::var("ZFUZZ_OPTVARY").is_ok() && rng.chance(15));
             // The draws the compressed record coding, the fence's tree and
             // the memo's victim hint took (`Options::zpages_record_coding`,
             // `Options::zpages_fence_tree`, `Options::zpages_memo_ahead`,
@@ -900,7 +893,6 @@ fn pick_cfg(rng: &mut Rng, want_cache: bool) -> Cfg {
         },
         point_part: !(vary && part_off),
         point_keys: !(vary && keys_off),
-        walk_part: !(vary && walk_off),
         hot_starts: if vary && hot_two {
             2
         } else {
@@ -946,7 +938,6 @@ fn opts(c: &Cfg) -> Options {
         sync: c.sync,
         compact: c.compact,
         promote: c.promote,
-        zpages_block_cursor: c.block_cursor,
         zpages_raw_tails: c.raw_tails,
         zpages_point_part: c.point_part,
         zpages_point_keys: c.point_keys,
@@ -956,7 +947,6 @@ fn opts(c: &Cfg) -> Options {
         copy_prefetch_span: c.copy_span,
         identity_by_keys: c.identity_keys,
         copy_packed: c.copy_packed,
-        zpages_walk_part: c.walk_part,
         zpages_cursor_steps: c.cursor_steps,
         zpages_stride_step_direct: c.stride_direct,
         bounds_by_heads: c.bounds_heads,

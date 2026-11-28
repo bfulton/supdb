@@ -2459,15 +2459,6 @@ fn scans_with_the_block_cache_resolving_every_filed_cut_agree_with_the_model_ove
 }
 
 #[test]
-fn scans_with_a_cursor_a_run_and_a_seek_a_cut_agree_with_the_model_over_every_window() {
-    // The block cache with a block read through a cursor a run, a seek a
-    // cut and a read by rank a replaced record (`Options::zpages_block_cursor`
-    // off), the shape before a block was read through one cursor held
-    // across it: both shapes answer every window alike.
-    windows_over_with("windows-cache-perrun", true, false, false, true, false);
-}
-
-#[test]
 fn scans_with_the_blocks_promoted_to_copies_agree_with_the_model_over_every_window() {
     // The cache with its blocks held as copies once read
     // (`Options::zpages_promote_copies`), under a budget small enough to
@@ -2586,7 +2577,7 @@ fn scans_over_a_piece_agree_with_the_model_over_every_window_of_a_covered_store(
 /// read of it is the raw form's by design, and the counter moves.
 #[test]
 fn the_compact_form_touches_no_raw_page() {
-    no_raw_touches("rawtouches", false, true);
+    no_raw_touches("rawtouches", false);
 }
 
 /// The same reads with the block cache on: the forms the walks build over
@@ -2597,20 +2588,7 @@ fn the_compact_form_touches_no_raw_page() {
 /// is touched by none of them.
 #[test]
 fn the_block_cache_under_the_compact_form_touches_no_raw_page() {
-    no_raw_touches("rawtouches-cache", true, true);
-}
-
-/// The positive control for the option: with the cache's reads of a
-/// partition sent through the door (`Options::zpages_block_cache` off),
-/// the same reads touch the raw form -- the shape that dragged the raw
-/// records through the page cache beside the form under a bound.
-#[test]
-fn the_block_cache_with_its_reads_raw_touches_the_raw_form() {
-    if !cfg!(debug_assertions) {
-        return;
-    }
-    let touched = no_raw_touches("rawtouches-cacheraw", true, false);
-    assert!(touched > 0, "the cache's reads through the door: {touched}");
+    no_raw_touches("rawtouches-cache", true);
 }
 
 /// A scan that starts where a scan started before takes its block from the
@@ -2719,12 +2697,10 @@ fn a_scan_from_a_key_a_scan_started_at_takes_its_block_from_the_start_cache() {
     round(&stores, "sealed into a piece");
 }
 
-/// The body of the three tests above: the store, its phases and the reads
-/// under each, counted on the writer and a handle. With `via_form` the
-/// count is held to zero; without it the touches are summed and returned.
-fn no_raw_touches(name: &str, cache: bool, via_form: bool) -> u64 {
-    let counts = cfg!(debug_assertions) && via_form;
-    let touched = std::cell::Cell::new(0u64);
+/// The body of the two tests above: the store, its phases and the reads
+/// under each, counted on the writer and a handle, the count held to zero.
+fn no_raw_touches(name: &str, cache: bool) {
+    let counts = cfg!(debug_assertions);
     let dir = scratch(name);
     // Every run inline: a run the appends grow past the inline bound goes
     // to a block, and a partition with one is declined, which is the raw
@@ -2735,7 +2711,6 @@ fn no_raw_touches(name: &str, cache: bool, via_form: bool) -> u64 {
             o.partition_bytes = Some(160 << 10);
             o.inline_bytes = 1 << 16;
             o.scan_block_cache = cache;
-            o.zpages_block_cache = via_form;
         }),
     )
     .unwrap();
@@ -2777,7 +2752,6 @@ fn no_raw_touches(name: &str, cache: bool, via_form: bool) -> u64 {
                 "{what}: {} touches of the raw form",
                 after - before
             );
-            touched.set(touched.get() + (after - before));
         }
     };
     // Every landing in flight joined before a count begins: the landing's
@@ -2874,9 +2848,6 @@ fn no_raw_touches(name: &str, cache: bool, via_form: bool) -> u64 {
     assert_eq!(c.form_files, c.partitions, "{c:?}");
     held(&db, &model, "after the merge");
     let _ = std::fs::remove_dir_all(&dir);
-    if !via_form {
-        return touched.get();
-    }
 
     // A record no page holds among keys of every length: the keys beside
     // it are answered from the fence, and the record itself is the raw
@@ -2947,7 +2918,6 @@ fn no_raw_touches(name: &str, cache: bool, via_form: bool) -> u64 {
         );
     }
     let _ = std::fs::remove_dir_all(&dir);
-    0
 }
 
 /// The memo of decoded groups (`Options::zpages_memo`): over one
@@ -3123,27 +3093,21 @@ fn a_point_read_decodes_a_first_touch_in_part_and_goes_straight_to_a_key_read_be
     }
 }
 
-/// The heads arm (`Options::zpages_seek_ord`): a scan's seek and cut by
-/// the ordered index and the raw records, the walk after them the
-/// form file's. The windows agree with the model as the fence's do, the walks
-/// are served, and the seeks touch the raw form, which the door counts.
 /// A scan over a run of unsealed keys dense in the partition's keys, the
-/// E mix's hot head: through the cursor (`Options::zpages_walk_cursor`)
-/// a scan of fifty opens a group once a group it crosses, and cut by rank
-/// (the `supdb-nocachezpagesrankwalk` arm) it opens one for the seek, one
-/// for the fresh walk and one for the read at every unsealed key, which
-/// was most of such a scan's time; both answer the model, on the writer
-/// and a handle.
+/// E mix's hot head: through the cursor that keeps its group across the
+/// unsealed keys it meets (`zfile::ZCursor::walk_until`) a scan of fifty
+/// opens a group once a group it crosses, where cut by rank it opened one
+/// for the seek, one for the fresh walk and one for the read at every
+/// unsealed key; it answers the model, on the writer and a handle.
 #[test]
-fn the_overlay_walk_through_the_cursor_opens_a_group_a_group_where_the_walk_by_rank_opened_three_a_key(
-) {
+fn the_overlay_walk_through_the_cursor_opens_a_group_a_group_it_crosses() {
     let mut opens = Vec::new();
-    for (name, by_cursor) in [("overlay-cursor", true), ("overlay-rankwalk", false)] {
+    {
+        let name = "overlay-cursor";
         let dir = scratch(name);
         let mut db = Db::create(
             &dir,
             forced(|o| {
-                o.zpages_walk_cursor = by_cursor;
                 o.inline_bytes = 1 << 16;
                 // The groups a walk opens are the block body's: the keys
                 // here are one run of one width that the stride form
@@ -3200,16 +3164,18 @@ fn the_overlay_walk_through_the_cursor_opens_a_group_a_group_where_the_walk_by_r
     }
     // A window of fifty at the head is about twenty-five partition keys
     // and twenty-five unsealed, over two to four groups of the page's
-    // sixteen records: the cursor opens those, and the walk by rank three
-    // a key.
-    let (cursor, rank) = (opens[0].1, opens[1].1);
+    // sixteen records: the cursor opens those.
+    let cursor = opens[0].1;
     assert!(
         cursor <= 6.0,
         "{cursor:.1} opens a scan through the cursor: {opens:?}"
     );
-    assert!(rank >= 20.0, "{rank:.1} opens a scan by rank: {opens:?}");
 }
 
+/// The heads arm (`Options::zpages_seek_ord`): a scan's seek and cut by
+/// the ordered index and the raw records, the walk after them the
+/// form file's. The windows agree with the model as the fence's do, the walks
+/// are served, and the seeks touch the raw form, which the door counts.
 #[test]
 fn the_heads_arm_seeks_through_the_raw_form_and_scans_the_same() {
     let dir = scratch("heads");
@@ -4562,17 +4528,6 @@ fn the_prefetch_arm_scans_the_same_and_asks_once_a_walk() {
 }
 
 fn windows_over(name: &str, cache: bool, promote: bool, span: bool, lazy: bool) {
-    windows_over_with(name, cache, promote, span, lazy, true);
-}
-
-fn windows_over_with(
-    name: &str,
-    cache: bool,
-    promote: bool,
-    span: bool,
-    lazy: bool,
-    block_cursor: bool,
-) {
     // The scans of a covered partition answer as if the form were not there,
     // with the unsealed keys laid over it: updates, inserts between records
     // and deletes, in the live table and in a frozen one. Windows begin at
@@ -4592,7 +4547,6 @@ fn windows_over_with(
             o.scan_block_cache = cache;
             o.zpages_seek_span = span;
             o.zpages_settle_span = lazy;
-            o.zpages_block_cursor = block_cursor;
             if span {
                 o.upkeep = supdb::Upkeep::Inline;
             }
@@ -4721,13 +4675,12 @@ fn windows_over_with(
     // Under the promotion's small budget the sheds rebase the tables,
     // which resolve every filed cut again (`rebase_tables`), so its builds
     // may find none left to resolve.
-    // Under the block cursor a build over a covered partition resolves a
-    // filed cut where its walk stops and counts none
-    // (`Options::zpages_block_cursor`), so the resolved count says nothing
-    // of it there.
+    // A build over a covered partition resolves a filed cut where its
+    // walk stops and counts none, so the resolved count says nothing of
+    // it there.
     if cache && lazy {
         assert!(
-            filed_lazy > 0 && (promote || block_cursor || resolved_lazy > 0),
+            filed_lazy > 0,
             "lazy cuts {filed_lazy} filed, {resolved_lazy} resolved"
         );
     } else {
@@ -15413,25 +15366,22 @@ fn a_scan_over_unvisited_clean_blocks_is_one_dispatch_into_the_form() {
 }
 
 /// A block-path scan's cursor over a covered partition holds the page's view
-/// across the page's groups (`Options::zpages_cursor_view`) and asks for
-/// the next group's lines at each open (`Options::zpages_group_ahead`): a
-/// scan of four blocks and a bit through a fresh handle builds fewer views
-/// than the groups it decodes with the first option and at least one a
-/// group without it, and asks ahead once a group opened with the second --
-/// the groups the cursor opened, the start seek's apart -- and never
-/// without. The entries come back as the model has them either way.
+/// across the page's groups (`zfile::ZFile::cursor_view`) and asks for the
+/// next group's lines at each open (`zfile::ZFile::group_ahead`): a scan of
+/// four blocks and a bit through a fresh handle builds fewer views than the
+/// groups it decodes, and asks ahead once a group opened -- the groups the
+/// cursor opened, the start seek's apart. The entries come back as the
+/// model has them.
 /// A few of the lowest keys are written first so the partition does not
 /// take the bulk walk, and the handle builds its own table (`commit_forms`
 /// off), as the cursor's test does.
 #[cfg(target_os = "linux")]
 #[test]
 fn a_cursor_holds_a_pages_view_across_its_groups_and_asks_for_the_next() {
-    for on in [true, false] {
-        let what = format!("cursor view and ahead {on}");
+    {
+        let what = "cursor view and ahead";
         let (dir, mut db, model, _inject, r, keys, _at) =
-            compact_store_with(&format!("cursor-view-{on}"), 1 << 20, |o| {
-                o.zpages_cursor_view = on;
-                o.zpages_group_ahead = on;
+            compact_store_with("cursor-view", 1 << 20, |o| {
                 o.commit_forms = false;
             });
         drop(r);
@@ -15465,24 +15415,15 @@ fn a_cursor_holds_a_pages_view_across_its_groups_and_asks_for_the_next() {
         let views = c.scan_views - before.scan_views;
         let aheads = c.group_aheads - before.group_aheads;
         assert!(groups >= 3, "{what}: groups decoded: {groups}");
-        if on {
-            assert!(
-                views < groups,
-                "{what}: a view a page and not a group: {views} views, {groups} groups"
-            );
-            // The scan's start seek decodes one group through no cursor.
-            assert!(
-                aheads + 1 >= groups,
-                "{what}: a group asked ahead at each open: {aheads} aheads, {groups} groups"
-            );
-        } else {
-            // A view at every open; the start seek's group apart, as above.
-            assert!(
-                views + 1 >= groups,
-                "{what}: a view an open: {views} views, {groups} groups"
-            );
-            assert_eq!(aheads, 0, "{what}: nothing asked ahead");
-        }
+        assert!(
+            views < groups,
+            "{what}: a view a page and not a group: {views} views, {groups} groups"
+        );
+        // The scan's start seek decodes one group through no cursor.
+        assert!(
+            aheads + 1 >= groups,
+            "{what}: a group asked ahead at each open: {aheads} aheads, {groups} groups"
+        );
         drop(r);
         db.close().unwrap();
         let _ = std::fs::remove_dir_all(&dir);
@@ -15657,8 +15598,8 @@ fn a_scans_first_touch_of_a_group_is_its_own_decode_and_its_second_the_memos() {
 /// scan made three times decodes its groups past the start's as its own
 /// and asks ahead at each page it leaves, or at each group, then into the
 /// memo at their admission, then not at all. Without the asks nothing is
-/// asked ahead. The cursor's asks are off in all three, and the scans the
-/// bulk walk's, and the entries come back as the model has them every
+/// asked ahead. The scans are the bulk walk's, which asks through none
+/// of the cursor's, and the entries come back as the model has them every
 /// time.
 #[cfg(target_os = "linux")]
 #[test]
@@ -15669,7 +15610,6 @@ fn a_bulk_walks_first_touch_of_a_group_is_its_own_decode_and_it_asks_for_the_nex
             compact_store_with(&format!("bulk-admit-{on}-{within}"), 1 << 20, |o| {
                 o.zpages_bulk_ahead = on;
                 o.zpages_bulk_ahead_within = within;
-                o.zpages_group_ahead = false;
                 o.commit_forms = false;
             });
         // A handle of its own, whose memo and tags no read before has
@@ -15761,91 +15701,11 @@ fn a_bulk_walks_first_touch_of_a_group_is_its_own_decode_and_it_asks_for_the_nex
     }
 }
 
-/// The bulk walk's own decode of the group it ends inside goes only as far
-/// as the walk reads (`Options::zpages_bulk_part`): a handle's scans of many
-/// lengths from starts spread over a drained store come back as the model
-/// has them with the option and without; with it the groups begun in part
-/// are counted among the walks' own and their bytes come short of the
-/// groups', and without it none is. The cursor's own partial decode and
-/// admission are off in both, so every count here is the bulk walk's.
-#[cfg(target_os = "linux")]
-#[test]
-fn a_bulk_walks_last_group_is_decoded_only_as_far_as_the_scan_reads() {
-    for on in [true, false] {
-        let what = format!("bulk part {on}");
-        let (dir, db, model, _inject, r, keys, _at) =
-            compact_store_with(&format!("bulk-part-{on}"), 1 << 20, |o| {
-                o.zpages_bulk_part = on;
-                o.zpages_walk_part = false;
-                o.commit_forms = false;
-            });
-        drop(r);
-        let r = db.reader().unwrap();
-        let lens = [1usize, 2, 3, 5, 8, 13, 21, 34, 55, 89, 144, 233];
-        let scans = 60usize;
-        assert!(keys.len() > 1000, "{what}: keys enough: {}", keys.len());
-        let before = db.zpage_counts();
-        for i in 0..scans {
-            let want = lens[i % lens.len()];
-            let start = 64 + i * (keys.len() - 400) / scans;
-            let expect: Vec<(Vec<u8>, Vec<u8>)> = keys[start..start + want]
-                .iter()
-                .flat_map(|k| model[k].iter().map(move |v| (k.clone(), v.clone())))
-                .collect();
-            let mut got: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
-            let n = r
-                .scan(
-                    &keys[start],
-                    want,
-                    kv(&mut |k, v| got.push((k.to_vec(), v.to_vec()))),
-                )
-                .unwrap();
-            assert_eq!(n, want, "{what}, scan {i}: the scan's entries");
-            assert_eq!(
-                got, expect,
-                "{what}, scan {i}: the entries as the model has them"
-            );
-        }
-        let c = db.zpage_counts();
-        let (parts, bytes, of, owned, walks) = (
-            c.walk_parts - before.walk_parts,
-            c.walk_part_bytes - before.walk_part_bytes,
-            c.walk_part_of - before.walk_part_of,
-            c.walk_owned - before.walk_owned,
-            c.scans - before.scans,
-        );
-        assert!(
-            walks >= scans as u64,
-            "{what}: the bulk walk served them: {c:?}"
-        );
-        if on {
-            // A scan begins one group in part at most, its last, and only
-            // where that group is a first touch the scan does not read to
-            // its end.
-            assert!(
-                parts as usize >= scans / 6 && parts as usize <= scans && parts <= owned,
-                "{what}: groups begun in part: {parts} of {owned} the walks' own, over {scans} scans"
-            );
-            assert!(
-                bytes * 100 < of * 85,
-                "{what}: {bytes} of {of} bytes decoded of the groups begun in part"
-            );
-        } else {
-            assert_eq!((parts, bytes, of), (0, 0, 0), "{what}");
-            assert!(owned > 0, "{what}: the walks' own decodes, each whole");
-        }
-        drop(r);
-        db.close().unwrap();
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-}
-
 /// A walk's own decode of a group it does not read to the end goes only as
-/// far as the walk reads (`Options::zpages_walk_part`): scans of many
+/// far as the walk reads (`zfile::ZMemo::walk_part`): scans of many
 /// lengths from starts spread over the store come back as the model has
-/// them with the option and without; with it the groups begun in part are
-/// counted among the walks' own and their bytes come short of the groups',
-/// and without it none is. The lowest keys are written first so the
+/// them, and the groups begun in part are counted among the walks' own and
+/// their bytes come short of the groups'. The lowest keys are written first so the
 /// partition does not take the bulk walk. Then the same over a stretch
 /// dense with unsealed keys, where a scan's entries come from the
 /// memtable as well and its walk of a block is cut into runs at each of
@@ -15856,11 +15716,10 @@ fn a_bulk_walks_last_group_is_decoded_only_as_far_as_the_scan_reads() {
 #[cfg(target_os = "linux")]
 #[test]
 fn a_scans_last_group_is_decoded_only_as_far_as_the_scan_reads() {
-    for on in [true, false] {
-        let what = format!("walk part {on}");
+    {
+        let what = "walk part";
         let (dir, mut db, model, _inject, r, keys, _at) =
-            compact_store_with(&format!("walk-part-{on}"), 1 << 20, |o| {
-                o.zpages_walk_part = on;
+            compact_store_with("walk-part", 1 << 20, |o| {
                 o.commit_forms = false;
             });
         drop(r);
@@ -15898,21 +15757,16 @@ fn a_scans_last_group_is_decoded_only_as_far_as_the_scan_reads() {
             c.walk_part_of - before.walk_part_of,
             c.walk_owned - before.walk_owned,
         );
-        if on {
-            // A scan begins one group in part at most, its last: its runs
-            // tell the cursor what the scan has ahead of them.
-            assert!(
-                parts as usize >= scans / 6 && parts as usize <= scans && parts <= owned,
-                "{what}: groups begun in part: {parts} of {owned} the walks' own, over {scans} scans"
-            );
-            assert!(
-                bytes * 100 < of * 85,
-                "{what}: {bytes} of {of} bytes decoded of the groups begun in part"
-            );
-        } else {
-            assert_eq!((parts, bytes, of), (0, 0, 0), "{what}");
-            assert!(owned > 0, "{what}: the walks' own decodes, each whole");
-        }
+        // A scan begins one group in part at most, its last: its runs
+        // tell the cursor what the scan has ahead of them.
+        assert!(
+            parts as usize >= scans / 6 && parts as usize <= scans && parts <= owned,
+            "{what}: groups begun in part: {parts} of {owned} the walks' own, over {scans} scans"
+        );
+        assert!(
+            bytes * 100 < of * 85,
+            "{what}: {bytes} of {of} bytes decoded of the groups begun in part"
+        );
         db.close().unwrap();
         let _ = std::fs::remove_dir_all(&dir);
         // A stretch with an unsealed value at every fifth key, its blocks'
@@ -15921,8 +15775,7 @@ fn a_scans_last_group_is_decoded_only_as_far_as_the_scan_reads() {
         // a scan of forty keys takes eight entries more than its keys from
         // the memtable and walks each block in runs between them.
         let (dir, mut db, mut model, inject, r, keys, _at) =
-            compact_store_with(&format!("walk-part-dense-{on}"), 1 << 20, |o| {
-                o.zpages_walk_part = on;
+            compact_store_with("walk-part-dense", 1 << 20, |o| {
                 o.upkeep = supdb::Upkeep::Inline;
             });
         drop(r);
@@ -15966,24 +15819,20 @@ fn a_scans_last_group_is_decoded_only_as_far_as_the_scan_reads() {
             c.walk_part_bytes - before.walk_part_bytes,
             c.walk_part_of - before.walk_part_of,
         );
-        if on {
-            // Where a run of the scan's last block opens the last group:
-            // a third of these scans, the rest opening it under the step
-            // past an unsealed key's own record, which is told no count
-            // and decodes whole. A count not taken down by the entries
-            // the memtable gave, or by the runs before in the block, wants
-            // the group whole in every one of them.
-            assert!(
-                parts as usize >= dense / 4 && parts as usize <= dense,
-                "{what}: groups begun in part over the dense stretch: {parts} over {dense} scans"
-            );
-            assert!(
-                bytes * 100 < of * 85,
-                "{what}: {bytes} of {of} bytes decoded of them"
-            );
-        } else {
-            assert_eq!((parts, bytes, of), (0, 0, 0), "{what}, the dense stretch");
-        }
+        // Where a run of the scan's last block opens the last group:
+        // a third of these scans, the rest opening it under the step past
+        // an unsealed key's own record, which is told no count and decodes
+        // whole. A count not taken down by the entries the memtable gave,
+        // or by the runs before in the block, wants the group whole in
+        // every one of them.
+        assert!(
+            parts as usize >= dense / 4 && parts as usize <= dense,
+            "{what}: groups begun in part over the dense stretch: {parts} over {dense} scans"
+        );
+        assert!(
+            bytes * 100 < of * 85,
+            "{what}: {bytes} of {of} bytes decoded of them"
+        );
         drop(h);
         db.close().unwrap();
         let _ = std::fs::remove_dir_all(&dir);
@@ -21281,14 +21130,12 @@ fn hundred(rng: &mut Rng) -> Vec<u8> {
 /// the dense run and a byte either side, at each partition's ends, at keys
 /// a page apart and at the edges of the key space, and end after the counts
 /// a block and a page make interesting; through the writer and a handle.
-/// Where a cursor walks -- the block cache's reader under the block cursor,
-/// the covered walk without the cache, and the merge path over the piece --
-/// it walks the stride partitions at its stride position, the values it
-/// hands over counted; under the cache read a run at a time
-/// (`Options::zpages_block_cursor` off) the walks are the file's own and no
-/// cursor's. Nothing is decoded, no walk is the raw form's, and the raw
+/// Where a cursor walks -- the block cache's reader, the covered walk
+/// without the cache, and the merge path over the piece -- it walks the
+/// stride partitions at its stride position, the values it hands over
+/// counted. Nothing is decoded, no walk is the raw form's, and the raw
 /// form is touched by none of it.
-fn stride_windows(name: &str, cache: bool, block_cursor: bool) {
+fn stride_windows(name: &str, cache: bool) {
     let counts = cfg!(debug_assertions);
     let dir = scratch(name);
     let mut db = Db::create(
@@ -21296,7 +21143,6 @@ fn stride_windows(name: &str, cache: bool, block_cursor: bool) {
         stride_forced(|o| {
             o.partition_bytes = Some(160 << 10);
             o.scan_block_cache = cache;
-            o.zpages_block_cursor = block_cursor;
         }),
     )
     .unwrap();
@@ -21413,11 +21259,9 @@ fn stride_windows(name: &str, cache: bool, block_cursor: bool) {
         );
         c.stride_cursor_reads - before.stride_cursor_reads
     };
-    let cursor = !cache || block_cursor;
     let through = windows(&db, &model, "over a frozen table and the live one");
-    assert_eq!(
+    assert!(
         through > 0,
-        cursor,
         "{name}: {through} values through the cursor's stride position"
     );
     // The seal lands: a piece over the partitions, and more writes over it.
@@ -21432,9 +21276,8 @@ fn stride_windows(name: &str, cache: bool, block_cursor: bool) {
     write(&mut db, &mut model, &mut rng, 120);
     db.commit().unwrap();
     let through = windows(&db, &model, "over a piece");
-    assert_eq!(
+    assert!(
         through > 0,
-        cursor,
         "{name}: over a piece, {through} values through the cursor's stride position"
     );
     assert!(db.levels().1 >= 1, "the piece stood through the windows");
@@ -21446,17 +21289,12 @@ fn stride_windows(name: &str, cache: bool, block_cursor: bool) {
 
 #[test]
 fn stride_scans_through_the_block_cursor_agree_with_the_model_over_every_window() {
-    stride_windows("stride-windows-cursor", true, true);
-}
-
-#[test]
-fn stride_scans_through_the_block_cache_a_run_at_a_time_agree_with_the_model_over_every_window() {
-    stride_windows("stride-windows-perrun", true, false);
+    stride_windows("stride-windows-cursor", true);
 }
 
 #[test]
 fn stride_scans_without_the_block_cache_agree_with_the_model_over_every_window() {
-    stride_windows("stride-windows-nocache", false, true);
+    stride_windows("stride-windows-nocache", false);
 }
 
 /// What a read of a stride partition touches of the raw form, counted at

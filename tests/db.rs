@@ -17265,7 +17265,7 @@ fn a_live_write_over_the_frozen_table_is_one_key_on_every_scan_path() {
 /// arm that keeps it: the block cache's, the merge over unrouted sources, the lazy snapshot, the snapshot's runs, a
 /// snapshot each handle builds alone, and frozen tables with no snapshot
 /// of their own.
-fn scan_path_arms() -> [(&'static str, Options); 9] {
+fn scan_path_arms() -> [(&'static str, Options); 8] {
     [
         ("default", common::options()),
         // The compact form forced, with the block cache and without it: the
@@ -17285,17 +17285,6 @@ fn scan_path_arms() -> [(&'static str, Options); 9] {
                 zpages: supdb::ZPages::Always,
                 zpages_min_bytes: 0,
                 scan_block_cache: false,
-                ..common::options()
-            },
-        ),
-        // The overlay walk cut by rank, as it was before the cursor.
-        (
-            "nocachezpagesrankwalk",
-            Options {
-                zpages: supdb::ZPages::Always,
-                zpages_min_bytes: 0,
-                scan_block_cache: false,
-                zpages_walk_cursor: false,
                 ..common::options()
             },
         ),
