@@ -16225,15 +16225,14 @@ impl Seg {
         &self.blob.0
     }
 
-    /// Cheap ordered key walk: O(extents), no block touched -- the property
-    /// `scan_counts_fixed` exists for. The width argument is irrelevant
-    /// here because only the keys are wanted.
-    fn for_each_key(blob: &Blob<MmapBytes>, mut f: impl FnMut(&[u8])) -> Result<()> {
-        blob.scan_counts_fixed(b"", usize::MAX, 8, |k, _| {
-            f(k);
-            true
-        })
-        .map_err(|e| err(&format!("segment key walk: {e}")))?;
+    /// Cheap ordered key walk: O(extents), no block touched. Every
+    /// record's key, a record with no value among them, since what is built
+    /// of it -- an ordered index, a merge's slicing -- is built of the
+    /// segment's records (`Blob::for_each_record_key`); a scan's count
+    /// passes such a record over.
+    fn for_each_key(blob: &Blob<MmapBytes>, f: impl FnMut(&[u8])) -> Result<()> {
+        blob.for_each_record_key(f)
+            .map_err(|e| err(&format!("segment key walk: {e}")))?;
         Ok(())
     }
 
@@ -47754,7 +47753,7 @@ impl Db {
         let store_bytes = Db::store_bytes_of(dir, &segs);
         let data_bytes = Db::data_bytes_of(&segs);
         let segs_tombs = segs.iter().any(|s| s.tombs);
-        let segs_bare = segs.iter().any(|s| s.bare);
+        let segs_bare = segs.iter().any(|s| s.level > 0 && s.bare);
         let max_key = Db::max_seg_key(&segs).max(replay_max);
         debug_assert_eq!(
             max_key,
@@ -63760,7 +63759,7 @@ impl Maint {
             AtomicOrdering::Relaxed,
         );
         let segs_tombs = segs.iter().any(|s| s.tombs);
-        let segs_bare = segs.iter().any(|s| s.bare);
+        let segs_bare = segs.iter().any(|s| s.level > 0 && s.bare);
         loop {
             let cur_p = self.shared.state.load(AtomicOrdering::Acquire);
             // SAFETY: this handle is pinned for its operation, and a state

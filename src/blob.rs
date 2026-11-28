@@ -2645,6 +2645,24 @@ impl<B: Bytes> Blob<B> {
         Ok(seen)
     }
 
+    /// Every record's key in key order, a record with no value among them,
+    /// and how many: the walk an index of the segment's records is built
+    /// from, in O(extents) with no block touched, as `scan_counts` walks.
+    pub(crate) fn for_each_record_key<F: FnMut(&[u8])>(&self, mut f: F) -> Result<usize> {
+        let mut rank = 0usize;
+        let walk = self
+            .flat()
+            .and_then(|(sec, idx)| idx.regions(sec).map(|(recs, dir)| (idx, recs, dir)));
+        while let Some(k) = match walk {
+            Some((idx, recs, dir)) => idx.at_full_in(recs, dir, rank).map(|(k, _, _)| k),
+            None => self.exts_at(rank).map(|(k, _)| k),
+        } {
+            f(k);
+            rank += 1;
+        }
+        Ok(rank)
+    }
+
     /// The same walk, counting in O(extents) for a fixed-width schema.
     ///
     /// This is the one a breakdown panel should call, and the difference is

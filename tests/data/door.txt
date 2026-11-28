@@ -67,6 +67,7 @@ thread	src/flatindex.rs	*	3	the writer's helper thread (S1: pin::)
 cfgout	src/blob.rs	Blob::scan_at_in	1	wasm: a lead nobody reads
 cfgout	src/block.rs	crc32_from	1	aarch64: the CRC instructions' dispatch
 cfgout	src/block.rs	crc32c_hw	1	aarch64: the CRC instructions
+cfgout	src/block.rs	crc32c_hw_x4	1	aarch64: the CRC instructions, four inputs at once
 cfgout	src/db.rs	Reader::convert_walked	1	not debug_assertions: a binding the check below uses
 cfgout	src/db.rs	io_priority_class	1	not Linux: no I/O class
 cfgout	src/db.rs	mod heap	1	not glibc: no allocator counts

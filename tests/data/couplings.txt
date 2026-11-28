@@ -16,6 +16,7 @@
 # above the file's fails as growth, one below it fails until the file is
 # lowered in the same change. The scopes say where; a coupling moved between
 # scopes changes no total. SUPDB_WALL_PRINT=1 prints the measured table.
+src/blob.rs	Blob::scan	piecewise/ASK_PIECES	code	2	stays	the dispatch on the source kind (R2 keeps it in blob): a scan from a key, which counts the keys that hold a value where a walk from a rank counts records
 src/blob.rs	Blob::scan_at	piecewise/ASK_PIECES	code	2	stays	the dispatch on the source kind (R2 keeps it in blob)
 src/blob.rs	Blob::scan_at_in	piecewise/ASK_PIECES	code	1	stays	the dispatch on the source kind (R2 keeps it in blob); new since 3b36b029
 src/blob.rs	Blob::scan_refused	piecewise/ASK_PIECES	code	1	stays	the dispatch on the source kind (R2 keeps it in blob)

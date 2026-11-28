@@ -166,3 +166,5 @@ tests/data/cost-entries.txt	Reader::window_resumes	0	1	a test seam that counts t
 tests/data/cost-entries.txt	Reader::holders_of	0	1	a test seam that names the sources holding a key's record, read by tests/fuzz.rs, at no key, entry, block or step of an operation
 tests/data/cost-entries.txt	Db::bare_walks	0	1	a test seam that counts the partitions an open walked for a record with no value and those it found, read by tests/db.rs, at no key, entry, block or step of an operation
 tests/data/cost-entries.txt	Db::write_as_older_release	0	1	a test seam that has the store write as a release from before MANIFEST_CLEAN did, read by tests/db.rs, at no key, entry, block or step of an operation
+tests/data/door.txt	cfgout src/block.rs crc32c_hw_x4	0	1	the ARM twin of the open verification's four-way CRC (block::crc32_x4), as crc32c_hw has one
+tests/data/couplings.txt	src/blob.rs Blob::scan piecewise/ASK_PIECES code	0	2	a scan from a key dispatches on the source kind as scan_at does, the key count (Blob::scan) where scan_at counts records

@@ -204,36 +204,40 @@ fn crc32c_shift_matrices() -> Vec<[u32; 32]> {
     out
 }
 
-/// Whether the CPU has the CRC-32C instruction, asked once: SSE4.2 on
-/// x86-64, the CRC extension on ARM, and neither elsewhere.
-#[inline]
-fn crc_hw() -> bool {
+fn crc32_from(init: u32, data: &[u8]) -> u32 {
     #[allow(unused_imports)]
     use std::sync::atomic::Ordering;
-    #[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
+    #[cfg(target_arch = "aarch64")]
     {
         let mut which = CRC_IMPL.load(Ordering::Relaxed);
         if which == 0 {
-            #[cfg(target_arch = "aarch64")]
-            let hw = std::arch::is_aarch64_feature_detected!("crc");
-            #[cfg(target_arch = "x86_64")]
-            let hw = std::arch::is_x86_feature_detected!("sse4.2");
-            which = if hw { 1 } else { 2 };
+            which = if std::arch::is_aarch64_feature_detected!("crc") {
+                1
+            } else {
+                2
+            };
             CRC_IMPL.store(which, Ordering::Relaxed);
         }
-        which == 1
+        if which == 1 {
+            // SAFETY: only reached once the CPU has advertised the CRC extension.
+            return unsafe { crc32c_hw(init, data) };
+        }
     }
-    #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
+    #[cfg(target_arch = "x86_64")]
     {
-        false
-    }
-}
-
-fn crc32_from(init: u32, data: &[u8]) -> u32 {
-    #[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
-    if crc_hw() {
-        // SAFETY: only reached once the CPU has advertised the instruction.
-        return unsafe { crc32c_hw(init, data) };
+        let mut which = CRC_IMPL.load(Ordering::Relaxed);
+        if which == 0 {
+            which = if std::arch::is_x86_feature_detected!("sse4.2") {
+                1
+            } else {
+                2
+            };
+            CRC_IMPL.store(which, Ordering::Relaxed);
+        }
+        if which == 1 {
+            // SAFETY: only reached once the CPU has advertised SSE4.2.
+            return unsafe { crc32c_hw(init, data) };
+        }
     }
     crc32c_scalar(init, data)
 }
@@ -247,9 +251,17 @@ fn crc32_from(init: u32, data: &[u8]) -> u32 {
 /// four at a time (`flatindex::verify_pieces_with`).
 pub fn crc32_x4(data: [&[u8]; 4]) -> [u32; 4] {
     #[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
-    if crc_hw() {
-        // SAFETY: only reached once the CPU has advertised the instruction.
-        return unsafe { crc32c_hw_x4(data) };
+    {
+        use std::sync::atomic::Ordering;
+        // The CPU asked once, as `crc32_from` asks it, by a CRC of nothing.
+        if CRC_IMPL.load(Ordering::Relaxed) == 0 {
+            crc32(&[]);
+        }
+        if CRC_IMPL.load(Ordering::Relaxed) == 1 {
+            // SAFETY: the dispatch is 1 only once the CPU has advertised
+            // the instruction.
+            return unsafe { crc32c_hw_x4(data) };
+        }
     }
     data.map(crc32)
 }
