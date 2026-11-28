@@ -21,8 +21,7 @@ on:
   workflow_dispatch:
 
 permissions:
-  contents: write
-  pull-requests: write
+  contents: read
 
 env:
   CARGO_TERM_COLOR: always
@@ -38,7 +37,9 @@ jobs:
     # GitHub's six hours.
     timeout-minutes: 90
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
       # The toolchain rust-toolchain.toml names, the one the local gate runs
       # under; no workflow names a version or a channel of its own.
       - name: The pinned toolchain
@@ -53,7 +54,7 @@ jobs:
       # `workspace -> target`, the target a path inside its workspace: see
       # the `test` job of ci.yml. The key is the one every job that builds
       # the suite's binary alone shares: see the `quick` job there.
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           workspaces: bench -> target
           shared-key: bench
@@ -69,7 +70,7 @@ jobs:
           ./target/release/bench run --scale quick --out runs-ci
           ./target/release/bench gate runs-ci/quick/*.json --runs runs > runs-ci/gate.txt 2>&1 || true
           cat runs-ci/gate.txt
-      - uses: actions/upload-artifact@v7
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         if: always()
         with:
           name: row-${{ matrix.runner }}
@@ -79,10 +80,15 @@ jobs:
   propose:
     needs: row
     if: always()
+    # The one job that writes: it pushes the branch and opens the pull
+    # request, so its checkout keeps the token for `git push`.
+    permissions:
+      contents: write
+      pull-requests: write
     runs-on: ubuntu-24.04
     timeout-minutes: 60
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       # The toolchain rust-toolchain.toml names, the one the local gate runs
       # under; no workflow names a version or a channel of its own.
       - name: The pinned toolchain
@@ -97,11 +103,11 @@ jobs:
       # `workspace -> target`, the target a path inside its workspace: see
       # the `test` job of ci.yml. The key is the one every job that builds
       # the suite's binary alone shares: see the `quick` job there.
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           workspaces: bench -> target
           shared-key: bench
-      - uses: actions/download-artifact@v8
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           pattern: row-*
           path: rows

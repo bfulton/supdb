@@ -14,6 +14,9 @@ on:
   schedule:
     - cron: '41 7 * * 1'
 
+permissions:
+  contents: read
+
 env:
   CARGO_TERM_COLOR: always
 
@@ -22,7 +25,9 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 240
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
       # The toolchain rust-toolchain.toml names, the one the local gate runs
       # under; no workflow names a version or a channel of its own.
       - name: The pinned toolchain
@@ -42,7 +47,7 @@ jobs:
       # since none of them builds the second directory. GitHub removes a
       # cache nothing has read for seven days and this job's schedule is
       # weekly, so a scheduled run may find its cache gone and build both.
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           workspaces: |
             bench -> target
@@ -67,7 +72,7 @@ jobs:
           set -eu
           python3 scripts/alloc_compare.py runs-glibc runs-jemalloc | tee alloc.md
           cat alloc.md >> "$GITHUB_STEP_SUMMARY"
-      - uses: actions/upload-artifact@v7
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         if: always()
         with:
           name: rocksdb-alloc
