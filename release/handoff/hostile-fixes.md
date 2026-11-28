@@ -55,21 +55,35 @@ Tree Borrows.
   reason is the new refusals' checks and their error strings in the
   readers. No budget is enforced (`web/build.sh` prints the sizes).
 
-## A key past 4 GiB in total across appends (run, 14:39 UTC, on `1a723c5`)
+## A key past 4 GiB in total across appends
 
-66 appends of 64 MiB to one key, a commit each, `common::options()`:
-every commit `Ok`; `flush` `InvalidData: "segment writer: a key's values
-exceed 4 GiB in one segment"`; `count` 66; a later commit `Ok` (not kept as
-`Db::lost`); `close` the same error; reopen `Ok`, `count` 66, `read_all`
-4,429,185,024 bytes; `close` the same error again. Nothing is lost and the
-store opens, but no flush or close succeeds again: the writer puts a key's
-values in a segment as one extent (`Extents::One`), whose length is 32 bits.
+Before (14:39 UTC, on `1a723c5`), 66 appends of 64 MiB to one key, a commit
+each, `common::options()`: every commit `Ok`; `flush` `InvalidData:
+"segment writer: a key's values exceed 4 GiB in one segment"`; `count` 66;
+a later commit `Ok`; `close` the same error; reopen `Ok`, `read_all`
+4,429,185,024 bytes; `close` the same error again.
 
-Fix not made, asked of the parent: refusing the append that carries a key
-past 4 GiB needs the key's total across the live table and every segment on
-every append (a lookup a write on the loads' path); writing such a run as
-several extents is a record shape no writer makes today.
+Fixed (the parent's choice (b)): `ba3015d`, reworked in `68d3c10`. The
+segment writer cuts a key's run past an extent's 32-bit length into several
+extents of one record (`SegmentWriter::end_cut`), a shape every reader reads
+(`Blob` mapped and copying, `SparseBlob`: counts summed, extents walked in
+turn, a tombstone on any extent the record's); the browser reader never
+meets one, as its host refuses an object of 4 GiB or more at open. Test:
+`a_run_past_an_extent_is_cut_into_several_and_read_as_one_key` (the limit
+set to 100 bytes by `set_max_extent`), red without the cut. The real case
+after, on `68d3c10` (15:27 UTC; the probe is not committed): every commit,
+`flush`, a later commit, `close`, the reopen and the second `close` answer
+`Ok`; `count` 66; `read_all` `Ok(66)`, 4,429,185,024 bytes, in the order
+written.
+
+Count on the writer's probes after `68d3c10`
+(`sh scripts/cost.sh 515d2cde seal merge load_durable`): `seal` -11 and
+`merge` -18.5 instructions a key in total; by function, `end_with` and the
+seal's loop gain 63 a key where `key_hash` and `BigVec::push` are now
+inlined into them and fall by as much or more. `ba3015d` alone had read the
+seal at +71 and the merge at +10.
 
 ## Next
 
-Waiting on the parent's choice above. Left for others: the cost raises above.
+In progress: the full count and the gate on `68d3c10` (started 15:29).
+Then this file's verdict lines, push, and the report to the parent.
