@@ -70,9 +70,7 @@
 //!   memtable's keys by FNV alone (`Cfg::mem_fold`);
 //!   and in a quarter of the seeds that hold their log overwrites a put's
 //!   value of the put's length where it lies on the `z` store, its handles
-//!   claimed only with nothing staged (`Cfg::in_place`); and in a quarter
-//!   each takes one of the settle's four shapes before (`Cfg::settle_loads`
-//!   and the three beside it).
+//!   claimed only with nothing staged (`Cfg::in_place`).
 //! - `ZFUZZ_SHARE`: `1`, handles write in the seeds whose log is held
 //!   with no frames, where both stores share their live table on demand
 //!   (`Options::share_on_write`, the engine's); `all`, every seed holds
@@ -248,11 +246,7 @@ fn share_mode() -> u8 {
 /// in which the stores share their live table on demand
 /// (`Options::shares`).
 fn shares(c: &Cfg) -> bool {
-    share_mode() > 0
-        && matches!(c.sync, SyncPolicy::Explicit)
-        && !c.held_frames
-        && !c.in_place
-        && !env_flag("ZFUZZ_SNAPKEPT")
+    share_mode() > 0 && matches!(c.sync, SyncPolicy::Explicit) && !c.held_frames && !c.in_place
 }
 
 fn trace_on() -> bool {
@@ -462,14 +456,6 @@ struct Cfg {
     /// and on otherwise, as the engine has it, so a run that makes its own
     /// file is held to the model beside one that finds it made.
     run_spare: bool,
-    /// A settle's patch appends a key past a copy's last entry on one
-    /// compare and takes a lone key's run from its chain
-    /// (`Options::settle_append_last`, `Options::settle_lone_chain`): each
-    /// off in a quarter of the seeds under `ZFUZZ_OPTVARY`, the side
-    /// generator's two draws after the run file's, and on otherwise, as
-    /// the engine has them.
-    settle_append: bool,
-    settle_lone: bool,
     /// A copy's prefetch by the span its walk reads
     /// (`Options::copy_prefetch_span`): on in a quarter of the seeds under
     /// `ZFUZZ_OPTVARY`, the side generator's draw after those, and off
@@ -494,17 +480,6 @@ struct Cfg {
     /// (`Options::held_bursts_lend` off): in a quarter of the seeds under
     /// `ZFUZZ_OPTVARY`, the side generator's next draw.
     held_files: bool,
-    /// The settle's four shapes before, each in a quarter of the seeds
-    /// under `ZFUZZ_OPTVARY` and each the side generator's next draw: its
-    /// resolve reading the pending list and the table by index
-    /// (`Options::settle_gathers` off), its batch sorted twice
-    /// (`Options::settle_sorts_once` off), every patch staged
-    /// (`Options::settle_patch_in_place` off) and the dense forms left to
-    /// the fill (`Options::settle_converts` off).
-    settle_loads: bool,
-    settle_twice: bool,
-    settle_staged: bool,
-    settle_noconvert: bool,
     /// A settle's conversion that leaves the fill no walk
     /// (`Options::settle_convert_fills` off): in a quarter of the seeds
     /// under `ZFUZZ_OPTVARY`, the side generator's draw after those.
@@ -817,16 +792,18 @@ fn pick_cfg(rng: &mut Rng, want_cache: bool) -> Cfg {
     let mem_fnv = side.chance(25);
     let in_place = side.chance(25);
     let spare_off = side.chance(25);
-    let append_off = side.chance(25);
-    let lone_chain_off = side.chance(25);
+    let _ = side.chance(25);
+    let _ = side.chance(25);
     let copy_span = side.chance(25);
     let identity_blob = side.chance(25);
     let copy_packed = side.chance(50);
     // The draw `upkeep_inline_min` took, kept so that the draws after it
     // stand.
     let (_, held_files) = (side.chance(25), side.chance(25));
-    let (settle_loads, settle_twice) = (side.chance(25), side.chance(25));
-    let (settle_staged, settle_noconvert) = (side.chance(25), side.chance(25));
+    let _ = side.chance(25);
+    let _ = side.chance(25);
+    let _ = side.chance(25);
+    let _ = side.chance(25);
     let settle_quiet = side.chance(25);
     // A generator of its own, as `side` is, so that the switch moves none
     // of the draws below.
@@ -912,16 +889,10 @@ fn pick_cfg(rng: &mut Rng, want_cache: bool) -> Cfg {
         mem_fold: !(vary && mem_fnv),
         in_place: vary && explicit_on && in_place,
         run_spare: !(vary && spare_off),
-        settle_append: !(vary && append_off),
-        settle_lone: !(vary && lone_chain_off),
         copy_span: vary && copy_span,
         identity_keys: !(vary && identity_blob),
         copy_packed: !vary || copy_packed,
         held_files: vary && held_files,
-        settle_loads: vary && settle_loads,
-        settle_twice: vary && settle_twice,
-        settle_staged: vary && settle_staged,
-        settle_noconvert: vary && settle_noconvert,
         settle_quiet: vary && settle_quiet,
         stride,
     }
@@ -947,8 +918,6 @@ fn opts(c: &Cfg) -> Options {
         zpages_point_part: c.point_part,
         zpages_point_keys: c.point_keys,
         run_spare: c.run_spare,
-        settle_append_last: c.settle_append,
-        settle_lone_chain: c.settle_lone,
         copy_prefetch_span: c.copy_span,
         identity_by_keys: c.identity_keys,
         copy_packed: c.copy_packed,
@@ -1073,10 +1042,6 @@ fn opts_z(c: &Cfg) -> Options {
         o.forms_to_fit = true;
     }
     o.held_bursts_lend = !c.held_files;
-    o.settle_gathers = !c.settle_loads;
-    o.settle_sorts_once = !c.settle_twice;
-    o.settle_patch_in_place = !c.settle_staged;
-    o.settle_converts = !c.settle_noconvert;
     o.settle_convert_fills = !c.settle_quiet;
     // Last, over whatever the flags set: the overwrite and what it needs.
     if c.in_place {

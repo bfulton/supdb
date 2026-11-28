@@ -438,8 +438,18 @@ pub struct WalHeld {
 /// The window the merge asks ahead of its second pass where
 /// `Options::merge_read_ahead` is set by the arm: four mebibytes, the
 /// device's largest request here and the window the controller's build asks
-/// ahead of its walk (`Options::zpages_build_ahead`).
+/// ahead of its walk (`ZBUILD_AHEAD`).
 pub const MERGE_AHEAD_WINDOW: usize = 4 << 20;
+
+/// The bytes of a partition's raw records a build asks the kernel for
+/// ahead of its walk, a window at a time (`MADV_WILLNEED`). Asking
+/// nothing, the walk's page faults fetched the device's readahead, 128 KB
+/// here, one window a wait; under a bound the walk's waits queued behind
+/// the readers' faults, and a build of a gigabyte ran at 5-15 MB/s
+/// whatever its I/O class, where four mebibytes asked ahead took its wall
+/// to a little over half. The bytes asked are counted
+/// (`ZCounts::build_ahead_bytes`).
+const ZBUILD_AHEAD: usize = 4 << 20;
 
 /// I/O priority for the seal and merge threads. `Idle` asks the block layer
 /// to serve everything else -- the commit path's barrier above all -- before
@@ -956,7 +966,7 @@ pub struct ZCounts {
     pub warm_collected: u64,
     pub job_ends: u64,
     /// Form files built ahead of the controller's decision and left on
-    /// disk unattached (`Options::zpages_prebuild`).
+    /// disk unattached.
     pub prebuilt: u64,
     /// Builds at a merge's output finish (`Options::zpages_build_at_finish`):
     /// started, built, failed, the merge's waits for a slot, and in flight.
@@ -977,8 +987,7 @@ pub struct ZCounts {
     /// built again in the picked one.
     pub ahead_recoded: u64,
     /// Partitions built ahead under the budget whose records were dropped
-    /// and form files asked back as the store passed its whole budget
-    /// (`Options::zpages_land_drop_past`).
+    /// and form files asked back as the store passed its whole budget.
     pub ahead_swapped: u64,
     /// Form files whose build dropped them from the page cache as it wrote
     /// them -- a build ahead begun under the selector's line -- asked back
@@ -1006,15 +1015,14 @@ pub struct ZCounts {
     pub raw_redrops: u64,
     pub raw_redrop_before: u64,
     pub raw_redrop_after: u64,
-    /// Form files synced once named, on their build's thread
-    /// (`Options::zpages_build_sync`).
+    /// Form files synced once named, on their build's thread.
     pub build_synced: u64,
     /// The I/O class the kernel reported for the last build thread, read
-    /// on the thread after it chose: 3 idle (`Options::zpages_io_idle`), 2
+    /// on the thread after it chose: 3 idle, 2
     /// best effort, 0 none, which is best effort at the thread's nice.
     pub build_io_class: u64,
     /// The raw record bytes the builds asked for ahead of their walks
-    /// (`Options::zpages_build_ahead`).
+    /// (`ZBUILD_AHEAD`).
     pub build_ahead_bytes: u64,
     /// Records the builds held no page for.
     pub build_nopage: u64,
@@ -1076,7 +1084,7 @@ pub struct ZCounts {
     pub census_scans: u64,
     pub census_scan_faults: u64,
     /// Over the windows that counted: the operations whose wall was
-    /// stamped (`Options::zpages_census_sample`), and the busy wall of the
+    /// stamped, and the busy wall of the
     /// windows with no commit inside, nanoseconds, scaled where the stride
     /// skipped operations.
     pub census_stamped: u64,
@@ -1102,7 +1110,7 @@ pub struct ZCounts {
     pub sample_declined: u64,
     pub sample_us: u64,
     /// Readings refreshed from the last sample in place of a sample
-    /// (`Options::zpages_build_at_finish`, `Options::zpages_ahead_past_scans`).
+    /// (`Options::zpages_build_at_finish`).
     pub sample_refreshed: u64,
     /// Readings made from the form files on disk at the crossing in place
     /// of a fill sample (`Maint::z_reading_from_files`).
@@ -1169,12 +1177,11 @@ pub struct ZCounts {
     pub hot_back_asks: u64,
     pub hot_back_waited: u64,
     /// The form files asked for whole where scans came back after a
-    /// stretch without one (`Options::zpages_rewarm_scans`): the looks
+    /// stretch without one: the looks
     /// that asked, and the files.
     pub rewarms: u64,
     pub rewarm_files: u64,
-    /// A settle's waits for the form files the store asked the kernel for
-    /// (`Options::zpages_settle_joins_asks`), their looks at the files'
+    /// A settle's waits for the form files the store asked the kernel for, their looks at the files'
     /// residency, the asks they made again for files the kernel had left
     /// short, and their milliseconds.
     pub ask_joins: u64,
@@ -1186,21 +1193,18 @@ pub struct ZCounts {
     /// trims gave back.
     pub rewarm_trims: u64,
     pub rewarm_trim_bytes: u64,
-    /// The rewarms that asked for the raw form's files
-    /// (`Options::zpages_rewarm_raw`), the files asked, the bytes of them
+    /// The rewarms that asked for the raw form's files, the files asked, the bytes of them
     /// the page cache did not hold, and the files short of the line left
     /// for want of room.
     pub raw_rewarms: u64,
     pub raw_rewarm_files: u64,
     pub raw_rewarm_bytes: u64,
     pub raw_rewarm_short: u64,
-    /// The settles that asked for the raw form's files and waited for them
-    /// (`Options::zpages_rewarm_raw`), and the milliseconds they waited.
+    /// The settles that asked for the raw form's files and waited for them, and the milliseconds they waited.
     pub raw_settles: u64,
     pub raw_settle_ms: u64,
     /// The segments such a settle mapped into the page tables after its
-    /// ask, and the milliseconds the mapping took
-    /// (`Options::zpages_rewarm_raw_maps`).
+    /// ask, and the milliseconds the mapping took.
     pub raw_maps: u64,
     pub raw_map_ms: u64,
     /// The partitions whose raw pages were dropped at their form file's
@@ -1525,7 +1529,7 @@ pub struct Options {
     /// where a bound has taken the pages back by then. Under a bound each
     /// input was read one kernel readahead window a wait, each wait a
     /// device round trip behind the readers' faults: the shape the
-    /// controller's build had before `zpages_build_ahead`. Zero asks
+    /// controller's build had before it asked ahead. Zero asks
     /// nothing; `supdb-mergeahead` is the arm with a window of
     /// `MERGE_AHEAD_WINDOW`; the asks are counted (`Db::merge_ahead`).
     /// A plain store's: a store under a cipher's merges ask by
@@ -1760,22 +1764,7 @@ pub struct Options {
     /// `supdb-cache64tofitautozpagesmemolinear` is the arm.
     #[doc(hidden)]
     pub zpages_memo_hash: bool,
-    /// A settle files a written key under the block the form file's fence
-    /// and the page's directory name (`ZFile::owner_span`) with its cut
-    /// left unresolved, where that block holds no form a patch would need
-    /// the cut for, and the build that reads the block's filed keys
-    /// resolves them for that block alone (`BuildCtx::filed_cuts`). The
-    /// exact resolve was a seek through the form a distinct key: the E
-    /// mix's first scan settles the 91,143 writes the A, F and D mixes
-    /// left, 44,857 distinct keys, in 55 of the settle's 60 ms at five
-    /// million keys under 640 MiB, 25,740 of the seeks decoding a group,
-    /// for blocks most of which E never builds; a block held wide walks a
-    /// key with its cut unknown, placed by key, as it walks a snapshot key
-    /// whose cut was never taken. Off resolves every key at the settle,
-    /// the shape before; `supdb-cache64tofitautozpagesexactcut` is the arm.
-    #[doc(hidden)]
-    pub zpages_settle_span: bool,
-    /// With `zpages_settle_span`, a partition served raw files a written
+    /// A partition served raw files a written
     /// key the same way, under the block the ordered index's top level
     /// names (`OrdIndex::floor_stride`, a sample every block's first rank)
     /// with its cut left for the build, where the key's head lies strictly
@@ -1793,17 +1782,6 @@ pub struct Options {
     /// `supdb-settlelazyraw` is the arm.
     #[doc(hidden)]
     pub settle_lazy_raw: bool,
-    /// A settle's patch of a copy finds a key above the copy's last entry
-    /// by one compare with that entry and appends it, where it searched
-    /// the copy's keys for its place (`Reader::splice_run`): the last block
-    /// of the last partition collects every key inserted past the store's
-    /// end, each above the one before, and each insert's patch was a
-    /// binary search of the copy -- ten compares through the entries and
-    /// the keys, a sixth of the patch's instructions -- for the answer
-    /// "after the last". Off searches, the shape before;
-    /// `supdb-settlesearch` and `supdb-ingestsettlesearch` are the arms.
-    #[doc(hidden)]
-    pub settle_append_last: bool,
     /// A copy's claim that its entries are its partition's records
     /// (`CachedBlock::identity`) is of the partition's keys and not of its
     /// file: a merge that rewrites a partition over the same keys -- every
@@ -1838,37 +1816,6 @@ pub struct Options {
     /// `supdb-copythree` and `supdb-ingestcopythree`.
     #[doc(hidden)]
     pub copy_packed: bool,
-    /// A settle's patch takes a key's run from the key's own chain where
-    /// no older source can hold the key (`Reader::patch_block`): the write
-    /// is the live table's, the partition has no record of the key at its
-    /// cut, no level-0 piece meets the partition and no table is frozen.
-    /// A `put` leaves a tombstone in the chain, which masks every older
-    /// source, and its run has been written from the chain since the
-    /// masked path; a plain insert leaves none, so it took the general
-    /// path -- a context made, an overlay of one key allocated, the
-    /// sources walked for a key none of them holds -- about seven hundred
-    /// instructions to learn that the run is the chain's. Off takes the
-    /// general path, the shape before; `supdb-settlesources` and
-    /// `supdb-ingestsettlesources` are the arms.
-    #[doc(hidden)]
-    pub settle_lone_chain: bool,
-    /// A covered partition's settle files a written key under the block the
-    /// ordered index's samples name (`OrdIndex::floor_stride`, one sample a
-    /// block, in memory) before it asks the form file, its cut left for the
-    /// build: the form's span names a block only where the group that holds
-    /// the key lies inside one, and a group straddles a block's edge often
-    /// enough that the settle fell to the exact seek, which decodes the
-    /// group. The first scan after the lag sweep's one-percent burst at ten
-    /// million keys under 1.25 GiB waited 89-172 ms for the upkeep
-    /// thread's pass over the burst's 99,000 writes, or settled them itself
-    /// in 114, the decoder and the page views a third of its thread; filed
-    /// by the samples, the thread kept up, the scan waited a millisecond at
-    /// most, and that pass read 1.46x and 1.72x in two sittings, its first
-    /// scan 36-106 ms against 129-212 (`docs/engine.md`). A tie of the
-    /// key's head with a sample, which the samples cannot settle, asks the
-    /// form as before. On; `supdb-settlespan` files by the form's span.
-    #[doc(hidden)]
-    pub settle_covered_samples: bool,
     /// A verified page of a form file is read with its directory trusted
     /// (`zpages::view_trusted`, `ZFile::view`), and a read takes a page's
     /// view once, for the group it wants and the open of it. The checked
@@ -2300,37 +2247,6 @@ pub struct Options {
     /// `supdb-cache64tofitautozpagespromote`.
     #[doc(hidden)]
     pub zpages_promote_copies: bool,
-    /// Whether the form's own threads -- the build and the warm, and the
-    /// sampler where `zpages_sample_idle` says -- take the device at the
-    /// idle I/O class, served only when nothing else is waiting on it; off,
-    /// they read at the class the readers have and share the device with
-    /// their faults. Under a bound the readers fault without pause, and a
-    /// build served after them took ten times its CPU in wall while they
-    /// read raw. The class the build thread ends in is read back from the
-    /// kernel and counted (`ZCounts::build_io_class`).
-    /// `supdb-nocacheautozpagesfairio` is the arm with it off.
-    #[doc(hidden)]
-    pub zpages_io_idle: bool,
-    /// Whether the sampler runs at the idle classes, the CPU's
-    /// (`SCHED_IDLE`) and, with `zpages_io_idle`, the device's. Its reads are
-    /// a few groups a partition and its fills a few pages, and beside the
-    /// read pass at five million keys under 640 MiB it took nine to sixteen
-    /// seconds and read its wall less its CPU as six to seven milliseconds
-    /// a fault, where the readers' own took forty microseconds and its own
-    /// with no reader beside it thirty: the price the controller puts on
-    /// the attach of form files built ahead, which came out above their
-    /// build.
-    #[doc(hidden)]
-    pub zpages_sample_idle: bool,
-    /// Whether the controller's build turn attaches every form file on disk
-    /// before it starts a warm: the turn takes the first partition due a
-    /// job, and a partition attached and not yet warmed is due its warm, so
-    /// the attaches of form files built ahead went one a warm, each warm a
-    /// whole file read at idle priority beside the readers, and the install
-    /// waited for every warm before the coverage it counts. Off is that
-    /// order.
-    #[doc(hidden)]
-    pub zpages_attach_first: bool,
     /// Whether the writer's own reads are counted by the controller's
     /// census, as a handle's are, through the writer's engine slot, while
     /// the gate is the census's -- the controller deciding -- and not while
@@ -2342,24 +2258,6 @@ pub struct Options {
     /// million keys under 640 MiB.
     #[doc(hidden)]
     pub zpages_writer_census: bool,
-    /// The census window's busy wall -- the operations' own wall, which
-    /// with the thread's CPU and its major faults prices a fault, the
-    /// `t_f` of the costs -- taken from one operation in `ZBUSY_STRIDE`
-    /// once a window is `ZBUSY_SAMPLED_FROM` operations long, and scaled
-    /// by the window's operations over the ones stamped; every operation
-    /// of a shorter window is stamped. A stamp is two clock reads an
-    /// operation, and in the row's shape at ten million keys under
-    /// 1.25 GiB they were 6% of ycsb-E's thread: 73 of 962 samples in
-    /// `clock_gettime`, 11 of them the harness's own, with the compact
-    /// form serving and a scan a few microseconds. A window of a thousand
-    /// operations or more is one whose operations are under a hundred
-    /// microseconds, the regime where the stamps are a share of the
-    /// operation and the wait they measure is not; a shorter window's
-    /// operations are the faulting ones the price is for, and every one
-    /// of them is stamped. Off, every operation is stamped:
-    /// `supdb-zbusyevery`.
-    #[doc(hidden)]
-    pub zpages_census_sample: bool,
     /// Whether the controller buys on the model's prediction, as the eager
     /// entry buys a build (`zpages_build_eager`), where the sampler finds
     /// form files on disk for the share of the partitions' keys whose
@@ -2373,47 +2271,16 @@ pub struct Options {
     /// budget was bought under them and cancelled a second later by the
     /// vanish rule. The rent waits for the group's refaults to pass half
     /// the faults over a trailing window, and the records a build ahead
-    /// drops past the line (`zpages_land_drop_past`) come back as faults
+    /// drops past the line come back as faults
     /// the kernel does not count as refaults, so after a load past the
     /// budget the evidence came eight to nine seconds after the load's end
     /// with eighteen or nineteen of nineteen files on disk, where the entry
     /// buys two seconds after it; paired at five million keys under 640 MiB
     /// the entry read the read pass 1.8x the rent's in both orders. On as
-    /// shipped; `supdb-cache64tofitautozpagesdropland50noattacheager` is the
-    /// rent alone.
+    /// shipped; off, the rent alone, is a seam the tests set.
     #[doc(hidden)]
     pub zpages_attach_eager: bool,
-    /// The bytes of a partition's raw records a build asks the kernel for
-    /// ahead of its walk, a window at a time (`MADV_WILLNEED`); zero asks
-    /// for nothing, and the walk's page faults fetch the device's
-    /// readahead, 128 KB here, one window a wait. Under a bound the walk's
-    /// waits queue behind the readers' faults, and a build of a gigabyte
-    /// ran at 5-15 MB/s whatever its I/O class; four mebibytes asked ahead
-    /// took its wall to a little over half. Four mebibytes as shipped; the
-    /// bytes asked are counted (`ZCounts::build_ahead_bytes`), and
-    /// `supdb-nocacheautozpagesnoahead` is the arm that asks nothing, the
-    /// shape the window was priced against.
-    #[doc(hidden)]
-    pub zpages_build_ahead: usize,
-    /// Under `ZPages::Auto`, the form files built ahead of the controller's
-    /// decision once the store has outgrown its budget -- the raw form's
-    /// populations, the hash slots and the records, past the cache the
-    /// store has, which is the model's own test -- and no seal, merge or
-    /// promotion is in flight: one partition at a time, the newest first,
-    /// on the builder's idle-class thread, each written to disk and left
-    /// dormant, unattached, with the raw form still serving every read.
-    /// The sampler waits for them, so its reading finds every form file
-    /// on disk and prices the buy at the attach's cost
-    /// (`zselect::Sampler::c_build`), and the controller's build is the
-    /// attach of files already written, as after a restart. What the
-    /// controller pays between SUSPECT and COMPACT is then the census's
-    /// evidence and the sampler, not the build's wall under the readers'
-    /// faults. A store that fits never builds: the test is the model's,
-    /// and nothing is built below it. Off is the shape the controller
-    /// shipped with; `supdb-cache64tofitautozpagesprebuild` is the arm.
-    #[doc(hidden)]
-    pub zpages_prebuild: bool,
-    /// Under `ZPages::Auto`, the builds ahead (`zpages_prebuild`) start once
+    /// Under `ZPages::Auto`, the builds ahead start once
     /// the raw form's populations pass this percent of the store's budget,
     /// read at every tick, and go on while seals land -- a merge in flight
     /// still holds them, since its landing would supersede what they build
@@ -2439,8 +2306,7 @@ pub struct Options {
     /// of fifty's in both orders, for a load a tenth cheaper; a hundred
     /// starts later still. The price is the ordered load's tenth, at five
     /// million keys and at three million, which fits and buys nothing.
-    /// Zero, off: the builds ahead as `zpages_prebuild` has them, past the
-    /// whole budget with nothing in flight, or none.
+    /// Zero, off: no build ahead.
     #[doc(hidden)]
     pub zpages_land_pct: u32,
     /// The builds ahead at landing (`zpages_land_pct`) wait while scans
@@ -2465,27 +2331,9 @@ pub struct Options {
     /// sweep's weighted sum 1.71x and 1.03x, the passes after the load
     /// level or ahead, and the mixes, half a second each at that rung,
     /// either way by sitting. Off, the builds ahead take no account of the
-    /// scans: `supdb-landnearscans`, `supdb-ingestlandnearscans`.
+    /// scans, a seam the tests set.
     #[doc(hidden)]
     pub zpages_land_scans_far: bool,
-    /// EXPERIMENT: past the selector's line to enter (`z_land_past`), the
-    /// builds ahead at landing run beside scans -- the hold for scans near
-    /// (`zpages_land_scans_far`) applies under the line alone -- and a
-    /// build ahead whose landing brings the files on disk to the install's
-    /// coverage (`zselect::COVERED_ENOUGH`) has the reading that refused the
-    /// attach for want of them refreshed against the files as they are
-    /// (`Maint::z_sample_refresh`), so the attach on the prediction
-    /// follows. The hold was drawn when a
-    /// store that was scanned and never point-read gave the controller
-    /// nothing to buy on; its scans' faults are evidence now, and at ten
-    /// million keys under 1.25 GiB the lag sweep's store -- every partition
-    /// fresh from the shuffled load's last merge, two files of twenty-four
-    /// on disk -- bought on the rent thirty seconds after its sample, its
-    /// ten-percent pass walking the raw form at 1.7 major faults a scan the
-    /// while, since the files that make the attach cheap were held by the
-    /// scans they would have served (`docs/engine.md`). Off.
-    #[doc(hidden)]
-    pub zpages_ahead_past_scans: bool,
     /// A merge's output partition is given its form file as it
     /// is finished, by a builder the merge's thread starts while the pages
     /// it just wrote are in the page cache -- at most `zpages_ahead_builders`
@@ -2503,54 +2351,10 @@ pub struct Options {
     /// last merge with two files of twenty-four and its first pass walked
     /// the raw form, and the full rewrite's pass read the merges' outputs
     /// back for their builds, a third of the 3.7 GB it read at the device
-    /// (`docs/engine.md`). On; `supdb-nozfinish` is the arm without it.
+    /// (`docs/engine.md`). On; off is a seam the tests set.
     #[doc(hidden)]
     pub zpages_build_at_finish: bool,
-    /// Whether a build ahead (`zpages_land_pct`, `zpages_prebuild`) drops
-    /// the raw records behind it, as a bought build does
-    /// (`zpages_drop_behind`), once the model's prediction of the raw
-    /// form's faults a read reaches the selector's line to enter
-    /// (`zselect::ZSelect::theta_enter`; under `zpages_prebuild` alone,
-    /// once the raw populations are past the budget). Below it a build
-    /// ahead leaves the raw form's cache as it found it, since the raw form
-    /// fits or nearly does; past it the raw form cannot be held, and the
-    /// records of the partitions already built, kept and made the most
-    /// recently used by the builds' own reads, pushed out the records of
-    /// the partitions still to be built. The look that first finds the
-    /// store past the line turns every partition built ahead under it into
-    /// what a build past it leaves, its records dropped and its form file
-    /// asked back, once (`Maint::z_cross`, `ZCounts::ahead_swapped`). The
-    /// line is the selector's and not the budget's: a store of three
-    /// million keys under 640 MiB ended its load a few percent past its
-    /// budget, the model reading a few faults in a hundred reads, and swapped
-    /// out a quarter of its records at the budget's line, its read pass ten
-    /// times longer than the controller's without the builds ahead. At five million
-    /// keys under 640 MiB the builds ahead kept twelve to seventeen of
-    /// nineteen partitions without it and eighteen or nineteen with it, and
-    /// paired with the attach on the rent's evidence in both, the read pass
-    /// read 1.07-1.09x in both orders. On as shipped; off is the build
-    /// ahead that drops nothing past the budget either and swaps nothing,
-    /// `supdb-cache64tofitautozpagesdropland50keepbehind`.
-    #[doc(hidden)]
-    pub zpages_land_drop_past: bool,
-    /// Whether a form file built ahead below the selector's line, its pages
-    /// written back and dropped as it was built (`zfile::BuildPlan::drop_output`),
-    /// is synced (`fdatasync`) once it has its name, on its build's thread
-    /// (`zfile::BuildPlan::sync`). Its pages reach the device by
-    /// `sync_file_range`, which asks for no flush of the device's write-back
-    /// cache, so the next fsync anyone issued paid it: at three million keys
-    /// under 640 MiB the builds ahead ended after the load's last commit,
-    /// and the first twenty-five commits of the mix after the read passes
-    /// took 74-1,690 ms where they take ten, and 10-13 with the sync, ycsb-B
-    /// 2.8x in one order and 17x in the other. A file kept dirty past the
-    /// line is not synced: its sync wrote its pages, 50-160 ms each at five
-    /// million keys, on the thread racing the eviction front. On as shipped;
-    /// `supdb-cache64tofitautozpagesdropland50nobuildsync` leaves the flush
-    /// to the next fsync.
-    #[doc(hidden)]
-    pub zpages_build_sync: bool,
-    /// Whether a build ahead past the selector's line to enter
-    /// (`zpages_land_drop_past`) takes a partition whatever share of its
+    /// Whether a build ahead past the selector's line to enter takes a partition whatever share of its
     /// records the page cache holds, one found cold before included. Below
     /// the line the bar stands (`LAND_RESIDENT`), since a store that fits
     /// would read records back from the device for a bet it loses; past it
@@ -2588,7 +2392,7 @@ pub struct Options {
     pub zpages_land_cache_pct: u32,
     /// The crossing asks for the raw pages of the partitions
     /// it has no form file for, ahead of the form files it asks back
-    /// (`zpages_land_drop_past`, `Maint::z_cross`). A partition whose
+    /// (`Maint::z_cross`). A partition whose
     /// records the cache let go during the load is one no build ahead
     /// takes while the store is under the line, and after the crossing it
     /// waits for the builder behind the builds in flight; until its form
@@ -2610,7 +2414,7 @@ pub struct Options {
     #[doc(hidden)]
     pub zpages_cross_asks_raw: bool,
     /// The selector's first buy makes the crossing where the
-    /// land look has not (`Maint::z_cross`, `zpages_land_drop_past`),
+    /// land look has not (`Maint::z_cross`),
     /// before the buy attaches anything. The crossing is what turns the
     /// partitions built ahead under the line -- records kept, form files
     /// dropped as they were written -- into what the form's install
@@ -2710,7 +2514,7 @@ pub struct Options {
     /// begun under the line writes its output back and drops it, so that
     /// a raw form that fits keeps its cache (`zpages_land_pct`); the
     /// crossing asks for every such file on disk and drops its records
-    /// (`zpages_land_drop_past`), and a build in flight at the crossing is
+    /// (`Maint::z_cross`), and a build in flight at the crossing is
     /// not on disk yet. Taken in after it, its file was attached with none
     /// of its pages in the cache, and under the random advice each came by
     /// a fault of its own: at ten million keys under 1.25 GiB the two
@@ -2805,31 +2609,6 @@ pub struct Options {
     /// per store.
     #[doc(hidden)]
     pub zpages_inject: Option<std::sync::Arc<zfile::ZInject>>,
-    /// EXPERIMENT: the block forms hold the fold of the partition and the
-    /// level-0 pieces alone, and the memtables' keys reach a scan through
-    /// the scan snapshot, which every walk overlays on its block whatever
-    /// form the block holds. The settle files no write into a form, so
-    /// the upkeep thread's cost a write is the snapshot's extension and
-    /// nothing else; a landing drops the forms of the blocks its piece
-    /// covers, which the fills build again from the pieces. Off, a write
-    /// is patched into its block's form, one resolve and one splice a
-    /// write, a chain of dependent misses that was the thread's whole
-    /// cost over a dense burst and left it behind the writer in the
-    /// buffered arm (`docs/engine.md`). A landing folds its piece's run
-    /// into the standing forms where the partition stands and drops them
-    /// where it was rewritten. Priced as the arm: the thread's cost a
-    /// write is below the default's at every lag point and the first
-    /// scan's wait on it goes; burst plus twice the pass reads level at
-    /// the one- and ten-percent points and the pass alone trails at the
-    /// hundred-percent ones, since every memtable key the walk lays over
-    /// a block after a burst is read from its chain, where the patched
-    /// form holds the value inline -- which was the reading, and priced
-    /// it was not the pass's cost: with `snapshot_runs` the snapshot
-    /// carries the values and the upkeep republishes it with its stale
-    /// runs copied again (`Reader::refresh_runs`), and the pass did not
-    /// move while the thread paid the copies, so the arms carry neither.
-    /// Not the default. `supdb-piecesonly`, `supdb-ingestpiecesonly`.
-    pub forms_pieces_only: bool,
     /// EXPERIMENT: the store's segment work (`Maint`) -- a seal's
     /// landing, the merges, the promotions, the manifest and the WAL
     /// retirement -- runs on a thread of its own and publishes from there,
@@ -3438,39 +3217,6 @@ pub struct Options {
     /// at 0.80x-0.97x. `supdb-aheadpub` prices it. The count above,
     /// which restarts by writes, is the other trigger and is also off.
     pub build_ahead_on_publish: bool,
-    /// EXPERIMENT: the canonical forms published only while a handle the
-    /// caller made is live to take them, and all at once when one is
-    /// claimed. A publish is an `Arc` clone of the writer's own form, so
-    /// every patch after it copies the block first, and a zipfian batch
-    /// of five thousand writes touches about a thousand blocks; the
-    /// suite's mixes and its lag sweep hold no handle, so every publish
-    /// there was for nobody. With no handle live the writer settles as
-    /// before and leaves the forms dirty; a claim files the backlog and
-    /// publishes every dirty form, at the log's length when nothing is
-    /// staged and at the next commit otherwise, and the table's position
-    /// and completeness move only when it publishes, so a handle at an
-    /// older commit still finds the forms of that commit. `false`
-    /// publishes at every maintained commit as before; `forms_to_writer`
-    /// publishes regardless, since the writer is then a taker too.
-    /// Eleven pairs at a hundred thousand keys: the tenth-unmerged lag
-    /// point at 1.11x (10/11, p=0.012), every mix within noise.
-    pub forms_publish_lazily: bool,
-    /// EXPERIMENT: the share of the store, as a percentage of the keys
-    /// its partitions hold, that may be unsealed before a commit stops
-    /// maintaining the forms; zero is no bound, which is what the
-    /// maintenance had before this.
-    ///
-    /// The bound exists because maintaining regardless of who reads is
-    /// worth 3.19x on the lag sweep at ten thousand keys with a tenth of
-    /// the store unmerged, and costs 0.869x at a hundred thousand with
-    /// *all* of it unmerged -- the one rung where it loses. At that depth
-    /// every block is overlaid, every form is a merged copy rather than
-    /// resolved deltas, and the scans are an order of magnitude slower
-    /// anyway, so the forms are rebuilt wholesale for reads that cannot
-    /// repay them. The store is also about to seal. Stopping is safe at
-    /// any commit: `forms_at` stops advancing and a reader trusts a form
-    /// only where it matches the log position it holds.
-    pub forms_max_unsealed_pct: usize,
     /// EXPERIMENT: unfiled writes, as a share of the partitions' keys,
     /// past which a commit settles into the forms whether or not a scan
     /// has preceded it; zero never does.
@@ -3979,27 +3725,6 @@ pub struct Options {
     /// buffered arm. `supdb-shortpass` and `supdb-ingestshortpass` keep
     /// the two-percent bound (`docs/engine.md`).
     pub upkeep_pass_pct: usize,
-    /// EXPERIMENT: a scan builds the snapshot only when a block it
-    /// reaches needs one. A block held as a sparse form, a copy or a
-    /// clean one is walked from the form and the partition alone; only a
-    /// block to be built, a wide form, a table to be made or the
-    /// builder's forms to be installed read the snapshot. So a scan that
-    /// finds the snapshot gone -- dropped at the publish before it, and
-    /// not yet rebuilt by a commit -- walks what it can without one and,
-    /// at the first block that needs it, builds it and goes on from that
-    /// block's first key, which is exact: everything it emitted is below
-    /// that key and everything after is at or above it.
-    ///
-    /// The first scan after the lag burst at three hundred thousand keys
-    /// rebuilt the snapshot for 4.4-6.5 ms of its 7-10 over a pass that
-    /// built no block, and so never read what it had built. In the suite
-    /// it prices flat: `bench ab` against `supdb-lazysnap` at a hundred
-    /// thousand and three hundred thousand keys marks nothing that holds
-    /// for the table, and the snapshots built over a pass come out level
-    /// -- the scan's builds are a tenth of a pass's, and the commits'
-    /// maintenance makes the rest either way. Off until a measurement
-    /// says otherwise; `docs/engine.md` has the two fixes it needed first.
-    pub scan_lazy_snapshot: bool,
     /// Out of core -- the compact form installed -- the writer whose scans
     /// start in the blocks recent scans started in under an eighth of the
     /// time keeps no block forms and takes the merge path, as the arm with
@@ -4094,80 +3819,6 @@ pub struct Options {
     /// first scan after -- so what it buys is the pass and what it costs
     /// is the burst. `supdb-snapcarry` prices it.
     pub snapshot_carry: bool,
-    /// A handle's scan snapshot stands across a publish that leaves the
-    /// memtables it is of: a merge's landing, a promotion, and a seal's
-    /// landing, whose frozen table goes with its base and leaves the live
-    /// runs. The snapshot is a function of the memtables, and what it
-    /// keeps against a partition, its bounds, it keeps under the
-    /// partition's blob id, so a publish that changes the segments alone
-    /// changes nothing it holds. The look that carries the writer's
-    /// tables across such a publish (`rebase_tables`) kept it already; the
-    /// look of a handle with no tables to carry -- every reader handle,
-    /// and the writer on the merge paths, which is where it scans once it
-    /// has given its forms up (`scan_forms_off_unreused`) -- dropped it
-    /// with the log position, and the next scan sorted every unsealed key
-    /// again. The pass after the lag sweep's full rewrite at ten million
-    /// keys under 1.25 GiB runs beside the merge chain's landings on that
-    /// path with 388,000 keys unsealed: one build at its first scan, and
-    /// one to three more at 50-60 ms each, a tenth to a fifth of the
-    /// pass, where the chain landed inside it (`docs/engine.md`). Off
-    /// drops it at every publish; `supdb-snapdrops` is the arm.
-    pub snapshot_stands: bool,
-    /// The snapshot's extension pushes each key of its batch without
-    /// comparing it with the key before it (`Snapshot::extend`). The
-    /// compare was for a fold that cannot happen there: the batch and the
-    /// run it is merged into are entries of one live table, which gives a
-    /// key one slot, so no two of them hold the same key. The batch's keys
-    /// are appended to the arena in the table's order and pushed in key
-    /// order, so each compare read two arena slices at random: at the lag
-    /// sweep's ten-percent point at ten million keys under 1 GiB, the first
-    /// scan extends an empty run by 309,000 keys, and the merge loop was
-    /// two fifths of the scanning thread's samples over that scan, the
-    /// radix a fifth and the rest fresh pages. The batch key's own bytes
-    /// are read now only while the run has entries left to walk past. At
-    /// the one-percent point, whose first scan extends an empty run by
-    /// 99,500 keys, the merge took 1.4 ms against 6.2, and over the full
-    /// rewrite at three million keys, where the run and the batch are
-    /// alike in size and the walk reads the run's keys, 222 ms of the
-    /// extensions' merges against 246. Off is the compare;
-    /// `supdb-snapfolded` is the arm, and `supdb-snapold` the arm with
-    /// `snapshot_build_lean` off too.
-    pub snapshot_extend_unfolded: bool,
-    /// The snapshot's build and extension keep a key's place as one
-    /// offset word where they kept a pending entry of six, and the build
-    /// copies the keys in the table's entry order. It sorted the entries
-    /// by their keys' offsets first, from when the table was walked in
-    /// the order of its hash slots, whose keys lie at random; the entries
-    /// are walked in the order they were made now, which for a hash
-    /// table is the order its keys were copied in, so the sort was three
-    /// radix passes and two arrays of twelve bytes a key over an order
-    /// the entries already had, and both paths kept a twenty-four-byte
-    /// entry a key beside the records they sort. Where a snapshot puts a
-    /// key in its own arena says nothing about its order, which the
-    /// records' sort gives, so an ordered table, whose straddling keys
-    /// are copied apart from its stream, takes the same path. Under a
-    /// bound every byte of that is a fresh page the group reclaims a
-    /// cached one for: at the lag sweep's ten-percent point at ten
-    /// million keys under 1 GiB the first scan's sort of 309,000 keys
-    /// took 41 ms, about 25 of them in the first touches of 42 MB, and
-    /// this takes 13.6 MB of them away. A snapshot that copies the runs
-    /// (`snapshot_runs`) builds as before. With the extension unfolded,
-    /// the first scans' snapshot phase there read 30 ms at the median of
-    /// six against 54, at the one-percent point 10.6 against 16.8 and
-    /// after the full rewrite 47 against 56, and the ten-percent pass
-    /// ahead in both orders (`pair.sh supdb supdb-snapold 10000000 --bound
-    /// 1073741824 --reps 3 --ops-div 10 --passes load,lag` under
-    /// `SUPDB_LAG_COUNTERS=1`). Off is the shape before; `supdb-snapfat`
-    /// is the arm.
-    pub snapshot_build_lean: bool,
-    /// A frozen table keeps its own sorted snapshot (`FrozenSnaps`): the
-    /// seal, a freeze's carry, the keeper or the first scan sets it, and
-    /// every later reader of the table -- the seal for its records, a
-    /// scan over a state published while the seal runs -- carries it
-    /// forward instead of sorting the table again. Off is the shape
-    /// before it, where each sorted the table for itself; `supdb-nofrozen`
-    /// prices it.
-    pub frozen_snaps: bool,
     /// EXPERIMENT: keys of one block in a settle's backlog from which
     /// the block is dropped and built once rather than patched key by
     /// key. A patch resolves one key's run against every source and
@@ -5497,23 +5148,6 @@ pub struct Options {
     /// rewritten burst. `supdb-rankrecords` and `supdb-ingestrankrecords`
     /// rank over the records; `docs/engine.md` has the figures.
     pub piece_ranks_by_heads: bool,
-    /// EXPERIMENT: the writer's own handle takes the canonical forms it
-    /// maintains, instead of building its own. Without this the
-    /// maintenance is pure cost wherever the reads are the writer's: a
-    /// form is taken only by a handle with a slot, and the writer's has
-    /// none, so the suite's ycsb-E -- whose scans go through the writer
-    /// -- pays for a structure it cannot read, and the arm that builds
-    /// no form at commit reads 1.06x-1.23x of the one that does.
-    ///
-    /// What the slot stood for is two things, and neither needs it. The
-    /// epoch: a form is freed past every pinned reader, and the writer
-    /// is the only thread that frees one and frees none while it reads,
-    /// which `canonical` already says. The watermark: a form is settled
-    /// at the last commit and the writer's reads honour none, so a form
-    /// is what the writer must read only while nothing has been written
-    /// past that commit. That is a comparison rather than a rule, so the
-    /// scan makes it and builds its own where it has staged writes.
-    pub forms_to_writer: bool,
     /// The deltas a sparse form the patches grew must hold before a fill
     /// converts it to a merged copy; zero is `CACHE_DENSE`. A copy is walked
     /// as one buffer, where a sparse form alternates the partition's
@@ -5560,13 +5194,6 @@ pub struct Options {
     /// did (`promote_entries`). Off, the walk marks the tables for the next
     /// fill.
     pub forms_convert_at_walk: bool,
-    /// How the ordered scan builds its sorted snapshot of the unsealed keys.
-    /// `true` keeps the keys in one arena and sorts 24-byte records (a
-    /// 16-byte key prefix and an index), touching the arena only on a shared
-    /// prefix; `false` is the build before it -- a `Vec<u8>` per key, sorted
-    /// through two heap pointers per compare -- kept as the comparison arm.
-    /// The build runs on the first scan after a commit and cost 300 ns a key.
-    pub scan_snapshot_arena: bool,
     /// The block cache costs what its forms' buffers allocate, and its
     /// budget (`scan_cache_bytes`) bounds that. A form's bytes were
     /// counted by what its vectors held, and the vectors cost more: a
@@ -5601,9 +5228,7 @@ pub struct Options {
     /// patch, which is what grows a form in a burst -- so a burst no
     /// longer builds the cache to the size of the store for the first
     /// scan after it to shed. Off: the budget is kept at a scan's build
-    /// and an install. Not kept after the fold of a landed piece's keys
-    /// into a block under `forms_pieces_only`, which grows forms where
-    /// the tables are away and sheds in neither setting.
+    /// and an install.
     pub forms_fit_shed: bool,
     /// With `forms_to_fit`: the snapshots and forms a publish replaced
     /// are swept when an engine thread's operation ends -- the writer's,
@@ -5981,45 +5606,7 @@ pub struct Options {
     /// form's header as much again. `supdb-settletablenear` asks for
     /// none.
     pub settle_table_ahead: usize,
-    /// Whether a settle's resolve reads its batch from the sorted records:
-    /// the writes' fields gathered once into key order, and a key of at
-    /// most sixteen bytes rebuilt from the two prefix words the batch was
-    /// sorted by. Before it the resolve's loops took each key's write from
-    /// the pending list by the index the sort carried and its bytes from
-    /// the table's arena, both in key order where the list and the arena
-    /// are in arrival order: two loads a key that nothing had asked for,
-    /// inside iterations too long for the core to overlap them, a seventh
-    /// of the upkeep thread's time over a full rewrite at three hundred
-    /// thousand keys. `supdb-settleloads` is the shape before.
-    pub settle_gathers: bool,
-    /// Whether a settle's batch is sorted once, by its keys' prefix words,
-    /// with the writes of keys that tie on them grouped by key afterwards.
-    /// Before it the batch was first sorted by key offset with a
-    /// comparison sort, so that the stable sort by prefix after it would
-    /// leave each key's writes adjacent: a burst's writes arrive nearly in
-    /// that order, new keys ascending with a few rewritten ones among
-    /// them, which is the input a pattern-defeating sort does its whole
-    /// work on, 150 instructions a write to group keys the prefix sort
-    /// separates by itself unless two of them share sixteen bytes.
-    /// `supdb-settlesortstwice` is the shape before.
-    pub settle_sorts_once: bool,
-    /// Whether a put's patch of a copy whose entries are its block's
-    /// records is written where it lies (`Reader::patch_in_place`): one
-    /// value above a tombstone in the key's chain, no longer than the run
-    /// the entry holds, copied over that run from the chain with nothing
-    /// staged, re-counted or searched. `supdb-settlepatchstaged` takes
-    /// every patch through `patch_block`.
-    pub settle_patch_in_place: bool,
-    /// Whether the settle converts a sparse form its batch takes to the
-    /// dense count, before it splices the block's keys of the batch
-    /// (`Reader::convert_settled`), where the fill converted it at the
-    /// pass's end or, on the upkeep thread behind a posted commit, not at
-    /// all (`Reader::fill_deferred`): a burst lent to the
-    /// thread left every form sparse, each patch an insert into a sorted
-    /// run of up to sixty-four deltas, and the scans after it walked them.
-    /// `supdb-settlenoconvert` leaves the conversions to the fill.
-    pub settle_converts: bool,
-    /// Whether a settle that converted a form (`settle_converts`) leaves
+    /// Whether a settle that converted a form leaves
     /// the fill its walk of the tables, as the patch that left a form at
     /// the dense count had. That walk is where the fill meets the light
     /// forms (`forms_convert_from`), and in a store whose every block
@@ -6223,41 +5810,6 @@ pub struct Options {
     /// took none. Off attaches the file at the look that decides it,
     /// `supdb-zbacknow`.
     pub zpages_hot_back_ask: bool,
-    /// Out of core with the form installed, where scans come back after a
-    /// stretch of `zpages_rewarm_quiet_ms` without one, every form file the page
-    /// cache holds under `HOT_RAW_RESIDENT` of is asked for whole
-    /// (`MADV_WILLNEED`) once no merge is in flight, on a thread of its
-    /// own, so its pages come in at the device's sequential rate and not a
-    /// 4 KB fault at a time under the scans: a form file is advised random
-    /// from its attach. The burst before the lag sweep's full-rewrite pass
-    /// at ten million keys under 1.25 GiB leaves 250 MB of the 746 MB of
-    /// form files out of the cache -- each built at a merge's finish with
-    /// its pages kept, then pushed out by the burst's later writes, as a
-    /// page written once and never read is -- and 97% of that pass's major
-    /// faults landed in them, eleven files of twenty-nine read cold end to
-    /// end. Asked at the pass's start, beside the chain's last merges, the
-    /// pages were pushed out again (117,000 refaults against 25,000), so
-    /// the ask waits for the chain. Paired at ten million keys under
-    /// 1.25 GiB the ten-percent pass read 1.24x and 1.81x in two sittings
-    /// with its faults a tenth, the full rewrite's 0.99x and 1.13x, and the
-    /// mixes found no form file cold (`docs/engine.md`). On;
-    /// `supdb-norewarm` asks for nothing.
-    pub zpages_rewarm_scans: bool,
-    /// A settle waits for the form files the store has asked the kernel
-    /// for -- at the look that first finds it past the selector's line
-    /// (`Maint::z_cross`) and at a rewarm (`zpages_rewarm_scans`) -- until
-    /// nine tenths of their pages are resident, asking again for what the
-    /// kernel left short (`Maint::z_join_asks`). Both asks are advice,
-    /// answered behind the call or not at all: a shuffled load's last
-    /// merge writes its outputs' form files and drops them, the bet a
-    /// build ahead makes, the landing that takes the store past the line
-    /// asks every one back, and in some loads the kernel brought half of
-    /// them and no more, so the lag sweep's first scans, a second later,
-    /// read the rest a fault at a time (`docs/engine.md`). Counted
-    /// (`ZCounts::ask_joins`, `ask_join_reasks`). On; `supdb-zsettleloose`
-    /// returns without the wait.
-    #[doc(hidden)]
-    pub zpages_settle_joins_asks: bool,
     /// EXPERIMENT: the rewarm gives the allocator's free pages back to the
     /// system (`malloc_trim`) before it asks for the cold form files, so
     /// the pages it brings in have the room the process's resident free
@@ -6276,116 +5828,7 @@ pub struct Options {
     /// own thread; an arena's lock is held while its pages go. Off;
     /// `supdb-rewarmtrim` trims.
     pub zpages_rewarm_trims: bool,
-    /// EXPERIMENT: a settle asks for the raw form's files and waits for
-    /// them (`Maint::z_raw_settle`), with or without a form installed: each
-    /// partition the raw form serves, the level-0 pieces, and their
-    /// ordered indexes, where the page cache holds under
-    /// `HOT_RAW_RESIDENT` of one, the indexes first and the pieces last,
-    /// up to the group's unused memory less the margin
-    /// (`zselect::Budget::slack`), so that an ask never takes the pages of
-    /// one of the store's files for another's. Under a bound a merge's
-    /// outputs are written once and read by nobody until the scans come,
-    /// and those are the pages the kernel reclaims first: at three million
-    /// keys under 1 GiB the lag sweep's clean store read 1.8M entries a
-    /// second against LMDB's 10.4M, with 271 of its partitions' 417 MB in
-    /// the cache, the group's file pages at 308 MB and the process at 68
-    /// of a limit of 1,024, and 2,147 major faults in a pass of 166 ms; the
-    /// rewarm asked for nothing, since it asks for form files and only
-    /// once a form is installed. At a settle, every seal and merge landed,
-    /// the store is at rest and the scans after it find the files back:
-    /// the default took refaults in that pass in 7 reps of 20 and the arm
-    /// in none. Where scans come back is too late
-    /// (`zpages_rewarm_raw_scans`). Counted (`ZCounts::raw_settles`,
-    /// `raw_settle_ms`, `raw_rewarm_files`, `raw_rewarm_bytes`,
-    /// `raw_rewarm_short`). On; `supdb-norewarmraw` asks for nothing.
-    #[doc(hidden)]
-    pub zpages_rewarm_raw: bool,
-    /// REFUTED: with `zpages_rewarm_raw`, the raw form's files are asked
-    /// for at the rewarm due where scans come back (`zpages_rewarm_scans`)
-    /// as well as at a settle. Those asks are made as the readers arrive
-    /// and the reads they start share the device with the readers' faults:
-    /// at three million keys under 1 GiB the clean store's pass, a tenth of
-    /// a second, read 135-160 MB inside it and ran no faster; at ten
-    /// million random ids under 1 GiB they asked about 200 MB a rep, mostly
-    /// as the full rewrite's merges landed in its pass, and that pass read
-    /// 0.68x and 0.63x of the arm without them in both orders. Off;
-    /// `supdb-zrewarmrawscans` asks there too.
-    #[doc(hidden)]
-    pub zpages_rewarm_raw_scans: bool,
-    /// A settle that asked for the raw form's files
-    /// (`zpages_rewarm_raw`) maps what came back into the process's page
-    /// tables as well (`MADV_POPULATE_READ`, `Maint::raw_map`): the record
-    /// region and the ordered index of every segment the ask could have
-    /// named, where `HOT_RAW_RESIDENT` of it is resident, so that mapping
-    /// reads at most the tenth the ask left. A page the cache dropped went
-    /// out of the page tables with it, and a page asked back is resident
-    /// and unmapped: at three million keys under 1 GiB the clean store's
-    /// pass after a settle that had asked 178 MB back took 1,400-2,260
-    /// minor faults in 3,000 scans where a store never pushed out takes 621,
-    /// about eight microseconds each under the bound by the fit across
-    /// reps, and ran 17-28 ms where the unpushed store runs 10-14. Counted
-    /// (`ZCounts::raw_maps`, `raw_map_ms`). On; `supdb-rewarmrawnomap`
-    /// asks and maps nothing.
-    #[doc(hidden)]
-    pub zpages_rewarm_raw_maps: bool,
-    /// A rewarm due (`zpages_rewarm_scans`) is made while merges are in
-    /// flight, for the form files of the partitions no merge in flight
-    /// holds, where off it waits for the merges to land. It was made beside
-    /// them for the pass after the ten-percent burst under a gibibyte at
-    /// ten million keys, which read the form files the burst's merges had
-    /// written and the cache had dropped while the rewarm waited behind
-    /// the chain (`pair.sh supdb-zrewarmwait supdb 10000000 --bound
-    /// 1073741824 --passes load,lag --ops-div 10 --reps 2`, read with the
-    /// quarter second of `zpages_rewarm_quiet_ms` that came with it). Off
-    /// by default: a file asked for beside the chain is read in by evicting
-    /// what the kernel ranks last, and after a burst that is the burst's
-    /// own last pieces, written once and read next by the pass, while the
-    /// merges' writes take back any room measured before the ask. At ten
-    /// million keys the pass after the full rewrite took 7,200-10,900
-    /// major faults in every sweep whose rewarm asked beside merges under
-    /// 1.25 GiB and 74-3,300 in every sweep whose rewarm found none
-    /// running, and 20,800-25,100 against 13,800-17,000 under a gibibyte;
-    /// the ten-percent pass's rewarm found no merge running in all of
-    /// them, so the quarter second is what that pass keeps. Paired in the
-    /// row's whole order under 1.25 GiB the full-rewrite pass read 2.1x and
-    /// 1.2x with a seventh and two fifths of the faults, the ten-percent
-    /// pass 1.07x and 1.15x, and no rewarm asked for a file in the mixes;
-    /// under a gibibyte the full-rewrite pass took 15,300-17,600 major
-    /// faults in every sweep against 21,000-25,100 (`pair.sh
-    /// supdb-zrewarmbeside supdb 10000000 --bound 1342177280 --ops-div 10
-    /// --reps 2`, and `--bound 1073741824 --passes load,lag --reps 3`).
-    /// Off; `supdb-zrewarmbeside` asks beside the merges.
-    pub zpages_rewarm_beside_merges: bool,
-    /// EXPERIMENT: the controller's install makes a rewarm due
-    /// (`zpages_rewarm_scans`), so the form files under nine tenths
-    /// resident are asked for whole once no merge is in flight. A store
-    /// opened past the line installs its form at its first reads with
-    /// whatever of the files the cache kept, and the rewarm waits for scans
-    /// that a pass of point reads never makes: at ten million keys under
-    /// 1.25 GiB the read pass after the load, in a process of its own, met
-    /// the form files whole in some reps and 48-180 MB of 543 short in
-    /// others, and those took 28,000-41,000 major faults against 4,000-
-    /// 7,000, a 4 KB fault for each cold page under the random advice.
-    /// The rewarm it makes due found every form file resident at the
-    /// install (`of_all 1.000` on the `zrewarm` line) in six traced reps
-    /// of six, the slow ones among them, so the cold pages are the pass's
-    /// own churn and not the install's; paired in the row's whole order the
-    /// read pass read 0.97x and 1.01x (`pair.sh supdb supdb-zrewarminstall
-    /// 10000000 --bound 1342177280 --ops-div 10 --reps 4`, at `6694659`).
-    /// Off; `supdb-zrewarminstall` turns it on.
-    #[doc(hidden)]
-    pub zpages_rewarm_at_install: bool,
-    /// The stretch without a scan after which the scans that come back
-    /// have the cold form files asked for (`zpages_rewarm_scans`), in
-    /// milliseconds: a quarter of a second. It was a second
-    /// (`REWARM_QUIET_BEFORE_MS`), and the ten-percent burst at ten million keys
-    /// under a gibibyte lasts 1.0-1.1 s, so the pass after it found the
-    /// second passed or not by a few milliseconds and the rewarm fired
-    /// there in two reps of eight; a pass's scans and a mix's scans come
-    /// microseconds apart, so a quarter of a second is a stretch with no
-    /// reader all the same. `supdb-zrewarmwait` keeps the second.
-    pub zpages_rewarm_quiet_ms: u32,
-    /// The rewarm's look (`zpages_rewarm_scans`) is taken at every turn of
+    /// The rewarm's look (`Maint::z_rewarm_look`) is taken at every turn of
     /// the segment work's loop, a hundredth of a second, where off it is
     /// taken at the controller's step alone, once a census interval
     /// (`zselect::CENSUS_INTERVAL`): the scans that come back after a quiet
@@ -6912,13 +6355,9 @@ impl Default for Options {
             zpages_seek_span: false,
             scan_start_cache: 0,
             zpages_memo_hash: true,
-            zpages_settle_span: true,
             settle_lazy_raw: false,
-            settle_append_last: true,
             identity_by_keys: true,
             copy_packed: true,
-            settle_lone_chain: true,
-            settle_covered_samples: true,
             zpages_trusted_views: true,
             zpages_memo_bytes: 8 << 20,
             zpages_memo_slab: false,
@@ -6947,18 +6386,10 @@ impl Default for Options {
             zpages_walk_cursor: true,
             zpages_block_cache: true,
             zpages_promote_copies: false,
-            zpages_io_idle: true,
-            zpages_sample_idle: false,
-            zpages_attach_first: true,
             zpages_writer_census: true,
-            zpages_census_sample: true,
             zpages_attach_eager: true,
-            zpages_build_ahead: 4 << 20,
-            zpages_prebuild: false,
             zpages_land_pct: 50,
             zpages_land_scans_far: true,
-            zpages_land_drop_past: true,
-            zpages_build_sync: true,
             zpages_land_cold_past: true,
             zpages_land_cache_pct: 25,
             zpages_ask_dropped: true,
@@ -6967,14 +6398,12 @@ impl Default for Options {
             zpages_cross_asks_raw: true,
             zpages_buy_crosses: true,
             zpages_drop_again: true,
-            zpages_ahead_past_scans: false,
             zpages_build_at_finish: true,
             zpages_raw_tails: false,
             zpages_drop_raw: true,
             zpages_drop_at_install: true,
             zpages_build_eager: false,
             zpages_inject: None,
-            forms_pieces_only: false,
             publish_in_background: true,
             adaptive_shape: false,
             seal_rotates_wal: false,
@@ -7015,8 +6444,6 @@ impl Default for Options {
             promote_starts: 0,
             build_ahead_on_commit: 0,
             build_ahead_on_publish: false,
-            forms_publish_lazily: true,
-            forms_max_unsealed_pct: 0,
             forms_settle_backlog_pct: 2,
             forms_settle_every: true,
             forms_settle_builds: true,
@@ -7042,11 +6469,6 @@ impl Default for Options {
             upkeep_batch_pct: 0,
             upkeep_pass_pct: 0,
             snapshot_carry: false,
-            snapshot_stands: true,
-            snapshot_extend_unfolded: true,
-            snapshot_build_lean: true,
-            frozen_snaps: true,
-            scan_lazy_snapshot: false,
             scan_forms_off_unreused: true,
             scan_forms_off_counts_built: false,
             scan_forms_off_stale_writes: 512,
@@ -7133,8 +6555,6 @@ impl Default for Options {
             forms_rebase: true,
             copy_prefetch_span: false,
             piece_ranks_by_heads: true,
-            forms_to_writer: false,
-            scan_snapshot_arena: true,
             forms_to_fit: false,
             forms_fit_shed: true,
             forms_fit_sweep: true,
@@ -7163,10 +6583,6 @@ impl Default for Options {
             settle_patch_at_cut: true,
             settle_value_ahead: 180,
             settle_table_ahead: 12,
-            settle_gathers: true,
-            settle_sorts_once: true,
-            settle_patch_in_place: true,
-            settle_converts: true,
             settle_convert_fills: true,
             heads_owned: true,
             zpages_hot_skew_room: false,
@@ -7175,15 +6591,7 @@ impl Default for Options {
             zpages_hot_cold_back: false,
             zpages_hot_fill: true,
             zpages_hot_back_ask: true,
-            zpages_rewarm_scans: true,
-            zpages_rewarm_at_install: false,
-            zpages_settle_joins_asks: true,
             zpages_rewarm_trims: false,
-            zpages_rewarm_raw: true,
-            zpages_rewarm_raw_scans: false,
-            zpages_rewarm_raw_maps: true,
-            zpages_rewarm_beside_merges: false,
-            zpages_rewarm_quiet_ms: 250,
             zpages_rewarm_every_turn: false,
             zpages_stride: ZStride::Forced,
             zpages_stride_room: true,
@@ -9431,8 +8839,7 @@ struct ZBuild {
     started: std::time::Instant,
     cancel: std::sync::Arc<std::sync::atomic::AtomicBool>,
     refused: bool,
-    /// A build ahead of the controller's decision
-    /// (`Options::zpages_prebuild`): its file is left on disk unattached
+    /// A build ahead of the controller's decision: its file is left on disk unattached
     /// unless the controller wants builds by the time it is collected, and
     /// a decision that wants none does not cancel it.
     dormant: bool,
@@ -16987,7 +16394,7 @@ struct Slot {
     /// then the windows that counted, the ones with a commit inside, and
     /// the ones dropped: mixed (both classes), or moved (the thread or the
     /// gate changed inside it); and over the windows that counted, the
-    /// operations whose wall was stamped (`Options::zpages_census_sample`).
+    /// operations whose wall was stamped.
     zcreads: AtomicU64,
     zcrflt: AtomicU64,
     zcscans: AtomicU64,
@@ -23634,7 +23041,7 @@ impl CachedBlock {
         }
     }
     /// Entry `i`'s values, in order.
-    #[inline]
+    #[cfg(test)]
     fn values_i(&self, i: usize, mut f: impl FnMut(&[u8])) {
         match self.fixed {
             Some((k, v)) => {
@@ -24475,8 +23882,7 @@ impl FormTally {
 /// the copy it saves. Rounds interleaved, one machine.
 const CACHE_DENSE: usize = 16;
 
-/// A filed key's cut not yet resolved (`Options::zpages_settle_span`): the
-/// build that reads the block resolves it (`BuildCtx::filed_cuts`), and a
+/// A filed key's cut not yet resolved: the build that reads the block resolves it (`BuildCtx::filed_cuts`), and a
 /// block held wide passes it to its walk as the overlay's unknown cut,
 /// which the walk places by key. No resolved cut is this, since a cut packs
 /// a rank under the key count, shifted, with one bit beside it.
@@ -25163,13 +24569,7 @@ impl State {
     /// its next look at the log (`Reader::rebase_tables`). It needs no
     /// writer's state, so whichever thread publishes may call it, pinned,
     /// since a slot it reads may be replaced and retired under it.
-    fn carry_published(
-        &self,
-        next: &mut State,
-        pieces_only: bool,
-        by_capacity: bool,
-        restamp: Option<usize>,
-    ) -> u64 {
+    fn carry_published(&self, next: &mut State, by_capacity: bool, restamp: Option<usize>) -> u64 {
         let np_cur = self.segs.partition_point(|s| s.level > 0);
         let np = next.segs.partition_point(|s| s.level > 0);
         if self.forms.len() < np_cur
@@ -25190,37 +24590,6 @@ impl State {
             }
             let rebased = !std::sync::Arc::ptr_eq(&self.segs[q], &next.segs[p]);
             rebases += u64::from(rebased);
-            // Under `pieces_only` a published form holds the pieces' fold,
-            // and a piece this state did not hold has keys over blocks
-            // whose forms are short of them: those carry a marker, which
-            // a reader takes as no form and builds for itself. The
-            // piece's bounds against the partition were taken before the
-            // publish (`rank_before_publish`); a piece without them marks
-            // every block.
-            let mut landed_over: Vec<bool> = Vec::new();
-            if pieces_only {
-                let nb = next.forms[p].len();
-                let part_id = next.segs[p].blob.id();
-                for piece in &next.segs[np..] {
-                    if self.segs[np_cur..]
-                        .iter()
-                        .any(|q| std::sync::Arc::ptr_eq(q, piece))
-                    {
-                        continue;
-                    }
-                    if landed_over.is_empty() {
-                        landed_over = vec![false; nb];
-                    }
-                    match piece.bounds.get(part_id) {
-                        Some(at) if at.len() == nb + 1 => {
-                            for (b, over) in landed_over.iter_mut().enumerate() {
-                                *over |= at[b + 1] > at[b];
-                            }
-                        }
-                        _ => landed_over.fill(true),
-                    }
-                }
-            }
             for (b, slot) in self.forms[q].iter().enumerate() {
                 let ptr = slot.load(AtomicOrdering::Acquire);
                 if ptr.is_null() {
@@ -25234,8 +24603,7 @@ impl State {
                 // next state's log is this one's, and is current to the
                 // fresh table's first position where it is not (a freeze).
                 let at = restamp.unwrap_or(src.at);
-                let landed = landed_over.get(b).is_some_and(|&o| o);
-                let form = if (rebased && matches!(**form, Cached::Sparse(_))) || landed {
+                let form = if rebased && matches!(**form, Cached::Sparse(_)) {
                     std::sync::Arc::new(Cached::Wide(WideBlock {
                         sorted: Vec::new(),
                         seen: 0,
@@ -25380,9 +24748,8 @@ struct Shared {
     /// EXPERIMENT: scan snapshots built over this store's life, which is
     /// what publishing one is meant to bring down; for a test.
     snap_builds: AtomicU64,
-    /// Snapshots kept across a publish that left their memtables
-    /// (`Options::snapshot_stands`), by the looks that had no tables to
-    /// carry.
+    /// Snapshots kept across a publish that left their memtables, by the
+    /// looks that had no tables to carry (`Reader::snapshot_stands`).
     snap_stood: AtomicU64,
     /// A landing's same-blocks questions (`Db::same_blocks`), by how each
     /// was answered: from the ordered indexes, from the records.
@@ -25531,12 +24898,10 @@ struct Shared {
     /// Patches that found the form shared with a published copy and had
     /// to copy it before writing (`Arc::make_mut` on a shared form).
     forms_cloned: AtomicU64,
-    /// Patches the settle wrote in place (`Options::settle_patch_in_place`)
-    /// and sparse forms it converted (`Options::settle_converts`).
+    /// Patches the settle wrote in place and sparse forms it converted.
     settle_placed: AtomicU64,
     settle_converted: AtomicU64,
-    /// Writes a settle read from its batch's gathered records
-    /// (`Options::settle_gathers`).
+    /// Writes a settle read from its batch's gathered records.
     settle_gathered: AtomicU64,
     /// Reads that took a canonical form, over this store's life. The
     /// count beside it on `State` is that state's and is zero again at
@@ -25678,8 +25043,8 @@ struct Shared {
     /// rise where `snap_builds` stops.
     snap_extends: AtomicU64,
     /// Builds that kept a key's place as an offset and copied the keys
-    /// in the table's order (`Options::snapshot_build_lean`), of
-    /// `snap_builds`.
+    /// in the table's order, of `snap_builds`: every build that copies no
+    /// runs.
     snap_lean_builds: AtomicU64,
     /// Snapshots republished with their stale runs copied again
     /// (`Snapshot::refreshed`).
@@ -26001,7 +25366,7 @@ fn map_resident_share(map: &MmapBytes) -> f64 {
     crate::bytes::Bytes::resident_share(map, 0, map_len(map)).unwrap_or(0.0)
 }
 
-/// A rewarm's asks for the raw form's files (`Options::zpages_rewarm_raw`),
+/// A rewarm's asks for the raw form's files,
 /// on the rewarm's thread: each file mapped by its path, so the thread
 /// holds nothing a landing retires, asked for whole where the page cache
 /// holds under `HOT_RAW_RESIDENT` of it and the bytes it lacks fit what
@@ -27032,7 +26397,7 @@ struct ZWindow {
     /// reads, and a put's or a commit's wall is no read's.
     t0: std::time::Instant,
     counting: bool,
-    /// The stamps' stride this window (`Options::zpages_census_sample`):
+    /// The stamps' stride this window:
     /// one operation in `stride` has its wall stamped, `sdown` of them to
     /// go before the next, and `sampled` stamped so far.
     stride: u32,
@@ -27050,7 +26415,7 @@ const ZWINDOW_TARGET: std::time::Duration = std::time::Duration::from_millis(100
 /// three hundred milliseconds, so a sparse handle's window closes too.
 const ZWINDOW_TICKS: u64 = 3;
 /// One operation in this many has its wall stamped onto a window of
-/// `ZBUSY_SAMPLED_FROM` operations or more (`Options::zpages_census_sample`);
+/// `ZBUSY_SAMPLED_FROM` operations or more;
 /// every operation of a shorter window is stamped.
 const ZBUSY_STRIDE: u32 = 16;
 const ZBUSY_SAMPLED_FROM: u32 = 1024;
@@ -27362,11 +26727,6 @@ struct FormsState {
     /// The chain-offset scratch a build or a walk's emissions use,
     /// `BuildCtx::take_offs`.
     emit_offs: std::cell::RefCell<Vec<usize>>,
-    /// The key a block scan resumes from (`Walk::Resume`), kept between
-    /// resumes: copied into a fresh `Vec` it was a malloc and a free on
-    /// every scan that met a block without a form, 132 of a pass of a
-    /// hundred scans after a burst.
-    resume_key: std::cell::RefCell<Vec<u8>>,
     /// EXPERIMENT: whether any table holds a block built or patched
     /// since the last publish; the writer's own handle alone sets it.
     dirty_any: std::cell::Cell<bool>,
@@ -27469,14 +26829,13 @@ struct FormsState {
     /// The scans' start keys and their blocks (`Options::scan_start_cache`).
     start_cache: std::cell::RefCell<StartCache>,
     /// Writes a settle filed with their cut unresolved, and filed cuts a
-    /// build resolved by a seek (`Options::zpages_settle_span`); a build
+    /// build resolved by a seek; a build
     /// under `Options::zpages_block_cursor` resolves them where its walk
     /// stops and counts none.
     lazy_cuts: Counts<2>,
     /// Patches that took a key's run from its own chain as the one source
-    /// that can hold it (`Options::settle_lone_chain`), and patches that
-    /// appended a key past a copy's last entry on one compare
-    /// (`Options::settle_append_last`).
+    /// that can hold it, and patches that appended a key past a copy's
+    /// last entry on one compare.
     settle_short: Counts<2>,
     /// The settle's resolves whose stride was planned ahead
     /// (`Options::settle_seek_ahead`).
@@ -27511,10 +26870,6 @@ struct FormsState {
     /// and not taken up by the other, and the store's forms waited for a
     /// scan to build them.
     fill_owed: std::cell::Cell<bool>,
-    /// What the lazy snapshot did, for a measurement and for the test
-    /// that must know the path was taken: scans that finished without a
-    /// snapshot, and scans that stopped to build one and went on.
-    lazy_scans: Counts<2>,
     /// EXPERIMENT: what the settles met, for a measurement of the
     /// backlog's density: settles, keys, blocks those keys fall in, and
     /// blocks at or past `Options::forms_settle_rebuild_from`.
@@ -27621,7 +26976,6 @@ impl FormsState {
             settle_offs: std::cell::RefCell::new(Vec::new()),
             clean: std::sync::Arc::new(Cached::Clean),
             emit_offs: std::cell::RefCell::new(Vec::new()),
-            resume_key: std::cell::RefCell::new(Vec::new()),
             dirty_any: std::cell::Cell::new(false),
             tables_complete: std::cell::Cell::new(false),
             abandoned: std::cell::Cell::new(u64::MAX),
@@ -27665,7 +27019,6 @@ impl FormsState {
             pass_batch: std::cell::Cell::new(0),
             log_short: std::cell::Cell::new(false),
             fill_owed: std::cell::Cell::new(false),
-            lazy_scans: Counts::new(),
             settle_density: Counts::new(),
             settle_refused: Counts::new(),
             settle_blocks: std::cell::RefCell::new(Vec::new()),
@@ -28709,9 +28062,6 @@ impl SlotSet {
             .get((*slot / 64) as usize)
             .is_some_and(|w| (w >> (*slot % 64)) & 1 == 1)
     }
-    fn len(&self) -> usize {
-        self.len
-    }
     fn clear(&mut self) {
         self.bits.clear();
         self.len = 0;
@@ -29085,17 +28435,6 @@ struct Snapshot {
     bounds: std::sync::Arc<SnapById>,
 }
 
-/// What `scan_blocks` did: walked to the limit or the store's end, or
-/// stopped at a block that needs the snapshot it was not given, with the
-/// entries emitted so far and the key the walk goes on from.
-enum Walk {
-    Done(usize),
-    /// The key to resume from is in `FormsState::resume_key`.
-    Resume {
-        seen: usize,
-    },
-}
-
 /// Entries a filing may leave in `fresh` before it is folded into `side`.
 const SNAP_FRESH: usize = 256;
 
@@ -29172,23 +28511,6 @@ impl Snapshot {
         } else {
             self.bases.iter().all(|b| b.runs)
         }
-    }
-    /// This snapshot with the live runs of the slots in `stale` copied
-    /// again from their chains, current to `log_at`: the same keys in the
-    /// same order, so the bounds and the bases carry, and the arena is
-    /// the same, appended to. Under `forms_pieces_only` the upkeep makes
-    /// one when enough of the runs have gone stale, so that a walk
-    /// streams the run where it read the chain (`Reader::refresh_runs`).
-    fn refreshed(&self, mem: &MemTable, stale: &SlotSet, log_at: usize) -> Snapshot {
-        let mut out = self.clone();
-        let mut scratch = Vec::new();
-        for e in out.ents.iter_mut() {
-            if e.mem != u32::MAX && (e.mem as usize) < mem.len() && stale.contains(&e.mem) {
-                e.lrun = self.copy_run(mem, mem.entry(e.mem as usize), &mut scratch);
-            }
-        }
-        out.log_at = log_at;
-        out
     }
     /// This snapshot's live runs over `bases`, the frozen tables' own,
     /// oldest first: what a state with those frozen tables reads.
@@ -29436,14 +28758,7 @@ impl Snapshot {
     /// over one burst of writes. Only for a run with nothing filed into
     /// it: a handle's side runs are that handle's own and are not what
     /// gets published.
-    fn extend(
-        &self,
-        mem: &MemTable,
-        to: usize,
-        runs: bool,
-        unfolded: bool,
-        lean: bool,
-    ) -> Snapshot {
+    fn extend(&self, mem: &MemTable, to: usize, runs: bool) -> Snapshot {
         debug_assert!(
             self.ents.iter().all(|e| e.frozen == u32::MAX),
             "an extension is of live runs; a frozen table's own is a base"
@@ -29454,10 +28769,10 @@ impl Snapshot {
         let log_at = mem.log_len();
         let arena = self.arena.clone();
         let mut rscratch: Vec<(u64, u32)> = Vec::new();
-        // Under `snapshot_build_lean` a batch key's place is one offset
-        // word, its keys back to back in one reservation, its length the
-        // next offset less its own and its slot its place in the batch.
-        let lean = lean && !runs;
+        // Without the runs a batch key's place is one offset word, its
+        // keys back to back in one reservation, its length the next
+        // offset less its own and its slot its place in the batch.
+        let lean = !runs;
         let mut batch: Vec<SnapKey> = Vec::with_capacity(if lean { 0 } else { to - from });
         let mut offs: Vec<u32> = Vec::with_capacity(if lean { to - from + 1 } else { 0 });
         // The batch's order from its keys' prefix words, as the build
@@ -29569,10 +28884,9 @@ impl Snapshot {
         let mut i = 0usize;
         for r in &recs {
             let b = batch_at(r.2 as usize);
-            // With the run walked to its end the key is not read at all
-            // under `snapshot_extend_unfolded`: what is left of the batch
-            // follows the run whole.
-            let at = if unfolded && i == self.ents.len() {
+            // With the run walked to its end the key is not read at all:
+            // what is left of the batch follows the run whole.
+            let at = if i == self.ents.len() {
                 i
             } else {
                 let key = key_at(&b);
@@ -29589,18 +28903,14 @@ impl Snapshot {
             };
             out.ents.extend_from_slice(&self.ents[i..at]);
             i = at;
-            if unfolded {
-                // One table's entries: a key is in one of them, so the
-                // fold `push_sorted` asks after never happens here, and
-                // the order the merge made is what a checked build holds.
-                debug_assert!(
-                    out.ents.last().is_none_or(|l| self.key_of(l) < key_at(&b)),
-                    "an extension's batch key at or below the entry before it"
-                );
-                out.push_folded(b, false);
-            } else {
-                out.push_sorted(b);
-            }
+            // One table's entries: a key is in one of them, so no fold
+            // happens here, and the order the merge made is what a
+            // checked build holds.
+            debug_assert!(
+                out.ents.last().is_none_or(|l| self.key_of(l) < key_at(&b)),
+                "an extension's batch key at or below the entry before it"
+            );
+            out.push_folded(b, false);
         }
         out.ents.extend_from_slice(&self.ents[i..]);
         // A run written again since this snapshot copied it, found by
@@ -29683,15 +28993,6 @@ impl Snapshot {
         }
         self.ents.partition_point(|e| key(e) < from)
     }
-    /// Merge a run of entries sorted by key into `ents`, folding a key
-    /// present in both tables into one entry carrying both indices.
-    fn push_sorted(&mut self, e: SnapKey) {
-        let same = self.ents.last().is_some_and(|last| {
-            self.arena.slice(last.off, last.len) == self.arena.slice(e.off, e.len)
-        });
-        self.push_folded(e, same);
-    }
-
     /// `push_sorted` with the comparison against the last entry made by
     /// the caller: `same` folds `e` into it.
     fn push_folded(&mut self, e: SnapKey, same: bool) {
@@ -30046,19 +29347,18 @@ fn key_prefix(k: &[u8]) -> (u64, u64) {
 }
 
 /// A settle's key for its resolve: rebuilt in `short` from the prefix
-/// words the batch was sorted by where the key is no longer than they are
-/// (`Options::settle_gathers`), which reads nothing of the table, and the
+/// words the batch was sorted by where the key is no longer than they are,
+/// which reads nothing of the table, and the
 /// table's own bytes otherwise. `key_prefix` pads a short key with zeros,
 /// so the words cut to the key's length are the key.
 #[inline]
 fn settle_key<'a>(
-    gathers: bool,
     src: &'a MemTable,
     (a, b): (u64, u64),
     (off, len): (u32, u32),
     short: &'a mut [u8; 16],
 ) -> &'a [u8] {
-    if gathers && len <= 16 {
+    if len <= 16 {
         short[..8].copy_from_slice(&a.to_be_bytes());
         short[8..].copy_from_slice(&b.to_be_bytes());
         debug_assert_eq!(
@@ -30565,7 +29865,7 @@ impl Reader {
         let now = std::time::Instant::now();
         self.attn_open.set(self.attn_open.get() | ATTN_OPEN);
         w.down = w.n;
-        w.stride = if self.opts.zpages_census_sample && w.n >= ZBUSY_SAMPLED_FROM {
+        w.stride = if w.n >= ZBUSY_SAMPLED_FROM {
             ZBUSY_STRIDE
         } else {
             1
@@ -30602,21 +29902,6 @@ impl Reader {
                     .store(0, AtomicOrdering::Relaxed);
             }
         }
-    }
-
-    /// The census's note of a scan's emitted keys, onto the window.
-    #[inline(always)]
-    fn zcensus_scanned(&self, n: usize) {
-        if self.attn & ATTN_CENSUS != 0 && self.attn_open.get() & ATTN_OPEN != 0 {
-            self.zcensus_scanned_slow(n);
-        }
-    }
-
-    #[inline(never)]
-    fn zcensus_scanned_slow(&self, n: usize) {
-        let mut w = self.zwin.get();
-        w.skeys = w.skeys.saturating_add(n as u64);
-        self.zwin.set(w);
     }
 
     /// Closes the window before this operation: the readings after its
@@ -32646,9 +31931,9 @@ impl Reader {
     /// and a batch resolved in key order hands each key the rank the key
     /// before it reached as `floor`, so the heads' seek gallops from one
     /// answer to the next over warm heads.
-    /// The block a settle may file `key` under with its cut unresolved
-    /// (`Options::zpages_settle_span`): the one the ordered index's samples
-    /// name (`Options::settle_covered_samples`, `Options::settle_lazy_raw`)
+    /// The block a settle may file `key` under with its cut unresolved: the
+    /// one the ordered index's samples name (`Options::settle_lazy_raw` for
+    /// a raw partition's)
     /// or the form file's fence and the page's directory name
     /// (`ZFile::owner_span`), where they name one, and where the
     /// partition's table holds no form for it that a patch reads the cut
@@ -32659,10 +31944,9 @@ impl Reader {
         // the option for the partition's kind asks for them.
         let sampled = |on: bool| if on { seg.ord.floor_stride(key) } else { None };
         let b = match self.zc(seg) {
-            // A covered partition's from the samples first
-            // (`Options::settle_covered_samples`), and from the form's span
-            // where a sample ties the key's head.
-            Some(z) => match sampled(self.opts.settle_covered_samples) {
+            // A covered partition's from the samples first, and from the
+            // form's span where a sample ties the key's head.
+            Some(z) => match sampled(true) {
                 Some(b) => b,
                 None => {
                     let (lo, hi) = z.owner_span_from(key, hint)?;
@@ -33728,8 +33012,7 @@ impl Reader {
     }
 
     /// The sorted snapshot of every unsealed key (frozen table first, then
-    /// live), one entry per key. Two builds behind `scan_snapshot_arena`;
-    /// both walk the hash tables once and both end in the same `Snapshot`.
+    /// live), one entry per key.
     /// The snapshot over the frozen table and the live one's first
     /// `live_len` entries: the count is the caller's, taken once, since
     /// the writer may be appending while this builds, and what the
@@ -33787,13 +33070,12 @@ impl Reader {
         };
         let mut rscratch: Vec<(u64, u32)> = Vec::new();
         // The tables in the order the build takes them, the frozen one's
-        // entries first, and the key bytes each will copy
-        // (`snapshot_build_lean`).
+        // entries first, and the key bytes each will copy.
         let tables = [
             (frozen, frozen.map_or(0, |f| f.len())),
             (live.map(|(m, _)| m), live_len),
         ];
-        let lean = self.opts.snapshot_build_lean && self.opts.scan_snapshot_arena && !runs;
+        let lean = !runs;
         if lean {
             let mut bytes = [0usize; 2];
             for (t, &(m, upto)) in tables.iter().enumerate() {
@@ -33885,7 +33167,7 @@ impl Reader {
                 snap.push_folded(e, same);
                 last = Some((r.0, r.1, e.len));
             }
-        } else if self.opts.scan_snapshot_arena {
+        } else {
             // Arena build. The hash table is walked in slot order, which
             // visits the key bytes in random order -- one cache miss a key,
             // and at 428k keys that walk, not the sort, was most of the
@@ -33996,48 +33278,6 @@ impl Reader {
                 });
                 snap.push_folded(e, same);
                 last = Some((r.0, r.1, e.len));
-            }
-        } else {
-            // The build before it: one allocation per key, sorted through
-            // the pointers, then copied into the arena the merge expects.
-            struct Old {
-                key: Vec<u8>,
-                mem: u32,
-                frozen: u32,
-                run: u32,
-            }
-            let mut all: Vec<Old> = Vec::with_capacity(n);
-            let mut take = |mem: &MemTable, live: bool| {
-                let upto = if live { live_len } else { mem.len() };
-                for (i, e) in (0..upto).map(|i| (i, mem.entry(i))) {
-                    all.push(Old {
-                        key: mem.key_of(e).to_vec(),
-                        mem: if live { i as u32 } else { u32::MAX },
-                        frozen: if live { u32::MAX } else { i as u32 },
-                        run: if runs {
-                            snap.copy_run(mem, e, &mut rscratch)
-                        } else {
-                            NO_RUN
-                        },
-                    });
-                }
-            };
-            if let Some(fr) = frozen {
-                take(fr, false);
-            }
-            if let Some((m, _)) = live {
-                take(m, true);
-            }
-            all.sort_by(|a, b| a.key.cmp(&b.key));
-            for o in all {
-                snap.push_sorted(SnapKey {
-                    off: snap.arena.append(&o.key),
-                    len: o.key.len() as u32,
-                    mem: o.mem,
-                    frozen: o.frozen,
-                    lrun: if o.mem != u32::MAX { o.run } else { NO_RUN },
-                    frun: if o.frozen != u32::MAX { o.run } else { NO_RUN },
-                });
             }
         }
         snap
@@ -34325,44 +33565,6 @@ impl Reader {
             self.settle_pending()?;
             self.scan_tick(2, t);
         }
-        // No snapshot of this state in hand: walk without one, and build
-        // it at the first block that needs it. See
-        // `Options::scan_lazy_snapshot`.
-        // With nothing unsealed the snapshot is empty and costs nothing to
-        // build, and walking without one gives up the clean partition's
-        // one walk: the drained scan pass at three hundred thousand keys
-        // ran lazily every scan, block by block, and read 0.92x.
-        let absent = self
-            .fs()
-            .scan_keys
-            .borrow()
-            .as_ref()
-            .is_none_or(|(g, _)| *g != gen);
-        let unsealed_any = !self.mem().is_empty() || !self.frozen().is_empty();
-        if use_cache && absent && unsealed_any && self.opts.scan_lazy_snapshot {
-            let (seen, from) = match self.scan_blocks(from, limit, None, false, &mut f)? {
-                Walk::Done(n) => {
-                    self.fs().lazy_scans.add(0, 1);
-                    self.zcensus_scanned(n);
-                    return Ok(n);
-                }
-                Walk::Resume { seen } => (
-                    seen,
-                    std::mem::take(&mut *self.fs().resume_key.borrow_mut()),
-                ),
-            };
-            self.fs().lazy_scans.add(1, 1);
-            self.refresh_snapshot(gen, use_cache, true);
-            let cache = self.fs().scan_keys.borrow();
-            let unsealed: &Snapshot = &cache.as_ref().expect("scan snapshot").1;
-            let walked = self.scan_blocks(&from, limit - seen, Some(unsealed), true, &mut f);
-            // The buffer back for the next resume, whatever the walk said.
-            *self.fs().resume_key.borrow_mut() = from;
-            return match walked? {
-                Walk::Done(n) => Ok(seen + n),
-                Walk::Resume { .. } => Err(err("block scan: resumed without a snapshot")),
-            };
-        }
         let t = self.tick_start();
         self.refresh_snapshot(gen, use_cache, moved);
         self.scan_tick(3, t);
@@ -34375,10 +33577,7 @@ impl Reader {
         // store of three million keys, half a microsecond of a far scan's
         // three, for a number nothing read.
         if use_cache {
-            return match self.scan_blocks(from, limit, Some(unsealed), false, &mut f)? {
-                Walk::Done(n) => Ok(n),
-                Walk::Resume { .. } => Err(err("block scan: stopped with a snapshot in hand")),
-            };
+            return self.scan_blocks(from, limit, unsealed, &mut f);
         }
         let mc = unsealed.cursor(from);
 
@@ -34518,8 +33717,8 @@ impl Reader {
     }
 
     /// Whether this handle's scan snapshot stands in `st`, a state
-    /// published since the one its log position is of
-    /// (`Options::snapshot_stands`), and the snapshot made `st`'s where it
+    /// published since the one its log position is of, and the snapshot
+    /// made `st`'s where it
     /// does: the live table the one the note names, by identity and by
     /// `State::lives`, and the frozen tables the ones it names or what the
     /// landings since left of them. Landings retire the front of the list,
@@ -34531,9 +33730,6 @@ impl Reader {
     /// and stand with it. Offered to `st` for the handles after, since a
     /// publish starts a state with no snapshot.
     fn snapshot_stands(&self, st: &State) -> bool {
-        if !self.opts.snapshot_stands {
-            return false;
-        }
         let kept = {
             let over = self.fs().over.borrow();
             let Some(over) = over.as_ref() else {
@@ -34822,8 +34018,6 @@ impl Reader {
         let was_complete = self.fs().tables_complete.get();
         let mut complete =
             was_complete && !froze && tables.iter().take(np).all(|c| c.borrow().is_some());
-        // The publishes since this handle's last look, by the generation.
-        let publishes = st.gen.saturating_sub(self.fs().log_gen.get());
         let mut dirty_any = false;
         let mut cache_bytes = 0usize;
         let mut dense_bytes = 0u64;
@@ -34833,96 +34027,9 @@ impl Reader {
             let Some(t) = held.as_mut() else { continue };
             let seg = &st.segs[p];
             let rebased = t.blob != seg.blob.id();
-            // Under `pieces_only` a copy carried across a partition's
-            // rewrite holds the fold of the pieces standing at this
-            // handle's last look, which the rewrite folded in or left
-            // standing, so it is the rewritten partition's fold too --
-            // when the rewrite was the one publish since. With more than
-            // one, a piece may have landed and been merged into the
-            // partition between the two looks, in neither piece set this
-            // look compares: the copy that never folded it was carried
-            // across the rewrite and published, and a handle at the
-            // writer's commit read a key's merged value as the one before
-            // it, with the key in no memtable and no piece for the
-            // point read to disagree about.
-            let rewritten = self.opts.forms_pieces_only && rebased && publishes > 1;
-            // Under `pieces_only` a form holds the pieces' fold, so a
-            // piece this table did not hold -- a landing's -- leaves
-            // every form it has keys over short of them: dropped, for
-            // the fills to build again, and the table incomplete until
-            // they have, for the blocks it has keys over and no form.
-            // Without the forms' memtable keys a block with no form
-            // says only that no piece had keys over it, and a landing
-            // is exactly what changes that: the table called complete
-            // past one, a handle at the writer's commit took the empty
-            // slot as clean and walked the partition alone, reading a
-            // key's sealed value as the one before it -- the reader
-            // threads met it in their first seconds, and the point
-            // read beside them, through the piece, was right. A piece
-            // is the same piece when its bounds against this partition
-            // are, the bounds being a function of the two.
-            // ... or, where the partition stands, folded in: a landed
-            // piece is newer than every piece the form holds, so its run
-            // over a block merges into the form in one pass over the
-            // piece's records for the block (`fold_piece_block`), where a
-            // build read every piece's again -- ten to fourteen thousand
-            // builds a burst at a hundred thousand keys, the thread's
-            // whole cost under this arm. Pieces fold oldest first, the
-            // order they stand in. A block with no form is clean, and
-            // folded from clean, only while the table was complete; short
-            // of that it is left to the fill, which knows what it lacks.
-            let mut landed_over: Vec<bool> = Vec::new();
-            if self.opts.forms_pieces_only {
-                landed_over = vec![false; t.slots.len()];
-                for (idx, (j, at)) in pieces.iter().enumerate() {
-                    if t.pieces
-                        .iter()
-                        .any(|(_, old)| std::sync::Arc::ptr_eq(old, at))
-                    {
-                        continue;
-                    }
-                    if rebased {
-                        for (b, over) in landed_over.iter_mut().enumerate() {
-                            *over |= at[b + 1] > at[b];
-                        }
-                        continue;
-                    }
-                    let piece = &l0[*j];
-                    let cuts = piece_ranks[idx].as_deref().map(|v| v.as_slice());
-                    for b in 0..t.slots.len() {
-                        let (r0, r1) = (at[b] as usize, at[b + 1] as usize);
-                        if r1 <= r0 {
-                            continue;
-                        }
-                        match t.slots[b].as_deref() {
-                            None if !was_complete => {
-                                complete = false;
-                                continue;
-                            }
-                            Some(Cached::Wide(_)) => continue,
-                            _ => {}
-                        }
-                        if self
-                            .fold_piece_block(p, b, t, seg, piece, (r0..r1, cuts))
-                            .is_err()
-                        {
-                            return self.refuse_rebase(12);
-                        }
-                    }
-                }
-            }
             for b in 0..t.slots.len() {
-                if landed_over.get(b).is_some_and(|&o| o) {
-                    complete = false;
-                    if let Some(f) = t.slots[b].take() {
-                        self.note_freed(self.fbytes(&f));
-                        t.dirty[b] = false;
-                        self.publish_marker(p, b);
-                    }
-                }
                 let mut sparse = matches!(t.slots[b].as_deref(), Some(Cached::Sparse(_)));
                 let wide = matches!(t.slots[b].as_deref(), Some(Cached::Wide(_)));
-                let copy = matches!(t.slots[b].as_deref(), Some(Cached::Block(_)));
                 // A sparse form of a partition rewritten over the same
                 // blocks keeps its deltas, each cut resolved again against
                 // the records as they stand: the runs it holds are the
@@ -34940,13 +34047,12 @@ impl Reader {
                 if rebased
                     && sparse
                     && self.opts.rebase_recuts_sparse
-                    && !self.opts.forms_pieces_only
                     && self.recut_sparse(seg, b, t.slots[b].as_mut().expect("a sparse form"))
                 {
                     sparse = false;
                 }
-                if (rebased && sparse) || wide || (rewritten && copy) {
-                    if sparse || copy {
+                if (rebased && sparse) || wide {
+                    if sparse {
                         complete = false;
                     }
                     if let Some(f) = t.slots[b].take() {
@@ -35460,23 +34566,6 @@ impl Reader {
         self.fs().pending_frozen.borrow_mut().clear();
     }
 
-    /// PROTOTYPE: the forms the builder ahead has sent, installed: each
-    /// into its partition's table, made here if the partition has none,
-    /// if the segment set is still the one it was built at and the block
-    /// is unbuilt and not past the wide bound; then the memtable's keys
-    /// over the block spliced in -- the snapshot's run over it and the
-    /// keys filed since, which is what a build here would have merged --
-    /// so the installed block equals one built here.
-    /// Whether the builder ahead has forms waiting to be installed, which
-    /// `install_ahead` would take; nothing is taken here.
-    fn ahead_posted(&self) -> bool {
-        self.fs()
-            .ahead
-            .borrow()
-            .as_ref()
-            .is_some_and(|a| !a.done.get() && a.posted.load(std::sync::atomic::Ordering::Acquire))
-    }
-
     fn install_ahead(&self, unsealed: &Snapshot) -> Result<()> {
         let mut ahead = self.fs().ahead.borrow_mut();
         let Some(a) = ahead.as_mut() else {
@@ -35559,11 +34648,8 @@ impl Reader {
                 // first key, or the upper fence for the last. Keys past the
                 // partition's last key fall in its last block alone, which
                 // is where every key a mix inserts past the end goes, and
-                // any other block learns so by one compare. Under
-                // `forms_pieces_only` a form holds no memtable key, so
-                // nothing is spliced: the keys since reach the walk
-                // through the snapshot as every other memtable key does.
-                if since.is_empty() || self.opts.forms_pieces_only {
+                // any other block learns so by one compare.
+                if since.is_empty() {
                     continue;
                 }
                 let past_all = b + 1 < table.slots.len()
@@ -35623,19 +34709,10 @@ impl Reader {
     /// EXPERIMENT: the log position a canonical form must have been
     /// settled at for this handle to read it, or none where the handle
     /// may not read one at all. A handle with a slot holds the position
-    /// of the commit its watermark names. The writer's own honours no
-    /// watermark, so it holds the log's whole length: equal to
-    /// `forms_at`, nothing has been written past the commit the forms
-    /// were settled at and they are exactly what it must read; short of
-    /// it, it has staged writes they do not carry and it builds its own.
-    /// `forms_at` before the first maintenance is `usize::MAX`, which no
-    /// log length equals, so an unmaintained table is never taken.
+    /// of the commit its watermark names; the writer reads none, since
+    /// it maintains them.
     fn forms_bound(&self) -> Option<usize> {
-        match self.slot {
-            Some(_) => Some(self.log_bound.get()),
-            None if self.opts.forms_to_writer => Some(self.mem().log_len()),
-            None => None,
-        }
+        self.slot.map(|_| self.log_bound.get())
     }
 
     fn forms_position_held(&self) -> bool {
@@ -35712,13 +34789,7 @@ impl Reader {
                 self.shared
                     .snap_extends
                     .fetch_add(1, AtomicOrdering::Relaxed);
-                std::sync::Arc::new(s.extend(
-                    self.mem(),
-                    to,
-                    self.opts.snapshot_runs,
-                    self.opts.snapshot_extend_unfolded,
-                    self.opts.snapshot_build_lean,
-                ))
+                std::sync::Arc::new(s.extend(self.mem(), to, self.opts.snapshot_runs))
             }
             None => std::sync::Arc::new(self.build_snapshot(to)),
         };
@@ -35730,7 +34801,7 @@ impl Reader {
     /// sorted the table first set on it, and otherwise sorted here, alone,
     /// by the build a scan would make, and set for whoever comes next.
     fn frozen_snapshot(&self, fr: &MemTable) -> std::sync::Arc<Snapshot> {
-        if !self.opts.share_snapshot || !self.opts.frozen_snaps {
+        if !self.opts.share_snapshot {
             // Each its own, sorted from nothing: what those arms price.
             return std::sync::Arc::new(self.build_over(None, Some(fr), 0));
         }
@@ -35758,7 +34829,7 @@ impl Reader {
     /// snapshots are shared: unshared, each handle builds its own from
     /// nothing, which is that arm's meaning.
     fn frozen_base(&self) -> Option<std::sync::Arc<Snapshot>> {
-        if !self.opts.share_snapshot || !self.opts.frozen_snaps || self.frozen().is_empty() {
+        if !self.opts.share_snapshot || self.frozen().is_empty() {
             return None;
         }
         let bases: Vec<std::sync::Arc<Snapshot>> = self
@@ -35777,7 +34848,6 @@ impl Reader {
     /// chains.
     fn upgrade_base(&self, s: std::sync::Arc<Snapshot>) -> std::sync::Arc<Snapshot> {
         if !self.opts.share_snapshot
-            || !self.opts.frozen_snaps
             || s.bases.len() != self.frozen().len()
             || s.bases.iter().all(|b| b.runs)
         {
@@ -36292,14 +35362,14 @@ impl Reader {
         self.publish_form(p, b, &marker, 0);
     }
 
-    /// EXPERIMENT: whether the forms are published now: always when
-    /// `force`d or published eagerly, else only for a handle the caller
-    /// holds; see `Options::forms_publish_lazily`.
+    /// Whether the forms are published now: always when `force`d, else
+    /// only for a handle the caller holds. A publish is an `Arc` clone of
+    /// the writer's own form, so every patch after it copies the block
+    /// first; with no handle live the writer settles and leaves the forms
+    /// dirty, and a claim files the backlog and publishes every dirty
+    /// form.
     fn publishing(&self, force: bool) -> bool {
-        force
-            || !self.opts.forms_publish_lazily
-            || self.opts.forms_to_writer
-            || self.shared.live_handles.load(AtomicOrdering::Relaxed) > 0
+        force || self.shared.live_handles.load(AtomicOrdering::Relaxed) > 0
     }
 
     /// EXPERIMENT: every block this handle built or patched since the
@@ -36534,15 +35604,6 @@ impl Reader {
     /// blocks those keys fall in, and the blocks at or past
     /// `Options::forms_settle_rebuild_from`. Keys over blocks is what
     /// decides a patch against a build.
-    /// Scans that finished without building the snapshot, and scans
-    /// that built it at a block that needed it and went on; see
-    /// `Options::scan_lazy_snapshot`.
-    #[doc(hidden)]
-    pub fn lazy_scans(&self) -> (u64, u64) {
-        let v = self.fs().lazy_scans.get();
-        (v[0], v[1])
-    }
-
     #[doc(hidden)]
     pub fn settle_density(&self) -> [u64; 4] {
         self.fs().settle_density.get()
@@ -36614,15 +35675,6 @@ impl Reader {
         }
     }
 
-    /// `Walk::Resume` from `seen` entries at `key`, the key kept in the
-    /// forms state's buffer rather than a fresh `Vec`.
-    fn resume_at(&self, seen: usize, key: &[u8]) -> Walk {
-        let mut k = self.fs().resume_key.borrow_mut();
-        k.clear();
-        k.extend_from_slice(key);
-        Walk::Resume { seen }
-    }
-
     /// The deltas from which a fill converts a sparse form to a copy
     /// (`Options::forms_convert_from`): a line under `CACHE_DENSE` on the
     /// upkeep thread alone, whose conversions yield to the writer, since
@@ -36657,7 +35709,6 @@ impl Reader {
             copy_dense: false,
             wide_copy: false,
             fit: self.fits(),
-            pieces_only: self.opts.forms_pieces_only,
             ranks_by_heads: self.opts.piece_ranks_by_heads,
             ranks_whole: self.opts.piece_ranks_whole,
         }
@@ -36740,7 +35791,7 @@ impl Reader {
         };
         // A snapshot of this state holds a base for each frozen table it
         // has, or none: a landing that retires one trims its base where
-        // the snapshot stands (`snapshot_stands`, `rebase_tables`), and a
+        // the snapshot stands (`Reader::snapshot_stands`, `rebase_tables`), and a
         // base left behind would hold the landed table for the
         // snapshot's life while every read took the tables as they are.
         debug_assert!(
@@ -36778,42 +35829,6 @@ impl Reader {
                         self.shared
                             .snap_switched
                             .fetch_add(1, AtomicOrdering::Relaxed);
-                    }
-                }
-            }
-        }
-        // Under `forms_pieces_only` the writer's upkeep republishes the
-        // snapshot with its stale runs copied again (`refresh_runs`): the
-        // same keys over the same bounds and bases, current to a later
-        // log position. A handle on the version before takes it and reads
-        // the log from that position for what is stale now, and keeps its
-        // filed keys, since the keys are the same.
-        if !stale && self.opts.forms_pieces_only {
-            if let Some((g, mine)) = cache.as_mut() {
-                if *g == gen {
-                    if let Some(published) = self.adopt_snapshot() {
-                        let same = published.live_len == mine.live_len
-                            && published.log_at > mine.log_at
-                            && std::sync::Arc::ptr_eq(&published.bounds, &mine.bounds)
-                            && published.bases.len() == mine.bases.len()
-                            && published
-                                .bases
-                                .iter()
-                                .zip(&mine.bases)
-                                .all(|(a, b)| std::sync::Arc::ptr_eq(a, b));
-                        if same {
-                            let mem = self.mem();
-                            let mut st = self.fs().snap_stale.borrow_mut();
-                            st.clear();
-                            let to = self.fs().log_seen.get().min(mem.log_len());
-                            for i in published.log_at..to {
-                                st.insert(mem.log_at(i).0 as u32);
-                            }
-                            *mine = published;
-                            self.shared
-                                .snap_switched
-                                .fetch_add(1, AtomicOrdering::Relaxed);
-                        }
                     }
                 }
             }
@@ -36956,51 +35971,6 @@ impl Reader {
         self.fill_forms()
     }
 
-    /// Under `forms_pieces_only`, on the writer's upkeep: once a
-    /// sixteenth of the snapshot's live runs are stale -- written since
-    /// the runs were copied, so a walk that lays the key over its block
-    /// reads the chain, two or three dependent misses, where a form
-    /// holds the value inline -- the snapshot is republished with those
-    /// runs copied again (`Snapshot::refreshed`), the same keys over the
-    /// same bounds, current to the log position this handle has read
-    /// to, and the stale set starts over from there. Every handle holding
-    /// the version before switches at its next scan
-    /// (`refresh_snapshot_to`). Not beside the keeper, which appends to
-    /// the same arena from its own thread.
-    fn refresh_runs(&self) {
-        if !self.opts.forms_pieces_only
-            || self.opts.snapshot_keeper
-            || !self.opts.share_snapshot
-            || self.slot.is_some()
-        {
-            return;
-        }
-        let fresh = {
-            let cache = self.fs().scan_keys.borrow();
-            let Some((_, snap)) = cache.as_ref() else {
-                return;
-            };
-            if !snap.runs || snap.live_len == 0 {
-                return;
-            }
-            let stale = self.fs().snap_stale.borrow();
-            if stale.len() < (snap.len() / 16).max(64) {
-                return;
-            }
-            let mem = self.mem();
-            let log_at = self.fs().log_seen.get().min(mem.log_len());
-            std::sync::Arc::new(snap.refreshed(mem, &stale, log_at))
-        };
-        self.fs().snap_stale.borrow_mut().clear();
-        if let Some((_, snap)) = self.fs().scan_keys.borrow_mut().as_mut() {
-            *snap = fresh.clone();
-        }
-        self.publish_snapshot(&fresh);
-        self.shared
-            .snap_refreshes
-            .fetch_add(1, AtomicOrdering::Relaxed);
-    }
-
     /// Whether this commit's maintenance files its writes, by the rules
     /// below; none where the store keeps no forms to file them into.
     /// `consume` takes the one-shot reasons with the answer, which only
@@ -37032,18 +36002,6 @@ impl Reader {
         }
         if st.forms.is_empty() || self.segs().first().is_none_or(|s| s.level == 0) {
             return None;
-        }
-        // Too much of the store unsealed to be worth organising: see
-        // `Options::forms_max_unsealed_pct`. The unsealed count is the
-        // memtables' own, and the store's is what the partitions hold,
-        // which is a load a segment and there are few.
-        if self.opts.forms_max_unsealed_pct > 0 {
-            let unsealed =
-                st.mem.committed_len() + st.frozen.iter().map(|f| f.len()).sum::<usize>();
-            let keys: usize = self.segs().iter().map(|s| s.blob.keys()).sum();
-            if keys > 0 && unsealed * 100 > keys * self.opts.forms_max_unsealed_pct {
-                return None;
-            }
         }
         // Nothing to maintain where nothing has been scanned since the
         // last commit: the structure is for range reads, and a run of
@@ -37276,7 +36234,6 @@ impl Reader {
             return Ok(());
         }
         self.refresh_snapshot(gen, true, moved);
-        self.refresh_runs();
         {
             let cache = self.fs().scan_keys.borrow();
             let unsealed: &Snapshot = &cache.as_ref().expect("scan snapshot").1;
@@ -37776,13 +36733,7 @@ impl Reader {
                         .convert_total_ns
                         .fetch_add(t_total.elapsed().as_nanos() as u64, AtomicOrdering::Relaxed);
                     continue;
-                } else if table.slots[b].is_some()
-                    || (if self.opts.forms_pieces_only {
-                        BuildCtx::piece_count(table, b)
-                    } else {
-                        BuildCtx::overlay_count(table, b)
-                    }) == 0
-                {
+                } else if table.slots[b].is_some() || BuildCtx::overlay_count(table, b) == 0 {
                     continue;
                 }
                 self.shared.forms_events[6].fetch_add(1, AtomicOrdering::Relaxed);
@@ -38317,9 +37268,8 @@ impl Reader {
             }
             // Sorted by key offset where the budget may cut the batch, so
             // that the cut falls between keys as it did; a batch taken
-            // whole is grouped by the settle itself
-            // (`Options::settle_sorts_once`).
-            if !self.opts.settle_sorts_once || writes.len() > budget {
+            // whole is grouped by the settle itself.
+            if writes.len() > budget {
                 writes.sort_unstable_by_key(|&(off, ..)| off);
             }
             let take = writes.len().min(budget);
@@ -38352,9 +37302,6 @@ impl Reader {
         // files the key into its block's list and the rest are skipped as
         // duplicates, so the order is a correctness order. One integer key,
         // since a tuple compared through a closure was a quarter of a settle.
-        if !self.opts.settle_sorts_once {
-            pending.sort_unstable_by_key(|&(off, _, new, _)| ((off as u64) << 1) | u64::from(!new));
-        }
         // A write that could not be settled leaves the block it landed in
         // stale, so an error drops every table rather than leave one.
         let settled = self.settle_each(&pending, self.mem());
@@ -38370,19 +37317,6 @@ impl Reader {
     /// a table frozen since they were read from its log, whose writes
     /// name no live entry (`settle_pending`).
     fn settle_each(&self, pending: &[(u32, u32, bool, u32)], src: &MemTable) -> Result<()> {
-        // Under `forms_pieces_only` nothing is spliced: a key written again
-        // reaches the walk through the stale set, and a key the table
-        // created since the snapshot's run was built through the side
-        // list its block keeps (`BlockTable::added`), which wants the
-        // key's cut, so those are resolved and filed and the rest is
-        // skipped. A frozen table's writes are its base snapshot's.
-        let created: Vec<(u32, u32, bool, u32)>;
-        let pending: &[(u32, u32, bool, u32)] = if self.opts.forms_pieces_only {
-            created = pending.iter().copied().filter(|p| p.2).collect();
-            &created
-        } else {
-            pending
-        };
         if pending.is_empty() {
             return Ok(());
         }
@@ -38413,13 +37347,12 @@ impl Reader {
         }
         let mut scratch = Vec::new();
         radix_by_prefix(&mut keyed, &mut scratch);
-        // The batch arrives in the log's order where it is sorted once
-        // (`Options::settle_sorts_once`), and the sort above is stable, so
+        // The batch arrives in the log's order, and the sort above is stable, so
         // a key's writes are adjacent unless another key shares its prefix
         // words: a run of equal words holding more than one key is grouped
         // by key, each key's writes in the order they came. The suite's
         // keys are sixteen bytes, so no two of its keys tie.
-        if self.opts.settle_sorts_once {
+        {
             let slot_of = |k: &(u64, u64, u32)| pending[k.2 as usize].3;
             let mut i = 0usize;
             while i + 1 < keyed.len() {
@@ -38439,28 +37372,16 @@ impl Reader {
                 i = j;
             }
         }
-        // The writes in key order, gathered once (`Options::settle_gathers`):
-        // the loops below read a key's write beside its prefix words where
-        // they took it from `pending` by the index the sort carried, a
-        // load a key into a list in arrival order.
-        let gathers = self.opts.settle_gathers;
-        let sorted: Vec<(u32, u32, bool, u32)> = if gathers {
-            keyed.iter().map(|&(_, _, i)| pending[i as usize]).collect()
-        } else {
-            Vec::new()
-        };
-        if gathers {
-            self.shared
-                .settle_gathered
-                .fetch_add(sorted.len() as u64, AtomicOrdering::Relaxed);
-        }
-        let write_at = |n: usize| -> (u32, u32, bool, u32) {
-            if gathers {
-                sorted[n]
-            } else {
-                pending[keyed[n].2 as usize]
-            }
-        };
+        // The writes in key order, gathered once: the loops below read a
+        // key's write beside its prefix words where they took it from
+        // `pending` by the index the sort carried, a load a key into a
+        // list in arrival order.
+        let sorted: Vec<(u32, u32, bool, u32)> =
+            keyed.iter().map(|&(_, _, i)| pending[i as usize]).collect();
+        self.shared
+            .settle_gathered
+            .fetch_add(sorted.len() as u64, AtomicOrdering::Relaxed);
+        let write_at = |n: usize| -> (u32, u32, bool, u32) { sorted[n] };
         let mut last = u32::MAX;
         let mut at = 0usize;
         let mut floor = 0usize;
@@ -38470,7 +37391,6 @@ impl Reader {
         let mut zhint = usize::MAX;
         let mut resolved: Vec<(u32, u32, u32, u32, u32, bool, u32)> =
             Vec::with_capacity(pending.len());
-        let lazy = self.opts.zpages_settle_span && !self.opts.forms_pieces_only;
         let mut lazy_n = 0u64;
         // Out of core, the heads a resolve will seek asked for ahead of it
         // (`OrdIndex::willneed_heads`): a resolve is a seek over one stride
@@ -38527,7 +37447,7 @@ impl Reader {
                     if slot != slot_pre {
                         slot_pre = slot;
                         let mut short = [0u8; 16];
-                        let k = settle_key(gathers, src, (pa, pb), (off, len), &mut short);
+                        let k = settle_key(src, (pa, pb), (off, len), &mut short);
                         let was = at_pre;
                         at_pre = self.settle_partition(np, at_pre, k);
                         if at_pre != was {
@@ -38551,7 +37471,7 @@ impl Reader {
             }
             last = slot;
             let mut short = [0u8; 16];
-            let key = settle_key(gathers, src, (ka, kb), (off, len), &mut short);
+            let key = settle_key(src, (ka, kb), (off, len), &mut short);
             // The partition holding the key: the one before's or a later
             // one in key order (`settle_partition`); the seek's floor and
             // the lazy filing's hint are the partition's.
@@ -38583,7 +37503,7 @@ impl Reader {
                     let (off, len, _, _) = write_at(ahead);
                     ahead += 1;
                     let mut short = [0u8; 16];
-                    let k = settle_key(gathers, src, (aa, ab), (off, len), &mut short);
+                    let k = settle_key(src, (aa, ab), (off, len), &mut short);
                     at_ahead = self.settle_partition(np, at_ahead, k);
                     let Some(s) = self.segs()[..np].get(at_ahead) else {
                         continue;
@@ -38599,10 +37519,7 @@ impl Reader {
                     }
                 }
             }
-            let (b, cut) = match lazy
-                .then(|| self.lazy_block(at, seg, key, &mut zhint))
-                .flatten()
-            {
+            let (b, cut) = match self.lazy_block(at, seg, key, &mut zhint) {
                 Some(b) => {
                     lazy_n += 1;
                     (b, LAZY_CUT)
@@ -38678,18 +37595,6 @@ impl Reader {
                 .all(|w| w[0].6 != w[1].6 || w[0].6 == u32::MAX),
             "a settle resolved one key's writes as two keys"
         );
-        if self.opts.forms_pieces_only {
-            for &(at, b, cut, _, _, _, slot) in &resolved {
-                let tables = self.fs().tables.borrow();
-                let mut held = tables[at as usize].borrow_mut();
-                let Some(table) = held.as_mut() else { continue };
-                if let Some(list) = table.added.get_mut(b as usize) {
-                    list.push((slot, cut));
-                    table.filed += 1;
-                }
-            }
-            return Ok(());
-        }
         // The backlog by block, which is what decides a patch against a
         // build: a cut packs the rank it is taken at, so the sort above
         // leaves one block's keys contiguous and the count is this
@@ -38705,8 +37610,6 @@ impl Reader {
         let at_cut = self.opts.settle_patch_at_cut;
         let tfar = self.opts.settle_table_ahead;
         let value_ahead = CHUNK_HDR + self.opts.settle_value_ahead;
-        let in_place = self.opts.settle_patch_in_place;
-        let converts = self.opts.settle_converts;
         let mut placed = 0u64;
         let mut asked = 0u64;
         let mut ahead_asks = [0u64; 2];
@@ -38899,13 +37802,12 @@ impl Reader {
                 }
                 // A sparse form the rest of this block's keys in the batch
                 // take to the dense count is converted before they are
-                // spliced (`Options::settle_converts`): each is then a
+                // spliced: each is then a
                 // patch of the copy, in place where it is an update, and
                 // not an insert into the form's sorted deltas. The writer
                 // waiting for its upkeep leaves the conversion, as it
                 // stops the fill's, and so does a cache at its budget.
-                if converts
-                    && self.fs().convert_dense.get()
+                if self.fs().convert_dense.get()
                     && matches!(
                         table.slots[b].as_deref(),
                         Some(Cached::Sparse(sb)) if sb.ents.len() + (group_end - i) >= CACHE_DENSE
@@ -38932,7 +37834,7 @@ impl Reader {
                         self.fs().tables_complete.set(false);
                     }
                 }
-                if in_place && self.patch_in_place(at, b, table, key, cut, (src, slot)) {
+                if self.patch_in_place(at, b, table, key, cut, (src, slot)) {
                     placed += 1;
                 } else {
                     self.patch_block(at, b, table, key, cut, (src, slot, tombs))?;
@@ -38996,7 +37898,7 @@ impl Reader {
         Ok(())
     }
 
-    /// A put's patch written where it lies (`Options::settle_patch_in_place`):
+    /// A put's patch written where it lies:
     /// whether it was. The copy is block `b`'s and its entries are the
     /// block's records (`CachedBlock::identity_for`), the cut names the
     /// key's own record, the form is this table's alone, and the key's
@@ -39101,8 +38003,8 @@ impl Reader {
     }
 
     /// Block `b`'s sparse form, which the settle's batch takes to the
-    /// dense count, converted to a merged copy from the form itself
-    /// (`Options::settle_converts`), as the fill's conversion makes it and
+    /// dense count, converted to a merged copy from the form itself, as the
+    /// fill's conversion makes it and
     /// counts it. Nothing is withdrawn from the state: the copy holds what
     /// the form held, so the form a state publishes for the block is as
     /// current as it was, to the position it was published at, and the
@@ -39213,7 +38115,7 @@ impl Reader {
         // live table's, the partition has no record of the key at its cut,
         // no piece meets the partition and no table is frozen. Its run is
         // its chain's, as a masked key's is, whether or not a tombstone
-        // ends the chain (`Options::settle_lone_chain`): a plain insert
+        // ends the chain: a plain insert
         // leaves none, and took the general path below to learn that
         // nothing older held it. The live table's writes alone: a write
         // read from a table frozen since names that table's chain, and
@@ -39222,8 +38124,7 @@ impl Reader {
         // held has gone, the sources' walk writes the key no run, and a
         // write settled after this one writes the run again -- so it
         // keeps the walk, which is the one that is right at every step.
-        let lone = self.opts.settle_lone_chain
-            && live_src
+        let lone = live_src
             && slot != u32::MAX
             && !same
             && table.pieces.is_empty()
@@ -39422,12 +38323,9 @@ impl Reader {
                     (c - lo, true)
                 } else {
                     // A key above the copy's last entry goes after it:
-                    // one compare, where the search made ten to say so
-                    // (`Options::settle_append_last`).
+                    // one compare, where the search made ten to say so.
                     let n = blk.len();
-                    let past = self.opts.settle_append_last
-                        && n > 0
-                        && key_cmp(blk.key_i(n - 1), key) == Ordering::Less;
+                    let past = n > 0 && key_cmp(blk.key_i(n - 1), key) == Ordering::Less;
                     if past {
                         debug_assert_eq!(
                             blk.lower_bound(key),
@@ -39635,108 +38533,6 @@ impl Reader {
         Ok(())
     }
 
-    /// Under `forms_pieces_only`: piece `p`'s run over block `b` of
-    /// partition `seg` -- `run_over`, its ranks with their cuts in the
-    /// partition where the piece has them -- folded into the block's
-    /// standing form, which holds the fold of the partition and every
-    /// piece older than `p`. A key the piece holds with a tombstone takes
-    /// the piece's values alone, since the tombstone masks every older
-    /// source; any other key's run is the form's for it, or the
-    /// partition's record where the key is the partition's own and the
-    /// form has none, with the piece's values after. A block with no
-    /// form is a clean block here, which the caller has checked.
-    fn fold_piece_block(
-        &self,
-        at: usize,
-        b: usize,
-        table: &mut BlockTable,
-        seg: &Seg,
-        p: &Seg,
-        run_over: (std::ops::Range<usize>, Option<&[u32]>),
-    ) -> Result<()> {
-        let (ranks, cuts) = run_over;
-        let keys = seg.blob.keys();
-        let lo = b * CACHE_BLOCK;
-        let hi = ((b + 1) * CACHE_BLOCK).min(keys);
-        if self.pieces_willneed() && ranks.start < ranks.end {
-            let n = p
-                .raw()
-                .willneed_ranks(ranks.start, ranks.end - ranks.start, WILLNEED_CAP);
-            self.zbump(|s| &s.zwillneeds);
-            if n > 0 {
-                self.zbump(|s| &s.zwillneedasks);
-            }
-        }
-        if table.slots[b].is_none() {
-            table.slots[b] = Some(std::sync::Arc::new(Cached::Clean));
-        }
-        if self.opts.commit_forms && self.slot.is_none() {
-            table.dirty[b] = true;
-            self.fs().dirty_any.set(true);
-        }
-        let read = |e: std::io::Error| err(&format!("block cache read: {e}"));
-        let mut run_scratch = self.fs().settle_run.borrow_mut();
-        let run: &mut Vec<u8> = &mut run_scratch;
-        for r in ranks {
-            let key = p
-                .raw()
-                .key_at(r)
-                .ok_or_else(|| err("block cache: a piece rank did not resolve"))?;
-            let cut = cuts.map_or(u32::MAX, |v| v[r]);
-            let (c, at_eq) = if cut != u32::MAX {
-                BuildCtx::cut_known(cut, lo, hi)
-            } else {
-                self.cache_cut(seg, lo, hi, key)
-            };
-            let same = c < hi && at_eq == Ordering::Equal;
-            run.clear();
-            let tomb = p.tombs
-                && p.raw()
-                    .exts_at(r)
-                    .is_some_and(|(_, exts)| exts.iter().any(|e| e.is_tombstone()));
-            if !tomb {
-                let had = match table.slots[b].as_deref() {
-                    Some(Cached::Sparse(sb)) => {
-                        let i = sb.ents.partition_point(|e| sb.key(e) < key);
-                        (i < sb.ents.len() && sb.key(&sb.ents[i]) == key).then(|| {
-                            let (o, n) = sb.ents[i].run;
-                            &sb.vals[o as usize..(o + n) as usize]
-                        })
-                    }
-                    Some(Cached::Block(blk)) => {
-                        // No copy is packed under `pieces_only`, the one
-                        // shape that folds a piece into a form.
-                        debug_assert!(blk.fixed.is_none());
-                        let i = blk.lower_bound(key);
-                        (i < blk.ents.len() && blk.key(&blk.ents[i]) == key).then(|| {
-                            let e = &blk.ents[i];
-                            &blk.vals[e[2] as usize..(e[2] + e[3]) as usize]
-                        })
-                    }
-                    _ => None,
-                };
-                match had {
-                    Some(bytes) => run.extend_from_slice(bytes),
-                    None if same => {
-                        self.cache_values(seg, c, &mut |v| {
-                            run.extend_from_slice(&(v.len() as u32).to_le_bytes());
-                            run.extend_from_slice(v);
-                        })?;
-                    }
-                    None => {}
-                }
-            }
-            p.raw()
-                .values_at(r, |v| {
-                    run.extend_from_slice(&(v.len() as u32).to_le_bytes());
-                    run.extend_from_slice(v);
-                })
-                .map_err(read)?;
-            self.splice_run(at, b, table, key, (c, same), run)?;
-        }
-        Ok(())
-    }
-
     /// PROTOTYPE: bookkeeping after a memtable write, when the block cache
     /// is on: a rehash renumbers every slot the snapshot and the lists
     /// hold, a created key joins the list of keys since the snapshot, and
@@ -39879,24 +38675,16 @@ impl Reader {
     /// block by block: a cached copy is walked, a clean block is walked in
     /// the partition, a sparse one with its deltas, and a block not yet
     /// seen is built first.
-    /// With `unsealed` absent the walk goes as far as it can without the
-    /// snapshot and returns `Walk::Resume` at the first block that needs
-    /// it, before emitting anything from that block; `resumed` is the
-    /// same scan going on, which counts nothing twice.
     fn scan_blocks<F: FnMut(&[u8], &[u8])>(
         &self,
         from: &[u8],
         limit: usize,
-        unsealed: Option<&Snapshot>,
-        resumed: bool,
+        unsealed: &Snapshot,
         f: &mut F,
-    ) -> Result<Walk> {
-        let lazy = unsealed.is_none();
+    ) -> Result<usize> {
         let np = self.segs().partition_point(|s| s.level > 0);
         let l0 = &self.segs()[np..];
-        let tick = if resumed {
-            self.fs().scan_tick.get()
-        } else {
+        let tick = {
             let t = self.fs().scan_tick.get().wrapping_add(1);
             self.fs().scan_tick.set(t);
             t
@@ -39918,25 +38706,16 @@ impl Reader {
                 .borrow()
                 .as_ref()
                 .is_none_or(|a| a.gen != gen)
-            && !lazy
             && self.ahead_scanned()
         {
             let t = self.tick_start();
             self.start_ahead();
             self.scan_tick(4, t);
         }
-        match unsealed {
-            Some(unsealed) => {
-                let t = self.tick_start();
-                self.install_ahead(unsealed)?;
-                self.scan_tick(5, t);
-            }
-            // The builder's forms are spliced against the snapshot, so a
-            // scan with forms waiting starts from the snapshot.
-            None if self.ahead_posted() => {
-                return Ok(self.resume_at(0, from));
-            }
-            None => {}
+        {
+            let t = self.tick_start();
+            self.install_ahead(unsealed)?;
+            self.scan_tick(5, t);
         }
         // EXPERIMENT: a reader handle whose watermark is the commit the
         // canonical forms were maintained at walks them and builds
@@ -39949,7 +38728,7 @@ impl Reader {
         // handle says so once per commit -- the count is compared, not
         // read -- so four handles scanning do not bump one line a
         // thousand times a millisecond.
-        if (self.opts.commit_forms || self.opts.snapshot_keeper) && !resumed {
+        if self.opts.commit_forms || self.opts.snapshot_keeper {
             let now = (st.gen, self.mem().committed_log());
             let signal = self.slot.is_none() || self.signalled.replace(now) != now;
             if signal {
@@ -39964,7 +38743,7 @@ impl Reader {
             && self
                 .forms_bound()
                 .is_some_and(|n| st.forms_at.load(AtomicOrdering::Acquire) == n);
-        if self.opts.commit_forms && self.forms_bound().is_some() && !resumed {
+        if self.opts.commit_forms && self.forms_bound().is_some() {
             match self.slot {
                 Some(slot) => {
                     let s = &self.shared.readers.slots[slot];
@@ -40048,7 +38827,7 @@ impl Reader {
             // handle holds it as a copy the copy is walked from the key by
             // its own search, the seek through the form not made. A key
             // whose head ties a sample names no block, and is sought.
-            let hot_on = hot_n > 0 && !lazy && self.zc(seg).is_some();
+            let hot_on = hot_n > 0 && self.zc(seg).is_some();
             let hot_b = if hot_on && scan_start {
                 seg.ord.floor_stride(cursor)
             } else {
@@ -40100,17 +38879,12 @@ impl Reader {
             let mut held = tables[pi].borrow_mut();
             if held.is_none() {
                 // A table is made against the snapshot's bounds.
-                let Some(unsealed) = unsealed else {
-                    return Ok(self.resume_at(seen, cursor));
-                };
                 *held = Some(self.make_table(seg, l0, unsealed)?);
                 self.fs().cache_used.set(true);
             }
             let table = held.as_mut().expect("just made");
-            if let Some(unsealed) = unsealed {
-                if table.snap_gen != self.fs().snap_gen.get() {
-                    table.resnap(seg, unsealed, self.fs().snap_gen.get());
-                }
+            if table.snap_gen != self.fs().snap_gen.get() {
+                table.resnap(seg, unsealed, self.fs().snap_gen.get());
             }
             // The start counted against its block, and the scan hot from
             // the `promote_starts`-th on: the block the samples named, or
@@ -40168,7 +38942,7 @@ impl Reader {
                 && self.opts.promote_entries > 0
                 && self.zc(seg).is_some())
                 || (hot_on && (hot || hot_copy));
-            if unsealed.is_some() && table.clean_throughout() && !canonical && !promote_copies {
+            if table.clean_throughout() && !canonical && !promote_copies {
                 // The suite's scan workload, and any store between a flush
                 // and its next write: one walk from the seek, as the bulk
                 // walk makes it. Measured through the blocks it was a
@@ -40240,35 +39014,6 @@ impl Reader {
                         None if complete => Some(&Cached::Clean),
                         None => None,
                     };
-                // A block to build, or one held wide, reads the
-                // snapshot: without one the walk stops here, before this
-                // block emits anything, and goes on from the block's
-                // first key -- the scan's own start for its first block,
-                // the partition's record at the block's first rank for
-                // any after, since every key a block holds is at or
-                // above that record and every key before it belongs to
-                // a block already walked.
-                let wants_snapshot = ctx.pieces_only
-                    || (canon.is_none()
-                        && matches!(table.slots[b].as_deref(), None | Some(Cached::Wide(_))));
-                let unsealed = match unsealed {
-                    Some(u) => u,
-                    None if wants_snapshot => {
-                        self.count_takes(takes);
-                        let mut kbuf = Vec::new();
-                        let from: &[u8] = if first {
-                            cursor
-                        } else if self.cache_key_at(seg, lo, &mut kbuf) {
-                            &kbuf
-                        } else {
-                            return Err(err("block scan: a block's first rank did not resolve"));
-                        };
-                        return Ok(self.resume_at(seen, from));
-                    }
-                    // Nothing below reads it for a block held as another
-                    // form; the empty one stands in.
-                    None => &NO_SNAPSHOT,
-                };
                 if canon.is_none() && table.slots[b].is_none() {
                     self.build_slot(&ctx, src, None, table, pi, b, unsealed)?;
                 }
@@ -40437,14 +39182,6 @@ impl Reader {
                 // take several, and the promotion after the walk credits
                 // each with what the run took from it.
                 let run_b0 = b;
-                // Under `pieces_only` the memtables' keys over this block,
-                // from the scan's cursor on, slipped into whatever form
-                // the block holds; none, and the form is walked alone.
-                let mem_ov: Option<Overlay> = if ctx.pieces_only {
-                    ctx.overlay_mem_window(src, table, b, unsealed, (from_key, limit - seen))?
-                } else {
-                    None
-                };
                 // The entry a copy's walk starts at, where the walk takes
                 // it by rank: this block's start less its first rank.
                 let copy_at =
@@ -40501,31 +39238,14 @@ impl Reader {
                 }
                 match form {
                     Cached::Sparse(deltas) => {
-                        seen += match &mem_ov {
-                            Some(ov) => ctx.walk_deltas_over(
-                                src,
-                                pr,
-                                start..hi,
-                                deltas,
-                                ov,
-                                (from_key, limit - seen),
-                                &mut *f,
-                            )?,
-                            None => ctx.walk_deltas(
-                                pr,
-                                start..hi,
-                                deltas,
-                                from_key,
-                                limit - seen,
-                                &mut *f,
-                            )?,
-                        };
-                    }
-                    Cached::Clean if mem_ov.is_some() => {
-                        let ov = mem_ov.as_ref().expect("checked");
-                        seen += ctx
-                            .walk_block(src, pr, start..hi, ov, limit - seen, |_k| {}, &mut *f)?
-                            .0;
+                        seen += ctx.walk_deltas(
+                            pr,
+                            start..hi,
+                            deltas,
+                            from_key,
+                            limit - seen,
+                            &mut *f,
+                        )?;
                     }
                     Cached::Clean => {
                         // Every clean block built after this one joins the
@@ -40534,27 +39254,17 @@ impl Reader {
                         // makes it, not three block-sized ones.
                         let mut run_hi = hi;
                         let clean_at = |table: &BlockTable, b: usize| {
-                            // Under `pieces_only` a block over memtable keys
-                            // is walked with them, so the run stops before
-                            // it; the bounds were taken for this block.
-                            (!ctx.pieces_only
-                                || !BuildCtx::mem_over(
-                                    &table.snap_at,
-                                    &table.fsnap_at,
-                                    &table.added,
-                                    b,
-                                ))
-                                && if canonical && complete {
-                                    st.forms[pi][b].load(AtomicOrdering::Acquire).is_null()
-                                } else {
-                                    // With the canonical table incomplete a
-                                    // null form says nothing, and the block
-                                    // is this handle's slot's, as the walk
-                                    // above takes it.
-                                    (!canonical
-                                        || st.forms[pi][b].load(AtomicOrdering::Acquire).is_null())
-                                        && matches!(table.slots[b].as_deref(), Some(Cached::Clean))
-                                }
+                            if canonical && complete {
+                                st.forms[pi][b].load(AtomicOrdering::Acquire).is_null()
+                            } else {
+                                // With the canonical table incomplete a
+                                // null form says nothing, and the block
+                                // is this handle's slot's, as the walk
+                                // above takes it.
+                                (!canonical
+                                    || st.forms[pi][b].load(AtomicOrdering::Acquire).is_null())
+                                    && matches!(table.slots[b].as_deref(), Some(Cached::Clean))
+                            }
                         };
                         // A block the run reaches with no form yet is built
                         // here, as the walk would build it at its next turn,
@@ -40567,8 +39277,6 @@ impl Reader {
                         while b + 1 < nblocks && run_hi - start < limit - seen {
                             let next = b + 1;
                             if self.opts.scan_run_builds
-                                && !lazy
-                                && !ctx.pieces_only
                                 && table.slots[next].is_none()
                                 && !(canonical && complete)
                                 && (!canonical
@@ -40600,11 +39308,6 @@ impl Reader {
                                 self.cache_scan(seg, start, want, &mut *f)?
                             };
                         }
-                    }
-                    Cached::Block(blk) if mem_ov.is_some() => {
-                        let ov = mem_ov.as_ref().expect("checked");
-                        seen +=
-                            ctx.walk_copy_over(src, blk, ov, from_key, limit - seen, &mut *f)?;
                     }
                     Cached::Block(blk) => {
                         // The seek's rank is the entry when the copy's
@@ -40721,7 +39424,7 @@ impl Reader {
                 // a block walked as a copy has nothing to promote.
                 // A copy is built from the snapshot; a walk without one
                 // leaves the promotion to the next.
-                if promote > 0 && !lazy && !(in_slot && walked_kind == 0) {
+                if promote > 0 && !(in_slot && walked_kind == 0) {
                     // The blocks this turn walked -- one, or the clean run's
                     // several -- each credited with the keys the walk took
                     // from it, and each judged on its own ranks: a run's
@@ -40811,7 +39514,7 @@ impl Reader {
                 None => break,
             }
         }
-        Ok(Walk::Done(seen))
+        Ok(seen)
     }
 
     /// PROTOTYPE: the cache's blocks by kind, for a measurement: clean,
@@ -41435,7 +40138,6 @@ impl Reader {
             + fs.settle_run.borrow().capacity()
             + fs.settle_offs.borrow().capacity() * 8
             + fs.emit_offs.borrow().capacity() * 8
-            + fs.resume_key.borrow().capacity()
             + fs.start_cache.borrow().bytes()
             + fs.pending_frozen
                 .borrow()
@@ -47555,7 +46257,6 @@ impl Db {
         } else {
             None
         };
-        let frozen_snaps = self.opts.frozen_snaps;
         // Reads around the table being sealed, by the writes of the
         // tables sealed since the store's scan count last moved: a seal
         // far from every scan builds no copy for scans that are not
@@ -47614,7 +46315,7 @@ impl Db {
                     whole,
                     "a frozen table's snapshot holds every entry of it once"
                 );
-                frozen_snaps && whole
+                whole
             });
             let order: blocks::BigVec<u32> = match &have {
                 Some(h) => {
@@ -47675,9 +46376,7 @@ impl Db {
                             built.bounds = h.bounds.clone();
                         }
                         let built = std::sync::Arc::new(built);
-                        if !frozen_snaps {
-                            built
-                        } else if mem.snaps.copied.set(built.clone()) {
+                        if mem.snaps.copied.set(built.clone()) {
                             shared.snap_on_table.fetch_add(1, AtomicOrdering::Release);
                             built
                         } else {
@@ -48510,7 +47209,6 @@ impl Db {
         let from = self.kept_from(&fresh);
         let complete = self.fs().tables_complete.get();
         let carried = std::cell::Cell::new(false);
-        let pieces_only = self.opts.forms_pieces_only;
         let by_capacity = self.opts.counts_capacity();
         self.close_shared(table);
         let Some(old) = self.try_publish_writer(|cur| {
@@ -48521,7 +47219,7 @@ impl Db {
             carried.set(carry);
             let mut next = Db::frozen_over(cur, &fresh, from);
             if carry {
-                cur.carry_published(&mut next, pieces_only, by_capacity, Some(0));
+                cur.carry_published(&mut next, by_capacity, Some(0));
                 next.forms_at = AtomicUsize::new(0);
                 next.forms_complete = std::sync::atomic::AtomicBool::new(complete);
             }
@@ -48976,7 +47674,6 @@ impl Db {
     /// direct run's start, whose log starts where the empty one's ended.
     fn set_mem_with(&mut self, mem: std::sync::Arc<MemTable>, carry: bool) {
         let from = self.kept_from(&mem);
-        let pieces_only = self.opts.forms_pieces_only;
         let by_capacity = self.opts.counts_capacity();
         let old = self.publish_writer(|cur| {
             let mut next = State {
@@ -49005,7 +47702,7 @@ impl Db {
                 layout: cur.layout.clone(),
             };
             if carry {
-                cur.carry_published(&mut next, pieces_only, by_capacity, None);
+                cur.carry_published(&mut next, by_capacity, None);
                 next.forms_at = AtomicUsize::new(cur.forms_at.load(AtomicOrdering::Acquire));
                 next.forms_complete = std::sync::atomic::AtomicBool::new(
                     cur.forms_complete.load(AtomicOrdering::Acquire),
@@ -49097,7 +47794,7 @@ impl Db {
     }
 
     /// Scan snapshots kept across a publish that left their memtables, by
-    /// a look with no tables to carry (`Options::snapshot_stands`).
+    /// a look with no tables to carry (`Reader::snapshot_stands`).
     pub fn snapshots_stood(&self) -> u64 {
         self.shared.snap_stood.load(AtomicOrdering::Relaxed)
     }
@@ -49119,8 +47816,8 @@ impl Db {
         self.shared.snap_extends.load(AtomicOrdering::Relaxed)
     }
 
-    /// Snapshot builds that took the lean path
-    /// (`Options::snapshot_build_lean`), of `snapshot_builds`.
+    /// Snapshot builds that took the lean path, every build that copies
+    /// no runs, of `snapshot_builds`.
     pub fn snapshot_lean_builds(&self) -> u64 {
         self.shared.snap_lean_builds.load(AtomicOrdering::Relaxed)
     }
@@ -49327,8 +48024,8 @@ impl Db {
     }
 
     /// The writer's own writes a settle filed with their cut unresolved,
-    /// and the filed cuts its builds resolved by a seek
-    /// (`Options::zpages_settle_span`); under `Options::zpages_block_cursor`
+    /// and the filed cuts its builds resolved by a seek; under
+    /// `Options::zpages_block_cursor`
     /// a build over a covered partition resolves them where its walk stops
     /// and counts none here.
     pub fn lazy_cuts(&self) -> [u64; 2] {
@@ -49337,9 +48034,8 @@ impl Db {
     }
 
     /// The writer's own settles' patches that took a key's run from its
-    /// chain alone (`Options::settle_lone_chain`) and that appended a key
-    /// past a copy's last entry without a search
-    /// (`Options::settle_append_last`).
+    /// chain alone and that appended a key past a copy's last entry
+    /// without a search.
     #[doc(hidden)]
     pub fn settle_short(&self) -> [u64; 2] {
         self.take_back_upkeep();
@@ -51687,7 +50383,7 @@ impl Db {
             zfile::build(&self.dir.join(&seg.name), &out, id, end, &{
                 let mut plan =
                     zfile::BuildPlan::new(self.opts.zpages_min_bytes, self.opts.zpages_drop_behind);
-                plan.ahead = self.opts.zpages_build_ahead;
+                plan.ahead = ZBUILD_AHEAD;
                 plan.group_bytes = zpages::ZGROUP_BYTES;
                 plan.coding = self.opts.z_coding();
                 plan.raw_tails = self.opts.zpages_raw_tails;
@@ -52929,13 +51625,7 @@ impl Reader {
                 self.shared
                     .snap_extends
                     .fetch_add(1, AtomicOrdering::Relaxed);
-                std::sync::Arc::new(s.extend(
-                    mem,
-                    len,
-                    self.opts.snapshot_runs,
-                    self.opts.snapshot_extend_unfolded,
-                    self.opts.snapshot_build_lean,
-                ))
+                std::sync::Arc::new(s.extend(mem, len, self.opts.snapshot_runs))
             }
             None => std::sync::Arc::new(self.build_snapshot(len)),
         };
@@ -53013,26 +51703,22 @@ impl Reader {
             let mut bases = s.bases.clone();
             // The table's own snapshot, where its seal or a scan set one
             // first: the same keys in the same order, made already.
-            let own = match live.snaps.best().filter(|_| self.opts.frozen_snaps) {
+            let own = match live.snaps.best() {
                 Some(have) => have,
                 None => {
                     let own = self.own_snapshot(s, live);
-                    if !self.opts.frozen_snaps {
+                    // Offered to the table, which is final now, for the
+                    // seal and every reader after: with every chain, as
+                    // the seal's own copy is, or as an order alone.
+                    let cell = if own.runs && own.ents.iter().all(|e| e.frun != NO_RUN) {
+                        &live.snaps.copied
+                    } else {
+                        &live.snaps.sorted
+                    };
+                    if cell.set(own.clone()) {
                         own
                     } else {
-                        // Offered to the table, which is final now, for the
-                        // seal and every reader after: with every chain, as
-                        // the seal's own copy is, or as an order alone.
-                        let cell = if own.runs && own.ents.iter().all(|e| e.frun != NO_RUN) {
-                            &live.snaps.copied
-                        } else {
-                            &live.snaps.sorted
-                        };
-                        if cell.set(own.clone()) {
-                            own
-                        } else {
-                            live.snaps.best().expect("set by whoever won")
-                        }
+                        live.snaps.best().expect("set by whoever won")
                     }
                 }
             };
@@ -53054,13 +51740,7 @@ impl Reader {
             self.shared
                 .snap_extends
                 .fetch_add(1, AtomicOrdering::Relaxed);
-            std::sync::Arc::new(s.extend(
-                live,
-                live.len(),
-                s.runs,
-                self.opts.snapshot_extend_unfolded,
-                self.opts.snapshot_build_lean,
-            ))
+            std::sync::Arc::new(s.extend(live, live.len(), s.runs))
         } else {
             s
         };
@@ -54826,10 +53506,9 @@ impl Db {
         self.shared.forms_cloned.load(AtomicOrdering::Relaxed)
     }
 
-    /// Patches the settle has written in place over a copy's own run
-    /// (`Options::settle_patch_in_place`) and sparse forms it has
-    /// converted to copies where it grew them dense
-    /// (`Options::settle_converts`), over the store's life.
+    /// Patches the settle has written in place over a copy's own run and
+    /// sparse forms it has converted to copies where it grew them dense,
+    /// over the store's life.
     #[doc(hidden)]
     pub fn settle_lean(&self) -> (u64, u64) {
         (
@@ -54838,8 +53517,8 @@ impl Db {
         )
     }
 
-    /// Writes the settles have read from their batches' gathered records
-    /// (`Options::settle_gathers`), over the store's life.
+    /// Writes the settles have read from their batches' gathered records,
+    /// over the store's life.
     #[doc(hidden)]
     pub fn settle_gathered(&self) -> u64 {
         self.shared.settle_gathered.load(AtomicOrdering::Relaxed)
@@ -55467,9 +54146,6 @@ struct BuildCtx<'s> {
     wide_copy: bool,
     /// See `Options::forms_to_fit`.
     fit: bool,
-    /// `Options::forms_pieces_only`: the forms hold the pieces' fold alone
-    /// and the walk overlays the snapshot.
-    pieces_only: bool,
     /// See `Options::piece_ranks_by_heads`.
     ranks_by_heads: bool,
     /// See `Options::piece_ranks_whole`.
@@ -55478,11 +54154,9 @@ struct BuildCtx<'s> {
 
 impl<'s> BuildCtx<'s> {
     /// Whether a copy this context builds is one stream of fixed-size
-    /// records where its entries allow it (`Options::copy_packed`). Not
-    /// under `pieces_only`, whose forms take a landed piece's runs folded
-    /// in, which reads the three buffers.
+    /// records where its entries allow it (`Options::copy_packed`).
     fn packs(&self) -> bool {
-        self.rd.opts.copy_packed && !self.pieces_only
+        self.rd.opts.copy_packed
     }
     /// A copy as its build finished it, counted where it came out packed.
     fn built(&self, build: CopyBuild) -> CachedBlock {
@@ -56235,7 +54909,7 @@ impl<'s> BuildCtx<'s> {
     /// PROTOTYPE: every key above the partition in block `b`, from the
     /// table's bounds; nothing is seeked.
     /// Block `b`'s filed keys with every cut a settle left unresolved
-    /// resolved (`Options::zpages_settle_span`): through the same exact
+    /// resolved: through the same exact
     /// resolve the settle would have made, for this block alone, where
     /// the build reads its groups anyway. The list as it is where it holds
     /// none.
@@ -56293,12 +54967,8 @@ impl<'s> BuildCtx<'s> {
                 None => None,
             };
         }
-        let mem = if self.pieces_only {
-            Vec::new()
-        } else {
-            let filed = self.filed_cuts(src, b, &table.added[b]);
-            self.overlay_mem(unsealed, snap, cuts, &frozen, &filed, false, usize::MAX)?
-        };
+        let filed = self.filed_cuts(src, b, &table.added[b]);
+        let mem = self.overlay_mem(unsealed, snap, cuts, &frozen, &filed, false, usize::MAX)?;
         let pieces: Vec<PieceRun<'_>> = table
             .pieces
             .iter()
@@ -56312,42 +54982,6 @@ impl<'s> BuildCtx<'s> {
             })
             .collect();
         self.overlay_runs(src, mem, &pieces, unsealed, usize::MAX)
-    }
-    /// PROTOTYPE: a floor under how many keys above the partition block
-    /// `b` has, from the table's bounds alone: its largest source's run
-    /// over it. Summing the runs was tried first, and a key updated in
-    /// every seal is in every piece, so the sum counted it once per
-    /// piece: with seven pieces over a range it called every hot block
-    /// wide, and a wide block's walk merges every source for every scan
-    /// through it. Any one source holds distinct keys, so its run is a
-    /// floor; a block can hold more than the floor, spread thin across
-    /// its sources, and the merge at `l0_trigger` bounds how thin.
-    /// `overlay_count` over the pieces alone: what a form holds under
-    /// `pieces_only`, the memtables' keys being the snapshot's.
-    fn piece_count(table: &BlockTable, b: usize) -> usize {
-        table
-            .pieces
-            .iter()
-            .map(|(_, at)| (at[b + 1] - at[b]) as usize)
-            .max()
-            .unwrap_or(0)
-    }
-    /// Whether any memtable key -- the snapshot's, a base's, or one filed
-    /// since -- falls in block `b`, from bounds the table has taken; a
-    /// table without them has none to answer for. The table's three
-    /// fields rather than the table, so a caller holding another field
-    /// mutably can ask.
-    fn mem_over(
-        snap_at: &std::cell::OnceCell<std::sync::Arc<SnapBounds>>,
-        fsnap_at: &[std::cell::OnceCell<std::sync::Arc<SnapBounds>>],
-        added: &[Vec<(u32, u32)>],
-        b: usize,
-    ) -> bool {
-        snap_at.get().is_some_and(|sb| sb.at[b + 1] > sb.at[b])
-            || fsnap_at
-                .iter()
-                .any(|f| f.get().is_some_and(|sb| sb.at[b + 1] > sb.at[b]))
-            || !added[b].is_empty()
     }
     /// Every source's run over block `b`, summed: the entries a copy's
     /// merge reads (`Reader::wide_copy_pays`).
@@ -56368,6 +55002,15 @@ impl<'s> BuildCtx<'s> {
             .sum();
         snap + frozen + table.added[b].len() + pieces
     }
+    /// PROTOTYPE: a floor under how many keys above the partition block
+    /// `b` has, from the table's bounds alone: its largest source's run
+    /// over it. Summing the runs was tried first, and a key updated in
+    /// every seal is in every piece, so the sum counted it once per
+    /// piece: with seven pieces over a range it called every hot block
+    /// wide, and a wide block's walk merges every source for every scan
+    /// through it. Any one source holds distinct keys, so its run is a
+    /// floor; a block can hold more than the floor, spread thin across
+    /// its sources, and the merge at `l0_trigger` bounds how thin.
     fn overlay_count(table: &BlockTable, b: usize) -> usize {
         // A table without its bounds has built nothing, and the one
         // caller that asks before a build unlists, which on an unbuilt
@@ -56768,20 +55411,6 @@ impl<'s> BuildCtx<'s> {
         if over == 0 && floor == 0 && table.added.get(b).is_none_or(|l| l.is_empty()) {
             return Ok(Cached::Clean);
         }
-        // Under `pieces_only` the form is the pieces' fold whatever the
-        // memtables hold over the block, and a block dense with piece
-        // keys is a copy, since the wide form's walk assembles the
-        // window from every source, which is the fold the form is for.
-        if self.pieces_only {
-            let ov = self.overlay_all(src, table, b, unsealed)?;
-            if ov.over.is_empty() {
-                return Ok(Cached::Clean);
-            }
-            if ov.over.len() < self.dense_from {
-                return Ok(Cached::Sparse(self.deltas_for(src, pr, lo..hi, &ov)?));
-            }
-            return Ok(Cached::Block(self.copy_block(src, pr, lo..hi, &ov)?));
-        }
         if (floor > WIDE && !self.wide_copy) || covered {
             return Ok(Cached::Wide(WideBlock {
                 sorted: self.sorted_filed(&table.added[b]),
@@ -56901,273 +55530,6 @@ impl<'s> BuildCtx<'s> {
             }
         }
         lo..s1.min(lo.saturating_add(limit))
-    }
-    /// Under `pieces_only`: the memtables' keys over block `b` from the
-    /// cursor on, as an overlay with no piece in it -- the snapshot's
-    /// run, each base's and the keys filed since -- or none when no
-    /// memtable key falls in the block. The table's bounds are taken
-    /// here if they were not, so `mem_over` can answer for the blocks
-    /// after it.
-    fn overlay_mem_window<'a>(
-        &'a self,
-        src: Sources<'a>,
-        table: &BlockTable,
-        b: usize,
-        unsealed: &'a Snapshot,
-        window: (&[u8], usize),
-    ) -> Result<Option<Overlay<'a>>> {
-        let (cursor, limit) = window;
-        let sb = table.snap_at(self.rd, src.seg, unsealed)?;
-        let mut any = sb.at[b + 1] > sb.at[b] || !table.added[b].is_empty();
-        let mut frozen: FrozenRuns<'_> = Default::default();
-        for (i, (f, base)) in frozen.iter_mut().zip(&unsealed.bases).enumerate() {
-            *f = match table.fsnap_at(self.rd, i, src.seg, unsealed)? {
-                Some(fb) => {
-                    any |= fb.at[b + 1] > fb.at[b];
-                    Some((
-                        BuildCtx::window_of(
-                            base,
-                            fb.at[b] as usize,
-                            fb.at[b + 1] as usize,
-                            cursor,
-                            limit,
-                        ),
-                        fb.cuts_of(self.rd, b, src.seg, base)?,
-                    ))
-                }
-                None => None,
-            };
-        }
-        if !any {
-            return Ok(None);
-        }
-        let cuts = sb.cuts_of(self.rd, b, src.seg, unsealed)?;
-        let snap = BuildCtx::window_of(
-            unsealed,
-            sb.at[b] as usize,
-            sb.at[b + 1] as usize,
-            cursor,
-            limit,
-        );
-        let key_of = |slot: u32| self.mem.key_of(self.mem.entry(slot as usize));
-        let filed: Vec<(u32, u32)> = self
-            .filed_cuts(src, b, &table.added[b])
-            .iter()
-            .copied()
-            .filter(|&(i, _)| cursor.is_empty() || key_of(i) >= cursor)
-            .collect();
-        let over = self.overlay_mem(unsealed, snap, cuts, &frozen, &filed, false, usize::MAX)?;
-        if over.is_empty() {
-            return Ok(None);
-        }
-        let ov = Overlay {
-            over,
-            held: Vec::new(),
-            snap: unsealed,
-            stale: &self.stale,
-        };
-        // The chains the walk will read, fetched ahead as a build's are:
-        // after a burst every overlaid key is written since the runs were
-        // copied and read from its chain, two dependent misses a key.
-        self.prefetch_overlay(&ov);
-        Ok(Some(ov))
-    }
-    /// A key the form and the memtables both hold, emitted: the form's run
-    /// -- the partition's values and the pieces', oldest first -- unless a
-    /// memtable tombstone masks every source older than it, then the
-    /// memtables' values through `emit_over`, which reads the pieces and
-    /// the partition for nothing since the overlay names none.
-    fn emit_both<F: FnMut(&[u8], &[u8])>(
-        &self,
-        f: &mut F,
-        em: &mut Emit,
-        ov: &Overlay,
-        oi: usize,
-        src: Sources,
-        run: impl FnOnce(&mut F),
-    ) -> Result<()> {
-        let start = self.oldest_live(em, ov, &ov.over[oi], &[], src);
-        if start == 0 {
-            run(f);
-        }
-        self.emit_over(f, em, ov, oi, None, src)
-    }
-    /// `walk_deltas` with the memtables' keys over the block slipped in
-    /// beside the form's: two key-ordered lists over one walk of the
-    /// partition, each key emitted at its cut, a key in both emitted once
-    /// through `emit_both`.
-    #[allow(clippy::too_many_arguments)]
-    fn walk_deltas_over<F: FnMut(&[u8], &[u8])>(
-        &self,
-        src: Sources,
-        pr: &mut PartReader<'_>,
-        ranks: std::ops::Range<usize>,
-        blk: &SparseBlock,
-        ov: &Overlay,
-        window: (&[u8], usize),
-        mut f: F,
-    ) -> Result<usize> {
-        let (cursor, limit) = window;
-        let hi = ranks.end;
-        let mut seen = 0usize;
-        let mut rank = ranks.start;
-        let mut di = if cursor.is_empty() {
-            0
-        } else {
-            select_lower_bound(blk.ents.len(), |i| blk.key(&blk.ents[i]) < cursor)
-        };
-        let mut oi = 0usize;
-        let mut em = Emit {
-            tombs: self.tombs,
-            scratch: self.take_offs(),
-        };
-        while seen < limit {
-            let d = blk.ents.get(di);
-            let o = ov.over.get(oi);
-            if d.is_none() && o.is_none() {
-                break;
-            }
-            let end = rank.saturating_add(limit - seen).min(hi);
-            // The memtable key first where it is not above the form's: two
-            // keys' cuts order as the keys do, and equal keys emit once. The
-            // shape before ordered the two by cut, which sought the overlay
-            // key's cut at every turn before it was taken.
-            let take_over = match (d, o) {
-                (Some(e), Some(o)) => o.key <= blk.key(e),
-                (None, Some(_)) => true,
-                _ => false,
-            };
-            // The run below the key taken, and the key's cut: the form's
-            // deltas carry theirs; an overlay key's is known, or found where
-            // the walk stops at it.
-            let (to, oat) = if take_over {
-                let o = o.expect("taken");
-                if o.cut != u32::MAX {
-                    let (c, at) = BuildCtx::cut_known(o.cut, rank, end);
-                    if c > rank {
-                        pr.scan(rank, c - rank, &mut f)?;
-                    }
-                    (c, at)
-                } else {
-                    pr.scan_until(rank, end, o.key, &mut f)?
-                }
-            } else {
-                let e = d.expect("taken");
-                let c = (e.cut as usize).clamp(rank, end);
-                if c > rank {
-                    pr.scan(rank, c - rank, &mut f)?;
-                }
-                (c, Ordering::Greater)
-            };
-            if to > rank {
-                seen += to - rank;
-                rank = to;
-                if seen >= limit {
-                    // The limit fell before the cut.
-                    break;
-                }
-            }
-            if take_over {
-                let o = o.expect("taken");
-                match d.filter(|e| blk.key(e) == o.key) {
-                    Some(e) => {
-                        self.emit_both(&mut f, &mut em, ov, oi, src, |f| {
-                            blk.each_value(e, |v| f(o.key, v))
-                        })?;
-                        di += 1;
-                        if e.same {
-                            rank += 1;
-                        }
-                    }
-                    None => {
-                        let same = rank < hi && oat == Ordering::Equal;
-                        self.emit_over(
-                            &mut f,
-                            &mut em,
-                            ov,
-                            oi,
-                            same.then_some((rank, &mut *pr)),
-                            src,
-                        )?;
-                        if same {
-                            rank += 1;
-                        }
-                    }
-                }
-                oi += 1;
-            } else {
-                let e = d.expect("taken");
-                let k = blk.key(e);
-                blk.each_value(e, |v| f(k, v));
-                di += 1;
-                if e.same {
-                    rank += 1;
-                }
-            }
-            seen += 1;
-        }
-        if seen < limit && rank < hi {
-            let want = (hi - rank).min(limit - seen);
-            seen += pr.scan(rank, want, &mut f)?;
-        }
-        self.give_offs(em.scratch);
-        Ok(seen)
-    }
-    /// A copy walked with the memtables' keys over the block slipped in:
-    /// the copy holds every key of the block the partition and the
-    /// pieces have, so the two lists merge by key, a key in both emitted
-    /// once through `emit_both` and a key in the overlay alone from the
-    /// memtables.
-    fn walk_copy_over<F: FnMut(&[u8], &[u8])>(
-        &self,
-        src: Sources,
-        blk: &CachedBlock,
-        ov: &Overlay,
-        cursor: &[u8],
-        limit: usize,
-        mut f: F,
-    ) -> Result<usize> {
-        let mut i = if cursor.is_empty() {
-            0
-        } else {
-            blk.lower_bound(cursor)
-        };
-        let mut oi = 0usize;
-        let mut seen = 0usize;
-        let mut em = Emit {
-            tombs: self.tombs,
-            scratch: self.take_offs(),
-        };
-        let n = blk.len();
-        while seen < limit {
-            let order = match (i < n, ov.over.get(oi)) {
-                (false, None) => break,
-                (true, None) => Ordering::Less,
-                (false, Some(_)) => Ordering::Greater,
-                (true, Some(o)) => blk.key_i(i).cmp(o.key),
-            };
-            match order {
-                Ordering::Less => {
-                    let k = blk.key_i(i);
-                    blk.values_i(i, |v| f(k, v));
-                    i += 1;
-                }
-                Ordering::Greater => {
-                    self.emit_over(&mut f, &mut em, ov, oi, None, src)?;
-                    oi += 1;
-                }
-                Ordering::Equal => {
-                    self.emit_both(&mut f, &mut em, ov, oi, src, |f| {
-                        blk.values_i(i, |v| f(blk.key_i(i), v))
-                    })?;
-                    i += 1;
-                    oi += 1;
-                }
-            }
-            seen += 1;
-        }
-        self.give_offs(em.scratch);
-        Ok(seen)
     }
     /// PROTOTYPE: the walk over ranks `from..hi` with the block's resolved
     /// keys slipped in at their cuts; only keys not below `cursor` are
@@ -58244,8 +56606,7 @@ const HOT_RAW_RESIDENT: f64 = 0.9;
 /// the form file asked for ahead of the way back.
 const HOT_ASKED_RAW: u8 = 1;
 const HOT_ASKED_FILE: u8 = 2;
-/// A settle's wait for the form files the store asked the kernel for
-/// (`Options::zpages_settle_joins_asks`): how often it looks at their
+/// A settle's wait for the form files the store asked the kernel for: how often it looks at their
 /// residency, how many looks in a row with no page more end it once it has
 /// no ask left to make again, and the longest it waits whatever the looks
 /// find.
@@ -58256,27 +56617,26 @@ const ASK_JOIN_STALLS: u32 = 10;
 const ASK_JOIN_REASK_AT: u32 = 2;
 const ASK_JOIN_REASKS: u32 = 3;
 const ASK_JOIN_CAP: std::time::Duration = std::time::Duration::from_secs(20);
-/// How long a stretch without a scan was before the scans after it had the
-/// cold form files asked for (`Options::zpages_rewarm_scans`), before it
-/// was `Options::zpages_rewarm_quiet_ms`: the shape `supdb-zrewarmwait`
-/// keeps.
-pub const REWARM_QUIET_BEFORE_MS: u32 = 1000;
+/// The stretch without a scan after which the scans that come back have
+/// the cold form files asked for (`Maint::z_rewarm_look`): a quarter of a
+/// second. It was a second, and the ten-percent burst at ten million keys
+/// under a gibibyte lasts 1.0-1.1 s, so the pass after it found the second
+/// passed or not by a few milliseconds and the rewarm fired there in two
+/// reps of eight; a pass's scans and a mix's scans come microseconds apart,
+/// so a quarter of a second is a stretch with no reader all the same.
+const REWARM_QUIET: std::time::Duration = std::time::Duration::from_millis(250);
 const HOT_RAW_ASK_WAIT: std::time::Duration = std::time::Duration::from_secs(2);
 /// How long after a served partition's drop its ordered index is dropped
 /// again (`Options::zpages_drop_again`): time for the writeback the first
 /// advice started to end, a few megabytes a file.
 const REDROP_AFTER: std::time::Duration = std::time::Duration::from_secs(1);
-/// The share of a form file's pages under which an install's rewarm asks for
-/// it (`Options::zpages_rewarm_at_install`): short of whole, since a pass of
-/// point reads over a form touches every page of it.
-const INSTALL_REWARM_RESIDENT: f64 = 0.995;
 const HOT_RAW_HOLD: std::time::Duration = std::time::Duration::from_secs(10);
 
 /// The share of a partition's records the page cache must hold for a build
 /// ahead at landing to take it (`Options::zpages_land_pct`): the build
 /// reads them back, and one that reads them all from the device beside the
 /// readers' faults is the build after the load the builds ahead were
-/// refuted as (`Options::zpages_prebuild`), so it reads at most half from
+/// refuted as, so it reads at most half from
 /// there. Nine tenths left four partitions of nineteen to the controller at
 /// five million keys under 640 MiB, read under the bar while the load's
 /// eviction front passed them, and the controller built them after its buy
@@ -58598,7 +56958,7 @@ struct Maint {
     z_scan_len: f64,
     /// Whether the store's raw populations were past its budget at the
     /// model's last reading or, under the builds at landing, the last tick
-    /// (`Options::zpages_prebuild`, `Options::zpages_land_drop_past`), and
+    /// (`Maint::z_cross`), and
     /// past the percent of it the builds at landing start at at the last
     /// tick (`Options::zpages_land_pct`, `z_land_look`).
     z_past_budget: bool,
@@ -58607,7 +56967,7 @@ struct Maint {
     /// reach the selector's line to enter (`zselect::ZSelect::theta_enter`)
     /// under the builds at landing: the bet on the form is the
     /// controller's to win from there, and the builds ahead stop sparing
-    /// the raw form's cache (`Options::zpages_land_drop_past`).
+    /// the raw form's cache.
     z_land_past: bool,
     /// Whether the raw prediction stood at the selector's line to suspect
     /// at the last look (`Options::zpages_suspect_at_crossing`), so that the
@@ -58620,7 +56980,7 @@ struct Maint {
     /// built ahead under it (`Maint::z_cross`): once a store.
     z_crossed: bool,
     /// The store has asked the kernel for form files since a settle last
-    /// waited for them (`Options::zpages_settle_joins_asks`).
+    /// waited for them.
     z_ask_pending: bool,
     /// The coding each build ahead wrote, by its form file's name, whether
     /// raw-tailed: a build ahead at landing comes before the sampler's
@@ -58718,14 +57078,11 @@ struct Maint {
     /// file on disk for the residency of its pages.
     z_hot_back_ask: Option<(Vec<u8>, std::time::Duration, MmapBytes)>,
     z_hot_hold: Option<std::time::Duration>,
-    /// The scans counted at the last look of `Options::zpages_rewarm_scans`,
+    /// The scans counted at the rewarm's last look (`z_rewarm_look`),
     /// since when none has come, and the thread asking for the form files.
     z_rewarm_life: u64,
     z_rewarm_quiet: Option<std::time::Duration>,
     z_rewarm_due: bool,
-    /// The rewarm due is an install's (`Options::zpages_rewarm_at_install`),
-    /// which asks for every form file short of whole.
-    z_rewarm_whole: bool,
     z_rewarm: Option<std::thread::JoinHandle<()>>,
 }
 
@@ -59517,7 +57874,6 @@ impl Maint {
             z_rewarm_life: 0,
             z_rewarm_quiet: None,
             z_rewarm_due: false,
-            z_rewarm_whole: false,
             z_rewarm: None,
         }
     }
@@ -60457,12 +58813,7 @@ impl Maint {
             let rebases = if swapped_live {
                 0
             } else {
-                cur.carry_published(
-                    &mut next,
-                    self.opts.forms_pieces_only,
-                    self.opts.counts_capacity(),
-                    None,
-                )
+                cur.carry_published(&mut next, self.opts.counts_capacity(), None)
             };
             let p = Box::into_raw(Box::new(next));
             if landed.is_some() {
@@ -63021,8 +61372,8 @@ impl Maint {
         zfile::ZEvents::add(&shared.z.hot_raw, 1);
     }
 
-    /// `Options::zpages_rewarm_scans`: where the scans counted move after a
-    /// stretch of `zpages_rewarm_quiet_ms` that saw none, out of core with the form
+    /// Where the scans counted move after a stretch of `REWARM_QUIET` that
+    /// saw none, out of core with the form
     /// installed, a rewarm is due; it is made once no merge is in flight,
     /// since a merge writing beside the scans pushes out what a rewarm
     /// brings in -- the full rewrite's pass refaulted 117,000 pages with a
@@ -63031,9 +61382,6 @@ impl Maint {
     /// thread of its own, each mapped by its path so the thread holds
     /// nothing a landing retires; one such thread at a time.
     fn z_rewarm_look(&mut self, now: std::time::Duration) {
-        if !self.opts.zpages_rewarm_scans {
-            return;
-        }
         if self.z_rewarm.as_ref().is_some_and(|h| h.is_finished()) {
             if let Some(h) = self.z_rewarm.take() {
                 let _ = h.join();
@@ -63044,59 +61392,31 @@ impl Maint {
             self.z_rewarm_quiet.get_or_insert(now);
         } else {
             self.z_rewarm_life = life;
-            if self.z_rewarm_quiet.take().is_some_and(|t| {
-                now.saturating_sub(t)
-                    >= std::time::Duration::from_millis(u64::from(self.opts.zpages_rewarm_quiet_ms))
-            }) {
+            if self
+                .z_rewarm_quiet
+                .take()
+                .is_some_and(|t| now.saturating_sub(t) >= REWARM_QUIET)
+            {
                 self.z_rewarm_due = true;
             }
         }
         let merging = !self.compacting.is_empty() || self.tiering.is_some();
-        if !self.z_rewarm_due
-            || self.z_rewarm.is_some()
-            || (merging && !self.opts.zpages_rewarm_beside_merges)
-        {
+        if !self.z_rewarm_due || self.z_rewarm.is_some() || merging {
             return;
         }
         self.z_rewarm_due = false;
-        // An install's rewarm asks for every file short of whole: the point
-        // reads after it touch every page of the form many times over, so
-        // each cold page is a fault where a scan's walk has the next group
-        // asked for ahead of it.
-        let line = if std::mem::take(&mut self.z_rewarm_whole) {
-            INSTALL_REWARM_RESIDENT
-        } else {
-            HOT_RAW_RESIDENT
-        };
+        let line = HOT_RAW_RESIDENT;
         let forms =
             self.zsel.counts().installs > 0 && self.shared.zgate.load() != zselect::GATE_RAW;
-        // The raw form's files (`Options::zpages_rewarm_raw`), asked within
-        // the group's room, and only where the room is known.
-        let room = if self.opts.zpages_rewarm_raw && self.opts.zpages_rewarm_raw_scans {
-            self.raw_rewarm_room()
-        } else {
-            None
-        };
-        let raw = if room.is_some() {
-            self.raw_rewarm_files(merging)
-        } else {
-            Vec::new()
-        };
-        if !forms && raw.is_empty() {
+        if !forms {
             return;
         }
         let mut whole = (0.0f64, 0u64);
-        let paths: Vec<(PathBuf, f64, u64)> = if !forms {
-            Vec::new()
-        } else {
+        let paths: Vec<(PathBuf, f64, u64)> = {
             let _op = self.op();
             self.segs()
                 .iter()
                 .filter(|s| s.level > 0)
-                // Beside merges in flight (`zpages_rewarm_beside_merges`),
-                // the partitions they hold are left: their files go at the
-                // landing.
-                .filter(|s| !(merging && self.in_flight_input(&s.name)))
                 .filter_map(|s| {
                     let z = s.z.get()?;
                     let resident = z.pages_resident();
@@ -63121,27 +61441,22 @@ impl Maint {
                 .collect();
             let slack = zfile::read_budget().and_then(|b| b.slack());
             eprintln!(
-                "zrewarm t={:.1} files {} line {line} of_all {:.3}/{} life {life} merging {merging} room_mb {} resident {} raw_files {} raw_room_mb {}",
+                "zrewarm t={:.1} files {} line {line} of_all {:.3}/{} life {life} room_mb {} resident {}",
                 now.as_secs_f64(),
                 paths.len(),
                 whole.0 / whole.1.max(1) as f64,
                 whole.1 >> 20,
                 slack.map_or("-".to_string(), |r| (r >> 20).to_string()),
                 shares.join(","),
-                raw.len(),
-                room.map_or("-".to_string(), |r| (r >> 20).to_string()),
             );
         }
         let paths: Vec<PathBuf> = paths.into_iter().map(|(p, _, _)| p).collect();
-        if paths.is_empty() && raw.is_empty() {
+        if paths.is_empty() {
             return;
         }
-        if !paths.is_empty() {
-            zfile::ZEvents::add(&self.shared.z.rewarms, 1);
-            zfile::ZEvents::add(&self.shared.z.rewarm_files, paths.len() as u64);
-            self.z_ask_pending = true;
-        }
-        let room = room.unwrap_or(0);
+        zfile::ZEvents::add(&self.shared.z.rewarms, 1);
+        zfile::ZEvents::add(&self.shared.z.rewarm_files, paths.len() as u64);
+        self.z_ask_pending = true;
         let (trims, shared, trace) = (
             self.opts.zpages_rewarm_trims,
             self.shared.clone(),
@@ -63176,9 +61491,6 @@ impl Maint {
                         let _ = crate::bytes::Bytes::advise_willneed(&map, 0, map_len(&map));
                     }
                 }
-                if !raw.is_empty() {
-                    let _ = raw_rewarm_ask(&shared, raw, room, trace, None);
-                }
             })
             .ok();
     }
@@ -63205,8 +61517,7 @@ impl Maint {
             < self.zsel.theta_sus(zselect::Class::Read)
     }
 
-    /// The room a rewarm's asks for the raw form's files may take
-    /// (`Options::zpages_rewarm_raw`): the group's unused memory less the
+    /// The room a rewarm's asks for the raw form's files may take: the group's unused memory less the
     /// margin, the seam's where a test set the budget, else the platform's;
     /// `None` where neither says.
     fn raw_rewarm_room(&self) -> Option<u64> {
@@ -63217,14 +61528,11 @@ impl Maint {
         }
     }
 
-    /// The raw form's files a rewarm may ask for
-    /// (`Options::zpages_rewarm_raw`), in the order it asks: the ordered
-    /// indexes, which every scan's start seeks, then the partitions the raw
-    /// form serves -- every one under the raw gate, else those no form
-    /// file serves -- then the level-0 pieces. Beside merges in flight
-    /// (`zpages_rewarm_beside_merges`) the segments they hold are left, as
-    /// the form files are: their files go at the landing.
-    fn raw_rewarm_files(&self, merging: bool) -> Vec<PathBuf> {
+    /// The raw form's files a settle's rewarm asks for, in the order it
+    /// asks: the ordered indexes, which every scan's start seeks, then the
+    /// partitions the raw form serves -- every one under the raw gate, else
+    /// those no form file serves -- then the level-0 pieces.
+    fn raw_rewarm_files(&self) -> Vec<PathBuf> {
         let raw_gate = self.shared.zgate.load() == zselect::GATE_RAW;
         let _op = self.op();
         // A partition with its form file's build in flight is the build's:
@@ -63243,9 +61551,6 @@ impl Maint {
             .collect();
         let (mut files, mut parts, mut pieces) = (Vec::new(), Vec::new(), Vec::new());
         for s in self.segs().iter() {
-            if merging && self.in_flight_input(&s.name) {
-                continue;
-            }
             if s.level > 0 && !raw_gate && s.z.get().is_some() {
                 continue;
             }
@@ -63266,7 +61571,7 @@ impl Maint {
         files
     }
 
-    /// A settle's ask for the raw form's files (`Options::zpages_rewarm_raw`)
+    /// A settle's ask for the raw form's files
     /// and its wait for them: with every seal and merge landed the store is
     /// at rest, and a rest is when the files the writes pushed out can come
     /// back into the room the writes left -- the scans that follow a
@@ -63281,13 +61586,10 @@ impl Maint {
     /// resident, `ASK_JOIN_STALLS` looks with no page more, or
     /// `ASK_JOIN_CAP`. Counted (`ZCounts::raw_settles`, `raw_settle_ms`).
     fn z_raw_settle(&mut self) {
-        if !self.opts.zpages_rewarm_raw {
-            return;
-        }
         let Some(room) = self.raw_rewarm_room() else {
             return;
         };
-        let files = self.raw_rewarm_files(false);
+        let files = self.raw_rewarm_files();
         if files.is_empty() {
             return;
         }
@@ -63332,13 +61634,10 @@ impl Maint {
             );
         }
         drop(maps);
-        if self.opts.zpages_rewarm_raw_maps {
-            self.raw_map();
-        }
+        self.raw_map();
     }
 
-    /// What a settle's ask brought back, mapped
-    /// (`Options::zpages_rewarm_raw_maps`): the record region and the
+    /// What a settle's ask brought back, mapped: the record region and the
     /// ordered index of every segment, through the mappings the readers
     /// read them by, each only where `HOT_RAW_RESIDENT` of it is resident
     /// -- a region the ask left out for want of room, or one a form file
@@ -63372,7 +61671,7 @@ impl Maint {
         }
     }
 
-    /// The thread of `Options::zpages_rewarm_scans` joined, where a settle
+    /// The rewarm's thread joined, where a settle
     /// asks that nothing the segment work started is still running.
     fn z_rewarm_join(&mut self) {
         if let Some(h) = self.z_rewarm.take() {
@@ -63381,7 +61680,7 @@ impl Maint {
     }
 
     /// The kernel's read of the form files the store asked for, waited
-    /// out (`Options::zpages_settle_joins_asks`): the live partitions'
+    /// out: the live partitions'
     /// form files on disk, each mapped by its path so the wait holds
     /// nothing a landing retires, looked at every `ASK_JOIN_POLL` until
     /// `HOT_RAW_RESIDENT` of their pages are resident. An ask is advice,
@@ -63399,7 +61698,7 @@ impl Maint {
     /// -- or at `ASK_JOIN_CAP`. Once an ask: a settle after it finds
     /// nothing pending.
     fn z_join_asks(&mut self) {
-        if !self.opts.zpages_settle_joins_asks || !std::mem::take(&mut self.z_ask_pending) {
+        if !std::mem::take(&mut self.z_ask_pending) {
             return;
         }
         struct Asked {
@@ -63661,7 +61960,6 @@ impl Maint {
         // makes, since a partition with its form attached is none the
         // crossing swaps.
         if self.opts.zpages_buy_crosses
-            && self.opts.zpages_land_drop_past
             && !self.z_crossed
             && matches!(d.event, Some(zselect::Event::BuildStart))
         {
@@ -63684,13 +61982,6 @@ impl Maint {
             self.z_misfit_caches = self.z_misfit_is_the_caches(m.budget);
         }
         self.z_apply(&d, model.as_ref(), &input);
-        // The form installed is the form every read is served from, so its
-        // files' cold pages are asked for now and not a fault at a time
-        // under the reads (`Options::zpages_rewarm_at_install`).
-        if self.opts.zpages_rewarm_at_install && matches!(d.event, Some(zselect::Event::Install)) {
-            self.z_rewarm_due = true;
-            self.z_rewarm_whole = true;
-        }
         self.z_last_d = Some(d);
         self.z_drive(&d);
         zfile::ZEvents::add(&self.shared.z.tick_ends, 1);
@@ -63867,20 +62158,12 @@ impl Maint {
         });
         let wake = self.wake.clone();
         zfile::ZEvents::add(&self.shared.z.samples, 1);
-        let idle = self.opts.zpages_sample_idle;
-        let io_idle = idle && self.opts.zpages_io_idle;
         let dir = self.dir.clone();
         let live = self.shared.life.job();
         let spawned = std::thread::Builder::new()
             .name("supdb-zsample".into())
             .spawn(move || {
                 let _live = live;
-                if io_idle {
-                    idle_io_priority();
-                }
-                if idle {
-                    idle_cpu_priority();
-                }
                 // Under a cipher the records a sample fills its pages from
                 // are read through the store's cache, by a thread with no
                 // slot of the reader table: under a hold, rested between
@@ -64466,8 +62749,8 @@ impl Maint {
     /// install needs and the selector holds no reading for the partitions as
     /// they stand: the sampler's last reading refreshed against a count of
     /// the files, cheaply, and handed at `generation`, where form files land
-    /// under the store's own writing (`Options::zpages_build_at_finish`,
-    /// `Options::zpages_ahead_past_scans`). A reading is of the partitions at
+    /// under the store's own writing (`Options::zpages_build_at_finish`). A
+    /// reading is of the partitions at
     /// a generation and the selector drops one taken at another, so under a
     /// chain of merges, a landing every half second and a sample longer than
     /// that, no reading reached a step: forty-one samples ran through one
@@ -64479,7 +62762,7 @@ impl Maint {
     /// build at nothing and refused the attach, stood at the generation, and
     /// kept every sample away for the store's life.
     fn z_sample_refresh(&mut self, generation: u64) {
-        if !(self.opts.zpages_build_at_finish || self.opts.zpages_ahead_past_scans) {
+        if !self.opts.zpages_build_at_finish {
             return;
         }
         let Some(last) = self.z_sample_last else {
@@ -64587,9 +62870,9 @@ impl Maint {
             self.z_convert_tick();
         }
         if d.build {
-            // Every form file on disk attached first, where the option says,
-            // so that no attach waits for a warm (`Options::zpages_attach_first`).
-            if self.opts.zpages_attach_first && self.zbuild.is_none() {
+            // Every form file on disk attached first, so that no attach
+            // waits for a warm.
+            if self.zbuild.is_none() {
                 for seg in self.z_unattached_on_disk() {
                     // A file that does not check out starts its build, and
                     // the turn goes on after it as below.
@@ -64607,10 +62890,7 @@ impl Maint {
             // at ten million keys under 1.25 GiB, the drain's last two builds
             // ahead in both slots. A file that does not check out is left for
             // the turn that builds, once the slot is free.
-            if self.opts.zpages_attach_first
-                && self.opts.zpages_cover_resident
-                && self.zbuild.as_ref().is_some_and(|b| b.dormant)
-            {
+            if self.opts.zpages_cover_resident && self.zbuild.as_ref().is_some_and(|b| b.dormant) {
                 for seg in self.z_unattached_on_disk() {
                     let (Some(id), Some(end)) =
                         (Db::name_id(&seg.name), Db::name_end_seq(&seg.name))
@@ -64683,17 +62963,14 @@ impl Maint {
         self.z_sample_due(d);
     }
 
-    /// A build ahead landed dormant (`Options::zpages_ahead_past_scans`), or
-    /// a build at a merge's output finish ended
+    /// A build at a merge's output finish ended
     /// (`Options::zpages_build_at_finish`): where the selector holds a
     /// reading that refused the attach for want of files on disk, the next
     /// tick refreshes it against the files as they are (`z_sample_refresh`),
     /// so that the attach can follow files that landed under one generation,
     /// which nothing else would ask for.
     fn z_prebuilt_landed(&mut self) {
-        if (self.opts.zpages_ahead_past_scans || self.opts.zpages_build_at_finish)
-            && self.zsel.sampler_attach() == Some(false)
-        {
+        if self.opts.zpages_build_at_finish && self.zsel.sampler_attach() == Some(false) {
             self.z_refresh_due = true;
         }
     }
@@ -65221,12 +63498,12 @@ impl Maint {
         let past = installed || self.z_land_past;
         let mut plan = zfile::BuildPlan::new(
             self.opts.zpages_min_bytes,
-            self.opts.zpages_drop_behind && past && self.opts.zpages_land_drop_past,
+            self.opts.zpages_drop_behind && past,
         );
         plan.drop_output = !past;
-        plan.sync = self.opts.zpages_build_sync && plan.drop_output;
+        plan.sync = plan.drop_output;
         (plan.stride_sparse, plan.stride_sparse_later) = self.z_sparse_now();
-        plan.ahead = self.opts.zpages_build_ahead;
+        plan.ahead = ZBUILD_AHEAD;
         plan.group_bytes = zpages::ZGROUP_BYTES;
         let (coding, raw_tails) = match self.z_coding_pick {
             Some(zselect::Coding::RawTails) => (zpages::ZCODING_RECORD, true),
@@ -65254,8 +63531,7 @@ impl Maint {
         }))
     }
 
-    /// The partition a build ahead takes next (`Options::zpages_prebuild`),
-    /// where one is due: the store past its budget at the model's last
+    /// The partition a build ahead takes next, where one is due: the store past its budget at the model's last
     /// reading, the controller never yet in COMPACT, nothing landing,
     /// sealing or merging, and a live partition with no cell, no decline
     /// and no form file on disk, the newest first -- an ordered load's last
@@ -65275,9 +63551,9 @@ impl Maint {
         let cold_ok = land && self.z_land_past && self.opts.zpages_land_cold_past;
         // Why no build ahead starts, for the trace: one line a change of
         // reason, since the question is asked every tick.
-        let held_by: u8 = if !(self.opts.zpages_prebuild || land) || !self.z_auto {
+        let held_by: u8 = if !land || !self.z_auto {
             1
-        } else if !(self.z_past_budget || (land && self.z_land_due)) {
+        } else if !(self.z_past_budget || self.z_land_due) {
             2
         } else if self.zsel.counts().installs > 0 {
             3
@@ -65285,13 +63561,7 @@ impl Maint {
             4
         } else if self.tiering.is_some() {
             5
-        } else if !land && !self.sealing.is_empty() {
-            6
-        } else if land
-            && self.opts.zpages_land_scans_far
-            && self.scans_near()
-            && !(self.opts.zpages_ahead_past_scans && self.z_land_past)
-        {
+        } else if self.opts.zpages_land_scans_far && self.scans_near() {
             7
         } else {
             0
@@ -65330,13 +63600,6 @@ impl Maint {
                     && !Db::z_on_disk(&self.dir, &s.name)
             })
             .collect();
-        if !land {
-            // The newest by the sequence its name ends at, the last of a tie.
-            return due
-                .into_iter()
-                .max_by_key(|s| Db::name_end_seq(&s.name).unwrap_or(0))
-                .cloned();
-        }
         // At landing, the oldest first, by the sequence and then the id a
         // partition was made under -- a direct run's partitions all end at
         // sequence zero -- since the page cache gives up its oldest pages
@@ -65390,7 +63653,7 @@ impl Maint {
     /// sample prices those as an attach and the rest as the build they
     /// are, and the buy attaches and builds.
     fn z_prebuild_pending(&self) -> bool {
-        if !self.opts.zpages_prebuild && self.opts.zpages_land_pct == 0 {
+        if self.opts.zpages_land_pct == 0 {
             return false;
         }
         self.zbuild.as_ref().is_some_and(|b| b.dormant) || self.zahead.is_some()
@@ -65398,7 +63661,7 @@ impl Maint {
 
     /// One build ahead started where one is due and the builder is free.
     fn z_prebuild_step(&mut self) {
-        if !self.opts.zpages_prebuild && self.opts.zpages_land_pct == 0 {
+        if self.opts.zpages_land_pct == 0 {
             return;
         }
         if self.zbuild.is_none() {
@@ -65506,7 +63769,7 @@ impl Maint {
             self.z_last_s1 = None;
         }
         self.z_land_sus = sus;
-        if self.z_land_past && !self.z_crossed && self.opts.zpages_land_drop_past {
+        if self.z_land_past && !self.z_crossed {
             self.z_crossed = true;
             self.z_cross();
             self.z_ask_pending = true;
@@ -65514,7 +63777,7 @@ impl Maint {
     }
 
     /// The store's first look past the selector's line to enter under the
-    /// builds at landing (`z_land_past`, `Options::zpages_land_drop_past`):
+    /// builds at landing (`z_land_past`):
     /// every partition built ahead while the store was under it -- its records kept, its form
     /// file dropped as it was written -- turned into what a build past the
     /// budget leaves, its records dropped and its form file asked back
@@ -66210,7 +64473,7 @@ impl Maint {
         // at a twelfth of its rate after builds ahead it never bought. Past
         // the selector's line to enter (`z_land_past`) the records behind
         // the build go as a bought build's do, so that the records of the
-        // partitions still to be built stay (`Options::zpages_land_drop_past`).
+        // partitions still to be built stay.
         let past = if self.opts.zpages_land_pct > 0 {
             self.z_land_past
         } else {
@@ -66218,7 +64481,7 @@ impl Maint {
         };
         let mut plan = zfile::BuildPlan::new(
             self.opts.zpages_min_bytes,
-            self.opts.zpages_drop_behind && (!dormant || (past && self.opts.zpages_land_drop_past)),
+            self.opts.zpages_drop_behind && (!dormant || past),
         );
         // A conversion's file goes the same way where the option says
         // (`Options::zpages_convert_drops_output`), and is asked back
@@ -66238,8 +64501,8 @@ impl Maint {
         // device and its sync asks for the flush alone; one kept dirty for
         // the install wrote its pages in its sync, 50-160 ms each at five
         // million keys on the thread racing the eviction front.
-        plan.sync = self.opts.zpages_build_sync && plan.drop_output;
-        plan.ahead = self.opts.zpages_build_ahead;
+        plan.sync = plan.drop_output;
+        plan.ahead = ZBUILD_AHEAD;
         plan.group_bytes = zpages::ZGROUP_BYTES;
         // The coding: the selector's pick where it chooses one
         // (`Options::zpages_coding_auto`), taken again against the
@@ -66273,9 +64536,9 @@ impl Maint {
         // into the page cache beside the mixes it is bought under: synced
         // here, on the builder's thread, where the builds sync theirs, or
         // its pages reach the device at the kernel's choosing and their
-        // flush is the next commit's to pay (`Options::zpages_build_sync`).
+        // flush is the next commit's to pay.
         if convert {
-            plan.sync = self.opts.zpages_build_sync;
+            plan.sync = true;
         }
         // A conversion asks for the form its partition is not served in:
         // the stride form alone of a block file's, so that a partition the
@@ -66301,7 +64564,6 @@ impl Maint {
         // the thread's first write and the count, and a test read the
         // temp name as a build nobody had started.
         zfile::ZEvents::add(&ev.build_starts, 1);
-        let io_idle = self.opts.zpages_io_idle;
         let io_ev = shared.clone();
         let live = shared.life.job();
         let spawned = std::thread::Builder::new()
@@ -66310,11 +64572,9 @@ impl Maint {
                 let _live = live;
                 // Derived data, built when the store is short of memory
                 // and the readers are faulting: the readers' cores first,
-                // and the device's queue too unless the option has the
-                // build share it; the class the kernel reports is counted.
-                if io_idle {
-                    idle_io_priority();
-                }
+                // and the device's queue too; the class the kernel reports
+                // is counted.
+                idle_io_priority();
                 io_ev
                     .z
                     .build_io_class
@@ -66690,7 +64950,6 @@ impl Maint {
         let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let flag = cancel.clone();
         let wake = self.wake.clone();
-        let io_idle = self.opts.zpages_io_idle;
         // Counted started before the thread exists, and ended by the thread
         // before its wake, as a build is (`ZCounts::job_ends`).
         zfile::ZEvents::add(&self.shared.z.warm_starts, 1);
@@ -66700,9 +64959,7 @@ impl Maint {
             .name("supdb-zwarm".into())
             .spawn(move || {
                 let _live = live;
-                if io_idle {
-                    idle_io_priority();
-                }
+                idle_io_priority();
                 idle_cpu_priority();
                 let r = zfile::warm_file(&path, Some(&flag));
                 zfile::ZEvents::add(&shared.z.job_ends, 1);

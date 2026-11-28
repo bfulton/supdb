@@ -380,21 +380,6 @@ trail by a hundredth of the store; `supdb-heldnfnocache`, with no block
 cache, files nothing at all. For pricing, as `supdb-ingestpaced` and
 `supdb-ingestpacelends` are of the buffered arm.
 
-What filing a batch costs is the settle's, and the settle's four lean
-shapes each have the shape before as an arm under the durable, the
-buffered and the held log's names: `supdb-settleloads`,
-`supdb-ingestsettleloads` and `supdb-heldsettleloads` read each key's
-write and its bytes by index (`Options::settle_gathers` off);
-`...settlesortstwice` sorts the batch by key offset ahead of its sort by
-prefix (`Options::settle_sorts_once` off); `supdb-settlepatchstaged`,
-`supdb-ingestsettlestaged` and `supdb-heldsettlestaged` stage every patch
-(`Options::settle_patch_in_place` off); `...settlenoconvert` leaves a
-dense form's conversion to the fill (`Options::settle_converts` off); and
-`...settlefat` is the four together, the settle before any of them. For
-pricing: the instruction count is the measure for the arms whose commits
-file (`examples/lag_only.rs` under callgrind, toggled on the engine's
-`maintain_forms`), and the pass after a lent burst for the held log's.
-
 The two differ on the ordered scan and the reopen, which `faster` has not
 got and has no setting for. The check that holds a guarantee's arms to one
 set of features (`engines::check_matched`, where a run starts) refuses
@@ -538,8 +523,6 @@ inputs beside the store's cache (`StoreCipher::merges_beside_cache`), and
 `supdb-cipherautodropskeep` the same with a drop of a file's pages leaving
 the plaintext it covers in the store's cache
 (`StoreCipher::drops_keep_plaintext`), the shape before, and
-`supdb-cipherautorewarmbeside` the same with its rewarm made beside the
-merges in flight (`Options::zpages_rewarm_beside_merges`), and
 `supdb-cipherautoaheadflat` the same with its merges asking ahead in one
 window for every input and over their records alone
 (`Options::merge_ahead_shares` off), the shape before. And three kept
@@ -772,13 +755,8 @@ partition lands, the memo of decoded groups off, a scan's seeks by the
 ordered index's heads instead of the form file's fence, a scan's prefetch
 of the pages it will cross on, and the overlay walk of a covered
 partition cut by rank rather than carried through a cursor; and
-`supdb-nocacheautozpagesfairio` is `supdb-nocacheautozpages` with the
-form's threads at the readers' I/O class rather than the device's idle
-class, for a build under a bound that shares the device with the faults it
-is there to remove, and `supdb-nocacheautozpagesnoahead` the same with its
-builds asking nothing of the raw records ahead of their walks, the shape
-before the window, whose every wait fetched the device's readahead and no
-more, and `supdb-nocacheautozpageseager` the controller buying the form at
+`supdb-nocacheautozpageseager` is `supdb-nocacheautozpages` with the
+controller buying the form at
 SUSPECT on the model's prediction, once the sampler has priced it and the
 partitions have stood for the settle, instead of after the ski rental's
 wait; `supdb-cache64tofit` is `supdb-cache256tofit` with its bound at
@@ -797,23 +775,14 @@ priced in, and `supdb-cache64tofitautozpagespromote` is the combined arm
 with a block that reads have walked a block's worth of entries held as a
 merged copy in its slot under the form, a clean block included
 (`Options::zpages_promote_copies`), so the hot blocks are walked without
-a group decoded. `supdb-cache64tofitautozpagesprebuild` is the
-combined arm with the form files built ahead of the controller's
-decision once the store outgrows its budget and left dormant on disk
-(`Options::zpages_prebuild`), so that the shift to the form is an attach
-and not a build under the readers' faults; a store that fits builds
-nothing. `supdb-cache64tofitautozpagesspan` is the combined arm with a
+a group decoded. `supdb-cache64tofitautozpagesspan` is the combined arm with a
 block-cache scan's block taken from the fence and the page's directory
 and its rank sought only for a block not held as a copy
 (`Options::zpages_seek_span`), where the default seeks every scan's rank
 through a group. `supdb-cache64tofitautozpagesmemolinear` is the combined arm with the
 memo's slot the group's number plus a multiple of the form file's
 identity (`Options::zpages_memo_hash` off), where the default hashes the
-two over every slot. `supdb-cache64tofitautozpagesexactcut` is the combined arm with a
-settle resolving every written key's cut through a seek
-(`Options::zpages_settle_span` off), where the default files a key under
-the block the fence and the directory name and leaves its cut to the build
-that reads the block. `supdb-cache64tofitautozpagescheckedviews` is the
+two over every slot. `supdb-cache64tofitautozpagescheckedviews` is the
 combined arm with every view of a form file's page checked and the memo
 asked after it (`Options::zpages_trusted_views` off), where the default
 reads a verified page's directory trusted, and `supdb-nocachezpagescheckedviews`
@@ -951,9 +920,7 @@ back at its drop, where the default keeps them for the next tables
 `supdb-zhotresident` is `supdb` with the hot-raw fill asking for the
 partitions the reads have not skewed by how much of their records the cache
 holds, most first (`Options::zpages_hot_fill_resident_first`);
-`supdb-zrewarminstall` is `supdb` with the controller's install making a
-rewarm due, so the form files short of resident are asked for at once
-(`Options::zpages_rewarm_at_install`); `supdb-zhotfillquiet` is `supdb` with
+`supdb-zhotfillquiet` is `supdb` with
 the hot-raw fill's quiet looks taking the growth share into their room
 (`Options::zpages_hot_fill_quiet`);
 `supdb-zpromote` is `supdb`
@@ -969,10 +936,6 @@ or three times, holding the blocks it walks as copies under the form
 `supdb-settleroomstill` is `supdb` with the room its commits' fills build in closed
 for a second by any growth of the memory group's refaults since the last
 reading, however old (`Options::forms_settle_room_pressure` off);
-`supdb-snapdrops` is `supdb` whose handles, and whose writer on the merge
-paths, drop their scan snapshot at every publish their look has no tables
-to carry across, a merge's or a seal's landing among them
-(`Options::snapshot_stands` off);
 `supdb-cache64tofitautozpagesperrun` is the combined arm with a block read
 through a cursor a run, a seek a cut and a read by rank a replaced record
 (`Options::zpages_block_cursor` off), where the default reads a block through

@@ -6551,12 +6551,11 @@ pub(super) struct ZEvents {
     pub hot_back_asks: AtomicU64,
     pub hot_back_waited: AtomicU64,
     /// The form files asked for whole where scans came back after a
-    /// stretch without one (`Options::zpages_rewarm_scans`): the looks
+    /// stretch without one: the looks
     /// that asked, and the files.
     pub rewarms: AtomicU64,
     pub rewarm_files: AtomicU64,
-    /// A settle's waits for the form files the store asked the kernel for
-    /// (`Options::zpages_settle_joins_asks`): the waits, their looks at the
+    /// A settle's waits for the form files the store asked the kernel for: the waits, their looks at the
     /// files' residency, the asks made again, and their milliseconds.
     pub ask_joins: AtomicU64,
     pub ask_join_polls: AtomicU64,
@@ -6567,8 +6566,7 @@ pub(super) struct ZEvents {
     /// trims gave back.
     pub rewarm_trims: AtomicU64,
     pub rewarm_trim_bytes: AtomicU64,
-    /// The rewarms that asked for the raw form's files
-    /// (`Options::zpages_rewarm_raw`), the files asked, the bytes of them
+    /// The rewarms that asked for the raw form's files, the files asked, the bytes of them
     /// the page cache did not hold, and the files left for want of room.
     pub raw_rewarms: AtomicU64,
     pub raw_rewarm_files: AtomicU64,
@@ -7423,7 +7421,7 @@ fn read_writeback(file: &super::vault::File) -> Result<()> {
 }
 
 /// A partition built ahead turned, in the page cache, into what a build
-/// past the budget leaves (`Options::zpages_land_drop_past`): the
+/// past the budget leaves: the
 /// segment's record region, `[at, at + len)` of `seg`, dropped
 /// (`POSIX_FADV_DONTNEED`, which skips a page a mapping holds), and the
 /// form file at `form` asked for (`POSIX_FADV_WILLNEED`) in the pieces the
@@ -7530,7 +7528,7 @@ pub(super) struct BuildPlan {
     /// The bytes of the raw record region passed between drops.
     pub window: usize,
     /// The bytes of the raw records asked for ahead of the walk, a window
-    /// at a time (`Options::zpages_build_ahead`); zero asks for nothing,
+    /// at a time (`db::ZBUILD_AHEAD` for a build); zero asks for nothing,
     /// and the walk's page faults fetch the device's readahead and no more.
     pub ahead: usize,
     /// The decoded bytes a page's groups are cut at
@@ -7572,7 +7570,7 @@ pub(super) struct BuildPlan {
     /// whose reads want the cache the file would take.
     pub drop_output: bool,
     /// The form file synced (`fdatasync`) once it has its name, on the
-    /// build's own thread (`Options::zpages_build_sync`): its pages reach
+    /// build's own thread: its pages reach
     /// the device by `sync_file_range`, which asks for no flush of the
     /// device's write-back cache, and the next fsync anyone issues pays
     /// that flush. The sync asks for that flush alone, and its error is the
@@ -9916,8 +9914,7 @@ pub struct ZInject {
     /// `u64::MAX` for none, which leaves the policy its fill line.
     pub slack: AtomicU64,
     /// Looks at the asked form files' residency that a settle's wait for
-    /// them reads as nothing resident yet
-    /// (`Options::zpages_settle_joins_asks`), counted down by the looks: a
+    /// them reads as nothing resident yet, counted down by the looks: a
     /// test's files are a mebibyte and resident before the first look, so
     /// the wait is held to waiting, and to giving up, through this.
     pub asked_holds: AtomicU64,
@@ -9933,7 +9930,7 @@ pub struct ZInject {
     /// look a move falls at is the host's without this.
     pub convert_price_ns: AtomicU64,
     /// The wall of an operation the census stamps, nanoseconds, in place of
-    /// the one it took (`Options::zpages_census_sample`); 0 for the measured
+    /// the one it took; 0 for the measured
     /// one. The census scales its stamps' wall to the window's operations,
     /// one in sixteen of them stamped, so one stamped read the host stalled
     /// for two milliseconds read as thirty in a window of three thousand,
