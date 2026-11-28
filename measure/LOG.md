@@ -101,3 +101,14 @@ and copied here under `measure/rows/` at the same relative path.
   (copied to `measure/rows/inflight/`; resume with
   `sh scripts/ooc.sh 1073741824 --resume <ledger>` on a 2.10GHz host).
 - Not run: this row, the full rows (numbered, ids), the noise floor.
+
+## Second series: the 2.30GHz class
+
+From 2026-11-28T11:01Z the coordinator directed: carry on here on
+`x86_64/intel-r-xeon-r-processor-2.30ghz/4c/16g/hypervisor` as a second
+series, in the order quick (numbered, the bridge between classes), noise
+floor, full rows (numbered, then ids), then the ooc 1 GiB ids row from the
+start; the cut ledger stays in `inflight/` as a record and is not used.
+No 2.10GHz row is compared with a 2.30GHz row as a verdict. Phase 6 pairs
+the kept C0 binaries against the last commit's on whatever host it gets.
+Same C0 binaries (`/home/user/c0/bench/target`, stamp `b3a043dc`, clean).
