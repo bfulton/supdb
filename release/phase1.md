@@ -28,25 +28,26 @@ those mechanically.
 
 ## The order
 
-Thirty pull requests into `release-candidate`, one cluster a commit, each
-under about 1,500 changed lines by the reviewer's estimate. The map of
-option to cluster and pull request is `release/phase1-clusters.csv`; the
-table of pull requests, what each must carry, and the test functions each
-touches are in `release/ledger-review/consistency-and-order.md`, "The pull
-requests, in order".
+All of phase 1 is one branch, one commit a cluster, landed on
+`release-candidate` once its whole gate is green; there is one pull request
+in all, `release-candidate` into main at the end. The map of option to
+cluster is `release/phase1-clusters.csv`; its `pr` column is the reviewer's
+grouping, kept only as the order the clusters are taken in. What each
+cluster must carry and the test functions it touches are in
+`release/ledger-review/consistency-and-order.md`.
 
-- First the small, isolated, mostly refuted removals (PR1 to PR3), so the
-  gate and the review are proven where little can go wrong.
+- First the small, isolated, mostly refuted removals.
 - Then the read and scan paths, the forms, the compact form's chain in its
   dependency order, and the seal and segment writer.
-- Last, in small pieces: the pin protocol, the drain and run close, the
-  ordered run, the log, the manifest and the encryption (PR24 to PR29).
-- PR30 hides the kept experimental fields from the docs.
+- Last: the pin protocol, the drain and run close, the ordered run, the
+  log, the manifest and the encryption.
+- Then the kept experimental fields are hidden from the docs.
 
-The pull requests are sequential, never parallel: nearly every one edits
-the arm tables of `bench/src/engines.rs`.
+Clusters that touch different code are written in parallel in worktrees of
+their own and brought onto one branch; the whole gate runs on the branch,
+not on each piece.
 
-## What every pull request is held to
+## What every commit is held to
 
 - `sh scripts/check.sh` green, and `sh scripts/cost.sh <the commit before>`
   green, once the gate reads C0 green against itself (the first pull
@@ -62,8 +63,8 @@ the arm tables of `bench/src/engines.rs`.
   keeps its draw call with the value discarded (`let _ = side.chance(25);`),
   so every seed runs the same cases after the commit as before it.
 - Each deleted arm's line in `bench/DESIGN.md` goes with it.
-- A reviewer that did not write the pull request reads the diff and re-runs
-  the gate.
+- An agent that did not write it reads the diff and re-runs the gate
+  before the branch lands.
 
 ## Amended since the reviews
 

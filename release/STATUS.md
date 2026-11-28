@@ -8,8 +8,9 @@ of the engine's, which goes in `ROADMAP.md`.
 Coordination branch: `claude/supdb-pretag-coordination-4qj5t4`.
 C0, the freeze commit: `b3a043dc` (#37), tree `7f58d776`
 (`git rev-parse origin/release-candidate 'origin/release-candidate^{tree}'`).
-Passes land as pull requests into `release-candidate`; Bright merges them,
-and merges that branch to main for the tag.
+Passes land on `release-candidate` once their gate is green and an agent
+that did not write them has read them; there is one pull request, that
+branch into main, for Bright to review and merge before the tag.
 
 ## Passes
 
