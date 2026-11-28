@@ -24681,6 +24681,9 @@ const REPLACED_CAP: usize = 8;
 const KEPT_HOLD_FREEZE: u8 = 4;
 const KEPT_HOLD_LOOK_STORE: u8 = 8;
 const KEPT_HOLD_LOOK_TRIMMED: u8 = 16;
+/// `Shared::kept_holding`'s mark that the freeze held published after the
+/// look stored and trimmed.
+const KEPT_CHAINED: u8 = 32;
 
 /// What a publish keeps in `State::replaced`: the tables live from the
 /// upkeep's last look, `from` (`u64::MAX` before any), on, within `bytes`
@@ -34793,7 +34796,11 @@ impl Reader {
                 && self.shared.kept_hold.load(AtomicOrdering::Acquire) & KEPT_HOLD_LOOK_STORE != 0
                 && self.shared.upkeep_lives.load(AtomicOrdering::Acquire) < st.lives
             {
-                Db::kept_held(&self.shared, KEPT_HOLD_LOOK_STORE);
+                // Once, until the freeze that read the look behind waits.
+                Db::set_hold_bit(&self.shared.kept_hold, KEPT_HOLD_LOOK_STORE, false);
+                Db::freeze_chain_wait(&self.shared, KEPT_HOLD_LOOK_STORE, |_, holding| {
+                    holding & KEPT_HOLD_FREEZE != 0
+                });
             }
             self.shared
                 .upkeep_lives
@@ -34812,9 +34819,13 @@ impl Reader {
                 unsafe { &*cur_p }.drop_replaced_before(st.lives);
             }
             if self.understudy
+                && self.shared.kept_hold.load(AtomicOrdering::Acquire) & KEPT_HOLD_LOOK_TRIMMED != 0
                 && self.shared.kept_holding.load(AtomicOrdering::Acquire) & KEPT_HOLD_FREEZE != 0
             {
-                Db::kept_held(&self.shared, KEPT_HOLD_LOOK_TRIMMED);
+                // Until the test lets it go (`Db::let_the_look_go`).
+                Db::freeze_chain_wait(&self.shared, KEPT_HOLD_LOOK_TRIMMED, |hold, _| {
+                    hold & KEPT_HOLD_LOOK_TRIMMED == 0
+                });
             }
         }
     }
@@ -47662,10 +47673,10 @@ impl Db {
 
     /// A test's hold (`Db::look_inside_a_freeze`): the writer, between
     /// its read of where the upkeep's look stands and the publish that
-    /// keeps tables from there, waits while `KEPT_HOLD_FREEZE` is set,
-    /// where the look it read stands behind the state it freezes (`lives`).
-    /// Not `kept_held`: the writer is no counted thread, and a store the
-    /// test crashes is one whose writer is the crashing thread.
+    /// keeps tables from there, waits once, where the look it read stands
+    /// behind the state it freezes (`lives`), until the look has stored
+    /// its position and trimmed. Where it has, the chain is marked whole
+    /// (`KEPT_CHAINED`).
     #[cold]
     #[inline(never)]
     fn freeze_held(shared: &Shared, from: Option<Keep>, lives: u64) {
@@ -47674,15 +47685,39 @@ impl Db {
         {
             return;
         }
-        shared
-            .kept_holding
-            .fetch_or(KEPT_HOLD_FREEZE, AtomicOrdering::AcqRel);
-        while shared.kept_hold.load(AtomicOrdering::Acquire) & KEPT_HOLD_FREEZE != 0 {
-            std::thread::sleep(std::time::Duration::from_micros(200));
+        Db::set_hold_bit(&shared.kept_hold, KEPT_HOLD_FREEZE, false);
+        if Db::freeze_chain_wait(shared, KEPT_HOLD_FREEZE, |_, holding| {
+            holding & KEPT_HOLD_LOOK_TRIMMED != 0
+        }) {
+            shared
+                .kept_holding
+                .fetch_or(KEPT_CHAINED, AtomicOrdering::AcqRel);
         }
-        shared
-            .kept_holding
-            .fetch_and(!KEPT_HOLD_FREEZE, AtomicOrdering::AcqRel);
+    }
+
+    /// A wait of `look_inside_a_freeze`'s holds: `mine` marked waiting in
+    /// `Shared::kept_holding` until `go`, asked of the holds and of the
+    /// waits, says to go on, a minute at most; whether it said so. It
+    /// spins: the writer and the upkeep thread each wait here once, for
+    /// the other's step, and the chain makes no thread and parks none.
+    #[cold]
+    #[inline(never)]
+    fn freeze_chain_wait(shared: &Shared, mine: u8, go: fn(u8, u8) -> bool) -> bool {
+        shared.kept_holding.fetch_or(mine, AtomicOrdering::AcqRel);
+        let t = std::time::Instant::now();
+        let went = loop {
+            let hold = shared.kept_hold.load(AtomicOrdering::Acquire);
+            let holding = shared.kept_holding.load(AtomicOrdering::Acquire);
+            if go(hold, holding) {
+                break true;
+            }
+            if t.elapsed() >= std::time::Duration::from_secs(60) {
+                break false;
+            }
+            std::hint::spin_loop();
+        };
+        shared.kept_holding.fetch_and(!mine, AtomicOrdering::AcqRel);
+        went
     }
 
     /// `table`, a hashed memtable whose every write is committed and
@@ -55122,43 +55157,32 @@ impl Db {
         })
     }
 
-    /// A test's: the upkeep thread's next look lands inside the writer's
-    /// next freeze, between the freeze's read of where the look stands and
-    /// its publish. The look that moves where the look stands waits before
-    /// it stores its position, and the freeze that read a look behind the
-    /// state it freezes waits after its read. Once both wait, a thread of this call's lets
-    /// the look store and trim, and once it waits after its trim, lets the
-    /// freeze publish. The look, trimmed while the freeze waited, then
-    /// waits after its trim until
-    /// `let_the_look_go`, so that nothing the upkeep does after it moves
-    /// what the freeze left. The thread answers whether both were held, in
-    /// a minute at most. The caller's commit is lent to the upkeep thread
-    /// and its seal is the freeze.
+    /// A test's: the upkeep thread's next look that moves where the look
+    /// stands lands inside the writer's next freeze that read it behind,
+    /// between the freeze's read and its publish. The look waits before it
+    /// stores its position until the freeze waits; the freeze waits until
+    /// the look has stored and trimmed; and the look then waits after its
+    /// trim until `let_the_look_go`, so that nothing the upkeep does after
+    /// it moves what the freeze left. Each wait is a minute at most. The
+    /// caller's commit is lent to the upkeep thread, and its seal is the
+    /// freeze; `look_inside_a_freeze_held` says after whether it was.
     #[doc(hidden)]
-    pub fn look_inside_a_freeze(&self) -> std::thread::JoinHandle<bool> {
+    pub fn look_inside_a_freeze(&self) {
+        self.shared
+            .kept_holding
+            .fetch_and(!KEPT_CHAINED, AtomicOrdering::AcqRel);
         Db::set_hold_bit(
             &self.shared.kept_hold,
             KEPT_HOLD_FREEZE | KEPT_HOLD_LOOK_STORE | KEPT_HOLD_LOOK_TRIMMED,
             true,
         );
-        let shared = self.shared.clone();
-        std::thread::spawn(move || {
-            let t = std::time::Instant::now();
-            let waited = |t: &std::time::Instant| t.elapsed() < std::time::Duration::from_secs(60);
-            let holding =
-                |bits: u8| shared.kept_holding.load(AtomicOrdering::Acquire) & bits == bits;
-            while !holding(KEPT_HOLD_FREEZE | KEPT_HOLD_LOOK_STORE) && waited(&t) {
-                std::thread::sleep(std::time::Duration::from_micros(200));
-            }
-            let both = holding(KEPT_HOLD_FREEZE | KEPT_HOLD_LOOK_STORE);
-            Db::set_hold_bit(&shared.kept_hold, KEPT_HOLD_LOOK_STORE, false);
-            while !holding(KEPT_HOLD_LOOK_TRIMMED) && waited(&t) {
-                std::thread::sleep(std::time::Duration::from_micros(200));
-            }
-            let trimmed = holding(KEPT_HOLD_LOOK_TRIMMED);
-            Db::set_hold_bit(&shared.kept_hold, KEPT_HOLD_FREEZE, false);
-            both && trimmed
-        })
+    }
+
+    /// Whether the freeze `look_inside_a_freeze` held published after the
+    /// look stored its position and trimmed: for a test.
+    #[doc(hidden)]
+    pub fn look_inside_a_freeze_held(&self) -> bool {
+        self.shared.kept_holding.load(AtomicOrdering::Acquire) & KEPT_CHAINED != 0
     }
 
     /// The upkeep thread's look held by `look_inside_a_freeze` let go,

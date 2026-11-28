@@ -2899,10 +2899,9 @@ fn a_look_that_lands_inside_a_freeze_asks_the_upkeep_to_give_nothing_up() {
     let abandons = db.upkeep_abandons();
     let merges_before = db.seal_waits().merges;
     db.hold_seal_durable(true);
-    let mut held = None;
     for round in 0..2u8 {
         if round == 1 {
-            held = Some(db.look_inside_a_freeze());
+            db.look_inside_a_freeze();
         }
         for k in keys.iter().step_by(5) {
             db.put(k, &[b'a' + round; 100]);
@@ -2911,7 +2910,7 @@ fn a_look_that_lands_inside_a_freeze_asks_the_upkeep_to_give_nothing_up() {
         db.commit().unwrap();
         db.seal().unwrap();
     }
-    let both = held.unwrap().join().unwrap();
+    let both = db.look_inside_a_freeze_held();
     // Read with the look still held after its trim: nothing of the
     // upkeep's has moved what the freeze left.
     let (asked, kept, lives, look) = db.upkeep_abandon_state();
