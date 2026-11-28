@@ -835,10 +835,6 @@ pub struct Supdb {
     /// The settle asking for none of the block table's own lines ahead
     /// (`Options::settle_table_ahead` zero): `supdb-settletablenear`.
     settletablenear: bool,
-    /// One look at a partition's heads' residency standing in for a
-    /// settle's asks for a hundred milliseconds (`Options::heads_look_ms`):
-    /// `supdb-headslook`.
-    headslook: bool,
     /// The ordered indexes' heads read through their mappings throughout,
     /// no copy of them held in memory out of core
     /// (`Options::heads_owned` off): `supdb-headsmapped`.
@@ -1061,12 +1057,6 @@ pub struct Supdb {
     /// `supdb-snapfat` is the shape before, and `supdb-snapold` the shape
     /// before of both.
     snaplean: Option<bool>,
-    /// The partitions' heads copied at the controller's census while the
-    /// block cache holds the raw records' place, whatever the model says
-    /// of the raw form (`Options::heads_owned_beside_copies`), `None` for
-    /// the engine's default. `supdb-headsmodel` copies them by the model's
-    /// word alone.
-    headscopies: Option<bool>,
     /// The merge path's scan snapshot kept to the commit by the commit's
     /// maintenance while the writer's forms are given up
     /// (`Options::forms_off_snapshot_kept`), `None` for the engine's
@@ -1406,10 +1396,6 @@ pub struct Supdb {
     /// Every copy held as its three buffers (`Options::copy_packed`
     /// off): `supdb-copythree` and `supdb-ingestcopythree`.
     copythree: bool,
-    /// The raw gate's heads left to the page cache whatever the store's
-    /// files have outgrown (`Options::heads_owned_past_fill` off):
-    /// `supdb-headsgate`.
-    headsgate: bool,
     /// The frozen tables bounded by their count alone
     /// (`Options::frozen_bytes` at `usize::MAX`): `supdb-frozencount`, and
     /// `supdb-heldpartfrozencount` under the held log.
@@ -2318,10 +2304,6 @@ struct Policy {
     /// The settle asking for none of the block table's own lines ahead
     /// (`Options::settle_table_ahead` zero): `supdb-settletablenear`.
     settletablenear: bool,
-    /// One look at a partition's heads' residency standing in for a
-    /// settle's asks for a hundred milliseconds (`Options::heads_look_ms`):
-    /// `supdb-headslook`.
-    headslook: bool,
     /// The ordered indexes' heads read through their mappings throughout,
     /// no copy of them held in memory out of core
     /// (`Options::heads_owned` off): `supdb-headsmapped`.
@@ -2544,12 +2526,6 @@ struct Policy {
     /// `supdb-snapfat` is the shape before, and `supdb-snapold` the shape
     /// before of both.
     snaplean: Option<bool>,
-    /// The partitions' heads copied at the controller's census while the
-    /// block cache holds the raw records' place, whatever the model says
-    /// of the raw form (`Options::heads_owned_beside_copies`), `None` for
-    /// the engine's default. `supdb-headsmodel` copies them by the model's
-    /// word alone.
-    headscopies: Option<bool>,
     /// The merge path's scan snapshot kept to the commit by the commit's
     /// maintenance while the writer's forms are given up
     /// (`Options::forms_off_snapshot_kept`), `None` for the engine's
@@ -2859,8 +2835,6 @@ struct Policy {
     identityblob: bool,
     /// Every copy as its three buffers: `...copythree`.
     copythree: bool,
-    /// The raw gate's heads left to the page cache: `...headsgate`.
-    headsgate: bool,
     /// The frozen tables bounded by their count alone: `...frozencount`.
     frozencount: bool,
     /// The patch's search for an appended key: `...settlesearch`.
@@ -3382,7 +3356,6 @@ impl Default for Policy {
             settleconvertquiet: false,
             settlevaluenear: false,
             settletablenear: false,
-            headslook: false,
             headsmapped: false,
             zpointwhole: false,
             znopointkeys: false,
@@ -3437,7 +3410,6 @@ impl Default for Policy {
             zrewarmturn: None,
             snapunfolded: None,
             snaplean: None,
-            headscopies: None,
             snapkept: None,
             zbuycross: None,
             copiesfit: None,
@@ -3505,7 +3477,6 @@ impl Default for Policy {
             copyspan: false,
             identityblob: false,
             copythree: false,
-            headsgate: false,
             frozencount: false,
             settlesearch: false,
             settlesources: false,
@@ -8433,22 +8404,6 @@ impl Supdb {
         )
     }
 
-    /// `supdb` with the partitions' heads copied at the controller's census
-    /// by the model's word alone (`Options::heads_owned_beside_copies`
-    /// off): a partition a merge lands after the block cache was granted
-    /// the raw records' place keeps its heads in a mapping, which the
-    /// burst's writes push out and the scans after it read back a page a
-    /// fault.
-    pub fn create_headsmodel(path: &Path) -> Res<Supdb> {
-        Supdb::with_policy(
-            path,
-            Policy {
-                headscopies: Some(false),
-                ..Policy::default()
-            },
-        )
-    }
-
     /// `supdb` with the form's pages cut into groups of a kibibyte of
     /// records where the default cuts at two (`Options::zpages_group_bytes`
     /// 1024): half the decode for a point read's first touch of a group,
@@ -10145,7 +10100,6 @@ impl Supdb {
             settleconvertquiet,
             settlevaluenear,
             settletablenear,
-            headslook,
             headsmapped,
             zpointwhole,
             znopointkeys,
@@ -10200,7 +10154,6 @@ impl Supdb {
             zrewarmturn,
             snapunfolded,
             snaplean,
-            headscopies,
             snapkept,
             zbuycross,
             copiesfit,
@@ -10287,7 +10240,6 @@ impl Supdb {
             copyspan,
             identityblob,
             copythree,
-            headsgate,
             frozencount,
             settlesearch,
             settlesources,
@@ -10655,11 +10607,6 @@ impl Supdb {
             } else {
                 supdb::Options::default().settle_table_ahead
             },
-            heads_look_ms: if headslook {
-                100
-            } else {
-                supdb::Options::default().heads_look_ms
-            },
             heads_owned: !headsmapped,
             zpages_point_part: !zpointwhole,
             zpages_point_keys: !znopointkeys,
@@ -10715,8 +10662,6 @@ impl Supdb {
             snapshot_extend_unfolded: snapunfolded
                 .unwrap_or(supdb::Options::default().snapshot_extend_unfolded),
             snapshot_build_lean: snaplean.unwrap_or(supdb::Options::default().snapshot_build_lean),
-            heads_owned_beside_copies: headscopies
-                .unwrap_or(supdb::Options::default().heads_owned_beside_copies),
             zpages_buy_crosses: zbuycross.unwrap_or(supdb::Options::default().zpages_buy_crosses),
             forms_off_snapshot_kept: snapkept
                 .unwrap_or(supdb::Options::default().forms_off_snapshot_kept),
@@ -10909,7 +10854,6 @@ impl Supdb {
             copy_prefetch_span: copyspan,
             identity_by_keys: !identityblob,
             copy_packed: !copythree,
-            heads_owned_past_fill: !headsgate,
             frozen_bytes: if frozencount { usize::MAX } else { 0 },
             settle_append_last: !settlesearch,
             settle_lone_chain: !settlesources,
@@ -11201,7 +11145,6 @@ impl Supdb {
             settleconvertquiet,
             settlevaluenear,
             settletablenear,
-            headslook,
             headsmapped,
             zpointwhole,
             znopointkeys,
@@ -11256,7 +11199,6 @@ impl Supdb {
             zrewarmturn,
             snapunfolded,
             snaplean,
-            headscopies,
             snapkept,
             zbuycross,
             copiesfit,
@@ -11343,7 +11285,6 @@ impl Supdb {
             copyspan,
             identityblob,
             copythree,
-            headsgate,
             frozencount,
             settlesearch,
             settlesources,
@@ -12537,9 +12478,6 @@ impl Engine for Supdb {
                 "supdb-ingestcopyspan"
             };
         }
-        if self.headsgate {
-            return "supdb-headsgate";
-        }
         if self.frozencount {
             return "supdb-frozencount";
         }
@@ -12802,9 +12740,6 @@ impl Engine for Supdb {
         if self.settletablenear {
             return "supdb-settletablenear";
         }
-        if self.headslook {
-            return "supdb-headslook";
-        }
         if self.headsmapped {
             return "supdb-headsmapped";
         }
@@ -13058,9 +12993,6 @@ impl Engine for Supdb {
         }
         if self.snaplean == Some(false) {
             return "supdb-snapfat";
-        }
-        if self.headscopies == Some(false) {
-            return "supdb-headsmodel";
         }
         if self.snapkept == Some(true) {
             return "supdb-snapkept";
@@ -13828,7 +13760,6 @@ impl Engine for Supdb {
             ("block_willneeds", z.block_willneeds as f64),
             ("willneed_asks", z.willneed_asks as f64),
             ("head_asks", z.head_asks as f64),
-            ("head_looks", z.head_looks as f64),
             ("head_submitted", z.head_submitted as f64),
             ("top_keys", z.top_keys as f64),
             ("dir_willneeds", z.dir_willneeds as f64),
@@ -15883,7 +15814,6 @@ pub fn guarantee(arm: &str) -> Option<Guarantee> {
         | "supdb-settlevaluenear"
         | "supdb-settlenoahead"
         | "supdb-settletablenear"
-        | "supdb-headslook"
         | "supdb-headsmapped"
         | "supdb-zpointwhole"
         | "supdb-znopointkeys"
@@ -15943,7 +15873,6 @@ pub fn guarantee(arm: &str) -> Option<Guarantee> {
         | "supdb-snapfolded"
         | "supdb-snapfat"
         | "supdb-snapold"
-        | "supdb-headsmodel"
         | "supdb-snapkept"
         | "supdb-zbuycross"
         | "supdb-jobsmappedbuycross"
@@ -16009,7 +15938,6 @@ pub fn guarantee(arm: &str) -> Option<Guarantee> {
         | "supdb-ingestidentityblob"
         | "supdb-copythree"
         | "supdb-ingestcopythree"
-        | "supdb-headsgate"
         | "supdb-frozencount"
         | "supdb-settlesearch"
         | "supdb-ingestsettlesearch"
@@ -17208,18 +17136,6 @@ pub fn open(arm: &str, dir: &Path, map_gb: usize) -> Res<Box<dyn Engine>> {
             },
             dir,
         )?,
-        "supdb-headsgate" => supdb_arm(
-            |d| {
-                Supdb::with_policy(
-                    d,
-                    Policy {
-                        headsgate: true,
-                        ..Policy::default()
-                    },
-                )
-            },
-            dir,
-        )?,
         "supdb-frozencount" => supdb_arm(
             |d| {
                 Supdb::with_policy(
@@ -18035,18 +17951,6 @@ pub fn open(arm: &str, dir: &Path, map_gb: usize) -> Res<Box<dyn Engine>> {
             },
             dir,
         )?,
-        "supdb-headslook" => supdb_arm(
-            |d| {
-                Supdb::with_policy(
-                    d,
-                    Policy {
-                        headslook: true,
-                        ..Policy::default()
-                    },
-                )
-            },
-            dir,
-        )?,
         "supdb-headsmapped" => supdb_arm(
             |d| {
                 Supdb::with_policy(
@@ -18476,7 +18380,6 @@ pub fn open(arm: &str, dir: &Path, map_gb: usize) -> Res<Box<dyn Engine>> {
         "supdb-snapfolded" => supdb_arm(Supdb::create_snapfolded, dir)?,
         "supdb-snapfat" => supdb_arm(Supdb::create_snapfat, dir)?,
         "supdb-snapold" => supdb_arm(Supdb::create_snapold, dir)?,
-        "supdb-headsmodel" => supdb_arm(Supdb::create_headsmodel, dir)?,
         "supdb-snapkept" => supdb_arm(Supdb::create_snapkept, dir)?,
         "supdb-zbuycross" => supdb_arm(Supdb::create_zbuycross, dir)?,
         "supdb-jobsmappedbuycross" => supdb_arm(Supdb::create_jobsmapped_buycross, dir)?,
@@ -21267,22 +21170,6 @@ mod tests {
                 assert_eq!(z.features(), base.features());
                 let o = z.db.as_ref().unwrap().options();
                 assert!(!o.copy_packed && b.copy_packed);
-                assert!(o.heads_owned_past_fill);
-            }
-            {
-                let z = Supdb::with_policy(
-                    &dir("headsgate"),
-                    Policy {
-                        headsgate: true,
-                        ..Policy::default()
-                    },
-                )
-                .unwrap();
-                assert_eq!(z.name(), "supdb-headsgate");
-                assert_eq!(z.features(), base.features());
-                let o = z.db.as_ref().unwrap().options();
-                assert!(!o.heads_owned_past_fill && b.heads_owned_past_fill);
-                assert!(o.copy_packed);
             }
             {
                 let z = Supdb::with_policy(
@@ -21611,12 +21498,6 @@ mod tests {
                 assert!(!o.snapshot_extend_unfolded && !o.snapshot_build_lean);
             }
             {
-                let z = Supdb::create_headsmodel(&dir("headsmodel")).unwrap();
-                assert_eq!(z.name(), "supdb-headsmodel");
-                assert_eq!(z.features(), base.features());
-                let o = z.db.as_ref().unwrap().options();
-                assert!(!o.heads_owned_beside_copies && b.heads_owned_beside_copies);
-                assert!(o.heads_owned && o.scan_cache_copies_fit);
                 let z = Supdb::create_snapkept(&dir("snapkept")).unwrap();
                 assert_eq!(z.name(), "supdb-snapkept");
                 assert_eq!(z.features(), base.features());

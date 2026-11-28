@@ -928,9 +928,6 @@ form's header read where its buffers are asked for
 without its value (`Options::settle_value_ahead`), the block table's own
 lines not asked for (`Options::settle_table_ahead`) -- and
 `supdb-settlenoahead` with all five, the loops as they stood;
-`supdb-headslook` is `supdb` with one look at a partition's heads'
-residency standing in for a settle's asks of the kernel for a hundred
-milliseconds (`Options::heads_look_ms`);
 `supdb-headsmapped` is `supdb` with the ordered indexes' heads read
 through their mappings throughout, no copy of a raw-served partition's
 held in the process's own memory out of core (`Options::heads_owned`

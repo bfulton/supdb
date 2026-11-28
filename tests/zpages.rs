@@ -3631,8 +3631,6 @@ fn a_settle_asks_for_the_heads_its_resolves_will_seek_only_out_of_core() {
             scan_block_cache: true,
             upkeep: supdb::Upkeep::Inline,
             publish_in_background: false,
-            // Every ask its own look: what is counted here is the asks.
-            heads_look_ms: 0,
             ..Options::default()
         },
     )
@@ -3707,138 +3705,6 @@ fn a_settle_asks_for_the_heads_its_resolves_will_seek_only_out_of_core() {
     check(&db, &model, "the gate at raw");
     db.close().unwrap();
     let _ = std::fs::remove_dir_all(&dir);
-}
-
-/// An ask for a run or a stride of heads is refused where its first page
-/// is resident, which it learns by a `mincore` of its own, so over an
-/// ordered index that is all in the page cache a settle's asks are those
-/// calls and nothing else. One look at each partition's whole stands in
-/// for them while it says the heads are resident
-/// (`Options::heads_look_ms`): such a settle looks and asks for nothing;
-/// with the indexes put out of the cache a look that has run out is made
-/// again, says so, and the asks go to the kernel as they did; a look that
-/// still stands is believed, a page gone since being a fault at the seek
-/// as it is with no ask; and zero is every ask's own look.
-#[cfg(target_os = "linux")]
-#[test]
-fn a_look_at_a_partitions_heads_stands_in_for_the_asks_while_they_are_resident() {
-    for look_ms in [0u32, 1, 600_000] {
-        let dir = scratch(&format!("head-looks-{look_ms}"));
-        let mut db = Db::create(
-            &dir,
-            Options {
-                zpages: ZPages::Off,
-                partition_bytes: Some(160 << 10),
-                scan_block_cache: true,
-                upkeep: supdb::Upkeep::Inline,
-                publish_in_background: false,
-                heads_look_ms: look_ms,
-                ..Options::default()
-            },
-        )
-        .unwrap();
-        let mut model = ordered_load(&mut db, 4000, 0x3B10E);
-        let check = |db: &Db, model: &Model, what: &str| {
-            for start in [b"".to_vec(), spaced_key(1000), spaced_key(2500)] {
-                for limit in [1usize, 57, 300] {
-                    same_window(
-                        &scanned(db, &start, limit),
-                        &window(model, &start, limit),
-                        &format!(
-                            "{what}, from {:?} for {limit}",
-                            String::from_utf8_lossy(&start)
-                        ),
-                    );
-                }
-            }
-        };
-        db.zgate_set(1);
-        // A scan first, so the commits after it file their batches.
-        check(&db, &model, "drained, the gate at the census");
-        let keys: Vec<Vec<u8>> = model.keys().cloned().collect();
-        let mut rng = Rng(0x3B10E1);
-        // The indexes resident, as the load left them.
-        let (size, resident) = resident_under(&dir, "ord-");
-        // Counted in whole pages, so not under the files' bytes.
-        assert!(
-            size > 0 && resident >= size,
-            "{resident} of {size} resident"
-        );
-        for k in keys.iter().step_by(5) {
-            let v = suite_value(&mut rng);
-            db.append(k, &v);
-            model.entry(k.clone()).or_default().push(v);
-        }
-        db.commit().unwrap();
-        let first = db.zpage_counts();
-        if look_ms == 0 {
-            assert!(
-                first.head_asks > 0 && first.head_looks == 0,
-                "every ask its own look: {} asks, {} looks",
-                first.head_asks,
-                first.head_looks
-            );
-        } else {
-            assert!(
-                first.head_asks == 0 && first.head_looks > 0,
-                "{look_ms} ms: the looks stood in for the asks: {} asks, {} looks",
-                first.head_asks,
-                first.head_looks
-            );
-        }
-        check(&db, &model, "a batch settled over resident heads");
-        // The indexes out of the page cache, and past the short look's time.
-        for path in common::store_paths(&dir) {
-            let name = path.file_name().unwrap().to_string_lossy().into_owned();
-            if name.starts_with("ord-") {
-                unmap_pages(&path);
-                evict(&path);
-            }
-        }
-        let (size, resident) = resident_under(&dir, "ord-");
-        assert!(
-            resident < size / 2,
-            "{resident} of {size} resident after the eviction"
-        );
-        std::thread::sleep(std::time::Duration::from_millis(20));
-        for k in keys.iter().skip(2).step_by(7) {
-            let v = suite_value(&mut rng);
-            db.append(k, &v);
-            model.entry(k.clone()).or_default().push(v);
-        }
-        db.commit().unwrap();
-        let second = db.zpage_counts();
-        match look_ms {
-            0 => assert!(
-                second.head_asks > first.head_asks && second.head_submitted > first.head_submitted,
-                "every ask its own look, and the kernel asked: {} asks, {} submitted",
-                second.head_asks,
-                second.head_submitted
-            ),
-            1 => assert!(
-                second.head_looks > first.head_looks
-                    && second.head_asks > 0
-                    && second.head_submitted > 0,
-                "a look run out is made again and the asks go: {} looks, {} asks, {} submitted",
-                second.head_looks,
-                second.head_asks,
-                second.head_submitted
-            ),
-            _ => assert!(
-                second.head_looks == first.head_looks && second.head_asks == 0,
-                "a look that stands is believed: {} looks, {} asks",
-                second.head_looks,
-                second.head_asks
-            ),
-        }
-        check(
-            &db,
-            &model,
-            "a batch settled over heads put out of the cache",
-        );
-        db.close().unwrap();
-        let _ = std::fs::remove_dir_all(&dir);
-    }
 }
 
 /// Away from the raw gate a mapping's pages leave the page cache between
@@ -4149,24 +4015,20 @@ fn under_the_forms_gate_a_declined_partitions_heads_are_copied_and_a_waiting_one
 /// still counted against it, and the grant stands only far from the point
 /// reads whose faults buy a form. At the census a misfit withholds the
 /// copies of the heads, so every partition landed after the grant read
-/// them through a mapping the bound could take. Under
-/// `Options::heads_owned_beside_copies` a grant standing reads as the store
-/// left raw, and every partition's heads are copied; without it none is,
-/// the model's word alone; and a grant a point read took back leaves the
-/// model's word alone under the option too. The page cache's budget is the
+/// them through a mapping the bound could take. A grant standing reads as
+/// the store left raw, and every partition's heads are copied; and a grant
+/// a point read took back leaves the model's word alone. The page cache's budget is the
 /// test's seam and falls by what the cache holds, as the platform's does.
 #[cfg(target_os = "linux")]
 #[test]
 fn a_cache_in_the_records_place_has_the_heads_copied_at_the_census() {
     #[derive(Clone, Copy, Debug, PartialEq)]
     enum Case {
-        /// The option, a grant standing.
+        /// A grant standing.
         Beside,
-        /// A grant standing, the option off.
-        ModelAlone,
-        /// The option, the grant taken back by a point read.
+        /// The grant taken back by a point read.
         TakenBack,
-        /// The option, and no grant: the cache's own budget never binds,
+        /// No grant: the cache's own budget never binds,
         /// and the misfit is its bytes all the same.
         NoGrant,
         /// No grant, the misfit the cache's, and a point read near.
@@ -4197,7 +4059,6 @@ fn a_cache_in_the_records_place_has_the_heads_copied_at_the_census() {
                 o.scan_cache_auto_room = true;
                 o.scan_cache_copies_fit = !no_grant(case);
                 o.heads_owned = true;
-                o.heads_owned_beside_copies = case != Case::ModelAlone;
                 o.upkeep = supdb::Upkeep::Inline;
             },
             |_| {},
@@ -4327,7 +4188,6 @@ fn a_cache_in_the_records_place_has_the_heads_copied_at_the_census() {
         let _ = std::fs::remove_dir_all(&dir);
     };
     run("heads-beside-copies", Case::Beside);
-    run("heads-beside-model", Case::ModelAlone);
     run("heads-beside-taken-back", Case::TakenBack);
     run("heads-beside-no-grant", Case::NoGrant);
     run("heads-beside-no-grant-near", Case::NoGrantNear);
@@ -4342,9 +4202,8 @@ fn a_cache_in_the_records_place_has_the_heads_copied_at_the_census() {
 /// its limit whatever the model says, and the kernel takes the pages
 /// written once and never read first, the ordered indexes of partitions
 /// just landed. So past that line the heads of a scanned store are copied
-/// under the raw gate too (`Options::heads_owned_past_fill`), and of every
-/// partition landed after, the line crossed back or not; at the line, or
-/// with the option off, none is.
+/// under the raw gate too, and of every partition landed after, the line
+/// crossed back or not; at the line none is.
 #[cfg(target_os = "linux")]
 #[test]
 fn under_the_raw_gate_heads_are_copied_once_the_stores_files_outgrow_the_fill() {
@@ -4362,107 +4221,82 @@ fn under_the_raw_gate_heads_are_copied_once_the_stores_files_outgrow_the_fill() 
             "{what}: FITS, the raw gate: {c:?}"
         );
     };
-    for on in [true, false] {
-        let (dir, mut db, mut model, inject) = auto_store_with(
-            &format!("heads-past-fill-{on}"),
-            1 << 40,
-            0.0,
-            FAULT_40US,
-            |o| o.heads_owned_past_fill = on,
-            |_| {},
-        );
-        let parts = db.zpage_counts().partitions;
-        // Scanned, the budget far over the store: nothing.
-        scan(&db, &model, "the raw gate, scanned");
-        wait_secs(&db, 3, 1);
-        raw_gate(&db, "a budget far over the store");
-        assert_eq!(db.heads_owned_counts(), (0, 0, 0), "far under the line");
-        // The store whole is more than the pages a read touches: the
-        // ordered indexes are in it.
-        let c = db.zpage_counts();
-        let whole = c.model_whole_bytes;
-        let touched = c.model_hash_bytes + c.model_record_bytes;
-        assert!(
-            whole >= touched + 8 * model.len() as u64,
-            "the store whole holds its indexes: {whole} over {touched}"
-        );
-        // The budget whose fill share is the store whole, to the byte: at
-        // the line and not past it, and the model's populations well
-        // inside it. Nothing.
-        let mut at = whole * 100 / 85;
-        while fill(at) < whole {
-            at += 1;
-        }
-        assert_eq!(fill(at), whole);
-        assert!(fill(at - 1) < whole && touched < at - 1);
-        inject.set_budget(at);
-        scan(&db, &model, "at the line");
-        wait_secs(&db, 3, 1);
-        raw_gate(&db, "at the line");
-        assert_eq!(db.heads_owned_counts(), (0, 0, 0), "at the line, not past");
-        // One byte less of budget: past the line, and every partition's
-        // heads are copied, where the option says so.
-        inject.set_budget(at - 1);
-        scan(&db, &model, "past the line");
-        let t = std::time::Instant::now();
-        while on && db.heads_owned_counts().0 < parts && t.elapsed().as_secs() < 20 {
-            wait_secs(&db, 1, 1);
-        }
-        if !on {
-            wait_secs(&db, 3, 1);
-        }
-        raw_gate(&db, "past the line");
-        let (made, given, bytes) = db.heads_owned_counts();
-        if on {
-            assert_eq!((made, given), (parts, 0), "every partition's heads copied");
-            assert_eq!(bytes, 8 * model.len() as u64);
-            assert_eq!(db.heads_past_fill(), parts, "each for the line");
-        } else {
-            assert_eq!((made, given, bytes), (0, 0, 0), "the mapping throughout");
-            assert_eq!(db.heads_past_fill(), 0);
-        }
-        assert_eq!(db.heads_beside_copies(), 0);
-        scan(&db, &model, "after the look");
-        // Past once, the store is one whose cache the kernel shrinks: with
-        // the budget far over it again, the partitions a rewrite lands
-        // have their heads copied all the same, and none is given back.
-        inject.set_budget(1 << 40);
-        wait_secs(&db, 3, 1);
-        rewrite_every_key(&mut db, &mut model, "after");
-        scan(&db, &model, "rewritten");
-        let landed = db.zpage_counts().partitions;
-        let t = std::time::Instant::now();
-        while on && db.heads_owned_counts().2 < 8 * model.len() as u64 && t.elapsed().as_secs() < 20
-        {
-            wait_secs(&db, 1, 1);
-        }
-        if !on {
-            wait_secs(&db, 3, 1);
-        }
-        raw_gate(&db, "rewritten");
-        let (made2, given2, bytes2) = db.heads_owned_counts();
-        if on {
-            assert_eq!(
-                bytes2,
-                8 * model.len() as u64,
-                "the landed partitions' heads"
-            );
-            assert_eq!((made2, given2), (made + landed, 0));
-            assert_eq!(db.heads_past_fill(), made2);
-        } else {
-            assert_eq!((made2, given2, bytes2), (0, 0, 0));
-        }
-        scan(&db, &model, "the copies of the landed partitions");
-        drop(db);
-        let _ = std::fs::remove_dir_all(&dir);
+    let (dir, mut db, mut model, inject) =
+        auto_store_with("heads-past-fill", 1 << 40, 0.0, FAULT_40US, |_| {}, |_| {});
+    let parts = db.zpage_counts().partitions;
+    // Scanned, the budget far over the store: nothing.
+    scan(&db, &model, "the raw gate, scanned");
+    wait_secs(&db, 3, 1);
+    raw_gate(&db, "a budget far over the store");
+    assert_eq!(db.heads_owned_counts(), (0, 0, 0), "far under the line");
+    // The store whole is more than the pages a read touches: the
+    // ordered indexes are in it.
+    let c = db.zpage_counts();
+    let whole = c.model_whole_bytes;
+    let touched = c.model_hash_bytes + c.model_record_bytes;
+    assert!(
+        whole >= touched + 8 * model.len() as u64,
+        "the store whole holds its indexes: {whole} over {touched}"
+    );
+    // The budget whose fill share is the store whole, to the byte: at
+    // the line and not past it, and the model's populations well
+    // inside it. Nothing.
+    let mut at = whole * 100 / 85;
+    while fill(at) < whole {
+        at += 1;
     }
+    assert_eq!(fill(at), whole);
+    assert!(fill(at - 1) < whole && touched < at - 1);
+    inject.set_budget(at);
+    scan(&db, &model, "at the line");
+    wait_secs(&db, 3, 1);
+    raw_gate(&db, "at the line");
+    assert_eq!(db.heads_owned_counts(), (0, 0, 0), "at the line, not past");
+    // One byte less of budget: past the line, and every partition's
+    // heads are copied.
+    inject.set_budget(at - 1);
+    scan(&db, &model, "past the line");
+    let t = std::time::Instant::now();
+    while db.heads_owned_counts().0 < parts && t.elapsed().as_secs() < 20 {
+        wait_secs(&db, 1, 1);
+    }
+    raw_gate(&db, "past the line");
+    let (made, given, bytes) = db.heads_owned_counts();
+    assert_eq!((made, given), (parts, 0), "every partition's heads copied");
+    assert_eq!(bytes, 8 * model.len() as u64);
+    assert_eq!(db.heads_past_fill(), parts, "each for the line");
+    assert_eq!(db.heads_beside_copies(), 0);
+    scan(&db, &model, "after the look");
+    // Past once, the store is one whose cache the kernel shrinks: with
+    // the budget far over it again, the partitions a rewrite lands
+    // have their heads copied all the same, and none is given back.
+    inject.set_budget(1 << 40);
+    wait_secs(&db, 3, 1);
+    rewrite_every_key(&mut db, &mut model, "after");
+    scan(&db, &model, "rewritten");
+    let landed = db.zpage_counts().partitions;
+    let t = std::time::Instant::now();
+    while db.heads_owned_counts().2 < 8 * model.len() as u64 && t.elapsed().as_secs() < 20 {
+        wait_secs(&db, 1, 1);
+    }
+    raw_gate(&db, "rewritten");
+    let (made2, given2, bytes2) = db.heads_owned_counts();
+    assert_eq!(
+        bytes2,
+        8 * model.len() as u64,
+        "the landed partitions' heads"
+    );
+    assert_eq!((made2, given2), (made + landed, 0));
+    assert_eq!(db.heads_past_fill(), made2);
+    scan(&db, &model, "the copies of the landed partitions");
+    drop(db);
+    let _ = std::fs::remove_dir_all(&dir);
 }
 
 /// The store whole is the level-0 pieces' files with the partitions': a
 /// burst seals pieces into the cache beside partitions the model goes on
 /// reading as fitting, the pieces being in neither population a read
-/// touches, and it is they that carry the store past the line
-/// (`Options::heads_owned_past_fill`).
+/// touches, and it is they that carry the store past the line.
 #[cfg(target_os = "linux")]
 #[test]
 fn a_bursts_pieces_carry_a_store_past_the_fill_line() {
@@ -4477,7 +4311,6 @@ fn a_bursts_pieces_carry_a_store_past_the_fill_line() {
         0.0,
         FAULT_40US,
         |o| {
-            o.heads_owned_past_fill = true;
             // The burst's piece stands until the test is done with it.
             o.l0_trigger = 1 << 20;
         },

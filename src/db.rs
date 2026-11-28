@@ -747,9 +747,6 @@ pub struct ZCounts {
     /// that seek them, and those submitted (`OrdIndex::willneed_heads`).
     pub head_asks: u64,
     pub head_submitted: u64,
-    /// Looks at whether a partition's heads are all resident, which stand
-    /// in for those asks while they say so (`Options::heads_look_ms`).
-    pub head_looks: u64,
     /// Block-boundary keys the block cache read off an ordered index's top
     /// level, in memory, where it read a record before
     /// (`Options::boundary_keys_from_top`).
@@ -1218,7 +1215,7 @@ pub struct ZCounts {
     pub model_hash_bytes: u64,
     pub model_record_bytes: u64,
     /// The store's files whole as the tick last summed them, the level-0
-    /// pieces' with the partitions' (`Options::heads_owned_past_fill`).
+    /// pieces' with the partitions'.
     pub model_whole_bytes: u64,
     /// Form files the controller retired.
     pub retired: u64,
@@ -6677,28 +6674,6 @@ pub struct Options {
     /// walked them. `supdb-settleconvertquiet` is the conversion with no
     /// walk left.
     pub settle_convert_fills: bool,
-    /// EXPERIMENT: how long a look at whether a partition's heads are all
-    /// in the page cache stands, in milliseconds, for the asks a settle
-    /// makes ahead of its resolves out of core (`OrdIndex::willneed_heads`):
-    /// while a
-    /// look says they are, the settle asks for none of them (0, the
-    /// default: every ask reads its own page's residency). An ask is
-    /// refused where its first page is resident, which it learns by a
-    /// `mincore` of its own, so a store that reads as out of core with
-    /// most of its ordered indexes in memory -- three million keys under
-    /// 1.25 GiB at the controller's census -- pays a call a key to be told
-    /// so, a tenth of the upkeep thread over the full rewrite's burst. One
-    /// look a partition every hundred milliseconds took that tenth off the
-    /// thread's CPU and put more than it back as waiting: under the bound
-    /// the indexes' pages leave the cache all through the burst, three to
-    /// five thousand of the thread's seeks faulted on one gone since its
-    /// partition's look where six hundred did with an ask a key, the
-    /// writer was held a quarter to a half longer and the burst read one
-    /// to three percent longer in both orders (`docs/engine.md`). The
-    /// calls are the price of pages that will not stay, and the lever is
-    /// keeping them. `supdb-headslook` is the look, at a hundred
-    /// milliseconds.
-    pub heads_look_ms: u32,
     /// Whether a partition's ordered-index heads are held in anonymous
     /// memory while the store reads as out of core and the controller
     /// leaves the partition to the raw form (`Maint::z_heads_look`), and
@@ -6715,72 +6690,6 @@ pub struct Options {
     /// through its own cache (`OrdIndex::mapped_heads`).
     /// `supdb-headsmapped` reads the mapping throughout.
     pub heads_owned: bool,
-    /// Whether the heads are copied (`heads_owned`) at the controller's
-    /// census while the block cache holds the raw records' place
-    /// (`scan_cache_copies_fit`), whatever the controller's model says of
-    /// the raw form. At the census a copy is made while the model
-    /// says the raw form fits and none while it says it does not, since a
-    /// misfit there is the stretch between a crossing and the install its
-    /// reads' faults buy (`Maint::z_heads_look`). A grant of the records'
-    /// place makes the model say so of a store nothing will be bought
-    /// for: the page cache's budget is the limit less the process's
-    /// anonymous memory, the copies are that memory, and the records they
-    /// stand in for are still counted as pages the raw form needs -- at
-    /// three million keys under 1 GiB a budget of 880 MB before the lag
-    /// sweep's full rewrite and 265 after the grant, against records of
-    /// 372 -- while the grant stands only far from point reads, whose
-    /// faults are what buys a form. So every partition a merge landed
-    /// after the grant kept its heads in a mapping, eight megabytes of
-    /// them at the pass after the burst, the burst's writes pushed their
-    /// pages out, and the scans' start seeks read them back a page a
-    /// fault behind a merge's reads: every major fault of the scanning
-    /// thread in six traced passes but one was `Reader::scan_seek` on one
-    /// such index, nine to thirty-six a pass and a hundred and ninety in
-    /// the slowest of twelve paired, a hundred and fifty to a hundred and
-    /// eighty in the two slow reps of three a row took. Under this option
-    /// a grant standing reads as the store left raw: the scanning thread
-    /// took a fault at most in twenty-four passes paired, where the
-    /// model's word alone left passes of sixty-three to a hundred and
-    /// ninety. A process with less beside the cache has room for every
-    /// copy with no grant, the cache's own budget never binding, and the
-    /// same misfit by the same count: with the jobs' arrays mapped
-    /// (`jobs_mapped`) no grant was made in six sweeps of six, thirteen
-    /// partitions of twenty had their heads copied, and two passes of six
-    /// took 49 and 178 faults on the late indexes, 47 and 55 ms where the
-    /// others ran 16 to 23. So the look asks the model's question with
-    /// the cache's bytes given back to the budget
-    /// (`Maint::z_misfit_is_the_caches`), far from point reads, grant or
-    /// none. On; `supdb-headsmodel` is the model's word alone.
-    #[doc(hidden)]
-    pub heads_owned_beside_copies: bool,
-    /// The heads of a partition the raw form serves are copied while the
-    /// controller's model says the raw form fits and it is asking nothing
-    /// -- the raw gate, where `z_heads_look` made no copy -- wherever the
-    /// store's files whole -- every segment's hash region, record region
-    /// and ordered index, the level-0 pieces' with the partitions' --
-    /// have stood past the fill share of its budget (`zselect::FORM_FILL`,
-    /// the share that leaves the cache's other tenants theirs) at a
-    /// reading of the model, and from then on. The model's fit is of the
-    /// pages a read touches, the partitions' two populations, and a burst
-    /// puts a store's worth of pieces in the cache beside them: the group
-    /// comes to its limit, and the kernel takes the pages written once
-    /// and never read first, the ordered indexes of the partitions the
-    /// burst's merges had just landed. With the copies of fixed-size
-    /// records a fifth smaller (`Options::copy_packed`) a store of three
-    /// million keys under 1.25 GiB never left the raw gate through a full
-    /// rewrite, no head was copied, and half the passes after it took two
-    /// hundred major faults on their scans' seeks, three times a pass's
-    /// length, where the larger process had tripped the census and had
-    /// its seventeen partitions' heads copied. The line is the store's own
-    /// arithmetic and not a reading of the group, so it is crossed in the
-    /// middle of the burst, seconds ahead of the limit: read as the
-    /// group's unused memory less the margin, once a second, the limit
-    /// was seen in half the sweeps, and read as the kernel's count of the
-    /// times the limit was met (`memory.failcnt`) in a third, the group
-    /// first meeting its limit as the burst ends. On; off leaves the raw
-    /// gate's heads the page cache's, `supdb-headsgate`.
-    #[doc(hidden)]
-    pub heads_owned_past_fill: bool,
     /// The hot-raw policy's skew bar read against the room
     /// (`Maint::z_hot_look`): the candidate partition is asked for where its
     /// raw bytes fit the group's unused memory and it is read more a key
@@ -7954,10 +7863,7 @@ impl Default for Options {
             settle_patch_in_place: true,
             settle_converts: true,
             settle_convert_fills: true,
-            heads_look_ms: 0,
             heads_owned: true,
-            heads_owned_beside_copies: true,
-            heads_owned_past_fill: true,
             zpages_hot_skew_room: false,
             zpages_hot_room_margin_pct: 0,
             zpages_walk_owns_decodes: false,
@@ -17750,9 +17656,6 @@ struct Slot {
     /// (`OrdIndex::willneed_heads`).
     zheadasks: AtomicU64,
     zheadsubmitted: AtomicU64,
-    /// Looks at a partition's heads' residency whole
-    /// (`Options::heads_look_ms`).
-    zheadlooks: AtomicU64,
     /// Partition walks of a scan served by a form file, the groups decoded
     /// for them, and the runs of records no page holds the raw form walked
     /// inside them.
@@ -17856,7 +17759,6 @@ impl Slot {
             zwillneedasks: AtomicU64::new(0),
             zheadasks: AtomicU64::new(0),
             zheadsubmitted: AtomicU64::new(0),
-            zheadlooks: AtomicU64::new(0),
             zscanz: AtomicU64::new(0),
             zscangroups: AtomicU64::new(0),
             znopagescans: AtomicU64::new(0),
@@ -17898,20 +17800,21 @@ impl Slot {
     }
 }
 
-// Five lines: the nine words that were here, the second form's thirteen
+// Four lines: the nine words that were here, the second form's thirteen
 // counters and the census's seventeen sums, thirty-nine words, were a
 // 384-byte slot since the census, the cursor's two counts (`zviews`,
 // `zaheads`) took it past forty-eight words into a fourth line, and the
 // count of a sparse stride walk's keys stepped by the field
 // (`zstride.direct`), the word after the cursor's steps (`zsteps`) filled
-// the fourth, took it into a fifth. What the layout is for is that no
+// the fourth, took it into a fifth, and the look at a partition's heads'
+// residency gone (`zheadlooks`) took it back to four. What the layout is for is that no
 // other thread writes a slot's lines, which the lines a handle owns keep
 // as one did; the first line's sixteen words were full at the seventh
 // second-form counter, the second's at the census's third sum, the
 // third's at the cursor's first count, the fourth's at its steps. The
 // size is pinned so that a counter added moves it here and not in a
 // threaded cell.
-const _: () = assert!(std::mem::align_of::<Slot>() >= 128 && std::mem::size_of::<Slot>() == 640);
+const _: () = assert!(std::mem::align_of::<Slot>() >= 128 && std::mem::size_of::<Slot>() == 512);
 
 const READER_SLOTS: usize = 256;
 
@@ -26344,8 +26247,7 @@ struct Shared {
     retired_heads: RetireList<HeadsBuf>,
     /// Copies of heads made, copies given up, and of the copies made
     /// those made for a grant of the records' place alone, the model
-    /// saying the raw form does not fit
-    /// (`Options::heads_owned_beside_copies`).
+    /// saying the raw form does not fit.
     heads_events: [AtomicU64; 4],
     /// The dead names given to retired form files (`zfile::zpg_dead_name`).
     next_dead: AtomicU64,
@@ -26796,7 +26698,7 @@ struct Shared {
     /// Whether a grant of the raw records' place stands
     /// (`Options::scan_cache_copies_fit`): set by the writer's side where
     /// it grants one and cleared where it takes one back, for the segment
-    /// work's look at the heads (`Options::heads_owned_beside_copies`),
+    /// work's look at the heads,
     /// which cannot read the writer's own record of it.
     copies_stand: std::sync::atomic::AtomicBool,
     /// The writer's block cache, bytes, as its last commit's maintenance
@@ -28387,10 +28289,6 @@ struct FormsState {
     /// The settle's resolves whose stride was planned ahead
     /// (`Options::settle_seek_ahead`).
     seeks_planned: std::cell::Cell<u64>,
-    /// Per partition by position, the last look at its heads' residency:
-    /// the segment looked at, when, and whether every page was resident
-    /// (`Options::heads_look_ms`).
-    heads_looks: std::cell::RefCell<Vec<Option<(u64, std::time::Instant, bool)>>>,
     /// The settle's patches whose lines were asked for by the cut
     /// (`Options::settle_patch_at_cut`).
     patch_asks: std::cell::Cell<u64>,
@@ -28574,7 +28472,6 @@ impl FormsState {
             lazy_cuts: Counts::new(),
             settle_short: Counts::new(),
             seeks_planned: std::cell::Cell::new(0),
-            heads_looks: std::cell::RefCell::new(Vec::new()),
             patch_asks: std::cell::Cell::new(0),
             settle_ahead: Counts::new(),
             read_cap: std::cell::Cell::new(0),
@@ -32620,7 +32517,6 @@ impl Reader {
             willneed_asks: rd.stat(|s| &s.zwillneedasks),
             head_asks: rd.stat(|s| &s.zheadasks),
             head_submitted: rd.stat(|s| &s.zheadsubmitted),
-            head_looks: rd.stat(|s| &s.zheadlooks),
             top_keys: get(&self.shared.asks.top_keys),
             dir_willneeds: get(&self.shared.asks.dir_runs),
             dir_asks: get(&self.shared.asks.dir_submitted),
@@ -33081,27 +32977,6 @@ impl Reader {
         if seg.ord.willneed_heads(lo, hi) > 0 {
             self.zbump(|s| &s.zheadsubmitted);
         }
-    }
-
-    /// Whether partition `at`'s heads were all resident at the last look,
-    /// the look made again once it is `Options::heads_look_ms` old or the
-    /// partition there is another segment (`OrdIndex::heads_all_resident`).
-    fn heads_warm(&self, at: usize, seg: &Seg, now: std::time::Instant) -> bool {
-        let id = seg.blob.id();
-        let mut looks = self.fs().heads_looks.borrow_mut();
-        if looks.len() <= at {
-            looks.resize(at + 1, None);
-        }
-        let stands = std::time::Duration::from_millis(u64::from(self.opts.heads_look_ms));
-        if let Some((seen, when, warm)) = looks[at] {
-            if seen == id && now.saturating_duration_since(when) < stands {
-                return warm;
-            }
-        }
-        let warm = seg.ord.heads_all_resident();
-        self.zbump(|s| &s.zheadlooks);
-        looks[at] = Some((id, now, warm));
-        warm
     }
 
     /// The partition `key` falls in, of the first `np` segments: stepped to
@@ -39553,21 +39428,6 @@ impl Reader {
         // second of the full rewrite's settles.
         let page = crate::bytes::os_page_size();
         let asking = out_of_core(&self.opts, self.shared.zgate.load()) && np > 0;
-        // One look a partition first (`Options::heads_look_ms`): the raw
-        // partitions whose heads are not all resident are the ones asked
-        // for, and with none there is no asking in this settle.
-        let cold: Vec<bool> = if asking && self.opts.heads_look_ms > 0 {
-            let now = std::time::Instant::now();
-            self.segs()[..np]
-                .iter()
-                .enumerate()
-                .map(|(p, s)| self.zc(s).is_none() && !self.heads_warm(p, s, now))
-                .collect()
-        } else {
-            Vec::new()
-        };
-        let asking = asking && (self.opts.heads_look_ms == 0 || cold.iter().any(|&c| c));
-        let asked_of = |p: usize| cold.get(p).copied().unwrap_or(true);
         // Per partition: the rank the asks have reached, the page of the
         // last resolve and whether the batch reads dense there; then the
         // sparse cursor's position in the batch and its partition.
@@ -39668,7 +39528,7 @@ impl Reader {
                     let Some(s) = self.segs()[..np].get(at_ahead) else {
                         continue;
                     };
-                    if dense[at_ahead] || self.zc(s).is_some() || !asked_of(at_ahead) {
+                    if dense[at_ahead] || self.zc(s).is_some() {
                         continue;
                     }
                     if let Some((lo, hi)) = s.ord.stride_window(k) {
@@ -39709,7 +39569,7 @@ impl Reader {
             // after this one -- this one is resident, the resolve just
             // seized it, and an ask that starts on a resident page asks
             // nothing -- until the frontier stands the lead past the rank.
-            if asking && cut != LAZY_CUT && self.zc(seg).is_none() && asked_of(at) {
+            if asking && cut != LAZY_CUT && self.zc(seg).is_none() {
                 let rank = (cut >> 1) as usize;
                 let pg = seg.ord.head_page(rank, page);
                 dense[at] = last_page[at] != usize::MAX && pg.saturating_sub(last_page[at]) <= 1;
@@ -55800,16 +55660,14 @@ impl Db {
     }
 
     /// The copies of heads made under the raw gate, the store's files
-    /// whole past the fill share of its budget
-    /// (`Options::heads_owned_past_fill`).
+    /// whole past the fill share of its budget.
     #[doc(hidden)]
     pub fn heads_past_fill(&self) -> u64 {
         self.shared.heads_events[3].load(AtomicOrdering::Relaxed)
     }
 
     /// The copies of heads made for a grant of the records' place alone,
-    /// the controller's model saying the raw form does not fit
-    /// (`Options::heads_owned_beside_copies`).
+    /// the controller's model saying the raw form does not fit.
     #[doc(hidden)]
     pub fn heads_beside_copies(&self) -> u64 {
         self.shared.heads_events[2].load(AtomicOrdering::Relaxed)
@@ -59713,8 +59571,7 @@ struct Maint {
     z_misfit_caches: bool,
     /// Whether the store's files whole have stood past the fill share of
     /// its budget at a reading of the model (`z_model`): what
-    /// `z_heads_look` copies heads on under the raw gate
-    /// (`Options::heads_owned_past_fill`).
+    /// `z_heads_look` copies heads on under the raw gate.
     z_past_fill: bool,
     /// The coding the selector chose at its last reading
     /// (`Options::zpages_coding_auto`, `zselect::choose_coding`), which the
@@ -62634,7 +62491,7 @@ impl Maint {
     /// the census being the group's pressure, and none while the model
     /// says it does not, which is the stretch between a crossing and the
     /// install its reads' faults buy -- but for a store whose block cache
-    /// holds the raw records' place (`Options::heads_owned_beside_copies`),
+    /// holds the raw records' place,
     /// where the misfit is the cache's own bytes and no read is near to
     /// buy anything. The first version copied whatever
     /// the raw form was serving at the look: at ten million keys under the
@@ -62668,23 +62525,22 @@ impl Maint {
         // them while the store fits -- and does not once the store's
         // files whole have outgrown the cache's share of the budget,
         // whatever the model says of the pages a read touches
-        // (`Options::heads_owned_past_fill`).
-        let past_fill = self.opts.heads_owned_past_fill && self.z_past_fill;
-        if gate == zselect::GATE_RAW && !past_fill {
+        // (`ZEvents::model_whole`).
+        if gate == zselect::GATE_RAW && !self.z_past_fill {
             return;
         }
         let near = self.scans_near();
-        // A grant of the records' place reads as the store left raw
-        // (`Options::heads_owned_beside_copies`): the model's misfit is
-        // then the grant's own bytes, and it stands only far from the
-        // point reads whose faults would buy a form.
+        // A grant of the records' place reads as the store left raw: the
+        // model's misfit is then the grant's own bytes, and it stands only
+        // far from the point reads whose faults would buy a form; the
+        // model's word alone charged the block cache's copies and the
+        // records they stand in for both.
         // And so does a cache that holds that place with no grant, its
         // own budget never having bound: the misfit is its bytes either
         // way (`z_misfit_is_the_caches`), and no point read is near to
         // buy anything.
-        let beside = self.opts.heads_owned_beside_copies
-            && (self.shared.copies_stand.load(AtomicOrdering::Acquire)
-                || (self.z_misfit_caches && self.shared.points_far.load(AtomicOrdering::Acquire)));
+        let beside = self.shared.copies_stand.load(AtomicOrdering::Acquire)
+            || (self.z_misfit_caches && self.shared.points_far.load(AtomicOrdering::Acquire));
         let model_raw = !self.z_auto || self.z_leaves_raw;
         let census_raw = model_raw || beside;
         let _op = self.op();
@@ -64897,7 +64753,7 @@ impl Maint {
     }
 
     /// Whether the misfit the model reads under `budget` is the block
-    /// cache's own bytes (`Options::heads_owned_beside_copies`): the raw
+    /// cache's own bytes: the raw
     /// populations within the budget once what the writer's cache holds
     /// is given back to it. The model's budget is the limit less the
     /// process's anonymous memory, the cache's copies are in that memory,
@@ -65394,7 +65250,7 @@ impl Maint {
         self.z_leaves_raw =
             heads_left_raw(self.z_leaves_raw, &d, model.as_ref().map(|m| m.phi_raw));
         // And whose the misfit is, where the model was read
-        // (`Options::heads_owned_beside_copies`).
+        // (`Db::z_misfit_is_the_caches`).
         if let Some(m) = model.as_ref() {
             self.z_misfit_caches = self.z_misfit_is_the_caches(m.budget);
         }
@@ -67590,8 +67446,7 @@ impl Maint {
             .model_whole
             .store(whole, AtomicOrdering::Relaxed);
         self.z_past_budget = hash.saturating_add(records) > budget;
-        // The store whole past the fill share of its budget
-        // (`Options::heads_owned_past_fill`): the cache then holds more of
+        // The store whole past the fill share of its budget: the cache then holds more of
         // the store's than the budget leaves it, whatever the model says
         // of the pages a read touches, and the kernel is taking some. Once
         // past, the store is one whose cache the kernel shrinks: a merge
