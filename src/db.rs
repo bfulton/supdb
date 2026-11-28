@@ -3795,29 +3795,6 @@ pub struct Options {
     /// copy at the commit instead, on a thread of the store's own, and
     /// is the write-time structure this is the read half of.
     pub snapshot_runs: bool,
-    /// The seal thread publishes the frozen table's scan snapshot, with
-    /// every key's chain copied beside it in key order, into the state
-    /// the freeze made, as soon as it has sorted the table: a store whose
-    /// only content is the table being sealed is read on the merge path
-    /// for the seal's whole run, and without this the first handle to
-    /// scan sorted the same table again and every scan after chased each
-    /// key's entry, chain and value through the memtable. It is
-    /// published as the base of a snapshot of no live entry, a handle's
-    /// extension carries it as its base, and a handle whose base is an
-    /// order without the chains takes the copy as its base at its next
-    /// scan. The copy is set on the table as well (`FrozenSnaps`), where
-    /// a state published later finds it, and is built from the order a
-    /// freeze, a scan or the keeper set there first rather than from a
-    /// sort of its own. The copy is about the table's key and value
-    /// bytes, held until the seal lands. Off is the shape before it, kept
-    /// to price it.
-    pub seal_snapshot: bool,
-    /// The seal writes its records from that snapshot's arena -- the keys
-    /// and the copied chains in key order, one sequential read -- instead
-    /// of walking each entry's chain through the memtable, three dependent
-    /// misses a key. Nothing without `seal_snapshot`. Off is the walk,
-    /// kept to price it.
-    pub seal_from_snapshot: bool,
     /// EXPERIMENT: the run keeper, a thread of the store's own at idle
     /// priority that keeps the published scan snapshot current to the
     /// commits. Polling them once a scan has happened over the store,
@@ -5613,45 +5590,22 @@ pub struct Options {
     /// first commit, `supdb-runcreate` and `supdb-ingestruncreate`.
     #[doc(hidden)]
     pub run_spare: bool,
-    /// EXPERIMENT, refuted and kept as an arm: a drain's seal copies the
-    /// frozen table's chains into a snapshot for the scans over the
-    /// store while the seal runs, as any seal does (`seal_snapshot`),
-    /// and under a drain the writer waits and reads nothing, so the copy
-    /// -- 1.0 to 1.5 ms of a shuffled load's drain at ten thousand keys
-    /// and 5 to 7 of 17 at thirty, in the drain's stamps (`snapped`) --
-    /// read as a cost paid for nobody. Taken away, the records phase grew
-    /// by the same amount at both rungs and the drain ended level: the
-    /// copy is the cheaper of two walks over the table, one pass with
-    /// its lookahead and a sequential read after it against a walk
-    /// interleaved with the writer's work, and its pages were not the
-    /// price. On, the default, the copy whatever the seal's reason. Off,
-    /// a drain's seal builds none and writes its records from the
-    /// table's chains with the copy's lookahead, a copy someone set on
-    /// the table already taken as it is: `supdb-nodrainsnap` and
-    /// `supdb-ingestnodrainsnap`.
-    pub drain_snapshot: bool,
-    /// A seal far from reads builds its snapshot copy as any seal does
-    /// (`seal_snapshot`). Off, the default, a seal of a table frozen with
+    /// A seal far from reads builds its snapshot copy as any seal does.
+    /// Off, the default, a seal of a table frozen with
     /// no scan around (`reads_around`: none in the store's life, or two
     /// stores' worth of writes since the last) builds none and writes its
-    /// records from the table's chains with the copy's lookahead, as a
-    /// drain's under `drain_snapshot` off; a copy someone set on the
-    /// table already is taken as it is. The copy is the table's key and
+    /// records from the table's chains with the copy's lookahead; a copy
+    /// someone set on the table already is taken as it is. The copy is the table's key and
     /// value bytes again, held with the table until the seal lands, and
     /// a load whose seals fall behind holds it for every table frozen:
     /// a shuffled load of five million keys under 640 MiB held three
     /// frozen tables and their three copies, 380 MB of the bound, and
     /// the bound killed it, where the arm without the block cache, its
     /// seals landing ahead of the next freeze, held one. A drain's seal
-    /// builds its copy as `drain_snapshot` says, far from reads or not:
-    /// one table's copy at a drain is not what the bound killed, and the
-    /// scans after a shuffled load of thirty thousand keys without it read
-    /// 0.89-0.97x in six sittings, at the same instructions and over the
-    /// same segment byte for byte, where two arms that differ in nothing
-    /// there read 0.92-1.09x -- the memory those scans run over, which
-    /// says nothing either way, so the drain keeps the shape its rows
-    /// were taken in. On, `supdb-sealcopyfar` and
-    /// `supdb-ingestsealcopyfar`.
+    /// builds its copy, far from reads or not: one table's copy at a drain
+    /// is not what the bound killed. A seam for the tests that hold a
+    /// seal's copy.
+    #[doc(hidden)]
     pub seal_snapshot_far: bool,
     /// A landing far from reads takes its pieces' bounds -- and their
     /// ranks, under `piece_ranks_whole` -- against their partitions before
@@ -7858,8 +7812,6 @@ impl Default for Options {
             share_snapshot: true,
             snapshot_adopt_behind: 0,
             snapshot_runs: false,
-            seal_snapshot: true,
-            seal_from_snapshot: true,
             snapshot_keeper: false,
             snapshot_keeper_recent_pct: 100,
             promote_entries: 0,
@@ -7961,7 +7913,6 @@ impl Default for Options {
             bloom_pieces_only: true,
             land_fresh_lazy: true,
             run_spare: true,
-            drain_snapshot: true,
             seal_snapshot_far: false,
             land_ranks_far: false,
             piece_ranks_whole: false,
@@ -37764,9 +37715,6 @@ impl Reader {
         gen: u64,
         mine: Option<&(u64, std::sync::Arc<Snapshot>)>,
     ) -> bool {
-        if !self.opts.seal_snapshot {
-            return false;
-        }
         let st = self.state();
         if st.frozen.is_empty() {
             return false;
@@ -37840,7 +37788,7 @@ impl Reader {
             let added = self.fs().snap_added.borrow().len();
             stale = behind(held, added);
         }
-        if !stale && moved && self.opts.seal_snapshot {
+        if !stale && moved {
             // The log moved and the seal's snapshot is published: the
             // switch above asks only when nothing moved.
             stale = self.seal_snapshot_ahead(gen, cache.as_ref());
@@ -48680,7 +48628,7 @@ impl Db {
         // handle adopts a published snapshot under no pin, and a swap
         // from another thread between its load and its clone would free
         // what it took.
-        let snap_reader = if self.opts.seal_snapshot && self.opts.writer_pins {
+        let snap_reader = if self.opts.writer_pins {
             let r = self.seal_reader();
             // Every engine slot has a claimant by name, and one more would
             // take a seal's silently: the fast path would go, and no
@@ -48693,7 +48641,6 @@ impl Db {
         } else {
             None
         };
-        let from_snapshot = self.opts.seal_from_snapshot;
         let frozen_snaps = self.opts.frozen_snaps;
         // Reads around the table being sealed, by the writes of the
         // tables sealed since the store's scan count last moved: a seal
@@ -48723,11 +48670,7 @@ impl Db {
         self.shared
             .reads_near
             .store(near || self.draining, AtomicOrdering::Release);
-        let build_copy = if self.draining {
-            self.opts.drain_snapshot
-        } else {
-            near || self.opts.seal_snapshot_far
-        };
+        let build_copy = self.draining || near || self.opts.seal_snapshot_far;
         let bloom_pieces_only = self.opts.bloom_pieces_only;
         // As the seal's writer has them (`Shared::job_buffers`, above).
         let jobs_mapped = opts.maps();
@@ -48809,7 +48752,8 @@ impl Db {
                 });
                 let snap = match copied {
                     Some(h) => h.clone(),
-                    // A drain's seal builds none (`Options::drain_snapshot`).
+                    // A seal far from reads builds none
+                    // (`Options::seal_snapshot_far`).
                     None if !build_copy => return None,
                     None => {
                         let mut built = Snapshot::from_frozen(&mem, &order)?;
@@ -48870,7 +48814,7 @@ impl Db {
             // one: the keys and the chains in key order, one sequential
             // read, where the walk through the memtable was the entry,
             // the chain and the value, three dependent misses a key.
-            let stream = snap.as_ref().filter(|_| from_snapshot);
+            let stream = snap.as_ref();
             // The table itself, one pointer for the walk to keep, where
             // the walk through the capture reloaded the capture and then
             // the table from it at each of a key's eight uses.

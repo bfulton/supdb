@@ -678,14 +678,6 @@ pub struct Supdb {
     /// before (`Options::drain_syncs_wal`). `supdb-ingestwalsync`, and
     /// `supdb-walsync` durable, where every commit synced already.
     walsync: bool,
-    /// A drain's seal builds no snapshot copy and walks the table for
-    /// its records (`Options::drain_snapshot` off), the refuted shape.
-    /// `supdb-ingestnodrainsnap`, and `supdb-nodrainsnap` durable.
-    nodrainsnap: bool,
-    /// A seal far from reads builds its snapshot copy as any seal did
-    /// (`Options::seal_snapshot_far`). `supdb-ingestsealcopyfar`, and
-    /// `supdb-sealcopyfar` durable.
-    sealcopyfar: bool,
     /// A landing far from reads takes its pieces' ranks and bounds as any
     /// landing did (`Options::land_ranks_far`). `supdb-ingestranksfar`,
     /// and `supdb-ranksfar` durable.
@@ -2173,14 +2165,6 @@ struct Policy {
     /// before (`Options::drain_syncs_wal`). `supdb-ingestwalsync`, and
     /// `supdb-walsync` durable, where every commit synced already.
     walsync: bool,
-    /// A drain's seal builds no snapshot copy and walks the table for
-    /// its records (`Options::drain_snapshot` off), the refuted shape.
-    /// `supdb-ingestnodrainsnap`, and `supdb-nodrainsnap` durable.
-    nodrainsnap: bool,
-    /// A seal far from reads builds its snapshot copy as any seal did
-    /// (`Options::seal_snapshot_far`). `supdb-ingestsealcopyfar`, and
-    /// `supdb-sealcopyfar` durable.
-    sealcopyfar: bool,
     /// A landing far from reads takes its pieces' ranks and bounds as any
     /// landing did (`Options::land_ranks_far`). `supdb-ingestranksfar`,
     /// and `supdb-ranksfar` durable.
@@ -3364,8 +3348,6 @@ impl Default for Policy {
             inlineall: false,
             lazysettle: false,
             walsync: false,
-            nodrainsnap: false,
-            sealcopyfar: false,
             ranksfar: false,
             rankswhole: false,
             mergerecordkeys: false,
@@ -6429,32 +6411,6 @@ impl Supdb {
         )
     }
 
-    /// `supdb` whose drain's seal builds no snapshot copy and walks the
-    /// table for its records: against `supdb` it prices the copy on the
-    /// durable drain, which read as the cheaper walk.
-    pub fn create_nodrainsnap(path: &Path) -> Res<Supdb> {
-        Supdb::with_policy(
-            path,
-            Policy {
-                nodrainsnap: true,
-                ..Policy::default()
-            },
-        )
-    }
-
-    /// `supdb` whose seals build their snapshot copy far from reads as
-    /// well: against `supdb` it prices the copy on a load nobody reads,
-    /// the walk the seal does without it and the memory it holds.
-    pub fn create_sealcopyfar(path: &Path) -> Res<Supdb> {
-        Supdb::with_policy(
-            path,
-            Policy {
-                sealcopyfar: true,
-                ..Policy::default()
-            },
-        )
-    }
-
     /// `supdb` whose landings take their pieces' ranks and bounds far from
     /// reads as well: against `supdb` it prices the walk on a load nobody
     /// reads, which a bound turns into faults on the segment work's thread.
@@ -6942,36 +6898,6 @@ impl Supdb {
                 partition: false,
                 durable: false,
                 boundarytop: true,
-                ..Policy::default()
-            },
-        )
-    }
-
-    /// `supdb-ingest` whose seals build their snapshot copy far from
-    /// reads as well: against `supdb-ingest` it prices the copy on the
-    /// buffered loads.
-    pub fn create_ingest_sealcopyfar(path: &Path) -> Res<Supdb> {
-        Supdb::with_policy(
-            path,
-            Policy {
-                partition: false,
-                durable: false,
-                sealcopyfar: true,
-                ..Policy::default()
-            },
-        )
-    }
-
-    /// `supdb-ingest` whose drain's seal builds no snapshot copy and
-    /// walks the table for its records: against `supdb-ingest` it prices
-    /// the copy on the buffered drain, which read as the cheaper walk.
-    pub fn create_ingest_nodrainsnap(path: &Path) -> Res<Supdb> {
-        Supdb::with_policy(
-            path,
-            Policy {
-                partition: false,
-                durable: false,
-                nodrainsnap: true,
                 ..Policy::default()
             },
         )
@@ -10093,8 +10019,6 @@ impl Supdb {
             inlineall,
             lazysettle,
             walsync,
-            nodrainsnap,
-            sealcopyfar,
             ranksfar,
             rankswhole,
             mergerecordkeys,
@@ -10552,8 +10476,6 @@ impl Supdb {
             },
             upkeep_settle_after_scans: !lazysettle,
             drain_syncs_wal: walsync,
-            drain_snapshot: !nodrainsnap,
-            seal_snapshot_far: sealcopyfar,
             land_ranks_far: ranksfar,
             piece_ranks_whole: rankswhole,
             merge_keys_by_heads: !mergerecordkeys,
@@ -11153,8 +11075,6 @@ impl Supdb {
             inlineall,
             lazysettle,
             walsync,
-            nodrainsnap,
-            sealcopyfar,
             ranksfar,
             rankswhole,
             mergerecordkeys,
@@ -12595,20 +12515,6 @@ impl Engine for Supdb {
                 "supdb-walsync"
             } else {
                 "supdb-ingestwalsync"
-            };
-        }
-        if self.nodrainsnap {
-            return if self.partition {
-                "supdb-nodrainsnap"
-            } else {
-                "supdb-ingestnodrainsnap"
-            };
-        }
-        if self.sealcopyfar {
-            return if self.partition {
-                "supdb-sealcopyfar"
-            } else {
-                "supdb-ingestsealcopyfar"
             };
         }
         if self.ranksfar {
@@ -15845,8 +15751,6 @@ pub fn guarantee(arm: &str) -> Option<Guarantee> {
         | "supdb-lazysettle"
         | "supdb-settlelate"
         | "supdb-walsync"
-        | "supdb-nodrainsnap"
-        | "supdb-sealcopyfar"
         | "supdb-ranksfar"
         | "supdb-rankswhole"
         | "supdb-mergerecordkeys"
@@ -16150,8 +16054,6 @@ pub fn guarantee(arm: &str) -> Option<Guarantee> {
         | "supdb-ingestlazysettle"
         | "supdb-ingestsettlelate"
         | "supdb-ingestwalsync"
-        | "supdb-ingestnodrainsnap"
-        | "supdb-ingestsealcopyfar"
         | "supdb-ingestranksfar"
         | "supdb-ingestrankswhole"
         | "supdb-ingestmergerecordkeys"
@@ -17652,10 +17554,6 @@ pub fn open(arm: &str, dir: &Path, map_gb: usize) -> Res<Box<dyn Engine>> {
         "supdb-ingestlazysettle" => supdb_arm(Supdb::create_ingest_lazysettle, dir)?,
         "supdb-walsync" => supdb_arm(Supdb::create_walsync, dir)?,
         "supdb-ingestwalsync" => supdb_arm(Supdb::create_ingest_walsync, dir)?,
-        "supdb-nodrainsnap" => supdb_arm(Supdb::create_nodrainsnap, dir)?,
-        "supdb-ingestnodrainsnap" => supdb_arm(Supdb::create_ingest_nodrainsnap, dir)?,
-        "supdb-sealcopyfar" => supdb_arm(Supdb::create_sealcopyfar, dir)?,
-        "supdb-ingestsealcopyfar" => supdb_arm(Supdb::create_ingest_sealcopyfar, dir)?,
         "supdb-ranksfar" => supdb_arm(Supdb::create_ranksfar, dir)?,
         "supdb-ingestranksfar" => supdb_arm(Supdb::create_ingest_ranksfar, dir)?,
         "supdb-rankswhole" => supdb_arm(Supdb::create_rankswhole, dir)?,

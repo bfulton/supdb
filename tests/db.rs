@@ -16844,18 +16844,11 @@ fn a_seal_far_from_reads_builds_no_copy() {
         m.check(&db, "the writer after both seals");
         db.close().unwrap();
     }
-    // A drain's seal builds its copy as `drain_snapshot` says, far from
-    // reads or not: shuffled, so the table is hashed and the seal sorts it.
-    for drain_snapshot in [true, false] {
-        let d = dir(&format!("seal-copy-far-drain-{drain_snapshot}"));
-        let mut db = Db::create(
-            &d,
-            Options {
-                drain_snapshot,
-                ..common::options()
-            },
-        )
-        .unwrap();
+    // A drain's seal builds its copy, far from reads or not: shuffled, so
+    // the table is hashed and the seal sorts it.
+    {
+        let d = dir("seal-copy-far-drain");
+        let mut db = Db::create(&d, common::options()).unwrap();
         let mut m = ScanModel::default();
         for i in 0..4000u64 {
             m.append(&mut db, &format!("key-{:05}", i * 7919 % 4000), "a");
@@ -16865,7 +16858,7 @@ fn a_seal_far_from_reads_builds_no_copy() {
         m.flushed();
         assert_eq!(
             db.seal_table_snapshots(),
-            u64::from(drain_snapshot),
+            1,
             "a drain's copy, nobody having scanned"
         );
         m.check(&db, "the writer after the drain");
