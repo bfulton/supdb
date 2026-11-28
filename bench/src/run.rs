@@ -2818,6 +2818,30 @@ fn ordered_load(
     let c0 = counting.begin();
     let (secs, process) = load(e, size, plan, payload, |i| i)?;
     let d1 = dev();
+    // PROBE: what each of the store's files still had dirty after the
+    // load's sync, file by file.
+    if std::env::var_os("SUPDB_LOAD_DIRTY").is_some() {
+        let mut stack = vec![counting.store_dir.clone()];
+        while let Some(d) = stack.pop() {
+            for ent in std::fs::read_dir(&d).map_err(|e| e.to_string())?.flatten() {
+                let p = ent.path();
+                if p.is_dir() {
+                    stack.push(p);
+                    continue;
+                }
+                let a = dev();
+                if let Ok(f) = std::fs::File::open(&p) {
+                    let _ = f.sync_all();
+                }
+                let b = dev();
+                if let (Some(a), Some(b)) = (a, b) {
+                    if b > a {
+                        eprintln!("loaddirty {arm} {size} {} {}", p.display(), b - a);
+                    }
+                }
+            }
+        }
+    }
     if mode != "none" {
         env::sync_filesystem(&counting.store_dir)?;
     }
