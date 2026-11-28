@@ -2951,6 +2951,10 @@ impl<B: Bytes> Blob<B> {
     }
 
     /// `scan_at_with` over regions the caller resolved (`walk_regions`).
+    /// Out of line: the walk's loop is the scan's, and inlined into
+    /// `scan_whole` once it had that caller alone it counted a twentieth
+    /// more instructions a record, by the registers its caller kept.
+    #[inline(never)]
     fn scan_at_in<const PACE: bool, F: FnMut(&[u8], &[u8])>(
         &self,
         walk: Option<(&FlatIndex, &[u8], &[u8])>,
