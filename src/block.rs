@@ -367,6 +367,15 @@ pub fn decompress_into(src: &[u8], dst: &mut Vec<u8>, uncompressed: usize) -> st
 /// old blocks stay readable.
 pub const CHUNK: usize = 4096;
 
+/// The most an LZ4 block decodes to, per stored byte. A sequence of
+/// token, two offset bytes and `k` length bytes of 255 yields at most
+/// `255 * k + 18` bytes and a run of literals one a byte, so no stored
+/// bytes decode to more than 255 times their length; a chunked block's
+/// directory and its verbatim chunks decode to less. A block whose table
+/// entry claims more is damaged, and is refused before the claim sizes a
+/// buffer.
+pub const LZ4_MAX_RATIO: usize = 255;
+
 /// How many chunk checksums a block may carry beside it.
 ///
 /// Sixteen covers a 64KiB block at `CHUNK` bytes each, which is every packed

@@ -166,6 +166,15 @@ fn fnv(bytes: &[u8]) -> u64 {
     h
 }
 
+/// Both superblock slots' FNV computed again over their fields and magic,
+/// as a forger does.
+fn forge_super(b: &mut [u8]) {
+    for slot in [0usize, 512] {
+        let h = fnv(&b[slot..slot + 136]);
+        b[slot + 136..slot + 144].copy_from_slice(&h.to_le_bytes());
+    }
+}
+
 /// The superblock extension's copy of the key header (at 1024, after its
 /// twenty words) with `f` applied, and its FNV computed again.
 fn forge_ext_header(b: &mut [u8], f: impl FnOnce(&mut [u8])) {
@@ -333,6 +342,67 @@ fn a_key_section_that_names_no_row_is_refused() {
             );
             forge_ext_header(&mut b, |h| h[160..168].fill(0));
             hold(&format!("crcoff shape{i} seed {seed}"), i, &b, m, true);
+        }
+    }
+}
+
+/// Superblock field `i` of both slots set to `v`.
+fn set_super(b: &mut [u8], i: usize, v: u64) {
+    for slot in [0usize, 512] {
+        b[slot + i * 8..slot + i * 8 + 8].copy_from_slice(&v.to_le_bytes());
+    }
+}
+
+/// HI-2. Lengths in the file that sized an allocation before anything
+/// held them to the object: a block table entry's stored length
+/// (`bytes::take`'s scratch) and its uncompressed length (`Blob`'s decode
+/// buffer), which no checksum covers, and the superblock's section lengths
+/// under a forged FNV (`Sec::read`), which panicked on a capacity overflow
+/// past `isize::MAX` and asked for the forged size below it. No reader asks
+/// for more than the bound; a section past the high water is refused.
+#[test]
+fn a_length_from_the_file_sizes_nothing_the_object_cannot_hold() {
+    for (i, (pristine, m)) in shapes().iter().enumerate() {
+        let blk_off = u64::from_le_bytes(pristine[48..56].try_into().unwrap()) as usize;
+        let n = u64::from_le_bytes(pristine[blk_off + 8..blk_off + 16].try_into().unwrap());
+        assert!(n > 0, "shape {i} has blocks");
+        for e in 0..n.min(6) as usize {
+            let at = blk_off + 16 + e * 32;
+            for (field, v) in [
+                (8, 0xffff_ffffu32),
+                (8, 0x7fff_ffff),
+                (12, 0xffff_fff0),
+                (12, 0x7fff_ffff),
+            ] {
+                let mut b = pristine.clone();
+                b[at + field..at + field + 4].copy_from_slice(&v.to_le_bytes());
+                let what = if field == 8 { "stored" } else { "uncompressed" };
+                hold(
+                    &format!("block shape{i} entry {e} {what}={v:#x}"),
+                    i,
+                    &b,
+                    m,
+                    false,
+                );
+            }
+        }
+        // The key section (fields 4 and 5) and the block table (7 and 8),
+        // each length set in both its words so the open does not refuse it
+        // as compressed first.
+        for (stored, unc) in [(4, 5), (7, 8)] {
+            for v in [3u64 << 30, 1 << 62, u64::MAX - 4095, u64::MAX] {
+                let mut b = pristine.clone();
+                set_super(&mut b, stored, v);
+                set_super(&mut b, unc, v);
+                forge_super(&mut b);
+                hold(
+                    &format!("superblock shape{i} f{stored}={v:#x}"),
+                    i,
+                    &b,
+                    m,
+                    true,
+                );
+            }
         }
     }
 }

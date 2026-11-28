@@ -355,6 +355,17 @@ fn pick_super(head: &[u8], object_len: u64) -> Result<Super> {
             "the superblock describes more bytes than the object holds: it is truncated",
         ));
     }
+    // Each section ends inside what the writer wrote: its high water is the
+    // end of the last byte, the block table's included. An end past it, or
+    // one that does not fit a u64, is a damaged field, refused before any
+    // length of it sizes a buffer or any offset of it is summed.
+    for (off, len) in [(sb.key_off, sb.key_stored), (sb.blk_off, sb.blk_stored)] {
+        if off.checked_add(len).is_none_or(|end| end > sb.high_water) {
+            return Err(corrupt(
+                "the superblock names a section past the end of what was written",
+            ));
+        }
+    }
     // A section that was compressed cannot be addressed where it lies, and
     // this reader has no reason to support the varint formats -- they are
     // what `flat_index` replaced, and a segment this reader is given is
@@ -505,6 +516,14 @@ impl Sec {
         }
         if src.slice_at(off, len).is_some() {
             return Ok(Sec::Lent { off, len });
+        }
+        // The superblock's length, held to the object before it sizes
+        // anything (`pick_super` holds it to the high water as well).
+        if off
+            .checked_add(len as u64)
+            .is_none_or(|end| end > src.len())
+        {
+            return Err(short(off, len, src.len()));
         }
         let mut v = vec![0u8; len];
         src.read_at(off, &mut v)?;
@@ -2177,7 +2196,10 @@ impl<B: Bytes> Blob<B> {
                 return f(&raw[a - c0..b - c0]);
             }
             let un = loc.uncompressed as usize;
-            if b > un {
+            // The decode buffer is sized by the table's uncompressed length,
+            // which no checksum covers: held to what the stored bytes can
+            // decode to before it sizes anything.
+            if b > un || un > raw.len().saturating_mul(block::LZ4_MAX_RATIO) {
                 return Err(corrupt("extent runs past its block"));
             }
             let mut dec = SCRATCH.with(|s| s.dec.take());

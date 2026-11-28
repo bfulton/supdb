@@ -292,6 +292,15 @@ pub fn take<'a, B: Bytes + ?Sized>(
         // checker cannot see that the `Some` arm does not also need `scratch`.
         return Ok(src.slice_at(off, len).unwrap());
     }
+    // Checked before the scratch is sized: `len` is a length out of the
+    // file, and a source that would refuse the read must not be asked to
+    // back it first. Off the borrowing path, which `slice_at` has checked.
+    if off
+        .checked_add(len as u64)
+        .is_none_or(|end| end > src.len())
+    {
+        return Err(short(off, len, src.len()));
+    }
     scratch.clear();
     scratch.resize(len, 0);
     src.read_at(off, scratch)?;
