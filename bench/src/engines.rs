@@ -1210,9 +1210,6 @@ pub struct Supdb {
     /// form is installed alone (`Options::out_of_core_installed`).
     /// `supdb-oocz`.
     oocz: bool,
-    /// The upkeep thread's fill run whatever the writer has posted, the
-    /// shape before `Options::upkeep_fill_skips_posted`. `supdb-fillposted`.
-    fillposted: bool,
     /// The WAL grown by its appends and a retired file removed, the shape
     /// before `Options::recycle_wal`. `supdb-walappend`.
     walappend: bool,
@@ -1374,11 +1371,6 @@ pub struct Supdb {
     /// off), the shape before. `supdb-noyield`, and `supdb-ingestnoyield`
     /// buffered.
     noyield: bool,
-    /// The upkeep thread's complete-table fill holding the writer's
-    /// upkeep until the fill is done (`Options::upkeep_fill_yields` off),
-    /// the shape before the fill gave it back at a block.
-    /// `supdb-fillholds`, and `supdb-ingestfillholds` buffered.
-    fillholds: bool,
     /// A form file's fence searched over its keys, the shape before the
     /// flat words (`Options::zpages_fence_words` off): `supdb-fencekeys`.
     fencekeys: bool,
@@ -2844,9 +2836,6 @@ struct Policy {
     /// form is installed alone (`Options::out_of_core_installed`).
     /// `supdb-oocz`.
     oocz: bool,
-    /// The upkeep thread's fill run whatever the writer has posted, the
-    /// shape before `Options::upkeep_fill_skips_posted`. `supdb-fillposted`.
-    fillposted: bool,
     /// The WAL grown by its appends and a retired file removed, the shape
     /// before `Options::recycle_wal`. `supdb-walappend`.
     walappend: bool,
@@ -3015,9 +3004,6 @@ struct Policy {
     /// The upkeep thread's fill never yielding its conversions:
     /// `supdb-noyield`, and `supdb-ingestnoyield` buffered.
     noyield: bool,
-    /// The complete-table fill holding the writer until it is done:
-    /// `supdb-fillholds`, and `supdb-ingestfillholds` buffered.
-    fillholds: bool,
     /// The fence searched over its keys: `supdb-fencekeys`.
     fencekeys: bool,
     /// No hot-raw policy: `supdb-znohotraw`.
@@ -3736,7 +3722,6 @@ impl Default for Policy {
             pacesyncsraw: false,
             pacesyncs5: false,
             oocz: false,
-            fillposted: false,
             walappend: false,
             walprefill: false,
             walaheadflat: false,
@@ -3760,7 +3745,6 @@ impl Default for Policy {
             convertcap: false,
             shortpass: false,
             noyield: false,
-            fillholds: false,
             fencekeys: false,
             znohotraw: false,
             zbusyevery: false,
@@ -4783,19 +4767,6 @@ impl Supdb {
                 partition: false,
                 durable: false,
                 noyield: true,
-                ..Policy::default()
-            },
-        )
-    }
-
-    /// `supdb` whose upkeep thread's complete-table fill holds the writer's
-    /// upkeep until the fill is done (`Options::upkeep_fill_yields` off):
-    /// the shape before the fill gave it back at a block.
-    pub fn create_fillholds(path: &Path) -> Res<Supdb> {
-        Supdb::with_policy(
-            path,
-            Policy {
-                fillholds: true,
                 ..Policy::default()
             },
         )
@@ -5854,19 +5825,6 @@ impl Supdb {
             path,
             Policy {
                 fencekeys: true,
-                ..Policy::default()
-            },
-        )
-    }
-
-    /// `supdb-ingest` whose fill holds the writer, as `supdb-fillholds`.
-    pub fn create_ingest_fillholds(path: &Path) -> Res<Supdb> {
-        Supdb::with_policy(
-            path,
-            Policy {
-                partition: false,
-                durable: false,
-                fillholds: true,
                 ..Policy::default()
             },
         )
@@ -9205,18 +9163,6 @@ impl Supdb {
         )
     }
 
-    /// `supdb` whose upkeep thread fills whatever the writer has posted
-    /// (`Options::upkeep_fill_skips_posted` off).
-    pub fn create_fillposted(path: &Path) -> Res<Supdb> {
-        Supdb::with_policy(
-            path,
-            Policy {
-                fillposted: true,
-                ..Policy::default()
-            },
-        )
-    }
-
     /// `supdb` whose mechanisms for a store out of core read it so where the
     /// compact form is installed (`Options::out_of_core_installed` on).
     pub fn create_oocz(path: &Path) -> Res<Supdb> {
@@ -10850,7 +10796,6 @@ impl Supdb {
             pacesyncsraw,
             pacesyncs5,
             oocz,
-            fillposted,
             walappend,
             walprefill,
             walaheadflat,
@@ -10893,7 +10838,6 @@ impl Supdb {
             convertcap,
             shortpass,
             noyield,
-            fillholds,
             fencekeys,
             znohotraw,
             zbusyevery,
@@ -11361,7 +11305,6 @@ impl Supdb {
             upkeep_abandons: !noabandon,
             upkeep_files_bursts: !deferbursts,
             upkeep_yields: passyield,
-            upkeep_fill_yields: !fillholds,
             scan_cache_auto: !cachenoauto,
             scan_cache_auto_room: !cacheeighth,
             settle_lazy_raw: settlelazyraw,
@@ -11416,7 +11359,6 @@ impl Supdb {
             },
             upkeep_pace_syncs_census: !pacesyncsraw,
             out_of_core_installed: oocz,
-            upkeep_fill_skips_posted: !fillposted,
             recycle_wal: !walappend,
             wal_ahead_bytes: if walprefill { 0 } else { 1 << 20 },
             wal_ahead_small_runs: !walaheadflat,
@@ -11985,7 +11927,6 @@ impl Supdb {
             pacesyncsraw,
             pacesyncs5,
             oocz,
-            fillposted,
             walappend,
             walprefill,
             walaheadflat,
@@ -12028,7 +11969,6 @@ impl Supdb {
             convertcap,
             shortpass,
             noyield,
-            fillholds,
             fencekeys,
             znohotraw,
             zbusyevery,
@@ -12824,13 +12764,6 @@ impl Engine for Supdb {
                 "supdb-noyield"
             } else {
                 "supdb-ingestnoyield"
-            };
-        }
-        if self.fillholds {
-            return if self.partition {
-                "supdb-fillholds"
-            } else {
-                "supdb-ingestfillholds"
             };
         }
         if self.notrim {
@@ -14121,9 +14054,6 @@ impl Engine for Supdb {
         }
         if self.pacesyncs5 {
             return "supdb-pacesyncs5";
-        }
-        if self.fillposted {
-            return "supdb-fillposted";
         }
         if self.walappend {
             return "supdb-walappend";
@@ -16932,7 +16862,6 @@ pub fn guarantee(arm: &str) -> Option<Guarantee> {
         | "supdb-pacesyncsraw"
         | "supdb-pacesyncs5"
         | "supdb-oocz"
-        | "supdb-fillposted"
         | "supdb-walappend"
         | "supdb-walprefill"
         | "supdb-walaheadflat"
@@ -16957,7 +16886,6 @@ pub fn guarantee(arm: &str) -> Option<Guarantee> {
         | "supdb-convertcap"
         | "supdb-shortpass"
         | "supdb-noyield"
-        | "supdb-fillholds"
         | "supdb-notrim"
         | "supdb-fencekeys"
         | "supdb-znohotraw"
@@ -17120,7 +17048,6 @@ pub fn guarantee(arm: &str) -> Option<Guarantee> {
         | "supdb-ingestconvertcap"
         | "supdb-ingestshortpass"
         | "supdb-ingestnoyield"
-        | "supdb-ingestfillholds"
         | "supdb-ingestpostedyield"
         | "supdb-ingestbehindyield"
         | "supdb-ingestpiecesonly"
@@ -18222,7 +18149,6 @@ pub fn open(arm: &str, dir: &Path, map_gb: usize) -> Res<Box<dyn Engine>> {
         "supdb-convertcap" => supdb_arm(Supdb::create_convertcap, dir)?,
         "supdb-shortpass" => supdb_arm(Supdb::create_shortpass, dir)?,
         "supdb-noyield" => supdb_arm(Supdb::create_noyield, dir)?,
-        "supdb-fillholds" => supdb_arm(Supdb::create_fillholds, dir)?,
         "supdb-notrim" => supdb_arm(Supdb::create_notrim, dir)?,
         "supdb-fencekeys" => supdb_arm(Supdb::create_fencekeys, dir)?,
         "supdb-znohotraw" => supdb_arm(Supdb::create_znohotraw, dir)?,
@@ -20092,7 +20018,6 @@ pub fn open(arm: &str, dir: &Path, map_gb: usize) -> Res<Box<dyn Engine>> {
         "supdb-pacesyncsraw" => supdb_arm(Supdb::create_pacesyncsraw, dir)?,
         "supdb-pacesyncs5" => supdb_arm(Supdb::create_pacesyncs5, dir)?,
         "supdb-oocz" => supdb_arm(Supdb::create_oocz, dir)?,
-        "supdb-fillposted" => supdb_arm(Supdb::create_fillposted, dir)?,
         "supdb-walappend" => supdb_arm(Supdb::create_walappend, dir)?,
         "supdb-walprefill" => supdb_arm(Supdb::create_walprefill, dir)?,
         "supdb-walaheadflat" => supdb_arm(Supdb::create_walaheadflat, dir)?,
@@ -20154,7 +20079,6 @@ pub fn open(arm: &str, dir: &Path, map_gb: usize) -> Res<Box<dyn Engine>> {
         "supdb-ingestconvertcap" => supdb_arm(Supdb::create_ingest_convertcap, dir)?,
         "supdb-ingestshortpass" => supdb_arm(Supdb::create_ingest_shortpass, dir)?,
         "supdb-ingestnoyield" => supdb_arm(Supdb::create_ingest_noyield, dir)?,
-        "supdb-ingestfillholds" => supdb_arm(Supdb::create_ingest_fillholds, dir)?,
         "supdb-ingestpostedyield" => supdb_arm(Supdb::create_ingest_postedyield, dir)?,
         "supdb-ingestbehindyield" => supdb_arm(Supdb::create_ingest_behindyield, dir)?,
         "supdb-idle" => supdb_arm(Supdb::create_idle, dir)?,
@@ -24099,13 +24023,6 @@ mod tests {
                 assert_eq!(z.features(), base.features());
                 let o = z.db.as_ref().unwrap().options();
                 assert!(o.out_of_core_installed && !b.out_of_core_installed);
-            }
-            {
-                let z = Supdb::create_fillposted(&dir("fillposted")).unwrap();
-                assert_eq!(z.name(), "supdb-fillposted");
-                assert_eq!(z.features(), base.features());
-                let o = z.db.as_ref().unwrap().options();
-                assert!(!o.upkeep_fill_skips_posted && b.upkeep_fill_skips_posted);
             }
             {
                 let z = Supdb::create_walappend(&dir("walappend")).unwrap();

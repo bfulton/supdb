@@ -1275,27 +1275,24 @@ fn the_builder_ahead_leaves_the_partitions_whose_pages_are_not_in_memory() {
 }
 
 /// The complete-table fill of a pass on the upkeep thread gives the writer
-/// its upkeep back at the fill's next block once the writer wants it
-/// (`Options::upkeep_fill_yields`), the settle before it standing and the
-/// pass published. The store: reads around from one short scan, so no
-/// block holds a form but the one it walked; a burst over every block is
-/// lent, and the thread's pass holds inside until the scan asks for the
-/// upkeep, so the pass settles the burst whole and begins its fill -- a
-/// form for every block of the store -- with the writer wanting it, and
-/// the scan reads every key as written. With the fill's yield the fill
-/// stops at a block and the pass is whole; without it the scan waits the
-/// fill out over every block, the pass whole too, since the fill's yield
+/// its upkeep back at the fill's next block once the writer wants it, the
+/// settle before it standing and the pass published. The store: reads
+/// around from one short scan, so no block holds a form but the one it
+/// walked; a burst over every block is lent, and the thread's pass holds
+/// inside until the scan asks for the upkeep, so the pass settles the
+/// burst whole and begins its fill -- a form for every block of the store
+/// -- with the writer wanting it, and the scan reads every key as written.
+/// The fill stops at a block and the pass is whole, since the fill's yield
 /// is not the pass's (`upkeep_yields`).
 #[test]
 fn a_fill_the_writer_wants_its_upkeep_back_from_stops_at_its_next_block() {
     const KEYS: u32 = 300_000;
-    let run = |name: &str, yields: bool| {
+    let run = |name: &str| {
         let d = dir(name);
         let mut db = Db::create(
             &d,
             Options {
                 upkeep: supdb::Upkeep::Background(1),
-                upkeep_fill_yields: yields,
                 // The fill is the commit's where no builder ahead runs, as
                 // out of core (`Options::ahead_out_of_core`).
                 scan_cache_ahead: false,
@@ -1367,50 +1364,36 @@ fn a_fill_the_writer_wants_its_upkeep_back_from_stops_at_its_next_block() {
         // microseconds, and the passes cut short.
         (cuts, walked, steps[3], c[8])
     };
-    let (cuts_on, walked_on, build_on, short_on) = run("fill-yield-on", true);
-    let (cuts_off, walked_off, build_off, short_off) = run("fill-yield-off", false);
-    eprintln!(
-        "fill yield: cut {cuts_on} walked {walked_on} built {build_on} us; \
-         holds: cut {cuts_off} walked {walked_off} built {build_off} us"
-    );
-    let blocks = u64::from(KEYS / 64);
+    let (cuts, walked, build, short) = run("fill-yield");
+    eprintln!("fill yield: cut {cuts} walked {walked} built {build} us");
     assert!(
-        cuts_on >= 1 && walked_on < walked_off,
-        "the fill stopped at a block for the writer: cut {cuts_on}, walked {walked_on} of {walked_off}"
-    );
-    assert_eq!(cuts_off, 0, "the fill that holds is never cut");
-    assert!(
-        walked_off >= blocks && build_off > 0,
-        "the fill that holds walked the store: walked {walked_off} of {blocks} blocks, built {build_off} us"
+        cuts >= 1,
+        "the fill stopped at a block for the writer: cut {cuts}, walked {walked}"
     );
     assert_eq!(
-        (short_on, short_off),
-        (0, 0),
-        "neither pass is cut short: the fill's yield is not the pass's"
+        short, 0,
+        "the pass is not cut short: the fill's yield is not the pass's"
     );
 }
 
 /// The upkeep thread's fill is left for a later pass while the writer has
-/// posted a newer commit (`Options::upkeep_fill_skips_posted`): a burst
-/// over every block is lent and the thread's pass holds inside, a second
-/// burst is posted behind it, and the held pass, released, settles the
-/// first burst and leaves its fill (`Db::fill_deferred`); the pass after,
-/// caught up with nothing posted, fills the store, every block walked. The
-/// scans read every key as the second burst wrote it, through the writer
-/// and through a handle. Without the option the held pass fills with the
-/// second burst waiting and defers nothing. The syncing pace is off here,
-/// so that the second commit posts and returns where the paced one would
-/// wait for the held thread.
+/// posted a newer commit: a burst over every block is lent and the
+/// thread's pass holds inside, a second burst is posted behind it, and the
+/// held pass, released, settles the first burst and leaves its fill
+/// (`Db::fill_deferred`); the pass after, caught up with nothing posted,
+/// fills the store, every block walked. The scans read every key as the
+/// second burst wrote it, through the writer and through a handle. The
+/// syncing pace is off here, so that the second commit posts and returns
+/// where the paced one would wait for the held thread.
 #[test]
 fn a_fill_with_a_newer_commit_posted_is_left_for_the_pass_caught_up() {
     const KEYS: u32 = 300_000;
-    let run = |name: &str, skips: bool| {
+    let run = |name: &str| {
         let d = dir(name);
         let mut db = Db::create(
             &d,
             Options {
                 upkeep: supdb::Upkeep::Background(1),
-                upkeep_fill_skips_posted: skips,
                 upkeep_pace_syncs_bp: 0,
                 scan_cache_ahead: false,
                 partition_bytes: Some(256 << 10),
@@ -1488,17 +1471,15 @@ fn a_fill_with_a_newer_commit_posted_is_left_for_the_pass_caught_up() {
         check(&h, &want, "through a handle after the bursts");
         deferred
     };
-    let deferred_on = run("fill-skip-on", true);
-    let deferred_off = run("fill-skip-off", false);
+    let deferred = run("fill-skip");
     assert!(
-        deferred_on >= 1,
-        "the held pass left its fill with a newer commit posted: {deferred_on}"
+        deferred >= 1,
+        "the held pass left its fill with a newer commit posted: {deferred}"
     );
-    assert_eq!(deferred_off, 0, "without the option no fill is left");
 }
 
 /// A fill the upkeep thread leaves for a later pass
-/// (`Options::upkeep_fill_skips_posted`) is that pass's to make whatever
+/// (`Reader::fill_deferred`) is that pass's to make whatever
 /// it has to file. A commit's writes are lent and the thread's pass holds
 /// inside it; a commit with nothing staged, which adds nothing to the
 /// log, is posted behind the held pass; released, the pass settles the
@@ -14554,7 +14535,7 @@ fn same_blocks_carries(long: bool, from_index: bool) -> (u64, u64, u64, [u64; 2]
 /// keeps the commit's fill for a scan, so a publish after a write moves
 /// the forms' position without building the written block again: the
 /// publish the upkeep thread's pass makes when it leaves its fill for a
-/// commit the writer has posted (`Options::upkeep_fill_skips_posted`).
+/// commit the writer has posted.
 fn forms_published_for_a_handle(name: &str) -> (Db, Reader, ScanModel, PathBuf) {
     let d = dir(name);
     let opts = Options {

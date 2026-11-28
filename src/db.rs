@@ -5126,46 +5126,6 @@ pub struct Options {
     /// core level, two passes cut a rep. Off, the default: the writer
     /// waits a pass out. `supdb-passyield` is the arm that yields.
     pub upkeep_yields: bool,
-    /// Whether the complete-table fill of a pass on the upkeep thread --
-    /// a form built for every block an unsealed key or a piece overlays
-    /// that holds none, the work the builder ahead does where there is one
-    /// -- gives the writer its upkeep back at the fill's next block once
-    /// the writer wants it, the settle before it standing and the pass
-    /// published; the fill goes on at the thread's next pass, and a scan
-    /// meanwhile builds the blocks it walks itself, as it does for any
-    /// block without a form. Where the pass yields whole
-    /// (`upkeep_yields`) this changes nothing. On. Off, the writer waits
-    /// the fill out: at ten million keys under 1.25 GiB, with the builder
-    /// ahead off out of core, the fill built 143 forms a pass over the
-    /// store's blocks in order, 684 ms of E's 832 passes against a settle
-    /// of 19, and E's scans waited 735 ms of 6.7 s on them for forms over
-    /// blocks they mostly never read (`docs/engine.md`). `supdb-fillholds`
-    /// and `supdb-ingestfillholds` are the arms that wait.
-    pub upkeep_fill_yields: bool,
-    /// The upkeep thread's fill (`Reader::complete_forms`) left for a later
-    /// pass while the writer has posted a newer commit: the fill walks every
-    /// block of every partition at every pass a table is incomplete, 25 ns a
-    /// block, a millisecond a pass at three million keys, and a burst's
-    /// passes come a few batches apart -- the thread's fill walk was 1.3 s
-    /// of its 7.1 s over the lag sweep's full rewrite there, its holds of the
-    /// syncing writer 2.4-2.6 s of the burst's 9.3, and the first scan after
-    /// the one-percent burst waited 1.4-8 ms for the pass in flight and
-    /// settled up to 4 more. Left while a commit is posted, the burst held
-    /// the writer for nothing, the first scan waited 0.2-0.8 ms and settled
-    /// nothing, and in the row's order at that rung under 1.25 GiB the
-    /// one-percent pass read 1.12-1.84x in three sittings, its burst
-    /// 1.16-1.63x, A and F 1.05-1.22x, the two-thread scan beside the mixes
-    /// 0.85-0.99x and E either way; at ten million keys the lag sweep's
-    /// forms are off and the fill never runs, and the mixes read level or
-    /// better (`docs/engine.md`). The pass caught up, with nothing posted,
-    /// fills as before, and a fill left is owed to the next pass
-    /// (`FormsState::fill_owed`), which is due by it whatever its commit
-    /// added to the log: the commit posted behind a pass may add nothing,
-    /// or too little to be due by, and its pass then filed nothing and
-    /// the fill stayed unmade until some later pass was due of itself.
-    /// Off, the shape before: `supdb-fillposted`.
-    #[doc(hidden)]
-    pub upkeep_fill_skips_posted: bool,
     /// Whether the engine's large blocks -- a memtable's arena blocks,
     /// its entry slabs and its hash index, a scan snapshot's arena
     /// blocks -- are mapped from the kernel, from `blocks::MAP_FROM`
@@ -7168,7 +7128,7 @@ pub struct Options {
     /// dense count, before it splices the block's keys of the batch
     /// (`Reader::convert_settled`), where the fill converted it at the
     /// pass's end or, on the upkeep thread behind a posted commit, not at
-    /// all (`Options::upkeep_fill_skips_posted`): a burst lent to the
+    /// all (`Reader::fill_deferred`): a burst lent to the
     /// thread left every form sparse, each patch an insert into a sorted
     /// run of up to sixty-four deltas, and the scans after it walked them.
     /// `supdb-settlenoconvert` leaves the conversions to the fill.
@@ -8419,8 +8379,6 @@ impl Default for Options {
             upkeep_abandons: true,
             upkeep_files_bursts: true,
             upkeep_yields: false,
-            upkeep_fill_yields: true,
-            upkeep_fill_skips_posted: true,
             blocks_mapped: true,
             blocks_pool_bytes: 64 << 20,
             index_populated: true,
@@ -27034,10 +26992,10 @@ struct Shared {
     pass_ns: [AtomicU64; 4],
     fill_walked: AtomicU64,
     fill_passes: AtomicU64,
-    /// Fills that stopped at a block for the writer (`Options::upkeep_fill_yields`).
+    /// Fills that stopped at a block for the writer (`Reader::fill_wanted`).
     fill_cuts: AtomicU64,
     /// Fills the upkeep thread left for a later pass because the writer
-    /// had posted a newer commit (`Options::upkeep_fill_skips_posted`).
+    /// had posted a newer commit (`Reader::fill_deferred`).
     fill_deferred: AtomicU64,
     /// Passes due by a fill owed and by nothing else
     /// (`FormsState::fill_owed`): the passes that had filed nothing.
@@ -29142,8 +29100,8 @@ struct FormsState {
     pass_batch: std::cell::Cell<u64>,
     log_short: std::cell::Cell<bool>,
     /// A fill the upkeep thread left for a later pass because the writer
-    /// had posted a newer commit (`Options::upkeep_fill_skips_posted`),
-    /// and no fill has run since: the pass that finds nothing posted
+    /// had posted a newer commit (`Reader::fill_deferred`), and no fill
+    /// has run since: the pass that finds nothing posted
     /// behind it is due for the fill whatever it has to file
     /// (`settle_due`). Without it the later pass was due only by its own
     /// backlog, and a commit that added nothing to the log -- an empty
@@ -37071,22 +37029,28 @@ impl Reader {
             && self.shared.upkeep.state.load(AtomicOrdering::Acquire) & LEND_WANT != 0
     }
 
-    /// Whether the writer wants its upkeep back while this pass's fill
-    /// holds it, where the pass is not one that yields whole
-    /// (`Options::upkeep_fill_yields`): asked at the fill's blocks, so that
-    /// the writer waits for a block's build and not for the fill. Off the
-    /// thread, never.
-    /// Whether the upkeep thread's fill is left for a later pass: the
-    /// writer has posted a newer commit (`Options::upkeep_fill_skips_posted`).
+    /// Whether the upkeep thread's fill (`Reader::complete_forms`) is left
+    /// for a later pass: the writer has posted a newer commit. The fill
+    /// walks every block of every partition at every pass a table is
+    /// incomplete, a millisecond a pass at three million keys, and a
+    /// burst's passes come a few batches apart; left while a commit is
+    /// posted, the burst held the writer for nothing (`docs/engine.md`). A
+    /// fill left is owed to the next pass (`FormsState::fill_owed`), which
+    /// is due by it whatever its commit added to the log.
     fn fill_deferred(&self) -> bool {
-        self.understudy
-            && self.opts.upkeep_fill_skips_posted
-            && self.shared.upkeep.state.load(AtomicOrdering::Acquire) & LEND_POSTED != 0
+        self.understudy && self.shared.upkeep.state.load(AtomicOrdering::Acquire) & LEND_POSTED != 0
     }
 
+    /// Whether the writer wants its upkeep back while this pass's fill
+    /// holds it, where the pass is not one that yields whole
+    /// (`Options::upkeep_yields`): asked at the fill's blocks, so that the
+    /// writer waits for a block's build and not for the fill, the settle
+    /// before it standing and the pass published; the fill goes on at the
+    /// thread's next pass. Waited out, the fill built 143 forms a pass at
+    /// ten million keys under 1.25 GiB, and E's scans waited 735 ms of
+    /// 6.7 s on them (`docs/engine.md`). Off the thread, never.
     fn fill_wanted(&self) -> bool {
         self.understudy
-            && self.opts.upkeep_fill_yields
             && !self.opts.upkeep_yields
             && self.shared.upkeep.state.load(AtomicOrdering::Acquire) & LEND_WANT != 0
     }
@@ -39641,7 +39605,7 @@ impl Reader {
                 // that yields whole: the fill alone stops here, at a block,
                 // the table not called complete, the settle before it
                 // standing and the pass published; the fill goes on at the
-                // thread's next pass (`Options::upkeep_fill_yields`). A
+                // thread's next pass (`Reader::fill_wanted`). A
                 // scan waited the whole fill out before: at ten million keys
                 // under 1.25 GiB the fill built 143 forms a pass over the
                 // store's blocks in order, 684 ms of E's 832 passes, for
@@ -56756,15 +56720,15 @@ impl Db {
     }
 
     /// Fills the upkeep thread left for a later pass because the writer had
-    /// posted a newer commit (`Options::upkeep_fill_skips_posted`).
+    /// posted a newer commit.
     #[doc(hidden)]
     pub fn fill_deferred(&self) -> u64 {
         self.shared.fill_deferred.load(AtomicOrdering::Relaxed)
     }
 
     /// Passes of the upkeep thread that were due by a fill a pass before
-    /// had left and by nothing else (`Options::upkeep_fill_skips_posted`):
-    /// the passes that filed nothing while the fill stayed unmade.
+    /// had left and by nothing else (`FormsState::fill_owed`): the passes
+    /// that filed nothing while the fill stayed unmade.
     #[doc(hidden)]
     pub fn fill_owed_due(&self) -> u64 {
         self.shared.fill_owed_due.load(AtomicOrdering::Relaxed)
@@ -56775,7 +56739,7 @@ impl Db {
     /// the builds ahead installed and the settled blocks built; the
     /// complete-table fill's walk over the blocks; and that fill's builds
     /// -- then the blocks the fill walked, the passes stamped and the fills
-    /// that stopped at a block for the writer (`Options::upkeep_fill_yields`).
+    /// that stopped at a block for the writer.
     /// Atomics only: a read takes nothing back from the thread.
     #[doc(hidden)]
     pub fn pass_steps(&self) -> ([u64; 4], u64, u64, u64) {
