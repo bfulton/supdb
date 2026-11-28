@@ -68611,21 +68611,23 @@ mod cipher_looks {
             // The evictor's time off its core so far, by the kernel's count
             // of the thread's wait to run, beside the pager's own waits for
             // the readers' pins.
-            let off_ns = |c: &pager::PagerCounts| -> u64 {
-                let delay =
-                    std::fs::read_to_string(format!("/proc/self/task/{}/schedstat", c.evictor_tid))
-                        .ok()
-                        .and_then(|s| s.split_whitespace().nth(1)?.parse::<u64>().ok())
-                        .unwrap_or(0);
-                delay.saturating_add(c.waited_us.saturating_mul(1000))
+            let off_ns = |tid: i64, waited_us: u64| -> u64 {
+                let delay = std::fs::read_to_string(format!("/proc/self/task/{tid}/schedstat"))
+                    .ok()
+                    .and_then(|s| s.split_whitespace().nth(1)?.parse::<u64>().ok())
+                    .unwrap_or(0);
+                delay.saturating_add(waited_us.saturating_mul(1000))
             };
             pager.restart_peak();
             let before = pager.counts();
-            let (off0, t0) = (off_ns(&before), std::time::Instant::now());
+            let (off0, t0) = (
+                off_ns(before.evictor_tid, before.waited_us),
+                std::time::Instant::now(),
+            );
             assert_eq!(scan10(&db, &h, through_handle, &key(1)), 10);
             let c = pager.counts();
             let (off, wall) = (
-                off_ns(&c).saturating_sub(off0),
+                off_ns(c.evictor_tid, c.waited_us).saturating_sub(off0),
                 (t0.elapsed().as_nanos() as u64).max(1),
             );
             let read = (c.fills - before.fills) * pager::CHUNK as u64;
