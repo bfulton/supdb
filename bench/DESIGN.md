@@ -330,7 +330,8 @@ no scan workload, no YCSB E and no recovery workload, and its row has no
 cell there. A load's window ends where the arm's guarantee is met,
 which for FASTER is a checkpoint of its log, written in whole pages of
 32 MiB. Read-modify-write in the `threads` workloads is FASTER's own single
-operation, and a read and then a write for every other arm.
+operation, supdb's a read and a put on condition that the key is as read,
+and a read and then a write for every other arm.
 
 `supdb-heldnoframes` is `supdb-ingest` opened under the one policy of the
 engine's that promises what FASTER does (`SyncPolicy::Explicit`) with its
