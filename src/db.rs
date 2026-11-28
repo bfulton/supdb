@@ -24675,6 +24675,13 @@ const FIT_SWEEP_RETRY: u32 = 64;
 /// The most live tables `State::replaced` keeps.
 const REPLACED_CAP: usize = 8;
 
+/// `Shared::kept_hold`'s bits for `Db::look_inside_a_freeze`: the writer's
+/// freeze after it read where the look stands, and the upkeep thread's
+/// look before it stores its position and after it trimmed.
+const KEPT_HOLD_FREEZE: u8 = 4;
+const KEPT_HOLD_LOOK_STORE: u8 = 8;
+const KEPT_HOLD_LOOK_TRIMMED: u8 = 16;
+
 /// What a publish keeps in `State::replaced`: the tables live from the
 /// upkeep's last look, `from` (`u64::MAX` before any), on, within `bytes`
 /// (`Options::upkeep_keep_bytes`).
@@ -31175,12 +31182,42 @@ impl State {
     }
 
     /// Whether `replaced` keeps fewer tables than were live since the
-    /// look `keep` names: the look is further behind than what was kept
-    /// for it, and drops its tables when it comes.
-    fn keeps_short(&self, keep: Option<Keep>) -> bool {
-        keep.is_some_and(|k| {
-            k.from != u64::MAX && self.lives.saturating_sub(k.from) > self.replaced().len() as u64
-        })
+    /// upkeep's look, which stands at `look` (`Shared::upkeep_lives`): the
+    /// look is further behind than what was kept for it, and drops its
+    /// tables when it comes. Asked of a state just published with `keep`,
+    /// where that publish found a look to keep tables for.
+    ///
+    /// Judged by where the look stands after the publish, not by
+    /// `keep.from`, the position the publish read before it made the
+    /// state. A look can land between that read and the swap: it stores
+    /// its position and drops the table it has read, and the swap trims
+    /// the new state's list by the position it reads after (`swap_state`),
+    /// so the list is short of `keep.from` while the look is no further
+    /// behind than the list keeps. Judged by `keep.from`, that was an ask
+    /// to give the forms up for a look that was current, and the upkeep
+    /// thread's next step dropped every copy the store held.
+    ///
+    /// The list is read first and the position after it. Each trim of a
+    /// list is made under the list's lock, after its maker stored or
+    /// loaded a position at least the trim's bound: the look stores its
+    /// position and then trims (`Reader::note_over`), and a publish loads
+    /// it and then trims (`swap_state`). A list read after a trim is read
+    /// after that store or load by the lock's order, so the position read
+    /// next is at least the bound, and every table the trim dropped is
+    /// one the look has read. A list read before a trim is the longer for
+    /// it, which asks nothing more. So there is no fence here: the two
+    /// sides are a message passed through the lock, not stores that each
+    /// side makes and then reads the other's. A look's position only
+    /// rises, except to `u64::MAX` where the forms were given up, which
+    /// asks nothing, so a position read here is never behind `keep.from`
+    /// and this asks only where the old judgement asked.
+    fn keeps_short(&self, keep: Option<Keep>, look: &AtomicU64) -> bool {
+        if !keep.is_some_and(|k| k.from != u64::MAX) {
+            return false;
+        }
+        let kept = self.replaced().len() as u64;
+        let from = look.load(AtomicOrdering::SeqCst);
+        from != u64::MAX && self.lives.saturating_sub(from) > kept
     }
 
     /// The tables kept for the upkeep's look, under their lock.
@@ -34752,6 +34789,12 @@ impl Reader {
         });
         if self.slot.is_none() {
             Db::kept_held(&self.shared, 2);
+            if self.understudy
+                && self.shared.kept_hold.load(AtomicOrdering::Acquire) & KEPT_HOLD_LOOK_STORE != 0
+                && self.shared.upkeep_lives.load(AtomicOrdering::Acquire) < st.lives
+            {
+                Db::kept_held(&self.shared, KEPT_HOLD_LOOK_STORE);
+            }
             self.shared
                 .upkeep_lives
                 .store(st.lives, AtomicOrdering::SeqCst);
@@ -34767,6 +34810,11 @@ impl Reader {
                 // SAFETY: the look runs inside a pinned operation, and a
                 // state is freed only past every pinned slot.
                 unsafe { &*cur_p }.drop_replaced_before(st.lives);
+            }
+            if self.understudy
+                && self.shared.kept_holding.load(AtomicOrdering::Acquire) & KEPT_HOLD_FREEZE != 0
+            {
+                Db::kept_held(&self.shared, KEPT_HOLD_LOOK_TRIMMED);
             }
         }
     }
@@ -47604,7 +47652,32 @@ impl Db {
     /// writer holds.
     fn kept_from(&self, fresh: &MemTable) -> Option<Keep> {
         let sharing = self.shared.shares && (fresh.shared.is_some() || self.state().sharing());
-        Db::replaced_from_in(&self.opts, &self.shared, sharing)
+        let from = Db::replaced_from_in(&self.opts, &self.shared, sharing);
+        Db::freeze_held(&self.shared, from, self.state().lives);
+        from
+    }
+
+    /// A test's hold (`Db::look_inside_a_freeze`): the writer, between
+    /// its read of where the upkeep's look stands and the publish that
+    /// keeps tables from there, waits while `KEPT_HOLD_FREEZE` is set,
+    /// where the look it read stands behind the state it freezes (`lives`).
+    /// Not `kept_held`: the writer is no counted thread, and a store the
+    /// test crashes is one whose writer is the crashing thread.
+    fn freeze_held(shared: &Shared, from: Option<Keep>, lives: u64) {
+        if shared.kept_hold.load(AtomicOrdering::Acquire) & KEPT_HOLD_FREEZE == 0
+            || !from.is_some_and(|k| k.from != u64::MAX && k.from < lives)
+        {
+            return;
+        }
+        shared
+            .kept_holding
+            .fetch_or(KEPT_HOLD_FREEZE, AtomicOrdering::AcqRel);
+        while shared.kept_hold.load(AtomicOrdering::Acquire) & KEPT_HOLD_FREEZE != 0 {
+            std::thread::sleep(std::time::Duration::from_micros(200));
+        }
+        shared
+            .kept_holding
+            .fetch_and(!KEPT_HOLD_FREEZE, AtomicOrdering::AcqRel);
     }
 
     /// `table`, a hashed memtable whose every write is committed and
@@ -48956,7 +49029,7 @@ impl Db {
     fn ask_abandon(opts: &Options, shared: &Shared, st: &State, keep: Option<Keep>) {
         if opts.upkeep_abandons
             && matches!(opts.upkeep, Upkeep::Background(_))
-            && st.keeps_short(keep)
+            && st.keeps_short(keep, &shared.upkeep_lives)
         {
             shared
                 .abandon_at
@@ -55042,6 +55115,56 @@ impl Db {
             shared.kept_hold.fetch_and(!2, AtomicOrdering::AcqRel);
             ok
         })
+    }
+
+    /// A test's: the upkeep thread's next look lands inside the writer's
+    /// next freeze, between the freeze's read of where the look stands and
+    /// its publish. The look that moves where the look stands waits before
+    /// it stores its position, and the freeze that read a look behind the
+    /// state it freezes waits after its read. Once both wait, a thread of this call's lets
+    /// the look store and trim, and once it waits after its trim, lets the
+    /// freeze publish. The look, trimmed while the freeze waited, then
+    /// waits after its trim until
+    /// `let_the_look_go`, so that nothing the upkeep does after it moves
+    /// what the freeze left. The thread answers whether both were held, in
+    /// a minute at most. The caller's commit is lent to the upkeep thread
+    /// and its seal is the freeze.
+    #[doc(hidden)]
+    pub fn look_inside_a_freeze(&self) -> std::thread::JoinHandle<bool> {
+        Db::set_hold_bit(
+            &self.shared.kept_hold,
+            KEPT_HOLD_FREEZE | KEPT_HOLD_LOOK_STORE | KEPT_HOLD_LOOK_TRIMMED,
+            true,
+        );
+        let shared = self.shared.clone();
+        std::thread::spawn(move || {
+            let t = std::time::Instant::now();
+            let waited = |t: &std::time::Instant| t.elapsed() < std::time::Duration::from_secs(60);
+            let holding =
+                |bits: u8| shared.kept_holding.load(AtomicOrdering::Acquire) & bits == bits;
+            while !holding(KEPT_HOLD_FREEZE | KEPT_HOLD_LOOK_STORE) && waited(&t) {
+                std::thread::sleep(std::time::Duration::from_micros(200));
+            }
+            let both = holding(KEPT_HOLD_FREEZE | KEPT_HOLD_LOOK_STORE);
+            Db::set_hold_bit(&shared.kept_hold, KEPT_HOLD_LOOK_STORE, false);
+            while !holding(KEPT_HOLD_LOOK_TRIMMED) && waited(&t) {
+                std::thread::sleep(std::time::Duration::from_micros(200));
+            }
+            let trimmed = holding(KEPT_HOLD_LOOK_TRIMMED);
+            Db::set_hold_bit(&shared.kept_hold, KEPT_HOLD_FREEZE, false);
+            both && trimmed
+        })
+    }
+
+    /// The upkeep thread's look held by `look_inside_a_freeze` let go,
+    /// with every hold that call set.
+    #[doc(hidden)]
+    pub fn let_the_look_go(&self) {
+        Db::set_hold_bit(
+            &self.shared.kept_hold,
+            KEPT_HOLD_FREEZE | KEPT_HOLD_LOOK_STORE | KEPT_HOLD_LOOK_TRIMMED,
+            false,
+        );
     }
 
     /// Tables the seals' landings have retired: for a test.
