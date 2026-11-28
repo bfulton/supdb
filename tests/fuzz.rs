@@ -99,12 +99,6 @@
 //!   (`Options::forms_off_snapshot_kept`), with the stale exit off so that
 //!   the forms stay off through the commits between two flips; a flag and
 //!   not a draw.
-//! - `ZFUZZ_PARSE=1`: the `z` store's block-coded groups are written by the
-//!   parsing encoder (`Options::zpages_parse`), a flag and not a draw, so
-//!   that every seed's operations are the ones it had without it.
-//! - `ZFUZZ_FLEXDEC=1`: the `z` store's block-coded groups are decoded by
-//!   `lz4_flex` and not the engine's own decoder (`Options::zpages_own_decoder`
-//!   off), a flag and not a draw for the same reason.
 //! - `ZFUZZ_KEEPONE=1`: both stores keep one table, and a byte's worth, for
 //!   the upkeep's look (`Options::upkeep_keep_bytes`), so that a look a
 //!   table behind and a pass with a table landed under its pin give the
@@ -1075,12 +1069,6 @@ fn opts_z(c: &Cfg) -> Options {
             o.forms_to_fit = true;
         }
     }
-    // Under `ZFUZZ_PARSE` the form's block-coded groups are the parsing
-    // encoder's (`Options::zpages_parse`): the same format in other
-    // sequences, read against the raw store.
-    if env_flag("ZFUZZ_PARSE") {
-        o.zpages_parse = true;
-    }
     // Under `ZFUZZ_FORMSOFF`, with the form forced so that the gate is the
     // compact form's, the `z` store's handles give their forms up for the
     // merge path and take them back every three scans whatever their
@@ -1106,12 +1094,6 @@ fn opts_z(c: &Cfg) -> Options {
     if env_flag("ZFUZZ_SNAPKEPT") {
         o.forms_off_snapshot_kept = true;
         o.scan_forms_off_stale_writes = 0;
-    }
-    // Under `ZFUZZ_FLEXDEC` they are decoded by `lz4_flex` and not the
-    // engine's own decoder (`Options::zpages_own_decoder`), read against the
-    // raw store.
-    if env_flag("ZFUZZ_FLEXDEC") {
-        o.zpages_own_decoder = false;
     }
     // Under `ZFUZZ_CIPHER` the `z` store is kept under a cipher
     // (`Encryption::Cipher`) while `r` is in the clear over the same writes:

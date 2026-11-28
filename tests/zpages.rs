@@ -15180,87 +15180,27 @@ fn a_form_with_raw_tails_answers_as_the_compressed_one_and_its_scans_read_in_pla
     );
 }
 
-/// The form's groups decoded by the engine's own decoder
-/// (`Options::zpages_own_decoder`): a store opened with it reads every key,
-/// count and window as the model has it, as a store opened without does, and
-/// each store decodes by its own options while the other is open beside it.
+/// The block coding's groups written by the parsing encoder (`db::zlz4`)
+/// where the parse wins, many short matches: the same format in fewer
+/// sequences, so the form answers every read, count and scan as the model
+/// has it; the builder's own check decodes every group it writes against
+/// the records, so a group the encoder got wrong would have failed the
+/// build. The values are half random bytes and half words of four to seven
+/// letters drawn from a dozen, where the motif `suite_value` repeats is one
+/// long match either encoder finds.
 #[test]
-fn a_form_read_through_the_engines_own_decoder_answers_as_through_lz4_flexs() {
-    let mut open = Vec::new();
-    for own in [true, false] {
-        let what = format!("own decoder {own}");
-        let dir = scratch(&format!("own-decoder-{own}"));
-        let mut db = Db::create(
-            &dir,
-            forced(|o| {
-                o.partition_bytes = Some(160 << 10);
-                o.zpages_own_decoder = own;
-            }),
-        )
-        .unwrap();
-        let model = ordered_load(&mut db, 5000, 0x0D3C);
-        db.zpages_settle().unwrap();
-        let keys: Vec<Vec<u8>> = model.keys().cloned().collect();
-        check(&db, &model, &keys, &what);
-        check_scan(&db, &model, &what);
-        for (i, limit) in [(1234usize, 70usize), (0, 3), (4990, 40)] {
-            same_window(
-                &scanned(&db, &keys[i], limit),
-                &window(&model, &keys[i], limit),
-                &what,
-            );
-        }
-        let c = db.zpage_counts();
-        assert!(
-            c.reads > 0 && c.decodes > 0,
-            "{what}: read and decoded: {c:?}"
-        );
-        assert_eq!((c.fallbacks, c.bad_pages), (0, 0), "{what}: {c:?}");
-        assert!(c.form_files > 0, "{what}: {c:?}");
-        let by_own = if own { c.form_files } else { 0 };
-        assert_eq!(
-            c.own_decoder_files, by_own,
-            "{what}: the decoder its own: {c:?}"
-        );
-        open.push((db, model, keys, what, dir, by_own));
-    }
-    // Both read again with both open, the second opened last, each through
-    // the decoder of its own options.
-    for (db, model, keys, what, _, by_own) in &open {
-        check(db, model, keys, what);
-        check_scan(db, model, what);
-        assert_eq!(db.zpage_counts().own_decoder_files, *by_own, "{what}");
-    }
-    for (db, _, _, _, dir, _) in open {
-        drop(db);
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-}
-
-/// The block coding's groups written by the parsing encoder
-/// (`Options::zpages_parse`): the same format in fewer sequences, so the
-/// form answers every read, count and scan as the greedy encoder's does,
-/// through the same decoder, and its files are smaller; the builder's own
-/// check decodes every group it writes against the records, so a group the
-/// encoder got wrong would have failed the build. The values are the shape
-/// the parse wins on, many short matches: half random bytes and half words
-/// of four to seven letters drawn from a dozen, where the motif
-/// `suite_value` repeats is one long match either encoder finds.
-#[test]
-fn a_form_the_parsing_encoder_wrote_answers_as_the_greedy_ones_in_fewer_bytes() {
+fn a_form_the_parsing_encoder_wrote_over_short_matches_answers_as_the_model() {
     const WORDS: [&[u8]; 12] = [
         b"oak ", b"birch ", b"pine ", b"elm ", b"cedar ", b"fir ", b"ash ", b"larch ", b"maple ",
         b"yew ", b"alder ", b"beech ",
     ];
-    let mut bytes = Vec::new();
-    for parse in [false, true] {
-        let what = format!("parse {parse}");
-        let dir = scratch(&format!("parse-{parse}"));
+    {
+        let what = "parse".to_string();
+        let dir = scratch("parse");
         let mut db = Db::create(
             &dir,
             forced(|o| {
                 o.partition_bytes = Some(160 << 10);
-                o.zpages_parse = parse;
             }),
         )
         .unwrap();
@@ -15300,19 +15240,9 @@ fn a_form_the_parsing_encoder_wrote_answers_as_the_greedy_ones_in_fewer_bytes() 
             "{what}: read and decoded: {c:?}"
         );
         assert_eq!(c.fallbacks, 0, "{what}: nothing fell back to the raw form");
-        bytes.push(
-            form_files(&dir)
-                .iter()
-                .map(|p| common::store_file(p).len() as u64)
-                .sum::<u64>(),
-        );
         drop(db);
         let _ = std::fs::remove_dir_all(&dir);
     }
-    assert!(
-        bytes[1] < bytes[0],
-        "the parsing encoder's form is the smaller: {bytes:?}"
-    );
 }
 
 /// The census window's busy wall is taken from one operation in sixteen

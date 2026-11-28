@@ -918,9 +918,7 @@ its own decode of the group it ends inside made only as far as it reads
 ask made for the next group of a page as well as the next page's head
 (`Options::zpages_bulk_ahead_within`), and `supdb-zbulksearch` with the
 fence searched at every page and the memo asked twice a group
-(`Options::zpages_bulk_steps` off), and `supdb-zflatshort` with the flat
-LZ4 decoder lent the fast loop's slack alone, so each group's last
-sequences go the fast loop's way (`Options::zpages_flat_slack` off);
+(`Options::zpages_bulk_steps` off);
 `supdb-settlegated` and `supdb-ingestsettlegated` are `supdb` and
 `supdb-ingest` filing a commit's batch at the write only where the
 partitions' data passes the last-level cache
@@ -993,13 +991,6 @@ reading, however old (`Options::forms_settle_room_pressure` off);
 paths, drop their scan snapshot at every publish their look has no tables
 to carry across, a merge's or a seal's landing among them
 (`Options::snapshot_stands` off);
-`supdb-cache64tofitzpagesdropparse` and `supdb-cache64tofitautozpagesparse`
-are the forced form with the drop and the combined arm with their
-block-coded groups written by the engine's parsing encoder
-(`Options::zpages_parse`), the same block format in fewer sequences;
-`supdb-cache64tofitzpagesdropflexdec` and `supdb-cache64tofitautozpagesflexdec`
-are the same two with their groups decoded by `lz4_flex` and not the engine's
-own LZ4 decoder (`Options::zpages_own_decoder` off);
 `supdb-cache64tofitautozpagesperrun` is the combined arm with a block read
 through a cursor a run, a seek a cut and a read by rank a replaced record
 (`Options::zpages_block_cursor` off), where the default reads a block through

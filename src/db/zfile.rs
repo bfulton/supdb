@@ -3535,13 +3535,13 @@ pub(super) struct ZFile {
     /// never sees a stride file, so it stays a plain field beside the body
     /// rather than a branch inside it.
     bind: u32,
-    /// The block coding's groups decoded by the engine's own decoder
-    /// (`Options::zpages_own_decoder`), set by the store after the attach
-    /// as `inplace` is; `lz4_flex`'s where not.
+    /// The block coding's groups decoded by the engine's own decoder, set
+    /// by the store after the attach as `inplace` is; `lz4_flex`'s where
+    /// not.
     pub(super) own_decoder: bool,
     /// The engine's own decoder runs its flat loop ahead of its fast one
-    /// (`Options::zpages_flat_decode`), set beside `own_decoder`; and runs
-    /// it to the group's end (`Options::zpages_flat_slack`).
+    /// (`zlz4::decompress_in_flat`), set beside `own_decoder`; and runs it
+    /// to the group's end (`zlz4::FLAT_SLACK`).
     pub(super) flat_decoder: bool,
     pub(super) flat_slack: bool,
     /// One bit per page: the first-decode checks passed in this process,
@@ -7547,13 +7547,12 @@ pub(super) struct BuildPlan {
     /// (`Options::zpages_raw_tails`, `FillScratch::raw_tails`).
     pub raw_tails: bool,
     /// The block coding's groups written by the parsing encoder
-    /// (`Options::zpages_parse`, `FillScratch::parse`), its search
-    /// (`Options::zpages_parse_chains`, `FillScratch::parse_chains`).
+    /// (`FillScratch::parse`), its search (`FillScratch::parse_chains`):
+    /// the controller's builds, and not a merge's output finish.
     pub parse: bool,
     pub parse_chains: u32,
     /// The pages the build writes checked through the engine's own decoder
-    /// (`Options::zpages_own_decoder`, `FillScratch::own_decode`), the one
-    /// the store's readers take.
+    /// (`FillScratch::own_decode`), the one the store's readers take.
     pub own_decode: bool,
     /// A build on a thread of its own looks here once a page: set, the
     /// build stops, removes its temp file and answers `Outcome::Cancelled`.
@@ -10210,7 +10209,7 @@ pub(super) const SAMPLE_CHAIN: usize = 3;
 /// decoded bytes a group is cut at, the coding of the groups that compress,
 /// whether every tail is stored raw, and which encoder writes the block
 /// coding's groups (`zpages::ZGROUP_BYTES`, `z_coding`, `zpages_raw_tails`,
-/// `zpages_parse`).
+/// the parse at the controller's builds).
 #[derive(Clone, Copy, Debug)]
 pub(super) struct FillShape {
     pub group_bytes: usize,
