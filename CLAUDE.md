@@ -159,7 +159,8 @@ pointer elsewhere of the form (`CLAUDE.md`, *entry*) names an entry there.
   speeds and memory placement move cells by that much. A rate is the median
   of alternated runs of two binaries, and a verdict needs a second sitting.
 - Under a bound, read memory by owner and by phase (`lagcensus`, the group's
-  `memory.stat`, `smaps` sampled from outside the process); what the census
+  `memory.stat`, `smaps` sampled from outside the process beside the
+  engine's mapped blocks by length, `SUPDB_BLOCKS_WATCH`); what the census
   leaves unexplained includes the kernel's own memory.
 - An ask of the kernel (`WILLNEED`, a drop) is held to the kernel's count
   after it (`mincore`, `pagemap`) and repeated where it fell short. Resident

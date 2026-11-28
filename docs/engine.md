@@ -7861,6 +7861,92 @@ again with `SUPDB_SCAN_OPS=1`): the passes move by the host's two speeds,
 a median scan of 2.8-3.0 µs or 3.6-3.8 with the thread's CPU at its
 wall, whichever arm.
 
+#### The upkeep's pass through a full rewrite
+
+Under 1.25 GiB the bound killed `supdb-heldpart` in the lag sweep's full
+rewrite at ten million keys, in one rep of the roster at `5fea7c0`, and
+the row keeps the group's memory only at the phase before. Read from
+outside the pass -- the group's `memory.stat` every 10 ms and the
+process's mappings every 100 ms (`GROUPMEM_INTERVAL_MS=10
+GROUPMEM_SMAPS_MS=100 python3 scripts/groupmem.py sample OUT`, laid out by
+`groupmem.py end`), beside the engine's mapped blocks by length printed at
+each new peak (`SUPDB_BLOCKS_WATCH=10`, `Db::mapped_by_length`), since the
+kernel merges two anonymous mappings that lie side by side and this one
+names none -- the charge the group cannot take back peaks in the first
+second or two of the full rewrite's burst in every rep, and it is the
+engine's. At the highest of three reps that lived, 1,170 MB of the
+1,280 MiB bound, with the page cache down to 107 MB, the engine's blocks
+held 852 MB of 1,158 anonymous: ninety-eight blocks of 4 MiB (373 MB
+resident), three of 128 MiB (289) and five of 16 MiB (74)
+(`SUPDB_BLOCKS_WATCH=10 SUPDB_LAG_MARK=1 bench run --scale ooc --bound
+1342177280 --arms supdb-heldpart --bottom 10000000 --reps 3`, at
+`3e09327`). The lengths name the structures: a table's arena blocks are
+4 MiB (`ARENA_SHIFT`), its index at this size 16 MiB and its entries'
+slabs 1.5 MiB, and a block of 128 MiB is a seal's copy of its table for
+scans, an arena whose first block is the table's bytes rounded up to a
+power of two (`Snapshot::from_frozen`). Five tables stood, three of them
+copied.
+
+The tables' trace says how (`SUPDB_TABLES_TRACE`: each seal, freeze, copy,
+landing, ask and abandon, stamped as the marks are). A table freezes at
+131 MB here and is counted at twice that against the frozen tables' bound
+of 160 MB, so that bound keeps its floor of one; every seal of the burst's
+start reads reads as near, the sweep's scans having just run
+(`reads_around`), so each copies its table; and every table a landing
+retires stands behind the upkeep thread's pass, pinned since the burst
+began, until the pass gives its forms up. Under the same watch, with the
+stall watcher beside it (`scripts/stallwatch.py`), the shape before gave
+them up 0.7 to 1.9 seconds into the burst in the seven reps of eight it
+lived at `09e3bc5`, on the writer's ask in six and its pin's price in one,
+and in the eighth the bound killed it: the writer asked 2.35 and 3.16
+seconds into the burst and nothing gave up, four tables landed with four
+copies, and at the last sample the group stood at its limit with no page
+cache left and the engine's blocks at 918 MB of 1,255 anonymous, four
+copies (313 MB resident), 105 arena blocks (398) and 47 slabs (64)
+(`SUPDB_TABLES_TRACE=1 SUPDB_BLOCKS_WATCH=10 SUPDB_LAG_MARK=1 bench run
+--scale ooc --bound 1342177280 --arms supdb-heldpartapplydeaf --bottom
+10000000 --reps 8`). Each thread's stack sampled at the limit (`stallwatch.py
+OUT --within 600 --after 0.3 --dumps 4`, beside the same run at `ab0d0f8`,
+`--reps 3`, killed in its first) put the upkeep thread in its settle's
+apply in the first dumps of both passes it took: a block's conversion to a copy
+walking its partition's raw records (`Reader::convert_settled`,
+`BuildCtx::copy_from_deltas`) and a patch's splice (`Reader::patch_block`),
+waiting in the kernel for a page read or, in `mprotect`, for the mapping
+lock beside the faults. The settle's resolve loop heard the ask every
+sixty-four writes; its apply loop heard nothing until its batch was done,
+and out of core every write it applies is such a fault, which at the
+bound waits on reclaim the pinned tables keep from coming.
+
+The apply loop hears the ask between its writes as the resolves do
+(`Options::settle_apply_looks`; `supdb-heldpartapplydeaf` and
+`supdb-applydeaf` are the shape before), and what it applied before its
+look is counted as applied. Under the same watch the held arm gave its
+forms up 0.8 to 1.2 seconds into each of eight full rewrites, seven times
+on its own pin's price (`Reader::abandon_by_pin`), and the burst's peak
+read 638 to 802 MB,
+where the shape before read 643 to 993 in the seven reps it lived (the
+same command with `--arms supdb-heldpart`, at `09e3bc5`). Paired, no pass
+of either arm was killed in sixteen and no quantity was marked in either
+sitting: the lag sweep's first point, which runs before any burst and
+which the look cannot reach, read 1.41x and 0.59x between the orders, as
+far apart as any cell it can; the peaks read 648 to 778 MB against 607 to
+911 (`SUPDB_LAG_MARK=1 sh
+scripts/pair.sh supdb-heldpart supdb-heldpartapplydeaf 10000000 --bound
+1342177280 --passes load,lag --ops-div 10 --reps 4`, at `09e3bc5`; at
+`ab0d0f8` the same pairing's first sitting had the shape before killed in
+one rep of four). The durable arm's writer waits on the thread's trail
+(`Options::upkeep_pace_syncs_bp`), and its apply's look fired in none of
+its six passes (`pair.sh supdb supdb-applydeaf 10000000` with the same
+options, `--reps 3`, at `ab0d0f8`).
+
+A seal's copy is freed with its table, which outlives its landing for the
+upkeep's look and behind a pin. Taken back at the landing through the
+epoch instead, with the look in place, the burst's peak read 600 to 710 MB
+against 641 to 763 over eight passes each, the take's count firing in its
+arm alone (`pair.sh supdb-heldpart supdb-heldpartcopykept` with the
+options above, at `ab0d0f8`): the peak is the pin's, and a copy taken
+through the epoch is freed past the same pin, so the take is not kept.
+
 #### Seals whenever the sealer is idle
 
 `Options::seal_idle` (the `supdb-idle` and `supdb-shapeidle` arms) seals
