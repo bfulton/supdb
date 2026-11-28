@@ -20,7 +20,7 @@ and merges that branch to main for the tag.
 | 0 | History decision (B) | Bright | none | keep history and fix forward, the plan's default; the audit finds nothing for a rewrite (`release/history.md`) | nothing, unless Bright overrules |
 | 0 | Release-candidate branch, C0 | coordinator | `release-candidate`, cut at C0 = `b3a043dc` (tree `7f58d776`) | done; `ci` was green on all nine legs at that commit (push run 46057759527) | nothing |
 | 0 | Baseline at C0 | measurement agent, cloud session `supdb: baseline measurement at C0` | `release/baseline.md`; rows on `release-measure` | prepared and verified; static counts measured; the cost count of C0 against itself running here; the measurement session started at 17:59 ET on the rows and the floor | nothing |
-| 1 | Delete: options ledger, dead code, API surface | coordinator's subagents | `release/options.csv`, `release/phase1.md` | ledger judged and reviewed twice: 260 of 453 options go, in thirty pull requests | the cost gate's fix (`rc/cost-floor`), then PR1 |
+| 1 | Delete: options ledger, dead code, API surface | coordinator's subagents | `release/options.csv`, `release/phase1.md`; #38 (the cost gate), `rc/phase1-pr1` | #38 open and in review: the count of C0 reads green against itself three times; PR1 being written | Bright's merge of #38 |
 | 2 | Reshape: split `src/db.rs`, style | not assigned | none | not started | phase 1 |
 | 3 | Verify: audits, then fixes | not assigned | `release/findings/` | not started; inputs from the history audit: `bank-row.yml`'s write token, unpinned actions, five workflows without `permissions:` | phase 2, decisions 4 and 7 |
 | 4 | Tests: flake loop, runtime, coverage | not assigned | none | not started | the last fix of phase 3, decision 5 |
