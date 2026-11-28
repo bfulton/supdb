@@ -68608,11 +68608,28 @@ mod cipher_looks {
                 );
                 std::thread::sleep(std::time::Duration::from_millis(2));
             }
+            // The evictor's time off its core so far, by the kernel's count
+            // of the thread's wait to run, beside the pager's own waits for
+            // the readers' pins.
+            let off_ns = |c: &pager::PagerCounts| -> u64 {
+                let delay =
+                    std::fs::read_to_string(format!("/proc/self/task/{}/schedstat", c.evictor_tid))
+                        .ok()
+                        .and_then(|s| s.split_whitespace().nth(1)?.parse::<u64>().ok())
+                        .unwrap_or(0);
+                delay.saturating_add(c.waited_us.saturating_mul(1000))
+            };
             pager.restart_peak();
             let before = pager.counts();
+            let (off0, t0) = (off_ns(&before), std::time::Instant::now());
             assert_eq!(scan10(&db, &h, through_handle, &key(1)), 10);
             let c = pager.counts();
+            let (off, wall) = (
+                off_ns(&c).saturating_sub(off0),
+                (t0.elapsed().as_nanos() as u64).max(1),
+            );
             let read = (c.fills - before.fills) * pager::CHUNK as u64;
+            let adopted = c.adopted_bytes - before.adopted_bytes;
             assert!(
                 read > 6 * cache,
                 "handle {through_handle}: the scan's settle read {read} bytes through the \
@@ -68620,12 +68637,19 @@ mod cipher_looks {
             );
             // Past the budget by what a caller's read may be before it
             // waits (`pager::Pager::swamped`) and the megabyte the cache
-            // gives back at a time.
+            // gives back at a time, and by what the scan read into it while
+            // the evictor could not give back -- off its core or waiting out
+            // pins -- at the scan's own rate. The bound is soft by design: a
+            // reader past the swamp line breathes and reads on
+            // (`Pager::breathe_swamped`), so a fixed slack read a busy
+            // machine's scheduling, as the room-following test's did.
             let slack: u64 = 10 << 20;
+            let allowed = (u128::from(read) * u128::from(off.min(wall)) / u128::from(wall)) as u64;
             assert!(
-                c.peak < cache + slack,
+                c.peak < cache + slack + allowed,
                 "handle {through_handle}: the cache held {} bytes through one scan's settle, \
-                 over a budget of {cache}: {c:?}",
+                 over a budget of {cache}, a slack of {slack} and {allowed} of the {read} read \
+                 while the evictor was off for {off} ns of {wall} ({adopted} adopted): {c:?}",
                 c.peak
             );
             // And what was written reads back, a key written twice and
