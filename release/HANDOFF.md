@@ -35,6 +35,7 @@ Rounds run on the merged tree (`release/tools/round.sh`):
 | 1 | `793cec2b` | all green | green | green |
 | 2 | `abeecbdd` | all green but one test: the settle copy's abandon, twice (named since: an engine race, fix in `claude/supdb-pretag-flake-settle`) | red: `compact_run` +2.0 and `Reader::settle_each` +13.9 an op, both spills carried (below) | green |
 | 3 | `e927955f` | all green | green | green |
+| 5 | `0e0ec88d` (track B's PR10 to PR12 and PR20) | all green | red only by track B's known reads: `Reader::build_over` +0.33 (padding), `work_probe::main` +0.17, `BuildCtx::overlay_all` +0.05 (inlining), and `Reader::patch_block` +0.38 an op (carried: `splice_run` inlined); scans down 27 to 112 an op | green |
 | 4 | `68c68ad0` | all green; holds track C's fix to PR14 (`607ed7d0`: removing a flag from `Db::z_attach`'s positional tuple shifted the raw-drop test onto the decode timer's slot, so a store with `zpages_drop_raw` off dropped anyway; now a named struct and a test) and the six hostile-input fixes | red by the hostile-input fixes' checks: `Db::append_batch` +13.8 an op (probes +4.8), `merge_walk::main` +2.0, `SegmentWriter::end_with` +1.0, the open path's few hundred over the run; and `compact_run` +13.5 an op on `merge`, read by instruction as inlining that moved (the k-way walk laid out again around `end_with`, which took `key_hash` and `BigVec::push` in), with the `merge` probe's total down 21 an op once the 4 GiB cut lands | green |
 
 ## Branches still to merge
