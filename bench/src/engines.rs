@@ -1124,10 +1124,6 @@ pub struct Supdb {
     /// refaults since the last reading, however old the reading
     /// (`Options::forms_settle_room_pressure` off). `supdb-settleroomstill`.
     settleroomstill: bool,
-    /// A covered partition's settle filing a key by the form's span alone,
-    /// the shape before the ordered index's samples
-    /// (`Options::settle_covered_samples` off). `supdb-settlespan`.
-    settlespan: bool,
     /// A syncing commit's batches of a burst lent unpaced, the shape before
     /// `Options::upkeep_pace_syncs_bp`. `supdb-nopacesyncs`.
     nopacesyncs: bool,
@@ -1365,14 +1361,6 @@ pub struct Supdb {
     /// (`Options::frozen_bytes` at `usize::MAX`): `supdb-frozencount`, and
     /// `supdb-heldpartfrozencount` under the held log.
     frozencount: bool,
-    /// A settle's patch searches a copy for a key above its last entry
-    /// (`Options::settle_append_last` off): `supdb-settlesearch` and
-    /// `supdb-ingestsettlesearch`.
-    settlesearch: bool,
-    /// A settle's patch walks the sources for a key only its chain holds
-    /// (`Options::settle_lone_chain` off): `supdb-settlesources` and
-    /// `supdb-ingestsettlesources`.
-    settlesources: bool,
     /// The fills' conversion to a copy at the dense count alone, the shape
     /// before light forms converted (`Options::forms_convert_from`):
     /// `supdb-convert16` and `supdb-ingestconvert16`.
@@ -1548,11 +1536,6 @@ pub struct Supdb {
     /// `supdb-cache64tofitautozpagesmemolinear`, the pair against
     /// `supdb-cache64tofitautozpages`.
     zmemolinear: bool,
-    /// The combined arm with a settle resolving every written key's cut
-    /// (`Options::zpages_settle_span` off):
-    /// `supdb-cache64tofitautozpagesexactcut`, the pair against
-    /// `supdb-cache64tofitautozpages`.
-    zexactcut: bool,
     /// Every view of a form file's page checked and the memo asked after it
     /// (`Options::zpages_trusted_views` off): the combined arm's
     /// `supdb-cache64tofitautozpagescheckedviews`, the pair against
@@ -2566,10 +2549,6 @@ struct Policy {
     /// refaults since the last reading, however old the reading
     /// (`Options::forms_settle_room_pressure` off). `supdb-settleroomstill`.
     settleroomstill: bool,
-    /// A covered partition's settle filing a key by the form's span alone,
-    /// the shape before the ordered index's samples
-    /// (`Options::settle_covered_samples` off). `supdb-settlespan`.
-    settlespan: bool,
     /// A syncing commit's batches of a burst lent unpaced, the shape before
     /// `Options::upkeep_pace_syncs_bp`. `supdb-nopacesyncs`.
     nopacesyncs: bool,
@@ -2771,10 +2750,6 @@ struct Policy {
     headsgate: bool,
     /// The frozen tables bounded by their count alone: `...frozencount`.
     frozencount: bool,
-    /// The patch's search for an appended key: `...settlesearch`.
-    settlesearch: bool,
-    /// The patch's walk of the sources for a lone key: `...settlesources`.
-    settlesources: bool,
     /// The writer's copy line from `DENSEFROM`: `...densefrom`.
     densefrom: usize,
     /// Conversions at the dense count alone: `...convert16`.
@@ -2877,9 +2852,6 @@ struct Policy {
     /// The memo's slot unhashed (`Options::zpages_memo_hash` off):
     /// `supdb-cache64tofitautozpagesmemolinear`.
     zmemolinear: bool,
-    /// Every filed cut resolved at the settle (`Options::zpages_settle_span`
-    /// off): `supdb-cache64tofitautozpagesexactcut`.
-    zexactcut: bool,
     /// Every view of a form file's page checked and the memo asked after it
     /// (`Options::zpages_trusted_views` off):
     /// `supdb-cache64tofitautozpagescheckedviews`.
@@ -3357,7 +3329,6 @@ impl Default for Policy {
             mergedropscovered: false,
             sameblocksrecords: false,
             settleroomstill: false,
-            settlespan: false,
             nopacesyncs: false,
             pacesyncsraw: false,
             pacesyncs5: false,
@@ -3406,8 +3377,6 @@ impl Default for Policy {
             copythree: false,
             headsgate: false,
             frozencount: false,
-            settlesearch: false,
-            settlesources: false,
             densefrom: 0,
             convert16: false,
             pacesyncsbatch: false,
@@ -3457,7 +3426,6 @@ impl Default for Policy {
             zprebuild: false,
             zspan: false,
             zmemolinear: false,
-            zexactcut: false,
             zcheckedviews: false,
             zrecord: false,
             zstored: false,
@@ -7041,25 +7009,6 @@ impl Supdb {
     /// off), the shape before the hash: the pair against
     /// `supdb-cache64tofitautozpages` prices the slots a form file of the
     /// shipped cut could not reach.
-    /// `supdb-cache64tofitautozpages` with a settle resolving every
-    /// written key's cut through a seek (`Options::zpages_settle_span`
-    /// off), the shape before: the pair against
-    /// `supdb-cache64tofitautozpages` prices the cuts left to the builds.
-    pub fn create_cache64_tofit_auto_zpages_exactcut(path: &Path) -> Res<Supdb> {
-        Supdb::with_policy(
-            path,
-            Policy {
-                budget: 64 << 20,
-                tofit: true,
-                zpages_auto: true,
-                zexactcut: true,
-                zdropraw: Some(false),
-                zlandpct: Some(0),
-                ..Policy::default()
-            },
-        )
-    }
-
     pub fn create_cache64_tofit_auto_zpages_memolinear(path: &Path) -> Res<Supdb> {
         Supdb::with_policy(
             path,
@@ -8254,18 +8203,6 @@ impl Supdb {
             path,
             Policy {
                 pacesyncsraw: true,
-                ..Policy::default()
-            },
-        )
-    }
-
-    /// `supdb` whose covered partitions' settle files a key by the form's
-    /// span alone (`Options::settle_covered_samples` off).
-    pub fn create_settlespan(path: &Path) -> Res<Supdb> {
-        Supdb::with_policy(
-            path,
-            Policy {
-                settlespan: true,
                 ..Policy::default()
             },
         )
@@ -9800,7 +9737,6 @@ impl Supdb {
             mergedropscovered,
             sameblocksrecords,
             settleroomstill,
-            settlespan,
             nopacesyncs,
             pacesyncsraw,
             pacesyncs5,
@@ -9866,8 +9802,6 @@ impl Supdb {
             copythree,
             headsgate,
             frozencount,
-            settlesearch,
-            settlesources,
             densefrom,
             convert16,
             pacesyncsbatch,
@@ -9903,7 +9837,6 @@ impl Supdb {
             zprebuild,
             zspan,
             zmemolinear,
-            zexactcut,
             zcheckedviews,
             zrecord,
             zstored,
@@ -10294,7 +10227,6 @@ impl Supdb {
                 .unwrap_or(supdb::Options::default().scan_forms_off_counts_built),
             scan_forms_off_unreused: !formson,
             forms_settle_room_pressure: !settleroomstill,
-            settle_covered_samples: !settlespan,
             upkeep_pace_syncs_bp: if nopacesyncs {
                 0
             } else if pacesyncs5 {
@@ -10410,7 +10342,6 @@ impl Supdb {
             zpages_prebuild: zprebuild,
             zpages_seek_span: zspan,
             zpages_memo_hash: !zmemolinear,
-            zpages_settle_span: !zexactcut,
             zpages_trusted_views: !zcheckedviews,
             zpages_store_all: zstored,
             zpages_raw_tails: zrawtails,
@@ -10460,8 +10391,6 @@ impl Supdb {
             copy_packed: !copythree,
             heads_owned_past_fill: !headsgate,
             frozen_bytes: if frozencount { usize::MAX } else { 0 },
-            settle_append_last: !settlesearch,
-            settle_lone_chain: !settlesources,
             forms_convert_from: if densefrom > 0 {
                 densefrom
             } else if convert16 {
@@ -10814,7 +10743,6 @@ impl Supdb {
             mergedropscovered,
             sameblocksrecords,
             settleroomstill,
-            settlespan,
             nopacesyncs,
             pacesyncsraw,
             pacesyncs5,
@@ -10880,8 +10808,6 @@ impl Supdb {
             copythree,
             headsgate,
             frozencount,
-            settlesearch,
-            settlesources,
             densefrom,
             convert16,
             pacesyncsbatch,
@@ -10917,7 +10843,6 @@ impl Supdb {
             zprebuild,
             zspan,
             zmemolinear,
-            zexactcut,
             zcheckedviews,
             zrecord,
             zstored,
@@ -11483,8 +11408,6 @@ impl Engine for Supdb {
                 "supdb-cache64tofitautozpagesspan"
             } else if self.zmemolinear {
                 "supdb-cache64tofitautozpagesmemolinear"
-            } else if self.zexactcut {
-                "supdb-cache64tofitautozpagesexactcut"
             } else if self.zcheckedviews {
                 "supdb-cache64tofitautozpagescheckedviews"
             } else if self.zrecord {
@@ -12063,20 +11986,6 @@ impl Engine for Supdb {
                 "supdb-ingestidentityblob"
             };
         }
-        if self.settlesearch {
-            return if self.partition {
-                "supdb-settlesearch"
-            } else {
-                "supdb-ingestsettlesearch"
-            };
-        }
-        if self.settlesources {
-            return if self.partition {
-                "supdb-settlesources"
-            } else {
-                "supdb-ingestsettlesources"
-            };
-        }
         if self.settlebuildsfiled {
             return if self.partition {
                 "supdb-settlebuildsfiled"
@@ -12652,9 +12561,6 @@ impl Engine for Supdb {
         }
         if self.zgroup == Some(1024) && !(self.zpages && !self.block_cache) {
             return "supdb-zgroup1k";
-        }
-        if self.settlespan {
-            return "supdb-settlespan";
         }
         if self.nopacesyncs {
             return "supdb-nopacesyncs";
@@ -15287,7 +15193,6 @@ pub fn guarantee(arm: &str) -> Option<Guarantee> {
         | "supdb-cache64tofitautozpagesprebuild"
         | "supdb-cache64tofitautozpagesspan"
         | "supdb-cache64tofitautozpagesmemolinear"
-        | "supdb-cache64tofitautozpagesexactcut"
         | "supdb-cache64tofitautozpagescheckedviews"
         | "supdb-cache64tofitautozpagesrecord"
         | "supdb-cache64tofitautozpagesmemofirst"
@@ -15434,7 +15339,6 @@ pub fn guarantee(arm: &str) -> Option<Guarantee> {
         | "supdb-sameblocksrecords"
         | "supdb-settleroomstill"
         | "supdb-zgroup1k"
-        | "supdb-settlespan"
         | "supdb-nopacesyncs"
         | "supdb-pacesyncsraw"
         | "supdb-pacesyncs5"
@@ -15481,10 +15385,6 @@ pub fn guarantee(arm: &str) -> Option<Guarantee> {
         | "supdb-ingestcopythree"
         | "supdb-headsgate"
         | "supdb-frozencount"
-        | "supdb-settlesearch"
-        | "supdb-ingestsettlesearch"
-        | "supdb-settlesources"
-        | "supdb-ingestsettlesources"
         | "supdb-densefrom"
         | "supdb-ingestdensefrom"
         | "supdb-convert16"
@@ -16011,9 +15911,6 @@ pub fn open(arm: &str, dir: &Path, map_gb: usize) -> Res<Box<dyn Engine>> {
         }
         "supdb-cache64tofitautozpagesmemolinear" => {
             supdb_arm(Supdb::create_cache64_tofit_auto_zpages_memolinear, dir)?
-        }
-        "supdb-cache64tofitautozpagesexactcut" => {
-            supdb_arm(Supdb::create_cache64_tofit_auto_zpages_exactcut, dir)?
         }
         "supdb-cache64tofitautozpagescheckedviews" => {
             supdb_arm(Supdb::create_cache64_tofit_auto_zpages_checkedviews, dir)?
@@ -16833,58 +16730,6 @@ pub fn open(arm: &str, dir: &Path, map_gb: usize) -> Res<Box<dyn Engine>> {
                         partition: false,
                         durable: false,
                         identityblob: true,
-                        ..Policy::default()
-                    },
-                )
-            },
-            dir,
-        )?,
-        "supdb-settlesearch" => supdb_arm(
-            |d| {
-                Supdb::with_policy(
-                    d,
-                    Policy {
-                        settlesearch: true,
-                        ..Policy::default()
-                    },
-                )
-            },
-            dir,
-        )?,
-        "supdb-ingestsettlesearch" => supdb_arm(
-            |d| {
-                Supdb::with_policy(
-                    d,
-                    Policy {
-                        partition: false,
-                        durable: false,
-                        settlesearch: true,
-                        ..Policy::default()
-                    },
-                )
-            },
-            dir,
-        )?,
-        "supdb-settlesources" => supdb_arm(
-            |d| {
-                Supdb::with_policy(
-                    d,
-                    Policy {
-                        settlesources: true,
-                        ..Policy::default()
-                    },
-                )
-            },
-            dir,
-        )?,
-        "supdb-ingestsettlesources" => supdb_arm(
-            |d| {
-                Supdb::with_policy(
-                    d,
-                    Policy {
-                        partition: false,
-                        durable: false,
-                        settlesources: true,
                         ..Policy::default()
                     },
                 )
@@ -18040,7 +17885,6 @@ pub fn open(arm: &str, dir: &Path, map_gb: usize) -> Res<Box<dyn Engine>> {
         "supdb-sameblocksrecords" => supdb_arm(Supdb::create_sameblocksrecords, dir)?,
         "supdb-settleroomstill" => supdb_arm(Supdb::create_settleroomstill, dir)?,
         "supdb-zgroup1k" => supdb_arm(Supdb::create_zgroup1k, dir)?,
-        "supdb-settlespan" => supdb_arm(Supdb::create_settlespan, dir)?,
         "supdb-nopacesyncs" => supdb_arm(Supdb::create_nopacesyncs, dir)?,
         "supdb-pacesyncsraw" => supdb_arm(Supdb::create_pacesyncsraw, dir)?,
         "supdb-pacesyncs5" => supdb_arm(Supdb::create_pacesyncs5, dir)?,
@@ -20938,37 +20782,6 @@ mod tests {
                 assert_eq!(z.features(), base.features());
                 let o = z.db.as_ref().unwrap().options();
                 assert!(!o.identity_by_keys && b.identity_by_keys);
-                assert!(o.settle_append_last);
-            }
-            {
-                let z = Supdb::with_policy(
-                    &dir("settlesearch"),
-                    Policy {
-                        settlesearch: true,
-                        ..Policy::default()
-                    },
-                )
-                .unwrap();
-                assert_eq!(z.name(), "supdb-settlesearch");
-                assert_eq!(z.features(), base.features());
-                let o = z.db.as_ref().unwrap().options();
-                assert!(!o.settle_append_last && b.settle_append_last);
-                assert!(o.settle_lone_chain);
-            }
-            {
-                let z = Supdb::with_policy(
-                    &dir("settlesources"),
-                    Policy {
-                        settlesources: true,
-                        ..Policy::default()
-                    },
-                )
-                .unwrap();
-                assert_eq!(z.name(), "supdb-settlesources");
-                assert_eq!(z.features(), base.features());
-                let o = z.db.as_ref().unwrap().options();
-                assert!(!o.settle_lone_chain && b.settle_lone_chain);
-                assert!(o.settle_append_last);
             }
             {
                 let z = Supdb::with_policy(
@@ -21655,13 +21468,6 @@ mod tests {
                 assert_eq!(z.features(), base.features());
                 let o = z.db.as_ref().unwrap().options();
                 assert_eq!((o.zpages_group_bytes, b.zpages_group_bytes), (1024, 2048));
-            }
-            {
-                let z = Supdb::create_settlespan(&dir("settlespan")).unwrap();
-                assert_eq!(z.name(), "supdb-settlespan");
-                assert_eq!(z.features(), base.features());
-                let o = z.db.as_ref().unwrap().options();
-                assert!(!o.settle_covered_samples && b.settle_covered_samples);
             }
             {
                 let z = Supdb::create_nopacesyncs(&dir("nopacesyncs")).unwrap();
@@ -22515,31 +22321,6 @@ mod tests {
             )
         );
         drop(linear);
-        assert!(supdb::Options::default().zpages_settle_span && b.zpages_settle_span);
-        let exact = new(
-            "supdb-cache64tofitautozpagesexactcut",
-            Supdb::create_cache64_tofit_auto_zpages_exactcut,
-        );
-        assert_eq!(exact.name(), "supdb-cache64tofitautozpagesexactcut");
-        assert_eq!(guarantee(exact.name()), guarantee(base.name()));
-        assert_eq!(exact.features(), base.features());
-        let g = exact.db.as_ref().unwrap().options();
-        assert!(!g.zpages_settle_span, "the one option");
-        assert_eq!(
-            (
-                g.zpages,
-                g.zpages_memo_hash,
-                g.zpages_seek_span,
-                g.scan_cache_bytes
-            ),
-            (
-                b.zpages,
-                b.zpages_memo_hash,
-                b.zpages_seek_span,
-                b.scan_cache_bytes
-            )
-        );
-        drop(exact);
         assert!(supdb::Options::default().zpages_trusted_views && b.zpages_trusted_views);
         let checked = new(
             "supdb-cache64tofitautozpagescheckedviews",
@@ -22554,14 +22335,12 @@ mod tests {
             (
                 g.zpages,
                 g.zpages_memo_hash,
-                g.zpages_settle_span,
                 g.zpages_seek_span,
                 g.scan_cache_bytes
             ),
             (
                 b.zpages,
                 b.zpages_memo_hash,
-                b.zpages_settle_span,
                 b.zpages_seek_span,
                 b.scan_cache_bytes
             )
@@ -22581,14 +22360,12 @@ mod tests {
             (
                 g.zpages,
                 g.zpages_trusted_views,
-                g.zpages_settle_span,
                 g.zpages_seek_span,
                 g.scan_cache_bytes
             ),
             (
                 b.zpages,
                 b.zpages_trusted_views,
-                b.zpages_settle_span,
                 b.zpages_seek_span,
                 b.scan_cache_bytes
             )
@@ -23057,7 +22834,6 @@ mod tests {
                 g.zpages,
                 g.zpages_trusted_views,
                 g.zpages_memo_first,
-                g.zpages_settle_span,
                 g.zpages_seek_span,
                 g.scan_cache_bytes
             ),
@@ -23065,7 +22841,6 @@ mod tests {
                 b.zpages,
                 b.zpages_trusted_views,
                 b.zpages_memo_first,
-                b.zpages_settle_span,
                 b.zpages_seek_span,
                 b.scan_cache_bytes
             )

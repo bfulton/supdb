@@ -1765,8 +1765,8 @@ fn appended(dir: &std::path::Path, n: usize, background: bool, o: Options) -> (D
 }
 
 /// A settle's patch of a copy appends a key above the copy's last entry on
-/// one compare with that entry (`Options::settle_append_last`), where it
-/// searched the copy's keys for the place: every key inserted past a
+/// one compare with that entry, where it searched the copy's keys for
+/// the place: every key inserted past a
 /// store's end lands so, in the copy its last block is held as. A key
 /// below the last entry is searched for as before, and lands in its
 /// place.
@@ -1775,14 +1775,13 @@ fn a_key_past_a_copys_last_entry_is_appended_without_a_search() {
     // And under the copy as one stream of fixed-size records
     // (`Options::copy_packed`), which this store's blocks are: a key
     // appended finds the three buffers.
-    for (on, packed) in [(true, false), (false, false), (true, true)] {
-        let dir = scratch(&format!("append-last-{on}-{packed}"));
+    for packed in [false, true] {
+        let dir = scratch(&format!("append-last-true-{packed}"));
         let (mut db, keys) = appended(
             &dir,
             1000,
             false,
             Options {
-                settle_append_last: on,
                 copy_packed: packed,
                 ..common::options()
             },
@@ -1807,9 +1806,9 @@ fn a_key_past_a_copys_last_entry_is_appended_without_a_search() {
             }
             db.commit().unwrap();
         }
-        assert!(scan_model(&db) == want, "{on}: after the rewrites");
+        assert!(scan_model(&db) == want, "{packed}: after the rewrites");
         let (_, _, copies, _) = db.block_cache_kinds();
-        assert!(copies >= 1, "{on}: the last block is held as a copy");
+        assert!(copies >= 1, "{packed}: the last block is held as a copy");
         // Keys past the store's end, each above the one before. The last
         // block is a sparse form for the first few and a copy from there:
         // every insert that finds no sparse form left is a copy's.
@@ -1824,19 +1823,17 @@ fn a_key_past_a_copys_last_entry_is_appended_without_a_search() {
             db.commit().unwrap();
             assert!(
                 scan_list(&db) == want.clone().into_iter().collect::<Vec<_>>(),
-                "{on}: after insert {i} past the end, every key in its place"
+                "{packed}: after insert {i} past the end, every key in its place"
             );
             let appended = db.settle_short()[1] - before;
-            if !on {
-                assert_eq!(appended, 0, "insert {i} searched for with the option off");
-            } else if copy {
+            if copy {
                 assert_eq!(appended, 1, "insert {i} past a copy's end, on one compare");
             }
             into_a_copy += usize::from(copy);
         }
         assert!(
             into_a_copy >= 8,
-            "{on}: the last block was a copy for most of the inserts: {into_a_copy}"
+            "{packed}: the last block was a copy for most of the inserts: {into_a_copy}"
         );
         // A key inside the copy, below its last entry: searched for, and
         // in its place.
@@ -1848,38 +1845,37 @@ fn a_key_past_a_copys_last_entry_is_appended_without_a_search() {
         db.commit().unwrap();
         assert!(
             scan_list(&db) == want.clone().into_iter().collect::<Vec<_>>(),
-            "{on}: a key inside the copy, in its place"
+            "{packed}: a key inside the copy, in its place"
         );
         assert_eq!(
             db.settle_short()[1],
             before,
-            "{on}: a key below the last entry is not appended"
+            "{packed}: a key below the last entry is not appended"
         );
         db.flush().unwrap();
         db.settle().unwrap();
-        assert!(scan_model(&db) == want, "{on}: and after the flush");
+        assert!(scan_model(&db) == want, "{packed}: and after the flush");
         drop(db);
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
 
 /// A settle's patch takes a key's run from the key's own chain where no
-/// older source can hold the key (`Options::settle_lone_chain`): a plain
+/// older source can hold the key: a plain
 /// insert of a key the partition has no record of, with no piece over the
 /// partition and no table frozen. A key the partition holds, a key under
 /// a piece and a key under a frozen table keep the walk of the sources,
 /// which is what finds their older values.
 #[test]
 fn a_key_only_its_chain_holds_takes_its_run_from_the_chain() {
-    for on in [true, false] {
+    {
         // No piece and no frozen table.
-        let dir = scratch(&format!("lone-chain-{on}"));
+        let dir = scratch("lone-chain-true");
         let (mut db, keys) = appended(
             &dir,
             1000,
             false,
             Options {
-                settle_lone_chain: on,
                 ..common::options()
             },
         );
@@ -1893,7 +1889,7 @@ fn a_key_only_its_chain_holds_takes_its_run_from_the_chain() {
                 db.scan(lo, 1, kv(&mut |_, _| {})).unwrap();
             }
         };
-        assert!(scan_model(&db) == want, "{on}: the store as loaded");
+        assert!(scan_model(&db) == want, "the store as loaded");
         let lone = |db: &Db| db.settle_short()[0];
         // A form for the block the keys below fall in, which a patch
         // needs to have something to patch: one of its keys given a second
@@ -1904,11 +1900,8 @@ fn a_key_only_its_chain_holds_takes_its_run_from_the_chain() {
         db.append(&keys[505], b"again");
         want.get_mut(&keys[505]).unwrap().push(b"again".to_vec());
         db.commit().unwrap();
-        assert!(
-            scan_model(&db) == want,
-            "{on}: a key of the block written again"
-        );
-        assert_eq!(lone(&db), 0, "{on}: a key the partition holds is not lone");
+        assert!(scan_model(&db) == want, "a key of the block written again");
+        assert_eq!(lone(&db), 0, "a key the partition holds is not lone");
         // A key the store has never held, and a second value for it.
         let fresh = b"k00500x".to_vec();
         for (i, v) in [b"one".to_vec(), b"two".to_vec()].into_iter().enumerate() {
@@ -1917,13 +1910,9 @@ fn a_key_only_its_chain_holds_takes_its_run_from_the_chain() {
             db.append(&fresh, &v);
             want.entry(fresh.clone()).or_default().push(v);
             db.commit().unwrap();
-            assert!(scan_model(&db) == want, "{on}: value {i} of a fresh key");
+            assert!(scan_model(&db) == want, "value {i} of a fresh key");
             let took = lone(&db) - before;
-            if on {
-                assert_eq!(took, 1, "value {i} of a fresh key came from its chain");
-            } else {
-                assert_eq!(took, 0, "the sources walked with the option off");
-            }
+            assert_eq!(took, 1, "value {i} of a fresh key came from its chain");
         }
         // A second value for a key the partition holds: the partition's
         // value is the run's first, and the chain alone would lose it.
@@ -1932,38 +1921,30 @@ fn a_key_only_its_chain_holds_takes_its_run_from_the_chain() {
         db.append(&keys[510], b"more");
         want.get_mut(&keys[510]).unwrap().push(b"more".to_vec());
         db.commit().unwrap();
-        assert!(
-            scan_model(&db) == want,
-            "{on}: a second value for a sealed key"
-        );
-        assert_eq!(
-            lone(&db),
-            before,
-            "{on}: a key the partition holds is not lone"
-        );
+        assert!(scan_model(&db) == want, "a second value for a sealed key");
+        assert_eq!(lone(&db), before, "a key the partition holds is not lone");
         // A fresh key written by a put: its tombstone masks, as before.
         let before = lone(&db);
         near(&db);
         db.put(b"k00507x", b"put");
         want.insert(b"k00507x".to_vec(), vec![b"put".to_vec()]);
         db.commit().unwrap();
-        assert!(scan_model(&db) == want, "{on}: a fresh key put");
-        assert_eq!(lone(&db), before, "{on}: a masked key is the masked path's");
+        assert!(scan_model(&db) == want, "a fresh key put");
+        assert_eq!(lone(&db), before, "a masked key is the masked path's");
         db.flush().unwrap();
         db.settle().unwrap();
-        assert!(scan_model(&db) == want, "{on}: and after the flush");
+        assert!(scan_model(&db) == want, "and after the flush");
         drop(db);
         let _ = std::fs::remove_dir_all(&dir);
 
         // Under a piece: a key sealed into a level-0 piece and written
         // again holds its first value in the piece.
-        let dir = scratch(&format!("lone-chain-piece-{on}"));
+        let dir = scratch("lone-chain-piece-true");
         let (mut db, keys) = appended(
             &dir,
             1000,
             false,
             Options {
-                settle_lone_chain: on,
                 ..common::options()
             },
         );
@@ -1981,15 +1962,12 @@ fn a_key_only_its_chain_holds_takes_its_run_from_the_chain() {
             db.segments() > partition_fences(&dir).len(),
             "a piece stands"
         );
-        assert!(scan_model(&db) == want, "{on}: with the piece standing");
+        assert!(scan_model(&db) == want, "with the piece standing");
         db.scan(b"k00690", 20, kv(&mut |_, _| {})).unwrap();
         db.put(&keys[705], b"rewritten");
         want.insert(keys[705].clone(), vec![b"rewritten".to_vec()]);
         db.commit().unwrap();
-        assert!(
-            scan_model(&db) == want,
-            "{on}: a key of the block rewritten"
-        );
+        assert!(scan_model(&db) == want, "a key of the block rewritten");
         let before = lone(&db);
         db.scan(b"k00690", 20, kv(&mut |_, _| {})).unwrap();
         db.append(&under, b"in the table");
@@ -1997,21 +1975,20 @@ fn a_key_only_its_chain_holds_takes_its_run_from_the_chain() {
         db.commit().unwrap();
         assert!(
             scan_model(&db) == want,
-            "{on}: a key a piece holds, written again"
+            "a key a piece holds, written again"
         );
-        assert_eq!(lone(&db), before, "{on}: a key under a piece is not lone");
+        assert_eq!(lone(&db), before, "a key under a piece is not lone");
         drop(db);
         let _ = std::fs::remove_dir_all(&dir);
 
         // Under a frozen table: a key in a table a held seal keeps frozen,
         // written again into the live one.
-        let dir = scratch(&format!("lone-chain-frozen-{on}"));
+        let dir = scratch("lone-chain-frozen-true");
         let (mut db, keys) = appended(
             &dir,
             1000,
             true,
             Options {
-                settle_lone_chain: on,
                 ..common::options()
             },
         );
@@ -2019,7 +1996,7 @@ fn a_key_only_its_chain_holds_takes_its_run_from_the_chain() {
             .iter()
             .map(|k| (k.clone(), vec![vec![b'v'; 100]]))
             .collect();
-        assert!(scan_model(&db) == want, "{on}: the store as loaded");
+        assert!(scan_model(&db) == want, "the store as loaded");
         let held = b"k00800x".to_vec();
         db.hold_seal_landing(true);
         db.append(&held, b"frozen");
@@ -2027,15 +2004,12 @@ fn a_key_only_its_chain_holds_takes_its_run_from_the_chain() {
         db.commit().unwrap();
         db.seal().unwrap();
         assert_eq!(db.frozen_tables(), 1, "the seal's table is frozen");
-        assert!(scan_model(&db) == want, "{on}: with the table frozen");
+        assert!(scan_model(&db) == want, "with the table frozen");
         db.scan(b"k00790", 20, kv(&mut |_, _| {})).unwrap();
         db.put(&keys[805], b"rewritten");
         want.insert(keys[805].clone(), vec![b"rewritten".to_vec()]);
         db.commit().unwrap();
-        assert!(
-            scan_model(&db) == want,
-            "{on}: a key of the block rewritten"
-        );
+        assert!(scan_model(&db) == want, "a key of the block rewritten");
         let before = lone(&db);
         db.scan(b"k00790", 20, kv(&mut |_, _| {})).unwrap();
         db.append(&held, b"live");
@@ -2043,19 +2017,12 @@ fn a_key_only_its_chain_holds_takes_its_run_from_the_chain() {
         db.commit().unwrap();
         assert!(
             scan_model(&db) == want,
-            "{on}: a key a frozen table holds, written again"
+            "a key a frozen table holds, written again"
         );
-        assert_eq!(
-            lone(&db),
-            before,
-            "{on}: a key under a frozen table is not lone"
-        );
+        assert_eq!(lone(&db), before, "a key under a frozen table is not lone");
         db.hold_seal_landing(false);
         db.settle().unwrap();
-        assert!(
-            scan_model(&db) == want,
-            "{on}: and once the seal has landed"
-        );
+        assert!(scan_model(&db) == want, "and once the seal has landed");
         drop(db);
         let _ = std::fs::remove_dir_all(&dir);
     }

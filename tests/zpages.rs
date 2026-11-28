@@ -2429,7 +2429,7 @@ fn same_window(got: &Window, want: &Window, what: &str) {
 #[test]
 fn scans_agree_with_the_model_over_every_window_of_a_covered_store() {
     // On the nocache policy, the arm's: the scans merge their sources.
-    windows_over("windows", false, false, true, true);
+    windows_over("windows", false, false, true);
 }
 
 #[test]
@@ -2437,7 +2437,7 @@ fn scans_with_the_block_cache_agree_with_the_model_over_every_window_of_a_covere
     // On the default policy, the block cache on: a scan of a covered
     // partition with the cache's forms around it is the case this is for.
     // It holds the seal, so nothing lands under the forms' upkeep.
-    windows_over("windows-cache", true, false, false, true);
+    windows_over("windows-cache", true, false, false);
 }
 
 #[test]
@@ -2448,15 +2448,7 @@ fn scans_with_the_block_cache_skipping_a_copys_rank_agree_with_the_model_over_ev
     // every window alike. The upkeep inline, so the dense blocks are the
     // writer's copies when its windows reach them: lent, a pass of the
     // thread's built them another way in one full run of four.
-    windows_over("windows-cache-span", true, false, true, true);
-}
-
-#[test]
-fn scans_with_the_block_cache_resolving_every_filed_cut_agree_with_the_model_over_every_window() {
-    // The block cache with a settle resolving every written key's cut
-    // through a seek (`Options::zpages_settle_span` off), the shape before
-    // the cuts were left to the builds: both shapes answer alike.
-    windows_over("windows-cache-exactcut", true, false, true, false);
+    windows_over("windows-cache-span", true, false, true);
 }
 
 #[test]
@@ -2470,7 +2462,6 @@ fn scans_with_a_cursor_a_run_and_a_seek_a_cut_agree_with_the_model_over_every_wi
         true,
         false,
         false,
-        true,
         true,
         false,
         false,
@@ -2488,7 +2479,6 @@ fn scans_with_every_page_view_checked_agree_with_the_model_over_every_window() {
         true,
         false,
         false,
-        true,
         false,
         false,
         true,
@@ -2509,7 +2499,6 @@ fn scans_with_the_memo_asked_before_the_view_agree_with_the_model_over_every_win
         true,
         true,
         true,
-        true,
     );
 }
 
@@ -2519,7 +2508,7 @@ fn scans_with_the_blocks_promoted_to_copies_agree_with_the_model_over_every_wind
     // (`Options::zpages_promote_copies`), under a budget small enough to
     // shed them between the windows, so the walks meet a block as a form,
     // as a copy in its slot, and as a form again after the shed.
-    windows_over("windows-promote", true, true, false, true);
+    windows_over("windows-promote", true, true, false);
 }
 
 #[test]
@@ -4705,8 +4694,8 @@ fn the_prefetch_arm_scans_the_same_and_asks_once_a_walk() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-fn windows_over(name: &str, cache: bool, promote: bool, span: bool, lazy: bool) {
-    windows_over_with(name, cache, promote, span, lazy, true, false, true);
+fn windows_over(name: &str, cache: bool, promote: bool, span: bool) {
+    windows_over_with(name, cache, promote, span, true, false, true);
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -4715,7 +4704,6 @@ fn windows_over_with(
     cache: bool,
     promote: bool,
     span: bool,
-    lazy: bool,
     trusted: bool,
     memo_first: bool,
     block_cursor: bool,
@@ -4738,7 +4726,6 @@ fn windows_over_with(
             o.partition_bytes = Some(160 << 10);
             o.scan_block_cache = cache;
             o.zpages_seek_span = span;
-            o.zpages_settle_span = lazy;
             o.zpages_trusted_views = trusted;
             o.zpages_memo_first = memo_first;
             o.zpages_block_cursor = block_cursor;
@@ -4874,13 +4861,17 @@ fn windows_over_with(
     // filed cut where its walk stops and counts none
     // (`Options::zpages_block_cursor`), so the resolved count says nothing
     // of it there.
-    if cache && lazy {
+    if cache {
         assert!(
             filed_lazy > 0 && (promote || block_cursor || resolved_lazy > 0),
             "lazy cuts {filed_lazy} filed, {resolved_lazy} resolved"
         );
     } else {
-        assert_eq!((filed_lazy, resolved_lazy), (0, 0), "lazy cuts with it off");
+        assert_eq!(
+            (filed_lazy, resolved_lazy),
+            (0, 0),
+            "lazy cuts without the block cache"
+        );
     }
     if cache && span && !promote {
         assert!(spanned > 0, "no window took the span");

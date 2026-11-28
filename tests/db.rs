@@ -6430,16 +6430,14 @@ fn point_reads_are_near_until_two_stores_of_writes_since_the_last() {
 }
 
 /// A covered partition's settle files a written key under the block the
-/// ordered index's samples name, its cut left for the build
-/// (`Options::settle_covered_samples`): over a store whose partitions are
-/// all served by their form files, scattered writes, deletes and inserts
-/// read back as the model has them through every window and every handle,
-/// with more keys filed by the samples than the form's span alone files.
+/// ordered index's samples name, its cut left for the build: over a store
+/// whose partitions are all served by their form files, scattered writes,
+/// deletes and inserts read back as the model has them through every
+/// window and every handle, with keys filed so.
 #[test]
 fn a_covered_partitions_settle_files_a_key_under_the_block_its_samples_name() {
-    let mut filed_by = [0u64; 2];
-    for samples in [true, false] {
-        let name = format!("settle-covered-samples-{samples}");
+    {
+        let name = "settle-covered-samples-true".to_string();
         let d = dir(&name);
         let mut db = Db::create(
             &d,
@@ -6458,7 +6456,6 @@ fn a_covered_partitions_settle_files_a_key_under_the_block_its_samples_name() {
                 // which these keys and values would take, names a key's
                 // block by its rank and files every one by its span.
                 zpages_stride: supdb::ZStride::Off,
-                settle_covered_samples: samples,
                 upkeep: supdb::Upkeep::Inline,
                 ..common::options()
             },
@@ -6513,12 +6510,12 @@ fn a_covered_partitions_settle_files_a_key_under_the_block_its_samples_name() {
         let h = db.reader().unwrap();
         m.check(&h, &format!("{name}: a handle at the end"));
         let [filed, _] = db.lazy_cuts();
-        filed_by[usize::from(samples)] = filed - before[0];
+        assert!(
+            filed > before[0],
+            "keys filed with their cuts left: {filed} from {}",
+            before[0]
+        );
     }
-    assert!(
-        filed_by[1] > filed_by[0],
-        "more keys filed by the samples than by the form's span alone: {filed_by:?}"
-    );
 }
 
 /// A raw partition's settle files a written key under the block the
@@ -6548,7 +6545,7 @@ fn a_raw_partitions_settle_files_a_key_under_the_block_its_samples_name() {
                 upkeep: supdb::Upkeep::Inline,
                 // Raw partitions, in memory: a partition a form file serves
                 // files its keys with their cuts left by the covered
-                // settle's samples (`Options::settle_covered_samples`),
+                // settle's samples,
                 // which the forced form's builds give it once they land.
                 zpages: supdb::ZPages::Auto,
                 ..common::options()

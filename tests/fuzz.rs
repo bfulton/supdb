@@ -493,14 +493,6 @@ struct Cfg {
     /// and on otherwise, as the engine has it, so a run that makes its own
     /// file is held to the model beside one that finds it made.
     run_spare: bool,
-    /// A settle's patch appends a key past a copy's last entry on one
-    /// compare and takes a lone key's run from its chain
-    /// (`Options::settle_append_last`, `Options::settle_lone_chain`): each
-    /// off in a quarter of the seeds under `ZFUZZ_OPTVARY`, the side
-    /// generator's two draws after the run file's, and on otherwise, as
-    /// the engine has them.
-    settle_append: bool,
-    settle_lone: bool,
     /// A copy's prefetch by the span its walk reads
     /// (`Options::copy_prefetch_span`): on in a quarter of the seeds under
     /// `ZFUZZ_OPTVARY`, the side generator's draw after those, and off
@@ -852,8 +844,8 @@ fn pick_cfg(rng: &mut Rng, want_cache: bool) -> Cfg {
     let mem_fnv = side.chance(25);
     let in_place = side.chance(25);
     let spare_off = side.chance(25);
-    let append_off = side.chance(25);
-    let lone_chain_off = side.chance(25);
+    let _ = side.chance(25);
+    let _ = side.chance(25);
     let copy_span = side.chance(25);
     let identity_blob = side.chance(25);
     let copy_packed = side.chance(50);
@@ -938,8 +930,6 @@ fn pick_cfg(rng: &mut Rng, want_cache: bool) -> Cfg {
         mem_fold: !(vary && mem_fnv),
         in_place: vary && explicit_on && in_place,
         run_spare: !(vary && spare_off),
-        settle_append: !(vary && append_off),
-        settle_lone: !(vary && lone_chain_off),
         copy_span: vary && copy_span,
         identity_keys: !(vary && identity_blob),
         copy_packed: !vary || copy_packed,
@@ -975,8 +965,6 @@ fn opts(c: &Cfg) -> Options {
         zpages_point_part: c.point_part,
         zpages_point_keys: c.point_keys,
         run_spare: c.run_spare,
-        settle_append_last: c.settle_append,
-        settle_lone_chain: c.settle_lone,
         copy_prefetch_span: c.copy_span,
         identity_by_keys: c.identity_keys,
         copy_packed: c.copy_packed,

@@ -817,11 +817,7 @@ and its rank sought only for a block not held as a copy
 through a group. `supdb-cache64tofitautozpagesmemolinear` is the combined arm with the
 memo's slot the group's number plus a multiple of the form file's
 identity (`Options::zpages_memo_hash` off), where the default hashes the
-two over every slot. `supdb-cache64tofitautozpagesexactcut` is the combined arm with a
-settle resolving every written key's cut through a seek
-(`Options::zpages_settle_span` off), where the default files a key under
-the block the fence and the directory name and leaves its cut to the build
-that reads the block. `supdb-cache64tofitautozpagescheckedviews` is the
+two over every slot. `supdb-cache64tofitautozpagescheckedviews` is the
 combined arm with every view of a form file's page checked and the memo
 asked after it (`Options::zpages_trusted_views` off), where the default
 reads a verified page's directory trusted, and `supdb-nocachezpagescheckedviews`

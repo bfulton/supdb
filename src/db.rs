@@ -1963,22 +1963,7 @@ pub struct Options {
     /// `supdb-cache64tofitautozpagesmemolinear` is the arm.
     #[doc(hidden)]
     pub zpages_memo_hash: bool,
-    /// A settle files a written key under the block the form file's fence
-    /// and the page's directory name (`ZFile::owner_span`) with its cut
-    /// left unresolved, where that block holds no form a patch would need
-    /// the cut for, and the build that reads the block's filed keys
-    /// resolves them for that block alone (`BuildCtx::filed_cuts`). The
-    /// exact resolve was a seek through the form a distinct key: the E
-    /// mix's first scan settles the 91,143 writes the A, F and D mixes
-    /// left, 44,857 distinct keys, in 55 of the settle's 60 ms at five
-    /// million keys under 640 MiB, 25,740 of the seeks decoding a group,
-    /// for blocks most of which E never builds; a block held wide walks a
-    /// key with its cut unknown, placed by key, as it walks a snapshot key
-    /// whose cut was never taken. Off resolves every key at the settle,
-    /// the shape before; `supdb-cache64tofitautozpagesexactcut` is the arm.
-    #[doc(hidden)]
-    pub zpages_settle_span: bool,
-    /// With `zpages_settle_span`, a partition served raw files a written
+    /// A partition served raw files a written
     /// key the same way, under the block the ordered index's top level
     /// names (`OrdIndex::floor_stride`, a sample every block's first rank)
     /// with its cut left for the build, where the key's head lies strictly
@@ -1996,17 +1981,6 @@ pub struct Options {
     /// `supdb-settlelazyraw` is the arm.
     #[doc(hidden)]
     pub settle_lazy_raw: bool,
-    /// A settle's patch of a copy finds a key above the copy's last entry
-    /// by one compare with that entry and appends it, where it searched
-    /// the copy's keys for its place (`Reader::splice_run`): the last block
-    /// of the last partition collects every key inserted past the store's
-    /// end, each above the one before, and each insert's patch was a
-    /// binary search of the copy -- ten compares through the entries and
-    /// the keys, a sixth of the patch's instructions -- for the answer
-    /// "after the last". Off searches, the shape before;
-    /// `supdb-settlesearch` and `supdb-ingestsettlesearch` are the arms.
-    #[doc(hidden)]
-    pub settle_append_last: bool,
     /// A copy's claim that its entries are its partition's records
     /// (`CachedBlock::identity`) is of the partition's keys and not of its
     /// file: a merge that rewrites a partition over the same keys -- every
@@ -2041,37 +2015,6 @@ pub struct Options {
     /// `supdb-copythree` and `supdb-ingestcopythree`.
     #[doc(hidden)]
     pub copy_packed: bool,
-    /// A settle's patch takes a key's run from the key's own chain where
-    /// no older source can hold the key (`Reader::patch_block`): the write
-    /// is the live table's, the partition has no record of the key at its
-    /// cut, no level-0 piece meets the partition and no table is frozen.
-    /// A `put` leaves a tombstone in the chain, which masks every older
-    /// source, and its run has been written from the chain since the
-    /// masked path; a plain insert leaves none, so it took the general
-    /// path -- a context made, an overlay of one key allocated, the
-    /// sources walked for a key none of them holds -- about seven hundred
-    /// instructions to learn that the run is the chain's. Off takes the
-    /// general path, the shape before; `supdb-settlesources` and
-    /// `supdb-ingestsettlesources` are the arms.
-    #[doc(hidden)]
-    pub settle_lone_chain: bool,
-    /// A covered partition's settle files a written key under the block the
-    /// ordered index's samples name (`OrdIndex::floor_stride`, one sample a
-    /// block, in memory) before it asks the form file, its cut left for the
-    /// build: the form's span names a block only where the group that holds
-    /// the key lies inside one, and a group straddles a block's edge often
-    /// enough that the settle fell to the exact seek, which decodes the
-    /// group. The first scan after the lag sweep's one-percent burst at ten
-    /// million keys under 1.25 GiB waited 89-172 ms for the upkeep
-    /// thread's pass over the burst's 99,000 writes, or settled them itself
-    /// in 114, the decoder and the page views a third of its thread; filed
-    /// by the samples, the thread kept up, the scan waited a millisecond at
-    /// most, and that pass read 1.46x and 1.72x in two sittings, its first
-    /// scan 36-106 ms against 129-212 (`docs/engine.md`). A tie of the
-    /// key's head with a sample, which the samples cannot settle, asks the
-    /// form as before. On; `supdb-settlespan` files by the form's span.
-    #[doc(hidden)]
-    pub settle_covered_samples: bool,
     /// A verified page of a form file is read with its directory trusted
     /// (`zpages::view_trusted`, `ZFile::view`), and a read takes a page's
     /// view once, for the group it wants and the open of it. The checked
@@ -7482,13 +7425,9 @@ impl Default for Options {
             zpages_seek_span: false,
             scan_start_cache: 0,
             zpages_memo_hash: true,
-            zpages_settle_span: true,
             settle_lazy_raw: false,
-            settle_append_last: true,
             identity_by_keys: true,
             copy_packed: true,
-            settle_lone_chain: true,
-            settle_covered_samples: true,
             zpages_trusted_views: true,
             zpages_memo_bytes: 8 << 20,
             zpages_memo_slab: false,
@@ -25169,8 +25108,7 @@ impl FormTally {
 /// the copy it saves. Rounds interleaved, one machine.
 const CACHE_DENSE: usize = 16;
 
-/// A filed key's cut not yet resolved (`Options::zpages_settle_span`): the
-/// build that reads the block resolves it (`BuildCtx::filed_cuts`), and a
+/// A filed key's cut not yet resolved: the build that reads the block resolves it (`BuildCtx::filed_cuts`), and a
 /// block held wide passes it to its walk as the overlay's unknown cut,
 /// which the walk places by key. No resolved cut is this, since a cut packs
 /// a rank under the key count, shifted, with one bit beside it.
@@ -28127,14 +28065,13 @@ struct FormsState {
     /// The scans' start keys and their blocks (`Options::scan_start_cache`).
     start_cache: std::cell::RefCell<StartCache>,
     /// Writes a settle filed with their cut unresolved, and filed cuts a
-    /// build resolved by a seek (`Options::zpages_settle_span`); a build
+    /// build resolved by a seek; a build
     /// under `Options::zpages_block_cursor` resolves them where its walk
     /// stops and counts none.
     lazy_cuts: Counts<2>,
     /// Patches that took a key's run from its own chain as the one source
-    /// that can hold it (`Options::settle_lone_chain`), and patches that
-    /// appended a key past a copy's last entry on one compare
-    /// (`Options::settle_append_last`).
+    /// that can hold it, and patches that appended a key past a copy's
+    /// last entry on one compare.
     settle_short: Counts<2>,
     /// The settle's resolves whose stride was planned ahead
     /// (`Options::settle_seek_ahead`).
@@ -33285,9 +33222,9 @@ impl Reader {
     /// and a batch resolved in key order hands each key the rank the key
     /// before it reached as `floor`, so the heads' seek gallops from one
     /// answer to the next over warm heads.
-    /// The block a settle may file `key` under with its cut unresolved
-    /// (`Options::zpages_settle_span`): the one the ordered index's samples
-    /// name (`Options::settle_covered_samples`, `Options::settle_lazy_raw`)
+    /// The block a settle may file `key` under with its cut unresolved: the
+    /// one the ordered index's samples name (`Options::settle_lazy_raw` for
+    /// a raw partition's)
     /// or the form file's fence and the page's directory name
     /// (`ZFile::owner_span`), where they name one, and where the
     /// partition's table holds no form for it that a patch reads the cut
@@ -33298,10 +33235,9 @@ impl Reader {
         // the option for the partition's kind asks for them.
         let sampled = |on: bool| if on { seg.ord.floor_stride(key) } else { None };
         let b = match self.zc(seg) {
-            // A covered partition's from the samples first
-            // (`Options::settle_covered_samples`), and from the form's span
-            // where a sample ties the key's head.
-            Some(z) => match sampled(self.opts.settle_covered_samples) {
+            // A covered partition's from the samples first, and from the
+            // form's span where a sample ties the key's head.
+            Some(z) => match sampled(true) {
                 Some(b) => b,
                 None => {
                     let (lo, hi) = z.owner_span_from(key, hint)?;
@@ -38790,7 +38726,6 @@ impl Reader {
         let mut zhint = usize::MAX;
         let mut resolved: Vec<(u32, u32, u32, u32, u32, bool, u32)> =
             Vec::with_capacity(pending.len());
-        let lazy = self.opts.zpages_settle_span;
         let mut lazy_n = 0u64;
         // Out of core, the heads a resolve will seek asked for ahead of it
         // (`OrdIndex::willneed_heads`): a resolve is a seek over one stride
@@ -38934,10 +38869,7 @@ impl Reader {
                     }
                 }
             }
-            let (b, cut) = match lazy
-                .then(|| self.lazy_block(at, seg, key, &mut zhint))
-                .flatten()
-            {
+            let (b, cut) = match self.lazy_block(at, seg, key, &mut zhint) {
                 Some(b) => {
                     lazy_n += 1;
                     (b, LAZY_CUT)
@@ -39536,7 +39468,7 @@ impl Reader {
         // live table's, the partition has no record of the key at its cut,
         // no piece meets the partition and no table is frozen. Its run is
         // its chain's, as a masked key's is, whether or not a tombstone
-        // ends the chain (`Options::settle_lone_chain`): a plain insert
+        // ends the chain: a plain insert
         // leaves none, and took the general path below to learn that
         // nothing older held it. The live table's writes alone: a write
         // read from a table frozen since names that table's chain, and
@@ -39545,8 +39477,7 @@ impl Reader {
         // held has gone, the sources' walk writes the key no run, and a
         // write settled after this one writes the run again -- so it
         // keeps the walk, which is the one that is right at every step.
-        let lone = self.opts.settle_lone_chain
-            && live_src
+        let lone = live_src
             && slot != u32::MAX
             && !same
             && table.pieces.is_empty()
@@ -39745,12 +39676,9 @@ impl Reader {
                     (c - lo, true)
                 } else {
                     // A key above the copy's last entry goes after it:
-                    // one compare, where the search made ten to say so
-                    // (`Options::settle_append_last`).
+                    // one compare, where the search made ten to say so.
                     let n = blk.len();
-                    let past = self.opts.settle_append_last
-                        && n > 0
-                        && key_cmp(blk.key_i(n - 1), key) == Ordering::Less;
+                    let past = n > 0 && key_cmp(blk.key_i(n - 1), key) == Ordering::Less;
                     if past {
                         debug_assert_eq!(
                             blk.lower_bound(key),
@@ -49415,8 +49343,8 @@ impl Db {
     }
 
     /// The writer's own writes a settle filed with their cut unresolved,
-    /// and the filed cuts its builds resolved by a seek
-    /// (`Options::zpages_settle_span`); under `Options::zpages_block_cursor`
+    /// and the filed cuts its builds resolved by a seek; under
+    /// `Options::zpages_block_cursor`
     /// a build over a covered partition resolves them where its walk stops
     /// and counts none here.
     pub fn lazy_cuts(&self) -> [u64; 2] {
@@ -49425,9 +49353,8 @@ impl Db {
     }
 
     /// The writer's own settles' patches that took a key's run from its
-    /// chain alone (`Options::settle_lone_chain`) and that appended a key
-    /// past a copy's last entry without a search
-    /// (`Options::settle_append_last`).
+    /// chain alone and that appended a key past a copy's last entry
+    /// without a search.
     #[doc(hidden)]
     pub fn settle_short(&self) -> [u64; 2] {
         self.take_back_upkeep();
@@ -56319,7 +56246,7 @@ impl<'s> BuildCtx<'s> {
     /// PROTOTYPE: every key above the partition in block `b`, from the
     /// table's bounds; nothing is seeked.
     /// Block `b`'s filed keys with every cut a settle left unresolved
-    /// resolved (`Options::zpages_settle_span`): through the same exact
+    /// resolved: through the same exact
     /// resolve the settle would have made, for this block alone, where
     /// the build reads its groups anyway. The list as it is where it holds
     /// none.
