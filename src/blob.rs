@@ -305,6 +305,12 @@ impl Super {
         if u64::from_le_bytes(buf[SB_FIELDS * 8 + 8..SB_BYTES].try_into().unwrap()) != h {
             return None;
         }
+        // The section lengths are taken as `usize` where they size or bound
+        // a section: a length that does not fit the target's is a damaged
+        // field, refused here rather than narrowed on wasm32.
+        for i in [4, 5, 7, 8] {
+            usize::try_from(f[i]).ok()?;
+        }
         Some(Super {
             generation: f[0],
             timestamp: f[2],

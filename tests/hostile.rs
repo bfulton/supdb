@@ -502,6 +502,42 @@ fn an_offset_at_the_top_of_the_range_panics_no_sparse_open() {
     }
 }
 
+/// HI-4. A u64 header word narrowed to `usize`: on wasm32 `2^32` read as
+/// 0, and the key header's `recs_cap` (word 13) at `2^32` or `2^62` made
+/// the parse `clamp` with its minimum past its maximum, which panicked,
+/// and under the browser module's `panic = "abort"` killed the instance.
+/// Every word of the key header from the key count on is set past 32 bits
+/// with the row computed again, and the superblock's lengths under a
+/// forged FNV: a 64-bit reader refuses or answers as written, and the
+/// browser reader (`web/hostile.test.mjs`) the same, never trapping.
+#[test]
+fn a_header_word_past_32_bits_is_refused_and_never_narrowed() {
+    for (i, (pristine, m)) in shapes().iter().enumerate() {
+        let (ko, _) = key_section(pristine);
+        for w in 7..20usize {
+            for v in [1u64 << 32, (1 << 32) + 1, 1 << 62, u64::MAX] {
+                let mut b = pristine.clone();
+                b[ko + w * 8..ko + w * 8 + 8].copy_from_slice(&v.to_le_bytes());
+                forge_row(&mut b);
+                // The extension's copy, which the sparse open reads first.
+                forge_ext_header(&mut b, |h| {
+                    h[w * 8..w * 8 + 8].copy_from_slice(&v.to_le_bytes())
+                });
+                hold(&format!("keyheader shape{i} w{w}={v:#x}"), i, &b, m, false);
+            }
+        }
+        for f in [4usize, 7] {
+            for v in [1u64 << 32, (1 << 32) + 4096] {
+                let mut b = pristine.clone();
+                set_super(&mut b, f, v);
+                set_super(&mut b, f + 1, v);
+                forge_super(&mut b);
+                hold(&format!("superblock shape{i} f{f}={v:#x}"), i, &b, m, true);
+            }
+        }
+    }
+}
+
 /// The cases, for the browser reader (`web/hostile.test.mjs`): each case's
 /// bytes and whether every reader must refuse it, under the directory
 /// `SUPDB_HOSTILE_DUMP` names. Every other test here writes its cases there

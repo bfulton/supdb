@@ -364,7 +364,7 @@ pub fn with_checksums(mut sec: Vec<u8>, base: u64) -> Vec<u8> {
 /// must refuse the section rather than read it unverified (a flip of that
 /// one byte was the first thing the reproducer found).
 fn checksum_words(sec: &[u8]) -> std::result::Result<Option<(usize, u32)>, ()> {
-    let crc_off = rd_u64(sec, W_CRC_OFF).ok_or(())? as usize;
+    let crc_off = rd_usize(sec, W_CRC_OFF).ok_or(())?;
     if crc_off == 0 {
         return Ok(None);
     }
@@ -513,12 +513,12 @@ impl Header {
         if !is_flat(sec) {
             return None;
         }
-        let nkeys = rd_u64(sec, 56)? as usize;
-        let hash_cap = rd_u64(sec, 64)? as usize;
-        let dir_base = rd_u64(sec, 80)? as usize;
-        let recs_len = rd_u64(sec, 96)? as usize;
-        let recs_cap = rd_u64(sec, 104)?.max(recs_len as u64) as usize;
-        let dir_cap = rd_u64(sec, 144)? as usize;
+        let nkeys = rd_usize(sec, 56)?;
+        let hash_cap = rd_usize(sec, 64)?;
+        let dir_base = rd_usize(sec, 80)?;
+        let recs_len = rd_usize(sec, 96)?;
+        let recs_cap = rd_usize(sec, 104)?.max(recs_len);
+        let dir_cap = rd_usize(sec, 144)?;
         let dir_state = rd_u64(sec, 152)?;
         if hash_cap == 0 || !hash_cap.is_power_of_two() {
             return None;
@@ -540,17 +540,17 @@ impl Header {
         Some(Header {
             generation: rd_u64(sec, 8)?,
             nkeys,
-            hash_off: rd_u64(sec, 72)? as usize,
+            hash_off: rd_usize(sec, 72)?,
             hash_cap,
             dir_off,
             dir_base,
             dir_cap,
-            recs_off: rd_u64(sec, 88)? as usize,
+            recs_off: rd_usize(sec, 88)?,
             recs_len,
-            bump: rd_u64(sec, 112)?.clamp(recs_len as u64, recs_cap as u64) as usize,
-            fence_offs_off: rd_u64(sec, 120)? as usize,
-            fence_n: rd_u64(sec, 128)? as usize,
-            fence_stride: rd_u64(sec, 136)? as usize,
+            bump: rd_usize(sec, 112)?.max(recs_len).min(recs_cap),
+            fence_offs_off: rd_usize(sec, 120)?,
+            fence_n: rd_usize(sec, 128)?,
+            fence_stride: rd_usize(sec, 136)?,
             crc_off: checksum_words(sec).ok()?.map_or(0, |w| w.0),
             piece_shift: checksum_words(sec).ok()?.map_or(0, |w| w.1),
         })
@@ -1030,6 +1030,13 @@ pub(crate) fn rd_u32(b: &[u8], at: usize) -> Option<u32> {
 }
 fn rd_u64(b: &[u8], at: usize) -> Option<u64> {
     Some(u64::from_le_bytes(b.get(at..at + 8)?.try_into().ok()?))
+}
+
+/// A u64 header word taken as a size or an offset: `None` where it does not
+/// fit the target's `usize`. Narrowed with `as` on wasm32, `2^32` read as 0
+/// and the parse went on with a word that was never written.
+fn rd_usize(b: &[u8], at: usize) -> Option<usize> {
+    usize::try_from(rd_u64(b, at)?).ok()
 }
 
 /// What the writer needs to know before it can lay the section out.
@@ -2171,18 +2178,18 @@ impl FlatIndex {
         let prev_off = rd_u64(sec, 32)?;
         let prev_stored = rd_u64(sec, 40)?;
         let prev_unc = rd_u64(sec, 48)?;
-        let nkeys = rd_u64(sec, 56)? as usize;
-        let hash_cap = rd_u64(sec, 64)? as usize;
-        let hash_off = rd_u64(sec, 72)? as usize;
-        let dir_off = rd_u64(sec, 80)? as usize;
-        let recs_off = rd_u64(sec, 88)? as usize;
-        let recs_len = rd_u64(sec, 96)? as usize;
-        let recs_cap = rd_u64(sec, 104)?.max(recs_len as u64) as usize;
-        let bump = rd_u64(sec, 112)?.clamp(recs_len as u64, recs_cap as u64) as usize;
-        let fence_offs_off = rd_u64(sec, 120)? as usize;
-        let fence_n = rd_u64(sec, 128)? as usize;
-        let fence_stride = rd_u64(sec, 136)? as usize;
-        let dir_cap = rd_u64(sec, 144)? as usize;
+        let nkeys = rd_usize(sec, 56)?;
+        let hash_cap = rd_usize(sec, 64)?;
+        let hash_off = rd_usize(sec, 72)?;
+        let dir_off = rd_usize(sec, 80)?;
+        let recs_off = rd_usize(sec, 88)?;
+        let recs_len = rd_usize(sec, 96)?;
+        let recs_cap = rd_usize(sec, 104)?.max(recs_len);
+        let bump = rd_usize(sec, 112)?.max(recs_len).min(recs_cap);
+        let fence_offs_off = rd_usize(sec, 120)?;
+        let fence_n = rd_usize(sec, 128)?;
+        let fence_stride = rd_usize(sec, 136)?;
+        let dir_cap = rd_usize(sec, 144)?;
         let dir_state = rd_u64(sec, 152)?;
 
         if hash_cap == 0 || !hash_cap.is_power_of_two() {
@@ -2212,7 +2219,7 @@ impl FlatIndex {
         let dir_region_end = if dir_cap == 0 {
             dir_off.checked_add(nkeys.checked_mul(4)?)?
         } else {
-            rd_u64(sec, 80)? as usize + dir_cap.checked_mul(8)?
+            rd_usize(sec, 80)?.checked_add(dir_cap.checked_mul(8)?)?
         };
         let dir_end = dir_region_end;
         let recs_end = recs_off.checked_add(recs_cap)?;
@@ -2301,7 +2308,7 @@ impl FlatIndex {
             hash: (hash_off, hash_end),
             dir: (dir_off, dir_end),
             dir_cap,
-            dir_base: rd_u64(sec, 80)? as usize,
+            dir_base: rd_usize(sec, 80)?,
             recs: (recs_off, recs_end),
             hash_cap,
             mask: hash_cap - 1,
