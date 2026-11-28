@@ -1197,12 +1197,6 @@ pub struct Supdb {
     /// piece, or none for the engine's own, which leaves them for the
     /// partition merge. `supdb-tier`.
     tier: Option<usize>,
-    /// The scan snapshot carries each unsealed key's chain, and a block
-    /// the runs cover is walked rather than copied. `supdb-runs`.
-    runs: bool,
-    /// The run keeper beside the runs: a thread at idle priority keeps
-    /// the published snapshot current from the commits. `supdb-keeper`.
-    keeper: bool,
     /// Whether a publish starts the builder and a commit installs its
     /// forms. `supdb-aheadpub`.
     aheadpub: bool,
@@ -2662,12 +2656,6 @@ struct Policy {
     /// piece, or none for the engine's own, which leaves them for the
     /// partition merge. `supdb-tier`.
     tier: Option<usize>,
-    /// The scan snapshot carries each unsealed key's chain, and a block
-    /// the runs cover is walked rather than copied. `supdb-runs`.
-    runs: bool,
-    /// The run keeper beside the runs: a thread at idle priority keeps
-    /// the published snapshot current from the commits. `supdb-keeper`.
-    keeper: bool,
     /// Whether a publish starts the builder and a commit installs its
     /// forms. `supdb-aheadpub`.
     aheadpub: bool,
@@ -3595,8 +3583,6 @@ impl Default for Policy {
             settleall: false,
             upkeep: None,
             tier: None,
-            runs: false,
-            keeper: false,
             aheadpub: false,
             pubalways: false,
             leave: false,
@@ -5629,29 +5615,6 @@ impl Supdb {
             path,
             Policy {
                 eager: Some(0),
-                ..Policy::default()
-            },
-        )
-    }
-
-    /// `supdb` with the piece merge on at three pieces, so a range's
-    /// pieces fold into one beside the partition merge: what prices it.
-    pub fn create_runs(path: &Path) -> Res<Supdb> {
-        Supdb::with_policy(
-            path,
-            Policy {
-                runs: true,
-                ..Policy::default()
-            },
-        )
-    }
-
-    pub fn create_keeper(path: &Path) -> Res<Supdb> {
-        Supdb::with_policy(
-            path,
-            Policy {
-                runs: true,
-                keeper: true,
                 ..Policy::default()
             },
         )
@@ -9988,8 +9951,6 @@ impl Supdb {
             settleall,
             upkeep,
             tier,
-            runs,
-            keeper,
             aheadpub,
             pubalways,
             leave,
@@ -10508,8 +10469,6 @@ impl Supdb {
             // The pieces over a range merged into one piece beside the
             // partition merge, or left for it as the engine has it.
             tier_pieces: tier.unwrap_or(supdb::Options::default().tier_pieces),
-            snapshot_runs: runs,
-            snapshot_keeper: keeper,
             // The builder started by a publish and installed by a commit,
             // or started by a scan as it is.
             build_ahead_on_publish: aheadpub,
@@ -11027,8 +10986,6 @@ impl Supdb {
             settleall,
             upkeep,
             tier,
-            runs,
-            keeper,
             aheadpub,
             pubalways,
             leave,
@@ -12091,12 +12048,6 @@ impl Engine for Supdb {
         }
         if self.tier.is_some_and(|t| t > 0) {
             return "supdb-tier";
-        }
-        if self.keeper {
-            return "supdb-keeper";
-        }
-        if self.runs {
-            return "supdb-runs";
         }
         if self.aheadpub {
             return "supdb-aheadpub";
@@ -15398,8 +15349,6 @@ pub fn guarantee(arm: &str) -> Option<Guarantee> {
         | "supdb-settleall"
         | "supdb-inline"
         | "supdb-tier"
-        | "supdb-runs"
-        | "supdb-keeper"
         | "supdb-aheadpub"
         | "supdb-pubalways"
         | "supdb-nosnap"
@@ -16022,8 +15971,6 @@ pub fn open(arm: &str, dir: &Path, map_gb: usize) -> Res<Box<dyn Engine>> {
         "supdb-hold" => supdb_arm(Supdb::create_hold, dir)?,
         "supdb-ingesthold" => supdb_arm(Supdb::create_ingest_hold, dir)?,
         "supdb-tier" => supdb_arm(Supdb::create_tier, dir)?,
-        "supdb-runs" => supdb_arm(Supdb::create_runs, dir)?,
-        "supdb-keeper" => supdb_arm(Supdb::create_keeper, dir)?,
         "supdb-aheadpub" => supdb_arm(Supdb::create_aheadpub, dir)?,
         "supdb-pubalways" => supdb_arm(Supdb::create_pubalways, dir)?,
         "supdb-lazyforms" => supdb_arm(Supdb::create_lazyforms, dir)?,

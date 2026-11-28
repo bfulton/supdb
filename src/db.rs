@@ -3739,46 +3739,6 @@ pub struct Options {
     /// into the block it overlays: adopting saves the sort and buys that
     /// list. See the sweep in the pull request for where the two cross.
     pub snapshot_adopt_behind: usize,
-    /// EXPERIMENT: the scan snapshot carries each unsealed key's chain,
-    /// copied in key order when the snapshot is built, so a read of an
-    /// overlaid key streams the copy instead of chasing the memtable's
-    /// entry, chain and value; and a block those runs cover -- three
-    /// quarters of its keys or more, counting every source's run over
-    /// it -- is walked on a read's first touch rather than copied,
-    /// since every partition record under such a run is masked by its
-    /// update's tombstone and the copy would be a copy of the run, and
-    /// copied on its second, since a block read over and over wants
-    /// the copy.
-    /// `docs/engine.md` has the pricing: on the lag sweep's last point at
-    /// ten thousand keys the handle passes read 8.0 µs a scan against
-    /// 9.7 without, level at thirty thousand where the pieces' keys are
-    /// read per window either way, and the writer's own pass reads
-    /// slower by the copy, which lands in the first scan after a burst
-    /// -- at ten thousand keys 1.5 ms over ten thousand chains, half the
-    /// pass. Off, and `supdb-runs` prices it; `snapshot_keeper` pays the
-    /// copy at the commit instead, on a thread of the store's own, and
-    /// is the write-time structure this is the read half of.
-    pub snapshot_runs: bool,
-    /// EXPERIMENT: the run keeper, a thread of the store's own at idle
-    /// priority that keeps the published scan snapshot current to the
-    /// commits. Polling them once a scan has happened over the store,
-    /// it appends the batches' keys and runs to the snapshot's shared
-    /// arena and publishes the extended version, so the first scan
-    /// after a burst adopts a snapshot that has the burst instead of
-    /// sorting it and copying its runs -- the copy that landed in the
-    /// writer's first scan under `snapshot_runs` alone, or inline at
-    /// each commit where the forms are maintained there. It carries the
-    /// snapshot across a seal, the live entries becoming frozen ones at
-    /// the freeze and leaving when the seal lands, and across a merge
-    /// unchanged. Off, and `supdb-keeper` prices it beside `supdb-runs`;
-    /// `docs/engine.md` has the figures.
-    pub snapshot_keeper: bool,
-    /// EXPERIMENT: how far past the last scan over the store the keeper
-    /// follows the writes, as a percentage of the store's sealed keys,
-    /// before it waits for a scan: its copy is a copy of every value
-    /// written, and a load with no read in sight is not worth doubling
-    /// in memory. Zero follows every write.
-    pub snapshot_keeper_recent_pct: usize,
     /// EXPERIMENT: entries reads must have taken from a block before the
     /// store holds it a second way, as a merged copy beside the cheap
     /// form, so that the reads ask for the shape rather than the writes
@@ -7529,9 +7489,7 @@ impl Options {
         self.share_on_write
             && !self.shared_writers
             && !self.held_frames
-            && !self.snapshot_keeper
             && !self.forms_off_snapshot_kept
-            && !self.snapshot_runs
             && !self.put_in_place
             && !self.adaptive_shape
     }
@@ -7760,9 +7718,6 @@ impl Default for Options {
             commit_forms_build: true,
             share_snapshot: true,
             snapshot_adopt_behind: 0,
-            snapshot_runs: false,
-            snapshot_keeper: false,
-            snapshot_keeper_recent_pct: 100,
             promote_entries: 0,
             promote_starts: 0,
             build_ahead_on_commit: 0,
@@ -21100,14 +21055,13 @@ fn check_options(opts: &Options) -> Result<()> {
     if opts.put_in_place
         && (!matches!(opts.sync, SyncPolicy::Explicit)
             || opts.scan_block_cache
-            || opts.snapshot_keeper
             || opts.forms_off_snapshot_kept
             || opts.upkeep != Upkeep::Inline)
     {
         return Err(err(
             "put_in_place overwrites a live table's values under the writer alone: \
-             it needs SyncPolicy::Explicit, Upkeep::Inline, and scan_block_cache, \
-             snapshot_keeper and forms_off_snapshot_kept off",
+             it needs SyncPolicy::Explicit, Upkeep::Inline, and scan_block_cache \
+             and forms_off_snapshot_kept off",
         ));
     }
     if opts.one_file && (!opts.manifest_slots || opts.manifest_pending) {
@@ -21120,9 +21074,7 @@ fn check_options(opts: &Options) -> Result<()> {
         && (!matches!(opts.sync, SyncPolicy::Explicit)
             || opts.held_frames
             || opts.scan_block_cache
-            || opts.snapshot_keeper
             || opts.forms_off_snapshot_kept
-            || opts.snapshot_runs
             || opts.direct_ingest
             || opts.put_in_place
             || opts.adaptive_shape
@@ -21131,8 +21083,8 @@ fn check_options(opts: &Options) -> Result<()> {
         return Err(err(
             "shared_writers writes the live table from every thread with nothing logged: \
              it needs SyncPolicy::Explicit with held_frames off, Upkeep::Inline, and \
-             scan_block_cache, snapshot_keeper, forms_off_snapshot_kept, snapshot_runs, \
-             direct_ingest, put_in_place and adaptive_shape off",
+             scan_block_cache, forms_off_snapshot_kept, direct_ingest, put_in_place and \
+             adaptive_shape off",
         ));
     }
     // The re-code policies tell a served form file's coding by
@@ -26463,13 +26415,6 @@ struct Shared {
     /// Snapshots republished with their stale runs copied again
     /// (`Snapshot::refreshed`).
     snap_refreshes: AtomicU64,
-    /// PROTOTYPE: the run keeper's thread, for a publish and a settle
-    /// to wake; a commit and a scan wake nothing, since the keeper
-    /// polls for those -- see `Reader::keep`. The flush sequence a
-    /// settle raises and the keeper answers once the snapshot is
-    /// current; and what the keeper has published, for a test: versions
-    /// extended, and versions carried across a publish.
-    keeper_thread: std::sync::OnceLock<std::thread::Thread>,
     /// The next segment id: the writer's seals and the segment work's
     /// merges draw from one counter.
     next_seg: AtomicU64,
@@ -26624,10 +26569,6 @@ struct Shared {
     /// drop removes the one that waits, behind the segment work's join
     /// (`Db::close_inner`).
     spare_run_off: std::sync::atomic::AtomicBool,
-    keeper_seq: AtomicU64,
-    keeper_done: AtomicU64,
-    snap_kept: AtomicU64,
-    snap_carried: AtomicU64,
     /// PROTOTYPE: handles that took the published snapshot over their
     /// own under the keeper's rule; for a test.
     snap_switched: AtomicU64,
@@ -28691,8 +28632,6 @@ pub struct Db {
     /// it once it lands -- no piece, no merge -- and the drain can be
     /// answered at its readable landing (`Options::drain_syncs_beside`).
     drain_first: bool,
-    /// PROTOTYPE: the run keeper, once the first commit has started it.
-    keeper: Option<Keeper>,
     /// EXPERIMENT: the upkeep thread, once a commit has had something
     /// for it; see `Upkeep::Background`.
     upkeeper: Option<Upkeeper>,
@@ -34617,21 +34556,14 @@ impl Reader {
     ) -> Snapshot {
         let live_len = live.map_or(0, |(_, n)| n);
         let n = live_len + frozen.map_or(0, |f| f.len());
-        let runs = self.opts.snapshot_runs;
         // The arena's first block sized to what the build appends: the
-        // keys, and with the runs the values and sixteen bytes a chunk.
-        let mut bytes =
-            live.map_or(0, |(m, _)| m.key_bytes()) + frozen.map_or(0, |f| f.key_bytes());
-        if runs {
-            bytes += live.map_or(0, |(m, _)| m.value_bytes())
-                + frozen.map_or(0, |f| f.value_bytes())
-                + 16 * n;
-        }
+        // keys.
+        let bytes = live.map_or(0, |(m, _)| m.key_bytes()) + frozen.map_or(0, |f| f.key_bytes());
         let mut snap = Snapshot {
             live_len,
             log_at,
             arena: std::sync::Arc::new(SnapArena::with_capacity(bytes, self.opts.blocks_mapped)),
-            runs,
+            runs: false,
             bases: Vec::new(),
             ents: Vec::with_capacity(n),
             side: Vec::new(),
@@ -34639,7 +34571,6 @@ impl Reader {
             filed: 0,
             bounds: Default::default(),
         };
-        let mut rscratch: Vec<(u64, u32)> = Vec::new();
         // The tables in the order the build takes them, the frozen one's
         // entries first, and the key bytes each will copy
         // (`snapshot_build_lean`).
@@ -34647,7 +34578,7 @@ impl Reader {
             (frozen, frozen.map_or(0, |f| f.len())),
             (live.map(|(m, _)| m), live_len),
         ];
-        let lean = self.opts.snapshot_build_lean && self.opts.scan_snapshot_arena && !runs;
+        let lean = self.opts.snapshot_build_lean && self.opts.scan_snapshot_arena;
         if lean {
             let mut bytes = [0usize; 2];
             for (t, &(m, upto)) in tables.iter().enumerate() {
@@ -34761,40 +34692,27 @@ impl Reader {
                     (e.key_off, e.key_len(), i as u32)
                 }));
                 radix_by_first(&mut order, &mut scratch);
-                // Without runs the keys are the arena's only bytes here,
-                // so they take one reservation between them and are
-                // copied in back to back; with runs each key's chain
-                // follows it, and each takes its own.
-                let (mut at, mut room) = if runs {
-                    (0, &mut [][..])
-                } else {
-                    let total: usize = order.iter().map(|t| t.1 as usize).sum();
-                    snap.arena.reserve_bytes(total)
-                };
+                // The keys are the arena's only bytes here, so they take
+                // one reservation between them and are copied in back to
+                // back.
+                let total: usize = order.iter().map(|t| t.1 as usize).sum();
+                let (mut at, mut room) = snap.arena.reserve_bytes(total);
                 for &(off, len, i) in &order {
                     let k = mem.key_at(off, len);
                     let (a, b) = key_prefix(k);
                     recs.push((a, b, pending.len() as u32));
-                    let (run, koff) = if runs {
-                        let koff = snap.arena.append(k);
-                        (
-                            snap.copy_run(mem, mem.entry(i as usize), &mut rscratch),
-                            koff,
-                        )
-                    } else {
-                        let (head, rest) = std::mem::take(&mut room).split_at_mut(k.len());
-                        head.copy_from_slice(k);
-                        room = rest;
-                        at += k.len() as u32;
-                        (NO_RUN, at - k.len() as u32)
-                    };
+                    let (head, rest) = std::mem::take(&mut room).split_at_mut(k.len());
+                    head.copy_from_slice(k);
+                    room = rest;
+                    at += k.len() as u32;
+                    let koff = at - k.len() as u32;
                     pending.push(SnapKey {
                         off: koff,
                         len: k.len() as u32,
                         mem: if live { i } else { u32::MAX },
                         frozen: if live { u32::MAX } else { i },
-                        lrun: if live { run } else { NO_RUN },
-                        frun: if live { NO_RUN } else { run },
+                        lrun: NO_RUN,
+                        frun: NO_RUN,
                     });
                 }
             };
@@ -34868,11 +34786,7 @@ impl Reader {
                         key: mem.key_of(e).to_vec(),
                         mem: if live { i as u32 } else { u32::MAX },
                         frozen: if live { u32::MAX } else { i as u32 },
-                        run: if runs {
-                            snap.copy_run(mem, e, &mut rscratch)
-                        } else {
-                            NO_RUN
-                        },
+                        run: NO_RUN,
                     });
                 }
             };
@@ -36566,7 +36480,7 @@ impl Reader {
                 std::sync::Arc::new(s.extend(
                     self.mem(),
                     to,
-                    self.opts.snapshot_runs,
+                    false,
                     self.opts.snapshot_extend_unfolded,
                     self.opts.snapshot_build_lean,
                 ))
@@ -37054,7 +36968,7 @@ impl Reader {
     /// says it (`scan_blocks`): once a commit for a handle, at every scan
     /// for the writer.
     fn signal_scan(&self) {
-        if !(self.opts.commit_forms || self.opts.snapshot_keeper) {
+        if !self.opts.commit_forms {
             return;
         }
         let st = self.state();
@@ -37625,28 +37539,6 @@ impl Reader {
             // switch above asks only when nothing moved.
             stale = self.seal_snapshot_ahead(gen, cache.as_ref());
         }
-        // PROTOTYPE: the published snapshot ahead of this handle's own
-        // by a share of what the handle holds -- the keeper has absorbed
-        // that many writes this one still reads from their chains, or
-        // holds in its added list -- is taken instead: the switch costs
-        // a merge of the run and the bounds walked again, and the share
-        // is where that is repaid by the reads.
-        if !stale && self.opts.snapshot_keeper {
-            if let Some((_, mine)) = cache.as_ref() {
-                let p = self.state().snap.load(AtomicOrdering::Acquire);
-                if !p.is_null() {
-                    // SAFETY: as in `adopt_snapshot`.
-                    let published = unsafe { &*p };
-                    let ahead = published.log_at.saturating_sub(mine.log_at);
-                    stale = ahead >= (mine.len() / 8).max(1024);
-                    if stale {
-                        self.shared
-                            .snap_switched
-                            .fetch_add(1, AtomicOrdering::Relaxed);
-                    }
-                }
-            }
-        }
         // Under `forms_pieces_only` the writer's upkeep republishes the
         // snapshot with its stale runs copied again (`refresh_runs`): the
         // same keys over the same bounds and bases, current to a later
@@ -37863,11 +37755,7 @@ impl Reader {
     /// (`refresh_snapshot_to`). Not beside the keeper, which appends to
     /// the same arena from its own thread.
     fn refresh_runs(&self) {
-        if !self.opts.forms_pieces_only
-            || self.opts.snapshot_keeper
-            || !self.opts.share_snapshot
-            || self.slot.is_some()
-        {
+        if !self.opts.forms_pieces_only || !self.opts.share_snapshot || self.slot.is_some() {
             return;
         }
         let fresh = {
@@ -40904,7 +40792,7 @@ impl Reader {
         // handle says so once per commit -- the count is compared, not
         // read -- so four handles scanning do not bump one line a
         // thousand times a millisecond.
-        if (self.opts.commit_forms || self.opts.snapshot_keeper) && !resumed {
+        if self.opts.commit_forms && !resumed {
             let now = (st.gen, self.mem().committed_log());
             let signal = self.slot.is_none() || self.signalled.replace(now) != now;
             if signal {
@@ -44410,7 +44298,6 @@ impl Db {
             snap_extends: AtomicU64::new(0),
             snap_lean_builds: AtomicU64::new(0),
             snap_refreshes: AtomicU64::new(0),
-            keeper_thread: std::sync::OnceLock::new(),
             next_seg: AtomicU64::new(next_seg),
             seal_counts: SealCounts::default(),
             drain_steps: DrainSteps::new(),
@@ -44446,10 +44333,6 @@ impl Db {
             spare_run_first: std::sync::atomic::AtomicBool::new(spare_run_first),
             spare_named_hold: std::sync::atomic::AtomicBool::new(false),
             spare_run_off: std::sync::atomic::AtomicBool::new(false),
-            keeper_seq: AtomicU64::new(0),
-            keeper_done: AtomicU64::new(0),
-            snap_kept: AtomicU64::new(0),
-            snap_carried: AtomicU64::new(0),
             snap_switched: AtomicU64::new(0),
             snaps_kept: AtomicU64::new(0),
             snap_sealed: AtomicU64::new(0),
@@ -44598,7 +44481,6 @@ impl Db {
             wal_opened: None,
             run_fault_open: 0,
             wal_dir_unsynced: false,
-            keeper: None,
             upkeeper: None,
             upkeep_log: (0, 0),
             points_log: (0, 0),
@@ -45826,7 +45708,6 @@ impl Db {
             snap_extends: AtomicU64::new(0),
             snap_lean_builds: AtomicU64::new(0),
             snap_refreshes: AtomicU64::new(0),
-            keeper_thread: std::sync::OnceLock::new(),
             next_seg: AtomicU64::new(next_seg),
             seal_counts: SealCounts::default(),
             drain_steps: DrainSteps::new(),
@@ -45862,10 +45743,6 @@ impl Db {
             spare_run_first: std::sync::atomic::AtomicBool::new(spare_run_first),
             spare_named_hold: std::sync::atomic::AtomicBool::new(false),
             spare_run_off: std::sync::atomic::AtomicBool::new(false),
-            keeper_seq: AtomicU64::new(0),
-            keeper_done: AtomicU64::new(0),
-            snap_kept: AtomicU64::new(0),
-            snap_carried: AtomicU64::new(0),
             snap_switched: AtomicU64::new(0),
             snaps_kept: AtomicU64::new(0),
             snap_sealed: AtomicU64::new(0),
@@ -46014,7 +45891,6 @@ impl Db {
             wal_opened,
             run_fault_open: 0,
             wal_dir_unsynced: false,
-            keeper: None,
             upkeeper: None,
             upkeep_log: (0, 0),
             points_log: (0, 0),
@@ -47119,7 +46995,6 @@ impl Db {
         if lent && self.fs_home() {
             self.hand_over_upkeep(false);
         }
-        self.start_keeper();
         // The thread frees what it replaced at its own passes: freed here
         // while it is lent, a form it had just replaced could go under a
         // read of its own.
@@ -48932,7 +48807,6 @@ impl Db {
             self.build_ahead_if_due();
             self.join_ahead();
         }
-        self.settle_keeper();
         Ok(())
     }
 
@@ -49348,11 +49222,10 @@ impl Db {
     }
 
     /// The end of the writer's publish: `old` retired, the forms it
-    /// replaced swept, the keeper told, and the state organised.
+    /// replaced swept, and the state organised.
     fn published(&mut self, old: *const State) {
         retire_state(&self.shared, old as *mut State);
         self.sweep_retired_forms();
-        self.wake_keeper();
         self.build_ahead_if_due();
     }
 
@@ -49365,7 +49238,6 @@ impl Db {
             self.sweep_retired_forms();
             self.build_ahead_if_due();
         }
-        self.wake_keeper();
     }
 
     /// The live memtable frozen and a fresh one live, in one publish;
@@ -52351,11 +52223,7 @@ impl Db {
             MaintHome::Away(a) => a.thread.as_ref(),
             MaintHome::Here(_) => None,
         };
-        me.shared.life.end([
-            maint,
-            me.shared.upkeep.thread.get(),
-            me.shared.keeper_thread.get(),
-        ]);
+        me.shared.life.end([maint, me.shared.upkeep.thread.get()]);
         // And the threads of an encrypted store's registration, which run
         // on past a forget where a dead process's do not.
         vault::crash(&me.dir);
@@ -53642,52 +53510,6 @@ impl Reader {
     }
 }
 
-/// PROTOTYPE: the run keeper in flight: its thread, and the flag that
-/// stops it.
-struct Keeper {
-    handle: Option<std::thread::JoinHandle<()>>,
-    stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
-}
-
-/// How long the keeper sleeps between looks at the commits, from the
-/// shortest after a tick that did something, doubling while nothing is
-/// due, to the longest, which is also how often a dormant keeper looks
-/// for a scan.
-const KEEPER_POLL_MIN: std::time::Duration = std::time::Duration::from_micros(100);
-const KEEPER_POLL_MAX: std::time::Duration = std::time::Duration::from_millis(20);
-/// Retired snapshot versions still held by a pinned reader past which
-/// the keeper stops publishing; see `keep_tick`.
-const KEEPER_RETIRED_MAX: usize = 8;
-/// The fewest writes an extension is made for, below a sixteenth of
-/// the version's entries; see `keep_tick`.
-const KEEPER_MIN_BATCH: usize = 256;
-
-/// What the keeper holds between ticks: the version it last published,
-/// the generation and the memtables it is over, the committed log
-/// position it was extended to, and the store's scan count as it last
-/// saw it with the commit that count was seen at.
-#[derive(Default)]
-struct Kept {
-    snap: Option<std::sync::Arc<Snapshot>>,
-    gen: u64,
-    live: Option<std::sync::Arc<MemTable>>,
-    frozen: Vec<std::sync::Arc<MemTable>>,
-    seen_log: usize,
-    scans_seen: u64,
-    scan_at: (u64, usize),
-}
-
-/// What a keeper's tick asks for next.
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum Want {
-    /// Look again at once: something was done and more may have landed.
-    More,
-    /// Nothing until a commit.
-    Commit,
-    /// Nothing until a scan over the store, or a publish.
-    Scan,
-}
-
 /// Put the calling thread in the idle scheduling class, which runs only
 /// when nothing else wants the core. Linux only; elsewhere a no-op, and
 /// a failure is ignored on purpose, as `idle_io_priority` ignores its.
@@ -53718,171 +53540,6 @@ fn thread_cpu_ns() -> u64 {
 }
 
 impl Reader {
-    /// PROTOTYPE: the run keeper's loop, on a handle of its own. Each
-    /// tick pins the state, carries the snapshot across a publish if one
-    /// happened, extends it to the last commit once enough has landed
-    /// and publishes the result; then the keeper sleeps and looks again,
-    /// for as short as `KEEPER_POLL_MIN` after a tick that did
-    /// something and doubling while nothing is due, to
-    /// `KEEPER_POLL_MAX`, which is also how often a dormant keeper looks
-    /// for a scan. Nothing on the commit path or the read path wakes it:
-    /// the version before this one was unparked by every commit, and
-    /// the wake is a futex call and an interrupt to an idle core, on
-    /// this guest a VM exit paid by the thread that woke it -- ycsb-A's
-    /// commits at a hundred thousand keys read 12-23% slower for it. A
-    /// publish and a settle wake it at once, and a settle's tick brings
-    /// the snapshot current whatever the regime or the batch bound says,
-    /// and answers on `keeper_done`.
-    fn keep(&self, stop: &std::sync::atomic::AtomicBool) {
-        let _ = self.shared.keeper_thread.set(std::thread::current());
-        let mut k = Kept::default();
-        let mut idle = KEEPER_POLL_MIN;
-        loop {
-            if stop.load(AtomicOrdering::SeqCst) || self.shared.life.dead() {
-                break;
-            }
-            let flush = self.shared.keeper_seq.load(AtomicOrdering::SeqCst);
-            let forced = flush != self.shared.keeper_done.load(AtomicOrdering::Relaxed);
-            let want = self.keep_tick(&mut k, forced);
-            if forced && want != Want::More {
-                self.shared.keeper_done.store(flush, AtomicOrdering::SeqCst);
-            }
-            match want {
-                Want::More => idle = KEEPER_POLL_MIN,
-                Want::Commit => {
-                    std::thread::park_timeout(idle);
-                    idle = (idle * 2).min(KEEPER_POLL_MAX);
-                }
-                Want::Scan => std::thread::park_timeout(KEEPER_POLL_MAX),
-            }
-        }
-    }
-
-    /// One tick of the keeper: see `keep`.
-    fn keep_tick(&self, k: &mut Kept, forced: bool) -> Want {
-        let Some(slot) = self.slot else {
-            return Want::Scan;
-        };
-        if self.isolation.get() == Isolation::Snapshot {
-            self.release();
-        }
-        self.shared.readers.pin(slot);
-        let p = self.shared.state.load(AtomicOrdering::Acquire);
-        self.held.store(p, AtomicOrdering::Relaxed);
-        self.isolation.set(Isolation::Snapshot);
-        // SAFETY: pinned above, so not freed under this handle.
-        let st = unsafe { &*p };
-        let mem = &st.mem;
-        // A publish since the last tick: the snapshot carried across it
-        // where the memtables allow, and dropped otherwise.
-        if st.gen != k.gen {
-            let carried = k.snap.take().and_then(|s| {
-                let live = k.live.clone()?;
-                self.carry_snapshot(s, &live, &k.frozen, st, true)
-            });
-            k.gen = st.gen;
-            k.live = Some(mem.clone());
-            k.frozen = st.frozen.clone();
-            // The carried version's mark, so the next tick extends only
-            // for the commits past it; none, where nothing carried.
-            k.seen_log = carried.as_ref().map_or(0, |s| s.log_at);
-            if let Some(s) = &carried {
-                self.shared
-                    .snap_carried
-                    .fetch_add(1, AtomicOrdering::Relaxed);
-                self.publish_snapshot(s);
-            }
-            k.snap = carried;
-        }
-        // The regime: nothing before the first scan over the store, and
-        // past the bound of writes since the last one, nothing until the
-        // next. The scan's position is taken as the commit it was seen
-        // at, which is at or past where it happened.
-        let life = self.shared.scans_life.load(AtomicOrdering::SeqCst);
-        if life != k.scans_seen {
-            k.scans_seen = life;
-            k.scan_at = (st.gen, mem.committed_log());
-        }
-        if !forced {
-            let pct = self.opts.snapshot_keeper_recent_pct;
-            let far = life == 0
-                || (pct > 0 && {
-                    let keys: usize = st.segs.iter().map(|s| s.blob.keys()).sum();
-                    let since = if k.scan_at.0 == st.gen {
-                        mem.committed_log().saturating_sub(k.scan_at.1)
-                    } else {
-                        mem.committed_log()
-                    };
-                    since > keys / 100 * pct
-                });
-            if far {
-                self.release();
-                return Want::Scan;
-            }
-        }
-        // The position and the count of one commit.
-        let (log, len, _) = mem.committed_at();
-        // Current, or behind by less than a sixteenth of what the version
-        // holds: an extension merges the whole entry run, so one per
-        // commit over a mix of small batches is a copy of the run per
-        // hundred writes -- ycsb-A at a hundred thousand keys read 0.82x
-        // beside the runs with the keeper streaming that much -- and
-        // what a scan then finds behind is a sixteenth's copy, which it
-        // makes for itself. A settle brings it current whatever the lag.
-        let behind = k.snap.as_ref().map_or(usize::MAX, |s| {
-            len.saturating_sub(s.live_len) + log.saturating_sub(k.seen_log)
-        });
-        let held = k.snap.as_ref().map_or(0, |s| s.len());
-        let current = behind == 0 || (!forced && behind < (held / 16).max(KEEPER_MIN_BATCH));
-        if current {
-            self.release();
-            return Want::Commit;
-        }
-        // The base: the keeper's own version, or the published one when
-        // a scan carried it further and it stops at or before this
-        // commit -- the writer's own reads cover what it has staged, and
-        // a version past the commit is no base for one at it.
-        let published = self
-            .adopt_snapshot()
-            .filter(|s| s.live_len <= len && s.side.is_empty() && s.fresh.is_empty());
-        let base = match (k.snap.take(), published) {
-            (Some(a), Some(b)) if (b.live_len, b.log_at) > (a.live_len, a.log_at) => Some(b),
-            (Some(a), _) => Some(a),
-            (None, b) => b,
-        }
-        .or_else(|| self.frozen_base());
-        let next = match base {
-            Some(s) => {
-                self.shared
-                    .snap_extends
-                    .fetch_add(1, AtomicOrdering::Relaxed);
-                std::sync::Arc::new(s.extend(
-                    mem,
-                    len,
-                    self.opts.snapshot_runs,
-                    self.opts.snapshot_extend_unfolded,
-                    self.opts.snapshot_build_lean,
-                ))
-            }
-            None => std::sync::Arc::new(self.build_snapshot(len)),
-        };
-        self.shared.snap_kept.fetch_add(1, AtomicOrdering::Relaxed);
-        // A version is published only while the ones it replaced are
-        // being freed: a handle pinned under `Snapshot` across a burst
-        // holds every version retired since it pinned, a copy of the run
-        // per commit, and the keeper's own version is dropped here at
-        // the next tick instead. Whoever adopts the last published one
-        // carries it forward, so nothing is wrong, only later.
-        let retired = self.shared.retired_snaps.len();
-        if retired < KEEPER_RETIRED_MAX {
-            self.publish_snapshot(&next);
-        }
-        k.snap = Some(next);
-        k.seen_log = log;
-        self.release();
-        Want::More
-    }
-
     /// PROTOTYPE: the keeper's snapshot, over the memtables `k` names,
     /// carried into the state `st`: unchanged where the memtables are
     /// the same, which is a merge; at a freeze, brought current to the
@@ -55942,87 +55599,6 @@ impl Db {
 }
 
 impl Db {
-    /// PROTOTYPE: the run keeper started, on a handle of its own, if the
-    /// option asks and it is not running.
-    fn start_keeper(&mut self) {
-        if self.keeper.is_some() || !self.opts.snapshot_keeper {
-            return;
-        }
-        let Ok(r) = self.new_reader(false) else {
-            return;
-        };
-        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let flag = stop.clone();
-        let live = self.shared.life.job();
-        let spawned = std::thread::Builder::new()
-            .name("supdb-keeper".into())
-            .spawn(move || {
-                let _live = live;
-                idle_cpu_priority();
-                r.keep(&flag);
-                if r.shared.life.dead() {
-                    std::mem::forget(r);
-                }
-            });
-        if let Ok(handle) = spawned {
-            self.keeper = Some(Keeper {
-                handle: Some(handle),
-                stop,
-            });
-        }
-    }
-
-    /// The keeper woken by a publish, so the snapshot is carried into
-    /// the new state before its first scan where it can be; a commit
-    /// wakes nothing, see `Reader::keep`.
-    fn wake_keeper(&self) {
-        if self.keeper.is_none() {
-            return;
-        }
-        if let Some(t) = self.shared.keeper_thread.get() {
-            t.unpark();
-        }
-    }
-
-    /// PROTOTYPE: the keeper's snapshot brought current to the last
-    /// commit and published, whatever its regime says, and waited for.
-    /// What `settle` does; for a test or an experiment that wants the
-    /// published snapshot as the keeper leaves it.
-    #[doc(hidden)]
-    pub fn settle_keeper(&mut self) {
-        let _op = self.op();
-        let Some(k) = self.keeper.as_ref() else {
-            return;
-        };
-        if k.handle.as_ref().is_none_or(|h| h.is_finished()) {
-            return;
-        }
-        let seq = self.shared.keeper_seq.fetch_add(1, AtomicOrdering::SeqCst) + 1;
-        while self.shared.keeper_done.load(AtomicOrdering::SeqCst) < seq {
-            if let Some(t) = self.shared.keeper_thread.get() {
-                t.unpark();
-            }
-            if k.handle.as_ref().is_none_or(|h| h.is_finished()) {
-                return;
-            }
-            // A sleep and not a yield: the keeper runs at idle priority,
-            // and a spinning waiter is what keeps it off the core.
-            std::thread::sleep(std::time::Duration::from_micros(50));
-        }
-    }
-
-    fn stop_keeper(&mut self) {
-        if let Some(mut k) = self.keeper.take() {
-            k.stop.store(true, AtomicOrdering::SeqCst);
-            if let Some(t) = self.shared.keeper_thread.get() {
-                t.unpark();
-            }
-            if let Some(h) = k.handle.take() {
-                let _ = h.join();
-            }
-        }
-    }
-
     /// The trim thread started at the open of a store that fits its forms
     /// from the start (`Options::forms_to_fit` with a stride), so that a
     /// handle's first request has a thread to wake. A store that fits them
@@ -56184,14 +55760,6 @@ impl Db {
     #[doc(hidden)]
     pub fn seal_table_snapshots(&self) -> u64 {
         self.shared.snap_on_table.load(AtomicOrdering::Acquire)
-    }
-
-    #[doc(hidden)]
-    pub fn snapshot_kept(&self) -> (u64, u64) {
-        (
-            self.shared.snap_kept.load(AtomicOrdering::Relaxed),
-            self.shared.snap_carried.load(AtomicOrdering::Relaxed),
-        )
     }
 }
 
@@ -58907,7 +58475,7 @@ impl Life {
     /// out. One that never ends is stuck, or waits on something only the
     /// store's writer would have given it, and is named rather than
     /// waited for without end.
-    fn end(&self, wake: [Option<&std::thread::Thread>; 3]) {
+    fn end(&self, wake: [Option<&std::thread::Thread>; 2]) {
         self.dead.store(true, AtomicOrdering::SeqCst);
         for t in wake.into_iter().flatten() {
             t.unpark();
@@ -61506,9 +61074,6 @@ impl Maint {
             break;
         }
         self.sweep_retired_forms();
-        if let Some(t) = self.shared.keeper_thread.get() {
-            t.unpark();
-        }
     }
 
     /// Start a piece merge where a partition's range holds `tier_pieces`
@@ -69016,7 +68581,6 @@ impl Drop for Db {
             .spare_named_hold
             .store(false, AtomicOrdering::Release);
         self.stop_upkeep();
-        self.stop_keeper();
         self.stop_trimmer();
         self.stop_ahead();
         // The segment work's stop joins every seal and merge in flight,

@@ -1108,8 +1108,6 @@ fn a_burst_the_writers_forms_cover_is_not_chained_through() {
         NeverScanned,
         NoCache,
         NoCommitForms,
-        /// No form filed at a commit, and a keeper that counts the scans.
-        NoCommitFormsKeeper,
         BudgetGiven,
         BudgetBound,
         FormsOff,
@@ -1126,7 +1124,6 @@ fn a_burst_the_writers_forms_cover_is_not_chained_through() {
         (true, Store::NeverScanned, 0, 2),
         (true, Store::NoCache, 0, 2),
         (true, Store::NoCommitForms, 0, 2),
-        (true, Store::NoCommitFormsKeeper, 0, 2),
         (true, Store::BudgetGiven, 0, 2),
         (true, Store::BudgetBound, 0, 2),
         (true, Store::FormsOff, 0, 2),
@@ -1159,8 +1156,7 @@ fn a_burst_the_writers_forms_cover_is_not_chained_through() {
                 zpages: supdb::ZPages::Off,
                 scan_block_cache: store != Store::NoCache,
                 scan_cache_ahead: false,
-                commit_forms: !matches!(store, Store::NoCommitForms | Store::NoCommitFormsKeeper),
-                snapshot_keeper: store == Store::NoCommitFormsKeeper,
+                commit_forms: store != Store::NoCommitForms,
                 scan_cache_bytes: if store == Store::BudgetGiven {
                     1 << 20
                 } else {

@@ -1387,27 +1387,13 @@ fn a_run_begun_after_a_shared_table_is_not_served_without_it() {
 
 /// The option acts only where nothing keeps a copy of a live table's
 /// values that a handle's write would have to reach, and never beside the
-/// option that shares every table: a store with the snapshot keeper, the
-/// kept snapshot runs or the hand-off of a live table refuses a handle's
+/// option that shares every table: a store with the kept snapshot or the
+/// hand-off of a live table refuses a handle's
 /// write as it did, and a store opened to share every table goes on
 /// sharing it with no handle writing.
 #[test]
 fn the_option_stands_down_beside_what_it_cannot_share_under() {
     for (name, o) in [
-        (
-            "keeper",
-            Options {
-                snapshot_keeper: true,
-                ..options()
-            },
-        ),
-        (
-            "runs",
-            Options {
-                snapshot_runs: true,
-                ..options()
-            },
-        ),
         (
             "kept",
             Options {

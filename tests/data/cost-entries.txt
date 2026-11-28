@@ -270,7 +270,6 @@ Db::upkeep_outran	-	a test seam or a counter: reads or sets the store's bookkeep
 Db::upkeep_abandon_state	-	a test seam or a counter: reads or sets the store's bookkeeping, at no key, entry, block or step of an operation
 Db::upkeep_behind_writes	-	a test seam or a counter: reads or sets the store's bookkeeping, at no key, entry, block or step of an operation
 Db::upkeep_counts	-	a test seam or a counter: reads or sets the store's bookkeeping, at no key, entry, block or step of an operation
-Db::settle_keeper	-	a test seam or a counter: reads or sets the store's bookkeeping, at no key, entry, block or step of an operation
 Db::trim_supported	-	a test seam or a counter: reads or sets the store's bookkeeping, at no key, entry, block or step of an operation
 Db::resident_beyond_use	-	a test seam or a counter: reads or sets the store's bookkeeping, at no key, entry, block or step of an operation
 Db::mapped_bytes	-	a test seam or a counter: reads or sets the store's bookkeeping, at no key, entry, block or step of an operation
@@ -283,7 +282,6 @@ Db::release_trim_after	-	a test seam or a counter: reads or sets the store's boo
 Db::snapshot_switches	-	a test seam or a counter: reads or sets the store's bookkeeping, at no key, entry, block or step of an operation
 Db::seal_snapshots	-	a test seam or a counter: reads or sets the store's bookkeeping, at no key, entry, block or step of an operation
 Db::seal_table_snapshots	-	a test seam or a counter: reads or sets the store's bookkeeping, at no key, entry, block or step of an operation
-Db::snapshot_kept	-	a test seam or a counter: reads or sets the store's bookkeeping, at no key, entry, block or step of an operation
 Blob::open	-	opens a segment, once a file
 Blob::open_with	-	opens a segment, once a file
 Blob::source	-	an accessor of the byte source, no key

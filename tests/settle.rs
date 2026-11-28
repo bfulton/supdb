@@ -765,8 +765,8 @@ fn a_sparse_forms_cuts_are_resolved_again_across_its_partitions_rewrite() {
 /// bytes touches no block now, and the scan answers the key.
 #[test]
 fn a_snapshot_over_the_empty_key_alone_is_sought_at_a_partitions_fence() {
-    for runs in [false, true] {
-        let dir = scratch(&format!("empty-key-alone-{runs}"));
+    {
+        let dir = scratch("empty-key-alone");
         let mut db = Db::create(
             &dir,
             Options {
@@ -776,7 +776,6 @@ fn a_snapshot_over_the_empty_key_alone_is_sought_at_a_partitions_fence() {
                 publish_in_background: false,
                 upkeep: Upkeep::Inline,
                 scan_block_cache: true,
-                snapshot_runs: runs,
                 ..common::options()
             },
         )
@@ -790,26 +789,27 @@ fn a_snapshot_over_the_empty_key_alone_is_sought_at_a_partitions_fence() {
         db.settle().unwrap();
         assert!(
             partition_fences(&dir).len() > 1,
-            "the shape needs a fence to seek in the snapshot (runs {runs})"
+            "the shape needs a fence to seek in the snapshot"
         );
         // The empty key alone in the live table: the snapshot over it
         // holds one key of no bytes.
         db.append(b"", b"e");
         db.commit().unwrap();
         let got = scan_model(&db);
-        assert_eq!(got.len(), 301, "runs {runs}: every key and the empty one");
-        assert_eq!(got.get(&b""[..]), Some(&vec![b"e".to_vec()]), "runs {runs}");
+        assert_eq!(got.len(), 301, "every key and the empty one");
+        assert_eq!(
+            got.get(&b""[..]),
+            Some(&vec![b"e".to_vec()]),
+            "the empty key"
+        );
         let r = db.reader().unwrap();
         let mut seen = Vec::new();
         r.scan(b"", 3, kv(&mut |k, _| seen.push(k.to_vec())))
             .unwrap();
-        assert_eq!(
-            seen[0], b"",
-            "runs {runs}: the handle's scan starts at the empty key"
-        );
+        assert_eq!(seen[0], b"", "the handle's scan starts at the empty key");
         let mut n = 0;
         db.read_all(b"", vf(&mut |_| n += 1)).unwrap();
-        assert_eq!(n, 1, "runs {runs}: the point read");
+        assert_eq!(n, 1, "the point read");
         drop(r);
         drop(db);
         let _ = std::fs::remove_dir_all(&dir);

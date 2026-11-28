@@ -1156,7 +1156,6 @@ fn opts_z(c: &Cfg) -> Options {
         o.put_in_place = true;
         o.scan_block_cache = false;
         o.upkeep = Upkeep::Inline;
-        o.snapshot_keeper = false;
         o.forms_off_snapshot_kept = false;
     }
     o

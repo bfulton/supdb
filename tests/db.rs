@@ -12559,13 +12559,10 @@ fn a_piece_kept_across_a_merge_is_ranked_against_the_partition_it_meets() {
 /// that stood.
 #[test]
 fn a_scan_snapshot_stands_across_a_publish_that_leaves_the_memtables() {
-    for (label, stands, block_cache, runs) in [
-        ("stands", true, false, false),
-        ("drops", false, false, false),
-        ("stands-cache", true, true, false),
-        // With the runs copied, so the slots written since the copy, which
-        // a stood snapshot keeps reading the chains for, matter.
-        ("stands-runs", true, false, true),
+    for (label, stands, block_cache) in [
+        ("stands", true, false),
+        ("drops", false, false),
+        ("stands-cache", true, true),
     ] {
         let d = dir(&format!("snap-stands-{label}"));
         let opts = Options {
@@ -12574,7 +12571,6 @@ fn a_scan_snapshot_stands_across_a_publish_that_leaves_the_memtables() {
             l0_trigger: 2,
             scan_block_cache: block_cache,
             snapshot_stands: stands,
-            snapshot_runs: runs,
             // The builds counted below are the scans' own.
             forms_settle_backlog_pct: 0,
             ..common::options()
@@ -15324,330 +15320,6 @@ fn pieces_merge_case(tier_pieces: usize, l0_trigger: usize) {
     }
 }
 
-/// The scan snapshot carries each unsealed key's chain as a run in key
-/// order, and a read of a run answers as a read of the chain does: a
-/// tombstone in it cuts every older source, a chunk past a handle's
-/// commit is not there, a frozen table's run is whole, and a key written
-/// again after the copy is read from its chain. Held on the block path
-/// and on the merge path, through the writer and through a handle under
-/// `Latest`, across a seal left in flight.
-#[test]
-fn the_snapshots_runs_answer_as_the_chains_do() {
-    for (block_cache, keeper) in [(true, false), (false, false), (true, true), (false, true)] {
-        let d = dir(&format!("snap-runs-{block_cache}-{keeper}"));
-        let opts = Options {
-            seal_bytes: 1 << 20,
-            partition_bytes: Some(2 << 10),
-            scan_block_cache: block_cache,
-            scan_cache_ahead: false,
-            share_snapshot: true,
-            snapshot_runs: true,
-            // With the keeper extending the published snapshot beside
-            // every step below, so the reads meet its versions too.
-            snapshot_keeper: keeper,
-            snapshot_keeper_recent_pct: 0,
-            ..common::options()
-        };
-        let mut db = Db::create(&d, opts).unwrap();
-        let mut m = ScanModel::default();
-        let key = |k: u32| format!("key-{k:06}");
-        for k in 0..3000u32 {
-            m.append(&mut db, &key(k), "p");
-        }
-        db.commit().unwrap();
-        db.flush().unwrap();
-        m.flushed();
-        assert!(db.levels().0 > 1, "several partitions");
-        // Updates as the suite makes them, a delete and an append; then a
-        // seal left in flight, so the runs are copied from a frozen table
-        // and a live one both.
-        for k in (0..3000u32).step_by(2) {
-            m.delete(&mut db, &key(k));
-            m.append(&mut db, &key(k), "u1");
-        }
-        db.commit().unwrap();
-        db.seal().unwrap();
-        for k in (0..3000u32).step_by(4) {
-            m.delete(&mut db, &key(k));
-            m.append(&mut db, &key(k), "u2");
-        }
-        for k in (1..3000u32).step_by(8) {
-            m.append(&mut db, &key(k), "a2");
-        }
-        db.commit().unwrap();
-        let reader = db.reader().unwrap();
-        let mut sink = 0usize;
-        db.scan(key(0).as_bytes(), 3000, kv(&mut |_k, v| sink += v.len()))
-            .unwrap();
-        m.check(
-            &db,
-            &format!("cache {block_cache}: the writer over the runs"),
-        );
-        m.check(
-            &reader,
-            &format!("cache {block_cache}: a handle over the runs"),
-        );
-        // Writes after the copy, over keys the runs hold and over new
-        // ones, staged: the handle at its commit sees none of them and
-        // the writer sees them all, from the chains.
-        let scan_one = |r: &supdb::Reader, k: u32| -> Vec<Vec<u8>> {
-            let mut out = Vec::new();
-            let want = key(k);
-            r.scan(
-                want.as_bytes(),
-                1,
-                kv(&mut |kk, v| {
-                    if kk == want.as_bytes() {
-                        out.push(v.to_vec());
-                    }
-                }),
-            )
-            .unwrap();
-            out
-        };
-        let before_12 = scan_one(&reader, 12);
-        let before_17 = scan_one(&reader, 17);
-        assert_eq!(before_12, vec![b"u2".to_vec()]);
-        assert_eq!(before_17, vec![b"p".to_vec(), b"a2".to_vec()]);
-        for k in (0..3000u32).step_by(6) {
-            m.delete(&mut db, &key(k));
-            m.append(&mut db, &key(k), "u3");
-        }
-        for k in (1..3000u32).step_by(16) {
-            m.append(&mut db, &key(k), "a3");
-        }
-        assert_eq!(
-            scan_one(&db, 12),
-            vec![b"u3".to_vec()],
-            "the writer sees its staged delete"
-        );
-        assert_eq!(
-            scan_one(&db, 17),
-            vec![b"p".to_vec(), b"a2".to_vec(), b"a3".to_vec()],
-            "the writer sees its staged append"
-        );
-        assert_eq!(
-            scan_one(&reader, 12),
-            before_12,
-            "staged, so unseen under Latest"
-        );
-        assert_eq!(
-            scan_one(&reader, 17),
-            before_17,
-            "staged, so unseen under Latest"
-        );
-        db.commit().unwrap();
-        m.check(
-            &db,
-            &format!("cache {block_cache}: the writer after writes over copied runs"),
-        );
-        m.check(
-            &reader,
-            &format!("cache {block_cache}: a handle after the commit of writes over copied runs"),
-        );
-        // A handle claimed now adopts the writer's snapshot, runs and all.
-        let later = db.reader().unwrap();
-        m.check(
-            &later,
-            &format!("cache {block_cache}: a handle claimed after"),
-        );
-        db.settle().unwrap();
-        m.check(&db, &format!("cache {block_cache}: after the seal lands"));
-        m.check(
-            &reader,
-            &format!("cache {block_cache}: a handle after the seal lands"),
-        );
-        drop(reader);
-        drop(later);
-        drop(db);
-        let db = Db::open(&d, common::options()).unwrap();
-        m.check(&db, &format!("cache {block_cache}: reopened"));
-    }
-}
-
-/// The run keeper: dormant until a scan, then every commit's batch is
-/// appended to the published snapshot and its runs, so the scans after a
-/// burst adopt a current snapshot and sort nothing; carried across a
-/// seal's freeze and its landing; and past its bound of writes since the
-/// last scan, dormant again, the scan bringing the rest itself.
-#[test]
-fn the_run_keeper_keeps_the_published_snapshot_current() {
-    for (block_cache, pct) in [(true, 0), (false, 0), (true, 100), (false, 100)] {
-        let d = dir(&format!("snap-keeper-{block_cache}-{pct}"));
-        let opts = Options {
-            seal_bytes: 1 << 20,
-            partition_bytes: Some(2 << 10),
-            scan_block_cache: block_cache,
-            scan_cache_ahead: false,
-            share_snapshot: true,
-            snapshot_runs: true,
-            snapshot_keeper: true,
-            snapshot_keeper_recent_pct: pct,
-            // The seal below is held in flight across a burst of writes
-            // (`hold_seal_landing`), and the writer drives its own
-            // landings: on a thread of its own the landing may fall
-            // between the keeper's settle and the scan after it, and the
-            // landing's carry is checked apart, after the settle that
-            // lands it. Unheld, a seal that finished first landed at the
-            // burst's commit, whose upkeep sorted the live table again
-            // where the keeper carries it across a landing anywhere else.
-            publish_in_background: false,
-            ..common::options()
-        };
-        let mut db = Db::create(&d, opts).unwrap();
-        let mut m = ScanModel::default();
-        let key = |k: u32| format!("key-{k:06}");
-        for k in 0..3000u32 {
-            m.append(&mut db, &key(k), "p");
-        }
-        db.commit().unwrap();
-        db.flush().unwrap();
-        m.flushed();
-        assert!(db.levels().0 > 1, "several partitions");
-        // Before any scan over the store the keeper is dormant: a
-        // commit does not wake it, and nothing is kept.
-        for k in (0..3000u32).step_by(3) {
-            m.delete(&mut db, &key(k));
-            m.append(&mut db, &key(k), "u0");
-        }
-        db.commit().unwrap();
-        assert_eq!(
-            db.snapshot_kept().0,
-            0,
-            "{block_cache} {pct}: dormant before a scan"
-        );
-        m.check(
-            &db,
-            &format!("{block_cache} {pct}: the writer before the keeper"),
-        );
-        let builds = db.snapshot_builds();
-        // A burst after the scan: updates over the run's keys and new
-        // keys, in rounds the keeper follows commit by commit.
-        for round in 0..10u32 {
-            for k in (round..3000).step_by(10) {
-                m.delete(&mut db, &key(k));
-                m.append(&mut db, &key(k), &format!("u{round}"));
-            }
-            for k in 3000 + round * 50..3000 + round * 50 + 50 {
-                m.append(&mut db, &key(k), "n");
-            }
-            db.commit().unwrap();
-        }
-        db.settle_keeper();
-        let (kept, _) = db.snapshot_kept();
-        assert!(
-            kept > 0,
-            "{block_cache} {pct}: the keeper extended the snapshot"
-        );
-        // The scans after adopt what it published: nothing is sorted
-        // again, through the writer or a handle claimed now.
-        m.check(
-            &db,
-            &format!("{block_cache} {pct}: the writer over the kept snapshot"),
-        );
-        assert_eq!(
-            db.snapshot_builds(),
-            builds,
-            "{block_cache} {pct}: the writer adopted the keeper's snapshot"
-        );
-        let reader = db.reader().unwrap();
-        m.check(
-            &reader,
-            &format!("{block_cache} {pct}: a handle over the kept snapshot"),
-        );
-        assert_eq!(
-            db.snapshot_builds(),
-            builds,
-            "{block_cache} {pct}: the handle adopted it"
-        );
-        // A seal held in flight: the keeper carries the snapshot across
-        // the freeze, the live entries frozen ones now, and the writes
-        // after go into the new table over the same keys.
-        db.hold_seal_landing(true);
-        db.seal().unwrap();
-        db.settle_keeper();
-        assert_eq!(
-            db.snapshot_kept().1,
-            1,
-            "{block_cache} {pct}: carried across the freeze"
-        );
-        let builds = db.snapshot_builds();
-        for k in (0..3000u32).step_by(7) {
-            m.delete(&mut db, &key(k));
-            m.append(&mut db, &key(k), "f1");
-        }
-        for k in (1..3000u32).step_by(11) {
-            m.append(&mut db, &key(k), "f2");
-        }
-        db.commit().unwrap();
-        db.settle_keeper();
-        m.check(
-            &db,
-            &format!("{block_cache} {pct}: the writer across the freeze"),
-        );
-        m.check(
-            &reader,
-            &format!("{block_cache} {pct}: a handle across the freeze"),
-        );
-        assert_eq!(
-            db.snapshot_builds(),
-            builds,
-            "{block_cache} {pct}: nothing sorted again across the freeze"
-        );
-        // The seal lands: the frozen entries leave the snapshot. At least
-        // one more carry: the landing's publish, and a merge it starts
-        // is one more when the keeper meets the two apart.
-        db.hold_seal_landing(false);
-        db.settle().unwrap();
-        assert!(
-            db.snapshot_kept().1 >= 2,
-            "{block_cache} {pct}: carried across the landing: {}",
-            db.snapshot_kept().1
-        );
-        m.check(
-            &db,
-            &format!("{block_cache} {pct}: the writer after the seal lands"),
-        );
-        m.check(
-            &reader,
-            &format!("{block_cache} {pct}: a handle after the seal lands"),
-        );
-        assert_eq!(
-            db.snapshot_builds(),
-            builds,
-            "{block_cache} {pct}: nothing sorted again across the landing"
-        );
-        // Past the bound of writes since the last scan the keeper goes
-        // dormant, and the scan after brings the rest itself: right
-        // either way, and the runs it holds are the chains' answers.
-        for round in 0..4u32 {
-            for k in (0..3000u32).step_by(2) {
-                m.delete(&mut db, &key(k));
-                m.append(&mut db, &key(k), &format!("d{round}"));
-            }
-            db.commit().unwrap();
-        }
-        m.check(
-            &db,
-            &format!("{block_cache} {pct}: the writer past the bound"),
-        );
-        m.check(
-            &reader,
-            &format!("{block_cache} {pct}: a handle past the bound"),
-        );
-        let later = db.reader().unwrap();
-        m.check(
-            &later,
-            &format!("{block_cache} {pct}: a handle claimed after"),
-        );
-        drop(reader);
-        drop(later);
-        drop(db);
-        let db = Db::open(&d, common::options()).unwrap();
-        m.check(&db, &format!("{block_cache} {pct}: reopened"));
-    }
-}
-
 /// A run no longer than the one it replaces is written over it in the
 /// writer's copy of a form, so a burst that rewrites every key leaves the
 /// copies the size a build makes them. Appended instead, half of every
@@ -17048,7 +16720,7 @@ fn a_live_write_over_the_frozen_table_is_one_key_on_every_scan_path() {
 /// arm that keeps it: the block cache's, the merge over unrouted sources, the lazy snapshot, the snapshot's runs, a
 /// snapshot each handle builds alone, and frozen tables with no snapshot
 /// of their own.
-fn scan_path_arms() -> [(&'static str, Options); 9] {
+fn scan_path_arms() -> [(&'static str, Options); 8] {
     [
         ("default", common::options()),
         // The compact form forced, with the block cache and without it: the
@@ -17093,13 +16765,6 @@ fn scan_path_arms() -> [(&'static str, Options); 9] {
             "lazy",
             Options {
                 scan_lazy_snapshot: true,
-                ..common::options()
-            },
-        ),
-        (
-            "runs",
-            Options {
-                snapshot_runs: true,
                 ..common::options()
             },
         ),
@@ -22787,17 +22452,7 @@ fn the_segment_work_ends_with_a_crash_straight_after_a_flush() {
     let n = 3000u32;
     for round in 0..8 {
         let d = dir("crash-flush");
-        // The keeper's thread in half the rounds: it ends with the store
-        // as the upkeep's does, and a crash that waited for one that ran
-        // on would not return.
-        let mut db = Db::create(
-            &d,
-            Options {
-                snapshot_keeper: round % 2 == 1,
-                ..crash_opts()
-            },
-        )
-        .unwrap();
+        let mut db = Db::create(&d, crash_opts()).unwrap();
         crash_batch(&mut db, n, "a");
         db.flush().unwrap();
         crash_batch(&mut db, n, "b");
@@ -23264,20 +22919,11 @@ fn a_landing_leaves_its_pieces_bounds_where_no_table_stands_to_read_them() {
 /// and overwrite again once it is dropped.
 #[test]
 fn a_store_that_overwrites_its_puts_answers_the_last_put() {
-    // The scan snapshot copies a key's chain under `snapshot_runs`, and the
-    // copy is read again only where the log says the key was written since.
-    for runs in [false, true] {
-        overwriting_store_answers_the_last_put(runs);
-    }
-}
-
-fn overwriting_store_answers_the_last_put(runs: bool) {
     let opts = || Options {
         sync: supdb::SyncPolicy::Explicit,
         put_in_place: true,
         upkeep: supdb::Upkeep::Inline,
         scan_block_cache: false,
-        snapshot_runs: runs,
         seal_bytes: 64 << 10,
         ..common::options()
     };
@@ -23298,7 +22944,7 @@ fn overwriting_store_answers_the_last_put(runs: bool) {
     .into_iter()
     .enumerate()
     {
-        let d = dir(&format!("put-in-place-refused-{runs}-{i}"));
+        let d = dir(&format!("put-in-place-refused-{i}"));
         assert!(Db::open(&d, bad).is_err(), "combination {i} is refused");
     }
     let d = dir("put-in-place");
@@ -23351,7 +22997,7 @@ fn overwriting_store_answers_the_last_put(runs: bool) {
         }
     }
     // A store of partitions alone, whose scans emit the live table's keys
-    // from the snapshot's copies of their runs (`snapshot_runs`) where the
+    // from the snapshot's copies of their runs where the
     // log says nothing has written them since: every key put once into a
     // fresh table, then a scan, then overwrites of values the snapshot
     // copied, with no seal between, then a scan. An overwrite is a write
