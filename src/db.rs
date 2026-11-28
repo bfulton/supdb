@@ -4603,36 +4603,9 @@ pub struct Options {
     /// took four hundred. A burst's batches, the lag sweep's, are larger
     /// than the line and leave the reading standing: filing a burst is the
     /// writer's cost, where a mix's commits are filed by the upkeep thread
-    /// beside its reads. Zero keeps the reading until a scan
-    /// (`supdb-formsoffkept`).
+    /// beside its reads. Zero keeps the reading until a scan.
     #[doc(hidden)]
     pub scan_forms_off_stale_writes: u32,
-    /// EXPERIMENT, refuted: while the writer's forms are given up for the
-    /// merge path (`scan_forms_off_unreused`) and scans are near, the
-    /// commit's maintenance keeps the merge path's scan snapshot to the
-    /// commit (`Reader::keep_merge_snapshot`): the log read and the keys
-    /// created since filed into the snapshot, as a scan's preamble does,
-    /// on the upkeep thread where the upkeep is lent. With the forms off
-    /// the maintenance does nothing -- nine hundred passes of the thread
-    /// in 1.3 ms over the lag sweep's ten-percent burst at ten million
-    /// keys -- and the first scan after a burst sorts every unsealed key
-    /// itself: 16-22 ms of the pass after the one-percent burst there,
-    /// 45-115 after the ten-percent and 42-118 after the full rewrite, a
-    /// tenth to a fifth of each divided pass under either bound. Kept, the
-    /// scan's snapshot phase read 2-4 ms, 5-18 and 0.5-8, and the passes
-    /// no faster: a snapshot does not stand across a freeze, so the
-    /// maintenance built one from every unsealed key at each, 173 builds
-    /// and 120 carried forward in a sweep where the scans make three, 14 s
-    /// of the thread over a full rewrite of 28, and what those builds
-    /// freed stayed in the process -- 70-80 MB more anonymous memory at
-    /// the pass after the full rewrite, which under 1 GiB was a quarter
-    /// more major faults on the scanning thread and the pass at 0.82x and
-    /// 0.84x, and under 1.25 GiB took a store that had fitted, thirteen
-    /// faults a pass, to 4,400 and the pass to 0.62x and 0.44x
-    /// (`docs/engine.md`). Off: the first scan builds it.
-    /// `supdb-snapkept` is the arm.
-    #[doc(hidden)]
-    pub forms_off_snapshot_kept: bool,
     /// The scans a window of `scan_forms_off_unreused`'s share is taken
     /// over. A test sets a few.
     #[doc(hidden)]
@@ -4761,30 +4734,6 @@ pub struct Options {
     /// before, and the write-driven rebuilds a burst made, one per block,
     /// wait for a read to ask. `supdb-bg` and `supdb-ingestbg` turn it off.
     pub forms_convert_unread: bool,
-    /// Dense sparse forms a fill rebuilds as copies at most, per fill;
-    /// zero, the default, is unbounded, and the upkeep thread's fill
-    /// yields instead (`forms_convert_yield`). A copy repays its build
-    /// only through later walks, and a fill that rebuilt every dense
-    /// form of a burst made the thread's pass ten to fifteen
-    /// milliseconds, which the writer's freeze or first scan waited out.
-    /// Capped, with the builder beside a reader's first scan converting
-    /// the rest (`ahead_converts`), it lost: a dense form the cap leaves
-    /// sparse is patched on until its replaced runs outweigh the live
-    /// ones, then dropped and built fresh, so on the durable arm at three
-    /// hundred thousand keys the thread made twice the fresh builds, its
-    /// last pass ran forty milliseconds longer and the first scan waited
-    /// it out -- the pass at a fifth of the rate, the burst plus twice
-    /// the pass at 1.13x (8/8). `supdb-convertcap` and
-    /// `supdb-ingestconvertcap` keep it (`docs/engine.md`).
-    pub forms_convert_cap: usize,
-    /// Whether the builder ahead of a reader also builds copies for the
-    /// blocks the writer holds as dense sparse forms, so a pass after a
-    /// burst finds copies installed beside it instead of walking sixty
-    /// deltas a block or converting them itself. Off by default, with
-    /// `forms_convert_cap`: installing the builder's copies cost the
-    /// first scan about what the copies returned over the pass. The arms
-    /// that cap the conversions turn it on.
-    pub ahead_converts: bool,
     /// Whether the builder ahead sends each form with the keys that bound
     /// its block -- the block's first record's key and the next block's,
     /// or the partition's fences at the ends -- read on its own thread
@@ -4993,7 +4942,7 @@ pub struct Options {
     /// since nothing logs a handle's write, and nothing that reads a live
     /// table's values beside the writer or keeps a copy of them:
     /// `Upkeep::Inline`, and `scan_block_cache`, `snapshot_keeper`,
-    /// `forms_off_snapshot_kept`, `snapshot_runs`, `direct_ingest` and
+    /// `snapshot_runs`, `direct_ingest` and
     /// `put_in_place` off. Off: the one writer's table, and a handle that
     /// writes is refused.
     pub shared_writers: bool,
@@ -5152,7 +5101,7 @@ pub struct Options {
     /// It acts only where a handle's write may go unlogged and nothing
     /// else keeps a copy of a live table's values (`Options::shares`):
     /// `SyncPolicy::Explicit` with `held_frames` off, and
-    /// `snapshot_keeper`, `forms_off_snapshot_kept`, `snapshot_runs`,
+    /// `snapshot_keeper`, `snapshot_runs`,
     /// `put_in_place` and `adaptive_shape` off. Elsewhere, and off, a
     /// handle that writes is refused, as it was: on, the option changes
     /// nothing of a store no handle writes. Off:
@@ -5294,62 +5243,6 @@ pub struct Options {
     /// behind would take both; `supdb-noyield` and `supdb-ingestnoyield`
     /// keep the fill that does not yield (`docs/engine.md`).
     pub forms_convert_yield: bool,
-    /// How far behind the writer, in writes lent past the commit its pass
-    /// is bringing the upkeep to, the upkeep thread must be before a
-    /// posted commit makes its fill yield its conversions; the writer's
-    /// own wait yields always. Zero yields at any posted commit: that
-    /// deferred every dense block of a burst to one rebuild after the
-    /// landing, on the durable arm at three hundred thousand keys 4,700
-    /// blocks built fresh in one pass of 23-56 ms, which the first scan
-    /// after the burst waited out whenever the landing fell at the
-    /// burst's end (`supdb-postedyield`, `supdb-ingestpostedyield`).
-    /// `usize::MAX`, the default, yields to the writer's wait alone and
-    /// converts whatever the pass finds dense, behind or not. A thousand
-    /// was the default while the measure of "behind" was the log position
-    /// the pass may read to less the position it had read, which on the
-    /// thread is zero in every pass, so it yielded to the writer's wait
-    /// alone in effect; measured as written, with the writer's lead, the
-    /// thread converted a third of the rewriting burst's forms, the scans
-    /// after it walked the rest as sixty-four-delta sparse forms and read
-    /// 0.65x on the buffered arm, and the durable arm's thread spent a
-    /// tenth more patching forms kept sparse. `supdb-behindyield` and
-    /// `supdb-ingestbehindyield` keep the thousand for pricing.
-    pub forms_convert_behind: usize,
-    /// Whether a dense sparse form is converted into a copy from its own
-    /// deltas and the partition's records, or built again from the
-    /// sources. A sparse form holds every key written over the block with
-    /// its run resolved -- the partition's values for an equal key, then
-    /// the pieces' and the memtables', a tombstone masking the older --
-    /// kept current by every settle, so the copy is one streaming merge
-    /// of the form with the block's records, by the cuts the form holds.
-    /// The build from the sources gathered every key's run again, a seek
-    /// of each piece standing and a chain walk in the memtable per key:
-    /// about 11 µs of the thread's time a block at three hundred thousand
-    /// keys with five to nine pieces against 7 from the form, timed in
-    /// one process (`Db::convert_us`), and a burst that rewrites the
-    /// store converts every block, on the thread that has the burst's
-    /// writes to file; the buffered lag point's scans after such a burst
-    /// read 1.1x with the form's. Off, the build from the sources, kept
-    /// for pricing as `supdb-convertsources` and
-    /// `supdb-ingestconvertsources`.
-    pub convert_from_form: bool,
-    /// Whether the copy a dense form converts to is sized to what it will
-    /// hold -- the form's keys, runs and entries plus a key, a run and an
-    /// entry for each record the form does not replace -- or with room
-    /// for a further record's worth per record of the block, as a copy
-    /// built from the sources is. Sized with that room, a copy of a block
-    /// whose every record the form replaces asks for twice the form's
-    /// bytes, fits no chunk the forms before it freed, and takes fresh
-    /// pages: a burst that rewrites a store of three hundred thousand keys
-    /// grew the heap by about ninety megabytes and the upkeep thread took
-    /// twelve to fourteen thousand page faults, each a first touch, at
-    /// 0.7 µs where the guest still backed the page and about 9 µs where
-    /// its balloon had handed the page to the host -- the thread's whole
-    /// slow mode, 57% of its samples zeroing pages in the slow reps
-    /// against 6-15% in the fast. Sized exactly, each block's copy fits
-    /// the chunks the block before it freed. Off, the room, kept for
-    /// pricing as `supdb-copyslack` and `supdb-ingestcopyslack`.
-    pub copy_exact: bool,
     /// Whether a sparse form outlives the merge that rewrites its
     /// partition over the same blocks, as a copy does. A delta names its
     /// place by a rank in the partition's records, and a rewrite moves the
@@ -6215,14 +6108,6 @@ pub struct Options {
     /// past that commit. That is a comparison rather than a rule, so the
     /// scan makes it and builds its own where it has staged writes.
     pub forms_to_writer: bool,
-    /// EXPERIMENT: overlay keys in a block from which the writer's
-    /// canonical form is a merged copy rather than resolved deltas; zero
-    /// is `CACHE_DENSE`, the threshold a handle building for itself
-    /// uses, and one is a copy of every overlaid block. The arm exists
-    /// because a form built once and patched per write has different
-    /// economics from one rebuilt on a read: `CACHE_DENSE` was measured
-    /// against the rebuilding cache.
-    pub form_dense_from: usize,
     /// The deltas a sparse form the patches grew must hold before a fill
     /// converts it to a merged copy; zero is `CACHE_DENSE`. A copy is walked
     /// as one buffer, where a sparse form alternates the partition's
@@ -6269,21 +6154,6 @@ pub struct Options {
     /// did (`promote_entries`). Off, the walk marks the tables for the next
     /// fill.
     pub forms_convert_at_walk: bool,
-    /// EXPERIMENT, refuted: light conversions (`forms_convert_from` under
-    /// `CACHE_DENSE`) on the writer's fills as well as the upkeep thread's.
-    /// A burst's first batch, filed inline, converted every light form the
-    /// burst had made: the ten-percent burst at thirty thousand keys read
-    /// 0.61x, two milliseconds of its five in conversions on the writer.
-    pub forms_convert_light_writer: bool,
-    /// EXPERIMENT, refuted: a light conversion on the upkeep thread yields
-    /// to any commit posted and to the writer's wait, where a dense one
-    /// yields to a posted commit only past `forms_convert_behind`. The
-    /// write mixes post a commit every few hundred operations, and the
-    /// conversions the scrambled E gains by are theirs, so it made almost
-    /// none: the scrambled E read 1.01x in twenty pairs at a hundred
-    /// thousand keys. The burst passes are skipped by `Reader::burst_pass`
-    /// either way.
-    pub forms_convert_light_yields: bool,
     /// How the ordered scan builds its sorted snapshot of the unsealed keys.
     /// `true` keeps the keys in one arena and sorts 24-byte records (a
     /// 16-byte key prefix and an index), touching the arena only on a shared
@@ -7669,7 +7539,6 @@ impl Options {
             && !self.shared_writers
             && !self.held_frames
             && !self.snapshot_keeper
-            && !self.forms_off_snapshot_kept
             && !self.snapshot_runs
             && !self.put_in_place
             && !self.adaptive_shape
@@ -7892,8 +7761,6 @@ impl Default for Options {
             forms_convert_from: 4,
             forms_convert_reads: 0,
             forms_convert_at_walk: false,
-            forms_convert_light_writer: false,
-            forms_convert_light_yields: false,
             forms_copy_hot_wide: true,
             scan_cache_ahead_min_blocks: 1024,
             ahead_out_of_core: true,
@@ -7951,14 +7818,11 @@ impl Default for Options {
             scan_forms_off_unreused: true,
             scan_forms_off_counts_built: false,
             scan_forms_off_stale_writes: 512,
-            forms_off_snapshot_kept: false,
             scan_forms_off_window: 512,
             scan_forms_off_ghost_bits: 10,
             scan_forms_off_flip: false,
             forms_settle_rebuild_from: 0,
             forms_convert_unread: true,
-            forms_convert_cap: 0,
-            ahead_converts: false,
             ahead_sends_bounds: true,
             upkeep_keep_bytes: 0,
             frozen_bytes: 0,
@@ -7990,9 +7854,6 @@ impl Default for Options {
             jobs_pooled: false,
             one_file: false,
             forms_convert_yield: true,
-            forms_convert_behind: usize::MAX,
-            convert_from_form: true,
-            copy_exact: true,
             rebase_recuts_sparse: true,
             prefault: false,
             drain_names_partition: true,
@@ -8044,7 +7905,6 @@ impl Default for Options {
             copy_prefetch_span: false,
             piece_ranks_by_heads: true,
             forms_to_writer: false,
-            form_dense_from: 0,
             scan_snapshot_arena: true,
             forms_to_fit: false,
             forms_fit_shed: true,
@@ -21324,13 +21184,12 @@ fn check_options(opts: &Options) -> Result<()> {
         && (!matches!(opts.sync, SyncPolicy::Explicit)
             || opts.scan_block_cache
             || opts.snapshot_keeper
-            || opts.forms_off_snapshot_kept
             || opts.upkeep != Upkeep::Inline)
     {
         return Err(err(
             "put_in_place overwrites a live table's values under the writer alone: \
-             it needs SyncPolicy::Explicit, Upkeep::Inline, and scan_block_cache, \
-             snapshot_keeper and forms_off_snapshot_kept off",
+             it needs SyncPolicy::Explicit, Upkeep::Inline, and scan_block_cache and \
+             snapshot_keeper off",
         ));
     }
     if opts.one_file && (!opts.manifest_slots || opts.manifest_pending) {
@@ -21344,7 +21203,6 @@ fn check_options(opts: &Options) -> Result<()> {
             || opts.held_frames
             || opts.scan_block_cache
             || opts.snapshot_keeper
-            || opts.forms_off_snapshot_kept
             || opts.snapshot_runs
             || opts.direct_ingest
             || opts.put_in_place
@@ -21354,7 +21212,7 @@ fn check_options(opts: &Options) -> Result<()> {
         return Err(err(
             "shared_writers writes the live table from every thread with nothing logged: \
              it needs SyncPolicy::Explicit with held_frames off, Upkeep::Inline, and \
-             scan_block_cache, snapshot_keeper, forms_off_snapshot_kept, snapshot_runs, \
+             scan_block_cache, snapshot_keeper, snapshot_runs, \
              direct_ingest, put_in_place and adaptive_shape off",
         ));
     }
@@ -24767,7 +24625,7 @@ impl CachedBlock {
     /// Whether this copy holds what `other` holds, entry for entry, and
     /// claims the identity at least where `other` does: the check the
     /// conversion from a form makes against the build from the sources
-    /// in the checked profile (`Options::convert_from_form`).
+    /// in the checked profile.
     #[cfg(debug_assertions)]
     fn agrees(&self, other: &CachedBlock) -> bool {
         let (this, other) = (self.unpacked(), other.unpacked());
@@ -26883,9 +26741,6 @@ struct Shared {
     /// PROTOTYPE: handles that took the published snapshot over their
     /// own under the keeper's rule; for a test.
     snap_switched: AtomicU64,
-    /// The times a commit's maintenance kept the merge path's snapshot to
-    /// its commit with the forms off (`Options::forms_off_snapshot_kept`).
-    snaps_kept: AtomicU64,
     /// Snapshots the seal thread published over the frozen table it was
     /// writing (`Options::seal_snapshot`); for a test.
     snap_sealed: AtomicU64,
@@ -28534,11 +28389,6 @@ struct FormsState {
     /// take the rest in its next pass (`Options::upkeep_pass_pct`). Zero
     /// is unbounded, which the writer's own looks are.
     read_cap: std::cell::Cell<usize>,
-    /// For a pass on the upkeep thread: `UpkeepTo::lent` of the commit
-    /// the pass brings the upkeep to, against which the conversions'
-    /// yield measures how far the writer has gone on
-    /// (`Options::forms_convert_behind`).
-    pass_lent: std::cell::Cell<u64>,
     /// The largest commit lent to the pass in flight on the upkeep thread
     /// since the thread was last caught up (`UpkeepTo::big`), for
     /// `settle_due` to tell a burst's batch from a mix's
@@ -28708,7 +28558,6 @@ impl FormsState {
             patch_asks: std::cell::Cell::new(0),
             settle_ahead: Counts::new(),
             read_cap: std::cell::Cell::new(0),
-            pass_lent: std::cell::Cell::new(0),
             pass_batch: std::cell::Cell::new(0),
             log_short: std::cell::Cell::new(false),
             fill_owed: std::cell::Cell::new(false),
@@ -36657,19 +36506,10 @@ impl Reader {
                 if b >= table.slots.len() || BuildCtx::overlay_count(table, b) > WIDE {
                     continue;
                 }
-                // A dense sparse form the builder made a copy for goes;
-                // any other form the writer holds stands.
-                match table.slots[b].as_deref() {
-                    None => {}
-                    Some(Cached::Sparse(sb))
-                        if self.opts.ahead_converts && sb.ents.len() >= CACHE_DENSE =>
-                    {
-                        self.unlist(pi, b, table);
-                    }
-                    Some(_) => {
-                        self.shared.forms_events[11].fetch_add(1, AtomicOrdering::Relaxed);
-                        continue;
-                    }
+                // A form the writer holds stands.
+                if table.slots[b].is_some() {
+                    self.shared.forms_events[11].fetch_add(1, AtomicOrdering::Relaxed);
+                    continue;
                 }
                 // The form as built, current to the builder's commit, is
                 // every handle's at that position; this handle's copy is
@@ -37764,13 +37604,7 @@ impl Reader {
     fn convert_from(&self) -> usize {
         match self.opts.forms_convert_from {
             0 => CACHE_DENSE,
-            n if n >= CACHE_DENSE
-                || self.understudy
-                || self.opts.forms_convert_light_writer
-                || self.opts.forms_convert_reads > 0 =>
-            {
-                n
-            }
+            n if n >= CACHE_DENSE || self.understudy || self.opts.forms_convert_reads > 0 => n,
             _ => CACHE_DENSE,
         }
     }
@@ -37784,19 +37618,11 @@ impl Reader {
             mem: self.mem(),
             frozen: self.frozen(),
             tombs: self.has_tombstones(),
-            dense_from: if self.opts.commit_forms && self.slot.is_none() {
-                match self.opts.form_dense_from {
-                    0 => CACHE_DENSE,
-                    n => n,
-                }
-            } else {
-                CACHE_DENSE
-            },
+            dense_from: CACHE_DENSE,
             stale: self.fs().snap_stale.borrow(),
             offs: Some(&self.fs().emit_offs),
             copy_dense: false,
             wide_copy: false,
-            copy_exact: self.opts.copy_exact,
             fit: self.fits(),
             pieces_only: self.opts.forms_pieces_only,
             ranks_by_heads: self.opts.piece_ranks_by_heads,
@@ -38094,40 +37920,10 @@ impl Reader {
                 .cache_seen
                 .store(self.fs().cache_bytes.get(), AtomicOrdering::Relaxed);
         }
-        self.keep_merge_snapshot();
         if self.settle_due(true) != Some(true) {
             return Ok(());
         }
         self.fill_forms()
-    }
-
-    /// The merge path's scan snapshot kept to this commit while the
-    /// writer's forms are given up (`Options::forms_off_snapshot_kept`):
-    /// what a scan's preamble does before its walk -- the log read to the
-    /// commit, the keys created since the snapshot filed into its side
-    /// runs, or the snapshot carried forward or built where it is behind
-    /// or absent (`refresh_snapshot`) -- done at the commit's maintenance,
-    /// so that the first scan after a burst reads the log from where the
-    /// last pass left it and files that much. Only while scans are near,
-    /// by the seals' reading of it (`Shared::scans_far_at`): a store
-    /// nobody scans keeps nothing. The writer's own upkeep alone: a handle
-    /// keeps no forms to give up.
-    fn keep_merge_snapshot(&self) {
-        if !self.opts.forms_off_snapshot_kept || self.slot.is_some() || !self.fs().forms_off.get() {
-            return;
-        }
-        // The forms go off at a scan, so the store has been scanned: far
-        // is the seals' mark at the scan count as it stands.
-        let life = self.shared.scans_life.load(AtomicOrdering::Relaxed)
-            + self.shared.scans_merged.load(AtomicOrdering::Relaxed);
-        if self.shared.scans_far_at.load(AtomicOrdering::Acquire) == life {
-            return;
-        }
-        let gen = self.state().gen;
-        if self.sync_log() {
-            self.refresh_snapshot(gen, false, true);
-            self.shared.snaps_kept.fetch_add(1, AtomicOrdering::Relaxed);
-        }
     }
 
     /// Under `forms_pieces_only`, on the writer's upkeep: once a
@@ -38761,7 +38557,6 @@ impl Reader {
     /// ahead does on a spare core, done here for the store the builder
     /// declined (too small) or has not reached.
     fn complete_forms(&self, unsealed: &Snapshot) -> Result<bool> {
-        let mut converted = 0usize;
         // The fill's walk and its builds apart, on the thread's clock, for
         // `Db::pass_steps`, recorded at every exit.
         struct FillStamp<'a> {
@@ -38873,14 +38668,13 @@ impl Reader {
                     return Ok(false);
                 }
                 // An empty slot with an overlay, or a form the patches
-                // grew to what a build would have copied -- the latter up
-                // to a cap, if one is set, and on the upkeep thread only
-                // while nothing newer is posted and the writer does not
-                // want the upkeep back: a conversion repays only through
-                // later walks, and a pass that converted every dense form
-                // of a burst ran ten to fifteen milliseconds, which the
+                // grew to what a build would have copied -- the latter, on
+                // the upkeep thread, only while the writer does not want
+                // the upkeep back: a conversion repays only through later
+                // walks, and a pass that converted every dense form of a
+                // burst ran ten to fifteen milliseconds, which the
                 // writer's next freeze or scan waited out
-                // (`Options::forms_convert_cap`, `forms_convert_yield`).
+                // (`Options::forms_convert_yield`).
                 let dense = self.fs().convert_dense.get()
                     && matches!(
                         table.slots[b].as_deref(),
@@ -38891,39 +38685,18 @@ impl Reader {
                                     && self.shared.zgate.load() == zselect::GATE_RAW))
                     );
                 if dense {
-                    let cap = self.opts.forms_convert_cap;
-                    // The writer's wait yields always; a posted commit
-                    // only once the thread is behind it by more than the
-                    // allowance (`Options::forms_convert_behind`).
+                    // The writer's wait yields; a posted commit does not.
                     let state = self.shared.upkeep.state.load(AtomicOrdering::Acquire);
-                    // A light form, one converted under `CACHE_DENSE`
-                    // (`Options::forms_convert_from`), yields to any commit
-                    // posted: its copy repays only through walks, and the
-                    // burst the post belongs to is paced by this thread.
-                    let light = matches!(
-                        table.slots[b].as_deref(),
-                        Some(Cached::Sparse(sb)) if sb.ents.len() < CACHE_DENSE
-                    );
-                    let yielding = (light
-                        && self.opts.forms_convert_light_yields
-                        && state & (LEND_WANT | LEND_POSTED) != 0)
-                        || (self.opts.forms_convert_yield
-                            && self.understudy
-                            && (state & LEND_WANT != 0
-                                || (state & LEND_POSTED != 0 && self.convert_behind())));
-                    if (cap > 0 && converted >= cap) || yielding {
+                    let yielding =
+                        self.opts.forms_convert_yield && self.understudy && state & LEND_WANT != 0;
+                    if yielding {
                         continue;
                     }
-                    converted += 1;
                     let t_total = std::time::Instant::now();
                     // From the form itself where it can be: every delta's
                     // run is in it, resolved, so the copy is a merge of the
-                    // form with the block's records and reads no source;
-                    // the build from the sources gathered every key's run
-                    // again (`Options::convert_from_form`).
-                    let from_form = if self.opts.convert_from_form
-                        && BuildCtx::overlay_count(table, b) <= WIDE
-                    {
+                    // form with the block's records and reads no source.
+                    let from_form = if BuildCtx::overlay_count(table, b) <= WIDE {
                         table.slots[b].clone()
                     } else {
                         None
@@ -39049,26 +38822,6 @@ impl Reader {
     /// forms in eight milliseconds and read 0.56x.
     fn burst_pass(&self) -> bool {
         self.understudy && self.fs().pass_batch.get() >= UPKEEP_WAKE_WRITES as u64
-    }
-
-    /// Whether the upkeep thread is behind the writer by more than the
-    /// conversions' allowance: the writes the writer has lent past the
-    /// commit this pass brings the upkeep to
-    /// (`Options::forms_convert_behind`). The first version measured the
-    /// log position this handle may read to less the position it had
-    /// read, and on the thread the first is the pass's own bound, which
-    /// the log read has just reached: zero in every pass, so no posted
-    /// commit ever yielded a conversion and only the writer's wait did.
-    fn convert_behind(&self) -> bool {
-        let allow = self.opts.forms_convert_behind;
-        if allow == 0 {
-            return true;
-        }
-        if allow == usize::MAX {
-            return false;
-        }
-        let lent = self.shared.upkeep.to.load().lent;
-        lent.saturating_sub(self.fs().pass_lent.get()) > allow as u64
     }
 
     /// The block cache's budget: the one given (`scan_cache_bytes`), or
@@ -39940,7 +39693,7 @@ impl Reader {
         let tfar = self.opts.settle_table_ahead;
         let value_ahead = CHUNK_HDR + self.opts.settle_value_ahead;
         let in_place = self.opts.settle_patch_in_place;
-        let converts = self.opts.settle_converts && self.opts.convert_from_form;
+        let converts = self.opts.settle_converts;
         let mut placed = 0u64;
         let mut asked = 0u64;
         let mut ahead_asks = [0u64; 2];
@@ -44740,7 +44493,6 @@ impl Db {
             snap_kept: AtomicU64::new(0),
             snap_carried: AtomicU64::new(0),
             snap_switched: AtomicU64::new(0),
-            snaps_kept: AtomicU64::new(0),
             snap_sealed: AtomicU64::new(0),
             snap_on_table: AtomicU64::new(0),
             upkeep: Lend::default(),
@@ -46156,7 +45908,6 @@ impl Db {
             snap_kept: AtomicU64::new(0),
             snap_carried: AtomicU64::new(0),
             snap_switched: AtomicU64::new(0),
-            snaps_kept: AtomicU64::new(0),
             snap_sealed: AtomicU64::new(0),
             snap_on_table: AtomicU64::new(0),
             upkeep: Lend::default(),
@@ -50329,13 +50080,6 @@ impl Db {
 
     /// EXPERIMENT: snapshots republished with their stale runs copied
     /// again; see `Snapshot::refreshed`.
-    /// The times a commit's maintenance kept the merge path's snapshot to
-    /// its commit with the forms off (`Options::forms_off_snapshot_kept`).
-    #[doc(hidden)]
-    pub fn snapshots_kept(&self) -> u64 {
-        self.shared.snaps_kept.load(AtomicOrdering::Relaxed)
-    }
-
     pub fn snapshot_refreshes(&self) -> u64 {
         self.shared.snap_refreshes.load(AtomicOrdering::Relaxed)
     }
@@ -50379,7 +50123,7 @@ impl Db {
     /// forms installed from a builder, writes settled against no table,
     /// the fill's dense conversions and fresh builds, the builder's skips
     /// and builds, the installs dropped and skipped, and the dense
-    /// conversions made from the form itself (`Options::convert_from_form`).
+    /// conversions made from the form itself.
     pub fn forms_events(&self) -> [u64; 14] {
         let mut out = [0u64; 14];
         out[0] = self.shared.blk_upkeep.load(AtomicOrdering::Relaxed);
@@ -51097,12 +50841,9 @@ impl Reader {
                 since.file(mem, e.key_off, e.key_len());
             }
         }
-        // Per block: 0 for no form, 1 for a form the builder leaves
-        // alone, whether or not it is published, and 2 for a sparse form
-        // grown dense, which the builder builds a copy for
-        // (`Options::ahead_converts`).
-        let converts = self.opts.ahead_converts;
-        let held: Vec<Vec<u8>> = self
+        // Per block: whether the writer holds a form, which the builder
+        // leaves alone, whether or not it is published.
+        let held: Vec<Vec<bool>> = self
             .fs()
             .tables
             .borrow()
@@ -51110,20 +50851,7 @@ impl Reader {
             .map(|cell| {
                 cell.borrow()
                     .as_ref()
-                    .map(|t| {
-                        t.slots
-                            .iter()
-                            .map(|s| match s.as_deref() {
-                                None => 0u8,
-                                Some(Cached::Sparse(sb))
-                                    if converts && sb.ents.len() >= CACHE_DENSE =>
-                                {
-                                    2
-                                }
-                                Some(_) => 1,
-                            })
-                            .collect()
-                    })
+                    .map(|t| t.slots.iter().map(|s| s.is_some()).collect())
                     .unwrap_or_default()
             })
             .collect();
@@ -53820,7 +53548,7 @@ impl Reader {
         stop: &std::sync::atomic::AtomicU8,
         tx: &std::sync::mpsc::Sender<Built>,
         posted: &std::sync::atomic::AtomicBool,
-        held: &[Vec<u8>],
+        held: &[Vec<bool>],
     ) -> Result<()> {
         if !self.pin_at(&at) {
             return Ok(());
@@ -53915,11 +53643,12 @@ impl Reader {
                     .get(pi)
                     .and_then(|f| f.get(b))
                     .is_some_and(|s| !s.load(AtomicOrdering::Acquire).is_null());
-                // A block the writer holds a form for, or one published
-                // already, has nothing to build for; one the writer holds
-                // as a dense sparse form gets a copy.
-                let code = held.get(pi).and_then(|h| h.get(b)).copied().unwrap_or(0);
-                if code == 1 || (published && code != 2) {
+                let writers = held
+                    .get(pi)
+                    .and_then(|h| h.get(b))
+                    .copied()
+                    .unwrap_or(false);
+                if writers || published {
                     self.shared.forms_events[7].fetch_add(1, AtomicOrdering::Relaxed);
                     continue;
                 }
@@ -55234,7 +54963,6 @@ impl Reader {
             self.wm.set(to.wm);
             self.force_due.set(to.force);
             self.fs().read_cap.set(to.cap as usize);
-            self.fs().pass_lent.set(to.lent);
             self.fs().pass_batch.set(to.big);
             self.fs().log_short.set(false);
             // Asked to give the forms up before the pass began: nothing of
@@ -55925,8 +55653,7 @@ impl Db {
     }
 
     /// Microseconds the fill's dense conversions spent building their
-    /// copies, and in the whole conversion, over the store's life
-    /// (`Options::convert_from_form`).
+    /// copies, and in the whole conversion, over the store's life.
     pub fn convert_us(&self) -> (u64, u64) {
         (
             self.shared.convert_build_ns.load(AtomicOrdering::Relaxed) / 1000,
@@ -56708,8 +56435,6 @@ struct BuildCtx<'s> {
     /// (`Options::forms_copy_hot_wide`), where the build would answer the
     /// wide form.
     wide_copy: bool,
-    /// See `Options::copy_exact`.
-    copy_exact: bool,
     /// See `Options::forms_to_fit`.
     fit: bool,
     /// `Options::forms_pieces_only`: the forms hold the pieces' fold alone
@@ -58587,7 +58312,7 @@ impl<'s> BuildCtx<'s> {
     /// them: the form's keys at their cuts, each with the run the form
     /// holds, and the partition's records between, streamed. What
     /// `copy_block` builds over the overlay, from the form instead of
-    /// from the sources; see `Options::convert_from_form`.
+    /// from the sources.
     fn copy_from_deltas(
         &self,
         src: Sources,
@@ -58597,14 +58322,10 @@ impl<'s> BuildCtx<'s> {
         let seg = src.seg;
         let (lo, hi) = (ranks.start, ranks.end);
         // Sized to the form plus the records it does not replace: a copy
-        // with room for a record's worth more per record fit no chunk the
-        // forms before it freed and faulted in fresh pages for the whole
-        // burst (`Options::copy_exact`).
-        let kept = if self.copy_exact {
-            (hi - lo).saturating_sub(sb.ents.iter().filter(|e| e.same).count())
-        } else {
-            hi - lo
-        };
+        // with room for a record's worth more per record fits no chunk the
+        // forms before it freed and faults in fresh pages for the whole
+        // burst.
+        let kept = (hi - lo).saturating_sub(sb.ents.iter().filter(|e| e.same).count());
         let mut blk = CopyBuild::new(
             seg.keyseq,
             (

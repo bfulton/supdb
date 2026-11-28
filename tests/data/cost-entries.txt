@@ -350,7 +350,6 @@ Blob::scan_at	scan_at
 Db::job_pool_counts	-	a test seam or a counter: reads or sets the store's bookkeeping, at no key, entry, block or step of an operation
 Db::job_pool_takes	-	a test seam or a counter: reads or sets the store's bookkeeping, at no key, entry, block or step of an operation
 Db::snapshot_lean_builds	-	a test seam or a counter: reads or sets the store's bookkeeping, at no key, entry, block or step of an operation
-Db::snapshots_kept	-	a test seam or a counter: reads or sets the store's bookkeeping, at no key, entry, block or step of an operation
 Db::zpage_hot_asks_in	-	a test seam or a counter: reads or sets the store's bookkeeping, at no key, entry, block or step of an operation
 Blob::read_all_fixed_hashed	-	the engine's reader of a segment: reached through Reader::read_all and Reader::scan, whose probes count what the engine inlines of it
 Blob::slot_table	-	the key index's slot table for a point read that asks for its slots' lines ahead (upstream dbc2a2a): reached through Reader::read_all, whose probes count what the engine inlines of it

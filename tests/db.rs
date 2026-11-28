@@ -8124,7 +8124,7 @@ fn a_copy_of_updates_starts_a_scan_at_the_seeks_rank() {
 }
 
 /// A dense sparse form is converted into a copy from its own deltas and the
-/// partition's records (`Options::convert_from_form`), where the build from
+/// partition's records, where the build from
 /// the sources gathered every key's run again. The forms here grow dense
 /// in rounds -- each round writes a part of every block, small enough that
 /// the first fill leaves a sparse form and the next finds it dense -- and
@@ -22231,24 +22231,16 @@ fn scans_that_meet_their_blocks_once_out_of_core_keep_no_forms() {
 }
 
 /// With the writer's forms given up for the merge path the commit's
-/// maintenance kept nothing, and the first scan after a burst read the
-/// burst's log and built the snapshot of its keys itself. Under
-/// `Options::forms_off_snapshot_kept` the maintenance keeps the merge
-/// path's snapshot to each commit while scans are near: with the upkeep
+/// maintenance keeps nothing, and the first scan after a burst reads the
+/// burst's log and builds the snapshot of its keys itself: with the upkeep
 /// inline, where a commit's maintenance is done at its return, the scan
-/// after a burst of twenty thousand new keys builds no snapshot and
-/// carries none forward, where without the option it does one or the
-/// other; nothing is kept while the forms are on, since the block path
-/// keeps its own; and nothing far from every scan, the seals' reading of
-/// it, until a scan comes back. Every scan answers as the model, through
-/// the burst with the upkeep lent to its thread as well.
+/// after a burst of twenty thousand new keys builds a snapshot or carries
+/// one forward. Every scan answers as the model.
 #[test]
-fn a_burst_with_the_forms_off_has_its_snapshot_kept_for_the_scan_after() {
-    for (case, kept, upkeep) in [
-        ("kept-inline", true, supdb::Upkeep::Inline),
-        ("scan-inline", false, supdb::Upkeep::Inline),
-        ("kept-lent", true, supdb::Upkeep::default()),
-    ] {
+fn a_burst_with_the_forms_off_leaves_its_snapshot_to_the_scan_after() {
+    {
+        let case = "scan-inline";
+        let upkeep = supdb::Upkeep::Inline;
         let d = dir(&format!("forms-off-snap-{case}"));
         let mut db = Db::create(
             &d,
@@ -22258,7 +22250,6 @@ fn a_burst_with_the_forms_off_has_its_snapshot_kept_for_the_scan_after() {
                 scan_forms_off_ghost_bits: 6,
                 // The reading stands through the small commits below.
                 scan_forms_off_stale_writes: 0,
-                forms_off_snapshot_kept: kept,
                 zpages: supdb::ZPages::Off,
                 partition_bytes: Some(256 << 10),
                 seal_bytes: 2 << 20,
@@ -22330,11 +22321,6 @@ fn a_burst_with_the_forms_off_has_its_snapshot_kept_for_the_scan_after() {
         }
         db.settle().unwrap();
         assert_eq!(db.forms_off_counts(), [0, 0, 0], "{case}: in core");
-        assert_eq!(
-            db.snapshots_kept(),
-            0,
-            "{case}: nothing kept with the forms on"
-        );
         // Out of core, starts uniform: the forms given up.
         db.zgate_set(2);
         for i in 0..256 {
@@ -22351,72 +22337,14 @@ fn a_burst_with_the_forms_off_has_its_snapshot_kept_for_the_scan_after() {
             write(&mut db, &mut want, &mut next, 1000);
         }
         assert_eq!(db.forms_off_counts(), c, "{case}: off through the burst");
-        if kept {
-            if upkeep != supdb::Upkeep::Inline {
-                db.settle().unwrap();
-            }
-            assert!(
-                db.snapshots_kept() >= 30,
-                "{case}: kept at the burst's commits: {}",
-                db.snapshots_kept()
-            );
-        } else {
-            assert_eq!(db.snapshots_kept(), 0, "{case}: the option off");
-        }
-        // The first scan after the burst: with the snapshot kept to the
-        // last commit it builds none and carries none forward.
+        // The first scan after the burst makes its snapshot.
         let made = |db: &Db| db.snapshot_builds() + db.snapshot_extends();
         let before = made(&db);
         check(&db, &want, (next() % keys as u64) as u32, "after the burst");
         let by_scan = made(&db) - before;
-        if upkeep == supdb::Upkeep::Inline {
-            if kept {
-                assert_eq!(by_scan, 0, "{case}: the scan found its snapshot kept");
-            } else {
-                assert!(by_scan >= 1, "{case}: the scan made its snapshot");
-            }
-        }
+        assert!(by_scan >= 1, "{case}: the scan made its snapshot");
         for start in (0..keys).step_by(1009) {
             check(&db, &want, start, "after the burst, everywhere");
-        }
-        // Far from every scan, by the seals' reading: two stores' worth
-        // of writes sealed since the last scan, and nothing is kept until
-        // a scan comes back. Updates alone, so that the store the writes
-        // are counted against stays the size it is.
-        if kept && upkeep == supdb::Upkeep::Inline {
-            let mut rewrite = |db: &mut Db, want: &mut BTreeMap<Vec<u8>, String>, tag: &str| {
-                for _ in 0..1000 {
-                    let k = key((next() % keys as u64) as u32);
-                    db.put(&k, tag.as_bytes());
-                    want.insert(k, tag.to_string());
-                }
-                db.commit().unwrap();
-            };
-            for r in 0..600u32 {
-                rewrite(&mut db, &mut want, &format!("f{r}"));
-            }
-            db.settle().unwrap();
-            let far = db.snapshots_kept();
-            for r in 0..8u32 {
-                rewrite(&mut db, &mut want, &format!("g{r}"));
-            }
-            assert_eq!(
-                db.snapshots_kept(),
-                far,
-                "{case}: nothing kept far from every scan"
-            );
-            assert_eq!(db.forms_off_counts()[..2], c[..2], "{case}: off throughout");
-            check(&db, &want, 77, "a scan again");
-            if db.forms_off_counts()[0] > db.forms_off_counts()[1] {
-                rewrite(&mut db, &mut want, "h");
-                assert!(
-                    db.snapshots_kept() > far,
-                    "{case}: kept again once a scan has come"
-                );
-            }
-            for start in (0..keys).step_by(1009) {
-                check(&db, &want, start, "at the end");
-            }
         }
         db.close().unwrap();
         let _ = std::fs::remove_dir_all(&d);

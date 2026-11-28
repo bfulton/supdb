@@ -976,9 +976,7 @@ copy only at the dense count, the shape before a light form of four deltas
 or more converted (`Options::forms_convert_from`), and
 `supdb-densefrom` and `supdb-ingestdensefrom` take the line from
 `DENSEFROM`, with the reads a form takes first from `CONVREADS` and the
-writer's fills, the yields and the walk's crossing from `CONVWRITER`,
-`CONVSTRICT` and `CONVWALK` (`Options::forms_convert_reads`,
-`forms_convert_light_writer`, `forms_convert_light_yields`,
+walk's crossing from `CONVWALK` (`Options::forms_convert_reads`,
 `forms_convert_at_walk`);
 `supdb-pacesyncsbatch` holds a syncing commit's paced batch within the
 share or the batch, the larger, and `supdb-pacesyncsthresholds` holds a
@@ -1023,10 +1021,7 @@ seek through the form; `supdb-zhotstarts2` and `supdb-zhotstarts3` are
 `supdb` with a scan that starts in a block scans have started in twice,
 or three times, holding the blocks it walks as copies under the form
 (`Options::promote_starts`), and `supdb-nohotstarts` with none held so;
-`supdb-formsoffkept` is `supdb` whose writer, its block forms given up on a
-reading of its scans, keeps them off until its next scan whatever it
-commits meanwhile (`Options::scan_forms_off_stale_writes` at zero), and
-`supdb-settleroomstill` with the room its commits' fills build in closed
+`supdb-settleroomstill` is `supdb` with the room its commits' fills build in closed
 for a second by any growth of the memory group's refaults since the last
 reading, however old (`Options::forms_settle_room_pressure` off);
 `supdb-snapdrops` is `supdb` whose handles, and whose writer on the merge
