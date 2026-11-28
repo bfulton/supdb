@@ -12846,37 +12846,121 @@ fn handle_counters(r: &supdb::Reader) -> Vec<(&'static str, u64)> {
 
 /// A writer thread's supdb: a `Reader` of its own for the reads, and the
 /// store's one writer, shared with the other threads, for the batches and
-/// the conditional puts.
+/// the read-modify-writes' puts.
 struct SupdbWriter<'a> {
     db: std::sync::Arc<std::sync::Mutex<&'a mut supdb::Db>>,
     r: supdb::Reader,
-    /// This thread's conditional puts not yet made (`rmw`), made under the
-    /// writer's lock a hundred at a time.
+    /// This thread's read-modify-writes' puts not yet made (`rmw`), made
+    /// under the writer's lock a hundred at a time.
     pending: PendingPuts,
+    /// The holds of the writer in which any thread wrote (`make_pending`,
+    /// `update_batch`), counted under the lock once the hold's commit is
+    /// made: a put read under the count that still stands met no other
+    /// thread's write between its read and its put.
+    writes: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    /// The keys each of the last holds wrote (`WriteRing`), taken only
+    /// inside a hold of the writer.
+    wrote: std::sync::Arc<std::sync::Mutex<WriteRing>>,
     /// The key's newest value as this thread's read found it.
     newest: Vec<u8>,
-    /// The conditional puts of this thread's refused (`rmw`).
+    /// This thread's puts whose key another thread's write had moved since
+    /// the thread's read, made over the writer's read instead
+    /// (`make_pending`).
     refused: std::cell::Cell<u64>,
     /// Whether the handle reads the writer's staged batch, as it does from
     /// its first read-modify-write (`rmw`).
     dirty: bool,
 }
 
-/// A thread's conditional puts in the order it asked them, each a key, the
-/// value it expects the key's newest to be (none for a key it read no value
-/// of) and the value it puts, end to end in one buffer that is kept, so
+/// A thread's read-modify-writes' puts in the order it asked them, each a
+/// key, the value its read found the key's newest to be (none for a key it
+/// read no value of) and the value it puts, end to end in one buffer that is kept, so
 /// that a put staged costs no allocation of its own.
 #[derive(Default)]
 struct PendingPuts {
     bytes: Vec<u8>,
     /// Each put's key, expected value and value, as ranges of `bytes`.
     puts: Vec<PendingPut>,
+    /// A bit for each key's hash among the puts: a key whose bit is clear
+    /// has none, which spares the walk of the list most reads would make.
+    filter: [u64; 16],
 }
 
 struct PendingPut {
     key: std::ops::Range<usize>,
     expect: Option<std::ops::Range<usize>>,
     value: std::ops::Range<usize>,
+    /// The count of writing holds (`SupdbWriter::writes`) before the read
+    /// the put was asked over, or `u64::MAX` where it was asked over this
+    /// thread's own put of the key, which is made just before it in the
+    /// same hold.
+    seen: u64,
+}
+
+/// The holds of the writer a `WriteRing` keeps the keys of.
+const WRITE_RING: usize = 64;
+
+/// For each of the last `WRITE_RING` holds of the writer in which a thread
+/// wrote, by the hold's number, a bit for the hash of each key it wrote, in
+/// 4,096 bits: a put whose key no hold since its read set the bit of met no
+/// other thread's write of the key, and is made as it is
+/// (`SupdbWriter::make_pending`). A bit set by another key only checks a
+/// put that needed none.
+struct WriteRing {
+    slots: Vec<[u64; 64]>,
+}
+
+impl WriteRing {
+    fn new() -> WriteRing {
+        WriteRing {
+            slots: vec![[0; 64]; WRITE_RING],
+        }
+    }
+
+    fn bit(key: &[u8]) -> (usize, u64) {
+        let i = ((key_hash(key) >> 40) & 4095) as usize;
+        (i >> 6, 1u64 << (i & 63))
+    }
+
+    /// Hold `hold`'s keys, over what the hold `WRITE_RING` before it left.
+    fn record<'k>(&mut self, hold: u64, keys: impl Iterator<Item = &'k [u8]>) {
+        let slot = &mut self.slots[(hold % WRITE_RING as u64) as usize];
+        *slot = [0; 64];
+        for k in keys {
+            let (w, b) = WriteRing::bit(k);
+            slot[w] |= b;
+        }
+    }
+
+    /// Whether no hold after `seen` up to `now` wrote `key`: false where
+    /// one may have, and for a read older than the ring holds.
+    fn untouched(&self, key: &[u8], seen: u64, now: u64) -> bool {
+        if now - seen >= WRITE_RING as u64 {
+            return false;
+        }
+        let (w, b) = WriteRing::bit(key);
+        (seen + 1..=now).all(|h| self.slots[(h % WRITE_RING as u64) as usize][w] & b == 0)
+    }
+}
+
+/// A key's hash, for the writer's filters of keys.
+fn key_hash(key: &[u8]) -> u64 {
+    let mut h = 0x9E37_79B9_7F4A_7C15u64;
+    let mut c = key.chunks_exact(8);
+    for w in &mut c {
+        h = (h ^ u64::from_le_bytes(w.try_into().expect("eight bytes")))
+            .wrapping_mul(0xFF51_AFD7_ED55_8CCD);
+    }
+    for &b in c.remainder() {
+        h = (h ^ u64::from(b)).wrapping_mul(0xFF51_AFD7_ED55_8CCD);
+    }
+    h
+}
+
+/// The bit of `PendingPuts::filter` a key takes.
+fn pending_bit(key: &[u8]) -> (usize, u64) {
+    let i = (key_hash(key) >> 54) as usize; // ten bits: 1,024 of them
+    (i >> 6, 1u64 << (i & 63))
 }
 
 impl PendingPuts {
@@ -12884,7 +12968,9 @@ impl PendingPuts {
         self.puts.len()
     }
 
-    fn push(&mut self, key: &[u8], expect: Option<&[u8]>, value: &[u8]) {
+    fn push(&mut self, key: &[u8], expect: Option<&[u8]>, value: &[u8], seen: u64) {
+        let (w, bit) = pending_bit(key);
+        self.filter[w] |= bit;
         let mut span = |b: &[u8]| {
             let at = self.bytes.len();
             self.bytes.extend_from_slice(b);
@@ -12893,12 +12979,21 @@ impl PendingPuts {
         let key = span(key);
         let expect = expect.map(&mut span);
         let value = span(value);
-        self.puts.push(PendingPut { key, expect, value });
+        self.puts.push(PendingPut {
+            key,
+            expect,
+            value,
+            seen,
+        });
     }
 
     /// The value of this thread's last put of `key` not yet made: what its
     /// own reads take as the key's newest.
     fn newest(&self, key: &[u8]) -> Option<&[u8]> {
+        let (w, bit) = pending_bit(key);
+        if self.filter[w] & bit == 0 {
+            return None;
+        }
         self.puts
             .iter()
             .rev()
@@ -12909,6 +13004,7 @@ impl PendingPuts {
     fn clear(&mut self) {
         self.bytes.clear();
         self.puts.clear();
+        self.filter = [0; 16];
     }
 }
 
@@ -12926,26 +13022,33 @@ impl ThreadWriter for SupdbWriter<'_> {
         c
     }
     fn update_batch(&mut self, items: &[(&[u8], &[u8])]) -> Res<()> {
-        // After the conditional puts asked before it.
+        // After the read-modify-writes asked before it.
         self.make_pending()?;
         let mut db = self.lock()?;
+        let now = self.writes.load(std::sync::atomic::Ordering::Relaxed);
+        self.wrote
+            .lock()
+            .map_err(|_| "a writer thread panicked holding the ring".to_string())?
+            .record(now + 1, items.iter().map(|&(k, _)| k));
         db.put_batch(items);
-        db.commit().map_err(|e| e.to_string())
+        let done = db.commit().map_err(|e| e.to_string());
+        self.writes
+            .store(now + 1, std::sync::atomic::Ordering::Release);
+        done
     }
-    /// A read-modify-write through the conditional put: the key read
-    /// through this thread's handle, which takes no lock, and its value put
-    /// on condition that the key's newest is still the one read
-    /// (`Db::put_if`). The puts wait in the thread's own list and are made
-    /// a hundred at a time under the writer's lock and committed, as
-    /// `update_batch` makes a batch, and the rest at `finish`: the reads go
-    /// on while another thread's commit syncs, as they did when the put was
-    /// a batched one, and no update is lost, since a put the key's newest
-    /// has moved past is refused and made again over the writer's own read,
-    /// under its lock. The thread's reads of a key it has put take that
-    /// put's value as the newest, so a second read-modify-write of it is
-    /// made over the first; the handle reads the writer's staged batch
-    /// (`Isolation::Dirty`), as a shared table's handles and FASTER's
-    /// sessions read every write as it lands.
+    /// A read-modify-write: the key read through this thread's handle,
+    /// which takes no lock, and its value put by the writer later, with the
+    /// thread's other puts, a hundred at a time in one hold of the writer's
+    /// lock, committed as `update_batch` commits a batch, and the rest at
+    /// `finish`. The reads go on while another thread's commit syncs, as
+    /// they did beside a batched put, and no update is lost: a put whose
+    /// key another thread wrote since this thread's read is made over the
+    /// writer's own read of the key, under the lock (`make_pending`). The
+    /// thread's reads of a key it has put take that put's value as the
+    /// newest, so a second read-modify-write of it is made over the first;
+    /// the handle reads the writer's staged batch (`Isolation::Dirty`), as
+    /// a shared table's handles and FASTER's sessions read every write as
+    /// it lands.
     fn rmw(&mut self, key: &[u8], value: &[u8]) -> Option<Res<usize>> {
         if !self.dirty {
             self.r.set_isolation(supdb::Isolation::Dirty);
@@ -12957,10 +13060,13 @@ impl ThreadWriter for SupdbWriter<'_> {
                 self.newest.clear();
                 self.newest.extend_from_slice(v);
                 let expect = std::mem::take(&mut self.newest);
-                self.pending.push(key, Some(&expect), value);
+                self.pending.push(key, Some(&expect), value, u64::MAX);
                 self.newest = expect;
                 n
             } else {
+                // Read before the read: a hold that wrote after it is one
+                // the put must be checked against.
+                let seen = self.writes.load(std::sync::atomic::Ordering::Acquire);
                 let newest = &mut self.newest;
                 let (mut n, mut read) = (0usize, false);
                 self.r
@@ -12972,7 +13078,7 @@ impl ThreadWriter for SupdbWriter<'_> {
                     })
                     .map_err(|e| e.to_string())?;
                 self.pending
-                    .push(key, read.then_some(self.newest.as_slice()), value);
+                    .push(key, read.then_some(self.newest.as_slice()), value, seen);
                 n
             };
             if self.pending.len() >= crate::run::YCSB_BATCH {
@@ -12993,10 +13099,16 @@ impl<'a> SupdbWriter<'a> {
             .map_err(|_| "a writer thread panicked holding the store".to_string())
     }
 
-    /// This thread's conditional puts made, in the order asked, under one
-    /// hold of the writer's lock, and committed: each refused one -- a
-    /// write of the key came after this thread's read -- made again over
-    /// the writer's read of the key, under the lock.
+    /// This thread's read-modify-writes' puts made, in the order asked,
+    /// under one hold of the writer's lock, and committed. A put no other
+    /// thread's write of its key can have come after the read of -- asked
+    /// over this thread's own put of the key, or of a key no writing hold
+    /// since its read wrote (`WriteRing`) -- is made as it is, the runs of
+    /// such puts one batch each. Any other is made over the writer's read
+    /// of the key, under the lock, where no write can come between the read
+    /// and the put, and counted refused where that read is not the
+    /// thread's. The hold's keys are recorded and its number counted before
+    /// the lock is given back.
     fn make_pending(&mut self) -> Res<()> {
         if self.pending.len() == 0 {
             return Ok(());
@@ -13005,14 +13117,28 @@ impl<'a> SupdbWriter<'a> {
             .db
             .lock()
             .map_err(|_| "a writer thread panicked holding the store".to_string())?;
-        let PendingPuts { bytes, puts } = &self.pending;
+        let now = self.writes.load(std::sync::atomic::Ordering::Relaxed);
+        let mut ring = self
+            .wrote
+            .lock()
+            .map_err(|_| "a writer thread panicked holding the ring".to_string())?;
+        let PendingPuts { bytes, puts, .. } = &self.pending;
+        let mut run: Vec<(&[u8], &[u8])> = Vec::new();
         for p in puts {
             let (key, value) = (&bytes[p.key.clone()], &bytes[p.value.clone()]);
-            let expect = p.expect.clone().map(|r| &bytes[r]);
-            if db.put_if(key, expect, value).map_err(|e| e.to_string())? {
+            if p.seen == u64::MAX || p.seen == now || ring.untouched(key, p.seen, now) {
+                run.push((key, value));
                 continue;
             }
-            self.refused.set(self.refused.get() + 1);
+            if !run.is_empty() {
+                db.put_batch(&run);
+                run.clear();
+            }
+            // Read under the lock, where no other thread's write can come
+            // between the read and the put, and put over it: a put whose
+            // key moved since this thread's read is counted refused, and
+            // made over the writer's read.
+            let expect = p.expect.clone().map(|r| &bytes[r]);
             let newest = &mut self.newest;
             let mut read = false;
             db.read_all(key, |v| {
@@ -13022,14 +13148,20 @@ impl<'a> SupdbWriter<'a> {
                 read = true;
             })
             .map_err(|e| e.to_string())?;
-            if !db
-                .put_if(key, read.then_some(newest.as_slice()), value)
-                .map_err(|e| e.to_string())?
-            {
-                return Err("a put refused on the writer's own read, under its lock".to_string());
+            if read.then_some(newest.as_slice()) != expect {
+                self.refused.set(self.refused.get() + 1);
             }
+            db.put(key, value);
         }
+        if !run.is_empty() {
+            db.put_batch(&run);
+        }
+        drop(run);
+        ring.record(now + 1, puts.iter().map(|p| &bytes[p.key.clone()]));
+        drop(ring);
         let done = db.commit().map_err(|e| e.to_string());
+        self.writes
+            .store(now + 1, std::sync::atomic::Ordering::Release);
         drop(db);
         self.pending.clear();
         done
@@ -15850,10 +15982,12 @@ impl Engine for Supdb {
             });
         }
         let db = std::sync::Arc::new(std::sync::Mutex::new(db));
+        let writes = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let wrote = std::sync::Arc::new(std::sync::Mutex::new(WriteRing::new()));
         Ok(readers
             .into_iter()
             .map(|r| {
-                let db = db.clone();
+                let (db, writes, wrote) = (db.clone(), writes.clone(), wrote.clone());
                 Box::new(move || {
                     Ok(if shared {
                         Box::new(SupdbSharedWriter {
@@ -15867,6 +16001,8 @@ impl Engine for Supdb {
                             db,
                             r,
                             pending: PendingPuts::default(),
+                            writes,
+                            wrote,
                             newest: Vec::new(),
                             refused: std::cell::Cell::new(0),
                             dirty: false,
@@ -21696,14 +21832,16 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
-    /// A one-writer arm's read-modify-write is a put on condition that the
-    /// thread makes later, a hundred at a time (`SupdbWriter::rmw`): a
-    /// thread's second one of a key is made over its first, which its own
-    /// reads see before it is made, and where another writer's write of
-    /// the key comes between the read and the put, the put is refused and
-    /// made again over the writer's read, so the thread's last put stands
-    /// and one refusal is counted. A put dropped where it was refused, or
-    /// made with no condition, or a second read that missed the first put,
+    /// A one-writer arm's read-modify-write is a read through the thread's
+    /// handle and a put the thread makes later, a hundred at a time in one
+    /// hold of the writer (`SupdbWriter::rmw`): a thread's second one of a
+    /// key is made over its first, which its own reads see before it is
+    /// made, and where another thread's write of the key -- a batch, or
+    /// another thread's read-modify-writes -- lands between the read and
+    /// the put, the hold that wrote it has recorded the key (`WriteRing`),
+    /// and the put is made over the writer's read, one refusal counted. A
+    /// put made as it is over the other's write, a hold that recorded no
+    /// keys, or a read of either kind that missed the thread's own put,
     /// each leaves another count or another value.
     #[test]
     fn a_one_writer_rmw_lands_over_a_write_that_came_between() {
@@ -21743,10 +21881,30 @@ mod tests {
                     Some(1),
                     "{arm}: the first put refused and made again, the second made over it"
                 );
+                // And the write between them the other thread's
+                // read-modify-write, its hold made first.
+                assert_eq!(
+                    wa.rmw(key, &was).unwrap().unwrap(),
+                    40,
+                    "{arm}: its last put"
+                );
+                assert_eq!(
+                    wb.rmw(key, &b).unwrap().unwrap(),
+                    40,
+                    "{arm}: the other's read"
+                );
+                wb.finish().unwrap();
+                wa.finish().unwrap();
+                let refused = wa
+                    .counters()
+                    .iter()
+                    .find(|(name, _)| *name == "refused")
+                    .map(|&(_, n)| n);
+                assert_eq!(refused, Some(2), "{arm}: the other's hold recorded its key");
             }
             assert_eq!(
                 e.get(key).unwrap(),
-                40,
+                100,
                 "{arm}: the thread's last put stands"
             );
             drop(e);

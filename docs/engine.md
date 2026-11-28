@@ -1319,11 +1319,13 @@ staged operations included, and a refused write stages nothing. Under
 `Options::shared_writers` a handle's write landing between a transaction's
 check and its commit is not seen by the check, where `Db::put_if` makes the
 check in the one hold a handle's does. In `threads-RMW` the one-writer arms
-read through each thread's handle and put through the writer on that
-condition, each thread's puts made a hundred at a time in one hold of the
-writer's lock and a refused one made again over the writer's read under it,
-so that no arm of the engine's loses an update and the reads go on while
-another thread's commit syncs, as they did beside a batched put.
+read through each thread's handle and put through the writer, each thread's
+puts made a hundred at a time in one hold of the writer's lock: a put whose
+key no other thread wrote since the read, by the keys each hold records, is
+made as it is, and any other over the writer's own read in the hold, where
+no write can come between the read and the put. No arm of the engine's
+loses an update, and the reads go on while another thread's commit syncs,
+as they did beside a batched put.
 
 Paired at `7b895b9`, with the same passes and reps as above:
 - **Against FASTER** (`pair.sh supdb-heldsharedbig faster 300000`), the
