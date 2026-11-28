@@ -995,24 +995,9 @@ pub struct Supdb {
     /// that decides it, its pages unasked (`Options::zpages_hot_back_ask`
     /// off). `supdb-zbacknow`.
     zbacknow: bool,
-    /// No cold form file asked for where scans come back after a stretch
-    /// without one (`Options::zpages_rewarm_scans` off). `supdb-norewarm`.
-    norewarm: bool,
     /// The rewarm trimming the allocator before it asks for the cold form
     /// files (`Options::zpages_rewarm_trims`). `supdb-rewarmtrim`.
     rewarmtrim: bool,
-    /// The rewarm asking for the raw form's files as well
-    /// (`Options::zpages_rewarm_raw`), `None` for the engine's default.
-    /// `supdb-norewarmraw` asks for nothing.
-    rewarmraw: Option<bool>,
-    /// With it, the raw form's files asked for where scans come back too
-    /// (`Options::zpages_rewarm_raw_scans`), `None` for the engine's
-    /// default. `supdb-zrewarmrawscans`.
-    rewarmrawscans: Option<bool>,
-    /// With `rewarmraw`, what the settle's ask brought back mapped into the
-    /// page tables (`Options::zpages_rewarm_raw_maps`), `None` for the
-    /// engine's default. `supdb-rewarmrawnomap` asks and maps nothing.
-    rewarmrawmaps: Option<bool>,
     /// The rewarm's look at every turn of the segment work's loop
     /// (`Options::zpages_rewarm_every_turn`), `None` for the engine's
     /// default: `supdb-zrewarmturn` looks at every turn, `supdb-zrewarmtick`
@@ -1127,10 +1112,6 @@ pub struct Supdb {
     /// it, once the commit has synced (`Options::wal_ahead_beside`,
     /// refuted). `supdb-walaheadbeside`.
     walaheadbeside: bool,
-    /// A settle that returns without waiting for the form files the store
-    /// asked the kernel for (`Options::zpages_settle_joins_asks` off).
-    /// `supdb-zsettleloose`.
-    zsettleloose: bool,
     /// A direct run's record stream kept whole in the arena, the shape
     /// before `Options::direct_recycle`. `supdb-norecycle`, and
     /// `supdb-ingestnorecycle` buffered.
@@ -1292,20 +1273,10 @@ pub struct Supdb {
     /// the fill line (`Options::zpages_hot_skew_room` on,
     /// `Options::zpages_hot_room_margin_pct` 5): `supdb-zhotskewroomhyst`.
     zhotskewroomhyst: bool,
-    /// The rewarm waiting for a second without a scan where the default
-    /// waits a quarter (`Options::zpages_rewarm_quiet_ms` 1000), the merges
-    /// in flight waited for as by default: `supdb-zrewarmwait`.
-    zrewarmwait: bool,
-    /// The rewarm made beside merges in flight, the shape before
-    /// (`Options::zpages_rewarm_beside_merges` on): `supdb-zrewarmbeside`.
-    zrewarmbeside: bool,
     /// A merge's asks ahead in one window for every input and over its
     /// records alone, the shape before (`Options::merge_ahead_shares`
     /// off): `supdb-cipherautoaheadflat`.
     aheadflat: bool,
-    /// The controller's install makes a rewarm due
-    /// (`Options::zpages_rewarm_at_install`): `supdb-zrewarminstall`.
-    zrewarminstall: bool,
     /// The fill's unskewed candidates asked for by their records' residency
     /// (`Options::zpages_hot_fill_resident_first`): `supdb-zhotresident`.
     zhotresident: bool,
@@ -2352,24 +2323,9 @@ struct Policy {
     /// that decides it, its pages unasked (`Options::zpages_hot_back_ask`
     /// off). `supdb-zbacknow`.
     zbacknow: bool,
-    /// No cold form file asked for where scans come back after a stretch
-    /// without one (`Options::zpages_rewarm_scans` off). `supdb-norewarm`.
-    norewarm: bool,
     /// The rewarm trimming the allocator before it asks for the cold form
     /// files (`Options::zpages_rewarm_trims`). `supdb-rewarmtrim`.
     rewarmtrim: bool,
-    /// The rewarm asking for the raw form's files as well
-    /// (`Options::zpages_rewarm_raw`), `None` for the engine's default.
-    /// `supdb-norewarmraw` asks for nothing.
-    rewarmraw: Option<bool>,
-    /// With it, the raw form's files asked for where scans come back too
-    /// (`Options::zpages_rewarm_raw_scans`), `None` for the engine's
-    /// default. `supdb-zrewarmrawscans`.
-    rewarmrawscans: Option<bool>,
-    /// With `rewarmraw`, what the settle's ask brought back mapped into the
-    /// page tables (`Options::zpages_rewarm_raw_maps`), `None` for the
-    /// engine's default. `supdb-rewarmrawnomap` asks and maps nothing.
-    rewarmrawmaps: Option<bool>,
     /// The rewarm's look at every turn of the segment work's loop
     /// (`Options::zpages_rewarm_every_turn`), `None` for the engine's
     /// default: `supdb-zrewarmturn` looks at every turn, `supdb-zrewarmtick`
@@ -2484,10 +2440,6 @@ struct Policy {
     /// it, once the commit has synced (`Options::wal_ahead_beside`,
     /// refuted). `supdb-walaheadbeside`.
     walaheadbeside: bool,
-    /// A settle that returns without waiting for the form files the store
-    /// asked the kernel for (`Options::zpages_settle_joins_asks` off).
-    /// `supdb-zsettleloose`.
-    zsettleloose: bool,
     /// A direct run's record stream kept whole in the arena, the shape
     /// before `Options::direct_recycle`. `supdb-norecycle`, and
     /// `supdb-ingestnorecycle` buffered.
@@ -2631,15 +2583,9 @@ struct Policy {
     zhotskewroom: bool,
     /// The room's bar under a margin: `supdb-zhotskewroomhyst`.
     zhotskewroomhyst: bool,
-    /// The rewarm that waits: `supdb-zrewarmwait`.
-    zrewarmwait: bool,
-    /// The rewarm beside merges: `supdb-zrewarmbeside`.
-    zrewarmbeside: bool,
     /// A merge's asks in one window, records alone:
     /// `supdb-cipherautoaheadflat`.
     aheadflat: bool,
-    /// A rewarm at the install: `supdb-zrewarminstall`.
-    zrewarminstall: bool,
     /// The fill's resident records first: `supdb-zhotresident`.
     zhotresident: bool,
     /// Write-time filing past the cache alone: `...settlegated`.
@@ -3174,11 +3120,7 @@ impl Default for Policy {
             settlelazyraw: false,
             mergesync1m: false,
             zbacknow: false,
-            norewarm: false,
             rewarmtrim: false,
-            rewarmraw: None,
-            rewarmrawscans: None,
-            rewarmrawmaps: None,
             zrewarmturn: None,
             headscopies: None,
             zbuycross: None,
@@ -3204,7 +3146,6 @@ impl Default for Policy {
             walprefill: false,
             walaheadflat: false,
             walaheadbeside: false,
-            zsettleloose: false,
             norecycle: false,
             heapblocks: false,
             nopool: false,
@@ -3232,10 +3173,7 @@ impl Default for Policy {
             sweepwalks: false,
             zhotskewroom: false,
             zhotskewroomhyst: false,
-            zrewarmwait: false,
-            zrewarmbeside: false,
             aheadflat: false,
-            zrewarminstall: false,
             zhotresident: false,
             settlegated: false,
             copyspan: false,
@@ -3708,21 +3646,6 @@ impl Supdb {
                 cipher: true,
                 cipher_auto: Some(true),
                 cipher_drops_keep: true,
-                ..Policy::default()
-            },
-        )
-    }
-
-    /// `supdb-cipherauto` whose rewarm is made beside merges in flight
-    /// (`Options::zpages_rewarm_beside_merges` on, `Policy::zrewarmbeside`):
-    /// `supdb-cipherautorewarmbeside`.
-    pub fn create_cipherauto_rewarmbeside(path: &Path) -> Res<Supdb> {
-        Supdb::with_policy(
-            path,
-            Policy {
-                cipher: true,
-                cipher_auto: Some(true),
-                zrewarmbeside: true,
                 ..Policy::default()
             },
         )
@@ -4349,18 +4272,6 @@ impl Supdb {
             path,
             Policy {
                 zhotskewroomhyst: true,
-                ..Policy::default()
-            },
-        )
-    }
-
-    /// `supdb` whose rewarm waits for a second without a scan where the
-    /// default waits a quarter (`Options::zpages_rewarm_quiet_ms` 1000).
-    pub fn create_zrewarmwait(path: &Path) -> Res<Supdb> {
-        Supdb::with_policy(
-            path,
-            Policy {
-                zrewarmwait: true,
                 ..Policy::default()
             },
         )
@@ -5046,18 +4957,6 @@ impl Supdb {
                 zdriveend: Some(true),
                 zcrossraw: Some(true),
                 ..Policy::zblock()
-            },
-        )
-    }
-
-    /// `supdb` whose rewarm is made beside merges in flight, the shape
-    /// before (`Options::zpages_rewarm_beside_merges` on).
-    pub fn create_zrewarmbeside(path: &Path) -> Res<Supdb> {
-        Supdb::with_policy(
-            path,
-            Policy {
-                zrewarmbeside: true,
-                ..Policy::default()
             },
         )
     }
@@ -7367,18 +7266,6 @@ impl Supdb {
         )
     }
 
-    /// `supdb` that asks for no cold form file where scans come back after a
-    /// stretch without one (`Options::zpages_rewarm_scans` off).
-    pub fn create_norewarm(path: &Path) -> Res<Supdb> {
-        Supdb::with_policy(
-            path,
-            Policy {
-                norewarm: true,
-                ..Policy::default()
-            },
-        )
-    }
-
     /// `supdb` whose rewarm trims the allocator before it asks for the cold
     /// form files (`Options::zpages_rewarm_trims`).
     pub fn create_rewarmtrim(path: &Path) -> Res<Supdb> {
@@ -7386,20 +7273,6 @@ impl Supdb {
             path,
             Policy {
                 rewarmtrim: true,
-                ..Policy::default()
-            },
-        )
-    }
-
-    /// `supdb` with no settle asking for the raw form's files
-    /// (`Options::zpages_rewarm_raw` off), the shape before: the partitions
-    /// the raw form serves, the pieces and their ordered indexes are read
-    /// back by whichever scan first wants them.
-    pub fn create_norewarmraw(path: &Path) -> Res<Supdb> {
-        Supdb::with_policy(
-            path,
-            Policy {
-                rewarmraw: Some(false),
                 ..Policy::default()
             },
         )
@@ -7421,20 +7294,6 @@ impl Supdb {
         )
     }
 
-    /// `supdb-nozjobs` with a settle asking the raw form's files back
-    /// (`Options::zpages_rewarm_raw`). `supdb-nozjobsrewarm`.
-    pub fn create_nozjobsrewarm(path: &Path) -> Res<Supdb> {
-        Supdb::with_policy(
-            path,
-            Policy {
-                zpages_off: true,
-                jobsmapped: true,
-                rewarmraw: Some(true),
-                ..Policy::default()
-            },
-        )
-    }
-
     /// `supdb` with the forms-off rule counting a start in a built form as
     /// a reuse (`Options::scan_forms_off_counts_built`).
     pub fn create_formsoffbuilt(path: &Path) -> Res<Supdb> {
@@ -7442,20 +7301,6 @@ impl Supdb {
             path,
             Policy {
                 formsoffbuilt: Some(true),
-                ..Policy::default()
-            },
-        )
-    }
-
-    /// `supdb-zrewarmraw` asking for the raw form's files where scans come
-    /// back as well as at a settle (`Options::zpages_rewarm_raw_scans`), the
-    /// shape refuted at ten million keys under 1 GiB.
-    pub fn create_zrewarmrawscans(path: &Path) -> Res<Supdb> {
-        Supdb::with_policy(
-            path,
-            Policy {
-                rewarmraw: Some(true),
-                rewarmrawscans: Some(true),
                 ..Policy::default()
             },
         )
@@ -7725,19 +7570,6 @@ impl Supdb {
         )
     }
 
-    /// `supdb` with the settle's ask for the raw form's files and nothing
-    /// of them mapped at its return (`Options::zpages_rewarm_raw_maps`
-    /// off): resident and unmapped, each first touch a fault.
-    pub fn create_rewarmrawnomap(path: &Path) -> Res<Supdb> {
-        Supdb::with_policy(
-            path,
-            Policy {
-                rewarmrawmaps: Some(false),
-                ..Policy::default()
-            },
-        )
-    }
-
     /// `supdb` with the rewarm's look taken at every turn of the segment
     /// work's loop (`Options::zpages_rewarm_every_turn` on): the scans
     /// that end a quiet stretch have their cold form files asked for at
@@ -7945,18 +7777,6 @@ impl Supdb {
             path,
             Policy {
                 walaheadflat: true,
-                ..Policy::default()
-            },
-        )
-    }
-
-    /// `supdb` whose settle does not wait for the form files the store
-    /// asked the kernel for (`Options::zpages_settle_joins_asks` off).
-    pub fn create_zsettleloose(path: &Path) -> Res<Supdb> {
-        Supdb::with_policy(
-            path,
-            Policy {
-                zsettleloose: true,
                 ..Policy::default()
             },
         )
@@ -9362,11 +9182,7 @@ impl Supdb {
             settlelazyraw,
             mergesync1m,
             zbacknow,
-            norewarm,
             rewarmtrim,
-            rewarmraw,
-            rewarmrawscans,
-            rewarmrawmaps,
             zrewarmturn,
             headscopies,
             zbuycross,
@@ -9392,7 +9208,6 @@ impl Supdb {
             walprefill,
             walaheadflat,
             walaheadbeside,
-            zsettleloose,
             norecycle,
             heapblocks,
             nopool,
@@ -9437,10 +9252,7 @@ impl Supdb {
             sweepwalks,
             zhotskewroom,
             zhotskewroomhyst,
-            zrewarmwait,
-            zrewarmbeside,
             aheadflat,
-            zrewarminstall,
             zhotresident,
             settlegated,
             copyspan,
@@ -9829,13 +9641,7 @@ impl Supdb {
             settle_lazy_raw: settlelazyraw,
             merge_sync_ahead: if mergesync1m { 1 << 20 } else { 0 },
             zpages_hot_back_ask: !zbacknow,
-            zpages_rewarm_scans: !norewarm,
             zpages_rewarm_trims: rewarmtrim,
-            zpages_rewarm_raw: rewarmraw.unwrap_or(supdb::Options::default().zpages_rewarm_raw),
-            zpages_rewarm_raw_scans: rewarmrawscans
-                .unwrap_or(supdb::Options::default().zpages_rewarm_raw_scans),
-            zpages_rewarm_raw_maps: rewarmrawmaps
-                .unwrap_or(supdb::Options::default().zpages_rewarm_raw_maps),
             zpages_rewarm_every_turn: zrewarmturn
                 .unwrap_or(supdb::Options::default().zpages_rewarm_every_turn),
             heads_owned_beside_copies: headscopies
@@ -9871,7 +9677,6 @@ impl Supdb {
             wal_ahead_bytes: if walprefill { 0 } else { 1 << 20 },
             wal_ahead_small_runs: !walaheadflat,
             wal_ahead_beside: walaheadbeside,
-            zpages_settle_joins_asks: !zsettleloose,
             prefault: populate,
             direct_put_one: !recordsteps,
             direct_stream: !copyvals && !refvals,
@@ -9995,9 +9800,7 @@ impl Supdb {
             sweep_remembers_pin: !sweepwalks,
             zpages_hot_skew_room: zhotskewroom || zhotskewroomhyst,
             zpages_hot_room_margin_pct: if zhotskewroomhyst { 5 } else { 0 },
-            zpages_rewarm_beside_merges: zrewarmbeside,
             merge_ahead_shares: !aheadflat,
-            zpages_rewarm_at_install: zrewarminstall,
             zpages_hot_fill_resident_first: zhotresident,
             forms_settle_past_llc: settlegated,
             copy_prefetch_span: copyspan,
@@ -10019,11 +9822,6 @@ impl Supdb {
             point_lone: !pointsources,
             point_layers_lean: !layersasone,
             forms_settle_builds_filed: settlebuildsfiled,
-            zpages_rewarm_quiet_ms: if zrewarmwait {
-                supdb::db::REWARM_QUIET_BEFORE_MS
-            } else {
-                supdb::Options::default().zpages_rewarm_quiet_ms
-            },
             zpages_walk_owns_decodes: zwalkowns,
             zpages_cursor_view: !zviewperopen,
             zpages_group_ahead: !znogroupahead,
@@ -10328,11 +10126,7 @@ impl Supdb {
             settlelazyraw,
             mergesync1m,
             zbacknow,
-            norewarm,
             rewarmtrim,
-            rewarmraw,
-            rewarmrawscans,
-            rewarmrawmaps,
             zrewarmturn,
             headscopies,
             zbuycross,
@@ -10358,7 +10152,6 @@ impl Supdb {
             walprefill,
             walaheadflat,
             walaheadbeside,
-            zsettleloose,
             norecycle,
             heapblocks,
             nopool,
@@ -10403,10 +10196,7 @@ impl Supdb {
             sweepwalks,
             zhotskewroom,
             zhotskewroomhyst,
-            zrewarmwait,
-            zrewarmbeside,
             aheadflat,
-            zrewarminstall,
             zhotresident,
             settlegated,
             copyspan,
@@ -10810,9 +10600,6 @@ impl Engine for Supdb {
                 true if self.cipher_auto == Some(true) && self.cipher_drops_keep => {
                     "supdb-cipherautodropskeep"
                 }
-                true if self.cipher_auto == Some(true) && self.zrewarmbeside => {
-                    "supdb-cipherautorewarmbeside"
-                }
                 true if self.cipher_auto == Some(true) && self.aheadflat => {
                     "supdb-cipherautoaheadflat"
                 }
@@ -10932,11 +10719,7 @@ impl Engine for Supdb {
         // The probe's combinations first, which the single fields below
         // would name by one of their parts.
         if self.zpages_off && self.jobsmapped {
-            return if self.rewarmraw == Some(true) {
-                "supdb-nozjobsrewarm"
-            } else {
-                "supdb-nozjobs"
-            };
+            return "supdb-nozjobs";
         }
         // Before the budget branch, which would name the policy the cache
         // arm whatever else it carries.
@@ -11146,17 +10929,8 @@ impl Engine for Supdb {
         if self.zhotskewroomhyst {
             return "supdb-zhotskewroomhyst";
         }
-        if self.zrewarmwait {
-            return "supdb-zrewarmwait";
-        }
-        if self.zrewarminstall {
-            return "supdb-zrewarminstall";
-        }
         if self.zhotresident {
             return "supdb-zhotresident";
-        }
-        if self.zrewarmbeside {
-            return "supdb-zrewarmbeside";
         }
         if self.zcursorsteps == Some(true) {
             return "supdb-zcursorsteps";
@@ -11978,17 +11752,8 @@ impl Engine for Supdb {
         if self.zbacknow {
             return "supdb-zbacknow";
         }
-        if self.norewarm {
-            return "supdb-norewarm";
-        }
         if self.rewarmtrim {
             return "supdb-rewarmtrim";
-        }
-        if self.rewarmrawscans == Some(true) {
-            return "supdb-zrewarmrawscans";
-        }
-        if self.rewarmrawmaps == Some(false) {
-            return "supdb-rewarmrawnomap";
         }
         if self.zrewarmturn == Some(true) {
             return "supdb-zrewarmturn";
@@ -12072,9 +11837,6 @@ impl Engine for Supdb {
         if self.formsoffbuilt == Some(true) {
             return "supdb-formsoffbuilt";
         }
-        if self.rewarmraw == Some(false) {
-            return "supdb-norewarmraw";
-        }
         if self.formson {
             return "supdb-formson";
         }
@@ -12113,9 +11875,6 @@ impl Engine for Supdb {
         }
         if self.walaheadflat {
             return "supdb-walaheadflat";
-        }
-        if self.zsettleloose {
-            return "supdb-zsettleloose";
         }
         if self.oocz {
             return "supdb-oocz";
@@ -14640,7 +14399,6 @@ pub fn guarantee(arm: &str) -> Option<Guarantee> {
         | "supdb-cipherautomergeapart"
         | "supdb-cipherautomergestream"
         | "supdb-cipherautodropskeep"
-        | "supdb-cipherautorewarmbeside"
         | "supdb-cipherautoaheadflat"
         | "supdb-cipherzpages"
         | "supdb-cipherzstride"
@@ -14827,11 +14585,7 @@ pub fn guarantee(arm: &str) -> Option<Guarantee> {
         | "supdb-settlelazyraw"
         | "supdb-mergesync1m"
         | "supdb-zbacknow"
-        | "supdb-norewarm"
         | "supdb-rewarmtrim"
-        | "supdb-norewarmraw"
-        | "supdb-zrewarmrawscans"
-        | "supdb-rewarmrawnomap"
         | "supdb-zrewarmturn"
         | "supdb-zrewarmtick"
         | "supdb-headsmodel"
@@ -14843,7 +14597,6 @@ pub fn guarantee(arm: &str) -> Option<Guarantee> {
         | "supdb-nocopiesfitchain"
         | "supdb-formsoffbuilt"
         | "supdb-nozjobs"
-        | "supdb-nozjobsrewarm"
         | "supdb-formson"
         | "supdb-mergedropscovered"
         | "supdb-mergedropsrecords"
@@ -14858,7 +14611,6 @@ pub fn guarantee(arm: &str) -> Option<Guarantee> {
         | "supdb-walprefill"
         | "supdb-walaheadflat"
         | "supdb-walaheadbeside"
-        | "supdb-zsettleloose"
         | "supdb-norecycle"
         | "supdb-heapblocks"
         | "supdb-nopool"
@@ -14883,7 +14635,6 @@ pub fn guarantee(arm: &str) -> Option<Guarantee> {
         | "supdb-zhotaskidle"
         | "supdb-zhotgrowth5"
         | "supdb-zhotfillquiet"
-        | "supdb-zrewarminstall"
         | "supdb-zhotresident"
         | "supdb-settlegated"
         | "supdb-ingestsettlegated"
@@ -14914,8 +14665,6 @@ pub fn guarantee(arm: &str) -> Option<Guarantee> {
         | "supdb-sweepwalks"
         | "supdb-zhotskewroom"
         | "supdb-zhotskewroomhyst"
-        | "supdb-zrewarmwait"
-        | "supdb-zrewarmbeside"
         | "supdb-zstride"
         | "supdb-zstrideroom"
         | "supdb-zstrideconv"
@@ -15230,7 +14979,6 @@ pub fn open(arm: &str, dir: &Path, map_gb: usize) -> Res<Box<dyn Engine>> {
         "supdb-cipherautomergeapart" => supdb_arm(Supdb::create_cipherauto_mergeapart, dir)?,
         "supdb-cipherautomergestream" => supdb_arm(Supdb::create_cipherauto_mergestream, dir)?,
         "supdb-cipherautodropskeep" => supdb_arm(Supdb::create_cipherauto_dropskeep, dir)?,
-        "supdb-cipherautorewarmbeside" => supdb_arm(Supdb::create_cipherauto_rewarmbeside, dir)?,
         "supdb-cipherautoaheadflat" => supdb_arm(Supdb::create_cipherauto_aheadflat, dir)?,
         "supdb-cipherzpages" => supdb_arm(Supdb::create_cipher_zpages, dir)?,
         "supdb-cipherzstride" => supdb_arm(Supdb::create_cipher_zstride, dir)?,
@@ -16295,18 +16043,6 @@ pub fn open(arm: &str, dir: &Path, map_gb: usize) -> Res<Box<dyn Engine>> {
             },
             dir,
         )?,
-        "supdb-zrewarminstall" => supdb_arm(
-            |d| {
-                Supdb::with_policy(
-                    d,
-                    Policy {
-                        zrewarminstall: true,
-                        ..Policy::default()
-                    },
-                )
-            },
-            dir,
-        )?,
         "supdb-zhotfillquiet" => supdb_arm(
             |d| {
                 Supdb::with_policy(
@@ -16325,8 +16061,6 @@ pub fn open(arm: &str, dir: &Path, map_gb: usize) -> Res<Box<dyn Engine>> {
         "supdb-sweepwalks" => supdb_arm(Supdb::create_sweepwalks, dir)?,
         "supdb-zhotskewroom" => supdb_arm(Supdb::create_zhotskewroom, dir)?,
         "supdb-zhotskewroomhyst" => supdb_arm(Supdb::create_zhotskewroomhyst, dir)?,
-        "supdb-zrewarmwait" => supdb_arm(Supdb::create_zrewarmwait, dir)?,
-        "supdb-zrewarmbeside" => supdb_arm(Supdb::create_zrewarmbeside, dir)?,
         "supdb-zstride" => supdb_arm(Supdb::create_zstride, dir)?,
         "supdb-zstrideroom" => supdb_arm(Supdb::create_zstride_room, dir)?,
         "supdb-zstrideconv" => supdb_arm(Supdb::create_zstride_conv, dir)?,
@@ -17078,11 +16812,7 @@ pub fn open(arm: &str, dir: &Path, map_gb: usize) -> Res<Box<dyn Engine>> {
         "supdb-settlelazyraw" => supdb_arm(Supdb::create_settlelazyraw, dir)?,
         "supdb-mergesync1m" => supdb_arm(Supdb::create_mergesync1m, dir)?,
         "supdb-zbacknow" => supdb_arm(Supdb::create_zbacknow, dir)?,
-        "supdb-norewarm" => supdb_arm(Supdb::create_norewarm, dir)?,
         "supdb-rewarmtrim" => supdb_arm(Supdb::create_rewarmtrim, dir)?,
-        "supdb-norewarmraw" => supdb_arm(Supdb::create_norewarmraw, dir)?,
-        "supdb-zrewarmrawscans" => supdb_arm(Supdb::create_zrewarmrawscans, dir)?,
-        "supdb-rewarmrawnomap" => supdb_arm(Supdb::create_rewarmrawnomap, dir)?,
         "supdb-zrewarmturn" => supdb_arm(Supdb::create_zrewarmturn, dir)?,
         "supdb-zrewarmtick" => supdb_arm(Supdb::create_zrewarmtick, dir)?,
         "supdb-headsmodel" => supdb_arm(Supdb::create_headsmodel, dir)?,
@@ -17094,7 +16824,6 @@ pub fn open(arm: &str, dir: &Path, map_gb: usize) -> Res<Box<dyn Engine>> {
         "supdb-nocopiesfitchain" => supdb_arm(Supdb::create_nocopiesfitchain, dir)?,
         "supdb-formsoffbuilt" => supdb_arm(Supdb::create_formsoffbuilt, dir)?,
         "supdb-nozjobs" => supdb_arm(Supdb::create_nozjobs, dir)?,
-        "supdb-nozjobsrewarm" => supdb_arm(Supdb::create_nozjobsrewarm, dir)?,
         "supdb-formson" => supdb_arm(Supdb::create_formson, dir)?,
         "supdb-mergedropscovered" => supdb_arm(Supdb::create_mergedropscovered, dir)?,
         "supdb-mergedropsrecords" => supdb_arm(Supdb::create_mergedropsrecords, dir)?,
@@ -17120,7 +16849,6 @@ pub fn open(arm: &str, dir: &Path, map_gb: usize) -> Res<Box<dyn Engine>> {
             },
             dir,
         )?,
-        "supdb-zsettleloose" => supdb_arm(Supdb::create_zsettleloose, dir)?,
         "supdb-ingestlatesync" => supdb_arm(Supdb::create_ingest_latesync, dir)?,
         "supdb-norecycle" => supdb_arm(Supdb::create_norecycle, dir)?,
         "supdb-ingestnorecycle" => supdb_arm(Supdb::create_ingest_norecycle, dir)?,
@@ -18490,26 +18218,6 @@ mod tests {
             guarantee("supdb-cipher")
         );
         drop(keep);
-        let beside = arm(
-            "supdb-cipherautorewarmbeside",
-            Supdb::create_cipherauto_rewarmbeside,
-        );
-        assert!(
-            under(&beside),
-            "supdb-cipherautorewarmbeside: under a cipher"
-        );
-        let b = o(&beside);
-        assert!(b.zpages_under_cipher, "supdb-cipherautorewarmbeside");
-        assert!(
-            !z.zpages_rewarm_beside_merges && b.zpages_rewarm_beside_merges,
-            "supdb-cipherautorewarmbeside rewarms beside merges in flight"
-        );
-        assert_eq!(b.zpages_rewarm_quiet_ms, z.zpages_rewarm_quiet_ms);
-        assert_eq!(
-            guarantee("supdb-cipherautorewarmbeside"),
-            guarantee("supdb-cipher")
-        );
-        drop(beside);
         let flat = arm(
             "supdb-cipherautoaheadflat",
             Supdb::create_cipherauto_aheadflat,
@@ -19731,20 +19439,6 @@ mod tests {
             }
             {
                 let z = Supdb::with_policy(
-                    &dir("zrewarminstall"),
-                    Policy {
-                        zrewarminstall: true,
-                        ..Policy::default()
-                    },
-                )
-                .unwrap();
-                assert_eq!(z.name(), "supdb-zrewarminstall");
-                assert_eq!(z.features(), base.features());
-                let o = z.db.as_ref().unwrap().options();
-                assert!(o.zpages_rewarm_at_install && !b.zpages_rewarm_at_install);
-            }
-            {
-                let z = Supdb::with_policy(
                     &dir("zhotresident"),
                     Policy {
                         zhotresident: true,
@@ -20084,44 +19778,11 @@ mod tests {
                 assert!(!o.zpages_hot_back_ask && b.zpages_hot_back_ask);
             }
             {
-                let z = Supdb::create_norewarm(&dir("norewarm")).unwrap();
-                assert_eq!(z.name(), "supdb-norewarm");
-                assert_eq!(z.features(), base.features());
-                let o = z.db.as_ref().unwrap().options();
-                assert!(!o.zpages_rewarm_scans && b.zpages_rewarm_scans);
-            }
-            {
                 let z = Supdb::create_rewarmtrim(&dir("rewarmtrim")).unwrap();
                 assert_eq!(z.name(), "supdb-rewarmtrim");
                 assert_eq!(z.features(), base.features());
                 let o = z.db.as_ref().unwrap().options();
                 assert!(o.zpages_rewarm_trims && !b.zpages_rewarm_trims);
-            }
-            {
-                let z = Supdb::create_norewarmraw(&dir("norewarmraw")).unwrap();
-                assert_eq!(z.name(), "supdb-norewarmraw");
-                assert_eq!(z.features(), base.features());
-                let o = z.db.as_ref().unwrap().options();
-                assert!(!o.zpages_rewarm_raw && b.zpages_rewarm_raw);
-                assert!(!o.zpages_rewarm_raw_scans && !b.zpages_rewarm_raw_scans);
-                let z = Supdb::create_rewarmrawnomap(&dir("rewarmrawnomap")).unwrap();
-                assert_eq!(z.name(), "supdb-rewarmrawnomap");
-                assert_eq!(z.features(), base.features());
-                let o = z.db.as_ref().unwrap().options();
-                assert!(
-                    o.zpages_rewarm_raw && !o.zpages_rewarm_raw_maps && b.zpages_rewarm_raw_maps
-                );
-                for (arm, on) in [("zrewarmturn", true), ("zrewarmtick", false)] {
-                    let z = if on {
-                        Supdb::create_zrewarmturn(&dir(arm)).unwrap()
-                    } else {
-                        Supdb::create_zrewarmtick(&dir(arm)).unwrap()
-                    };
-                    assert_eq!(z.name(), format!("supdb-{arm}"));
-                    assert_eq!(z.features(), base.features());
-                    let o = z.db.as_ref().unwrap().options();
-                    assert_eq!(o.zpages_rewarm_every_turn, on, "{arm}");
-                }
             }
             {
                 let z = Supdb::create_headsmodel(&dir("headsmodel")).unwrap();
@@ -20451,13 +20112,6 @@ mod tests {
                 assert!(!o.scan_cache_copies_fit && !o.merge_chains_writes_uncovered);
             }
             {
-                let z = Supdb::create_zrewarmrawscans(&dir("zrewarmrawscans")).unwrap();
-                assert_eq!(z.name(), "supdb-zrewarmrawscans");
-                assert_eq!(z.features(), base.features());
-                let o = z.db.as_ref().unwrap().options();
-                assert!(o.zpages_rewarm_raw && o.zpages_rewarm_raw_scans);
-            }
-            {
                 let z = Supdb::create_formsoffbuilt(&dir("formsoffbuilt")).unwrap();
                 assert_eq!(z.name(), "supdb-formsoffbuilt");
                 assert_eq!(z.features(), base.features());
@@ -20659,13 +20313,6 @@ mod tests {
                 assert!(o.wal_ahead_small_runs);
             }
             {
-                let z = Supdb::create_zsettleloose(&dir("zsettleloose")).unwrap();
-                assert_eq!(z.name(), "supdb-zsettleloose");
-                assert_eq!(z.features(), base.features());
-                let o = z.db.as_ref().unwrap().options();
-                assert!(!o.zpages_settle_joins_asks && b.zpages_settle_joins_asks);
-            }
-            {
                 let z = Supdb::create_sweepwalks(&dir("sweepwalks")).unwrap();
                 assert_eq!(z.name(), "supdb-sweepwalks");
                 assert_eq!(z.features(), base.features());
@@ -20686,22 +20333,6 @@ mod tests {
                 let o = z.db.as_ref().unwrap().options();
                 assert!(o.zpages_hot_skew_room && !b.zpages_hot_skew_room);
                 assert!(o.zpages_hot_room_margin_pct == 5 && b.zpages_hot_room_margin_pct == 0);
-            }
-            {
-                let z = Supdb::create_zrewarmwait(&dir("zrewarmwait")).unwrap();
-                assert_eq!(z.name(), "supdb-zrewarmwait");
-                assert_eq!(z.features(), base.features());
-                let o = z.db.as_ref().unwrap().options();
-                assert!(!o.zpages_rewarm_beside_merges && !b.zpages_rewarm_beside_merges);
-                assert!(o.zpages_rewarm_quiet_ms == 1000 && b.zpages_rewarm_quiet_ms == 250);
-            }
-            {
-                let z = Supdb::create_zrewarmbeside(&dir("zrewarmbeside")).unwrap();
-                assert_eq!(z.name(), "supdb-zrewarmbeside");
-                assert_eq!(z.features(), base.features());
-                let o = z.db.as_ref().unwrap().options();
-                assert!(o.zpages_rewarm_beside_merges && !b.zpages_rewarm_beside_merges);
-                assert!(o.zpages_rewarm_quiet_ms == b.zpages_rewarm_quiet_ms);
             }
             {
                 // The stride form's default, read as one tuple of the seven

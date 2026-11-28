@@ -6590,12 +6590,11 @@ pub(super) struct ZEvents {
     pub hot_back_asks: AtomicU64,
     pub hot_back_waited: AtomicU64,
     /// The form files asked for whole where scans came back after a
-    /// stretch without one (`Options::zpages_rewarm_scans`): the looks
+    /// stretch without one: the looks
     /// that asked, and the files.
     pub rewarms: AtomicU64,
     pub rewarm_files: AtomicU64,
-    /// A settle's waits for the form files the store asked the kernel for
-    /// (`Options::zpages_settle_joins_asks`): the waits, their looks at the
+    /// A settle's waits for the form files the store asked the kernel for: the waits, their looks at the
     /// files' residency, the asks made again, and their milliseconds.
     pub ask_joins: AtomicU64,
     pub ask_join_polls: AtomicU64,
@@ -6606,8 +6605,7 @@ pub(super) struct ZEvents {
     /// trims gave back.
     pub rewarm_trims: AtomicU64,
     pub rewarm_trim_bytes: AtomicU64,
-    /// The rewarms that asked for the raw form's files
-    /// (`Options::zpages_rewarm_raw`), the files asked, the bytes of them
+    /// The rewarms that asked for the raw form's files, the files asked, the bytes of them
     /// the page cache did not hold, and the files left for want of room.
     pub raw_rewarms: AtomicU64,
     pub raw_rewarm_files: AtomicU64,
@@ -9967,8 +9965,7 @@ pub struct ZInject {
     /// `u64::MAX` for none, which leaves the policy its fill line.
     pub slack: AtomicU64,
     /// Looks at the asked form files' residency that a settle's wait for
-    /// them reads as nothing resident yet
-    /// (`Options::zpages_settle_joins_asks`), counted down by the looks: a
+    /// them reads as nothing resident yet, counted down by the looks: a
     /// test's files are a mebibyte and resident before the first look, so
     /// the wait is held to waiting, and to giving up, through this.
     pub asked_holds: AtomicU64,

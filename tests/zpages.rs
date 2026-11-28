@@ -2044,7 +2044,7 @@ fn the_build_drops_the_raw_records_it_passed_when_asked_to_and_not_otherwise() {
 #[test]
 fn a_settle_asks_nothing_back_of_a_partition_its_build_has_in_flight() {
     // A build drops its partition's records behind it, and a settle's ask
-    // for the raw form's files (`Options::zpages_rewarm_raw`) passes over the
+    // for the raw form's files passes over the
     // partitions a form file serves; a partition whose build is in flight is
     // the build's, and the ask leaves its records where the drop left them.
     // Built: the build held before its rename, past its drop, with the room
@@ -2059,7 +2059,6 @@ fn a_settle_asks_nothing_back_of_a_partition_its_build_has_in_flight() {
         forced(|o| {
             o.zpages_drop_behind = true;
             o.zpages_drop_raw = false;
-            o.zpages_rewarm_raw = true;
             o.zpages_inject = Some(inject.clone());
         }),
     )
@@ -10893,15 +10892,13 @@ fn builds_ahead_at_landing_start_past_the_percent_and_only_from_resident_records
 }
 
 /// A settle waits for the form files the store has asked the kernel for
-/// and asks again for the ones the kernel left out
-/// (`Options::zpages_settle_joins_asks`): a store built ahead under its
+/// and asks again for the ones the kernel left out: a store built ahead under its
 /// budget and then taken past the selector's line, whose crossing drops the
 /// records and asks the files back behind the call. An ask the kernel did
 /// not answer is made by putting the files out of the page cache once the
 /// crossing's ask has brought them: the settle finds them out, asks again
 /// where its looks stall, and returns with them in, by the kernel's own
-/// count; with the option off the settle looks at nothing and the files
-/// stay out. And the wait's bound, through the seam that holds its looks
+/// count. And the wait's bound, through the seam that holds its looks
 /// (`ZInject::hold_asked`): with every look reading nothing resident it
 /// asks again as often as it may and gives up at the looks a stall is after
 /// the last. A settle before any ask and a settle after the wait look at
@@ -10913,13 +10910,11 @@ fn a_settle_waits_for_the_form_files_the_store_asked_for() {
     enum Case {
         Evicted,
         Held,
-        Off,
     }
-    for case in [Case::Evicted, Case::Held, Case::Off] {
+    for case in [Case::Evicted, Case::Held] {
         let what = format!("settle joins asks, {case:?}");
         let (dir, mut db, model, inject, raw) =
             land_store_with(&format!("auto-join-asks-{case:?}"), 50, |o| {
-                o.zpages_settle_joins_asks = case != Case::Off;
                 // The swap at the crossing before any buy, as the
                 // crossing's own test has it.
                 o.zpages_cover_resident = false;
@@ -10991,27 +10986,14 @@ fn a_settle_waits_for_the_form_files_the_store_asked_for() {
                     "{what}: the asks again and the stall's looks: {c:?}"
                 );
             }
-            Case::Off => {
-                assert_eq!(
-                    (c.ask_joins, c.ask_join_polls, c.ask_join_reasks),
-                    (0, 0, 0),
-                    "{what}: a wait with the option off: {c:?}"
-                );
-                assert!(
-                    resident * 4 < size,
-                    "{what}: the files came back with nothing asking: {resident} of {size}"
-                );
-            }
         }
-        if case != Case::Off {
-            // Once an ask: the next settle finds nothing pending.
-            db.settle().unwrap();
-            assert_eq!(
-                db.zpage_counts().ask_joins,
-                1,
-                "{what}: a second wait for one ask"
-            );
-        }
+        // Once an ask: the next settle finds nothing pending.
+        db.settle().unwrap();
+        assert_eq!(
+            db.zpage_counts().ask_joins,
+            1,
+            "{what}: a second wait for one ask"
+        );
         let keys: Vec<Vec<u8>> = model.keys().cloned().collect();
         let some: Vec<Vec<u8>> = keys.iter().step_by(97).cloned().collect();
         let r = db.reader().unwrap();
@@ -13350,12 +13332,11 @@ fn the_controller_serves_the_hottest_partition_raw_within_the_budget() {
 
 /// Out of core with the form installed, the scans that come back after a
 /// stretch without one have the form files the page cache has lost asked
-/// for whole (`Options::zpages_rewarm_scans`): every form file dropped from
+/// for whole: every form file dropped from
 /// the cache, a second and a half of the injected clock with no scan, then
 /// a scan of one entry, and the look after it asks for each file under the
 /// share resident and the files come back; a scan with no quiet stretch
-/// before it asks for nothing again. Without the option nothing is asked
-/// and the files stay out. The scan that brings the look is of one entry,
+/// before it asks for nothing again. The scan that brings the look is of one entry,
 /// so that the scan's own faults are not what brings the files back, and
 /// the writer's, since a handle counts its scans once a commit. With
 /// `Options::zpages_rewarm_trims` the rewarm trims the allocator before it
@@ -13363,20 +13344,15 @@ fn the_controller_serves_the_hottest_partition_raw_within_the_budget() {
 #[cfg(target_os = "linux")]
 #[test]
 fn scans_after_a_quiet_stretch_have_the_cold_form_files_asked_for() {
-    for (on, trims) in [(true, true), (true, false), (false, true)] {
-        let what = format!("rewarm {on} trims {trims}");
+    for trims in [true, false] {
+        let what = format!("rewarm trims {trims}");
         let (dir, db, model, inject) = auto_store_with(
-            &format!("auto-rewarm-{on}-{trims}"),
+            &format!("auto-rewarm-true-{trims}"),
             1 << 20,
             1_000_000.0,
             FAULT_1MS,
             |o| {
-                o.zpages_rewarm_scans = on;
                 o.zpages_rewarm_trims = trims;
-                // The raw form's files asked for too, with room for them:
-                // a partition its form file serves has none to ask for.
-                o.zpages_rewarm_raw = true;
-                o.zpages_rewarm_raw_scans = true;
                 o.zpages_hot_raw = false;
                 o.zpages_memo = false;
                 o.partition_bytes = Some(400 << 10);
@@ -13421,46 +13397,30 @@ fn scans_after_a_quiet_stretch_have_the_cold_form_files_asked_for() {
         advance_tick(&db, std::time::Duration::from_millis(200));
         advance_tick(&db, std::time::Duration::from_millis(200));
         let c = db.zpage_counts();
-        if on {
-            assert_eq!(c.rewarms, 1, "{what}: one rewarm: {c:?}");
-            assert!(
-                c.rewarm_files + 1 >= n,
-                "{what}: every cold file asked for: {c:?}"
-            );
-            assert_eq!(
-                (c.raw_rewarm_files, c.raw_rewarm_short),
-                (0, 0),
-                "{what}: no raw file of a partition its form serves: {c:?}"
-            );
-        } else {
-            assert_eq!((c.rewarms, c.rewarm_files), (0, 0), "{what}: {c:?}");
-        }
-        // The asks land in the cache; without them the files stay out.
+        assert_eq!(c.rewarms, 1, "{what}: one rewarm: {c:?}");
+        assert!(
+            c.rewarm_files + 1 >= n,
+            "{what}: every cold file asked for: {c:?}"
+        );
+        // The asks land in the cache.
         let t = std::time::Instant::now();
         let mut warm = resident_under(&dir, "zpg-").1;
-        while on && warm * 10 < size * 9 && t.elapsed().as_secs() < 30 {
+        while warm * 10 < size * 9 && t.elapsed().as_secs() < 30 {
             std::thread::sleep(std::time::Duration::from_millis(20));
             warm = resident_under(&dir, "zpg-").1;
         }
-        if on {
-            assert!(
-                warm * 10 >= size * 9,
-                "{what}: the form files back in the cache: {warm} of {size}"
-            );
-            // The trim runs on the rewarm's thread before its asks, so the
-            // files back in the cache are past it.
-            assert_eq!(
-                db.zpage_counts().rewarm_trims,
-                u64::from(trims),
-                "{what}: the trim before the asks: {:?}",
-                db.zpage_counts()
-            );
-        } else {
-            assert!(
-                warm * 2 < size,
-                "{what}: the form files left out: {warm} of {size}"
-            );
-        }
+        assert!(
+            warm * 10 >= size * 9,
+            "{what}: the form files back in the cache: {warm} of {size}"
+        );
+        // The trim runs on the rewarm's thread before its asks, so the
+        // files back in the cache are past it.
+        assert_eq!(
+            db.zpage_counts().rewarm_trims,
+            u64::from(trims),
+            "{what}: the trim before the asks: {:?}",
+            db.zpage_counts()
+        );
         // A scan with no quiet stretch before it asks for nothing more, the
         // files out of the cache again so that there would be something to
         // ask for.
@@ -13479,13 +13439,13 @@ fn scans_after_a_quiet_stretch_have_the_cold_form_files_asked_for() {
         advance_tick(&db, std::time::Duration::from_millis(200));
         assert_eq!(
             db.zpage_counts().rewarms,
-            u64::from(on),
+            1,
             "{what}: no rewarm without the quiet: {:?}",
             db.zpage_counts()
         );
         assert_eq!(
             db.zpage_counts().rewarm_trims,
-            u64::from(on && trims),
+            u64::from(trims),
             "{what}: a trim a rewarm: {:?}",
             db.zpage_counts()
         );
@@ -13514,7 +13474,7 @@ fn scans_after_a_quiet_stretch_have_the_cold_form_files_asked_for() {
         advance_tick(&db, std::time::Duration::from_millis(200));
         assert_eq!(
             db.zpage_counts().rewarms,
-            u64::from(on),
+            1,
             "{what}: no rewarm over files in the cache: {:?}",
             db.zpage_counts()
         );
@@ -13549,12 +13509,10 @@ fn raw_resident(dir: &Path) -> (u64, u64) {
     (ps + os, pr + or)
 }
 
-/// A settle that asked for the raw form's files maps what came back
-/// (`Options::zpages_rewarm_raw_maps`). Every partition and ordered index
-/// is put out of the cache and out of the store's page tables; the settle
-/// asks for them and waits, and with the option the partitions' record
-/// regions are mapped when it returns, where without it they are resident
-/// and unmapped, each first touch a fault. With no room in the group
+/// A settle that asked for the raw form's files maps what came back.
+/// Every partition and ordered index is put out of the cache and out of
+/// the store's page tables; the settle asks for them and waits, and the
+/// partitions' record regions are mapped when it returns. With no room in the group
 /// nothing is asked, and nothing is mapped: the mapping reads no region
 /// the ask left out. And a region the scans have faulted in is mapped
 /// either way, which is what the count is of.
@@ -13571,24 +13529,20 @@ fn a_settle_maps_the_raw_files_it_asked_back() {
         Indexes,
         None,
     }
-    for (maps, room) in [
-        (true, Room::All),
-        (true, Room::AllLate),
-        (false, Room::All),
-        (true, Room::Half),
-        (true, Room::Indexes),
-        (true, Room::None),
+    for room in [
+        Room::All,
+        Room::AllLate,
+        Room::Half,
+        Room::Indexes,
+        Room::None,
     ] {
-        let what = format!("raw maps {maps} room {room:?}");
+        let what = format!("raw maps room {room:?}");
         let (dir, db, model, inject) = auto_store_with(
-            &format!("auto-rawmaps-{maps}-{room:?}"),
+            &format!("auto-rawmaps-true-{room:?}"),
             1 << 30,
             0.0,
             FAULT_1MS,
             |o| {
-                o.zpages_rewarm_raw = true;
-                o.zpages_rewarm_raw_scans = false;
-                o.zpages_rewarm_raw_maps = maps;
                 o.zpages_hot_raw = false;
                 o.partition_bytes = Some(400 << 10);
             },
@@ -13626,8 +13580,8 @@ fn a_settle_maps_the_raw_files_it_asked_back() {
         let c = db.zpage_counts();
         let (recs, ord) = db.raw_mapped_share().unwrap();
         let warm = raw_resident(&dir).1;
-        match (maps, room) {
-            (true, Room::All | Room::AllLate) => {
+        match room {
+            Room::All | Room::AllLate => {
                 assert!(c.raw_settles == 1 && c.raw_maps > 0, "{what}: {c:?}");
                 assert!(
                     warm * 10 >= size * 9 && recs >= 0.9 && ord >= 0.9,
@@ -13635,15 +13589,7 @@ fn a_settle_maps_the_raw_files_it_asked_back() {
                      records {recs:.2} and indexes {ord:.2} mapped"
                 );
             }
-            (false, _) => {
-                assert!(c.raw_settles == 1 && c.raw_maps == 0, "{what}: {c:?}");
-                assert!(
-                    warm * 10 >= size * 9 && recs < 0.1 && ord < 0.1,
-                    "{what}: the files back and nothing of them mapped: {warm} of {size} \
-                     resident, records {recs:.2} and indexes {ord:.2} mapped"
-                );
-            }
-            (true, Room::Half) => {
+            Room::Half => {
                 // The ordered indexes are asked first and all come back;
                 // the room ends among the partitions, and a partition the
                 // ask left out is neither read nor mapped.
@@ -13657,7 +13603,7 @@ fn a_settle_maps_the_raw_files_it_asked_back() {
                      {size} resident, records {recs:.2} and indexes {ord:.2} mapped"
                 );
             }
-            (true, Room::Indexes) => {
+            Room::Indexes => {
                 assert!(
                     c.raw_settles == 1 && c.raw_maps > 0 && c.raw_rewarm_short > 0,
                     "{what}: {c:?}"
@@ -13668,7 +13614,7 @@ fn a_settle_maps_the_raw_files_it_asked_back() {
                      the ask left out: records {recs:.2} and indexes {ord:.2} mapped"
                 );
             }
-            (true, Room::None) => {
+            Room::None => {
                 assert!(c.raw_settles == 0 && c.raw_maps == 0, "{what}: {c:?}");
                 assert!(
                     warm * 10 < size && recs < 0.1 && ord < 0.1,
@@ -13690,39 +13636,25 @@ fn a_settle_maps_the_raw_files_it_asked_back() {
 }
 
 /// With the raw form serving -- the store in core, no form installed --
-/// the scans that come back after a stretch without one have the raw files
-/// the page cache has lost asked for (`Options::zpages_rewarm_raw`): every
-/// partition and ordered index out of the cache, a second and a half of the
-/// injected clock with no scan, then a scan of one entry, and the look
-/// after it asks for each file and the files come back; a scan with no
-/// quiet stretch before it asks for nothing again; a settle asks for them
-/// and returns with them back. Those asks where the scans come back are
-/// `Options::zpages_rewarm_raw_scans`'s: with the settle's option alone the
-/// scans ask nothing and the settle brings the files back. Without either
-/// nothing is asked and the files stay out. With no room in the group
-/// (`ZInject::set_slack`, the group's unused memory less the margin) the
-/// look asks for nothing and counts every file short of the line short,
-/// since an ask beyond the room takes one of the store's pages for
-/// another's. The scan that brings the look is of one entry, so that its
-/// own faults are not what brings the files back.
+/// the scans that come back after a stretch without one ask for none of
+/// the raw files the page cache has lost, and a settle asks for them and
+/// returns with them back: every partition and ordered index out of the
+/// cache, a second and a half of the injected clock with no scan, then a
+/// scan of one entry, which asks nothing, then a settle. The scan that
+/// brings the look is of one entry, so that its own faults are not what
+/// brings the files back.
 #[cfg(target_os = "linux")]
 #[test]
-fn scans_after_a_quiet_stretch_have_the_cold_raw_files_asked_for() {
-    for (on, scans, room) in [
-        (true, true, 1u64 << 30),
-        (false, false, 1 << 30),
-        (true, true, 0),
-        (true, false, 1 << 30),
-    ] {
-        let what = format!("raw rewarm {on} at scans {scans} room {room}");
+fn a_settle_asks_for_the_cold_raw_files_and_the_scans_after_a_quiet_stretch_do_not() {
+    {
+        let room = 1u64 << 30;
+        let what = format!("raw rewarm room {room}");
         let (dir, db, model, inject) = auto_store_with(
-            &format!("auto-rawrewarm-{on}-{scans}-{room}"),
+            &format!("auto-rawrewarm-true-false-{room}"),
             1 << 30,
             0.0,
             FAULT_1MS,
             |o| {
-                o.zpages_rewarm_raw = on;
-                o.zpages_rewarm_raw_scans = scans;
                 o.zpages_hot_raw = false;
                 o.partition_bytes = Some(400 << 10);
             },
@@ -13741,21 +13673,6 @@ fn scans_after_a_quiet_stretch_have_the_cold_raw_files_asked_for() {
             size > 0 && cold * 10 < size,
             "{what}: the raw files out of the cache: {cold} of {size}"
         );
-        // One ordered index read back whole: a file the cache holds is not
-        // asked for, nor counted short.
-        let raw_files: Vec<PathBuf> = common::store_paths(&dir)
-            .into_iter()
-            .filter(|p| {
-                let n = p.file_name().unwrap().to_string_lossy().into_owned();
-                (n.starts_with("par-") || n.starts_with("ord-")) && common::store_len(p) > 0
-            })
-            .collect();
-        let warm_one = raw_files
-            .iter()
-            .find(|p| p.file_name().unwrap().to_string_lossy().starts_with("ord-"))
-            .unwrap();
-        let _ = common::store_file(warm_one);
-        let cold_files = raw_files.len() as u64 - 1;
         // A stretch with no scan, then a scan of one entry.
         for _ in 0..5 {
             advance_tick(&db, std::time::Duration::from_millis(300));
@@ -13765,59 +13682,18 @@ fn scans_after_a_quiet_stretch_have_the_cold_raw_files_asked_for() {
         assert_eq!(one, 1, "{what}: the scan");
         advance_tick(&db, std::time::Duration::from_millis(200));
         advance_tick(&db, std::time::Duration::from_millis(200));
-        // The asks are made and counted on the rewarm's own thread.
-        let t = std::time::Instant::now();
-        let done = |c: &supdb::db::ZCounts| c.raw_rewarm_files + c.raw_rewarm_short > 0;
-        while on && scans && !done(&db.zpage_counts()) && t.elapsed().as_secs() < 30 {
-            std::thread::sleep(std::time::Duration::from_millis(5));
-        }
+        // The scans ask for nothing of the raw form's files.
         let c = db.zpage_counts();
-        match (on && scans, room > 0) {
-            (true, true) => {
-                assert_eq!(c.raw_rewarms, 1, "{what}: one raw rewarm: {c:?}");
-                assert_eq!(
-                    c.raw_rewarm_files, cold_files,
-                    "{what}: every cold partition and index asked for, and the warm one not: {c:?}"
-                );
-                assert!(c.raw_rewarm_bytes > 0, "{what}: {c:?}");
-                assert_eq!(c.raw_rewarm_short, 0, "{what}: {c:?}");
-            }
-            (true, false) => {
-                assert_eq!(
-                    (c.raw_rewarms, c.raw_rewarm_files),
-                    (0, 0),
-                    "{what}: nothing asked beyond the room: {c:?}"
-                );
-                assert_eq!(
-                    c.raw_rewarm_short, cold_files,
-                    "{what}: every cold file short, and the warm one not: {c:?}"
-                );
-            }
-            (false, _) => assert_eq!(
-                (c.raw_rewarms, c.raw_rewarm_files, c.raw_rewarm_short),
-                (0, 0, 0),
-                "{what}: {c:?}"
-            ),
-        }
-        // The asks land in the cache; without them the files stay out.
-        let asked = on && scans && room > 0;
-        let t = std::time::Instant::now();
-        let mut warm = raw_resident(&dir).1;
-        while asked && warm * 10 < size * 9 && t.elapsed().as_secs() < 30 {
-            std::thread::sleep(std::time::Duration::from_millis(20));
-            warm = raw_resident(&dir).1;
-        }
-        if asked {
-            assert!(
-                warm * 10 >= size * 9,
-                "{what}: the raw files back in the cache: {warm} of {size}"
-            );
-        } else {
-            assert!(
-                warm * 2 < size,
-                "{what}: the raw files left out: {warm} of {size}"
-            );
-        }
+        assert_eq!(
+            (c.raw_rewarms, c.raw_rewarm_files, c.raw_rewarm_short),
+            (0, 0, 0),
+            "{what}: {c:?}"
+        );
+        let warm = raw_resident(&dir).1;
+        assert!(
+            warm * 2 < size,
+            "{what}: the raw files left out: {warm} of {size}"
+        );
         // A scan with no quiet stretch before it asks for nothing more, the
         // files out of the cache again so that there would be something to
         // ask for.
@@ -13843,19 +13719,11 @@ fn scans_after_a_quiet_stretch_have_the_cold_raw_files_asked_for() {
         db.settle().unwrap();
         let c = db.zpage_counts();
         let warm = raw_resident(&dir).1;
-        if on && room > 0 {
-            assert_eq!(c.raw_settles, 1, "{what}: the settle's asks: {c:?}");
-            assert!(
-                warm * 10 >= size * 9,
-                "{what}: the raw files back as the settle returns: {warm} of {size}"
-            );
-        } else {
-            assert_eq!(c.raw_settles, 0, "{what}: no settle's asks: {c:?}");
-            assert!(
-                warm * 2 < size,
-                "{what}: the raw files left out by the settle: {warm} of {size}"
-            );
-        }
+        assert_eq!(c.raw_settles, 1, "{what}: the settle's asks: {c:?}");
+        assert!(
+            warm * 10 >= size * 9,
+            "{what}: the raw files back as the settle returns: {warm} of {size}"
+        );
         let r = db.reader().unwrap();
         check(&r, &model, &keys, &format!("{what}: after"));
         drop(r);
@@ -13864,25 +13732,23 @@ fn scans_after_a_quiet_stretch_have_the_cold_raw_files_asked_for() {
     }
 }
 
-/// Under a cipher a settle's asks for the raw form's files
-/// (`Options::zpages_rewarm_raw`) are asks for their envelopes: the store's
+/// Under a cipher a settle's asks for the raw form's files are asks for
+/// their envelopes: the store's
 /// files are read through its cache from the kernel's cache of the
 /// ciphertext, which is what a first read waits on the device for, so the
 /// asks go through the mapping each file is read by and reach the envelope
 /// behind it. A store reopened with every envelope out of the page cache
 /// and room in the group has them asked for and back as the settle
-/// returns, with nothing decrypted for the asking; with no room every one
-/// is counted short and left; and without the option nothing is asked. An
+/// returns, with nothing decrypted for the asking; and with no room every
+/// one is counted short and left. An
 /// ask made of the bytes a paged mapping lends unasked measured files of
 /// none and asked for nothing.
 ///
-/// And what the ask brought back is mapped
-/// (`Options::zpages_rewarm_raw_maps`), which under a cipher is the
+/// And what the ask brought back is mapped, which under a cipher is the
 /// ciphertext a fill reads its chunk through: the envelopes' pages for the
 /// record regions and the ordered indexes are in this process's page
-/// tables as the settle returns, where without the option they are
-/// resident and no more mapped than the open left them, and where nothing
-/// was asked nothing is mapped. A map made of the bytes a paged mapping
+/// tables as the settle returns, and where nothing was asked nothing is
+/// mapped. A map made of the bytes a paged mapping
 /// lends unasked would have mapped none either; it decrypts nothing.
 ///
 /// And the first envelope asked coming in late (`ZInject::ask_first_late`)
@@ -13893,22 +13759,14 @@ fn scans_after_a_quiet_stretch_have_the_cold_raw_files_asked_for() {
 #[cfg(target_os = "linux")]
 #[test]
 fn a_settles_raw_rewarm_under_a_cipher_asks_for_the_envelopes_and_decrypts_nothing() {
-    for (on, room, maps, late) in [
-        (true, 1u64 << 30, true, false),
-        (true, 1 << 30, true, true),
-        (true, 1 << 30, false, false),
-        (true, 0, true, false),
-        (false, 1 << 30, true, false),
-    ] {
-        let what = format!("raw rewarm under a cipher {on} room {room} maps {maps} late {late}");
-        let dir = scratch(&format!("rawrewarm-cipher-{on}-{room}-{maps}-{late}"));
+    for (room, late) in [(1u64 << 30, false), (1 << 30, true), (0, false)] {
+        let what = format!("raw rewarm under a cipher room {room} late {late}");
+        let dir = scratch(&format!("rawrewarm-cipher-true-{room}-true-{late}"));
         let inject = std::sync::Arc::new(supdb::ZInject::new());
         inject.set_budget(1 << 30);
         inject.set_slack(room);
         let opts = || Options {
             zpages_inject: Some(inject.clone()),
-            zpages_rewarm_raw: on,
-            zpages_rewarm_raw_maps: maps,
             partition_bytes: Some(400 << 10),
             encryption: supdb::Encryption::Cipher(supdb::StoreCipher::new(
                 common::Gcm::new(&[0x5c; 32]),
@@ -13964,8 +13822,8 @@ fn a_settles_raw_rewarm_under_a_cipher_asks_for_the_envelopes_and_decrypts_nothi
         let c = db.zpage_counts();
         let (_, warm) = resident_under(&dir, "x-");
         let (recs, ord) = db.raw_mapped_share().unwrap();
-        match (on, room > 0) {
-            (true, true) => {
+        match room > 0 {
+            true => {
                 assert_eq!(c.raw_settles, 1, "{what}: the settle's asks: {c:?}");
                 assert!(
                     c.raw_rewarm_files >= 4 && c.raw_rewarm_bytes * 2 > size,
@@ -13976,21 +13834,13 @@ fn a_settles_raw_rewarm_under_a_cipher_asks_for_the_envelopes_and_decrypts_nothi
                     warm * 10 >= size * 8,
                     "{what}: the envelopes back as the settle returns: {warm} of {size}"
                 );
-                if maps {
-                    assert!(c.raw_maps > 0, "{what}: the settle mapped: {c:?}");
-                    assert!(
-                        recs >= 0.9 && ord >= 0.9,
-                        "{what}: what came back is mapped: records {recs:.2}, indexes {ord:.2}"
-                    );
-                } else {
-                    assert_eq!(c.raw_maps, 0, "{what}: {c:?}");
-                    assert!(
-                        recs <= recs0 + 0.05,
-                        "{what}: back and no more of it mapped: records {recs0:.2} -> {recs:.2}"
-                    );
-                }
+                assert!(c.raw_maps > 0, "{what}: the settle mapped: {c:?}");
+                assert!(
+                    recs >= 0.9 && ord >= 0.9,
+                    "{what}: what came back is mapped: records {recs:.2}, indexes {ord:.2}"
+                );
             }
-            (true, false) => {
+            false => {
                 assert_eq!(
                     (c.raw_settles, c.raw_rewarm_files, c.raw_maps),
                     (0, 0, 0),
@@ -14004,22 +13854,6 @@ fn a_settles_raw_rewarm_under_a_cipher_asks_for_the_envelopes_and_decrypts_nothi
                     warm * 2 < size && recs <= recs0 + 0.05,
                     "{what}: the envelopes left out and unmapped: {warm} of {size}, \
                      records {recs0:.2} -> {recs:.2}"
-                );
-            }
-            (false, _) => {
-                assert_eq!(
-                    (
-                        c.raw_settles,
-                        c.raw_rewarm_files,
-                        c.raw_rewarm_short,
-                        c.raw_maps
-                    ),
-                    (0, 0, 0, 0),
-                    "{what}: {c:?}"
-                );
-                assert!(
-                    warm * 2 < size,
-                    "{what}: the envelopes left out: {warm} of {size}"
                 );
             }
         }
@@ -14037,30 +13871,23 @@ fn a_settles_raw_rewarm_under_a_cipher_asks_for_the_envelopes_and_decrypts_nothi
     }
 }
 
-/// The rewarm's two gates, each held to firing: a rewarm due while a merge
-/// is in flight is made at once for the cold form files of the partitions
-/// the merge does not hold (`Options::zpages_rewarm_beside_merges`), and
-/// waits for the merge's landing without the option; and a stretch of
-/// 300 ms of the injected clock with no scan makes one due at a quiet of a
-/// quarter second (`Options::zpages_rewarm_quiet_ms`, as shipped) and not
-/// at a second, which a stretch of 1.6 s does. The merge rewrites the first
-/// partition and is held in flight; every form file is out of the cache
-/// when the scans come back, so a rewarm beside it asks for every file but
-/// that partition's.
+/// A rewarm due while a merge is in flight waits for the merge's landing,
+/// and is made at the look after it: a stretch of 300 ms of the injected
+/// clock with no scan makes one due at the quarter second the quiet is,
+/// and the merge, which rewrites the first partition, is held in flight;
+/// every form file is out of the cache when the scans come back.
 #[cfg(target_os = "linux")]
 #[test]
-fn a_rewarm_is_made_beside_a_merge_in_flight_after_a_quarter_second() {
+fn a_rewarm_due_beside_a_merge_in_flight_waits_for_its_landing() {
     let ms = std::time::Duration::from_millis;
-    for (beside, quiet_ms) in [(true, 250u32), (false, 250), (true, 1000), (false, 1000)] {
-        let what = format!("rewarm beside {beside} quiet {quiet_ms}");
+    {
+        let what = "rewarm beside false quiet 250".to_string();
         let (dir, mut db, mut model, inject) = auto_store_with(
-            &format!("auto-rewarm-beside-{beside}-{quiet_ms}"),
+            "auto-rewarm-beside-false-250",
             1 << 20,
             1_000_000.0,
             FAULT_1MS,
             |o| {
-                o.zpages_rewarm_beside_merges = beside;
-                o.zpages_rewarm_quiet_ms = quiet_ms;
                 o.zpages_hot_raw = false;
                 o.zpages_memo = false;
                 o.partition_bytes = Some(400 << 10);
@@ -14116,7 +13943,7 @@ fn a_rewarm_is_made_beside_a_merge_in_flight_after_a_quarter_second() {
             unmap_pages(&p);
             evict(&p);
         }
-        let (r0, f0) = (db.zpage_counts().rewarms, db.zpage_counts().rewarm_files);
+        let r0 = db.zpage_counts().rewarms;
         // 300 ms with no scan, then a scan.
         advance_tick(&db, ms(200));
         advance_tick(&db, ms(200));
@@ -14124,40 +13951,16 @@ fn a_rewarm_is_made_beside_a_merge_in_flight_after_a_quarter_second() {
         advance_tick(&db, ms(100));
         advance_tick(&db, ms(100));
         let c = db.zpage_counts();
-        let quick = quiet_ms <= 300;
-        if quick && beside {
-            assert_eq!(
-                c.rewarms - r0,
-                1,
-                "{what}: a rewarm beside the merge: {c:?}"
-            );
-            let asked = c.rewarm_files - f0;
-            assert!(
-                asked + 2 >= n && asked < n,
-                "{what}: every cold file but the merge's, of {n}: {c:?}"
-            );
-        } else {
-            assert_eq!(c.rewarms, r0, "{what}: no rewarm yet: {c:?}");
-        }
-        // 1.6 s with no scan, then a scan: due under either quiet, made
-        // beside the merge where the option says so.
+        assert_eq!(c.rewarms, r0, "{what}: no rewarm yet: {c:?}");
+        // 1.6 s with no scan, then a scan: still none beside the merge.
         for _ in 0..8 {
             advance_tick(&db, ms(200));
         }
         db.scan(b"", 1, kv(&mut |_, _| one += 1)).unwrap();
         advance_tick(&db, ms(100));
         advance_tick(&db, ms(100));
-        // A rewarm made at the quarter second may be followed by one for
-        // files its asks had not brought in by this look.
         let c = db.zpage_counts();
-        if beside {
-            assert!(
-                c.rewarms - r0 >= 1,
-                "{what}: beside the merge after a second: {c:?}"
-            );
-        } else {
-            assert_eq!(c.rewarms, r0, "{what}: waiting for the merge: {c:?}");
-        }
+        assert_eq!(c.rewarms, r0, "{what}: waiting for the merge: {c:?}");
         assert!(db.merges_in_flight() >= 1, "{what}: the merge still held");
         // The merge lands; a rewarm waiting for it is made at the next look.
         db.hold_merge_landing(false);
@@ -14165,15 +13968,11 @@ fn a_rewarm_is_made_beside_a_merge_in_flight_after_a_quarter_second() {
         advance_tick(&db, ms(100));
         advance_tick(&db, ms(100));
         let c = db.zpage_counts();
-        if beside {
-            assert!(c.rewarms - r0 >= 1, "{what}: {c:?}");
-        } else {
-            assert_eq!(
-                c.rewarms - r0,
-                1,
-                "{what}: the rewarm made at the merge's landing: {c:?}"
-            );
-        }
+        assert_eq!(
+            c.rewarms - r0,
+            1,
+            "{what}: the rewarm made at the merge's landing: {c:?}"
+        );
         check(&r, &model, &keys, &format!("{what}: after"));
         drop(release);
         drop(r);

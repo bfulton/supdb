@@ -523,8 +523,6 @@ inputs beside the store's cache (`StoreCipher::merges_beside_cache`), and
 `supdb-cipherautodropskeep` the same with a drop of a file's pages leaving
 the plaintext it covers in the store's cache
 (`StoreCipher::drops_keep_plaintext`), the shape before, and
-`supdb-cipherautorewarmbeside` the same with its rewarm made beside the
-merges in flight (`Options::zpages_rewarm_beside_merges`), and
 `supdb-cipherautoaheadflat` the same with its merges asking ahead in one
 window for every input and over their records alone
 (`Options::merge_ahead_shares` off), the shape before. And three kept
@@ -977,9 +975,7 @@ key's partition placed at the state's publish
 `supdb-zhotresident` is `supdb` with the hot-raw fill asking for the
 partitions the reads have not skewed by how much of their records the cache
 holds, most first (`Options::zpages_hot_fill_resident_first`);
-`supdb-zrewarminstall` is `supdb` with the controller's install making a
-rewarm due, so the form files short of resident are asked for at once
-(`Options::zpages_rewarm_at_install`); `supdb-zhotfillquiet` is `supdb` with
+`supdb-zhotfillquiet` is `supdb` with
 the hot-raw fill's quiet looks taking the growth share into their room
 (`Options::zpages_hot_fill_quiet`);
 `supdb-zpromote` is `supdb`
