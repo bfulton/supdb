@@ -3759,32 +3759,9 @@ pub struct Options {
     /// supdb-ingestwidewalks 300000 --reps 12`), once a patch stopped
     /// summing the copy's every run (`CachedBlock::dead`) and a walk
     /// stopped asking for the whole of it ahead. Off walks the block wide
-    /// for as long as it is (`supdb-widewalks`).
-    pub forms_copy_hot_wide: bool,
-    /// A hot wide block's copy bought when its walks have paid for it, the
-    /// rent and the price both counted in the merge they run, in place of
-    /// `WIDE_COPY_PER_WALK`'s fixed ratio of a walk to a hundred copied
-    /// keys (`Options::forms_copy_hot_wide`). The rent is the keys the
-    /// block's walks merged, a window of a scan each; the price is the
-    /// entries the copy will merge, every source's run over the block and
-    /// the block's records. The block is copied at the walk where the
-    /// rent the walks before it paid reaches the price -- a buyer who knew
-    /// how many walks were to come would have paid at least half of that.
-    /// The one assumption is that a walk merges a key for about what a
-    /// copy merges an entry for, and over the scrambled E's tail at a
-    /// hundred and three hundred thousand keys a walk took 6.2-7.7 us for
-    /// its 48-50 keys, about 140 ns a key, and the copy 110-230 ns an
-    /// entry. The fixed ratio was the suite's -- a walk of a window of
-    /// fifty, its E's scan -- and bought at a third of the copy's price.
-    /// Paired against it in the row's order at a hundred and three hundred
-    /// thousand keys in both orders, the scrambled E's copy came at the
-    /// 37th walk and the 102nd where the ratio's came at the 18th and the
-    /// 51st, about 0.3% of the mix by the walks' count, and the mix read
-    /// 0.95-1.07x over the four sittings with the unscrambled E, which
-    /// walks nothing wide, leaning as far. Off, `supdb-widecopyfixed` and
-    /// `supdb-ingestwidecopyfixed`.
+    /// for as long as it is.
     #[doc(hidden)]
-    pub forms_copy_wide_priced: bool,
+    pub forms_copy_hot_wide: bool,
     /// PROTOTYPE: the partitions' blocks below which no builder starts.
     /// Measured on the probe's E, six rounds interleaved, the builder
     /// against none: at ten thousand keys, 160 blocks, 310k-351k against
@@ -6359,38 +6336,6 @@ pub struct Options {
     /// rebuilt every block. On by default; `supdb-norebase` is the carry
     /// that drops them, and `docs/engine.md` has the figures.
     pub forms_rebase: bool,
-    /// A copy's entry is found by rank when the copy's entries are the
-    /// block's records and nothing else -- the copy of a block whose
-    /// unsealed keys are all updates, which is every copy after a burst
-    /// of them: a scan over it starts at the rank the partition's seek
-    /// found, and a settle patches the entry at the rank the resolve
-    /// found, instead of searching the copy for the key again. The
-    /// search was six dependent misses into two cold buffers that the
-    /// rank already settled, on every scan's first block and on every
-    /// patch. `supdb-copysearch` and `supdb-ingestcopysearch` are the
-    /// second search; `docs/engine.md` has the figures.
-    pub copy_start_at_rank: bool,
-    /// EXPERIMENT: a copy walked from the rank the seek found
-    /// (`copy_start_at_rank`, an identity copy) is prefetched from that
-    /// entry -- the first lines of its entries, keys and values from
-    /// there, eight lines -- and not whole, the fifty-six lines of its
-    /// three buffers that the search over them wanted, which such a walk
-    /// never makes. In ycsb-E at ten million keys every copy start was at
-    /// its rank (`start_at_rank` 102,500, `start_search` 0) and the
-    /// prefetch instructions were a sixth of the thread's samples in
-    /// core, the stall of issuing a hundred lines a scan; the walk streams
-    /// its three buffers from the start entry on, which the hardware's
-    /// prefetcher follows. A copy the walk searches, and the sparse and
-    /// clean forms, are prefetched as before. Refuted: paired in core at
-    /// ten million keys (`bench ab --arms supdb,supdb-leancopyprefetch
-    /// --size 10000000 --bound 8589934592 --passes load,mixes --ops-div 10
-    /// --reps 2`), E read 0.96x with the lean prefetch in both reps, so the
-    /// fifty-six lines are not the stall's cost but the walk's fills moved
-    /// ahead of it, the three buffers being cold for the hardware's
-    /// prefetcher at every block; the row's shape read E 1.05x with it
-    /// beside point-read mixes, which it never touches, at 0.84x, a sitting
-    /// that resolves nothing. Off; `supdb-leancopyprefetch` is the arm.
-    pub copy_prefetch_from_start: bool,
     /// EXPERIMENT: a copy's prefetch asks for the lines its walk reads and
     /// no others: the entries from the one the walk starts at, as many as
     /// the scan still wants, and the keys and the first kilobyte of values
@@ -6398,8 +6343,8 @@ pub struct Options {
     /// entry is loaded to place them (`CachedBlock::prefetch_span`). The
     /// whole prefetch asks for every entry and key of the block and the
     /// first kilobyte of its values, wherever the walk starts: a scan of
-    /// fifty that starts at a copy's fortieth entry by rank
-    /// (`copy_start_at_rank`) was asked for thirty-two lines of entries
+    /// fifty that starts at a copy's fortieth entry by rank was asked for
+    /// thirty-two lines of entries
     /// and keys of which it reads twelve, and for the values of the
     /// block's first ten entries, none of which it reads, while the value
     /// it reads first was left to a miss; and the block it walks into
@@ -6407,17 +6352,6 @@ pub struct Options {
     /// entries. A copy the walk searches is asked for whole as before.
     /// Off; `supdb-copyspan` and `supdb-ingestcopyspan` are the arms.
     pub copy_prefetch_span: bool,
-    /// EXPERIMENT: the prefetch of the copy block a copy walk reaches next
-    /// paced through the walk -- four lines of each of its three buffers
-    /// every sixteen entries, the whole of it by the forty-eighth
-    /// (`Pace`) -- instead of one burst at the block's start. Built on the
-    /// profile's reading that the burst's forty-eight prefetches outrun
-    /// the core's fill buffers and stall for the lines they wait on, 8.7%
-    /// of E's thread at ten million keys under 1.25 GiB on the prefetch
-    /// instructions themselves; paired in the row's shape the paced walk
-    /// read E 0.90x in both reps, so the burst is the shape and the pace
-    /// the arm, `supdb-pacedprefetch` (`docs/engine.md`). Off.
-    pub scan_prefetch_paced: bool,
     /// A piece's keys are ranked against their partition over the ordered
     /// index's heads, galloping from the rank the key before reached, as
     /// the settle resolves a batch -- instead of over the partition's
@@ -6903,16 +6837,6 @@ pub struct Options {
     /// million keys under 1.25 GiB, 3% of its thread (`docs/engine.md`).
     /// Off is the walk at every end; `supdb-sweepwalks` is the arm.
     pub sweep_remembers_pin: bool,
-    /// EXPERIMENT: a copy block's prefetch ahead of its walk asks for the
-    /// whole of its values (`CachedBlock::prefetch`) and not their first
-    /// kilobyte, the rest left to the hardware's prefetcher: the walk's
-    /// copies of the values out of the block were a fifth of E's thread at
-    /// ten million keys under 1.25 GiB, on lines the stream had not
-    /// brought. Paired in the row's shape it read E 0.95x in one sitting
-    /// and 1.23x in the next, the scan pass 0.95x and 0.89x, with the
-    /// releases falling differently in each: unresolved, so the kilobyte is
-    /// the default and `supdb-copyprefetchwhole` is the arm.
-    pub copy_prefetch_whole: bool,
     /// How many of a settle's keys ahead the header of the block form a
     /// key will be patched into is asked for, before the form's buffers
     /// are, one group ahead (0: the buffers alone, as it was). The patch
@@ -6952,8 +6876,8 @@ pub struct Options {
     /// copy's entries, its keys and the first kilobyte of its values,
     /// forty-eight lines -- which is what a search over the copy reads. A
     /// patch whose cut is the key's own record in a copy whose entries are
-    /// the block's records (`CachedBlock::identity`,
-    /// `Options::copy_start_at_rank`) searches nothing: it reads the one
+    /// the block's records (`CachedBlock::identity`) searches nothing: it
+    /// reads the one
     /// entry at the rank and writes the run that entry names, three lines,
     /// two of them past the first kilobyte for five records in six and so
     /// never asked for. Over a full rewrite under the syncing pace every
@@ -8143,7 +8067,6 @@ impl Default for Options {
             forms_convert_light_writer: false,
             forms_convert_light_yields: false,
             forms_copy_hot_wide: true,
-            forms_copy_wide_priced: true,
             scan_cache_ahead_min_blocks: 1024,
             ahead_out_of_core: true,
             ahead_resident_pct: 90,
@@ -8295,10 +8218,7 @@ impl Default for Options {
             forms_carry: true,
             freeze_settles: false,
             forms_rebase: true,
-            copy_start_at_rank: true,
-            copy_prefetch_from_start: false,
             copy_prefetch_span: false,
-            scan_prefetch_paced: false,
             piece_ranks_by_heads: true,
             forms_to_writer: false,
             form_dense_from: 0,
@@ -8328,7 +8248,6 @@ impl Default for Options {
             zpages_hot_fill_resident_first: false,
             zpages_seek_seeds: false,
             sweep_remembers_pin: true,
-            copy_prefetch_whole: false,
             settle_form_ahead: 6,
             settle_seek_ahead: 8,
             settle_patch_at_cut: true,
@@ -24710,7 +24629,7 @@ struct CachedBlock {
     /// names, entry `i` the block's record `lo + i` for every `i`: the
     /// copy was built over updates alone and no insert has been spliced
     /// in since, so a walk's start and a patch's entry are a rank less the
-    /// block's first (`Options::copy_start_at_rank`). An insert clears it
+    /// block's first. An insert clears it
     /// for good; a delete leaves the entry, with an empty run, so it
     /// holds. A walk's start takes the entry by its rank only where the
     /// claim is of the partition in hand (`CachedBlock::identity_for`); a
@@ -25097,7 +25016,7 @@ impl CachedBlock {
     /// and the lower bound over its entries is six dependent misses into
     /// two of them; issued together they cost one, and the values stream
     /// behind the walk once its first lines are in.
-    fn prefetch(&self, whole: bool) {
+    fn prefetch(&self) {
         // A copy kept past the wide bound holds thousands of entries, and a
         // walk into it from the block before starts at its first: its
         // first lines, where the whole of its entries and keys was a few
@@ -25107,31 +25026,22 @@ impl CachedBlock {
             return;
         }
         // One stream: as many lines of it as the three buffers' asks came
-        // to, from its first, and the whole of it where the values' whole
-        // is asked for.
+        // to, from its first.
         if self.fixed.is_some() {
-            let n = if whole {
-                self.vals.len()
-            } else {
-                self.vals.len().min(48 * 64)
-            };
-            prefetch_lines(self.vals.as_ptr(), n);
+            prefetch_lines(self.vals.as_ptr(), self.vals.len().min(48 * 64));
             return;
         }
         prefetch_lines(self.ents.as_ptr() as *const u8, self.ents.len() * 16);
         prefetch_lines(self.keys.as_ptr(), self.keys.len());
-        // The whole of the values (`Options::copy_prefetch_whole`), or
-        // their first kilobyte with the rest the hardware's.
-        let vals = if whole {
-            self.vals.len()
-        } else {
-            self.vals.len().min(1024)
-        };
-        prefetch_lines(self.vals.as_ptr(), vals);
+        // The values' first kilobyte, the rest the hardware's: the whole of
+        // them asked for read E 0.95x in one sitting and 1.23x in the next
+        // at ten million keys under 1.25 GiB, and the scan pass 0.95x and
+        // 0.89x.
+        prefetch_lines(self.vals.as_ptr(), self.vals.len().min(1024));
     }
     /// The first lines of the three buffers from entry `i`, ahead of a walk
-    /// that starts there and streams on (`Options::copy_prefetch_from_start`):
-    /// two lines of entries, two of keys and four of values.
+    /// that starts there and streams on: two lines of entries, two of keys
+    /// and four of values.
     fn prefetch_from(&self, i: usize) {
         if let Some((k, v)) = self.fixed {
             let at = (i * (k + v) as usize).min(self.vals.len());
@@ -25314,9 +25224,9 @@ fn wide_mut(slot: &mut Option<std::sync::Arc<Cached>>) -> Option<&mut Cached> {
     }
 }
 
-fn prefetch_form(form: &Cached, whole: bool) {
+fn prefetch_form(form: &Cached) {
     match form {
-        Cached::Block(blk) => blk.prefetch(whole),
+        Cached::Block(blk) => blk.prefetch(),
         Cached::Sparse(sb) => sb.prefetch(),
         Cached::Clean | Cached::Wide(_) => {}
     }
@@ -25408,70 +25318,10 @@ fn copy_entry_at(table: &BlockTable, b: u32, cut: u32) -> Option<(&CachedBlock, 
     (blk.identity_for(table.keyseq) && j < blk.len()).then_some((blk, j))
 }
 
-/// The prefetch of a copy block paced through the walk of the block before
-/// it (`Options::scan_prefetch_paced`): its three buffers, each asked for
-/// `PACE_BYTES` at a step, a step every `PACE_STEP` entries of the walk,
-/// and the rest at the walk's end. The pointers are the next block's
-/// buffers', which nothing moves while the block before it is walked.
-struct Pace {
-    spans: [(*const u8, usize); 3],
-    at: usize,
-}
-
 /// What a walk asks for of a packed copy from the entry it starts at
 /// (`CachedBlock::prefetch_span`): a kilobyte and a half, a dozen records
 /// of the suite's shape, behind which the stream runs on its own.
 const PACKED_ASK: usize = 1536;
-
-/// Four lines of each buffer a step.
-const PACE_BYTES: usize = 256;
-/// Entries of the walk between steps: a block's sixty-four entries take
-/// four steps, the last with sixteen entries of lead.
-const PACE_STEP: usize = 16;
-
-impl Pace {
-    fn of(blk: &CachedBlock) -> Pace {
-        if blk.fixed.is_some() {
-            return Pace {
-                spans: [
-                    (blk.vals.as_ptr(), blk.vals.len().min(48 * 64)),
-                    (std::ptr::null(), 0),
-                    (std::ptr::null(), 0),
-                ],
-                at: 0,
-            };
-        }
-        Pace {
-            spans: [
-                (blk.ents.as_ptr() as *const u8, blk.ents.len() * 16),
-                (blk.keys.as_ptr(), blk.keys.len()),
-                (blk.vals.as_ptr(), blk.vals.len().min(1024)),
-            ],
-            at: 0,
-        }
-    }
-
-    fn done(&self) -> bool {
-        self.spans.iter().all(|&(_, n)| self.at >= n)
-    }
-
-    fn step(&mut self) {
-        for &(p, n) in &self.spans {
-            if self.at < n {
-                // SAFETY: a prefetch is a hint that faults on no address,
-                // and `[at, at + len)` lies inside the buffer `p` names.
-                prefetch_lines(unsafe { p.add(self.at) }, PACE_BYTES.min(n - self.at));
-            }
-        }
-        self.at += PACE_BYTES;
-    }
-
-    fn finish(&mut self) {
-        while !self.done() {
-            self.step();
-        }
-    }
-}
 
 /// How far into the partition's records a walk's prefetch reaches, in
 /// bytes from the walk's first record: the lines are asked for at once,
@@ -25492,14 +25342,12 @@ const SCAN_PREFETCH_BYTES: usize = 4096;
 /// time at ten thousand keys; at three hundred thousand keys, where the
 /// store is past the cache, the lag passes read 0.80-0.93x and E 0.97x
 /// without them.
-#[allow(clippy::too_many_arguments)]
 fn prefetch_block(
     blob: Option<&Blob<MmapBytes>>,
     form: &Cached,
     at: Option<usize>,
     from: usize,
     n: usize,
-    whole: bool,
     copy_span: Option<bool>,
     packed_at: Option<(usize, bool)>,
 ) {
@@ -25512,11 +25360,6 @@ fn prefetch_block(
         blob.prefetch_ranks_est(from, n, SCAN_PREFETCH_BYTES);
     };
     match form {
-        // An identity copy walked from the entry `at` names is prefetched
-        // from there (`Options::copy_prefetch_from_start`), a claim of the
-        // partition before a rewrite too, whose entries a rewrite of
-        // updates alone leaves where they were; a copy the walk will
-        // search, whole.
         // By span (`Options::copy_prefetch_span`) where the walk takes
         // its entry without a search: by rank in an identity copy, or at
         // the block's first where it walks in from the block before
@@ -25527,14 +25370,13 @@ fn prefetch_block(
         // lines the walk reads first are the whole of the ask.
         Cached::Block(blk) if blk.fixed.is_some() => match packed_at {
             Some((i, by_rank)) if blk.identity || !by_rank => blk.prefetch_span(i, n),
-            _ => blk.prefetch(whole),
+            _ => blk.prefetch(),
         },
         Cached::Block(blk) => match (at, copy_span) {
             (Some(i), Some(enters)) if (blk.identity || enters) && !blk.wide => {
                 blk.prefetch_span(i, n)
             }
-            (Some(i), None) if blk.identity => blk.prefetch_from(i),
-            _ => blk.prefetch(whole),
+            _ => blk.prefetch(),
         },
         Cached::Sparse(sb) => {
             sb.prefetch();
@@ -25586,20 +25428,13 @@ struct WideBlock {
     covered: bool,
     walks: u32,
     /// The keys the walks so far merged: the rent a copy is weighed
-    /// against (`Options::forms_copy_wide_priced`).
+    /// against (`Reader::wide_copy_pays`).
     rent_keys: u64,
 }
 
 /// PROTOTYPE: keys above the partition, as `overlay_count` counts them,
 /// past which a block is walked as a merge instead of built.
 const WIDE: usize = 4 * CACHE_BLOCK;
-
-/// The overlay keys a copy of a block wide by its count builds for each
-/// walk the block has had before it is built (`Options::forms_copy_hot_wide`):
-/// a wide walk merges a window of a scan's length from every source, about
-/// what a copy's build pays for a hundred of its keys, so a block of `n`
-/// keys is copied at its `2 + n / WIDE_COPY_PER_WALK`th walk.
-const WIDE_COPY_PER_WALK: usize = 100;
 
 /// PROTOTYPE: a sparse block's keys above the partition, resolved once:
 /// each key's bytes, where it cuts the walk, and its values as (source,
@@ -25652,8 +25487,7 @@ impl SparseBlock {
     /// inserts at the key's cut, where a search by key read a key out of
     /// the second buffer at every probe: six dependent misses into two
     /// buffers a patch, over a burst whose every write patches a sparse
-    /// form before the thread has slack to convert one
-    /// (`Options::copy_start_at_rank`).
+    /// form before the thread has slack to convert one.
     fn find_at_cut(&self, cut: u32, same: bool, key: &[u8]) -> (usize, bool) {
         let i = self.ents.partition_point(|e| (e.cut, e.same) < (cut, same));
         if same {
@@ -28826,7 +28660,7 @@ struct FormsState {
     /// empty or not: one a scan's start on the block path.
     dir_prefetches: std::cell::Cell<u64>,
     /// Scans that started a copy walk at the seek's rank, and that
-    /// searched the copy (`Options::copy_start_at_rank`).
+    /// searched the copy.
     copy_starts: Counts<2>,
     /// The settle's patches of a copy by how each found its entry: at the
     /// key's rank, and by a search of the copy (`Db::copy_patches`).
@@ -28840,9 +28674,6 @@ struct FormsState {
     /// Scans that started in a block scans keep starting in, and scans
     /// that started on a copy with no seek (`Options::promote_starts`).
     hot_starts: Counts<2>,
-    /// Copy walks that paced the next block's prefetch through themselves
-    /// (`Options::scan_prefetch_paced`).
-    prefetch_paces: std::cell::Cell<u64>,
     /// Scans whose first block was a copy walked from the start key with
     /// the rank never sought (`Options::zpages_seek_span`).
     span_starts: std::cell::Cell<u64>,
@@ -29043,7 +28874,6 @@ impl FormsState {
             copy_packs: Counts::new(),
             seek_seeds: std::cell::Cell::new(0),
             hot_starts: Counts::new(),
-            prefetch_paces: std::cell::Cell::new(0),
             span_starts: std::cell::Cell::new(0),
             start_cache: std::cell::RefCell::new(StartCache::new()),
             lazy_cuts: Counts::new(),
@@ -40338,10 +40168,10 @@ impl Reader {
         let mut rebuild = false;
         let mut ahead: Option<(u32, u32, bool)> = None;
         let far = self.opts.settle_form_ahead;
-        let at_cut = self.opts.settle_patch_at_cut && self.opts.copy_start_at_rank;
+        let at_cut = self.opts.settle_patch_at_cut;
         let tfar = self.opts.settle_table_ahead;
         let value_ahead = CHUNK_HDR + self.opts.settle_value_ahead;
-        let in_place = self.opts.settle_patch_in_place && self.opts.copy_start_at_rank;
+        let in_place = self.opts.settle_patch_in_place;
         let converts = self.opts.settle_converts && self.opts.convert_from_form;
         let mut placed = 0u64;
         let mut asked = 0u64;
@@ -40486,7 +40316,7 @@ impl Reader {
                     if let Some(form) = table.slots.get(b2 as usize).and_then(|s| s.as_deref()) {
                         let by_cut = exact && matches!(form, Cached::Block(blk) if blk.identity);
                         if !by_cut {
-                            prefetch_form(form, self.opts.copy_prefetch_whole);
+                            prefetch_form(form);
                         }
                     }
                 }
@@ -41032,7 +40862,7 @@ impl Reader {
                 // copy's keys, six dependent misses into two cold buffers
                 // a patch, was a tenth of the upkeep thread's time over a
                 // burst of updates, repeating what the resolve had
-                // answered (`Options::copy_start_at_rank`).
+                // answered.
                 //
                 // A copy carried across a rewrite of its partition over
                 // the same blocks claims the partition before it
@@ -41044,8 +40874,7 @@ impl Reader {
                 // so the one compare proves it for this patch and the
                 // search is for where it does not.
                 let lo = b * CACHE_BLOCK;
-                let at_rank = self.opts.copy_start_at_rank
-                    && blk.identity
+                let at_rank = blk.identity
                     && same
                     && c >= lo
                     && c - lo < blk.len()
@@ -41157,7 +40986,7 @@ impl Reader {
             Cached::Sparse(sb) => {
                 // By the cut the resolve found, not by the key: see
                 // `SparseBlock::find_at_cut`.
-                let (i, found) = if self.opts.copy_start_at_rank {
+                let (i, found) = {
                     let at = sb.find_at_cut(c as u32, same, key);
                     debug_assert_eq!(
                         at,
@@ -41174,14 +41003,6 @@ impl Reader {
                         "a sparse form's entry by cut disagrees with its search by key"
                     );
                     at
-                } else {
-                    let i = sb
-                        .ents
-                        .partition_point(|e| key_cmp(sb.key(e), key) == Ordering::Less);
-                    (
-                        i,
-                        i < sb.ents.len() && key_cmp(sb.key(&sb.ents[i]), key) == Ordering::Equal,
-                    )
                 };
                 // Room for the dense count at once where a buffer is full:
                 // grown by doubling from the two or three deltas a build
@@ -41503,13 +41324,19 @@ impl Reader {
 
     /// Whether a hot wide block's walks have paid for its copy, at the walk
     /// `w.walks` counts (`Options::forms_copy_hot_wide`): the keys its
-    /// earlier walks merged against the `entries` the copy will merge
-    /// (`Options::forms_copy_wide_priced`); off, the fixed ratio of a walk
-    /// to a hundred copied keys over the largest source's run.
-    fn wide_copy_pays(&self, w: &WideBlock, n_over: usize, entries: usize) -> bool {
-        if !self.opts.forms_copy_wide_priced {
-            return w.walks as usize >= 2 + n_over / WIDE_COPY_PER_WALK;
-        }
+    /// earlier walks merged against the `entries` the copy will merge,
+    /// every source's run over the block and the block's records. The block
+    /// is copied at the walk where the rent the walks before it paid reaches
+    /// the price -- a buyer who knew how many walks were to come would have
+    /// paid at least half of that -- on the one assumption that a walk
+    /// merges a key for about what a copy merges an entry for: over the
+    /// scrambled E's tail at a hundred and three hundred thousand keys a
+    /// walk took about 140 ns a key and the copy 110-230 ns an entry. A
+    /// fixed ratio of a walk to a hundred copied keys, the suite's walk of
+    /// fifty, bought at a third of the copy's price; paired against it the
+    /// scrambled E read 0.95-1.07x over four sittings with the unscrambled E,
+    /// which walks nothing wide, leaning as far.
+    fn wide_copy_pays(&self, w: &WideBlock, entries: usize) -> bool {
         w.walks >= 2 && w.rent_keys >= entries as u64
     }
 
@@ -41927,14 +41754,9 @@ impl Reader {
                 let mut wide_rent: Option<u64> = None;
                 let hot_wide = self.opts.forms_copy_hot_wide
                     && matches!(table.slots[b].as_deref(), Some(Cached::Wide(w)) if !w.covered);
-                let n_over = if hot_wide {
-                    BuildCtx::overlay_count(table, b)
-                } else {
-                    0
-                };
                 // The copy's merge: every source's run over the block and
                 // the block's records.
-                let entries = if hot_wide && self.opts.forms_copy_wide_priced {
+                let entries = if hot_wide {
                     BuildCtx::overlay_sum(table, b) + ((b + 1) * CACHE_BLOCK).min(keys)
                         - b * CACHE_BLOCK
                 } else {
@@ -41943,7 +41765,7 @@ impl Reader {
                 if let (None, Some(Cached::Wide(w))) = (canon, wide_mut(&mut table.slots[b])) {
                     w.walks = w.walks.saturating_add(1);
                     recopy = w.covered && w.walks >= 2;
-                    if hot_wide && self.wide_copy_pays(w, n_over, entries) {
+                    if hot_wide && self.wide_copy_pays(w, entries) {
                         recopy = true;
                         wide_copy = true;
                     }
@@ -42090,11 +41912,8 @@ impl Reader {
                 };
                 // The entry a copy's walk starts at, where the walk takes
                 // it by rank: this block's start less its first rank.
-                let copy_at = ((self.opts.copy_prefetch_from_start
-                    || self.opts.copy_prefetch_span)
-                    && self.opts.copy_start_at_rank
-                    && rank != usize::MAX)
-                    .then(|| start - lo);
+                let copy_at =
+                    (self.opts.copy_prefetch_span && rank != usize::MAX).then(|| start - lo);
                 let copy_span = self.opts.copy_prefetch_span;
                 // The entry a packed copy's walk starts at: the first of a
                 // block after the scan's first, and in the first the
@@ -42103,9 +41922,8 @@ impl Reader {
                 let packed_at = if !first {
                     Some((0, false))
                 } else {
-                    (self.opts.copy_start_at_rank && rank != usize::MAX).then(|| (start - lo, true))
+                    (rank != usize::MAX).then(|| (start - lo, true))
                 };
-                let mut pace: Option<Pace> = None;
                 if !fetched {
                     prefetch_block(
                         self.zc(seg).is_none().then(|| seg.raw()),
@@ -42113,7 +41931,6 @@ impl Reader {
                         copy_at,
                         start,
                         ahead,
-                        self.opts.copy_prefetch_whole,
                         // A block after the scan's first is walked from
                         // its first entry, whatever its copy holds.
                         copy_span.then_some(!first),
@@ -42131,23 +41948,19 @@ impl Reader {
                         None => table.slots[b + 1].as_deref(),
                     };
                     if let Some(next) = next {
-                        // A copy after a copy: paced through the walk below
-                        // (`Options::scan_prefetch_paced`); else the burst.
-                        match (self.opts.scan_prefetch_paced, form, next) {
-                            (true, Cached::Block(_), Cached::Block(nb)) => {
-                                pace = Some(Pace::of(nb))
-                            }
-                            _ => prefetch_block(
-                                self.zc(seg).is_none().then(|| seg.raw()),
-                                next,
-                                copy_at.map(|_| 0),
-                                hi,
-                                ahead - (hi - start),
-                                self.opts.copy_prefetch_whole,
-                                copy_span.then_some(true),
-                                Some((0, false)),
-                            ),
-                        }
+                        // In one burst at the block's start: paced through
+                        // the walk of the block before, four lines of each
+                        // buffer every sixteen entries, it read E 0.90x at
+                        // ten million keys under 1.25 GiB in both reps.
+                        prefetch_block(
+                            self.zc(seg).is_none().then(|| seg.raw()),
+                            next,
+                            copy_at.map(|_| 0),
+                            hi,
+                            ahead - (hi - start),
+                            copy_span.then_some(true),
+                            Some((0, false)),
+                        );
                         fetched = true;
                     }
                 }
@@ -42263,9 +42076,7 @@ impl Reader {
                         // entries are the block's records; the cursor is
                         // above record `start - 1` and not above `start`,
                         // so no entry between them is skipped.
-                        let at_rank = self.opts.copy_start_at_rank
-                            && blk.identity_for(src.seg.keyseq)
-                            && rank != usize::MAX;
+                        let at_rank = blk.identity_for(src.seg.keyseq) && rank != usize::MAX;
                         let i = if !first {
                             0
                         } else if at_rank {
@@ -42291,44 +42102,28 @@ impl Reader {
                             // entry to decode and no length to read.
                             let (kl, stride) = (kl as usize, (kl + vl) as usize);
                             let recs = blk.vals[i * stride..].chunks_exact(stride);
-                            for (n, r) in recs.enumerate() {
+                            for r in recs {
                                 if seen >= limit {
                                     break;
-                                }
-                                if let Some(p) = pace.as_mut() {
-                                    if n.is_multiple_of(PACE_STEP) {
-                                        p.step();
-                                    }
                                 }
                                 f(&r[..kl], &r[kl..]);
                                 seen += 1;
                             }
                         } else {
-                            for (n, e) in blk.ents[i..].iter().enumerate() {
+                            for e in &blk.ents[i..] {
                                 if seen >= limit {
                                     break;
-                                }
-                                if let Some(p) = pace.as_mut() {
-                                    if n.is_multiple_of(PACE_STEP) {
-                                        p.step();
-                                    }
                                 }
                                 let k = blk.key(e);
                                 blk.each_value(e, |v| f(k, v));
                                 seen += 1;
                             }
                         }
-                        if pace.is_some() {
-                            let fs = self.fs();
-                            fs.prefetch_paces.set(fs.prefetch_paces.get() + 1);
-                        }
                     }
                     Cached::Wide(w) => {
                         // A hot wide block's walk pays the keys it merged
-                        // toward the copy (`Options::forms_copy_wide_priced`).
-                        let priced = self.opts.forms_copy_hot_wide
-                            && self.opts.forms_copy_wide_priced
-                            && !w.covered;
+                        // toward the copy (`Reader::wide_copy_pays`).
+                        let priced = self.opts.forms_copy_hot_wide && !w.covered;
                         let window = (from_key, limit - seen);
                         let ov = ctx.overlay_window(src, table, b, unsealed, w, window)?;
                         let merged = ov.over.len() as u64;
@@ -42346,11 +42141,6 @@ impl Reader {
                     if let (None, Some(Cached::Wide(w))) = (canon, wide_mut(&mut table.slots[b])) {
                         w.rent_keys = w.rent_keys.saturating_add(merged);
                     }
-                }
-                // The rest of the next block's prefetch, where the walk was
-                // shorter than its pace or took another shape.
-                if let Some(mut p) = pace.take() {
-                    p.finish();
                 }
                 // A light sparse form's walk credits the block with what it
                 // took, and the walk that takes it past the line has the
@@ -50875,7 +50665,7 @@ impl Db {
     }
 
     /// The writer's own copy walks by how they started: at the seek's
-    /// rank, and by searching the copy (`Options::copy_start_at_rank`).
+    /// rank, and by searching the copy.
     pub fn copy_starts(&self) -> [u64; 2] {
         self.take_back_upkeep();
         self.r.fs().copy_starts.get()
@@ -50884,7 +50674,7 @@ impl Db {
     /// The writer's own settles' patches of a copy by how each found its
     /// entry: at the key's rank, where the copy's entries are its
     /// partition's records, and by a search of the copy
-    /// (`Options::copy_start_at_rank`, `Options::identity_by_keys`).
+    /// (`Options::identity_by_keys`).
     pub fn copy_patches(&self) -> [u64; 2] {
         self.take_back_upkeep();
         self.r.fs().copy_patches.get()
@@ -50930,13 +50720,6 @@ impl Db {
             .readers
             .block_walks
             .load(AtomicOrdering::Relaxed)
-    }
-
-    /// The writer's copy walks that paced the next block's prefetch
-    /// through themselves (`Options::scan_prefetch_paced`).
-    pub fn prefetch_paces(&self) -> u64 {
-        self.take_back_upkeep();
-        self.r.fs().prefetch_paces.get()
     }
 
     /// The writer's settles over the store's life: settles run, keys
@@ -58064,7 +57847,7 @@ impl<'s> BuildCtx<'s> {
             || !added[b].is_empty()
     }
     /// Every source's run over block `b`, summed: the entries a copy's
-    /// merge reads (`Options::forms_copy_wide_priced`).
+    /// merge reads (`Reader::wide_copy_pays`).
     fn overlay_sum(table: &BlockTable, b: usize) -> usize {
         let snap = table
             .snap_at

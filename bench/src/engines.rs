@@ -1294,10 +1294,6 @@ pub struct Supdb {
     /// The segment work driven inline by the writer, as before
     /// `Options::publish_in_background`. `supdb-inlinemaint`.
     inlinemaint: bool,
-    /// A scan and a settle search a copy for their key, as before
-    /// `Options::copy_start_at_rank`. `supdb-copysearch`, and
-    /// `supdb-ingestcopysearch` buffered.
-    copysearch: bool,
     /// A dense sparse form converted by a build from the sources, as
     /// before `Options::convert_from_form`. `supdb-convertsources`, and
     /// `supdb-ingestconvertsources` buffered.
@@ -1399,9 +1395,6 @@ pub struct Supdb {
     /// end a pin holds it, the shape before the sweep remembered the pin
     /// (`Options::sweep_remembers_pin` off): `supdb-sweepwalks`.
     sweepwalks: bool,
-    /// A copy block's prefetch asking for the whole of its values
-    /// (`Options::copy_prefetch_whole` on): `supdb-copyprefetchwhole`.
-    copyprefetchwhole: bool,
     /// The hot-raw policy's skew bar relaxed to the median where the
     /// candidate fits the room (`Options::zpages_hot_skew_room` on):
     /// `supdb-zhotskewroom`.
@@ -1470,14 +1463,6 @@ pub struct Supdb {
     /// before light forms converted (`Options::forms_convert_from`):
     /// `supdb-convert16` and `supdb-ingestconvert16`.
     convert16: bool,
-    /// A block wide by its count walked wide for as long as it is
-    /// (`Options::forms_copy_hot_wide` off): `supdb-widewalks` and
-    /// `supdb-ingestwidewalks`.
-    widewalks: bool,
-    /// A hot wide block copied at the walk the fixed ratio of a walk to a
-    /// hundred copied keys names (`Options::forms_copy_wide_priced` off):
-    /// `supdb-widecopyfixed` and `supdb-ingestwidecopyfixed`.
-    widecopyfixed: bool,
     /// A syncing commit's paced batch held within the share or the batch,
     /// the larger (`Options::upkeep_pace_syncs_model` and
     /// `upkeep_pace_syncs_to_share` off): `supdb-pacesyncsbatch`.
@@ -1532,12 +1517,6 @@ pub struct Supdb {
     /// a covered partition read through one cursor
     /// (`Options::zpages_scan_cursor` off): `supdb-blockcursors`.
     blockcursors: bool,
-    /// A copy prefetched from the entry its walk starts at and not whole
-    /// (`Options::copy_prefetch_from_start`): `supdb-leancopyprefetch`.
-    leancopyprefetch: bool,
-    /// The next copy block's prefetch paced through the walk before it
-    /// (`Options::scan_prefetch_paced` on): `supdb-pacedprefetch`.
-    pacedprefetch: bool,
     /// The fill yielding its conversions at any posted commit
     /// (`Options::forms_convert_behind` zero), the shape before it
     /// converted in the thread's slack. `supdb-postedyield`, and
@@ -2873,10 +2852,6 @@ struct Policy {
     /// The segment work driven inline by the writer, as before
     /// `Options::publish_in_background`. `supdb-inlinemaint`.
     inlinemaint: bool,
-    /// A scan and a settle search a copy for their key, as before
-    /// `Options::copy_start_at_rank`. `supdb-copysearch`, and
-    /// `supdb-ingestcopysearch` buffered.
-    copysearch: bool,
     /// A dense sparse form converted by a build from the sources, as
     /// before `Options::convert_from_form`. `supdb-convertsources`, and
     /// `supdb-ingestconvertsources` buffered.
@@ -2966,8 +2941,6 @@ struct Policy {
     zhotcoldback: bool,
     /// The reader table walked at every end: `supdb-sweepwalks`.
     sweepwalks: bool,
-    /// The values prefetched whole: `supdb-copyprefetchwhole`.
-    copyprefetchwhole: bool,
     /// The skew bar relaxed where the room fits: `supdb-zhotskewroom`.
     zhotskewroom: bool,
     /// The room's bar under a margin: `supdb-zhotskewroomhyst`.
@@ -3007,10 +2980,6 @@ struct Policy {
     densefrom: usize,
     /// Conversions at the dense count alone: `...convert16`.
     convert16: bool,
-    /// A hot wide block walked wide: `...widewalks`.
-    widewalks: bool,
-    /// A hot wide block copied by the fixed ratio: `...widecopyfixed`.
-    widecopyfixed: bool,
     /// Syncing batches held within the batch: `supdb-pacesyncsbatch`.
     pacesyncsbatch: bool,
     /// The syncing pace by cut-offs: `supdb-pacesyncsthresholds`.
@@ -3035,10 +3004,6 @@ struct Policy {
     norunbuilds: bool,
     /// A cursor a block: `supdb-blockcursors`.
     blockcursors: bool,
-    /// A copy prefetched from its start entry: `supdb-leancopyprefetch`.
-    leancopyprefetch: bool,
-    /// The next block's prefetch paced through the walk: `supdb-pacedprefetch`.
-    pacedprefetch: bool,
     /// The fill yielding at any posted commit: `supdb-postedyield`, and
     /// `supdb-ingestpostedyield` buffered.
     postedyield: bool,
@@ -3501,7 +3466,6 @@ impl Default for Policy {
             piecesonly: false,
             latewb: false,
             inlinemaint: false,
-            copysearch: false,
             convertsources: false,
             copyslack: false,
             drainpromote: false,
@@ -3671,7 +3635,6 @@ impl Default for Policy {
             zrecorddefault: false,
             zhotcoldback: false,
             sweepwalks: false,
-            copyprefetchwhole: false,
             zhotskewroom: false,
             zhotskewroomhyst: false,
             zrewarmwait: false,
@@ -3691,8 +3654,6 @@ impl Default for Policy {
             settlesources: false,
             densefrom: 0,
             convert16: false,
-            widewalks: false,
-            widecopyfixed: false,
             pacesyncsbatch: false,
             pacesyncsthresholds: false,
             probestwice: false,
@@ -3705,8 +3666,6 @@ impl Default for Policy {
             znogroupahead: false,
             norunbuilds: false,
             blockcursors: false,
-            leancopyprefetch: false,
-            pacedprefetch: false,
             postedyield: false,
             behindyield: false,
             bg: false,
@@ -4873,18 +4832,6 @@ impl Supdb {
         )
     }
 
-    /// `supdb` whose copy blocks' prefetch asks for the whole of the
-    /// values (`Options::copy_prefetch_whole` on).
-    pub fn create_copyprefetchwhole(path: &Path) -> Res<Supdb> {
-        Supdb::with_policy(
-            path,
-            Policy {
-                copyprefetchwhole: true,
-                ..Policy::default()
-            },
-        )
-    }
-
     /// `supdb` whose hot-raw policy relaxes its skew bar to the median
     /// where the candidate fits the room (`Options::zpages_hot_skew_room`
     /// on).
@@ -5685,32 +5632,6 @@ impl Supdb {
         )
     }
 
-    /// `supdb` whose identity copies are prefetched from the entry the
-    /// walk starts at, eight lines, and not whole
-    /// (`Options::copy_prefetch_from_start`).
-    pub fn create_leancopyprefetch(path: &Path) -> Res<Supdb> {
-        Supdb::with_policy(
-            path,
-            Policy {
-                leancopyprefetch: true,
-                ..Policy::default()
-            },
-        )
-    }
-
-    /// `supdb` whose copy walks pace the next copy block's prefetch through
-    /// themselves (`Options::scan_prefetch_paced` on), against the burst at
-    /// a block's start.
-    pub fn create_pacedprefetch(path: &Path) -> Res<Supdb> {
-        Supdb::with_policy(
-            path,
-            Policy {
-                pacedprefetch: true,
-                ..Policy::default()
-            },
-        )
-    }
-
     /// `supdb` whose form files' fences are searched over their keys
     /// (`Options::zpages_fence_words` off): the shape before the flat
     /// words.
@@ -6327,32 +6248,6 @@ impl Supdb {
             path,
             Policy {
                 latewb: true,
-                ..Policy::default()
-            },
-        )
-    }
-
-    /// `supdb` whose scans and settles search a copy for their key, as
-    /// before `Options::copy_start_at_rank`: against `supdb` it prices
-    /// finding the entry by the rank the seek or the resolve found.
-    pub fn create_copysearch(path: &Path) -> Res<Supdb> {
-        Supdb::with_policy(
-            path,
-            Policy {
-                copysearch: true,
-                ..Policy::default()
-            },
-        )
-    }
-
-    /// `supdb-ingest` with the copies searched, as `supdb-copysearch`.
-    pub fn create_ingest_copysearch(path: &Path) -> Res<Supdb> {
-        Supdb::with_policy(
-            path,
-            Policy {
-                partition: false,
-                durable: false,
-                copysearch: true,
                 ..Policy::default()
             },
         )
@@ -10455,7 +10350,6 @@ impl Supdb {
             piecesonly,
             latewb,
             inlinemaint,
-            copysearch,
             convertsources,
             copyslack,
             drainpromote,
@@ -10644,7 +10538,6 @@ impl Supdb {
             zrecorddefault,
             zhotcoldback,
             sweepwalks,
-            copyprefetchwhole,
             zhotskewroom,
             zhotskewroomhyst,
             zrewarmwait,
@@ -10664,8 +10557,6 @@ impl Supdb {
             settlesources,
             densefrom,
             convert16,
-            widewalks,
-            widecopyfixed,
             pacesyncsbatch,
             pacesyncsthresholds,
             probestwice,
@@ -10678,8 +10569,6 @@ impl Supdb {
             znogroupahead,
             norunbuilds,
             blockcursors,
-            leancopyprefetch,
-            pacedprefetch,
             postedyield,
             behindyield,
             bg,
@@ -10887,7 +10776,6 @@ impl Supdb {
             // afresh at every publish as it was.
             forms_carry: carry,
             freeze_settles: settlefreeze,
-            copy_start_at_rank: !copysearch,
             convert_from_form: !convertsources,
             copy_exact: !copyslack,
             drain_names_partition: !drainpromote,
@@ -11290,7 +11178,6 @@ impl Supdb {
             zpages_seek_seeds: zseekseed,
             zpages_hot_cold_back: zhotcoldback,
             sweep_remembers_pin: !sweepwalks,
-            copy_prefetch_whole: copyprefetchwhole,
             zpages_hot_skew_room: zhotskewroom || zhotskewroomhyst,
             zpages_hot_room_margin_pct: if zhotskewroomhyst { 5 } else { 0 },
             zpages_rewarm_beside_merges: zrewarmbeside,
@@ -11320,8 +11207,6 @@ impl Supdb {
                 && std::env::var("CONVWRITER").as_deref() == Ok("1"),
             forms_convert_light_yields: densefrom > 0
                 && std::env::var("CONVSTRICT").as_deref() == Ok("1"),
-            forms_copy_hot_wide: !widewalks,
-            forms_copy_wide_priced: !widecopyfixed,
             upkeep_pace_syncs_to_share: !pacesyncsbatch,
             upkeep_pace_syncs_model: !pacesyncsbatch && !pacesyncsthresholds,
             read_probes_once: !probestwice,
@@ -11339,8 +11224,6 @@ impl Supdb {
             zpages_group_ahead: !znogroupahead,
             scan_run_builds: !norunbuilds,
             zpages_scan_cursor: !blockcursors,
-            copy_prefetch_from_start: leancopyprefetch,
-            scan_prefetch_paced: pacedprefetch,
             zpages_memo_ahead: !zmemonoahead,
             scan_start_cache: if zstartcache { 4096 } else { 0 },
             zpages_block_cursor: !zperrun,
@@ -11557,7 +11440,6 @@ impl Supdb {
             piecesonly,
             latewb,
             inlinemaint,
-            copysearch,
             convertsources,
             copyslack,
             drainpromote,
@@ -11746,7 +11628,6 @@ impl Supdb {
             zrecorddefault,
             zhotcoldback,
             sweepwalks,
-            copyprefetchwhole,
             zhotskewroom,
             zhotskewroomhyst,
             zrewarmwait,
@@ -11766,8 +11647,6 @@ impl Supdb {
             settlesources,
             densefrom,
             convert16,
-            widewalks,
-            widecopyfixed,
             pacesyncsbatch,
             pacesyncsthresholds,
             probestwice,
@@ -11780,8 +11659,6 @@ impl Supdb {
             znogroupahead,
             norunbuilds,
             blockcursors,
-            leancopyprefetch,
-            pacedprefetch,
             postedyield,
             behindyield,
             bg,
@@ -12562,9 +12439,6 @@ impl Engine for Supdb {
         if self.sweepwalks {
             return "supdb-sweepwalks";
         }
-        if self.copyprefetchwhole {
-            return "supdb-copyprefetchwhole";
-        }
         if self.zhotskewroom {
             return "supdb-zhotskewroom";
         }
@@ -12731,12 +12605,6 @@ impl Engine for Supdb {
         if self.blockcursors {
             return "supdb-blockcursors";
         }
-        if self.leancopyprefetch {
-            return "supdb-leancopyprefetch";
-        }
-        if self.pacedprefetch {
-            return "supdb-pacedprefetch";
-        }
         if self.postedyield {
             return if self.partition {
                 "supdb-postedyield"
@@ -12882,13 +12750,6 @@ impl Engine for Supdb {
                 "supdb-ingestlatewb"
             };
         }
-        if self.copysearch {
-            return if self.partition {
-                "supdb-copysearch"
-            } else {
-                "supdb-ingestcopysearch"
-            };
-        }
         if self.convertsources {
             return if self.partition {
                 "supdb-convertsources"
@@ -13021,20 +12882,6 @@ impl Engine for Supdb {
                 "supdb-layersasone"
             } else {
                 "supdb-ingestlayersasone"
-            };
-        }
-        if self.widewalks {
-            return if self.partition {
-                "supdb-widewalks"
-            } else {
-                "supdb-ingestwidewalks"
-            };
-        }
-        if self.widecopyfixed {
-            return if self.partition {
-                "supdb-widecopyfixed"
-            } else {
-                "supdb-ingestwidecopyfixed"
             };
         }
         if self.convert16 {
@@ -16391,7 +16238,6 @@ pub fn guarantee(arm: &str) -> Option<Guarantee> {
         | "supdb-extsval"
         | "supdb-piecesonly"
         | "supdb-latewb"
-        | "supdb-copysearch"
         | "supdb-convertsources"
         | "supdb-copyslack"
         | "supdb-manifestfree"
@@ -16593,10 +16439,6 @@ pub fn guarantee(arm: &str) -> Option<Guarantee> {
         | "supdb-ingestdensefrom"
         | "supdb-convert16"
         | "supdb-ingestconvert16"
-        | "supdb-widewalks"
-        | "supdb-ingestwidewalks"
-        | "supdb-widecopyfixed"
-        | "supdb-ingestwidecopyfixed"
         | "supdb-pacesyncsbatch"
         | "supdb-pacesyncsthresholds"
         | "supdb-probestwice"
@@ -16614,7 +16456,6 @@ pub fn guarantee(arm: &str) -> Option<Guarantee> {
         | "supdb-zrecord"
         | "supdb-zhotcoldback"
         | "supdb-sweepwalks"
-        | "supdb-copyprefetchwhole"
         | "supdb-zhotskewroom"
         | "supdb-zhotskewroomhyst"
         | "supdb-zrewarmwait"
@@ -16678,8 +16519,6 @@ pub fn guarantee(arm: &str) -> Option<Guarantee> {
         | "supdb-znogroupahead"
         | "supdb-norunbuilds"
         | "supdb-blockcursors"
-        | "supdb-leancopyprefetch"
-        | "supdb-pacedprefetch"
         | "supdb-postedyield"
         | "supdb-behindyield"
         | "supdb-bg"
@@ -16710,7 +16549,6 @@ pub fn guarantee(arm: &str) -> Option<Guarantee> {
         | "supdb-ingestbehindyield"
         | "supdb-ingestpiecesonly"
         | "supdb-ingestlatewb"
-        | "supdb-ingestcopysearch"
         | "supdb-ingestconvertsources"
         | "supdb-ingestcopyslack"
         | "supdb-ingestdrainpromote"
@@ -17770,14 +17608,12 @@ pub fn open(arm: &str, dir: &Path, map_gb: usize) -> Res<Box<dyn Engine>> {
         "supdb-piecesonly" => supdb_arm(Supdb::create_piecesonly, dir)?,
         "supdb-ingestpiecesonly" => supdb_arm(Supdb::create_ingest_piecesonly, dir)?,
         "supdb-latewb" => supdb_arm(Supdb::create_latewb, dir)?,
-        "supdb-copysearch" => supdb_arm(Supdb::create_copysearch, dir)?,
         "supdb-convertsources" => supdb_arm(Supdb::create_convertsources, dir)?,
         "supdb-copyslack" => supdb_arm(Supdb::create_copyslack, dir)?,
         "supdb-manifestfree" => supdb_arm(Supdb::create_manifestfree, dir)?,
         "supdb-oidxsync" => supdb_arm(Supdb::create_oidxsync, dir)?,
         "supdb-refvals" => supdb_arm(Supdb::create_refvals, dir)?,
         "supdb-rowatclose" => supdb_arm(Supdb::create_rowatclose, dir)?,
-        "supdb-ingestcopysearch" => supdb_arm(Supdb::create_ingest_copysearch, dir)?,
         "supdb-ingestconvertsources" => supdb_arm(Supdb::create_ingest_convertsources, dir)?,
         "supdb-ingestcopyslack" => supdb_arm(Supdb::create_ingest_copyslack, dir)?,
         "supdb-ingestdrainpromote" => supdb_arm(Supdb::create_ingest_drainpromote, dir)?,
@@ -18024,58 +17860,6 @@ pub fn open(arm: &str, dir: &Path, map_gb: usize) -> Res<Box<dyn Engine>> {
                     d,
                     Policy {
                         pacesyncsbatch: true,
-                        ..Policy::default()
-                    },
-                )
-            },
-            dir,
-        )?,
-        "supdb-widewalks" => supdb_arm(
-            |d| {
-                Supdb::with_policy(
-                    d,
-                    Policy {
-                        widewalks: true,
-                        ..Policy::default()
-                    },
-                )
-            },
-            dir,
-        )?,
-        "supdb-ingestwidewalks" => supdb_arm(
-            |d| {
-                Supdb::with_policy(
-                    d,
-                    Policy {
-                        partition: false,
-                        durable: false,
-                        widewalks: true,
-                        ..Policy::default()
-                    },
-                )
-            },
-            dir,
-        )?,
-        "supdb-widecopyfixed" => supdb_arm(
-            |d| {
-                Supdb::with_policy(
-                    d,
-                    Policy {
-                        widecopyfixed: true,
-                        ..Policy::default()
-                    },
-                )
-            },
-            dir,
-        )?,
-        "supdb-ingestwidecopyfixed" => supdb_arm(
-            |d| {
-                Supdb::with_policy(
-                    d,
-                    Policy {
-                        partition: false,
-                        durable: false,
-                        widecopyfixed: true,
                         ..Policy::default()
                     },
                 )
@@ -18368,7 +18152,6 @@ pub fn open(arm: &str, dir: &Path, map_gb: usize) -> Res<Box<dyn Engine>> {
         "supdb-zrecord" => supdb_arm(Supdb::create_zrecord, dir)?,
         "supdb-zhotcoldback" => supdb_arm(Supdb::create_zhotcoldback, dir)?,
         "supdb-sweepwalks" => supdb_arm(Supdb::create_sweepwalks, dir)?,
-        "supdb-copyprefetchwhole" => supdb_arm(Supdb::create_copyprefetchwhole, dir)?,
         "supdb-zhotskewroom" => supdb_arm(Supdb::create_zhotskewroom, dir)?,
         "supdb-zhotskewroomhyst" => supdb_arm(Supdb::create_zhotskewroomhyst, dir)?,
         "supdb-zrewarmwait" => supdb_arm(Supdb::create_zrewarmwait, dir)?,
@@ -18439,8 +18222,6 @@ pub fn open(arm: &str, dir: &Path, map_gb: usize) -> Res<Box<dyn Engine>> {
         "supdb-znogroupahead" => supdb_arm(Supdb::create_znogroupahead, dir)?,
         "supdb-norunbuilds" => supdb_arm(Supdb::create_norunbuilds, dir)?,
         "supdb-blockcursors" => supdb_arm(Supdb::create_blockcursors, dir)?,
-        "supdb-leancopyprefetch" => supdb_arm(Supdb::create_leancopyprefetch, dir)?,
-        "supdb-pacedprefetch" => supdb_arm(Supdb::create_pacedprefetch, dir)?,
         "supdb-postedyield" => supdb_arm(Supdb::create_postedyield, dir)?,
         "supdb-behindyield" => supdb_arm(Supdb::create_behindyield, dir)?,
         "supdb-bg" => supdb_arm(Supdb::create_bg, dir)?,
@@ -22158,20 +21939,6 @@ mod tests {
                 );
             }
             {
-                let z = Supdb::create_leancopyprefetch(&dir("leancopyprefetch")).unwrap();
-                assert_eq!(z.name(), "supdb-leancopyprefetch");
-                assert_eq!(z.features(), base.features());
-                let o = z.db.as_ref().unwrap().options();
-                assert!(o.copy_prefetch_from_start && !b.copy_prefetch_from_start);
-            }
-            {
-                let z = Supdb::create_pacedprefetch(&dir("pacedprefetch")).unwrap();
-                assert_eq!(z.name(), "supdb-pacedprefetch");
-                assert_eq!(z.features(), base.features());
-                let o = z.db.as_ref().unwrap().options();
-                assert!(o.scan_prefetch_paced && !b.scan_prefetch_paced);
-            }
-            {
                 let z = Supdb::create_blockcursors(&dir("blockcursors")).unwrap();
                 assert_eq!(z.name(), "supdb-blockcursors");
                 assert_eq!(z.features(), base.features());
@@ -22593,35 +22360,6 @@ mod tests {
                 let o = z.db.as_ref().unwrap().options();
                 assert!(!o.upkeep_pace_syncs_to_share && b.upkeep_pace_syncs_to_share);
                 assert!(!o.upkeep_pace_syncs_model);
-            }
-            {
-                let z = Supdb::with_policy(
-                    &dir("widewalks"),
-                    Policy {
-                        widewalks: true,
-                        ..Policy::default()
-                    },
-                )
-                .unwrap();
-                assert_eq!(z.name(), "supdb-widewalks");
-                assert_eq!(z.features(), base.features());
-                let o = z.db.as_ref().unwrap().options();
-                assert!(!o.forms_copy_hot_wide && b.forms_copy_hot_wide);
-            }
-            {
-                let z = Supdb::with_policy(
-                    &dir("widecopyfixed"),
-                    Policy {
-                        widecopyfixed: true,
-                        ..Policy::default()
-                    },
-                )
-                .unwrap();
-                assert_eq!(z.name(), "supdb-widecopyfixed");
-                assert_eq!(z.features(), base.features());
-                let o = z.db.as_ref().unwrap().options();
-                assert!(!o.forms_copy_wide_priced && b.forms_copy_wide_priced);
-                assert!(o.forms_copy_hot_wide);
             }
             {
                 let z = Supdb::with_policy(
@@ -23340,13 +23078,6 @@ mod tests {
                 assert_eq!(z.features(), base.features());
                 let o = z.db.as_ref().unwrap().options();
                 assert!(!o.sweep_remembers_pin && b.sweep_remembers_pin);
-            }
-            {
-                let z = Supdb::create_copyprefetchwhole(&dir("copyprefetchwhole")).unwrap();
-                assert_eq!(z.name(), "supdb-copyprefetchwhole");
-                assert_eq!(z.features(), base.features());
-                let o = z.db.as_ref().unwrap().options();
-                assert!(o.copy_prefetch_whole && !b.copy_prefetch_whole);
             }
             {
                 let z = Supdb::create_zhotskewroom(&dir("zhotskewroom")).unwrap();

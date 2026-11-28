@@ -8119,8 +8119,8 @@ fn fold_model_with(block_cache: bool, pieces_only: bool, hot_copy: bool) {
 /// and reads hold each result to the merge.
 /// A copy built over updates alone starts a scan at the rank the
 /// partition's seek found, instead of searching its entries for the
-/// cursor, and streams what the search streamed
-/// (`Options::copy_start_at_rank`). One partition of several blocks, every
+/// cursor, and streams what the search streamed. One partition of several
+/// blocks, every
 /// key updated once: every block is dense with overlay keys that are all
 /// updates, so its copy's entries are its records. The model's scans start
 /// at every key and between keys, where the two starts could differ. Then
@@ -8169,54 +8169,6 @@ fn a_copy_of_updates_starts_a_scan_at_the_seeks_rank() {
         "the blocks without the insert still start at the rank"
     );
     assert!(searched2 > 0, "the block with the insert is searched");
-}
-
-/// A copy walk paces the prefetch of the copy block it reaches next through
-/// itself (`Options::scan_prefetch_paced`): over a partition of several
-/// blocks, every one a copy, the model's scans across block boundaries pace
-/// one with the option and none without, and read the same entries either
-/// way.
-#[test]
-fn a_copy_walk_paces_the_next_blocks_prefetch_through_itself() {
-    for on in [true, false] {
-        let d = dir(&format!("copy-prefetch-paced-{on}"));
-        let opts = Options {
-            seal_bytes: 1 << 20,
-            partition_bytes: Some(64 << 10),
-            scan_block_cache: true,
-            scan_prefetch_paced: on,
-            ..common::options()
-        };
-        let mut db = Db::create(&d, opts).unwrap();
-        let mut m = ScanModel::default();
-        let key = |k: u32| format!("key-{k:05}");
-        for k in (0..1200).step_by(3) {
-            m.append(&mut db, &key(k), &format!("p{k}"));
-        }
-        db.commit().unwrap();
-        db.flush().unwrap();
-        m.flushed();
-        assert_eq!(db.levels(), (1, 0), "one partition of several blocks");
-        for k in (0..1200).step_by(3) {
-            m.append(&mut db, &key(k), &format!("u{k}"));
-        }
-        db.commit().unwrap();
-        m.check(
-            &db,
-            &format!("paced {on}: every key updated once, copies of the records"),
-        );
-        let [at_rank, _] = db.copy_starts();
-        assert!(at_rank > 0, "paced {on}: the scans walked copies");
-        let paces = db.prefetch_paces();
-        if on {
-            assert!(
-                paces > 0,
-                "paced {on}: walks across a block paced the next's prefetch"
-            );
-        } else {
-            assert_eq!(paces, 0, "paced {on}: the burst paces nothing");
-        }
-    }
 }
 
 /// A dense sparse form is converted into a copy from its own deltas and the
@@ -9174,7 +9126,9 @@ fn a_wide_blocks_window_stops_at_the_scans_limit() {
 /// inserts after it are appended to it, a delete and an update of keys in it
 /// are spliced in, and every scan answers what the model holds
 /// (`Options::forms_copy_hot_wide`). Without the option the block stays
-/// wide.
+/// wide. The copy is bought when its walks have paid for it: the block's
+/// eight records and the six hundred keys past the end are 608 entries,
+/// and walks of fifty pay for them by the fourteenth.
 #[test]
 fn a_hot_wide_block_is_copied_and_kept_past_the_bound() {
     for on in [true, false] {
@@ -9184,9 +9138,6 @@ fn a_hot_wide_block_is_copied_and_kept_past_the_bound() {
             partition_bytes: Some(2 << 10),
             scan_block_cache: true,
             forms_copy_hot_wide: on,
-            // The walk at which the copy pays by the fixed ratio; the
-            // priced rule has a test of its own.
-            forms_copy_wide_priced: false,
             ..common::options()
         };
         let mut db = Db::create(&d, opts).unwrap();
@@ -9207,15 +9158,10 @@ fn a_hot_wide_block_is_copied_and_kept_past_the_bound() {
         }
         db.commit().unwrap();
         let state = format!("hot wide {on}");
-        // Six hundred keys past the end: the block is copied at its eighth
-        // walk.
-        for i in 0..12u32 {
-            m.check_one(
-                &db,
-                tail(i * 37).as_bytes(),
-                1 + (i as usize * 7) % 60,
-                &state,
-            );
+        // Six hundred keys past the end and the block's eight records: the
+        // copy pays at the fourteenth walk of fifty.
+        for i in 0..14u32 {
+            m.check_one(&db, tail(i * 37).as_bytes(), 50, &state);
         }
         let (_, recopies, _) = db.build_kinds();
         if on {
@@ -9256,13 +9202,11 @@ fn a_hot_wide_block_is_copied_and_kept_past_the_bound() {
 
 /// A hot wide block's copy is bought once the keys its earlier walks
 /// merged reach the entries the copy will merge, every source's run over
-/// the block and its records (`Options::forms_copy_wide_priced`): six
+/// the block and its records (`Reader::wide_copy_pays`): six
 /// hundred keys past the end and the block's eight records are 608
 /// entries, a scan of fifty from the tail merges fifty, and the fourteenth
 /// walk copies -- the keys all in the live table, or half of them in a
-/// frozen table under it, where the largest source's run alone would have
-/// copied at the eighth. The fixed ratio copies at the eighth
-/// (`a_hot_wide_block_is_copied_and_kept_past_the_bound`).
+/// frozen table under it.
 #[test]
 fn a_hot_wide_blocks_copy_is_bought_once_its_walks_have_paid() {
     for frozen in [false, true] {
@@ -9273,7 +9217,7 @@ fn a_hot_wide_blocks_copy_is_bought_once_its_walks_have_paid() {
             scan_block_cache: true,
             ..common::options()
         };
-        assert!(opts.forms_copy_hot_wide && opts.forms_copy_wide_priced);
+        assert!(opts.forms_copy_hot_wide);
         let mut db = Db::create(&d, opts).unwrap();
         let mut m = ScanModel::default();
         let key = |k: u32| format!("key-{k:05}");
