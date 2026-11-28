@@ -21,9 +21,11 @@
 //! day to read and the reading is what this control is.
 //!
 //! That is the whole rule. The window is the only parameter and it is
-//! stated once, in DESIGN.md; this is the code for it.
+//! stated once, in DESIGN.md; this is the code for it. A row that carries
+//! a kill (`Row::killed`) is not the series' whatever its cells read: its
+//! roster did not fit its bound, so the gate names every kill and fails.
 
-use crate::row::Row;
+use crate::row::{Kill, Row};
 use crate::stats::{Samples, CI_CONF, CI_RESAMPLES};
 use std::collections::HashMap;
 use std::io;
@@ -172,9 +174,18 @@ pub struct Report {
     /// Prior rows found for this class and scale, after the window.
     pub prior_rows: usize,
     pub findings: Vec<Finding>,
+    /// The row's kills, a retaken rep's among them: any one fails it.
+    pub killed: Vec<Kill>,
 }
 
 impl Report {
+    /// Whether the row fails the gate: an engine quantity worse than its
+    /// window (`regressed`), or a pass the bound killed, which no cell of
+    /// the row can answer for.
+    pub fn failed(&self) -> bool {
+        self.regressed() || !self.killed.is_empty()
+    }
+
     /// A floor or a comparator below its window is the machine, never the
     /// engine, so both are reported and neither is failed on.
     pub fn regressed(&self) -> bool {
@@ -346,6 +357,15 @@ impl Report {
         } else {
             format!("ok: nothing worse than the window ({flagged} flagged{withheld})\n")
         });
+        if !self.killed.is_empty() {
+            let which: Vec<String> = self.killed.iter().map(Kill::describe).collect();
+            out.push_str(&format!(
+                "KILLED: {} pass{} killed under the bound ({}); the row is not the series'\n",
+                self.killed.len(),
+                if self.killed.len() == 1 { "" } else { "es" },
+                which.join("; ")
+            ));
+        }
         out
     }
 }
@@ -528,6 +548,7 @@ pub fn gate(row: &Row, runs: &Path) -> io::Result<Report> {
         scale: row.scale.as_str(),
         prior_rows: window.len(),
         findings,
+        killed: row.killed.clone(),
     })
 }
 
@@ -793,6 +814,63 @@ mod tests {
         let text = rep.render();
         assert!(!rep.regressed(), "{text}");
         assert_eq!(rep.comparators_low().len(), 1, "{text}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A row that carries a kill fails the gate, a kill kept from a rep
+    /// cut and taken again as much as one of the rep that stood, however
+    /// its cells read against a window they are within; each kill is
+    /// named, and the same row without its kills passes.
+    #[test]
+    fn a_row_with_a_kill_fails_the_gate_a_retaken_reps_included() {
+        let dir = fixture_with_control(6);
+        let clean = with_control(
+            row(
+                "20260201T000000Z",
+                4,
+                [100.0, 101.0, 99.5, 100.2, 100.8],
+                [5.0, 5.1, 5.0, 5.2, 4.9],
+            ),
+            1_000_000.0,
+            9.0e9,
+            3_000_000.0,
+            1.44,
+        );
+        let rep = gate(&clean, &dir).unwrap();
+        let text = rep.render();
+        assert!(!rep.failed(), "the cells alone pass\n{text}");
+        assert!(!text.contains("KILLED"), "{text}");
+        let kill = |rep: usize, retaken: bool| crate::row::Kill {
+            arm: "supdb".into(),
+            size: 10_000,
+            rep,
+            after_phase: Some("load".into()),
+            rss_bytes: None,
+            cache_bytes: None,
+            utc: "u".into(),
+            retaken,
+        };
+        for (killed, line) in [
+            (
+                vec![kill(2, true)],
+                "KILLED: 1 pass killed under the bound (supdb at rep 2 of 10000 keys after \
+                 load, in a rep cut and taken again); the row is not the series'",
+            ),
+            (
+                vec![kill(1, false), kill(2, true)],
+                "KILLED: 2 passes killed under the bound (supdb at rep 1 of 10000 keys after \
+                 load; supdb at rep 2 of 10000 keys after load, in a rep cut and taken \
+                 again); the row is not the series'",
+            ),
+        ] {
+            let mut r = clean.clone();
+            r.killed = killed;
+            let rep = gate(&r, &dir).unwrap();
+            let text = rep.render();
+            assert!(!rep.regressed(), "no cell is worse\n{text}");
+            assert!(rep.failed(), "the kill fails it\n{text}");
+            assert!(text.ends_with(&format!("{line}\n")), "{text}");
+        }
         let _ = std::fs::remove_dir_all(&dir);
     }
 

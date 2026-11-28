@@ -54,7 +54,7 @@ run    measures every arm over the size ladder and writes runs/<scale>/<utc>-<sh
                threads at once, is in no row unless named here
        --resume DIR  take up the run whose ledger is DIR (<out>/inflight/<utc>-<sha7>, what a run
                that was cut leaves): the same binary, class and bound, the plan the ledger's,
-               every whole rep kept and a cut rep taken again whole. --reps may raise the
+               every whole rep kept and a cut rep taken again whole, its kills kept. --reps may raise the
                count; --resume-passes keeps a cut rep's passes, for a loop that is not the series'
        A pass killed under the bound is a cell of the row, which then goes under
        <out>/killed/<scale>/, and the command exits 137 once the row is written.
@@ -90,7 +90,8 @@ ab     two arms in one process, alternating and paired rep by rep, for choosing
        An arm against itself (--arms supdb,supdb) is the control: what a
        verdict looks like when nothing differs.
 gate   compares ROW to the last ten rows of its class and scale under runs/ (--runs, default runs);
-       exits 1 if any quantity is worse than every one of them
+       exits 1 if any quantity is worse than every one of them, or if the row carries a pass
+       killed under its bound
 figures draws every figure for the latest row of each class at --scale (default full) into
        --out (default figures), from --runs (default runs)
 machine prints the machine fields as a row records them, and its derived class";
@@ -318,7 +319,7 @@ fn cmd_gate(a: Args) -> i32 {
     match gate::gate(&row, &runs) {
         Ok(rep) => {
             print!("{}", rep.render());
-            i32::from(rep.regressed())
+            i32::from(rep.failed())
         }
         Err(e) => {
             eprintln!("gate: {e}");
@@ -548,21 +549,13 @@ fn cmd_ab(a: Args) -> i32 {
             killed.len(),
             killed
                 .iter()
-                .map(|k| format!("rep {} {}{}", k.rep, k.arm, after_phase(k)))
+                .map(|k| format!("rep {} {}{}", k.rep, k.arm, k.after()))
                 .collect::<Vec<_>>()
                 .join(", ")
         );
         return 137;
     }
     0
-}
-
-/// The phase a kill says the pass had finished, for a line that names it.
-fn after_phase(k: &row::Kill) -> String {
-    match &k.after_phase {
-        Some(p) => format!(" after {p}"),
-        None => " in its first phase".to_string(),
-    }
 }
 
 /// The row written and its path printed; the status is the kill's, 137,
@@ -577,13 +570,7 @@ fn finish(row: row::Row, out: &Path) -> i32 {
                 return 0;
             }
             for k in &row.killed {
-                eprintln!(
-                    "killed: {} at rep {} of {} keys{}",
-                    k.arm,
-                    k.rep,
-                    k.size,
-                    after_phase(k)
-                );
+                eprintln!("killed: {}", k.describe());
             }
             eprintln!(
                 "{} passes were killed under the bound; the row is under {}/ and not the series': \

@@ -401,6 +401,103 @@ fn a_killed_pass_is_a_cell_of_the_row_and_the_run_goes_on() {
     let _ = std::fs::remove_dir_all(&base);
 }
 
+/// A kill in a rep that is then cut stays the row's when the rep is
+/// taken again whole: the retake runs the killed arm again and measures
+/// it, and the row carries the kill marked retaken beside those cells,
+/// goes under `killed/`, and the command exits with the kill's status.
+/// The gate reads the kept kill and fails the row on it, naming it, with
+/// no history to judge any cell against.
+#[test]
+fn a_kill_in_a_rep_cut_and_taken_again_stays_the_rows_and_fails_the_gate() {
+    let base = scratch("retaken");
+    let (out, tmp) = (base.join("out"), base.join("tmp"));
+    std::fs::create_dir_all(&tmp).unwrap();
+    // The first take: supdb killed after its load, the run cut after it,
+    // before lmdb, so the rep is cut with a kill in it.
+    let cut = run(
+        &out,
+        &tmp,
+        "supdb,lmdb",
+        "1",
+        &[
+            ("SUPDB_BENCH_KILL_AFTER", "supdb:load:1"),
+            ("SUPDB_BENCH_STOP_AFTER", "10000-1-supdb"),
+        ],
+        &[],
+    );
+    let (_, err) = text(&cut);
+    assert_eq!(cut.status.code(), Some(1), "{err}");
+    assert!(
+        err.contains("supdb           KILLED under the bound after load"),
+        "{err}"
+    );
+    let ledger = ledger_in(&out);
+    assert!(ledger.join("kill-10000-1-supdb.json").exists());
+    assert!(!ledger.join("rep-10000-1.json").exists(), "the rep is cut");
+
+    // The retake, with nothing to kill it: both arms run and measure.
+    let taken = resume(&ledger, &tmp, &[]);
+    let (stdout, err) = text(&taken);
+    assert!(
+        err.contains("rep 1 at 10000 was cut after supdb; taken again whole"),
+        "{err}"
+    );
+    assert!(err.contains("rep 1  supdb"), "supdb ran again: {err}");
+    assert!(err.contains("rep 1  lmdb"), "lmdb ran: {err}");
+    assert_eq!(taken.status.code(), Some(137), "the kill's status: {err}");
+    assert!(
+        err.contains(
+            "killed: supdb at rep 1 of 10000 keys after load, in a rep cut and taken again"
+        ),
+        "{err}"
+    );
+    assert!(stdout.contains("killed/quick/"), "{stdout}");
+    assert!(
+        !out.join("quick").exists(),
+        "nothing beside the series: {err}"
+    );
+    let killed_dir = out.join("killed").join("quick");
+    let row = row_in(&killed_dir);
+    let k = row["killed"].as_array().expect("the kill is in the row");
+    assert_eq!(k.len(), 1, "{k:?}");
+    assert_eq!(k[0]["arm"], "supdb");
+    assert_eq!(k[0]["rep"], 1);
+    assert_eq!(k[0]["after_phase"], "load");
+    assert_eq!(k[0]["retaken"], true);
+    let c = counts(&row);
+    assert_eq!(c[&("read".into(), "supdb".into(), "reads_per_s".into())], 1);
+    assert_eq!(c[&("read".into(), "lmdb".into(), "reads_per_s".into())], 1);
+    assert!(!ledger.exists(), "the ledger goes with the row");
+
+    // The gate, over an empty series: every cell without a band, and the
+    // row failed on its kill alone.
+    let path = std::fs::read_dir(&killed_dir)
+        .unwrap()
+        .map(|e| e.unwrap().path())
+        .find(|p| p.extension().and_then(|s| s.to_str()) == Some("json"))
+        .unwrap();
+    let series = base.join("series");
+    std::fs::create_dir_all(&series).unwrap();
+    let g = bench()
+        .arg("gate")
+        .arg(&path)
+        .arg("--runs")
+        .arg(&series)
+        .output()
+        .unwrap();
+    let (stdout, err) = text(&g);
+    assert_eq!(g.status.code(), Some(1), "the gate fails: {stdout}{err}");
+    assert!(stdout.contains("no band yet"), "{stdout}");
+    assert!(
+        stdout.contains(
+            "KILLED: 1 pass killed under the bound (supdb at rep 1 of 10000 keys after load, \
+             in a rep cut and taken again)"
+        ),
+        "{stdout}"
+    );
+    let _ = std::fs::remove_dir_all(&base);
+}
+
 /// A pairing under fresh processes loses a killed rep's pair and goes
 /// on, and says so with the kill's status.
 #[test]

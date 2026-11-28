@@ -503,11 +503,17 @@ run of fresh processes starts at rep one (`run::first_rep`). The row's
 cells enter it through one function, live or replayed, and a run writes
 them to a ledger as it goes (`ledger`), so a run cut by anything --
 the kill, a timeout, a hand, the disk -- is taken up from its last
-whole rep (`bench run --resume`). The rule: a pass that was made
+whole rep (`bench run --resume`). A cut rep taken again dropped its
+kills with its passes at first, so a retake the bound let through banked
+a roster it had killed beside the series; the ledger keeps a cut rep's
+kills under names of their own now (`Ledger::forget_rep`), the row
+carries them marked `retaken`, and the gate fails a row on any kill. The
+rule: a pass that was made
 independent so that it could be isolated is a checkpoint, and a run is
 what its ledger holds; a result the run discards is work the run does
-not do; and a failure a process boundary was built to contain is
-reported by the boundary, not relayed through it.
+not do; a failure a process boundary was built to contain is
+reported by the boundary, not relayed through it; and a retake drops
+what it will measure again and keeps what no retake undoes.
 
 **A run the session does not hold is the container's to end.** A roster
 of two hours was started detached, with a message scheduled for its end,

@@ -1669,7 +1669,7 @@ pub fn run(
 
     // What the ledger holds: every earlier sitting's floors, and which
     // reps are whole. A cut rep is taken again whole, from its first
-    // arm, unless the resume keeps passes.
+    // arm, its kills kept for the row, unless the resume keeps passes.
     let mut sittings = 0;
     if let Some(l) = &ledger {
         for f in l.read_floors().map_err(|e| ledger_err("its floors", e))? {
@@ -1816,6 +1816,14 @@ pub fn run(
         }
         let map_gb = lmdb_map_gb(size, plan.value_size);
         for rep in first..=plan.reps {
+            // The kills of the rep's earlier takes, cut and taken again
+            // (`Ledger::forget_rep`): the row's whatever this take does.
+            if let Some(l) = &ledger {
+                killed.extend(
+                    l.read_kept_kills(size, rep)
+                        .map_err(|e| ledger_err("a cut rep's kills", e))?,
+                );
+            }
             let Some((_, _, arms_to_run)) = todo.iter().find(|(sz, r, _)| *sz == size && *r == rep)
             else {
                 // A rep the ledger holds whole: replayed, each arm's pass
@@ -1853,10 +1861,7 @@ pub fn run(
                         log(&format!(
                             "{:>7}s  size {size:>9}  rep {rep}  {arm:<15} KILLED under the bound{}{}",
                             started.elapsed().as_secs(),
-                            match &k.after_phase {
-                                Some(p) => format!(" after {p}"),
-                                None => " in its first phase".to_string(),
-                            },
+                            k.after(),
                             match (k.rss_bytes, k.cache_bytes) {
                                 (Some(r), Some(c)) => format!(
                                     ", the group at {} MB anon and {} MB cache there",
@@ -3021,6 +3026,7 @@ fn pass_in_child(
                         .and_then(|m| m.cache_bytes)
                         .or(group_stat.map(|s| s.cache)),
                     utc: crate::row::utc_now(),
+                    retaken: false,
                 }));
             }
         }
@@ -4557,10 +4563,7 @@ pub fn ab(
                         log,
                         "{:>6.0}s  rep {rep}/{reps}  {arm} KILLED under the bound{}; the rep's pair is lost",
                         t0.elapsed().as_secs_f64(),
-                        match &k.after_phase {
-                            Some(p) => format!(" after {p}"),
-                            None => " in its first phase".to_string(),
-                        }
+                        k.after()
                     );
                     killed.push(k);
                     break;
