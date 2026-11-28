@@ -852,7 +852,7 @@ impl<'a> ZCursor<'a> {
         let mut memoise = memoise;
         if memoise && self.memo.scan_admit && self.zfile.memo {
             if let Ok(index) = u8::try_from(j) {
-                let (id, hashed) = (self.zfile.id, self.zfile.memo_hashed);
+                let (id, hashed) = (self.zfile.id, true);
                 if !self.memo.holds(id, entry.page, index, hashed)
                     && !self.memo.admit(id, entry.page, index)
                 {
@@ -873,10 +873,9 @@ impl<'a> ZCursor<'a> {
                 self.pview = None;
             }
             self.pview_page = self.page;
-            match self.zfile.memo_first_hit(self.memo, entry, j) {
+            match self.zfile.touch_group(self.memo, entry, j) {
                 Err(()) => None,
-                Ok(Some(hit)) => Some(hit),
-                Ok(None) => {
+                Ok(()) => {
                     if self.pview.is_none() {
                         self.pview = self
                             .zfile
@@ -994,11 +993,10 @@ impl<'a> ZCursor<'a> {
         if reads >= count {
             return None;
         }
-        // A group the memo holds is the memo's to hand over: asked already
-        // where the memo is asked first (`ZFile::memo_first_hit`).
-        if self.zfile.memo && !self.zfile.memo_first {
+        // A group the memo holds is the memo's to hand over.
+        if self.zfile.memo {
             if let Ok(index) = u8::try_from(j) {
-                let (id, hashed) = (self.zfile.id, self.zfile.memo_hashed);
+                let (id, hashed) = (self.zfile.id, true);
                 if self.memo.holds(id, entry.page, index, hashed) {
                     return None;
                 }
@@ -2526,27 +2524,6 @@ fn put_verify_buf(b: GroupBuf) {
 /// (`Options::zpages_scan_prefetch`).
 const ZPREFETCH_PAGES: usize = 16;
 
-/// How a form file's compressed pages meet the handle's memo: not at all
-/// (`Options::zpages_memo` off), at the slot the group's number gives
-/// (`Options::zpages_memo_hash` off, the shape before the hash), or at the
-/// hashed slot. A bool is the memo on hashed or off.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(super) enum MemoShape {
-    Off,
-    Linear,
-    Hashed,
-}
-
-impl From<bool> for MemoShape {
-    fn from(on: bool) -> MemoShape {
-        if on {
-            MemoShape::Hashed
-        } else {
-            MemoShape::Off
-        }
-    }
-}
-
 /// The memo's slots, its cap on the decoded bytes it holds, and the
 /// displaced buffers it keeps for the next decodes, a handle. The slots
 /// went from a thousand and twenty-four to four thousand and ninety-six
@@ -2964,7 +2941,7 @@ impl Memo {
 
     fn slot(&self, zfile: u64, page: u32, index: u8, hashed: bool) -> usize {
         if !hashed {
-            // The shape before the hash (`Options::zpages_memo_hash` off):
+            // The shape before the hash, a unit test's for slots it places:
             // the group's number plus a multiple of the identity.
             return (page as usize)
                 .wrapping_mul(ZMAX_GROUPS)
@@ -3117,14 +3094,14 @@ pub(super) struct ZMemo {
 }
 
 impl ZMemo {
-    /// A memo at the shipped cap (`Options::zpages_memo_bytes` as it
-    /// defaults): the tests' handle; a store's handles take `sized`.
+    /// A memo at the shipped cap (`ZMEMO_BYTES`): the tests' handle; a
+    /// store's handles take `sized`.
     #[cfg(test)]
     pub(super) fn new() -> ZMemo {
         ZMemo::sized(ZMEMO_BYTES)
     }
 
-    /// A memo capped at `bytes` of decoded groups (`Options::zpages_memo_bytes`),
+    /// A memo capped at `bytes` of decoded groups (`ZMEMO_BYTES` for a store's),
     /// its slots scaled with the cap at the shipped ratio -- a slot per two
     /// kibibytes, a group's decoded size at the suite's shape -- so the cap
     /// and not the slot count bounds what it holds, as `ZMemo::new` has it.
@@ -3634,16 +3611,12 @@ pub(super) struct ZFile {
     /// which holds that the file is not a stride file.
     body: ZBody,
     /// Whether compressed pages are opened through the handle's memo
-    /// (`Options::zpages_memo`), and whether its slot is the hashed one
-    /// (`Options::zpages_memo_hash`).
+    /// (`Options::zpages_memo`), at the hashed slot (`Memo::slot`).
     memo: bool,
-    memo_hashed: bool,
-    /// Whether a verified page's directory is read trusted
-    /// (`Options::zpages_trusted_views`, `ZFile::view`), and whether its
-    /// group is asked of the memo before any view
-    /// (`Options::zpages_memo_first`, `ZFile::open_group`).
+    /// Whether a verified page's directory is read trusted (`ZFile::view`),
+    /// as the store attaches every form file; a unit test's attach reads it
+    /// checked, the shape before.
     trusted: bool,
-    memo_first: bool,
     /// A raw-tail coded group read where it lies, record by record, by the
     /// cursor (`Options::zpages_inplace_walk`; `Group::Coded`), instead of
     /// decoded whole into the buffer.
@@ -3659,8 +3632,8 @@ pub(super) struct ZFile {
     /// (`Options::zpages_walk_owns_decodes`).
     pub(super) walk_owns: bool,
     /// Whether a decode asks for the line of the memo entry its put will
-    /// displace before it begins (`Options::zpages_memo_ahead`,
-    /// `ZFile::open_group`).
+    /// displace before it begins (`Memo::prefetch_victim`,
+    /// `ZFile::open_group`), as the store attaches.
     memo_ahead: bool,
     /// Whether a scan asks for the pages it will cross after its first
     /// (`Options::zpages_scan_prefetch`).
@@ -3758,11 +3731,12 @@ impl ZFile {
     /// whose trailer's decode refuses one of neither kind at its magic.
     ///
     /// `advise` maps the file `MADV_RANDOM`, before its own sampled reads.
-    /// `fence` is how the fence is searched: over its keys, over its words
-    /// laid flat (`ZFence::index_words`, `Options::zpages_fence_words`) or
-    /// through the tree over them (`ZFence::index`,
-    /// `Options::zpages_fence_tree`); `memo_ahead` is
-    /// `Options::zpages_memo_ahead`.
+    /// `fence` is how the fence is searched: over its keys or through the
+    /// tree of its words (`ZFence::index_words`, as the store attaches);
+    /// `trusted` reads a verified page's directory trusted (`ZFile::view`);
+    /// `memo_ahead` asks for the line of the memo entry a decode's put will
+    /// displace before the decode (`Memo::prefetch_victim`). The store sets
+    /// all three on; a unit test's attach may take the shape before.
     #[allow(clippy::too_many_arguments)]
     pub(super) fn attach(
         path: &Path,
@@ -3770,15 +3744,13 @@ impl ZFile {
         id: u64,
         end_seq: u64,
         advise: bool,
-        memo: impl Into<MemoShape>,
+        memo: bool,
         prefetch: bool,
         trusted: bool,
-        memo_first: bool,
         fence: FenceSearch,
         memo_ahead: bool,
         stride: &StrideAttach,
     ) -> std::result::Result<ZFile, Reject> {
-        let memo = memo.into();
         let damage = |e: ZError| Reject::Damage(e.to_string());
         // The attach's own reads -- the trailer, the resident part, the
         // sampled pages, and the live segment's header and checksum row --
@@ -3859,7 +3831,6 @@ impl ZFile {
                 memo,
                 prefetch,
                 trusted,
-                memo_first,
                 memo_ahead,
             );
             if trusted_all {
@@ -3907,7 +3878,6 @@ impl ZFile {
         match fence_search {
             FenceSearch::Keys => {}
             FenceSearch::Words => fence.index_words(),
-            FenceSearch::Tree => fence.index(),
         }
         let filter = if t.filter {
             Some(engine_filter(&t, filter, &fence, nkeys)?)
@@ -3931,7 +3901,6 @@ impl ZFile {
             memo,
             prefetch,
             trusted,
-            memo_first,
             memo_ahead,
         );
         zfile.coded = zfile.check_sample().map_err(damage)?;
@@ -3942,14 +3911,7 @@ impl ZFile {
     /// one place its fields are listed: every block-coding and memo setting
     /// at what the store's options and the store's sets after the attach
     /// start from, nothing verified, nothing counted.
-    fn assemble(
-        a: Assembly,
-        memo: MemoShape,
-        prefetch: bool,
-        trusted: bool,
-        memo_first: bool,
-        memo_ahead: bool,
-    ) -> ZFile {
+    fn assemble(a: Assembly, memo: bool, prefetch: bool, trusted: bool, memo_ahead: bool) -> ZFile {
         // A bit a page a read checks at its first touch: the pages that
         // hold the records, and with them a sparse stride form's pages of
         // its keys' numbers.
@@ -4002,10 +3964,8 @@ impl ZFile {
             coded: false,
             id: NEXT_ZSIDE_ID.fetch_add(1, Ordering::Relaxed),
             body: a.body,
-            memo: memo != MemoShape::Off,
-            memo_hashed: memo == MemoShape::Hashed,
+            memo,
             trusted,
-            memo_first,
             inplace: true,
             cursor_view: false,
             group_ahead: false,
@@ -4210,12 +4170,9 @@ impl ZFile {
     /// and the form file are out of service then -- or a stored group is
     /// misaligned, which a mapping never is; the caller answers a fallback.
     /// `view` is the page's view where the caller took one to find the
-    /// group, else one is taken here (`ZFile::view`). Under
-    /// `Options::zpages_memo_first` a verified page's group is asked of the
-    /// memo before any view, the entry carrying the group's first record
-    /// and count, so a hit reads nothing of the page; as shipped the memo
-    /// is asked after the view, which says whether the group is compressed,
-    /// the order the shape before had. With `inplace`, a raw-tail coded
+    /// group, else one is taken here (`ZFile::view`). The memo is asked
+    /// after the view, which says whether the group is compressed. With
+    /// `inplace`, a raw-tail coded
     /// group is handed back as its payload, undecoded, for a caller that
     /// reads it record by record (`ZCursor`, `Group::Coded`); every other
     /// caller reads the bytes as a decoded group and passes `false`.
@@ -4234,21 +4191,18 @@ impl ZFile {
         self.open_group_with(memo, entry, j, buf, view, inplace, false, false, memoise)
     }
 
-    /// The memo's group for group `j` of `entry`'s page, asked before any
-    /// view is built where the page is one this process has verified
-    /// (`Options::zpages_memo_first`), the page touched as an open touches
-    /// it: `Ok(Some)` on a hit, `Ok(None)` where the memo does not hold it
-    /// or is not asked first, and the caller opens through
-    /// `open_group_with` with `after_memo`; `Err` where the page or the
-    /// group is none the file has, the page failed. For the cursor under
-    /// `Options::zpages_cursor_view`, whose view is held and built only for
-    /// an open that reads the page.
-    fn memo_first_hit<'a>(
-        &'a self,
+    /// Group `j` of `entry`'s page checked to be one the file has and the
+    /// page touched as an open touches it, for the cursor under
+    /// `ZFile::cursor_view`, whose view is held and built only for an open
+    /// that reads the page and which opens through `open_group_with` with
+    /// `after_memo`; `Err` where the page or the group is none the file
+    /// has, the page failed.
+    fn touch_group(
+        &self,
         memo: &ZMemo,
         entry: &FenceEntry<'_>,
         j: usize,
-    ) -> std::result::Result<Option<(Opened<'a>, usize, usize, bool)>, ()> {
+    ) -> std::result::Result<(), ()> {
         debug_assert!(!self.is_stride(), "a block-only helper over a stride file");
         let p = entry.page as usize;
         if self.page_bytes(p).filter(|_| p < self.n_pages).is_none() {
@@ -4256,27 +4210,15 @@ impl ZFile {
             return Err(());
         }
         memo.touch(self.id, entry.page, self.n_pages);
-        let Ok(index) = u8::try_from(j) else {
+        if u8::try_from(j).is_err() {
             self.fail(p);
             return Err(());
-        };
-        if self.memo_first && self.memo && bit(&self.verified, p) {
-            if let Some((g, n, first, count)) =
-                memo.get(self.id, entry.page, index, self.memo_hashed)
-            {
-                return Ok(Some((
-                    Opened::Memo(g, n),
-                    usize::from(first),
-                    usize::from(count),
-                    false,
-                )));
-            }
         }
-        Ok(None)
+        Ok(())
     }
 
-    /// `open_group`; with `after_memo`, for a caller that asked the memo
-    /// first itself (`memo_first_hit`) and touched the page, neither again;
+    /// `open_group`; with `after_memo`, for a caller that touched the page
+    /// itself (`touch_group`), not again;
     /// with `absent`, for a caller that has just found the memo without the
     /// group (`ZMemo::holds`), the memo not asked for it again.
     #[allow(clippy::too_many_arguments)]
@@ -4306,18 +4248,6 @@ impl ZFile {
             return None;
         };
         let was_verified = bit(&self.verified, p);
-        if !after_memo && !absent && self.memo_first && self.memo && was_verified {
-            if let Some((g, n, first, count)) =
-                memo.get(self.id, entry.page, index, self.memo_hashed)
-            {
-                return Some((
-                    Opened::Memo(g, n),
-                    usize::from(first),
-                    usize::from(count),
-                    false,
-                ));
-            }
-        }
         let own;
         let view: &PageView<'a> = match view {
             Some(v) => v,
@@ -4370,10 +4300,8 @@ impl ZFile {
         // first decode verifying every group of it. A stored group is
         // parsed where it lies and has nothing to memoise.
         if self.memo && !g.stored {
-            if was_verified && !self.memo_first && !absent {
-                if let Some((g, n, first, count)) =
-                    memo.get(self.id, entry.page, index, self.memo_hashed)
-                {
+            if was_verified && !absent {
+                if let Some((g, n, first, count)) = memo.get(self.id, entry.page, index, true) {
                     return Some((
                         Opened::Memo(g, n),
                         usize::from(first),
@@ -4396,9 +4324,9 @@ impl ZFile {
                 // now: the put tries the displaced group's `Arc` for its last
                 // reference, a load of a line last touched when that entry was
                 // made, thousands of decodes ago, and the decode is long enough
-                // to bring it (`Options::zpages_memo_ahead`).
+                // to bring it.
                 if self.memo_ahead {
-                    memo.prefetch_victim(self.id, entry.page, index, self.memo_hashed);
+                    memo.prefetch_victim(self.id, entry.page, index, true);
                 }
                 let mut fresh = memo.fresh_buf();
                 let tick = self.decode_tick();
@@ -4426,7 +4354,7 @@ impl ZFile {
                     self.id,
                     entry.page,
                     index,
-                    self.memo_hashed,
+                    true,
                     Arc::clone(&g),
                     ulen,
                     first as u16,
@@ -4460,8 +4388,8 @@ impl ZFile {
     }
 
     /// Page `p`'s view over its bytes `page`: with its directory trusted
-    /// (`view_trusted`) for a page this process has verified, under
-    /// `Options::zpages_trusted_views`, and through every check of
+    /// (`view_trusted`) for a page this process has verified, where the
+    /// attach asked for it (the store's always do), and through every check of
     /// `page_view` otherwise. What every lookup of a group in a page goes
     /// through, so the two shapes differ here and nowhere else.
     fn view<'a>(&self, p: usize, page: &'a [u8]) -> std::result::Result<PageView<'a>, ZError> {
@@ -4621,7 +4549,7 @@ impl ZFile {
         }
         if keyed {
             if let Some((page, index, off)) = memo.key_at(self.id, kh) {
-                if let Some((g, n)) = memo.peek(self.id, page, index, self.memo_hashed) {
+                if let Some((g, n)) = memo.peek(self.id, page, index, true) {
                     if record_key(g.bytes(n), off) == Some(key) {
                         memo.touch(self.id, page, self.n_pages);
                         memo.count_key_hit();
@@ -4752,7 +4680,7 @@ impl ZFile {
                 self.fail(p);
                 return Locate::Fallback;
             };
-            if !memo.holds(self.id, entry.page, index, self.memo_hashed)
+            if !memo.holds(self.id, entry.page, index, true)
                 && !memo.admit(self.id, entry.page, index)
             {
                 let tick = self.decode_tick();
@@ -5069,7 +4997,7 @@ impl ZFile {
                 let memoise = !memo.bulk_admit
                     || !self.memo
                     || u8::try_from(j).map_or(true, |index| {
-                        held = memo.holds(self.id, entry.page, index, self.memo_hashed);
+                        held = memo.holds(self.id, entry.page, index, true);
                         held || memo.admit(self.id, entry.page, index)
                     });
                 // Found absent just now: the open asks the memo nothing
@@ -11200,7 +11128,6 @@ mod tests {
                 true,
                 false,
                 true,
-                false,
                 FenceSearch::Keys,
                 true,
                 &StrideAttach::Check,
@@ -11223,18 +11150,17 @@ mod tests {
                 memo,
                 prefetch,
                 true,
-                false,
                 FenceSearch::Keys,
                 true,
                 &StrideAttach::Check,
             )
         }
 
-        /// Attached with the fence's tree and the memo's victim hint as
-        /// given (`Options::zpages_fence_tree`, `Options::zpages_memo_ahead`).
+        /// Attached with the fence's word tree and the memo's victim hint as
+        /// given, each on as the store attaches or off, the shape before.
         fn attach_lines(
             &self,
-            fence_tree: bool,
+            words: bool,
             memo_ahead: bool,
         ) -> std::result::Result<ZFile, Reject> {
             ZFile::attach(
@@ -11246,9 +11172,8 @@ mod tests {
                 true,
                 false,
                 true,
-                false,
-                if fence_tree {
-                    FenceSearch::Tree
+                if words {
+                    FenceSearch::Words
                 } else {
                     FenceSearch::Keys
                 },
@@ -11272,7 +11197,6 @@ mod tests {
                 false,
                 false,
                 true,
-                false,
                 FenceSearch::Keys,
                 true,
                 &StrideAttach::Check,
@@ -11291,7 +11215,6 @@ mod tests {
                 true,
                 false,
                 true,
-                false,
                 FenceSearch::Keys,
                 true,
                 &stride,
@@ -11408,20 +11331,20 @@ mod tests {
         }
     }
 
-    /// The fence's tree and the memo's victim hint
-    /// (`Options::zpages_fence_tree`, `Options::zpages_memo_ahead`), in
-    /// every combination, answer every key as the segment does, twice over,
-    /// with the fence indexed only where the tree is asked for.
+    /// The fence's word tree and the memo's victim hint, each as the store
+    /// attaches and as the shape before, in every combination, answer
+    /// every key as the segment does, twice over, with the word tree
+    /// standing only where it is asked for.
     #[test]
-    fn the_fences_tree_and_the_memos_hint_answer_as_the_segment_does_in_every_combination() {
+    fn the_fences_words_and_the_memos_hint_answer_as_the_segment_does_in_every_combination() {
         let fx = Fixture::new("lines", suite(3000, 17), 256);
         assert!(matches!(fx.build(), Outcome::Built(_)));
-        for (tree, ahead) in [(false, false), (true, false), (false, true), (true, true)] {
-            let zfile = fx.attach_lines(tree, ahead).unwrap();
-            assert_eq!(zfile.fence.indexed(), tree, "tree {tree}");
+        for (words, ahead) in [(false, false), (true, false), (false, true), (true, true)] {
+            let zfile = fx.attach_lines(words, ahead).unwrap();
+            assert_eq!(zfile.fence.worded(), words, "words {words}");
             agree(&fx.memo, &zfile, &fx.blob, &fx.recs);
             agree(&fx.memo, &zfile, &fx.blob, &fx.recs);
-            assert_eq!(zfile.bad_pages(), 0, "tree {tree} ahead {ahead}");
+            assert_eq!(zfile.bad_pages(), 0, "words {words} ahead {ahead}");
         }
     }
 
@@ -13199,7 +13122,6 @@ mod tests {
             false,
             false,
             true,
-            false,
             FenceSearch::Keys,
             true,
             &StrideAttach::Check,
@@ -13213,7 +13135,7 @@ mod tests {
         );
     }
 
-    /// The trusted view of a verified page (`Options::zpages_trusted_views`)
+    /// The trusted view of a verified page (`ZFile::view`)
     /// agrees with the checked view on every page of a built form file --
     /// the header, every group's entry, key and payload -- so nothing a read
     /// takes from a directory differs between the two shapes; and over a
@@ -13281,20 +13203,18 @@ mod tests {
         }
     }
 
-    /// A memo hit asked before any view (`Options::zpages_memo_first`)
-    /// answers the group's first record index and count from its entry,
-    /// reading nothing of the page: a scan of the whole form file and a seek
-    /// of every key answer, through the hits, as they did through the
-    /// decodes that filled the memo. Asked after the view, trusted or
-    /// checked, the same from the view.
+    /// A memo hit, asked after the page's view, trusted or checked, answers
+    /// the group's first record index and count: a scan of the whole form
+    /// file and a seek of every key answer, through the hits, as they did
+    /// through the decodes that filled the memo.
     #[test]
     fn a_memo_hit_carries_the_groups_first_and_count() {
-        for (trusted, memo_first) in [(true, true), (true, false), (false, false)] {
+        for trusted in [true, false] {
             let fx = Fixture::new(
-                match (trusted, memo_first) {
-                    (true, true) => "memo-first",
-                    (true, false) => "memo-first-after",
-                    _ => "memo-first-checked",
+                if trusted {
+                    "memo-hit-trusted"
+                } else {
+                    "memo-hit-checked"
                 },
                 suite(3000, 41),
                 256,
@@ -13309,7 +13229,6 @@ mod tests {
                 true,
                 false,
                 trusted,
-                memo_first,
                 FenceSearch::Keys,
                 true,
                 &StrideAttach::Check,
@@ -13354,11 +13273,8 @@ mod tests {
             let (hits, misses) = fx.memo.take_counts();
             assert_eq!((d2, misses), (0, 0), "the second pass hits for every group");
             assert!(hits > 0);
-            assert_eq!(
-                first_pass, second_pass,
-                "trusted {trusted} memo first {memo_first}"
-            );
-            assert_eq!(seeks1, seeks2, "trusted {trusted} memo first {memo_first}");
+            assert_eq!(first_pass, second_pass, "trusted {trusted}");
+            assert_eq!(seeks1, seeks2, "trusted {trusted}");
         }
     }
 
@@ -13393,7 +13309,6 @@ mod tests {
                 true,
                 false,
                 true,
-                false,
                 FenceSearch::Keys,
                 true,
                 &StrideAttach::Check,
@@ -13410,7 +13325,6 @@ mod tests {
                 true,
                 false,
                 true,
-                false,
                 FenceSearch::Keys,
                 true,
                 &StrideAttach::Check,
@@ -18108,7 +18022,6 @@ mod tests {
                 true,
                 prefetch,
                 true,
-                false,
                 FenceSearch::Keys,
                 true,
                 &StrideAttach::Check,

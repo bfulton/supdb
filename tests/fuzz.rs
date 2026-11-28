@@ -60,9 +60,8 @@
 //! - `ZFUZZ_PROMOTE`: set, with the form forced and the cache on, the `z`
 //!   store holds a block read a few entries' worth as a copy in its slot
 //!   under a small budget (`Options::zpages_promote_copies`).
-//! - `ZFUZZ_OPTVARY`: set, a seed turns compaction, promotion, the trusted
-//!   page views of the compact form or its block cursor off, or its
-//!   memo-first ask on, each with a chance of 15%; and holds its log in
+//! - `ZFUZZ_OPTVARY`: set, a seed turns compaction, promotion or the
+//!   compact form's block cursor off, each with a chance of 15%; and holds its log in
 //!   the process in a quarter of the seeds (`SyncPolicy::Explicit`,
 //!   `Cfg::hold_small`), dropped at half its reopens and closed at the
 //!   rest; and in half of those builds no frames (`Cfg::held_frames`),
@@ -356,26 +355,10 @@ struct Cfg {
     big: bool,
     compact: bool,
     promote: bool,
-    /// A verified form page's directory read trusted
-    /// (`Options::zpages_trusted_views`); off in some seeds under
-    /// `ZFUZZ_OPTVARY`, so the shape before is read against the model too.
-    trusted: bool,
-    /// A verified page's group asked of the memo before any view
-    /// (`Options::zpages_memo_first`, off as shipped); on in some seeds
-    /// under `ZFUZZ_OPTVARY`.
-    memo_first: bool,
     /// A block of a covered partition read through one cursor
     /// (`Options::zpages_block_cursor`); off in some seeds under
     /// `ZFUZZ_OPTVARY`, so the shape before is read against the model too.
     block_cursor: bool,
-    /// The fence searched through its tree (`Options::zpages_fence_tree`,
-    /// off as shipped); on in a quarter of the seeds under `ZFUZZ_OPTVARY`,
-    /// so the tree is read against the model too.
-    fence_tree: bool,
-    /// A decode asking ahead for the memo entry its put displaces
-    /// (`Options::zpages_memo_ahead`); off in some seeds under
-    /// `ZFUZZ_OPTVARY`.
-    memo_ahead: bool,
     /// The scans' start keys kept with their blocks
     /// (`Options::scan_start_cache`, off); on in some seeds under
     /// `ZFUZZ_OPTVARY`, so a scan that takes its block from the cache is
@@ -893,18 +876,24 @@ fn pick_cfg(rng: &mut Rng, want_cache: bool) -> Cfg {
         big: rng.chance(25),
         compact: !(std::env::var("ZFUZZ_OPTVARY").is_ok() && rng.chance(15)),
         promote: !(std::env::var("ZFUZZ_OPTVARY").is_ok() && rng.chance(15)),
-        trusted: !(std::env::var("ZFUZZ_OPTVARY").is_ok() && rng.chance(15)),
-        memo_first: std::env::var("ZFUZZ_OPTVARY").is_ok() && rng.chance(15),
-        block_cursor: !(std::env::var("ZFUZZ_OPTVARY").is_ok() && rng.chance(15)),
-        fence_tree: {
-            // The draw the compressed record coding took
-            // (`Options::zpages_record_coding`, gone), kept so that no
-            // seed's draws after it move.
+        block_cursor: {
+            // The draws the checked views and the memo asked first took
+            // (`Options::zpages_trusted_views`, `Options::zpages_memo_first`,
+            // gone), kept so that no seed's draws after them move.
+            let _ = !(std::env::var("ZFUZZ_OPTVARY").is_ok() && rng.chance(15));
+            let _ = std::env::var("ZFUZZ_OPTVARY").is_ok() && rng.chance(15);
+            !(std::env::var("ZFUZZ_OPTVARY").is_ok() && rng.chance(15))
+        },
+        start_cache: {
+            // The draws the compressed record coding, the fence's tree and
+            // the memo's victim hint took (`Options::zpages_record_coding`,
+            // `Options::zpages_fence_tree`, `Options::zpages_memo_ahead`,
+            // gone), kept so that no seed's draws after them move.
             let _ = std::env::var("ZFUZZ_OPTVARY").is_ok() && rng.chance(25);
+            let _ = std::env::var("ZFUZZ_OPTVARY").is_ok() && rng.chance(25);
+            let _ = !(std::env::var("ZFUZZ_OPTVARY").is_ok() && rng.chance(15));
             std::env::var("ZFUZZ_OPTVARY").is_ok() && rng.chance(25)
         },
-        memo_ahead: !(std::env::var("ZFUZZ_OPTVARY").is_ok() && rng.chance(15)),
-        start_cache: std::env::var("ZFUZZ_OPTVARY").is_ok() && rng.chance(25),
         raw_tails: {
             // The draw the stored-whole form took (`Options::zpages_store_all`,
             // gone), kept so that no seed's draws after it move.
@@ -960,12 +949,8 @@ fn opts(c: &Cfg) -> Options {
         sync: c.sync,
         compact: c.compact,
         promote: c.promote,
-        zpages_trusted_views: c.trusted,
-        zpages_memo_first: c.memo_first,
         zpages_block_cursor: c.block_cursor,
         zpages_raw_tails: c.raw_tails,
-        zpages_fence_tree: c.fence_tree,
-        zpages_memo_ahead: c.memo_ahead,
         zpages_point_part: c.point_part,
         zpages_point_keys: c.point_keys,
         run_spare: c.run_spare,

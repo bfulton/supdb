@@ -806,28 +806,11 @@ nothing. `supdb-cache64tofitautozpagesspan` is the combined arm with a
 block-cache scan's block taken from the fence and the page's directory
 and its rank sought only for a block not held as a copy
 (`Options::zpages_seek_span`), where the default seeks every scan's rank
-through a group. `supdb-cache64tofitautozpagesmemolinear` is the combined arm with the
-memo's slot the group's number plus a multiple of the form file's
-identity (`Options::zpages_memo_hash` off), where the default hashes the
-two over every slot. `supdb-cache64tofitautozpagesexactcut` is the combined arm with a
+through a group. `supdb-cache64tofitautozpagesexactcut` is the combined arm with a
 settle resolving every written key's cut through a seek
 (`Options::zpages_settle_span` off), where the default files a key under
 the block the fence and the directory name and leaves its cut to the build
-that reads the block. `supdb-cache64tofitautozpagescheckedviews` is the
-combined arm with every view of a form file's page checked and the memo
-asked after it (`Options::zpages_trusted_views` off), where the default
-reads a verified page's directory trusted, and `supdb-nocachezpagescheckedviews`
-is the forced arm with the same, the pair against `supdb-nocachezpages`;
-`supdb-cache64tofitautozpagesmemofirst` is the combined arm with a
-verified page's group asked of the memo before any view of the page
-(`Options::zpages_memo_first`), where the default asks after it;
-`supdb-cache64tofitautozpagesfencetree` is the combined arm with the
-form file's fence searched through a tree over the entries' words built at
-the attach (`Options::zpages_fence_tree`), where the default searches the
-keys; `supdb-cache64tofitautozpagesmemonoahead` is the combined arm
-with a decode asking nothing ahead for the memo entry its put displaces
-(`Options::zpages_memo_ahead` off), where the default asks for its line
-before the decode; `supdb-cache64tofitautozpagesstartcache` is the
+that reads the block; `supdb-cache64tofitautozpagesstartcache` is the
 combined arm with a scan's start key kept with its block
 (`Options::scan_start_cache` at 4,096 entries), a scan starting where a
 scan started skipping the partition's seek, where the default seeks every
@@ -895,17 +878,11 @@ milliseconds (`Options::heads_look_ms`);
 through their mappings throughout, no copy of a raw-served partition's
 held in the process's own memory out of core (`Options::heads_owned`
 off);
-`supdb-zpointwhole` is `supdb` with a point read through a form file
-decoding its group whole into the handle's memo at every miss, no decode
-of a first-touched group only as far as its key and no admission at the
-second touch (`Options::zpages_point_part` off), `supdb-znopointkeys`
-with no table of where the keys read through the memo lie
-(`Options::zpages_point_keys` off), and `supdb-zpointplain` with both
-off, the point read through the form as it stood; `supdb-zscanputs` is
-`supdb` with every decode of a walk through a form file put in the memo,
-no first touch of a group decoded into the cursor's own buffer
-(`Options::zpages_scan_admit` off), and `supdb-zmemoplain` with all three
-off, the memo as it stood; `supdb-zwalkwhole` is `supdb` with every group
+`supdb-znopointkeys` is `supdb` with no table of where the keys read
+through a form file's memo lie (`Options::zpages_point_keys` off);
+`supdb-zscanputs` is `supdb` with every decode of a walk through a form
+file put in the memo, no first touch of a group decoded into the cursor's
+own buffer (`Options::zpages_scan_admit` off); `supdb-zwalkwhole` is `supdb` with every group
 a walk opens through a form file decoded whole, none only as far as the
 walk reads (`Options::zpages_walk_part` off); `supdb-zbulkmemo` is
 `supdb` with every decode of the bulk walk through a form file
@@ -994,11 +971,7 @@ to carry across, a merge's or a seal's landing among them
 `supdb-cache64tofitautozpagesperrun` is the combined arm with a block read
 through a cursor a run, a seek a cut and a read by rank a replaced record
 (`Options::zpages_block_cursor` off), where the default reads a block through
-one cursor held across it; `supdb-cache64tofitautozpagesmemo4`,
-`supdb-cache64tofitautozpagesmemo16` and `supdb-cache64tofitautozpagesmemo32`
-are the combined arm with the memo of decoded groups capped at four, sixteen
-and thirty-two mebibytes (`Options::zpages_memo_bytes`), where the default
-caps it at eight. The
+one cursor held across it. The
 forced arm's
 `sync` builds the form files, so its load carries the build, and in memory
 it reads slower than the raw form: it is an arm for the bound, not a

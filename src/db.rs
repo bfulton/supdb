@@ -1865,15 +1865,6 @@ pub struct Options {
     /// `memo_misses`). `supdb-nocachezpagesnomemo` is the arm with it off.
     #[doc(hidden)]
     pub zpages_memo: bool,
-    /// The memo's slot for a group by a Fibonacci hash of the group's
-    /// number and the form file's identity (`zfile::Memo::slot`), over
-    /// every slot. Off is the group's number plus a multiple of the
-    /// identity, the shape before: a page's groups take sixteen numbers and
-    /// the shipped cut puts about four groups on a page, so a form file's
-    /// groups reached a quarter of the slots and pages 256 apart collided.
-    /// `supdb-cache64tofitautozpagesmemolinear` is the arm.
-    #[doc(hidden)]
-    pub zpages_memo_hash: bool,
     /// A settle files a written key under the block the form file's fence
     /// and the page's directory name (`ZFile::owner_span`) with its cut
     /// left unresolved, where that block holds no form a patch would need
@@ -1983,53 +1974,13 @@ pub struct Options {
     /// form as before. On; `supdb-settlespan` files by the form's span.
     #[doc(hidden)]
     pub settle_covered_samples: bool,
-    /// A verified page of a form file is read with its directory trusted
-    /// (`zpages::view_trusted`, `ZFile::view`), and a read takes a page's
-    /// view once, for the group it wants and the open of it. The checked
-    /// view (`view_checked`) re-made the directory's cross-checks at every
-    /// group open, two or three times a group between the view that found
-    /// the group, the view the open took and a miss's decode: 8.5% of the E
-    /// mix's time and 15% of D's on the main thread at five million keys
-    /// under 640 MiB, beside the decode's 27%; by callgrind the views are
-    /// 437 instructions of a point read's 5,315 checked and 144 trusted.
-    /// What those checks catch on a page a first decode has passed is a
-    /// directory changed under the mapping since, which the decode's length
-    /// check or the record parse catches where they would catch it by
-    /// chance too, and the page leaves service there as before. Off is
-    /// every view checked, the shape before;
-    /// `supdb-cache64tofitautozpagescheckedviews` and the forced
-    /// `supdb-nocachezpagescheckedviews` are the arms.
-    #[doc(hidden)]
-    pub zpages_trusted_views: bool,
-    /// The decoded bytes a handle's memo of groups holds at most
-    /// (`zfile::ZMemo`), its slots scaled with it: eight mebibytes as
-    /// shipped, which E's Zipfian head outgrows at five million keys under
-    /// 640 MiB (a 42% hit rate over 2.4 asks a scan, the block read through
-    /// one cursor). A larger memo trades the page cache a bound leaves the
-    /// form files for decodes saved: by count, sixteen mebibytes decode 8%
-    /// fewer groups in E and 12% fewer in C, thirty-two 14% and 16% fewer,
-    /// four 5.5% and 12% more, with the point reads' major faults level.
-    /// Paired, none of the three moves E or C for the better: sixteen reads
-    /// D slower in both orders, thirty-two reads C a tenth slower in both,
-    /// and four reads E slower in both -- the memo pays for the groups that
-    /// come back while still warm in the last-level cache, the Zipfian
-    /// head's, and a hit on a cold group costs the walk its lines from
-    /// memory, about what the decode would have. Eight is at the knee for
-    /// the suite's shape; `supdb-cache64tofitautozpagesmemo4`, `...memo16`
-    /// and `...memo32` are the arms, paired against the default by
-    /// `bench/scripts/pair.sh supdb-cache64tofitautozpages
-    /// supdb-cache64tofitautozpagesmemo4 5000000 --reps 5 --bound 671088640
-    /// --passes read,read-threaded,scan,scan-threaded,mixes --ops-div 10` and
-    /// the same with the others, at `89e309d`.
-    #[doc(hidden)]
-    pub zpages_memo_bytes: usize,
     /// EXPERIMENT: a handle's memo keeps its decoded groups in the cells of
     /// a slab of its own, one block mapped by the engine and unmapped when
     /// the handle drops (`blocks::Slab`, `zfile::memo_cell_bytes`), each
     /// cell the bytes a group is cut at and the decoder's room past them.
     /// From the allocator a group's buffer is a chunk of its own in whole
-    /// pages, 4 KB for a group of two, so a memo budgeted at
-    /// `zpages_memo_bytes`, which counts the groups' bytes, held twice
+    /// pages, 4 KB for a group of two, so a memo budgeted at eight
+    /// mebibytes (`zfile::ZMEMO_BYTES`), which counts the groups' bytes, held twice
     /// that: a thread reading through the block form held 18 MB at its
     /// most at six hundred thousand keys, by an allocator that counts by
     /// thread (`tests/alloc_peaks.rs`), and when the thread ended its
@@ -2041,70 +1992,6 @@ pub struct Options {
     /// `supdb-zmemoslab` turns it on.
     #[doc(hidden)]
     pub zpages_memo_slab: bool,
-    /// EXPERIMENT: a verified page's group asked of the handle's memo before
-    /// any view of the page, the memo's entry carrying the group's first
-    /// record and count, so a hit reads nothing of the page
-    /// (`ZFile::open_group`). Off, the memo is asked after the view, which
-    /// says whether the group is compressed, the order the shape before
-    /// had. Paired on with the trusted views in four sittings of two
-    /// pairings at five million keys under 640 MiB, the pair read 1-4%
-    /// slower in time on every mix, in 44 of 72 pairs, for 2-6% fewer
-    /// instructions by callgrind: a cost the count does not show, read as
-    /// the memo slot's miss serialized ahead of the page's where the view's
-    /// work had overlapped them, and not resolved, since this guest has no
-    /// cycle counters. Off; `supdb-cache64tofitautozpagesmemofirst` is the
-    /// arm.
-    #[doc(hidden)]
-    pub zpages_memo_first: bool,
-    /// EXPERIMENT: a form file's fence searched through a tree over the
-    /// entries' words (`zpages::ZFence::index`, built at the attach): a
-    /// balanced tree over the entries in key order laid out breadth first,
-    /// one word a level, the line three levels down asked for before it is
-    /// read, and the whole key compared only where entries tie on the word.
-    /// Built for the fence's search, a twentieth of the E mix's thread at
-    /// five million keys under 640 MiB, read as a binary search whose every
-    /// probe below the top missed on a line of the offsets and a line of
-    /// the keys. Profiled arm against arm, the tree's search took more of
-    /// the thread, not less (4.2% against 3.4%), and the pairing read level
-    /// everywhere: that store's fences are nineteen of some 4,900 entries,
-    /// a hundred kilobytes each and in the second-level cache for the
-    /// partitions a Zipfian reads, so the search was never miss-bound and
-    /// the tree's prefetches, bounds and word compares are instructions
-    /// added to a search that had none to lose. Off;
-    /// `supdb-cache64tofitautozpagesfencetree` is the arm, for a store
-    /// whose fence does not fit a cache -- one partition of millions of
-    /// pages -- where the tree's reading of one line a level would count.
-    /// Twelve bytes an entry beside the fence's sixteen and the keys.
-    #[doc(hidden)]
-    pub zpages_fence_tree: bool,
-    /// A form file's fence searched over the entries' words laid flat
-    /// (`zpages::ZFence::index_words`, built at the attach), by a binary
-    /// search whose every step moves by arithmetic on the compare and not
-    /// by a branch, and the whole key compared only where entries tie on
-    /// the word. The search over the keys (the shape before) read a line
-    /// of the offsets and a line of the key blob a probe and mispredicted
-    /// half its probes, thirteen a search over a partition's fence of
-    /// some five thousand entries: at ten million keys under 1.25 GiB it
-    /// was 7% of ycsb-E's thread, 5% of C's and 8% of D's, a search a scan
-    /// and one or more a point read (`docs/engine.md`); the tree over the
-    /// words (`zpages_fence_tree`) took more, since a search of instructions
-    /// and cache hits had no misses for a tree to save. Eight bytes an
-    /// entry. On; `supdb-fencekeys` is the shape before. Where the tree is
-    /// asked for it is built instead.
-    #[doc(hidden)]
-    pub zpages_fence_words: bool,
-    /// A group's decode asks for the line of the memo entry its put will
-    /// displace before it begins (`zfile::Memo::prefetch_victim`): the put
-    /// tries the displaced group's `Arc` for its last reference, a load of
-    /// a line last touched when that entry was made, thousands of decodes
-    /// ago, and a cold miss a decode -- `Memo::recycle` was 2.9% of the E
-    /// mix's thread at five million keys under 640 MiB, on no instruction
-    /// worth the name. Profiled arm against arm the recycle's samples go
-    /// from 2.0% of the thread to 0.25%, the miss gone; paired, the
-    /// memo-heavy mixes read 3-6% for the hint in two thirds of the pairs
-    /// and no cell against it, inside the band. On;
-    /// `supdb-cache64tofitautozpagesmemonoahead` is the shape before.
-    pub zpages_memo_ahead: bool,
     /// EXPERIMENT: a point read's first touch of a block-coded group of a
     /// verified page decodes the group into the read's own buffer only as
     /// far as the walk for its key reads (`zpages::seek_group_partly`,
@@ -2114,8 +2001,9 @@ pub struct Options {
     /// of the memo decoded its group whole, into a buffer of the memo's
     /// last written thousands of decodes ago, and displaced a group that
     /// may have been read again -- and a store larger than its caches
-    /// reads most of its groups once. `supdb-zpointwhole` is the whole
-    /// decode into the memo at every miss.
+    /// reads most of its groups once. A test's seam off: the whole decode
+    /// into the memo at every miss, the shape before.
+    #[doc(hidden)]
     pub zpages_point_part: bool,
     /// EXPERIMENT: a handle keeps where the keys it read through the memo
     /// lie -- the form file, the page, the group and the record's offset,
@@ -2251,9 +2139,8 @@ pub struct Options {
     /// `supdb-zwalkwhole` decodes every group a walk opens whole.
     pub zpages_walk_part: bool,
     /// EXPERIMENT: the block path's cursor over a form file
-    /// (`zfile::ZCursor`) keeps the page's view across the page's groups,
-    /// and where `zpages_memo_first` asks the memo before any view it builds
-    /// none for a group the memo holds: a view was built at every open --
+    /// (`zfile::ZCursor`) keeps the page's view across the page's groups:
+    /// a view was built at every open --
     /// the header parsed and checked, the directory's keys walked -- and
     /// twice more where the cursor was placed by rank, for a page the cursor
     /// had the view of already, a tenth of a covered scan's time beside the
@@ -7179,7 +7066,7 @@ impl Options {
     /// here and nowhere else, so an option of the memo's is every
     /// handle's or none's.
     fn handle_memo(&self) -> zfile::ZMemo {
-        zfile::ZMemo::sized(self.zpages_memo_bytes)
+        zfile::ZMemo::sized(zfile::ZMEMO_BYTES)
             .slab(self.memo_cell())
             .point(self.zpages_point_part, self.zpages_point_keys)
             .point_filter(self.zpages_point_filter)
@@ -7363,7 +7250,6 @@ impl Default for Options {
             zpages_seek_ord: false,
             zpages_seek_span: false,
             scan_start_cache: 0,
-            zpages_memo_hash: true,
             zpages_settle_span: true,
             settle_lazy_raw: false,
             settle_append_last: true,
@@ -7371,13 +7257,7 @@ impl Default for Options {
             copy_packed: true,
             settle_lone_chain: true,
             settle_covered_samples: true,
-            zpages_trusted_views: true,
-            zpages_memo_bytes: 8 << 20,
             zpages_memo_slab: false,
-            zpages_memo_first: false,
-            zpages_fence_tree: false,
-            zpages_fence_words: true,
-            zpages_memo_ahead: true,
             zpages_point_part: true,
             zpages_point_keys: true,
             zpages_point_filter: true,
@@ -45275,13 +45155,9 @@ impl Db {
                     dir,
                     s,
                     advise,
-                    Db::z_memo(&opts),
+                    opts.zpages_memo,
                     opts.zpages_scan_prefetch,
-                    opts.zpages_trusted_views,
-                    opts.zpages_memo_first,
                     ZAttachLines {
-                        fence: Db::fence_search(&opts),
-                        memo_ahead: opts.zpages_memo_ahead,
                         drop_raw: opts.zpages_drop_raw,
                         time_decodes: opts.z_times_decodes(),
                         cursor_view: opts.zpages_cursor_view,
@@ -52112,8 +51988,6 @@ const ZPARSE_CHAINS: u32 = 4;
 /// own shape, by name: a tuple of flags read by position lost the raw
 /// drop to the decode timer's slot when a flag before them went.
 struct ZAttachLines {
-    fence: zpages::FenceSearch,
-    memo_ahead: bool,
     drop_raw: bool,
     time_decodes: bool,
     cursor_view: bool,
@@ -52164,28 +52038,6 @@ impl Db {
         opts.read_advice != ReadAdvice::Normal
     }
 
-    /// How a form file meets the handles' memos, by the options
-    /// (`Options::zpages_memo`, `Options::zpages_memo_hash`).
-    /// How a form file's fence is searched, from the options: the tree
-    /// where asked, else the flat words where asked, else the keys.
-    fn fence_search(opts: &Options) -> zpages::FenceSearch {
-        if opts.zpages_fence_tree {
-            zpages::FenceSearch::Tree
-        } else if opts.zpages_fence_words {
-            zpages::FenceSearch::Words
-        } else {
-            zpages::FenceSearch::Keys
-        }
-    }
-
-    fn z_memo(opts: &Options) -> zfile::MemoShape {
-        match (opts.zpages_memo, opts.zpages_memo_hash) {
-            (false, _) => zfile::MemoShape::Off,
-            (true, false) => zfile::MemoShape::Linear,
-            (true, true) => zfile::MemoShape::Hashed,
-        }
-    }
-
     /// `seg`'s form file attached from the file its name carries, if there is
     /// one that checks out against the segment: installed, counted, and
     /// true. A file that does not check out is counted by kind and left
@@ -52197,10 +52049,8 @@ impl Db {
         dir: &Path,
         seg: &Seg,
         advise: bool,
-        memo: zfile::MemoShape,
+        memo: bool,
         prefetch: bool,
-        trusted: bool,
-        memo_first: bool,
         lines: ZAttachLines,
         stride: &zfile::StrideAttach,
         ev: &zfile::ZEvents,
@@ -52219,10 +52069,9 @@ impl Db {
             advise,
             memo,
             prefetch,
-            trusted,
-            memo_first,
-            lines.fence,
-            lines.memo_ahead,
+            true,
+            zpages::FenceSearch::Words,
+            true,
             stride,
         ) {
             Ok(mut side) => {
@@ -52280,13 +52129,9 @@ impl Db {
                 &self.dir,
                 seg,
                 advise,
-                Db::z_memo(&self.opts),
+                self.opts.zpages_memo,
                 self.opts.zpages_scan_prefetch,
-                self.opts.zpages_trusted_views,
-                self.opts.zpages_memo_first,
                 ZAttachLines {
-                    fence: Db::fence_search(&self.opts),
-                    memo_ahead: self.opts.zpages_memo_ahead,
                     drop_raw: z_drop_now(&self.opts, &self.shared),
                     time_decodes: self.opts.z_times_decodes(),
                     cursor_view: self.opts.zpages_cursor_view,
@@ -52334,12 +52179,11 @@ impl Db {
                     id,
                     end,
                     advise,
-                    Db::z_memo(&self.opts),
+                    self.opts.zpages_memo,
                     self.opts.zpages_scan_prefetch,
-                    self.opts.zpages_trusted_views,
-                    self.opts.zpages_memo_first,
-                    Db::fence_search(&self.opts),
-                    self.opts.zpages_memo_ahead,
+                    true,
+                    zpages::FenceSearch::Words,
+                    true,
                     &self.opts.z_stride_attach_built(&b),
                 ) {
                     Ok(mut side) => {
@@ -66746,13 +66590,9 @@ impl Maint {
                 &self.dir,
                 seg,
                 Db::z_advise(&self.opts),
-                Db::z_memo(&self.opts),
+                self.opts.zpages_memo,
                 self.opts.zpages_scan_prefetch,
-                self.opts.zpages_trusted_views,
-                self.opts.zpages_memo_first,
                 ZAttachLines {
-                    fence: Db::fence_search(&self.opts),
-                    memo_ahead: self.opts.zpages_memo_ahead,
                     drop_raw: z_drop_now(&self.opts, &self.shared),
                     time_decodes: self.opts.z_times_decodes(),
                     cursor_view: self.opts.zpages_cursor_view,
@@ -67137,12 +66977,11 @@ impl Maint {
                     id,
                     end,
                     Db::z_advise(&self.opts),
-                    Db::z_memo(&self.opts),
+                    self.opts.zpages_memo,
                     self.opts.zpages_scan_prefetch,
-                    self.opts.zpages_trusted_views,
-                    self.opts.zpages_memo_first,
-                    Db::fence_search(&self.opts),
-                    self.opts.zpages_memo_ahead,
+                    true,
+                    zpages::FenceSearch::Words,
+                    true,
                     &self.opts.z_stride_attach_built(&built),
                 ) {
                     Ok(mut side) => {
@@ -67238,12 +67077,11 @@ impl Maint {
                         id,
                         end,
                         Db::z_advise(&self.opts),
-                        Db::z_memo(&self.opts),
+                        self.opts.zpages_memo,
                         self.opts.zpages_scan_prefetch,
-                        self.opts.zpages_trusted_views,
-                        self.opts.zpages_memo_first,
-                        Db::fence_search(&self.opts),
-                        self.opts.zpages_memo_ahead,
+                        true,
+                        zpages::FenceSearch::Words,
+                        true,
                         &self.opts.z_stride_attach_built(&built),
                     ) {
                         Ok(mut side) => {

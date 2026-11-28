@@ -2464,52 +2464,7 @@ fn scans_with_a_cursor_a_run_and_a_seek_a_cut_agree_with_the_model_over_every_wi
     // cut and a read by rank a replaced record (`Options::zpages_block_cursor`
     // off), the shape before a block was read through one cursor held
     // across it: both shapes answer every window alike.
-    windows_over_with(
-        "windows-cache-perrun",
-        true,
-        false,
-        false,
-        true,
-        true,
-        false,
-        false,
-    );
-}
-
-#[test]
-fn scans_with_every_page_view_checked_agree_with_the_model_over_every_window() {
-    // The block cache with every view of a form file's page checked and the
-    // memo asked after it (`Options::zpages_trusted_views` off), the shape
-    // before a verified page's directory was read trusted: both shapes
-    // answer every window alike.
-    windows_over_with(
-        "windows-cache-checkedviews",
-        true,
-        false,
-        false,
-        true,
-        false,
-        false,
-        true,
-    );
-}
-
-#[test]
-fn scans_with_the_memo_asked_before_the_view_agree_with_the_model_over_every_window() {
-    // The block cache with a verified page's group asked of the memo before
-    // any view of the page (`Options::zpages_memo_first`, off as shipped):
-    // a hit answers the group's first record and count from its entry, and
-    // every window answers alike.
-    windows_over_with(
-        "windows-cache-memofirst",
-        true,
-        false,
-        false,
-        true,
-        true,
-        true,
-        true,
-    );
+    windows_over_with("windows-cache-perrun", true, false, false, true, false);
 }
 
 #[test]
@@ -4607,18 +4562,15 @@ fn the_prefetch_arm_scans_the_same_and_asks_once_a_walk() {
 }
 
 fn windows_over(name: &str, cache: bool, promote: bool, span: bool, lazy: bool) {
-    windows_over_with(name, cache, promote, span, lazy, true, false, true);
+    windows_over_with(name, cache, promote, span, lazy, true);
 }
 
-#[allow(clippy::too_many_arguments)]
 fn windows_over_with(
     name: &str,
     cache: bool,
     promote: bool,
     span: bool,
     lazy: bool,
-    trusted: bool,
-    memo_first: bool,
     block_cursor: bool,
 ) {
     // The scans of a covered partition answer as if the form were not there,
@@ -4640,8 +4592,6 @@ fn windows_over_with(
             o.scan_block_cache = cache;
             o.zpages_seek_span = span;
             o.zpages_settle_span = lazy;
-            o.zpages_trusted_views = trusted;
-            o.zpages_memo_first = memo_first;
             o.zpages_block_cursor = block_cursor;
             if span {
                 o.upkeep = supdb::Upkeep::Inline;
@@ -5362,8 +5312,7 @@ fn the_sizes_the_store_reports_are_the_files_it_holds() {
         let (mut fnc, filter) =
             ZFence::decode_resident(&bytes[t.res_off as usize..bytes.len() - ZTRAILER], &t)
                 .unwrap();
-        // The fence as the attach keeps it: its word tree indexed
-        // (`Options::zpages_fence_words`, on).
+        // The fence as the attach keeps it: its word tree indexed.
         fnc.index_words();
         fence += fnc.heap_bytes() as u64 + filter.len() as u64;
     }

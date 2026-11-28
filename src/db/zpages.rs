@@ -619,7 +619,8 @@ fn view_checked(page: &[u8]) -> Result<PageView<'_>, ZError> {
 /// directory a flipped byte changed after the verification is caught where
 /// the checked view would catch it only by chance too -- at the decode, whose
 /// length the payload no longer fits, or at the record parse -- and the page
-/// leaves service there as it would. `Options::zpages_trusted_views`.
+/// leaves service there as it would. Every view the store takes of a
+/// verified page is this one (`ZFile::view`).
 pub fn view_trusted(page: &[u8]) -> Result<PageView<'_>, ZError> {
     view_with(page, false)
 }
@@ -3016,16 +3017,13 @@ pub struct FenceEntry<'a> {
 
 /// How a form file's fence is searched, decided at the attach: over the
 /// keys, a binary search with a line of the offsets and a line of the key
-/// blob a probe (the shape before); through a static B-tree of the
-/// entries' words, eight a node and a cache line a level
-/// (`Options::zpages_fence_words`, [`ZFence::index_words`]); or through the
-/// binary tree over the words (`Options::zpages_fence_tree`,
-/// [`ZFence::index`]).
+/// blob a probe (the shape before, and the oracle); or through a static
+/// B-tree of the entries' words, eight a node and a cache line a level
+/// ([`ZFence::index_words`]), as the store attaches every form file.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum FenceSearch {
     Keys,
     Words,
-    Tree,
 }
 
 /// The fence: for each entry the rank and the key of the first record it
@@ -3039,35 +3037,18 @@ pub struct ZFence {
     /// `key_off[i]..key_off[i + 1]` is entry `i`'s key in `keys`.
     key_off: Vec<u32>,
     keys: Vec<u8>,
-    /// The search tree over the entries' words ([`ZFence::index`]): the
-    /// nodes of a balanced binary tree over the entries in key order, laid
-    /// out breadth first -- node 1 the root, node `i`'s children `2i` and
-    /// `2i + 1` -- so that a search reads one word a level and asks for the
-    /// line that holds a node's great-grandchildren three levels before it
-    /// reads one of them. Empty until `index` builds it, and emptied by a
-    /// `push`.
-    probe: Vec<ProbeLine>,
-    /// Each node's entry: `probe_pos[i]` for node `i`.
-    probe_pos: Vec<u32>,
     /// The entries' words in a static B-tree of eight a node
     /// ([`ZFence::index_words`]): node `k`'s words at `words[8k..8k + 8]`,
     /// its nine children the nodes `9k + 1..=9k + 9`, the words in key
     /// order through the tree, padded with `u64::MAX` past the last entry.
-    /// Empty until `index_words` builds it, and emptied by a `push` or by
-    /// `index`; `words_h` is the tree's height.
+    /// Empty until `index_words` builds it, and emptied by a `push`;
+    /// `words_h` is the tree's height.
     words: Vec<u64>,
     words_h: u8,
     /// The bytes every non-empty key shares, and so where an entry's word
     /// begins in its key.
     shared: Vec<u8>,
 }
-
-/// Eight nodes of a fence's search tree, a line of them: node `i` sits at
-/// `probe[i / 8].0[i % 8]`, so node `8i` begins a line and the line at index
-/// `i` holds the eight great-grandchildren of node `i`.
-#[repr(C, align(64))]
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct ProbeLine([u64; 8]);
 
 /// An entry's word: the eight bytes of `key` after the `shared` bytes every
 /// non-empty key begins with, padded with zeros, as a big-endian integer.
@@ -3111,8 +3092,6 @@ impl ZFence {
             page: Vec::new(),
             key_off: vec![0],
             keys: Vec::new(),
-            probe: Vec::new(),
-            probe_pos: Vec::new(),
             words: Vec::new(),
             words_h: 0,
             shared: Vec::new(),
@@ -3133,58 +3112,15 @@ impl ZFence {
         self.keys.extend_from_slice(key);
         self.key_off.push(end);
         // The tree was of the entries before this one.
-        self.probe.clear();
-        self.probe_pos.clear();
         self.words.clear();
         self.words_h = 0;
         self.shared.clear();
         Ok(())
     }
 
-    /// The search tree over the entries' words built, for `entry_of` to
-    /// read where it stands; without it the search is over the keys, a pair
-    /// of lines a probe. A reader's fence is indexed once at the attach
-    /// under `Options::zpages_fence_tree`. The words are the eight bytes after
-    /// the bytes every non-empty key shares, which are the bytes the first
-    /// non-empty key and the last share, since the keys ascend; the empty
-    /// key, the open lower fence, has no bytes to share and its word is
-    /// zero, below every other.
-    pub fn index(&mut self) {
-        let n = self.len();
-        self.probe.clear();
-        self.probe_pos.clear();
-        self.words.clear();
-        self.words_h = 0;
-        self.shared.clear();
-        if n == 0 {
-            return;
-        }
-        self.find_shared();
-        let shared = self.shared.len();
-        self.probe = vec![ProbeLine([0; 8]); (n + 1).div_ceil(8)];
-        self.probe_pos = vec![0; n + 1];
-        // The nodes filled in key order: an in-order walk of the tree, the
-        // walk's depth the tree's height.
-        fn fill(f: &mut ZFence, node: usize, n: usize, next: &mut usize, shared: usize) {
-            if node > n {
-                return;
-            }
-            fill(f, 2 * node, n, next, shared);
-            let e = *next;
-            *next += 1;
-            let w = fence_word(f.key(e).expect("an entry has its key"), shared);
-            f.probe[node / 8].0[node % 8] = w;
-            f.probe_pos[node] = e as u32;
-            fill(f, 2 * node + 1, n, next, shared);
-        }
-        let mut next = 0usize;
-        fill(self, 1, n, &mut next, shared);
-        debug_assert_eq!(next, n, "every entry has its node");
-    }
-
     /// The bytes every non-empty key shares, found: the bytes the first
-    /// non-empty key and the last share, since the keys ascend. For `index`
-    /// and `index_words`.
+    /// non-empty key and the last share, since the keys ascend. For
+    /// `index_words`.
     fn find_shared(&mut self) {
         let n = self.len();
         let first = (0..n).find(|&i| self.key(i).is_some_and(|k| !k.is_empty()));
@@ -3197,18 +3133,15 @@ impl ZFence {
     }
 
     /// The entries' words in a static B-tree, for `entry_of` to search a
-    /// cache line a level (`Options::zpages_fence_words`): eight words a
-    /// node, nine children, the words as `index` takes them laid through
+    /// cache line a level: eight words a node, nine children, the words
+    /// after the bytes every non-empty key shares laid through
     /// the tree in key order -- node `k`'s children are nodes `9k + 1` to
     /// `9k + 9`, a child's whole subtree below the node word after it --
     /// and the slots past the last entry `u64::MAX`. The height is the
     /// least with room for every entry: four levels hold 6,560, which is a
     /// partition's fence at the suite's shape, where a binary search over
-    /// the same words is thirteen dependent loads. Takes the binary tree
-    /// down, as a push does: a fence is searched one way.
+    /// the same words is thirteen dependent loads.
     pub fn index_words(&mut self) {
-        self.probe.clear();
-        self.probe_pos.clear();
         self.words.clear();
         self.words_h = 0;
         self.shared.clear();
@@ -3304,33 +3237,6 @@ impl ZFence {
         (rank.min(self.len()), tie)
     }
 
-    /// Whether the tree stands (`index`).
-    pub fn indexed(&self) -> bool {
-        !self.probe.is_empty()
-    }
-
-    /// The first entry whose word is above `w`, by the tree, or `len()` for
-    /// none: a level a step, the line a step three levels down will read
-    /// asked for first, and the answer the node of the last step that went
-    /// left.
-    fn above_by_word(&self, w: u64) -> usize {
-        let n = self.len();
-        let mut i = 1usize;
-        while i <= n {
-            if let Some(line) = self.probe.get(i) {
-                super::prefetch_lines(line.0.as_ptr() as *const u8, 64);
-            }
-            let node = self.probe[i / 8].0[i % 8];
-            i = 2 * i + usize::from(node <= w);
-        }
-        let j = i >> (i.trailing_ones() + 1);
-        if j == 0 {
-            n
-        } else {
-            self.probe_pos[j] as usize
-        }
-    }
-
     /// Whether the first entry's key is empty -- the open lower fence, at or
     /// below every key -- as the answer for a key below every non-empty
     /// entry's.
@@ -3407,22 +3313,17 @@ impl ZFence {
     /// measured. An empty key sorts below every other, so neither needs
     /// one.
     ///
-    /// Over a fence with its word tree (`index_words`,
-    /// `Options::zpages_fence_words`) or indexed (`index`,
-    /// `Options::zpages_fence_tree`) the search is by the entries' words,
-    /// the word tree a line a level and the binary tree a word a level: a
-    /// key that differs
+    /// Over a fence with its word tree (`index_words`) the search is by
+    /// the entries' words, a line a level: a key that differs
     /// from the shared bytes is below or above every non-empty entry, a key
     /// shorter than them that agrees as far as it goes is below them all (a
     /// prefix sorts first), and a key that carries them is searched by its
     /// word, with the entries tied on the word compared whole from the top
-    /// of the tie. The tree reads one line a level, asked for three levels
-    /// ahead, where the search over the keys reads a line of the offsets
-    /// and a line of the key blob a probe; it is the arm, since a
-    /// partitioned store's fences are small enough to sit in a cache and
-    /// the search over them was never miss-bound (the option's doc).
+    /// of the tie. The tree reads one line a level, where the search over
+    /// the keys reads a line of the offsets and a line of the key blob a
+    /// probe and mispredicts half its probes.
     pub fn entry_of(&self, key: &[u8]) -> Option<usize> {
-        if self.probe.is_empty() && self.words.is_empty() {
+        if self.words.is_empty() {
             return self.entry_of_search(key);
         }
         if key.is_empty() {
@@ -3438,11 +3339,7 @@ impl ZFence {
             Ordering::Equal => {}
         }
         let w = fence_word(key, shared);
-        let (mut e, tie) = if self.words.is_empty() {
-            (self.above_by_word(w), true)
-        } else {
-            self.above_by_word_wide(w)
-        };
+        let (mut e, tie) = self.above_by_word_wide(w);
         // No entry tied on the word: the one before the first above is at
         // or below by its word, and no key is read.
         if !tie {
@@ -3465,8 +3362,8 @@ impl ZFence {
     }
 
     /// [`entry_of`](ZFence::entry_of) by a binary search over the keys: the
-    /// shape before the tree, the search of a fence not indexed, and the
-    /// oracle the tree is held to.
+    /// shape before the word tree, the search of a fence without one, and
+    /// the oracle the word tree is held to.
     fn entry_of_search(&self, key: &[u8]) -> Option<usize> {
         let (mut lo, mut hi) = (0usize, self.len());
         while lo < hi {
@@ -3540,12 +3437,10 @@ impl ZFence {
     }
 
     /// Heap bytes the fence holds: the four tables of region B, as they sit
-    /// in memory, and the search tree where it stands.
+    /// in memory, and the word tree where it stands.
     pub fn heap_bytes(&self) -> usize {
         4 * (self.first_rank.len() + self.page.len() + self.key_off.len())
             + self.keys.len()
-            + std::mem::size_of::<ProbeLine>() * self.probe.len()
-            + 4 * self.probe_pos.len()
             + 8 * self.words.len()
             + self.shared.len()
     }
@@ -3659,8 +3554,6 @@ impl ZFence {
             page: words(4 * e, e),
             key_off,
             keys: region[12 * e + 4..b_end].to_vec(),
-            probe: Vec::new(),
-            probe_pos: Vec::new(),
             words: Vec::new(),
             words_h: 0,
             shared: Vec::new(),
@@ -6724,11 +6617,11 @@ mod tests {
             assert_eq!(f.entry_of(b"e"), Some(2));
             assert_eq!(f.entry_of(b"zzzz"), Some(4));
         };
-        assert!(!f.indexed());
+        assert!(!f.worded());
         check(&f);
         let mut fi = f.clone();
-        fi.index();
-        assert!(fi.indexed());
+        fi.index_words();
+        assert!(fi.worded());
         check(&fi);
         // An empty fence key, the first, is at or below every key, the empty
         // one included, and a long key is compared as the engine compares it.
@@ -6744,30 +6637,31 @@ mod tests {
             assert_eq!(g.entry_of(&[7u8; 41]), Some(1));
         };
         check(&g);
-        g.index();
+        g.index_words();
         check(&g);
         // The shared bytes are the one non-empty key's, so its word is zero
         // like the empty key's, and the tie is told apart by the whole key.
         assert_eq!(g.shared, vec![7u8; 40]);
         assert_eq!(ZFence::new().entry_of(b"k"), None);
         let mut e = ZFence::new();
-        e.index();
-        assert!(!e.indexed());
+        e.index_words();
+        assert!(!e.worded());
         assert_eq!(e.entry_of(b"k"), None);
-        // A push after the index takes the tree down: it was of the entries
+        // A push after the words takes the tree down: it was of the entries
         // before.
         g.push(9, 2, &[9u8; 3]).unwrap();
-        assert!(!g.indexed());
+        assert!(!g.worded());
         assert_eq!(g.entry_of(&[8u8]), Some(1));
         // The fence's heap: four words an entry, one more for the offsets,
-        // and the keys; indexed, a line of eight nodes and a word a node
-        // beside them, and the shared bytes (none here).
+        // and the keys; with the word tree, a line of eight words beside
+        // them, and the shared bytes (none here).
         assert_eq!(f.heap_bytes(), 4 * (5 + 5 + 6) + 1 + 1 + 2 + 1 + 2);
-        assert_eq!(fi.heap_bytes(), f.heap_bytes() + 64 + 4 * 6);
+        assert_eq!(fi.shared.len(), 0);
+        assert_eq!(fi.heap_bytes(), f.heap_bytes() + 64);
     }
 
-    /// The tree's search (`index`) and the word tree's (`index_words`)
-    /// answer as the search over the keys for
+    /// The word tree's search (`index_words`) answers as the search over
+    /// the keys for
     /// every shape of fence -- the suite's digit keys with their long
     /// shared prefix, an empty first key, random keys of every length,
     /// keys tied on the word and told apart beyond it, a key that is
@@ -6776,7 +6670,7 @@ mod tests {
     /// truncations, the shared bytes themselves and keys below and above
     /// them all, and random ones.
     #[test]
-    fn the_trees_search_answers_as_the_search_over_the_keys() {
+    fn the_word_trees_search_answers_as_the_search_over_the_keys() {
         let mut rng = Rng(0xF3A1);
         let digits = |n: u32, step: u32| -> Vec<Vec<u8>> {
             (0..n)
@@ -6839,11 +6733,8 @@ mod tests {
                 f.push(i as u32 * 10, i as u32, k).unwrap();
             }
             let mut fw = f.clone();
-            f.index();
-            assert!(f.indexed());
             fw.index_words();
             assert_eq!(fw.worded(), !keys.is_empty());
-            assert!(!fw.indexed(), "a fence is searched one way");
             if !keys.is_empty() {
                 // The least height with room for every entry, and the
                 // tree's slots exactly that height's.
@@ -6853,11 +6744,7 @@ mod tests {
                 assert!(h == 1 || keys.len() > slots(h as u32 - 1));
                 assert_eq!(fw.words.len(), slots(h as u32));
             }
-            assert_eq!(
-                fw.shared, f.shared,
-                "the words' shared bytes are the tree's"
-            );
-            let shared = f.shared.clone();
+            let shared = fw.shared.clone();
             let mut probes: Vec<Vec<u8>> = vec![
                 Vec::new(),
                 vec![0],
@@ -6900,13 +6787,6 @@ mod tests {
             }
             for key in &probes {
                 assert_eq!(
-                    f.entry_of(key),
-                    f.entry_of_search(key),
-                    "fence of {} keys (shared {:?}), key {key:?}",
-                    keys.len(),
-                    String::from_utf8_lossy(&shared)
-                );
-                assert_eq!(
                     fw.entry_of(key),
                     f.entry_of_search(key),
                     "word tree: fence of {} keys (shared {:?}), key {key:?}",
@@ -6914,7 +6794,7 @@ mod tests {
                     String::from_utf8_lossy(&shared)
                 );
             }
-            // A push after the words takes them down, as it takes the tree.
+            // A push after the words takes them down.
             let mut fp = fw.clone();
             fp.push(u32::MAX - 1, u32::MAX - 1, &[255u8; 32]).unwrap();
             assert!(!fp.worded());
