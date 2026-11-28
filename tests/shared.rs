@@ -52,6 +52,17 @@ fn common_key(i: usize) -> Vec<u8> {
     format!("common-{i:05}").into_bytes()
 }
 
+/// A closure run when the guard drops, a panic's unwind included: a
+/// thread's release of a hold another thread waits in, so that a failed
+/// assertion ends its test as itself, not as the watchdog's minute.
+struct OnDrop<F: FnMut()>(F);
+
+impl<F: FnMut()> Drop for OnDrop<F> {
+    fn drop(&mut self) {
+        (self.0)();
+    }
+}
+
 /// Every value of `k`, oldest first, through the handle `r`.
 fn handle_values(r: &supdb::Reader, k: &[u8]) -> Vec<Vec<u8>> {
     let mut got = Vec::new();
@@ -380,11 +391,12 @@ fn handles_overwrite_in_place_beside_reads_and_scans_and_every_value_is_whole() 
     let _ = std::fs::remove_dir_all(&d);
 }
 
-/// A table its freeze has closed takes no write: a handle's put started
-/// once the freeze has closed and settled the table, and before it has
-/// published it frozen, is answered as a full table's is, with nothing
-/// written and nothing overwritten, and made again after the flush it
-/// lands in the next table. A frozen table is then one nothing writes, as
+/// A table its freeze has closed takes no write: a handle's write, plain or
+/// on condition, started once the freeze has closed and settled the table,
+/// and before it has published it frozen, is answered as a full table's
+/// is, with nothing written and nothing overwritten, and made again after
+/// the flush it lands in the next table. A frozen table is then one nothing
+/// writes, as
 /// the one writer's is: a write that landed in it after its publish was
 /// one a scan made before it had sorted the table without.
 #[test]
@@ -421,6 +433,8 @@ fn a_closed_table_refuses(in_place: bool) {
             while !r.shared_closed_holding() {
                 std::thread::yield_now();
             }
+            // The freeze let go however this thread ends.
+            let go = OnDrop(|| r.release_shared_closed());
             let before = r.rewrites_made();
             // Every kind of write, each refused.
             let mut read = 0;
@@ -433,9 +447,21 @@ fn a_closed_table_refuses(in_place: bool) {
             ];
             assert_eq!(refused, [false; 5], "a closed table took a write");
             assert_eq!(read, 0, "a refused read-modify-write read its key");
+            // And every conditional write, each on the condition that holds:
+            // of a key the table holds, and of one it lacks.
+            let cond = [
+                r.put_if(b"k", Some(&[2u8; 64]), &[5u8; 64]).unwrap(),
+                r.put_if(b"new", None, b"v").unwrap(),
+                r.delete_if(b"k", Some(&[2u8; 64])).unwrap(),
+            ];
+            assert_eq!(
+                cond,
+                [supdb::CondWrite::Full; 3],
+                "a closed table took a conditional write"
+            );
             assert_eq!(r.rewrites_made(), before, "a closed table was overwritten");
             assert_eq!(handle_values(&r, b"k"), vec![vec![2u8; 64]]);
-            r.release_shared_closed();
+            drop(go);
             r
         });
         db.flush().unwrap();
@@ -1665,6 +1691,96 @@ fn the_writers_write_a_full_table_refuses_lands_in_the_next() {
     assert_eq!(values(&db, b"huge-plain"), vec![huge]);
     assert_eq!(values(&db, b"after"), vec![b"1".to_vec()]);
     assert_eq!(values(&db, b"between"), vec![b"1".to_vec()]);
+    drop(db);
+    let _ = std::fs::remove_dir_all(&d);
+}
+
+/// The writer's own write into a shared live table lands however many
+/// fresh tables the handles fill before it: held past each seal it makes
+/// for room (`Reader::hold_own_seals`) while a handle fills the fresh
+/// table, the write finds three tables full in a row and is made in the
+/// fourth, a plain one and a conditional one alike. A bound on the tables
+/// asked dropped the write, or answered it as larger than a table, where
+/// the handles filled each fresh table before the writer asked it.
+#[test]
+fn the_writers_write_lands_however_many_tables_the_handles_fill_first() {
+    let _w = Watchdog::arm("the refilled tables' test waited a minute");
+    let d = scratch("own-refill");
+    let mut db = Db::create(&d, options(32 << 10)).unwrap();
+    let fill = |r: &supdb::Reader, round: usize| {
+        let mut i = 0;
+        while r.put(&own_key(round, i), &[b'f'; 100]).unwrap() {
+            i += 1;
+        }
+        assert!(i > 10, "table {round}: the handle filled it with {i} puts");
+    };
+    // The fresh tables the handle fills past the writer's seals, beside
+    // the one it filled before the write: three full in a row.
+    const REFILLS: usize = 2;
+    let mut r = db.reader().unwrap();
+    for (n, key) in [b"plain".as_slice(), b"cond"].into_iter().enumerate() {
+        let base = n * (REFILLS + 1);
+        fill(&r, base);
+        let seals0 = db.seal_waits().joins;
+        r.hold_own_seals(true);
+        let done = std::sync::atomic::AtomicBool::new(false);
+        let (back, holds) = std::thread::scope(|s| {
+            let done = &done;
+            let filler = s.spawn(move || {
+                // The writer let go however this thread ends.
+                let go = OnDrop(|| {
+                    r.hold_own_seals(false);
+                    r.release_own_seal();
+                });
+                let mut holds = 0;
+                'refill: for k in 1..=REFILLS {
+                    while !r.own_seal_held() {
+                        if done.load(std::sync::atomic::Ordering::Acquire) {
+                            break 'refill;
+                        }
+                        std::thread::yield_now();
+                    }
+                    holds += 1;
+                    fill(&r, base + k);
+                    if k == REFILLS {
+                        r.hold_own_seals(false);
+                    }
+                    r.release_own_seal();
+                }
+                drop(go);
+                (r, holds)
+            });
+            {
+                // The filler let go however the write ends.
+                let _done = OnDrop(|| done.store(true, std::sync::atomic::Ordering::Release));
+                if n == 0 {
+                    db.put(key, b"1");
+                } else {
+                    assert!(
+                        db.put_if(key, None, b"1").unwrap(),
+                        "the conditional write was made"
+                    );
+                }
+            }
+            filler.join().unwrap()
+        });
+        r = back;
+        assert_eq!(
+            holds, REFILLS,
+            "{n}: the writer's write held past a seal for each table refilled"
+        );
+        db.commit().unwrap();
+        db.settle().unwrap();
+        assert!(
+            db.seal_waits().joins > seals0 + REFILLS as u64,
+            "{n}: the write sealed each table it found full"
+        );
+        assert_eq!(handle_values(&r, key), vec![b"1".to_vec()], "{n}");
+    }
+    drop(r);
+    db.flush().unwrap();
+    assert_eq!(values(&db, b"plain"), vec![b"1".to_vec()]);
+    assert_eq!(values(&db, b"cond"), vec![b"1".to_vec()]);
     drop(db);
     let _ = std::fs::remove_dir_all(&d);
 }

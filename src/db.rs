@@ -17219,10 +17219,14 @@ fn newest_of<'v>(vals: &'v [u8], ends: &[usize]) -> Option<&'v [u8]> {
 
 /// The bits of `Shared::cond_hold`: the two hold points a test may set
 /// (`Reader::hold_cond_inserts`, `Reader::hold_rmw_reads`), and the one a
-/// write held at either sets while it waits.
+/// write held at either sets while it waits; and the writer's own hold past
+/// a seal (`Reader::hold_own_seals`), with the bit it sets while it waits,
+/// which the test clears to let it go.
 const HOLD_COND_INSERT: u8 = 1;
 const COND_HELD: u8 = 2;
 const HOLD_RMW_READ: u8 = 4;
+const HOLD_OWN_SEAL: u8 = 8;
+const OWN_SEAL_HELD: u8 = 16;
 
 /// What a shared read-modify-write came to (`MemTable::rmw_shared`).
 enum SharedRmw {
@@ -30750,6 +30754,33 @@ impl Reader {
     #[doc(hidden)]
     pub fn cond_insert_held(&self) -> bool {
         self.shared.cond_hold.load(AtomicOrdering::Acquire) & COND_HELD != 0
+    }
+
+    /// A test's: while `on`, the writer's own write into a shared live
+    /// table that finds it full (`Db::put`, `Db::put_if` and the rest,
+    /// under `Options::shared_writers`) waits past each seal it makes for
+    /// room and before it asks the fresh table, until `release_own_seal`,
+    /// so that the handles' writes can fill the fresh table first. Through
+    /// a handle, since the writer is inside its write.
+    #[doc(hidden)]
+    pub fn hold_own_seals(&self, on: bool) {
+        Db::set_hold_bit(&self.shared.cond_hold, HOLD_OWN_SEAL, on);
+    }
+
+    /// A test's: whether the writer's own write waits in a hold of
+    /// `hold_own_seals`.
+    #[doc(hidden)]
+    pub fn own_seal_held(&self) -> bool {
+        self.shared.cond_hold.load(AtomicOrdering::Acquire) & OWN_SEAL_HELD != 0
+    }
+
+    /// A test's: the writer's own write that waits in a hold of
+    /// `hold_own_seals` let go, to ask the fresh table.
+    #[doc(hidden)]
+    pub fn release_own_seal(&self) {
+        self.shared
+            .cond_hold
+            .fetch_and(!OWN_SEAL_HELD, AtomicOrdering::AcqRel);
     }
 
     /// A test's: the conditional writes this handle made again -- an
@@ -49457,8 +49488,32 @@ impl Db {
                 CondWrite::Applied => return Ok(true),
                 CondWrite::Refused => return Ok(false),
                 // Asked again of a fresh table, as `write_shared_own` asks.
-                CondWrite::Full => self.seal()?,
+                CondWrite::Full => {
+                    self.seal()?;
+                    self.own_seal_hold();
+                }
             }
+        }
+    }
+
+    /// The hold point of `Reader::hold_own_seals`, in the writer's own
+    /// write into a shared live table past a seal it made for room: a
+    /// test's, read only on that path.
+    #[inline]
+    fn own_seal_hold(&self) {
+        if self.shared.cond_hold.load(AtomicOrdering::Relaxed) & HOLD_OWN_SEAL != 0 {
+            self.hold_own_seal();
+        }
+    }
+
+    /// A test's: the writer's own write waits until the test lets it go
+    /// (`Reader::release_own_seal`).
+    #[cold]
+    fn hold_own_seal(&self) {
+        let h = &self.shared.cond_hold;
+        h.fetch_or(OWN_SEAL_HELD, AtomicOrdering::AcqRel);
+        while h.load(AtomicOrdering::Acquire) & OWN_SEAL_HELD != 0 {
+            std::thread::sleep(std::time::Duration::from_millis(1));
         }
     }
 
@@ -49501,6 +49556,7 @@ impl Db {
                 self.pending_err.get_or_insert(e);
                 return;
             }
+            self.own_seal_hold();
         }
     }
 
