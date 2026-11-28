@@ -3290,31 +3290,6 @@ pub struct Options {
     /// per store.
     #[doc(hidden)]
     pub zpages_inject: Option<std::sync::Arc<zfile::ZInject>>,
-    /// EXPERIMENT: the block forms hold the fold of the partition and the
-    /// level-0 pieces alone, and the memtables' keys reach a scan through
-    /// the scan snapshot, which every walk overlays on its block whatever
-    /// form the block holds. The settle files no write into a form, so
-    /// the upkeep thread's cost a write is the snapshot's extension and
-    /// nothing else; a landing drops the forms of the blocks its piece
-    /// covers, which the fills build again from the pieces. Off, a write
-    /// is patched into its block's form, one resolve and one splice a
-    /// write, a chain of dependent misses that was the thread's whole
-    /// cost over a dense burst and left it behind the writer in the
-    /// buffered arm (`docs/engine.md`). A landing folds its piece's run
-    /// into the standing forms where the partition stands and drops them
-    /// where it was rewritten. Priced as the arm: the thread's cost a
-    /// write is below the default's at every lag point and the first
-    /// scan's wait on it goes; burst plus twice the pass reads level at
-    /// the one- and ten-percent points and the pass alone trails at the
-    /// hundred-percent ones, since every memtable key the walk lays over
-    /// a block after a burst is read from its chain, where the patched
-    /// form holds the value inline -- which was the reading, and priced
-    /// it was not the pass's cost: with `snapshot_runs` the snapshot
-    /// carries the values and the upkeep republishes it with its stale
-    /// runs copied again (`Reader::refresh_runs`), and the pass did not
-    /// move while the thread paid the copies, so the arms carry neither.
-    /// Not the default. `supdb-piecesonly`, `supdb-ingestpiecesonly`.
-    pub forms_pieces_only: bool,
     /// EXPERIMENT: the store's segment work (`Maint`) -- a seal's
     /// landing, the merges, the promotions, the manifest and the WAL
     /// retirement -- runs on a thread of its own and publishes from there,
@@ -3951,39 +3926,6 @@ pub struct Options {
     /// at 0.80x-0.97x. `supdb-aheadpub` prices it. The count above,
     /// which restarts by writes, is the other trigger and is also off.
     pub build_ahead_on_publish: bool,
-    /// EXPERIMENT: the canonical forms published only while a handle the
-    /// caller made is live to take them, and all at once when one is
-    /// claimed. A publish is an `Arc` clone of the writer's own form, so
-    /// every patch after it copies the block first, and a zipfian batch
-    /// of five thousand writes touches about a thousand blocks; the
-    /// suite's mixes and its lag sweep hold no handle, so every publish
-    /// there was for nobody. With no handle live the writer settles as
-    /// before and leaves the forms dirty; a claim files the backlog and
-    /// publishes every dirty form, at the log's length when nothing is
-    /// staged and at the next commit otherwise, and the table's position
-    /// and completeness move only when it publishes, so a handle at an
-    /// older commit still finds the forms of that commit. `false`
-    /// publishes at every maintained commit as before; `forms_to_writer`
-    /// publishes regardless, since the writer is then a taker too.
-    /// Eleven pairs at a hundred thousand keys: the tenth-unmerged lag
-    /// point at 1.11x (10/11, p=0.012), every mix within noise.
-    pub forms_publish_lazily: bool,
-    /// EXPERIMENT: the share of the store, as a percentage of the keys
-    /// its partitions hold, that may be unsealed before a commit stops
-    /// maintaining the forms; zero is no bound, which is what the
-    /// maintenance had before this.
-    ///
-    /// The bound exists because maintaining regardless of who reads is
-    /// worth 3.19x on the lag sweep at ten thousand keys with a tenth of
-    /// the store unmerged, and costs 0.869x at a hundred thousand with
-    /// *all* of it unmerged -- the one rung where it loses. At that depth
-    /// every block is overlaid, every form is a merged copy rather than
-    /// resolved deltas, and the scans are an order of magnitude slower
-    /// anyway, so the forms are rebuilt wholesale for reads that cannot
-    /// repay them. The store is also about to seal. Stopping is safe at
-    /// any commit: `forms_at` stops advancing and a reader trusts a form
-    /// only where it matches the log position it holds.
-    pub forms_max_unsealed_pct: usize,
     /// EXPERIMENT: unfiled writes, as a share of the partitions' keys,
     /// past which a commit settles into the forms whether or not a scan
     /// has preceded it; zero never does.
@@ -6091,23 +6033,6 @@ pub struct Options {
     /// rewritten burst. `supdb-rankrecords` and `supdb-ingestrankrecords`
     /// rank over the records; `docs/engine.md` has the figures.
     pub piece_ranks_by_heads: bool,
-    /// EXPERIMENT: the writer's own handle takes the canonical forms it
-    /// maintains, instead of building its own. Without this the
-    /// maintenance is pure cost wherever the reads are the writer's: a
-    /// form is taken only by a handle with a slot, and the writer's has
-    /// none, so the suite's ycsb-E -- whose scans go through the writer
-    /// -- pays for a structure it cannot read, and the arm that builds
-    /// no form at commit reads 1.06x-1.23x of the one that does.
-    ///
-    /// What the slot stood for is two things, and neither needs it. The
-    /// epoch: a form is freed past every pinned reader, and the writer
-    /// is the only thread that frees one and frees none while it reads,
-    /// which `canonical` already says. The watermark: a form is settled
-    /// at the last commit and the writer's reads honour none, so a form
-    /// is what the writer must read only while nothing has been written
-    /// past that commit. That is a comparison rather than a rule, so the
-    /// scan makes it and builds its own where it has staged writes.
-    pub forms_to_writer: bool,
     /// The deltas a sparse form the patches grew must hold before a fill
     /// converts it to a merged copy; zero is `CACHE_DENSE`. A copy is walked
     /// as one buffer, where a sparse form alternates the partition's
@@ -6195,9 +6120,7 @@ pub struct Options {
     /// patch, which is what grows a form in a burst -- so a burst no
     /// longer builds the cache to the size of the store for the first
     /// scan after it to shed. Off: the budget is kept at a scan's build
-    /// and an install. Not kept after the fold of a landed piece's keys
-    /// into a block under `forms_pieces_only`, which grows forms where
-    /// the tables are away and sheds in neither setting.
+    /// and an install.
     pub forms_fit_shed: bool,
     /// With `forms_to_fit`: the snapshots and forms a publish replaced
     /// are swept when an engine thread's operation ends -- the writer's,
@@ -7738,7 +7661,6 @@ impl Default for Options {
             zpages_inplace_walk: true,
             zpages_build_eager: false,
             zpages_inject: None,
-            forms_pieces_only: false,
             publish_in_background: true,
             adaptive_shape: false,
             seal_rotates_wal: false,
@@ -7781,8 +7703,6 @@ impl Default for Options {
             promote_starts: 0,
             build_ahead_on_commit: 0,
             build_ahead_on_publish: false,
-            forms_publish_lazily: true,
-            forms_max_unsealed_pct: 0,
             forms_settle_backlog_pct: 2,
             forms_settle_every: true,
             forms_settle_builds: true,
@@ -7904,7 +7824,6 @@ impl Default for Options {
             forms_rebase: true,
             copy_prefetch_span: false,
             piece_ranks_by_heads: true,
-            forms_to_writer: false,
             scan_snapshot_arena: true,
             forms_to_fit: false,
             forms_fit_shed: true,
@@ -24517,7 +24436,7 @@ impl CachedBlock {
         }
     }
     /// Entry `i`'s values, in order.
-    #[inline]
+    #[cfg(test)]
     fn values_i(&self, i: usize, mut f: impl FnMut(&[u8])) {
         match self.fixed {
             Some((k, v)) => {
@@ -26046,13 +25965,7 @@ impl State {
     /// its next look at the log (`Reader::rebase_tables`). It needs no
     /// writer's state, so whichever thread publishes may call it, pinned,
     /// since a slot it reads may be replaced and retired under it.
-    fn carry_published(
-        &self,
-        next: &mut State,
-        pieces_only: bool,
-        by_capacity: bool,
-        restamp: Option<usize>,
-    ) -> u64 {
+    fn carry_published(&self, next: &mut State, by_capacity: bool, restamp: Option<usize>) -> u64 {
         let np_cur = self.segs.partition_point(|s| s.level > 0);
         let np = next.segs.partition_point(|s| s.level > 0);
         if self.forms.len() < np_cur
@@ -26073,37 +25986,6 @@ impl State {
             }
             let rebased = !std::sync::Arc::ptr_eq(&self.segs[q], &next.segs[p]);
             rebases += u64::from(rebased);
-            // Under `pieces_only` a published form holds the pieces' fold,
-            // and a piece this state did not hold has keys over blocks
-            // whose forms are short of them: those carry a marker, which
-            // a reader takes as no form and builds for itself. The
-            // piece's bounds against the partition were taken before the
-            // publish (`rank_before_publish`); a piece without them marks
-            // every block.
-            let mut landed_over: Vec<bool> = Vec::new();
-            if pieces_only {
-                let nb = next.forms[p].len();
-                let part_id = next.segs[p].blob.id();
-                for piece in &next.segs[np..] {
-                    if self.segs[np_cur..]
-                        .iter()
-                        .any(|q| std::sync::Arc::ptr_eq(q, piece))
-                    {
-                        continue;
-                    }
-                    if landed_over.is_empty() {
-                        landed_over = vec![false; nb];
-                    }
-                    match piece.bounds.get(part_id) {
-                        Some(at) if at.len() == nb + 1 => {
-                            for (b, over) in landed_over.iter_mut().enumerate() {
-                                *over |= at[b + 1] > at[b];
-                            }
-                        }
-                        _ => landed_over.fill(true),
-                    }
-                }
-            }
             for (b, slot) in self.forms[q].iter().enumerate() {
                 let ptr = slot.load(AtomicOrdering::Acquire);
                 if ptr.is_null() {
@@ -26117,8 +25999,7 @@ impl State {
                 // next state's log is this one's, and is current to the
                 // fresh table's first position where it is not (a freeze).
                 let at = restamp.unwrap_or(src.at);
-                let landed = landed_over.get(b).is_some_and(|&o| o);
-                let form = if (rebased && matches!(**form, Cached::Sparse(_))) || landed {
+                let form = if rebased && matches!(**form, Cached::Sparse(_)) {
                     std::sync::Arc::new(Cached::Wide(WideBlock {
                         sorted: Vec::new(),
                         seen: 0,
@@ -29598,9 +29479,6 @@ impl SlotSet {
             .get((*slot / 64) as usize)
             .is_some_and(|w| (w >> (*slot % 64)) & 1 == 1)
     }
-    fn len(&self) -> usize {
-        self.len
-    }
     fn clear(&mut self) {
         self.bits.clear();
         self.len = 0;
@@ -30061,23 +29939,6 @@ impl Snapshot {
         } else {
             self.bases.iter().all(|b| b.runs)
         }
-    }
-    /// This snapshot with the live runs of the slots in `stale` copied
-    /// again from their chains, current to `log_at`: the same keys in the
-    /// same order, so the bounds and the bases carry, and the arena is
-    /// the same, appended to. Under `forms_pieces_only` the upkeep makes
-    /// one when enough of the runs have gone stale, so that a walk
-    /// streams the run where it read the chain (`Reader::refresh_runs`).
-    fn refreshed(&self, mem: &MemTable, stale: &SlotSet, log_at: usize) -> Snapshot {
-        let mut out = self.clone();
-        let mut scratch = Vec::new();
-        for e in out.ents.iter_mut() {
-            if e.mem != u32::MAX && (e.mem as usize) < mem.len() && stale.contains(&e.mem) {
-                e.lrun = self.copy_run(mem, mem.entry(e.mem as usize), &mut scratch);
-            }
-        }
-        out.log_at = log_at;
-        out
     }
     /// This snapshot's live runs over `bases`, the frozen tables' own,
     /// oldest first: what a state with those frozen tables reads.
@@ -35789,8 +35650,6 @@ impl Reader {
         let was_complete = self.fs().tables_complete.get();
         let mut complete =
             was_complete && !froze && tables.iter().take(np).all(|c| c.borrow().is_some());
-        // The publishes since this handle's last look, by the generation.
-        let publishes = st.gen.saturating_sub(self.fs().log_gen.get());
         let mut dirty_any = false;
         let mut cache_bytes = 0usize;
         let mut dense_bytes = 0u64;
@@ -35800,96 +35659,9 @@ impl Reader {
             let Some(t) = held.as_mut() else { continue };
             let seg = &st.segs[p];
             let rebased = t.blob != seg.blob.id();
-            // Under `pieces_only` a copy carried across a partition's
-            // rewrite holds the fold of the pieces standing at this
-            // handle's last look, which the rewrite folded in or left
-            // standing, so it is the rewritten partition's fold too --
-            // when the rewrite was the one publish since. With more than
-            // one, a piece may have landed and been merged into the
-            // partition between the two looks, in neither piece set this
-            // look compares: the copy that never folded it was carried
-            // across the rewrite and published, and a handle at the
-            // writer's commit read a key's merged value as the one before
-            // it, with the key in no memtable and no piece for the
-            // point read to disagree about.
-            let rewritten = self.opts.forms_pieces_only && rebased && publishes > 1;
-            // Under `pieces_only` a form holds the pieces' fold, so a
-            // piece this table did not hold -- a landing's -- leaves
-            // every form it has keys over short of them: dropped, for
-            // the fills to build again, and the table incomplete until
-            // they have, for the blocks it has keys over and no form.
-            // Without the forms' memtable keys a block with no form
-            // says only that no piece had keys over it, and a landing
-            // is exactly what changes that: the table called complete
-            // past one, a handle at the writer's commit took the empty
-            // slot as clean and walked the partition alone, reading a
-            // key's sealed value as the one before it -- the reader
-            // threads met it in their first seconds, and the point
-            // read beside them, through the piece, was right. A piece
-            // is the same piece when its bounds against this partition
-            // are, the bounds being a function of the two.
-            // ... or, where the partition stands, folded in: a landed
-            // piece is newer than every piece the form holds, so its run
-            // over a block merges into the form in one pass over the
-            // piece's records for the block (`fold_piece_block`), where a
-            // build read every piece's again -- ten to fourteen thousand
-            // builds a burst at a hundred thousand keys, the thread's
-            // whole cost under this arm. Pieces fold oldest first, the
-            // order they stand in. A block with no form is clean, and
-            // folded from clean, only while the table was complete; short
-            // of that it is left to the fill, which knows what it lacks.
-            let mut landed_over: Vec<bool> = Vec::new();
-            if self.opts.forms_pieces_only {
-                landed_over = vec![false; t.slots.len()];
-                for (idx, (j, at)) in pieces.iter().enumerate() {
-                    if t.pieces
-                        .iter()
-                        .any(|(_, old)| std::sync::Arc::ptr_eq(old, at))
-                    {
-                        continue;
-                    }
-                    if rebased {
-                        for (b, over) in landed_over.iter_mut().enumerate() {
-                            *over |= at[b + 1] > at[b];
-                        }
-                        continue;
-                    }
-                    let piece = &l0[*j];
-                    let cuts = piece_ranks[idx].as_deref().map(|v| v.as_slice());
-                    for b in 0..t.slots.len() {
-                        let (r0, r1) = (at[b] as usize, at[b + 1] as usize);
-                        if r1 <= r0 {
-                            continue;
-                        }
-                        match t.slots[b].as_deref() {
-                            None if !was_complete => {
-                                complete = false;
-                                continue;
-                            }
-                            Some(Cached::Wide(_)) => continue,
-                            _ => {}
-                        }
-                        if self
-                            .fold_piece_block(p, b, t, seg, piece, (r0..r1, cuts))
-                            .is_err()
-                        {
-                            return self.refuse_rebase(12);
-                        }
-                    }
-                }
-            }
             for b in 0..t.slots.len() {
-                if landed_over.get(b).is_some_and(|&o| o) {
-                    complete = false;
-                    if let Some(f) = t.slots[b].take() {
-                        self.note_freed(self.fbytes(&f));
-                        t.dirty[b] = false;
-                        self.publish_marker(p, b);
-                    }
-                }
                 let mut sparse = matches!(t.slots[b].as_deref(), Some(Cached::Sparse(_)));
                 let wide = matches!(t.slots[b].as_deref(), Some(Cached::Wide(_)));
-                let copy = matches!(t.slots[b].as_deref(), Some(Cached::Block(_)));
                 // A sparse form of a partition rewritten over the same
                 // blocks keeps its deltas, each cut resolved again against
                 // the records as they stand: the runs it holds are the
@@ -35907,13 +35679,12 @@ impl Reader {
                 if rebased
                     && sparse
                     && self.opts.rebase_recuts_sparse
-                    && !self.opts.forms_pieces_only
                     && self.recut_sparse(seg, b, t.slots[b].as_mut().expect("a sparse form"))
                 {
                     sparse = false;
                 }
-                if (rebased && sparse) || wide || (rewritten && copy) {
-                    if sparse || copy {
+                if (rebased && sparse) || wide {
+                    if sparse {
                         complete = false;
                     }
                     if let Some(f) = t.slots[b].take() {
@@ -36526,11 +36297,8 @@ impl Reader {
                 // first key, or the upper fence for the last. Keys past the
                 // partition's last key fall in its last block alone, which
                 // is where every key a mix inserts past the end goes, and
-                // any other block learns so by one compare. Under
-                // `forms_pieces_only` a form holds no memtable key, so
-                // nothing is spliced: the keys since reach the walk
-                // through the snapshot as every other memtable key does.
-                if since.is_empty() || self.opts.forms_pieces_only {
+                // any other block learns so by one compare.
+                if since.is_empty() {
                     continue;
                 }
                 let past_all = b + 1 < table.slots.len()
@@ -36590,19 +36358,10 @@ impl Reader {
     /// EXPERIMENT: the log position a canonical form must have been
     /// settled at for this handle to read it, or none where the handle
     /// may not read one at all. A handle with a slot holds the position
-    /// of the commit its watermark names. The writer's own honours no
-    /// watermark, so it holds the log's whole length: equal to
-    /// `forms_at`, nothing has been written past the commit the forms
-    /// were settled at and they are exactly what it must read; short of
-    /// it, it has staged writes they do not carry and it builds its own.
-    /// `forms_at` before the first maintenance is `usize::MAX`, which no
-    /// log length equals, so an unmaintained table is never taken.
+    /// of the commit its watermark names; the writer reads none, since
+    /// it maintains them.
     fn forms_bound(&self) -> Option<usize> {
-        match self.slot {
-            Some(_) => Some(self.log_bound.get()),
-            None if self.opts.forms_to_writer => Some(self.mem().log_len()),
-            None => None,
-        }
+        self.slot.map(|_| self.log_bound.get())
     }
 
     fn forms_position_held(&self) -> bool {
@@ -37259,14 +37018,14 @@ impl Reader {
         self.publish_form(p, b, &marker, 0);
     }
 
-    /// EXPERIMENT: whether the forms are published now: always when
-    /// `force`d or published eagerly, else only for a handle the caller
-    /// holds; see `Options::forms_publish_lazily`.
+    /// Whether the forms are published now: always when `force`d, else
+    /// only for a handle the caller holds. A publish is an `Arc` clone of
+    /// the writer's own form, so every patch after it copies the block
+    /// first; with no handle live the writer settles and leaves the forms
+    /// dirty, and a claim files the backlog and publishes every dirty
+    /// form.
     fn publishing(&self, force: bool) -> bool {
-        force
-            || !self.opts.forms_publish_lazily
-            || self.opts.forms_to_writer
-            || self.shared.live_handles.load(AtomicOrdering::Relaxed) > 0
+        force || self.shared.live_handles.load(AtomicOrdering::Relaxed) > 0
     }
 
     /// EXPERIMENT: every block this handle built or patched since the
@@ -37624,7 +37383,6 @@ impl Reader {
             copy_dense: false,
             wide_copy: false,
             fit: self.fits(),
-            pieces_only: self.opts.forms_pieces_only,
             ranks_by_heads: self.opts.piece_ranks_by_heads,
             ranks_whole: self.opts.piece_ranks_whole,
         }
@@ -37748,42 +37506,6 @@ impl Reader {
                         self.shared
                             .snap_switched
                             .fetch_add(1, AtomicOrdering::Relaxed);
-                    }
-                }
-            }
-        }
-        // Under `forms_pieces_only` the writer's upkeep republishes the
-        // snapshot with its stale runs copied again (`refresh_runs`): the
-        // same keys over the same bounds and bases, current to a later
-        // log position. A handle on the version before takes it and reads
-        // the log from that position for what is stale now, and keeps its
-        // filed keys, since the keys are the same.
-        if !stale && self.opts.forms_pieces_only {
-            if let Some((g, mine)) = cache.as_mut() {
-                if *g == gen {
-                    if let Some(published) = self.adopt_snapshot() {
-                        let same = published.live_len == mine.live_len
-                            && published.log_at > mine.log_at
-                            && std::sync::Arc::ptr_eq(&published.bounds, &mine.bounds)
-                            && published.bases.len() == mine.bases.len()
-                            && published
-                                .bases
-                                .iter()
-                                .zip(&mine.bases)
-                                .all(|(a, b)| std::sync::Arc::ptr_eq(a, b));
-                        if same {
-                            let mem = self.mem();
-                            let mut st = self.fs().snap_stale.borrow_mut();
-                            st.clear();
-                            let to = self.fs().log_seen.get().min(mem.log_len());
-                            for i in published.log_at..to {
-                                st.insert(mem.log_at(i).0 as u32);
-                            }
-                            *mine = published;
-                            self.shared
-                                .snap_switched
-                                .fetch_add(1, AtomicOrdering::Relaxed);
-                        }
                     }
                 }
             }
@@ -37926,51 +37648,6 @@ impl Reader {
         self.fill_forms()
     }
 
-    /// Under `forms_pieces_only`, on the writer's upkeep: once a
-    /// sixteenth of the snapshot's live runs are stale -- written since
-    /// the runs were copied, so a walk that lays the key over its block
-    /// reads the chain, two or three dependent misses, where a form
-    /// holds the value inline -- the snapshot is republished with those
-    /// runs copied again (`Snapshot::refreshed`), the same keys over the
-    /// same bounds, current to the log position this handle has read
-    /// to, and the stale set starts over from there. Every handle holding
-    /// the version before switches at its next scan
-    /// (`refresh_snapshot_to`). Not beside the keeper, which appends to
-    /// the same arena from its own thread.
-    fn refresh_runs(&self) {
-        if !self.opts.forms_pieces_only
-            || self.opts.snapshot_keeper
-            || !self.opts.share_snapshot
-            || self.slot.is_some()
-        {
-            return;
-        }
-        let fresh = {
-            let cache = self.fs().scan_keys.borrow();
-            let Some((_, snap)) = cache.as_ref() else {
-                return;
-            };
-            if !snap.runs || snap.live_len == 0 {
-                return;
-            }
-            let stale = self.fs().snap_stale.borrow();
-            if stale.len() < (snap.len() / 16).max(64) {
-                return;
-            }
-            let mem = self.mem();
-            let log_at = self.fs().log_seen.get().min(mem.log_len());
-            std::sync::Arc::new(snap.refreshed(mem, &stale, log_at))
-        };
-        self.fs().snap_stale.borrow_mut().clear();
-        if let Some((_, snap)) = self.fs().scan_keys.borrow_mut().as_mut() {
-            *snap = fresh.clone();
-        }
-        self.publish_snapshot(&fresh);
-        self.shared
-            .snap_refreshes
-            .fetch_add(1, AtomicOrdering::Relaxed);
-    }
-
     /// Whether this commit's maintenance files its writes, by the rules
     /// below; none where the store keeps no forms to file them into.
     /// `consume` takes the one-shot reasons with the answer, which only
@@ -38002,18 +37679,6 @@ impl Reader {
         }
         if st.forms.is_empty() || self.segs().first().is_none_or(|s| s.level == 0) {
             return None;
-        }
-        // Too much of the store unsealed to be worth organising: see
-        // `Options::forms_max_unsealed_pct`. The unsealed count is the
-        // memtables' own, and the store's is what the partitions hold,
-        // which is a load a segment and there are few.
-        if self.opts.forms_max_unsealed_pct > 0 {
-            let unsealed =
-                st.mem.committed_len() + st.frozen.iter().map(|f| f.len()).sum::<usize>();
-            let keys: usize = self.segs().iter().map(|s| s.blob.keys()).sum();
-            if keys > 0 && unsealed * 100 > keys * self.opts.forms_max_unsealed_pct {
-                return None;
-            }
         }
         // Nothing to maintain where nothing has been scanned since the
         // last commit: the structure is for range reads, and a run of
@@ -38248,7 +37913,6 @@ impl Reader {
             return Ok(());
         }
         self.refresh_snapshot(gen, true, moved);
-        self.refresh_runs();
         {
             let cache = self.fs().scan_keys.borrow();
             let unsealed: &Snapshot = &cache.as_ref().expect("scan snapshot").1;
@@ -38748,13 +38412,7 @@ impl Reader {
                         .convert_total_ns
                         .fetch_add(t_total.elapsed().as_nanos() as u64, AtomicOrdering::Relaxed);
                     continue;
-                } else if table.slots[b].is_some()
-                    || (if self.opts.forms_pieces_only {
-                        BuildCtx::piece_count(table, b)
-                    } else {
-                        BuildCtx::overlay_count(table, b)
-                    }) == 0
-                {
+                } else if table.slots[b].is_some() || BuildCtx::overlay_count(table, b) == 0 {
                     continue;
                 }
                 self.shared.forms_events[6].fetch_add(1, AtomicOrdering::Relaxed);
@@ -39342,19 +39000,6 @@ impl Reader {
     /// a table frozen since they were read from its log, whose writes
     /// name no live entry (`settle_pending`).
     fn settle_each(&self, pending: &[(u32, u32, bool, u32)], src: &MemTable) -> Result<()> {
-        // Under `forms_pieces_only` nothing is spliced: a key written again
-        // reaches the walk through the stale set, and a key the table
-        // created since the snapshot's run was built through the side
-        // list its block keeps (`BlockTable::added`), which wants the
-        // key's cut, so those are resolved and filed and the rest is
-        // skipped. A frozen table's writes are its base snapshot's.
-        let created: Vec<(u32, u32, bool, u32)>;
-        let pending: &[(u32, u32, bool, u32)] = if self.opts.forms_pieces_only {
-            created = pending.iter().copied().filter(|p| p.2).collect();
-            &created
-        } else {
-            pending
-        };
         if pending.is_empty() {
             return Ok(());
         }
@@ -39442,7 +39087,7 @@ impl Reader {
         let mut zhint = usize::MAX;
         let mut resolved: Vec<(u32, u32, u32, u32, u32, bool, u32)> =
             Vec::with_capacity(pending.len());
-        let lazy = self.opts.zpages_settle_span && !self.opts.forms_pieces_only;
+        let lazy = self.opts.zpages_settle_span;
         let mut lazy_n = 0u64;
         // Out of core, the heads a resolve will seek asked for ahead of it
         // (`OrdIndex::willneed_heads`): a resolve is a seek over one stride
@@ -39665,18 +39310,6 @@ impl Reader {
                 .all(|w| w[0].6 != w[1].6 || w[0].6 == u32::MAX),
             "a settle resolved one key's writes as two keys"
         );
-        if self.opts.forms_pieces_only {
-            for &(at, b, cut, _, _, _, slot) in &resolved {
-                let tables = self.fs().tables.borrow();
-                let mut held = tables[at as usize].borrow_mut();
-                let Some(table) = held.as_mut() else { continue };
-                if let Some(list) = table.added.get_mut(b as usize) {
-                    list.push((slot, cut));
-                    table.filed += 1;
-                }
-            }
-            return Ok(());
-        }
         // The backlog by block, which is what decides a patch against a
         // build: a cut packs the rank it is taken at, so the sort above
         // leaves one block's keys contiguous and the count is this
@@ -40622,108 +40255,6 @@ impl Reader {
         Ok(())
     }
 
-    /// Under `forms_pieces_only`: piece `p`'s run over block `b` of
-    /// partition `seg` -- `run_over`, its ranks with their cuts in the
-    /// partition where the piece has them -- folded into the block's
-    /// standing form, which holds the fold of the partition and every
-    /// piece older than `p`. A key the piece holds with a tombstone takes
-    /// the piece's values alone, since the tombstone masks every older
-    /// source; any other key's run is the form's for it, or the
-    /// partition's record where the key is the partition's own and the
-    /// form has none, with the piece's values after. A block with no
-    /// form is a clean block here, which the caller has checked.
-    fn fold_piece_block(
-        &self,
-        at: usize,
-        b: usize,
-        table: &mut BlockTable,
-        seg: &Seg,
-        p: &Seg,
-        run_over: (std::ops::Range<usize>, Option<&[u32]>),
-    ) -> Result<()> {
-        let (ranks, cuts) = run_over;
-        let keys = seg.blob.keys();
-        let lo = b * CACHE_BLOCK;
-        let hi = ((b + 1) * CACHE_BLOCK).min(keys);
-        if self.pieces_willneed() && ranks.start < ranks.end {
-            let n = p
-                .raw()
-                .willneed_ranks(ranks.start, ranks.end - ranks.start, WILLNEED_CAP);
-            self.zbump(|s| &s.zwillneeds);
-            if n > 0 {
-                self.zbump(|s| &s.zwillneedasks);
-            }
-        }
-        if table.slots[b].is_none() {
-            table.slots[b] = Some(std::sync::Arc::new(Cached::Clean));
-        }
-        if self.opts.commit_forms && self.slot.is_none() {
-            table.dirty[b] = true;
-            self.fs().dirty_any.set(true);
-        }
-        let read = |e: std::io::Error| err(&format!("block cache read: {e}"));
-        let mut run_scratch = self.fs().settle_run.borrow_mut();
-        let run: &mut Vec<u8> = &mut run_scratch;
-        for r in ranks {
-            let key = p
-                .raw()
-                .key_at(r)
-                .ok_or_else(|| err("block cache: a piece rank did not resolve"))?;
-            let cut = cuts.map_or(u32::MAX, |v| v[r]);
-            let (c, at_eq) = if cut != u32::MAX {
-                BuildCtx::cut_known(cut, lo, hi)
-            } else {
-                self.cache_cut(seg, lo, hi, key)
-            };
-            let same = c < hi && at_eq == Ordering::Equal;
-            run.clear();
-            let tomb = p.tombs
-                && p.raw()
-                    .exts_at(r)
-                    .is_some_and(|(_, exts)| exts.iter().any(|e| e.is_tombstone()));
-            if !tomb {
-                let had = match table.slots[b].as_deref() {
-                    Some(Cached::Sparse(sb)) => {
-                        let i = sb.ents.partition_point(|e| sb.key(e) < key);
-                        (i < sb.ents.len() && sb.key(&sb.ents[i]) == key).then(|| {
-                            let (o, n) = sb.ents[i].run;
-                            &sb.vals[o as usize..(o + n) as usize]
-                        })
-                    }
-                    Some(Cached::Block(blk)) => {
-                        // No copy is packed under `pieces_only`, the one
-                        // shape that folds a piece into a form.
-                        debug_assert!(blk.fixed.is_none());
-                        let i = blk.lower_bound(key);
-                        (i < blk.ents.len() && blk.key(&blk.ents[i]) == key).then(|| {
-                            let e = &blk.ents[i];
-                            &blk.vals[e[2] as usize..(e[2] + e[3]) as usize]
-                        })
-                    }
-                    _ => None,
-                };
-                match had {
-                    Some(bytes) => run.extend_from_slice(bytes),
-                    None if same => {
-                        self.cache_values(seg, c, &mut |v| {
-                            run.extend_from_slice(&(v.len() as u32).to_le_bytes());
-                            run.extend_from_slice(v);
-                        })?;
-                    }
-                    None => {}
-                }
-            }
-            p.raw()
-                .values_at(r, |v| {
-                    run.extend_from_slice(&(v.len() as u32).to_le_bytes());
-                    run.extend_from_slice(v);
-                })
-                .map_err(read)?;
-            self.splice_run(at, b, table, key, (c, same), run)?;
-        }
-        Ok(())
-    }
-
     /// PROTOTYPE: bookkeeping after a memtable write, when the block cache
     /// is on: a rehash renumbers every slot the snapshot and the lists
     /// hold, a created key joins the list of keys since the snapshot, and
@@ -41235,9 +40766,8 @@ impl Reader {
                 // any after, since every key a block holds is at or
                 // above that record and every key before it belongs to
                 // a block already walked.
-                let wants_snapshot = ctx.pieces_only
-                    || (canon.is_none()
-                        && matches!(table.slots[b].as_deref(), None | Some(Cached::Wide(_))));
+                let wants_snapshot = canon.is_none()
+                    && matches!(table.slots[b].as_deref(), None | Some(Cached::Wide(_)));
                 let unsealed = match unsealed {
                     Some(u) => u,
                     None if wants_snapshot => {
@@ -41424,14 +40954,6 @@ impl Reader {
                 // take several, and the promotion after the walk credits
                 // each with what the run took from it.
                 let run_b0 = b;
-                // Under `pieces_only` the memtables' keys over this block,
-                // from the scan's cursor on, slipped into whatever form
-                // the block holds; none, and the form is walked alone.
-                let mem_ov: Option<Overlay> = if ctx.pieces_only {
-                    ctx.overlay_mem_window(src, table, b, unsealed, (from_key, limit - seen))?
-                } else {
-                    None
-                };
                 // The entry a copy's walk starts at, where the walk takes
                 // it by rank: this block's start less its first rank.
                 let copy_at =
@@ -41488,31 +41010,14 @@ impl Reader {
                 }
                 match form {
                     Cached::Sparse(deltas) => {
-                        seen += match &mem_ov {
-                            Some(ov) => ctx.walk_deltas_over(
-                                src,
-                                pr,
-                                start..hi,
-                                deltas,
-                                ov,
-                                (from_key, limit - seen),
-                                &mut *f,
-                            )?,
-                            None => ctx.walk_deltas(
-                                pr,
-                                start..hi,
-                                deltas,
-                                from_key,
-                                limit - seen,
-                                &mut *f,
-                            )?,
-                        };
-                    }
-                    Cached::Clean if mem_ov.is_some() => {
-                        let ov = mem_ov.as_ref().expect("checked");
-                        seen += ctx
-                            .walk_block(src, pr, start..hi, ov, limit - seen, |_k| {}, &mut *f)?
-                            .0;
+                        seen += ctx.walk_deltas(
+                            pr,
+                            start..hi,
+                            deltas,
+                            from_key,
+                            limit - seen,
+                            &mut *f,
+                        )?;
                     }
                     Cached::Clean => {
                         // Every clean block built after this one joins the
@@ -41521,27 +41026,17 @@ impl Reader {
                         // makes it, not three block-sized ones.
                         let mut run_hi = hi;
                         let clean_at = |table: &BlockTable, b: usize| {
-                            // Under `pieces_only` a block over memtable keys
-                            // is walked with them, so the run stops before
-                            // it; the bounds were taken for this block.
-                            (!ctx.pieces_only
-                                || !BuildCtx::mem_over(
-                                    &table.snap_at,
-                                    &table.fsnap_at,
-                                    &table.added,
-                                    b,
-                                ))
-                                && if canonical && complete {
-                                    st.forms[pi][b].load(AtomicOrdering::Acquire).is_null()
-                                } else {
-                                    // With the canonical table incomplete a
-                                    // null form says nothing, and the block
-                                    // is this handle's slot's, as the walk
-                                    // above takes it.
-                                    (!canonical
-                                        || st.forms[pi][b].load(AtomicOrdering::Acquire).is_null())
-                                        && matches!(table.slots[b].as_deref(), Some(Cached::Clean))
-                                }
+                            if canonical && complete {
+                                st.forms[pi][b].load(AtomicOrdering::Acquire).is_null()
+                            } else {
+                                // With the canonical table incomplete a
+                                // null form says nothing, and the block
+                                // is this handle's slot's, as the walk
+                                // above takes it.
+                                (!canonical
+                                    || st.forms[pi][b].load(AtomicOrdering::Acquire).is_null())
+                                    && matches!(table.slots[b].as_deref(), Some(Cached::Clean))
+                            }
                         };
                         // A block the run reaches with no form yet is built
                         // here, as the walk would build it at its next turn,
@@ -41555,7 +41050,6 @@ impl Reader {
                             let next = b + 1;
                             if self.opts.scan_run_builds
                                 && !lazy
-                                && !ctx.pieces_only
                                 && table.slots[next].is_none()
                                 && !(canonical && complete)
                                 && (!canonical
@@ -41587,11 +41081,6 @@ impl Reader {
                                 self.cache_scan(seg, start, want, &mut *f)?
                             };
                         }
-                    }
-                    Cached::Block(blk) if mem_ov.is_some() => {
-                        let ov = mem_ov.as_ref().expect("checked");
-                        seen +=
-                            ctx.walk_copy_over(src, blk, ov, from_key, limit - seen, &mut *f)?;
                     }
                     Cached::Block(blk) => {
                         // The seek's rank is the entry when the copy's
@@ -49463,7 +48952,6 @@ impl Db {
         let from = self.kept_from(&fresh);
         let complete = self.fs().tables_complete.get();
         let carried = std::cell::Cell::new(false);
-        let pieces_only = self.opts.forms_pieces_only;
         let by_capacity = self.opts.counts_capacity();
         self.close_shared(table);
         let Some(old) = self.try_publish_writer(|cur| {
@@ -49474,7 +48962,7 @@ impl Db {
             carried.set(carry);
             let mut next = Db::frozen_over(cur, &fresh, from);
             if carry {
-                cur.carry_published(&mut next, pieces_only, by_capacity, Some(0));
+                cur.carry_published(&mut next, by_capacity, Some(0));
                 next.forms_at = AtomicUsize::new(0);
                 next.forms_complete = std::sync::atomic::AtomicBool::new(complete);
             }
@@ -49929,7 +49417,6 @@ impl Db {
     /// direct run's start, whose log starts where the empty one's ended.
     fn set_mem_with(&mut self, mem: std::sync::Arc<MemTable>, carry: bool) {
         let from = self.kept_from(&mem);
-        let pieces_only = self.opts.forms_pieces_only;
         let by_capacity = self.opts.counts_capacity();
         let old = self.publish_writer(|cur| {
             let mut next = State {
@@ -49958,7 +49445,7 @@ impl Db {
                 layout: cur.layout.clone(),
             };
             if carry {
-                cur.carry_published(&mut next, pieces_only, by_capacity, None);
+                cur.carry_published(&mut next, by_capacity, None);
                 next.forms_at = AtomicUsize::new(cur.forms_at.load(AtomicOrdering::Acquire));
                 next.forms_complete = std::sync::atomic::AtomicBool::new(
                     cur.forms_complete.load(AtomicOrdering::Acquire),
@@ -56437,9 +55924,6 @@ struct BuildCtx<'s> {
     wide_copy: bool,
     /// See `Options::forms_to_fit`.
     fit: bool,
-    /// `Options::forms_pieces_only`: the forms hold the pieces' fold alone
-    /// and the walk overlays the snapshot.
-    pieces_only: bool,
     /// See `Options::piece_ranks_by_heads`.
     ranks_by_heads: bool,
     /// See `Options::piece_ranks_whole`.
@@ -56448,11 +55932,9 @@ struct BuildCtx<'s> {
 
 impl<'s> BuildCtx<'s> {
     /// Whether a copy this context builds is one stream of fixed-size
-    /// records where its entries allow it (`Options::copy_packed`). Not
-    /// under `pieces_only`, whose forms take a landed piece's runs folded
-    /// in, which reads the three buffers.
+    /// records where its entries allow it (`Options::copy_packed`).
     fn packs(&self) -> bool {
-        self.rd.opts.copy_packed && !self.pieces_only
+        self.rd.opts.copy_packed
     }
     /// A copy as its build finished it, counted where it came out packed.
     fn built(&self, build: CopyBuild) -> CachedBlock {
@@ -57263,12 +56745,8 @@ impl<'s> BuildCtx<'s> {
                 None => None,
             };
         }
-        let mem = if self.pieces_only {
-            Vec::new()
-        } else {
-            let filed = self.filed_cuts(src, b, &table.added[b]);
-            self.overlay_mem(unsealed, snap, cuts, &frozen, &filed, false, usize::MAX)?
-        };
+        let filed = self.filed_cuts(src, b, &table.added[b]);
+        let mem = self.overlay_mem(unsealed, snap, cuts, &frozen, &filed, false, usize::MAX)?;
         let pieces: Vec<PieceRun<'_>> = table
             .pieces
             .iter()
@@ -57282,42 +56760,6 @@ impl<'s> BuildCtx<'s> {
             })
             .collect();
         self.overlay_runs(src, mem, &pieces, unsealed, usize::MAX)
-    }
-    /// PROTOTYPE: a floor under how many keys above the partition block
-    /// `b` has, from the table's bounds alone: its largest source's run
-    /// over it. Summing the runs was tried first, and a key updated in
-    /// every seal is in every piece, so the sum counted it once per
-    /// piece: with seven pieces over a range it called every hot block
-    /// wide, and a wide block's walk merges every source for every scan
-    /// through it. Any one source holds distinct keys, so its run is a
-    /// floor; a block can hold more than the floor, spread thin across
-    /// its sources, and the merge at `l0_trigger` bounds how thin.
-    /// `overlay_count` over the pieces alone: what a form holds under
-    /// `pieces_only`, the memtables' keys being the snapshot's.
-    fn piece_count(table: &BlockTable, b: usize) -> usize {
-        table
-            .pieces
-            .iter()
-            .map(|(_, at)| (at[b + 1] - at[b]) as usize)
-            .max()
-            .unwrap_or(0)
-    }
-    /// Whether any memtable key -- the snapshot's, a base's, or one filed
-    /// since -- falls in block `b`, from bounds the table has taken; a
-    /// table without them has none to answer for. The table's three
-    /// fields rather than the table, so a caller holding another field
-    /// mutably can ask.
-    fn mem_over(
-        snap_at: &std::cell::OnceCell<std::sync::Arc<SnapBounds>>,
-        fsnap_at: &[std::cell::OnceCell<std::sync::Arc<SnapBounds>>],
-        added: &[Vec<(u32, u32)>],
-        b: usize,
-    ) -> bool {
-        snap_at.get().is_some_and(|sb| sb.at[b + 1] > sb.at[b])
-            || fsnap_at
-                .iter()
-                .any(|f| f.get().is_some_and(|sb| sb.at[b + 1] > sb.at[b]))
-            || !added[b].is_empty()
     }
     /// Every source's run over block `b`, summed: the entries a copy's
     /// merge reads (`Reader::wide_copy_pays`).
@@ -57338,6 +56780,15 @@ impl<'s> BuildCtx<'s> {
             .sum();
         snap + frozen + table.added[b].len() + pieces
     }
+    /// PROTOTYPE: a floor under how many keys above the partition block
+    /// `b` has, from the table's bounds alone: its largest source's run
+    /// over it. Summing the runs was tried first, and a key updated in
+    /// every seal is in every piece, so the sum counted it once per
+    /// piece: with seven pieces over a range it called every hot block
+    /// wide, and a wide block's walk merges every source for every scan
+    /// through it. Any one source holds distinct keys, so its run is a
+    /// floor; a block can hold more than the floor, spread thin across
+    /// its sources, and the merge at `l0_trigger` bounds how thin.
     fn overlay_count(table: &BlockTable, b: usize) -> usize {
         // A table without its bounds has built nothing, and the one
         // caller that asks before a build unlists, which on an unbuilt
@@ -57738,20 +57189,6 @@ impl<'s> BuildCtx<'s> {
         if over == 0 && floor == 0 && table.added.get(b).is_none_or(|l| l.is_empty()) {
             return Ok(Cached::Clean);
         }
-        // Under `pieces_only` the form is the pieces' fold whatever the
-        // memtables hold over the block, and a block dense with piece
-        // keys is a copy, since the wide form's walk assembles the
-        // window from every source, which is the fold the form is for.
-        if self.pieces_only {
-            let ov = self.overlay_all(src, table, b, unsealed)?;
-            if ov.over.is_empty() {
-                return Ok(Cached::Clean);
-            }
-            if ov.over.len() < self.dense_from {
-                return Ok(Cached::Sparse(self.deltas_for(src, pr, lo..hi, &ov)?));
-            }
-            return Ok(Cached::Block(self.copy_block(src, pr, lo..hi, &ov)?));
-        }
         if (floor > WIDE && !self.wide_copy) || covered {
             return Ok(Cached::Wide(WideBlock {
                 sorted: self.sorted_filed(&table.added[b]),
@@ -57871,273 +57308,6 @@ impl<'s> BuildCtx<'s> {
             }
         }
         lo..s1.min(lo.saturating_add(limit))
-    }
-    /// Under `pieces_only`: the memtables' keys over block `b` from the
-    /// cursor on, as an overlay with no piece in it -- the snapshot's
-    /// run, each base's and the keys filed since -- or none when no
-    /// memtable key falls in the block. The table's bounds are taken
-    /// here if they were not, so `mem_over` can answer for the blocks
-    /// after it.
-    fn overlay_mem_window<'a>(
-        &'a self,
-        src: Sources<'a>,
-        table: &BlockTable,
-        b: usize,
-        unsealed: &'a Snapshot,
-        window: (&[u8], usize),
-    ) -> Result<Option<Overlay<'a>>> {
-        let (cursor, limit) = window;
-        let sb = table.snap_at(self.rd, src.seg, unsealed)?;
-        let mut any = sb.at[b + 1] > sb.at[b] || !table.added[b].is_empty();
-        let mut frozen: FrozenRuns<'_> = Default::default();
-        for (i, (f, base)) in frozen.iter_mut().zip(&unsealed.bases).enumerate() {
-            *f = match table.fsnap_at(self.rd, i, src.seg, unsealed)? {
-                Some(fb) => {
-                    any |= fb.at[b + 1] > fb.at[b];
-                    Some((
-                        BuildCtx::window_of(
-                            base,
-                            fb.at[b] as usize,
-                            fb.at[b + 1] as usize,
-                            cursor,
-                            limit,
-                        ),
-                        fb.cuts_of(self.rd, b, src.seg, base)?,
-                    ))
-                }
-                None => None,
-            };
-        }
-        if !any {
-            return Ok(None);
-        }
-        let cuts = sb.cuts_of(self.rd, b, src.seg, unsealed)?;
-        let snap = BuildCtx::window_of(
-            unsealed,
-            sb.at[b] as usize,
-            sb.at[b + 1] as usize,
-            cursor,
-            limit,
-        );
-        let key_of = |slot: u32| self.mem.key_of(self.mem.entry(slot as usize));
-        let filed: Vec<(u32, u32)> = self
-            .filed_cuts(src, b, &table.added[b])
-            .iter()
-            .copied()
-            .filter(|&(i, _)| cursor.is_empty() || key_of(i) >= cursor)
-            .collect();
-        let over = self.overlay_mem(unsealed, snap, cuts, &frozen, &filed, false, usize::MAX)?;
-        if over.is_empty() {
-            return Ok(None);
-        }
-        let ov = Overlay {
-            over,
-            held: Vec::new(),
-            snap: unsealed,
-            stale: &self.stale,
-        };
-        // The chains the walk will read, fetched ahead as a build's are:
-        // after a burst every overlaid key is written since the runs were
-        // copied and read from its chain, two dependent misses a key.
-        self.prefetch_overlay(&ov);
-        Ok(Some(ov))
-    }
-    /// A key the form and the memtables both hold, emitted: the form's run
-    /// -- the partition's values and the pieces', oldest first -- unless a
-    /// memtable tombstone masks every source older than it, then the
-    /// memtables' values through `emit_over`, which reads the pieces and
-    /// the partition for nothing since the overlay names none.
-    fn emit_both<F: FnMut(&[u8], &[u8])>(
-        &self,
-        f: &mut F,
-        em: &mut Emit,
-        ov: &Overlay,
-        oi: usize,
-        src: Sources,
-        run: impl FnOnce(&mut F),
-    ) -> Result<()> {
-        let start = self.oldest_live(em, ov, &ov.over[oi], &[], src);
-        if start == 0 {
-            run(f);
-        }
-        self.emit_over(f, em, ov, oi, None, src)
-    }
-    /// `walk_deltas` with the memtables' keys over the block slipped in
-    /// beside the form's: two key-ordered lists over one walk of the
-    /// partition, each key emitted at its cut, a key in both emitted once
-    /// through `emit_both`.
-    #[allow(clippy::too_many_arguments)]
-    fn walk_deltas_over<F: FnMut(&[u8], &[u8])>(
-        &self,
-        src: Sources,
-        pr: &mut PartReader<'_>,
-        ranks: std::ops::Range<usize>,
-        blk: &SparseBlock,
-        ov: &Overlay,
-        window: (&[u8], usize),
-        mut f: F,
-    ) -> Result<usize> {
-        let (cursor, limit) = window;
-        let hi = ranks.end;
-        let mut seen = 0usize;
-        let mut rank = ranks.start;
-        let mut di = if cursor.is_empty() {
-            0
-        } else {
-            select_lower_bound(blk.ents.len(), |i| blk.key(&blk.ents[i]) < cursor)
-        };
-        let mut oi = 0usize;
-        let mut em = Emit {
-            tombs: self.tombs,
-            scratch: self.take_offs(),
-        };
-        while seen < limit {
-            let d = blk.ents.get(di);
-            let o = ov.over.get(oi);
-            if d.is_none() && o.is_none() {
-                break;
-            }
-            let end = rank.saturating_add(limit - seen).min(hi);
-            // The memtable key first where it is not above the form's: two
-            // keys' cuts order as the keys do, and equal keys emit once. The
-            // shape before ordered the two by cut, which sought the overlay
-            // key's cut at every turn before it was taken.
-            let take_over = match (d, o) {
-                (Some(e), Some(o)) => o.key <= blk.key(e),
-                (None, Some(_)) => true,
-                _ => false,
-            };
-            // The run below the key taken, and the key's cut: the form's
-            // deltas carry theirs; an overlay key's is known, or found where
-            // the walk stops at it.
-            let (to, oat) = if take_over {
-                let o = o.expect("taken");
-                if o.cut != u32::MAX {
-                    let (c, at) = BuildCtx::cut_known(o.cut, rank, end);
-                    if c > rank {
-                        pr.scan(rank, c - rank, &mut f)?;
-                    }
-                    (c, at)
-                } else {
-                    pr.scan_until(rank, end, o.key, &mut f)?
-                }
-            } else {
-                let e = d.expect("taken");
-                let c = (e.cut as usize).clamp(rank, end);
-                if c > rank {
-                    pr.scan(rank, c - rank, &mut f)?;
-                }
-                (c, Ordering::Greater)
-            };
-            if to > rank {
-                seen += to - rank;
-                rank = to;
-                if seen >= limit {
-                    // The limit fell before the cut.
-                    break;
-                }
-            }
-            if take_over {
-                let o = o.expect("taken");
-                match d.filter(|e| blk.key(e) == o.key) {
-                    Some(e) => {
-                        self.emit_both(&mut f, &mut em, ov, oi, src, |f| {
-                            blk.each_value(e, |v| f(o.key, v))
-                        })?;
-                        di += 1;
-                        if e.same {
-                            rank += 1;
-                        }
-                    }
-                    None => {
-                        let same = rank < hi && oat == Ordering::Equal;
-                        self.emit_over(
-                            &mut f,
-                            &mut em,
-                            ov,
-                            oi,
-                            same.then_some((rank, &mut *pr)),
-                            src,
-                        )?;
-                        if same {
-                            rank += 1;
-                        }
-                    }
-                }
-                oi += 1;
-            } else {
-                let e = d.expect("taken");
-                let k = blk.key(e);
-                blk.each_value(e, |v| f(k, v));
-                di += 1;
-                if e.same {
-                    rank += 1;
-                }
-            }
-            seen += 1;
-        }
-        if seen < limit && rank < hi {
-            let want = (hi - rank).min(limit - seen);
-            seen += pr.scan(rank, want, &mut f)?;
-        }
-        self.give_offs(em.scratch);
-        Ok(seen)
-    }
-    /// A copy walked with the memtables' keys over the block slipped in:
-    /// the copy holds every key of the block the partition and the
-    /// pieces have, so the two lists merge by key, a key in both emitted
-    /// once through `emit_both` and a key in the overlay alone from the
-    /// memtables.
-    fn walk_copy_over<F: FnMut(&[u8], &[u8])>(
-        &self,
-        src: Sources,
-        blk: &CachedBlock,
-        ov: &Overlay,
-        cursor: &[u8],
-        limit: usize,
-        mut f: F,
-    ) -> Result<usize> {
-        let mut i = if cursor.is_empty() {
-            0
-        } else {
-            blk.lower_bound(cursor)
-        };
-        let mut oi = 0usize;
-        let mut seen = 0usize;
-        let mut em = Emit {
-            tombs: self.tombs,
-            scratch: self.take_offs(),
-        };
-        let n = blk.len();
-        while seen < limit {
-            let order = match (i < n, ov.over.get(oi)) {
-                (false, None) => break,
-                (true, None) => Ordering::Less,
-                (false, Some(_)) => Ordering::Greater,
-                (true, Some(o)) => blk.key_i(i).cmp(o.key),
-            };
-            match order {
-                Ordering::Less => {
-                    let k = blk.key_i(i);
-                    blk.values_i(i, |v| f(k, v));
-                    i += 1;
-                }
-                Ordering::Greater => {
-                    self.emit_over(&mut f, &mut em, ov, oi, None, src)?;
-                    oi += 1;
-                }
-                Ordering::Equal => {
-                    self.emit_both(&mut f, &mut em, ov, oi, src, |f| {
-                        blk.values_i(i, |v| f(blk.key_i(i), v))
-                    })?;
-                    i += 1;
-                    oi += 1;
-                }
-            }
-            seen += 1;
-        }
-        self.give_offs(em.scratch);
-        Ok(seen)
     }
     /// PROTOTYPE: the walk over ranks `from..hi` with the block's resolved
     /// keys slipped in at their cuts; only keys not below `cursor` are
@@ -61505,12 +60675,7 @@ impl Maint {
             let rebases = if swapped_live {
                 0
             } else {
-                cur.carry_published(
-                    &mut next,
-                    self.opts.forms_pieces_only,
-                    self.opts.counts_capacity(),
-                    None,
-                )
+                cur.carry_published(&mut next, self.opts.counts_capacity(), None)
             };
             let p = Box::into_raw(Box::new(next));
             if landed.is_some() {

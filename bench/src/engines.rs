@@ -607,10 +607,6 @@ pub struct Supdb {
     snap: bool,
     /// Whether a commit's maintenance stops after settling; `supdb-settle`.
     settle: bool,
-    /// Whether the writer reads the forms it maintains; `supdb-wforms`.
-    wforms: bool,
-    /// The unsealed share past which a commit stops; `supdb-regime`.
-    lagcap: usize,
     /// Whether the forms wait for a caller's handle; `supdb-lazyforms`.
     lazyforms: bool,
     /// The settle backlog this arm pins, or none for the engine's own;
@@ -1223,9 +1219,6 @@ pub struct Supdb {
     /// Whether a publish starts the builder and a commit installs its
     /// forms. `supdb-aheadpub`.
     aheadpub: bool,
-    /// Whether the forms are published at every maintained commit, as
-    /// they were before they waited for a handle. `supdb-pubalways`.
-    pubalways: bool,
     /// A flush that does not partition leaves its pieces as they are,
     /// as before `Options::flush_schedules`. `supdb-ingestleave`.
     leave: bool,
@@ -1248,10 +1241,6 @@ pub struct Supdb {
     /// A point read takes a segment's extents by value, as before
     /// `Blob::with_lookup` (`Options::exts_by_value`). `supdb-extsval`.
     extsval: bool,
-    /// The forms hold the pieces' fold alone and every walk overlays the
-    /// snapshot (`Options::forms_pieces_only`). `supdb-piecesonly`, and
-    /// `supdb-ingestpiecesonly` buffered.
-    piecesonly: bool,
     /// The segment writer leaves every piece dirty and unsynced until the
     /// closing fsync, as before `SegmentOptions::early_writeback` and
     /// `sync_ahead`. `supdb-latewb`, and `supdb-ingestlatewb` buffered.
@@ -2079,12 +2068,6 @@ struct Policy {
     /// Maintain at every commit but settle only: no form built for an
     /// overlaid block, nothing published. `supdb-settle`.
     settle: bool,
-    /// The writer's own handle reads the forms it maintains rather than
-    /// building its own. `supdb-wforms`.
-    wforms: bool,
-    /// The share of the store that may be unsealed before a commit
-    /// stops maintaining; zero is no bound. `supdb-regime`.
-    lagcap: usize,
     /// Whether the forms wait for a caller's handle to have scanned, as
     /// they did before the seal cap. `supdb-lazyforms`.
     lazyforms: bool,
@@ -2697,9 +2680,6 @@ struct Policy {
     /// Whether a publish starts the builder and a commit installs its
     /// forms. `supdb-aheadpub`.
     aheadpub: bool,
-    /// Whether the forms are published at every maintained commit, as
-    /// they were before they waited for a handle. `supdb-pubalways`.
-    pubalways: bool,
     /// A flush that does not partition leaves its pieces as they are,
     /// as before `Options::flush_schedules`. `supdb-ingestleave`.
     leave: bool,
@@ -2721,10 +2701,6 @@ struct Policy {
     /// A point read takes a segment's extents by value, as before
     /// `Blob::with_lookup` (`Options::exts_by_value`). `supdb-extsval`.
     extsval: bool,
-    /// The forms hold the pieces' fold alone and every walk overlays the
-    /// snapshot (`Options::forms_pieces_only`). `supdb-piecesonly`, and
-    /// `supdb-ingestpiecesonly` buffered.
-    piecesonly: bool,
     /// The segment writer leaves every piece dirty and unsynced until the
     /// closing fsync, as before `SegmentOptions::early_writeback` and
     /// `sync_ahead`. `supdb-latewb`, and `supdb-ingestlatewb` buffered.
@@ -3296,14 +3272,11 @@ impl Default for Policy {
             forms: false,
             snap: true,
             settle: false,
-            wforms: false,
-            lagcap: 0,
             sealcap: None,
             l0: None,
             nopin: false,
             asympin: false,
             extsval: false,
-            piecesonly: false,
             latewb: false,
             inlinemaint: false,
             drainpromote: false,
@@ -3616,7 +3589,6 @@ impl Default for Policy {
             runs: false,
             keeper: false,
             aheadpub: false,
-            pubalways: false,
             leave: false,
         }
     }
@@ -5804,20 +5776,6 @@ impl Supdb {
         )
     }
 
-    /// `supdb` publishing the forms at every maintained commit whether
-    /// or not a handle is live to take them, as it did before. Against
-    /// `supdb` it prices the copy every publish forces on the next patch
-    /// of the block, over the mixes and the sweep, where no handle is.
-    pub fn create_pubalways(path: &Path) -> Res<Supdb> {
-        Supdb::with_policy(
-            path,
-            Policy {
-                pubalways: true,
-                ..Policy::default()
-            },
-        )
-    }
-
     /// `supdb` settling by its backlog only within `RECENT` percent of
     /// the store's keys written since the last scan (ten unless set), at
     /// `BACKLOG` percent of the store's keys or the engine's own bound.
@@ -5950,33 +5908,6 @@ impl Supdb {
             path,
             Policy {
                 nopin: true,
-                ..Policy::default()
-            },
-        )
-    }
-
-    /// `supdb` with the forms holding the pieces' fold alone and every
-    /// walk overlaying the scan snapshot (`Options::forms_pieces_only`):
-    /// against `supdb` it prices the settle that files nothing.
-    pub fn create_piecesonly(path: &Path) -> Res<Supdb> {
-        Supdb::with_policy(
-            path,
-            Policy {
-                piecesonly: true,
-                ..Policy::default()
-            },
-        )
-    }
-
-    /// `supdb-ingest` with the forms holding the pieces' fold alone, as
-    /// `supdb-piecesonly`.
-    pub fn create_ingest_piecesonly(path: &Path) -> Res<Supdb> {
-        Supdb::with_policy(
-            path,
-            Policy {
-                partition: false,
-                durable: false,
-                piecesonly: true,
                 ..Policy::default()
             },
         )
@@ -8750,38 +8681,6 @@ impl Supdb {
         )
     }
 
-    /// `supdb` maintaining the forms whoever is reading, as `supdb-forms`
-    /// does, but stopping where too much of the store is unsealed. The pair
-    /// against `supdb` says whether the regime's 3.19x on the lag sweep can
-    /// be had without its loss at the deepest lag.
-    pub fn create_regime(path: &Path) -> Res<Supdb> {
-        Supdb::with_policy(
-            path,
-            Policy {
-                forms: true,
-                lagcap: std::env::var("LAGCAP")
-                    .ok()
-                    .and_then(|v| v.parse().ok())
-                    .unwrap_or(25),
-                ..Policy::default()
-            },
-        )
-    }
-
-    /// `supdb` with the writer reading the canonical forms it maintains.
-    /// Against `supdb` it prices the half of the mechanism the shipping
-    /// arm cannot use: a form is taken only by a handle with a slot, and
-    /// the writer's has none.
-    pub fn create_wforms(path: &Path) -> Res<Supdb> {
-        Supdb::with_policy(
-            path,
-            Policy {
-                wforms: true,
-                ..Policy::default()
-            },
-        )
-    }
-
     pub fn create_nosnap(path: &Path) -> Res<Supdb> {
         Supdb::with_policy(
             path,
@@ -9917,14 +9816,11 @@ impl Supdb {
             forms,
             snap,
             settle,
-            wforms,
-            lagcap,
             sealcap,
             l0,
             nopin,
             asympin,
             extsval,
-            piecesonly,
             latewb,
             inlinemaint,
             drainpromote,
@@ -10085,7 +9981,6 @@ impl Supdb {
             runs,
             keeper,
             aheadpub,
-            pubalways,
             leave,
             rotate,
             nofrozen,
@@ -10322,7 +10217,6 @@ impl Supdb {
             // the shipping arm until the pair is measured: the suite's
             // ycsb-E reads through the writer, so it pays for the
             // maintenance and today cannot read it.
-            forms_to_writer: wforms,
             // Settle every commit, so a write burst never leaves its
             // filing to the first read after it.
             forms_settle_backlog_pct: eager
@@ -10599,12 +10493,10 @@ impl Supdb {
             build_ahead_on_publish: aheadpub,
             // The forms published for a handle, or at every maintained
             // commit as they were.
-            forms_publish_lazily: !pubalways,
             flush_schedules: !leave,
             // The unsealed share past which the maintenance stops, so an
             // arm can maintain whoever is reading without paying for it
             // on a store that is nearly all unmerged.
-            forms_max_unsealed_pct: lagcap,
             // The seal capped by a share of the store, so the memtable
             // cannot hold the whole of a store smaller than the floor.
             seal_max_pct: sealcap.unwrap_or(base_seal_max_pct),
@@ -10817,7 +10709,6 @@ impl Supdb {
             } else {
                 supdb::Options::default().zpages_eager
             },
-            forms_pieces_only: piecesonly,
             // Unpinned, the writer must be the one publisher, as it was
             // when the pins were priced: the store refuses the pair.
             publish_in_background: !(inlinemaint || nopin),
@@ -10950,14 +10841,11 @@ impl Supdb {
             forms,
             snap,
             settle,
-            wforms,
-            lagcap,
             sealcap,
             l0,
             nopin,
             asympin,
             extsval,
-            piecesonly,
             latewb,
             inlinemaint,
             drainpromote,
@@ -11118,7 +11006,6 @@ impl Supdb {
             runs,
             keeper,
             aheadpub,
-            pubalways,
             leave,
             rotate,
             nofrozen,
@@ -12175,9 +12062,6 @@ impl Engine for Supdb {
         if self.leave {
             return "supdb-ingestleave";
         }
-        if self.pubalways {
-            return "supdb-pubalways";
-        }
         if self.recent.is_some() {
             return "supdb-recency";
         }
@@ -12206,13 +12090,6 @@ impl Engine for Supdb {
         }
         if self.extsval {
             return "supdb-extsval";
-        }
-        if self.piecesonly {
-            return if self.partition {
-                "supdb-piecesonly"
-            } else {
-                "supdb-ingestpiecesonly"
-            };
         }
         if self.latewb {
             return if self.partition {
@@ -13064,12 +12941,6 @@ impl Engine for Supdb {
         }
         if self.sealcap.is_some() {
             return "supdb-noseal";
-        }
-        if self.lagcap > 0 {
-            return "supdb-regime";
-        }
-        if self.wforms {
-            return "supdb-wforms";
         }
         if self.forms {
             return "supdb-forms";
@@ -15481,8 +15352,6 @@ pub fn guarantee(arm: &str) -> Option<Guarantee> {
         "supdb"
         | "supdb-forms"
         | "supdb-settle"
-        | "supdb-wforms"
-        | "supdb-regime"
         | "supdb-noseal"
         | "supdb-ahead"
         | "supdb-noahead"
@@ -15503,7 +15372,6 @@ pub fn guarantee(arm: &str) -> Option<Guarantee> {
         | "supdb-runs"
         | "supdb-keeper"
         | "supdb-aheadpub"
-        | "supdb-pubalways"
         | "supdb-nosnap"
         | "supdb-noadvice"
         | "supdb-advicerandom"
@@ -15621,7 +15489,6 @@ pub fn guarantee(arm: &str) -> Option<Guarantee> {
         | "supdb-nopin"
         | "supdb-asympin"
         | "supdb-extsval"
-        | "supdb-piecesonly"
         | "supdb-latewb"
         | "supdb-manifestfree"
         | "supdb-oidxsync"
@@ -15909,7 +15776,6 @@ pub fn guarantee(arm: &str) -> Option<Guarantee> {
         | "supdb-ingestsettlefreeze"
         | "supdb-ingestshortpass"
         | "supdb-ingestnoyield"
-        | "supdb-ingestpiecesonly"
         | "supdb-ingestlatewb"
         | "supdb-ingestdrainpromote"
         | "supdb-ingestmanifestfree"
@@ -16132,13 +15998,10 @@ pub fn open(arm: &str, dir: &Path, map_gb: usize) -> Res<Box<dyn Engine>> {
         "supdb-runs" => supdb_arm(Supdb::create_runs, dir)?,
         "supdb-keeper" => supdb_arm(Supdb::create_keeper, dir)?,
         "supdb-aheadpub" => supdb_arm(Supdb::create_aheadpub, dir)?,
-        "supdb-pubalways" => supdb_arm(Supdb::create_pubalways, dir)?,
         "supdb-lazyforms" => supdb_arm(Supdb::create_lazyforms, dir)?,
         "supdb-ahead" => supdb_arm(Supdb::create_ahead, dir)?,
         "supdb-noahead" => supdb_arm(Supdb::create_noahead, dir)?,
         "supdb-noseal" => supdb_arm(Supdb::create_noseal, dir)?,
-        "supdb-regime" => supdb_arm(Supdb::create_regime, dir)?,
-        "supdb-wforms" => supdb_arm(Supdb::create_wforms, dir)?,
         "supdb-nosnap" => supdb_arm(Supdb::create_nosnap, dir)?,
         "supdb-noadvice" => supdb_arm(Supdb::create_noadvice, dir)?,
         "supdb-advicerandom" => supdb_arm(Supdb::create_advicerandom, dir)?,
@@ -16902,8 +16765,6 @@ pub fn open(arm: &str, dir: &Path, map_gb: usize) -> Res<Box<dyn Engine>> {
         "supdb-nopin" => supdb_arm(Supdb::create_nopin, dir)?,
         "supdb-asympin" => supdb_arm(Supdb::create_asympin, dir)?,
         "supdb-extsval" => supdb_arm(Supdb::create_extsval, dir)?,
-        "supdb-piecesonly" => supdb_arm(Supdb::create_piecesonly, dir)?,
-        "supdb-ingestpiecesonly" => supdb_arm(Supdb::create_ingest_piecesonly, dir)?,
         "supdb-latewb" => supdb_arm(Supdb::create_latewb, dir)?,
         "supdb-manifestfree" => supdb_arm(Supdb::create_manifestfree, dir)?,
         "supdb-oidxsync" => supdb_arm(Supdb::create_oidxsync, dir)?,
@@ -24284,7 +24145,6 @@ mod tests {
             );
             assert_eq!(a.scan_block_cache, b.scan_block_cache, "{name}");
             assert_eq!(a.commit_forms, b.commit_forms, "{name}");
-            assert_eq!(a.forms_publish_lazily, b.forms_publish_lazily, "{name}");
             assert_eq!(a.scan_cache_ahead, b.scan_cache_ahead, "{name}");
             assert_eq!(a.upkeep, b.upkeep, "{name}");
             assert_eq!(a.forms_settle_far, b.forms_settle_far, "{name}");
