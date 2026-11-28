@@ -855,15 +855,7 @@ whatever the controller would decide, and `supdb-cache64tofitzpagesstored`
 the same with every group stored; `supdb-nocachezpagesrecordraw` and
 `supdb-cache64tofitzpagesrecordraw` are the two under the record coding with
 every tail stored raw (`Options::zpages_raw_tails`), the heads front-coded
-and the values the records' own bytes, and
-`supdb-cache64tofitzpagesrecordrawlean` is the cached one with the memo of
-decoded groups off and the allocator trimmed once after the form files'
-install (`Options::zpages_trim_install`), the fit check of that form, and
-`supdb-cache64tofitzpagesrecordrawleantrim` the same with the trim thread
-asked to look at every upkeep pass end (`Options::upkeep_trim_look`), and
-`supdb-cache64tofitzpagesrecordrawleanresident` the same with the trim's
-stride counted by the anonymous bytes resident beyond the allocator's use
-instead of its free count (`Options::trim_by_resident`);
+and the values the records' own bytes;
 `supdb-cache64tofitzpageshot4` and `supdb-cache64tofitzpageshot1` are
 `supdb-cache64tofitzpages` with the first four, or the first, partitions by
 key order in the raw-tail coding and the rest in the block coding

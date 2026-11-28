@@ -1405,45 +1405,6 @@ pub struct Options {
     /// one-sided on the ladder: ycsb-E is the only mix this engine loses
     /// to LMDB, at 0.74x-0.87x, and ycsb-F it wins by 2.84x-6.27x.
     pub seal_max_pct: usize,
-    /// EXPERIMENT: the seal cap follows the reads. A scan over unsealed
-    /// keys or level-0 pieces, or a point read whose key's range has
-    /// level-0 pieces, is a read that lag costs, and one raises the
-    /// store's lag level to its full at the writer's next commit
-    /// (`Reader::lag_level`); the writes since the last such read, over
-    /// `lag_relax_pct` of the partitions' keys, take it back to zero. The
-    /// cap the seal threshold takes is `cap_reading_pct` at the full
-    /// level, `seal_max_pct` at zero, and the line between, so a store
-    /// nobody reads seals as the cap has it and one being read seals
-    /// sooner -- or later, with `cap_reading_pct` above the cap, for the
-    /// store whose reads a seal costs more than the lag it removes; the
-    /// sweep's shape -- a burst with no reads, then a pass of
-    /// them -- is why the level decays with writes and not with time,
-    /// and the level moves at a commit, so a pass of reads with no write
-    /// between tightens the cadence of the burst after it. Off is the
-    /// cap as it stands, whoever is reading; `seal_max_pct` of zero,
-    /// uncapped, stays uncapped either way.
-    pub adaptive_cap: bool,
-    /// The seal cap, as a percentage of the store, at the full lag
-    /// level; `SEAL_CAP_FLOOR` floors it as it floors the cap. Below
-    /// `seal_max_pct` the cap tightens under reads, above it the cap
-    /// loosens.
-    pub cap_reading_pct: usize,
-    /// EXPERIMENT: the merge trigger follows the reads as the cap does:
-    /// `trigger_reading` pieces a range at the full lag level,
-    /// `l0_trigger` at zero, and the line between. The seal's growth
-    /// rule (`seal_grows`) keeps dividing by `l0_trigger`, so at the full
-    /// level a merge takes in fewer pieces than the seal was sized for
-    /// and rewrites more per byte taken; that is the trade the arm
-    /// prices.
-    pub adaptive_trigger: bool,
-    /// The pieces a range holds before it merges, at the full lag level;
-    /// below `l0_trigger` the trigger tightens under reads, above it the
-    /// trigger loosens.
-    pub trigger_reading: usize,
-    /// The writes, as a percentage of the partitions' keys, over which
-    /// the lag level decays from full to zero with no read over lag
-    /// between; floored at `LAG_RELAX_FLOOR` keys.
-    pub lag_relax_pct: usize,
     /// Size the store for `seal_grows` and `seal_max_pct` by its
     /// partitions' file bytes (`true`, the rule before) rather than by the
     /// key and value bytes they hold (`false`). The file's length moves
@@ -1917,9 +1878,7 @@ pub struct Options {
     /// behind a longer path and the live table's probe, whose branch no
     /// predictor learns. The ask starts the first wait before either.
     ///
-    /// A store whose merges follow its reads (`adaptive_cap`,
-    /// `adaptive_trigger`), which counts a read a piece consulted, and a
-    /// frozen table that was a run of ordered ingest are `read_layers`'
+    /// A frozen table that was a run of ordered ingest is `read_layers`'
     /// still, with everything it leaves to the general read.
     /// `Reader::point_placed_reads` counts the reads this one answered.
     /// Needs `point_lone`. Off: `supdb-layersasone`, and
@@ -3287,52 +3246,6 @@ pub struct Options {
     /// shape before.
     #[doc(hidden)]
     pub zpages_flat_slack: bool,
-    /// EXPERIMENT: the allocator trimmed once (`malloc_trim`) at the end of
-    /// `zpages_settle`, after every partition has its form file: what the
-    /// builds' threads and the load left free in their arenas is given back
-    /// to the kernel, so a form that fits the bound by a margin of tens of
-    /// megabytes has them for its pages. With `zpages_memo` off it is the
-    /// fit check of the raw-tail coding at five million keys under 640 MiB
-    /// (`supdb-cache64tofitzpagesrecordrawlean` against
-    /// `supdb-cache64tofitzpages`), where the form's 556 MB beside the
-    /// block cache left the process's anonymous bytes the margin. Off.
-    #[doc(hidden)]
-    pub zpages_trim_install: bool,
-    /// EXPERIMENT: the trim thread (`forms_to_fit` with `forms_trim_bytes`)
-    /// asked to look at the allocator at the end of every upkeep pass, the
-    /// stride deciding whether it trims (`trim_due`), and not only when a
-    /// handle has freed a stride of forms. The pass is the engine's moment
-    /// inside a run of reads, where the process's resident free pages
-    /// compete with its own file's: the census after each mix under the
-    /// bound read 40-50 MB of free chunks resident in the arenas the seal
-    /// and build threads left and the main arena's churn, with the trim
-    /// after the install (`zpages_trim_install`) taken back by then. With
-    /// that trim and the memo off it is the second fit check of the
-    /// raw-tail coding (`supdb-cache64tofitzpagesrecordrawleantrim`). Off.
-    #[doc(hidden)]
-    pub upkeep_trim_look: bool,
-    /// EXPERIMENT: the trim thread counts its stride by the anonymous bytes
-    /// this process holds resident beyond what the allocator has in use
-    /// (`RssAnon` less `mallinfo2`'s in-use and mmapped bytes) and not by
-    /// the allocator's free count. The free count stands still while a
-    /// thread re-uses a dead arena's free chunks and frees them again --
-    /// the chunks were free before and are free after, and only their
-    /// pages came back -- so at five million keys under 640 MiB the look
-    /// at every pass end (`upkeep_trim_look`) found nothing to trim nine
-    /// hundred and seventy times while 40-50 MB sat resident and free in
-    /// the arenas the seal and build threads left. The resident count
-    /// moves with the pages. An allocation nobody has touched yet counts
-    /// as in use and not as resident, so the count runs under the truth
-    /// by that much and a trim comes late, never for nothing. With the
-    /// lean arm's levers and the look it is the third fit check of the
-    /// raw-tail form (`supdb-cache64tofitzpagesrecordrawleanresident`),
-    /// refuted as its first two were: at a stride of eight megabytes the
-    /// count fired, four to nine trims in the mixes, and the process's
-    /// anonymous bytes through the mixes and the faults read as without
-    /// it, since the pages a trim returns are the pages the mixes touch
-    /// next. Off.
-    #[doc(hidden)]
-    pub trim_by_resident: bool,
     /// EXPERIMENT: the first this many partitions by key order are built
     /// in the record coding with raw tails, and the rest as the options say
     /// (`zpages_raw_tails` off). The upper bound of a coding chosen per
@@ -3548,14 +3461,6 @@ pub struct Options {
     /// at one where it was not. A closed file retires at the landing of
     /// the next seal, which covers every record in it.
     pub seal_rotates_wal: bool,
-    /// EXPERIMENT: a commit past the seal threshold while the frozen
-    /// tables fill the list keeps writing instead of waiting for the
-    /// oldest to land; a later commit seals once the list has room. Past
-    /// a ceiling of twice the threshold the commit waits as before, which
-    /// keeps the live table and the piece it seals into within a factor
-    /// of two of where the wait bounded them. Off, the commit waits in the
-    /// seal for room.
-    pub seal_defers: bool,
     /// EXPERIMENT: a commit under the seal threshold seals anyway when no
     /// seal is writing a table -- the frozen list empty and no table
     /// handed -- and the live table holds `SEAL_CAP_FLOOR` or more: the
@@ -3572,22 +3477,12 @@ pub struct Options {
     /// piece; sealed meanwhile, a backlog left by a point-read phase met
     /// the scans of the phase after as a frozen table and then a piece,
     /// and ycsb-E read 0.88-0.91x. While the idle seals run the threshold
-    /// is `seal_bytes` alone, the cap and the first floor left off, since
-    /// the idle seals keep the backlog small; with reads around the cap
-    /// stands. A commit in such a stretch with no scan near files no
-    /// backlog into the forms either, since the idle seals put partitions
-    /// under a load nobody reads.
+    /// is `seal_bytes` alone, the cap left off, since the idle seals keep
+    /// the backlog small; with reads around the cap stands. A commit in
+    /// such a stretch with no scan near files no backlog into the forms
+    /// either, since the idle seals put partitions under a load nobody
+    /// reads.
     pub seal_idle: bool,
-    /// EXPERIMENT: under `adaptive_shape`, with `compact` and `promote`, a
-    /// store with no segment seals its first table at `SEAL_CAP_FLOOR`
-    /// rather than at `seal_bytes`, so a first load leaves a partition
-    /// behind -- the first seal's piece is promoted at its landing -- and
-    /// the cap's share of the store takes over from there. Never a direct
-    /// run's: a run closes when a seal would, and closed at the floor an
-    /// ordered load became partitions of a megabyte each. Without it a store under `seal_bytes` stays
-    /// wholly in the memtable until something reads it, and the first
-    /// scans after its load sort the whole table and walk the merge path.
-    pub seal_first_floor: bool,
     /// How a flush drains level 0 once partitions exist: merge only the
     /// ranges that hold pieces, under the live fences (`true`), or
     /// re-partition everything from every key (`false`, the original), kept
@@ -4531,29 +4426,6 @@ pub struct Options {
     /// one rung is the whole burst at the rung below. `supdb-bglag` and
     /// `supdb-ingestbglag` set it.
     pub upkeep_lag_pct: usize,
-    /// EXPERIMENT: a commit that lends wakes the upkeep thread not only
-    /// for a batch worth waking it for but also when the thread is parked
-    /// for longer than the wait it grants a short batch before it begins
-    /// a pass anyway (`UPKEEP_BATCH_WAIT`). The thread doubles its poll to
-    /// twenty milliseconds while nothing is lent, and a run of commits
-    /// too small to wake it for -- the mixes' hundred-write batches --
-    /// then lies lent for the whole run: at ten thousand keys it made no
-    /// pass through four mixes, and the first scan of the fifth filed
-    /// their whole backlog and built every block they had dirtied, a
-    /// sixth of ycsb-E. The thread publishes its park timeout and the
-    /// commit reads it. Priced three ways against the shape that never
-    /// wakes for a small batch, 24 pairs at ten thousand keys: woken past
-    /// its shortest poll, or past this wait, the thread filed the mixes'
-    /// writes beside them -- its passes 12 to 21, the blocks it built 0
-    /// to 149 -- and ycsb-E read 1.18-1.19x, but ycsb-A 0.84-0.86x,
-    /// ycsb-F 0.82-0.85x and B 0.95x; woken only at its full back-off it
-    /// was never woken there, since the reads before the mixes are
-    /// shorter than the climb to it. At three hundred thousand keys
-    /// nothing moved. A wake is a VM exit on this guest, and the passes
-    /// run on a sibling of the writer's core; whichever of the two it is,
-    /// the mixes that write pay more than the mix that scans gains, so
-    /// this is off: `supdb-wake` and `supdb-ingestwake` price it.
-    pub upkeep_wake_parked: bool,
     /// The upkeep thread stays alert after work: for `UPKEEP_ALERT` after
     /// its last pass or hand-over it parks for at most `UPKEEP_ALERT_POLL`
     /// at a time, and climbs its back-off to `UPKEEP_POLL_MAX` only once
@@ -4563,13 +4435,13 @@ pub struct Options {
     /// writer wakes nobody: the thread's own timer runs on its own core,
     /// where a wake from the writer was a VM exit on this guest, seven
     /// microseconds a commit, and the mixes that write paid more than the
-    /// mix that scans gained (`upkeep_wake_parked`). Before this the
-    /// back-off, climbed during the read passes, slept through two
-    /// milliseconds of mixes, and ycsb-E's first scans filed seventeen
-    /// hundred writes and built a hundred and fifty blocks at ten thousand
-    /// keys, 0.93x of the comparator where the durable store, whose
-    /// fsyncs gave the thread its window, read 1.3x. Off, the arm
-    /// `supdb-noalert` and `supdb-ingestnoalert`: the back-off as it was.
+    /// mix that scans gained. Before this the back-off, climbed during the
+    /// read passes, slept through two milliseconds of mixes, and ycsb-E's
+    /// first scans filed seventeen hundred writes and built a hundred and
+    /// fifty blocks at ten thousand keys, 0.93x of the comparator where
+    /// the durable store, whose fsyncs gave the thread its window, read
+    /// 1.3x. Off, the arm `supdb-noalert` and `supdb-ingestnoalert`: the
+    /// back-off as it was.
     pub upkeep_alert: bool,
     /// The longest the alert thread parks for, in microseconds: how soon
     /// after a lent batch it files and builds, against how often its
@@ -8340,11 +8212,6 @@ impl Default for Options {
             // bytes.
             seal_bytes: 32 << 20,
             seal_max_pct: 10,
-            adaptive_cap: false,
-            cap_reading_pct: 2,
-            adaptive_trigger: false,
-            trigger_reading: 2,
-            lag_relax_pct: 100,
             seal_on_file: false,
             seal_grows: true,
             seal_floor_out_of_core: false,
@@ -8476,9 +8343,6 @@ impl Default for Options {
             zpages_own_decoder: true,
             zpages_flat_decode: true,
             zpages_flat_slack: true,
-            zpages_trim_install: false,
-            upkeep_trim_look: false,
-            trim_by_resident: false,
             zpages_raw_tails_first: 0,
             zpages_drop_raw: true,
             zpages_drop_at_install: true,
@@ -8493,9 +8357,7 @@ impl Default for Options {
             publish_in_background: true,
             adaptive_shape: false,
             seal_rotates_wal: false,
-            seal_defers: false,
             seal_idle: false,
-            seal_first_floor: false,
             recycle_wal: true,
             wal_recycle_pads: true,
             wal_ahead_bytes: 1 << 20,
@@ -8558,7 +8420,6 @@ impl Default for Options {
             forms_settle_keys_all: false,
             upkeep: Upkeep::default(),
             upkeep_lag_pct: 0,
-            upkeep_wake_parked: false,
             upkeep_alert: true,
             upkeep_alert_poll_us: 200,
             upkeep_inline_bursts: true,
@@ -18481,9 +18342,6 @@ struct Slot {
     /// Reads and scans this handle made over a store with pieces and no
     /// partition (`Options::adaptive_shape`).
     unshaped: AtomicU64,
-    /// Reads and scans this handle made that lag cost: over unsealed
-    /// keys or level-0 pieces (`Options::adaptive_cap`).
-    lag: AtomicU64,
     takes: AtomicU64,
     tried: AtomicU64,
     hit: AtomicU64,
@@ -18617,7 +18475,6 @@ impl Slot {
             scans: AtomicU64::new(0),
             blockpath: AtomicU64::new(0),
             unshaped: AtomicU64::new(0),
-            lag: AtomicU64::new(0),
             takes: AtomicU64::new(0),
             tried: AtomicU64::new(0),
             hit: AtomicU64::new(0),
@@ -24855,10 +24712,6 @@ impl DrainSteps {
 
 #[derive(Default)]
 struct SealCounts {
-    /// Reads and scans over lag by the engine's own handles -- the
-    /// writer's above all, whose reads are the sweep's -- where a
-    /// caller's handle counts on its slot's line (`Options::adaptive_cap`).
-    lag: AtomicU64,
     /// Reads and scans over a store with pieces and no partition made
     /// through no handle of a caller's: the writer's own.
     unshaped: AtomicU64,
@@ -24896,9 +24749,6 @@ struct SealCounts {
     /// closed, promoted on their keys; for a test that asserts the arm.
     promoted: AtomicU64,
     promoted_open: AtomicU64,
-    /// Commits past the seal threshold that kept writing because the
-    /// frozen tables filled the list (`Options::seal_defers`).
-    deferred: AtomicU64,
     /// Seals a commit under the threshold started because no seal was
     /// writing (`Options::seal_idle`).
     idle_seals: AtomicU64,
@@ -24976,7 +24826,6 @@ impl SealCounts {
             seal_records_ns: get(&self.seal_records_ns),
             seal_thread_ns: get(&self.seal_thread_ns),
             seal_sorts: get(&self.seal_sorts),
-            deferred: get(&self.deferred),
             idle_seals: get(&self.idle_seals),
             drains_early: get(&self.drains_early),
             drains_beside: get(&self.drains_beside),
@@ -25046,10 +24895,6 @@ pub struct SealWaits {
     /// Seals that sorted their table themselves; the rest took the order
     /// a freeze, a scan or the keeper had set on it.
     pub seal_sorts: u64,
-    /// See `SealCounts`: commits that deferred their seal, WAL rotations
-    /// and the bytes they left unsynced, and the writer's time in the
-    /// seals its commits started.
-    pub deferred: u64,
     /// Seals started by a commit under the threshold because no seal was
     /// writing (`Options::seal_idle`).
     pub idle_seals: u64,
@@ -25071,6 +24916,8 @@ pub struct SealWaits {
     /// The directory fsyncs their readable landings left owed, paid at
     /// the durable landing.
     pub dir_owed_syncs: u64,
+    /// See `SealCounts`: WAL rotations and the bytes they left unsynced,
+    /// and the writer's time in the seals its commits started.
     pub wal_rotations: u64,
     pub rotated_unsynced: u64,
     pub loose_synced: u64,
@@ -27210,13 +27057,6 @@ struct Shared {
     /// work last looked (`Options::adaptive_shape`): set by the read that
     /// finds it clear, which wakes the thread, cleared by the look.
     unshaped_wake: std::sync::atomic::AtomicBool,
-    /// A read over lag happened since the writer's last commit
-    /// (`Options::adaptive_cap`): set by the read that finds it clear,
-    /// taken by the commit.
-    lag_wake: std::sync::atomic::AtomicBool,
-    /// The lag level the writer's last commit left, for the segment
-    /// work's trigger and the tests; see `Db::lag_level`.
-    lag_level: std::sync::atomic::AtomicU32,
     /// The segment work's thread, for a read to wake.
     maint_thread: std::sync::OnceLock<std::thread::Thread>,
     /// The segment work's thread's CPU clock, in nanoseconds, as of its
@@ -27934,7 +27774,7 @@ mod heap {
     /// `mallinfo2`'s in-use bytes in the arenas and its mmapped chunks.
     /// Free chunks' resident pages, mostly, since the engine maps no
     /// anonymous memory of its own; the stacks and the binary's data are a
-    /// constant the trim's floor absorbs, and an allocation not yet touched
+    /// constant a difference of two readings absorbs, and an allocation not yet touched
     /// counts as in use and not as resident, so the reading runs under the
     /// truth and never over it. None where either reading cannot be had.
     // The door (tests/data/door.txt): a /proc read for the trim (G3: Memory).
@@ -27950,22 +27790,11 @@ mod heap {
         // is resident comes out too, read from the kernel and never the
         // blocks whole: a store's tables in flight map tens of megabytes
         // they have barely written, and taken out whole they read a dead
-        // arena of thirty-two megabytes as seven, so the trim that counts
-        // by this never fired on it.
+        // arena of thirty-two megabytes as seven.
         Some(
             anon.saturating_sub(mi.uordblks.saturating_add(mi.hblkhd))
                 .saturating_sub(super::blocks::mapped_resident_bytes()),
         )
-    }
-
-    /// What the trim counts its stride by: the resident bytes beyond use
-    /// (`Options::trim_by_resident`), or the allocator's free count.
-    pub fn held(by_resident: bool) -> Option<usize> {
-        if by_resident {
-            resident_beyond_use()
-        } else {
-            free_bytes()
-        }
     }
 
     /// The pages inside every free chunk of every arena given back,
@@ -27994,10 +27823,6 @@ mod heap {
         None
     }
 
-    pub fn held(_by_resident: bool) -> Option<usize> {
-        None
-    }
-
     pub fn trim() {}
 
     pub fn set_mmap_threshold(_bytes: usize) {}
@@ -28015,12 +27840,12 @@ fn trim_due(held: usize, floor: usize, stride: usize) -> (usize, bool) {
 
 /// Give the system the pages the allocator holds free, if it holds
 /// `stride` more than it did when it was last asked to (`trim_due`), by
-/// the count the store asks for (`heap::held`, `Options::trim_by_resident`).
-/// Pages, not chunks: glibc releases the whole pages inside every free
-/// chunk of every arena, not only a heap's top.
-fn trim_free_memory(shared: &Shared, stride: usize, by_resident: bool) {
+/// its free count (`heap::free_bytes`). Pages, not chunks: glibc releases
+/// the whole pages inside every free chunk of every arena, not only a
+/// heap's top.
+fn trim_free_memory(shared: &Shared, stride: usize) {
     let t = std::time::Instant::now();
-    let Some(held) = heap::held(by_resident) else {
+    let Some(held) = heap::free_bytes() else {
         return;
     };
     let (floor, due) = trim_due(
@@ -28031,7 +27856,7 @@ fn trim_free_memory(shared: &Shared, stride: usize, by_resident: bool) {
     shared.trim_floor.store(floor, AtomicOrdering::Relaxed);
     if due {
         heap::trim();
-        let left = heap::held(by_resident).unwrap_or(held);
+        let left = heap::free_bytes().unwrap_or(held);
         shared.trim_floor.store(left, AtomicOrdering::Relaxed);
         shared.trims.fetch_add(1, AtomicOrdering::Relaxed);
     }
@@ -28060,12 +27885,7 @@ fn mono_secs() -> f64 {
 /// held from landing a seal or answering a flush; and not niced, since it
 /// holds an arena's lock for as long as it trims it and a thread that
 /// could be preempted holding one is the one that keeps the rest waiting.
-fn trim_loop(
-    shared: &Shared,
-    stop: &std::sync::atomic::AtomicBool,
-    stride: usize,
-    by_resident: bool,
-) {
+fn trim_loop(shared: &Shared, stop: &std::sync::atomic::AtomicBool, stride: usize) {
     while !stop.load(AtomicOrdering::Acquire) {
         if shared.trim_wanted.swap(false, AtomicOrdering::AcqRel) {
             shared.trim_begun.fetch_add(1, AtomicOrdering::Release);
@@ -28074,7 +27894,7 @@ fn trim_loop(
             {
                 std::thread::sleep(std::time::Duration::from_millis(1));
             }
-            trim_free_memory(shared, stride, by_resident);
+            trim_free_memory(shared, stride);
             continue;
         }
         std::thread::park();
@@ -28110,10 +27930,9 @@ fn start_trimmer(shared: &std::sync::Arc<Shared>, opts: &Options) {
     let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     let flag = stop.clone();
     let stride = opts.forms_trim_bytes;
-    let by_resident = opts.trim_by_resident;
     let spawned = std::thread::Builder::new()
         .name("supdb-trim".into())
-        .spawn(move || trim_loop(&held, &flag, stride, by_resident));
+        .spawn(move || trim_loop(&held, &flag, stride));
     if let Ok(handle) = spawned {
         let _ = shared.trim_thread.set(handle.thread().clone());
         slot.trimmer = Some(Trimmer {
@@ -29733,13 +29552,6 @@ pub struct Db {
     /// (`Shared::log_covered`), and until then the log answers as one with
     /// frames no sync has covered (`Db::log_unsynced`).
     unframed_to: u64,
-    /// The writes since the last read over lag, and the live table with
-    /// the log position they were last counted to (`Db::lag_tick`,
-    /// `Options::adaptive_cap`): the table by identity -- its address,
-    /// as a number so the store stays `Send` -- since a landing publishes
-    /// a new state over the same table and its log.
-    lag_writes: usize,
-    lag_log: (usize, usize),
     /// Nanoseconds spent in each phase of a load, accumulated so an
     /// experiment can attribute the durable-load cost instead of inferring
     /// it. `commit` is the WAL append and its fdatasync -- the only work on
@@ -31747,30 +31559,6 @@ mod radix {
             }
         }
     }
-    /// The line the cap and the trigger follow: the idle value at a level
-    /// of zero, the reading value at the full level, both directions, and
-    /// the two clamps.
-    #[test]
-    fn the_lag_line_runs_both_ways() {
-        assert_eq!(super::lag_interp(10, 2, 0), 10);
-        assert_eq!(super::lag_interp(10, 2, super::LAG_FULL), 2);
-        assert_eq!(super::lag_interp(10, 2, super::LAG_FULL / 2), 6);
-        assert_eq!(super::lag_interp(10, 30, 0), 10);
-        assert_eq!(super::lag_interp(10, 30, super::LAG_FULL), 30);
-        assert_eq!(super::lag_interp(10, 30, super::LAG_FULL / 2), 20);
-        assert_eq!(super::lag_interp(4, 4, super::LAG_FULL), 4);
-        assert_eq!(
-            super::lag_interp(4, 0, super::LAG_FULL),
-            1,
-            "a reading value of zero is one"
-        );
-        assert_eq!(
-            super::lag_interp(10, 2, super::LAG_FULL + 5),
-            2,
-            "a level past full is full"
-        );
-    }
-
     /// The gallop answers as `partition_point` does for every monotone
     /// predicate over runs of every length, the answer at every place:
     /// the start, one past it, inside each probe's span, and the end.
@@ -33021,28 +32809,6 @@ impl State {
 /// cap a no-op on a store too small to have a lag problem.
 const SEAL_CAP_FLOOR: usize = 1 << 20;
 
-/// The lag level at a read over lag (`Options::adaptive_cap`); zero is a
-/// store nothing has read that way for a relax span of writes.
-const LAG_FULL: u32 = 1000;
-/// The fewest writes a lag level decays over, for a store whose
-/// partitions hold few keys or none.
-const LAG_RELAX_FLOOR: usize = 4096;
-
-/// `idle` at a lag level of zero, `reading` at the full level, and the
-/// line between, in either direction: what the cap's share and the merge
-/// trigger both follow (`Options::adaptive_cap`,
-/// `Options::adaptive_trigger`). A `reading` below `idle` tightens under
-/// reads, one above loosens; zero reads as one.
-fn lag_interp(idle: usize, reading: usize, level: u32) -> usize {
-    let reading = reading.max(1);
-    let level = level.min(LAG_FULL) as usize;
-    if reading <= idle {
-        idle - (idle - reading) * level / LAG_FULL as usize
-    } else {
-        idle + (reading - idle) * level / LAG_FULL as usize
-    }
-}
-
 /// Data bytes per file byte, as a fraction, at the shape the seal rules
 /// were tuned in: the store's size in their terms is its key and value
 /// bytes scaled by the inverse, so the cadence stays where the tuning left
@@ -33071,12 +32837,12 @@ impl Reader {
     }
 
     /// `seal_threshold`, or with `idle` -- the idle seals on and the store
-    /// not being read by key -- `seal_bytes` alone: the cap and the first
-    /// floor keep the backlog small by sealing sooner, which the idle
-    /// seals do already, and would only cut the pieces finer. While the
-    /// store is read by key the idle seals are off and the cap stands, so
-    /// a backlog a point-read phase leaves is the cap's and not
-    /// `seal_bytes` of one; see `Options::seal_idle`.
+    /// not being read by key -- `seal_bytes` alone: the cap keeps the
+    /// backlog small by sealing sooner, which the idle seals do already,
+    /// and would only cut the pieces finer. While the store is read by key
+    /// the idle seals are off and the cap stands, so a backlog a
+    /// point-read phase leaves is the cap's and not `seal_bytes` of one;
+    /// see `Options::seal_idle`.
     fn threshold_for(&self, idle: bool) -> usize {
         let _e = self.enter();
         let st = self.state();
@@ -33098,19 +32864,7 @@ impl Reader {
         if idle {
             return base;
         }
-        // A store with no segment and a shape the background makes: its
-        // first seal at the floor, so a first load leaves a partition. Not
-        // a direct run's; see `Options::seal_first_floor`.
-        if self.opts.seal_first_floor
-            && self.opts.adaptive_shape
-            && self.opts.compact
-            && self.opts.promote
-            && !st.mem.ordered
-            && st.segs.is_empty()
-        {
-            return base.min(SEAL_CAP_FLOOR);
-        }
-        let pct = self.cap_pct();
+        let pct = self.opts.seal_max_pct;
         if pct == 0 {
             return base;
         }
@@ -33121,54 +32875,6 @@ impl Reader {
             0 => base,
             cap => base.min(cap.max(SEAL_CAP_FLOOR)),
         }
-    }
-
-    /// The seal cap's share of the store now: `seal_max_pct`, or under
-    /// `Options::adaptive_cap` the line from it at a lag level of zero to
-    /// `cap_reading_pct` at the full level. Uncapped stays uncapped.
-    #[doc(hidden)]
-    pub fn cap_pct(&self) -> usize {
-        let idle = self.opts.seal_max_pct;
-        if !self.opts.adaptive_cap || idle == 0 {
-            return idle;
-        }
-        lag_interp(
-            idle,
-            self.opts.cap_reading_pct,
-            self.shared.lag_level.load(AtomicOrdering::Relaxed),
-        )
-    }
-
-    /// The merge trigger now: `l0_trigger`, or under
-    /// `Options::adaptive_trigger` the line from it at a lag level of zero
-    /// to `trigger_reading` at the full level.
-    #[doc(hidden)]
-    pub fn l0_trigger_now(&self) -> usize {
-        if !self.opts.adaptive_trigger {
-            return self.opts.l0_trigger;
-        }
-        lag_interp(
-            self.opts.l0_trigger.max(1),
-            self.opts.trigger_reading,
-            self.shared.lag_level.load(AtomicOrdering::Relaxed),
-        )
-    }
-
-    /// The store's lag level, as the writer's last commit left it: full
-    /// (`LAG_FULL`) at a read over lag since the commit before, and what
-    /// the writes since the last such read leave of it otherwise; see
-    /// `Options::adaptive_cap`.
-    #[doc(hidden)]
-    pub fn lag_level(&self) -> u32 {
-        self.shared.lag_level.load(AtomicOrdering::Relaxed)
-    }
-
-    /// Reads and scans that lag cost, over this store's life; see
-    /// `Options::adaptive_cap`.
-    #[doc(hidden)]
-    pub fn lag_reads(&self) -> u64 {
-        self.shared.readers.stat(|s| &s.lag)
-            + self.shared.seal_counts.lag.load(AtomicOrdering::Relaxed)
     }
 
     /// The partitions' file bytes and their key and value bytes: the two
@@ -35249,7 +34955,7 @@ impl Reader {
         }
         let (segs, mem) = (&st.segs, &*st.mem);
         let (np, nf) = (st.parts, st.frozen.len());
-        if np == 0 || mem.ordered || nf > FROZEN_CAP || self.lag_adapts() {
+        if np == 0 || mem.ordered || nf > FROZEN_CAP {
             return None;
         }
         if self.opts.zpages != ZPages::Off && self.z_on() {
@@ -35473,11 +35179,6 @@ impl Reader {
             for seg in l0 {
                 seg.prefetch_probe(fnv);
             }
-        }
-        // A point read pays lag per piece it consults, as the general
-        // read counts it.
-        if !l0.is_empty() && self.lag_adapts() {
-            self.count_lag();
         }
         // Newest first, to the newest tombstone: `cut` once one is found.
         // A source the pass does not reach, being older than the
@@ -35760,11 +35461,6 @@ impl Reader {
         }
         if np == 0 {
             self.count_unshaped();
-        }
-        // A point read pays lag per piece it consults; the memtable's
-        // probe it pays whatever the cadence.
-        if !l0.is_empty() && self.lag_adapts() {
-            self.count_lag();
         }
         // Sources oldest to newest: the partition (0), the level-0 pieces
         // (1..), the frozen memtables oldest first, the live one. `start`
@@ -36428,18 +36124,6 @@ impl Reader {
         } else if !use_cache {
             self.count_unshaped();
             self.note_merged_scan();
-        }
-        // A scan pays lag over every unsealed key and every piece its
-        // blocks meet. The pieces are counted from the partitions' end,
-        // since the segments sort partitions first: a walk over every
-        // segment here was a dependent load a partition on the drained
-        // scans the arms are timed on.
-        if self.lag_adapts() {
-            let st = self.state();
-            let np = st.segs.partition_point(|s| s.level > 0);
-            if !st.frozen.is_empty() || !st.mem.is_empty() || np < st.segs.len() {
-                self.count_lag();
-            }
         }
         if let (true, Some(slot)) = (self.counted, self.slot) {
             let s = &self.shared.readers.slots[slot];
@@ -38496,31 +38180,6 @@ impl Reader {
         self.shared
             .scans_merged
             .fetch_add(1, AtomicOrdering::Relaxed);
-    }
-
-    /// Whether the store's cadence follows its reads at all.
-    fn lag_adapts(&self) -> bool {
-        self.opts.adaptive_cap || self.opts.adaptive_trigger
-    }
-
-    /// A read or a scan that lag cost -- over unsealed keys or level-0
-    /// pieces -- for the writer's commit to take the store's lag level
-    /// from (`Options::adaptive_cap`): counted on the handle's own line,
-    /// and the first since the writer's last commit sets the flag, which
-    /// the rest find set. No wake: the commit reads the flag, and the
-    /// segment work polls.
-    fn count_lag(&self) {
-        match (self.counted, self.slot) {
-            (true, Some(slot)) => {
-                self.shared.readers.slots[slot]
-                    .lag
-                    .fetch_add(1, AtomicOrdering::Relaxed);
-            }
-            _ => SealCounts::add(&self.shared.seal_counts.lag, 1),
-        }
-        if !self.shared.lag_wake.load(AtomicOrdering::Relaxed) {
-            self.shared.lag_wake.store(true, AtomicOrdering::Release);
-        }
     }
 
     /// `count_built`, with the kind of the form built kept for the counts
@@ -45398,31 +45057,6 @@ impl Db {
         e
     }
 
-    /// Whether a commit past the seal threshold seals now: always, unless
-    /// `Options::seal_defers` and the frozen tables fill the list, when
-    /// the live table keeps growing and a later commit seals once the list
-    /// has room -- up to a ceiling of twice the threshold, past which the
-    /// commit waits in the seal as before, so the table and the piece it
-    /// seals into stay within a factor of two of what the wait held them
-    /// to. A wedged queue seals, so its error reaches the caller.
-    fn seal_now(&self, threshold: usize) -> bool {
-        if !self.opts.seal_defers {
-            return true;
-        }
-        // The commit's held state dates from its start; a landing the
-        // segment work published meanwhile may have made room. A stale
-        // full list only defers, so no order against the count.
-        self.rehold();
-        if self.frozen_room().1 || self.shared.seal_wedged.load(AtomicOrdering::Acquire) {
-            return true;
-        }
-        if self.mem_bytes >= threshold.saturating_mul(2) {
-            return true;
-        }
-        SealCounts::add(&self.shared.seal_counts.deferred, 1);
-        false
-    }
-
     /// Whether a commit under the seal threshold seals because the sealer
     /// is idle (`Options::seal_idle`): no table frozen, none handed, the
     /// segment work on its own thread, and the live table hashed and past
@@ -45881,8 +45515,6 @@ impl Db {
             same_blocks_asked: [AtomicU64::new(0), AtomicU64::new(0)],
             frozen_sorts: AtomicU64::new(0),
             unshaped_wake: std::sync::atomic::AtomicBool::new(false),
-            lag_wake: std::sync::atomic::AtomicBool::new(false),
-            lag_level: std::sync::atomic::AtomicU32::new(0),
             maint_thread: std::sync::OnceLock::new(),
             maint_cpu_ns: AtomicU64::new(0),
             convert_build_ns: AtomicU64::new(0),
@@ -46178,8 +45810,6 @@ impl Db {
             upkeep_file_first: false,
             unsynced: 0,
             unframed_to: 0,
-            lag_writes: usize::MAX,
-            lag_log: (0, 0),
             phase_ns: [0; 3],
             draining: false,
             presync_failed: None,
@@ -47301,8 +46931,6 @@ impl Db {
             same_blocks_asked: [AtomicU64::new(0), AtomicU64::new(0)],
             frozen_sorts: AtomicU64::new(0),
             unshaped_wake: std::sync::atomic::AtomicBool::new(false),
-            lag_wake: std::sync::atomic::AtomicBool::new(false),
-            lag_level: std::sync::atomic::AtomicU32::new(0),
             maint_thread: std::sync::OnceLock::new(),
             maint_cpu_ns: AtomicU64::new(0),
             convert_build_ns: AtomicU64::new(0),
@@ -47598,8 +47226,6 @@ impl Db {
             upkeep_file_first: false,
             unsynced: 0,
             unframed_to: 0,
-            lag_writes: usize::MAX,
-            lag_log: (0, 0),
             phase_ns: [0; 3],
             draining: false,
             presync_failed: None,
@@ -48690,15 +48316,13 @@ impl Db {
             self.sweep_retired_forms();
         }
         self.phase_ns[0] += t.elapsed().as_nanos() as u64;
-        self.lag_tick();
         // A direct run closes when a seal would: it joins whole, as a
         // seal's piece does by promotion, so the two paths leave one shape.
         self.note_read_mode();
         let threshold = self.threshold_for(self.opts.seal_idle && self.read_mode.2);
         // A shared table counts nothing toward the threshold, which is its
         // cap: it seals where a write found it full.
-        let due =
-            (self.mem_bytes >= threshold && self.seal_now(threshold)) || self.mem().shared_full();
+        let due = self.mem_bytes >= threshold || self.mem().shared_full();
         // For a store that shares on demand as for one that always does:
         // a shared table made after this commit takes the threshold this
         // commit found. No test tells the two apart where the threshold is
@@ -48732,56 +48356,6 @@ impl Db {
             }
         }
         Ok(())
-    }
-
-    /// The lag level at this commit (`Options::adaptive_cap`): full when
-    /// a read over lag happened since the last commit, else what the
-    /// writes since the last such read leave of it over the relax span --
-    /// `lag_relax_pct` of the partitions' keys, floored -- so a store's
-    /// worth of writes with no read between takes it to zero, and a
-    /// burst's first commits after a pass of reads still seal at the
-    /// reading cap. The writes are the live table's log, counted from the
-    /// position the last tick left, and the table by identity: a landing
-    /// publishes a new state over the same table, and a tick keyed on the
-    /// state's generation counted that table's whole log again at every
-    /// one. Published for the segment work's trigger and the tests, and
-    /// read by the seal threshold this commit asks next.
-    fn lag_tick(&mut self) {
-        if !self.lag_adapts() {
-            return;
-        }
-        let (table, len) = {
-            let st = self.state();
-            (std::sync::Arc::as_ptr(&st.mem) as usize, st.mem.log_len())
-        };
-        let grew = if self.lag_log.0 == table {
-            len.saturating_sub(self.lag_log.1)
-        } else {
-            len
-        };
-        self.lag_log = (table, len);
-        if self.shared.lag_wake.swap(false, AtomicOrdering::AcqRel) {
-            self.lag_writes = 0;
-        } else {
-            self.lag_writes = self.lag_writes.saturating_add(grew);
-        }
-        let level = if self.lag_writes == 0 {
-            LAG_FULL
-        } else if self.lag_writes == usize::MAX {
-            0
-        } else {
-            let keys: usize = self
-                .segs()
-                .iter()
-                .filter(|s| s.level > 0)
-                .map(|s| s.blob.keys())
-                .sum();
-            let span = (keys / 100 * self.opts.lag_relax_pct).max(LAG_RELAX_FLOOR);
-            let spent =
-                (self.lag_writes as u64 * LAG_FULL as u64 / span as u64).min(LAG_FULL as u64);
-            LAG_FULL - spent as u32
-        };
-        self.shared.lag_level.store(level, AtomicOrdering::Relaxed);
     }
 
     /// What is staged made durable where it is going: the batch's records
@@ -54512,24 +54086,10 @@ impl Db {
     /// The end of `zpages_settle`, whichever home the segment work has: the
     /// form files no live segment claims swept, by the segment work
     /// (`Maint::z_sweep_settled`) -- on its own thread the `ZSettle`
-    /// answer has swept already, inline it is swept here -- and under
-    /// `Options::zpages_trim_install` the allocator trimmed once, now that
-    /// every partition has its form file and the builds' threads have left
-    /// what they freed in their arenas.
+    /// answer has swept already, inline it is swept here.
     fn z_settle_end(&mut self) -> Result<()> {
         if matches!(self.maint, MaintHome::Here(_)) {
             self.with_maint(|m| m.z_sweep_settled())?;
-        }
-        if self.opts.zpages_trim_install {
-            heap::trim();
-            // Counted with the trim thread's trims, and the floor its
-            // next stride is counted from set to what is left, so the
-            // census reads this trim and the looks after it start from it.
-            self.shared.trim_floor.store(
-                heap::held(self.opts.trim_by_resident).unwrap_or(0),
-                AtomicOrdering::Relaxed,
-            );
-            self.shared.trims.fetch_add(1, AtomicOrdering::Relaxed);
         }
         Ok(())
     }
@@ -55774,7 +55334,7 @@ struct Lend {
     partial: AtomicU64,
     /// The thread's park timeout in microseconds while it is parked
     /// between polls, zero while it is awake: what a commit reads to
-    /// wake a thread that has backed off (`Options::upkeep_wake_parked`).
+    /// wake a thread parked past its alert poll (`Options::upkeep_alert`).
     parked_us: std::sync::atomic::AtomicU32,
     /// Whether reads were around at the last hand-over: what the thread
     /// stays alert for (`Options::upkeep_alert`), since a pass beside a
@@ -56504,16 +56064,6 @@ impl Reader {
                 AtomicOrdering::Relaxed,
             );
             lend.passes.fetch_add(1, AtomicOrdering::Relaxed);
-            // Under `Options::upkeep_trim_look`, the trim thread is asked
-            // to look at the allocator at every pass end, the stride
-            // deciding (`trim_due`); a store with no trim thread is asked
-            // nothing, as a shed asks nothing.
-            if self.opts.upkeep_trim_look {
-                shared.trim_wanted.store(true, AtomicOrdering::Release);
-                if let Some(t) = shared.trim_thread.get() {
-                    t.unpark();
-                }
-            }
             match pass {
                 Ok((fs, ran, whole, done)) => {
                     // Filed only by a pass that ran, and ran to the commit:
@@ -57012,13 +56562,8 @@ impl Db {
             Some(fs) => self.shared.upkeep.lend(fs, to),
             None => self.shared.upkeep.post(to),
         }
-        // Woken for a batch worth waking for, or for any batch while the
-        // thread is parked longer than a short batch's wait: see
-        // `Options::upkeep_wake_parked`.
-        let parked = self.shared.upkeep.parked_us.load(AtomicOrdering::Acquire);
-        if batch >= UPKEEP_WAKE_WRITES
-            || (self.opts.upkeep_wake_parked && parked > UPKEEP_BATCH_WAIT.as_micros() as u32)
-        {
+        // Woken for a batch worth waking for.
+        if batch >= UPKEEP_WAKE_WRITES {
             self.shared.upkeep.wake();
         }
         // Lent as a batch of a burst: the commit waits at its end until
@@ -57744,7 +57289,8 @@ impl Db {
     }
 
     /// This process's anonymous bytes resident beyond the allocator's use,
-    /// the count `Options::trim_by_resident` trims by. For a test.
+    /// what a trim at the rewarm reports giving back
+    /// (`Options::zpages_rewarm_trims`). For a test.
     #[doc(hidden)]
     pub fn resident_beyond_use() -> Option<usize> {
         heap::resident_beyond_use()
@@ -57793,19 +57339,12 @@ impl Db {
     }
 
     /// The bytes of those blocks the kernel has resident, read from it
-    /// (`mincore`), process-wide: what the resident count the trim reads
-    /// (`Options::trim_by_resident`) takes out, since a mapped page never
+    /// (`mincore`), process-wide: what the resident count
+    /// (`Db::resident_beyond_use`) takes out, since a mapped page never
     /// touched is resident nowhere; the mapped bytes whole where the kernel
     /// cannot be asked.
     pub fn mapped_resident_bytes() -> usize {
         blocks::mapped_resident_bytes()
-    }
-
-    /// The bytes the trim counts its stride by at this moment, by the
-    /// store's option. For a test.
-    #[doc(hidden)]
-    pub fn trim_held_bytes(&self) -> Option<usize> {
-        heap::held(self.opts.trim_by_resident)
     }
 
     /// A trim of every arena now, on the calling thread. For a test of what
@@ -61772,12 +61311,6 @@ impl Maint {
             let life = self.scan_life();
             let reads = life != self.chain_life;
             self.chain_life = life;
-            // At the base trigger and not the one reads lower: the lowered
-            // trigger paces the seals' plans, a merge a seal at most, and
-            // a chain at it rewrote partitions of seventy megabytes to fold
-            // one or two pieces each, one after another, while the
-            // ten-percent pass read -- 2.9 major faults a scan against 2.0
-            // with the same pieces standing, the pass a quarter slower.
             // Out of core a write-only stretch chains as well under
             // `Options::merge_chains_writes`, so a burst's merge debt is paid
             // beside its writes rather than beside the scans after it.
@@ -63463,17 +62996,14 @@ impl Maint {
     }
 
     /// A merge is due when any one range has accumulated `l0_trigger`
-    /// aligned pieces -- `l0_trigger_now` where the trigger follows the
-    /// reads -- or, before the first partitioning, when that many
+    /// aligned pieces, or, before the first partitioning, when that many
     /// full-range segments have piled up.
     fn maybe_compact(&mut self) -> Result<()> {
-        let trigger = self.l0_trigger_now();
-        self.maybe_compact_at(trigger)
+        self.maybe_compact_at(self.opts.l0_trigger)
     }
 
     /// `maybe_compact` with the trigger given: a range is due at `trigger`
-    /// pieces. The seals plan at the trigger reads lower
-    /// (`l0_trigger_now`), a chained landing at the base one.
+    /// pieces.
     fn maybe_compact_at(&mut self, trigger: usize) -> Result<()> {
         self.merge_why.0 = trigger;
         // Collect a finished merge BEFORE deciding. Its outputs are the

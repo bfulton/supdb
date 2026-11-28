@@ -20,10 +20,6 @@ Reader::isolation	-	a handle's isolation, read once a handle
 Reader::snapshot	-	pins a snapshot, once a snapshot, not an operation's step
 Reader::release	-	releases a snapshot, once a snapshot
 Reader::seal_threshold	-	a test seam or a counter: reads or sets the store's bookkeeping, at no key, entry, block or step of an operation
-Reader::cap_pct	-	a test seam or a counter: reads or sets the store's bookkeeping, at no key, entry, block or step of an operation
-Reader::l0_trigger_now	-	a test seam or a counter: reads or sets the store's bookkeeping, at no key, entry, block or step of an operation
-Reader::lag_level	-	a test seam or a counter: reads or sets the store's bookkeeping, at no key, entry, block or step of an operation
-Reader::lag_reads	-	a test seam or a counter: reads or sets the store's bookkeeping, at no key, entry, block or step of an operation
 Reader::sized_bytes	-	a test seam or a counter: reads or sets the store's bookkeeping, at no key, entry, block or step of an operation
 Reader::advice_random	-	a test seam or a counter: reads or sets the store's bookkeeping, at no key, entry, block or step of an operation
 Reader::pieces_aligned	-	a test seam or a counter: reads or sets the store's bookkeeping, at no key, entry, block or step of an operation
@@ -282,7 +278,6 @@ Db::mapped_bytes	-	a test seam or a counter: reads or sets the store's bookkeepi
 Db::job_buffers_mapped	-	a test seam or a counter: reads or sets the store's bookkeeping, at no key, entry, block or step of an operation
 Db::memo_cells_taken	-	a test seam or a counter: reads or sets the store's bookkeeping, at no key, entry, block or step of an operation
 Db::mapped_resident_bytes	-	a test seam or a counter: reads or sets the store's bookkeeping, at no key, entry, block or step of an operation
-Db::trim_held_bytes	-	a test seam or a counter: reads or sets the store's bookkeeping, at no key, entry, block or step of an operation
 Db::trim_now	-	a test seam or a counter: reads or sets the store's bookkeeping, at no key, entry, block or step of an operation
 Db::hold_trim	-	a test seam or a counter: reads or sets the store's bookkeeping, at no key, entry, block or step of an operation
 Db::release_trim_after	-	a test seam or a counter: reads or sets the store's bookkeeping, at no key, entry, block or step of an operation
