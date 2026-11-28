@@ -260,7 +260,6 @@ fn shares(c: &Cfg) -> bool {
         && matches!(c.sync, SyncPolicy::Explicit)
         && !c.held_frames
         && !c.in_place
-        && !env_flag("ZFUZZ_SNAPKEPT")
 }
 
 fn trace_on() -> bool {
