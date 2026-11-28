@@ -4744,9 +4744,9 @@ pub struct Options {
     /// each delta's cut again against the partition as it stands -- the
     /// block is the same one, since the boundaries are -- and keeps the
     /// form with the runs it holds, which are the keys' whole runs and
-    /// newer than anything the merge folded in. Off, the drop; a fix of
-    /// neither a wrong answer nor a format, so the arm stays for pricing
-    /// as `supdb-rebasedrops`.
+    /// newer than anything the merge folded in. Off, the drop: a test's
+    /// seam, for a store whose rewrites drop their sparse forms.
+    #[doc(hidden)]
     pub rebase_recuts_sparse: bool,
     /// EXPERIMENT: the writer's buffers have their pages populated ahead
     /// of the fill, a window at a time, instead of faulting page by page
@@ -5500,39 +5500,7 @@ pub struct Options {
     /// the shape that filed; `build_ahead_on_publish`, which asks for
     /// the forms before any read by design, files as it did too.
     pub forms_settle_far: bool,
-    /// EXPERIMENT: the canonical forms carried across a seal. A form is
-    /// the merged content of a partition's block and everything unsealed
-    /// above it, and a seal changes none of that content: the memtable's
-    /// values move into a piece. What a seal changes is the bookkeeping
-    /// a form was resolved with -- the memtable's slots, the pieces'
-    /// ranks, the snapshot's bounds -- and every publish makes a fresh,
-    /// empty table and drops the writer's own tables with it, so
-    /// everything filed since the last seal is filed for nobody. With
-    /// this the writer files the backlog at the freeze, so the forms are
-    /// current to the whole log, carries the state's pointers into the
-    /// state the freeze publishes and again into the two the piece's
-    /// join publishes, keeps its own tables' forms and remakes only
-    /// their bookkeeping. A merge changes the partitions and starts
-    /// afresh as before.
-    ///
-    /// On. As first built it lost the mixes, and the loss was the arm's
-    /// own, four costs found in the commit-by-commit profile and taken
-    /// out: it published the carried forms whether or not a handle was
-    /// there to read them, so every patch after a carry cloned its
-    /// block first; it read the log from its start again across a
-    /// landing and settled the whole log twice; a form the patches alone
-    /// had made stayed deltas past the dense bound, where a build makes
-    /// a copy; and the carried tables took the new piece's bounds before
-    /// its ranks, so a build through them sought the partition once per
-    /// piece key. What it costs is the burst's writes: the forms stay
-    /// whole through a write-only stretch, so its commits file every
-    /// batch, where the default regime had dropped the tables at each
-    /// freeze and, between one landing and the next freeze, never
-    /// refilled them. `supdb-nocarry` prices it, `docs/engine.md` has
-    /// the rows, and the test holds it to the model through two seals
-    /// and a merge.
-    pub forms_carry: bool,
-    /// Whether the freeze carries the forms itself, as `forms_carry` first
+    /// Whether the freeze carries the forms itself, as the carry first
     /// did: it takes the upkeep home, waiting for a pass in flight, files
     /// the backlog and publishes it, and only then swaps the tables --
     /// every part of it work for the reads on the writer's path. Off, the
@@ -5546,18 +5514,10 @@ pub struct Options {
     /// times a burst, so every form the thread had made was thrown away
     /// and the pass after built the store; and its wait for the pass in
     /// flight was the one place the writer still waited on work done for
-    /// the reads. `supdb-settlefreeze` and `supdb-ingestsettlefreeze`
-    /// keep the settling freeze to price it (`docs/engine.md`).
+    /// the reads. On, a test's seam: the settling freeze stands a scan over
+    /// carried forms with no snapshot of its state.
+    #[doc(hidden)]
     pub freeze_settles: bool,
-    /// The carry across a merge that rewrote a partition over the same
-    /// keys -- the same fences, key count and key at every block's first
-    /// rank -- keeps the partition's copies and drops its sparse forms,
-    /// where it drops every form. The partition merge that folds a burst
-    /// of updates is that merge, and whether it published during the
-    /// burst decided the fully-unmerged lag point: the pass after it
-    /// rebuilt every block. On by default; `supdb-norebase` is the carry
-    /// that drops them, and `docs/engine.md` has the figures.
-    pub forms_rebase: bool,
     /// EXPERIMENT: a copy's prefetch asks for the lines its walk reads and
     /// no others: the entries from the one the walk starts at, as many as
     /// the scan still wants, and the keys and the first kilobyte of values
@@ -7306,9 +7266,7 @@ impl Default for Options {
             direct_map_bytes: 0,
             forms_settle_recent_pct: 0,
             forms_settle_far: false,
-            forms_carry: true,
             freeze_settles: false,
-            forms_rebase: true,
             copy_prefetch_span: false,
             piece_ranks_by_heads: true,
             forms_to_writer: false,
@@ -34798,7 +34756,7 @@ impl Reader {
     /// drops everything as a handle does.
     fn rebase_tables(&self, st: &State) -> bool {
         if self.slot.is_some()
-            || !(self.opts.forms_carry && self.opts.commit_forms && self.opts.scan_block_cache)
+            || !(self.opts.commit_forms && self.opts.scan_block_cache)
             || !self.fs().cache_used.get()
         {
             return self.refuse_rebase(1);
@@ -45445,7 +45403,7 @@ impl Db {
     /// scans after the piece landed a build of every block.
     fn carry_switch(&self, old: &std::sync::Arc<MemTable>) {
         debug_assert!(old.is_empty(), "a direct run opens over an empty table");
-        if !(self.opts.forms_carry && self.opts.commit_forms && self.opts.scan_block_cache) {
+        if !(self.opts.commit_forms && self.opts.scan_block_cache) {
             return;
         }
         let st = self.state();
@@ -48927,15 +48885,12 @@ impl Db {
     /// (`Reader::cache_on`) and a list kept for a look that is not coming
     /// held every table frozen meanwhile.
     fn replaced_from_in(opts: &Options, shared: &Shared, sharing: bool) -> Option<Keep> {
-        (!sharing
-            && opts.forms_carry
-            && opts.commit_forms
-            && opts.scan_block_cache
-            && !opts.freeze_settles)
-            .then(|| Keep {
+        (!sharing && opts.commit_forms && opts.scan_block_cache && !opts.freeze_settles).then(
+            || Keep {
                 from: shared.upkeep_lives.load(AtomicOrdering::SeqCst),
                 bytes: shared.keep_bytes,
-            })
+            },
+        )
     }
 
     /// `p` swapped in as the store's state where `cur_p` still stands,
@@ -49038,12 +48993,12 @@ impl Db {
         }
     }
 
-    /// Whether the freeze carries the forms (`Options::forms_carry`), with
+    /// Whether the freeze carries the forms (`Options::freeze_settles`), with
     /// what it needs done first: the log read, which carries the writer's
     /// tables to the state it holds, then the backlog settled and every
     /// dirty form published into it.
     fn freeze_prepare(&self) -> bool {
-        if !(self.opts.forms_carry && self.opts.commit_forms && self.opts.scan_block_cache) {
+        if !(self.opts.commit_forms && self.opts.scan_block_cache) {
             return false;
         }
         let cur = self.state();
@@ -60557,7 +60512,7 @@ impl Maint {
             let layout = Db::layout_of(
                 cur,
                 &segs,
-                !tier && self.opts.forms_rebase,
+                !tier,
                 &self.shared.same_blocks_asked,
                 Some(&self.r),
             );

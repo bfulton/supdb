@@ -14153,8 +14153,6 @@ fn the_copies_survive_a_merge_with(compact: bool) {
         scan_cache_ahead: false,
         forms_settle_backlog_pct: 0,
         commit_forms: true,
-        forms_carry: true,
-        forms_rebase: true,
         segment: supdb::SegmentOptions {
             compact_records: compact,
             ..Default::default()
@@ -14301,8 +14299,6 @@ fn same_blocks_carries(long: bool) -> (u64, u64, u64, [u64; 2]) {
         scan_cache_ahead: false,
         forms_settle_backlog_pct: 0,
         commit_forms: true,
-        forms_carry: true,
-        forms_rebase: true,
         upkeep: supdb::Upkeep::Inline,
         freeze_settles: true,
         ..common::options()
@@ -14567,7 +14563,6 @@ fn the_forms_survive_a_seal_with(snapshot_carry: bool) {
         // The commit's own maintenance, step by step: on the thread, which
         // commit a pass files is the thread's timing.
         upkeep: supdb::Upkeep::Inline,
-        forms_carry: true,
         snapshot_carry,
         // The freeze's own carry, which this is about: off, the next look
         // at the log carries the tables (`the_next_look_carries_the_forms_across_a_freeze`).
@@ -14699,7 +14694,6 @@ fn the_forms_survive_a_direct_runs_start() {
         scan_cache_ahead: false,
         forms_settle_backlog_pct: 0,
         commit_forms: true,
-        forms_carry: true,
         // The commit's own maintenance, step by step: on the thread, which
         // commit a pass files is the thread's timing.
         upkeep: supdb::Upkeep::Inline,
@@ -15964,7 +15958,6 @@ fn a_scan_builds_the_snapshot_only_where_a_block_needs_it() {
             forms_settle_backlog_pct: 0,
             forms_from_reader_scans: 0,
             commit_forms: true,
-            forms_carry: true,
             scan_lazy_snapshot: lazy,
             // The commit's own maintenance, step by step: on the thread,
             // which commit a pass files is the thread's timing.
@@ -18852,7 +18845,6 @@ fn a_landing_that_replaces_the_live_table_carries_no_form() {
         scan_cache_bytes: 64 << 20,
         scan_cache_ahead: false,
         commit_forms: true,
-        forms_carry: true,
         // Filed only where a scan preceded the commit, so a batch committed
         // with none since is left to the next scan, as the shape needs.
         forms_settle_backlog_pct: 0,
@@ -18953,7 +18945,6 @@ fn a_form_dropped_under_a_landings_carry_is_retracted_at_the_writers_look() {
         scan_cache_bytes: 64 << 20,
         scan_cache_ahead: false,
         commit_forms: true,
-        forms_carry: true,
         upkeep: supdb::Upkeep::Inline,
         // The commit leaves its batch to the look, the shape this state is made in
         // (`Options::forms_settle_every` and `forms_settle_builds` off).
@@ -19772,7 +19763,6 @@ fn the_next_look_carries_the_forms_across_a_freeze_with(
         scan_cache_ahead: false,
         forms_settle_backlog_pct: 0,
         commit_forms: true,
-        forms_carry: true,
         freeze_settles: false,
         snapshot_carry,
         upkeep,

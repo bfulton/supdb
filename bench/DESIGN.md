@@ -851,12 +851,9 @@ bound to the scans, the shape before every such commit filed its batch and
 built the blocks it filed into (`Options::forms_settle_every`,
 `forms_settle_builds`), and `supdb-cache64tofitautozpagessettlebuilds` is
 `supdb-cache64tofitautozpages`, which pins that shape, with the two on;
-`supdb-rebasedrops` is `supdb` with a partition's sparse block forms
-dropped at the look that carries its table across the merge that rewrites
-it (`Options::rebase_recuts_sparse` off), `supdb-settleshedunbound` with
-the fills' forms shed where their room goes while the cache's budget is
-not bound (`Options::forms_settle_sheds_unbound`), and
-`supdb-rebasedropsshed` with both, the default as it stood before the two;
+`supdb-settleshedunbound` is `supdb` with the fills' forms shed where
+their room goes while the cache's budget is not bound
+(`Options::forms_settle_sheds_unbound`);
 `supdb-settlegallop`, `supdb-settleformnear`, `supdb-settlepatchwhole`,
 `supdb-settlevaluenear` and `supdb-settletablenear` are `supdb` with one of
 a settle's asks ahead taken away -- each raw resolve a gallop over the

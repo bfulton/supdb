@@ -619,8 +619,6 @@ pub struct Supdb {
     /// The recency window this arm pins, or none for the engine's own.
     /// `supdb-recency`.
     recent: Option<usize>,
-    /// Whether the forms are carried across a seal; off is `supdb-nocarry`.
-    carry: bool,
     /// Keys of one block in a settle's backlog from which the block is
     /// rebuilt rather than patched key by key. `supdb-rebuild`.
     rebuild: usize,
@@ -633,9 +631,6 @@ pub struct Supdb {
     /// Every record written with its extent, as before the compact
     /// record. `supdb-fullrec`.
     fullrec: bool,
-    /// A partition's copies dropped at a merge that rewrote it over the
-    /// same keys, as before the rebase. `supdb-norebase`.
-    norebase: bool,
     /// The seal sized by the partitions' file bytes rather than the key
     /// and value bytes they hold. `supdb-sealfile`.
     sealfile: bool,
@@ -779,14 +774,9 @@ pub struct Supdb {
     /// (`Options::ahead_in_core_scans_div` zero), the shape before it
     /// waited for a state that is being scanned: `supdb-aheadfirst`.
     aheadfirst: bool,
-    /// A sparse form dropped at the look that carries its table across a
-    /// partition's rewrite, where the default resolves its cuts again and
-    /// keeps it (`Options::rebase_recuts_sparse` off): `supdb-rebasedrops`.
-    rebasedrops: bool,
     /// The fills' forms shed where their room goes while the cache's
     /// budget is not bound, for the commit's fill to build again
-    /// (`Options::forms_settle_sheds_unbound`): `supdb-settleshedunbound`,
-    /// and with the drop above `supdb-rebasedropsshed`.
+    /// (`Options::forms_settle_sheds_unbound`): `supdb-settleshedunbound`.
     settleshedunbound: bool,
     /// The settle's patch loop asking for the next block form's buffers
     /// alone, its header read cold (`Options::settle_form_ahead` zero):
@@ -1263,11 +1253,6 @@ pub struct Supdb {
     /// Segments written in 2 MB pieces, `SegmentOptions::write_piece`.
     /// `supdb-pmd`, and `supdb-ingestpmd` buffered.
     pmd: bool,
-    /// The freeze settles the backlog and carries the tables itself,
-    /// `Options::freeze_settles` on, as it did before the carry was left
-    /// to the look. `supdb-settlefreeze`, and `supdb-ingestsettlefreeze`
-    /// buffered.
-    settlefreeze: bool,
     /// Dense forms' conversions capped at a fill, the builder ahead of a
     /// reader converting the rest (`Options::forms_convert_cap` at
     /// `CONVERT_CAP`, `Options::ahead_converts` on). `supdb-convertcap`,
@@ -1925,8 +1910,6 @@ struct Policy {
     /// The recency window this arm pins, or none for the engine's own.
     /// `supdb-recency`.
     recent: Option<usize>,
-    /// Whether the forms are carried across a seal; off is `supdb-nocarry`.
-    carry: bool,
     /// Keys of one block in a settle's backlog from which the block is
     /// rebuilt rather than patched key by key. `supdb-rebuild`.
     rebuild: usize,
@@ -1939,9 +1922,6 @@ struct Policy {
     /// Every record written with its extent, as before the compact
     /// record. `supdb-fullrec`.
     fullrec: bool,
-    /// A partition's copies dropped at a merge that rewrote it over the
-    /// same keys, as before the rebase. `supdb-norebase`.
-    norebase: bool,
     /// The seal sized by the partitions' file bytes rather than the key
     /// and value bytes they hold. `supdb-sealfile`.
     sealfile: bool,
@@ -2085,14 +2065,9 @@ struct Policy {
     /// (`Options::ahead_in_core_scans_div` zero), the shape before it
     /// waited for a state that is being scanned: `supdb-aheadfirst`.
     aheadfirst: bool,
-    /// A sparse form dropped at the look that carries its table across a
-    /// partition's rewrite, where the default resolves its cuts again and
-    /// keeps it (`Options::rebase_recuts_sparse` off): `supdb-rebasedrops`.
-    rebasedrops: bool,
     /// The fills' forms shed where their room goes while the cache's
     /// budget is not bound, for the commit's fill to build again
-    /// (`Options::forms_settle_sheds_unbound`): `supdb-settleshedunbound`,
-    /// and with the drop above `supdb-rebasedropsshed`.
+    /// (`Options::forms_settle_sheds_unbound`): `supdb-settleshedunbound`.
     settleshedunbound: bool,
     /// The settle's patch loop asking for the next block form's buffers
     /// alone, its header read cold (`Options::settle_form_ahead` zero):
@@ -2578,10 +2553,6 @@ struct Policy {
     /// `SegmentOptions::write_piece`. `supdb-pmd`, and `supdb-ingestpmd`
     /// buffered.
     pmd: bool,
-    /// The freeze takes the upkeep home, settles the backlog and carries
-    /// the tables itself: `Options::freeze_settles` on.
-    /// `supdb-settlefreeze`, and `supdb-ingestsettlefreeze` buffered.
-    settlefreeze: bool,
     /// Dense forms' conversions capped at a fill, the builder converting
     /// the rest: `supdb-convertcap`, and `supdb-ingestconvertcap`
     /// buffered.
@@ -3071,7 +3042,6 @@ impl Default for Policy {
             aheadcold: false,
             aheadeager: false,
             aheadfirst: false,
-            rebasedrops: false,
             settleshedunbound: false,
             settleformnear: false,
             settlegallop: false,
@@ -3171,7 +3141,6 @@ impl Default for Policy {
             nofrozen: false,
             idle: false,
             pmd: false,
-            settlefreeze: false,
             convertcap: false,
             shortpass: false,
             noyield: false,
@@ -3296,12 +3265,10 @@ impl Default for Policy {
             lazyforms: false,
             eager: None,
             recent: None,
-            carry: true,
             rebuild: 0,
             snapcarry: false,
             lazysnap: false,
             fullrec: false,
-            norebase: false,
             sealfile: false,
             settleall: false,
             upkeep: None,
@@ -4007,32 +3974,6 @@ impl Supdb {
                 partition: false,
                 durable: false,
                 pmd: true,
-                ..Policy::default()
-            },
-        )
-    }
-
-    /// `supdb` whose freeze settles the backlog and carries the tables
-    /// itself, as it did before the carry was left to the look.
-    pub fn create_settlefreeze(path: &Path) -> Res<Supdb> {
-        Supdb::with_policy(
-            path,
-            Policy {
-                settlefreeze: true,
-                ..Policy::default()
-            },
-        )
-    }
-
-    /// `supdb-ingest` whose freeze settles and carries, as
-    /// `supdb-settlefreeze`.
-    pub fn create_ingest_settlefreeze(path: &Path) -> Res<Supdb> {
-        Supdb::with_policy(
-            path,
-            Policy {
-                partition: false,
-                durable: false,
-                settlefreeze: true,
                 ..Policy::default()
             },
         )
@@ -5428,29 +5369,6 @@ impl Supdb {
                 partition: false,
                 durable: false,
                 upkeep: Some(supdb::Upkeep::Background(2)),
-                ..Policy::default()
-            },
-        )
-    }
-
-    /// `supdb` dropping a partition's copies at a merge that rewrote it
-    /// over the same keys. Against `supdb` it prices the rebase: the
-    /// fully-unmerged lag point's pass after the burst's partition merge.
-    pub fn create_norebase(path: &Path) -> Res<Supdb> {
-        Supdb::with_policy(
-            path,
-            Policy {
-                norebase: true,
-                ..Policy::default()
-            },
-        )
-    }
-
-    pub fn create_nocarry(path: &Path) -> Res<Supdb> {
-        Supdb::with_policy(
-            path,
-            Policy {
-                carry: false,
                 ..Policy::default()
             },
         )
@@ -8882,7 +8800,6 @@ impl Supdb {
             aheadcold,
             aheadeager,
             aheadfirst,
-            rebasedrops,
             settleshedunbound,
             settleformnear,
             settlegallop,
@@ -8982,12 +8899,10 @@ impl Supdb {
             lazyforms,
             eager,
             recent,
-            carry,
             rebuild,
             snapcarry,
             lazysnap,
             fullrec,
-            norebase,
             sealfile,
             settleall,
             upkeep,
@@ -9001,7 +8916,6 @@ impl Supdb {
             nofrozen,
             idle,
             pmd,
-            settlefreeze,
             convertcap,
             shortpass,
             noyield,
@@ -9216,8 +9130,6 @@ impl Supdb {
                 .unwrap_or(supdb::Options::default().forms_settle_recent_pct),
             // The forms carried across a seal, or the table started
             // afresh at every publish as it was.
-            forms_carry: carry,
-            freeze_settles: settlefreeze,
             convert_from_form: !convertsources,
             copy_exact: !copyslack,
             drain_names_partition: !drainpromote,
@@ -9259,7 +9171,6 @@ impl Supdb {
             } else {
                 upkeepbatch.unwrap_or(supdb::Options::default().upkeep_batch_pct)
             },
-            forms_rebase: !norebase,
             // The seal sized by the file, as it was before the store's
             // payload was recorded.
             seal_on_file: sealfile,
@@ -9337,7 +9248,6 @@ impl Supdb {
             } else {
                 supdb::Options::default().ahead_in_core_scans_div
             },
-            rebase_recuts_sparse: !rebasedrops,
             forms_settle_sheds_unbound: settleshedunbound,
             settle_form_ahead: if settleformnear {
                 0
@@ -9852,7 +9762,6 @@ impl Supdb {
             aheadcold,
             aheadeager,
             aheadfirst,
-            rebasedrops,
             settleshedunbound,
             settleformnear,
             settlegallop,
@@ -9952,12 +9861,10 @@ impl Supdb {
             lazyforms,
             eager,
             recent,
-            carry,
             rebuild,
             snapcarry,
             lazysnap,
             fullrec,
-            norebase,
             sealfile,
             settleall,
             upkeep,
@@ -9971,7 +9878,6 @@ impl Supdb {
             nofrozen,
             idle,
             pmd,
-            settlefreeze,
             convertcap,
             shortpass,
             noyield,
@@ -10625,13 +10531,6 @@ impl Engine for Supdb {
                 "supdb-ingestpmd"
             };
         }
-        if self.settlefreeze {
-            return if self.partition {
-                "supdb-settlefreeze"
-            } else {
-                "supdb-ingestsettlefreeze"
-            };
-        }
         if self.convertcap {
             return if self.partition {
                 "supdb-convertcap"
@@ -10879,9 +10778,6 @@ impl Engine for Supdb {
         if self.settle {
             return "supdb-settle";
         }
-        if !self.carry {
-            return "supdb-nocarry";
-        }
         if self.rebuild > 0 {
             return if self.partition {
                 "supdb-rebuild"
@@ -10897,9 +10793,6 @@ impl Engine for Supdb {
         }
         if self.fullrec {
             return "supdb-fullrec";
-        }
-        if self.norebase {
-            return "supdb-norebase";
         }
         if self.sealfile {
             return "supdb-sealfile";
@@ -11283,12 +11176,6 @@ impl Engine for Supdb {
         }
         if self.aheadfirst {
             return "supdb-aheadfirst";
-        }
-        if self.rebasedrops && self.settleshedunbound {
-            return "supdb-rebasedropsshed";
-        }
-        if self.rebasedrops {
-            return "supdb-rebasedrops";
         }
         if self.settleshedunbound {
             return "supdb-settleshedunbound";
@@ -14175,12 +14062,10 @@ pub fn guarantee(arm: &str) -> Option<Guarantee> {
         | "supdb-eager"
         | "supdb-nosettle"
         | "supdb-recency"
-        | "supdb-nocarry"
         | "supdb-rebuild"
         | "supdb-snapcarry"
         | "supdb-lazysnap"
         | "supdb-fullrec"
-        | "supdb-norebase"
         | "supdb-sealfile"
         | "supdb-settleall"
         | "supdb-inline"
@@ -14309,9 +14194,7 @@ pub fn guarantee(arm: &str) -> Option<Guarantee> {
         | "supdb-aheadcold"
         | "supdb-aheadeager"
         | "supdb-aheadfirst"
-        | "supdb-rebasedrops"
         | "supdb-settleshedunbound"
-        | "supdb-rebasedropsshed"
         | "supdb-settleformnear"
         | "supdb-settlegallop"
         | "supdb-settlepatchwhole"
@@ -14414,7 +14297,6 @@ pub fn guarantee(arm: &str) -> Option<Guarantee> {
         | "supdb-idle"
         | "supdb-pmd"
         | "supdb-hold"
-        | "supdb-settlefreeze"
         | "supdb-convertcap"
         | "supdb-shortpass"
         | "supdb-noyield"
@@ -14534,7 +14416,6 @@ pub fn guarantee(arm: &str) -> Option<Guarantee> {
         | "supdb-shapenofrozen"
         | "supdb-shapeidle"
         | "supdb-ingestpmd"
-        | "supdb-ingestsettlefreeze"
         | "supdb-ingestconvertcap"
         | "supdb-ingestshortpass"
         | "supdb-ingestnoyield"
@@ -14748,13 +14629,11 @@ pub fn open(arm: &str, dir: &Path, map_gb: usize) -> Res<Box<dyn Engine>> {
         "supdb-nosettle" => supdb_arm(Supdb::create_nosettle, dir)?,
         "supdb-eager" => supdb_arm(Supdb::create_eager, dir)?,
         "supdb-recency" => supdb_arm(Supdb::create_recency, dir)?,
-        "supdb-nocarry" => supdb_arm(Supdb::create_nocarry, dir)?,
         "supdb-rebuild" => supdb_arm(Supdb::create_rebuild, dir)?,
         "supdb-ingestrebuild" => supdb_arm(Supdb::create_ingest_rebuild, dir)?,
         "supdb-snapcarry" => supdb_arm(Supdb::create_snapcarry, dir)?,
         "supdb-lazysnap" => supdb_arm(Supdb::create_lazysnap, dir)?,
         "supdb-fullrec" => supdb_arm(Supdb::create_fullrec, dir)?,
-        "supdb-norebase" => supdb_arm(Supdb::create_norebase, dir)?,
         "supdb-sealfile" => supdb_arm(Supdb::create_sealfile, dir)?,
         "supdb-settleall" => supdb_arm(Supdb::create_settleall, dir)?,
         "supdb-inline" => supdb_arm(Supdb::create_inline, dir)?,
@@ -15470,7 +15349,6 @@ pub fn open(arm: &str, dir: &Path, map_gb: usize) -> Res<Box<dyn Engine>> {
         "supdb-shapenofrozen" => supdb_arm(Supdb::create_shape_nofrozen, dir)?,
         "supdb-pmd" => supdb_arm(Supdb::create_pmd, dir)?,
         "supdb-ingestpmd" => supdb_arm(Supdb::create_ingest_pmd, dir)?,
-        "supdb-settlefreeze" => supdb_arm(Supdb::create_settlefreeze, dir)?,
         "supdb-convertcap" => supdb_arm(Supdb::create_convertcap, dir)?,
         "supdb-shortpass" => supdb_arm(Supdb::create_shortpass, dir)?,
         "supdb-noyield" => supdb_arm(Supdb::create_noyield, dir)?,
@@ -16070,18 +15948,6 @@ pub fn open(arm: &str, dir: &Path, map_gb: usize) -> Res<Box<dyn Engine>> {
             },
             dir,
         )?,
-        "supdb-rebasedrops" => supdb_arm(
-            |d| {
-                Supdb::with_policy(
-                    d,
-                    Policy {
-                        rebasedrops: true,
-                        ..Policy::default()
-                    },
-                )
-            },
-            dir,
-        )?,
         "supdb-settleshedunbound" => supdb_arm(
             |d| {
                 Supdb::with_policy(
@@ -16578,21 +16444,6 @@ pub fn open(arm: &str, dir: &Path, map_gb: usize) -> Res<Box<dyn Engine>> {
             },
             dir,
         )?,
-        // Both at once, the default as it stood before either: the block
-        // forms a merge's rewrite and a refault each had built a second time.
-        "supdb-rebasedropsshed" => supdb_arm(
-            |d| {
-                Supdb::with_policy(
-                    d,
-                    Policy {
-                        rebasedrops: true,
-                        settleshedunbound: true,
-                        ..Policy::default()
-                    },
-                )
-            },
-            dir,
-        )?,
         "supdb-ingestaheadincore" => supdb_arm(
             |d| {
                 Supdb::with_policy(
@@ -16838,7 +16689,6 @@ pub fn open(arm: &str, dir: &Path, map_gb: usize) -> Res<Box<dyn Engine>> {
         "supdb-ingestfatentries" => supdb_arm(Supdb::create_ingest_fatentries, dir)?,
         "supdb-waitmanifest" => supdb_arm(Supdb::create_waitmanifest, dir)?,
         "supdb-ingestwaitmanifest" => supdb_arm(Supdb::create_ingest_waitmanifest, dir)?,
-        "supdb-ingestsettlefreeze" => supdb_arm(Supdb::create_ingest_settlefreeze, dir)?,
         "supdb-ingestconvertcap" => supdb_arm(Supdb::create_ingest_convertcap, dir)?,
         "supdb-ingestshortpass" => supdb_arm(Supdb::create_ingest_shortpass, dir)?,
         "supdb-ingestnoyield" => supdb_arm(Supdb::create_ingest_noyield, dir)?,
