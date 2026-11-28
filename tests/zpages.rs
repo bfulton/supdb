@@ -10209,6 +10209,101 @@ fn a_build_ahead_that_declines_is_collected_and_no_build_is_in_flight_after_it()
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// The controller's reading waits for the last build ahead: past its budget
+/// a store's controller wants a sample while its builds ahead go on, and at
+/// the tick that takes one build ahead in the next one takes the builder
+/// before the sample is asked for, so no reading starts between two builds
+/// ahead -- neither the fill sample, which the files on disk do not yet
+/// cover the keys for, nor one from the files. Once the last build ahead
+/// is in the reading is taken, and from the form files on disk, which by
+/// then cover the store (`Maint::z_reading_from_files`).
+#[cfg(target_os = "linux")]
+#[test]
+fn the_sample_waits_for_the_last_build_ahead() {
+    let (dir, db, _model, inject, raw) = land_store_with("auto-sample-after-ahead", 50, |o| {
+        // One builder, so that the builds ahead run one after another and
+        // every turn that takes one in starts the next.
+        o.zpages_ahead_builders = 1;
+        o.partition_bytes = Some(400 << 10);
+        // The sample's wait for a build ahead, which a store whose
+        // resident and in-flight partitions count as covered never makes,
+        // and the build ahead started before the sample, which a
+        // controller suspecting at the crossing does not give it time for.
+        o.zpages_cover_resident = false;
+        o.zpages_suspect_at_crossing = false;
+    });
+    let reading = |c: &supdb::db::ZCounts| c.samples + c.sample_from_files;
+    // Past the whole budget the builds ahead run, and the model calls for
+    // the controller's sample: the first build ahead is held at its rename
+    // until the controller is past FITS, so the sample is wanted while
+    // builds ahead are still due, and the hold is then lifted.
+    db.hold_zpage_rename(true);
+    inject.set_budget(raw / 2);
+    assert!(
+        tick_until(&db, 400, |c| c.phase >= 1 && c.build_starts >= 1),
+        "past FITS with a build ahead in flight: {:?}",
+        db.zpage_counts()
+    );
+    let t = std::time::Instant::now();
+    while !db.zpage_build_waiting() {
+        assert!(t.elapsed() < JOB_WALL, "the build never reached its hold");
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+    wait_steps(&db, 3);
+    assert_eq!(
+        reading(&db.zpage_counts()),
+        0,
+        "a reading beside a build ahead in flight"
+    );
+    // The next build ahead held at its start and the first let go: the
+    // turn that takes the first in chooses between the sample and the next
+    // build, and the choice is read with the next one held, since read at
+    // the next tick it is read after however many builds the chain ran
+    // meanwhile.
+    db.hold_zpage_build(true);
+    db.hold_zpage_rename(false);
+    assert!(
+        tick_until(&db, 400, |c| c.build_collected >= 1 && c.build_starts >= 2),
+        "the first build ahead in, the next started: {:?}",
+        db.zpage_counts()
+    );
+    let t = std::time::Instant::now();
+    while !db.zpage_build_waiting() {
+        assert!(
+            t.elapsed() < JOB_WALL,
+            "the next build never reached its hold"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(2));
+    }
+    let f = db.zpage_counts();
+    assert!(f.partitions >= 3, "{f:?}");
+    let left = f.partitions - (f.prebuilt + f.ahead_cold).min(f.partitions);
+    assert!(left > 0, "builds ahead still due: {f:?}");
+    assert_eq!(
+        (f.samples, f.sample_from_files),
+        (0, 0),
+        "a reading between builds ahead: {f:?}"
+    );
+    // The rest of the builds ahead let go: the reading waits for the last.
+    db.hold_zpage_build(false);
+    assert!(
+        tick_until(&db, 400, |c| reading(c) > 0),
+        "no reading: {:?}",
+        db.zpage_counts()
+    );
+    let c = db.zpage_counts();
+    assert!(
+        c.prebuilt + c.ahead_cold >= c.partitions,
+        "the reading after the last build ahead: {c:?}"
+    );
+    assert!(
+        c.samples == 0 && c.sample_from_files > 0,
+        "the reading from the files the builds ahead left: {c:?}"
+    );
+    db.close().unwrap();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// The builds ahead at landing wait while scans are near
 /// (`Options::zpages_land_scans_far`): a store scanned, its raw
 /// populations past the percent of its budget, builds nothing ahead, and
