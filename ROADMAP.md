@@ -18,9 +18,6 @@ a tenth behind its comparator or behind a shape the engine already reaches.
   under a cipher checks a tag on every chunk it reads. Done when RocksDB
   reads with its default, or the methods say what each engine verifies, the
   encrypted arms included.
-- [ ] **A kill in a rep taken again.** `Ledger::forget_rep` deletes a cut
-  rep's kills with its passes, so a row can lose a kill. Done when the row
-  keeps them and the gate reads them.
 - [ ] **Device bytes measured at the device.** "Device bytes written" is
   the process's `/proc/self/io` count, which equals bytes on disk for
   buffered arms, while `bench/DESIGN.md` calls it the device's counter.

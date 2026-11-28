@@ -735,8 +735,10 @@ its row from the ledger; `bench run --resume DIR` takes a cut run up
 from its last whole rep (`ledger`). The pass is the grain the suite
 already paid to make independent, and the rep is the grain a bankable
 row resumes at, since the arms are interleaved within one: a rep cut
-between two arms is taken again whole, unless `--resume-passes` keeps
-what it holds for a loop that is not the series'. A resume is the same
+between two arms is taken again whole, its passes dropped and its
+kills kept for the row, since no retake undoes what the bound did,
+unless `--resume-passes` keeps what it holds for a loop that is not the
+series'. A resume is the same
 binary, the same class and the same bound, with the plan the ledger's
 and `--reps` the one thing it may raise; the floors are taken again at
 every sitting, since the host may have moved between them, and the row
@@ -1341,6 +1343,11 @@ regression fails. A row better than every prior CI is flagged, not failed:
 it is either a win or a broken measurement, and a person should know which.
 
 Fewer than three prior rows: no band, and the gate says so.
+
+A row with a pass killed under its bound fails whatever its cells read,
+and the gate names each kill: its roster did not fit the bound, which is
+the number to move. That holds a kill in a rep the run cut and took
+again, which the row keeps beside the retake's cells.
 
 ### The machine is judged first
 

@@ -121,6 +121,40 @@ pub struct Kill {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cache_bytes: Option<u64>,
     pub utc: String,
+    /// The kill fell in a rep that was cut after it and taken again whole
+    /// (`ledger::Ledger::forget_rep`): the row holds the retaken rep's
+    /// cells, this arm's among them where it ran, beside the kill, since
+    /// a bound that killed the arm once is a bound the roster does not
+    /// fit whatever the retake did. Absent from the file for any other.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub retaken: bool,
+}
+
+impl Kill {
+    /// The phase the pass had finished, for a line that names it.
+    pub fn after(&self) -> String {
+        match &self.after_phase {
+            Some(p) => format!(" after {p}"),
+            None => " in its first phase".to_string(),
+        }
+    }
+
+    /// The kill as a line names it: the arm, the rep, the rung, the phase
+    /// it fell after, and whether its rep was taken again.
+    pub fn describe(&self) -> String {
+        format!(
+            "{} at rep {} of {} keys{}{}",
+            self.arm,
+            self.rep,
+            self.size,
+            self.after(),
+            if self.retaken {
+                ", in a rep cut and taken again"
+            } else {
+                ""
+            }
+        )
+    }
 }
 
 /// Where a later sitting of a resumed run began (`bench run --resume`,

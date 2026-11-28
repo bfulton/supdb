@@ -16,7 +16,8 @@
 //! The grain a bankable row resumes at is the rep, whole. The arms are
 //! interleaved within a rep, which is the one comparison the suite
 //! trusts, so a rep that was cut between two arms is taken again from
-//! its first arm; the rep's own file (`rep-<size>-<rep>.json`, the
+//! its first arm, its passes dropped and its kills kept for the row,
+//! since a kill is the bound's and no retake undoes it; the rep's own file (`rep-<size>-<rep>.json`, the
 //! floors sampled after it, written last) is what says a rep is whole.
 //! `--resume-passes` keeps a cut rep's passes instead, for a loop where
 //! the interleaving is not the point, and the row says so. The floors
@@ -189,6 +190,12 @@ impl Ledger {
     fn kill_path(&self, size: u64, rep: usize, arm: &str) -> PathBuf {
         self.dir.join(format!("kill-{size}-{rep}-{arm}.json"))
     }
+    /// The `n`th kill kept from a cut rep of `size` and `rep`, under a
+    /// name `rep_state` does not read, so that the rep is cut again with
+    /// nothing in it and its kill stays the row's.
+    fn kept_kill_path(&self, size: u64, rep: usize, n: usize) -> PathBuf {
+        self.dir.join(format!("kept-kill-{size}-{rep}-{n}.json"))
+    }
     fn rep_path(&self, size: u64, rep: usize) -> PathBuf {
         self.dir.join(format!("rep-{size}-{rep}.json"))
     }
@@ -265,22 +272,54 @@ impl Ledger {
         )
     }
 
-    /// Forget a cut rep: every pass and kill of it, so that it is taken
-    /// again whole, from its first arm.
+    /// Forget a cut rep, so that it is taken again whole from its first
+    /// arm: every pass of it removed, and every kill of it kept, renamed
+    /// to the next kept name of the rep (`read_kept_kills`). A pass is a
+    /// measurement the retake makes again; a kill is what the bound did
+    /// to the arm, which no retake undoes, and a row that lost it would
+    /// be banked beside the series as a roster its bound fits. The kills
+    /// go first and each by one rename, so a forget cut part way is
+    /// finished by the next with no kill lost and none kept twice.
     pub fn forget_rep(&self, size: u64, rep: usize, arms: &[String]) -> io::Result<()> {
+        let mut n = self.kept_kills_len(size, rep);
         for arm in arms {
-            for p in [
-                self.pass_path(size, rep, arm),
-                self.kill_path(size, rep, arm),
-            ] {
-                match std::fs::remove_file(&p) {
-                    Ok(()) => {}
-                    Err(e) if e.kind() == io::ErrorKind::NotFound => {}
-                    Err(e) => return Err(io_at(&p, e)),
-                }
+            let from = self.kill_path(size, rep, arm);
+            let to = self.kept_kill_path(size, rep, n);
+            match std::fs::rename(&from, &to) {
+                Ok(()) => n += 1,
+                Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+                Err(e) => return Err(io_at(&from, e)),
+            }
+        }
+        for arm in arms {
+            let p = self.pass_path(size, rep, arm);
+            match std::fs::remove_file(&p) {
+                Ok(()) => {}
+                Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+                Err(e) => return Err(io_at(&p, e)),
             }
         }
         Ok(())
+    }
+
+    fn kept_kills_len(&self, size: u64, rep: usize) -> usize {
+        (0..)
+            .find(|&n| !self.kept_kill_path(size, rep, n).exists())
+            .expect("a count below usize::MAX")
+    }
+
+    /// The kills a cut rep of `size` and `rep` held when it was taken
+    /// again (`forget_rep`), in the order they were kept, each marked
+    /// `retaken`.
+    pub fn read_kept_kills(&self, size: u64, rep: usize) -> io::Result<Vec<Kill>> {
+        let mut out = Vec::new();
+        for n in 0.. {
+            match read_json::<Kill>(&self.kept_kill_path(size, rep, n))? {
+                Some(k) => out.push(Kill { retaken: true, ..k }),
+                None => break,
+            }
+        }
+        Ok(out)
     }
 
     /// The ledger is done with: its row is written.
@@ -390,8 +429,8 @@ mod tests {
     }
 
     /// A rep is whole by its own file and by nothing else, a cut rep names
-    /// the arms it holds in the plan's order, and forgetting it leaves
-    /// nothing of it.
+    /// the arms it holds in the plan's order, and forgetting a rep of
+    /// passes alone leaves nothing of it.
     #[test]
     fn a_rep_is_whole_by_its_file_and_a_cut_rep_names_what_it_holds() {
         let out = scratch("rep");
@@ -417,6 +456,7 @@ mod tests {
             rss_bytes: Some(1),
             cache_bytes: None,
             utc: "now".into(),
+            retaken: false,
         };
         l.write_kill(&k).unwrap();
         assert_eq!(
@@ -445,6 +485,73 @@ mod tests {
         l.forget_rep(3_000_000, 2, &arms).unwrap();
         assert_eq!(l.rep_state(3_000_000, 2, &arms), RepState::Cut(vec![]));
         assert_eq!(l.rep_state(3_000_000, 1, &arms), RepState::Whole);
+        assert_eq!(l.read_kept_kills(3_000_000, 2).unwrap(), vec![]);
+        let _ = std::fs::remove_dir_all(&out);
+    }
+
+    fn kill(arm: &str, rep: usize, utc: &str) -> Kill {
+        Kill {
+            arm: arm.into(),
+            size: 3_000_000,
+            rep,
+            after_phase: Some("load".into()),
+            rss_bytes: Some(1),
+            cache_bytes: Some(2),
+            utc: utc.into(),
+            retaken: false,
+        }
+    }
+
+    /// A cut rep taken again keeps its kills and drops its passes: the
+    /// rep reads cut with nothing in it, so it runs whole, and every kill
+    /// of every take comes back marked retaken, in the order the takes
+    /// were cut, with no other rep's among them. A forget cut part way,
+    /// its kills kept and its passes not yet removed, is finished by the
+    /// next with no kill kept twice.
+    #[test]
+    fn a_cut_rep_taken_again_keeps_its_kills_and_drops_its_passes() {
+        let out = scratch("kept");
+        let l = Ledger::create(&out, &head()).unwrap();
+        let arms = vec!["supdb".to_string(), "lmdb".to_string()];
+        let lmdb = [m("read", "lmdb", Some(3_000_000), "reads_per_s", 1.0)];
+        // The first take: supdb killed, lmdb measured, then the cut.
+        l.write_kill(&kill("supdb", 2, "first")).unwrap();
+        l.write_pass(3_000_000, 2, "lmdb", &lmdb).unwrap();
+        l.write_kill(&kill("supdb", 1, "another rep")).unwrap();
+        l.forget_rep(3_000_000, 2, &arms).unwrap();
+        assert_eq!(l.rep_state(3_000_000, 2, &arms), RepState::Cut(vec![]));
+        assert_eq!(l.read_pass(3_000_000, 2, "lmdb").unwrap(), None);
+        assert_eq!(l.read_kill(3_000_000, 2, "supdb").unwrap(), None);
+        let first = Kill {
+            retaken: true,
+            ..kill("supdb", 2, "first")
+        };
+        assert_eq!(
+            l.read_kept_kills(3_000_000, 2).unwrap(),
+            vec![first.clone()]
+        );
+        // The second take: both arms killed, then cut again.
+        l.write_kill(&kill("supdb", 2, "second")).unwrap();
+        l.write_kill(&kill("lmdb", 2, "second")).unwrap();
+        l.forget_rep(3_000_000, 2, &arms).unwrap();
+        assert_eq!(l.rep_state(3_000_000, 2, &arms), RepState::Cut(vec![]));
+        let second = |arm: &str| Kill {
+            retaken: true,
+            ..kill(arm, 2, "second")
+        };
+        let all = vec![first, second("supdb"), second("lmdb")];
+        assert_eq!(l.read_kept_kills(3_000_000, 2).unwrap(), all);
+        // A forget again over nothing new keeps nothing twice.
+        l.write_pass(3_000_000, 2, "supdb", &[]).unwrap();
+        l.forget_rep(3_000_000, 2, &arms).unwrap();
+        assert_eq!(l.read_kept_kills(3_000_000, 2).unwrap(), all);
+        assert_eq!(l.read_pass(3_000_000, 2, "supdb").unwrap(), None);
+        // The other rep's kill is its own, and kept by nobody.
+        assert_eq!(l.read_kept_kills(3_000_000, 1).unwrap(), vec![]);
+        assert_eq!(
+            l.read_kill(3_000_000, 1, "supdb").unwrap(),
+            Some(kill("supdb", 1, "another rep"))
+        );
         let _ = std::fs::remove_dir_all(&out);
     }
 
