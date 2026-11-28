@@ -10,6 +10,8 @@ version = "0.2.0"
 edition = "2021"
 # The engine's floor (`../Cargo.toml`).
 rust-version = "1.95"
+# The suite measures the engine and ships with nothing.
+publish = false
 build = "build.rs"
 
 [lib]

@@ -8,6 +8,9 @@ rust-version = "1.95"
 description = "A read-optimized embedded key-multivalue store"
 license = "MIT"
 repository = "https://github.com/bfulton/supdb"
+# Not published until the owner decides the version and whether to publish:
+# an upload to crates.io cannot be taken back, only yanked.
+publish = false
 
 # A wasm build gets the reader and nothing else. `cdylib` is what the browser
 # loads; `rlib` is what the bins and tests link.
