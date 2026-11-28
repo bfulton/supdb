@@ -77,3 +77,12 @@ and copied here under `measure/rows/` at the same relative path.
   against the window's [1,328,102, 1,934,464]); 19 of 3131 no-verdict,
   nothing the engine's own, 18 flagged; 8 comparator cells below their
   window (lmdb-nordahead, rocksdb-tuned-lz4); no band yet for 1770.
+
+## 5. Bounded row, 1.25 GiB, ids
+
+- Command: `cd /home/user/c0/bench && TMPDIR=/home/user/base/tmp/ooc-1280-ids sh scripts/ooc.sh 1342177280 --keys ids --out /home/user/base/rows`
+- Start 2026-11-28T07:25:44Z, verdict `ooc.sh: bounded run under 1342177280 bytes banked`
+  by 10:57:01Z; the run's own clock 12,666 s (3 h 31 m), one sitting. No kill.
+- Row: `measure/rows/ooc/20261128T072548Z-b3a043d.json` (10 arms, rungs 3M and 10M, 3 reps).
+- Gate (exit 0; `measure/logs/ooc-1280-ids-gate.txt`): class `.../b1280m/kids`,
+  1 prior row: no band yet for any of 3134 quantities.

@@ -1,0 +1,5 @@
+gate: class x86_64/intel-r-xeon-r-processor-2.10ghz/4c/16g/hypervisor/b1280m/kids scale ooc -- 1 prior row (window 10)
+host: no floor in band yet (8 floor quantities); the verdict stands on the engine's alone
+comparators: none below their window
+  no band yet: fewer than 3 prior rows for every quantity (3134 quantities)
+ok: nothing worse than the window (0 flagged)
