@@ -410,12 +410,10 @@ fn where_the_writers_arrays_live_changes_nothing_of_the_segment() {
             );
             for (site, was) in sites.iter().zip(before) {
                 let made = count(site) - was;
+                // Off, the count is the process's, and the stores of the
+                // tests beside this one map theirs.
                 if mapped {
                     assert_eq!(made, 1, "{layout}: the {site} array a mapping");
-                } else if common::jobs_heap_switch() {
-                    // But under the switch the stores of the tests beside
-                    // this one map theirs, and the count is the process's.
-                    assert_eq!(made, 0, "{layout}: off, {site} is no mapping");
                 }
             }
             files.push(without_the_clock(&std::fs::read(&path).unwrap()));

@@ -1,5 +1,5 @@
-//! A job's large arrays are the engine's own mappings where the option
-//! says so, and the store they write is the same store.
+//! A job's large arrays are the engine's own mappings, unmapped with the
+//! job.
 //!
 //! Its own test binary, with one test, because what it reads is the
 //! process's: the count of the buffers that became mappings and the bytes
@@ -27,45 +27,16 @@ type Life = (
     Vec<(Vec<u8>, usize)>,
 );
 
-fn life(name: &str, mapped: bool) -> Life {
-    life_with(name, mapped, None)
-}
-
-/// `life`, and with a budget the arrays mapped only while the store is
-/// short of it (`Options::jobs_mapped_when_short`): the store's first
-/// flush leaves a partition of some seven megabytes, the budget is held
-/// to that from the seam, and the second flush's seal and the merge after
-/// it start once the segment work has looked.
-fn life_with(name: &str, mapped: bool, budget: Option<u64>) -> Life {
+fn life(name: &str) -> Life {
     let d = std::env::temp_dir().join(format!(
         "supdb-next-jobsmapped-{name}-{}",
         std::process::id()
     ));
     let _ = std::fs::remove_dir_all(&d);
     std::fs::create_dir_all(&d).unwrap();
-    let inject = budget.map(|b| {
-        let i = std::sync::Arc::new(supdb::ZInject::new());
-        i.set_budget(b);
-        i
-    });
+    // The files are listed by name: a store of files (`common::files`).
+    let opts = common::files(common::options());
     let opts = Options {
-        jobs_mapped_when_short: budget.is_some(),
-        // The look at the store against its budget is the jobs' own here,
-        // with the forms' fit, which shares it, turned off.
-        forms_fit_when_short: budget.is_none(),
-        // The budget is the seam's and the form is nobody's question here.
-        zpages: if budget.is_some() {
-            supdb::ZPages::Off
-        } else {
-            common::options().zpages
-        },
-        zpages_inject: inject,
-        // The two stores' files are compared by name, byte for byte: a
-        // store of files (`common::files`).
-        ..common::files(common::options())
-    };
-    let opts = Options {
-        jobs_mapped: mapped,
         // One seal a flush and none between, so the jobs are the test's
         // and the table the second flush seals holds every key: neither
         // the byte threshold nor the cap at a share of the store, which
@@ -87,24 +58,6 @@ fn life_with(name: &str, mapped: bool, budget: Option<u64>) -> Life {
     db.commit().unwrap();
     db.flush().unwrap();
     db.settle().unwrap();
-    if let Some(b) = budget {
-        // The segment work looks at the store against its budget once a
-        // second: short of a budget of a megabyte within a few looks, and
-        // never of one of a terabyte.
-        let short = b < (1 << 30);
-        let t = std::time::Instant::now();
-        while db.forms_short() != short && t.elapsed().as_secs() < 30 {
-            std::thread::sleep(std::time::Duration::from_millis(20));
-        }
-        if !short {
-            std::thread::sleep(std::time::Duration::from_millis(2500));
-        }
-        assert_eq!(
-            db.forms_short(),
-            short,
-            "{name}: the store against its budget"
-        );
-    }
     // Scattered: every key at a stride coprime to the count, so the table
     // is a hash table and the seal sorts it.
     for i in 0..keys {
@@ -124,33 +77,6 @@ fn life_with(name: &str, mapped: bool, budget: Option<u64>) -> Life {
         kv(&mut |k, v| read.push((k.to_vec(), v.len()))),
     )
     .unwrap();
-    if let Some(b) = budget {
-        // A run of ordered ingest begun and closed now: its close composes
-        // a trailer, in a mapping where the store reads short and in the
-        // allocator's buffer where it does not.
-        let trailers = || {
-            Db::job_buffers_mapped()
-                .iter()
-                .find(|(s, _)| *s == "trailer")
-                .unwrap()
-                .1
-        };
-        let before = trailers();
-        for k in keys..2 * keys {
-            db.append(&key(k), &[b'c'; 100]);
-            if k % 1000 == 999 {
-                db.commit().unwrap();
-            }
-        }
-        db.commit().unwrap();
-        db.flush().unwrap();
-        db.settle().unwrap();
-        assert_eq!(
-            trailers() > before,
-            b < (1 << 30),
-            "{name}: the trailer of a run closed now"
-        );
-    }
     db.close().unwrap();
     let made: Vec<(&'static str, usize)> = Db::job_buffers_mapped()
         .into_iter()
@@ -171,144 +97,71 @@ fn life_with(name: &str, mapped: bool, budget: Option<u64>) -> Life {
     (files, made, read)
 }
 
-/// Under `Options::jobs_mapped` the seal's sort, the writers' per-key
-/// arrays, the ordered index builders' keys, the merge's key list and the
-/// finishes' trailers are mappings once they are large -- counted as each
-/// becomes one -- and none where the option is off; the segments and the
-/// ordered indexes the two stores leave are the same bytes, every key
-/// reads back with its last value, and nothing stays mapped past either
-/// store's close.
+/// The seal's sort, the writers' per-key arrays, the ordered index
+/// builders' keys, the merge's key list and the finishes' trailers are
+/// mappings once they are large -- counted as each becomes one -- every
+/// key reads back with its last value, and nothing stays mapped past the
+/// store's close; and a run a crash left, which the open finishes, has its
+/// trailer composed in a mapping too.
 #[test]
-fn a_jobs_large_arrays_are_mapped_and_the_store_is_the_same() {
+fn a_jobs_large_arrays_are_mapped_and_go_with_the_job() {
     let mapped_before = Db::mapped_bytes();
-    let (heap_files, heap_made, heap_read) = life("heap", false);
-    assert!(
-        heap_made.iter().all(|&(_, n)| n == 0),
-        "off, no job's array is a mapping: {heap_made:?}"
-    );
-    assert_eq!(Db::mapped_bytes(), mapped_before, "the heap store closed");
-    let (map_files, map_made, map_read) = life("mapped", true);
-    // Every array the option names, each large at sixty thousand keys:
-    // the seal's sort and its order, the writer's four and the builder's
-    // two for the piece it writes and for the merge's output, the
-    // merge's key list, and a trailer at every finish.
-    assert_eq!(map_made.len(), 12, "the sites the option names");
-    for &(site, n) in &map_made {
-        assert!(n > 0, "on, no {site} array became a mapping: {map_made:?}");
+    let (files, made, read) = life("mapped");
+    // Every array the store maps, each large at sixty thousand keys: the
+    // seal's sort and its order, the writer's four and the builder's two
+    // for the piece it writes and for the merge's output, the merge's key
+    // list, and a trailer at every finish.
+    assert_eq!(made.len(), 12, "the sites the jobs map");
+    for &(site, n) in &made {
+        assert!(n > 0, "no {site} array became a mapping: {made:?}");
     }
     assert_eq!(
         Db::mapped_bytes(),
         mapped_before,
         "every mapping a job made went with the job"
     );
-    assert_eq!(heap_read.len(), 60_000);
+    assert_eq!(read.len(), 60_000);
     assert!(
-        heap_read.iter().all(|(_, n)| *n == 90),
+        read.iter().all(|(_, n)| *n == 90),
         "every key reads its last value"
     );
-    assert_eq!(heap_read, map_read, "the same keys and values read back");
-    assert_eq!(
-        heap_files.keys().collect::<Vec<_>>(),
-        map_files.keys().collect::<Vec<_>>(),
-        "the same files"
-    );
-    assert!(heap_files.keys().any(|n| n.starts_with("par-")));
-    // Mapped only while short (`Options::jobs_mapped_when_short`): a store
-    // with memory to spare maps none of its jobs' arrays, and one short of
-    // its budget maps those of the jobs that start once it reads so -- the
-    // second flush's seal, its sort and its writer, and the merge after
-    // it -- with the first flush's close, before the look, the
-    // allocator's. Both read back as the others do.
-    let (_, spare_made, spare_read) = life_with("spare", true, Some(1 << 40));
-    assert!(
-        spare_made.iter().all(|&(_, n)| n == 0),
-        "memory to spare, no array a mapping: {spare_made:?}"
-    );
-    assert_eq!(spare_read, heap_read);
-    let (_, short_made, short_read) = life_with("short", true, Some(1 << 20));
-    for site in [
-        "sort records",
-        "sort scratch",
-        "sort order",
-        "writer keys",
-        "list keys",
-    ] {
-        let n = short_made.iter().find(|(s, _)| *s == site).unwrap().1;
-        assert!(
-            n > 0,
-            "short of memory, no {site} array became a mapping: {short_made:?}"
-        );
-    }
-    // The seal's writer and the merge's, one piece each: both asked the
-    // store, not the merge's alone.
-    let writers = short_made
-        .iter()
-        .find(|(s, _)| *s == "writer keys")
-        .unwrap()
-        .1;
-    assert!(
-        writers >= 2,
-        "the seal's writer and the merge's: {short_made:?}"
-    );
-    assert_eq!(short_read, heap_read);
-    assert_eq!(Db::mapped_bytes(), mapped_before, "both stores closed");
-    // A run a crash left is finished by the open, its trailer composed
-    // there: in a mapping where the option maps whatever the store's
-    // memory, and in the allocator's buffer where it maps only while the
-    // store is short, which a store being opened has not been found to be.
+    assert!(files.keys().any(|n| n.starts_with("par-")));
     // Last, since a crashed store's blocks are never unmapped.
-    for (name, when_short) in [("crash-always", false), ("crash-short", true)] {
-        let d = std::env::temp_dir().join(format!(
-            "supdb-next-jobsmapped-{name}-{}",
-            std::process::id()
-        ));
-        let _ = std::fs::remove_dir_all(&d);
-        std::fs::create_dir_all(&d).unwrap();
-        let opts = || Options {
-            jobs_mapped: true,
-            jobs_mapped_when_short: when_short,
-            zpages: supdb::ZPages::Off,
-            ..Options::default()
-        };
-        let mut db = Db::create(&d, opts()).unwrap();
-        for k in 0..60_000u32 {
-            db.append(&key(k), &[b'a'; 100]);
-            if k % 1000 == 999 {
-                db.commit().unwrap();
-            }
+    let d = std::env::temp_dir().join(format!(
+        "supdb-next-jobsmapped-crash-{}",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_dir_all(&d);
+    std::fs::create_dir_all(&d).unwrap();
+    let opts = || Options {
+        zpages: supdb::ZPages::Off,
+        ..Options::default()
+    };
+    let mut db = Db::create(&d, opts()).unwrap();
+    for k in 0..60_000u32 {
+        db.append(&key(k), &[b'a'; 100]);
+        if k % 1000 == 999 {
+            db.commit().unwrap();
         }
-        db.commit().unwrap();
-        db.crash();
-        let trailers = || {
-            Db::job_buffers_mapped()
-                .iter()
-                .find(|(s, _)| *s == "trailer")
-                .unwrap()
-                .1
-        };
-        let before = trailers();
-        let db = Db::open(&d, opts()).unwrap();
-        assert_eq!(
-            trailers() > before,
-            !when_short,
-            "{name}: the trailer of the run the open finished"
-        );
-        let mut n = 0usize;
-        db.scan(b"", usize::MAX, kv(&mut |_, _| n += 1)).unwrap();
-        assert_eq!(n, 60_000, "{name}: every committed key recovered");
-        db.close().unwrap();
-        let _ = std::fs::remove_dir_all(&d);
     }
-    for (name, bytes) in &heap_files {
-        let other = &map_files[name];
-        let first = if bytes.len() != other.len() {
-            Some(bytes.len().min(other.len()))
-        } else {
-            bytes.iter().zip(other).position(|(a, b)| a != b)
-        };
-        assert!(
-            first.is_none(),
-            "{name} differs between the two, first at {first:?}"
-        );
-    }
+    db.commit().unwrap();
+    db.crash();
+    let trailers = || {
+        Db::job_buffers_mapped()
+            .iter()
+            .find(|(s, _)| *s == "trailer")
+            .unwrap()
+            .1
+    };
+    let before = trailers();
+    let db = Db::open(&d, opts()).unwrap();
+    assert!(
+        trailers() > before,
+        "the trailer of the run the open finished"
+    );
+    let mut n = 0usize;
+    db.scan(b"", usize::MAX, kv(&mut |_, _| n += 1)).unwrap();
+    assert_eq!(n, 60_000, "every committed key recovered");
+    db.close().unwrap();
+    let _ = std::fs::remove_dir_all(&d);
 }

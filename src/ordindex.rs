@@ -283,7 +283,7 @@ impl Builder {
     }
 
     /// `new`, its copies of the keys the engine's own mappings once they
-    /// are large where `mapped` (`Options::jobs_mapped`).
+    /// are large where `mapped`, as a store's jobs have them.
     pub(crate) fn new_in(mapped: impl Into<crate::db::blocks::Maps>) -> Builder {
         let mapped = mapped.into();
         Builder {

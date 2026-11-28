@@ -15,9 +15,9 @@
 //! has ended (`docs/engine.md`, which form a workload calls for).
 //! `PROBE_N` is the store's key count, six hundred thousand unless set;
 //! `PROBE_BIG` the size an allocation is printed from, two megabytes unless
-//! set; `PROBE_JOBS_MAPPED=1` runs the store under `Options::jobs_mapped`
-//! and `PROBE_MEMO_SLAB=1` under `Options::zpages_memo_slab`, whose
-//! mappings the allocator never sees: the bytes mapped at each phase's
+//! set; and `PROBE_MEMO_SLAB=1` runs the store under
+//! `Options::zpages_memo_slab`. The jobs' large arrays and the memos'
+//! slabs are mappings the allocator never sees: the bytes mapped at each phase's
 //! end are printed beside its line.
 #![cfg(target_os = "linux")]
 
@@ -211,9 +211,6 @@ fn the_peaks_by_phase_and_thread() {
     let dir = std::env::temp_dir().join(format!("supdb-next-alloc-peaks-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     let val = vec![0x5au8; 100];
-    // `PROBE_JOBS_MAPPED=1`: the jobs' large arrays as the engine's
-    // mappings (`Options::jobs_mapped`), which leave the allocator's count.
-    let jobs_mapped = std::env::var("PROBE_JOBS_MAPPED").is_ok_and(|v| v == "1");
     // `PROBE_MEMO_SLAB=1`: the handles' memos in slabs of their own
     // (`Options::zpages_memo_slab`), mappings too.
     let memo_slab = std::env::var("PROBE_MEMO_SLAB").is_ok_and(|v| v == "1");
@@ -224,7 +221,6 @@ fn the_peaks_by_phase_and_thread() {
     }
     let off = || Options {
         zpages: ZPages::Off,
-        jobs_mapped,
         ..Options::default()
     };
     let mut db = Db::create(&dir, off()).unwrap();
@@ -274,7 +270,6 @@ fn the_peaks_by_phase_and_thread() {
             zpages_min_bytes: 0,
             zpages_stride: stride,
             zpages_stride_room: false,
-            jobs_mapped,
             zpages_memo_slab: memo_slab,
             ..Options::default()
         };

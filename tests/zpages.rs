@@ -11915,26 +11915,23 @@ fn an_attach_of_form_files_built_ahead_is_bought_on_the_prediction() {
 }
 
 /// A store bought before the land look has found it past the selector's
-/// line makes the crossing at the buy (`Options::zpages_buy_crosses`).
+/// line makes the crossing at the buy.
 /// Built ahead under its budget, the records kept and the files dropped
 /// as they were written; then two percent past it under the group's
 /// pressure, where the model's saving is under the line to enter, the
 /// look crosses nothing and nothing is bought on the prediction; then
-/// bought on what its reads measure. With the option the buy swaps every
-/// partition built ahead, once and before it attaches any -- a crossing
-/// that came after the attaches would find none to swap -- and without
-/// it the buy attaches the files as they lie and nothing is swapped. A
-/// store the look took past the line first makes its crossing there, and
+/// bought on what its reads measure. The buy swaps every partition built
+/// ahead, once and before it attaches any -- a crossing that came after the
+/// attaches would find none to swap. A store the look took past the line first makes its crossing there, and
 /// its buy makes none.
 #[cfg(target_os = "linux")]
 #[test]
 fn a_buy_before_the_crossing_makes_the_crossing() {
-    for (on, far) in [(true, false), (false, false), (true, true)] {
-        let what = format!("buy crosses {on}, far {far}");
+    for far in [false, true] {
+        let what = format!("buy crosses, far {far}");
         let (dir, db, model, inject, raw) =
-            land_store_with(&format!("auto-buy-cross-{on}-{far}"), 50, |o| {
+            land_store_with(&format!("auto-buy-cross-{far}"), 50, |o| {
                 o.partition_bytes = Some(160 << 10);
-                o.zpages_buy_crosses = on;
             });
         inject.set_budget(raw * 3 / 2);
         assert!(
@@ -11983,11 +11980,7 @@ fn a_buy_before_the_crossing_makes_the_crossing() {
         );
         wait_steps(&db, 10);
         let c = db.zpage_counts();
-        let want = match (far, on) {
-            (true, _) => (0, n),
-            (false, true) => (1, n),
-            (false, false) => (0, 0),
-        };
+        let want = if far { (0, n) } else { (1, n) };
         assert_eq!(
             (c.buy_crosses, c.ahead_swapped),
             want,
