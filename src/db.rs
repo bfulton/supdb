@@ -34896,8 +34896,8 @@ impl Reader {
     /// `read_layers` with its sources asked in the order of what each
     /// costs (`Options::point_layers_lean`): `None`, with nothing handed to
     /// `f`, for every store and key that read leaves to the general one,
-    /// and for a store whose merges follow its reads or with a frozen
-    /// table that was a run of ordered ingest, which are that read's.
+    /// and for a store with a frozen table that was a run of ordered
+    /// ingest, which is that read's.
     ///
     /// The key's partition and the pieces over it come from the state
     /// (`State::parts`, `pieces_placed`), and the partition's first hash
