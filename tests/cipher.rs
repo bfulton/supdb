@@ -2180,6 +2180,17 @@ fn a_store_whose_cache_follows_its_room_holds_what_the_room_allows() {
         size > 4 * (4 << 20),
         "the store is {size} bytes, not several times its room"
     );
+    // Held to the same bound before the reads: a cache that never gives
+    // back makes every read below breathe its whole breath, and twenty
+    // thousand of them ran for minutes before the bound was read.
+    let c = db.cipher_counts().unwrap().cache;
+    let (allowed, off_ns, wall_ns) = overshoot(&c, born);
+    assert!(
+        c.peak < (4 << 20) + slack + allowed,
+        "held {} through the load, of a room of four mebibytes, a slack of {slack} and {allowed} \
+         read while the evictor was off for {off_ns} ns of {wall_ns}: {c:?}",
+        c.peak
+    );
     holds(&db, n);
     let c = until(&db, "under the first room", &|c| c.held <= c.budget);
     assert!(c.rooms > 0, "the room was never read: {c:?}");
