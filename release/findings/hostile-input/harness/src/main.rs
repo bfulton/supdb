@@ -315,7 +315,13 @@ type Model = BTreeMap<Vec<u8>, Vec<Vec<u8>>>;
 /// Segments in several shapes, written by the public `SegmentWriter`.
 fn segments(dir: &Path) -> Vec<(String, Vec<u8>, Model)> {
     let mut out = Vec::new();
+    let only: Option<u64> = std::env::var("HOSTILE_ONLY_SHAPE")
+        .ok()
+        .and_then(|v| v.parse().ok());
     for shape in 0..6u64 {
+        if only.is_some_and(|o| o != shape) {
+            continue;
+        }
         let path = dir.join(format!("seg-{shape}.sup"));
         let opts = SegmentOptions {
             block_size: if shape == 3 { 512 } else { 4096 },
@@ -1390,6 +1396,108 @@ fn t_bigkey() -> Tally {
     t
 }
 
+/// Each pristine segment lent from an address 1..7 bytes past an 8-aligned
+/// one (a caller's `SliceBytes(&buf[k..])`): the same bytes, which every
+/// reader must answer exactly as it does from an aligned buffer.
+fn t_unaligned() -> Tally {
+    let dir = scratch("unal");
+    let segs = segments(&dir);
+    let mut t = Tally::default();
+    for (shape, b, m) in &segs {
+        for k in 0..8usize {
+            let mut buf: Vec<u64> = vec![0; b.len() / 8 + 2];
+            // SAFETY: a u64 buffer viewed as bytes, which is always sound.
+            let raw = unsafe {
+                std::slice::from_raw_parts_mut(buf.as_mut_ptr() as *mut u8, buf.len() * 8)
+            };
+            raw[k..k + b.len()].copy_from_slice(b);
+            let src = SliceBytes(&raw[k..k + b.len()]);
+            let name = format!("unaligned {shape} +{k}");
+            t.cases += 1;
+            match Blob::open(src) {
+                Ok(blob) => {
+                    t.opened += 1;
+                    let mut bad = None;
+                    for (key, want) in m {
+                        let mut got = Vec::new();
+                        match blob.read_all(key, |v: &[u8]| got.push(v.to_vec())) {
+                            Ok(_) if &got == want => {}
+                            Ok(_) => bad = Some(format!("read_all({}) differs", hex(key))),
+                            Err(e) => bad = Some(format!("read_all({}) erred: {e}", hex(key))),
+                        }
+                        if bad.is_some() {
+                            break;
+                        }
+                    }
+                    if let Some(w) = bad {
+                        println!("REFUSED-READ {name}: {w}");
+                        t.fails.push(name);
+                    }
+                }
+                Err(e) => {
+                    t.refused += 1;
+                    println!("REFUSED {name}: {e}");
+                    t.fails.push(name);
+                }
+            }
+        }
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+    t
+}
+
+/// Each pristine segment, as written, read whole through each reader: the
+/// errors a valid file answers.
+fn t_pristine() -> Tally {
+    let dir = scratch("pristine");
+    let segs = segments(&dir);
+    let mut t = Tally::default();
+    fn errs<B: Bytes>(blob: &Blob<B>, m: &Model) -> (usize, usize, Option<String>) {
+        let (mut e, mut w, mut first) = (0, 0, None);
+        for (k, want) in m {
+            let mut got = Vec::new();
+            match blob.read_all(k, |v: &[u8]| got.push(v.to_vec())) {
+                Ok(_) if &got == want => {}
+                Ok(_) => w += 1,
+                Err(x) => {
+                    e += 1;
+                    if std::env::var_os("HOSTILE_WHY").is_some() {
+                        let lens: Vec<usize> = want.iter().map(|v| v.len()).collect();
+                        eprintln!("  erred {} ({} values, lengths {lens:?}): {x}", hex(k), want.len());
+                    }
+                    first.get_or_insert(format!("{}: {x}", hex(k)));
+                }
+            }
+        }
+        (e, w, first)
+    }
+    for (shape, b, m) in &segs {
+        let p = dir.join(format!("{shape}.sup"));
+        std::fs::write(&p, b).unwrap();
+        let r = [
+            ("lent", errs(&Blob::open(SliceBytes(b)).unwrap(), m)),
+            ("copying", errs(&Blob::open(Copying(b.clone())).unwrap(), m)),
+            (
+                "mapped",
+                errs(&Blob::open(MmapBytes::open(&p).unwrap()).unwrap(), m),
+            ),
+        ];
+        for (who, (e, w, first)) in r {
+            t.cases += 1;
+            println!(
+                "{shape} {who}: {} keys, {e} errors, {w} wrong{}",
+                m.len(),
+                first.map_or(String::new(), |f| format!(", first {f}"))
+            );
+            if e + w > 0 {
+                t.fails.push(shape.clone());
+            }
+        }
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+    t
+}
+
 // ---------------------------------------------------------------------- main
 
 fn main() {
@@ -1439,6 +1547,8 @@ fn main() {
         "walhead-cipher" => t_walhead(Kind::Cipher, to as usize),
         "walhead-onefile" => t_walhead(Kind::OneFile, to as usize),
         "bigkey" => t_bigkey(),
+        "unaligned" => t_unaligned(),
+        "pristine" => t_pristine(),
         "leak" => t_leak(only.unwrap_or("crash"), to),
         "store" => t_store(Kind::Plain, from, to, only),
         "onefile" => t_store(Kind::OneFile, from, to, only),
