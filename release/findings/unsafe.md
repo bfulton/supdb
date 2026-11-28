@@ -89,7 +89,17 @@ sh release/findings/unsafe/miri.sh          # every test of the pure modules, on
 | unsupported by Miri | 5 | `bytes::tests` ×3 (file-backed `mmap`), `crypt::tests::{a_section_lent_once_is_not_walked_again, pages_asked_for_ahead_stay_inside_the_bound}` (`madvise(MADV_POPULATE_WRITE)` at `crypt.rs:736`) |
 | timeout (600 s) | 16 | `db::zlz4` ×5 (the damaged-block and part-at-a-time decodes, every effort, the kept tables), `flatindex::{fill_tests::the_sections_length_is_the_composers, tests::damage_never_panics, tests::the_fence_never_changes_where_a_seek_lands}`, `reserve::tests::the_planner_holds_aggregates_rather_than_the_input`, `db::radix` ×2, `db::lockfree::a_retire_list_frees_each_item_once_and_never_early`, `db::put_index::two_keys_that_share_a_tag_are_two_entries`, `crypt::tests::{a_changed_bit_anywhere_is_refused, the_whole_object_decrypts_to_what_was_encrypted, the_writer_writes_whole_megabytes}` |
 
-MIRI_RERUN
+The eight timeouts in the decoder, `flatindex` and the lock-free list were run again from 11:31 to 12:28 UTC with nothing else running, under a 2,400 s cap, four at a time:
+
+```sh
+timeout 2400 cargo +nightly miri test --lib -- --exact <test>
+```
+
+The results are in `out/miri-summary-2400s.txt`:
+- **pass**, 4: `db::zlz4::tests::{a_damaged_block_never_reads_or_writes_outside_its_buffers_and_agrees_where_both_decode, a_damaged_block_decoded_in_parts_has_the_whole_decodes_verdict_and_bytes, a_block_decoded_a_part_at_a_time_writes_the_whole_decodes_bytes_at_every_stop, the_tables_kept_across_groups_name_no_position_of_an_earlier_group}`. These are the LZ4 decoder's damaged-input tests, which reach every unchecked read and write in `zlz4.rs`, and Miri found no UB in them.
+- **timeout**, 4: `db::zlz4::tests::every_case_decodes_to_its_input_under_every_effort`, `flatindex::fill_tests::the_sections_length_is_the_composers`, `flatindex::tests::damage_never_panics`, `db::lockfree::a_retire_list_frees_each_item_once_and_never_early`. These are too large for Miri at this cap. A Miri run of them needs their case counts cut under `cfg(miri)`.
+
+The other eight 600 s timeouts (`reserve`, `db::radix`, `db::put_index::two_keys_that_share_a_tag_are_two_entries`, three `crypt`, `flatindex::tests::the_fence_never_changes_where_a_seek_lands`) were not rerun.
 
 The script writes `release/findings/unsafe/out/miri-summary.txt`. This run's copy is `miri-summary-600s.txt`, and each test's log is under `out/miri/`.
 
