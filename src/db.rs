@@ -1325,43 +1325,16 @@ pub struct Options {
     /// Memtable bytes that trigger a seal at the next commit. Sealing is off
     /// the commit path in cost accounting but runs on the committing thread
     /// in milestone 1; the brief's "Segment size" question owns this number.
-    /// With `seal_grows` this is the floor: see there.
+    ///
+    /// It is the floor: the seal grows with the store, to the store's size
+    /// over `4 * l0_trigger`, so a merge takes in at least a quarter of
+    /// what it rewrites and level-0 stays a few pieces a range.
     pub seal_bytes: usize,
-    /// Let the seal grow with the store, so a merge takes in at least a
-    /// quarter of what it rewrites. A seal of a fixed size drops a slice
-    /// into every range, and the slice shrinks as ranges multiply: on a
-    /// store of thirty million keys a 32 MiB seal put 0.3 MB into each of
-    /// 104 ranges, `l0_trigger` of them made 1.2 MB, and merging them
-    /// rewrote a 64 MB partition -- fifty times the bytes -- while twenty
-    /// more seals landed on the ranges the job covered. Level-0 reached 24
-    /// pieces a range and every read checked 24 Blooms. With the seal at
-    /// a sixteenth of the partitions' bytes, level-0 stayed under three,
-    /// and D went from 35k to 533k ops/s, E from 14k to 334k. The divisor
-    /// is `4 * l0_trigger`: the bytes a merge rewrites over the bytes it
-    /// takes in, held to four. Off, the seal is `seal_bytes` and nothing
-    /// else, the shape the suite's arms were measured in before this.
-    pub seal_grows: bool,
-    /// EXPERIMENT: with `seal_grows`, the seal holds at `seal_bytes` while
-    /// the compact form's gate is away from the raw form -- the store out
-    /// of core -- and grows with the store only in core. Grown, the
-    /// memtable is the store's bytes over four times `l0_trigger`, 77 MB at
-    /// ten million keys, and under a bound it and the scan snapshot's copy
-    /// of it are anonymous memory beside the form files' page cache, where
-    /// LMDB holds 17 MB; the floor leaves the unsealed writes in pieces on
-    /// disk instead, at the price of more and smaller pieces for the scans
-    /// to fold and the merges to take. Refuted: paired undivided at ten
-    /// million keys under 1.25 GiB, two pairs, the floor held E's
-    /// anonymous memory at 230-249 MB against 381-404 and its major faults
-    /// to 0.6x, and read E at 0.70x, D and F at 0.78x and A, B and C at
-    /// 0.92-0.95x in both pairs, the pieces' folds and merges costing more
-    /// than the memory freed. Off: the seal grows whatever the gate.
-    /// `supdb-sealfloorooc` is the arm.
-    pub seal_floor_out_of_core: bool,
     /// EXPERIMENT: the share of the store's bytes the memtable may reach
     /// before a commit seals, as a cap on `seal_threshold` rather than a
     /// floor under it; zero is no cap.
     ///
-    /// `seal_bytes` and `seal_grows` are both floors, so on a store
+    /// `seal_bytes` and the grown seal are both floors, so on a store
     /// smaller than the floor the memtable can hold the whole of it and
     /// never seal: a hundred thousand keys are six megabytes against a
     /// 32 MiB seal, so the lag sweep's every point sits unsealed. That is
@@ -1384,14 +1357,6 @@ pub struct Options {
     /// one-sided on the ladder: ycsb-E is the only mix this engine loses
     /// to LMDB, at 0.74x-0.87x, and ycsb-F it wins by 2.84x-6.27x.
     pub seal_max_pct: usize,
-    /// Size the store for `seal_grows` and `seal_max_pct` by its
-    /// partitions' file bytes (`true`, the rule before) rather than by the
-    /// key and value bytes they hold (`false`). The file's length moves
-    /// with the record format -- compact records cut a tenth of it at the
-    /// suite's shape -- so under the file rule a denser format seals more
-    /// often, and pricing the format priced the cadence with it. Kept as
-    /// the comparison arm.
-    pub seal_on_file: bool,
     /// Ordered ingest goes straight into a segment. Keys arriving above the
     /// store's greatest, with values the record holds inline
     /// (`inline_bytes`), while the memtable is empty, fill an ordered
@@ -3113,11 +3078,6 @@ pub struct Options {
     /// either, since the idle seals put partitions under a load nobody
     /// reads.
     pub seal_idle: bool,
-    /// How a flush drains level 0 once partitions exist: merge only the
-    /// ranges that hold pieces, under the live fences (`true`), or
-    /// re-partition everything from every key (`false`, the original), kept
-    /// as the comparison arm.
-    pub flush_ranges: bool,
     /// Runs of values up to this many bytes are stored inline in the index
     /// record rather than in a block, so a point read of such a key touches
     /// the hash slot and the record and nothing else. Zero disables.
@@ -3563,29 +3523,6 @@ pub struct Options {
     /// copy at the commit instead, on a thread of the store's own, and
     /// is the write-time structure this is the read half of.
     pub snapshot_runs: bool,
-    /// The seal thread publishes the frozen table's scan snapshot, with
-    /// every key's chain copied beside it in key order, into the state
-    /// the freeze made, as soon as it has sorted the table: a store whose
-    /// only content is the table being sealed is read on the merge path
-    /// for the seal's whole run, and without this the first handle to
-    /// scan sorted the same table again and every scan after chased each
-    /// key's entry, chain and value through the memtable. It is
-    /// published as the base of a snapshot of no live entry, a handle's
-    /// extension carries it as its base, and a handle whose base is an
-    /// order without the chains takes the copy as its base at its next
-    /// scan. The copy is set on the table as well (`FrozenSnaps`), where
-    /// a state published later finds it, and is built from the order a
-    /// freeze, a scan or the keeper set there first rather than from a
-    /// sort of its own. The copy is about the table's key and value
-    /// bytes, held until the seal lands. Off is the shape before it, kept
-    /// to price it.
-    pub seal_snapshot: bool,
-    /// The seal writes its records from that snapshot's arena -- the keys
-    /// and the copied chains in key order, one sequential read -- instead
-    /// of walking each entry's chain through the memtable, three dependent
-    /// misses a key. Nothing without `seal_snapshot`. Off is the walk,
-    /// kept to price it.
-    pub seal_from_snapshot: bool,
     /// EXPERIMENT: the run keeper, a thread of the store's own at idle
     /// priority that keeps the published scan snapshot current to the
     /// commits. Polling them once a scan has happened over the store,
@@ -5226,45 +5163,22 @@ pub struct Options {
     /// first commit, `supdb-runcreate` and `supdb-ingestruncreate`.
     #[doc(hidden)]
     pub run_spare: bool,
-    /// EXPERIMENT, refuted and kept as an arm: a drain's seal copies the
-    /// frozen table's chains into a snapshot for the scans over the
-    /// store while the seal runs, as any seal does (`seal_snapshot`),
-    /// and under a drain the writer waits and reads nothing, so the copy
-    /// -- 1.0 to 1.5 ms of a shuffled load's drain at ten thousand keys
-    /// and 5 to 7 of 17 at thirty, in the drain's stamps (`snapped`) --
-    /// read as a cost paid for nobody. Taken away, the records phase grew
-    /// by the same amount at both rungs and the drain ended level: the
-    /// copy is the cheaper of two walks over the table, one pass with
-    /// its lookahead and a sequential read after it against a walk
-    /// interleaved with the writer's work, and its pages were not the
-    /// price. On, the default, the copy whatever the seal's reason. Off,
-    /// a drain's seal builds none and writes its records from the
-    /// table's chains with the copy's lookahead, a copy someone set on
-    /// the table already taken as it is: `supdb-nodrainsnap` and
-    /// `supdb-ingestnodrainsnap`.
-    pub drain_snapshot: bool,
-    /// A seal far from reads builds its snapshot copy as any seal does
-    /// (`seal_snapshot`). Off, the default, a seal of a table frozen with
+    /// A seal far from reads builds its snapshot copy as any seal does.
+    /// Off, the default, a seal of a table frozen with
     /// no scan around (`reads_around`: none in the store's life, or two
     /// stores' worth of writes since the last) builds none and writes its
-    /// records from the table's chains with the copy's lookahead, as a
-    /// drain's under `drain_snapshot` off; a copy someone set on the
-    /// table already is taken as it is. The copy is the table's key and
+    /// records from the table's chains with the copy's lookahead; a copy
+    /// someone set on the table already is taken as it is. The copy is the table's key and
     /// value bytes again, held with the table until the seal lands, and
     /// a load whose seals fall behind holds it for every table frozen:
     /// a shuffled load of five million keys under 640 MiB held three
     /// frozen tables and their three copies, 380 MB of the bound, and
     /// the bound killed it, where the arm without the block cache, its
     /// seals landing ahead of the next freeze, held one. A drain's seal
-    /// builds its copy as `drain_snapshot` says, far from reads or not:
-    /// one table's copy at a drain is not what the bound killed, and the
-    /// scans after a shuffled load of thirty thousand keys without it read
-    /// 0.89-0.97x in six sittings, at the same instructions and over the
-    /// same segment byte for byte, where two arms that differ in nothing
-    /// there read 0.92-1.09x -- the memory those scans run over, which
-    /// says nothing either way, so the drain keeps the shape its rows
-    /// were taken in. On, `supdb-sealcopyfar` and
-    /// `supdb-ingestsealcopyfar`.
+    /// builds its copy, far from reads or not: one table's copy at a drain
+    /// is not what the bound killed. A seam for the tests that hold a
+    /// seal's copy.
+    #[doc(hidden)]
     pub seal_snapshot_far: bool,
     /// A landing far from reads takes its pieces' bounds -- and their
     /// ranks, under `piece_ranks_whole` -- against their partitions before
@@ -5481,16 +5395,6 @@ pub struct Options {
     /// `supdb-landboundsalways`, and `supdb-boundsold` with the records.
     #[doc(hidden)]
     pub land_bounds_read: bool,
-    /// A seal writes a key whose chain holds one value and no tombstone
-    /// -- every key of a load, and most of any table -- through the
-    /// writer's one-value path (`SegmentWriter::put_one`), the record
-    /// laid out once, where the general path staged the value, encoded
-    /// the run from the staging and encoded the record from the run:
-    /// callgrind over the seal's job counted the general path at some
-    /// 950 instructions a record of the job's 2,350. Off, every key takes
-    /// the general path, as before: `supdb-sealrun` and
-    /// `supdb-ingestsealrun`.
-    pub seal_put_one: bool,
     /// At a flush's close of a direct run, the writer fdatasyncs the run's
     /// file -- the records committed to it so far, hinted to the page
     /// cache as they were written and flushed to the device by nothing yet
@@ -7147,9 +7051,6 @@ impl Default for Options {
             // bytes.
             seal_bytes: 32 << 20,
             seal_max_pct: 10,
-            seal_on_file: false,
-            seal_grows: true,
-            seal_floor_out_of_core: false,
             direct_ingest: true,
             segment: SegmentOptions::default(),
             l0_trigger: 4,
@@ -7169,7 +7070,6 @@ impl Default for Options {
             seal_sync_every: 0,
             inline_bytes: 256,
             partition_bytes: Some(64 << 20),
-            flush_ranges: true,
             promote: true,
             flush_schedules: true,
             writer_pins: true,
@@ -7303,8 +7203,6 @@ impl Default for Options {
             share_snapshot: true,
             snapshot_adopt_behind: 0,
             snapshot_runs: false,
-            seal_snapshot: true,
-            seal_from_snapshot: true,
             snapshot_keeper: false,
             snapshot_keeper_recent_pct: 100,
             promote_entries: 0,
@@ -7397,7 +7295,6 @@ impl Default for Options {
             bloom_pieces_only: true,
             land_fresh_lazy: true,
             run_spare: true,
-            drain_snapshot: true,
             seal_snapshot_far: false,
             land_ranks_far: false,
             piece_ranks_whole: false,
@@ -7412,7 +7309,6 @@ impl Default for Options {
             boundary_keys_from_top: false,
             bounds_by_heads: true,
             land_bounds_read: true,
-            seal_put_one: true,
             close_presync: true,
             ord_durable: false,
             direct_table_refs: false,
@@ -25293,7 +25189,7 @@ struct State {
     mean_key_bytes: usize,
     /// The partitions' bytes on disk, refreshed with the segment set: what
     /// a merge rewrites, and what the seal was sized against before
-    /// `data_bytes` (`Options::seal_on_file`).
+    /// `data_bytes`.
     store_bytes: u64,
     /// The partitions' key and value bytes (`Seg::data`), refreshed with
     /// the segment set: what the seal is sized against, so the cadence
@@ -31413,12 +31309,11 @@ const SEAL_CAP_FLOOR: usize = 1 << 20;
 const DATA_PER_FILE: (u64, u64) = (5, 7);
 
 impl Reader {
-    /// The memtable bytes at which the next commit seals: `seal_bytes`, or
-    /// with `seal_grows` the larger of that and the store's size over four
-    /// times `l0_trigger`, capped by `seal_max_pct` of the store's size.
-    /// The store's size is its partitions' key and value bytes in file
-    /// bytes at the calibrated ratio (`DATA_PER_FILE`), or their file bytes
-    /// themselves under `seal_on_file`.
+    /// The memtable bytes at which the next commit seals: the larger of
+    /// `seal_bytes` and the store's size over four times `l0_trigger`,
+    /// capped by `seal_max_pct` of the store's size. The store's size is
+    /// its partitions' key and value bytes in file bytes at the calibrated
+    /// ratio (`DATA_PER_FILE`).
     pub fn seal_threshold(&self) -> usize {
         self.threshold_for(false)
     }
@@ -31433,21 +31328,12 @@ impl Reader {
     fn threshold_for(&self, idle: bool) -> usize {
         let _e = self.enter();
         let st = self.state();
-        let sized = if self.opts.seal_on_file {
-            st.store_bytes
-        } else {
-            st.data_bytes.saturating_mul(DATA_PER_FILE.1) / DATA_PER_FILE.0
-        };
-        let floored =
-            self.opts.seal_floor_out_of_core && self.shared.zgate.load() != zselect::GATE_RAW;
-        let base = if !self.opts.seal_grows || floored {
-            self.opts.seal_bytes
-        } else {
-            let grown = sized / self.opts.l0_trigger.max(1).saturating_mul(4) as u64;
-            self.opts
-                .seal_bytes
-                .max(usize::try_from(grown).unwrap_or(usize::MAX))
-        };
+        let sized = st.data_bytes.saturating_mul(DATA_PER_FILE.1) / DATA_PER_FILE.0;
+        let grown = sized / self.opts.l0_trigger.max(1).saturating_mul(4) as u64;
+        let base = self
+            .opts
+            .seal_bytes
+            .max(usize::try_from(grown).unwrap_or(usize::MAX));
         if idle {
             return base;
         }
@@ -36962,9 +36848,6 @@ impl Reader {
         gen: u64,
         mine: Option<&(u64, std::sync::Arc<Snapshot>)>,
     ) -> bool {
-        if !self.opts.seal_snapshot {
-            return false;
-        }
         let st = self.state();
         if st.frozen.is_empty() {
             return false;
@@ -37038,7 +36921,7 @@ impl Reader {
             let added = self.fs().snap_added.borrow().len();
             stale = behind(held, added);
         }
-        if !stale && moved && self.opts.seal_snapshot {
+        if !stale && moved {
             // The log moved and the seal's snapshot is published: the
             // switch above asks only when nothing moved.
             stale = self.seal_snapshot_ahead(gen, cache.as_ref());
@@ -47784,7 +47667,7 @@ impl Db {
         // handle adopts a published snapshot under no pin, and a swap
         // from another thread between its load and its clone would free
         // what it took.
-        let snap_reader = if self.opts.seal_snapshot && self.opts.writer_pins {
+        let snap_reader = if self.opts.writer_pins {
             let r = self.seal_reader();
             // Every engine slot has a claimant by name, and one more would
             // take a seal's silently: the fast path would go, and no
@@ -47797,7 +47680,6 @@ impl Db {
         } else {
             None
         };
-        let from_snapshot = self.opts.seal_from_snapshot;
         let frozen_snaps = self.opts.frozen_snaps;
         // Reads around the table being sealed, by the writes of the
         // tables sealed since the store's scan count last moved: a seal
@@ -47827,12 +47709,7 @@ impl Db {
         self.shared
             .reads_near
             .store(near || self.draining, AtomicOrdering::Release);
-        let build_copy = if self.draining {
-            self.opts.drain_snapshot
-        } else {
-            near || self.opts.seal_snapshot_far
-        };
-        let put_one = self.opts.seal_put_one;
+        let build_copy = self.draining || near || self.opts.seal_snapshot_far;
         let bloom_pieces_only = self.opts.bloom_pieces_only;
         // As the seal's writer has them (`Shared::job_buffers`, above).
         let jobs_mapped = opts.maps();
@@ -47914,7 +47791,8 @@ impl Db {
                 });
                 let snap = match copied {
                     Some(h) => h.clone(),
-                    // A drain's seal builds none (`Options::drain_snapshot`).
+                    // A seal far from reads builds none
+                    // (`Options::seal_snapshot_far`).
                     None if !build_copy => return None,
                     None => {
                         let mut built = Snapshot::from_frozen(&mem, &order)?;
@@ -47975,7 +47853,7 @@ impl Db {
             // one: the keys and the chains in key order, one sequential
             // read, where the walk through the memtable was the entry,
             // the chain and the value, three dependent misses a key.
-            let stream = snap.as_ref().filter(|_| from_snapshot);
+            let stream = snap.as_ref();
             // The table itself, one pointer for the walk to keep, where
             // the walk through the capture reloaded the capture and then
             // the table from it at each of a key's eight uses.
@@ -48049,8 +47927,8 @@ impl Db {
                                 let (n, v) = s.arena.run(e.frun);
                                 let (range, tomb) = Snapshot::run_visible(n, v, SEE_ALL);
                                 // One value and no tombstone: the record
-                                // laid out once (`Options::seal_put_one`).
-                                if put_one && !tomb && range.len() >= 12 {
+                                // laid out once (`SegmentWriter::put_one`).
+                                if !tomb && range.len() >= 12 {
                                     let len = u32::from_le_bytes(
                                         v[range.start + 8..range.start + 12]
                                             .try_into()
@@ -48096,7 +47974,7 @@ impl Db {
                                 // Only what is live after the newest
                                 // tombstone, and the flag if there was one.
                                 let tomb = mem.live_offs_into(e, &mut offs, SEE_ALL);
-                                if put_one && !tomb && offs.len() == 1 {
+                                if !tomb && offs.len() == 1 {
                                     w.put_one(key, mem.value_at(offs[0]))?;
                                     continue;
                                 }
@@ -60524,20 +60402,15 @@ impl Maint {
             }
             return Ok(());
         }
-        // With `flush_ranges`, each round merges only the ranges that hold
-        // pieces, under the live fences -- one piece is enough to be due
-        // here, where the background trigger waits for several -- so a
-        // flush after an ordered or skewed load rewrites the partitions it
-        // touched and not the store. Without it, or before the first
-        // partitioning, everything is re-partitioned from every key.
+        // Each round merges only the ranges that hold pieces, under the
+        // live fences -- one piece is enough to be due here, where the
+        // background trigger waits for several -- so a flush after an
+        // ordered or skewed load rewrites the partitions it touched and not
+        // the store. Before the first partitioning everything is
+        // partitioned from every key.
         let mut rounds = 0usize;
         while self.segs().iter().any(|s| s.level == 0) {
-            let plan = if self.opts.flush_ranges {
-                self.merge_due(1)
-            } else {
-                None
-            };
-            match plan {
+            match self.merge_due(1) {
                 Some(fences) if !fences.is_empty() => {
                     let fences = if self.opts.promote {
                         self.promote_ranges(fences)?
