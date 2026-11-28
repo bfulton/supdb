@@ -1,0 +1,6 @@
+bench: bound 1342177280 bytes in group /sys/fs/cgroup/memory/process_api/01a221d0-2163-76a3-ba24-f0fe2c623019/claude-code-bash/supdb-bench-11497
+bench: each pass in a group of its own with the bound on it, this process in none
+bench ab: supdb against supdb at 3000000 keys, scans of 100, 3 pairs, each pass in a process of its own, under a bound of 1342177280 bytes, ops divided by 10
+    42s  rep 1/3
+    89s  rep 2/3
+   134s  rep 3/3

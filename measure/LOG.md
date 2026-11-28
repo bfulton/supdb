@@ -137,3 +137,12 @@ Same C0 binaries (`/home/user/c0/bench/target`, stamp `b3a043dc`, clean).
 - Tables: `measure/pairs/floor-supdb-core-{numbered,ids}-$SIZE-{1,2}.{out,err}` and `-head.txt`.
 - The floor itself (the band of the 2S medians per cell) is not computed:
   the run sheet's reader of the tables is not written yet.
+
+## 9. Noise floor, under both bounds, 2.30GHz class
+
+- Same queue (`measure/floor.sh`), each call:
+  `NAME=floor-supdb-b$((B >> 20))m-$K sh scripts/pair.sh supdb supdb $SIZE --bound $B --ops-div 10 --reps 3 --keys $K --passes load,read,read-threaded,scan,scan-threaded,mixes,scan-mixed,mixes-scrambled,lag --pairs ' '`
+  for B in 1073741824 1342177280, K in numbered ids, SIZE in 3M and 10M.
+- 2026-11-28T13:10:06Z to 15:03:09Z (`QUEUE DONE`), about 1 h 53 m. Every
+  pairing exit 0, both sittings whole; no kill. Times in `measure/logs/floor-bounded.log`.
+- Tables: `measure/pairs/floor-supdb-b{1024m,1280m}-{numbered,ids}-$SIZE-{1,2}.{out,err}` and `-head.txt`.
