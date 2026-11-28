@@ -107,15 +107,40 @@ But the writer's ask does not depend on the keep.
 
 ## Fix
 
-Proposed, and sent to the coordinator before it was written (13:42Z), since
-it changes the engine's behaviour. `ask_abandon` stops judging by the `from`
-the publish took before its swap. After the swap it reads the kept list
-first, then the look's position (`upkeep_lives`, SeqCst). The look stores its
-position before it trims, so a position read after the list is never newer
-than a trim the list reflects. The two then agree.
+The fix is commits `7a026f5`, `d20d75a` and `4485fca`. It changes the engine's behaviour, so it was sent to the coordinator before it was written (13:42Z) and approved (13:42Z).
 
-Status: _pending the coordinator's answer._
+`State::keeps_short` stops judging by `keep.from`, the position the publish read before its swap. After the swap it reads the kept list, then the look's position (`Shared::upkeep_lives`, SeqCst). The publish's own "no look" (`keep.from == u64::MAX`) still asks nothing, so it asks only where the old judgement asked. This covers every site that hands `ask_abandon` its `from`: `freeze_table`, `freeze_swap`, `set_mem_with`, and the landing that swaps the live table in `publish_segs_with`.
 
-## Mutants
+**No fence.** The comment at `keeps_short` gives the ordering argument, and the coordinator agreed (13:46Z). Every trim of a kept list is made under the list's lock, after its maker stored or loaded a position at least the trim's bound: the look in `Reader::note_over`, a publish in `swap_state`. So a list read after a trim is followed by a position at least that bound. That is a message passed through the lock, not the store-buffering shape. A fence there would have no litmus that can fail. `swap_state`'s own store-buffering pair, its CAS then load of the position against the look's store then load of the state, is SeqCst operations on both sides and is unchanged.
 
-_Pending the fix._
+**Seams and test.** `Db::look_inside_a_freeze` arms three bits of `kept_hold`, and the holds chain themselves. Each wait spins (`freeze_chain_wait`, cold) for a minute at most, and the seam makes no thread.
+- The upkeep thread's look that moves the position waits before its store until the freeze waits (`KEPT_HOLD_LOOK_STORE`, in `note_over`).
+- The freeze that read a position behind its state waits until the look has stored and trimmed (`KEPT_HOLD_FREEZE`, in `kept_from`; `freeze_held`, cold).
+- The look then waits after its trim until `Db::let_the_look_go` (`KEPT_HOLD_LOOK_TRIMMED`).
+- `Db::look_inside_a_freeze_held` says whether the chain ran whole.
+
+The test is `tests/settle.rs` `a_look_that_lands_inside_a_freeze_asks_the_upkeep_to_give_nothing_up`. It asserts its premise first: the chain ran whole, the look one table behind, one table kept. Then it asserts no ask, nothing given up, and the copies carried across the merge.
+
+The seam's first shape spawned a thread to drive the holds. The gate's `source` tests refused it: 5 more `std::thread` uses in `src/db.rs` (the door, 123 > 118), and public functions on no line of `tests/data/cost-entries.txt`. The chained shape adds no thread use. Its three entry points are on `cost-entries.txt`, declared in `scripts/raises.txt`.
+
+## Verdicts
+
+- Mutant, judging by `keep.from` again (the code before the fix):
+  `$B --exact a_look_that_lands_inside_a_freeze_asks_the_upkeep_to_give_nothing_up`
+  red 3 of 3, `no ask to give the forms up for a current look`, with the premise assertions passing. That held under both seam shapes. With the fix: green 3 of 3.
+- Unforced, four at once, 100 runs each:
+  - `a_copy_of_fixed_size_records_is_one_stream_until_a_write_it_cannot_take`: 400 of 400 green (before: 2 of 200 red).
+  - `a_copys_identity_outlives_a_merge_that_kept_its_partitions_keys`: 400 of 400 green.
+  - Under `SUPDB_TEST_STRIDE=1`, two at once, 100 runs of each test: green.
+- Cost, `sh scripts/cost.sh abeecbdd land merge seal`: green.
+  - `land` −4.95 an op over 100,000; `Db::freeze_table` +32 instructions over the run.
+  - `seal` +0.00; `merge` +5.04 an op (a whole-mode probe, within its slack).
+  - The first count, with `kept_from` out of line, was RED on `Db::kept_from` +352 over the run. Commit `d20d75a` made it inline again.
+  - `sh scripts/check.sh cost` against its own base (`b3a043dc`, C0) is RED, but on functions this change does not touch (`Blob::scan_at_in` +5367 an op on `scan_at`, `Reader::settle_each` +14 on `land`, `compact_run`, `Reader::scan`). Against `abeecbdd`, `settle_each` does not move. That RED is the coordination branch's since C0, not this change's.
+- Whole gate, `sh scripts/check.sh`, on `4485fca`, after `git fetch origin main`, with a `TMPDIR` of its own: passed twice, 14:57–15:38Z and 15:38–16:01Z (`all checks passed: build test stride onefile lint wasm bench lists`). `sh scripts/check.sh lists` let the three raises through.
+
+## Left open
+
+- The seam's own mutants (a hold removed) were not run: each would end red after its 60 s bound at the premise `the look and the freeze each held`.
+- The test cannot catch a mutant that reads the position before the list. In the seam, the look's trim lands before the publish, so that order makes no difference there.
+- The `cost` group against C0 is RED on the coordination branch's own changes (above). That is for whoever counts the branch.
