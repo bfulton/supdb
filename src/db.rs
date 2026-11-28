@@ -4778,35 +4778,10 @@ pub struct Options {
     /// `put_in_place` off. Off: the one writer's table, and a handle that
     /// writes is refused.
     pub shared_writers: bool,
-    /// EXPERIMENT, under `shared_writers`: a put or a delete of a key the
-    /// shared table holds lays its tombstone over nothing, since none of
-    /// the table's readers is isolated from a write and nothing reads past
-    /// the tombstone, and the chain it replaces -- one put's tombstone and
-    /// value, or one delete's tombstone -- is reused by the writer for a
-    /// write of the same length once every reader is pinned past the epoch
-    /// of its replacement (`TableLocal`). So a put over a value of its
-    /// length grows the table by nothing once the writer has a range back,
-    /// and the table is frozen for the keys it holds and not for the writes
-    /// made to them, as FASTER updates a record in its mutable region. A
-    /// value is never changed under a reader: the bytes a reader may hold
-    /// are reused only once it has gone. Off: every put appends, as the one
-    /// writer's table does.
-    pub shared_recycles: bool,
     /// EXPERIMENT, under `shared_writers`: the bytes of values a fresh
     /// shared live table takes before a write finds it full; zero takes
     /// the seal's threshold, a share of the store (`seal_max_pct`).
     pub shared_table_bytes: usize,
-    /// EXPERIMENT, under `shared_writers`: a probe of the shared table asks
-    /// for the line of the chain's head as it reads the entry, before the
-    /// key compare, since the entry names both (`MemTable::ask_head`). A get
-    /// or a read-modify-write of a key the table holds is four dependent
-    /// misses otherwise -- the index slot, the entry, the key and the head
-    /// -- where FASTER's is two, the bucket and the record. The lean path
-    /// (`shared_lean`) asks for the record's lines past its first, where a
-    /// put's value lies, as its key compare loads the first
-    /// (`MemTable::ask_record`). Off: the head read once the key has
-    /// compared, and the value's lines once the head names them.
-    pub shared_chunk_ahead: bool,
     /// EXPERIMENT, under `shared_writers`: the slots a shared table's index
     /// is made with, rounded up to a power of two; zero sizes it from the
     /// table's cap, a slot for each thirty-two bytes of values, which is
@@ -4817,96 +4792,10 @@ pub struct Options {
     /// finds itself full where its entries pass half its slots, as by the
     /// cap.
     pub shared_index_slots: usize,
-    /// EXPERIMENT, under `shared_writers`: a shared table lays each new key
-    /// as a record in its value arena -- the chain's head, its count and
-    /// the key's lock beside the key, and the key's first write just after
-    /// it -- and its index slots name the records (`MemTable::records`).
-    /// A probe goes from the slot to the record, which answers the key
-    /// compare and the head on the lines it starts on, and for a key one
-    /// put made, the value on the lines after: where a probe through the
-    /// entry was the slot, the entry, the key and the head, four misses in
-    /// a row, FASTER's is the bucket and the record. The entries stay, each
-    /// naming its record, for the walks by number. Off: an entry a key, its
-    /// key and its chunks apart.
-    pub shared_records: bool,
-    /// EXPERIMENT, under `shared_writers` with `shared_records`: a put of a
-    /// value of the length its key's value has overwrites the value where it
-    /// lies, under the record's lock, as FASTER updates a record in its
-    /// mutable region: no chunk laid down, no head swapped, and the value
-    /// beside its key on the record's lines for every read after. A read of
-    /// a table that rewrites copies a key's chain between two equal, even
-    /// readings of the record's lock (`MemTable::copy_chain`), as a sequence
-    /// lock's reader does, until the table's freeze has stopped the
-    /// overwrites and waited out the writers that may have been making one,
-    /// before it publishes the table frozen; a frozen table is read as the
-    /// one writer's is. Off: a put lays its value down and swaps the head.
-    pub shared_in_place: bool,
-    /// EXPERIMENT, under `shared_writers` with `shared_records`: a handle's
-    /// get, put and read-modify-write of a key the live table holds in one
-    /// put's shape -- one value over a lone tombstone, laid together -- go
-    /// from the index slot to the record by one lookup of its block and
-    /// read and write the key, the lock, the head and the value through
-    /// that one address (`MemTable::lean_find`, `Reader::read_live_lean`).
-    /// Every other key and shape takes the layered path. Off: every
-    /// operation goes through the layers, each of which looked the
-    /// record's block up again, 1,338 instructions a get, 887 a
-    /// read-modify-write and 692 a put of the threaded mixes at three
-    /// hundred thousand keys, where FASTER's are 365, 462 and 434.
-    pub shared_lean: bool,
-    /// EXPERIMENT, under `shared_writers`: the shared table's value arena
-    /// and its index are mapped at addresses a multiple of two megabytes and
-    /// advised onto the kernel's transparent huge pages (`MADV_HUGEPAGE`,
-    /// `blocks::map_huge`), neither taken from the
-    /// block pool nor given to it. A get or a write of a key the table holds
-    /// loads an index slot and then the key's record, each on a page of its
-    /// own among the table's: over 4 KiB pages a table of a store's records
-    /// is many times what the TLB maps, and every operation walks twice for
-    /// the translations before either miss starts, the walk charged to
-    /// whichever instruction first touches each page. FASTER's log and index
-    /// are on small pages under the kernel's `madvise` policy. Where the
-    /// host backs the guest's memory on small pages the translations stay
-    /// as small as the host's. Off: blocks as every other table maps them.
-    pub shared_huge: bool,
-    /// EXPERIMENT, under `shared_writers`: an insert into the shared table
-    /// leaves the slab's length where it is, and whoever reads the length
-    /// carries it over the entries written -- a walk of the entries, the
-    /// upkeep, a freeze once its writers are out (`MemTable::len`) -- where
-    /// every insert carried it, a sequentially consistent fence and the
-    /// loads of two words and an entry every inserting writer writes, a
-    /// third of an insert on one thread and the reason three threads
-    /// inserted no faster than one. A handle's operation takes no bound
-    /// from a shared table, whose reads are unbounded already: a get or a
-    /// put reads no length. Off: every insert carries the length.
-    pub shared_len_lazy: bool,
-    /// Under `shared_lean`, a handle whose last read found no record of
-    /// its key in the live table -- a key the store has, read below the
-    /// table, as a key's first touch is -- asks for the line of its next
-    /// key's partition slot before it probes the live table
-    /// (`Seg::prefetch_slot`), and hands the key's FNV word and partition
-    /// to the read below (`Reader::read_lone`, `Reader::read_placed`), as
-    /// a read-modify-write of a key the table lacks does
-    /// (`shared_rmw_absent`): such a read waits on three
-    /// lines one after another, the table's slot, the partition's slot and
-    /// its record, where FASTER's waits on two, and the partition's slot
-    /// is a function of the key alone, so its wait can stand beside the
-    /// table's. A handle whose reads the live table ends asks nothing. Off:
-    /// the partition asked for once the table has said it lacks the key.
-    pub shared_fall_ahead: bool,
-    /// EXPERIMENT, under `shared_fall_ahead`: every read asks for its
+    /// EXPERIMENT: every read asks for its
     /// partition's slot ahead of the live table's probe, whatever the last
     /// read found.
     pub shared_fall_always: bool,
-    /// Under `shared_lean`, a handle's read-modify-write of a key the live
-    /// table has no record of -- a key's first touch -- reads the key
-    /// below the table in the pin
-    /// and the state its lean probe was made in, and asks for the key's
-    /// partition slot ahead of that probe where the handle's last read
-    /// fell below the table (`shared_fall_ahead`), then puts. It probed
-    /// the table three times before it read below it, in the lean probe,
-    /// in the layered read-modify-write (`MemTable::rmw_shared`) and in
-    /// the read, and asked for the partition after the table's miss. Off:
-    /// those three probes, `supdb-heldsharedbigrmwprobes`.
-    pub shared_rmw_absent: bool,
     /// The live table shared by the handles' writes while handles write,
     /// and the one writer's otherwise: the form of the table follows who
     /// writes it. A store opens with the one writer's table, its block
@@ -4939,26 +4828,6 @@ pub struct Options {
     /// nothing of a store no handle writes. Off:
     /// `supdb-heldnoshare`, whose threads take the one writer in turn.
     pub share_on_write: bool,
-    /// Under `share_on_write`: the shared table the writer installs for
-    /// its handles is made whole before it is published -- every block of
-    /// its value arena up to its cap and the entry slab's blocks for the
-    /// entries its index takes, populated for writing
-    /// (`MemTable::populate_shared`) -- at the commit that installs it,
-    /// which a claim of a handle that writes makes (`Db::writer`). A table
-    /// installed in the middle of a workload is memory nothing has
-    /// touched, and its handles' first writes zeroed it a page at a time
-    /// on their own path, on huge pages two megabytes a fault: at the
-    /// host's price, which where the guest's balloon has reported the free
-    /// blocks to its host is milliseconds a huge page, and the first
-    /// threaded mix after a load read at half its rate for it. The price
-    /// is paid at the install, once, as FASTER pays for its log and index
-    /// at its open; the table's cap is memory the store was given for a
-    /// live table already. A value of over half an arena block is laid past
-    /// the blocks made ahead, and ends the table's room. A table a freeze
-    /// makes for the handles is not made ahead: its writers are waiting
-    /// for the commit that makes it. Off: the table's blocks made as its
-    /// writers reach them, `supdb-heldnopopulate`.
-    pub shared_populates: bool,
     /// A job's large per-key arrays -- a seal's sort of its
     /// table, a segment writer's copy of every key with its span, its
     /// record's offset and its hash, the ordered index builder's keys, a
@@ -7318,12 +7187,12 @@ impl Options {
                 self.block_shape(pool),
                 cap.max(4 * SHARED_STRIDE),
                 self.shared_index_slots,
-                self.shared_recycles,
-                self.shared_chunk_ahead,
-                self.shared_records,
-                self.shared_in_place,
-                self.shared_huge,
-                self.shared_len_lazy,
+                true,
+                true,
+                true,
+                true,
+                true,
+                true,
             )
         } else {
             MemTable::new(self.block_shape(pool))
@@ -7628,20 +7497,10 @@ impl Default for Options {
             index_populated: true,
             put_in_place: false,
             shared_writers: false,
-            shared_recycles: true,
             shared_table_bytes: 0,
-            shared_chunk_ahead: true,
             shared_index_slots: 0,
-            shared_records: true,
-            shared_in_place: true,
-            shared_lean: true,
-            shared_huge: true,
-            shared_len_lazy: true,
-            shared_fall_ahead: true,
             shared_fall_always: false,
-            shared_rmw_absent: true,
             share_on_write: true,
-            shared_populates: true,
             jobs_mapped: true,
             jobs_mapped_when_short: false,
             jobs_pooled: false,
@@ -15770,14 +15629,14 @@ struct MemTable {
     /// A table writers on several threads write at once
     /// (`Options::shared_writers`); `None` for the one writer's.
     shared: Option<Box<SharedTable>>,
-    /// A shared table whose keys are records in the value arena
-    /// (`Options::shared_records`): an index slot names the key's record,
+    /// A shared table whose keys are records in the value arena:
+    /// an index slot names the key's record,
     /// which holds the chain's head beside the key and the key's first
     /// write after it, and an entry names the record for the walks.
     records: bool,
     /// A table of records whose puts of a value of the length they replace
-    /// overwrite it where it lies, under the record's lock
-    /// (`Options::shared_in_place`); `closed` once its freeze has stopped
+    /// overwrite it where it lies, under the record's lock;
+    /// `closed` once its freeze has stopped
     /// that, and `settled` once the writers that may have been overwriting
     /// are out: every read of a table that rewrites and is not settled
     /// copies a chain between two equal readings of its record's lock
@@ -15797,7 +15656,7 @@ struct MemTable {
 const SHARED_STRIDE: usize = 64 << 10;
 /// A shared table's write locks, a stripe an entry number.
 const SHARED_STRIPES: usize = 4096;
-/// A shared table's key record (`Options::shared_records`), eight-aligned in
+/// A shared table's key record, eight-aligned in
 /// the value arena: the chain's head, offset plus one as an entry keeps it;
 /// the chain's count; the key's lock, odd while a writer changes the chain;
 /// the entry's number; the key's length; then the key, at `REC_HDR`, and the
@@ -15846,13 +15705,13 @@ struct SharedTable {
     vers: Box<[AtomicU32]>,
     /// A put or a delete drops the chain it replaces, whose bytes its
     /// writer reuses once no reader can be reading them
-    /// (`Options::shared_recycles`, `TableLocal::retire`).
+    /// (`TableLocal::retire`).
     recycles: bool,
     /// A probe asks for the chain's head as it reads the entry, before the
-    /// key compare (`Options::shared_chunk_ahead`, `MemTable::ask_head`).
+    /// key compare (`MemTable::ask_head`).
     head_ahead: bool,
     /// An insert leaves the slab's length to whoever reads it
-    /// (`Options::shared_len_lazy`, `MemTable::len`).
+    /// (`MemTable::len`).
     lazy_len: bool,
 }
 
@@ -17924,7 +17783,7 @@ impl MemTable {
         } = shape;
         let src = || blocks::Source::new(true, pool.clone());
         // A shared table's value arena and index on huge pages, where it
-        // asks (`Options::shared_huge`): the two a probe loads from.
+        // asks: the two a probe loads from.
         let huge = shared.is_some_and(|(_, _, h)| h);
         let slots = shared.map_or(1024, |(cap, want, _)| {
             let slots = if want > 0 {
@@ -18027,7 +17886,7 @@ impl MemTable {
     /// Shared, before the table is published: every block of the value
     /// arena up to the table's cap, and the entry slab's blocks for the
     /// entries its index takes at half load, made and populated for
-    /// writing (`Options::shared_populates`), so that the handles' first
+    /// writing, so that the handles' first
     /// writes into the table find their pages and take no fault for them.
     /// The bytes made. A range of over half a block is laid past the
     /// blocks made here (`ByteArena::made_ahead`), each of which is a
@@ -18137,7 +17996,7 @@ impl MemTable {
 
     /// Shared: the line of entry `e`'s chain head asked for, and the
     /// twelve bytes below it where a put's tombstone sits, where the table
-    /// asks (`Options::shared_chunk_ahead`): the entry names both the key
+    /// asks: the entry names both the key
     /// and the head, so the head's line comes while the key compare waits
     /// on the key's, where it was the fourth miss in a row of a get or a
     /// read-modify-write -- the slot, the entry, the key, the head.
@@ -18285,8 +18144,8 @@ impl MemTable {
         if self.slim_entries {
             return self.slim.len();
         }
-        // A shared table whose inserts leave the length to its readers
-        // (`Options::shared_len_lazy`): carried over the entries written
+        // A shared table whose inserts leave the length to its readers:
+        // carried over the entries written
         // before it is read, so a walk meets every entry written below the
         // first one claimed and not yet written, as an insert that carried
         // it would have left it.
@@ -18559,7 +18418,7 @@ impl MemTable {
     /// more (`Reader::note_read`): for a shared table whose length its
     /// readers carry, the length as it was last carried, since carrying it
     /// at every handle's read was a fence and the loads of two words every
-    /// inserting writer writes on every get (`Options::shared_len_lazy`).
+    /// inserting writer writes on every get.
     fn log_mark(&self) -> usize {
         if self.shared.as_deref().is_some_and(|st| st.lazy_len) {
             self.entries.len()
@@ -20066,7 +19925,7 @@ impl MemTable {
         true
     }
 
-    /// Shared records, the lean path (`Options::shared_lean`): the record
+    /// Shared records, the lean path: the record
     /// holding `key` in a table of records, as its offset in the value arena
     /// and the address of its first byte, from the index slot and one lookup
     /// of its block; `Ok(None)` where the table holds no record of the key.
@@ -20124,7 +19983,7 @@ impl MemTable {
 
     /// Shared records, lean: the lines of the record at `p` past its first,
     /// where a put of a value of `LEAN_AHEAD` bytes or fewer lies, asked for
-    /// as the key compare loads the first (`Options::shared_chunk_ahead`): a
+    /// as the key compare loads the first: a
     /// record names its value through its head, so the core can ask for the
     /// value's lines only once the first line has come, where FASTER's
     /// record has its value at a fixed offset and both are asked at once.
@@ -26196,8 +26055,8 @@ struct Shared {
     /// the seals that chose the one writer's table for the next
     /// (`Db::seal`): `Db::share_counts`.
     share_counts: [AtomicU64; 3],
-    /// The bytes of the shared tables made whole at their install
-    /// (`Options::shared_populates`): `Db::share_populated`.
+    /// The bytes of the shared tables made whole at their install:
+    /// `Db::share_populated`.
     share_populated: AtomicU64,
     /// A test's: how long a handle's shared write waits between taking the
     /// state and writing its table, in microseconds (`Db::hold_shared_writes`).
@@ -27469,17 +27328,16 @@ pub struct Reader {
     /// layered one (`Reader::read_lone`, `Reader::read_layers`), for a test that has to know which read its
     /// store took (`point_lean_reads`).
     lone_reads: std::cell::Cell<u64>,
-    /// The gets, puts and read-modify-writes the lean path answered
-    /// (`Options::shared_lean`).
+    /// The gets, puts and read-modify-writes the lean path answered.
     lean_ops: std::cell::Cell<u64>,
     /// This handle's last read found no record of its key in the live
-    /// table (`Options::shared_fall_ahead`).
+    /// table.
     lean_fell: std::cell::Cell<bool>,
     /// The reads that asked for their partition's slot ahead of the live
-    /// table's probe (`Options::shared_fall_ahead`).
+    /// table's probe.
     fall_asks: std::cell::Cell<u64>,
     /// The read-modify-writes that read a key the live table lacks below
-    /// it in their own pin (`Options::shared_rmw_absent`).
+    /// it in their own pin.
     rmw_below: std::cell::Cell<u64>,
     /// The live table's probes the placed read made (`Reader::read_placed`),
     /// which a read the lean probe found absent from it makes none of.
@@ -28377,7 +28235,7 @@ pub struct Db {
     share_quiet: bool,
     /// The next shared table made is the one the writer installs for its
     /// handles (`share`), which is made whole before it is published
-    /// (`Options::shared_populates`, `fresh_table`).
+    /// (`fresh_table`).
     share_flip: std::cell::Cell<bool>,
     /// Scratch for the run a value would encode as, measured at `append`
     /// against the inline limit.
@@ -28859,8 +28717,8 @@ impl Reader {
         self.state().mem.settled.load(AtomicOrdering::Acquire)
     }
 
-    /// A test's: the puts this handle has overwritten in place
-    /// (`Options::shared_in_place`), over every table it has written.
+    /// A test's: the puts this handle has overwritten in place,
+    /// over every table it has written.
     #[doc(hidden)]
     pub fn rewrites_made(&self) -> u64 {
         self.shared_local.borrow().rewrites
@@ -28917,9 +28775,7 @@ impl Reader {
         let mut l = self.shared_local.borrow_mut();
         let hash = mem.hash(key);
         if let SharedWrite::Put(value) = w {
-            if self.opts.shared_lean
-                && mem.records
-                && mem.lean_overwrite(&mut l, hash, key, value, None) == LeanWrite::Done
+            if mem.records && mem.lean_overwrite(&mut l, hash, key, value, None) == LeanWrite::Done
             {
                 self.lean_ops.set(self.lean_ops.get() + 1);
                 return Ok(true);
@@ -28954,26 +28810,19 @@ impl Reader {
             }
             let mut l = self.shared_local.borrow_mut();
             let hash = mem.hash(key);
-            if self.opts.shared_lean && mem.records {
+            if mem.records {
                 // A key the table lacks is read below it in this pin, from
                 // the state the probe was made in, with its partition's
                 // slot asked for ahead of the probe where the last read
-                // fell below the table (`Options::shared_rmw_absent`).
-                let absent_below = self.opts.shared_rmw_absent;
-                let pre = if absent_below {
-                    self.fall_ask(st, key)
-                } else {
-                    None
-                };
+                // fell below the table.
+                let pre = self.fall_ask(st, key);
                 match mem.lean_overwrite(&mut l, hash, key, value, Some(&mut f)) {
                     LeanWrite::Done => {
                         self.lean_ops.set(self.lean_ops.get() + 1);
-                        if absent_below {
-                            self.lean_fell.set(false);
-                        }
+                        self.lean_fell.set(false);
                         return Ok(true);
                     }
-                    LeanWrite::Absent if absent_below => {
+                    LeanWrite::Absent => {
                         drop(l);
                         self.lean_fell.set(true);
                         self.rmw_below.set(self.rmw_below.get() + 1);
@@ -30721,7 +30570,7 @@ impl Reader {
                     // named the writer's staged keys, and a scan counted
                     // them against its limit with nothing to emit. A
                     // shared table whose length its readers carry
-                    // (`Options::shared_len_lazy`) bounds nothing: its
+                    // bounds nothing: its
                     // reads are unbounded, and a walk reads the length as
                     // it walks (`MemTable::len`), so a get or a put reads
                     // no length.
@@ -32518,7 +32367,7 @@ impl Reader {
     /// its common shape; a read counted in neither took the general read. A
     /// handle's own count, as `ord_point_reads` is.
     /// A test's: the length of the live table this handle reads as it was
-    /// last carried, not carried here (`Options::shared_len_lazy`).
+    /// last carried, not carried here.
     #[doc(hidden)]
     pub fn shared_len_carried(&self) -> usize {
         let _e = self.enter();
@@ -32526,22 +32375,21 @@ impl Reader {
     }
 
     /// A test's: the gets, puts and read-modify-writes this handle's lean
-    /// path answered (`Options::shared_lean`).
+    /// path answered.
     #[doc(hidden)]
     pub fn shared_lean_ops(&self) -> u64 {
         self.lean_ops.get()
     }
 
     /// A test's: the read-modify-writes this handle made of a key the
-    /// live table lacked, read below it in their own pin
-    /// (`Options::shared_rmw_absent`).
+    /// live table lacked, read below it in their own pin.
     #[doc(hidden)]
     pub fn shared_rmw_below(&self) -> u64 {
         self.rmw_below.get()
     }
 
     /// A test's: the reads this handle asked for their partition's slot
-    /// ahead of the live table's probe (`Options::shared_fall_ahead`).
+    /// ahead of the live table's probe.
     #[doc(hidden)]
     pub fn shared_fall_asks(&self) -> u64 {
         self.fall_asks.get()
@@ -33651,13 +33499,13 @@ impl Reader {
         // an accessor at every step, thirty nanoseconds on a read of two
         // hundred at three hundred thousand keys.
         let st = self.state();
-        // A shared table of records first, through the record's address
-        // (`Options::shared_lean`): a shared table promises its readers no
+        // A shared table of records first, through the record's address: a
+        // shared table promises its readers no
         // isolation, so its reads honour no mark. A key with no record
         // there is read below with the live table known not to hold it.
         let mut live_absent = false;
         let mut pre = None;
-        if self.opts.shared_lean && st.mem.records {
+        if st.mem.records {
             pre = self.fall_ask(st, key);
             match self.read_live_lean(&st.mem, key, &mut f) {
                 LeanRead::Done(n) => {
@@ -33684,13 +33532,11 @@ impl Reader {
     }
 
     /// The partition's slot asked for ahead of the live table's probe
-    /// where the last read fell below the table
-    /// (`Options::shared_fall_ahead`): the key's FNV word and partition,
-    /// for the read below it, where the ask was made.
+    /// where the last read fell below the table: the key's FNV word and
+    /// partition, for the read below it, where the ask was made.
     #[inline(always)]
     fn fall_ask(&self, st: &State, key: &[u8]) -> Option<(u64, usize)> {
-        if !(self.opts.shared_fall_ahead
-            && (self.lean_fell.get() || self.opts.shared_fall_always)
+        if !((self.lean_fell.get() || self.opts.shared_fall_always)
             && st.parts > 0
             && !(self.opts.zpages != ZPages::Off && self.z_on()))
         {
@@ -33741,8 +33587,7 @@ impl Reader {
     }
 
     /// The live table's read of `key` where it is a shared table of
-    /// records, through the record's address (`Options::shared_lean`,
-    /// `MemTable::lean_read`), counted where it ends the read.
+    /// records, through the record's address (`MemTable::lean_read`), counted where it ends the read.
     #[inline(always)]
     fn read_live_lean<F: FnMut(&[u8])>(&self, mem: &MemTable, key: &[u8], f: &mut F) -> LeanRead {
         let r = mem.lean_read(mem.hash(key), key, f);
@@ -33794,7 +33639,7 @@ impl Reader {
         // partition and the pieces over it with the asks for the lines
         // their probes will load first, before the live table's probe: both
         // taken already where the read asked for its partition ahead of the
-        // live table (`pre`, `Options::shared_fall_ahead`). The live table
+        // live table (`pre`). The live table
         // asked first saved 78 instructions of a read it ends and cost the
         // others their asks' lead: timed by kind under the held log at
         // three hundred thousand keys, F's gets read 0.99x and 0.95x of
@@ -34061,8 +33906,7 @@ impl Reader {
     /// `f`, for every other store, which `read_sources` reads. With
     /// `live_absent`, the shared table's lean probe has found no record of
     /// the key in the live table, which is then left unread. `pre` is the key's FNV word and
-    /// partition where the read took them ahead of the live table's probe
-    /// (`Options::shared_fall_ahead`).
+    /// partition where the read took them ahead of the live table's probe.
     #[inline(always)]
     fn read_lone<F: FnMut(&[u8])>(
         &self,
@@ -48126,8 +47970,8 @@ impl Db {
             self.shared.shared_cap.load(AtomicOrdering::Relaxed),
         );
         // The table the writer installs for its handles, made whole here,
-        // before anyone else has it (`Options::shared_populates`).
-        if shared && self.share_flip.take() && self.opts.shared_populates {
+        // before anyone else has it.
+        if shared && self.share_flip.take() {
             self.shared
                 .share_populated
                 .fetch_add(t.populate_shared() as u64, AtomicOrdering::Relaxed);
@@ -49722,8 +49566,8 @@ impl Db {
     ///
     /// The claim commits, as `commit` does, what the writer has staged.
     /// In a store that shares on demand that commit finds the handle and
-    /// installs the shared table for it (`share_look`), made whole where
-    /// `Options::shared_populates` says: so the handle's first write
+    /// installs the shared table for it (`share_look`), made whole: so the
+    /// handle's first write
     /// lands, where a handle from `reader` has its first write answered
     /// `false` until the writer's next commit, and what installing a
     /// table costs is paid here, where a thread is given its handle, and
@@ -51774,8 +51618,8 @@ impl Db {
         ]
     }
 
-    /// The bytes of the shared tables made whole at their install
-    /// (`Options::shared_populates`), over the store's life.
+    /// The bytes of the shared tables made whole at their install,
+    /// over the store's life.
     pub fn share_populated(&self) -> u64 {
         self.shared.share_populated.load(AtomicOrdering::Relaxed)
     }
@@ -70300,7 +70144,7 @@ mod shared_table {
 
     thread_local! {
         /// The tables this thread's test makes leave the slab's length to
-        /// its readers (`Options::shared_len_lazy`): each test of the
+        /// its readers: each test of the
         /// length runs once as inserts carry it and once as walks do
         /// (`as_lazy`).
         static LAZY: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
@@ -70804,7 +70648,7 @@ mod shared_table {
     }
 
     /// A writer's puts over one key reuse the bytes of the puts they
-    /// replace once no reader can hold them (`Options::shared_recycles`):
+    /// replace once no reader can hold them:
     /// with nothing pinned the table stops growing after its first
     /// batches, every read the last put whole. A reader pinned meanwhile
     /// keeps the bytes it read as it read them, while the table grows beside
@@ -71681,7 +71525,7 @@ mod shared_table {
         }
     }
 
-    /// A shared table that asks for huge pages (`Options::shared_huge`)
+    /// A shared table that asks for huge pages
     /// has its value arena, where its records lie, and its index mapped
     /// advised onto them, and one that does not has neither: read off the
     /// kernel's flags for the mapping that holds a record and the index.

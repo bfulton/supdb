@@ -254,7 +254,7 @@ pub(crate) struct Source {
     /// handed out (`Options::index_populated`, `populate_write`).
     populate: bool,
     /// A mapped block of `HUGE` bytes or more is mapped on huge pages
-    /// (`map_huge`, `Options::shared_huge`), and neither taken from the
+    /// (`map_huge`), and neither taken from the
     /// pool nor given to it, whose blocks of its length are not.
     huge: bool,
 }
@@ -270,7 +270,7 @@ impl Source {
     }
 
     /// This source with its mapped blocks of `HUGE` bytes or more mapped on
-    /// huge pages, or not (`Options::shared_huge`).
+    /// huge pages, or not.
     pub(crate) fn huge(mut self, on: bool) -> Source {
         self.huge = on;
         self

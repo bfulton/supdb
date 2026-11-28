@@ -357,13 +357,11 @@ table and makes it whole, its index and its arena populated, as FASTER's
 log and index stand from its open, so that a cell times its operations and
 not the first touches of a table made inside it. `supdb-heldnoshare` is
 that arm with the table the one writer's whoever writes, its threads
-taking the writer in turn; `supdb-heldnopopulate` installs the table at the
-claim and leaves its memory to the writes that reach it; and
-`supdb-heldsharedbig` is the arm whose every table is shared, with what a
+taking the writer in turn; and `supdb-heldsharedbig` is the arm whose every table is shared, with what a
 shared table refuses turned off for the store's life. `supdb-heldhandle`
 makes the arm's own updates a write at a time through such a handle, with
 no batch behind a commit, which is the one isolation level FASTER has, and
-never leaves the shared table. All four are for pricing.
+never leaves the shared table. All three are for pricing.
 
 A burst of its own writer's -- the lag sweep's -- is lent to the upkeep
 thread and never filed by a commit or waited for

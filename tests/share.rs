@@ -1605,22 +1605,16 @@ fn a_claim_to_write_is_refused_where_no_handle_may_write() {
 }
 
 /// The table the writer installs for its handles is made whole before it
-/// is published (`Options::shared_populates`): its arena to its cap and
-/// its slab, counted in bytes, at a claim and at a commit that finds a
-/// handle asking alike. A table a freeze makes for the handles is not, and
-/// with the option off none is. The writes land and read back either way.
+/// is published: its arena to its cap and its slab, counted in bytes, at a
+/// claim and at a commit that finds a handle asking alike. A table a
+/// freeze makes for the handles is not. The writes land and read back.
 #[test]
 fn the_table_installed_for_the_handles_is_made_whole() {
     let _w = Watchdog::arm("a table made whole waited a minute");
     let cap = 6usize << 20;
-    for (name, populates, claimed) in [
-        ("whole-claim", true, true),
-        ("whole-asked", true, false),
-        ("whole-off", false, true),
-    ] {
+    for (name, claimed) in [("whole-claim", true), ("whole-asked", false)] {
         let o = Options {
             shared_table_bytes: cap,
-            shared_populates: populates,
             ..options()
         };
         let (d, mut db, mut model) = loaded(name, o);
@@ -1635,14 +1629,10 @@ fn the_table_installed_for_the_handles_is_made_whole() {
         };
         assert!(db.live_shared(), "{name}");
         let made = db.share_populated();
-        if populates {
-            assert!(
-                made >= cap as u64,
-                "{name}: the table's arena to its cap, {made} bytes"
-            );
-        } else {
-            assert_eq!(made, 0, "{name}: made as it is written");
-        }
+        assert!(
+            made >= cap as u64,
+            "{name}: the table's arena to its cap, {made} bytes"
+        );
         // Values enough to fill the table, so that a put is refused and
         // the commit after it freezes the table under a fresh one.
         let big = vec![0x5Au8; 64 << 10];
@@ -1673,41 +1663,39 @@ fn the_table_installed_for_the_handles_is_made_whole() {
 /// whole is laid past the blocks made ahead, each of which is a block's
 /// bytes: it reads back whole, beside the keys written before it and
 /// after, through the freeze its range ends the table's room with, the
-/// flush and a reopen. The same with the table made as it is written.
+/// flush and a reopen.
 #[test]
 fn a_value_over_an_arena_block_lands_whole_in_a_table_made_ahead() {
     let _w = Watchdog::arm("a value over a block waited a minute");
-    for (name, populates) in [("over-block-whole", true), ("over-block-bare", false)] {
-        let o = Options {
-            shared_table_bytes: 6 << 20,
-            shared_populates: populates,
-            ..options()
-        };
-        let (d, mut db, mut model) = loaded(name, o.clone());
-        let w = db.writer().unwrap();
-        for i in 0..200 {
-            let (k, v) = (key(i * 2 + 1), format!("before-{i}").into_bytes());
-            write(&mut db, || w.put(&k, &v));
-            model.insert(k, v);
-        }
-        let big: Vec<u8> = (0..(5usize << 20)).map(|i| (i % 251) as u8).collect();
-        let k = b"key-over-a-block".to_vec();
-        write(&mut db, || w.put(&k, &big));
-        model.insert(k, big);
-        for i in 200..400 {
-            let (k, v) = (key(i * 2 + 1), format!("after-{i}").into_bytes());
-            write(&mut db, || w.put(&k, &v));
-            model.insert(k, v);
-        }
-        hold(&db, &model, name);
-        drop(w);
-        db.flush().unwrap();
-        db.settle().unwrap();
-        hold(&db, &model, name);
-        drop(db);
-        let db = Db::open(&d, o).unwrap();
-        hold(&db, &model, name);
-        drop(db);
-        let _ = std::fs::remove_dir_all(&d);
+    let name = "over-block-whole";
+    let o = Options {
+        shared_table_bytes: 6 << 20,
+        ..options()
+    };
+    let (d, mut db, mut model) = loaded(name, o.clone());
+    let w = db.writer().unwrap();
+    for i in 0..200 {
+        let (k, v) = (key(i * 2 + 1), format!("before-{i}").into_bytes());
+        write(&mut db, || w.put(&k, &v));
+        model.insert(k, v);
     }
+    let big: Vec<u8> = (0..(5usize << 20)).map(|i| (i % 251) as u8).collect();
+    let k = b"key-over-a-block".to_vec();
+    write(&mut db, || w.put(&k, &big));
+    model.insert(k, big);
+    for i in 200..400 {
+        let (k, v) = (key(i * 2 + 1), format!("after-{i}").into_bytes());
+        write(&mut db, || w.put(&k, &v));
+        model.insert(k, v);
+    }
+    hold(&db, &model, name);
+    drop(w);
+    db.flush().unwrap();
+    db.settle().unwrap();
+    hold(&db, &model, name);
+    drop(db);
+    let db = Db::open(&d, o).unwrap();
+    hold(&db, &model, name);
+    drop(db);
+    let _ = std::fs::remove_dir_all(&d);
 }
