@@ -11,29 +11,73 @@ and is signed. Times are UTC.
 |---|---|---|---|
 | PR13 | `745febd` zpages-recode, `70cbecc` merge-drop, `70ce215` the zpages tests' Linux-only helpers (macOS clippy) | green at `70ce215`: every group, with `lists` rerun after `git fetch origin main` | RED against `8e3f9d71` on `merge`, carried to PR18 (below) |
 | PR14 | `1ee67db` zpages-coding, `e4e6e0f` `zpages_hold_after_settle` goes (no setter left), `b52e269` zpages-codec | green at `b52e269`: "all checks passed: build test stride onefile lint wasm bench lists" | green against `70ce215` |
+| PR15 | `607ed7d` the open's attach drops raw pages only where asked (a fix of 1ee67db's positional tuple), `69cec32` zpages-read, `f317848` zpages-walk | green at `f317848`: "all checks passed: build test stride onefile lint wasm bench lists" | RED against `b52e269` by the script's verdict, but it passes under the amended rule: each gain is inlining that moved, and every probe's net falls (below) |
 
-## In progress: PR15 (zpages-read, zpages-walk)
+### PR15's count, read by function
 
-- `607ed7d`: a fix for a bug `1ee67db` (PR14) made. `Db::z_attach`'s
-  positional flag tuple lost `zpages_inplace_walk`, and the raw drop kept
-  index 3, which became the decode timer's. An attach at the open, at a
-  seal or at the gate's give then dropped raw pages wherever decodes are
-  timed (on by default), not where `zpages_drop_raw` asks. The default,
-  which drops, read the same. The flags are now a struct
-  (`ZAttachLines`). Its test fails at `b52e269` and passes at the fix.
-  PR14's gate and count read the buggy shape for drop-off stores and
-  arms; the default did not differ.
-- `69cec32`: zpages-read. `zpages_point_part` stays as a hidden seam,
-  and its three arms go.
-- Next: zpages-walk (`zpages_scan_admit`, `zpages_bulk_admit`,
-  `zpages_bulk_steps`, `zpages_seek_seeds`, `zpages_walk_owns_decodes`;
-  arms supdb-zbulkmemo, supdb-zbulksearch, supdb-zscanputs,
-  supdb-zseekseed, supdb-zwalkowns; `zpages_scan_admit` is a fuzz draw
-  and keeps its call). Then the whole gate, then the count against
-  `b52e269`, alone:
+`sh scripts/cost.sh b52e269`, at `f317848`, alone:
 
-      sh scripts/check.sh           # to its last line
-      sh scripts/cost.sh b52e269    # nothing else on the machine
+- The nets: read_z -22.17 an op, scan -101.00, scan_long -101.15,
+  scan_z -281.83, scan_long_z -5,440.13, scan_s -18.00 and
+  scan_long_s -18.00. merge's +8.09 is `Reader::sweep_retired_states`,
+  held to its own bound, as it was at PR14.
+- Gains, and what they were inlined from:
+  - `ZFile::open_group_with` +11.9 an op on read_z (+101 on scan_z,
+    +3,536 on scan_long_z), against `ZMemo::get` -27.1 (-276 on scan_z).
+    Once the memo-first branch went (69cec32), `ZMemo::get` was small
+    enough to inline. The base's `open_group_with` called it 101,095
+    times on read_z and the head's calls it none; the symbol is in
+    neither of the head's probes (`nm -C`).
+  - `Reader::pwalk_seek` +132.0 on scan_z (+10.0 on scan_s) and
+    `ZCursor::stride_seek` +3.0 on scan_s, against `ZCursor::seek`
+    -151.0 (-31.0). Its other caller was the seeded seek, which went in
+    f317848. The head's `pwalk_seek` calls seek's own callees (`place`,
+    `group_of_key`, `open_at`), and the symbol is gone.
+
+### Positional check (the coordinator's ask after 607ed7d)
+
+I read every commit of this track (745febd, 70cbecc, 70ce215, 1ee67db,
+e4e6e0f, b52e269, 607ed7d, 69cec32) for an entry removed from a tuple,
+array, bit set or positional argument list whose other entries are still
+read by position:
+
+- Tuples read by index (`git show C -- src | grep '[a-z_]\.[0-9]'`):
+  - In 745febd the only ones are the re-code look's rows (`r.5`, `r.6`,
+    `t.0`..`t.2`), removed whole with `Maint::z_recode_look`.
+  - 1ee67db's `z_attach` tuple is the bug 607ed7d fixed.
+  - b52e269 renumbered the same tuple's tail (cursor_view, group_ahead,
+    walk_owns) to match; its one wrong read was the drop's `lines.3`,
+    from 1ee67db.
+  - Since 607ed7d the tuple is a struct.
+- Bit sets and arrays: none of these commits removes a flag bit, a
+  constant shift or an array slot. The only removed lines of that shape
+  are byte sizes (`32 << 20`, `2 << 20`, `8 << 20`) and the fence tree's
+  `ProbeLine([u64; 8])`, which went whole.
+- Positional arguments, a removed parameter against each call site:
+  - 70cbecc: `Db::layout_of` lost `from_index` after `rebase`, and its
+    one call dropped `self.opts.same_blocks_from_index`, the argument in
+    that place. `Db::same_blocks` lost `from_index` between `b` and
+    `asked`, and its call matches. Both are typed apart from their
+    neighbours.
+  - 69cec32: `Db::z_attach` lost `trusted` and `memo_first`, and its
+    three callers pass `advise, memo, prefetch` in order.
+    `zfile::ZFile::attach` lost `memo_first` after `trusted`. Its 14
+    callers (10 in zfile.rs, 4 in db.rs), parsed before and after, each
+    dropped the `memo_first` argument and kept `trusted`, the fence and
+    `memo_ahead`. The store's calls now pass `true`,
+    `FenceSearch::Words` and `true`, which are what its defaults gave.
+  - Every other removed field is a struct's or an initializer's, named.
+
+## Next: PR16 (zpages-cursor)
+
+`zpages_bulk_part`, `zpages_walk_part`, `zpages_cursor_view`,
+`zpages_group_ahead`, `zpages_block_cursor`, `zpages_scan_cursor`,
+`zpages_walk_cursor`, `zpages_block_cache`: 9 arms, 12 test functions,
+and fuzz draws (`zpages_walk_part`, `zpages_block_cursor`) whose calls
+stay. `cursor_view` and `group_ahead` are `ZAttachLines` fields. Then:
+
+    sh scripts/check.sh           # to its last line
+    sh scripts/cost.sh f317848    # nothing else on the machine
 
 ## Held back, and why
 
@@ -50,9 +94,9 @@ and is signed. Times are UTC.
   fails, declare it in `scripts/raises.txt` with the instruction reading
   as its reason, and report it.
 
-## After PR15
+## After PR16
 
-PR16 is zpages-cursor. PR17 is forms-carry, then hot-raw. PR18 is
+PR17 is forms-carry, then hot-raw. PR18 is
 settle-filing, then merge-walk. Each follows
 `release/ledger-review/consistency-and-order.md` (its rows and its
 appendix) and `release/phase1.md`.
