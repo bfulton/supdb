@@ -40,3 +40,15 @@ and copied here under `measure/rows/` at the same relative path.
   that move with the machine get no verdict; 3 of 2228 quantities
   no-verdict (supdb-heldnoframes recover-shuffled open_ms at 30k, 100k, 300k),
   37 flagged better, none of the engine's regressed.
+
+## 2. Encrypted roster, quick row
+
+- Build: `sh scripts/deps.sh openssl` (`all deps ready: openssl`), then
+  `cd bench && cargo build --release --no-default-features --features enc --target-dir target-enc --bin bench`
+  (cargo reported 8m 22s); stamp `b3a043dc…`, clean.
+- Command: `cd /home/user/c0/bench && TMPDIR=/home/user/base/tmp/enc ./target-enc/release/bench run --scale quick --arms enc --out /home/user/base/rows-enc`
+- Start 2026-11-27T23:41:08Z, row written 2026-11-28T00:09:01Z (about 28 minutes). No kill.
+- Row: `measure/rows-enc/quick/20261127T234108Z-b3a043d.json` (to 300,000 keys).
+- Read: `python3 scripts/encrow.py <row>` → `measure/logs/encrow.txt`
+  (supdb-cipher against lmdb3-enc: ahead 111, behind 17, unresolved 16;
+  against rocksdb-tuned-enc: ahead 114, behind 9, unresolved 21; the rest in the file).
