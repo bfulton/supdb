@@ -256,10 +256,7 @@ fn share_mode() -> u8 {
 /// in which the stores share their live table on demand
 /// (`Options::shares`).
 fn shares(c: &Cfg) -> bool {
-    share_mode() > 0
-        && matches!(c.sync, SyncPolicy::Explicit)
-        && !c.held_frames
-        && !c.in_place
+    share_mode() > 0 && matches!(c.sync, SyncPolicy::Explicit) && !c.held_frames && !c.in_place
 }
 
 fn trace_on() -> bool {
