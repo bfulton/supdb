@@ -6787,6 +6787,7 @@ fn ss_run_close_fails(tag: &str, by_flush: bool, inline: bool, strict: bool) {
     db.fail_next_seal_sync();
     db.hold_seal_durable(true);
     let cause = "a test failed this seal's fsync";
+    let mut flush_answered = false;
     if by_flush {
         let h = db.reader().unwrap();
         let lifter = std::thread::spawn(move || {
@@ -6800,7 +6801,15 @@ fn ss_run_close_fails(tag: &str, by_flush: bool, inline: bool, strict: bool) {
             }
             h.hold_seal_durable_from_handle(false);
         });
-        match db.flush() {
+        // Answered early, the flush may still meet the failure: where the
+        // seal's fsync fails between the drain's early answer and the
+        // writer's look at the segment work's error after it, the flush
+        // takes that error as its answer, and no commit after it has one
+        // to answer. 5 of 120 runs four at once beside four busy loops, each
+        // with the flush answering `Err`, waited 120 s for a commit's.
+        let flushed = db.flush();
+        flush_answered = flushed.is_err();
+        match flushed {
             Ok(()) if !strict => {}
             Ok(()) => panic!("{tag}: the flush answered Ok over its seal's failure"),
             Err(e) => assert!(
@@ -6827,7 +6836,7 @@ fn ss_run_close_fails(tag: &str, by_flush: bool, inline: bool, strict: bool) {
     // A write below the run's keys, through the log, acknowledged: the
     // segment work's error, left for the writer where the work met the
     // failure on its own, answered by a commit first.
-    if !by_flush || !strict {
+    if (!by_flush || !strict) && !flush_answered {
         let e = ss_commit_answer(&mut db);
         assert!(
             e.to_string().contains(cause),
@@ -15219,9 +15228,32 @@ fn do_drain_lands_its_run(tag: &str, inline: bool, strict: bool, presync: bool) 
             db.commit().unwrap();
         }
     }
+    // Where the drain may answer early, its seal held between its phases
+    // across the flush: the early answer is the one at the seal's readable
+    // landing, and a seal thread that returned before the segment work
+    // took that landing left nothing to answer early -- the drain was
+    // answered at the durable landing, no later, and one run in thirteen
+    // beside four busy loops read `drains_early` 0. Lifted once the flush
+    // answers, or after a minute, so a flush that waits for the durable
+    // landing ends red and not parked.
+    let lifter = early.then(|| {
+        let h = db.reader().unwrap();
+        h.hold_seal_durable_from_handle(true);
+        let (tx, rx) = std::sync::mpsc::channel::<()>();
+        let t = std::thread::spawn(move || {
+            let _ = rx.recv_timeout(std::time::Duration::from_secs(60));
+            h.hold_seal_durable_from_handle(false);
+        });
+        (tx, t)
+    });
     db.flush().unwrap();
+    let answered_held = db.seal_waits().drains_early;
+    if let Some((tx, t)) = lifter {
+        drop(tx);
+        t.join().expect("the lifter");
+    }
     assert_eq!(
-        db.seal_waits().drains_early,
+        answered_held,
         u64::from(early),
         "{tag}: the drain answered early where it may"
     );
