@@ -158,6 +158,8 @@ pub const MAX_KEY_LEN: usize = u16::MAX as usize;
 /// The longest value a store holds, in bytes: the live table names a
 /// value's length in a 32-bit word. Every write refuses a longer one.
 pub const MAX_VALUE_LEN: usize = u32::MAX as usize;
+// `batch_fits` reads each limit as the bits past it: the two are its shifts.
+const _: () = assert!(MAX_KEY_LEN as u64 == (1 << 16) - 1 && MAX_VALUE_LEN as u64 == (1 << 32) - 1);
 
 /// Whether a write of `key` and `value` is one the store can hold: the
 /// one check every write entry point makes before anything of the write
@@ -170,6 +172,17 @@ fn write_fits(key: &[u8], value: &[u8]) -> Result<()> {
         return Err(write_refused(key.len(), value.len()));
     }
     Ok(())
+}
+
+/// `write_fits` for every record of a batch, as one pass with no branch a
+/// record: the bits of each length past its limit, gathered. A refusal
+/// finds the record to name off the loads' path (`Db::refuse_batch`).
+#[inline]
+fn batch_fits(items: &[(&[u8], &[u8])]) -> bool {
+    let past = items.iter().fold(0u64, |m, &(k, v)| {
+        m | (k.len() as u64 >> 16) | (v.len() as u64 >> 32)
+    });
+    past == 0
 }
 
 #[cold]
@@ -46439,8 +46452,8 @@ impl Db {
     /// `commit` answers `InvalidInput`.
     pub fn append_batch(&mut self, items: &[(&[u8], &[u8])]) {
         let _op = self.op();
-        if let Err(e) = items.iter().try_for_each(|&(k, v)| write_fits(k, v)) {
-            return self.refuse_write(e);
+        if !batch_fits(items) {
+            return self.refuse_batch(items);
         }
         for &(key, value) in items {
             self.append_pinned(key, value);
@@ -46454,6 +46467,16 @@ impl Db {
     #[inline(never)]
     fn refuse_write(&mut self, e: std::io::Error) {
         self.pending_err.get_or_insert(e);
+    }
+
+    /// A batch `batch_fits` refused, answered as `refuse_write` answers a
+    /// write, naming its first record past a limit.
+    #[cold]
+    #[inline(never)]
+    fn refuse_batch(&mut self, items: &[(&[u8], &[u8])]) {
+        if let Err(e) = items.iter().try_for_each(|&(k, v)| write_fits(k, v)) {
+            self.refuse_write(e);
+        }
     }
 
     fn append_pinned(&mut self, key: &[u8], value: &[u8]) {
@@ -47228,8 +47251,8 @@ impl Db {
     /// `append_batch` refuses one.
     pub fn put_batch(&mut self, items: &[(&[u8], &[u8])]) {
         let _op = self.op();
-        if let Err(e) = items.iter().try_for_each(|&(k, v)| write_fits(k, v)) {
-            return self.refuse_write(e);
+        if !batch_fits(items) {
+            return self.refuse_batch(items);
         }
         for &(key, value) in items {
             self.put_pinned(key, value);
