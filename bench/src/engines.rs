@@ -12946,12 +12946,11 @@ impl WriteRing {
 /// A key's hash, for the writer's filters of keys.
 fn key_hash(key: &[u8]) -> u64 {
     let mut h = 0x9E37_79B9_7F4A_7C15u64;
-    let mut c = key.chunks_exact(8);
-    for w in &mut c {
-        h = (h ^ u64::from_le_bytes(w.try_into().expect("eight bytes")))
-            .wrapping_mul(0xFF51_AFD7_ED55_8CCD);
+    let (words, rest) = key.as_chunks::<8>();
+    for w in words {
+        h = (h ^ u64::from_le_bytes(*w)).wrapping_mul(0xFF51_AFD7_ED55_8CCD);
     }
-    for &b in c.remainder() {
+    for &b in rest {
         h = (h ^ u64::from(b)).wrapping_mul(0xFF51_AFD7_ED55_8CCD);
     }
     h

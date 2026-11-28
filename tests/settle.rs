@@ -2181,6 +2181,9 @@ fn a_copys_identity_outlives_a_merge_that_kept_its_partitions_keys() {
                 want.insert(k.clone(), vec![v.to_vec()]);
             }
             db.commit().unwrap();
+            // The writer's look at the log's end before the freeze
+            // (`a_copy_of_fixed_size_records_is_one_stream_until_a_write_it_cannot_take`).
+            assert_eq!(scan_model(&db), want, "the writer's scan before the seal");
             db.seal().unwrap();
         }
         // The writer's look brought to the log's end before the tables land
@@ -2772,10 +2775,17 @@ fn a_copy_of_fixed_size_records_is_one_stream_until_a_write_it_cannot_take() {
                 want.insert(k.clone(), vec![vec![b'a' + round; 100]]);
             }
             db.commit().unwrap();
+            // The writer's look brought to the log's end before each freeze
+            // and before the tables land: a scan takes the upkeep's pass
+            // home and reads the log. A freeze that finds the look further
+            // behind than the tables the store keeps for it asks the
+            // upkeep to give its forms up, and a look behind the landings
+            // comes back to tables it cannot carry: either way the copies
+            // are gone, which the keep bound (an eighth of the memory
+            // available at open) and a pass a loaded machine slows decide.
+            answers(&db, &want, &from, "before the seal");
             db.seal().unwrap();
         }
-        // The writer's look brought to the log's end before the tables
-        // land: a scan takes the upkeep's pass home and reads the log.
         answers(&db, &want, &from, "before the landings");
         let drops_before = db.forms_drop_reasons();
         db.hold_seal_durable(false);
