@@ -12,6 +12,7 @@ and is signed. Times are UTC.
 | PR13 | `745febd` zpages-recode, `70cbecc` merge-drop, `70ce215` the zpages tests' Linux-only helpers (macOS clippy) | green at `70ce215`: every group, with `lists` rerun after `git fetch origin main` | RED against `8e3f9d71` on `merge`, carried to PR18 (below) |
 | PR14 | `1ee67db` zpages-coding, `e4e6e0f` `zpages_hold_after_settle` goes (no setter left), `b52e269` zpages-codec | green at `b52e269`: "all checks passed: build test stride onefile lint wasm bench lists" | green against `70ce215` |
 | PR15 | `607ed7d` the open's attach drops raw pages only where asked (a fix of 1ee67db's positional tuple), `69cec32` zpages-read, `f317848` zpages-walk | green at `f317848`: "all checks passed: build test stride onefile lint wasm bench lists" | RED against `b52e269` by the script's verdict, but it passes under the amended rule: each gain is inlining that moved, and every probe's net falls (below) |
+| PR16 | `6869f6c` zpages-cursor (seven options go; `zpages_scan_cursor` held as a hidden seam, below) | green at `6869f6c`: "all checks passed: build test stride onefile lint wasm bench lists" | RED against `f317848`: `scan` +1.0 and `scan_long` +1.15 a scan, `work` +0.83 an op, register allocation with the net above zero (below); reported |
 
 ### PR15's count, read by function
 
@@ -68,16 +69,19 @@ read by position:
     `FenceSearch::Words` and `true`, which are what its defaults gave.
   - Every other removed field is a struct's or an initializer's, named.
 
-## Next: PR16 (zpages-cursor)
+## Next: PR17 (forms-carry, then hot-raw)
 
-`zpages_bulk_part`, `zpages_walk_part`, `zpages_cursor_view`,
-`zpages_group_ahead`, `zpages_block_cursor`, `zpages_scan_cursor`,
-`zpages_walk_cursor`, `zpages_block_cache`: 9 arms, 12 test functions,
-and fuzz draws (`zpages_walk_part`, `zpages_block_cursor`) whose calls
-stay. `cursor_view` and `group_ahead` are `ZAttachLines` fields. Then:
+- forms-carry: `forms_carry`, `freeze_settles` and `forms_rebase` go.
+  `rebase_recuts_sparse` is a seam: its arms supdb-rebasedrops and
+  supdb-rebasedropsshed go. 13 test functions in tests/db.rs.
+- hot-raw: eight options go. `zpages_hot_raw` and `zpages_hot_fill` are
+  seams: their arms supdb-znohotraw and supdb-znohotfill go. Five test
+  functions in tests/zpages.rs.
+
+Then:
 
     sh scripts/check.sh           # to its last line
-    sh scripts/cost.sh f317848    # nothing else on the machine
+    sh scripts/cost.sh 6869f6c    # nothing else on the machine
 
 ## Held back, and why
 
@@ -94,9 +98,28 @@ stay. `cursor_view` and `group_ahead` are `ZAttachLines` fields. Then:
   fails, declare it in `scripts/raises.txt` with the instruction reading
   as its reason, and report it.
 
-## After PR16
+- PR16's count against `f317848`: three probes rise.
+  - `scan` and `scan_long`: HOT GAINED `Reader::scan_blocks` +3 a scan,
+    with `Reader::scan_seek` -2. The two option checks removed from
+    `scan_blocks` and `PartReader::new` save 8 instructions a scan
+    (`cmpb`/`jne`). On no source line, the head adds stores of `r9`,
+    `r8` and `rcx` to the frame at entry, two reloads of `0x20(%rsp)`,
+    an `xorl` and a `nop`. That is register allocation, but the net is
+    above zero.
+  - `work`: HOT GAINED `Reader::scan` +0.83 an op (+250,000 over the
+    run). Its lines balance; the gain is on no line, about one
+    instruction a call.
+  - `land`: `scan_blocks` +0.001 an op and `SnapBounds::cuts_of` +0.078,
+    with the net -4.30.
+  - Reported to the coordinator; not fixed and not declared.
+- `zpages_scan_cursor`: the ledger says inline, but it is kept as a
+  hidden seam. `a_scan_over_unvisited_clean_blocks_is_one_dispatch_into_the_form`
+  sets it off to count one dispatch a block against the clean run's one,
+  and under one held cursor that count is one either way. Only its arm
+  supdb-blockcursors goes. This waits for the coordinator to confirm.
 
-PR17 is forms-carry, then hot-raw. PR18 is
-settle-filing, then merge-walk. Each follows
+## After PR17
+
+PR18 is settle-filing, then merge-walk. Each follows
 `release/ledger-review/consistency-and-order.md` (its rows and its
 appendix) and `release/phase1.md`.
