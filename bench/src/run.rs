@@ -2408,10 +2408,17 @@ struct PhaseMark {
 }
 
 /// Takes the readings around a bounded pass's phases, and nothing for
-/// an unbounded one. The device is the temp directory's, falling back to
-/// `vda`, and its stat file read once to decide whether it is there.
+/// an unbounded one, and the device's writes across the ordered load in
+/// either. The device is the one the store's directory is on
+/// (`env::device_stat_of`), or none: a device that is not the store's
+/// counts somebody else's requests.
 struct Counting<'a> {
     bound: Option<&'a Bound>,
+    /// The store's directory, which the load's reading syncs.
+    store_dir: PathBuf,
+    /// The store's device's `stat`, wherever it can be read.
+    store_dev: Option<PathBuf>,
+    /// The same, bounded alone: the phases' read counts.
     dev_stat: Option<PathBuf>,
     out: Vec<(String, String, PhaseCounts)>,
     trace: Option<PhaseTrace>,
@@ -2431,13 +2438,14 @@ impl<'a> Counting<'a> {
         if let Some(b) = bound {
             probe_counts(b)?;
         }
-        let dev_stat = bound.map(|_| {
-            let dev = env::block_device_of(dir).unwrap_or_else(|| "vda".to_string());
-            PathBuf::from(format!("/sys/block/{dev}/stat"))
-        });
-        let dev_stat = dev_stat.filter(|p| dev_read_stat(p).is_some());
+        let store_dev = env::device_stat_of(dir);
+        let dev_stat = bound
+            .and(store_dev.clone())
+            .filter(|p| dev_read_stat(p).is_some());
         Ok(Counting {
             bound,
+            store_dir: dir.to_path_buf(),
+            store_dev,
             dev_stat,
             out: Vec::new(),
             trace,
@@ -2552,8 +2560,6 @@ pub fn probe_counts(bound: &Bound) -> Result<(), String> {
     Ok(())
 }
 
-/// `/sys/block/<dev>/stat`'s (read I/Os, read ticks in ms): the first and
-/// fourth fields (`Documentation/block/stat.rst`).
 /// The device's sectors read and written so far, from its `stat` file
 /// (fields 3 and 7): what a pass's window of them says the device did,
 /// whoever asked.
@@ -2578,6 +2584,8 @@ fn proc_io() -> Option<(u64, u64)> {
     Some((field("read_bytes:")?, field("write_bytes:")?))
 }
 
+/// A device's `stat`'s (read I/Os, read ticks in ms): the first and
+/// fourth fields (`Documentation/block/stat.rst`).
 fn dev_read_stat(path: &Path) -> Option<(u64, u64)> {
     let text = std::fs::read_to_string(path).ok()?;
     let mut f = text.split_whitespace().map(|x| x.parse::<u64>().ok());
@@ -2790,12 +2798,50 @@ fn ordered_load(
     plan: &Plan,
     payload: &Payload,
     counting: &mut Counting<'_>,
-) -> Result<(f64, u64), String> {
+) -> Result<(f64, Option<u64>), String> {
+    // PROBE (`SUPDB_DEVBYTES_SYNC`): where the filesystem is synced around
+    // the device's reading -- `none`, `after` the load's sync, or `both`
+    // before the load's first batch and after its sync -- and a
+    // `loadbytes` line per load with every reading.
+    let mode = std::env::var("SUPDB_DEVBYTES_SYNC").unwrap_or_else(|_| "after".into());
+    let dev = || {
+        counting
+            .store_dev
+            .as_deref()
+            .and_then(env::device_written_bytes)
+    };
+    let pre0 = dev();
+    if mode == "both" {
+        env::sync_filesystem(&counting.store_dir)?;
+    }
+    let d0 = dev();
     let c0 = counting.begin();
-    let got = load(e, size, plan, payload, |i| i)?;
+    let (secs, process) = load(e, size, plan, payload, |i| i)?;
+    let d1 = dev();
+    if mode != "none" {
+        env::sync_filesystem(&counting.store_dir)?;
+    }
+    let d2 = dev();
     counting.end(c0, "load", "", None, size);
+    let mb = |b: u64| b as f64 / 1e6;
+    if std::env::var_os("SUPDB_LOAD_BYTES").is_some() {
+        if let (Some(p), Some(a), Some(b), Some(c)) = (pre0, d0, d1, d2) {
+            eprintln!(
+                "loadbytes {arm} {size} mode {mode} proc_mb {:.4} dev_mb {:.4} | pending_mb {:.4} window_mb {:.4} after_mb {:.4}",
+                mb(process),
+                mb(c - a),
+                mb(a - p),
+                mb(b - a),
+                mb(c - b)
+            );
+        }
+    }
     zpages_refusal(arm, size, ZStage::Loaded, e.zpages_state())?;
-    Ok(got)
+    let device = match (d0, d2) {
+        (Some(a), Some(c)) => Some(c.saturating_sub(a)),
+        _ => None,
+    };
+    Ok((secs, device))
 }
 
 /// The pass's second store loaded in a shuffled order, its seconds returned.
@@ -3538,10 +3584,9 @@ fn one_pass(
         } else {
             f64::NAN
         },
-        load_bpb: if passes.load {
-            wrote as f64 / stored
-        } else {
-            f64::NAN
+        load_bpb: match wrote {
+            Some(w) if passes.load => w as f64 / stored,
+            _ => f64::NAN,
         },
         disk_bpb: if passes.load {
             on_disk as f64 / stored
@@ -5594,7 +5639,9 @@ pub fn replay_row<E: Engine>(
 
 /// Load `size` keys through `order`, batched, ending with one `sync` so a
 /// buffered arm's number includes getting its tail to the device once. Returns
-/// (seconds, device bytes written).
+/// (seconds, the bytes the process dirtied, from `/proc/self/io`'s
+/// `write_bytes`), the second for the `loadbytes` line alone: a count of
+/// pages dirtied is not what the device wrote (`ordered_load`).
 fn load(
     e: &mut dyn Engine,
     size: u64,
@@ -5654,8 +5701,8 @@ fn load(
             cpu_c as f64 / 1e3, flt_c, cpu_s as f64 / 1e3, flt_s
         );
     }
-    let wrote = IoCounters::read_now().since(&io0).write_bytes;
-    Ok((secs, wrote))
+    let dirtied = IoCounters::read_now().since(&io0).write_bytes;
+    Ok((secs, dirtied))
 }
 
 /// The durable-write floor: the load's records, framed as length-prefixed

@@ -200,14 +200,7 @@ fn queue_num(dev: &str, name: &str) -> Option<u64> {
 /// a tmpfs, whose numbers are anonymous -- or on a host without `/sys`.
 #[cfg(target_os = "linux")]
 pub fn block_device_of(path: &std::path::Path) -> Option<String> {
-    use std::os::unix::fs::MetadataExt;
-    let dev = std::fs::metadata(path).ok()?.dev();
-    // The kernel's encoding of a device number (`include/linux/kdev_t.h`,
-    // the `new_encode_dev` form glibc's `major` and `minor` undo): twelve
-    // bits of major split around the low byte of minor.
-    let major = ((dev >> 8) & 0xfff) | ((dev >> 32) & !0xfff);
-    let minor = (dev & 0xff) | ((dev >> 12) & !0xff);
-    let link = std::fs::read_link(format!("/sys/dev/block/{major}:{minor}")).ok()?;
+    let link = std::fs::read_link(dev_block_entry(path)?).ok()?;
     let sys = std::path::Path::new("/sys/dev/block").join(&link);
     let node = if sys.join("partition").exists() {
         sys.parent()?.to_path_buf()
@@ -224,6 +217,81 @@ pub fn block_device_of(path: &std::path::Path) -> Option<String> {
 #[cfg(not(target_os = "linux"))]
 pub fn block_device_of(_path: &std::path::Path) -> Option<String> {
     None
+}
+
+/// `/sys/dev/block/MAJ:MIN` for the device number the file at `path`
+/// sits on, whether or not the kernel has an entry there.
+#[cfg(target_os = "linux")]
+fn dev_block_entry(path: &std::path::Path) -> Option<std::path::PathBuf> {
+    use std::os::unix::fs::MetadataExt;
+    let dev = std::fs::metadata(path).ok()?.dev();
+    // The kernel's encoding of a device number (`include/linux/kdev_t.h`,
+    // the `new_encode_dev` form glibc's `major` and `minor` undo): twelve
+    // bits of major split around the low byte of minor.
+    let major = ((dev >> 8) & 0xfff) | ((dev >> 32) & !0xfff);
+    let minor = (dev & 0xff) | ((dev >> 12) & !0xff);
+    Some(std::path::PathBuf::from(format!(
+        "/sys/dev/block/{major}:{minor}"
+    )))
+}
+
+/// The `stat` file of the block device the filesystem holding `path` is
+/// on, as the kernel counts that device's requests: the partition where
+/// the filesystem is on one, the disk where it is on the disk, the
+/// mapped volume where it is on one. Not the disk under a partition, whose
+/// counts are every partition's. None where the device number has no
+/// block device behind it -- an overlay, a tmpfs, whose numbers are
+/// anonymous -- and off Linux.
+#[cfg(target_os = "linux")]
+pub fn device_stat_of(path: &std::path::Path) -> Option<std::path::PathBuf> {
+    let stat = dev_block_entry(path)?.join("stat");
+    device_written_bytes(&stat).map(|_| stat)
+}
+
+#[cfg(not(target_os = "linux"))]
+pub fn device_stat_of(_path: &std::path::Path) -> Option<std::path::PathBuf> {
+    None
+}
+
+/// The bytes a block device has written since it appeared, from its
+/// `stat` file: the seventh field, sectors written, which the kernel
+/// counts in 512-byte units whatever the device's own sector size
+/// (`Documentation/block/stat.rst`), as each write request completes.
+/// What the device was asked to write, by whichever process or kernel
+/// thread asked, a filesystem's journal and metadata included.
+pub fn device_written_bytes(stat: &std::path::Path) -> Option<u64> {
+    let text = std::fs::read_to_string(stat).ok()?;
+    stat_written_bytes(&text)
+}
+
+/// `device_written_bytes` of a `stat` file's text.
+fn stat_written_bytes(text: &str) -> Option<u64> {
+    let sectors: u64 = text.split_whitespace().nth(6)?.parse().ok()?;
+    sectors.checked_mul(512)
+}
+
+/// Every write the filesystem holding `dir` has been handed, data and
+/// metadata, made durable (`syncfs(2)`), so that a reading of the
+/// device's counter after it covers them; nothing off Linux, where the
+/// counter is not read either. The result is the sync's own.
+#[cfg(target_os = "linux")]
+pub fn sync_filesystem(dir: &std::path::Path) -> Result<(), String> {
+    use std::os::unix::io::AsRawFd as _;
+    let f = std::fs::File::open(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
+    // SAFETY: a syscall on a descriptor this function holds open.
+    if unsafe { libc::syncfs(f.as_raw_fd()) } != 0 {
+        return Err(format!(
+            "syncfs {}: {}",
+            dir.display(),
+            std::io::Error::last_os_error()
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(not(target_os = "linux"))]
+pub fn sync_filesystem(_dir: &std::path::Path) -> Result<(), String> {
+    Ok(())
 }
 
 #[cfg(not(target_os = "macos"))]
