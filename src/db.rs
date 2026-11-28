@@ -151,6 +151,38 @@ fn err(msg: &str) -> std::io::Error {
     std::io::Error::new(std::io::ErrorKind::InvalidData, msg)
 }
 
+/// The longest key a store or a segment holds, in bytes: a record names
+/// its key's length in a 16-bit word. Every write refuses a longer one.
+pub const MAX_KEY_LEN: usize = u16::MAX as usize;
+
+/// The longest value a store holds, in bytes: the live table names a
+/// value's length in a 32-bit word. Every write refuses a longer one.
+pub const MAX_VALUE_LEN: usize = u32::MAX as usize;
+
+/// Whether a write of `key` and `value` is one the store can hold: the
+/// one check every write entry point makes before anything of the write
+/// is taken. A key past `MAX_KEY_LEN` was stored, in release, as another
+/// key (65,536 bytes as the empty key), and a value past `MAX_VALUE_LEN`
+/// as a shorter one.
+#[inline]
+fn write_fits(key: &[u8], value: &[u8]) -> Result<()> {
+    if key.len() > MAX_KEY_LEN || value.len() > MAX_VALUE_LEN {
+        return Err(write_refused(key.len(), value.len()));
+    }
+    Ok(())
+}
+
+#[cold]
+#[inline(never)]
+fn write_refused(key: usize, value: usize) -> std::io::Error {
+    let what = if key > MAX_KEY_LEN {
+        format!("a key of {key} bytes is longer than the {MAX_KEY_LEN} a store holds")
+    } else {
+        format!("a value of {value} bytes is longer than the {MAX_VALUE_LEN} a store holds")
+    };
+    std::io::Error::new(std::io::ErrorKind::InvalidInput, what)
+}
+
 /// The name a checkpoint is built under before it is renamed to `dest`:
 /// beside it, so the rename stays on one filesystem.
 fn checkpoint_tmp(dest: &Path) -> Result<PathBuf> {
@@ -13941,7 +13973,8 @@ impl SegmentWriter {
 
     /// Start a key. Keys must arrive in strictly increasing order; the
     /// writer refuses anything else rather than build an index whose
-    /// directory disagrees with its records.
+    /// directory disagrees with its records, and refuses a key longer than
+    /// [`MAX_KEY_LEN`] bytes.
     pub fn begin(&mut self, key: &[u8]) -> Result<()> {
         if self.deferred.is_some() {
             return Err(err(
@@ -13971,7 +14004,9 @@ impl SegmentWriter {
         Ok(())
     }
 
-    /// One value of the open key, in append order.
+    /// One value of the open key, in append order. A key whose values come
+    /// to more than [`MAX_VALUE_LEN`] bytes, one of them or all together, is
+    /// refused at `end`.
     pub fn value(&mut self, v: &[u8]) {
         debug_assert!(self.open_key.is_some(), "value without begin");
         // Raw bytes and a length: the encoding is chosen at `end`, when the
@@ -13995,6 +14030,13 @@ impl SegmentWriter {
             .take()
             .ok_or_else(|| err("segment writer: end without begin"))?;
         let value_len = if self.records == 1 { self.raw.len() } else { 0 };
+        // Before the run is encoded from lengths `value` took as 32 bits: a
+        // run whose values come to no more than that has no value past it.
+        if self.raw.len() > MAX_VALUE_LEN {
+            return Err(err(
+                "segment writer: a key's values exceed 4 GiB in one segment",
+            ));
+        }
         let (last, flag) = crate::index::encode_run(&self.raw, &self.lens, &mut self.run);
         self.last = last as usize;
         // A put is its key and value and a delete its key and sixteen, as
@@ -14119,7 +14161,8 @@ impl SegmentWriter {
     /// copies of every value an ordered load made, where a one-value run
     /// is the value itself with the fixed flag. A value the record cannot
     /// carry inline, an empty one, or a blocks-first layout take the three
-    /// calls (`Options::direct_put_one`).
+    /// calls (`Options::direct_put_one`). A key or a value past the limits
+    /// `begin` and `value` name is refused as they refuse it.
     pub fn put_one(&mut self, key: &[u8], value: &[u8]) -> Result<()> {
         if self.deferred.is_some() {
             return Err(err(
@@ -29257,6 +29300,8 @@ impl Reader {
     /// close, as with any write under the held log. `Ok(false)`, with
     /// nothing written, where the live table is full: the writer's next
     /// `commit` freezes it, and the write is made again after that.
+    /// `InvalidInput`, with nothing written, for a key longer than
+    /// [`MAX_KEY_LEN`] or a value longer than [`MAX_VALUE_LEN`].
     pub fn put(&self, key: &[u8], value: &[u8]) -> Result<bool> {
         self.write_shared(key, SharedWrite::Put(value))
     }
@@ -29359,6 +29404,11 @@ impl Reader {
     /// freeze that reads the list without it published its table first, and
     /// this write takes the fresh one), then pinned as its reads are.
     fn write_shared(&self, key: &[u8], w: SharedWrite<'_>) -> Result<bool> {
+        let value = match w {
+            SharedWrite::Put(v) | SharedWrite::Append(v) => v,
+            SharedWrite::Delete => &[],
+        };
+        write_fits(key, value)?;
         self.may_write_shared()?;
         let _e = self.enter();
         let mem = &self.state().mem;
@@ -46360,19 +46410,40 @@ impl Db {
 
     /// Buffered until `commit`; visible to this handle's reads immediately,
     /// which is the read-your-writes contract `Store::read_all` set.
+    ///
+    /// A key longer than [`MAX_KEY_LEN`] bytes or a value longer than
+    /// [`MAX_VALUE_LEN`] is refused: nothing of it is written, and the next
+    /// `commit` answers `InvalidInput`.
     pub fn append(&mut self, key: &[u8], value: &[u8]) {
         let _op = self.op();
+        if let Err(e) = write_fits(key, value) {
+            return self.refuse_write(e);
+        }
         self.append_pinned(key, value);
     }
 
     /// `append` for every record of `items`, pinned once for all of them:
     /// the pin and its fence a record were three percent of an ordered
-    /// load's writer.
+    /// load's writer. A batch with a key or a value past the limits
+    /// `append` names is refused whole: none of it is written, and the next
+    /// `commit` answers `InvalidInput`.
     pub fn append_batch(&mut self, items: &[(&[u8], &[u8])]) {
         let _op = self.op();
+        if let Err(e) = items.iter().try_for_each(|&(k, v)| write_fits(k, v)) {
+            return self.refuse_write(e);
+        }
         for &(key, value) in items {
             self.append_pinned(key, value);
         }
+    }
+
+    /// A write refused before anything of it was taken (`write_fits`),
+    /// answered by the next `commit`, as every error a write cannot return
+    /// is (`pending_err`).
+    #[cold]
+    #[inline(never)]
+    fn refuse_write(&mut self, e: std::io::Error) {
+        self.pending_err.get_or_insert(e);
     }
 
     fn append_pinned(&mut self, key: &[u8], value: &[u8]) {
@@ -47128,17 +47199,28 @@ impl Db {
     /// what `Store::put` and every single-value engine do; `append` is the
     /// other verb, and using it for an update piled every Zipfian rewrite
     /// onto its key until each read walked the pile.
+    ///
+    /// A key or a value past the limits `append` names is refused as
+    /// `append` refuses it.
     pub fn put(&mut self, key: &[u8], value: &[u8]) {
         let _op = self.op();
+        if let Err(e) = write_fits(key, value) {
+            return self.refuse_write(e);
+        }
         self.put_pinned(key, value);
     }
 
     /// `put` for every record of `items`, pinned once for all of them, as
     /// `append_batch` is for a load's: the pin, its fence and the unpin a
     /// record were 88 instructions of an update's 1,213 by callgrind
-    /// (`bench/examples/point_ops.rs`), and the fence a locked store.
+    /// (`bench/examples/point_ops.rs`), and the fence a locked store. A
+    /// batch with a key or a value past the limits is refused whole, as
+    /// `append_batch` refuses one.
     pub fn put_batch(&mut self, items: &[(&[u8], &[u8])]) {
         let _op = self.op();
+        if let Err(e) = items.iter().try_for_each(|&(k, v)| write_fits(k, v)) {
+            return self.refuse_write(e);
+        }
         for &(key, value) in items {
             self.put_pinned(key, value);
         }
@@ -47185,9 +47267,13 @@ impl Db {
     /// start fresh. Durable at the next `commit`, exactly like an append,
     /// and reclaimed by the next merge that reaches the key. A deleted key
     /// counts toward the store's greatest, so ordered appends go through
-    /// the log, not a direct run, until they pass it.
+    /// the log, not a direct run, until they pass it. A key longer than
+    /// [`MAX_KEY_LEN`] is refused as `append` refuses it.
     pub fn delete(&mut self, key: &[u8]) {
         let _op = self.op();
+        if let Err(e) = write_fits(key, &[]) {
+            return self.refuse_write(e);
+        }
         if !self.writes_go() {
             return;
         }
@@ -53404,9 +53490,14 @@ impl Txn<'_> {
         Ok(n)
     }
 
-    /// Apply every staged operation and commit them as one batch.
+    /// Apply every staged operation and commit them as one batch. A
+    /// transaction with a key longer than [`MAX_KEY_LEN`] or a value longer
+    /// than [`MAX_VALUE_LEN`] is refused whole with `InvalidInput`, before
+    /// any of it is applied.
     pub fn commit(self) -> Result<()> {
         let Txn { db, ops } = self;
+        ops.iter()
+            .try_for_each(|(k, v)| write_fits(k, v.as_deref().unwrap_or(&[])))?;
         for (k, v) in ops {
             match v {
                 Some(v) => db.append(&k, &v),

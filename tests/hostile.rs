@@ -588,3 +588,190 @@ fn dump_model(i: usize, m: &Model) {
     )
     .unwrap();
 }
+
+// -------------------------------------------------------------- the store
+
+/// Every value of `key` the store answers.
+fn values(db: &supdb::Db, key: &[u8]) -> Vec<Vec<u8>> {
+    let mut out = Vec::new();
+    db.read_all(key, vf(&mut |v| out.push(v.to_vec()))).unwrap();
+    out
+}
+
+/// Every key the store's scan answers, with its value's length.
+fn scanned(db: &supdb::Db) -> Vec<(usize, usize)> {
+    let mut out = Vec::new();
+    db.scan(
+        b"",
+        usize::MAX,
+        kv(&mut |k, v| out.push((k.len(), v.len()))),
+    )
+    .unwrap();
+    out
+}
+
+fn refused(r: std::io::Result<()>, what: &str) {
+    let e = r.expect_err(what);
+    assert_eq!(e.kind(), std::io::ErrorKind::InvalidInput, "{what}: {e}");
+    assert!(e.to_string().contains("longer than"), "{what}: {e}");
+}
+
+/// A handle's writes (`Options::shared_writers`) of `key` and `value`, one
+/// of them past its limit: each refused with nothing written.
+fn handle_refuses(key: &[u8], value: &[u8]) {
+    let dir = scratch("handle");
+    let mut db = supdb::Db::open(
+        &dir,
+        supdb::Options {
+            sync: supdb::SyncPolicy::Explicit,
+            held_frames: false,
+            scan_block_cache: false,
+            upkeep: supdb::Upkeep::Inline,
+            direct_ingest: false,
+            shared_writers: true,
+            ..common::options()
+        },
+    )
+    .unwrap();
+    let h = db.writer().unwrap();
+    let mut answers = vec![h.put(key, value), h.append(key, value)];
+    if value.len() <= supdb::MAX_VALUE_LEN {
+        answers.push(h.delete(key));
+    }
+    for r in answers {
+        let e = r.expect_err("a handle's write");
+        assert_eq!(e.kind(), std::io::ErrorKind::InvalidInput, "{e}");
+    }
+    drop(h);
+    db.commit().unwrap();
+    assert!(values(&db, key).is_empty());
+    db.close().unwrap();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// HI-5. A key over 65,535 bytes was stored in release as another key: its
+/// length went into a 16-bit word, so 65,536 bytes landed on the empty key
+/// and 70,000 on its first 4,464 bytes, and a checked build panicked. Every
+/// write entry point refuses it now -- `put`, `append`, `delete`, both
+/// batches, a transaction, a handle's write, an ordered load's next key,
+/// and the public segment writer -- with nothing of the write taken, and
+/// 65,535 bytes round-trips through the live table, a flush and a reopen.
+/// In a store in the clear and in a store in one file.
+#[test]
+fn a_key_past_65535_bytes_is_refused_at_every_write() {
+    for one_file in [false, true] {
+        let dir = scratch(if one_file { "bigkey-one" } else { "bigkey" });
+        let opts = || supdb::Options {
+            one_file,
+            ..common::options()
+        };
+        let mut db = supdb::Db::open(&dir, opts()).unwrap();
+        // An ordered load first, so the last refusal below is an ordered
+        // load's next key.
+        for i in 0..100u32 {
+            db.append(format!("a{i:04}").as_bytes(), b"v");
+        }
+        db.commit().unwrap();
+        // The load is a direct run, and its next key past the limit is
+        // refused with the run left open.
+        assert!(
+            db.run_synced_bytes().is_some(),
+            "the load is an ordered run"
+        );
+        let mut last = vec![b'z'; supdb::MAX_KEY_LEN + 1];
+        last[0] = b'~';
+        db.append(&last, b"4");
+        refused(db.commit(), "an ordered load's next key");
+        assert!(db.run_synced_bytes().is_some(), "the refusal left the run");
+        assert!(values(&db, &last).is_empty());
+        db.append(b"", b"the empty key's");
+        db.commit().unwrap();
+        let edge = vec![b'k'; supdb::MAX_KEY_LEN];
+        db.put(&edge, b"edge");
+        db.commit().unwrap();
+        for n in [supdb::MAX_KEY_LEN + 1, 70_000] {
+            let long = vec![b'k'; n];
+            db.append(&long, b"long");
+            refused(db.commit(), "append");
+            db.put(&long, b"long");
+            refused(db.commit(), "put");
+            db.delete(&long);
+            refused(db.commit(), "delete");
+            // A batch is refused whole: its key that fits is not written.
+            db.append_batch(&[(b"b-fits", b"1"), (&long, b"2")]);
+            refused(db.commit(), "append_batch");
+            db.put_batch(&[(b"c-fits", b"1"), (&long, b"2")]);
+            refused(db.commit(), "put_batch");
+            let mut t = db.begin();
+            t.append(b"d-fits", b"1");
+            t.append(&long, b"2");
+            refused(t.commit(), "a transaction");
+            // Nothing of any of them landed, on the key or on another.
+            db.commit().unwrap();
+            assert!(values(&db, &long).is_empty(), "{n}: the long key");
+            assert!(values(&db, &long[..n % 65_536]).is_empty() || n % 65_536 == 0);
+            assert_eq!(values(&db, b""), vec![b"the empty key's".to_vec()], "{n}");
+            for k in [&b"b-fits"[..], b"c-fits", b"d-fits"] {
+                assert!(values(&db, k).is_empty(), "{n}: {k:?}");
+            }
+        }
+        let want = |db: &supdb::Db| {
+            assert_eq!(values(db, &edge), vec![b"edge".to_vec()]);
+            assert_eq!(values(db, b""), vec![b"the empty key's".to_vec()]);
+            let s = scanned(db);
+            assert_eq!(s.len(), 102, "{s:?}");
+            assert!(s.iter().all(|&(k, _)| k <= supdb::MAX_KEY_LEN));
+        };
+        want(&db);
+        db.flush().unwrap();
+        want(&db);
+        db.close().unwrap();
+        let db = supdb::Db::open(&dir, opts()).unwrap();
+        want(&db);
+        db.close().unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+    handle_refuses(&vec![b'k'; supdb::MAX_KEY_LEN + 1], b"v");
+    // The public segment writer.
+    let dir = scratch("bigkey-seg");
+    let long = vec![b'k'; supdb::MAX_KEY_LEN + 1];
+    let opts = SegmentOptions::default();
+    let mut w = SegmentWriter::create(&dir.join("a.sup"), &opts).unwrap();
+    assert!(w.begin(&long).is_err(), "begin");
+    let mut w = SegmentWriter::create(&dir.join("b.sup"), &opts).unwrap();
+    assert!(w.put_one(&long, b"v").is_err(), "put_one");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// HI-5's values: a value's length is a 32-bit word in the live table, so a
+/// value past 4 GiB would be stored as a shorter one. Refused at the store's
+/// writes as a long key is, its bytes never touched: the value is a mapping
+/// of a sparse file, so no memory backs it.
+#[cfg(target_pointer_width = "64")]
+#[test]
+fn a_value_past_4_gib_is_refused_at_every_write() {
+    let dir = scratch("bigvalue");
+    let path = dir.join("value");
+    let f = std::fs::File::create(&path).unwrap();
+    f.set_len(supdb::MAX_VALUE_LEN as u64 + 1).unwrap();
+    drop(f);
+    let map = MmapBytes::open(&path).unwrap();
+    let big = map.slice_at(0, supdb::MAX_VALUE_LEN + 1).unwrap();
+    let store = dir.join("store");
+    std::fs::create_dir_all(&store).unwrap();
+    let mut db = supdb::Db::open(&store, common::options()).unwrap();
+    db.append(b"k", big);
+    refused(db.commit(), "append");
+    db.put(b"k", big);
+    refused(db.commit(), "put");
+    db.append_batch(&[(b"j", b"1"), (b"k", big)]);
+    refused(db.commit(), "append_batch");
+    db.put_batch(&[(b"j", b"1"), (b"k", big)]);
+    refused(db.commit(), "put_batch");
+    db.commit().unwrap();
+    assert!(values(&db, b"k").is_empty() && values(&db, b"j").is_empty());
+    db.close().unwrap();
+    handle_refuses(b"k", big);
+    drop(map);
+    let _ = std::fs::remove_dir_all(&dir);
+}

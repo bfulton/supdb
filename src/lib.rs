@@ -255,5 +255,5 @@ pub use db::OneCounts;
 pub use db::{
     BackgroundIo, Db, Encryption, HelperFault, Isolation, Options, ReadAdvice, Reader,
     SegmentOptions, SegmentWrite, SegmentWriter, SyncPolicy, Txn, Upkeep, ZInject, ZPages, ZStride,
-    MERGE_AHEAD_WINDOW, STORE_FORMAT, STORE_FORMAT_OLDEST,
+    MAX_KEY_LEN, MAX_VALUE_LEN, MERGE_AHEAD_WINDOW, STORE_FORMAT, STORE_FORMAT_OLDEST,
 };
