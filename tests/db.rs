@@ -14198,68 +14198,55 @@ fn the_copies_survive_a_merge_with(compact: bool) {
 
 /// Whether a merge rewrote a partition over the same blocks -- the same
 /// key count and the same key at every block's first rank and at the last --
-/// is asked of the two ordered indexes where their heads are whole keys
-/// (`Options::same_blocks_from_index`) and of the records otherwise, and the
-/// two answer alike: over keys a head holds whole and keys it does not, the
-/// same partitions are carried across a merge that keeps every key and one
-/// that replaces the store's first key with another below it, the count
+/// is asked of the two ordered indexes where their heads are whole keys and
+/// of the records otherwise: over keys a head holds whole every question is
+/// answered from the indexes, over keys it does not from the records, and
+/// the same partitions are carried across a merge that keeps every key and
+/// one that replaces the store's first key with another below it, the count
 /// kept; over the short keys, every partition across the first and every
 /// one but the changed partition across the second, and again across a
-/// merge that replaces the store's last key. Asked of the records the landing
-/// read the old partition's key every sixty-fourth rank, which under a
-/// bound are the pages the merge has just read past.
+/// merge that replaces the store's last key.
 #[test]
-fn a_rewrite_over_the_same_blocks_is_found_by_the_index_as_by_the_records() {
+fn a_rewrite_over_the_same_blocks_is_found_from_the_index_or_the_records() {
     for long in [false, true] {
-        let mut seen = Vec::new();
-        for from_index in [true, false] {
-            let (carried, after, last, asked) = same_blocks_carries(long, from_index);
-            let label = format!("long {long}, from the index {from_index}");
-            assert!(
-                carried > 0,
-                "{label}: the forms were carried across the merge"
-            );
-            // Over the short keys every partition holds forms at both
-            // merges, so the count is exact; over the long ones a partition
-            // the first merge left without forms makes it inexact, and the
-            // agreement below is what holds.
-            if !long {
-                assert_eq!(
-                    after,
-                    carried - 1,
-                    "{label}: the partition whose first key changed is not carried, and only it"
-                );
-                assert_eq!(
-                    last,
-                    carried - 1,
-                    "{label}: the partition whose last key changed is not carried, and only it"
-                );
-            }
-            if from_index && !long {
-                assert!(
-                    asked[0] > 0 && asked[1] == 0,
-                    "{label}: every question answered from the indexes: {asked:?}"
-                );
-            } else {
-                assert!(
-                    asked[0] == 0 && asked[1] > 0,
-                    "{label}: every question answered from the records: {asked:?}"
-                );
-            }
-            seen.push((carried, after, last));
-        }
-        assert_eq!(
-            seen[0], seen[1],
-            "long {long}: the index and the records agree"
+        let (carried, after, last, asked) = same_blocks_carries(long);
+        let label = format!("long {long}");
+        assert!(
+            carried > 0,
+            "{label}: the forms were carried across the merge"
         );
+        // Over the short keys every partition holds forms at both
+        // merges, so the count is exact; over the long ones a partition
+        // the first merge left without forms makes it inexact.
+        if !long {
+            assert_eq!(
+                after,
+                carried - 1,
+                "{label}: the partition whose first key changed is not carried, and only it"
+            );
+            assert_eq!(
+                last,
+                carried - 1,
+                "{label}: the partition whose last key changed is not carried, and only it"
+            );
+            assert!(
+                asked[0] > 0 && asked[1] == 0,
+                "{label}: every question answered from the indexes: {asked:?}"
+            );
+        } else {
+            assert!(
+                asked[0] == 0 && asked[1] > 0,
+                "{label}: every question answered from the records: {asked:?}"
+            );
+        }
     }
 }
 
 /// The body of the test above: the forms carried across a merge that keeps
 /// every key, across one that replaces the store's first key, and the
 /// landings' questions by how they were answered.
-fn same_blocks_carries(long: bool, from_index: bool) -> (u64, u64, u64, [u64; 2]) {
-    let d = dir(&format!("same-blocks-{long}-{from_index}"));
+fn same_blocks_carries(long: bool) -> (u64, u64, u64, [u64; 2]) {
+    let d = dir(&format!("same-blocks-{long}"));
     let opts = Options {
         seal_bytes: 1 << 20,
         partition_bytes: Some(4 << 10),
@@ -14272,7 +14259,6 @@ fn same_blocks_carries(long: bool, from_index: bool) -> (u64, u64, u64, [u64; 2]
         forms_rebase: true,
         upkeep: supdb::Upkeep::Inline,
         freeze_settles: true,
-        same_blocks_from_index: from_index,
         ..common::options()
     };
     let mut db = Db::create(&d, opts).unwrap();

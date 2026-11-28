@@ -811,7 +811,7 @@ impl<B: Bytes> Bytes for Advised<B> {
 }
 
 /// What a reader answers and advises for the ranks of a segment: every
-/// record's offset, the record region's place, and the asks and drops of
+/// record's offset, the record region's place, and the asks of
 /// a fixed set of calls, each with the advice it gave.
 type AdviceTrace = (
     Vec<Option<u64>>,
@@ -842,10 +842,6 @@ fn advice_trace<B: Bytes>(blob: &Blob<Advised<B>>) -> AdviceTrace {
         let got = blob.willneed_dir(rank, n);
         calls.push((got, src.take()));
     }
-    if let (Some(a), Some(b)) = (offsets[1], offsets[keys / 2]) {
-        blob.drop_records(a, b);
-    }
-    calls.push((0, src.take()));
     (offsets, place, calls)
 }
 
@@ -1085,18 +1081,11 @@ fn holds_to_the_file<B: Bytes>(
             "{name}: the word at {d} names record {r}"
         );
     }
-    // The asks over ranks start at the first rank's record and the drop
-    // runs between the two offsets it was given.
+    // The asks over ranks start at the first rank's record.
     assert_eq!(
         calls[1].1.first(),
         Some(&Advice::Willneed(offsets[0].unwrap(), calls[1].0)),
         "{name}: the ask for rank 0"
-    );
-    let (a, b) = (offsets[1].unwrap(), offsets[keys / 2].unwrap());
-    assert_eq!(
-        calls.last().unwrap().1,
-        vec![Advice::Dontneed(a, (b - a) as usize)],
-        "{name}: the drop"
     );
     // An ask whose first page is resident is skipped, by the residency of
     // the offset the ask would start at and of no other.

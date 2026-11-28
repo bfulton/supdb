@@ -706,7 +706,7 @@ fn counters_line(
     let get = |c: &[(&str, f64)], n: &str| c.iter().find(|(k, _)| *k == n).map_or(0.0, |(_, v)| *v);
     let d = |n: &str| get(c1, n) - get(c0, n);
     eprintln!(
-        "{tag} {arm} {point} flt up {flt_up} main {flt_main} memfree_mb {} burst_ms {burst_ms:.1} pass_ms {pass_ms:.1} | ph take {:.2} sync {:.2} settle {:.2} snap {:.2} ahead {:.2} install {:.2} | thread {:.1}ms/{:.0}p holds {:.0}/{:.1}ms maint {:.1}ms | built up {:.0} eng {:.0} rd {:.0} cloned {:.0} | snaps {:.0} refr {:.0} stood {:.0} dropped_mb {:.0} | walks {:.0}/{:.0}/{:.0} starts {:.0}/{:.0} | pieces {:.0} unsealed {:.0} handles-scans {:.0} | z reads {:.0} dec {:.0} scans {:.0} groups {:.0} memo {:.0}/{:.0} pf {:.0} | steps settle {:.1} snap {:.1} fillwalk {:.1} fillbuild {:.1} ms fills {:.0} cuts {:.0} left {:.0} owed {:.0} | zs reads {:.0} checks {:.0} cursor {:.0} builds {:.0} files {:.0} | gets lone {:.0} layers {:.0} placed {:.0} live {:.0} | merges {:.0} keyseqs {:.0} patches {:.0}/{:.0} packs {:.0}/{:.0} heads {:.0}/{:.0}",
+        "{tag} {arm} {point} flt up {flt_up} main {flt_main} memfree_mb {} burst_ms {burst_ms:.1} pass_ms {pass_ms:.1} | ph take {:.2} sync {:.2} settle {:.2} snap {:.2} ahead {:.2} install {:.2} | thread {:.1}ms/{:.0}p holds {:.0}/{:.1}ms maint {:.1}ms | built up {:.0} eng {:.0} rd {:.0} cloned {:.0} | snaps {:.0} refr {:.0} stood {:.0} | walks {:.0}/{:.0}/{:.0} starts {:.0}/{:.0} | pieces {:.0} unsealed {:.0} handles-scans {:.0} | z reads {:.0} dec {:.0} scans {:.0} groups {:.0} memo {:.0}/{:.0} pf {:.0} | steps settle {:.1} snap {:.1} fillwalk {:.1} fillbuild {:.1} ms fills {:.0} cuts {:.0} left {:.0} owed {:.0} | zs reads {:.0} checks {:.0} cursor {:.0} builds {:.0} files {:.0} | gets lone {:.0} layers {:.0} placed {:.0} live {:.0} | merges {:.0} keyseqs {:.0} patches {:.0}/{:.0} packs {:.0}/{:.0} heads {:.0}/{:.0}",
         mem_free_mb(),
         d("scan_take_us") / 1e3,
         d("scan_sync_us") / 1e3,
@@ -726,7 +726,6 @@ fn counters_line(
         d("snapshot_builds"),
         d("snapshot_refreshes"),
         d("snapshots_stood"),
-        d("merge_dropped_mb"),
         d("walk_copy"),
         d("walk_sparse"),
         d("walk_other"),

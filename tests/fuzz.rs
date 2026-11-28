@@ -91,9 +91,6 @@
 //! - `ZFUZZ_SETTLEBUILDS=1`: the `z` store's commits near reads file their
 //!   batches and build the blocks they filed into, under a small cache
 //!   budget (`Options::forms_settle_every`, `forms_settle_builds`).
-//! - `ZFUZZ_BOTH=1`, with `ZFUZZ_ZPAGES`: the `z` store keeps both codings
-//!   of every partition and re-codes by exchanging them
-//!   (`Options::zpages_both`).
 //! - `ZFUZZ_FORMSOFF=1`, with `ZFUZZ_ZPAGES`: the `z` store's handles give
 //!   their block forms up for the merge path and take them back every few
 //!   scans (`Options::scan_forms_off_unreused`), a flag and not a draw.
@@ -171,8 +168,7 @@
 //!   page found damaged -- fails, since the raw form answers in their place
 //!   and the model sees nothing wrong; and a range in which the stride form
 //!   served no read fails, since a steer that reaches no partition is a run
-//!   that tested nothing. Refused beside `ZFUZZ_BOTH`, whose re-code the
-//!   store refuses beside the stride form. `concurrent_range` runs its store
+//!   that tested nothing. `concurrent_range` runs its store
 //!   forced with the stride form under it, its keys one run of numbers at
 //!   one width, each written once before the readers start and put again,
 //!   never appended or deleted, with a value of one width that says how many
@@ -1083,17 +1079,6 @@ fn opts_z(c: &Cfg) -> Options {
     // raw store.
     if env_flag("ZFUZZ_FLEXDEC") {
         o.zpages_own_decoder = false;
-    }
-    // Under `ZFUZZ_BOTH`, with the form forced, every partition keeps its
-    // form file in both codings and the re-code policy exchanges them
-    // (`Options::zpages_both`): the spares' builds, their collect beside the
-    // served file and their retirement with a merged segment, and whatever
-    // the reads heat into a flip, are read against the raw store.
-    if env_flag("ZFUZZ_BOTH") && zpages_forced() {
-        o.zpages_recode = true;
-        o.zpages_recode_keep = true;
-        o.zpages_both = true;
-        o.zpages_drop_raw = true;
     }
     // Under `ZFUZZ_CIPHER` the `z` store is kept under a cipher
     // (`Encryption::Cipher`) while `r` is in the clear over the same writes:
@@ -3007,10 +2992,6 @@ fn run_range() {
             env_flag("ZFUZZ_ZPAGES"),
             "ZFUZZ_STRIDE forces the stride form on the store whose form is forced: set ZFUZZ_ZPAGES"
         );
-        assert!(
-            !env_flag("ZFUZZ_BOTH"),
-            "ZFUZZ_STRIDE beside ZFUZZ_BOTH: the store refuses the stride form beside the re-code"
-        );
     }
     let (mut bad, mut reopens, mut abandons, mut bindings, mut beside, mut switches) =
         (Vec::new(), 0u64, 0u64, 0u64, 0u64, 0u64);
@@ -3583,10 +3564,6 @@ fn concurrent_range() {
         assert!(
             env_flag("ZFUZZ_ZPAGES"),
             "ZFUZZ_STRIDE forces the stride form on the store whose form is forced: set ZFUZZ_ZPAGES"
-        );
-        assert!(
-            !env_flag("ZFUZZ_BOTH"),
-            "ZFUZZ_STRIDE beside ZFUZZ_BOTH: the store refuses the stride form beside the re-code"
         );
     }
     let mut bad = Vec::new();

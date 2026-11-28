@@ -856,35 +856,11 @@ the same with every group stored; `supdb-nocachezpagesrecordraw` and
 `supdb-cache64tofitzpagesrecordraw` are the two under the record coding with
 every tail stored raw (`Options::zpages_raw_tails`), the heads front-coded
 and the values the records' own bytes;
-`supdb-cache64tofitzpageshot4` and `supdb-cache64tofitzpageshot1` are
-`supdb-cache64tofitzpages` with the first four, or the first, partitions by
-key order in the raw-tail coding and the rest in the block coding
-(`Options::zpages_raw_tails_first`), the upper bound of a coding chosen per
-partition by its heat;
-`supdb-cache64tofitzpagesdrop` and `supdb-cache64tofitzpageshot4drop` are
-`supdb-cache64tofitzpages` and its hot4 arm with each partition's raw file
-and ordered index unmapped and dropped from the page cache once its form
-file serves it (`Options::zpages_drop_raw`);
-`supdb-cache64tofitzpageshot8drop` is the hot4 drop arm with the first
-eight partitions raw-tailed, `supdb-cache64tofitzpageshot8dropsettleevery`
-the same with every commit near reads settling its batch into the forms
-(`Options::forms_settle_every`), where the update mixes' writes are
-otherwise filed by ycsb-E's first scans,
-`supdb-cache64tofitzpageshot8dropsettlebuilds` that with the commit's fill
-building a form for every block its settle filed into that held none
-(`Options::forms_settle_builds`), and `supdb-cache64tofitzpagesrecordrawdrop`
-`supdb-cache64tofitzpagesrecordraw` with the drop, the two sides of the fit
-line the drop moves;
-`supdb-cache64tofitzpagesrecodedrop` is `supdb-cache64tofitzpagesdrop` with
-its partitions re-coded while served by what their decodes cost
-(`Options::zpages_recode`), the policy the key-order arms bound, and
-`supdb-cache64tofitzpagesrecodekeepdrop` the same with the form file a
-re-code replaced kept beside the served one, so that a partition's later
-re-codes exchange the two without a build (`Options::zpages_recode_keep`);
-`supdb-cache64tofitzpagesbothdrop` is that with both codings of every
-partition built at write time, the other beside each served file on the
-builder's thread, and the policy only exchanging them
-(`Options::zpages_both`);
+`supdb-cache64tofitzpagesdrop` is `supdb-cache64tofitzpages` with each
+partition's raw file and ordered index unmapped and dropped from the page
+cache once its form file serves it (`Options::zpages_drop_raw`), and
+`supdb-cache64tofitzpagesrecordrawdrop` `supdb-cache64tofitzpagesrecordraw`
+with the drop, the two sides of the fit line the drop moves;
 `supdb-nocachezstride` is `supdb-nocachezpages` with every build of a form
 file asking for the stride form -- a partition's values alone at their
 stride, where its keys are one run of numbers at one width and every record
@@ -1014,14 +990,7 @@ reading, however old (`Options::forms_settle_room_pressure` off);
 `supdb-snapdrops` is `supdb` whose handles, and whose writer on the merge
 paths, drop their scan snapshot at every publish their look has no tables
 to carry across, a merge's or a seal's landing among them
-(`Options::snapshot_stands` off); `supdb-mergedropscovered` with its
-merges dropping behind them the raw records of an input partition its form
-file serves (`Options::merge_drops_covered`), and
-`supdb-sameblocksrecords` with the landing's question whether a rewritten
-partition cuts the same blocks asked of the records whatever the ordered
-indexes hold (`Options::same_blocks_from_index` off), and
-`supdb-mergedropsrecords` with both, the shape the drop was first priced
-in;
+(`Options::snapshot_stands` off);
 `supdb-zgroup1k` is `supdb` with the form's pages cut into groups of a
 kibibyte of records where the default cuts at two
 (`Options::zpages_group_bytes`);

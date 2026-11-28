@@ -700,10 +700,6 @@ pub struct Supdb {
     /// that size or more is mapped and unmapped at its free.
     /// `supdb-ingestmmapthr`, and `supdb-mmapthr` durable.
     mmapthr: bool,
-    /// A merge drops its inputs' pages from the page cache behind its
-    /// second pass (`Options::merge_drop_behind`, refuted and off).
-    /// `supdb-ingestmergedropbehind`, and `supdb-mergedropbehind` durable.
-    mergedropbehind: bool,
     /// A merge's landing plans nothing, as a seal's landing alone did, so a
     /// store nothing writes keeps its pieces however long it is read
     /// (`Options::merge_chains` off). `supdb-ingestnomergechain`, and
@@ -731,14 +727,6 @@ pub struct Supdb {
     /// drops them a megabyte at a time (`Options::wal_drop_bytes` zero).
     /// `supdb-walkeep`, durable.
     walkeep: bool,
-    /// The controller's re-code of its hottest partitions to the raw tails
-    /// once the form is installed (`Options::zpages_recode_auto`).
-    /// `supdb-zrecodeauto`, durable.
-    zrecodeauto: bool,
-    /// The controller's re-parse of its hottest block-coded partitions once
-    /// the form is installed (`Options::zpages_reparse`).
-    /// `supdb-zreparse`, durable.
-    zreparse: bool,
     /// The builds ahead run beside scans past the selector's line, and a
     /// landing that covers the keys has the selector's reading refreshed
     /// (`Options::zpages_ahead_past_scans`). `supdb-zaheadscans`, durable.
@@ -1104,14 +1092,6 @@ pub struct Supdb {
     /// has no tables to carry (`Options::snapshot_stands` off).
     /// `supdb-snapdrops`.
     snapdrops: bool,
-    /// A merge drops behind it the raw records of an input partition its
-    /// form file serves (`Options::merge_drops_covered`).
-    /// `supdb-mergedropscovered`.
-    mergedropscovered: bool,
-    /// The landing's same-blocks check read from the records whatever the
-    /// indexes hold (`Options::same_blocks_from_index` off).
-    /// `supdb-sameblocksrecords`.
-    sameblocksrecords: bool,
     /// The fills' room closed for a second by any growth of the group's
     /// refaults since the last reading, however old the reading
     /// (`Options::forms_settle_room_pressure` off). `supdb-settleroomstill`.
@@ -1564,15 +1544,9 @@ pub struct Supdb {
     /// in-place walk: `supdb-cache64tofitzpagesrecordrawdecode` against
     /// `supdb-cache64tofitzpagesrecordraw`.
     zdecodewalk: bool,
-    /// The first this many partitions by key order raw-tailed and the rest
-    /// block-coded (`Options::zpages_raw_tails_first`): the upper bound of a
-    /// coding chosen per partition by its heat,
-    /// `supdb-cache64tofitzpageshot4` against `supdb-cache64tofitzpages`.
-    zhotfirst: usize,
     /// A partition's raw file and ordered index dropped from the page cache
     /// once its form file serves it (`Options::zpages_drop_raw`):
-    /// `supdb-cache64tofitzpagesdrop` and `supdb-cache64tofitzpageshot4drop`
-    /// against the same without. `None` follows the engine; the
+    /// `supdb-cache64tofitzpagesdrop` against the same without. `None` follows the engine; the
     /// `cache64tofit` arms pin the shape before the drop, since their pairs
     /// were priced against it.
     zdropraw: Option<bool>,
@@ -1643,34 +1617,14 @@ pub struct Supdb {
     /// `supdb-cache64tofitautozpagesdropland50coldskip` against
     /// `...dropland50`.
     zcoldskip: bool,
-    /// Its partitions re-coded while served by what their decodes cost
-    /// (`Options::zpages_recode`): `supdb-cache64tofitzpagesrecodedrop`
-    /// against `supdb-cache64tofitzpagesdrop` and the key-order arms.
-    zrecode: bool,
-    /// The form file a re-code replaced kept beside the served one, so the
-    /// partition's later re-codes are the two exchanged
-    /// (`Options::zpages_recode_keep`):
-    /// `supdb-cache64tofitzpagesrecodekeepdrop` against
-    /// `supdb-cache64tofitzpagesrecodedrop`.
-    zrecodekeep: bool,
-    /// Every commit near reads settling its batch into the forms
-    /// (`Options::forms_settle_every`), the engine's where this is `None`:
-    /// `supdb-cache64tofitzpageshot8dropsettleevery` against
-    /// `supdb-cache64tofitzpageshot8drop`, which pins it off.
-    settleevery: Option<bool>,
     /// And the commit's fill building a form for every block its settle
     /// filed into that held none (`Options::forms_settle_builds`), the
     /// engine's where this is `None`:
-    /// `supdb-cache64tofitzpageshot8dropsettlebuilds` and
-    /// `supdb-cache64tofitautozpagessettlebuilds` against bases that pin
+    /// `supdb-cache64tofitautozpagessettlebuilds` against a base that pins
     /// both off, and both off on the shipping arms as `supdb-settlelate`
     /// and `supdb-ingestsettlelate`, the shape before they were the
     /// default.
     settlebuilds: Option<bool>,
-    /// Both codings of every partition built at write time and kept, the
-    /// policy only exchanging them (`Options::zpages_both`):
-    /// `supdb-cache64tofitzpagesbothdrop`.
-    zboth: bool,
     /// before any view (`Options::zpages_memo_first`):
     /// `supdb-cache64tofitautozpagesmemofirst`, the pair against
     /// `supdb-cache64tofitautozpages`.
@@ -2117,10 +2071,6 @@ struct Policy {
     /// that size or more is mapped and unmapped at its free.
     /// `supdb-ingestmmapthr`, and `supdb-mmapthr` durable.
     mmapthr: bool,
-    /// A merge drops its inputs' pages from the page cache behind its
-    /// second pass (`Options::merge_drop_behind`, refuted and off).
-    /// `supdb-ingestmergedropbehind`, and `supdb-mergedropbehind` durable.
-    mergedropbehind: bool,
     /// A merge's landing plans nothing, as a seal's landing alone did, so a
     /// store nothing writes keeps its pieces however long it is read
     /// (`Options::merge_chains` off). `supdb-ingestnomergechain`, and
@@ -2148,14 +2098,6 @@ struct Policy {
     /// drops them a megabyte at a time (`Options::wal_drop_bytes` zero).
     /// `supdb-walkeep`, durable.
     walkeep: bool,
-    /// The controller's re-code of its hottest partitions to the raw tails
-    /// once the form is installed (`Options::zpages_recode_auto`).
-    /// `supdb-zrecodeauto`, durable.
-    zrecodeauto: bool,
-    /// The controller's re-parse of its hottest block-coded partitions once
-    /// the form is installed (`Options::zpages_reparse`).
-    /// `supdb-zreparse`, durable.
-    zreparse: bool,
     /// The builds ahead run beside scans past the selector's line, and a
     /// landing that covers the keys has the selector's reading refreshed
     /// (`Options::zpages_ahead_past_scans`). `supdb-zaheadscans`, durable.
@@ -2521,14 +2463,6 @@ struct Policy {
     /// has no tables to carry (`Options::snapshot_stands` off).
     /// `supdb-snapdrops`.
     snapdrops: bool,
-    /// A merge drops behind it the raw records of an input partition its
-    /// form file serves (`Options::merge_drops_covered`).
-    /// `supdb-mergedropscovered`.
-    mergedropscovered: bool,
-    /// The landing's same-blocks check read from the records whatever the
-    /// indexes hold (`Options::same_blocks_from_index` off).
-    /// `supdb-sameblocksrecords`.
-    sameblocksrecords: bool,
     /// The fills' room closed for a second by any growth of the group's
     /// refaults since the last reading, however old the reading
     /// (`Options::forms_settle_room_pressure` off). `supdb-settleroomstill`.
@@ -2866,11 +2800,8 @@ struct Policy {
     /// Its raw-tail groups decoded whole for a scan
     /// (`Options::zpages_inplace_walk` off): `supdb-cache64tofitzpagesrecordrawdecode`.
     zdecodewalk: bool,
-    /// Its first partitions raw-tailed (`Options::zpages_raw_tails_first`):
-    /// `supdb-cache64tofitzpageshot4`.
-    zhotfirst: usize,
     /// Its raw pages dropped behind the form (`Options::zpages_drop_raw`):
-    /// `supdb-cache64tofitzpagesdrop`, `supdb-cache64tofitzpageshot4drop`.
+    /// `supdb-cache64tofitzpagesdrop`.
     zdropraw: Option<bool>,
     /// Its block-coded groups the parsing encoder's (`Options::zpages_parse`):
     /// `supdb-cache64tofitzpagesdropparse`, `supdb-cache64tofitautozpagesparse`.
@@ -2921,22 +2852,13 @@ struct Policy {
     /// (`Options::zpages_land_cold_past` off):
     /// `supdb-cache64tofitautozpagesdropland50coldskip`.
     zcoldskip: bool,
-    /// Its partitions re-coded while served (`Options::zpages_recode`):
-    /// `supdb-cache64tofitzpagesrecodedrop`.
-    zrecode: bool,
-    /// The replaced form file kept for the next re-code
-    /// (`Options::zpages_recode_keep`): `supdb-cache64tofitzpagesrecodekeepdrop`.
-    zrecodekeep: bool,
     /// Every commit near reads settles its batch
-    /// (`Options::forms_settle_every`), the engine's where `None`:
-    /// `supdb-cache64tofitzpageshot8dropsettleevery`.
+    /// (`Options::forms_settle_every`), the engine's where `None`.
     settleevery: Option<bool>,
     /// Its settles' blocks built by the fill (`Options::forms_settle_builds`),
     /// the engine's where `None`: `...settlebuilds` on the pinned families,
     /// and both off as the shipping arms' `...settlelate`.
     settlebuilds: Option<bool>,
-    /// Both codings kept (`Options::zpages_both`): `supdb-cache64tofitzpagesbothdrop`.
-    zboth: bool,
     /// (`Options::zpages_memo_first`): `supdb-cache64tofitautozpagesmemofirst`.
     zmemofirst: bool,
     /// The fence searched through its tree (`Options::zpages_fence_tree`):
@@ -3215,15 +3137,12 @@ impl Default for Policy {
             mergewalkrescan: false,
             mergenoverify: false,
             mmapthr: false,
-            mergedropbehind: false,
             nomergechain: false,
             mergeuncapped: false,
             mergeone: false,
             sealfloorooc: false,
             nofitshort: false,
             walkeep: false,
-            zrecodeauto: false,
-            zreparse: false,
             zaheadscans: false,
             nozfinish: false,
             bgidle: false,
@@ -3311,8 +3230,6 @@ impl Default for Policy {
             formsoffbuilt: None,
             formson: false,
             snapdrops: false,
-            mergedropscovered: false,
-            sameblocksrecords: false,
             settleroomstill: false,
             settlespan: false,
             nopacesyncs: false,
@@ -3418,13 +3335,9 @@ impl Default for Policy {
             zstored: false,
             zrawtails: false,
             zdecodewalk: false,
-            zhotfirst: 0,
             zdropraw: None,
-            zrecode: false,
-            zrecodekeep: false,
             settleevery: None,
             settlebuilds: None,
-            zboth: false,
             zmemofirst: false,
             zfencetree: false,
             zmemonoahead: false,
@@ -6217,33 +6130,6 @@ impl Supdb {
         )
     }
 
-    /// `supdb` whose merges drop their inputs' pages from the page cache
-    /// behind the second pass (`Options::merge_drop_behind`, refuted):
-    /// against `supdb` under a bound it prices the drop.
-    pub fn create_mergedropbehind(path: &Path) -> Res<Supdb> {
-        Supdb::with_policy(
-            path,
-            Policy {
-                mergedropbehind: true,
-                ..Policy::default()
-            },
-        )
-    }
-
-    /// `supdb-ingest` whose merges drop their inputs' pages, as
-    /// `supdb-mergedropbehind`.
-    pub fn create_ingest_mergedropbehind(path: &Path) -> Res<Supdb> {
-        Supdb::with_policy(
-            path,
-            Policy {
-                partition: false,
-                durable: false,
-                mergedropbehind: true,
-                ..Policy::default()
-            },
-        )
-    }
-
     /// `supdb` whose merge landings plan nothing, where the default plans
     /// the next merge at each (`Options::merge_chains`): against `supdb`
     /// under a bound it prices the pieces a read pass meets.
@@ -6334,33 +6220,6 @@ impl Supdb {
             path,
             Policy {
                 nofitshort: true,
-                ..Policy::default()
-            },
-        )
-    }
-
-    /// `supdb` whose controller re-codes its hottest partitions to the raw
-    /// tails once the form is installed (`Options::zpages_recode_auto`):
-    /// against `supdb` it prices the re-code under the controller.
-    pub fn create_zrecodeauto(path: &Path) -> Res<Supdb> {
-        Supdb::with_policy(
-            path,
-            Policy {
-                zrecodeauto: true,
-                ..Policy::default()
-            },
-        )
-    }
-
-    /// `supdb` whose controller re-parses its hottest block-coded
-    /// partitions once the form is installed and the builder is free
-    /// (`Options::zpages_reparse`), `supdb-zreparse`: the parse's cheaper
-    /// decodes without its CPU in the builds the install waits for.
-    pub fn create_zreparse(path: &Path) -> Res<Supdb> {
-        Supdb::with_policy(
-            path,
-            Policy {
-                zreparse: true,
                 ..Policy::default()
             },
         )
@@ -8081,47 +7940,6 @@ impl Supdb {
         )
     }
 
-    /// `supdb` whose landings ask the records whether a rewritten
-    /// partition cuts the same blocks, whatever the ordered indexes hold
-    /// (`Options::same_blocks_from_index` off).
-    pub fn create_sameblocksrecords(path: &Path) -> Res<Supdb> {
-        Supdb::with_policy(
-            path,
-            Policy {
-                sameblocksrecords: true,
-                ..Policy::default()
-            },
-        )
-    }
-
-    /// `supdb` whose merges drop behind them the raw records of an input
-    /// partition its form file serves (`Options::merge_drops_covered`)
-    /// with the landing's same-blocks question asked of the records
-    /// (`Options::same_blocks_from_index` off): the shape that first priced
-    /// the drop, whose landings read back the pages the merge had dropped.
-    pub fn create_mergedropsrecords(path: &Path) -> Res<Supdb> {
-        Supdb::with_policy(
-            path,
-            Policy {
-                mergedropscovered: true,
-                sameblocksrecords: true,
-                ..Policy::default()
-            },
-        )
-    }
-
-    /// `supdb` whose merges drop behind them the raw records of an input
-    /// partition its form file serves (`Options::merge_drops_covered`).
-    pub fn create_mergedropscovered(path: &Path) -> Res<Supdb> {
-        Supdb::with_policy(
-            path,
-            Policy {
-                mergedropscovered: true,
-                ..Policy::default()
-            },
-        )
-    }
-
     /// `supdb` whose writer keeps its block forms out of core whatever its
     /// scans meet (`Options::scan_forms_off_unreused` off).
     pub fn create_formson(path: &Path) -> Res<Supdb> {
@@ -8836,26 +8654,6 @@ impl Supdb {
         )
     }
 
-    /// `supdb-cache64tofitzpages` with its first four partitions by key order
-    /// built in the record coding with raw tails and the rest in the block
-    /// coding (`Options::zpages_raw_tails_first`),
-    /// `supdb-cache64tofitzpageshot4`: the upper bound of a coding chosen per
-    /// partition by its heat, where the suite's unscrambled Zipfian puts
-    /// three quarters of the E mix's decodes at five million keys.
-    pub fn create_cache64_tofit_zpages_hot4(path: &Path) -> Res<Supdb> {
-        Supdb::with_policy(
-            path,
-            Policy {
-                budget: 64 << 20,
-                tofit: true,
-                zpages: true,
-                zhotfirst: 4,
-                zdropraw: Some(false),
-                ..Policy::default()
-            },
-        )
-    }
-
     /// `supdb-cache64tofitzpages` with each partition's raw file and ordered
     /// index dropped from the page cache once its form file serves it
     /// (`Options::zpages_drop_raw`), `supdb-cache64tofitzpagesdrop`: the
@@ -9126,112 +8924,6 @@ impl Supdb {
         )
     }
 
-    /// `supdb-cache64tofitzpageshot4` with the raw pages dropped behind the
-    /// form (`Options::zpages_drop_raw`), `supdb-cache64tofitzpageshot4drop`:
-    /// whether the room makes the four raw-tailed partitions fit the
-    /// uniform read pass the hot4 arm faulted in.
-    pub fn create_cache64_tofit_zpages_hot4_drop(path: &Path) -> Res<Supdb> {
-        Supdb::with_policy(
-            path,
-            Policy {
-                budget: 64 << 20,
-                tofit: true,
-                zpages: true,
-                zhotfirst: 4,
-                zdropraw: Some(true),
-                ..Policy::default()
-            },
-        )
-    }
-
-    /// `supdb-cache64tofitzpageshot4drop` with the first eight partitions
-    /// raw-tailed, `supdb-cache64tofitzpageshot8drop`: where the room the
-    /// drop gives ends for the raw-tail coding by key order.
-    pub fn create_cache64_tofit_zpages_hot8_drop(path: &Path) -> Res<Supdb> {
-        Supdb::with_policy(
-            path,
-            Policy {
-                budget: 64 << 20,
-                tofit: true,
-                zpages: true,
-                zhotfirst: 8,
-                zdropraw: Some(true),
-                // The settle left to the backlog bound, the shape its
-                // `...settleevery` and `...settlebuilds` pairs were priced
-                // against.
-                settleevery: Some(false),
-                settlebuilds: Some(false),
-                ..Policy::default()
-            },
-        )
-    }
-
-    /// `supdb-cache64tofitzpageshot8drop` with every commit near reads
-    /// settling its batch into the forms (`Options::forms_settle_every`),
-    /// `supdb-cache64tofitzpageshot8dropsettleevery`: the update mixes'
-    /// writes filed and their blocks' forms built by their own commits,
-    /// on the upkeep thread through the fsync, rather than by ycsb-E's
-    /// first scans.
-    pub fn create_cache64_tofit_zpages_hot8_drop_settle_every(path: &Path) -> Res<Supdb> {
-        Supdb::with_policy(
-            path,
-            Policy {
-                budget: 64 << 20,
-                tofit: true,
-                zpages: true,
-                zhotfirst: 8,
-                zdropraw: Some(true),
-                settleevery: Some(true),
-                settlebuilds: Some(false),
-                ..Policy::default()
-            },
-        )
-    }
-
-    /// `supdb-cache64tofitzpageshot8dropsettleevery` with the commit's fill
-    /// building a form for every block its settle filed into that held
-    /// none (`Options::forms_settle_builds`),
-    /// `supdb-cache64tofitzpageshot8dropsettlebuilds`: the update mixes'
-    /// blocks formed by the commits that dirty them, where the settle
-    /// alone patches only the blocks a scan has formed.
-    pub fn create_cache64_tofit_zpages_hot8_drop_settle_builds(path: &Path) -> Res<Supdb> {
-        Supdb::with_policy(
-            path,
-            Policy {
-                budget: 64 << 20,
-                tofit: true,
-                zpages: true,
-                zhotfirst: 8,
-                zdropraw: Some(true),
-                settleevery: Some(true),
-                settlebuilds: Some(true),
-                ..Policy::default()
-            },
-        )
-    }
-
-    /// `supdb-cache64tofitzpagesrecodekeepdrop` with both codings of every
-    /// partition built at write time and kept (`Options::zpages_both`),
-    /// `supdb-cache64tofitzpagesbothdrop`: the other coding built beside each
-    /// served form file on the builder's thread, and the policy choosing the
-    /// raw-tailed set by heat and exchanging the two, never building while
-    /// the store serves.
-    pub fn create_cache64_tofit_zpages_both_drop(path: &Path) -> Res<Supdb> {
-        Supdb::with_policy(
-            path,
-            Policy {
-                budget: 64 << 20,
-                tofit: true,
-                zpages: true,
-                zdropraw: Some(true),
-                zrecode: true,
-                zrecodekeep: true,
-                zboth: true,
-                ..Policy::default()
-            },
-        )
-    }
-
     /// `supdb` whose commits leave their batches to the backlog bound and
     /// the first scans after them, and whose fill builds no block of its
     /// own (`Options::forms_settle_every` and `forms_settle_builds` off),
@@ -9282,44 +8974,6 @@ impl Supdb {
         )
     }
 
-    /// `supdb-cache64tofitzpagesdrop` with its partitions re-coded while
-    /// served by what their decodes cost (`Options::zpages_recode`),
-    /// `supdb-cache64tofitzpagesrecodedrop`: the raw tails where the
-    /// decodes are, to the budget, and given back at the group's refaults --
-    /// the policy the key-order arms are the upper bound of.
-    pub fn create_cache64_tofit_zpages_recode_drop(path: &Path) -> Res<Supdb> {
-        Supdb::with_policy(
-            path,
-            Policy {
-                budget: 64 << 20,
-                tofit: true,
-                zpages: true,
-                zdropraw: Some(true),
-                zrecode: true,
-                ..Policy::default()
-            },
-        )
-    }
-
-    /// `supdb-cache64tofitzpagesrecodedrop` with the form file a re-code
-    /// replaced kept beside the served one (`Options::zpages_recode_keep`),
-    /// `supdb-cache64tofitzpagesrecodekeepdrop`: a partition's re-codes
-    /// after its first are the two files exchanged, no build.
-    pub fn create_cache64_tofit_zpages_recode_keep_drop(path: &Path) -> Res<Supdb> {
-        Supdb::with_policy(
-            path,
-            Policy {
-                budget: 64 << 20,
-                tofit: true,
-                zpages: true,
-                zdropraw: Some(true),
-                zrecode: true,
-                zrecodekeep: true,
-                ..Policy::default()
-            },
-        )
-    }
-
     /// `supdb-cache64tofitzpagesrecordraw` with the raw pages dropped behind
     /// the form (`Options::zpages_drop_raw`),
     /// `supdb-cache64tofitzpagesrecordrawdrop`: whether the whole raw-tail
@@ -9334,23 +8988,6 @@ impl Supdb {
                 zpages: true,
                 zrawtails: true,
                 zdropraw: Some(true),
-                ..Policy::default()
-            },
-        )
-    }
-
-    /// `supdb-cache64tofitzpageshot4` with the first partition alone
-    /// raw-tailed, `supdb-cache64tofitzpageshot1`: half of the E mix's
-    /// decodes at five million keys for a quarter of hot4's extra bytes.
-    pub fn create_cache64_tofit_zpages_hot1(path: &Path) -> Res<Supdb> {
-        Supdb::with_policy(
-            path,
-            Policy {
-                budget: 64 << 20,
-                tofit: true,
-                zpages: true,
-                zhotfirst: 1,
-                zdropraw: Some(false),
                 ..Policy::default()
             },
         )
@@ -9689,15 +9326,12 @@ impl Supdb {
             mergewalkrescan,
             mergenoverify,
             mmapthr,
-            mergedropbehind,
             nomergechain,
             mergeuncapped,
             mergeone,
             sealfloorooc,
             nofitshort,
             walkeep,
-            zrecodeauto,
-            zreparse,
             zaheadscans,
             nozfinish,
             bgidle,
@@ -9785,8 +9419,6 @@ impl Supdb {
             formsoffbuilt,
             formson,
             snapdrops,
-            mergedropscovered,
-            sameblocksrecords,
             settleroomstill,
             settlespan,
             nopacesyncs,
@@ -9897,7 +9529,6 @@ impl Supdb {
             zstored,
             zrawtails,
             zdecodewalk,
-            zhotfirst,
             zdropraw,
             zparse,
             zparsestart,
@@ -9913,11 +9544,8 @@ impl Supdb {
             zkeepbehind,
             znobuildsync,
             zcoldskip,
-            zrecode,
-            zrecodekeep,
             settleevery,
             settlebuilds,
-            zboth,
             zmemofirst,
             zfencetree,
             zmemonoahead,
@@ -10116,9 +9744,6 @@ impl Supdb {
             merge_walk_cached: !mergewalkrescan,
             merge_verifies_inputs: !mergenoverify,
             malloc_mmap_threshold: if mmapthr { 128 << 10 } else { 0 },
-            merge_drop_behind: mergedropbehind,
-            merge_drops_covered: mergedropscovered,
-            same_blocks_from_index: !sameblocksrecords,
             merge_chains: !nomergechain,
             merge_bytes_cap: if mergeuncapped {
                 0
@@ -10132,8 +9757,6 @@ impl Supdb {
             },
             seal_floor_out_of_core: sealfloorooc,
             forms_fit_when_short: !nofitshort,
-            zpages_recode_auto: zrecodeauto,
-            zpages_reparse: zreparse,
             zpages_ahead_past_scans: zaheadscans,
             zpages_build_at_finish: !nozfinish,
             background_io: if bgidle {
@@ -10371,7 +9994,7 @@ impl Supdb {
             zpages_coding_auto: !zcodingfixed,
             // The re-parse arm's builds keep the greedy encoder, as it was
             // priced: the parse is bought there after the install.
-            zpages_parse: !(zgreedy || zreparse),
+            zpages_parse: !zgreedy,
             zpages_parse_finish: zparse,
             zpages_parse_chains: if zparse || zparsestart {
                 0
@@ -10392,7 +10015,6 @@ impl Supdb {
             zpages_store_all: zstored,
             zpages_raw_tails: zrawtails,
             zpages_inplace_walk: !zdecodewalk,
-            zpages_raw_tails_first: zhotfirst,
             zpages_drop_raw: zdropraw.unwrap_or(supdb::Options::default().zpages_drop_raw),
             zpages_land_pct: if noland {
                 0
@@ -10406,12 +10028,9 @@ impl Supdb {
             zpages_land_drop_past: !zkeepbehind,
             zpages_build_sync: !znobuildsync,
             zpages_land_cold_past: !zcoldskip,
-            zpages_recode: zrecode,
-            zpages_recode_keep: zrecodekeep,
             forms_settle_every: settleevery.unwrap_or(supdb::Options::default().forms_settle_every),
             forms_settle_builds: settlebuilds
                 .unwrap_or(supdb::Options::default().forms_settle_builds),
-            zpages_both: zboth,
             zpages_record_coding: zrecord || zrawtails || zrecorddefault,
             zpages_memo_first: zmemofirst,
             zpages_fence_tree: zfencetree,
@@ -10471,10 +10090,9 @@ impl Supdb {
             // The stride form follows the engine, but for an arm that
             // forces the compact form, which prices a form by itself -- the
             // block form unless it names the other, and then that form at
-            // every build -- and an arm that starts a re-code, which the
-            // engine refuses beside the stride form: both keep their shape
-            // whichever way the engine's default stands.
-            zpages_stride: zstride.unwrap_or(if zpages || zrecode || zrecodeauto || zreparse {
+            // every build -- keeps its shape whichever way the engine's
+            // default stands.
+            zpages_stride: zstride.unwrap_or(if zpages {
                 supdb::ZStride::Off
             } else {
                 supdb::Options::default().zpages_stride
@@ -10687,15 +10305,12 @@ impl Supdb {
             mergewalkrescan,
             mergenoverify,
             mmapthr,
-            mergedropbehind,
             nomergechain,
             mergeuncapped,
             mergeone,
             sealfloorooc,
             nofitshort,
             walkeep,
-            zrecodeauto,
-            zreparse,
             zaheadscans,
             nozfinish,
             bgidle,
@@ -10783,8 +10398,6 @@ impl Supdb {
             formsoffbuilt,
             formson,
             snapdrops,
-            mergedropscovered,
-            sameblocksrecords,
             settleroomstill,
             settlespan,
             nopacesyncs,
@@ -10895,7 +10508,6 @@ impl Supdb {
             zstored,
             zrawtails,
             zdecodewalk,
-            zhotfirst,
             zdropraw,
             zparse,
             zparsestart,
@@ -10911,11 +10523,7 @@ impl Supdb {
             zkeepbehind,
             znobuildsync,
             zcoldskip,
-            zrecode,
-            zrecodekeep,
-            settleevery,
             settlebuilds,
-            zboth,
             zmemofirst,
             zfencetree,
             zmemonoahead,
@@ -11492,32 +11100,14 @@ impl Engine for Supdb {
         if self.budget == 64 << 20 && self.tofit && self.zpages {
             return if self.zstored {
                 "supdb-cache64tofitzpagesstored"
-            } else if self.zboth && self.zrecodekeep && self.zrecode && zdropraw {
-                "supdb-cache64tofitzpagesbothdrop"
-            } else if self.zrecodekeep && self.zrecode && zdropraw {
-                "supdb-cache64tofitzpagesrecodekeepdrop"
-            } else if self.zrecode && zdropraw {
-                "supdb-cache64tofitzpagesrecodedrop"
-            } else if self.zhotfirst == 8 && zdropraw && self.settlebuilds == Some(true) {
-                "supdb-cache64tofitzpageshot8dropsettlebuilds"
-            } else if self.zhotfirst == 8 && zdropraw && self.settleevery == Some(true) {
-                "supdb-cache64tofitzpageshot8dropsettleevery"
-            } else if self.zhotfirst == 8 && zdropraw {
-                "supdb-cache64tofitzpageshot8drop"
             } else if self.zrawtails && zdropraw {
                 "supdb-cache64tofitzpagesrecordrawdrop"
-            } else if self.zhotfirst == 4 && zdropraw {
-                "supdb-cache64tofitzpageshot4drop"
-            } else if self.zhotfirst == 4 {
-                "supdb-cache64tofitzpageshot4"
             } else if zdropraw && self.zparse {
                 "supdb-cache64tofitzpagesdropparse"
             } else if zdropraw && self.zflexdec {
                 "supdb-cache64tofitzpagesdropflexdec"
             } else if zdropraw {
                 "supdb-cache64tofitzpagesdrop"
-            } else if self.zhotfirst == 1 {
-                "supdb-cache64tofitzpageshot1"
             } else if self.zrawtails && self.zdecodewalk {
                 "supdb-cache64tofitzpagesrecordrawdecode"
             } else if self.zrawtails {
@@ -12089,13 +11679,6 @@ impl Engine for Supdb {
                 "supdb-ingestmergenoverify"
             };
         }
-        if self.mergedropbehind {
-            return if self.partition {
-                "supdb-mergedropbehind"
-            } else {
-                "supdb-ingestmergedropbehind"
-            };
-        }
         if self.nomergechain {
             return if self.partition {
                 "supdb-nomergechain"
@@ -12115,12 +11698,6 @@ impl Engine for Supdb {
         }
         if self.walkeep {
             return "supdb-walkeep";
-        }
-        if self.zrecodeauto {
-            return "supdb-zrecodeauto";
-        }
-        if self.zreparse {
-            return "supdb-zreparse";
         }
         if self.zaheadscans {
             return "supdb-zaheadscans";
@@ -12584,15 +12161,6 @@ impl Engine for Supdb {
         if self.snapdrops {
             return "supdb-snapdrops";
         }
-        if self.mergedropscovered && self.sameblocksrecords {
-            return "supdb-mergedropsrecords";
-        }
-        if self.mergedropscovered {
-            return "supdb-mergedropscovered";
-        }
-        if self.sameblocksrecords {
-            return "supdb-sameblocksrecords";
-        }
         if self.settleroomstill {
             return "supdb-settleroomstill";
         }
@@ -13021,10 +12589,6 @@ impl Engine for Supdb {
             ("merge_record_inputs", db.merge_key_sources().1 as f64),
             ("merge_ahead_asks", db.merge_ahead().0 as f64),
             ("merge_ahead_mb", db.merge_ahead().1 as f64 / 1048576.0),
-            (
-                "merge_dropped_mb",
-                db.merge_dropped_bytes() as f64 / 1048576.0,
-            ),
             ("unsealed_keys", db.unsealed_keys() as f64),
             // The writer's point reads by the path that answered them: the
             // partition and the live table alone, and the layered read of
@@ -13399,11 +12963,7 @@ impl Engine for Supdb {
             ("zpage_build_wall_ms", z.build_wall_us as f64 / 1e3),
             ("zpage_build_cpu_ms", z.build_cpu_us as f64 / 1e3),
             ("zpage_build_majflt", z.build_majflt as f64),
-            ("zpage_recodes", z.recodes as f64),
-            ("zpage_recodes_back", z.recodes_back as f64),
-            ("zpage_reparses", z.reparses as f64),
             ("zpage_recode_failed", z.recode_failed as f64),
-            ("zpage_recode_flips", z.recode_flips as f64),
             ("zpage_hot_raw", z.hot_raw as f64),
             ("zpage_hot_back", z.hot_back as f64),
             ("zpage_hot_looks", z.hot_looks as f64),
@@ -13430,9 +12990,6 @@ impl Engine for Supdb {
             ("forms_off_exits", db.forms_off_counts()[1] as f64),
             ("forms_off_scans", db.forms_off_counts()[2] as f64),
             ("forms_off_stale", db.forms_off_stale_exits() as f64),
-            ("zpage_spare_files", z.spare_files as f64),
-            ("zpage_spare_builds", z.spare_builds as f64),
-            ("zpage_spare_failed", z.spare_failed as f64),
             ("zpage_sel_samples", z.sel_samples as f64),
             ("zpage_sel_builds", z.sel_builds as f64),
             ("zpage_sel_installs", z.sel_installs as f64),
@@ -15178,18 +14735,9 @@ pub fn guarantee(arm: &str) -> Option<Guarantee> {
         | "supdb-cache64tofitzpages"
         | "supdb-cache64tofitzpagesstored"
         | "supdb-cache64tofitzpagesrecordraw"
-        | "supdb-cache64tofitzpageshot4"
-        | "supdb-cache64tofitzpageshot1"
         | "supdb-cache64tofitzpagesdrop"
         | "supdb-cache64tofitzpagesdropparse"
         | "supdb-cache64tofitzpagesdropflexdec"
-        | "supdb-cache64tofitzpageshot4drop"
-        | "supdb-cache64tofitzpageshot8drop"
-        | "supdb-cache64tofitzpageshot8dropsettleevery"
-        | "supdb-cache64tofitzpageshot8dropsettlebuilds"
-        | "supdb-cache64tofitzpagesbothdrop"
-        | "supdb-cache64tofitzpagesrecodedrop"
-        | "supdb-cache64tofitzpagesrecodekeepdrop"
         | "supdb-cache64tofitzpagesrecordrawdrop"
         | "supdb-cache64tofitzpagesrecordrawdecode"
         | "supdb-nocachezpagesheads"
@@ -15273,7 +14821,6 @@ pub fn guarantee(arm: &str) -> Option<Guarantee> {
         | "supdb-mergewalkrescan"
         | "supdb-mergenoverify"
         | "supdb-mmapthr"
-        | "supdb-mergedropbehind"
         | "supdb-nomergechain"
         | "supdb-mergeuncapped"
         | "supdb-mergeone"
@@ -15281,8 +14828,6 @@ pub fn guarantee(arm: &str) -> Option<Guarantee> {
         | "supdb-cacheraw"
         | "supdb-nofitshort"
         | "supdb-walkeep"
-        | "supdb-zrecodeauto"
-        | "supdb-zreparse"
         | "supdb-zaheadscans"
         | "supdb-nozfinish"
         | "supdb-bgidle"
@@ -15379,9 +14924,6 @@ pub fn guarantee(arm: &str) -> Option<Guarantee> {
         | "supdb-nozjobsrewarm"
         | "supdb-formson"
         | "supdb-snapdrops"
-        | "supdb-mergedropscovered"
-        | "supdb-mergedropsrecords"
-        | "supdb-sameblocksrecords"
         | "supdb-settleroomstill"
         | "supdb-zgroup1k"
         | "supdb-settlespan"
@@ -15559,7 +15101,6 @@ pub fn guarantee(arm: &str) -> Option<Guarantee> {
         | "supdb-ingestmergewalkrescan"
         | "supdb-ingestmergenoverify"
         | "supdb-ingestmmapthr"
-        | "supdb-ingestmergedropbehind"
         | "supdb-ingestnomergechain"
         | "supdb-ingestmergeuncapped"
         | "supdb-ingestmergeone"
@@ -15801,34 +15342,12 @@ pub fn open(arm: &str, dir: &Path, map_gb: usize) -> Res<Box<dyn Engine>> {
         "supdb-cache64tofitzpagesrecordraw" => {
             supdb_arm(Supdb::create_cache64_tofit_zpages_record_raw, dir)?
         }
-        "supdb-cache64tofitzpageshot4" => supdb_arm(Supdb::create_cache64_tofit_zpages_hot4, dir)?,
-        "supdb-cache64tofitzpageshot1" => supdb_arm(Supdb::create_cache64_tofit_zpages_hot1, dir)?,
         "supdb-cache64tofitzpagesdrop" => supdb_arm(Supdb::create_cache64_tofit_zpages_drop, dir)?,
         "supdb-cache64tofitzpagesdropparse" => {
             supdb_arm(Supdb::create_cache64_tofit_zpages_drop_parse, dir)?
         }
         "supdb-cache64tofitzpagesdropflexdec" => {
             supdb_arm(Supdb::create_cache64_tofit_zpages_drop_flexdec, dir)?
-        }
-        "supdb-cache64tofitzpageshot4drop" => {
-            supdb_arm(Supdb::create_cache64_tofit_zpages_hot4_drop, dir)?
-        }
-        "supdb-cache64tofitzpageshot8drop" => {
-            supdb_arm(Supdb::create_cache64_tofit_zpages_hot8_drop, dir)?
-        }
-        "supdb-cache64tofitzpageshot8dropsettleevery" => supdb_arm(
-            Supdb::create_cache64_tofit_zpages_hot8_drop_settle_every,
-            dir,
-        )?,
-        "supdb-cache64tofitzpageshot8dropsettlebuilds" => supdb_arm(
-            Supdb::create_cache64_tofit_zpages_hot8_drop_settle_builds,
-            dir,
-        )?,
-        "supdb-cache64tofitzpagesrecodedrop" => {
-            supdb_arm(Supdb::create_cache64_tofit_zpages_recode_drop, dir)?
-        }
-        "supdb-cache64tofitzpagesrecodekeepdrop" => {
-            supdb_arm(Supdb::create_cache64_tofit_zpages_recode_keep_drop, dir)?
         }
         "supdb-cache64tofitzpagesrecordrawdrop" => {
             supdb_arm(Supdb::create_cache64_tofit_zpages_record_raw_drop, dir)?
@@ -15880,9 +15399,6 @@ pub fn open(arm: &str, dir: &Path, map_gb: usize) -> Res<Box<dyn Engine>> {
         }
         "supdb-cache64tofitautozpagessettlebuilds" => {
             supdb_arm(Supdb::create_cache64_tofit_auto_zpages_settlebuilds, dir)?
-        }
-        "supdb-cache64tofitzpagesbothdrop" => {
-            supdb_arm(Supdb::create_cache64_tofit_zpages_both_drop, dir)?
         }
         "supdb-cache64tofitautozpagescodingfixed" => {
             supdb_arm(Supdb::create_cache64_tofit_auto_zpages_codingfixed, dir)?
@@ -16969,8 +16485,6 @@ pub fn open(arm: &str, dir: &Path, map_gb: usize) -> Res<Box<dyn Engine>> {
             dir,
         )?,
         "supdb-ingestmergenoverify" => supdb_arm(Supdb::create_ingest_mergenoverify, dir)?,
-        "supdb-mergedropbehind" => supdb_arm(Supdb::create_mergedropbehind, dir)?,
-        "supdb-ingestmergedropbehind" => supdb_arm(Supdb::create_ingest_mergedropbehind, dir)?,
         "supdb-nomergechain" => supdb_arm(Supdb::create_nomergechain, dir)?,
         "supdb-ingestnomergechain" => supdb_arm(Supdb::create_ingest_nomergechain, dir)?,
         "supdb-mergeuncapped" => supdb_arm(Supdb::create_mergeuncapped, dir)?,
@@ -16980,8 +16494,6 @@ pub fn open(arm: &str, dir: &Path, map_gb: usize) -> Res<Box<dyn Engine>> {
         "supdb-cacheraw" => supdb_arm(Supdb::create_cacheraw, dir)?,
         "supdb-nofitshort" => supdb_arm(Supdb::create_nofitshort, dir)?,
         "supdb-walkeep" => supdb_arm(Supdb::create_walkeep, dir)?,
-        "supdb-zrecodeauto" => supdb_arm(Supdb::create_zrecodeauto, dir)?,
-        "supdb-zreparse" => supdb_arm(Supdb::create_zreparse, dir)?,
         "supdb-zaheadscans" => supdb_arm(Supdb::create_zaheadscans, dir)?,
         "supdb-nozfinish" => supdb_arm(Supdb::create_nozfinish, dir)?,
         "supdb-bgidle" => supdb_arm(Supdb::create_bgidle, dir)?,
@@ -17859,9 +17371,6 @@ pub fn open(arm: &str, dir: &Path, map_gb: usize) -> Res<Box<dyn Engine>> {
         "supdb-nozjobsrewarm" => supdb_arm(Supdb::create_nozjobsrewarm, dir)?,
         "supdb-formson" => supdb_arm(Supdb::create_formson, dir)?,
         "supdb-snapdrops" => supdb_arm(Supdb::create_snapdrops, dir)?,
-        "supdb-mergedropscovered" => supdb_arm(Supdb::create_mergedropscovered, dir)?,
-        "supdb-mergedropsrecords" => supdb_arm(Supdb::create_mergedropsrecords, dir)?,
-        "supdb-sameblocksrecords" => supdb_arm(Supdb::create_sameblocksrecords, dir)?,
         "supdb-settleroomstill" => supdb_arm(Supdb::create_settleroomstill, dir)?,
         "supdb-zgroup1k" => supdb_arm(Supdb::create_zgroup1k, dir)?,
         "supdb-settlespan" => supdb_arm(Supdb::create_settlespan, dir)?,
@@ -20437,9 +19946,7 @@ mod tests {
             "supdb-cacheraw",
             "supdb-nofitshort",
             "supdb-walkeep",
-            "supdb-zrecodeauto",
             "supdb-zparse",
-            "supdb-zreparse",
             "supdb-zaheadscans",
             "supdb-nozfinish",
             "supdb-bgidle",
@@ -20486,17 +19993,6 @@ mod tests {
                         b.merge_bytes_cap,
                         b.upkeep
                     )
-                );
-            }
-            {
-                let z = Supdb::create_zrecodeauto(&dir("zrecodeauto")).unwrap();
-                assert_eq!(z.features(), base.features());
-                let o = z.db.as_ref().unwrap().options();
-                assert!(o.zpages_recode_auto && !b.zpages_recode_auto);
-                assert!(!o.zpages_recode && !o.zpages_both);
-                assert_eq!(
-                    (o.zpages, o.zpages_cover_resident, o.wal_drop_bytes),
-                    (b.zpages, b.zpages_cover_resident, b.wal_drop_bytes)
                 );
             }
             {
@@ -21310,27 +20806,6 @@ mod tests {
                 assert!(!o.snapshot_stands && b.snapshot_stands);
             }
             {
-                let z = Supdb::create_mergedropscovered(&dir("mergedropscovered")).unwrap();
-                assert_eq!(z.name(), "supdb-mergedropscovered");
-                assert_eq!(z.features(), base.features());
-                let o = z.db.as_ref().unwrap().options();
-                assert!(o.merge_drops_covered && !b.merge_drops_covered);
-            }
-            {
-                let z = Supdb::create_mergedropsrecords(&dir("mergedropsrecords")).unwrap();
-                assert_eq!(z.name(), "supdb-mergedropsrecords");
-                assert_eq!(z.features(), base.features());
-                let o = z.db.as_ref().unwrap().options();
-                assert!(o.merge_drops_covered && !o.same_blocks_from_index);
-            }
-            {
-                let z = Supdb::create_sameblocksrecords(&dir("sameblocksrecords")).unwrap();
-                assert_eq!(z.name(), "supdb-sameblocksrecords");
-                assert_eq!(z.features(), base.features());
-                let o = z.db.as_ref().unwrap().options();
-                assert!(!o.same_blocks_from_index && b.same_blocks_from_index);
-            }
-            {
                 let z = Supdb::with_policy(
                     &dir("zbulkmemo"),
                     Policy {
@@ -21955,10 +21430,7 @@ mod tests {
                 assert_eq!(z.features(), base.features());
                 let o = z.db.as_ref().unwrap().options();
                 assert!(!o.zpages_hot_raw && b.zpages_hot_raw);
-                assert_eq!(
-                    (o.zpages, o.zpages_recode_auto),
-                    (b.zpages, b.zpages_recode_auto)
-                );
+                assert_eq!(o.zpages, b.zpages);
             }
             {
                 let z = Supdb::create_zparse(&dir("zparse")).unwrap();
@@ -21967,16 +21439,9 @@ mod tests {
                 assert!(o.zpages_parse && o.zpages_parse_finish && o.zpages_parse_chains == 0);
                 assert!(b.zpages_parse && !b.zpages_parse_finish && b.zpages_parse_chains == 4);
                 assert_eq!(
-                    (o.zpages, o.zpages_cover_resident, o.zpages_reparse),
-                    (b.zpages, b.zpages_cover_resident, b.zpages_reparse)
+                    (o.zpages, o.zpages_cover_resident),
+                    (b.zpages, b.zpages_cover_resident)
                 );
-            }
-            {
-                let z = Supdb::create_zreparse(&dir("zreparse")).unwrap();
-                assert_eq!(z.features(), base.features());
-                let o = z.db.as_ref().unwrap().options();
-                assert!(o.zpages_reparse && !b.zpages_reparse);
-                assert!(!o.zpages_parse && !o.zpages_recode_auto);
             }
             {
                 let z = Supdb::create_zaheadscans(&dir("zaheadscans")).unwrap();
@@ -21992,12 +21457,8 @@ mod tests {
                 assert!(!o.zpages_build_at_finish && b.zpages_build_at_finish);
                 assert!(!o.zpages_ahead_past_scans && o.zpages_land_scans_far);
                 assert_eq!(
-                    (o.zpages, o.zpages_land_pct, o.zpages_reparse),
-                    (b.zpages, b.zpages_land_pct, b.zpages_reparse)
-                );
-                assert_eq!(
-                    (o.zpages, o.zpages_cover_resident, o.zpages_recode_auto),
-                    (b.zpages, b.zpages_cover_resident, b.zpages_recode_auto)
+                    (o.zpages, o.zpages_land_pct, o.zpages_cover_resident),
+                    (b.zpages, b.zpages_land_pct, b.zpages_cover_resident)
                 );
             }
             let w = Supdb::create_walkeep(&dir("walkeep")).unwrap();
@@ -22560,94 +22021,24 @@ mod tests {
             drop(arm);
         }
         assert!(supdb::Options::default().zpages_block_cursor && b.zpages_block_cursor);
-        // The first four partitions raw-tailed, the rest block-coded: the
-        // forced block form's arm but for that one option.
-        for (name, make, first, drop_raw, recode, keep) in [
-            (
-                "supdb-cache64tofitzpageshot4",
-                Supdb::create_cache64_tofit_zpages_hot4 as fn(&Path) -> Res<Supdb>,
-                4,
-                false,
-                false,
-                false,
-            ),
-            (
-                "supdb-cache64tofitzpageshot1",
-                Supdb::create_cache64_tofit_zpages_hot1 as fn(&Path) -> Res<Supdb>,
-                1,
-                false,
-                false,
-                false,
-            ),
-            (
-                "supdb-cache64tofitzpagesdrop",
-                Supdb::create_cache64_tofit_zpages_drop as fn(&Path) -> Res<Supdb>,
-                0,
-                true,
-                false,
-                false,
-            ),
-            (
-                "supdb-cache64tofitzpageshot4drop",
-                Supdb::create_cache64_tofit_zpages_hot4_drop as fn(&Path) -> Res<Supdb>,
-                4,
-                true,
-                false,
-                false,
-            ),
-            (
-                "supdb-cache64tofitzpageshot8drop",
-                Supdb::create_cache64_tofit_zpages_hot8_drop as fn(&Path) -> Res<Supdb>,
-                8,
-                true,
-                false,
-                false,
-            ),
-            (
-                "supdb-cache64tofitzpagesrecodedrop",
-                Supdb::create_cache64_tofit_zpages_recode_drop as fn(&Path) -> Res<Supdb>,
-                0,
-                true,
-                true,
-                false,
-            ),
-            (
-                "supdb-cache64tofitzpagesrecodekeepdrop",
-                Supdb::create_cache64_tofit_zpages_recode_keep_drop as fn(&Path) -> Res<Supdb>,
-                0,
-                true,
-                true,
-                true,
-            ),
-        ] {
-            let hot = new(name, make);
+        // The raw pages dropped behind the form: the forced block form's arm
+        // but for that one option.
+        {
+            let name = "supdb-cache64tofitzpagesdrop";
+            let hot = new(name, Supdb::create_cache64_tofit_zpages_drop);
             assert_eq!(hot.name(), name);
             assert_eq!(guarantee(hot.name()), guarantee(base.name()));
             assert_eq!(hot.features(), base.features());
             let g = hot.db.as_ref().unwrap().options();
             assert_eq!(g.zpages, supdb::ZPages::Always);
-            assert_eq!(
-                g.zpages_raw_tails_first, first,
-                "{name}: the partitions raw-tailed"
-            );
-            assert_eq!(g.zpages_drop_raw, drop_raw, "{name}: the raw pages dropped");
-            assert_eq!(g.zpages_recode, recode, "{name}: the re-code policy");
-            assert_eq!(
-                g.zpages_recode_keep, keep,
-                "{name}: the replaced form file kept"
-            );
-            // The engine's settle, but for the arm its settle pairs were
-            // priced against, which pins the one before it.
+            assert!(g.zpages_drop_raw, "{name}: the raw pages dropped");
+            // The engine's settle.
             assert_eq!(
                 g.forms_settle_every,
-                name != "supdb-cache64tofitzpageshot8drop"
-                    && supdb::Options::default().forms_settle_every,
+                supdb::Options::default().forms_settle_every,
                 "{name}: the settle"
             );
-            assert!(!supdb::Options::default().zpages_recode_keep);
-            assert!(!supdb::Options::default().zpages_recode);
             assert!(supdb::Options::default().zpages_drop_raw);
-            assert_eq!(supdb::Options::default().zpages_raw_tails_first, 0);
             assert!(!g.zpages_raw_tails && !g.zpages_record_coding && g.zpages_memo);
             assert_eq!(
                 (
@@ -22668,41 +22059,6 @@ mod tests {
             );
             drop(hot);
         }
-        // Hot8 with the drop and every commit near reads settling: hot8's
-        // options but for that one.
-        let every = new(
-            "supdb-cache64tofitzpageshot8dropsettleevery",
-            Supdb::create_cache64_tofit_zpages_hot8_drop_settle_every,
-        );
-        assert_eq!(every.name(), "supdb-cache64tofitzpageshot8dropsettleevery");
-        assert_eq!(guarantee(every.name()), guarantee(base.name()));
-        assert_eq!(every.features(), base.features());
-        {
-            let e = every.db.as_ref().unwrap().options();
-            assert!(e.forms_settle_every);
-            assert_eq!(
-                (e.zpages_raw_tails_first, e.zpages_drop_raw, e.zpages_recode),
-                (8, true, false)
-            );
-            assert_eq!(e.forms_settle_backlog_pct, b.forms_settle_backlog_pct);
-            assert!(!e.forms_settle_builds && supdb::Options::default().forms_settle_builds);
-        }
-        drop(every);
-        let builds = new(
-            "supdb-cache64tofitzpageshot8dropsettlebuilds",
-            Supdb::create_cache64_tofit_zpages_hot8_drop_settle_builds,
-        );
-        assert_eq!(
-            builds.name(),
-            "supdb-cache64tofitzpageshot8dropsettlebuilds"
-        );
-        assert_eq!(guarantee(builds.name()), guarantee(base.name()));
-        {
-            let e = builds.db.as_ref().unwrap().options();
-            assert!(e.forms_settle_every && e.forms_settle_builds);
-            assert_eq!((e.zpages_raw_tails_first, e.zpages_drop_raw), (8, true));
-        }
-        drop(builds);
         // The shipping arms without settle-builds, and the combined arm with
         // it: their bases' options but for the two.
         for (name, make, base_name, base_make) in [
@@ -22765,20 +22121,6 @@ mod tests {
             drop(arm);
             drop(base_arm);
         }
-        // Both codings kept: the keep arm's options and the one more.
-        let both = new(
-            "supdb-cache64tofitzpagesbothdrop",
-            Supdb::create_cache64_tofit_zpages_both_drop,
-        );
-        assert_eq!(both.name(), "supdb-cache64tofitzpagesbothdrop");
-        assert_eq!(guarantee(both.name()), guarantee(base.name()));
-        {
-            let e = both.db.as_ref().unwrap().options();
-            assert!(e.zpages_both && e.zpages_recode_keep && e.zpages_recode && e.zpages_drop_raw);
-            assert!(!supdb::Options::default().zpages_both);
-            assert_eq!(e.zpages, supdb::ZPages::Always);
-        }
-        drop(both);
         // The whole raw-tail form with the raw pages dropped: the raw-tail
         // arm's options but for that one.
         let raw = new(
