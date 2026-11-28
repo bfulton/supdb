@@ -18,7 +18,7 @@ publish = false
 crate-type = ["rlib", "cdylib"]
 
 [dependencies]
-lz4_flex = { version = "0.11", default-features = false, features = ["std", "frame"] }
+lz4_flex = { version = "0.11.7", default-features = false, features = ["std", "frame"] }
 
 # Not merely unused on wasm -- unreachable there, by cfg rather than by hoping.
 #
@@ -29,8 +29,8 @@ lz4_flex = { version = "0.11", default-features = false, features = ["std", "fra
 # `libc` goes with it: the I/O priority and advice calls that use it are
 # native-only paths.
 [target.'cfg(not(target_family = "wasm"))'.dependencies]
-memmap2 = "0.9"
-libc = "0.2"
+memmap2 = "0.9.11"
+libc = "0.2.189"
 
 # The tests' and the examples' cipher, and nothing a build of the crate
 # links: `supdb::crypt` defines the envelope and takes the cipher from its
