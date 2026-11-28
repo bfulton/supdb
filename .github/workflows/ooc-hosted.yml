@@ -88,6 +88,10 @@ jobs:
           REPS: ${{ inputs.reps }}
         run: |
           set -eu
+          # Digits only: bash evaluates a variable named in $(( )) as an
+          # expression, and an array subscript in it runs a command.
+          case "$BOUND_MIB" in ''|*[!0-9]*) echo "bound_mib is whole MiB: '$BOUND_MIB'" >&2; exit 2 ;; esac
+          case "$REPS" in ''|*[!0-9]*) echo "reps is a count: '$REPS'" >&2; exit 2 ;; esac
           BOUND=$(( BOUND_MIB * 1048576 ))
           ARM_FLAG=""
           if [ -n "$ARMS" ] && [ "$ARMS" != all ]; then ARM_FLAG="--arms $ARMS"; fi
