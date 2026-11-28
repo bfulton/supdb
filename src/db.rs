@@ -747,10 +747,6 @@ pub struct ZCounts {
     /// that seek them, and those submitted (`OrdIndex::willneed_heads`).
     pub head_asks: u64,
     pub head_submitted: u64,
-    /// Block-boundary keys the block cache read off an ordered index's top
-    /// level, in memory, where it read a record before
-    /// (`Options::boundary_keys_from_top`).
-    pub top_keys: u64,
     /// Piece runs whose directory words a block's build asked for ahead of
     /// its record asks, and those submitted (`Blob::willneed_dir`).
     pub dir_willneeds: u64,
@@ -5214,42 +5210,6 @@ pub struct Options {
     /// were taken in. On, `supdb-sealcopyfar` and
     /// `supdb-ingestsealcopyfar`.
     pub seal_snapshot_far: bool,
-    /// A landing far from reads takes its pieces' bounds -- and their
-    /// ranks, under `piece_ranks_whole` -- against their partitions before
-    /// it publishes, as every landing does near them
-    /// (`Maint::rank_before_publish`). Off, the default, a
-    /// landing while the writer's last seal was far from every scan
-    /// (`reads_around`, as `seal_snapshot_far` asks it; a drain's seal
-    /// counts as near, since a flush is a writer saying it has stopped
-    /// and reads come next) publishes the pieces without them, and a
-    /// reader that comes takes them for itself, as it does for a piece
-    /// opened from disk. The walk reads the partition's keys, and under a
-    /// bound those are pages the load has pushed out: in a shuffled load
-    /// of five million keys under 640 MiB the segment work's thread took
-    /// three times the no-cache arm's time, its landings fell behind the
-    /// freezes, the writer waited 1.3 to 2.4 s for room and three frozen
-    /// tables stood beside the live one; the next merge folds the pieces
-    /// away before anything reads them. On, `supdb-ranksfar` and
-    /// `supdb-ingestranksfar`.
-    pub land_ranks_far: bool,
-    /// A level-0 piece's keys ranked against its partition whole -- every
-    /// key's cut in one forward walk, kept on the piece under the
-    /// partition's identity (`Seg::ranks`) -- by the segment work before
-    /// it publishes the piece near reads (`Maint::rank_before_publish`)
-    /// and by a reader that meets a piece without them
-    /// (`BuildCtx::rank_pieces`). Off, the default, nobody does: a build
-    /// finds each piece key's cut where its walk of the partition stops at
-    /// the key, or by one seek over the block's heads where it does not
-    /// walk, as it always did for a piece holding none. Under a bound the
-    /// whole ranking was the first scan after the full rewrite at ten
-    /// million keys: the burst's landings were far from reads and took
-    /// none, so the writer's rebase ranked every piece standing -- three
-    /// to four hundred of them, the store's records once more -- through
-    /// major faults for twenty seconds before the scan that asked walked
-    /// a block, and the scans after it read every piece key's cut from a
-    /// rank the walk was about to reach anyway. On, `supdb-rankswhole`
-    /// and `supdb-ingestrankswhole`.
-    pub piece_ranks_whole: bool,
     /// A merge's landing plans the next merge while reads are around -- a
     /// scan since the last landing -- as a seal's durable landing plans
     /// one (`Maint::collect`): the planner ran at a seal's landing alone,
@@ -5380,21 +5340,6 @@ pub struct Options {
     /// `supdb-ingestnoidleplan`.
     #[doc(hidden)]
     pub merge_plan_idle: bool,
-    /// The block cache reads a block boundary's key -- a partition's key at
-    /// a block's first rank, which every table's bounds, splice and resumed
-    /// walk asks for -- off the partition's ordered index's top level,
-    /// which holds every sixty-fourth head in memory, where the heads are
-    /// whole keys (`OrdIndex::top_key_at`); the record otherwise. Out of
-    /// core each boundary's record is a page of its own, and those reads,
-    /// the builder ahead's bounds of every block it built, were over half
-    /// the major faults of the ten-percent lag pass at ten million keys
-    /// under 1.25 GiB; read off the top they fell by twenty-five thousand
-    /// and the pass ran slower in both rounds of a pairing, the builder,
-    /// freed of its faults, posting its forms faster and the scanning
-    /// thread paying their install, 133 and 148 ms against 25 and 21. Off
-    /// for that: `supdb-boundarytop` and `supdb-ingestboundarytop` read the
-    /// top.
-    pub boundary_keys_from_top: bool,
     /// A walk of a source's keys against a partition's block boundaries
     /// (`block_bounds_of`) places a boundary by its head where the head is
     /// not the whole of its key, and reads the boundary's record only
@@ -5715,15 +5660,6 @@ pub struct Options {
     /// entries. A copy the walk searches is asked for whole as before.
     /// Off; `supdb-copyspan` and `supdb-ingestcopyspan` are the arms.
     pub copy_prefetch_span: bool,
-    /// A piece's keys are ranked against their partition over the ordered
-    /// index's heads, galloping from the rank the key before reached, as
-    /// the settle resolves a batch -- instead of over the partition's
-    /// records, a cold record read a probe. The ranking is taken once per
-    /// piece before its publish, on the segment work's thread, where it
-    /// was two fifths of that thread's time over the buffered arm's
-    /// rewritten burst. `supdb-rankrecords` and `supdb-ingestrankrecords`
-    /// rank over the records; `docs/engine.md` has the figures.
-    pub piece_ranks_by_heads: bool,
     /// EXPERIMENT: the writer's own handle takes the canonical forms it
     /// maintains, instead of building its own. Without this the
     /// maintenance is pure cost wherever the reads are the writer's: a
@@ -7416,8 +7352,6 @@ impl Default for Options {
             run_spare: true,
             drain_snapshot: true,
             seal_snapshot_far: false,
-            land_ranks_far: false,
-            piece_ranks_whole: false,
             merge_chains: true,
             merge_chains_writes: true,
             merge_chains_writes_uncovered: true,
@@ -7426,7 +7360,6 @@ impl Default for Options {
             merge_parallel: 2,
             merge_parallel_quiet: 3,
             merge_quiet_any_gate: false,
-            boundary_keys_from_top: false,
             bounds_by_heads: true,
             land_bounds_read: true,
             seal_put_one: true,
@@ -7447,7 +7380,6 @@ impl Default for Options {
             freeze_settles: false,
             forms_rebase: true,
             copy_prefetch_span: false,
-            piece_ranks_by_heads: true,
             forms_to_writer: false,
             form_dense_from: 0,
             scan_snapshot_arena: true,
@@ -10128,7 +10060,7 @@ fn z_dead_rename(shared: &Shared, dir: &Path, seg: &Seg) -> Option<PathBuf> {
 /// (`Reader::cache_scan`, `cache_values`, `cache_cut`, `cache_seek_exact`,
 /// `cache_key_at`), which the form file's dispatch serves under
 /// `Options::zpages_block_cache` and the door serves with it off, and the
-/// piece's side of every join the cache makes (`table_bounds`, `ranks_over`,
+/// piece's side of every join the cache makes (`table_bounds`,
 /// `patch_block`'s piece reads); and the segment work's own passes at a
 /// landing, a promotion or the open
 /// (a piece's ranks and bounds against its partition, `same_blocks` one key
@@ -10219,9 +10151,10 @@ struct Seg {
     /// shared vector and reads it at every block build after: a lookup
     /// per block build and piece, when it was a lock, bounced the lock's
     /// word between a builder's thread and the scan's, twenty-two pieces
-    /// a block at three million keys. Taken at all only under
-    /// `Options::piece_ranks_whole`; a piece without them has each key's
-    /// cut found at the build, where the walk stops at the key.
+    /// a block at three million keys. No path ranks a piece whole now, the
+    /// shape that stalled the first scan after a full rewrite; a piece
+    /// without them has each key's cut found at the build, where the walk
+    /// stops at the key.
     ranks: IdCache<Vec<u32>>,
     /// Where this piece's positions fall against a partition's block
     /// boundaries, by the partition's blob id: a function of two sealed
@@ -25902,7 +25835,7 @@ struct Shared {
     merge_helpers: AtomicU64,
     /// Whether the writer's last seal was near reads, a drain's counted
     /// near: the segment work's landings take the pieces' ranks and
-    /// bounds only then (`Options::land_ranks_far`).
+    /// bounds only then.
     reads_near: std::sync::atomic::AtomicBool,
     /// The store's scan count (`Maint::scan_life`) at which the writer's
     /// last seal found two stores' worth of writes since the last scan
@@ -31738,7 +31671,7 @@ impl Reader {
     }
 
     /// The level-0 pieces standing that hold ranks or bounds against a
-    /// partition, and the pieces standing (`Options::land_ranks_far`).
+    /// partition, and the pieces standing.
     /// For a test.
     #[doc(hidden)]
     pub fn pieces_ranked(&self) -> (usize, usize) {
@@ -31755,8 +31688,8 @@ impl Reader {
     }
 
     /// The level-0 pieces standing that hold ranks against a partition,
-    /// those that hold bounds against one, and the pieces standing
-    /// (`Options::piece_ranks_whole`). For a test.
+    /// those that hold bounds against one, and the pieces standing.
+    /// For a test.
     #[doc(hidden)]
     pub fn pieces_with_ranks(&self) -> (usize, usize, usize) {
         let _entered = self.enter();
@@ -31996,7 +31929,6 @@ impl Reader {
             willneed_asks: rd.stat(|s| &s.zwillneedasks),
             head_asks: rd.stat(|s| &s.zheadasks),
             head_submitted: rd.stat(|s| &s.zheadsubmitted),
-            top_keys: get(&self.shared.asks.top_keys),
             dir_willneeds: get(&self.shared.asks.dir_runs),
             dir_asks: get(&self.shared.asks.dir_submitted),
             bounds_head_asks: get(&self.shared.asks.bounds_heads),
@@ -33102,17 +33034,6 @@ impl Reader {
     }
 
     fn cache_key_at(&self, seg: &Seg, rank: usize, out: &mut Vec<u8>) -> bool {
-        // A block's first rank is in the ordered index's top level, in
-        // memory, where the heads are whole keys: no page read, where the
-        // record is a page of its own out of core and a form file's group a
-        // decode (`Options::boundary_keys_from_top`).
-        if self.opts.boundary_keys_from_top && seg.ord.top_key_at(rank, out).is_some() {
-            self.shared
-                .asks
-                .top_keys
-                .fetch_add(1, AtomicOrdering::Relaxed);
-            return true;
-        }
         if let Some(z) = self.zc(seg) {
             let r = z.key_at_into(&self.zmemo, rank, out);
             self.zmemo_take();
@@ -35024,9 +34945,6 @@ impl Reader {
         // as they were for the caller to drop.
         let l0 = &st.segs[np..];
         let ctx = self.build_ctx();
-        if ctx.rank_pieces().is_err() {
-            return self.refuse_rebase(10);
-        }
         let mut bounds = Vec::with_capacity(np);
         for seg in &st.segs[..np] {
             match ctx.table_bounds(seg, l0) {
@@ -36989,7 +36907,6 @@ impl Reader {
         BuildCtx {
             rd: self,
             wm: self.wm(),
-            segs: self.segs(),
             mem: self.mem(),
             frozen: self.frozen(),
             tombs: self.has_tombstones(),
@@ -37008,8 +36925,6 @@ impl Reader {
             copy_exact: self.opts.copy_exact,
             fit: self.fits(),
             pieces_only: self.opts.forms_pieces_only,
-            ranks_by_heads: self.opts.piece_ranks_by_heads,
-            ranks_whole: self.opts.piece_ranks_whole,
         }
     }
 
@@ -37776,7 +37691,6 @@ impl Reader {
         let np = self.segs().partition_point(|s| s.level > 0);
         let l0 = &self.segs()[np..];
         let ctx = self.build_ctx();
-        ctx.rank_pieces()?;
         for &(pi, b) in blocks {
             if self.abandon_asked() || self.upkeep_wanted() || self.fill_wanted() {
                 return Ok(());
@@ -38007,8 +37921,6 @@ impl Reader {
         let every = self.look_mask();
         let np = self.segs().partition_point(|s| s.level > 0);
         let l0 = &self.segs()[np..];
-        let ctx = self.build_ctx();
-        ctx.rank_pieces()?;
         for pi in 0..np {
             if self.abandon_asked() {
                 return Ok(false);
@@ -40204,7 +40116,6 @@ impl Reader {
         self.fs().cache_used.set(true);
         let nblocks = seg.blocks();
         let ctx = self.build_ctx();
-        ctx.rank_pieces()?;
         let (pieces, piece_ranks) = ctx.table_bounds(seg, l0)?;
         let mut added: Vec<Vec<(u32, u32)>> = (0..nblocks).map(|_| Vec::new()).collect();
         for &slot in self.fs().snap_added.borrow().iter() {
@@ -48629,8 +48540,8 @@ impl Db {
         self.draining = true;
         self.drain_first = false;
         // Reads come after a drain: its landings, and whatever lands
-        // before the next seal says otherwise, take their pieces' ranks
-        // (`Options::land_ranks_far`), whichever path the drain's own
+        // before the next seal says otherwise, take their pieces' ranks,
+        // whichever path the drain's own
         // seal takes.
         self.shared.reads_near.store(true, AtomicOrdering::Release);
         // A run's close that awaits the writer's word for its durable
@@ -49272,9 +49183,7 @@ impl Db {
         let np = next.segs.partition_point(|s| s.level > 0);
         let l0 = &next.segs[np..];
         let ctx = self.build_ctx();
-        let bounds: Option<Vec<_>> = if ctx.rank_pieces().is_err() {
-            None
-        } else {
+        let bounds: Option<Vec<_>> = {
             next.segs[..np]
                 .iter()
                 .map(|seg| ctx.table_bounds(seg, l0).ok())
@@ -53028,7 +52937,6 @@ impl Reader {
         // by it too: the store sheds past the budget only as it installs.
         let budget = self.cache_budget();
         let mut sent = 0usize;
-        ctx.rank_pieces()?;
         let np = self.segs().partition_point(|s| s.level > 0);
         let l0 = &self.segs()[np..];
         for (pi, seg) in self.segs()[..np].iter().enumerate() {
@@ -55671,30 +55579,6 @@ impl Db {
     }
 }
 
-/// The ranks of every level-0 piece in `segs` against the partition it is
-/// aligned to, where the piece has none against that partition yet; see
-/// `BuildCtx::rank_pieces`. In any order: a set about to be published is
-/// not yet sorted.
-fn rank_pieces_of(segs: &[std::sync::Arc<Seg>], by_heads: bool) -> Result<()> {
-    for p in segs.iter().filter(|s| s.level == 0) {
-        let Some(part) = segs
-            .iter()
-            .find(|q| q.level > 0 && q.lo == p.lo && q.hi == p.hi)
-        else {
-            continue;
-        };
-        let id = part.blob.id();
-        if p.ranks.get(id).is_some() {
-            continue;
-        }
-        p.ranks.put(
-            id,
-            std::sync::Arc::new(BuildCtx::ranks_over(part, p, by_heads)?),
-        );
-    }
-    Ok(())
-}
-
 /// `Blob::key_at` through the door, copied into `out`: the boundary key of
 /// a join the segment work makes with no handle in hand
 /// (`bound_pieces_of`), where a handle's join asks `Reader::cache_key_at`.
@@ -55718,9 +55602,6 @@ fn raw_key_into(seg: &Seg, rank: usize, out: &mut Vec<u8>) -> bool {
 #[derive(Default)]
 #[repr(align(128))]
 struct AskCounts {
-    /// Block-boundary keys read off an ordered index's top level
-    /// (`Options::boundary_keys_from_top`).
-    top_keys: AtomicU64,
     /// Piece runs whose directory words a block's build asked for, and
     /// those submitted (`Blob::willneed_dir`).
     dir_runs: AtomicU64,
@@ -55848,7 +55729,6 @@ struct BuildCtx<'s> {
     rd: &'s Reader,
     /// The watermark the live memtable's chains are walked under.
     wm: u64,
-    segs: &'s [std::sync::Arc<Seg>],
     mem: &'s MemTable,
     /// The frozen tables, oldest first.
     frozen: &'s [std::sync::Arc<MemTable>],
@@ -55881,10 +55761,6 @@ struct BuildCtx<'s> {
     /// `Options::forms_pieces_only`: the forms hold the pieces' fold alone
     /// and the walk overlays the snapshot.
     pieces_only: bool,
-    /// See `Options::piece_ranks_by_heads`.
-    ranks_by_heads: bool,
-    /// See `Options::piece_ranks_whole`.
-    ranks_whole: bool,
 }
 
 impl<'s> BuildCtx<'s> {
@@ -55983,97 +55859,6 @@ impl<'s> BuildCtx<'s> {
         } else {
             (c, Ordering::Greater)
         }
-    }
-    /// PROTOTYPE: each key of `piece` ranked in `part`, the partition it is
-    /// aligned to, from one forward walk: a gallop from the last rank, then
-    /// a binary search inside the gallop's span, so a run of keys the
-    /// partition also holds costs two reads a key.
-    fn ranks_over(part: &Seg, piece: &Seg, by_heads: bool) -> Result<Vec<u32>> {
-        if !by_heads {
-            return Self::ranks_over_records(part, piece);
-        }
-        // Over the heads, each key from the rank the key before it
-        // reached: the piece's keys are in order, so each seek gallops a
-        // short way over heads the last one left warm, where the walk
-        // over the records read a cold record a probe
-        // (`Options::piece_ranks_by_heads`).
-        let n = piece.blob.keys();
-        let pk = part.blob.keys();
-        let mut out = Vec::with_capacity(n);
-        let mut r = 0usize;
-        for i in 0..n {
-            let key = piece
-                .raw()
-                .key_at(i)
-                .ok_or_else(|| err("block cache: a rank did not resolve"))?;
-            let (rank, exact) = part.ord.seek_exact_from(r, key, |j| part.raw().key_at(j));
-            let same = rank < pk && exact.unwrap_or_else(|| part.raw().key_at(rank) == Some(key));
-            r = rank;
-            out.push(((rank as u32) << 1) | same as u32);
-        }
-        debug_assert_eq!(
-            out,
-            Self::ranks_over_records(part, piece)?,
-            "a piece's ranks over the heads disagree with its ranks over the records"
-        );
-        Ok(out)
-    }
-    /// `ranks_over` by the partition's records: a gallop from the last
-    /// rank, then a binary search inside the gallop's span, a record read
-    /// a probe.
-    fn ranks_over_records(part: &Seg, piece: &Seg) -> Result<Vec<u32>> {
-        let n = piece.blob.keys();
-        let pk = part.blob.keys();
-        let mut out = Vec::with_capacity(n);
-        let mut r = 0usize;
-        for i in 0..n {
-            let key = piece
-                .raw()
-                .key_at(i)
-                .ok_or_else(|| err("block cache: a rank did not resolve"))?;
-            let below = |j: usize| part.raw().key_at(j).is_some_and(|k| k < key);
-            if r < pk && below(r) {
-                let mut lo = r;
-                let mut step = 1usize;
-                let hi = loop {
-                    let probe = lo + step;
-                    if probe >= pk {
-                        break pk;
-                    }
-                    if below(probe) {
-                        lo = probe;
-                        step *= 2;
-                    } else {
-                        break probe;
-                    }
-                };
-                let (mut a, mut b) = (lo + 1, hi);
-                while a < b {
-                    let m = a + (b - a) / 2;
-                    if below(m) {
-                        a = m + 1;
-                    } else {
-                        b = m;
-                    }
-                }
-                r = a;
-            }
-            let same = r < pk && part.raw().key_at(r) == Some(key);
-            out.push(((r as u32) << 1) | same as u32);
-        }
-        Ok(out)
-    }
-    /// PROTOTYPE: rank the keys of every piece aligned to a partition
-    /// that has no ranks against that partition yet: what the segment
-    /// work does before it publishes a set (`Maint::rank_before_publish`),
-    /// and a table's making does for pieces that were opened from disk.
-    /// Only under `Options::piece_ranks_whole`; otherwise nothing, and
-    /// every build finds its cuts.
-    fn rank_pieces(&self) -> Result<()> {
-        if !self.ranks_whole {
-            return Ok(());
-        }
-        rank_pieces_of(self.segs, self.ranks_by_heads)
     }
     /// PROTOTYPE: where the snapshot's keys fall against the partition's
     /// block boundaries.
@@ -57863,7 +57648,7 @@ impl<'s> BuildCtx<'s> {
     /// was 3 us, most of it here, and a fifth of E's first pass. Then it
     /// read the one key at the cut for the compare, a record page a sparse
     /// build touches for nothing else: with the pieces' cuts found at the
-    /// builds (`Options::piece_ranks_whole` off), under a bound that was a
+    /// builds, under a bound that was a
     /// major fault per overlay key, a quarter more over the ten-percent lag
     /// pass at ten million keys. The second answer is whether the compare
     /// read a record.
@@ -60456,9 +60241,8 @@ impl Maint {
         self.opts.manifest_pending && self.opts.manifest_slots
     }
 
-    /// The pieces' ranks against the partitions they are aligned to
-    /// (`BuildCtx::rank_pieces`) and the pieces' bounds against the
-    /// partitions they meet (`BuildCtx::table_bounds`), taken before the
+    /// The pieces' bounds against the partitions they meet
+    /// (`BuildCtx::table_bounds`), taken before the
     /// publish that makes `segs` the live set. Each is a function of two
     /// immutable segments, keyed by the partition's blob id, and taken
     /// once; taken after the publish, the writer's next scan found the
@@ -60474,15 +60258,9 @@ impl Maint {
             self.tops_before_publish(segs);
         }
         // Far from reads the pieces go without, and a reader that comes
-        // takes them (`Options::land_ranks_far`).
-        let near = self.opts.land_ranks_far || self.shared.reads_near.load(AtomicOrdering::Acquire);
+        // takes them.
+        let near = self.shared.reads_near.load(AtomicOrdering::Acquire);
         if self.cache_on() && near {
-            // The ranks only under the arm (`Options::piece_ranks_whole`);
-            // the bounds are a table's, and every table over the pair
-            // would walk them otherwise.
-            if self.opts.piece_ranks_whole {
-                rank_pieces_of(segs, self.opts.piece_ranks_by_heads)?;
-            }
             // Only where a table stands to read them
             // (`Options::land_bounds_read`): the writer with its forms
             // given up makes none, and a handle that comes walks its own.

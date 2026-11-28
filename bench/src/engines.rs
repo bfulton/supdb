@@ -673,15 +673,6 @@ pub struct Supdb {
     /// (`Options::seal_snapshot_far`). `supdb-ingestsealcopyfar`, and
     /// `supdb-sealcopyfar` durable.
     sealcopyfar: bool,
-    /// A landing far from reads takes its pieces' ranks and bounds as any
-    /// landing did (`Options::land_ranks_far`). `supdb-ingestranksfar`,
-    /// and `supdb-ranksfar` durable.
-    ranksfar: bool,
-    /// The pieces ranked whole against their partitions, by the segment
-    /// work near reads and by a reader that meets a piece without ranks
-    /// (`Options::piece_ranks_whole`). `supdb-ingestrankswhole`, and
-    /// `supdb-rankswhole` durable.
-    rankswhole: bool,
     /// A merge's first pass reads its inputs' keys off the records, as
     /// before the heads carried them (`Options::merge_keys_by_heads` off).
     /// `supdb-ingestmergerecordkeys`, and `supdb-mergerecordkeys` durable.
@@ -754,11 +745,6 @@ pub struct Supdb {
     /// window ahead of its walk (`Options::merge_read_ahead` at
     /// `MERGE_AHEAD_WINDOW`). `supdb-mergeahead`, durable.
     mergeahead: bool,
-    /// The block cache reads a block boundary's key off the ordered index's
-    /// top level in memory, where the default reads the partition's record
-    /// (`Options::boundary_keys_from_top`). `supdb-ingestboundarytop`, and
-    /// `supdb-boundarytop` durable.
-    boundarytop: bool,
     /// The builder ahead starts in core alone, the shape before it ran out
     /// of core for the partitions in memory (`Options::ahead_out_of_core`
     /// off). `supdb-ingestaheadincore`, and `supdb-aheadincore` durable.
@@ -1246,10 +1232,6 @@ pub struct Supdb {
     /// as before `SegmentOptions::row_on_write`. `supdb-rowatclose`, and
     /// `supdb-ingestrowatclose` buffered.
     rowatclose: bool,
-    /// A piece's keys ranked over the partition's records, as before
-    /// `Options::piece_ranks_by_heads`. `supdb-rankrecords`, and
-    /// `supdb-ingestrankrecords` buffered.
-    rankrecords: bool,
     /// A store with no partitions partitioned once it is read,
     /// `Options::adaptive_shape`. `supdb-ingestshape`.
     shape: bool,
@@ -2050,15 +2032,6 @@ struct Policy {
     /// (`Options::seal_snapshot_far`). `supdb-ingestsealcopyfar`, and
     /// `supdb-sealcopyfar` durable.
     sealcopyfar: bool,
-    /// A landing far from reads takes its pieces' ranks and bounds as any
-    /// landing did (`Options::land_ranks_far`). `supdb-ingestranksfar`,
-    /// and `supdb-ranksfar` durable.
-    ranksfar: bool,
-    /// The pieces ranked whole against their partitions, by the segment
-    /// work near reads and by a reader that meets a piece without ranks
-    /// (`Options::piece_ranks_whole`). `supdb-ingestrankswhole`, and
-    /// `supdb-rankswhole` durable.
-    rankswhole: bool,
     /// A merge's first pass reads its inputs' keys off the records, as
     /// before the heads carried them (`Options::merge_keys_by_heads` off).
     /// `supdb-ingestmergerecordkeys`, and `supdb-mergerecordkeys` durable.
@@ -2131,11 +2104,6 @@ struct Policy {
     /// window ahead of its walk (`Options::merge_read_ahead` at
     /// `MERGE_AHEAD_WINDOW`). `supdb-mergeahead`, durable.
     mergeahead: bool,
-    /// The block cache reads a block boundary's key off the ordered index's
-    /// top level in memory, where the default reads the partition's record
-    /// (`Options::boundary_keys_from_top`). `supdb-ingestboundarytop`, and
-    /// `supdb-boundarytop` durable.
-    boundarytop: bool,
     /// The builder ahead starts in core alone, the shape before it ran out
     /// of core for the partitions in memory (`Options::ahead_out_of_core`
     /// off). `supdb-ingestaheadincore`, and `supdb-aheadincore` durable.
@@ -2622,10 +2590,6 @@ struct Policy {
     /// as before `SegmentOptions::row_on_write`. `supdb-rowatclose`, and
     /// `supdb-ingestrowatclose` buffered.
     rowatclose: bool,
-    /// A piece's keys ranked over the partition's records, as before
-    /// `Options::piece_ranks_by_heads`. `supdb-rankrecords`, and
-    /// `supdb-ingestrankrecords` buffered.
-    rankrecords: bool,
     /// A store with no partitions partitioned once it is read,
     /// `Options::adaptive_shape`. `supdb-ingestshape`.
     shape: bool,
@@ -3132,8 +3096,6 @@ impl Default for Policy {
             walsync: false,
             nodrainsnap: false,
             sealcopyfar: false,
-            ranksfar: false,
-            rankswhole: false,
             mergerecordkeys: false,
             mergewalkrescan: false,
             mergenoverify: false,
@@ -3151,7 +3113,6 @@ impl Default for Policy {
             nozfinish: false,
             bgidle: false,
             mergeahead: false,
-            boundarytop: false,
             aheadincore: false,
             aheadcold: false,
             aheadeager: false,
@@ -3252,7 +3213,6 @@ impl Default for Policy {
             noalert: false,
             ordlog: false,
             fatentries: false,
-            rankrecords: false,
             shape: false,
             rotate: false,
             nofrozen: false,
@@ -5970,62 +5930,6 @@ impl Supdb {
         )
     }
 
-    /// `supdb` whose landings take their pieces' ranks and bounds far from
-    /// reads as well: against `supdb` it prices the walk on a load nobody
-    /// reads, which a bound turns into faults on the segment work's thread.
-    pub fn create_ranksfar(path: &Path) -> Res<Supdb> {
-        Supdb::with_policy(
-            path,
-            Policy {
-                ranksfar: true,
-                ..Policy::default()
-            },
-        )
-    }
-
-    /// `supdb-ingest` whose landings take their pieces' ranks and bounds
-    /// far from reads as well: against `supdb-ingest` it prices the walk on
-    /// the buffered loads.
-    pub fn create_ingest_ranksfar(path: &Path) -> Res<Supdb> {
-        Supdb::with_policy(
-            path,
-            Policy {
-                partition: false,
-                durable: false,
-                ranksfar: true,
-                ..Policy::default()
-            },
-        )
-    }
-
-    /// `supdb` whose pieces are ranked whole against their partitions --
-    /// by the segment work near reads and by a reader that meets a piece
-    /// without ranks -- as every arm's were before the cuts were found at
-    /// the builds (`Options::piece_ranks_whole`): against `supdb` it
-    /// prices the whole ranking.
-    pub fn create_rankswhole(path: &Path) -> Res<Supdb> {
-        Supdb::with_policy(
-            path,
-            Policy {
-                rankswhole: true,
-                ..Policy::default()
-            },
-        )
-    }
-
-    /// `supdb-ingest` whose pieces are ranked whole, as `supdb-rankswhole`.
-    pub fn create_ingest_rankswhole(path: &Path) -> Res<Supdb> {
-        Supdb::with_policy(
-            path,
-            Policy {
-                partition: false,
-                durable: false,
-                rankswhole: true,
-                ..Policy::default()
-            },
-        )
-    }
-
     /// `supdb` whose merges read their inputs' keys off the records in the
     /// first pass, as before the heads carried them
     /// (`Options::merge_keys_by_heads`): against `supdb` under a bound it
@@ -6442,34 +6346,6 @@ impl Supdb {
                 partition: false,
                 durable: false,
                 mergeone: true,
-                ..Policy::default()
-            },
-        )
-    }
-
-    /// `supdb` whose block cache reads its boundary keys off the ordered
-    /// index's top level, where the default reads the partition's records
-    /// (`Options::boundary_keys_from_top`): against `supdb` under a bound
-    /// it prices the records' pages.
-    pub fn create_boundarytop(path: &Path) -> Res<Supdb> {
-        Supdb::with_policy(
-            path,
-            Policy {
-                boundarytop: true,
-                ..Policy::default()
-            },
-        )
-    }
-
-    /// `supdb-ingest` reading its boundary keys off the top level, as
-    /// `supdb-boundarytop`.
-    pub fn create_ingest_boundarytop(path: &Path) -> Res<Supdb> {
-        Supdb::with_policy(
-            path,
-            Policy {
-                partition: false,
-                durable: false,
-                boundarytop: true,
                 ..Policy::default()
             },
         )
@@ -8228,32 +8104,6 @@ impl Supdb {
         )
     }
 
-    /// `supdb` ranking a piece's keys over the partition's records, as
-    /// before `Options::piece_ranks_by_heads`: against `supdb` it prices
-    /// the ranking over the index's heads, on the segment work's thread.
-    pub fn create_rankrecords(path: &Path) -> Res<Supdb> {
-        Supdb::with_policy(
-            path,
-            Policy {
-                rankrecords: true,
-                ..Policy::default()
-            },
-        )
-    }
-
-    /// `supdb-ingest` ranking over the records, as `supdb-rankrecords`.
-    pub fn create_ingest_rankrecords(path: &Path) -> Res<Supdb> {
-        Supdb::with_policy(
-            path,
-            Policy {
-                partition: false,
-                durable: false,
-                rankrecords: true,
-                ..Policy::default()
-            },
-        )
-    }
-
     /// `supdb-ingest` with the closing fsync writing everything, as
     /// `supdb-latewb`.
     pub fn create_ingest_latewb(path: &Path) -> Res<Supdb> {
@@ -9483,8 +9333,6 @@ impl Supdb {
             walsync,
             nodrainsnap,
             sealcopyfar,
-            ranksfar,
-            rankswhole,
             mergerecordkeys,
             mergewalkrescan,
             mergenoverify,
@@ -9502,7 +9350,6 @@ impl Supdb {
             nozfinish,
             bgidle,
             mergeahead,
-            boundarytop,
             aheadincore,
             aheadcold,
             aheadeager,
@@ -9603,7 +9450,6 @@ impl Supdb {
             noalert,
             ordlog,
             fatentries,
-            rankrecords,
             shape,
             aheadmin,
             lazyforms,
@@ -9860,7 +9706,6 @@ impl Supdb {
             manifest_spare: !manifestfree,
             ord_durable: oidxsync,
             direct_table_refs: refvals,
-            piece_ranks_by_heads: !rankrecords,
             forms_convert_unread: !(bg || bglag),
             // The capped conversions and the builder's, kept to price again
             // once the thread keeps up with the writer.
@@ -9913,8 +9758,6 @@ impl Supdb {
             drain_syncs_wal: walsync,
             drain_snapshot: !nodrainsnap,
             seal_snapshot_far: sealcopyfar,
-            land_ranks_far: ranksfar,
-            piece_ranks_whole: rankswhole,
             merge_keys_by_heads: !mergerecordkeys,
             merge_walk_cached: !mergewalkrescan,
             merge_verifies_inputs: !mergenoverify,
@@ -9954,7 +9797,6 @@ impl Supdb {
             } else {
                 supdb::Options::default().wal_drop_bytes
             },
-            boundary_keys_from_top: boundarytop,
             ahead_out_of_core: !aheadincore,
             ahead_resident_pct: if aheadcold {
                 0
@@ -10475,8 +10317,6 @@ impl Supdb {
             walsync,
             nodrainsnap,
             sealcopyfar,
-            ranksfar,
-            rankswhole,
             mergerecordkeys,
             mergewalkrescan,
             mergenoverify,
@@ -10494,7 +10334,6 @@ impl Supdb {
             nozfinish,
             bgidle,
             mergeahead,
-            boundarytop,
             aheadincore,
             aheadcold,
             aheadeager,
@@ -10595,7 +10434,6 @@ impl Supdb {
             noalert,
             ordlog,
             fatentries,
-            rankrecords,
             shape,
             aheadmin,
             lazyforms,
@@ -11795,20 +11633,6 @@ impl Engine for Supdb {
                 "supdb-ingestsealcopyfar"
             };
         }
-        if self.ranksfar {
-            return if self.partition {
-                "supdb-ranksfar"
-            } else {
-                "supdb-ingestranksfar"
-            };
-        }
-        if self.rankswhole {
-            return if self.partition {
-                "supdb-rankswhole"
-            } else {
-                "supdb-ingestrankswhole"
-            };
-        }
         if self.mergerecordkeys {
             return if self.partition {
                 "supdb-mergerecordkeys"
@@ -11914,13 +11738,6 @@ impl Engine for Supdb {
                 "supdb-mergeone"
             } else {
                 "supdb-ingestmergeone"
-            };
-        }
-        if self.boundarytop {
-            return if self.partition {
-                "supdb-boundarytop"
-            } else {
-                "supdb-ingestboundarytop"
             };
         }
         if self.aheadincore {
@@ -12409,13 +12226,6 @@ impl Engine for Supdb {
                 "supdb-waitmanifest"
             } else {
                 "supdb-ingestwaitmanifest"
-            };
-        }
-        if self.rankrecords {
-            return if self.partition {
-                "supdb-rankrecords"
-            } else {
-                "supdb-ingestrankrecords"
             };
         }
         if self.shape {
@@ -12980,7 +12790,6 @@ impl Engine for Supdb {
             ("willneed_asks", z.willneed_asks as f64),
             ("head_asks", z.head_asks as f64),
             ("head_submitted", z.head_submitted as f64),
-            ("top_keys", z.top_keys as f64),
             ("dir_willneeds", z.dir_willneeds as f64),
             ("dir_asks", z.dir_asks as f64),
             ("bounds_head_asks", z.bounds_head_asks as f64),
@@ -14967,8 +14776,6 @@ pub fn guarantee(arm: &str) -> Option<Guarantee> {
         | "supdb-walsync"
         | "supdb-nodrainsnap"
         | "supdb-sealcopyfar"
-        | "supdb-ranksfar"
-        | "supdb-rankswhole"
         | "supdb-mergerecordkeys"
         | "supdb-mergewalkrescan"
         | "supdb-mergenoverify"
@@ -14990,7 +14797,6 @@ pub fn guarantee(arm: &str) -> Option<Guarantee> {
         | "supdb-zparse"
         | "supdb-nozpagesnofitshort"
         | "supdb-nozpagesmergeone"
-        | "supdb-boundarytop"
         | "supdb-aheadincore"
         | "supdb-aheadcold"
         | "supdb-aheadeager"
@@ -15247,8 +15053,6 @@ pub fn guarantee(arm: &str) -> Option<Guarantee> {
         | "supdb-ingestwalsync"
         | "supdb-ingestnodrainsnap"
         | "supdb-ingestsealcopyfar"
-        | "supdb-ingestranksfar"
-        | "supdb-ingestrankswhole"
         | "supdb-ingestmergerecordkeys"
         | "supdb-ingestmergewalkrescan"
         | "supdb-ingestmergenoverify"
@@ -15257,7 +15061,6 @@ pub fn guarantee(arm: &str) -> Option<Guarantee> {
         | "supdb-ingestnomergechain"
         | "supdb-ingestmergeuncapped"
         | "supdb-ingestmergeone"
-        | "supdb-ingestboundarytop"
         | "supdb-ingestaheadincore"
         | "supdb-ingestnochainwrites"
         | "supdb-ingestnoland"
@@ -15290,8 +15093,6 @@ pub fn guarantee(arm: &str) -> Option<Guarantee> {
         | "supdb-ingestfatentries"
         | "supdb-ingestwaitmanifest"
         | "supdb-ingestrebuild"
-        | "supdb-rankrecords"
-        | "supdb-ingestrankrecords"
         | "supdb-ingestbg"
         | "supdb-ingestbglag"
         | "supdb-ingesthold"
@@ -16011,8 +15812,6 @@ pub fn open(arm: &str, dir: &Path, map_gb: usize) -> Res<Box<dyn Engine>> {
         "supdb-ingestoidxsync" => supdb_arm(Supdb::create_ingest_oidxsync, dir)?,
         "supdb-ingestrefvals" => supdb_arm(Supdb::create_ingest_refvals, dir)?,
         "supdb-ingestrowatclose" => supdb_arm(Supdb::create_ingest_rowatclose, dir)?,
-        "supdb-rankrecords" => supdb_arm(Supdb::create_rankrecords, dir)?,
-        "supdb-ingestrankrecords" => supdb_arm(Supdb::create_ingest_rankrecords, dir)?,
         "supdb-ingestlatewb" => supdb_arm(Supdb::create_ingest_latewb, dir)?,
         "supdb-inlinemaint" => supdb_arm(Supdb::create_inlinemaint, dir)?,
         "supdb-ingestinline" => supdb_arm(Supdb::create_ingest_inline, dir)?,
@@ -16450,10 +16249,6 @@ pub fn open(arm: &str, dir: &Path, map_gb: usize) -> Res<Box<dyn Engine>> {
         "supdb-ingestnodrainsnap" => supdb_arm(Supdb::create_ingest_nodrainsnap, dir)?,
         "supdb-sealcopyfar" => supdb_arm(Supdb::create_sealcopyfar, dir)?,
         "supdb-ingestsealcopyfar" => supdb_arm(Supdb::create_ingest_sealcopyfar, dir)?,
-        "supdb-ranksfar" => supdb_arm(Supdb::create_ranksfar, dir)?,
-        "supdb-ingestranksfar" => supdb_arm(Supdb::create_ingest_ranksfar, dir)?,
-        "supdb-rankswhole" => supdb_arm(Supdb::create_rankswhole, dir)?,
-        "supdb-ingestrankswhole" => supdb_arm(Supdb::create_ingest_rankswhole, dir)?,
         "supdb-mergerecordkeys" => supdb_arm(Supdb::create_mergerecordkeys, dir)?,
         "supdb-ingestmergerecordkeys" => supdb_arm(Supdb::create_ingest_mergerecordkeys, dir)?,
         "supdb-mergewalkrescan" => supdb_arm(Supdb::create_mergewalkrescan, dir)?,
@@ -16522,8 +16317,6 @@ pub fn open(arm: &str, dir: &Path, map_gb: usize) -> Res<Box<dyn Engine>> {
         "supdb-nozpagesnofitshort" => supdb_arm(Supdb::create_nozpages_nofitshort, dir)?,
         "supdb-nozpagesmergeone" => supdb_arm(Supdb::create_nozpages_mergeone, dir)?,
         "supdb-ingestmergeone" => supdb_arm(Supdb::create_ingest_mergeone, dir)?,
-        "supdb-boundarytop" => supdb_arm(Supdb::create_boundarytop, dir)?,
-        "supdb-ingestboundarytop" => supdb_arm(Supdb::create_ingest_boundarytop, dir)?,
         "supdb-aheadincore" => supdb_arm(
             |d| {
                 Supdb::with_policy(

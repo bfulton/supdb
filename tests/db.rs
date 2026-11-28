@@ -14805,96 +14805,6 @@ fn a_publish_starts_the_builder_and_a_commit_installs_its_forms_with(upkeep: sup
     m.check(&db, "the writer over its own");
 }
 
-/// A block boundary's key -- a partition's key at a block's first rank,
-/// which the builder ahead and its install bound every block they splice
-/// by (`Reader::block_bounds`) -- is read off the ordered index's top level
-/// in memory where the heads are whole keys
-/// (`Options::boundary_keys_from_top`), where it is a record read, a page
-/// of its own out of core. Two stores of the same writes, one with the
-/// option and one without, answer the same bounds for every block of every
-/// partition, over keys of one length and over keys of two, and only the
-/// option reads the top, and only where the heads are whole keys.
-#[test]
-fn the_splice_bounds_off_the_top_level_are_the_records_bounds() {
-    for (shape, key) in [
-        (
-            "one length",
-            Box::new(|k: u32| format!("key-{k:05}")) as Box<dyn Fn(u32) -> String>,
-        ),
-        (
-            "two lengths",
-            Box::new(|k: u32| {
-                if k.is_multiple_of(3) {
-                    format!("key-{k:05}-long")
-                } else {
-                    format!("key-{k:05}")
-                }
-            }),
-        ),
-    ] {
-        let stores: Vec<(Db, std::path::PathBuf)> = [true, false]
-            .into_iter()
-            .map(|on| {
-                let d = dir(&format!("splice-bounds-{on}-{}", shape.replace(' ', "-")));
-                let mut db = Db::create(
-                    &d,
-                    Options {
-                        partition_bytes: Some(32 << 10),
-                        scan_block_cache: true,
-                        boundary_keys_from_top: on,
-                        ..common::options()
-                    },
-                )
-                .unwrap();
-                for k in 0..6000u32 {
-                    db.append(key(k).as_bytes(), b"v0");
-                }
-                db.commit().unwrap();
-                db.flush().unwrap();
-                db.settle().unwrap();
-                (db, d)
-            })
-            .collect();
-        let (on, off) = (&stores[0].0, &stores[1].0);
-        let mut blocks = 0usize;
-        for part in 0.. {
-            if on.splice_bounds(part, 0).is_none() {
-                assert!(
-                    off.splice_bounds(part, 0).is_none(),
-                    "{shape}: the partitions differ"
-                );
-                break;
-            }
-            for b in 0.. {
-                let a = on.splice_bounds(part, b);
-                assert_eq!(
-                    a,
-                    off.splice_bounds(part, b),
-                    "{shape}: partition {part} block {b}"
-                );
-                if a.is_none() {
-                    break;
-                }
-                blocks += 1;
-            }
-        }
-        assert!(blocks > 20, "{shape}: the bounds of {blocks} blocks");
-        let (top_on, top_off) = (on.zpage_counts().top_keys, off.zpage_counts().top_keys);
-        assert_eq!(
-            top_off, 0,
-            "{shape}: nothing read off the top without the option"
-        );
-        assert_eq!(
-            top_on > 0,
-            shape == "one length",
-            "{shape}: the top read only where heads are whole keys: {top_on}"
-        );
-        for (db, _) in stores {
-            db.close().unwrap();
-        }
-    }
-}
-
 /// The builder ahead starts while the store is in core, the controller's
 /// gate at the raw form, and out of core only under the option
 /// (`Options::ahead_out_of_core`, on as shipped for the partitions whose
@@ -16823,9 +16733,9 @@ fn a_seal_far_from_reads_builds_no_copy() {
         drop(r);
         db.close().unwrap();
     }
-    // The block path's count, and the landings' ranks: a store with
+    // The block path's count, and the landings' bounds: a store with
     // partitions, sealed once with no scan and once after one, under the
-    // default and under both arms.
+    // default and under the seam.
     for far in [false, true] {
         let d = dir(&format!("seal-copy-far-blocks-{far}"));
         let mut db = Db::create(
@@ -16836,7 +16746,6 @@ fn a_seal_far_from_reads_builds_no_copy() {
                 // One seal's pieces stand until the test is done with them.
                 l0_trigger: 1 << 20,
                 seal_snapshot_far: far,
-                land_ranks_far: far,
                 ..common::options()
             },
         )
@@ -16871,8 +16780,7 @@ fn a_seal_far_from_reads_builds_no_copy() {
             "no scan in the store's life: a copy only under the arm"
         );
         assert_eq!(
-            ranked,
-            if far { pieces } else { 0 },
+            ranked, 0,
             "the landing far from reads published its pieces unranked"
         );
         // The first scan takes what the landing left, and answers right.
@@ -16934,86 +16842,74 @@ fn a_seal_far_from_reads_builds_no_copy() {
 /// sorting the table again. The seal sorted it once and nobody else does.
 /// The seal is held after its publish until the settle, since the commit
 /// that opens the run lands a seal that has finished.
-// The pieces' ranks are taken whole only under the arm
-// (`Options::piece_ranks_whole`): a landing near reads and the first scan
-// over pieces landed far from reads take every piece's bounds and leave
-// the ranks, and a build finds each piece key's cut where its walk stops
-// at the key. The model holds every read, count and scan to the same
-// answer either way, through the writer and through a handle.
+// No piece is ranked whole: a landing near reads and the first scan over
+// pieces landed far from reads take every piece's bounds and leave the
+// ranks, and a build finds each piece key's cut where its walk stops at
+// the key. The model holds every read, count and scan, through the writer
+// and through a handle.
 #[test]
-fn the_pieces_are_ranked_whole_only_under_the_arm() {
-    for whole in [false, true] {
-        let d = dir(&format!("ranks-whole-{whole}"));
-        let mut db = Db::create(
-            &d,
-            Options {
-                seal_bytes: 1 << 30,
-                partition_bytes: Some(2 << 10),
-                // One seal's pieces stand until the test is done with them.
-                l0_trigger: 1 << 20,
-                piece_ranks_whole: whole,
-                ..common::options()
-            },
-        )
-        .unwrap();
-        let mut m = ScanModel::default();
-        let key = |k: u32| format!("key-{k:06}");
-        for k in (0..6000u32).step_by(3) {
-            m.append(&mut db, &key(k), "p");
-        }
-        db.commit().unwrap();
-        db.flush().unwrap();
-        m.flushed();
-        assert!(db.levels().0 > 1, "several partitions");
-        // A seal with no scan in the store's life lands far from reads and
-        // takes neither ranks nor bounds, under either shape.
-        for k in (0..6000u32).step_by(7) {
-            m.append(&mut db, &key(k), "far");
-        }
-        db.commit().unwrap();
-        db.seal().unwrap();
-        db.settle().unwrap();
-        let (ranks, bounds, pieces) = db.pieces_with_ranks();
-        assert!(pieces > 0, "the seal's pieces stand");
-        assert_eq!(
-            (ranks, bounds),
-            (0, 0),
-            "a landing far from reads published its pieces bare"
-        );
-        // The first scan makes every partition's table: the bounds for
-        // every piece, and the ranks only under the arm.
-        m.check(&db, "the writer over pieces landed bare");
-        let (ranks, bounds, pieces) = db.pieces_with_ranks();
-        assert_eq!(bounds, pieces, "the scan took every piece's bounds");
-        assert_eq!(
-            ranks,
-            if whole { pieces } else { 0 },
-            "the scan ranked the pieces whole only under the arm"
-        );
-        // A seal after a scan lands near reads: its landing takes the
-        // bounds, and the ranks only under the arm, before anything scans.
-        for k in (0..6000u32).step_by(11) {
-            m.append(&mut db, &key(k), "near");
-        }
-        db.commit().unwrap();
-        db.seal().unwrap();
-        db.settle().unwrap();
-        let (ranks, bounds, pieces) = db.pieces_with_ranks();
-        assert_eq!(
-            bounds, pieces,
-            "a landing near reads took its pieces' bounds"
-        );
-        assert_eq!(
-            ranks,
-            if whole { pieces } else { 0 },
-            "a landing near reads ranked its pieces whole only under the arm"
-        );
-        m.check(&db, "the writer after both seals");
-        let r = db.reader().unwrap();
-        m.check(&r, "a handle after both seals");
-        drop(r);
-        db.close().unwrap();
+fn the_pieces_are_never_ranked_whole() {
+    let d = dir("ranks-whole");
+    let mut db = Db::create(
+        &d,
+        Options {
+            seal_bytes: 1 << 30,
+            partition_bytes: Some(2 << 10),
+            // One seal's pieces stand until the test is done with them.
+            l0_trigger: 1 << 20,
+            ..common::options()
+        },
+    )
+    .unwrap();
+    let mut m = ScanModel::default();
+    let key = |k: u32| format!("key-{k:06}");
+    for k in (0..6000u32).step_by(3) {
+        m.append(&mut db, &key(k), "p");
     }
+    db.commit().unwrap();
+    db.flush().unwrap();
+    m.flushed();
+    assert!(db.levels().0 > 1, "several partitions");
+    // A seal with no scan in the store's life lands far from reads and
+    // takes neither ranks nor bounds.
+    for k in (0..6000u32).step_by(7) {
+        m.append(&mut db, &key(k), "far");
+    }
+    db.commit().unwrap();
+    db.seal().unwrap();
+    db.settle().unwrap();
+    let (ranks, bounds, pieces) = db.pieces_with_ranks();
+    assert!(pieces > 0, "the seal's pieces stand");
+    assert_eq!(
+        (ranks, bounds),
+        (0, 0),
+        "a landing far from reads published its pieces bare"
+    );
+    // The first scan makes every partition's table: the bounds for
+    // every piece, and no ranks.
+    m.check(&db, "the writer over pieces landed bare");
+    let (ranks, bounds, pieces) = db.pieces_with_ranks();
+    assert_eq!(bounds, pieces, "the scan took every piece's bounds");
+    assert_eq!(ranks, 0, "the scan ranked no piece whole");
+    // A seal after a scan lands near reads: its landing takes the
+    // bounds, and no ranks, before anything scans.
+    for k in (0..6000u32).step_by(11) {
+        m.append(&mut db, &key(k), "near");
+    }
+    db.commit().unwrap();
+    db.seal().unwrap();
+    db.settle().unwrap();
+    let (ranks, bounds, pieces) = db.pieces_with_ranks();
+    assert_eq!(
+        bounds, pieces,
+        "a landing near reads took its pieces' bounds"
+    );
+    assert_eq!(ranks, 0, "a landing near reads ranked no piece whole");
+    m.check(&db, "the writer after both seals");
+    let r = db.reader().unwrap();
+    m.check(&r, "a handle after both seals");
+    drop(r);
+    db.close().unwrap();
 }
 
 #[test]
