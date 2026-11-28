@@ -367,3 +367,16 @@ case, such as an option to open a store with one segment set aside.
 ## Memory
 
 The user memory was empty, so nothing above comes from it.
+
+## Found while gating phase 1
+
+- `tests/cipher.rs` `a_store_whose_cache_follows_its_room_holds_what_the_room_allows`
+  fails under CPU contention at C0 as well (once in 3 runs of the whole
+  binary beside four busy loops), and its sibling
+  `the_builders_rest_at_every_block_of_a_store_of_wide_values` once in 9:
+  a cache past its budget under contention. For the flake loop (phase 4).
+- `tests/zpages.rs`
+  `builds_ahead_at_landing_start_past_the_percent_and_only_from_resident_records`
+  fails at C0 whenever the page cache is dropped while it runs. Correct
+  for what it tests; a cost count, which drops the cache, must not run
+  beside it.
