@@ -929,9 +929,6 @@ pub struct Supdb {
     /// `Options::close_presync`. `supdb-latesync`, and
     /// `supdb-ingestlatesync` buffered.
     latesync: bool,
-    /// The upkeep thread files on however far the writes have outrun it,
-    /// `Options::upkeep_abandons` off. `supdb-noabandon`.
-    noabandon: bool,
     /// A pass on the upkeep thread gives the writer its upkeep back at
     /// its next step, `Options::upkeep_yields` on. `supdb-passyield`.
     passyield: bool,
@@ -1210,10 +1207,6 @@ pub struct Supdb {
     /// `CONVERT_CAP`, `Options::ahead_converts` on). `supdb-convertcap`,
     /// and `supdb-ingestconvertcap` buffered.
     convertcap: bool,
-    /// The upkeep thread's pass bounded at `SHORT_PASS_PCT` of the
-    /// store's keys (`Options::upkeep_pass_pct`). `supdb-shortpass`, and
-    /// `supdb-ingestshortpass` buffered.
-    shortpass: bool,
     /// The upkeep thread's fill converting every dense form it meets
     /// rather than yielding to a newer commit (`Options::forms_convert_yield`
     /// off), the shape before. `supdb-noyield`, and `supdb-ingestnoyield`
@@ -1355,15 +1348,6 @@ pub struct Supdb {
     /// the option's first default meant. `supdb-behindyield`, and
     /// `supdb-ingestbehindyield` buffered.
     behindyield: bool,
-    /// The background work as the cost model in `docs/engine.md` orders
-    /// it: no dense form rebuilt while nothing reads
-    /// (`Options::forms_convert_unread` off). `supdb-bg`, and
-    /// `supdb-ingestbg` buffered.
-    bg: bool,
-    /// `bg` with the thread's lag bounded and its passes batched
-    /// (`Options::upkeep_lag_pct`, `Options::upkeep_batch_pct`):
-    /// `supdb-bglag`, and `supdb-ingestbglag` buffered.
-    bglag: bool,
     /// A point read of a partition through its ordered index rather than
     /// its hash (`Options::point_via_ord`). `supdb-nocacheordread`, the
     /// nocache policy alone: the form is for a store that does not fit.
@@ -1761,10 +1745,6 @@ pub struct Supdb {
     /// block cache off and the upkeep the writer's: `supdb-heldinplace`,
     /// beside `supdb-heldnfinline`, which differs in the overwrite alone.
     inplace: bool,
-    /// The upkeep thread's passes batched to this percentage of the
-    /// store's keys (`Options::upkeep_batch_pct`) under the held log with
-    /// no frames: `supdb-heldbatch1`.
-    upkeepbatch: Option<usize>,
     /// EXPERIMENT: the live table written by every thread's handle at once
     /// (`Options::shared_writers`), under the held log with no frames, the
     /// block cache off, the upkeep the writer's and ordered ingest off,
@@ -2239,9 +2219,6 @@ struct Policy {
     /// `Options::close_presync`. `supdb-latesync`, and
     /// `supdb-ingestlatesync` buffered.
     latesync: bool,
-    /// The upkeep thread files on however far the writes have outrun it,
-    /// `Options::upkeep_abandons` off. `supdb-noabandon`.
-    noabandon: bool,
     /// A pass on the upkeep thread gives the writer its upkeep back at
     /// its next step, `Options::upkeep_yields` on. `supdb-passyield`.
     passyield: bool,
@@ -2527,9 +2504,6 @@ struct Policy {
     /// the rest: `supdb-convertcap`, and `supdb-ingestconvertcap`
     /// buffered.
     convertcap: bool,
-    /// The upkeep thread's pass bounded: `supdb-shortpass`, and
-    /// `supdb-ingestshortpass` buffered.
-    shortpass: bool,
     /// The upkeep thread's fill never yielding its conversions:
     /// `supdb-noyield`, and `supdb-ingestnoyield` buffered.
     noyield: bool,
@@ -2610,13 +2584,6 @@ struct Policy {
     /// the option's first default meant. `supdb-behindyield`, and
     /// `supdb-ingestbehindyield` buffered.
     behindyield: bool,
-    /// The background work as the cost model orders it: `supdb-bg`, and
-    /// `supdb-ingestbg` buffered.
-    bg: bool,
-    /// `bg` with the thread's lag bounded and its passes batched
-    /// (`Options::upkeep_lag_pct`, `Options::upkeep_batch_pct`):
-    /// `supdb-bglag`, and `supdb-ingestbglag` buffered.
-    bglag: bool,
     /// A point read of a partition through its ordered index
     /// (`Options::point_via_ord`): `supdb-nocacheordread`.
     ordread: bool,
@@ -2914,9 +2881,6 @@ struct Policy {
     /// Puts overwritten in place (`Options::put_in_place`):
     /// `supdb-heldinplace`.
     inplace: bool,
-    /// The upkeep's passes batched (`Options::upkeep_batch_pct`):
-    /// `supdb-heldbatch1`.
-    upkeepbatch: Option<usize>,
     /// Every thread's handle writing the live table
     /// (`Options::shared_writers`): `supdb-heldshared`.
     shared: bool,
@@ -2950,11 +2914,6 @@ struct Policy {
 /// version's cap, about a pass's worth of conversions at a hundred
 /// thousand keys.
 const CONVERT_CAP: usize = 64;
-
-/// The share of the store's keys a pass of `supdb-shortpass` files at
-/// most: the square-root rule's pass size at the quick ladder's rungs
-/// (`docs/engine.md`, the cost model).
-const SHORT_PASS_PCT: usize = 2;
 
 impl Default for Policy {
     /// `supdb`: the shipping configuration.
@@ -3065,7 +3024,6 @@ impl Default for Policy {
             keycopies: false,
             fillplain: false,
             latesync: false,
-            noabandon: false,
             passyield: false,
             cachenoauto: false,
             cacheeighth: false,
@@ -3118,7 +3076,6 @@ impl Default for Policy {
             pmd: false,
             settlefreeze: false,
             convertcap: false,
-            shortpass: false,
             noyield: false,
             fencekeys: false,
             znohotraw: false,
@@ -3155,8 +3112,6 @@ impl Default for Policy {
             blockcursors: false,
             postedyield: false,
             behindyield: false,
-            bg: false,
-            bglag: false,
             ordread: false,
             zpages: false,
             zpages_nodrop: false,
@@ -3237,7 +3192,6 @@ impl Default for Policy {
             noframes: false,
             indexzeropage: false,
             inplace: false,
-            upkeepbatch: None,
             shared: false,
             sharedbig: false,
             sharedcapindex: false,
@@ -3986,31 +3940,6 @@ impl Supdb {
                 partition: false,
                 durable: false,
                 convertcap: true,
-                ..Policy::default()
-            },
-        )
-    }
-
-    /// `supdb` whose upkeep thread files at most a share of the store's
-    /// keys in one pass and re-posts the rest.
-    pub fn create_shortpass(path: &Path) -> Res<Supdb> {
-        Supdb::with_policy(
-            path,
-            Policy {
-                shortpass: true,
-                ..Policy::default()
-            },
-        )
-    }
-
-    /// `supdb-ingest` with the bounded pass, as `supdb-shortpass`.
-    pub fn create_ingest_shortpass(path: &Path) -> Res<Supdb> {
-        Supdb::with_policy(
-            path,
-            Policy {
-                partition: false,
-                durable: false,
-                shortpass: true,
                 ..Policy::default()
             },
         )
@@ -4980,55 +4909,6 @@ impl Supdb {
                 partition: false,
                 durable: false,
                 behindyield: true,
-                ..Policy::default()
-            },
-        )
-    }
-
-    /// `supdb` with the background work the cost model orders.
-    pub fn create_bg(path: &Path) -> Res<Supdb> {
-        Supdb::with_policy(
-            path,
-            Policy {
-                bg: true,
-                ..Policy::default()
-            },
-        )
-    }
-
-    /// `supdb-ingest` with the background work the cost model orders.
-    pub fn create_ingest_bg(path: &Path) -> Res<Supdb> {
-        Supdb::with_policy(
-            path,
-            Policy {
-                partition: false,
-                durable: false,
-                bg: true,
-                ..Policy::default()
-            },
-        )
-    }
-
-    /// `supdb-bg` with the thread's lag bounded and its passes batched.
-    pub fn create_bglag(path: &Path) -> Res<Supdb> {
-        Supdb::with_policy(
-            path,
-            Policy {
-                bglag: true,
-                ..Policy::default()
-            },
-        )
-    }
-
-    /// `supdb-ingestbg` with the thread's lag bounded and its passes
-    /// batched.
-    pub fn create_ingest_bglag(path: &Path) -> Res<Supdb> {
-        Supdb::with_policy(
-            path,
-            Policy {
-                partition: false,
-                durable: false,
-                bglag: true,
                 ..Policy::default()
             },
         )
@@ -7024,18 +6904,6 @@ impl Supdb {
             path,
             Policy {
                 latesync: true,
-                ..Policy::default()
-            },
-        )
-    }
-
-    /// `supdb` with the upkeep thread filing on however far the writes
-    /// have outrun it.
-    pub fn create_noabandon(path: &Path) -> Res<Supdb> {
-        Supdb::with_policy(
-            path,
-            Policy {
-                noabandon: true,
                 ..Policy::default()
             },
         )
@@ -9191,7 +9059,6 @@ impl Supdb {
             keycopies,
             fillplain,
             latesync,
-            noabandon,
             passyield,
             cachenoauto,
             cacheeighth,
@@ -9261,7 +9128,6 @@ impl Supdb {
             pmd,
             settlefreeze,
             convertcap,
-            shortpass,
             noyield,
             fencekeys,
             znohotraw,
@@ -9298,8 +9164,6 @@ impl Supdb {
             blockcursors,
             postedyield,
             behindyield,
-            bg,
-            bglag,
             ordread,
             zpages,
             zpages_nodrop,
@@ -9380,7 +9244,6 @@ impl Supdb {
             noframes,
             indexzeropage,
             inplace,
-            upkeepbatch,
             shared,
             sharedbig,
             sharedcapindex,
@@ -9489,7 +9352,6 @@ impl Supdb {
             manifest_spare: !manifestfree,
             ord_durable: oidxsync,
             direct_table_refs: refvals,
-            forms_convert_unread: !(bg || bglag),
             // The capped conversions and the builder's, kept to price again
             // once the thread keeps up with the writer.
             forms_convert_cap: if convertcap {
@@ -9505,23 +9367,6 @@ impl Supdb {
                 1000
             } else {
                 supdb::Options::default().forms_convert_behind
-            },
-            // The bounded pass, at the share the square-root rule of the
-            // cost model gives at these rungs.
-            upkeep_pass_pct: if shortpass {
-                SHORT_PASS_PCT
-            } else {
-                supdb::Options::default().upkeep_pass_pct
-            },
-            // The thread trails a burst by at most a sixth of the store's
-            // keys with reads around, and begins a pass for no fewer than
-            // a twelfth: the bound and the batch of the cost model, as
-            // the shares the sweep at a hundred thousand keys settled on.
-            upkeep_lag_pct: if bglag { 16 } else { 0 },
-            upkeep_batch_pct: if bglag {
-                8
-            } else {
-                upkeepbatch.unwrap_or(supdb::Options::default().upkeep_batch_pct)
             },
             forms_rebase: !norebase,
             // The seal sized by the file, as it was before the store's
@@ -9636,7 +9481,6 @@ impl Supdb {
             manifest_pending: manifestpending,
             flush_waits_manifest: waitmanifest,
             close_presync: !latesync,
-            upkeep_abandons: !noabandon,
             upkeep_yields: passyield,
             scan_cache_auto: !cachenoauto,
             scan_cache_auto_room: !cacheeighth,
@@ -10134,7 +9978,6 @@ impl Supdb {
             keycopies,
             fillplain,
             latesync,
-            noabandon,
             passyield,
             cachenoauto,
             cacheeighth,
@@ -10204,7 +10047,6 @@ impl Supdb {
             pmd,
             settlefreeze,
             convertcap,
-            shortpass,
             noyield,
             fencekeys,
             znohotraw,
@@ -10241,8 +10083,6 @@ impl Supdb {
             blockcursors,
             postedyield,
             behindyield,
-            bg,
-            bglag,
             ordread,
             zpages,
             zpages_nodrop,
@@ -10323,7 +10163,6 @@ impl Supdb {
             noframes,
             indexzeropage,
             inplace,
-            upkeepbatch,
             shared,
             sharedbig,
             sharedcapindex,
@@ -10693,8 +10532,6 @@ impl Engine for Supdb {
                     "supdb-heldnfnocache"
                 } else if self.indexzeropage {
                     "supdb-heldindexzeropage"
-                } else if self.upkeepbatch.is_some() {
-                    "supdb-heldbatch1"
                 } else if self.noalert {
                     "supdb-heldnoalert"
                 } else if self.upkeep == Some(supdb::Upkeep::Inline) {
@@ -10892,13 +10729,6 @@ impl Engine for Supdb {
                 "supdb-ingestconvertcap"
             };
         }
-        if self.shortpass {
-            return if self.partition {
-                "supdb-shortpass"
-            } else {
-                "supdb-ingestshortpass"
-            };
-        }
         if self.noyield {
             return if self.partition {
                 "supdb-noyield"
@@ -11090,20 +10920,6 @@ impl Engine for Supdb {
                 "supdb-behindyield"
             } else {
                 "supdb-ingestbehindyield"
-            };
-        }
-        if self.bg {
-            return if self.partition {
-                "supdb-bg"
-            } else {
-                "supdb-ingestbg"
-            };
-        }
-        if self.bglag {
-            return if self.partition {
-                "supdb-bglag"
-            } else {
-                "supdb-ingestbglag"
             };
         }
         if self.nofrozen {
@@ -11709,9 +11525,6 @@ impl Engine for Supdb {
                 "supdb-ingestlatesync"
             };
         }
-        if self.noabandon {
-            return "supdb-noabandon";
-        }
         if self.passyield {
             return "supdb-passyield";
         }
@@ -12234,7 +12047,7 @@ impl Engine for Supdb {
             ("upkeep_passes", db.upkeep_counts()[0] as f64),
             ("upkeep_skipped", db.upkeep_counts()[7] as f64),
             // The times the upkeep thread gave its forms up, and of those
-            // the ones its own pin decided (`Options::upkeep_abandons`).
+            // the ones its own pin decided.
             ("upkeep_abandons", db.upkeep_abandons() as f64),
             ("upkeep_abandons_pinned", db.upkeep_abandons_pinned() as f64),
             // The times the cache's own budget bound
@@ -14543,7 +14356,6 @@ pub fn guarantee(arm: &str) -> Option<Guarantee> {
         | "supdb-keycopies"
         | "supdb-fillplain"
         | "supdb-latesync"
-        | "supdb-noabandon"
         | "supdb-passyield"
         | "supdb-cachenoauto"
         | "supdb-cacheeighth"
@@ -14596,7 +14408,6 @@ pub fn guarantee(arm: &str) -> Option<Guarantee> {
         | "supdb-hold"
         | "supdb-settlefreeze"
         | "supdb-convertcap"
-        | "supdb-shortpass"
         | "supdb-noyield"
         | "supdb-notrim"
         | "supdb-fencekeys"
@@ -14690,8 +14501,6 @@ pub fn guarantee(arm: &str) -> Option<Guarantee> {
         | "supdb-blockcursors"
         | "supdb-postedyield"
         | "supdb-behindyield"
-        | "supdb-bg"
-        | "supdb-bglag"
         | "lmdb"
         | "lmdb-nordahead"
         | "lmdb3"
@@ -14712,7 +14521,6 @@ pub fn guarantee(arm: &str) -> Option<Guarantee> {
         | "supdb-ingestpmd"
         | "supdb-ingestsettlefreeze"
         | "supdb-ingestconvertcap"
-        | "supdb-ingestshortpass"
         | "supdb-ingestnoyield"
         | "supdb-ingestpostedyield"
         | "supdb-ingestbehindyield"
@@ -14774,8 +14582,6 @@ pub fn guarantee(arm: &str) -> Option<Guarantee> {
         | "supdb-ingestfatentries"
         | "supdb-ingestwaitmanifest"
         | "supdb-ingestrebuild"
-        | "supdb-ingestbg"
-        | "supdb-ingestbglag"
         | "supdb-ingesthold"
         | "lmdb-nosync"
         | "lmdb3-nosync"
@@ -14826,7 +14632,6 @@ pub fn guarantee(arm: &str) -> Option<Guarantee> {
         | "supdb-heldsettlestaged"
         | "supdb-heldsettlenoconvert"
         | "supdb-heldsettlefat"
-        | "supdb-heldbatch1"
         | "proto-shared"
         | "faster" => Guarantee::Memory,
         _ => return None,
@@ -15192,22 +14997,6 @@ pub fn open(arm: &str, dir: &Path, map_gb: usize) -> Res<Box<dyn Engine>> {
             },
             dir,
         )?,
-        "supdb-heldbatch1" => supdb_arm(
-            |d| {
-                Supdb::with_policy(
-                    d,
-                    Policy {
-                        partition: false,
-                        durable: false,
-                        held: true,
-                        noframes: true,
-                        upkeepbatch: Some(1),
-                        ..Policy::default()
-                    },
-                )
-            },
-            dir,
-        )?,
         "supdb-heldindexzeropage" => supdb_arm(
             |d| {
                 Supdb::with_policy(
@@ -15461,7 +15250,6 @@ pub fn open(arm: &str, dir: &Path, map_gb: usize) -> Res<Box<dyn Engine>> {
         "supdb-ingestpmd" => supdb_arm(Supdb::create_ingest_pmd, dir)?,
         "supdb-settlefreeze" => supdb_arm(Supdb::create_settlefreeze, dir)?,
         "supdb-convertcap" => supdb_arm(Supdb::create_convertcap, dir)?,
-        "supdb-shortpass" => supdb_arm(Supdb::create_shortpass, dir)?,
         "supdb-noyield" => supdb_arm(Supdb::create_noyield, dir)?,
         "supdb-notrim" => supdb_arm(Supdb::create_notrim, dir)?,
         "supdb-fencekeys" => supdb_arm(Supdb::create_fencekeys, dir)?,
@@ -15847,10 +15635,6 @@ pub fn open(arm: &str, dir: &Path, map_gb: usize) -> Res<Box<dyn Engine>> {
         "supdb-blockcursors" => supdb_arm(Supdb::create_blockcursors, dir)?,
         "supdb-postedyield" => supdb_arm(Supdb::create_postedyield, dir)?,
         "supdb-behindyield" => supdb_arm(Supdb::create_behindyield, dir)?,
-        "supdb-bg" => supdb_arm(Supdb::create_bg, dir)?,
-        "supdb-ingestbg" => supdb_arm(Supdb::create_ingest_bg, dir)?,
-        "supdb-bglag" => supdb_arm(Supdb::create_bglag, dir)?,
-        "supdb-ingestbglag" => supdb_arm(Supdb::create_ingest_bglag, dir)?,
         "supdb-settlelate" => supdb_arm(Supdb::create_settlelate, dir)?,
         "supdb-ingestsettlelate" => supdb_arm(Supdb::create_ingest_settlelate, dir)?,
         "supdb-walsync" => supdb_arm(Supdb::create_walsync, dir)?,
@@ -16686,7 +16470,6 @@ pub fn open(arm: &str, dir: &Path, map_gb: usize) -> Res<Box<dyn Engine>> {
         "supdb-fillplain" => supdb_arm(Supdb::create_fillplain, dir)?,
         "supdb-ingestfillplain" => supdb_arm(Supdb::create_ingest_fillplain, dir)?,
         "supdb-latesync" => supdb_arm(Supdb::create_latesync, dir)?,
-        "supdb-noabandon" => supdb_arm(Supdb::create_noabandon, dir)?,
         "supdb-passyield" => supdb_arm(Supdb::create_passyield, dir)?,
         "supdb-cachenoauto" => supdb_arm(Supdb::create_cachenoauto, dir)?,
         "supdb-cacheeighth" => supdb_arm(Supdb::create_cacheeighth, dir)?,
@@ -16751,7 +16534,6 @@ pub fn open(arm: &str, dir: &Path, map_gb: usize) -> Res<Box<dyn Engine>> {
         "supdb-ingestwaitmanifest" => supdb_arm(Supdb::create_ingest_waitmanifest, dir)?,
         "supdb-ingestsettlefreeze" => supdb_arm(Supdb::create_ingest_settlefreeze, dir)?,
         "supdb-ingestconvertcap" => supdb_arm(Supdb::create_ingest_convertcap, dir)?,
-        "supdb-ingestshortpass" => supdb_arm(Supdb::create_ingest_shortpass, dir)?,
         "supdb-ingestnoyield" => supdb_arm(Supdb::create_ingest_noyield, dir)?,
         "supdb-ingestpostedyield" => supdb_arm(Supdb::create_ingest_postedyield, dir)?,
         "supdb-ingestbehindyield" => supdb_arm(Supdb::create_ingest_behindyield, dir)?,
@@ -17178,7 +16960,6 @@ mod tests {
             ("supdb-heldnoalert", |a| !a.upkeep_alert),
             ("supdb-heldinline", |a| a.upkeep == supdb::Upkeep::Inline),
             ("supdb-heldindexzeropage", |a| !a.index_populated),
-            ("supdb-heldbatch1", |a| a.upkeep_batch_pct == 1),
             ("supdb-heldnoshare", |a| !a.share_on_write),
         ] {
             let e = open(arm, &root.join(arm), 1).unwrap();
@@ -17197,10 +16978,6 @@ mod tests {
                 },
                 "supdb-heldindexzeropage" => Policy {
                     indexzeropage: true,
-                    ..Policy::default()
-                },
-                "supdb-heldbatch1" => Policy {
-                    upkeepbatch: Some(1),
                     ..Policy::default()
                 },
                 "supdb-heldnoshare" => Policy {

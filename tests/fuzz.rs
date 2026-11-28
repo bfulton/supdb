@@ -110,7 +110,7 @@
 //! - `ZFUZZ_KEEPONE=1`: both stores keep one table, and a byte's worth, for
 //!   the upkeep's look (`Options::upkeep_keep_bytes`), so that a look a
 //!   table behind and a pass with a table landed under its pin give the
-//!   forms up (`Options::upkeep_abandons`) and the store reads as far from
+//!   forms up and the store reads as far from
 //!   reads until its next scan; a flag and not a draw.
 //! - `ZFUZZ_AUTOCACHE=1`: both stores' caches budget themselves at 64 KB
 //!   (`Options::scan_cache_auto_bytes`), so the budget binds part way
@@ -1994,8 +1994,8 @@ struct Handle {
 
 struct Stats {
     reopens: u64,
-    /// The times either store's upkeep thread gave its forms up
-    /// (`Options::upkeep_abandons`), summed over the store's opens: what
+    /// The times either store's upkeep thread gave its forms up,
+    /// summed over the store's opens: what
     /// says a run under `ZFUZZ_KEEPONE` reached the path it is for.
     abandons: u64,
     /// The times either store's own cache budget bound

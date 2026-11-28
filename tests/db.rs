@@ -540,26 +540,6 @@ fn the_oracle_holds_with_the_carry_left_to_the_next_look() {
     );
 }
 
-/// And with the background work as the cost model orders it: no dense
-/// form rebuilt while nothing reads, the thread's lag bounded with
-/// commits holding past it, and its passes begun only for a batch. The
-/// bound and the batch are small here so the holds and the waits for a
-/// batch happen inside the oracle's few thousand operations.
-#[test]
-fn the_oracle_holds_with_the_lag_bounded_and_the_passes_batched() {
-    let _ = oracle_in(
-        "oracle-bglag",
-        Options {
-            freeze_settles: false,
-            forms_convert_unread: false,
-            upkeep_lag_pct: 50,
-            upkeep_batch_pct: 50,
-            upkeep: supdb::Upkeep::Background(1),
-            ..common::options()
-        },
-    );
-}
-
 /// And on a buffered store, whose commits near reads file a burst's
 /// batch themselves (`Options::upkeep_inline_bursts`) and lend the thread
 /// only the batches too small to wake it for.
@@ -796,8 +776,8 @@ fn a_look_over_a_state_a_landing_replaced_drops_its_tables_from_the_state_that_s
     let _ = std::fs::remove_dir_all(&d);
 }
 
-/// A thread the writes have outrun gives its forms up until the next scan
-/// (`Options::upkeep_abandons`): with one table kept for its look and the
+/// A thread the writes have outrun gives its forms up until the next scan:
+/// with one table kept for its look and the
 /// thread held before its pass while the writer freezes tables past it, the
 /// publish asks, the thread gives the forms up as its pass begins, the store
 /// is far from reads until it is scanned, and the scan reads every key's
@@ -19728,61 +19708,6 @@ fn a_commit_that_freezes_leaves_the_carry_to_the_upkeep_thread() {
     db.hold_seal_landing(false);
     db.settle().unwrap();
     m.check(&r, "a handle after the landing");
-    std::hint::black_box(sink);
-}
-
-/// A commit that finds the upkeep thread more than the bound of
-/// `Options::upkeep_lag_pct` behind, with reads around, holds until the
-/// thread trails by half the bound, and the thread begins a pass only
-/// for `Options::upkeep_batch_pct` of the store's keys or a holding
-/// commit. The holds happen,
-/// and every answer after the burst is the model's through a handle and
-/// through the writer.
-#[test]
-fn a_commit_past_the_bound_holds_for_the_thread() {
-    let d = dir("upkeep-lag");
-    let opts = Options {
-        partition_bytes: Some(2 << 10),
-        l0_trigger: 64,
-        scan_block_cache: true,
-        scan_cache_ahead: false,
-        forms_settle_backlog_pct: 0,
-        freeze_settles: false,
-        forms_convert_unread: false,
-        upkeep_lag_pct: 7,
-        upkeep_batch_pct: 3,
-        upkeep: supdb::Upkeep::Background(1),
-        ..common::options()
-    };
-    let mut db = Db::create(&d, opts).unwrap();
-    let mut m = ScanModel::default();
-    let key = |k: u32| format!("key-{k:05}");
-    for k in 0..1500u32 {
-        m.append(&mut db, &key(k), "v0");
-    }
-    db.commit().unwrap();
-    db.flush().unwrap();
-    m.flushed();
-    db.settle().unwrap();
-    // A scan, so the burst after it has reads around.
-    let mut sink = 0usize;
-    db.scan(key(0).as_bytes(), 10, kv(&mut |_k, v| sink += v.len()))
-        .unwrap();
-    let holds = db.upkeep_counts()[4];
-    for round in 0..10u32 {
-        let value = format!("v{}", round + 1);
-        for k in (round..1500u32).step_by(7) {
-            m.append(&mut db, &key(k), &value);
-        }
-        db.commit().unwrap();
-    }
-    assert!(
-        db.upkeep_counts()[4] > holds,
-        "a commit held for the thread"
-    );
-    let r = db.reader().unwrap();
-    m.check(&r, "a handle after the bounded burst");
-    m.check(&db, "the writer after the bounded burst");
     std::hint::black_box(sink);
 }
 
