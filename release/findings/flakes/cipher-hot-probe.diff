@@ -1,0 +1,114 @@
+diff --git a/src/db.rs b/src/db.rs
+index 105f3a0..215874f 100644
+--- a/src/db.rs
++++ b/src/db.rs
+@@ -71221,7 +71221,12 @@ mod cipher_looks {
+             // The cache back under its budget with nothing reading, and
+             // its peak started again there: what follows is the drop's.
+             let t = std::time::Instant::now();
++            let mut dumped = false;
+             while pager.held() > pager.budget() {
++                if !dumped && t.elapsed() > std::time::Duration::from_secs(3) {
++                    dumped = true;
++                    eprintln!("PROBE OVER held {} budget {} unbacked {} in flight {:?} counts {:?} files {:#?}", pager.held(), pager.budget(), pager.unbacked(), db.in_flight(), pager.counts(), pager.probe_files());
++                }
+                 assert!(
+                     t.elapsed() < std::time::Duration::from_secs(20),
+                     "away {away}: the cache stayed over its budget before the drop: {:?}",
+diff --git a/src/db/pager.rs b/src/db/pager.rs
+index a87c4e6..337b8e0 100644
+--- a/src/db/pager.rs
++++ b/src/db/pager.rs
+@@ -475,6 +475,8 @@ pub(crate) struct Pager {
+     /// there is somewhere to read it again from.
+     unbacked: AtomicU64,
+     peak: AtomicU64,
++    probe_skip: [AtomicU64; 5],
++    probe_hot_by: Mutex<std::collections::BTreeMap<String, u64>>,
+     /// `StoreCipher::chunks_apart`.
+     apart: AtomicBool,
+     /// `StoreCipher::merges_beside_cache`.
+@@ -569,6 +571,8 @@ impl Pager {
+             held: AtomicU64::new(0),
+             unbacked: AtomicU64::new(0),
+             peak: AtomicU64::new(0),
++            probe_skip: Default::default(),
++            probe_hot_by: Mutex::new(std::collections::BTreeMap::new()),
+             apart: AtomicBool::new(false),
+             beside: AtomicBool::new(false),
+             drops_keep: AtomicBool::new(false),
+@@ -760,6 +764,20 @@ impl Pager {
+         self.unbacked.load(Ordering::Relaxed)
+     }
+ 
++    #[cfg(test)]
++    pub(crate) fn probe_files(&self) -> Vec<String> {
++        let files: Vec<Arc<Paged>> = lock(&self.files).iter().filter_map(Weak::upgrade).collect();
++        files
++            .iter()
++            .filter(|f| f.present.load(Ordering::Relaxed) > 0)
++            .map(|f| {
++                let states: Vec<u8> = f.state.iter().map(|s| s.load(Ordering::Relaxed)).collect();
++                let units: Vec<u8> = f.unit.iter().map(|s| s.load(Ordering::Relaxed)).collect();
++                format!("{} len {} backed {} present {} chunk-states {:?} unit-states {:?}", f.label, f.len, f.back.get().is_some(), f.present.load(Ordering::Relaxed), states, units)
++            })
++            .collect()
++    }
++
+     /// Whether `bytes` more would fit under the budget.
+     pub(crate) fn room_for(&self, bytes: u64) -> bool {
+         self.held().saturating_add(bytes) <= self.budget()
+@@ -1057,6 +1075,11 @@ impl Pager {
+             }
+             if marked.is_empty() {
+                 Counts::bump(&self.counts.stalls);
++                if std::env::var("SUPDB_PROBE_HOT").is_ok() {
++                    let k: Vec<u64> = self.probe_skip.iter().map(|a| a.swap(0, Ordering::Relaxed)).collect();
++                    let by = std::mem::take(&mut *lock(&self.probe_hot_by));
++                    eprintln!("STALL held {} budget {} over {over} goal {goal} skips hot {} empty {} notlive {} unbacked {} hot_by {:?}", self.held(), budget, k[0], k[1], k[2], k[3], by);
++                }
+                 return false;
+             }
+         } else if marked.is_empty() {
+@@ -1179,6 +1202,9 @@ impl Pager {
+                 continue;
+             }
+             seen += 1;
++            if f.back.get().is_none() {
++                self.probe_skip[3].fetch_add(1, Ordering::Relaxed);
++            }
+             if f.back.get().is_some() {
+                 let got = f.mark(ui);
+                 if got > 0 {
+@@ -1756,6 +1782,10 @@ impl Paged {
+                         .compare_exchange(COLD, HOT, Ordering::SeqCst, Ordering::SeqCst)
+                         .is_ok()
+                     {
++                        if std::env::var("SUPDB_PROBE_HOT").is_ok() {
++                            let who = std::thread::current().name().unwrap_or("?").to_string();
++                            *lock(&self.pager.probe_hot_by).entry(format!("{who} {}", self.label)).or_insert(0) += 1;
++                        }
+                         return true;
+                     }
+                 }
+@@ -1885,13 +1915,19 @@ impl Paged {
+                 _ => {}
+             }
+         }
+-        if hot || !present {
++        if hot {
++            self.pager.probe_skip[0].fetch_add(1, Ordering::Relaxed);
++            return 0;
++        }
++        if !present {
++            self.pager.probe_skip[1].fetch_add(1, Ordering::Relaxed);
+             return 0;
+         }
+         if self.unit[u]
+             .compare_exchange(LIVE, EVICTING, Ordering::SeqCst, Ordering::SeqCst)
+             .is_err()
+         {
++            self.pager.probe_skip[2].fetch_add(1, Ordering::Relaxed);
+             return 0;
+         }
+         let mut bytes = 0u64;
