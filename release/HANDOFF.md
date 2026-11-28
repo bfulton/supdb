@@ -34,7 +34,8 @@ Rounds run on the merged tree (`release/tools/round.sh`):
 |---|---|---|---|---|
 | 1 | `793cec2b` | all green | green | green |
 | 2 | `abeecbdd` | all green but one test: the settle copy's abandon, twice (named since: an engine race, fix in `claude/supdb-pretag-flake-settle`) | red: `compact_run` +2.0 and `Reader::settle_each` +13.9 an op, both spills carried (below) | green |
-| 3 | `e927955f` | build to wasm green; bench, lists, cost and fuzz were running at the hand-off's first writing | | |
+| 3 | `e927955f` | all green | green | green |
+| 4 | `68c68ad0` | running: track C's fix to PR14 (`607ed7d0`: removing a flag from `Db::z_attach`'s positional tuple shifted the raw-drop test onto the decode timer's slot, so a store with `zpages_drop_raw` off dropped anyway; now a named struct and a test), and the six hostile-input fixes, whose own count is red by their checks (below) | | |
 
 ## Branches still to merge
 
@@ -51,7 +52,7 @@ after the hunk, since a hunk can end inside a block whose brace is common
 | `claude/supdb-pretag-p1-b` | PR9 to PR12, PR20, PR21 | PR9 merged; PR10 to PR12 pushed (`62c73dc`), gates green, merge once its `settle_patch_in_place` assertion and the `ZFUZZ_SNAPKEPT` leftover are pushed | `release/handoff/p1-b.md` |
 | `claude/supdb-pretag-p1-c` | PR13 to PR18 | PR13, PR14 merged; PR15 on | `release/handoff/p1-c.md` |
 | `claude/supdb-pretag-p1-d` | PR22 to PR29 | PR22 merged; PR23, PR24 in progress | `release/handoff/p1-d.md` |
-| `claude/supdb-pretag-hostile-fixes` | the six highs of `release/findings/hostile-input.md` and `unsafe.md` | in progress; the browser reader opens all 14,364 crafted cases with no trap and no misread; the wasm module grows to 133,566 bytes (cap 131,556 at C0: the reason is the bounds checks) | `release/handoff/hostile-fixes.md` |
+| `claude/supdb-pretag-hostile-fixes` | the six highs of `release/findings/hostile-input.md` and `unsafe.md` | done and merged at `68c68ad0`: gate green twice, fuzz past the ranges green; the browser reader opens all 14,364 crafted cases with no trap and no misread; the wasm module grows to 133,566 bytes (cap 131,556 at C0: the reason is the new refusals' checks and their messages); the count is red by those checks on the write and open paths, read paths unmoved | `release/handoff/hostile-fixes.md` |
 | `claude/supdb-pretag-flakes` | the known flakes | five fixed in their tests and merged; the pager's placeholder debt fixed in the engine (`58810f2`); the adoption overshoot (an engine design question), the builders' rest test and `cipher_looks` open | `release/findings/flakes.md` |
 | `claude/supdb-pretag-flake-settle` | the settle copy's abandon | cause named and forced (a writer's freeze judges the upkeep by a position read before its publish); fix in progress at all three sites | `release/findings/flake-settle.md` |
 | `claude/supdb-pretag-flake-hunt-1` | `test` and `stride` loops, CI history | CI history read; loops under load in progress | `release/findings/flake-hunt-1.md` |
@@ -69,6 +70,16 @@ after the hunk, since a hunk can end inside a block whose brace is common
 - **`compact_run`** +2.0 an op on `merge` (track C's PR13): counted again at
   PR18's end; one try at a shape, else declared in `scripts/raises.txt`
   with its reading.
+- **The hostile-input fixes' raises**, each a check a wrong answer needed:
+  `Db::append_batch` and `put_batch` about 5 an op on `load_*` and
+  `commit_*` (the batch's length pass), `Db::append`, `put` and `delete` 2
+  an op (the length test of a write), `SegmentWriter::end_with` 1 a key,
+  and the open path's checks on `land` (`Blob::open_with`, `Sec::get`,
+  `MemTable::index_insert`). The count has no raise file of its own: the
+  pull request names them with their reasons.
+- **Positional lists.** Every track checks its removals for a tuple, array,
+  bit set or positional list whose later entries shifted (track C's PR14
+  bug), and records the check in its hand-off file.
 - **PR30**, the last group of phase 1: `#[doc(hidden)]` on the kept
   experimental and test-seam fields.
 
