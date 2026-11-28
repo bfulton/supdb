@@ -33499,25 +33499,39 @@ impl Reader {
         // an accessor at every step, thirty nanoseconds on a read of two
         // hundred at three hundred thousand keys.
         let st = self.state();
-        // A shared table of records first, through the record's address: a
-        // shared table promises its readers no
-        // isolation, so its reads honour no mark. A key with no record
-        // there is read below with the live table known not to hold it.
-        let mut live_absent = false;
-        let mut pre = None;
+        // A shared table of records first, through the record's address:
+        // out of line, so that what it carries is not the plain read's.
         if st.mem.records {
-            pre = self.fall_ask(st, key);
-            match self.read_live_lean(&st.mem, key, &mut f) {
-                LeanRead::Done(n) => {
-                    self.lean_fell.set(false);
-                    return Ok(n);
-                }
-                LeanRead::Absent => {
-                    live_absent = true;
-                    self.lean_fell.set(true);
-                }
-                LeanRead::General => self.lean_fell.set(false),
+            return self.read_shared_records(st, key, f);
+        }
+        self.read_below(st, key, false, None, f)
+    }
+
+    /// The read of `key` where the live table is a shared table of
+    /// records, through the record's address: a shared table promises its
+    /// readers no isolation, so its reads honour no mark. A key with no
+    /// record there is read below with the live table known not to hold
+    /// it.
+    #[cold]
+    #[inline(never)]
+    fn read_shared_records<F: FnMut(&[u8])>(
+        &self,
+        st: &State,
+        key: &[u8],
+        mut f: F,
+    ) -> Result<u64> {
+        let pre = self.fall_ask(st, key);
+        let mut live_absent = false;
+        match self.read_live_lean(&st.mem, key, &mut f) {
+            LeanRead::Done(n) => {
+                self.lean_fell.set(false);
+                return Ok(n);
             }
+            LeanRead::Absent => {
+                live_absent = true;
+                self.lean_fell.set(true);
+            }
+            LeanRead::General => self.lean_fell.set(false),
         }
         self.read_below(st, key, live_absent, pre, f)
     }
