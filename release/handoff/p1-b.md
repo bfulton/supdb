@@ -13,7 +13,8 @@ PR12, PR20 and PR21 in that order (`release/phase1.md`,
 | PR11 | `c940f90` settle-patch, `d536f9d` settle-lean | passed | against `d80073c`: red, `land` +10.12 net: `settle_each` +11.36 an op (stack moves), `patch_block` +0.383 (`splice_run` inlined), `overlay_all` +0.047 (net negative); same disposition as PR10 |
 | PR12 | `cca2f0e` zpages-controller, `62c73dc` zpages-ahead | passed | against `d536f9d`: green |
 | PR20 | `22a55f9` rewarm | passed on the second run (the first: the cipher flake below) | against `62c73dc`: green; `scan_z` +15.60 an op in the allocator within its bound (`_int_malloc` +12.76 of 124), `scan_long_z` -25.07, `merge` -4.23 (`sweep_retired_states` -5.08) |
-| follow-ups | `e33a0f2` the fuzz's `shares()` no longer reads `ZFUZZ_SNAPKEPT`; `4932fe0` the in-place patch test names `settle_lean().0` as the patches' own count, held to a mutant (`patch_in_place` never taken) that fails it with "the puts over the copies in place: 0" | `lists`, `settle`, `source` and a fuzz range passed | test-only |
+| PR21 | `fc93666` block-cache, `9386db8` merge-chain | passed | against `4932fe0`: green; every probe fell, `read_z` -7.27 an op, `read_s` -7.00, `scan_long_z` -24.72, `work` -2.08: `Options::tracks_points` went with `merge_chains_writes_uncovered`, and with it the early returns in `note_read` and `note_read_mode` |
+| follow-ups | `e33a0f2` the fuzz's `shares()` no longer reads `ZFUZZ_SNAPKEPT`; `4932fe0` the in-place patch test names `settle_lean().0` as the patches' own count, held to a mutant (`patch_in_place` never taken) that fails it with "the puts over the copies in place: 0"; `a05999e` puts `shares()` on one line, which the format gate asks for since `e33a0f2` | `lists`, `settle`, `source` and a fuzz range passed | test-only |
 
 ## Held back, or done otherwise than the ledger says
 
@@ -48,45 +49,13 @@ argument and left the others in place. No tuple, array or bit set read by
 index lost an entry: fuzz draws keep their slots as `let _ =`, and the
 counter arrays (`forms_events`, `settle_lean`) are unchanged in length.
 
-## In progress
+- PR21: the doc of `the_raw_cache_arm_differs_from_the_combined_arm_in_the_cache_reads_alone`
+  sat on the parallel merge arms' test, which went with its arms; it was
+  moved onto its own test.
 
-PR21 (block-cache, merge-chain), not started; the tree is at `4932fe0`.
-Plan, per cluster, one commit each:
+## State
 
-- block-cache: inline `scan_run_builds` at true (`src/db.rs` near
-  `if self.opts.scan_run_builds`); `scan_cache_auto` stays a hidden seam
-  (above); arms `supdb-cachenoauto`, `supdb-norunbuilds`,
-  `supdb-cacheeighth` (seam `scan_cache_auto_room`), `supdb-nocopiesfit`
-  (seam `scan_cache_copies_fit`) go; the shared `supdb-nocopiesfitchain`
-  goes with merge-chain. `tests/zpages.rs`
-  `a_scan_over_unvisited_clean_blocks_is_one_dispatch_into_the_form`
-  loses its off case.
-- merge-chain: inline `merge_quiet_any_gate` at false and
-  `merge_chains_writes_uncovered` at true; the fuzz keeps the
-  `merge_quiet_any` draw as `let _ = side.chance(50);`; seams
-  `merge_chains`, `merge_bytes_cap`, `merge_parallel`,
-  `merge_chains_writes` lose their arms (`supdb-nomergechain`,
-  `supdb-ingestnomergechain`, `supdb-mergeuncapped`,
-  `supdb-ingestmergeuncapped`, `supdb-merge3`, `supdb-mergeone`,
-  `supdb-nozpagesmergeone`, `supdb-ingestmergeone`, `supdb-nochainwrites`,
-  `supdb-ingestnochainwrites`); `supdb-quietany`, `supdb-chaincovered`,
-  `supdb-nocopiesfitchain` go. `tests/fences.rs`
-  `a_burst_the_writers_forms_cover_is_not_chained_through` loses its
-  `opt = false` row and `a_third_merge_runs_only_in_a_stretch_of_writes_nobody_reads`
-  its `RawFormAnyGate` case.
-
-## Next step
-
-Make the two PR21 commits as above, each with its `bench/DESIGN.md`
-lines, `tests/data/cost-entries.txt` and `tests/data/couplings.txt`
-lowered, then per commit:
-
-    cargo build --profile checked --tests
-    cargo test --profile checked --no-fail-fast --test db --test zpages --test fences --test fuzz --test source
-    (cd bench && cargo test --release engines::)
-    python3 bench/scripts/policy_defaults.py
-
-and for the group:
-
-    sh scripts/check.sh            # to its last line
-    sh scripts/cost.sh 4932fe0     # with nothing else running
+Track B is done: PR9, PR10, PR11, PR12, PR20 and PR21, each gated and
+counted, at `9386db8`, with this file after it. Open for the coordinator:
+the `settle_each` and `patch_block` reds of PR10 and PR11 on the merged
+tree, and the overlap of `supdb-nozjobsrewarm` with track A's PR7.
