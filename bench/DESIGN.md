@@ -757,10 +757,8 @@ partition lands, the memo of decoded groups off, a scan's seeks by the
 ordered index's heads instead of the form file's fence, a scan's prefetch
 of the pages it will cross on, and the overlay walk of a covered
 partition cut by rank rather than carried through a cursor; and
-`supdb-nocacheautozpagesnoahead` is `supdb-nocacheautozpages` with its
-builds asking nothing of the raw records ahead of their walks, the shape
-before the window, whose every wait fetched the device's readahead and no
-more, and `supdb-nocacheautozpageseager` the controller buying the form at
+`supdb-nocacheautozpageseager` is `supdb-nocacheautozpages` with the
+controller buying the form at
 SUSPECT on the model's prediction, once the sampler has priced it and the
 partitions have stood for the settle, instead of after the ski rental's
 wait; `supdb-cache64tofit` is `supdb-cache256tofit` with its bound at
@@ -787,12 +785,7 @@ the target at zero, the page as one group, the shape before the cut,
 `supdb-nocachezpagesonegroup` is the forced arm with the same, which
 prices the cut on a point read through the form from the pass's first
 read, and `supdb-cache64tofitautozpagesgroup1k` cuts at a kibibyte where
-the default cuts at two. `supdb-cache64tofitautozpagesprebuild` is the
-combined arm with the form files built ahead of the controller's
-decision once the store outgrows its budget and left dormant on disk
-(`Options::zpages_prebuild`), so that the shift to the form is an attach
-and not a build under the readers' faults; a store that fits builds
-nothing. `supdb-cache64tofitautozpagesspan` is the combined arm with a
+the default cuts at two. `supdb-cache64tofitautozpagesspan` is the combined arm with a
 block-cache scan's block taken from the fence and the page's directory
 and its rank sought only for a block not held as a copy
 (`Options::zpages_seek_span`), where the default seeks every scan's rank

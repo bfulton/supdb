@@ -7468,7 +7468,7 @@ fn read_writeback(file: &super::vault::File) -> Result<()> {
 }
 
 /// A partition built ahead turned, in the page cache, into what a build
-/// past the budget leaves (`Options::zpages_land_drop_past`): the
+/// past the budget leaves: the
 /// segment's record region, `[at, at + len)` of `seg`, dropped
 /// (`POSIX_FADV_DONTNEED`, which skips a page a mapping holds), and the
 /// form file at `form` asked for (`POSIX_FADV_WILLNEED`) in the pieces the
@@ -7575,7 +7575,7 @@ pub(super) struct BuildPlan {
     /// The bytes of the raw record region passed between drops.
     pub window: usize,
     /// The bytes of the raw records asked for ahead of the walk, a window
-    /// at a time (`Options::zpages_build_ahead`); zero asks for nothing,
+    /// at a time (`db::ZBUILD_AHEAD` for a build); zero asks for nothing,
     /// and the walk's page faults fetch the device's readahead and no more.
     pub ahead: usize,
     /// The decoded bytes a page's groups are cut at
@@ -7621,7 +7621,7 @@ pub(super) struct BuildPlan {
     /// whose reads want the cache the file would take.
     pub drop_output: bool,
     /// The form file synced (`fdatasync`) once it has its name, on the
-    /// build's own thread (`Options::zpages_build_sync`): its pages reach
+    /// build's own thread: its pages reach
     /// the device by `sync_file_range`, which asks for no flush of the
     /// device's write-back cache, and the next fsync anyone issues pays
     /// that flush. The sync asks for that flush alone, and its error is the

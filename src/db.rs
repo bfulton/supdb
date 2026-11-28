@@ -393,8 +393,18 @@ pub struct WalHeld {
 /// The window the merge asks ahead of its second pass where
 /// `Options::merge_read_ahead` is set by the arm: four mebibytes, the
 /// device's largest request here and the window the controller's build asks
-/// ahead of its walk (`Options::zpages_build_ahead`).
+/// ahead of its walk (`ZBUILD_AHEAD`).
 pub const MERGE_AHEAD_WINDOW: usize = 4 << 20;
+
+/// The bytes of a partition's raw records a build asks the kernel for
+/// ahead of its walk, a window at a time (`MADV_WILLNEED`). Asking
+/// nothing, the walk's page faults fetched the device's readahead, 128 KB
+/// here, one window a wait; under a bound the walk's waits queued behind
+/// the readers' faults, and a build of a gigabyte ran at 5-15 MB/s
+/// whatever its I/O class, where four mebibytes asked ahead took its wall
+/// to a little over half. The bytes asked are counted
+/// (`ZCounts::build_ahead_bytes`).
+const ZBUILD_AHEAD: usize = 4 << 20;
 
 /// I/O priority for the seal and merge threads. `Idle` asks the block layer
 /// to serve everything else -- the commit path's barrier above all -- before
@@ -914,7 +924,7 @@ pub struct ZCounts {
     pub warm_collected: u64,
     pub job_ends: u64,
     /// Form files built ahead of the controller's decision and left on
-    /// disk unattached (`Options::zpages_prebuild`).
+    /// disk unattached.
     pub prebuilt: u64,
     /// Builds at a merge's output finish (`Options::zpages_build_at_finish`):
     /// started, built, failed, the merge's waits for a slot, and in flight.
@@ -935,8 +945,7 @@ pub struct ZCounts {
     /// built again in the picked one.
     pub ahead_recoded: u64,
     /// Partitions built ahead under the budget whose records were dropped
-    /// and form files asked back as the store passed its whole budget
-    /// (`Options::zpages_land_drop_past`).
+    /// and form files asked back as the store passed its whole budget.
     pub ahead_swapped: u64,
     /// Form files whose build dropped them from the page cache as it wrote
     /// them -- a build ahead begun under the selector's line -- asked back
@@ -964,15 +973,14 @@ pub struct ZCounts {
     pub raw_redrops: u64,
     pub raw_redrop_before: u64,
     pub raw_redrop_after: u64,
-    /// Form files synced once named, on their build's thread
-    /// (`Options::zpages_build_sync`).
+    /// Form files synced once named, on their build's thread.
     pub build_synced: u64,
     /// The I/O class the kernel reported for the last build thread, read
     /// on the thread after it chose: 3 idle, 2
     /// best effort, 0 none, which is best effort at the thread's nice.
     pub build_io_class: u64,
     /// The raw record bytes the builds asked for ahead of their walks
-    /// (`Options::zpages_build_ahead`).
+    /// (`ZBUILD_AHEAD`).
     pub build_ahead_bytes: u64,
     /// Records the builds held no page for.
     pub build_nopage: u64,
@@ -1060,7 +1068,7 @@ pub struct ZCounts {
     pub sample_declined: u64,
     pub sample_us: u64,
     /// Readings refreshed from the last sample in place of a sample
-    /// (`Options::zpages_build_at_finish`, `Options::zpages_ahead_past_scans`).
+    /// (`Options::zpages_build_at_finish`).
     pub sample_refreshed: u64,
     /// Readings made from the form files on disk at the crossing in place
     /// of a fill sample (`Maint::z_reading_from_files`).
@@ -1599,7 +1607,7 @@ pub struct Options {
     /// where a bound has taken the pages back by then. Under a bound each
     /// input was read one kernel readahead window a wait, each wait a
     /// device round trip behind the readers' faults: the shape the
-    /// controller's build had before `zpages_build_ahead`. Zero asks
+    /// controller's build had before it asked ahead. Zero asks
     /// nothing; `supdb-mergeahead` is the arm with a window of
     /// `MERGE_AHEAD_WINDOW`; the asks are counted (`Db::merge_ahead`).
     /// A plain store's: a store under a cipher's merges ask by
@@ -2471,47 +2479,16 @@ pub struct Options {
     /// budget was bought under them and cancelled a second later by the
     /// vanish rule. The rent waits for the group's refaults to pass half
     /// the faults over a trailing window, and the records a build ahead
-    /// drops past the line (`zpages_land_drop_past`) come back as faults
+    /// drops past the line come back as faults
     /// the kernel does not count as refaults, so after a load past the
     /// budget the evidence came eight to nine seconds after the load's end
     /// with eighteen or nineteen of nineteen files on disk, where the entry
     /// buys two seconds after it; paired at five million keys under 640 MiB
     /// the entry read the read pass 1.8x the rent's in both orders. On as
-    /// shipped; `supdb-cache64tofitautozpagesdropland50noattacheager` is the
-    /// rent alone.
+    /// shipped; off, the rent alone, is a seam the tests set.
     #[doc(hidden)]
     pub zpages_attach_eager: bool,
-    /// The bytes of a partition's raw records a build asks the kernel for
-    /// ahead of its walk, a window at a time (`MADV_WILLNEED`); zero asks
-    /// for nothing, and the walk's page faults fetch the device's
-    /// readahead, 128 KB here, one window a wait. Under a bound the walk's
-    /// waits queue behind the readers' faults, and a build of a gigabyte
-    /// ran at 5-15 MB/s whatever its I/O class; four mebibytes asked ahead
-    /// took its wall to a little over half. Four mebibytes as shipped; the
-    /// bytes asked are counted (`ZCounts::build_ahead_bytes`), and
-    /// `supdb-nocacheautozpagesnoahead` is the arm that asks nothing, the
-    /// shape the window was priced against.
-    #[doc(hidden)]
-    pub zpages_build_ahead: usize,
-    /// Under `ZPages::Auto`, the form files built ahead of the controller's
-    /// decision once the store has outgrown its budget -- the raw form's
-    /// populations, the hash slots and the records, past the cache the
-    /// store has, which is the model's own test -- and no seal, merge or
-    /// promotion is in flight: one partition at a time, the newest first,
-    /// on the builder's idle-class thread, each written to disk and left
-    /// dormant, unattached, with the raw form still serving every read.
-    /// The sampler waits for them, so its reading finds every form file
-    /// on disk and prices the buy at the attach's cost
-    /// (`zselect::Sampler::c_build`), and the controller's build is the
-    /// attach of files already written, as after a restart. What the
-    /// controller pays between SUSPECT and COMPACT is then the census's
-    /// evidence and the sampler, not the build's wall under the readers'
-    /// faults. A store that fits never builds: the test is the model's,
-    /// and nothing is built below it. Off is the shape the controller
-    /// shipped with; `supdb-cache64tofitautozpagesprebuild` is the arm.
-    #[doc(hidden)]
-    pub zpages_prebuild: bool,
-    /// Under `ZPages::Auto`, the builds ahead (`zpages_prebuild`) start once
+    /// Under `ZPages::Auto`, the builds ahead start once
     /// the raw form's populations pass this percent of the store's budget,
     /// read at every tick, and go on while seals land -- a merge in flight
     /// still holds them, since its landing would supersede what they build
@@ -2537,8 +2514,7 @@ pub struct Options {
     /// of fifty's in both orders, for a load a tenth cheaper; a hundred
     /// starts later still. The price is the ordered load's tenth, at five
     /// million keys and at three million, which fits and buys nothing.
-    /// Zero, off: the builds ahead as `zpages_prebuild` has them, past the
-    /// whole budget with nothing in flight, or none.
+    /// Zero, off: no build ahead.
     #[doc(hidden)]
     pub zpages_land_pct: u32,
     /// The builds ahead at landing (`zpages_land_pct`) wait while scans
@@ -2563,27 +2539,9 @@ pub struct Options {
     /// sweep's weighted sum 1.71x and 1.03x, the passes after the load
     /// level or ahead, and the mixes, half a second each at that rung,
     /// either way by sitting. Off, the builds ahead take no account of the
-    /// scans: `supdb-landnearscans`, `supdb-ingestlandnearscans`.
+    /// scans, a seam the tests set.
     #[doc(hidden)]
     pub zpages_land_scans_far: bool,
-    /// EXPERIMENT: past the selector's line to enter (`z_land_past`), the
-    /// builds ahead at landing run beside scans -- the hold for scans near
-    /// (`zpages_land_scans_far`) applies under the line alone -- and a
-    /// build ahead whose landing brings the files on disk to the install's
-    /// coverage (`zselect::COVERED_ENOUGH`) has the reading that refused the
-    /// attach for want of them refreshed against the files as they are
-    /// (`Maint::z_sample_refresh`), so the attach on the prediction
-    /// follows. The hold was drawn when a
-    /// store that was scanned and never point-read gave the controller
-    /// nothing to buy on; its scans' faults are evidence now, and at ten
-    /// million keys under 1.25 GiB the lag sweep's store -- every partition
-    /// fresh from the shuffled load's last merge, two files of twenty-four
-    /// on disk -- bought on the rent thirty seconds after its sample, its
-    /// ten-percent pass walking the raw form at 1.7 major faults a scan the
-    /// while, since the files that make the attach cheap were held by the
-    /// scans they would have served (`docs/engine.md`). Off.
-    #[doc(hidden)]
-    pub zpages_ahead_past_scans: bool,
     /// A merge's output partition is given its form file as it
     /// is finished, by a builder the merge's thread starts while the pages
     /// it just wrote are in the page cache -- at most `zpages_ahead_builders`
@@ -2601,54 +2559,10 @@ pub struct Options {
     /// last merge with two files of twenty-four and its first pass walked
     /// the raw form, and the full rewrite's pass read the merges' outputs
     /// back for their builds, a third of the 3.7 GB it read at the device
-    /// (`docs/engine.md`). On; `supdb-nozfinish` is the arm without it.
+    /// (`docs/engine.md`). On; off is a seam the tests set.
     #[doc(hidden)]
     pub zpages_build_at_finish: bool,
-    /// Whether a build ahead (`zpages_land_pct`, `zpages_prebuild`) drops
-    /// the raw records behind it, as a bought build does
-    /// (`zpages_drop_behind`), once the model's prediction of the raw
-    /// form's faults a read reaches the selector's line to enter
-    /// (`zselect::ZSelect::theta_enter`; under `zpages_prebuild` alone,
-    /// once the raw populations are past the budget). Below it a build
-    /// ahead leaves the raw form's cache as it found it, since the raw form
-    /// fits or nearly does; past it the raw form cannot be held, and the
-    /// records of the partitions already built, kept and made the most
-    /// recently used by the builds' own reads, pushed out the records of
-    /// the partitions still to be built. The look that first finds the
-    /// store past the line turns every partition built ahead under it into
-    /// what a build past it leaves, its records dropped and its form file
-    /// asked back, once (`Maint::z_cross`, `ZCounts::ahead_swapped`). The
-    /// line is the selector's and not the budget's: a store of three
-    /// million keys under 640 MiB ended its load a few percent past its
-    /// budget, the model reading a few faults in a hundred reads, and swapped
-    /// out a quarter of its records at the budget's line, its read pass ten
-    /// times longer than the controller's without the builds ahead. At five million
-    /// keys under 640 MiB the builds ahead kept twelve to seventeen of
-    /// nineteen partitions without it and eighteen or nineteen with it, and
-    /// paired with the attach on the rent's evidence in both, the read pass
-    /// read 1.07-1.09x in both orders. On as shipped; off is the build
-    /// ahead that drops nothing past the budget either and swaps nothing,
-    /// `supdb-cache64tofitautozpagesdropland50keepbehind`.
-    #[doc(hidden)]
-    pub zpages_land_drop_past: bool,
-    /// Whether a form file built ahead below the selector's line, its pages
-    /// written back and dropped as it was built (`zfile::BuildPlan::drop_output`),
-    /// is synced (`fdatasync`) once it has its name, on its build's thread
-    /// (`zfile::BuildPlan::sync`). Its pages reach the device by
-    /// `sync_file_range`, which asks for no flush of the device's write-back
-    /// cache, so the next fsync anyone issued paid it: at three million keys
-    /// under 640 MiB the builds ahead ended after the load's last commit,
-    /// and the first twenty-five commits of the mix after the read passes
-    /// took 74-1,690 ms where they take ten, and 10-13 with the sync, ycsb-B
-    /// 2.8x in one order and 17x in the other. A file kept dirty past the
-    /// line is not synced: its sync wrote its pages, 50-160 ms each at five
-    /// million keys, on the thread racing the eviction front. On as shipped;
-    /// `supdb-cache64tofitautozpagesdropland50nobuildsync` leaves the flush
-    /// to the next fsync.
-    #[doc(hidden)]
-    pub zpages_build_sync: bool,
-    /// Whether a build ahead past the selector's line to enter
-    /// (`zpages_land_drop_past`) takes a partition whatever share of its
+    /// Whether a build ahead past the selector's line to enter takes a partition whatever share of its
     /// records the page cache holds, one found cold before included. Below
     /// the line the bar stands (`LAND_RESIDENT`), since a store that fits
     /// would read records back from the device for a bet it loses; past it
@@ -2686,7 +2600,7 @@ pub struct Options {
     pub zpages_land_cache_pct: u32,
     /// The crossing asks for the raw pages of the partitions
     /// it has no form file for, ahead of the form files it asks back
-    /// (`zpages_land_drop_past`, `Maint::z_cross`). A partition whose
+    /// (`Maint::z_cross`). A partition whose
     /// records the cache let go during the load is one no build ahead
     /// takes while the store is under the line, and after the crossing it
     /// waits for the builder behind the builds in flight; until its form
@@ -2708,7 +2622,7 @@ pub struct Options {
     #[doc(hidden)]
     pub zpages_cross_asks_raw: bool,
     /// The selector's first buy makes the crossing where the
-    /// land look has not (`Maint::z_cross`, `zpages_land_drop_past`),
+    /// land look has not (`Maint::z_cross`),
     /// before the buy attaches anything. The crossing is what turns the
     /// partitions built ahead under the line -- records kept, form files
     /// dropped as they were written -- into what the form's install
@@ -2808,7 +2722,7 @@ pub struct Options {
     /// begun under the line writes its output back and drops it, so that
     /// a raw form that fits keeps its cache (`zpages_land_pct`); the
     /// crossing asks for every such file on disk and drops its records
-    /// (`zpages_land_drop_past`), and a build in flight at the crossing is
+    /// (`Maint::z_cross`), and a build in flight at the crossing is
     /// not on disk yet. Taken in after it, its file was attached with none
     /// of its pages in the cache, and under the random advice each came by
     /// a fault of its own: at ten million keys under 1.25 GiB the two
@@ -7371,12 +7285,8 @@ impl Default for Options {
             zpages_promote_copies: false,
             zpages_writer_census: true,
             zpages_attach_eager: true,
-            zpages_build_ahead: 4 << 20,
-            zpages_prebuild: false,
             zpages_land_pct: 50,
             zpages_land_scans_far: true,
-            zpages_land_drop_past: true,
-            zpages_build_sync: true,
             zpages_land_cold_past: true,
             zpages_land_cache_pct: 25,
             zpages_ask_dropped: true,
@@ -7385,7 +7295,6 @@ impl Default for Options {
             zpages_cross_asks_raw: true,
             zpages_buy_crosses: true,
             zpages_drop_again: true,
-            zpages_ahead_past_scans: false,
             zpages_build_at_finish: true,
             zpages_group_bytes: zpages::ZGROUP_BYTES,
             zpages_record_coding: false,
@@ -9863,8 +9772,7 @@ struct ZBuild {
     started: std::time::Instant,
     cancel: std::sync::Arc<std::sync::atomic::AtomicBool>,
     refused: bool,
-    /// A build ahead of the controller's decision
-    /// (`Options::zpages_prebuild`): its file is left on disk unattached
+    /// A build ahead of the controller's decision: its file is left on disk unattached
     /// unless the controller wants builds by the time it is collected, and
     /// a decision that wants none does not cancel it.
     dormant: bool,
@@ -51587,7 +51495,7 @@ impl Db {
             zfile::build(&self.dir.join(&seg.name), &out, id, end, &{
                 let mut plan =
                     zfile::BuildPlan::new(self.opts.zpages_min_bytes, self.opts.zpages_drop_behind);
-                plan.ahead = self.opts.zpages_build_ahead;
+                plan.ahead = ZBUILD_AHEAD;
                 plan.group_bytes = self.opts.zpages_group_bytes;
                 plan.coding = self.opts.z_coding();
                 plan.store_all = self.opts.zpages_store_all;
@@ -57886,7 +57794,7 @@ const HOT_RAW_HOLD: std::time::Duration = std::time::Duration::from_secs(10);
 /// ahead at landing to take it (`Options::zpages_land_pct`): the build
 /// reads them back, and one that reads them all from the device beside the
 /// readers' faults is the build after the load the builds ahead were
-/// refuted as (`Options::zpages_prebuild`), so it reads at most half from
+/// refuted as, so it reads at most half from
 /// there. Nine tenths left four partitions of nineteen to the controller at
 /// five million keys under 640 MiB, read under the bar while the load's
 /// eviction front passed them, and the controller built them after its buy
@@ -58217,7 +58125,7 @@ struct Maint {
     z_scan_len: f64,
     /// Whether the store's raw populations were past its budget at the
     /// model's last reading or, under the builds at landing, the last tick
-    /// (`Options::zpages_prebuild`, `Options::zpages_land_drop_past`), and
+    /// (`Maint::z_cross`), and
     /// past the percent of it the builds at landing start at at the last
     /// tick (`Options::zpages_land_pct`, `z_land_look`).
     z_past_budget: bool,
@@ -58226,7 +58134,7 @@ struct Maint {
     /// reach the selector's line to enter (`zselect::ZSelect::theta_enter`)
     /// under the builds at landing: the bet on the form is the
     /// controller's to win from there, and the builds ahead stop sparing
-    /// the raw form's cache (`Options::zpages_land_drop_past`).
+    /// the raw form's cache.
     z_land_past: bool,
     /// Whether the raw prediction stood at the selector's line to suspect
     /// at the last look (`Options::zpages_suspect_at_crossing`), so that the
@@ -63856,7 +63764,6 @@ impl Maint {
         // makes, since a partition with its form attached is none the
         // crossing swaps.
         if self.opts.zpages_buy_crosses
-            && self.opts.zpages_land_drop_past
             && !self.z_crossed
             && matches!(d.event, Some(zselect::Event::BuildStart))
         {
@@ -64661,8 +64568,8 @@ impl Maint {
     /// install needs and the selector holds no reading for the partitions as
     /// they stand: the sampler's last reading refreshed against a count of
     /// the files, cheaply, and handed at `generation`, where form files land
-    /// under the store's own writing (`Options::zpages_build_at_finish`,
-    /// `Options::zpages_ahead_past_scans`). A reading is of the partitions at
+    /// under the store's own writing (`Options::zpages_build_at_finish`). A
+    /// reading is of the partitions at
     /// a generation and the selector drops one taken at another, so under a
     /// chain of merges, a landing every half second and a sample longer than
     /// that, no reading reached a step: forty-one samples ran through one
@@ -64674,7 +64581,7 @@ impl Maint {
     /// build at nothing and refused the attach, stood at the generation, and
     /// kept every sample away for the store's life.
     fn z_sample_refresh(&mut self, generation: u64) {
-        if !(self.opts.zpages_build_at_finish || self.opts.zpages_ahead_past_scans) {
+        if !self.opts.zpages_build_at_finish {
             return;
         }
         let Some(last) = self.z_sample_last else {
@@ -64890,17 +64797,14 @@ impl Maint {
         self.z_sample_due(d);
     }
 
-    /// A build ahead landed dormant (`Options::zpages_ahead_past_scans`), or
-    /// a build at a merge's output finish ended
+    /// A build at a merge's output finish ended
     /// (`Options::zpages_build_at_finish`): where the selector holds a
     /// reading that refused the attach for want of files on disk, the next
     /// tick refreshes it against the files as they are (`z_sample_refresh`),
     /// so that the attach can follow files that landed under one generation,
     /// which nothing else would ask for.
     fn z_prebuilt_landed(&mut self) {
-        if (self.opts.zpages_ahead_past_scans || self.opts.zpages_build_at_finish)
-            && self.zsel.sampler_attach() == Some(false)
-        {
+        if self.opts.zpages_build_at_finish && self.zsel.sampler_attach() == Some(false) {
             self.z_refresh_due = true;
         }
     }
@@ -65431,12 +65335,12 @@ impl Maint {
         let past = installed || self.z_land_past;
         let mut plan = zfile::BuildPlan::new(
             self.opts.zpages_min_bytes,
-            self.opts.zpages_drop_behind && past && self.opts.zpages_land_drop_past,
+            self.opts.zpages_drop_behind && past,
         );
         plan.drop_output = !past;
-        plan.sync = self.opts.zpages_build_sync && plan.drop_output;
+        plan.sync = plan.drop_output;
         (plan.stride_sparse, plan.stride_sparse_later) = self.z_sparse_now();
-        plan.ahead = self.opts.zpages_build_ahead;
+        plan.ahead = ZBUILD_AHEAD;
         plan.group_bytes = self.opts.zpages_group_bytes;
         let (coding, raw_tails) = match self.z_coding_pick {
             Some(zselect::Coding::RawTails) if self.opts.zpages_coding_auto => {
@@ -65469,8 +65373,7 @@ impl Maint {
         }))
     }
 
-    /// The partition a build ahead takes next (`Options::zpages_prebuild`),
-    /// where one is due: the store past its budget at the model's last
+    /// The partition a build ahead takes next, where one is due: the store past its budget at the model's last
     /// reading, the controller never yet in COMPACT, nothing landing,
     /// sealing or merging, and a live partition with no cell, no decline
     /// and no form file on disk, the newest first -- an ordered load's last
@@ -65490,9 +65393,9 @@ impl Maint {
         let cold_ok = land && self.z_land_past && self.opts.zpages_land_cold_past;
         // Why no build ahead starts, for the trace: one line a change of
         // reason, since the question is asked every tick.
-        let held_by: u8 = if !(self.opts.zpages_prebuild || land) || !self.z_auto {
+        let held_by: u8 = if !land || !self.z_auto {
             1
-        } else if !(self.z_past_budget || (land && self.z_land_due)) {
+        } else if !(self.z_past_budget || self.z_land_due) {
             2
         } else if self.zsel.counts().installs > 0 {
             3
@@ -65500,13 +65403,7 @@ impl Maint {
             4
         } else if self.tiering.is_some() {
             5
-        } else if !land && !self.sealing.is_empty() {
-            6
-        } else if land
-            && self.opts.zpages_land_scans_far
-            && self.scans_near()
-            && !(self.opts.zpages_ahead_past_scans && self.z_land_past)
-        {
+        } else if self.opts.zpages_land_scans_far && self.scans_near() {
             7
         } else {
             0
@@ -65545,13 +65442,6 @@ impl Maint {
                     && !Db::z_on_disk(&self.dir, &s.name)
             })
             .collect();
-        if !land {
-            // The newest by the sequence its name ends at, the last of a tie.
-            return due
-                .into_iter()
-                .max_by_key(|s| Db::name_end_seq(&s.name).unwrap_or(0))
-                .cloned();
-        }
         // At landing, the oldest first, by the sequence and then the id a
         // partition was made under -- a direct run's partitions all end at
         // sequence zero -- since the page cache gives up its oldest pages
@@ -65605,7 +65495,7 @@ impl Maint {
     /// sample prices those as an attach and the rest as the build they
     /// are, and the buy attaches and builds.
     fn z_prebuild_pending(&self) -> bool {
-        if !self.opts.zpages_prebuild && self.opts.zpages_land_pct == 0 {
+        if self.opts.zpages_land_pct == 0 {
             return false;
         }
         self.zbuild.as_ref().is_some_and(|b| b.dormant) || self.zahead.is_some()
@@ -65613,7 +65503,7 @@ impl Maint {
 
     /// One build ahead started where one is due and the builder is free.
     fn z_prebuild_step(&mut self) {
-        if !self.opts.zpages_prebuild && self.opts.zpages_land_pct == 0 {
+        if self.opts.zpages_land_pct == 0 {
             return;
         }
         if self.zbuild.is_none() {
@@ -65721,7 +65611,7 @@ impl Maint {
             self.z_last_s1 = None;
         }
         self.z_land_sus = sus;
-        if self.z_land_past && !self.z_crossed && self.opts.zpages_land_drop_past {
+        if self.z_land_past && !self.z_crossed {
             self.z_crossed = true;
             self.z_cross();
             self.z_ask_pending = true;
@@ -65729,7 +65619,7 @@ impl Maint {
     }
 
     /// The store's first look past the selector's line to enter under the
-    /// builds at landing (`z_land_past`, `Options::zpages_land_drop_past`):
+    /// builds at landing (`z_land_past`):
     /// every partition built ahead while the store was under it -- its records kept, its form
     /// file dropped as it was written -- turned into what a build past the
     /// budget leaves, its records dropped and its form file asked back
@@ -66443,7 +66333,7 @@ impl Maint {
         // at a twelfth of its rate after builds ahead it never bought. Past
         // the selector's line to enter (`z_land_past`) the records behind
         // the build go as a bought build's do, so that the records of the
-        // partitions still to be built stay (`Options::zpages_land_drop_past`).
+        // partitions still to be built stay.
         let past = if self.opts.zpages_land_pct > 0 {
             self.z_land_past
         } else {
@@ -66451,7 +66341,7 @@ impl Maint {
         };
         let mut plan = zfile::BuildPlan::new(
             self.opts.zpages_min_bytes,
-            self.opts.zpages_drop_behind && (!dormant || (past && self.opts.zpages_land_drop_past)),
+            self.opts.zpages_drop_behind && (!dormant || past),
         );
         // A conversion's file goes the same way where the option says
         // (`Options::zpages_convert_drops_output`), and is asked back
@@ -66471,8 +66361,8 @@ impl Maint {
         // device and its sync asks for the flush alone; one kept dirty for
         // the install wrote its pages in its sync, 50-160 ms each at five
         // million keys on the thread racing the eviction front.
-        plan.sync = self.opts.zpages_build_sync && plan.drop_output;
-        plan.ahead = self.opts.zpages_build_ahead;
+        plan.sync = plan.drop_output;
+        plan.ahead = ZBUILD_AHEAD;
         plan.group_bytes = self.opts.zpages_group_bytes;
         // The coding: the other one for a re-code, the selector's pick where
         // it chooses one (`Options::zpages_coding_auto`), taken again
@@ -66563,9 +66453,9 @@ impl Maint {
         // into the page cache beside the mixes it is bought under: synced
         // here, on the builder's thread, where the builds sync theirs, or
         // its pages reach the device at the kernel's choosing and their
-        // flush is the next commit's to pay (`Options::zpages_build_sync`).
+        // flush is the next commit's to pay.
         if convert {
-            plan.sync = self.opts.zpages_build_sync;
+            plan.sync = true;
         }
         // A conversion asks for the form its partition is not served in:
         // the stride form alone of a block file's, so that a partition the

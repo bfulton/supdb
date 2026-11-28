@@ -1960,39 +1960,25 @@ fn the_forms_build_thread_takes_the_idle_io_class_and_records_it() {
 // partition file, Linux's alone, like the asks the build makes.
 #[cfg(target_os = "linux")]
 #[test]
-fn the_build_asks_the_records_ahead_when_told_to_and_counts_what_it_asked() {
-    // `Options::zpages_build_ahead` is the window of raw records a build
-    // asks the kernel for ahead of its walk; the bytes asked are counted,
-    // and a window of zero asks for nothing. The whole record section is
-    // asked for exactly once, in windows clamped to its end.
+fn the_build_asks_the_records_ahead_and_counts_what_it_asked() {
+    // A build asks the kernel for its raw records a window of four
+    // mebibytes ahead of its walk, and the bytes asked are counted: the
+    // whole record section is asked for exactly once, in windows clamped
+    // to its end.
+    let dir = scratch("ahead-4194304");
+    let mut db = Db::create(&dir, forced(|_| {})).unwrap();
+    let _model = ordered_load(&mut db, 8000, 0xD22);
+    let seg = partition_file(&dir);
+    let r = regions_of(&seg);
+    db.zpages_settle().unwrap();
+    let c = db.zpage_counts();
+    assert_eq!(c.form_files, 1);
+    assert!(c.build_starts >= 1, "a build ran");
     assert_eq!(
-        Options::default().zpages_build_ahead,
-        4 << 20,
-        "four mebibytes are asked ahead unless told otherwise"
+        c.build_ahead_bytes, r.rec.1 as u64,
+        "the whole record section asked for once ({} bytes of records)",
+        r.rec.1
     );
-    for ahead in [0usize, 256 << 10] {
-        let dir = scratch(&format!("ahead-{ahead}"));
-        let mut db = Db::create(&dir, forced(|o| o.zpages_build_ahead = ahead)).unwrap();
-        let _model = ordered_load(&mut db, 8000, 0xD22);
-        let seg = partition_file(&dir);
-        let r = regions_of(&seg);
-        db.zpages_settle().unwrap();
-        let c = db.zpage_counts();
-        assert_eq!(c.form_files, 1);
-        assert!(c.build_starts >= 1, "a build ran");
-        if ahead == 0 {
-            assert_eq!(
-                c.build_ahead_bytes, 0,
-                "nothing asked with the window at zero"
-            );
-        } else {
-            assert_eq!(
-                c.build_ahead_bytes, r.rec.1 as u64,
-                "the whole record section asked for once ({} bytes of records)",
-                r.rec.1
-            );
-        }
-    }
 }
 
 #[cfg(target_os = "linux")]
@@ -7439,11 +7425,7 @@ fn an_auto_store_that_fits_builds_nothing() {
     };
     let mut dirs = Vec::new();
     let mut listings = Vec::new();
-    for (name, mode, prebuild) in [
-        ("auto-fits", ZPages::Auto, false),
-        ("auto-fits-prebuild", ZPages::Auto, true),
-        ("auto-fits-off", ZPages::Off, false),
-    ] {
+    for (name, mode) in [("auto-fits", ZPages::Auto), ("auto-fits-off", ZPages::Off)] {
         let dir = scratch(name);
         // The budget and the group's refaults through the seam: the
         // platform's own reading is the platform test's, and under the
@@ -7460,7 +7442,6 @@ fn an_auto_store_that_fits_builds_nothing() {
                 zpages: mode,
                 zpages_min_bytes: 0,
                 zpages_inject: Some(inject.clone()),
-                zpages_prebuild: prebuild,
                 ..Options::default()
             },
         )
@@ -7509,10 +7490,9 @@ fn an_auto_store_that_fits_builds_nothing() {
         dirs.push(dir);
     }
     assert_eq!(
-        listings[0], listings[2],
+        listings[0], listings[1],
         "the directories are the same, file for file"
     );
-    assert_eq!(listings[1], listings[2], "the prebuild store's too");
     for d in dirs {
         let _ = std::fs::remove_dir_all(&d);
     }
@@ -9489,7 +9469,9 @@ fn a_lifted_hold_holds_nothing_and_the_builders_jobs_balance_at_rest() {
         1_000_000.0,
         FAULT_1MS,
         |o| {
-            o.zpages_prebuild = true;
+            // Builds ahead to hold: the ones at landing, from half the
+            // budget.
+            o.zpages_land_pct = 50;
             o.zpages_cover_resident = false;
             o.zpages_suspect_at_crossing = false;
         },
@@ -9546,114 +9528,6 @@ fn a_lifted_hold_holds_nothing_and_the_builders_jobs_balance_at_rest() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// A store past its budget with the builds ahead on
-/// (`Options::zpages_prebuild`): every partition's form file is built and
-/// left on disk unattached while the controller is in SUSPECT, the raw
-/// form serving every read and nothing counted through the form; the
-/// controller's build is then the attach of those files, with no build
-/// started past the ones made ahead, and the reads after the install go
-/// through the form, every answer the model's. The same store without
-/// the option has no form file on disk at the same point.
-#[cfg(target_os = "linux")]
-#[test]
-fn a_store_past_its_budget_builds_its_form_files_ahead_and_buys_them_by_attach() {
-    // Every build held at its start from before the load.
-    let (dir, db, model, inject) = auto_store_with(
-        "auto-prebuild",
-        1 << 20,
-        1_000_000.0,
-        FAULT_1MS,
-        |o| {
-            o.zpages_prebuild = true;
-            // The sample's wait for the builds ahead, which a store whose
-            // in-flight partitions count as covered never makes.
-            o.zpages_cover_resident = false;
-            o.zpages_suspect_at_crossing = false;
-        },
-        |db| db.hold_zpage_build(true),
-    );
-    let c = db.zpage_counts();
-    assert_eq!((c.phase, c.gate), (1, 1), "SUSPECT: {c:?}");
-    // The sampler waits for the builds ahead: one held at its start, the
-    // ticks run on and no sample is taken.
-    for _ in 0..400 {
-        if db.zpage_build_waiting() {
-            break;
-        }
-        wait_steps(&db, 1);
-    }
-    assert!(
-        db.zpage_build_waiting(),
-        "a build ahead at its hold: {:?}",
-        db.zpage_counts()
-    );
-    assert!(
-        !tick_until(&db, 30, |c| c.samples > 0),
-        "{:?}",
-        db.zpage_counts()
-    );
-    db.hold_zpage_build(false);
-    assert!(
-        tick_until(&db, 400, |c| c.prebuilt >= c.partitions && c.partitions > 0),
-        "built ahead: {:?}",
-        db.zpage_counts()
-    );
-    let c = db.zpage_counts();
-    assert_eq!((c.phase, c.gate), (1, 1), "still SUSPECT: {c:?}");
-    assert_eq!(c.prebuilt, c.partitions, "{c:?}");
-    assert_eq!(c.build_starts, c.prebuilt, "one build each: {c:?}");
-    assert_eq!(
-        (c.form_files, c.attached, c.reads),
-        (0, 0, 0),
-        "dormant: {c:?}"
-    );
-    assert_eq!(form_files(&dir).len() as u64, c.partitions, "on disk");
-    let keys: Vec<Vec<u8>> = model.keys().cloned().collect();
-    let some: Vec<Vec<u8>> = keys.iter().step_by(97).cloned().collect();
-    let r = db.reader().unwrap();
-    check(&r, &model, &some, "raw beside the dormant files");
-    assert_eq!(db.zpage_counts().reads, 0, "nothing through the form yet");
-    let mut at = 0usize;
-    assert!(
-        drive_to(&db, &r, &keys, &inject, &mut at, 640, 1, 3, 400),
-        "COMPACT: {:?}",
-        db.zpage_counts()
-    );
-    let c = db.zpage_counts();
-    assert_eq!((c.gate, c.phase), (2, 3), "{c:?}");
-    assert_eq!(
-        c.build_starts, c.prebuilt,
-        "attached, not built again: {c:?}"
-    );
-    assert_eq!(
-        (c.attached, c.form_files),
-        (c.partitions, c.partitions),
-        "{c:?}"
-    );
-    check(&r, &model, &some, "through the form built ahead");
-    check_scan(&r, &model, "through the form built ahead");
-    assert!(db.zpage_counts().reads > 0, "{:?}", db.zpage_counts());
-    drop(r);
-    db.close().unwrap();
-    let _ = std::fs::remove_dir_all(&dir);
-    // The control: the same store, the option off, in SUSPECT with
-    // nothing on disk however long the ticks run without a read.
-    let (dir, db, _model, _inject) = blocked_store("auto-prebuild-off");
-    assert!(
-        !tick_until(&db, 60, |c| c.build_starts > 0),
-        "{:?}",
-        db.zpage_counts()
-    );
-    let c = db.zpage_counts();
-    assert_eq!((c.prebuilt, c.build_starts), (0, 0), "{c:?}");
-    assert!(
-        form_files(&dir).is_empty(),
-        "nothing ahead without the option"
-    );
-    db.close().unwrap();
-    let _ = std::fs::remove_dir_all(&dir);
-}
-
 /// The builds ahead are for the first shift up: a store that reached
 /// COMPACT, left it on the trial (E2: the touched pages fit, the
 /// populations still past the budget) and retired its form files at the
@@ -9663,8 +9537,13 @@ fn a_store_past_its_budget_builds_its_form_files_ahead_and_buys_them_by_attach()
 #[test]
 fn a_store_that_left_compact_builds_nothing_ahead_again() {
     let (dir, db, _model, inject, r, keys, _) =
-        compact_store_with("auto-prebuild-exit", 1 << 20, |o| o.zpages_prebuild = true);
+        compact_store_with("auto-prebuild-exit", 1 << 20, |o| o.zpages_land_pct = 50);
     let built = db.zpage_counts().prebuilt;
+    assert!(
+        built > 0,
+        "built ahead before the first shift up: {:?}",
+        db.zpage_counts()
+    );
     let hot: Vec<Vec<u8>> = keys[..1].to_vec();
     wait_secs(&db, 61, 1);
     assert!(
@@ -10246,24 +10125,18 @@ fn builds_ahead_at_landing_wait_while_scans_are_around() {
     }
 }
 
-/// Past the selector's line the builds ahead at landing run beside scans
-/// (`Options::zpages_ahead_past_scans`): a store scanned and never
-/// point-read, its raw populations past its budget, builds its partitions
-/// ahead, and the landing that brings the files on disk to the install's
-/// coverage has the selector's reading refreshed against them, in place of
-/// a sample, so the attach on the prediction follows and the form installs;
-/// without the option nothing is built ahead beside the scans, the first
-/// reading stands, and nothing installs.
+/// Past the selector's line the builds ahead at landing still wait beside
+/// scans: a store scanned and never point-read, its raw populations past
+/// its budget, builds nothing ahead beside the scans, the first reading
+/// stands, and nothing installs.
 #[cfg(target_os = "linux")]
 #[test]
-fn builds_ahead_run_beside_scans_past_the_line_and_the_attach_follows() {
-    for on in [true, false] {
-        let what = format!("ahead past scans {on}");
-        let (dir, db, model, inject, raw) =
-            land_store_with(&format!("auto-ahead-scans-{on}"), 50, |o| {
-                o.zpages_ahead_past_scans = on;
-                o.partition_bytes = Some(400 << 10);
-            });
+fn builds_ahead_wait_beside_scans_past_the_line() {
+    {
+        let what = "ahead past scans false".to_string();
+        let (dir, db, model, inject, raw) = land_store_with("auto-ahead-scans-false", 50, |o| {
+            o.partition_bytes = Some(400 << 10);
+        });
         let keys: Vec<Vec<u8>> = model.keys().cloned().collect();
         let mut seen = 0usize;
         db.scan(b"", 10, kv(&mut |_, _| seen += 1)).unwrap();
@@ -10272,69 +10145,18 @@ fn builds_ahead_run_beside_scans_past_the_line_and_the_attach_follows() {
         // the decode priced through the seam, so the line to enter is not
         // the build profile's to draw.
         inject.set_decode_cost(std::time::Duration::from_micros(1));
-        // The builds ahead held at their start, so that the first reading
-        // finds no file on disk and refuses the attach, as the store the
-        // lag sweep runs on did; in core they would land before it.
-        db.hold_zpage_build(on);
         inject.set_budget(raw / 2);
-        if on {
-            // A build ahead at its hold, and the reading taken in by the
-            // selector with it there: no file on disk, so the reading
-            // refuses the attach.
-            assert!(
-                tick_until(&db, 200, |c| c.build_starts >= 1),
-                "{what}: nothing built ahead beside the scans: {:?}",
-                db.zpage_counts()
-            );
-            wait_for_job("a build ahead at its hold", || db.zpage_build_waiting());
-            // `sample_us` is written as the reading is collected, where the
-            // files on disk are counted; one tick more and the selector
-            // holds it.
-            assert!(
-                tick_until(&db, 200, |c| c.sample_us > 0),
-                "{what}: no reading: {:?}",
-                db.zpage_counts()
-            );
-            wait_steps(&db, 1);
-            let c = db.zpage_counts();
-            assert_eq!(
-                (
-                    c.prebuilt,
-                    c.sel_installs,
-                    c.samples,
-                    form_files(&dir).len()
-                ),
-                (0, 0, 1, 0),
-                "{what}: the reading taken with the builds held: {c:?}"
-            );
-            db.hold_zpage_build(false);
-            assert!(
-                tick_until(&db, 400, |c| c.sel_installs >= 1),
-                "{what}: the attach did not follow the files: {:?}",
-                db.zpage_counts()
-            );
-            let c = db.zpage_counts();
-            assert!(
-                c.samples == 1 && c.sample_refreshed >= 1 && c.prebuilt >= 1,
-                "{what}: the reading refreshed once the files landed and covered the keys, not sampled again: {c:?}"
-            );
-            assert!(
-                c.attached >= 1 && c.phase == 3,
-                "{what}: the files attached and the form installed: {c:?}"
-            );
-        } else {
-            assert!(
-                !tick_until(&db, 60, |c| c.build_starts > 0),
-                "{what}: built ahead beside the scans: {:?}",
-                db.zpage_counts()
-            );
-            let c = db.zpage_counts();
-            assert_eq!(
-                (c.sel_installs, c.prebuilt),
-                (0, 0),
-                "{what}: the first reading stands: {c:?}"
-            );
-        }
+        assert!(
+            !tick_until(&db, 60, |c| c.build_starts > 0),
+            "{what}: built ahead beside the scans: {:?}",
+            db.zpage_counts()
+        );
+        let c = db.zpage_counts();
+        assert_eq!(
+            (c.sel_installs, c.prebuilt),
+            (0, 0),
+            "{what}: the first reading stands: {c:?}"
+        );
         let r = db.reader().unwrap();
         check(&r, &model, &keys, &what);
         drop(r);
@@ -10766,8 +10588,7 @@ fn builds_ahead_at_landing_read_the_records_residency_and_not_the_directorys() {
 /// raw populations pass the percent of its budget and stay under the whole
 /// of it builds every partition's form file ahead, dormant, while the
 /// controller stays in FITS and every read is the raw form's -- what the
-/// builds ahead alone (`zpages_prebuild`), which wait for the whole budget,
-/// never do for it -- and leaves the page cache to the raw form, the
+/// builds ahead after the load never did for it -- and leaves the page cache to the raw form, the
 /// records the builds read cached and the files they wrote not; under a
 /// percent above where the store stands it builds
 /// nothing; with its records read out of the page cache it builds
@@ -10776,7 +10597,7 @@ fn builds_ahead_at_landing_read_the_records_residency_and_not_the_directorys() {
 /// line, past which it builds them from the device; and past it the builds drop
 /// the records behind them, and the look that finds the store past it
 /// first swaps the records of the partitions built ahead under it for
-/// their files (`Options::zpages_land_drop_past`).
+/// their files.
 #[cfg(target_os = "linux")]
 #[test]
 fn builds_ahead_at_landing_start_past_the_percent_and_only_from_resident_records() {
@@ -10910,22 +10731,19 @@ fn builds_ahead_at_landing_start_past_the_percent_and_only_from_resident_records
     db.close().unwrap();
     let _ = std::fs::remove_dir_all(&dir);
     // Past the whole budget the raw form cannot be held, and the builds
-    // ahead drop the records behind them as a bought build does
-    // (`Options::zpages_land_drop_past`), so the records of the partitions
-    // still to land keep the cache; with the option off they stay. Nothing
-    // is bought without the group's refaults, so every read stays raw.
+    // ahead drop the records behind them as a bought build does, so the
+    // records of the partitions still to land keep the cache. Nothing is
+    // bought without the group's refaults, so every read stays raw.
     #[cfg(target_os = "linux")]
-    for drop_past in [true, false] {
-        let what = format!("drop past {drop_past}");
-        let (dir, db, model, inject, raw) =
-            land_store_with(&format!("auto-land-past-{drop_past}"), 50, |o| {
-                o.zpages_land_drop_past = drop_past;
-                // The sample waits for the builds ahead, so that its fills
-                // and their readahead take nothing of the records back
-                // while the cache is read.
-                o.zpages_cover_resident = false;
-                o.zpages_suspect_at_crossing = false;
-            });
+    {
+        let what = "drop past true".to_string();
+        let (dir, db, model, inject, raw) = land_store_with("auto-land-past-true", 50, |o| {
+            // The sample waits for the builds ahead, so that its fills
+            // and their readahead take nothing of the records back
+            // while the cache is read.
+            o.zpages_cover_resident = false;
+            o.zpages_suspect_at_crossing = false;
+        });
         inject.set_budget(raw * 2 / 3);
         assert!(
             tick_until_built(&db, |c| c.prebuilt >= c.partitions),
@@ -10958,17 +10776,10 @@ fn builds_ahead_at_landing_start_past_the_percent_and_only_from_resident_records
             }
         }
         assert!(pages > 0, "{what}");
-        if drop_past {
-            assert!(
-                cached * 4 < pages,
-                "{what}: {cached} of {pages} record pages left cached"
-            );
-        } else {
-            assert!(
-                cached * 2 >= pages,
-                "{what}: {cached} of {pages} record pages cached"
-            );
-        }
+        assert!(
+            cached * 4 < pages,
+            "{what}: {cached} of {pages} record pages left cached"
+        );
         let keys: Vec<Vec<u8>> = model.keys().cloned().collect();
         let some: Vec<Vec<u8>> = keys.iter().step_by(97).cloned().collect();
         let r = db.reader().unwrap();
@@ -10985,16 +10796,14 @@ fn builds_ahead_at_landing_start_past_the_percent_and_only_from_resident_records
     // Built ahead under the budget -- the records kept, the files dropped
     // as written -- and then past the selector's line to enter: the look
     // that first finds the store past it swaps the two (`Maint::z_cross`),
-    // the records dropped and the files asked back, once; with the option
-    // off nothing moves, and nothing moves either for a store two percent
-    // past its budget, where the model reads two faults in a hundred reads,
+    // the records dropped and the files asked back, once; nothing moves for
+    // a store two percent past its budget, where the model reads two faults in a hundred reads,
     // under the line, and the raw form still holds nearly all of itself.
     #[cfg(target_os = "linux")]
-    for (drop_past, near) in [(true, false), (false, false), (true, true)] {
-        let what = format!("crossing, drop past {drop_past}, near {near}");
+    for near in [false, true] {
+        let what = format!("crossing, near {near}");
         let (dir, db, model, inject, raw) =
-            land_store_with(&format!("auto-land-cross-{drop_past}-{near}"), 50, |o| {
-                o.zpages_land_drop_past = drop_past;
+            land_store_with(&format!("auto-land-cross-true-{near}"), 50, |o| {
                 // The swap at the crossing before any buy: a controller
                 // that suspects at the crossing buys the attach on the
                 // prediction inside the steps this waits, and with the
@@ -11035,7 +10844,7 @@ fn builds_ahead_at_landing_start_past_the_percent_and_only_from_resident_records
             "{what}: under: records {rc}/{rp} forms {fc}/{fp}"
         );
         inject.set_budget(if near { raw * 98 / 100 } else { raw * 2 / 3 });
-        if drop_past && !near {
+        if !near {
             assert!(
                 tick_until(&db, 200, |c| c.ahead_swapped >= c.partitions),
                 "{what}: swapped: {:?}",
@@ -11214,20 +11023,15 @@ fn a_settle_waits_for_the_form_files_the_store_asked_for() {
 }
 
 /// A form file built ahead below the selector's line, written back as it
-/// was built, is synced once it has its name, on its build's thread
-/// (`Options::zpages_build_sync`), so that the device's flush of it is the
-/// build's and not the writer's next commit's: every such build counts its
-/// sync, and with the option off none does. The files read as built either
-/// way.
+/// was built, is synced once it has its name, on its build's thread, so
+/// that the device's flush of it is the build's and not the writer's next
+/// commit's: every such build counts its sync. The files read as built.
 #[cfg(target_os = "linux")]
 #[test]
-fn form_files_are_synced_by_their_build_and_only_with_the_option() {
-    for on in [true, false] {
-        let what = format!("build sync {on}");
-        let (dir, db, model, inject, raw) =
-            land_store_with(&format!("auto-land-sync-{on}"), 50, |o| {
-                o.zpages_build_sync = on;
-            });
+fn form_files_are_synced_by_their_build() {
+    {
+        let what = "build sync true".to_string();
+        let (dir, db, model, inject, raw) = land_store_with("auto-land-sync-true", 50, |_| {});
         inject.set_budget(raw * 3 / 2);
         assert!(
             tick_until(&db, 200, |c| c.prebuilt >= c.partitions),
@@ -11235,11 +11039,7 @@ fn form_files_are_synced_by_their_build_and_only_with_the_option() {
             db.zpage_counts()
         );
         let c = db.zpage_counts();
-        assert_eq!(
-            c.build_synced,
-            if on { c.builds } else { 0 },
-            "{what}: {c:?}"
-        );
+        assert_eq!(c.build_synced, c.builds, "{what}: {c:?}");
         assert_eq!(
             form_files(&dir).len() as u64,
             c.partitions,
@@ -11257,8 +11057,8 @@ fn form_files_are_synced_by_their_build_and_only_with_the_option() {
 
 /// The controller's buy of a store whose form files were built ahead
 /// attaches every one of them in the turn that buys, before the warms,
-/// which go one a turn after. Nothing is built past the files made ahead, and the reads after the
-/// install answer the model through the form.
+/// which go one a turn after. Nothing is built past the files made ahead,
+/// and the reads after the install answer the model through the form.
 #[cfg(target_os = "linux")]
 #[test]
 fn a_buy_attaches_every_form_file_built_ahead_before_any_warm() {
