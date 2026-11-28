@@ -1366,8 +1366,6 @@ pub struct Supdb {
     /// `Options::adaptive_shape`. `supdb-ingestshape`.
     shape: bool,
     rotate: bool,
-    defer: bool,
-    firstfloor: bool,
     nofrozen: bool,
     idle: bool,
     sortover: bool,
@@ -3029,12 +3027,6 @@ struct Policy {
     /// A seal syncs and rotates the WAL, the shape before seals kept it,
     /// `Options::seal_rotates_wal`. `supdb-rotate`, `supdb-shaperotate`.
     rotate: bool,
-    /// A commit past the threshold keeps writing while a seal holds the
-    /// slot, `Options::seal_defers`. `supdb-shapedefer`.
-    defer: bool,
-    /// A store with nothing sealed seals at the floor under the shape,
-    /// `Options::seal_first_floor`. `supdb-shapefloor`.
-    firstfloor: bool,
     /// Each reader of a frozen table sorts it for itself, as before the
     /// table kept its own snapshot: `Options::frozen_snaps` off.
     /// `supdb-nofrozen`, and `supdb-shapenofrozen` under the shape.
@@ -3997,8 +3989,6 @@ impl Default for Policy {
             noshare: false,
             nopopulate: false,
             ownhandle: false,
-            defer: false,
-            firstfloor: false,
             aheadmin: None,
             lazyforms: false,
             eager: None,
@@ -6116,41 +6106,6 @@ impl Supdb {
                 durable: false,
                 shape: true,
                 rotate: true,
-                ..Policy::default()
-            },
-        )
-    }
-
-    /// EXPERIMENT: `supdb-ingestshape` whose commits defer a seal the frozen
-    /// slot cannot take yet (`Options::seal_defers`); the deferred seal
-    /// takes whatever grew, up to twice the threshold, so the seal's size
-    /// moves with the wait it removes.
-    pub fn create_shape_defer(path: &Path) -> Res<Supdb> {
-        Supdb::with_policy(
-            path,
-            Policy {
-                partition: false,
-                drain: false,
-                durable: false,
-                shape: true,
-                defer: true,
-                ..Policy::default()
-            },
-        )
-    }
-
-    /// EXPERIMENT: `supdb-shapedefer` whose first seal comes at the floor
-    /// (`Options::seal_first_floor`), so its load leaves a partition.
-    pub fn create_shape_floor(path: &Path) -> Res<Supdb> {
-        Supdb::with_policy(
-            path,
-            Policy {
-                partition: false,
-                drain: false,
-                durable: false,
-                shape: true,
-                defer: true,
-                firstfloor: true,
                 ..Policy::default()
             },
         )
@@ -11110,8 +11065,6 @@ impl Supdb {
             pubalways,
             leave,
             rotate,
-            defer,
-            firstfloor,
             nofrozen,
             idle,
             sortover,
@@ -11951,9 +11904,7 @@ impl Supdb {
             seal_rotates_wal: rotate,
             frozen_snaps: !nofrozen,
             overlay_merge: !sortover,
-            seal_defers: defer,
             seal_idle: idle,
-            seal_first_floor: firstfloor,
             // Below this the builder declines and the writer fills the
             // forms inline on the commit path instead, which is the
             // comparison the threshold was never measured against.
@@ -12270,8 +12221,6 @@ impl Supdb {
             pubalways,
             leave,
             rotate,
-            defer,
-            firstfloor,
             nofrozen,
             idle,
             sortover,
@@ -13045,12 +12994,6 @@ impl Engine for Supdb {
             } else {
                 "supdb-cache256"
             };
-        }
-        if self.firstfloor {
-            return "supdb-shapefloor";
-        }
-        if self.defer {
-            return "supdb-shapedefer";
         }
         if self.idle {
             return if self.shape {
@@ -14762,7 +14705,6 @@ impl Engine for Supdb {
             ("lazy_scans_resumed", db.lazy_scans().1 as f64),
             ("seals", db.seal_waits().joins as f64),
             ("publishes", db.seal_waits().publishes as f64),
-            ("seals_deferred", db.seal_waits().deferred as f64),
             ("seals_idle", db.seal_waits().idle_seals as f64),
             // Flushes answered at their seal's readable landing
             // (`Options::drain_answers_readable`).
@@ -17409,8 +17351,6 @@ pub fn guarantee(arm: &str) -> Option<Guarantee> {
         | "supdb-ingestinline"
         | "supdb-ingestshape"
         | "supdb-shaperotate"
-        | "supdb-shapedefer"
-        | "supdb-shapefloor"
         | "supdb-shapenofrozen"
         | "supdb-shapeidle"
         | "supdb-shapesortover"
@@ -18525,8 +18465,6 @@ pub fn open(arm: &str, dir: &Path, map_gb: usize) -> Res<Box<dyn Engine>> {
         "supdb-rotate" => supdb_arm(Supdb::create_rotate, dir)?,
         "supdb-nofrozen" => supdb_arm(Supdb::create_nofrozen, dir)?,
         "supdb-shaperotate" => supdb_arm(Supdb::create_shape_rotate, dir)?,
-        "supdb-shapedefer" => supdb_arm(Supdb::create_shape_defer, dir)?,
-        "supdb-shapefloor" => supdb_arm(Supdb::create_shape_floor, dir)?,
         "supdb-shapenofrozen" => supdb_arm(Supdb::create_shape_nofrozen, dir)?,
         "supdb-sortover" => supdb_arm(Supdb::create_sortover, dir)?,
         "supdb-shapesortover" => supdb_arm(Supdb::create_shape_sortover, dir)?,

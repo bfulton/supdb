@@ -3461,14 +3461,6 @@ pub struct Options {
     /// at one where it was not. A closed file retires at the landing of
     /// the next seal, which covers every record in it.
     pub seal_rotates_wal: bool,
-    /// EXPERIMENT: a commit past the seal threshold while the frozen
-    /// tables fill the list keeps writing instead of waiting for the
-    /// oldest to land; a later commit seals once the list has room. Past
-    /// a ceiling of twice the threshold the commit waits as before, which
-    /// keeps the live table and the piece it seals into within a factor
-    /// of two of where the wait bounded them. Off, the commit waits in the
-    /// seal for room.
-    pub seal_defers: bool,
     /// EXPERIMENT: a commit under the seal threshold seals anyway when no
     /// seal is writing a table -- the frozen list empty and no table
     /// handed -- and the live table holds `SEAL_CAP_FLOOR` or more: the
@@ -3485,22 +3477,12 @@ pub struct Options {
     /// piece; sealed meanwhile, a backlog left by a point-read phase met
     /// the scans of the phase after as a frozen table and then a piece,
     /// and ycsb-E read 0.88-0.91x. While the idle seals run the threshold
-    /// is `seal_bytes` alone, the cap and the first floor left off, since
-    /// the idle seals keep the backlog small; with reads around the cap
-    /// stands. A commit in such a stretch with no scan near files no
-    /// backlog into the forms either, since the idle seals put partitions
-    /// under a load nobody reads.
+    /// is `seal_bytes` alone, the cap left off, since the idle seals keep
+    /// the backlog small; with reads around the cap stands. A commit in
+    /// such a stretch with no scan near files no backlog into the forms
+    /// either, since the idle seals put partitions under a load nobody
+    /// reads.
     pub seal_idle: bool,
-    /// EXPERIMENT: under `adaptive_shape`, with `compact` and `promote`, a
-    /// store with no segment seals its first table at `SEAL_CAP_FLOOR`
-    /// rather than at `seal_bytes`, so a first load leaves a partition
-    /// behind -- the first seal's piece is promoted at its landing -- and
-    /// the cap's share of the store takes over from there. Never a direct
-    /// run's: a run closes when a seal would, and closed at the floor an
-    /// ordered load became partitions of a megabyte each. Without it a store under `seal_bytes` stays
-    /// wholly in the memtable until something reads it, and the first
-    /// scans after its load sort the whole table and walk the merge path.
-    pub seal_first_floor: bool,
     /// How a flush drains level 0 once partitions exist: merge only the
     /// ranges that hold pieces, under the live fences (`true`), or
     /// re-partition everything from every key (`false`, the original), kept
@@ -8398,9 +8380,7 @@ impl Default for Options {
             publish_in_background: true,
             adaptive_shape: false,
             seal_rotates_wal: false,
-            seal_defers: false,
             seal_idle: false,
-            seal_first_floor: false,
             recycle_wal: true,
             wal_recycle_pads: true,
             wal_ahead_bytes: 1 << 20,
@@ -24793,9 +24773,6 @@ struct SealCounts {
     /// closed, promoted on their keys; for a test that asserts the arm.
     promoted: AtomicU64,
     promoted_open: AtomicU64,
-    /// Commits past the seal threshold that kept writing because the
-    /// frozen tables filled the list (`Options::seal_defers`).
-    deferred: AtomicU64,
     /// Seals a commit under the threshold started because no seal was
     /// writing (`Options::seal_idle`).
     idle_seals: AtomicU64,
@@ -24873,7 +24850,6 @@ impl SealCounts {
             seal_records_ns: get(&self.seal_records_ns),
             seal_thread_ns: get(&self.seal_thread_ns),
             seal_sorts: get(&self.seal_sorts),
-            deferred: get(&self.deferred),
             idle_seals: get(&self.idle_seals),
             drains_early: get(&self.drains_early),
             drains_beside: get(&self.drains_beside),
@@ -24943,10 +24919,6 @@ pub struct SealWaits {
     /// Seals that sorted their table themselves; the rest took the order
     /// a freeze, a scan or the keeper had set on it.
     pub seal_sorts: u64,
-    /// See `SealCounts`: commits that deferred their seal, WAL rotations
-    /// and the bytes they left unsynced, and the writer's time in the
-    /// seals its commits started.
-    pub deferred: u64,
     /// Seals started by a commit under the threshold because no seal was
     /// writing (`Options::seal_idle`).
     pub idle_seals: u64,
@@ -24968,6 +24940,8 @@ pub struct SealWaits {
     /// The directory fsyncs their readable landings left owed, paid at
     /// the durable landing.
     pub dir_owed_syncs: u64,
+    /// See `SealCounts`: WAL rotations and the bytes they left unsynced,
+    /// and the writer's time in the seals its commits started.
     pub wal_rotations: u64,
     pub rotated_unsynced: u64,
     pub loose_synced: u64,
@@ -32887,12 +32861,12 @@ impl Reader {
     }
 
     /// `seal_threshold`, or with `idle` -- the idle seals on and the store
-    /// not being read by key -- `seal_bytes` alone: the cap and the first
-    /// floor keep the backlog small by sealing sooner, which the idle
-    /// seals do already, and would only cut the pieces finer. While the
-    /// store is read by key the idle seals are off and the cap stands, so
-    /// a backlog a point-read phase leaves is the cap's and not
-    /// `seal_bytes` of one; see `Options::seal_idle`.
+    /// not being read by key -- `seal_bytes` alone: the cap keeps the
+    /// backlog small by sealing sooner, which the idle seals do already,
+    /// and would only cut the pieces finer. While the store is read by key
+    /// the idle seals are off and the cap stands, so a backlog a
+    /// point-read phase leaves is the cap's and not `seal_bytes` of one;
+    /// see `Options::seal_idle`.
     fn threshold_for(&self, idle: bool) -> usize {
         let _e = self.enter();
         let st = self.state();
@@ -32913,18 +32887,6 @@ impl Reader {
         };
         if idle {
             return base;
-        }
-        // A store with no segment and a shape the background makes: its
-        // first seal at the floor, so a first load leaves a partition. Not
-        // a direct run's; see `Options::seal_first_floor`.
-        if self.opts.seal_first_floor
-            && self.opts.adaptive_shape
-            && self.opts.compact
-            && self.opts.promote
-            && !st.mem.ordered
-            && st.segs.is_empty()
-        {
-            return base.min(SEAL_CAP_FLOOR);
         }
         let pct = self.opts.seal_max_pct;
         if pct == 0 {
@@ -45119,31 +45081,6 @@ impl Db {
         e
     }
 
-    /// Whether a commit past the seal threshold seals now: always, unless
-    /// `Options::seal_defers` and the frozen tables fill the list, when
-    /// the live table keeps growing and a later commit seals once the list
-    /// has room -- up to a ceiling of twice the threshold, past which the
-    /// commit waits in the seal as before, so the table and the piece it
-    /// seals into stay within a factor of two of what the wait held them
-    /// to. A wedged queue seals, so its error reaches the caller.
-    fn seal_now(&self, threshold: usize) -> bool {
-        if !self.opts.seal_defers {
-            return true;
-        }
-        // The commit's held state dates from its start; a landing the
-        // segment work published meanwhile may have made room. A stale
-        // full list only defers, so no order against the count.
-        self.rehold();
-        if self.frozen_room().1 || self.shared.seal_wedged.load(AtomicOrdering::Acquire) {
-            return true;
-        }
-        if self.mem_bytes >= threshold.saturating_mul(2) {
-            return true;
-        }
-        SealCounts::add(&self.shared.seal_counts.deferred, 1);
-        false
-    }
-
     /// Whether a commit under the seal threshold seals because the sealer
     /// is idle (`Options::seal_idle`): no table frozen, none handed, the
     /// segment work on its own thread, and the live table hashed and past
@@ -48409,8 +48346,7 @@ impl Db {
         let threshold = self.threshold_for(self.opts.seal_idle && self.read_mode.2);
         // A shared table counts nothing toward the threshold, which is its
         // cap: it seals where a write found it full.
-        let due =
-            (self.mem_bytes >= threshold && self.seal_now(threshold)) || self.mem().shared_full();
+        let due = self.mem_bytes >= threshold || self.mem().shared_full();
         // For a store that shares on demand as for one that always does:
         // a shared table made after this commit takes the threshold this
         // commit found. No test tells the two apart where the threshold is

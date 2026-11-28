@@ -12,7 +12,7 @@ use supdb::{Db, Isolation, Options, ReadAdvice, Reader};
 mod common;
 #[cfg(target_os = "linux")]
 use common::cached_pages;
-use common::{kv, manifest_v2_of, vf, watchdog_exit, without_the_clock, Watchdog};
+use common::{kv, manifest_v2_of, vf, without_the_clock, Watchdog};
 
 fn dir(name: &str) -> PathBuf {
     let d = std::env::temp_dir().join(format!("supdb-next-{name}-{}", std::process::id()));
@@ -418,7 +418,6 @@ fn oracle_in(name: &str, opts: Options) -> supdb::db::SealWaits {
     let add = |t: &mut supdb::db::SealWaits, w: supdb::db::SealWaits| {
         t.wal_rotations += w.wal_rotations;
         t.rotated_unsynced += w.rotated_unsynced;
-        t.deferred += w.deferred;
         t.publishes += w.publishes;
     };
     let mut model: HashMap<Vec<u8>, Vec<Vec<u8>>> = HashMap::new();
@@ -19633,133 +19632,6 @@ fn a_rotated_wal_torn_in_its_new_file_reopens_to_a_prefix() {
     }
 }
 
-/// A commit past the threshold while the frozen tables fill the list
-/// keeps writing (`seal_defers`): the seals in flight are held before
-/// they write, so a commit that waited for room would wait for good, and
-/// the deferred count says the commits took the other path. The first
-/// three crossings freeze into room and defer nothing. Released, a later
-/// commit seals what grew, and every key reads right.
-#[test]
-fn a_commit_past_the_threshold_keeps_writing_while_the_frozen_list_is_full() {
-    commits_defer_past_room("seal-defers", usize::MAX, 3);
-}
-
-/// The same past the frozen tables' bytes (`Options::frozen_bytes`): with
-/// a bound any second table passes, the first crossing freezes, since one
-/// table is frozen whatever it holds, and the crossing after it finds no
-/// room with one table frozen and defers as at a full list.
-#[test]
-fn a_commit_past_the_frozen_tables_bytes_keeps_writing_too() {
-    commits_defer_past_room("seal-defers-bytes", 1, 1);
-}
-
-/// `seal_defers` with the frozen tables bounded at `bound` bytes: `room`
-/// crossings freeze into room, and the commits past the threshold after
-/// them defer.
-fn commits_defer_past_room(name: &str, bound: usize, room: u32) {
-    let d = dir(name);
-    let opts = Options {
-        seal_rotates_wal: false,
-        seal_defers: true,
-        frozen_bytes: bound,
-        seal_bytes: 256 << 10,
-        seal_max_pct: 0,
-        sync: supdb::SyncPolicy::EveryN(u32::MAX),
-        // Ascending keys would go to ordered ingest, which writes a
-        // segment and not the log.
-        direct_ingest: false,
-        ..common::options()
-    };
-    let mut db = Db::create(&d, opts).unwrap();
-    // A commit that waited would never return; say so rather than hang.
-    // Disarmed as the commits end, or by the unwind of a failure in them,
-    // so an assertion below reports itself and not the watchdog.
-    struct Disarm(std::sync::Arc<std::sync::atomic::AtomicBool>);
-    impl Drop for Disarm {
-        fn drop(&mut self) {
-            self.0.store(true, std::sync::atomic::Ordering::Relaxed);
-        }
-    }
-    let done = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-    let disarm = Disarm(done.clone());
-    let watch = {
-        let done = done.clone();
-        std::thread::spawn(move || {
-            let t = std::time::Instant::now();
-            while !done.load(std::sync::atomic::Ordering::Relaxed) {
-                if t.elapsed() > std::time::Duration::from_secs(60) {
-                    watchdog_exit("a commit waited for a held seal: seal_defers did not defer");
-                }
-                std::thread::sleep(std::time::Duration::from_millis(20));
-            }
-        })
-    };
-    db.hold_seal_landing(true);
-    let mut want: BTreeMap<Vec<u8>, Vec<Vec<u8>>> = BTreeMap::new();
-    // Past the threshold `room` times, each sealing into room and held,
-    // then past it again and under the ceiling of twice the threshold.
-    let per = tail_key(0).len() + tail_val(1).len();
-    let crossing = (256 << 10) / per as u32 + 100;
-    let full = room * crossing;
-    let n = full + (350 << 10) / per as u32;
-    for i in 0..n {
-        db.append(&tail_key(i), &tail_val(1));
-        want.entry(tail_key(i)).or_default().push(tail_val(1));
-        if i % 100 == 99 {
-            db.commit().unwrap();
-        }
-        if i + 1 == full {
-            db.commit().unwrap();
-            assert_eq!(
-                db.frozen_tables(),
-                room as usize,
-                "{name}: the crossings froze into room"
-            );
-            assert_eq!(db.seal_waits().deferred, 0, "{name}: and deferred nothing");
-        }
-    }
-    db.commit().unwrap();
-    drop(disarm);
-    watch.join().unwrap();
-    let w = db.seal_waits();
-    assert!(db.in_flight().0, "the seals are in flight, held");
-    assert_eq!(
-        db.frozen_tables(),
-        room as usize,
-        "{name}: nothing froze past the room"
-    );
-    assert!(
-        w.deferred > 0,
-        "{name}: the commits past the threshold deferred: {w:?}"
-    );
-    assert_eq!(w.join_wait_ns, 0, "and none waited for the slot");
-    assert_eq!(w.frozen_byte_waits, 0, "nor for the bytes: {w:?}");
-    holds_all(&db, &want, "beside the held seal");
-    db.hold_seal_landing(false);
-    // The seals land; the table that grew meanwhile seals at the first
-    // commit that finds room. A writer that goes quiet
-    // first leaves it live until it commits again -- this stage moves no
-    // idle tail.
-    db.settle().unwrap();
-    let before = db.seal_waits().publishes;
-    for i in n..n + 100 {
-        db.append(&tail_key(i), &tail_val(1));
-        want.entry(tail_key(i)).or_default().push(tail_val(1));
-    }
-    db.commit().unwrap();
-    db.settle().unwrap();
-    assert!(
-        db.seal_waits().publishes > before,
-        "the deferred seal happened once the list had room"
-    );
-    assert!(
-        db.unsealed_keys() < 200,
-        "and took what grew: {} unsealed",
-        db.unsealed_keys()
-    );
-    holds_all(&db, &want, "after the deferred seal");
-}
-
 /// A commit under the seal threshold seals whenever the sealer is idle
 /// (`seal_idle`) in a stretch of writes nobody reads: no table frozen or
 /// handed, the live table past the floor, and no read since the commit
@@ -19868,57 +19740,6 @@ fn a_commit_seals_whenever_the_sealer_is_idle() {
             "idle {idle}: unsealed"
         );
         holds_all(&db, &want, &format!("idle {idle}: after the landings"));
-    }
-}
-
-/// A fresh store under the shape (`adaptive_shape`) seals its first load
-/// at the floor (`seal_first_floor`), so the load leaves a partition
-/// behind, where without it a store under `seal_bytes` stays wholly in
-/// the memtable until something reads it.
-#[test]
-fn a_fresh_store_under_the_shape_seals_its_first_load_at_the_floor() {
-    for floor in [false, true] {
-        let d = dir(if floor {
-            "first-floor"
-        } else {
-            "first-floor-off"
-        });
-        let opts = Options {
-            adaptive_shape: true,
-            seal_rotates_wal: false,
-            seal_first_floor: floor,
-            sync: supdb::SyncPolicy::EveryN(u32::MAX),
-            ..common::options()
-        };
-        let mut db = Db::create(&d, opts).unwrap();
-        let n = 30_000u32;
-        let mut want: BTreeMap<Vec<u8>, Vec<Vec<u8>>> = BTreeMap::new();
-        for i in 0..n {
-            let k = (i as u64 * 7919 % n as u64) as u32;
-            db.append(&tail_key(k), &tail_val(1));
-            want.entry(tail_key(k)).or_default().push(tail_val(1));
-            if i % 1000 == 999 {
-                db.commit().unwrap();
-            }
-        }
-        db.settle().unwrap();
-        if floor {
-            assert!(
-                db.levels().0 >= 1,
-                "the load left a partition: {:?}, unsealed {}",
-                db.levels(),
-                db.unsealed_keys()
-            );
-            assert!(
-                db.unsealed_keys() < n as usize / 2,
-                "most of the load sealed: {} unsealed",
-                db.unsealed_keys()
-            );
-        } else {
-            assert_eq!(db.levels(), (0, 0), "without the floor nothing sealed");
-            assert_eq!(db.unsealed_keys(), n as usize);
-        }
-        holds_all(&db, &want, if floor { "the floor" } else { "no floor" });
     }
 }
 
