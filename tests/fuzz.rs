@@ -1443,6 +1443,269 @@ fn handle_write(d: &mut Db, h: &Reader, op: &Op) -> std::io::Result<()> {
     ))
 }
 
+/// Under `ZFUZZ_SHARE`, one conditional write made on both stores over one
+/// key of the pool, drawn from `rng`, a generator of its own: the writer's
+/// (`Db::put_if`, `Db::delete_if`), a transaction's of one to three
+/// operations (`Txn::put_if`, `Txn::delete_if`), or, beside a handle, the
+/// handle's (`Reader::put_if`, `Reader::delete_if`) or its
+/// read-modify-write (`Reader::rmw`). The condition is drawn against the
+/// key's values as the write sees them -- the writer's the model with the
+/// staged batch over it, a transaction's that with its own operations over
+/// it, a handle's what is committed, the batch committed first as a
+/// handle's write commits it -- and each store's answer is held to the
+/// model's, a read-modify-write's values to the model's values. A write the
+/// model says applies is taken into it as the plain write is.
+// The seed's state the write reads and changes, each part as the loop
+// holds it.
+#[allow(clippy::too_many_arguments)]
+fn cond_write(
+    rng: &mut Rng,
+    pool: &[Vec<u8>],
+    step: u64,
+    big: bool,
+    (z, r): (&mut Db, &mut Db),
+    model: &mut Model,
+    staged: &mut Vec<Op>,
+    writers: Option<&(Reader, Reader)>,
+    cond: &mut [u64; 7],
+    fails: &mut Vec<String>,
+) -> Result<(), String> {
+    let handles = writers.filter(|_| rng.chance(40));
+    if let Some((wz, wr)) = handles {
+        // A handle's write is no part of a batch.
+        commit_both(z, r, model, staged)?;
+        if rng.chance(25) {
+            let k = pool[rng.below(pool.len())].clone();
+            let v = cond_value(rng, step, big);
+            let want = model.get(&k).cloned().unwrap_or_default();
+            for (name, d, h) in [("z", &mut *z, wz), ("r", &mut *r, wr)] {
+                let got = handle_rmw(d, h, &k, &v).map_err(|e| format!("{name} rmw: {e}"))?;
+                if got != want {
+                    fail(
+                        fails,
+                        format!(
+                            "{name} handle's read-modify-write of key {}: {}: read {} values, the model {}",
+                            show(&k),
+                            shape(&got, &want),
+                            got.len(),
+                            want.len()
+                        ),
+                    );
+                }
+            }
+            cond[6] += 1;
+            taken(Op::Put(k, v), z, r, model);
+            return Ok(());
+        }
+        let (op, expect) = cond_draw(rng, pool, step, big, model);
+        let want = newest(model, op_key(&op)) == expect.as_deref();
+        let got = [
+            handle_cond(z, wz, &op, expect.as_deref()).map_err(|e| format!("z handle's: {e}"))?,
+            handle_cond(r, wr, &op, expect.as_deref()).map_err(|e| format!("r handle's: {e}"))?,
+        ];
+        cond_answer("a handle's", &op, expect.as_deref(), want, got, fails);
+        cond[4 + usize::from(!want)] += 1;
+        if want {
+            taken(op, z, r, model);
+        }
+        return Ok(());
+    }
+    // The writer's and a transaction's see the staged batch.
+    let mut dirty = model.clone();
+    for op in staged.iter() {
+        apply(&mut dirty, op);
+    }
+    if rng.chance(70) {
+        let (op, expect) = cond_draw(rng, pool, step, big, &dirty);
+        let want = newest(&dirty, op_key(&op)) == expect.as_deref();
+        let mut got = [false; 2];
+        for (g, d) in got.iter_mut().zip([&mut *z, &mut *r]) {
+            *g = match &op {
+                Op::Put(k, v) => d.put_if(k, expect.as_deref(), v),
+                Op::Delete(k) => d.delete_if(k, expect.as_deref()),
+                Op::Append(..) => unreachable!("a conditional write puts or deletes"),
+            }
+            .map_err(|e| format!("the writer's conditional write: {e}"))?;
+        }
+        cond_answer("the writer's", &op, expect.as_deref(), want, got, fails);
+        cond[usize::from(!want)] += 1;
+        if want {
+            note(Rec::Write {
+                step: STEP.get(),
+                op: op.clone(),
+            });
+            staged.push(op);
+        }
+        return Ok(());
+    }
+    let (mut tz, mut tr) = (z.begin(), r.begin());
+    let mut applied = Vec::new();
+    for _ in 0..1 + rng.below(3) {
+        let (op, expect) = cond_draw(rng, pool, step, big, &dirty);
+        let want = newest(&dirty, op_key(&op)) == expect.as_deref();
+        let mut got = [false; 2];
+        for (g, t) in got.iter_mut().zip([&mut tz, &mut tr]) {
+            *g = match &op {
+                Op::Put(k, v) => t.put_if(k, expect.as_deref(), v),
+                Op::Delete(k) => t.delete_if(k, expect.as_deref()),
+                Op::Append(..) => unreachable!("a conditional write puts or deletes"),
+            }
+            .map_err(|e| format!("a transaction's conditional write: {e}"))?;
+        }
+        cond_answer("a transaction's", &op, expect.as_deref(), want, got, fails);
+        cond[2 + usize::from(!want)] += 1;
+        if want {
+            apply(&mut dirty, &op);
+            applied.push(op);
+        }
+    }
+    tz.commit()
+        .map_err(|e| format!("commit z's transaction: {e}"))?;
+    tr.commit()
+        .map_err(|e| format!("commit r's transaction: {e}"))?;
+    // The transaction's commit is the writer's: the staged batch and the
+    // transaction's operations after it.
+    for op in applied {
+        note(Rec::Write {
+            step: STEP.get(),
+            op: op.clone(),
+        });
+        staged.push(op);
+    }
+    for op in staged.drain(..) {
+        apply(model, &op);
+    }
+    note_commit("transaction", z, r);
+    Ok(())
+}
+
+/// A conditional write's key, its operation and the condition it is made
+/// on, drawn against `view`, the key's values as the write sees them: the
+/// newest of them, which the write applies on, or another, which it is
+/// refused on unless it equals the newest -- no value, the empty value, the
+/// value before the newest (the read a lost update was made over), or a
+/// fresh one.
+fn cond_draw(
+    rng: &mut Rng,
+    pool: &[Vec<u8>],
+    step: u64,
+    big: bool,
+    view: &Model,
+) -> (Op, Option<Vec<u8>>) {
+    let k = pool[rng.below(pool.len())].clone();
+    let vals = view.get(&k).map_or(&[][..], Vec::as_slice);
+    let expect = match rng.below(10) {
+        0..=5 => vals.last().cloned(),
+        6 => None,
+        7 => Some(Vec::new()),
+        8 if vals.len() >= 2 => Some(vals[vals.len() - 2].clone()),
+        _ => Some(value(rng, step, big)),
+    };
+    let op = if rng.chance(25) {
+        Op::Delete(k)
+    } else {
+        Op::Put(k, cond_value(rng, step, big))
+    };
+    (op, expect)
+}
+
+/// A conditional put's value: half of one length, so that a put meets a
+/// put's value it overwrites where it lies.
+fn cond_value(rng: &mut Rng, step: u64, big: bool) -> Vec<u8> {
+    if rng.chance(50) {
+        format!("{:08}", rng.below(100_000_000)).into_bytes()
+    } else {
+        value(rng, step, big)
+    }
+}
+
+/// The newest of `k`'s values in `m`, none where it holds none.
+fn newest<'a>(m: &'a Model, k: &[u8]) -> Option<&'a [u8]> {
+    m.get(k).and_then(|v| v.last()).map(Vec::as_slice)
+}
+
+/// A handle's write the model applied, taken into it as `handle_write`'s
+/// is: the write recorded and committed.
+fn taken(op: Op, z: &Db, r: &Db, model: &mut Model) {
+    note(Rec::Write {
+        step: STEP.get(),
+        op: op.clone(),
+    });
+    apply(model, &op);
+    note_commit("commit", z, r);
+}
+
+/// A conditional write's answers, `z`'s and `r`'s, held to the model's.
+fn cond_answer(
+    who: &str,
+    op: &Op,
+    expect: Option<&[u8]>,
+    want: bool,
+    got: [bool; 2],
+    fails: &mut Vec<String>,
+) {
+    if got == [want; 2] {
+        return;
+    }
+    let said = |a: bool| if a { "applied" } else { "refused" };
+    let kind = match op {
+        Op::Put(..) => "put",
+        Op::Delete(_) => "delete",
+        Op::Append(..) => "append",
+    };
+    fail(
+        fails,
+        format!(
+            "{who} conditional {kind} of key {} on {}: z {}, r {}, the model {}",
+            show(op_key(op)),
+            expect.map_or("no value".to_string(), |e| format!(
+                "a value of {} bytes",
+                e.len()
+            )),
+            said(got[0]),
+            said(got[1]),
+            said(want)
+        ),
+    );
+}
+
+/// A handle's conditional write, made again past the writer's commit where
+/// the live table is full, as `handle_write` makes a plain one: whether it
+/// applied.
+fn handle_cond(d: &mut Db, h: &Reader, op: &Op, expect: Option<&[u8]>) -> std::io::Result<bool> {
+    for _ in 0..16 {
+        let done = match op {
+            Op::Put(k, v) => h.put_if(k, expect, v)?,
+            Op::Delete(k) => h.delete_if(k, expect)?,
+            Op::Append(..) => unreachable!("a conditional write puts or deletes"),
+        };
+        match done {
+            supdb::CondWrite::Applied => return Ok(true),
+            supdb::CondWrite::Refused => return Ok(false),
+            supdb::CondWrite::Full => d.commit()?,
+        }
+    }
+    Err(std::io::Error::other(
+        "a handle's conditional write refused past every commit",
+    ))
+}
+
+/// A handle's read-modify-write, made again past the writer's commit where
+/// the live table is full: the values it read, the read its put was made
+/// over.
+fn handle_rmw(d: &mut Db, h: &Reader, k: &[u8], v: &[u8]) -> std::io::Result<Vec<Vec<u8>>> {
+    for _ in 0..16 {
+        let mut got = Vec::new();
+        if h.rmw(k, v, common::vf(&mut |x| got.push(x.to_vec())))? {
+            return Ok(got);
+        }
+        d.commit()?;
+    }
+    Err(std::io::Error::other(
+        "a handle's read-modify-write refused past every commit",
+    ))
+}
+
 /// Both stores' commits, and the staged writes taken into the model.
 fn commit_both(
     z: &mut Db,
@@ -2248,6 +2511,11 @@ struct Stats {
     /// opens as `kept` is, and the writes the seed made through handles:
     /// what says a run reached the flips it is for.
     share: [u64; 4],
+    /// Under `ZFUZZ_SHARE`, the conditional writes the seed made
+    /// (`cond_write`): the writer's applied and refused, a transaction's
+    /// applied and refused, a handle's applied and refused, and a handle's
+    /// read-modify-writes.
+    cond: [u64; 7],
     /// The `z` store's stride form under `ZFUZZ_STRIDE`.
     stride: StrideStats,
     /// The stores walked end to end a page at a time (`Reader::scan_page`),
@@ -2595,6 +2863,7 @@ fn run_seed_inner(seed: u64, want_cache: bool, verbose: bool) -> Result<Stats, S
         kept: 0,
         in_place: 0,
         share: [0; 4],
+        cond: [0; 7],
         recuts: 0,
         heads: [0; 2],
         held: [0; 2],
@@ -2618,6 +2887,8 @@ fn run_seed_inner(seed: u64, want_cache: bool, verbose: bool) -> Result<Stats, S
     // apart from the seed's own so that none of its draws moves.
     let sharing = shares(&cfg);
     let mut share_rng = Rng::new(seed ^ 0x5AA2_E0D3_0000_0001);
+    // And the conditional writes', apart from both.
+    let mut cond_rng = Rng::new(seed ^ 0x5AA2_E0D3_0000_0002);
     let mut writers: Option<(Reader, Reader)> = None;
     for step in 0..cfg.ops as u64 {
         STEP.set(step as i64);
@@ -2742,6 +3013,20 @@ fn run_seed_inner(seed: u64, want_cache: bool, verbose: bool) -> Result<Stats, S
                     check_keys("z writer, shared", &z, &model, &sample, &mut fails);
                     check_keys("r writer, shared", &r, &model, &sample, &mut fails);
                 }
+            }
+            if cond_rng.chance(8) {
+                cond_write(
+                    &mut cond_rng,
+                    &pool,
+                    step,
+                    cfg.big,
+                    (&mut z, &mut r),
+                    &mut model,
+                    &mut staged,
+                    writers.as_ref(),
+                    &mut st.cond,
+                    &mut fails,
+                )?;
             }
         }
         // The writer's own reads see the staged batch.
@@ -3252,6 +3537,7 @@ fn run_range() {
     let mut mem_fnv = 0u64;
     let mut in_place = [0u64; 2];
     let mut share = [0u64; 4];
+    let mut cond = [0u64; 7];
     let mut sharing_seeds = 0u64;
     let mut stride = StrideStats::default();
     let mut paged = [0u64; 4];
@@ -3298,6 +3584,9 @@ fn run_range() {
                 kept += s.kept;
                 in_place[1] += s.in_place;
                 for (a, b) in share.iter_mut().zip(s.share) {
+                    *a += b;
+                }
+                for (a, b) in cond.iter_mut().zip(s.cond) {
                     *a += b;
                 }
                 for (a, b) in point.iter_mut().zip(s.point) {
@@ -3369,6 +3658,18 @@ fn run_range() {
         if sharing_seeds > 0 && (share[0] == 0 || share[1] + share[2] == 0 || share[3] == 0) {
             bad.push(format!(
                 "ZFUZZ_SHARE reached no flip in {sharing_seeds} sharing seeds: {share:?}"
+            ));
+        }
+        eprintln!(
+            "seeds {from}..{to}: conditional writes applied and refused by the writer {} {}, in a transaction {} {}, through a handle {} {}, read-modify-writes {}",
+            cond[0], cond[1], cond[2], cond[3], cond[4], cond[5], cond[6]
+        );
+        // And a range whose conditional writes never took one of their
+        // paths, or never met a condition that applies or one that refuses
+        // on it, tested nothing of that.
+        if sharing_seeds > 0 && cond.contains(&0) {
+            bad.push(format!(
+                "ZFUZZ_SHARE made no conditional write on one of its paths in {sharing_seeds} sharing seeds: {cond:?}"
             ));
         }
     }
