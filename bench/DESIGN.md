@@ -976,9 +976,7 @@ copy only at the dense count, the shape before a light form of four deltas
 or more converted (`Options::forms_convert_from`), and
 `supdb-densefrom` and `supdb-ingestdensefrom` take the line from
 `DENSEFROM`, with the reads a form takes first from `CONVREADS` and the
-writer's fills, the yields and the walk's crossing from `CONVWRITER`,
-`CONVSTRICT` and `CONVWALK` (`Options::forms_convert_reads`,
-`forms_convert_light_writer`, `forms_convert_light_yields`,
+walk's crossing from `CONVWALK` (`Options::forms_convert_reads`,
 `forms_convert_at_walk`);
 `supdb-pacesyncsbatch` holds a syncing commit's paced batch within the
 share or the batch, the larger, and `supdb-pacesyncsthresholds` holds a

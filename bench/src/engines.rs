@@ -1268,14 +1268,6 @@ pub struct Supdb {
     /// The segment work driven inline by the writer, as before
     /// `Options::publish_in_background`. `supdb-inlinemaint`.
     inlinemaint: bool,
-    /// A dense sparse form converted by a build from the sources, as
-    /// before `Options::convert_from_form`. `supdb-convertsources`, and
-    /// `supdb-ingestconvertsources` buffered.
-    convertsources: bool,
-    /// A dense form's copy sized with a record's worth of room per record,
-    /// as before `Options::copy_exact`. `supdb-copyslack`, and
-    /// `supdb-ingestcopyslack` buffered.
-    copyslack: bool,
     /// A drain landing its lone piece and promoting it under a second
     /// manifest, as before `Options::drain_names_partition`:
     /// `supdb-ingestdrainpromote`.
@@ -1314,11 +1306,6 @@ pub struct Supdb {
     /// to the look. `supdb-settlefreeze`, and `supdb-ingestsettlefreeze`
     /// buffered.
     settlefreeze: bool,
-    /// Dense forms' conversions capped at a fill, the builder ahead of a
-    /// reader converting the rest (`Options::forms_convert_cap` at
-    /// `CONVERT_CAP`, `Options::ahead_converts` on). `supdb-convertcap`,
-    /// and `supdb-ingestconvertcap` buffered.
-    convertcap: bool,
     /// The upkeep thread's pass bounded at `SHORT_PASS_PCT` of the
     /// store's keys (`Options::upkeep_pass_pct`). `supdb-shortpass`, and
     /// `supdb-ingestshortpass` buffered.
@@ -1474,16 +1461,6 @@ pub struct Supdb {
     /// a covered partition read through one cursor
     /// (`Options::zpages_scan_cursor` off): `supdb-blockcursors`.
     blockcursors: bool,
-    /// The fill yielding its conversions at any posted commit
-    /// (`Options::forms_convert_behind` zero), the shape before it
-    /// converted in the thread's slack. `supdb-postedyield`, and
-    /// `supdb-ingestpostedyield` buffered.
-    postedyield: bool,
-    /// The fill's conversions yielding to a posted commit once the thread
-    /// is a thousand writes behind (`Options::forms_convert_behind`), as
-    /// the option's first default meant. `supdb-behindyield`, and
-    /// `supdb-ingestbehindyield` buffered.
-    behindyield: bool,
     /// The background work as the cost model in `docs/engine.md` orders
     /// it: no dense form rebuilt while nothing reads
     /// (`Options::forms_convert_unread` off). `supdb-bg`, and
@@ -2773,14 +2750,6 @@ struct Policy {
     /// The segment work driven inline by the writer, as before
     /// `Options::publish_in_background`. `supdb-inlinemaint`.
     inlinemaint: bool,
-    /// A dense sparse form converted by a build from the sources, as
-    /// before `Options::convert_from_form`. `supdb-convertsources`, and
-    /// `supdb-ingestconvertsources` buffered.
-    convertsources: bool,
-    /// A dense form's copy sized with a record's worth of room per record,
-    /// as before `Options::copy_exact`. `supdb-copyslack`, and
-    /// `supdb-ingestcopyslack` buffered.
-    copyslack: bool,
     /// A drain landing its lone piece and promoting it under a second
     /// manifest, as before `Options::drain_names_partition`:
     /// `supdb-ingestdrainpromote`.
@@ -2828,10 +2797,6 @@ struct Policy {
     /// the tables itself: `Options::freeze_settles` on.
     /// `supdb-settlefreeze`, and `supdb-ingestsettlefreeze` buffered.
     settlefreeze: bool,
-    /// Dense forms' conversions capped at a fill, the builder converting
-    /// the rest: `supdb-convertcap`, and `supdb-ingestconvertcap`
-    /// buffered.
-    convertcap: bool,
     /// The upkeep thread's pass bounded: `supdb-shortpass`, and
     /// `supdb-ingestshortpass` buffered.
     shortpass: bool,
@@ -2917,14 +2882,6 @@ struct Policy {
     norunbuilds: bool,
     /// A cursor a block: `supdb-blockcursors`.
     blockcursors: bool,
-    /// The fill yielding at any posted commit: `supdb-postedyield`, and
-    /// `supdb-ingestpostedyield` buffered.
-    postedyield: bool,
-    /// The fill's conversions yielding to a posted commit once the thread
-    /// is a thousand writes behind (`Options::forms_convert_behind`), as
-    /// the option's first default meant. `supdb-behindyield`, and
-    /// `supdb-ingestbehindyield` buffered.
-    behindyield: bool,
     /// The background work as the cost model orders it: `supdb-bg`, and
     /// `supdb-ingestbg` buffered.
     bg: bool,
@@ -3328,11 +3285,6 @@ struct Policy {
     ownhandle: bool,
 }
 
-/// The conversions a fill makes at most in `supdb-convertcap`: the first
-/// version's cap, about a pass's worth of conversions at a hundred
-/// thousand keys.
-const CONVERT_CAP: usize = 64;
-
 /// The share of the store's keys a pass of `supdb-shortpass` files at
 /// most: the square-root rule's pass size at the quick ladder's rungs
 /// (`docs/engine.md`, the cost model).
@@ -3372,8 +3324,6 @@ impl Default for Policy {
             piecesonly: false,
             latewb: false,
             inlinemaint: false,
-            convertsources: false,
-            copyslack: false,
             drainpromote: false,
             manifestfree: false,
             oidxsync: false,
@@ -3522,7 +3472,6 @@ impl Default for Policy {
             idle: false,
             pmd: false,
             settlefreeze: false,
-            convertcap: false,
             shortpass: false,
             noyield: false,
             fencekeys: false,
@@ -3563,8 +3512,6 @@ impl Default for Policy {
             znogroupahead: false,
             norunbuilds: false,
             blockcursors: false,
-            postedyield: false,
-            behindyield: false,
             bg: false,
             bglag: false,
             ordread: false,
@@ -4418,31 +4365,6 @@ impl Supdb {
         )
     }
 
-    /// `supdb` with the dense forms' conversions capped at a fill and the
-    /// builder ahead of a reader converting the rest.
-    pub fn create_convertcap(path: &Path) -> Res<Supdb> {
-        Supdb::with_policy(
-            path,
-            Policy {
-                convertcap: true,
-                ..Policy::default()
-            },
-        )
-    }
-
-    /// `supdb-ingest` converting as `supdb-convertcap`.
-    pub fn create_ingest_convertcap(path: &Path) -> Res<Supdb> {
-        Supdb::with_policy(
-            path,
-            Policy {
-                partition: false,
-                durable: false,
-                convertcap: true,
-                ..Policy::default()
-            },
-        )
-    }
-
     /// `supdb` whose upkeep thread files at most a share of the store's
     /// keys in one pass and re-posts the rest.
     pub fn create_shortpass(path: &Path) -> Res<Supdb> {
@@ -4475,33 +4397,6 @@ impl Supdb {
             path,
             Policy {
                 noyield: true,
-                ..Policy::default()
-            },
-        )
-    }
-
-    /// `supdb` whose fill yields its conversions at any posted commit
-    /// (`Options::forms_convert_behind` zero): against `supdb` it prices
-    /// converting in the thread's slack through a burst.
-    pub fn create_postedyield(path: &Path) -> Res<Supdb> {
-        Supdb::with_policy(
-            path,
-            Policy {
-                postedyield: true,
-                ..Policy::default()
-            },
-        )
-    }
-
-    /// `supdb-ingest` whose fill yields at any posted commit, as
-    /// `supdb-postedyield`.
-    pub fn create_ingest_postedyield(path: &Path) -> Res<Supdb> {
-        Supdb::with_policy(
-            path,
-            Policy {
-                partition: false,
-                durable: false,
-                postedyield: true,
                 ..Policy::default()
             },
         )
@@ -5540,33 +5435,6 @@ impl Supdb {
         )
     }
 
-    /// `supdb` whose conversions yield to a posted commit once the thread
-    /// is a thousand writes behind the writer (`Options::forms_convert_behind`):
-    /// against `supdb` it prices the yield to the writer's wait alone.
-    pub fn create_behindyield(path: &Path) -> Res<Supdb> {
-        Supdb::with_policy(
-            path,
-            Policy {
-                behindyield: true,
-                ..Policy::default()
-            },
-        )
-    }
-
-    /// `supdb-ingest` yielding a thousand writes behind, as
-    /// `supdb-behindyield`.
-    pub fn create_ingest_behindyield(path: &Path) -> Res<Supdb> {
-        Supdb::with_policy(
-            path,
-            Policy {
-                partition: false,
-                durable: false,
-                behindyield: true,
-                ..Policy::default()
-            },
-        )
-    }
-
     /// `supdb` with the background work the cost model orders.
     pub fn create_bg(path: &Path) -> Res<Supdb> {
         Supdb::with_policy(
@@ -6143,58 +6011,6 @@ impl Supdb {
             path,
             Policy {
                 latewb: true,
-                ..Policy::default()
-            },
-        )
-    }
-
-    /// `supdb` converting a dense sparse form by a build from the sources,
-    /// as before `Options::convert_from_form`: against `supdb` it prices
-    /// the conversion from the form's own deltas.
-    pub fn create_convertsources(path: &Path) -> Res<Supdb> {
-        Supdb::with_policy(
-            path,
-            Policy {
-                convertsources: true,
-                ..Policy::default()
-            },
-        )
-    }
-
-    /// `supdb-ingest` converting from the sources, as `supdb-convertsources`.
-    pub fn create_ingest_convertsources(path: &Path) -> Res<Supdb> {
-        Supdb::with_policy(
-            path,
-            Policy {
-                partition: false,
-                durable: false,
-                convertsources: true,
-                ..Policy::default()
-            },
-        )
-    }
-
-    /// `supdb` sizing a dense form's copy with room, as before
-    /// `Options::copy_exact`: against `supdb` it prices the exact size,
-    /// which fits the chunks the forms before it freed.
-    pub fn create_copyslack(path: &Path) -> Res<Supdb> {
-        Supdb::with_policy(
-            path,
-            Policy {
-                copyslack: true,
-                ..Policy::default()
-            },
-        )
-    }
-
-    /// `supdb-ingest` with the copies sized with room, as `supdb-copyslack`.
-    pub fn create_ingest_copyslack(path: &Path) -> Res<Supdb> {
-        Supdb::with_policy(
-            path,
-            Policy {
-                partition: false,
-                durable: false,
-                copyslack: true,
                 ..Policy::default()
             },
         )
@@ -10159,8 +9975,6 @@ impl Supdb {
             piecesonly,
             latewb,
             inlinemaint,
-            convertsources,
-            copyslack,
             drainpromote,
             manifestfree,
             oidxsync,
@@ -10328,7 +10142,6 @@ impl Supdb {
             idle,
             pmd,
             settlefreeze,
-            convertcap,
             shortpass,
             noyield,
             fencekeys,
@@ -10369,8 +10182,6 @@ impl Supdb {
             znogroupahead,
             norunbuilds,
             blockcursors,
-            postedyield,
-            behindyield,
             bg,
             bglag,
             ordread,
@@ -10574,30 +10385,13 @@ impl Supdb {
             // afresh at every publish as it was.
             forms_carry: carry,
             freeze_settles: settlefreeze,
-            convert_from_form: !convertsources,
-            copy_exact: !copyslack,
             drain_names_partition: !drainpromote,
             manifest_spare: !manifestfree,
             ord_durable: oidxsync,
             direct_table_refs: refvals,
             piece_ranks_by_heads: !rankrecords,
             forms_convert_unread: !(bg || bglag),
-            // The capped conversions and the builder's, kept to price again
-            // once the thread keeps up with the writer.
-            forms_convert_cap: if convertcap {
-                CONVERT_CAP
-            } else {
-                supdb::Options::default().forms_convert_cap
-            },
-            ahead_converts: convertcap,
             forms_convert_yield: !noyield,
-            forms_convert_behind: if postedyield {
-                0
-            } else if behindyield {
-                1000
-            } else {
-                supdb::Options::default().forms_convert_behind
-            },
             // The bounded pass, at the share the square-root rule of the
             // cost model gives at these rungs.
             upkeep_pass_pct: if shortpass {
@@ -10994,10 +10788,6 @@ impl Supdb {
             },
             forms_convert_reads: if densefrom > 0 { conv_reads_env() } else { 0 },
             forms_convert_at_walk: densefrom > 0 && std::env::var("CONVWALK").as_deref() == Ok("1"),
-            forms_convert_light_writer: densefrom > 0
-                && std::env::var("CONVWRITER").as_deref() == Ok("1"),
-            forms_convert_light_yields: densefrom > 0
-                && std::env::var("CONVSTRICT").as_deref() == Ok("1"),
             upkeep_pace_syncs_to_share: !pacesyncsbatch,
             upkeep_pace_syncs_model: !pacesyncsbatch && !pacesyncsthresholds,
             point_lone: !pointsources,
@@ -11227,8 +11017,6 @@ impl Supdb {
             piecesonly,
             latewb,
             inlinemaint,
-            convertsources,
-            copyslack,
             drainpromote,
             manifestfree,
             oidxsync,
@@ -11396,7 +11184,6 @@ impl Supdb {
             idle,
             pmd,
             settlefreeze,
-            convertcap,
             shortpass,
             noyield,
             fencekeys,
@@ -11437,8 +11224,6 @@ impl Supdb {
             znogroupahead,
             norunbuilds,
             blockcursors,
-            postedyield,
-            behindyield,
             bg,
             bglag,
             ordread,
@@ -12145,13 +11930,6 @@ impl Engine for Supdb {
                 "supdb-ingestsettlefreeze"
             };
         }
-        if self.convertcap {
-            return if self.partition {
-                "supdb-convertcap"
-            } else {
-                "supdb-ingestconvertcap"
-            };
-        }
         if self.shortpass {
             return if self.partition {
                 "supdb-shortpass"
@@ -12371,20 +12149,6 @@ impl Engine for Supdb {
         if self.blockcursors {
             return "supdb-blockcursors";
         }
-        if self.postedyield {
-            return if self.partition {
-                "supdb-postedyield"
-            } else {
-                "supdb-ingestpostedyield"
-            };
-        }
-        if self.behindyield {
-            return if self.partition {
-                "supdb-behindyield"
-            } else {
-                "supdb-ingestbehindyield"
-            };
-        }
         if self.bg {
             return if self.partition {
                 "supdb-bg"
@@ -12514,20 +12278,6 @@ impl Engine for Supdb {
                 "supdb-latewb"
             } else {
                 "supdb-ingestlatewb"
-            };
-        }
-        if self.convertsources {
-            return if self.partition {
-                "supdb-convertsources"
-            } else {
-                "supdb-ingestconvertsources"
-            };
-        }
-        if self.copyslack {
-            return if self.partition {
-                "supdb-copyslack"
-            } else {
-                "supdb-ingestcopyslack"
             };
         }
         if self.drainpromote {
@@ -15939,8 +15689,6 @@ pub fn guarantee(arm: &str) -> Option<Guarantee> {
         | "supdb-extsval"
         | "supdb-piecesonly"
         | "supdb-latewb"
-        | "supdb-convertsources"
-        | "supdb-copyslack"
         | "supdb-manifestfree"
         | "supdb-oidxsync"
         | "supdb-refvals"
@@ -16099,7 +15847,6 @@ pub fn guarantee(arm: &str) -> Option<Guarantee> {
         | "supdb-pmd"
         | "supdb-hold"
         | "supdb-settlefreeze"
-        | "supdb-convertcap"
         | "supdb-shortpass"
         | "supdb-noyield"
         | "supdb-notrim"
@@ -16207,8 +15954,6 @@ pub fn guarantee(arm: &str) -> Option<Guarantee> {
         | "supdb-znogroupahead"
         | "supdb-norunbuilds"
         | "supdb-blockcursors"
-        | "supdb-postedyield"
-        | "supdb-behindyield"
         | "supdb-bg"
         | "supdb-bglag"
         | "lmdb"
@@ -16230,15 +15975,10 @@ pub fn guarantee(arm: &str) -> Option<Guarantee> {
         | "supdb-shapeidle"
         | "supdb-ingestpmd"
         | "supdb-ingestsettlefreeze"
-        | "supdb-ingestconvertcap"
         | "supdb-ingestshortpass"
         | "supdb-ingestnoyield"
-        | "supdb-ingestpostedyield"
-        | "supdb-ingestbehindyield"
         | "supdb-ingestpiecesonly"
         | "supdb-ingestlatewb"
-        | "supdb-ingestconvertsources"
-        | "supdb-ingestcopyslack"
         | "supdb-ingestdrainpromote"
         | "supdb-ingestmanifestfree"
         | "supdb-ingestoidxsync"
@@ -17233,14 +16973,10 @@ pub fn open(arm: &str, dir: &Path, map_gb: usize) -> Res<Box<dyn Engine>> {
         "supdb-piecesonly" => supdb_arm(Supdb::create_piecesonly, dir)?,
         "supdb-ingestpiecesonly" => supdb_arm(Supdb::create_ingest_piecesonly, dir)?,
         "supdb-latewb" => supdb_arm(Supdb::create_latewb, dir)?,
-        "supdb-convertsources" => supdb_arm(Supdb::create_convertsources, dir)?,
-        "supdb-copyslack" => supdb_arm(Supdb::create_copyslack, dir)?,
         "supdb-manifestfree" => supdb_arm(Supdb::create_manifestfree, dir)?,
         "supdb-oidxsync" => supdb_arm(Supdb::create_oidxsync, dir)?,
         "supdb-refvals" => supdb_arm(Supdb::create_refvals, dir)?,
         "supdb-rowatclose" => supdb_arm(Supdb::create_rowatclose, dir)?,
-        "supdb-ingestconvertsources" => supdb_arm(Supdb::create_ingest_convertsources, dir)?,
-        "supdb-ingestcopyslack" => supdb_arm(Supdb::create_ingest_copyslack, dir)?,
         "supdb-ingestdrainpromote" => supdb_arm(Supdb::create_ingest_drainpromote, dir)?,
         "supdb-ingestmanifestfree" => supdb_arm(Supdb::create_ingest_manifestfree, dir)?,
         "supdb-ingestoidxsync" => supdb_arm(Supdb::create_ingest_oidxsync, dir)?,
@@ -17260,7 +16996,6 @@ pub fn open(arm: &str, dir: &Path, map_gb: usize) -> Res<Box<dyn Engine>> {
         "supdb-pmd" => supdb_arm(Supdb::create_pmd, dir)?,
         "supdb-ingestpmd" => supdb_arm(Supdb::create_ingest_pmd, dir)?,
         "supdb-settlefreeze" => supdb_arm(Supdb::create_settlefreeze, dir)?,
-        "supdb-convertcap" => supdb_arm(Supdb::create_convertcap, dir)?,
         "supdb-shortpass" => supdb_arm(Supdb::create_shortpass, dir)?,
         "supdb-noyield" => supdb_arm(Supdb::create_noyield, dir)?,
         "supdb-notrim" => supdb_arm(Supdb::create_notrim, dir)?,
@@ -17743,8 +17478,6 @@ pub fn open(arm: &str, dir: &Path, map_gb: usize) -> Res<Box<dyn Engine>> {
         "supdb-znogroupahead" => supdb_arm(Supdb::create_znogroupahead, dir)?,
         "supdb-norunbuilds" => supdb_arm(Supdb::create_norunbuilds, dir)?,
         "supdb-blockcursors" => supdb_arm(Supdb::create_blockcursors, dir)?,
-        "supdb-postedyield" => supdb_arm(Supdb::create_postedyield, dir)?,
-        "supdb-behindyield" => supdb_arm(Supdb::create_behindyield, dir)?,
         "supdb-bg" => supdb_arm(Supdb::create_bg, dir)?,
         "supdb-ingestbg" => supdb_arm(Supdb::create_ingest_bg, dir)?,
         "supdb-bglag" => supdb_arm(Supdb::create_bglag, dir)?,
@@ -18775,11 +18508,8 @@ pub fn open(arm: &str, dir: &Path, map_gb: usize) -> Res<Box<dyn Engine>> {
         "supdb-waitmanifest" => supdb_arm(Supdb::create_waitmanifest, dir)?,
         "supdb-ingestwaitmanifest" => supdb_arm(Supdb::create_ingest_waitmanifest, dir)?,
         "supdb-ingestsettlefreeze" => supdb_arm(Supdb::create_ingest_settlefreeze, dir)?,
-        "supdb-ingestconvertcap" => supdb_arm(Supdb::create_ingest_convertcap, dir)?,
         "supdb-ingestshortpass" => supdb_arm(Supdb::create_ingest_shortpass, dir)?,
         "supdb-ingestnoyield" => supdb_arm(Supdb::create_ingest_noyield, dir)?,
-        "supdb-ingestpostedyield" => supdb_arm(Supdb::create_ingest_postedyield, dir)?,
-        "supdb-ingestbehindyield" => supdb_arm(Supdb::create_ingest_behindyield, dir)?,
         "supdb-idle" => supdb_arm(Supdb::create_idle, dir)?,
         "supdb-shapeidle" => supdb_arm(Supdb::create_shape_idle, dir)?,
         "supdb-ingestnoseal" => supdb_arm(Supdb::create_ingest_noseal, dir)?,
@@ -24636,7 +24366,6 @@ mod tests {
             );
             assert_eq!(a.scan_block_cache, b.scan_block_cache, "{name}");
             assert_eq!(a.commit_forms, b.commit_forms, "{name}");
-            assert_eq!(a.copy_exact, b.copy_exact, "{name}");
             assert_eq!(a.forms_publish_lazily, b.forms_publish_lazily, "{name}");
             assert_eq!(a.scan_cache_ahead, b.scan_cache_ahead, "{name}");
             assert_eq!(a.upkeep, b.upkeep, "{name}");
@@ -24724,7 +24453,6 @@ mod tests {
             assert_eq!(a.scan_cache_bytes, b.scan_cache_bytes, "{name}: the budget");
             assert_eq!(a.scan_block_cache, b.scan_block_cache, "{name}");
             assert_eq!(a.commit_forms, b.commit_forms, "{name}");
-            assert_eq!(a.copy_exact, b.copy_exact, "{name}");
             assert_eq!(a.scan_cache_ahead, b.scan_cache_ahead, "{name}");
             assert_eq!(a.upkeep, b.upkeep, "{name}");
             assert_eq!(a.forms_settle_far, b.forms_settle_far, "{name}");

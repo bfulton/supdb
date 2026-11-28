@@ -8124,7 +8124,7 @@ fn a_copy_of_updates_starts_a_scan_at_the_seeks_rank() {
 }
 
 /// A dense sparse form is converted into a copy from its own deltas and the
-/// partition's records (`Options::convert_from_form`), where the build from
+/// partition's records, where the build from
 /// the sources gathered every key's run again. The forms here grow dense
 /// in rounds -- each round writes a part of every block, small enough that
 /// the first fill leaves a sparse form and the next finds it dense -- and
