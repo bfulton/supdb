@@ -21,22 +21,6 @@ fn dir(name: &str) -> PathBuf {
     d
 }
 
-/// The first byte at which two files a store left differ, `None` when they
-/// are the same file. A segment (`.sup`) is compared without its clock; the
-/// ordered index beside it, and everything else, byte for byte, since none
-/// of it carries one.
-fn first_difference(name: &str, a: &[u8], b: &[u8]) -> Option<usize> {
-    if a.len() != b.len() {
-        return Some(a.len().min(b.len()));
-    }
-    let (x, y) = if name.ends_with(".sup") {
-        (without_the_clock(a), without_the_clock(b))
-    } else {
-        (a.to_vec(), b.to_vec())
-    };
-    x.iter().zip(&y).position(|(p, q)| p != q)
-}
-
 /// The manifest's two slots (`Options::manifest_slots`): the file names a
 /// publish alternates between.
 const MANIFEST_SLOTS: [&str; 2] = ["manifest", "manifest.alt"];
@@ -4177,59 +4161,6 @@ fn a_buffered_flush_is_answered_by_its_slot_and_needs_nothing_of_its_log() {
     }
 }
 
-/// The seal's one-value path lays a record out once where the general
-/// path staged, encoded and re-encoded it, and the two must leave the
-/// same bytes: a segment sealed through each, from the same table, byte
-/// for byte, its ordered index too.
-#[test]
-fn a_seal_through_the_one_value_path_writes_the_segment_the_general_path_does() {
-    let mut files: Vec<std::collections::BTreeMap<String, Vec<u8>>> = Vec::new();
-    for put_one in [true, false] {
-        let d = dir(if put_one { "sealputone" } else { "sealrun" });
-        let opts = Options {
-            seal_put_one: put_one,
-            ..common::files(wal_arm())
-        };
-        let mut db = Db::create(&d, opts).unwrap();
-        for c in 0u32..3000 {
-            // Mostly one value a key; some keys two, a few deleted.
-            let k = format!("k{:04}", (c * 7919) % 2500);
-            db.append(k.as_bytes(), &c.to_le_bytes());
-            if c % 97 == 0 {
-                db.delete(k.as_bytes());
-            }
-            if c % 50 == 49 {
-                db.commit().unwrap();
-            }
-        }
-        db.flush().unwrap();
-        drop(db);
-        let mut m = std::collections::BTreeMap::new();
-        for e in std::fs::read_dir(&d).unwrap() {
-            let p = e.unwrap().path();
-            let name = p.file_name().unwrap().to_str().unwrap().to_string();
-            if name.ends_with(".sup") || name.ends_with(".oidx") {
-                m.insert(name, std::fs::read(&p).unwrap());
-            }
-        }
-        assert!(!m.is_empty(), "the flush sealed a segment");
-        files.push(m);
-    }
-    let (a, b) = (&files[0], &files[1]);
-    assert_eq!(
-        a.keys().collect::<Vec<_>>(),
-        b.keys().collect::<Vec<_>>(),
-        "the same files"
-    );
-    for (name, bytes) in a {
-        let first = first_difference(name, bytes, &b[name]);
-        assert!(
-            first.is_none(),
-            "{name} differs between the two paths, first at {first:?}"
-        );
-    }
-}
-
 /// The bytes of a store's files but its log's: the live WAL and its spare
 /// are pre-written and recycled at sizes of their own
 /// (`Options::recycle_wal`), and say nothing of what the store holds.
@@ -7644,16 +7575,14 @@ fn the_caches_own_budget_answers_the_model_with_a_handle_claimed() {
 /// The seal grows with the partitions: past the floor, a memtable seals
 /// only once it holds a sixteenth of what a merge would rewrite. On a
 /// store whose partitions are far larger than the floor, a commit past
-/// the floor and under the grown threshold seals nothing, and with the
-/// growth off the same commit seals.
+/// the floor and under the grown threshold seals nothing.
 #[test]
 fn the_seal_grows_with_the_store() {
-    for grows in [true, false] {
-        let d = dir(if grows { "seal-grows" } else { "seal-fixed" });
+    {
+        let d = dir("seal-grows");
         let opts = Options {
             seal_bytes: 64 << 10,
             partition_bytes: Some(256 << 10),
-            seal_grows: grows,
             ..common::options()
         };
         let mut db = Db::create(&d, opts).unwrap();
@@ -7670,14 +7599,10 @@ fn the_seal_grows_with_the_store() {
         assert!(parts > 1, "the load did not partition: {parts}");
         let floor = 64usize << 10;
         let threshold = db.seal_threshold();
-        if grows {
-            assert!(
-                threshold > 4 * floor,
-                "the threshold did not grow past the floor: {threshold}"
-            );
-        } else {
-            assert_eq!(threshold, floor);
-        }
+        assert!(
+            threshold > 4 * floor,
+            "the threshold did not grow past the floor: {threshold}"
+        );
         // Twice the floor, under the grown threshold. On the direct path a
         // seal of these ordered keys is a partition more, not a piece.
         let parts = db.levels().0;
@@ -7686,9 +7611,9 @@ fn the_seal_grows_with_the_store() {
         }
         db.commit().unwrap();
         let sealed = db.in_flight().0 || db.levels().1 > 0 || db.levels().0 > parts;
-        assert_eq!(
-            sealed, !grows,
-            "seal_grows={grows}: a commit of twice the floor sealed={sealed}"
+        assert!(
+            !sealed,
+            "a commit of twice the floor sealed under the grown threshold"
         );
         drop(db);
         let _ = std::fs::remove_dir_all(&d);
@@ -7813,72 +7738,49 @@ fn the_wal_drops_its_synced_frames_from_the_page_cache() {
     }
 }
 
-/// Out of core the seal holds at its floor (`seal_floor_out_of_core`):
-/// with the compact form's gate away from the raw form, a store whose
-/// threshold grew in core reads the floor, and a commit of twice the
-/// floor seals; back at the raw form the threshold grows again. Without
-/// the option the gate changes nothing.
+/// The seal grows with the store whatever the compact form's gate: a
+/// store whose threshold grew in core reads the same threshold with the
+/// gate away from the raw form, and a commit of twice the floor seals
+/// nothing there either.
 #[test]
-fn the_seal_holds_at_its_floor_out_of_core() {
-    for floor_ooc in [true, false] {
-        let d = dir(if floor_ooc {
-            "seal-floor-ooc"
-        } else {
-            "seal-floor-ooc-off"
-        });
-        let opts = Options {
-            seal_bytes: 64 << 10,
-            partition_bytes: Some(256 << 10),
-            seal_grows: true,
-            seal_floor_out_of_core: floor_ooc,
-            // The gate is the test's to set.
-            zpages: supdb::ZPages::Off,
-            ..common::options()
-        };
-        let mut db = Db::create(&d, opts).unwrap();
-        let val = vec![7u8; 200];
-        for k in 0..20_000u32 {
-            db.append(format!("key-{k:06}").as_bytes(), &val);
-            if k % 500 == 499 {
-                db.commit().unwrap();
-            }
+fn the_seal_grows_out_of_core_as_in_core() {
+    let d = dir("seal-floor-ooc-off");
+    let opts = Options {
+        seal_bytes: 64 << 10,
+        partition_bytes: Some(256 << 10),
+        // The gate is the test's to set.
+        zpages: supdb::ZPages::Off,
+        ..common::options()
+    };
+    let mut db = Db::create(&d, opts).unwrap();
+    let val = vec![7u8; 200];
+    for k in 0..20_000u32 {
+        db.append(format!("key-{k:06}").as_bytes(), &val);
+        if k % 500 == 499 {
+            db.commit().unwrap();
         }
-        db.commit().unwrap();
-        db.flush().unwrap();
-        let floor = 64usize << 10;
-        let grown = db.seal_threshold();
-        assert!(grown > 4 * floor, "the threshold did not grow: {grown}");
-        for gate in [1u8, 2] {
-            db.zgate_set(gate);
-            let t = db.seal_threshold();
-            if floor_ooc {
-                assert_eq!(t, floor, "gate {gate}: the threshold under the bound");
-            } else {
-                assert_eq!(t, grown, "gate {gate}: the gate moved the threshold");
-            }
-        }
-        // Twice the floor, under the grown threshold: out of core it seals.
-        let parts = db.levels().0;
-        for k in 0..600u32 {
-            db.append(format!("late-{k:06}").as_bytes(), &val);
-        }
-        db.commit().unwrap();
-        let sealed = db.in_flight().0 || db.levels().1 > 0 || db.levels().0 > parts;
-        assert_eq!(
-            sealed, floor_ooc,
-            "floor_ooc={floor_ooc}: a commit of twice the floor sealed={sealed}"
-        );
-        // The late keys may have landed as a partition more, so the grown
-        // threshold is read again rather than held to the first.
-        db.zgate_set(0);
-        assert!(
-            db.seal_threshold() >= grown,
-            "back at the raw form: {}",
-            db.seal_threshold()
-        );
-        drop(db);
-        let _ = std::fs::remove_dir_all(&d);
     }
+    db.commit().unwrap();
+    db.flush().unwrap();
+    let floor = 64usize << 10;
+    let grown = db.seal_threshold();
+    assert!(grown > 4 * floor, "the threshold did not grow: {grown}");
+    for gate in [1u8, 2] {
+        db.zgate_set(gate);
+        let t = db.seal_threshold();
+        assert_eq!(t, grown, "gate {gate}: the gate moved the threshold");
+    }
+    // Twice the floor, under the grown threshold: out of core it seals
+    // nothing.
+    let parts = db.levels().0;
+    for k in 0..600u32 {
+        db.append(format!("late-{k:06}").as_bytes(), &val);
+    }
+    db.commit().unwrap();
+    let sealed = db.in_flight().0 || db.levels().1 > 0 || db.levels().0 > parts;
+    assert!(!sealed, "a commit of twice the floor sealed out of core");
+    drop(db);
+    let _ = std::fs::remove_dir_all(&d);
 }
 
 /// A key the frozen memtable holds and the live one then touches, with a
@@ -13828,14 +13730,13 @@ fn the_seal_is_sized_by_the_data_and_not_by_the_file() {
     // Enough that a tenth of the store clears `SEAL_CAP_FLOOR`, so the
     // threshold is the cap's and moves with the size it is taken from.
     let n = 80_000u32;
-    let run = |compact: bool, on_file: bool| -> (u64, u64, usize) {
-        let d = dir(&format!("sealdata-{compact}-{on_file}"));
+    let run = |compact: bool| -> (u64, u64, usize) {
+        let d = dir(&format!("sealdata-{compact}"));
         let opts = Options {
             segment: supdb::SegmentOptions {
                 compact_records: compact,
                 ..Default::default()
             },
-            seal_on_file: on_file,
             ..common::options()
         };
         let mut db = Db::create(&d, opts.clone()).unwrap();
@@ -13864,17 +13765,15 @@ fn the_seal_is_sized_by_the_data_and_not_by_the_file() {
         assert_eq!(
             db.sized_bytes(),
             (file, data),
-            "compact {compact}, file rule {on_file}: a reopened store reads the sizes back"
+            "compact {compact}: a reopened store reads the sizes back"
         );
         assert_eq!(db.seal_threshold(), threshold);
         drop(db);
         let _ = std::fs::remove_dir_all(&d);
         (file, data, threshold)
     };
-    let (full_file, full_data, full_t) = run(false, false);
-    let (compact_file, compact_data, compact_t) = run(true, false);
-    let (_, _, full_on_file) = run(false, true);
-    let (_, _, compact_on_file) = run(true, true);
+    let (full_file, full_data, full_t) = run(false);
+    let (compact_file, compact_data, compact_t) = run(true);
     let per = (16 + val.len()) as u64;
     let want = n as u64 * per + (n as u64).div_ceil(4) * per;
     assert_eq!(full_data, want, "the payload is every key and value put");
@@ -13886,10 +13785,6 @@ fn the_seal_is_sized_by_the_data_and_not_by_the_file() {
     assert_eq!(
         compact_t, full_t,
         "sized by the data, the format does not move the seal"
-    );
-    assert!(
-        compact_on_file < full_on_file,
-        "sized by the file, the denser format seals sooner: {compact_on_file} against {full_on_file}"
     );
 }
 

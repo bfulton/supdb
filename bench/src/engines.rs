@@ -636,9 +636,6 @@ pub struct Supdb {
     /// A partition's copies dropped at a merge that rewrote it over the
     /// same keys, as before the rebase. `supdb-norebase`.
     norebase: bool,
-    /// The seal sized by the partitions' file bytes rather than the key
-    /// and value bytes they hold. `supdb-sealfile`.
-    sealfile: bool,
     /// The settle bound taken on every segment's keys, level-0 pieces
     /// included, rather than the partitions'. `supdb-settleall`.
     settleall: bool,
@@ -734,10 +731,6 @@ pub struct Supdb {
     /// over disjoint ranges (`Options::merge_parallel` at one).
     /// `supdb-ingestmergeone`, and `supdb-mergeone` durable.
     mergeone: bool,
-    /// The seal held at its floor while the store is out of core, where the
-    /// default grows it with the store (`Options::seal_floor_out_of_core`).
-    /// `supdb-sealfloorooc`, durable.
-    sealfloorooc: bool,
     /// The forms never fitted for want of memory, only by `forms_to_fit` or
     /// a bound budget, where the default fits them while the store is short
     /// (`Options::forms_fit_when_short` off). `supdb-nofitshort`, and
@@ -915,10 +908,6 @@ pub struct Supdb {
     /// since its last look (`Options::merge_plan_idle` off).
     /// `supdb-ingestnoidleplan`, and `supdb-noidleplan` durable.
     noidleplan: bool,
-    /// A seal writes every key through the writer's general path, as
-    /// before the one-value path (`Options::seal_put_one` off).
-    /// `supdb-ingestsealrun`, and `supdb-sealrun` durable.
-    sealrun: bool,
     /// A flush's close composes the trailer on the writer's thread while
     /// a thread syncs the records (`Options::close_finish_inline`), the
     /// refuted shape. `supdb-ingestcloseinline`, and `supdb-closeinline`
@@ -2142,9 +2131,6 @@ struct Policy {
     /// A partition's copies dropped at a merge that rewrote it over the
     /// same keys, as before the rebase. `supdb-norebase`.
     norebase: bool,
-    /// The seal sized by the partitions' file bytes rather than the key
-    /// and value bytes they hold. `supdb-sealfile`.
-    sealfile: bool,
     /// The settle bound taken on every segment's keys, level-0 pieces
     /// included, rather than the partitions'. `supdb-settleall`.
     settleall: bool,
@@ -2240,10 +2226,6 @@ struct Policy {
     /// over disjoint ranges (`Options::merge_parallel` at one).
     /// `supdb-ingestmergeone`, and `supdb-mergeone` durable.
     mergeone: bool,
-    /// The seal held at its floor while the store is out of core, where the
-    /// default grows it with the store (`Options::seal_floor_out_of_core`).
-    /// `supdb-sealfloorooc`, durable.
-    sealfloorooc: bool,
     /// The forms never fitted for want of memory, only by `forms_to_fit` or
     /// a bound budget, where the default fits them while the store is short
     /// (`Options::forms_fit_when_short` off). `supdb-nofitshort`, and
@@ -2421,10 +2403,6 @@ struct Policy {
     /// since its last look (`Options::merge_plan_idle` off).
     /// `supdb-ingestnoidleplan`, and `supdb-noidleplan` durable.
     noidleplan: bool,
-    /// A seal writes every key through the writer's general path, as
-    /// before the one-value path (`Options::seal_put_one` off).
-    /// `supdb-ingestsealrun`, and `supdb-sealrun` durable.
-    sealrun: bool,
     /// A flush's close composes the trailer on the writer's thread while
     /// a thread syncs the records (`Options::close_finish_inline`), the
     /// refuted shape. `supdb-ingestcloseinline`, and `supdb-closeinline`
@@ -3398,7 +3376,6 @@ impl Default for Policy {
             nomergechain: false,
             mergeuncapped: false,
             mergeone: false,
-            sealfloorooc: false,
             nofitshort: false,
             walkeep: false,
             zrecodeauto: false,
@@ -3444,7 +3421,6 @@ impl Default for Policy {
             noland: false,
             landnearscans: false,
             noidleplan: false,
-            sealrun: false,
             closeinline: false,
             timers: false,
             settlefar: false,
@@ -3682,7 +3658,6 @@ impl Default for Policy {
             lazysnap: false,
             fullrec: false,
             norebase: false,
-            sealfile: false,
             settleall: false,
             upkeep: None,
             tier: None,
@@ -5849,20 +5824,6 @@ impl Supdb {
         )
     }
 
-    /// `supdb` sizing the seal by the partitions' file bytes, the rule
-    /// before the store's payload was recorded. Against `supdb` it prices
-    /// the calibration that carries the file rule's cadence over to the
-    /// data; beside `supdb-fullrec` it is what the format priced before.
-    pub fn create_sealfile(path: &Path) -> Res<Supdb> {
-        Supdb::with_policy(
-            path,
-            Policy {
-                sealfile: true,
-                ..Policy::default()
-            },
-        )
-    }
-
     /// `supdb` taking the settle bound on every segment's keys, level-0
     /// pieces included, as before. Against `supdb` it prices the bound on
     /// the partitions': the lag sweep's pass after a burst, and the mixes'
@@ -6729,19 +6690,6 @@ impl Supdb {
         )
     }
 
-    /// `supdb` whose seal holds at its floor while the store is out of core
-    /// (`Options::seal_floor_out_of_core`): under a bound it prices the
-    /// memtable's anonymous memory against the pieces it leaves on disk.
-    pub fn create_sealfloorooc(path: &Path) -> Res<Supdb> {
-        Supdb::with_policy(
-            path,
-            Policy {
-                sealfloorooc: true,
-                ..Policy::default()
-            },
-        )
-    }
-
     /// `supdb` whose forms are never fitted for want of memory
     /// (`Options::forms_fit_when_short` off): against `supdb` it prices the
     /// fit under a bound, with the in-core shape the same in both.
@@ -7024,34 +6972,6 @@ impl Supdb {
                 partition: false,
                 durable: false,
                 nodrainsnap: true,
-                ..Policy::default()
-            },
-        )
-    }
-
-    /// `supdb` whose seals write every key through the writer's general
-    /// path, as before: against `supdb` it prices the one-value path on
-    /// the durable seals.
-    pub fn create_sealrun(path: &Path) -> Res<Supdb> {
-        Supdb::with_policy(
-            path,
-            Policy {
-                sealrun: true,
-                ..Policy::default()
-            },
-        )
-    }
-
-    /// `supdb-ingest` whose seals write every key through the writer's
-    /// general path, as before: against `supdb-ingest` it prices the
-    /// one-value path on the buffered seals.
-    pub fn create_ingest_sealrun(path: &Path) -> Res<Supdb> {
-        Supdb::with_policy(
-            path,
-            Policy {
-                partition: false,
-                durable: false,
-                sealrun: true,
                 ..Policy::default()
             },
         )
@@ -10185,7 +10105,6 @@ impl Supdb {
             nomergechain,
             mergeuncapped,
             mergeone,
-            sealfloorooc,
             nofitshort,
             walkeep,
             zrecodeauto,
@@ -10231,7 +10150,6 @@ impl Supdb {
             noland,
             landnearscans,
             noidleplan,
-            sealrun,
             closeinline,
             timers,
             settlefar,
@@ -10314,7 +10232,6 @@ impl Supdb {
             lazysnap,
             fullrec,
             norebase,
-            sealfile,
             settleall,
             upkeep,
             tier,
@@ -10616,9 +10533,6 @@ impl Supdb {
                 upkeepbatch.unwrap_or(supdb::Options::default().upkeep_batch_pct)
             },
             forms_rebase: !norebase,
-            // The seal sized by the file, as it was before the store's
-            // payload was recorded.
-            seal_on_file: sealfile,
             // The settle bound on every segment's keys, as it was.
             forms_settle_keys_all: settleall,
             // The upkeep where the arm puts it, or where the engine does.
@@ -10660,7 +10574,6 @@ impl Supdb {
             } else {
                 mergepar.unwrap_or(supdb::Options::default().merge_parallel)
             },
-            seal_floor_out_of_core: sealfloorooc,
             forms_fit_when_short: !nofitshort,
             zpages_recode_auto: zrecodeauto,
             zpages_reparse: zreparse,
@@ -10750,7 +10663,6 @@ impl Supdb {
             merge_chains_writes: !nochainwrites,
             zpages_land_scans_far: !landnearscans,
             merge_plan_idle: !noidleplan,
-            seal_put_one: !sealrun,
             close_finish_inline: closeinline,
             forms_settle_far: settlefar,
             forms_to_fit: tofit,
@@ -11253,7 +11165,6 @@ impl Supdb {
             nomergechain,
             mergeuncapped,
             mergeone,
-            sealfloorooc,
             nofitshort,
             walkeep,
             zrecodeauto,
@@ -11299,7 +11210,6 @@ impl Supdb {
             noland,
             landnearscans,
             noidleplan,
-            sealrun,
             closeinline,
             timers,
             settlefar,
@@ -11382,7 +11292,6 @@ impl Supdb {
             lazysnap,
             fullrec,
             norebase,
-            sealfile,
             settleall,
             upkeep,
             tier,
@@ -12438,9 +12347,6 @@ impl Engine for Supdb {
         if self.norebase {
             return "supdb-norebase";
         }
-        if self.sealfile {
-            return "supdb-sealfile";
-        }
         if self.settleall {
             return "supdb-settleall";
         }
@@ -12768,9 +12674,6 @@ impl Engine for Supdb {
                 "supdb-ingestmergeuncapped"
             };
         }
-        if self.sealfloorooc {
-            return "supdb-sealfloorooc";
-        }
         if self.walkeep {
             return "supdb-walkeep";
         }
@@ -13011,13 +12914,6 @@ impl Engine for Supdb {
                 "supdb-noidleplan"
             } else {
                 "supdb-ingestnoidleplan"
-            };
-        }
-        if self.sealrun {
-            return if self.partition {
-                "supdb-sealrun"
-            } else {
-                "supdb-ingestsealrun"
             };
         }
         if self.closeinline {
@@ -15812,7 +15708,6 @@ pub fn guarantee(arm: &str) -> Option<Guarantee> {
         | "supdb-lazysnap"
         | "supdb-fullrec"
         | "supdb-norebase"
-        | "supdb-sealfile"
         | "supdb-settleall"
         | "supdb-inline"
         | "supdb-tier"
@@ -15962,7 +15857,6 @@ pub fn guarantee(arm: &str) -> Option<Guarantee> {
         | "supdb-nomergechain"
         | "supdb-mergeuncapped"
         | "supdb-mergeone"
-        | "supdb-sealfloorooc"
         | "supdb-cacheraw"
         | "supdb-nofitshort"
         | "supdb-walkeep"
@@ -16018,7 +15912,6 @@ pub fn guarantee(arm: &str) -> Option<Guarantee> {
         | "supdb-noland"
         | "supdb-landnearscans"
         | "supdb-noidleplan"
-        | "supdb-sealrun"
         | "supdb-closeinline"
         | "supdb-timers"
         | "supdb-settlefar"
@@ -16275,7 +16168,6 @@ pub fn guarantee(arm: &str) -> Option<Guarantee> {
         | "supdb-ingestnoland"
         | "supdb-ingestlandnearscans"
         | "supdb-ingestnoidleplan"
-        | "supdb-ingestsealrun"
         | "supdb-ingestcloseinline"
         | "supdb-ingesttimers"
         | "supdb-ingestsyncbeside"
@@ -16451,7 +16343,6 @@ pub fn open(arm: &str, dir: &Path, map_gb: usize) -> Res<Box<dyn Engine>> {
         "supdb-lazysnap" => supdb_arm(Supdb::create_lazysnap, dir)?,
         "supdb-fullrec" => supdb_arm(Supdb::create_fullrec, dir)?,
         "supdb-norebase" => supdb_arm(Supdb::create_norebase, dir)?,
-        "supdb-sealfile" => supdb_arm(Supdb::create_sealfile, dir)?,
         "supdb-settleall" => supdb_arm(Supdb::create_settleall, dir)?,
         "supdb-inline" => supdb_arm(Supdb::create_inline, dir)?,
         "supdb-hold" => supdb_arm(Supdb::create_hold, dir)?,
@@ -17808,7 +17699,6 @@ pub fn open(arm: &str, dir: &Path, map_gb: usize) -> Res<Box<dyn Engine>> {
         "supdb-mergeuncapped" => supdb_arm(Supdb::create_mergeuncapped, dir)?,
         "supdb-ingestmergeuncapped" => supdb_arm(Supdb::create_ingest_mergeuncapped, dir)?,
         "supdb-mergeone" => supdb_arm(Supdb::create_mergeone, dir)?,
-        "supdb-sealfloorooc" => supdb_arm(Supdb::create_sealfloorooc, dir)?,
         "supdb-cacheraw" => supdb_arm(Supdb::create_cacheraw, dir)?,
         "supdb-nofitshort" => supdb_arm(Supdb::create_nofitshort, dir)?,
         "supdb-walkeep" => supdb_arm(Supdb::create_walkeep, dir)?,
@@ -18643,8 +18533,6 @@ pub fn open(arm: &str, dir: &Path, map_gb: usize) -> Res<Box<dyn Engine>> {
             },
             dir,
         )?,
-        "supdb-sealrun" => supdb_arm(Supdb::create_sealrun, dir)?,
-        "supdb-ingestsealrun" => supdb_arm(Supdb::create_ingest_sealrun, dir)?,
         "supdb-closeinline" => supdb_arm(Supdb::create_closeinline, dir)?,
         "supdb-ingestcloseinline" => supdb_arm(Supdb::create_ingest_closeinline, dir)?,
         "supdb-timers" => supdb_arm(Supdb::create_timers, dir)?,
@@ -21290,7 +21178,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
-    /// The seal-floor and raw-read cache arms are named as themselves,
+    /// The raw-read cache arm and the others here are named as themselves,
     /// opened by that name, and differ from `supdb` in their one option.
     #[test]
     fn the_memory_arms_differ_from_supdb_in_their_option_alone() {
@@ -21304,7 +21192,6 @@ mod tests {
         let base = Supdb::create(&dir("base")).unwrap();
         let b = base.db.as_ref().unwrap().options();
         for arm in [
-            "supdb-sealfloorooc",
             "supdb-cacheraw",
             "supdb-nofitshort",
             "supdb-walkeep",
@@ -21323,7 +21210,6 @@ mod tests {
             assert_eq!(guarantee(arm), guarantee("supdb"), "{arm}");
             assert!(!ARMS.contains(&arm) && !OOC_ARMS.contains(&arm), "{arm}");
         }
-        let floor = Supdb::create_sealfloorooc(&dir("floor")).unwrap();
         let raw = Supdb::create_cacheraw(&dir("raw")).unwrap();
         let short = Supdb::create_nofitshort(&dir("short")).unwrap();
         {
@@ -22983,57 +22869,19 @@ mod tests {
             let s = short.db.as_ref().unwrap().options();
             assert!(!s.forms_fit_when_short && b.forms_fit_when_short);
             assert_eq!(
-                (
-                    s.forms_to_fit,
-                    s.zpages,
-                    s.zpages_block_cache,
-                    s.seal_floor_out_of_core
-                ),
-                (
-                    b.forms_to_fit,
-                    b.zpages,
-                    b.zpages_block_cache,
-                    b.seal_floor_out_of_core
-                )
+                (s.forms_to_fit, s.zpages, s.zpages_block_cache),
+                (b.forms_to_fit, b.zpages, b.zpages_block_cache)
             );
         }
-        assert_eq!(floor.features(), base.features());
         assert_eq!(raw.features(), base.features());
-        let (f, r) = (
-            floor.db.as_ref().unwrap().options(),
-            raw.db.as_ref().unwrap().options(),
-        );
-        assert!(f.seal_floor_out_of_core && !b.seal_floor_out_of_core);
+        let r = raw.db.as_ref().unwrap().options();
         assert!(!r.zpages_block_cache && b.zpages_block_cache);
+        assert_eq!(r.zpages, b.zpages);
         assert_eq!(
-            (
-                f.zpages_block_cache,
-                f.zpages,
-                r.seal_floor_out_of_core,
-                r.zpages
-            ),
-            (
-                b.zpages_block_cache,
-                b.zpages,
-                b.seal_floor_out_of_core,
-                b.zpages
-            )
+            (r.scan_cache_auto, r.forms_to_fit),
+            (b.scan_cache_auto, b.forms_to_fit)
         );
-        assert_eq!(
-            (
-                f.scan_cache_auto,
-                f.forms_to_fit,
-                r.scan_cache_auto,
-                r.forms_to_fit
-            ),
-            (
-                b.scan_cache_auto,
-                b.forms_to_fit,
-                b.scan_cache_auto,
-                b.forms_to_fit
-            )
-        );
-        drop((base, floor, raw, short));
+        drop((base, raw, short));
         let _ = std::fs::remove_dir_all(&root);
     }
 

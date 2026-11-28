@@ -1346,43 +1346,16 @@ pub struct Options {
     /// Memtable bytes that trigger a seal at the next commit. Sealing is off
     /// the commit path in cost accounting but runs on the committing thread
     /// in milestone 1; the brief's "Segment size" question owns this number.
-    /// With `seal_grows` this is the floor: see there.
+    ///
+    /// It is the floor: the seal grows with the store, to the store's size
+    /// over `4 * l0_trigger`, so a merge takes in at least a quarter of
+    /// what it rewrites and level-0 stays a few pieces a range.
     pub seal_bytes: usize,
-    /// Let the seal grow with the store, so a merge takes in at least a
-    /// quarter of what it rewrites. A seal of a fixed size drops a slice
-    /// into every range, and the slice shrinks as ranges multiply: on a
-    /// store of thirty million keys a 32 MiB seal put 0.3 MB into each of
-    /// 104 ranges, `l0_trigger` of them made 1.2 MB, and merging them
-    /// rewrote a 64 MB partition -- fifty times the bytes -- while twenty
-    /// more seals landed on the ranges the job covered. Level-0 reached 24
-    /// pieces a range and every read checked 24 Blooms. With the seal at
-    /// a sixteenth of the partitions' bytes, level-0 stayed under three,
-    /// and D went from 35k to 533k ops/s, E from 14k to 334k. The divisor
-    /// is `4 * l0_trigger`: the bytes a merge rewrites over the bytes it
-    /// takes in, held to four. Off, the seal is `seal_bytes` and nothing
-    /// else, the shape the suite's arms were measured in before this.
-    pub seal_grows: bool,
-    /// EXPERIMENT: with `seal_grows`, the seal holds at `seal_bytes` while
-    /// the compact form's gate is away from the raw form -- the store out
-    /// of core -- and grows with the store only in core. Grown, the
-    /// memtable is the store's bytes over four times `l0_trigger`, 77 MB at
-    /// ten million keys, and under a bound it and the scan snapshot's copy
-    /// of it are anonymous memory beside the form files' page cache, where
-    /// LMDB holds 17 MB; the floor leaves the unsealed writes in pieces on
-    /// disk instead, at the price of more and smaller pieces for the scans
-    /// to fold and the merges to take. Refuted: paired undivided at ten
-    /// million keys under 1.25 GiB, two pairs, the floor held E's
-    /// anonymous memory at 230-249 MB against 381-404 and its major faults
-    /// to 0.6x, and read E at 0.70x, D and F at 0.78x and A, B and C at
-    /// 0.92-0.95x in both pairs, the pieces' folds and merges costing more
-    /// than the memory freed. Off: the seal grows whatever the gate.
-    /// `supdb-sealfloorooc` is the arm.
-    pub seal_floor_out_of_core: bool,
     /// EXPERIMENT: the share of the store's bytes the memtable may reach
     /// before a commit seals, as a cap on `seal_threshold` rather than a
     /// floor under it; zero is no cap.
     ///
-    /// `seal_bytes` and `seal_grows` are both floors, so on a store
+    /// `seal_bytes` and the grown seal are both floors, so on a store
     /// smaller than the floor the memtable can hold the whole of it and
     /// never seal: a hundred thousand keys are six megabytes against a
     /// 32 MiB seal, so the lag sweep's every point sits unsealed. That is
@@ -1405,14 +1378,6 @@ pub struct Options {
     /// one-sided on the ladder: ycsb-E is the only mix this engine loses
     /// to LMDB, at 0.74x-0.87x, and ycsb-F it wins by 2.84x-6.27x.
     pub seal_max_pct: usize,
-    /// Size the store for `seal_grows` and `seal_max_pct` by its
-    /// partitions' file bytes (`true`, the rule before) rather than by the
-    /// key and value bytes they hold (`false`). The file's length moves
-    /// with the record format -- compact records cut a tenth of it at the
-    /// suite's shape -- so under the file rule a denser format seals more
-    /// often, and pricing the format priced the cadence with it. Kept as
-    /// the comparison arm.
-    pub seal_on_file: bool,
     /// Ordered ingest goes straight into a segment. Keys arriving above the
     /// store's greatest, with values the record holds inline
     /// (`inline_bytes`), while the memtable is empty, fill an ordered
@@ -5903,16 +5868,6 @@ pub struct Options {
     /// `supdb-landboundsalways`, and `supdb-boundsold` with the records.
     #[doc(hidden)]
     pub land_bounds_read: bool,
-    /// A seal writes a key whose chain holds one value and no tombstone
-    /// -- every key of a load, and most of any table -- through the
-    /// writer's one-value path (`SegmentWriter::put_one`), the record
-    /// laid out once, where the general path staged the value, encoded
-    /// the run from the staging and encoded the record from the run:
-    /// callgrind over the seal's job counted the general path at some
-    /// 950 instructions a record of the job's 2,350. Off, every key takes
-    /// the general path, as before: `supdb-sealrun` and
-    /// `supdb-ingestsealrun`.
-    pub seal_put_one: bool,
     /// At a flush's close of a direct run, the writer fdatasyncs the run's
     /// file -- the records committed to it so far, hinted to the page
     /// cache as they were written and flushed to the device by nothing yet
@@ -7734,9 +7689,6 @@ impl Default for Options {
             // bytes.
             seal_bytes: 32 << 20,
             seal_max_pct: 10,
-            seal_on_file: false,
-            seal_grows: true,
-            seal_floor_out_of_core: false,
             direct_ingest: true,
             segment: SegmentOptions::default(),
             l0_trigger: 4,
@@ -8024,7 +7976,6 @@ impl Default for Options {
             boundary_keys_from_top: false,
             bounds_by_heads: true,
             land_bounds_read: true,
-            seal_put_one: true,
             close_presync: true,
             ord_durable: false,
             direct_table_refs: false,
@@ -26044,7 +25995,7 @@ struct State {
     mean_key_bytes: usize,
     /// The partitions' bytes on disk, refreshed with the segment set: what
     /// a merge rewrites, and what the seal was sized against before
-    /// `data_bytes` (`Options::seal_on_file`).
+    /// `data_bytes`.
     store_bytes: u64,
     /// The partitions' key and value bytes (`Seg::data`), refreshed with
     /// the segment set: what the seal is sized against, so the cadence
@@ -32185,12 +32136,11 @@ const SEAL_CAP_FLOOR: usize = 1 << 20;
 const DATA_PER_FILE: (u64, u64) = (5, 7);
 
 impl Reader {
-    /// The memtable bytes at which the next commit seals: `seal_bytes`, or
-    /// with `seal_grows` the larger of that and the store's size over four
-    /// times `l0_trigger`, capped by `seal_max_pct` of the store's size.
-    /// The store's size is its partitions' key and value bytes in file
-    /// bytes at the calibrated ratio (`DATA_PER_FILE`), or their file bytes
-    /// themselves under `seal_on_file`.
+    /// The memtable bytes at which the next commit seals: the larger of
+    /// `seal_bytes` and the store's size over four times `l0_trigger`,
+    /// capped by `seal_max_pct` of the store's size. The store's size is
+    /// its partitions' key and value bytes in file bytes at the calibrated
+    /// ratio (`DATA_PER_FILE`).
     pub fn seal_threshold(&self) -> usize {
         self.threshold_for(false)
     }
@@ -32205,21 +32155,12 @@ impl Reader {
     fn threshold_for(&self, idle: bool) -> usize {
         let _e = self.enter();
         let st = self.state();
-        let sized = if self.opts.seal_on_file {
-            st.store_bytes
-        } else {
-            st.data_bytes.saturating_mul(DATA_PER_FILE.1) / DATA_PER_FILE.0
-        };
-        let floored =
-            self.opts.seal_floor_out_of_core && self.shared.zgate.load() != zselect::GATE_RAW;
-        let base = if !self.opts.seal_grows || floored {
-            self.opts.seal_bytes
-        } else {
-            let grown = sized / self.opts.l0_trigger.max(1).saturating_mul(4) as u64;
-            self.opts
-                .seal_bytes
-                .max(usize::try_from(grown).unwrap_or(usize::MAX))
-        };
+        let sized = st.data_bytes.saturating_mul(DATA_PER_FILE.1) / DATA_PER_FILE.0;
+        let grown = sized / self.opts.l0_trigger.max(1).saturating_mul(4) as u64;
+        let base = self
+            .opts
+            .seal_bytes
+            .max(usize::try_from(grown).unwrap_or(usize::MAX));
         if idle {
             return base;
         }
@@ -48787,7 +48728,6 @@ impl Db {
         } else {
             near || self.opts.seal_snapshot_far
         };
-        let put_one = self.opts.seal_put_one;
         let bloom_pieces_only = self.opts.bloom_pieces_only;
         // As the seal's writer has them (`Shared::job_buffers`, above).
         let jobs_mapped = opts.maps();
@@ -49004,8 +48944,8 @@ impl Db {
                                 let (n, v) = s.arena.run(e.frun);
                                 let (range, tomb) = Snapshot::run_visible(n, v, SEE_ALL);
                                 // One value and no tombstone: the record
-                                // laid out once (`Options::seal_put_one`).
-                                if put_one && !tomb && range.len() >= 12 {
+                                // laid out once (`SegmentWriter::put_one`).
+                                if !tomb && range.len() >= 12 {
                                     let len = u32::from_le_bytes(
                                         v[range.start + 8..range.start + 12]
                                             .try_into()
@@ -49051,7 +48991,7 @@ impl Db {
                                 // Only what is live after the newest
                                 // tombstone, and the flag if there was one.
                                 let tomb = mem.live_offs_into(e, &mut offs, SEE_ALL);
-                                if put_one && !tomb && offs.len() == 1 {
+                                if !tomb && offs.len() == 1 {
                                     w.put_one(key, mem.value_at(offs[0]))?;
                                     continue;
                                 }
