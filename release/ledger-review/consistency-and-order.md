@@ -1,5 +1,10 @@
 # Review B: the judgment pass held to one rule set, and the order of phase 1
 
+> Read with `release/phase1.md`, "Amended since the reviews": where this
+> file says `CLAUDE.md` names options in its sentence on comparison arms,
+> it read the file as it stood before #37. At C0 that sentence names no
+> option, and phase 1 does not edit `CLAUDE.md`.
+
 Input: `release/options.csv` at the coordination branch (453 rows, the five
 slices merged; `emit_lone_unsearched` is the row slice 2 judged outside its
 CSV, and `zpages_sample_between` was in slices 4 and 5 with one verdict).
