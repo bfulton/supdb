@@ -1254,9 +1254,6 @@ pub struct Supdb {
     /// The sweep fences for the pins and the pin does not
     /// (`Options::asym_pins`). `supdb-asympin`.
     asympin: bool,
-    /// A point read takes a segment's extents by value, as before
-    /// `Blob::with_lookup` (`Options::exts_by_value`). `supdb-extsval`.
-    extsval: bool,
     /// The forms hold the pieces' fold alone and every walk overlays the
     /// snapshot (`Options::forms_pieces_only`). `supdb-piecesonly`, and
     /// `supdb-ingestpiecesonly` buffered.
@@ -1437,14 +1434,6 @@ pub struct Supdb {
     /// (`Options::upkeep_pace_syncs_model` off):
     /// `supdb-pacesyncsthresholds`.
     pacesyncsthresholds: bool,
-    /// A point read of every store by the general read of its sources,
-    /// the two-source and the layered reads off (`Options::point_lone`
-    /// off): `supdb-pointsources` and `supdb-ingestpointsources`.
-    pointsources: bool,
-    /// A store with pieces read by the layered read that sets up for every
-    /// source before it asks one (`Options::point_layers_lean` off):
-    /// `supdb-layersasone` and `supdb-ingestlayersasone`.
-    layersasone: bool,
     /// EXPERIMENT: the deltas from which the upkeep thread converts a sparse
     /// form the walks have read `CONVREADS` entries of to a copy
     /// (`Options::forms_convert_from`, `forms_convert_reads`), from
@@ -1909,10 +1898,6 @@ pub struct Supdb {
     /// block cache off and the upkeep the writer's: `supdb-heldinplace`,
     /// beside `supdb-heldnfinline`, which differs in the overwrite alone.
     inplace: bool,
-    /// The placed read bounded by the pieces over a range and not by the
-    /// records it keeps (`Options::point_placed_runs` off), the in-place
-    /// arm's shape otherwise: `supdb-heldinplacepieces`.
-    placedpieces: bool,
     /// The upkeep thread's passes batched to this percentage of the
     /// store's keys (`Options::upkeep_batch_pct`) under the held log with
     /// no frames: `supdb-heldbatch1`.
@@ -1958,14 +1943,6 @@ pub struct Supdb {
     /// The big shared table's inserts each carrying the slab's length
     /// (`Options::shared_len_lazy` off): `supdb-heldsharedbigeagerlen`.
     sharedeagerlen: bool,
-    /// The big shared table's point reads placing their partition by the
-    /// fences' bytes (`Options::point_fence_words` off):
-    /// `supdb-heldsharedbignowords`.
-    sharednowords: bool,
-    /// The big shared table's reads the lean probe found absent from the
-    /// table taking the placed read (`Options::point_lone_absent` off):
-    /// `supdb-heldsharedbignolone`.
-    sharednolone: bool,
     /// The big shared table's reads asking for their partition's slot only
     /// once the live table has said it lacks the key
     /// (`Options::shared_fall_ahead` off): `supdb-heldsharedbignofall`.
@@ -2759,9 +2736,6 @@ struct Policy {
     /// The sweep fences for the pins and the pin does not
     /// (`Options::asym_pins`). `supdb-asympin`.
     asympin: bool,
-    /// A point read takes a segment's extents by value, as before
-    /// `Blob::with_lookup` (`Options::exts_by_value`). `supdb-extsval`.
-    extsval: bool,
     /// The forms hold the pieces' fold alone and every walk overlays the
     /// snapshot (`Options::forms_pieces_only`). `supdb-piecesonly`, and
     /// `supdb-ingestpiecesonly` buffered.
@@ -2901,10 +2875,6 @@ struct Policy {
     pacesyncsbatch: bool,
     /// The syncing pace by cut-offs: `supdb-pacesyncsthresholds`.
     pacesyncsthresholds: bool,
-    /// Every point read the general one: `...pointsources`.
-    pointsources: bool,
-    /// The layered read as one pass over every source: `...layersasone`.
-    layersasone: bool,
     /// A filed burst's builds in the commit: `...settlebuildsfiled`.
     settlebuildsfiled: bool,
     /// The walk's own decodes: `supdb-zwalkowns`.
@@ -3250,9 +3220,6 @@ struct Policy {
     /// Puts overwritten in place (`Options::put_in_place`):
     /// `supdb-heldinplace`.
     inplace: bool,
-    /// The placed read bounded by the pieces (`Options::point_placed_runs`
-    /// off): `supdb-heldinplacepieces`.
-    placedpieces: bool,
     /// The upkeep's passes batched (`Options::upkeep_batch_pct`):
     /// `supdb-heldbatch1`.
     upkeepbatch: Option<usize>,
@@ -3289,14 +3256,6 @@ struct Policy {
     /// The big shared table's inserts each carrying the slab's length
     /// (`Options::shared_len_lazy` off): `supdb-heldsharedbigeagerlen`.
     sharedeagerlen: bool,
-    /// The big shared table's point reads placing their partition by the
-    /// fences' bytes (`Options::point_fence_words` off):
-    /// `supdb-heldsharedbignowords`.
-    sharednowords: bool,
-    /// The big shared table's reads the lean probe found absent from the
-    /// table taking the placed read (`Options::point_lone_absent` off):
-    /// `supdb-heldsharedbignolone`.
-    sharednolone: bool,
     /// The big shared table's reads asking for their partition's slot only
     /// once the live table has said it lacks the key
     /// (`Options::shared_fall_ahead` off): `supdb-heldsharedbignofall`.
@@ -3368,7 +3327,6 @@ impl Default for Policy {
             l0: None,
             nopin: false,
             asympin: false,
-            extsval: false,
             piecesonly: false,
             latewb: false,
             inlinemaint: false,
@@ -3555,8 +3513,6 @@ impl Default for Policy {
             convert16: false,
             pacesyncsbatch: false,
             pacesyncsthresholds: false,
-            pointsources: false,
-            layersasone: false,
             settlebuildsfiled: false,
             zwalkowns: false,
             zviewperopen: false,
@@ -3652,7 +3608,6 @@ impl Default for Policy {
             indexzeropage: false,
             memfnv: false,
             inplace: false,
-            placedpieces: false,
             upkeepbatch: None,
             shared: false,
             sharednorecycle: false,
@@ -3664,8 +3619,6 @@ impl Default for Policy {
             sharednolean: false,
             sharednohuge: false,
             sharedeagerlen: false,
-            sharednowords: false,
-            sharednolone: false,
             sharednofall: false,
             sharedfallalways: false,
             sharedrmwprobes: false,
@@ -4241,8 +4194,6 @@ impl Supdb {
             asym,
             nohuge,
             eagerlen,
-            nowords,
-            nolone,
             nofall,
             fallalways,
             rmwprobes,
@@ -4266,8 +4217,6 @@ impl Supdb {
                 sharednolean: nolean,
                 sharednohuge: nohuge,
                 sharedeagerlen: eagerlen,
-                sharednowords: nowords,
-                sharednolone: nolone,
                 sharednofall: nofall,
                 sharedfallalways: fallalways,
                 sharedrmwprobes: rmwprobes,
@@ -8942,20 +8891,6 @@ impl Supdb {
         )
     }
 
-    /// `supdb` with a point read taking a segment's extents by value from
-    /// `lookup_full`, as before `Blob::with_lookup` lent them on the
-    /// index's frame (`Options::exts_by_value`): against `supdb` it prices
-    /// the by-value shape on the point read.
-    pub fn create_extsval(path: &Path) -> Res<Supdb> {
-        Supdb::with_policy(
-            path,
-            Policy {
-                extsval: true,
-                ..Policy::default()
-            },
-        )
-    }
-
     /// `supdb` with the sweep fencing for the pins through `membarrier`
     /// and the pin a plain store (`Options::asym_pins`): against `supdb`
     /// it prices the fence on every read.
@@ -10155,7 +10090,6 @@ impl Supdb {
             l0,
             nopin,
             asympin,
-            extsval,
             piecesonly,
             latewb,
             inlinemaint,
@@ -10361,8 +10295,6 @@ impl Supdb {
             convert16,
             pacesyncsbatch,
             pacesyncsthresholds,
-            pointsources,
-            layersasone,
             settlebuildsfiled,
             zwalkowns,
             zviewperopen,
@@ -10458,7 +10390,6 @@ impl Supdb {
             indexzeropage,
             memfnv,
             inplace,
-            placedpieces,
             upkeepbatch,
             shared,
             sharednorecycle,
@@ -10470,8 +10401,6 @@ impl Supdb {
             sharednolean,
             sharednohuge,
             sharedeagerlen,
-            sharednowords,
-            sharednolone,
             sharednofall,
             sharedfallalways,
             sharedrmwprobes,
@@ -10874,7 +10803,6 @@ impl Supdb {
             l0_trigger: l0.unwrap_or(supdb::Options::default().l0_trigger),
             writer_pins: !nopin,
             asym_pins: asympin,
-            exts_by_value: extsval,
             point_via_ord: ordread,
             // The second form forced on for the arm that prices it, and
             // whatever the engine ships for every other.
@@ -11000,8 +10928,6 @@ impl Supdb {
                 && std::env::var("CONVSTRICT").as_deref() == Ok("1"),
             upkeep_pace_syncs_to_share: !pacesyncsbatch,
             upkeep_pace_syncs_model: !pacesyncsbatch && !pacesyncsthresholds,
-            point_lone: !pointsources,
-            point_layers_lean: !layersasone,
             forms_settle_builds_filed: settlebuildsfiled,
             zpages_rewarm_quiet_ms: if zrewarmwait {
                 supdb::db::REWARM_QUIET_BEFORE_MS
@@ -11116,7 +11042,6 @@ impl Supdb {
             index_populated: !indexzeropage,
             mem_hash_fold: !memfnv,
             put_in_place: inplace,
-            point_placed_runs: !placedpieces,
             shared_writers: shared,
             share_on_write: !noshare,
             shared_populates: !nopopulate,
@@ -11135,8 +11060,6 @@ impl Supdb {
             shared_lean: !sharednolean,
             shared_huge: !sharednohuge,
             shared_len_lazy: !sharedeagerlen,
-            point_fence_words: !sharednowords,
-            point_lone_absent: !sharednolone,
             shared_fall_ahead: !sharednofall,
             shared_fall_always: sharedfallalways,
             shared_rmw_absent: !sharedrmwprobes,
@@ -11223,7 +11146,6 @@ impl Supdb {
             l0,
             nopin,
             asympin,
-            extsval,
             piecesonly,
             latewb,
             inlinemaint,
@@ -11429,8 +11351,6 @@ impl Supdb {
             convert16,
             pacesyncsbatch,
             pacesyncsthresholds,
-            pointsources,
-            layersasone,
             settlebuildsfiled,
             zwalkowns,
             zviewperopen,
@@ -11526,7 +11446,6 @@ impl Supdb {
             indexzeropage,
             memfnv,
             inplace,
-            placedpieces,
             upkeepbatch,
             shared,
             sharednorecycle,
@@ -11538,8 +11457,6 @@ impl Supdb {
             sharednolean,
             sharednohuge,
             sharedeagerlen,
-            sharednowords,
-            sharednolone,
             sharednofall,
             sharedfallalways,
             sharedrmwprobes,
@@ -11915,10 +11832,6 @@ impl Engine for Supdb {
                     "supdb-heldsharedbignohuge"
                 } else if self.shared && self.sharedbig && self.sharedeagerlen {
                     "supdb-heldsharedbigeagerlen"
-                } else if self.shared && self.sharedbig && self.sharednowords {
-                    "supdb-heldsharedbignowords"
-                } else if self.shared && self.sharedbig && self.sharednolone {
-                    "supdb-heldsharedbignolone"
                 } else if self.shared && self.sharedbig && self.sharednofall {
                     "supdb-heldsharedbignofall"
                 } else if self.shared && self.sharedbig && self.sharedfallalways {
@@ -11929,8 +11842,6 @@ impl Engine for Supdb {
                     "supdb-heldsharedbig"
                 } else if self.shared {
                     "supdb-heldshared"
-                } else if self.inplace && self.placedpieces {
-                    "supdb-heldinplacepieces"
                 } else if self.inplace {
                     "supdb-heldinplace"
                 } else if !self.block_cache && self.upkeep == Some(supdb::Upkeep::Inline) {
@@ -12499,9 +12410,6 @@ impl Engine for Supdb {
         if self.asympin {
             return "supdb-asympin";
         }
-        if self.extsval {
-            return "supdb-extsval";
-        }
         if self.piecesonly {
             return if self.partition {
                 "supdb-piecesonly"
@@ -12607,20 +12515,6 @@ impl Engine for Supdb {
         }
         if self.pacesyncsthresholds {
             return "supdb-pacesyncsthresholds";
-        }
-        if self.pointsources {
-            return if self.partition {
-                "supdb-pointsources"
-            } else {
-                "supdb-ingestpointsources"
-            };
-        }
-        if self.layersasone {
-            return if self.partition {
-                "supdb-layersasone"
-            } else {
-                "supdb-ingestlayersasone"
-            };
         }
         if self.convert16 {
             return if self.partition {
@@ -14993,10 +14887,7 @@ pub fn set_store_bound(bytes: Option<u64>) {
 /// pins plain stores the sweep fences for (`Options::asym_pins`),
 /// `supdb-heldsharedbigasym`, or its table on small pages,
 /// `supdb-heldsharedbignohuge`, or its inserts each carrying the slab's
-/// length, `supdb-heldsharedbigeagerlen`, or its point reads placing their
-/// partition by the fences' bytes, `supdb-heldsharedbignowords`, or its
-/// reads the lean probe found absent from the table taking the placed
-/// read, `supdb-heldsharedbignolone`, or its reads asking for their
+/// length, `supdb-heldsharedbigeagerlen`, or its reads asking for their
 /// partition's slot only once the live table lacks the key,
 /// `supdb-heldsharedbignofall`, or all of them asking for it ahead of the
 /// table's probe, `supdb-heldsharedbigfallalways`, or its read-modify-writes
@@ -15014,8 +14905,6 @@ pub struct SharedShape {
     pub asym: bool,
     pub nohuge: bool,
     pub eagerlen: bool,
-    pub nowords: bool,
-    pub nolone: bool,
     pub nofall: bool,
     pub fallalways: bool,
     pub rmwprobes: bool,
@@ -15936,7 +15825,6 @@ pub fn guarantee(arm: &str) -> Option<Guarantee> {
         | "supdb-l0"
         | "supdb-nopin"
         | "supdb-asympin"
-        | "supdb-extsval"
         | "supdb-piecesonly"
         | "supdb-latewb"
         | "supdb-convertsources"
@@ -16133,10 +16021,6 @@ pub fn guarantee(arm: &str) -> Option<Guarantee> {
         | "supdb-ingestconvert16"
         | "supdb-pacesyncsbatch"
         | "supdb-pacesyncsthresholds"
-        | "supdb-pointsources"
-        | "supdb-ingestpointsources"
-        | "supdb-layersasone"
-        | "supdb-ingestlayersasone"
         | "supdb-settlebuildsfiled"
         | "supdb-ingestsettlebuildsfiled"
         | "supdb-ingestpromote"
@@ -16346,7 +16230,6 @@ pub fn guarantee(arm: &str) -> Option<Guarantee> {
         | "supdb-heldindexzeropage"
         | "supdb-heldmemfnv"
         | "supdb-heldinplace"
-        | "supdb-heldinplacepieces"
         | "supdb-heldnfinline"
         | "supdb-heldshared"
         | "supdb-heldsharednorecycle"
@@ -16359,8 +16242,6 @@ pub fn guarantee(arm: &str) -> Option<Guarantee> {
         | "supdb-heldsharedbigasym"
         | "supdb-heldsharedbignohuge"
         | "supdb-heldsharedbigeagerlen"
-        | "supdb-heldsharedbignowords"
-        | "supdb-heldsharedbignolone"
         | "supdb-heldsharedbignofall"
         | "supdb-heldsharedbigfallalways"
         | "supdb-heldsharedbigrmwprobes"
@@ -16868,25 +16749,6 @@ pub fn open(arm: &str, dir: &Path, map_gb: usize) -> Res<Box<dyn Engine>> {
             },
             dir,
         )?,
-        "supdb-heldinplacepieces" => supdb_arm(
-            |d| {
-                Supdb::with_policy(
-                    d,
-                    Policy {
-                        partition: false,
-                        durable: false,
-                        held: true,
-                        noframes: true,
-                        block_cache: false,
-                        upkeep: Some(supdb::Upkeep::Inline),
-                        inplace: true,
-                        placedpieces: true,
-                        ..Policy::default()
-                    },
-                )
-            },
-            dir,
-        )?,
         "supdb-heldnfinline" => supdb_arm(
             |d| {
                 Supdb::with_policy(
@@ -17117,32 +16979,6 @@ pub fn open(arm: &str, dir: &Path, map_gb: usize) -> Res<Box<dyn Engine>> {
             },
             dir,
         )?,
-        "supdb-heldsharedbignowords" => supdb_arm(
-            |d| {
-                Supdb::create_held_shared(
-                    d,
-                    SharedShape {
-                        big: true,
-                        nowords: true,
-                        ..SharedShape::default()
-                    },
-                )
-            },
-            dir,
-        )?,
-        "supdb-heldsharedbignolone" => supdb_arm(
-            |d| {
-                Supdb::create_held_shared(
-                    d,
-                    SharedShape {
-                        big: true,
-                        nolone: true,
-                        ..SharedShape::default()
-                    },
-                )
-            },
-            dir,
-        )?,
         "supdb-heldsharedbignofall" => supdb_arm(
             |d| {
                 Supdb::create_held_shared(
@@ -17229,7 +17065,6 @@ pub fn open(arm: &str, dir: &Path, map_gb: usize) -> Res<Box<dyn Engine>> {
         "supdb-l0" => supdb_arm(Supdb::create_l0, dir)?,
         "supdb-nopin" => supdb_arm(Supdb::create_nopin, dir)?,
         "supdb-asympin" => supdb_arm(Supdb::create_asympin, dir)?,
-        "supdb-extsval" => supdb_arm(Supdb::create_extsval, dir)?,
         "supdb-piecesonly" => supdb_arm(Supdb::create_piecesonly, dir)?,
         "supdb-ingestpiecesonly" => supdb_arm(Supdb::create_ingest_piecesonly, dir)?,
         "supdb-latewb" => supdb_arm(Supdb::create_latewb, dir)?,
@@ -17305,58 +17140,6 @@ pub fn open(arm: &str, dir: &Path, map_gb: usize) -> Res<Box<dyn Engine>> {
                         partition: false,
                         durable: false,
                         settlebuildsfiled: true,
-                        ..Policy::default()
-                    },
-                )
-            },
-            dir,
-        )?,
-        "supdb-pointsources" => supdb_arm(
-            |d| {
-                Supdb::with_policy(
-                    d,
-                    Policy {
-                        pointsources: true,
-                        ..Policy::default()
-                    },
-                )
-            },
-            dir,
-        )?,
-        "supdb-layersasone" => supdb_arm(
-            |d| {
-                Supdb::with_policy(
-                    d,
-                    Policy {
-                        layersasone: true,
-                        ..Policy::default()
-                    },
-                )
-            },
-            dir,
-        )?,
-        "supdb-ingestlayersasone" => supdb_arm(
-            |d| {
-                Supdb::with_policy(
-                    d,
-                    Policy {
-                        partition: false,
-                        durable: false,
-                        layersasone: true,
-                        ..Policy::default()
-                    },
-                )
-            },
-            dir,
-        )?,
-        "supdb-ingestpointsources" => supdb_arm(
-            |d| {
-                Supdb::with_policy(
-                    d,
-                    Policy {
-                        partition: false,
-                        durable: false,
-                        pointsources: true,
                         ..Policy::default()
                     },
                 )
@@ -19354,8 +19137,6 @@ mod tests {
             asym: false,
             nohuge: false,
             eagerlen: false,
-            nowords: false,
-            nolone: false,
             nofall: false,
             fallalways: false,
             rmwprobes: false,
@@ -19417,20 +19198,6 @@ mod tests {
                 },
             ),
             (
-                "supdb-heldsharedbignowords",
-                SharedShape {
-                    nowords: true,
-                    ..shape(false, true, false, false, false)
-                },
-            ),
-            (
-                "supdb-heldsharedbignolone",
-                SharedShape {
-                    nolone: true,
-                    ..shape(false, true, false, false, false)
-                },
-            ),
-            (
                 "supdb-heldsharedbignofall",
                 SharedShape {
                     nofall: true,
@@ -19470,8 +19237,6 @@ mod tests {
             assert_eq!(ao.asym_pins, s.asym, "{arm}");
             assert_eq!(ao.shared_huge, !s.nohuge, "{arm}");
             assert_eq!(ao.shared_len_lazy, !s.eagerlen, "{arm}");
-            assert_eq!(ao.point_fence_words, !s.nowords, "{arm}");
-            assert_eq!(ao.point_lone_absent, !s.nolone, "{arm}");
             assert_eq!(ao.shared_fall_ahead, !s.nofall, "{arm}");
             assert_eq!(ao.shared_fall_always, s.fallalways, "{arm}");
             assert_eq!(ao.shared_rmw_absent, !s.rmwprobes, "{arm}");
@@ -20298,13 +20063,12 @@ mod tests {
         assert_eq!(arm.budget, base.budget);
         assert_eq!(arm.advice, base.advice);
         assert_eq!(arm.features(), base.features());
-        assert!(!arm.extsval && !arm.forms && !arm.lazyforms);
+        assert!(!arm.forms && !arm.lazyforms);
         let (a, b) = (
             arm.db.as_ref().unwrap().options(),
             base.db.as_ref().unwrap().options(),
         );
         assert!(a.point_via_ord && !b.point_via_ord, "the one option");
-        assert_eq!(a.exts_by_value, b.exts_by_value);
         assert_eq!(a.scan_block_cache, b.scan_block_cache);
         assert_eq!(a.scan_cache_bytes, b.scan_cache_bytes);
         assert_eq!(a.read_advice, b.read_advice);
@@ -20431,7 +20195,7 @@ mod tests {
         assert_eq!(arm.budget, base.budget);
         assert_eq!(arm.advice, base.advice);
         assert_eq!(arm.features(), base.features());
-        assert!(!arm.ordread && !arm.extsval && !arm.forms && !arm.lazyforms);
+        assert!(!arm.ordread && !arm.forms && !arm.lazyforms);
         let (a, b) = (
             arm.db.as_ref().unwrap().options(),
             base.db.as_ref().unwrap().options(),
@@ -20447,7 +20211,6 @@ mod tests {
         );
         assert!(a.zpages_drop_behind, "the engine's own, on");
         assert_eq!(a.point_via_ord, b.point_via_ord);
-        assert_eq!(a.exts_by_value, b.exts_by_value);
         assert_eq!(a.scan_block_cache, b.scan_block_cache);
         assert_eq!(a.scan_cache_bytes, b.scan_cache_bytes);
         assert_eq!(a.read_advice, b.read_advice);
@@ -21661,20 +21424,6 @@ mod tests {
             }
             {
                 let z = Supdb::with_policy(
-                    &dir("pointsources"),
-                    Policy {
-                        pointsources: true,
-                        ..Policy::default()
-                    },
-                )
-                .unwrap();
-                assert_eq!(z.name(), "supdb-pointsources");
-                assert_eq!(z.features(), base.features());
-                let o = z.db.as_ref().unwrap().options();
-                assert!(!o.point_lone && b.point_lone);
-            }
-            {
-                let z = Supdb::with_policy(
                     &dir("nopool"),
                     Policy {
                         nopool: true,
@@ -21687,21 +21436,6 @@ mod tests {
                 let o = z.db.as_ref().unwrap().options();
                 assert!(o.blocks_pool_bytes == 0 && b.blocks_pool_bytes > 0);
                 assert!(o.blocks_mapped, "the one option moved");
-            }
-            {
-                let z = Supdb::with_policy(
-                    &dir("layersasone"),
-                    Policy {
-                        layersasone: true,
-                        ..Policy::default()
-                    },
-                )
-                .unwrap();
-                assert_eq!(z.name(), "supdb-layersasone");
-                assert_eq!(z.features(), base.features());
-                let o = z.db.as_ref().unwrap().options();
-                assert!(!o.point_layers_lean && b.point_layers_lean);
-                assert!(o.point_lone, "the one option moved");
             }
             {
                 let z = Supdb::with_policy(

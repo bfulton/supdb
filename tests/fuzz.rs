@@ -451,18 +451,6 @@ struct Cfg {
     /// compact form is installed (`Options::merge_quiet_any_gate`): in half
     /// the seeds that draw the third merge.
     merge_quiet_any: bool,
-    /// A point read reads a store's sources in their common shape by the
-    /// two-source and the layered read (`Options::point_lone`): off in a
-    /// quarter of the seeds under `ZFUZZ_OPTVARY`, the side generator's
-    /// draw after the one `point_fixed` took, and on otherwise, as the
-    /// engine has it, so the general read is held to the model beside the
-    /// reads that stand in for it.
-    point_lone: bool,
-    /// The layered read that places its sources first
-    /// (`Options::point_layers_lean`): off in a quarter of the seeds under
-    /// `ZFUZZ_OPTVARY`, so both layered reads meet the fuzz's stores, with
-    /// their pieces, their seals in flight and their chains of appends.
-    point_layers_lean: bool,
     /// The log held in the process (`SyncPolicy::Explicit`, which `sync`
     /// then is) in a quarter of the seeds under `ZFUZZ_OPTVARY`, and in
     /// half of those to a cap of two kibibytes (`Options::wal_hold_bytes`),
@@ -843,12 +831,14 @@ fn pick_cfg(rng: &mut Rng, want_cache: bool) -> Cfg {
     let (heads_on, land_on) = (side.chance(50), side.chance(50));
     let quiet_on = side.chance(50);
     let quiet_any = side.chance(50);
-    // The draw `point_fixed` took, kept so that the draws after it stand.
+    // The draws `point_fixed` and `point_lone` took, kept so that the
+    // draws after them stand.
     let _ = side.chance(25);
-    let lone_off = side.chance(25);
+    let _ = side.chance(25);
     let (explicit_on, hold_small) = (side.chance(25), side.chance(50));
-    // After every draw before it, so that it moves none of them.
-    let layers_as_one = side.chance(25);
+    // The draw `point_layers_lean` took, kept so that the draws after it
+    // stand.
+    let _ = side.chance(25);
     let no_frames = side.chance(50);
     // The draws `point_record_ahead` and `point_live_first` took, kept so
     // that the draws after them stand.
@@ -936,8 +926,6 @@ fn pick_cfg(rng: &mut Rng, want_cache: bool) -> Cfg {
         land_bounds: !(vary && land_on),
         merge_quiet: !(vary && quiet_on),
         merge_quiet_any: vary && !quiet_on && quiet_any,
-        point_lone: !(vary && lone_off),
-        point_layers_lean: !(vary && layers_as_one),
         hold_small: vary && explicit_on && hold_small,
         held_frames: !(vary && explicit_on && no_frames),
         mem_fold: !(vary && mem_fnv),
@@ -993,8 +981,6 @@ fn opts(c: &Cfg) -> Options {
         land_bounds_read: c.land_bounds,
         merge_parallel_quiet: if c.merge_quiet { 3 } else { 0 },
         merge_quiet_any_gate: c.merge_quiet_any,
-        point_lone: c.point_lone,
-        point_layers_lean: c.point_layers_lean,
         held_frames: c.held_frames,
         mem_hash_fold: c.mem_fold,
         wal_hold_bytes: if c.hold_small {
@@ -2072,7 +2058,7 @@ struct Stats {
     held: [u64; 2],
     /// The point reads either store's writer answered by the two-source
     /// read, by a layered read, and of those by the one that places its
-    /// sources first (`Options::point_lone`, `point_layers_lean`), summed
+    /// sources first (`Reader::point_lean_reads`), summed
     /// as `abandons` is: what says a range reached each, since the general
     /// read answers every key they decline and the model cannot tell.
     reads: [u64; 3],

@@ -764,74 +764,68 @@ fn partitioned(name: &str, o: Options) -> (PathBuf, Db, Vec<Vec<u8>>, Vec<Vec<u8
 }
 
 /// A key the shared table's lean probe finds no record of is read from
-/// its partition alone where the store has no piece and no frozen table
-/// (`Options::point_lone_absent`), and the partition is placed by the
-/// fences' words (`Options::point_fence_words`): every answer is the one
-/// the placed read gives and the one the search by bytes gives, over keys
-/// at, between and past the fences, and the reads are counted by the
-/// read that answered them. A key the table holds is the lean probe's,
-/// and a store with a frozen table is the placed read's.
+/// its partition alone where the store has no piece and no frozen table,
+/// and the partition is placed by the fences' words: every answer is the
+/// one the store was written with, over keys at, between and past the fences, and the reads are
+/// counted by the read that answered them. A key the table holds is the
+/// lean probe's, and a store with a frozen table is the placed read's.
 #[test]
 fn a_key_the_live_table_lacks_is_read_from_its_partition_alone() {
     let _w = Watchdog::arm("the lone read's test waited a minute");
-    let mut answers = Vec::new();
-    for (lone, words) in [(true, true), (false, true), (true, false)] {
-        let (d, mut db, keys, absent) = partitioned(
-            &format!("lone-{lone}-{words}"),
-            Options {
-                point_lone_absent: lone,
-                point_fence_words: words,
-                ..options(1 << 20)
-            },
-        );
-        assert!(db.segments() > 4, "partitions: {}", db.segments());
-        let r = db.reader().unwrap();
-        let mut got: Vec<Vec<Vec<u8>>> = Vec::new();
-        let (lone0, layer0) = r.point_lean_reads();
-        for k in keys.iter().chain(&absent) {
-            got.push(handle_values(&r, k));
-        }
-        let (lone1, layer1) = r.point_lean_reads();
-        // Under the stride switch a form file serves the partitions and
-        // the general read takes every key (`common::stride_switch`).
-        if !common::stride_switch() {
-            let n = (keys.len() + absent.len()) as u64;
-            assert_eq!(
-                (lone1 - lone0, layer1 - layer0),
-                if lone { (n, 0) } else { (0, n) },
-                "lone {lone}, words {words}: the reads by the read that answered"
-            );
-        }
-        // A key the table holds, and then a store with a frozen table.
-        assert!(r.put(&keys[5], b"live").unwrap());
-        let ops0 = r.shared_lean_ops();
-        got.push(handle_values(&r, &keys[5]));
-        assert_eq!(
-            r.shared_lean_ops() - ops0,
-            1,
-            "the table's key is the lean probe's"
-        );
-        assert!(r.put(&keys[7], b"frozen").unwrap());
-        db.hold_seal_landing(true);
-        db.seal().unwrap();
-        assert_eq!(db.frozen_tables(), 1, "the frozen table");
-        let (lone2, _) = r.point_lean_reads();
-        got.push(handle_values(&r, &keys[7]));
-        got.push(handle_values(&r, &keys[9]));
-        assert_eq!(
-            r.point_lean_reads().0,
-            lone2,
-            "a frozen table is the placed read's"
-        );
-        drop(r);
-        db.hold_seal_landing(false);
-        drop(db);
-        let _ = std::fs::remove_dir_all(&d);
-        answers.push(got);
+    let (d, mut db, keys, absent) = partitioned("lone", options(1 << 20));
+    assert!(db.segments() > 4, "partitions: {}", db.segments());
+    let r = db.reader().unwrap();
+    let mut got: Vec<Vec<Vec<u8>>> = Vec::new();
+    let (lone0, layer0) = r.point_lean_reads();
+    for k in keys.iter().chain(&absent) {
+        got.push(handle_values(&r, k));
     }
-    assert_eq!(answers[0], answers[1], "the lone read and the placed one");
-    assert_eq!(answers[0], answers[2], "the search by words and by bytes");
-    let a = &answers[0];
+    let (lone1, layer1) = r.point_lean_reads();
+    // Every key's value is itself, and the keys the store lacks read absent.
+    for (k, v) in keys.iter().chain(&absent).zip(&got) {
+        let want = if keys.contains(k) {
+            vec![k.clone()]
+        } else {
+            Vec::new()
+        };
+        assert_eq!(v, &want, "{}", String::from_utf8_lossy(k));
+    }
+    // Under the stride switch a form file serves the partitions and
+    // the general read takes every key (`common::stride_switch`).
+    if !common::stride_switch() {
+        let n = (keys.len() + absent.len()) as u64;
+        assert_eq!(
+            (lone1 - lone0, layer1 - layer0),
+            (n, 0),
+            "the reads by the read that answered"
+        );
+    }
+    // A key the table holds, and then a store with a frozen table.
+    assert!(r.put(&keys[5], b"live").unwrap());
+    let ops0 = r.shared_lean_ops();
+    got.push(handle_values(&r, &keys[5]));
+    assert_eq!(
+        r.shared_lean_ops() - ops0,
+        1,
+        "the table's key is the lean probe's"
+    );
+    assert!(r.put(&keys[7], b"frozen").unwrap());
+    db.hold_seal_landing(true);
+    db.seal().unwrap();
+    assert_eq!(db.frozen_tables(), 1, "the frozen table");
+    let (lone2, _) = r.point_lean_reads();
+    got.push(handle_values(&r, &keys[7]));
+    got.push(handle_values(&r, &keys[9]));
+    assert_eq!(
+        r.point_lean_reads().0,
+        lone2,
+        "a frozen table is the placed read's"
+    );
+    drop(r);
+    db.hold_seal_landing(false);
+    drop(db);
+    let _ = std::fs::remove_dir_all(&d);
+    let a = &got;
     assert!(
         a.iter().filter(|v| v.is_empty()).count() >= 4,
         "the keys the store lacks read absent"
@@ -958,7 +952,7 @@ fn a_handles_rmw_of_a_key_the_table_lacks_reads_it_below_in_one_pin() {
         }
         let n = (keys.len() + missing.len()) as u64;
         // Each first touch read the partition alone, the table known not to
-        // hold the key (`Options::point_lone_absent`), in either shape.
+        // hold the key, in either shape.
         if !common::stride_switch() {
             assert_eq!(
                 r.point_lean_reads().0 - lone0,

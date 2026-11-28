@@ -1698,127 +1698,6 @@ pub struct Options {
     /// 1.1x and 0.97x on reads, so the fence stays and this is the arm.
     /// A kernel without `membarrier` has the fence whatever this says.
     pub asym_pins: bool,
-    /// EXPERIMENT: a point read takes a segment's extents by value from
-    /// `Blob::lookup_full`, the shape before `Blob::with_lookup` lent them
-    /// on the index's frame; kept to price it. `supdb-extsval`.
-    pub exts_by_value: bool,
-    /// A point read of a store whose sources hold the key in their common
-    /// shape reads them in one pass, newest first, on its own frame. Two
-    /// reads stand in for the general one. A store with no frozen table
-    /// and no level-0 piece, which is every store between a drain and the
-    /// next seal, is read as its partition and the live table alone
-    /// (`Reader::read_lone`): the key hashed once, the live table's chain
-    /// for it read once to its newest tombstone, the partition found by
-    /// its fence and the record read where no tombstone masks it. A store
-    /// with pieces or frozen tables is read the same way over each of them
-    /// (`Reader::read_layers`), a piece asked once for its record, which
-    /// is kept. The general read is written for a key in any number of
-    /// sources in any record shape: the newest tombstone found by a pass
-    /// of its own, what it probed carried in a structure, the pieces over
-    /// the range found by two searches, the frozen tables and the live one
-    /// each asked in turn, a chain's offsets in a vector; with one source
-    /// it still set each of those up, about three hundred instructions of
-    /// a get's 747 over a store just loaded once the record was read in
-    /// place, by callgrind at a hundred thousand keys
-    /// (`bench/examples/point_ops.rs`). The same values in the same order:
-    /// the newest tombstone the pass finds is the newest of the read's
-    /// sources, and with none the partition's values come first. A
-    /// partition a form file may serve, a run of ordered ingest in
-    /// progress, a store with no partition yet, a chain of more live
-    /// values than the read's frame holds, a range under more pieces than
-    /// it holds, a record of another shape in a piece and a store under
-    /// any option that reads a partition another way (`point_via_ord`,
-    /// `exts_by_value`) take the general read; `Reader::point_lean_reads`
-    /// counts the reads that did not. Off: `supdb-pointsources`, and
-    /// `supdb-ingestpointsources` buffered.
-    pub point_lone: bool,
-    /// The layered read asks its sources in the order of what each costs,
-    /// sets up for none it does not reach, and asks for the partition's
-    /// first line before it reads anything (`Reader::read_placed`). A
-    /// store a write mix has sealed once is a partition, a piece and a
-    /// live table for as long as the piece waits for its merge, with a
-    /// frozen table beside them for the milliseconds of each seal, and
-    /// `read_layers` over it executes 1,052 instructions a get where the
-    /// read of a store just loaded executes 497 and FASTER's whole get
-    /// 417, by callgrind at a hundred thousand keys with the seal landed
-    /// (`bench/examples/point_ops.rs` under `POINT_OPS_LAND=1`, the
-    /// `reads_dirty` phase, `supdb-ingestlayersasone`; this read 838),
-    /// and no line of it over three in a hundred:
-    /// the partitions counted and the key's found by two searches of the
-    /// segments, the pieces over it by two more, a frame of eight hundred
-    /// bytes cleared for three frozen tables and eight pieces where one
-    /// piece stood, each chunk of a table's chain reached by three
-    /// lookups of its block, and all of it ahead of the one probe that
-    /// answers three reads in ten, the live table's, whose tombstone
-    /// masks everything older.
-    ///
-    /// Here the partitions' count and each one's run of pieces are the
-    /// state's, taken at its publish (`State::placing`), and a store of
-    /// one partition is not searched; the live table is asked first, and
-    /// a tombstone there ends the read with the table's own values; the
-    /// frozen tables are asked after it, newest first, the same way; a
-    /// chunk's header is one lookup and its value another
-    /// (`MemTable::live_small_hashed`); and the pieces' records and the
-    /// tables' values are kept in the order found, on a frame nothing
-    /// clears. The same values in the same order as `read_layers` hands
-    /// over, from the same sources.
-    ///
-    /// And the partition's first hash slot is asked for as soon as the
-    /// key is hashed, ahead of the tables' probes and the pieces' filters.
-    /// A get over keys the cache does not
-    /// hold waits on two lines of the partition, the slot and then the
-    /// record, and what a loop of gets costs is how far those waits
-    /// overlap from one get to the next: sampled by phase
-    /// (`perf record --call-graph dwarf` over the same probe), the load
-    /// of a partition's record took half again the samples a read in the
-    /// layered read that it takes in the read of a store just loaded,
-    /// behind a longer path and the live table's probe, whose branch no
-    /// predictor learns. The ask starts the first wait before either.
-    ///
-    /// A frozen table that was a run of ordered ingest is `read_layers`'
-    /// still, with everything it leaves to the general read.
-    /// `Reader::point_placed_reads` counts the reads this one answered.
-    /// Needs `point_lone`. Off: `supdb-layersasone`, and
-    /// `supdb-ingestlayersasone` buffered.
-    pub point_layers_lean: bool,
-    /// The placed read (`point_layers_lean`) takes a range under any
-    /// number of pieces, and leaves to the general read only a key with
-    /// more records than its frame keeps (`LAYERS_PIECES`) above the newest
-    /// tombstone, where it had left every range under more than that many
-    /// pieces. A put's tombstone ends the walk at the newest piece that
-    /// holds the key, so under puts a read keeps one or two. It asks for
-    /// the newest pieces' filters, at most `PLACED_ASKS` of them, as it did
-    /// for all of them. Beside a writer that appends faster than its merges
-    /// fold -- a live handle beside the overwriting arm's writer, the
-    /// threaded writers' mixes -- ten to thirty pieces stood over a
-    /// partition and every read took the general path. Off: the bound by
-    /// the pieces, `supdb-heldinplacepieces`.
-    pub point_placed_runs: bool,
-    /// A point read finds the key's partition by the partitions' upper
-    /// fences held as words (`State::fence_words`): each fence's bytes
-    /// big-endian in a `u128`, zero-padded, beside its length, and the
-    /// key's first sixteen bytes the same way, so that a step of the
-    /// search is two integer compares where it was a call to `memcmp`
-    /// through each partition's `Seg`. A fence of a word or less, which is
-    /// every fence a store names (`FENCE_MAX`), orders against a key as
-    /// its word and length do, the length breaking a tie of the words: a
-    /// tie says the fence is a prefix of the key's first sixteen bytes
-    /// padded with zeros, so the shorter of the two sorts first. A state
-    /// with a fence longer than a word searches the fences' bytes. The
-    /// placed partition's own fences are not compared again by the read:
-    /// the partitions tile the key space, so the one placed holds the key
-    /// in its range. Off: the search compares the fences' bytes.
-    pub point_fence_words: bool,
-    /// A point read that the shared table's lean probe found absent from
-    /// the live table (`Options::shared_lean`) takes the read of a store
-    /// that is a partition and the live table alone (`Reader::read_lone`)
-    /// where the store has no piece and no frozen table, with the table
-    /// left unread: that read refused any table that rewrites in place,
-    /// since such a table is read through a copy, and a key the probe has
-    /// found no record of has nothing in the table to copy. Off: such a
-    /// read takes the placed read (`Reader::read_placed`), which sets up
-    /// for frozen tables and pieces the store does not have.
-    pub point_lone_absent: bool,
     /// EXPERIMENT: a point read of a partition whose ordered index holds
     /// whole keys (`OrdIndex::uniform`: every key one length, no longer
     /// than the common prefix and eight bytes) finds its rank through the
@@ -7490,11 +7369,11 @@ pub struct Options {
 
 impl Options {
     /// Whether a point read takes the two-source or the layered read
-    /// where the store allows one (`point_lone`): the option, and none of
-    /// the arms that read a partition another way.
+    /// where the store allows one: none of the arms that read a partition
+    /// another way.
     #[inline(always)]
     fn point_lone_on(&self) -> bool {
-        self.point_lone && !self.exts_by_value && !self.point_via_ord
+        !self.point_via_ord
     }
 
     /// Whether the store keeps `Shared::points_far`, for the options that
@@ -7765,12 +7644,6 @@ impl Default for Options {
             flush_schedules: true,
             writer_pins: true,
             asym_pins: false,
-            exts_by_value: false,
-            point_lone: true,
-            point_layers_lean: true,
-            point_placed_runs: true,
-            point_fence_words: true,
-            point_lone_absent: true,
             point_via_ord: false,
             zpages: ZPages::Auto,
             zpages_min_bytes: zfile::ZMIN_RECS,
@@ -9874,8 +9747,7 @@ fn fence_lo(min_key: &[u8]) -> Vec<u8> {
 /// partition whose range holds it, where `words` are the upper fences of
 /// every partition but the last, in order (`State::part_of`).
 ///
-/// A fence or a key as the search compares it (`fence_word`,
-/// `Options::point_fence_words`) is its first sixteen
+/// A fence or a key as the search compares it (`fence_word`) is its first sixteen
 /// bytes big-endian in a word, padded with zeros, and how many of them it
 /// has. For a fence `h` of sixteen bytes or fewer, `h <= k` exactly where
 /// `fence_word(h) <= fence_word(k)`: words that differ differ first at a
@@ -16686,12 +16558,12 @@ const LIVE_SMALL: usize = 8;
 /// The pieces over a range a point read keeps the records of on its own
 /// frame (`Reader::read_layers`); a range under more takes the general
 /// read. The placed read keeps the records of the pieces that hold the key
-/// down to the newest tombstone, and with `Options::point_placed_runs` it
-/// is that count it bounds (`Reader::read_placed`).
+/// down to the newest tombstone, and it is that count it bounds
+/// (`Reader::read_placed`).
 const LAYERS_PIECES: usize = 8;
 
 /// The most pieces' filters a placed read asks for ahead of its probes, the
-/// newest (`Reader::place`, `Options::point_placed_runs`).
+/// newest (`Reader::place`).
 const PLACED_ASKS: usize = 4 * LAYERS_PIECES;
 
 /// No watermark: every chunk in a chain is visible, committed or not.
@@ -26063,11 +25935,11 @@ struct State {
     /// and then a read consults them all. What `pieces_aligned_over`
     /// finds by two searches of the pieces, taken once where the segments
     /// are published (`State::placing`) for the point read that asks at
-    /// every key (`pieces_placed`, `Options::point_layers_lean`).
+    /// every key (`pieces_placed`, `Reader::read_placed`).
     piece_runs: Vec<(u32, u32)>,
     /// The upper fence of every partition but the last, which has none,
     /// as a word and a length (`fence_word`), for the point read's search
-    /// (`State::part_of`, `Options::point_fence_words`); empty where a
+    /// (`State::part_of`); empty where a
     /// fence is longer than a word, and then the search compares bytes.
     /// Taken once where the segments are published (`State::placing`).
     fence_words: std::sync::Arc<[(u128, u8)]>,
@@ -27929,8 +27801,7 @@ pub struct Reader {
     /// threaded cells it is meant to be read beside would price.
     ord_served: std::cell::Cell<u64>,
     /// Point reads this handle answered by the two-source read and by the
-    /// layered one (`Reader::read_lone`, `Reader::read_layers`,
-    /// `Options::point_lone`), for a test that has to know which read its
+    /// layered one (`Reader::read_lone`, `Reader::read_layers`), for a test that has to know which read its
     /// store took (`point_lean_reads`).
     lone_reads: std::cell::Cell<u64>,
     /// The gets, puts and read-modify-writes the lean path answered
@@ -27949,8 +27820,7 @@ pub struct Reader {
     /// which a read the lean probe found absent from it makes none of.
     placed_live_probes: std::cell::Cell<u64>,
     layer_reads: std::cell::Cell<u64>,
-    /// Of `layer_reads`, the ones `read_placed` answered
-    /// (`Options::point_layers_lean`).
+    /// Of `layer_reads`, the ones `read_placed` answered.
     placed_reads: std::cell::Cell<u64>,
     /// Of the lean reads, the ones a tombstone in the live table's chain
     /// ended: answered by the live table alone, whatever the store below
@@ -32127,17 +31997,16 @@ impl State {
     }
 
     /// The partition whose range holds `key`: the first whose upper fence
-    /// is above it. By the fences' words where `words` asks and the state
-    /// has them (`Options::point_fence_words`), else by their bytes; the
-    /// two agree for every fence a word holds (`fence_word`).
+    /// is above it. By the fences' words where the state has them, else by
+    /// their bytes; the two agree for every fence a word holds
+    /// (`fence_word`).
     #[inline(always)]
-    fn part_of(&self, key: &[u8], words: bool) -> usize {
+    fn part_of(&self, key: &[u8]) -> usize {
         let np = self.parts;
         if np <= 1 {
             return 0;
         }
-        let words = words.then_some(&*self.fence_words);
-        part_by(words, np, key, || {
+        part_by(Some(&*self.fence_words), np, key, || {
             self.segs[..np].partition_point(|s| s.hi.as_ref().is_some_and(|h| h.as_slice() <= key))
         })
     }
@@ -32988,8 +32857,7 @@ impl Reader {
 
     /// Point reads this handle answered by the read of a partition and
     /// the live table alone, and by the layered read of every source in
-    /// its common shape (`Options::point_lone`); both zero without the
-    /// option, and a read counted in neither took the general read. A
+    /// its common shape; a read counted in neither took the general read. A
     /// handle's own count, as `ord_point_reads` is.
     /// A test's: the length of the live table this handle reads as it was
     /// last carried, not carried here (`Options::shared_len_lazy`).
@@ -33042,7 +32910,7 @@ impl Reader {
 
     /// Of the layered reads `point_lean_reads` counts, the ones the read
     /// that places its sources first answered
-    /// (`Options::point_layers_lean`, `Reader::read_placed`); the rest
+    /// (`Reader::read_placed`); the rest
     /// were `read_layers`'. A handle's own count.
     pub fn point_placed_reads(&self) -> u64 {
         self.placed_reads.get()
@@ -34192,7 +34060,7 @@ impl Reader {
             return None;
         }
         let fnv = crate::flatindex::key_hash(key);
-        let at = st.part_of(key, self.opts.point_fence_words);
+        let at = st.part_of(key);
         if let Some(seg) = st.segs[..st.parts].get(at) {
             seg.prefetch_slot(fnv);
         }
@@ -34226,18 +34094,13 @@ impl Reader {
     }
 
     /// Whether the partition `seg`, which the read placed for `key`
-    /// (`State::part_of`), may hold it: its filter alone where the
-    /// placement is by the fences' words (`Options::point_fence_words`),
-    /// since the partitions tile the key space and the one placed holds
-    /// the key in its range, and its fences and filter otherwise.
+    /// (`State::part_of`), may hold it: its filter alone, since the
+    /// partitions tile the key space and the one placed holds the key in
+    /// its range.
     #[inline(always)]
     fn placed_may_hold(&self, seg: &Seg, key: &[u8], fnv: u64) -> bool {
-        if self.opts.point_fence_words {
-            debug_assert!(!seg.below_lo(key) && seg.hi.as_ref().is_none_or(|h| key < h.as_slice()));
-            seg.bloom.as_ref().is_none_or(|b| b.maybe_contains_fnv(fnv))
-        } else {
-            seg.may_hold_fnv(key, fnv)
-        }
+        debug_assert!(!seg.below_lo(key) && seg.hi.as_ref().is_none_or(|h| key < h.as_slice()));
+        seg.bloom.as_ref().is_none_or(|b| b.maybe_contains_fnv(fnv))
     }
 
     /// The live table's read of `key` where it is a shared table of
@@ -34253,7 +34116,7 @@ impl Reader {
     }
 
     /// `read_layers` with its sources asked in the order of what each
-    /// costs (`Options::point_layers_lean`): `None`, with nothing handed to
+    /// costs: `None`, with nothing handed to
     /// `f`, for every store and key that read leaves to the general one,
     /// and for a store with a frozen table that was a run of ordered
     /// ingest, which is that read's.
@@ -34279,7 +34142,7 @@ impl Reader {
         pre: Option<(u64, usize)>,
         f: &mut F,
     ) -> Option<Result<u64>> {
-        if !self.opts.point_layers_lean || !self.opts.point_lone_on() {
+        if !self.opts.point_lone_on() {
             return None;
         }
         let (segs, mem) = (&st.segs, &*st.mem);
@@ -34304,8 +34167,8 @@ impl Reader {
             None => crate::flatindex::key_hash(key),
         };
         let (at, l0) = match pre {
-            Some((_, at)) => Reader::place_at(&self.opts, st, at, fnv, false)?,
-            None => Reader::place(&self.opts, st, key, fnv)?,
+            Some((_, at)) => Reader::place_at(st, at, fnv, false),
+            None => Reader::place(st, key, fnv),
         };
         // The live table first: the values of the key's chain newest
         // first, the first `live_n` of `live`. They are slices of the
@@ -34390,8 +34253,7 @@ impl Reader {
                 }
                 if let Some(c) = seg.raw().find_fixed_hashed(key, fnv)? {
                     // More records above the newest tombstone than the
-                    // frame keeps: the general read's
-                    // (`Options::point_placed_runs`).
+                    // frame keeps: the general read's.
                     if held == LAYERS_PIECES {
                         return None;
                     }
@@ -34442,7 +34304,7 @@ impl Reader {
 
     /// A point read over a partition, the pieces over its range, the
     /// frozen tables and the live one, where each holds the key in its
-    /// common shape (`Options::point_lone`): `None`, with nothing handed
+    /// common shape: `None`, with nothing handed
     /// to `f`, for any other store or key, which `read_sources` reads.
     ///
     /// One pass, newest source first, to the newest tombstone: the live
@@ -34478,7 +34340,7 @@ impl Reader {
         if np == 0 {
             return None;
         }
-        let at = st.part_of(key, self.opts.point_fence_words);
+        let at = st.part_of(key);
         let l0 = st.pieces_over(np, at);
         if l0.len() > LAYERS_PIECES {
             return None;
@@ -34558,11 +34420,10 @@ impl Reader {
     }
 
     /// A point read where the key's sources are the partition and the
-    /// live table (`Options::point_lone`): `None`, with nothing handed to
+    /// live table: `None`, with nothing handed to
     /// `f`, for every other store, which `read_sources` reads. With
     /// `live_absent`, the shared table's lean probe has found no record of
-    /// the key in the live table, which is then left unread
-    /// (`Options::point_lone_absent`). `pre` is the key's FNV word and
+    /// the key in the live table, which is then left unread. `pre` is the key's FNV word and
     /// partition where the read took them ahead of the live table's probe
     /// (`Options::shared_fall_ahead`).
     #[inline(always)]
@@ -34588,7 +34449,7 @@ impl Reader {
         // A table that rewrites in place is read through a copy, which the
         // general read takes (`MemTable::live_values`), unless the lean
         // probe found nothing of the key there to copy.
-        let absent = live_absent && self.opts.point_lone_absent;
+        let absent = live_absent;
         if !absent && mem.rewrites_now() {
             return None;
         }
@@ -34628,7 +34489,7 @@ impl Reader {
             };
             let at = match pre {
                 Some((_, at)) => at,
-                None => st.part_of(key, self.opts.point_fence_words),
+                None => st.part_of(key),
             };
             if let Some(seg) = segs.get(at).filter(|s| self.placed_may_hold(s, key, fnv)) {
                 match seg.raw().read_all_fixed_hashed(key, fnv, f) {
@@ -34648,40 +34509,30 @@ impl Reader {
     }
 
     /// The placed read's partition for `key` and the pieces over it, with
-    /// the asks for the lines their probes load first; `None` where the
-    /// pieces are more than the
-    /// read takes. Inlined at both of the read's places for it, since as a
-    /// closure it was a call and fifty instructions of every read.
+    /// the asks for the lines their probes load first. Inlined at both of
+    /// the read's places for it, since as a closure it was a call and fifty
+    /// instructions of every read.
     #[inline(always)]
-    fn place<'s>(
-        opts: &Options,
-        st: &'s State,
-        key: &[u8],
-        fnv: u64,
-    ) -> Option<(usize, &'s [std::sync::Arc<Seg>])> {
-        let at = st.part_of(key, opts.point_fence_words);
-        Reader::place_at(opts, st, at, fnv, true)
+    fn place<'s>(st: &'s State, key: &[u8], fnv: u64) -> (usize, &'s [std::sync::Arc<Seg>]) {
+        let at = st.part_of(key);
+        Reader::place_at(st, at, fnv, true)
     }
 
     /// `place` for a key whose partition `at` the read has, its slot
     /// asked for already where `ask_slot` is false.
     #[inline(always)]
-    fn place_at<'s>(
-        opts: &Options,
-        st: &'s State,
+    fn place_at(
+        st: &State,
         at: usize,
         fnv: u64,
         ask_slot: bool,
-    ) -> Option<(usize, &'s [std::sync::Arc<Seg>])> {
+    ) -> (usize, &[std::sync::Arc<Seg>]) {
         let (segs, np) = (&st.segs, st.parts);
         let l0 = st.pieces_placed(at);
         debug_assert!(
             std::ptr::eq(l0, st.pieces_over(np, at)),
             "the pieces a publish placed over a partition are the ones a search finds"
         );
-        if !opts.point_placed_runs && l0.len() > LAYERS_PIECES {
-            return None;
-        }
         // The partition's slot first: it is the read's longest wait where
         // no tombstone masks the partition, and the tables' probes and the
         // pieces' filters are the lead for it. The newest pieces' filters,
@@ -34692,7 +34543,7 @@ impl Reader {
         for seg in l0.iter().rev().take(PLACED_ASKS) {
             seg.prefetch_probe(fnv);
         }
-        Some((at, l0))
+        (at, l0)
     }
 
     /// A point read over every source that may hold the key: the
@@ -34717,7 +34568,7 @@ impl Reader {
             mem.prefetch_hashed(mem.hash_with(key, fnv))
         };
         let np = segs.partition_point(|s| s.level > 0);
-        let at = st.part_of(key, self.opts.point_fence_words);
+        let at = st.part_of(key);
         let holds = |s: &Seg| s.may_hold_fnv(key, fnv);
         let part = segs[..np].get(at).filter(|s| holds(s));
         let l0 = st.pieces_over(np, at);
@@ -34762,16 +34613,11 @@ impl Reader {
             (0, Probed::default())
         };
         let mut n = 0u64;
-        // The segment read lends the extents on the index's frame; the arm
-        // takes them by value, the shape before (`Options::exts_by_value`).
-        let by_value = self.opts.exts_by_value;
+        // The segment read lends the extents on the index's frame.
         let seg_read = |seg: &Seg, f: &mut F| {
-            if by_value {
-                seg.raw().read_all_by_value(key, f)
-            } else {
-                seg.raw().read_all_fixed_hashed(key, fnv, f)
-            }
-            .map_err(|e| err(&format!("segment read: {e}")))
+            seg.raw()
+                .read_all_fixed_hashed(key, fnv, f)
+                .map_err(|e| err(&format!("segment read: {e}")))
         };
         if start == 0 {
             if let Some(seg) = part {
@@ -43421,7 +43267,7 @@ impl Reader {
             mem.prefetch_hashed(mem.hash_with(key, fnv))
         };
         let np = segs.partition_point(|s| s.level > 0);
-        let at = st.part_of(key, self.opts.point_fence_words);
+        let at = st.part_of(key);
         let holds = |s: &Seg| s.may_hold_fnv(key, fnv);
         let raw_count = |s: &Seg| {
             s.raw()
