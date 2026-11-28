@@ -1348,7 +1348,6 @@ pub struct Supdb {
     rotate: bool,
     nofrozen: bool,
     idle: bool,
-    sortover: bool,
     /// Segments written in 2 MB pieces, `SegmentOptions::write_piece`.
     /// `supdb-pmd`, and `supdb-ingestpmd` buffered.
     pmd: bool,
@@ -1508,14 +1507,6 @@ pub struct Supdb {
     /// before light forms converted (`Options::forms_convert_from`):
     /// `supdb-convert16` and `supdb-ingestconvert16`.
     convert16: bool,
-    /// A wide block's overlay merged from every source in full for a scan
-    /// (`Options::scan_wide_capped` off): `supdb-widefull` and
-    /// `supdb-ingestwidefull`.
-    widefull: bool,
-    /// The tombstone search for every overlay key, a lone source's too
-    /// (`Options::emit_lone_unsearched` off): `supdb-lonetombs` and
-    /// `supdb-ingestlonetombs`.
-    lonetombs: bool,
     /// A block wide by its count walked wide for as long as it is
     /// (`Options::forms_copy_hot_wide` off): `supdb-widewalks` and
     /// `supdb-ingestwidewalks`.
@@ -2981,10 +2972,6 @@ struct Policy {
     /// (`Options::seal_idle`). `supdb-idle`, and `supdb-shapeidle` under
     /// the shape.
     idle: bool,
-    /// A block over pieces sorts the pieces' keys whole rather than
-    /// merging their runs: `Options::overlay_merge` off. `supdb-sortover`,
-    /// and `supdb-shapesortover` under the shape.
-    sortover: bool,
     /// Segments written in 2 MB pieces at 2 MB offsets, the page cache's
     /// PMD-sized folios, where the engine writes a megabyte:
     /// `SegmentOptions::write_piece`. `supdb-pmd`, and `supdb-ingestpmd`
@@ -3084,10 +3071,6 @@ struct Policy {
     densefrom: usize,
     /// Conversions at the dense count alone: `...convert16`.
     convert16: bool,
-    /// A wide block's overlay merged in full: `...widefull`.
-    widefull: bool,
-    /// Every overlay key's tombstone search: `...lonetombs`.
-    lonetombs: bool,
     /// A hot wide block walked wide: `...widewalks`.
     widewalks: bool,
     /// A hot wide block copied by the fixed ratio: `...widecopyfixed`.
@@ -3739,7 +3722,6 @@ impl Default for Policy {
             rotate: false,
             nofrozen: false,
             idle: false,
-            sortover: false,
             pmd: false,
             settlefreeze: false,
             convertcap: false,
@@ -3783,8 +3765,6 @@ impl Default for Policy {
             scanlevers: false,
             densefrom: 0,
             convert16: false,
-            widefull: false,
-            lonetombs: false,
             widewalks: false,
             widecopyfixed: false,
             pacesyncsbatch: false,
@@ -4600,18 +4580,6 @@ impl Supdb {
             path,
             Policy {
                 nofrozen: true,
-                ..Policy::default()
-            },
-        )
-    }
-
-    /// `supdb` whose blocks over pieces sort the pieces' keys whole
-    /// (`Options::overlay_merge` off), the shape before the merge.
-    pub fn create_sortover(path: &Path) -> Res<Supdb> {
-        Supdb::with_policy(
-            path,
-            Policy {
-                sortover: true,
                 ..Policy::default()
             },
         )
@@ -5901,23 +5869,6 @@ impl Supdb {
                 partition: false,
                 durable: false,
                 bglag: true,
-                ..Policy::default()
-            },
-        )
-    }
-
-    /// `supdb-ingestshape` whose blocks over pieces sort the pieces' keys
-    /// whole, as `supdb-sortover`: the arm that keeps its pieces until a
-    /// read shapes the store.
-    pub fn create_shape_sortover(path: &Path) -> Res<Supdb> {
-        Supdb::with_policy(
-            path,
-            Policy {
-                partition: false,
-                drain: false,
-                durable: false,
-                shape: true,
-                sortover: true,
                 ..Policy::default()
             },
         )
@@ -10832,7 +10783,6 @@ impl Supdb {
             rotate,
             nofrozen,
             idle,
-            sortover,
             pmd,
             settlefreeze,
             convertcap,
@@ -10876,8 +10826,6 @@ impl Supdb {
             scanlevers,
             densefrom,
             convert16,
-            widefull,
-            lonetombs,
             widewalks,
             widecopyfixed,
             pacesyncsbatch,
@@ -11547,8 +11495,6 @@ impl Supdb {
                 && std::env::var("CONVWRITER").as_deref() == Ok("1"),
             forms_convert_light_yields: densefrom > 0
                 && std::env::var("CONVSTRICT").as_deref() == Ok("1"),
-            scan_wide_capped: !widefull,
-            emit_lone_unsearched: !lonetombs,
             forms_copy_hot_wide: !widewalks,
             forms_copy_wide_priced: !widecopyfixed,
             upkeep_pace_syncs_to_share: !pacesyncsbatch,
@@ -11648,7 +11594,6 @@ impl Supdb {
             adaptive_shape: shape,
             seal_rotates_wal: rotate,
             frozen_snaps: !nofrozen,
-            overlay_merge: !sortover,
             seal_idle: idle,
             // Below this the builder declines and the writer fills the
             // forms inline on the commit path instead, which is the
@@ -11963,7 +11908,6 @@ impl Supdb {
             rotate,
             nofrozen,
             idle,
-            sortover,
             pmd,
             settlefreeze,
             convertcap,
@@ -12007,8 +11951,6 @@ impl Supdb {
             scanlevers,
             densefrom,
             convert16,
-            widefull,
-            lonetombs,
             widewalks,
             widecopyfixed,
             pacesyncsbatch,
@@ -13017,13 +12959,6 @@ impl Engine for Supdb {
                 "supdb-ingestbglag"
             };
         }
-        if self.sortover {
-            return if self.shape {
-                "supdb-shapesortover"
-            } else {
-                "supdb-sortover"
-            };
-        }
         if self.nofrozen {
             return if self.shape {
                 "supdb-shapenofrozen"
@@ -13248,13 +13183,6 @@ impl Engine for Supdb {
                 "supdb-ingestreadnoahead"
             };
         }
-        if self.widefull {
-            return if self.partition {
-                "supdb-widefull"
-            } else {
-                "supdb-ingestwidefull"
-            };
-        }
         if self.pacesyncsbatch {
             return "supdb-pacesyncsbatch";
         }
@@ -13301,13 +13229,6 @@ impl Engine for Supdb {
                 "supdb-widecopyfixed"
             } else {
                 "supdb-ingestwidecopyfixed"
-            };
-        }
-        if self.lonetombs {
-            return if self.partition {
-                "supdb-lonetombs"
-            } else {
-                "supdb-ingestlonetombs"
             };
         }
         if self.convert16 {
@@ -16879,7 +16800,6 @@ pub fn guarantee(arm: &str) -> Option<Guarantee> {
         | "supdb-rotate"
         | "supdb-nofrozen"
         | "supdb-idle"
-        | "supdb-sortover"
         | "supdb-pmd"
         | "supdb-hold"
         | "supdb-settlefreeze"
@@ -16928,10 +16848,6 @@ pub fn guarantee(arm: &str) -> Option<Guarantee> {
         | "supdb-ingestdensefrom"
         | "supdb-convert16"
         | "supdb-ingestconvert16"
-        | "supdb-widefull"
-        | "supdb-ingestwidefull"
-        | "supdb-lonetombs"
-        | "supdb-ingestlonetombs"
         | "supdb-widewalks"
         | "supdb-ingestwidewalks"
         | "supdb-widecopyfixed"
@@ -17042,7 +16958,6 @@ pub fn guarantee(arm: &str) -> Option<Guarantee> {
         | "supdb-shaperotate"
         | "supdb-shapenofrozen"
         | "supdb-shapeidle"
-        | "supdb-shapesortover"
         | "supdb-ingestpmd"
         | "supdb-ingestsettlefreeze"
         | "supdb-ingestconvertcap"
@@ -18141,8 +18056,6 @@ pub fn open(arm: &str, dir: &Path, map_gb: usize) -> Res<Box<dyn Engine>> {
         "supdb-nofrozen" => supdb_arm(Supdb::create_nofrozen, dir)?,
         "supdb-shaperotate" => supdb_arm(Supdb::create_shape_rotate, dir)?,
         "supdb-shapenofrozen" => supdb_arm(Supdb::create_shape_nofrozen, dir)?,
-        "supdb-sortover" => supdb_arm(Supdb::create_sortover, dir)?,
-        "supdb-shapesortover" => supdb_arm(Supdb::create_shape_sortover, dir)?,
         "supdb-pmd" => supdb_arm(Supdb::create_pmd, dir)?,
         "supdb-ingestpmd" => supdb_arm(Supdb::create_ingest_pmd, dir)?,
         "supdb-settlefreeze" => supdb_arm(Supdb::create_settlefreeze, dir)?,
@@ -18255,58 +18168,6 @@ pub fn open(arm: &str, dir: &Path, map_gb: usize) -> Res<Box<dyn Engine>> {
                         partition: false,
                         durable: false,
                         readnoahead: true,
-                        ..Policy::default()
-                    },
-                )
-            },
-            dir,
-        )?,
-        "supdb-widefull" => supdb_arm(
-            |d| {
-                Supdb::with_policy(
-                    d,
-                    Policy {
-                        widefull: true,
-                        ..Policy::default()
-                    },
-                )
-            },
-            dir,
-        )?,
-        "supdb-ingestwidefull" => supdb_arm(
-            |d| {
-                Supdb::with_policy(
-                    d,
-                    Policy {
-                        partition: false,
-                        durable: false,
-                        widefull: true,
-                        ..Policy::default()
-                    },
-                )
-            },
-            dir,
-        )?,
-        "supdb-lonetombs" => supdb_arm(
-            |d| {
-                Supdb::with_policy(
-                    d,
-                    Policy {
-                        lonetombs: true,
-                        ..Policy::default()
-                    },
-                )
-            },
-            dir,
-        )?,
-        "supdb-ingestlonetombs" => supdb_arm(
-            |d| {
-                Supdb::with_policy(
-                    d,
-                    Policy {
-                        partition: false,
-                        durable: false,
-                        lonetombs: true,
                         ..Policy::default()
                     },
                 )
@@ -23166,21 +23027,6 @@ mod tests {
             }
             {
                 let z = Supdb::with_policy(
-                    &dir("widefull"),
-                    Policy {
-                        widefull: true,
-                        ..Policy::default()
-                    },
-                )
-                .unwrap();
-                assert_eq!(z.name(), "supdb-widefull");
-                assert_eq!(z.features(), base.features());
-                let o = z.db.as_ref().unwrap().options();
-                assert!(!o.scan_wide_capped && b.scan_wide_capped);
-                assert!(o.emit_lone_unsearched);
-            }
-            {
-                let z = Supdb::with_policy(
                     &dir("probestwice"),
                     Policy {
                         probestwice: true,
@@ -23311,21 +23157,6 @@ mod tests {
                 let o = z.db.as_ref().unwrap().options();
                 assert!(!o.forms_copy_wide_priced && b.forms_copy_wide_priced);
                 assert!(o.forms_copy_hot_wide);
-            }
-            {
-                let z = Supdb::with_policy(
-                    &dir("lonetombs"),
-                    Policy {
-                        lonetombs: true,
-                        ..Policy::default()
-                    },
-                )
-                .unwrap();
-                assert_eq!(z.name(), "supdb-lonetombs");
-                assert_eq!(z.features(), base.features());
-                let o = z.db.as_ref().unwrap().options();
-                assert!(!o.emit_lone_unsearched && b.emit_lone_unsearched);
-                assert!(o.scan_wide_capped);
             }
             {
                 let z = Supdb::with_policy(

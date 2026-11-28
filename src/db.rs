@@ -3624,14 +3624,6 @@ pub struct Options {
     /// the arm.
     #[doc(hidden)]
     pub wal_ahead_beside: bool,
-    /// The ordered scan's merge over unrouted sources. `true` is the merge
-    /// that replaced the original: one cursor over the disjoint partitions
-    /// in order rather than one per partition, each cursor's key resolved
-    /// once per emitted key, and the unsealed snapshot carrying each key's
-    /// memtable entry so the emit is a chain walk over a reused buffer
-    /// instead of two hash probes and an allocation. `false` is the merge
-    /// before it, kept as the comparison arm.
-    pub scan_merge: bool,
     /// PROTOTYPE, on by default: keep merged copies of the partition
     /// blocks that scans read over unsealed keys, so a scan over them
     /// walks one sorted copy instead of merging. `false` is the merge on
@@ -3809,26 +3801,6 @@ pub struct Options {
     /// ahead (`Options::scan_raw_ahead`), which keeps its own path.
     /// `supdb-runsheld` is the arm.
     pub scan_runs_held: bool,
-    /// A wide block's overlay for a scan merged only as far as the scan
-    /// reads: the walk takes at most its limit of the overlay's keys, and
-    /// the window took its limit of keys from every source and merged them
-    /// all -- the level-0 pieces' runs read key by key and merged, the
-    /// memtables' folded -- so a scan starting among the inserts above the
-    /// store merged a limit from each of nine or ten pieces for the limit
-    /// it emitted, 28,000 instructions a scan on the scrambled E at a
-    /// hundred thousand keys, and about half that capped. The answer is
-    /// the same and the work strictly less, so the count is the verdict;
-    /// the scrambled E leaned its way in both orders, under what a pairing
-    /// resolves. Off is that merge (`supdb-widefull`).
-    pub scan_wide_capped: bool,
-    /// An overlay key one source holds, with no partition record of its
-    /// own, emitted without the search for the newest tombstone: the
-    /// search only decides which older sources a tombstone cuts, and a
-    /// lone source is emitted whatever it finds. It was a third of the
-    /// overlay's 620 instructions a key on the scrambled E's inserts above
-    /// the store, each in one source. Off is the search for every key
-    /// (`supdb-lonetombs`).
-    pub emit_lone_unsearched: bool,
     /// A block wide by its count of keys above the partition -- the last
     /// block, where every insert past the store's greatest key lands --
     /// copied once its walks have paid for the copy, and the copy kept past
@@ -4964,13 +4936,6 @@ pub struct Options {
     /// before it, where each sorted the table for itself; `supdb-nofrozen`
     /// prices it.
     pub frozen_snaps: bool,
-    /// A block built over level-0 pieces merges the pieces' runs of keys
-    /// over it, each already in key order, comparing their heads by the
-    /// keys' leading sixteen bytes as two words (`merge_runs`). Off is the
-    /// shape before it, a comparison sort of all of them through the keys
-    /// themselves; `supdb-sortover` and, under the shape,
-    /// `supdb-shapesortover` price it.
-    pub overlay_merge: bool,
     /// EXPERIMENT: keys of one block in a settle's backlog from which
     /// the block is dropped and built once rather than patched key by
     /// key. A patch resolves one key's run against every source and
@@ -8284,7 +8249,6 @@ impl Default for Options {
             wal_ahead_beside: false,
             read_advice: ReadAdvice::default(),
             scan_readahead_bytes: 256 << 10,
-            scan_merge: true,
             scan_block_cache: true,
             scan_cache_bytes: 0,
             scan_cache_auto: true,
@@ -8303,8 +8267,6 @@ impl Default for Options {
             forms_convert_light_yields: false,
             scan_prefetch_sparse_span: false,
             scan_runs_held: false,
-            scan_wide_capped: true,
-            emit_lone_unsearched: true,
             forms_copy_hot_wide: true,
             forms_copy_wide_priced: true,
             seek_prefetch_dir: true,
@@ -8360,7 +8322,6 @@ impl Default for Options {
             snapshot_extend_unfolded: true,
             snapshot_build_lean: true,
             frozen_snaps: true,
-            overlay_merge: true,
             scan_lazy_snapshot: false,
             scan_forms_off_unreused: true,
             scan_forms_off_counts_built: false,
@@ -36134,13 +36095,13 @@ impl Reader {
                 Walk::Resume { .. } => Err(err("block scan: stopped with a snapshot in hand")),
             };
         }
-        let mut mc = unsealed.cursor(from);
+        let mc = unsealed.cursor(from);
 
         // With no level-0 piece the partitions tile the key space in order
         // and the unsealed keys are one sorted array, so the partitions can
         // be walked in bulk by `Blob::scan_at`, which resolves each key
         // once, with the unsealed keys laid over the walk where they fall.
-        // The merge below costs five or six index lookups an entry (a
+        // A merge over the sources cost five or six index lookups an entry (a
         // key_at per cursor to find the minimum, another to emit, and a
         // third inside `values_at`) where this costs one, and after a
         // routed flush this is the shape the store is in. An earlier
@@ -36149,117 +36110,7 @@ impl Reader {
         if !self.segs().iter().any(|s| s.level == 0) {
             return self.scan_partitions(from, limit, mc, unsealed, f);
         }
-
-        if self.opts.scan_merge {
-            return self.scan_merged(from, limit, mc, unsealed, f);
-        }
-
-        // A k-way merge over rank cursors, allocating nothing per key.
-        //
-        // The version before this one materialised every candidate key from
-        // every source, sorted them and re-read each one: three copies and
-        // a sort per key, which cost more than the reads. `Blob::key_at`
-        // borrows out of the mapped index and the unsealed snapshot is
-        // already sorted, so the merge can run on borrowed keys and emit
-        // values straight from the position it is already holding.
-        let mut cursors: Vec<(&std::sync::Arc<Seg>, usize)> = self
-            .segs()
-            .iter()
-            .filter(|s| s.may_reach(from))
-            .map(|s| (s, s.ord.seek(s.cursor_from(from), |r| s.raw().key_at(r))))
-            .collect();
-
-        let tombs = self.has_tombstones();
-        let mut seen = 0usize;
-        while seen < limit {
-            // The next key is the smallest any source is holding.
-            let mut next: Option<&[u8]> = None;
-            for (seg, rank) in &cursors {
-                if let Some(k) = seg.raw().key_at(*rank) {
-                    if next.is_none_or(|n| k < n) {
-                        next = Some(k);
-                    }
-                }
-            }
-            if let Some((k, _)) = unsealed.peek(mc) {
-                if next.is_none_or(|n| k < n) {
-                    next = Some(k);
-                }
-            }
-            let Some(key) = next else { break };
-
-            // Emit in append order -- partitions, then L0 oldest to
-            // newest, then the frozen memtables oldest first, then the live
-            // one -- and advance every cursor that was sitting on this key.
-            // Sources are ordered oldest to newest -- the cursors, then the
-            // frozen memtables, then the live one -- so the newest source
-            // with a tombstone for this key is a cut, and live values start
-            // there.
-            let nc = cursors.len();
-            let in_unsealed = unsealed.peek(mc).map(|(k, _)| k) == Some(key);
-            let mut start = 0usize;
-            if tombs {
-                if in_unsealed {
-                    if self
-                        .mem()
-                        .get(key, self.len_bound.get())
-                        .is_some_and(|e| self.mem().has_tomb(e, self.wm()))
-                    {
-                        start = nc + self.frozen().len();
-                    } else if let Some(i) = self.frozen().iter().rposition(|fr| {
-                        fr.get(key, MemTable::ALL)
-                            .is_some_and(|e| fr.has_tomb(e, SEE_ALL))
-                    }) {
-                        start = nc + i;
-                    }
-                }
-                if start == 0 {
-                    for (j, (seg, rank)) in cursors.iter().enumerate().rev() {
-                        if seg.tombs && seg.raw().key_at(*rank) == Some(key) {
-                            if let Some((_, exts)) = seg.raw().exts_at(*rank) {
-                                if exts.iter().any(|e| e.is_tombstone()) {
-                                    start = j;
-                                    break;
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-            for (j, (seg, rank)) in cursors.iter_mut().enumerate() {
-                if seg.raw().key_at(*rank) == Some(key) {
-                    if j >= start {
-                        seg.raw()
-                            .values_at(*rank, |v| f(key, v))
-                            .map_err(|e| err(&format!("segment scan read: {e}")))?;
-                    }
-                    *rank += 1;
-                }
-            }
-            if in_unsealed {
-                for (i, fr) in self.frozen().iter().enumerate() {
-                    if nc + i < start {
-                        continue;
-                    }
-                    if let Some(e) = fr.get(key, MemTable::ALL) {
-                        for off in fr.live_chain(e, SEE_ALL).0 {
-                            f(key, fr.value_at(off));
-                        }
-                    }
-                }
-                if nc + self.frozen().len() >= start {
-                    if let Some(e) = self.mem().get(key, self.len_bound.get()) {
-                        let (mut offs, mut copy) = (Vec::new(), ChainCopy::default());
-                        self.mem()
-                            .live_values(e, self.wm(), &mut offs, &mut copy, |v| f(key, v));
-                    }
-                }
-                unsealed.advance(&mut mc);
-            }
-            seen += 1;
-        }
-        self.zcensus_scanned(seen);
-        Ok(seen)
+        self.scan_merged(from, limit, mc, unsealed, f)
     }
 
     /// PROTOTYPE: every cached block dropped, and the flag that says a
@@ -38544,7 +38395,6 @@ impl Reader {
             wide_copy: false,
             copy_exact: self.opts.copy_exact,
             fit: self.fits(),
-            merge_pieces: self.opts.overlay_merge,
             pieces_only: self.opts.forms_pieces_only,
             ranks_by_heads: self.opts.piece_ranks_by_heads,
             ranks_whole: self.opts.piece_ranks_whole,
@@ -43987,8 +43837,8 @@ impl Reader {
         Ok(())
     }
 
-    /// The merge over unrouted sources, the `scan_merge` arm: one cursor walking the
-    /// disjoint partitions in order, one cursor per level-0 segment, and the
+    /// The merge over unrouted sources: one cursor walking the disjoint
+    /// partitions in order, one cursor per level-0 segment, and the
     /// unsealed snapshot with each key's entries in hand. Every cursor's key
     /// is resolved once per emitted key. Sources are ordered oldest to
     /// newest -- the partition, level 0 oldest first, the frozen memtables
@@ -54663,7 +54513,6 @@ impl Reader {
         let unsealed = self.snapshot_to(len, self.adopt_snapshot().filter(|s| s.live_len <= len));
         let ctx = BuildCtx {
             copy_dense: true,
-            merge_pieces: self.opts.overlay_merge,
             ..self.build_ctx()
         };
         // Under a budget, the forms queued for the install are bounded
@@ -57547,9 +57396,6 @@ struct BuildCtx<'s> {
     ranks_by_heads: bool,
     /// See `Options::piece_ranks_whole`.
     ranks_whole: bool,
-    /// The pieces' runs over a block merged on their keys' leading words
-    /// (`merge_runs`) rather than sorted whole: `Options::overlay_merge`.
-    merge_pieces: bool,
 }
 
 impl<'s> BuildCtx<'s> {
@@ -57869,9 +57715,9 @@ impl<'s> BuildCtx<'s> {
         Ok(Self::fold_overs(out, fresh, UKey::merge, cap))
     }
     /// `overlay_mem` for a walk that takes at most `cap` of its keys, with
-    /// the filed keys in key order (`Options::scan_wide_capped`): the
-    /// sources merged by their heads and stopped at the `cap`th key, where
-    /// each source's window was listed whole and the lists folded. A key's
+    /// the filed keys in key order: the sources merged by their heads and
+    /// stopped at the `cap`th key, where each source's window was listed
+    /// whole and the lists folded. A key's
     /// entry is folded from its sources in `overlay_mem`'s order -- the
     /// bases oldest first, the live run, the keys filed since -- and its cut
     /// is the first of theirs a source knows.
@@ -58120,9 +57966,7 @@ impl<'s> BuildCtx<'s> {
                     .key_at(r)
                     .ok_or_else(|| err("block cache: a rank did not resolve"))?;
                 let cut = ranks.map_or(u32::MAX, |v| v[r]);
-                if self.merge_pieces {
-                    pre.push(key_prefix(k));
-                }
+                pre.push(key_prefix(k));
                 held.push((k, *j, r, cut));
             }
             if held.len() > start {
@@ -58137,9 +57981,9 @@ impl<'s> BuildCtx<'s> {
                 stale,
             });
         }
-        if !self.merge_pieces {
-            held.sort_by(|x, y| x.0.cmp(y.0).then(x.1.cmp(&y.1)));
-        } else if runs.len() > 1 {
+        // The pieces' runs, each in key order already, merged on their
+        // keys' leading sixteen bytes as two words (`merge_runs`).
+        if runs.len() > 1 {
             held = merge_runs(&held, &pre, &mut runs);
         }
         let mut over: Vec<Over> = Vec::with_capacity(mem.len() + held.len());
@@ -58184,8 +58028,8 @@ impl<'s> BuildCtx<'s> {
         })
     }
     /// `overlay_runs` for a walk that takes at most `cap` of the overlay's
-    /// keys (`Options::scan_wide_capped`): the memtables' keys and the
-    /// pieces' runs merged by their heads, each piece's key read as its
+    /// keys: the memtables' keys and the pieces' runs merged by their
+    /// heads, each piece's key read as its
     /// head moves, and stopped at the `cap`th key. The keys and the piece
     /// entries are `overlay_runs`' first `cap`, in its order: a key's
     /// pieces oldest first and its cut the first of theirs a source knows,
@@ -58500,13 +58344,13 @@ impl<'s> BuildCtx<'s> {
         let key_of = |slot: u32| self.mem.key_of(self.mem.entry(slot as usize));
         let f0 = wide.sorted.partition_point(|&(i, _)| key_of(i) < cursor);
         let filed = &wide.sorted[f0..wide.sorted.len().min(f0.saturating_add(limit))];
-        // A scan's walk takes at most `limit` of the overlay's keys
-        // (`Options::scan_wide_capped`).
-        let cap = if self.rd.opts.scan_wide_capped {
-            limit
-        } else {
-            usize::MAX
-        };
+        // A scan's walk takes at most `limit` of the overlay's keys, and the
+        // window merges its sources only as far as the scan reads: merged
+        // from every source in full, a scan starting among the inserts above
+        // the store merged a limit from each of nine or ten pieces for the
+        // limit it emitted, 28,000 instructions a scan on the scrambled E at
+        // a hundred thousand keys, and about half that capped.
+        let cap = limit;
         let mem = self.overlay_mem(unsealed, snap, cuts, &frozen, filed, true, cap)?;
         let pieces: Vec<PieceRun<'_>> = table
             .pieces
@@ -58613,10 +58457,10 @@ impl<'s> BuildCtx<'s> {
         let read = |e: std::io::Error| err(&format!("block cache read: {e}"));
         // A key no partition record of its own and one source holds emits
         // that source whatever the search finds: the search names the
-        // oldest source to emit, and a lone source is at or past it
-        // (`Options::emit_lone_unsearched`).
+        // oldest source to emit, and a lone source is at or past it. The
+        // search for every key was a third of the overlay's 620
+        // instructions a key on the scrambled E's inserts above the store.
         let lone = part.is_none()
-            && self.rd.opts.emit_lone_unsearched
             && held.len()
                 + o.sk.map_or(0, |sk| {
                     usize::from(sk.mem != u32::MAX)

@@ -996,11 +996,6 @@ asking for the first two blocks' form headers
 of it (`Options::scan_prefetch_sparse_span`) and a partition walk's raw
 runs through one walker (`Options::scan_runs_held`), and
 `supdb-scanlevers` and `supdb-ingestscanlevers` the three together;
-`supdb-widefull` and `supdb-ingestwidefull` merge a wide block's sources
-whole for a scan, where the default stops at the scan's limit
-(`Options::scan_wide_capped`), `supdb-lonetombs` and
-`supdb-ingestlonetombs` search every overlay key's sources for its newest
-tombstone, a lone source's too (`Options::emit_lone_unsearched`), and
 `supdb-widewalks` and `supdb-ingestwidewalks` walk a block wide by its
 count of keys past the end for as long as it is, where the default copies
 it once its walks have paid (`Options::forms_copy_hot_wide`), and

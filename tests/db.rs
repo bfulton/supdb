@@ -9086,93 +9086,87 @@ fn a_key_held_by_many_pieces_counts_once_toward_a_wide_block() {
 }
 
 /// A wide block's walk takes at most a scan's limit of the overlay's keys,
-/// and the window that merges its sources for the scan stops there
-/// (`Options::scan_wide_capped`); a key one source holds is emitted without
-/// the tombstone search (`Options::emit_lone_unsearched`). Each held to the
-/// model, and so to the shape before it, over a block whose keys past the
-/// end sit in four pieces interleaved key by key, every seventh in two
-/// pieces, every eleventh deleted in another, and the live memtable over
-/// some of them and between them.
+/// and the window that merges its sources for the scan stops there; a key
+/// one source holds is emitted without the tombstone search. Held to the
+/// model, over a block whose keys past the end sit in four pieces
+/// interleaved key by key, every seventh in two pieces, every eleventh
+/// deleted in another, and the live memtable over some of them and between
+/// them.
 #[test]
 fn a_wide_blocks_window_stops_at_the_scans_limit() {
-    for (capped, lone) in [(true, true), (false, true), (true, false), (false, false)] {
-        let d = dir(&format!("wide-window-{capped}-{lone}"));
-        let opts = Options {
-            seal_bytes: 1 << 20,
-            partition_bytes: Some(2 << 10),
-            l0_trigger: 64,
-            scan_block_cache: true,
-            // Four pieces over the last range, none merged.
-            tier_pieces: 0,
-            scan_wide_capped: capped,
-            emit_lone_unsearched: lone,
-            // The window is what is tested: the block stays wide.
-            forms_copy_hot_wide: false,
-            ..common::options()
-        };
-        let mut db = Db::create(&d, opts).unwrap();
-        let mut m = ScanModel::default();
-        let key = |k: u32| format!("key-{k:05}");
-        for k in (0..600).step_by(3) {
-            m.append(&mut db, &key(k), &format!("p{k}"));
-        }
-        db.commit().unwrap();
-        db.flush().unwrap();
-        m.flushed();
-        let tail = |k: u32| format!("key-00600x{k:04}");
-        for round in 0..4u32 {
-            for k in 0..1280u32 {
-                if k % 4 == round || (k % 7 == 0 && (k + 1) % 4 == round) {
-                    m.append(&mut db, &tail(k), &format!("r{round}"));
-                }
-                if k % 11 == 0 && (k + 2) % 4 == round {
-                    m.delete(&mut db, &tail(k));
-                }
-            }
-            db.commit().unwrap();
-            db.seal().unwrap();
-            db.settle().unwrap();
-        }
-        assert!(db.levels().1 >= 4, "the tail's four pieces stand");
-        for k in (0..1280u32).step_by(5) {
-            m.append(&mut db, &tail(k), "live");
-        }
-        for k in (0..1280u32).step_by(13) {
-            m.append(&mut db, &format!("{}+", tail(k)), "live-new");
-        }
-        m.delete(&mut db, &tail(40));
-        db.commit().unwrap();
-        let state = format!("pieces and the live table past the end, capped {capped} lone {lone}");
-        m.check(&db, &state);
-        held(&db, 0);
-        assert!(
-            db.block_cache_wide() > 0,
-            "{state}: the tail's block is wide"
-        );
-        // That table frozen and held, and a live one over it and between
-        // its keys: the window's memtable sources are a base and the live
-        // run, a key in both folded from both, a live tombstone over a
-        // frozen key.
-        db.hold_seal_landing(true);
-        db.seal().unwrap();
-        for k in (0..1280u32).step_by(10) {
-            m.append(&mut db, &tail(k), "over-frozen");
-        }
-        for k in (3..1280u32).step_by(17) {
-            m.append(&mut db, &format!("{}-", tail(k)), "live-between");
-        }
-        m.delete(&mut db, &tail(65));
-        db.commit().unwrap();
-        assert!(db.in_flight().0, "the seal is held");
-        let state =
-            format!("a frozen table and a live one past the end, capped {capped} lone {lone}");
-        m.check(&db, &state);
-        held(&db, 0);
-        db.hold_seal_landing(false);
-        db.settle().unwrap();
-        m.check(&db, &format!("{state}, landed"));
-        held(&db, 0);
+    let d = dir("wide-window");
+    let opts = Options {
+        seal_bytes: 1 << 20,
+        partition_bytes: Some(2 << 10),
+        l0_trigger: 64,
+        scan_block_cache: true,
+        // Four pieces over the last range, none merged.
+        tier_pieces: 0,
+        // The window is what is tested: the block stays wide.
+        forms_copy_hot_wide: false,
+        ..common::options()
+    };
+    let mut db = Db::create(&d, opts).unwrap();
+    let mut m = ScanModel::default();
+    let key = |k: u32| format!("key-{k:05}");
+    for k in (0..600).step_by(3) {
+        m.append(&mut db, &key(k), &format!("p{k}"));
     }
+    db.commit().unwrap();
+    db.flush().unwrap();
+    m.flushed();
+    let tail = |k: u32| format!("key-00600x{k:04}");
+    for round in 0..4u32 {
+        for k in 0..1280u32 {
+            if k % 4 == round || (k % 7 == 0 && (k + 1) % 4 == round) {
+                m.append(&mut db, &tail(k), &format!("r{round}"));
+            }
+            if k % 11 == 0 && (k + 2) % 4 == round {
+                m.delete(&mut db, &tail(k));
+            }
+        }
+        db.commit().unwrap();
+        db.seal().unwrap();
+        db.settle().unwrap();
+    }
+    assert!(db.levels().1 >= 4, "the tail's four pieces stand");
+    for k in (0..1280u32).step_by(5) {
+        m.append(&mut db, &tail(k), "live");
+    }
+    for k in (0..1280u32).step_by(13) {
+        m.append(&mut db, &format!("{}+", tail(k)), "live-new");
+    }
+    m.delete(&mut db, &tail(40));
+    db.commit().unwrap();
+    let state = "pieces and the live table past the end";
+    m.check(&db, state);
+    held(&db, 0);
+    assert!(
+        db.block_cache_wide() > 0,
+        "{state}: the tail's block is wide"
+    );
+    // That table frozen and held, and a live one over it and between
+    // its keys: the window's memtable sources are a base and the live
+    // run, a key in both folded from both, a live tombstone over a
+    // frozen key.
+    db.hold_seal_landing(true);
+    db.seal().unwrap();
+    for k in (0..1280u32).step_by(10) {
+        m.append(&mut db, &tail(k), "over-frozen");
+    }
+    for k in (3..1280u32).step_by(17) {
+        m.append(&mut db, &format!("{}-", tail(k)), "live-between");
+    }
+    m.delete(&mut db, &tail(65));
+    db.commit().unwrap();
+    assert!(db.in_flight().0, "the seal is held");
+    let state = "a frozen table and a live one past the end";
+    m.check(&db, state);
+    held(&db, 0);
+    db.hold_seal_landing(false);
+    db.settle().unwrap();
+    m.check(&db, &format!("{state}, landed"));
+    held(&db, 0);
 }
 
 /// A block wide by its count of keys past the end is copied once its walks
@@ -17386,11 +17380,10 @@ fn a_live_write_over_the_frozen_table_is_one_key_on_every_scan_path() {
 }
 
 /// The scan paths a frozen table's keys reach a scan through, each the
-/// arm that keeps it: the block cache's, the cursor merge's, the merge
-/// over unrouted sources, the lazy snapshot, the snapshot's runs, a
+/// arm that keeps it: the block cache's, the merge over unrouted sources, the lazy snapshot, the snapshot's runs, a
 /// snapshot each handle builds alone, and frozen tables with no snapshot
 /// of their own.
-fn scan_path_arms() -> [(&'static str, Options); 10] {
+fn scan_path_arms() -> [(&'static str, Options); 9] {
     [
         ("default", common::options()),
         // The compact form forced, with the block cache and without it: the
@@ -17421,14 +17414,6 @@ fn scan_path_arms() -> [(&'static str, Options); 10] {
                 zpages_min_bytes: 0,
                 scan_block_cache: false,
                 zpages_walk_cursor: false,
-                ..common::options()
-            },
-        ),
-        (
-            "cursormerge",
-            Options {
-                scan_merge: false,
-                scan_block_cache: false,
                 ..common::options()
             },
         ),
