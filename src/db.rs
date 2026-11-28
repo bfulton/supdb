@@ -3345,11 +3345,6 @@ pub struct Options {
     /// either, since the idle seals put partitions under a load nobody
     /// reads.
     pub seal_idle: bool,
-    /// How a flush drains level 0 once partitions exist: merge only the
-    /// ranges that hold pieces, under the live fences (`true`), or
-    /// re-partition everything from every key (`false`, the original), kept
-    /// as the comparison arm.
-    pub flush_ranges: bool,
     /// Runs of values up to this many bytes are stored inline in the index
     /// record rather than in a block, so a point read of such a key touches
     /// the hash slot and the record and nothing else. Zero disables.
@@ -7666,7 +7661,6 @@ impl Default for Options {
             seal_sync_every: 0,
             inline_bytes: 256,
             partition_bytes: Some(64 << 20),
-            flush_ranges: true,
             promote: true,
             flush_schedules: true,
             writer_pins: true,
@@ -61473,20 +61467,15 @@ impl Maint {
             }
             return Ok(());
         }
-        // With `flush_ranges`, each round merges only the ranges that hold
-        // pieces, under the live fences -- one piece is enough to be due
-        // here, where the background trigger waits for several -- so a
-        // flush after an ordered or skewed load rewrites the partitions it
-        // touched and not the store. Without it, or before the first
-        // partitioning, everything is re-partitioned from every key.
+        // Each round merges only the ranges that hold pieces, under the
+        // live fences -- one piece is enough to be due here, where the
+        // background trigger waits for several -- so a flush after an
+        // ordered or skewed load rewrites the partitions it touched and not
+        // the store. Before the first partitioning everything is
+        // partitioned from every key.
         let mut rounds = 0usize;
         while self.segs().iter().any(|s| s.level == 0) {
-            let plan = if self.opts.flush_ranges {
-                self.merge_due(1)
-            } else {
-                None
-            };
-            match plan {
+            match self.merge_due(1) {
                 Some(fences) if !fences.is_empty() => {
                     let fences = if self.opts.promote {
                         self.promote_ranges(fences)?

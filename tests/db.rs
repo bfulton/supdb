@@ -3887,87 +3887,22 @@ fn a_crash_before_the_manifest_lands_keeps_the_pre_merge_store() {
 
 #[test]
 fn every_key_survives_partitioning_and_range_merges_at_scale() {
-    scale(true)
+    scale()
 }
 
-/// The original flush -- re-partition everything from every key -- stays
-/// behind `flush_ranges: false` as the comparison arm, and a path only one
-/// arm exercises is a path nothing tests.
-#[test]
-fn every_key_survives_the_full_flush_too() {
-    scale(false)
-}
-
-/// Promotion without a merge is for a store with no partitions yet: every
-/// piece becomes one, the first open below. The full flush asked for it on
-/// a partitioned store too, and pieces that happened to be disjoint became
-/// partitions over ranges partitions already held -- nothing raised, and
-/// the reads routed past the keys. Pieces piled up over a partitioned store
-/// are what a flush meets after a merge in flight held them back; here the
-/// trigger holds them back.
-#[test]
-fn a_full_flush_over_partitions_does_not_promote_its_pieces() {
-    let d = dir("fullflush-promote");
-    let mut db = Db::create(
-        &d,
-        Options {
-            seal_bytes: 64 << 10,
-            l0_trigger: 1000,
-            partition_bytes: None,
-            flush_ranges: false,
-            ..common::options()
-        },
-    )
-    .unwrap();
-    let n = 20_000u32;
-    let val = |i: u32| {
-        let mut v = i.to_le_bytes().to_vec();
-        v.extend_from_slice(&[b'x'; 100]);
-        v
-    };
-    for i in 0..n {
-        db.append(format!("k{i:08}").as_bytes(), &val(i));
-        if i % 500 == 499 {
-            db.commit().unwrap();
-        }
-        if i == n / 2 - 1 {
-            db.flush().unwrap();
-            assert!(db.levels().0 > 1, "the first flush partitions");
-        }
-    }
-    db.settle().unwrap();
-    assert!(db.levels().1 > 1, "pieces held back over the partitions");
-    db.flush().unwrap();
-    let wrong: Vec<u32> = (0..n)
-        .filter(|&i| read_vec(&db, format!("k{i:08}").as_bytes()) != vec![val(i)])
-        .collect();
-    assert!(
-        wrong.is_empty(),
-        "{} keys wrong, first {:?} ({:?})",
-        wrong.len(),
-        &wrong[..wrong.len().min(5)],
-        db.levels()
-    );
-}
-
-fn scale(flush_ranges: bool) {
+fn scale() {
     // The contract tests above use stores too small to make a partition
     // boundary interesting. This one loads enough to force the initial
     // partitioning AND several per-range merges, then demands every key
     // back. A fence that does not tile the key space loses keys silently
     // here and nowhere smaller.
-    let d = dir(if flush_ranges {
-        "scale"
-    } else {
-        "scale-fullflush"
-    });
+    let d = dir("scale");
     let mut db = Db::create(
         &d,
         Options {
             seal_bytes: 512 << 10,
             l0_trigger: 3,
             partition_bytes: None,
-            flush_ranges,
             ..common::options()
         },
     )
