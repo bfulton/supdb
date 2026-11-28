@@ -47650,10 +47650,13 @@ impl Db {
     /// tables from, for the upkeep's look (`replaced_from_in`): nowhere
     /// where `fresh` is a shared table or one stands in the state the
     /// writer holds.
+    #[inline]
     fn kept_from(&self, fresh: &MemTable) -> Option<Keep> {
         let sharing = self.shared.shares && (fresh.shared.is_some() || self.state().sharing());
         let from = Db::replaced_from_in(&self.opts, &self.shared, sharing);
-        Db::freeze_held(&self.shared, from, self.state().lives);
+        if self.shared.kept_hold.load(AtomicOrdering::Relaxed) & KEPT_HOLD_FREEZE != 0 {
+            Db::freeze_held(&self.shared, from, self.state().lives);
+        }
         from
     }
 
@@ -47663,6 +47666,8 @@ impl Db {
     /// where the look it read stands behind the state it freezes (`lives`).
     /// Not `kept_held`: the writer is no counted thread, and a store the
     /// test crashes is one whose writer is the crashing thread.
+    #[cold]
+    #[inline(never)]
     fn freeze_held(shared: &Shared, from: Option<Keep>, lives: u64) {
         if shared.kept_hold.load(AtomicOrdering::Acquire) & KEPT_HOLD_FREEZE == 0
             || !from.is_some_and(|k| k.from != u64::MAX && k.from < lives)
