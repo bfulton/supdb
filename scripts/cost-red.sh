@@ -26,27 +26,39 @@
 #      name in a file of the workspace; libc's and a library's are not. A `~`
 #      line holds its function to its own bound, red past it, the larger of
 #      two lines' where both name it; one with no bound is refused; one that
-#      names its probes holds in those alone, a toggled one included. A listing whose functions do not sum to its program total,
+#      names its probes holds in those alone, a toggled one included; and
+#      under a toggle one that names libc's function holds it to the bound
+#      in place of the library tests, red past it where the tests read noise
+#      and green under it where they read red, while a library function no
+#      line names in the probe is held to the tests beside it. A listing whose functions do not sum to its program total,
 #      or that has none, is red, and a mode the comparator does not know is
 #      refused.
 #   G. the group: `check.sh cost` exits non-zero where cost-red.sh fails, and
 #      stops there, and where cost.sh fails; and cost.sh over a BASE that
-#      names no commit exits 2 and names it, before anything is made.
+#      names no commit exits 2 and names it, before anything is made, as it
+#      does where COST_TARGET, COST_HEAD_TARGET or COST_BASE_TARGET is set,
+#      a target the build's fixed paths have no room for, and where another
+#      count holds the build's lock.
 #   V. the job over a scratch copy whose suite's `supdb_get` reads a value's
 #      length and not the value, and over one whose sink is `#[inline(never)]`:
 #      exit 2 before anything is built, the suite's per-operation code
 #      differing between the two sides.
 #   S. the job over a scratch copy of this tree as it stands, against HEAD:
-#      exit 0, `cost: green`, and no hot function of the point read's
-#      toggle moved by one instruction -- the tree against itself reads
-#      zero, so a count that moves is the engine's and not the build's
-#      (another directory, another target). libc's counts may move: they
-#      follow the addresses they are handed, and the point read's memcmp
-#      moved by most of an instruction a read between two runs of one build.
+#      exit 0, `cost: green`, the two sides' probe binaries the same bytes,
+#      and no hot function of the point read's toggle moved by one
+#      instruction -- the two sides are built at one path in one target, so
+#      a head whose engine is the base's builds nothing the base did not,
+#      and a count that moves is the engine's and not the build's. libc's
+#      counts may move: they follow the addresses they are handed, and the
+#      point read's memcmp moved by most of an instruction a read between
+#      two runs of one build.
 #   B. the job over a scratch copy of this tree whose `Reader::read_all`
 #      begins with a load of the store's pager and a branch on it -- the
 #      shape CLAUDE.md records a plain store once paid -- against HEAD: exit
-#      1, `cost: RED`, and the gain reported in a hot function.
+#      1, `cost: RED`, and the gain reported in a hot function. The edit
+#      reaches the head's build only through the sync of the head's tree
+#      over the base's build, so B holds that the sync builds what it
+#      changes, and U and K hold it for a function out of line.
 #   U. the job's scan probe over a scratch copy whose
 #      `Reader::install_ahead` -- out of line, run once a scan, and on no
 #      line of the hot list -- begins with the load and the branch of B,
@@ -64,11 +76,10 @@
 #      every key twice, against HEAD: exit 0, `cost: green` -- the probe is
 #      the head's on both sides, so a probe that changes is no cost.
 # S, B, T and C count the point read alone, U the scan and K the ordered
-# load, and all six share one target directory, so
-# RocksDB is built once. Everything is made under COST_RED_DIR (default
-# $TMPDIR/supdb-cost-red-PID) and removed at the end, pass or fail; the
-# shared target is COST_RED_TARGET where that is set, and is then kept, so
-# that runs one after another build RocksDB once between them.
+# load, and all six build in the count's own target, at its fixed path
+# (scripts/cost.sh), which keeps RocksDB built from one run to the next.
+# Everything else is made under COST_RED_DIR (default
+# $TMPDIR/supdb-cost-red-PID) and removed at the end, pass or fail.
 # COST_RED_STEPS (default `A G V S B U K T C`) runs the steps it names, in the order
 # named, and each step's checks are the ones above whichever runs. The last
 # line is `cost-red: ok` or names the step that went wrong; exit 0 or 1.
@@ -253,6 +264,28 @@ cp "$R/fx/a25" "$R/fx/a28"
 [ "$(diffs a28 whole "$OWN")" = 0 ] || fail "A: a ~ line naming its probe did not bound its function there"
 [ "$(diffs a28 toggle "$OWN")" = 0 ] || fail "A: a ~ line naming a probe with a toggle did not bound its function there"
 [ "$(diffs a25 whole "$OWN")" = 1 ] || fail "A: a ~ line naming another probe bounded its function in this one"
+# A `~` line that names a library function holds it, under a toggle, to its
+# bound in place of the library tests, both ways: libc's compare at 0.83 an
+# operation, which those tests call noise, is red past a bound of 0.5, and
+# its copy at ten an operation and half again its count, which they call
+# red, is green under a bound of 15. A library function no line names in
+# the probe is held to the tests still, beside one a line names, and in the
+# probe a line does not name.
+printf '%s\n' 'supdb::db::Reader::read_all' '~a29: __memcmp_avx2_movbe 0.5' \
+    '~a30,a31: __memcpy_avx_unaligned_erms 15' >"$hot"
+base_rows 2,000,000 2,083,000 48,000,000 1,000,000 1,000,000 1,000,000 1,000,000 1,000,000 0 >"$R/fx/a29"
+cp "$R/fx/a21" "$R/fx/a30"
+base_rows 3,000,000 2,500,000 48,000,000 1,000,000 1,000,000 1,000,000 1,000,000 1,000,000 0 >"$R/fx/a31"
+[ "$(diffs a29 toggle "$OWN")" = 1 ] &&
+    grep -q 'LIBRARY GAINED: __memcmp_avx2_movbe .*its bound 0.500' "$R/fx/a29.out" ||
+    fail "A: under a toggle, a library function past its ~ line's bound and under the library tests was not red"
+[ "$(diffs a30 toggle "$OWN")" = 0 ] ||
+    fail "A: under a toggle, a library function under its ~ line's bound and past the library tests was red"
+[ "$(diffs a31 toggle "$OWN")" = 1 ] && grep -q 'LIBRARY GAINED: __memcmp_avx2_movbe ' "$R/fx/a31.out" &&
+    ! grep -q 'LIBRARY GAINED: __memcpy' "$R/fx/a31.out" ||
+    fail "A: under a toggle, beside a ~ line's library function, one no line names was not held to the library tests"
+[ "$(diffs a21 toggle "$OWN")" = 1 ] && grep -q 'LIBRARY GAINED: __memcpy_avx_unaligned_erms ' "$R/fx/a21.out" ||
+    fail "A: under a toggle, a library function in a probe its ~ line does not name was not held to the library tests"
 # A listing cut short of its program total: callgrind_annotate's default
 # threshold leaves out the functions under it, and a cost added to one of
 # them would read as nothing on both sides.
@@ -286,11 +319,8 @@ if s.count(old) != 1:
 open(path, "w").write(s.replace(old, new))
 PY
 }
-RT=${COST_RED_TARGET:-$R/t}
-# Every step's copy is made at one path, $R/h, and removed when the step
-# ends: cargo keys a path package's artifacts by its path, so a copy at a
-# path of its own would leave another build of the engine, the suite and the
-# probe in the shared target for every step, a gigabyte and more each.
+# Every step's copy is made at $R/h and removed when the step ends; the job
+# builds both its sides at the count's fixed paths whatever the copy's.
 # S, B, T and C count copies of this tree against HEAD, so the engine and the
 # suite in the tree have to be HEAD's: an uncommitted change to either would
 # read as the job's fault in S and hide behind it in B.
@@ -306,7 +336,7 @@ job() { # copy step [probe] -> the job's exit status; its output in $R/<step>.lo
         return 0
     fi
     st=0
-    COST_DIR="$R/w" COST_HEAD="$1" COST_HEAD_TARGET="$RT" COST_BASE_TARGET="$RT" \
+    env -u COST_TARGET -u COST_BASE_TARGET -u COST_HEAD_TARGET COST_DIR="$R/w" COST_HEAD="$1" \
         sh "$ROOT/scripts/cost.sh" HEAD "${3:-read}" >"$R/$2.log" 2>&1 || st=$?
     echo "$st"
 }
@@ -322,6 +352,8 @@ st=$(job "$R/h" S)
 shown S
 [ "$st" = 0 ] || fail "S: the job exited $st over the tree against itself"
 tail -1 "$R/S.log" | grep -qx 'cost: green' || fail "S: the verdict line is not cost: green"
+[ -s "$R/w/out/bin-base.sha256" ] && cmp -s "$R/w/out/bin-base.sha256" "$R/w/out/bin-head.sha256" ||
+    fail "S: the tree against itself built probe binaries that differ between the sides"
 grep -q '^== read (toggle)' "$R/S.log" && grep -q 'on no line), 0 of them moved, ' "$R/S.log" ||
     fail "S: the tree against itself moved a hot function under the toggle"
 echo "cost-red: S ok"
@@ -394,6 +426,24 @@ env -u COST_DIR sh "$ROOT/scripts/cost.sh" cost-red-no-such-ref seal >"$R/G3.log
 shown G3
 [ "$st" = 2 ] && grep -q "BASE 'cost-red-no-such-ref' names no commit" "$R/G3.log" ||
     fail "G: cost.sh exited $st over a BASE that names no commit"
+# A target of the caller's is refused by name before anything is made.
+for v in COST_TARGET COST_HEAD_TARGET COST_BASE_TARGET; do
+    st=0
+    env -u COST_DIR -u COST_TARGET -u COST_HEAD_TARGET -u COST_BASE_TARGET "$v=$R/no-such-target" \
+        sh "$ROOT/scripts/cost.sh" HEAD seal >"$R/G4.log" 2>&1 || st=$?
+    shown G4
+    [ "$st" = 2 ] && grep -q 'COST_TARGET, COST_BASE_TARGET and COST_HEAD_TARGET are gone' "$R/G4.log" &&
+        [ ! -e "$R/no-such-target" ] || fail "G: cost.sh exited $st where $v was set"
+done
+# A count beside one that holds the build's lock is refused before it makes
+# anything.
+mkdir -p /tmp/supdb-cost
+st=0
+flock -n /tmp/supdb-cost/lock env -u COST_TARGET -u COST_HEAD_TARGET -u COST_BASE_TARGET COST_DIR="$R/g5" \
+    sh "$ROOT/scripts/cost.sh" HEAD seal >"$R/G5.log" 2>&1 || st=$?
+shown G5
+[ "$st" = 2 ] && grep -q 'another count holds /tmp/supdb-cost/lock' "$R/G5.log" && [ ! -e "$R/g5" ] ||
+    fail "G: cost.sh exited $st beside a count that holds the build's lock"
 echo "cost-red: G ok"
 }
 

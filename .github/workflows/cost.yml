@@ -43,15 +43,9 @@ jobs:
         run: sh bench/scripts/faster.sh
       - name: valgrind
         run: sh scripts/apt.sh valgrind
-      # `workspace -> target`, the target a path inside its workspace: see
-      # ci.yml's `test` job. The key every job that builds the suite's binary
-      # shares (ci.yml's `quick` job): the probes build on the binary's
-      # dependencies, RocksDB's among them, which the key restores, and
-      # what they build beside it is the job's own each run.
-      - uses: Swatinem/rust-cache@v2
-        with:
-          workspaces: bench -> target
-          shared-key: bench
+      # No cache of the suite's build: the count and its red input build in
+      # the count's own target at a fixed path (scripts/cost.sh), so a
+      # restored bench/target is read by nothing.
       # The base the person named, or none, which scripts/base.sh reads as
       # the merge-base with main.
       - name: The plain store's cost, by function

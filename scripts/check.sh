@@ -93,7 +93,8 @@
 #            fails where a hot function gains past its slack: in a probe
 #            with a toggle, more than 64 instructions over the probe's whole
 #            run in any function built from source (libc's: more than 2 an
-#            operation and 5% of its own count), and in a probe with none,
+#            operation and 5% of its own count, or its `~` line's bound),
+#            and in a probe with none,
 #            more than a hundredth of an instruction an operation in any
 #            function of the engine, and a function a `~` line of
 #            scripts/cost-hot.txt names past the bound the line gives it
