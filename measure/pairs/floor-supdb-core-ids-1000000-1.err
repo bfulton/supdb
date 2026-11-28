@@ -1,0 +1,9 @@
+bench ab: supdb against supdb at 1000000 keys (ids for keys), scans of 100, 7 pairs after a warmup, passes load,read,read-threaded,scan,scan-threaded,mixes,scan-mixed,mixes-scrambled,lag,recover
+    42s  rep 0/7 (warmup)
+    80s  rep 1/7
+   123s  rep 2/7
+   167s  rep 3/7
+   210s  rep 4/7
+   253s  rep 5/7
+   293s  rep 6/7
+   334s  rep 7/7

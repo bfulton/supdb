@@ -124,3 +124,16 @@ Same C0 binaries (`/home/user/c0/bench/target`, stamp `b3a043dc`, clean).
   against prior [0.37, 0.79] (the same cell family the 2.10GHz row read as
   no-verdict). The group stopped at the gate, so there is no
   `all checks passed: quick` line and no figures were drawn; the row is whole.
+
+## 8. Noise floor, in core, 2.30GHz class
+
+- Queue: `measure/floor.sh` (the run sheet 4.4's loops, one pairing at a time,
+  `RESUME=1`, `OUT=/home/user/base/pairs`, a TMPDIR per pairing, started with
+  `nohup` at 2026-11-28T11:18:40Z). Each call:
+  `NAME=floor-supdb-core-$K sh scripts/pair.sh supdb supdb $SIZE --reps 7 --keys $K --passes load,read,read-threaded,scan,scan-threaded,mixes,scan-mixed,mixes-scrambled,lag,recover --pairs ' '`
+- numbered, 10k to 3M: 11:18:40Z to 12:06Z; ids, 10k to 3M: to 13:10:06Z.
+  Every pairing exit 0, both sittings whole; no kill. Times per pairing in
+  `measure/logs/floor-core.log`.
+- Tables: `measure/pairs/floor-supdb-core-{numbered,ids}-$SIZE-{1,2}.{out,err}` and `-head.txt`.
+- The floor itself (the band of the 2S medians per cell) is not computed:
+  the run sheet's reader of the tables is not written yet.
