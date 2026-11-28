@@ -12,12 +12,6 @@ a tenth behind its comparator or behind a shape the engine already reaches.
   `supdb-heldpart` was killed once under 1.25 GiB, and the kill's owner was
   never read. Done when a run sampled from outside the process names it,
   which needs a count of the engine's mapped blocks by length.
-- [ ] **What each engine's checksums verify.** RocksDB reads with
-  `verify_checksums(false)`, in memory, from its files out of core and in
-  `rocksdb-tuned-enc`, whose counter-mode Env has no tag, while a store
-  under a cipher checks a tag on every chunk it reads. Done when RocksDB
-  reads with its default, or the methods say what each engine verifies, the
-  encrypted arms included.
 - [ ] **Device bytes measured at the device.** "Device bytes written" is
   the process's `/proc/self/io` count, which equals bytes on disk for
   buffered arms, while `bench/DESIGN.md` calls it the device's counter.
