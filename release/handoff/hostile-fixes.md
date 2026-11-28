@@ -55,10 +55,21 @@ Tree Borrows.
   reason is the new refusals' checks and their error strings in the
   readers. No budget is enforced (`web/build.sh` prints the sizes).
 
+## A key past 4 GiB in total across appends (run, 14:39 UTC, on `1a723c5`)
+
+66 appends of 64 MiB to one key, a commit each, `common::options()`:
+every commit `Ok`; `flush` `InvalidData: "segment writer: a key's values
+exceed 4 GiB in one segment"`; `count` 66; a later commit `Ok` (not kept as
+`Db::lost`); `close` the same error; reopen `Ok`, `count` 66, `read_all`
+4,429,185,024 bytes; `close` the same error again. Nothing is lost and the
+store opens, but no flush or close succeeds again: the writer puts a key's
+values in a segment as one extent (`Extents::One`), whose length is 32 bits.
+
+Fix not made, asked of the parent: refusing the append that carries a key
+past 4 GiB needs the key's total across the live table and every segment on
+every append (a lookup a write on the loads' path); writing such a run as
+several extents is a record shape no writer makes today.
+
 ## Next
 
-Nothing is in progress. Left for others: the cost raises above (the
-parent's call), and a key's values past 4 GiB in total across appends,
-which the store takes and its seal then refuses (`SegmentWriter::end_with`)
--- found by reading `end_with`'s check, not run; not a narrowing, and not
-touched here.
+Waiting on the parent's choice above. Left for others: the cost raises above.
