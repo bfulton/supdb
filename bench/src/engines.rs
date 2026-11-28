@@ -1001,9 +1001,6 @@ pub struct Supdb {
     /// samples, its cut left for the build (`Options::settle_lazy_raw` on).
     /// `supdb-settlelazyraw`.
     settlelazyraw: bool,
-    /// A merge's writers syncing behind them every megabyte
-    /// (`Options::merge_sync_ahead` 1 MB). `supdb-mergesync1m`.
-    mergesync1m: bool,
     /// The hot-raw policy's way back attaching the form file at the look
     /// that decides it, its pages unasked (`Options::zpages_hot_back_ask`
     /// off). `supdb-zbacknow`.
@@ -2488,9 +2485,6 @@ struct Policy {
     /// samples, its cut left for the build (`Options::settle_lazy_raw` on).
     /// `supdb-settlelazyraw`.
     settlelazyraw: bool,
-    /// A merge's writers syncing behind them every megabyte
-    /// (`Options::merge_sync_ahead` 1 MB). `supdb-mergesync1m`.
-    mergesync1m: bool,
     /// The hot-raw policy's way back attaching the form file at the look
     /// that decides it, its pages unasked (`Options::zpages_hot_back_ask`
     /// off). `supdb-zbacknow`.
@@ -3427,7 +3421,6 @@ impl Default for Policy {
             cachenoauto: false,
             cacheeighth: false,
             settlelazyraw: false,
-            mergesync1m: false,
             zbacknow: false,
             norewarm: false,
             rewarmtrim: false,
@@ -7812,18 +7805,6 @@ impl Supdb {
         )
     }
 
-    /// `supdb` whose merges' writers sync behind them every megabyte
-    /// (`Options::merge_sync_ahead` 1 MB).
-    pub fn create_mergesync1m(path: &Path) -> Res<Supdb> {
-        Supdb::with_policy(
-            path,
-            Policy {
-                mergesync1m: true,
-                ..Policy::default()
-            },
-        )
-    }
-
     /// `supdb` whose hot-raw policy's way back attaches the form file at
     /// the look that decides it, its pages unasked
     /// (`Options::zpages_hot_back_ask` off).
@@ -10098,7 +10079,6 @@ impl Supdb {
             cachenoauto,
             cacheeighth,
             settlelazyraw,
-            mergesync1m,
             zbacknow,
             norewarm,
             rewarmtrim,
@@ -10606,7 +10586,6 @@ impl Supdb {
             scan_cache_auto: !cachenoauto,
             scan_cache_auto_room: !cacheeighth,
             settle_lazy_raw: settlelazyraw,
-            merge_sync_ahead: if mergesync1m { 1 << 20 } else { 0 },
             zpages_hot_back_ask: !zbacknow,
             zpages_rewarm_scans: !norewarm,
             zpages_rewarm_trims: rewarmtrim,
@@ -11154,7 +11133,6 @@ impl Supdb {
             cachenoauto,
             cacheeighth,
             settlelazyraw,
-            mergesync1m,
             zbacknow,
             norewarm,
             rewarmtrim,
@@ -12933,9 +12911,6 @@ impl Engine for Supdb {
         }
         if self.settlelazyraw {
             return "supdb-settlelazyraw";
-        }
-        if self.mergesync1m {
-            return "supdb-mergesync1m";
         }
         if self.zbacknow {
             return "supdb-zbacknow";
@@ -15840,7 +15815,6 @@ pub fn guarantee(arm: &str) -> Option<Guarantee> {
         | "supdb-cachenoauto"
         | "supdb-cacheeighth"
         | "supdb-settlelazyraw"
-        | "supdb-mergesync1m"
         | "supdb-zbacknow"
         | "supdb-norewarm"
         | "supdb-rewarmtrim"
@@ -18467,7 +18441,6 @@ pub fn open(arm: &str, dir: &Path, map_gb: usize) -> Res<Box<dyn Engine>> {
         "supdb-cachenoauto" => supdb_arm(Supdb::create_cachenoauto, dir)?,
         "supdb-cacheeighth" => supdb_arm(Supdb::create_cacheeighth, dir)?,
         "supdb-settlelazyraw" => supdb_arm(Supdb::create_settlelazyraw, dir)?,
-        "supdb-mergesync1m" => supdb_arm(Supdb::create_mergesync1m, dir)?,
         "supdb-zbacknow" => supdb_arm(Supdb::create_zbacknow, dir)?,
         "supdb-norewarm" => supdb_arm(Supdb::create_norewarm, dir)?,
         "supdb-rewarmtrim" => supdb_arm(Supdb::create_rewarmtrim, dir)?,
@@ -21589,13 +21562,6 @@ mod tests {
                 assert_eq!(z.features(), base.features());
                 let o = z.db.as_ref().unwrap().options();
                 assert!(o.settle_lazy_raw && !b.settle_lazy_raw);
-            }
-            {
-                let z = Supdb::create_mergesync1m(&dir("mergesync1m")).unwrap();
-                assert_eq!(z.name(), "supdb-mergesync1m");
-                assert_eq!(z.features(), base.features());
-                let o = z.db.as_ref().unwrap().options();
-                assert_eq!((o.merge_sync_ahead, b.merge_sync_ahead), (1 << 20, 0));
             }
             {
                 let z = Supdb::create_zbacknow(&dir("zbacknow")).unwrap();

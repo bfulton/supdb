@@ -1600,24 +1600,6 @@ pub struct Options {
     /// the records alone: `supdb-cipherautoaheadflat`.
     #[doc(hidden)]
     pub merge_ahead_shares: bool,
-    /// A merge's writer syncs its output behind it every this many bytes
-    /// (`SegmentOptions::sync_ahead` for the merge's writers alone), zero
-    /// for the segment's own. The writer's hint moves a piece to the
-    /// device and only an fsync makes the device flush its write-back
-    /// cache, so between two of the merge's syncs the cache fills with
-    /// its output and the next commit's fdatasync flushes it: through the
-    /// scrambled E mix at three million keys in core, beside the merges
-    /// of the scrambled write mixes' debt, the commits' fdatasync took
-    /// 2.85 ms where the unscrambled E's took 0.81, a third of them past
-    /// 3 ms, with the merges' helpers syncing 8 MB every 20 ms beside them
-    /// (`docs/engine.md`). A megabyte made seven times the merges' syncs
-    /// and moved the scrambled E's commits nothing in two sittings (638
-    /// ms against 631, 520 against 597), while the lag sweep at three
-    /// million keys read 12% worse by its weighted sum in both reps, the
-    /// merges paying the bursts down slower for the syncs: refuted, so
-    /// zero, the segment's own, is the default and `supdb-mergesync1m` is
-    /// the arm.
-    pub merge_sync_ahead: u64,
     /// I/O priority of the seal and merge threads.
     pub background_io: BackgroundIo,
     /// Have the segment writer fdatasync every this many bytes as it
@@ -7656,7 +7638,6 @@ impl Default for Options {
             merge_read_ahead: 0,
             merge_read_ahead_cipher: MERGE_AHEAD_WINDOW,
             merge_ahead_shares: true,
-            merge_sync_ahead: 0,
             background_io: BackgroundIo::Normal,
             seal_sync_every: 0,
             inline_bytes: 256,
@@ -23165,7 +23146,7 @@ struct Emitter<'a, R: MergeRest> {
     /// (`Options::zpages_build_at_finish`).
     zfinish: Option<std::sync::Arc<ZFinish>>,
     /// The syncs the outputs' writers made behind them
-    /// (`Options::merge_sync_ahead`).
+    /// (`SegmentOptions::sync_ahead`).
     syncs: u64,
     /// The outputs whose writers started a helper.
     helpers: u64,
@@ -26512,7 +26493,7 @@ struct Shared {
     /// Bytes of input records a merge's second pass dropped from the page
     /// cache behind itself (`Options::merge_drop_behind`).
     merge_dropped_bytes: AtomicU64,
-    /// The syncs merge writers made behind them (`Options::merge_sync_ahead`).
+    /// The syncs merge writers made behind them (`SegmentOptions::sync_ahead`).
     merge_syncs: AtomicU64,
     /// The merge outputs whose writers started a helper.
     merge_helpers: AtomicU64,
@@ -32439,14 +32420,14 @@ impl Reader {
     /// page cache behind themselves over the store's life
     /// (`Options::merge_drop_behind`).
     /// The syncs merge writers made behind them over the store's life
-    /// (`Options::merge_sync_ahead`).
+    /// (`SegmentOptions::sync_ahead`).
     #[doc(hidden)]
     pub fn merge_syncs(&self) -> u64 {
         self.shared.merge_syncs.load(AtomicOrdering::Relaxed)
     }
 
     /// The merge outputs whose writers started a helper thread, the first
-    /// time the output passed the stride (`Options::merge_sync_ahead`).
+    /// time the output passed the stride (`SegmentOptions::sync_ahead`).
     #[doc(hidden)]
     pub fn merge_helpers(&self) -> u64 {
         self.shared.merge_helpers.load(AtomicOrdering::Relaxed)
@@ -44326,16 +44307,6 @@ impl Db {
         // (`Shared::jobs_map`).
         s.buffers_mapped = opts.jobs_mapped && !opts.jobs_mapped_when_short;
         s.buffers_pooled = opts.jobs_pooled;
-        s
-    }
-
-    /// `segment_opts` for a merge's writers: the sync behind them every
-    /// `Options::merge_sync_ahead` bytes where that is set.
-    fn merge_segment_opts(opts: &Options) -> SegmentOptions {
-        let mut s = Db::segment_opts(opts);
-        if opts.merge_sync_ahead > 0 {
-            s.sync_ahead = opts.merge_sync_ahead;
-        }
         s
     }
 
@@ -60794,10 +60765,10 @@ impl Maint {
                 .is_some_and(|(inputs, _)| inputs.iter().any(|n| n == name))
     }
 
-    /// A merge's writers' options (`Db::merge_segment_opts`), their arrays
+    /// A merge's writers' options (`Db::segment_opts`), their arrays
     /// mapped where a job that starts now has them so (`Shared::jobs_map`).
     fn merge_opts(&self) -> SegmentOptions {
-        let mut s = Db::merge_segment_opts(&self.opts);
+        let mut s = Db::segment_opts(&self.opts);
         self.shared.job_buffers(&self.opts, &mut s);
         s
     }
