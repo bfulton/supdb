@@ -67,7 +67,13 @@ fn the_devices_counter_takes_what_reached_the_device_and_nothing_dropped_before_
     let (d1, (w1, c1)) = (device(), process_io());
     let (dev, proc_) = (d1 - d0, w1 - w0);
     eprintln!("kept: device {dev} process {proc_} cancelled {}", c1 - c0);
-    assert_eq!(proc_, n, "the process dirtied each page once");
+    // The file's pages, and the filesystem's metadata blocks the process
+    // dirtied allocating them (bitmaps, the inode's table), which it is
+    // charged for as it is for its own pages: six pages of ext4's here.
+    assert!(
+        (n..n + n / 64).contains(&proc_),
+        "the process dirtied {proc_} for {n} written"
+    );
     assert!(dev >= n, "the device wrote {dev} of the {n} synced");
     assert!(dev < n + n / 4, "the device wrote {dev} for {n} synced");
 
@@ -83,7 +89,10 @@ fn the_devices_counter_takes_what_reached_the_device_and_nothing_dropped_before_
     let (d3, (w3, c3)) = (device(), process_io());
     let (dev, proc_, cancelled) = (d3 - d2, w3 - w2, c3 - c2);
     eprintln!("dropped: device {dev} process {proc_} cancelled {cancelled}");
-    assert_eq!(proc_, n, "the process dirtied each page once");
+    assert!(
+        (n..n + n / 64).contains(&proc_),
+        "the process dirtied {proc_} for {n} written"
+    );
     assert_eq!(
         cancelled, n,
         "the premise: nothing of the file was written back before its removal"
