@@ -1411,7 +1411,8 @@ its window is the machine, and the run did not choose its machine. What
 keeps its verdict whatever they say is `device_bytes_per_byte` and
 `bytes_on_disk_per_byte`: counts of what the engine wrote and stored,
 which came back identical to three decimals across hosts that moved every
-rate by half, and the device's count repeats to four between reps.
+rate by half, and the device's count repeats between reps to a fortieth
+at the smallest rung and to three places at the quick scale's top.
 
 The case this answers cost a day. A quick row failed with 121 of 1,106
 quantities regressed; LMDB's scan at three hundred thousand keys read a

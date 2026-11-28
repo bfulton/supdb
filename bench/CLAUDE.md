@@ -1153,7 +1153,8 @@ keys (written unsynced on purpose, `Options::ord_durable`; a probe synced
 the store's files one at a time and read the device after each). So the
 filesystem is synced before the load's first batch and after the arm's
 `sync`, both outside the clock, and the comparators' reps then agree to
-four places (`SUPDB_LOAD_BYTES=1 SUPDB_DEVBYTES_SYNC=none|after|both
+three or four places at three hundred thousand keys and within a fortieth
+at ten thousand, where a few journal blocks are a percent of the store (`SUPDB_LOAD_BYTES=1 SUPDB_DEVBYTES_SYNC=none|after|both
 bench run --scale quick --reps 3 --passes load --out DIR`, at `fee70e8`).
 The sync ahead of the load changes the state the timed load starts in,
 and was priced by alternating runs with and without it, three of each, in
