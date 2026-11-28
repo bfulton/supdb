@@ -7752,19 +7752,6 @@ pub struct Options {
     /// (`zfile::ZFile::asks`).
     #[doc(hidden)]
     pub zpages_stride: ZStride,
-    /// EXPERIMENT: under `zpages_stride` `Forced`, the key at and above
-    /// which a partition is not asked for the stride form: a build of a
-    /// partition whose first key is at or above it builds the block form, as
-    /// under `Off`, and keeps no reason (`zfile::BuildPlan::stride_below`).
-    /// `None`, the default, asks every partition. It makes a store in two
-    /// forms by its keys' place, which no policy chooses: the arm that
-    /// measures what a store holding the stride form for as many of its keys
-    /// as fit, and the block form for the rest, reads at a bound the stride
-    /// form does not fit whole (`bench/examples/formfit.rs` models it). A
-    /// stride file found on disk is attached whichever side of the key its
-    /// partition lies, as `zpages_stride` attaches one.
-    #[doc(hidden)]
-    pub zpages_stride_below: Option<std::sync::Arc<[u8]>>,
     /// With `zpages_stride` at `Forced`, a build on the segment
     /// work's thread -- a partition's own, a build ahead, a merge output's
     /// at its finish -- asks for the stride form only where the store in
@@ -8583,7 +8570,6 @@ impl Default for Options {
             zpages_rewarm_quiet_ms: 250,
             zpages_rewarm_every_turn: false,
             zpages_stride: ZStride::Forced,
-            zpages_stride_below: None,
             zpages_stride_room: true,
             zpages_stride_trust_built: true,
             zpages_stride_convert: true,
@@ -53801,7 +53787,6 @@ impl Db {
                 plan.parse_chains = self.opts.zpages_parse_chains;
                 plan.own_decode = self.opts.zpages_own_decoder;
                 plan.stride = self.opts.z_stride_ask();
-                plan.stride_below = self.opts.zpages_stride_below.clone();
                 plan.stride_sparse = self.opts.zpages_stride_sparse;
                 plan
             })
@@ -68077,7 +68062,6 @@ impl Maint {
         plan.parse_chains = self.opts.zpages_parse_chains;
         plan.own_decode = self.opts.zpages_own_decoder;
         (plan.stride, plan.stride_spans) = self.z_stride_ask_finish();
-        plan.stride_below = self.opts.zpages_stride_below.clone();
         plan.hold = Some(self.shared.zbuild_hold.clone());
         plan.life = Some(self.shared.life.clone());
         Some(std::sync::Arc::new(ZFinish {
@@ -69198,12 +69182,6 @@ impl Maint {
         } else {
             self.z_stride_ask_now()
         };
-        // The key at which the options keep a partition in the block form
-        // is for the builds that ask of their own; a conversion's partition
-        // was chosen.
-        if !convert {
-            plan.stride_below = self.opts.zpages_stride_below.clone();
-        }
         if raw_tails && plan.stride != zfile::StrideAsk::Only {
             zfile::ZEvents::add(&ev.builds_raw_tails, 1);
         }

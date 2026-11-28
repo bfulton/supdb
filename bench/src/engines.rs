@@ -1907,10 +1907,6 @@ pub struct Supdb {
     /// one that starts a re-code (`with_policy`); every other arm that
     /// pins nothing follows the engine. `supdb-zblock` pins `Off`.
     zstride: Option<supdb::ZStride>,
-    /// The key number from which the partitions are not asked for the
-    /// stride form (`Options::zpages_stride_below`), or none where every
-    /// partition is asked: `supdb-cache64tofitzstridedrop2m` to `...7m`.
-    zstride_first: Option<u64>,
     /// The stride form asked for only where the store in it fits the room
     /// (`Options::zpages_stride_room`), the engine's where `None`:
     /// `supdb-zstrideroom` pins it on over `supdb-zblock`.
@@ -3340,16 +3336,6 @@ struct Policy {
     /// (`with_policy`): `supdb-nocachezstride`,
     /// `supdb-cache64tofitzstride`, and `supdb-zblock`, which pins `Off`.
     zstride: Option<supdb::ZStride>,
-    /// Under the forced stride form, the store's first keys alone asked for
-    /// it, by number: a partition whose first key is this key number or
-    /// above is built in the block form (`Options::zpages_stride_below`),
-    /// so the store is in two forms by its keys' place. `None` asks every
-    /// partition. A number and not a share, since a policy is made before
-    /// its store has a size: `supdb-cache64tofitzstridedrop2m`, `...3m`,
-    /// `...5m` and `...7m` are the first two, three, five and seven million
-    /// keys, shares of the ten-million rung they are for and every key of a
-    /// rung under them.
-    zstride_first: Option<u64>,
     /// A build asks for the stride form only where the store in that form
     /// fits the room at the build (`Options::zpages_stride_room`), the
     /// engine's where `None`, and off for an arm that forces the compact
@@ -3890,7 +3876,6 @@ impl Default for Policy {
             zperrun: false,
             zmemo_mib: 0,
             zstride: None,
-            zstride_first: None,
             zstride_room: None,
             zstride_convert: None,
             zaskdropped: None,
@@ -4075,17 +4060,6 @@ impl Policy {
         Policy {
             zstride: Some(supdb::ZStride::Forced),
             ..Policy::cache64_tofit_zpages_drop()
-        }
-    }
-
-    /// `supdb-cache64tofitzstridedrop2m`, `...3m`, `...5m` and `...7m`: that
-    /// arm with the
-    /// stride form for the partitions under key number `first` alone and
-    /// the block form from it up.
-    fn cache64_tofit_zstride_drop_first(first: u64) -> Policy {
-        Policy {
-            zstride_first: Some(first),
-            ..Policy::cache64_tofit_zstride_drop()
         }
     }
 }
@@ -9940,32 +9914,6 @@ impl Supdb {
         Supdb::with_policy(path, Policy::cache64_tofit_zstride_drop())
     }
 
-    /// `supdb-cache64tofitzstridedrop5m`: `supdb-cache64tofitzstridedrop`
-    /// with the stride form for the store's first five million keys and the
-    /// block form for the rest (`Options::zpages_stride_below`), a store in
-    /// two forms by its keys' place. The pair against the stride arm and
-    /// against `supdb-cache64tofitzpagesdrop` at ten million keys under a
-    /// bound the stride form does not fit whole measures what
-    /// `examples/formfit.rs` models: as much of the stride form as fits.
-    pub fn create_cache64_tofit_zstride_drop_5m(path: &Path) -> Res<Supdb> {
-        Supdb::with_policy(path, Policy::cache64_tofit_zstride_drop_first(5_000_000))
-    }
-
-    /// `supdb-cache64tofitzstridedrop7m`: the first seven million keys.
-    pub fn create_cache64_tofit_zstride_drop_7m(path: &Path) -> Res<Supdb> {
-        Supdb::with_policy(path, Policy::cache64_tofit_zstride_drop_first(7_000_000))
-    }
-
-    /// `supdb-cache64tofitzstridedrop2m`: the first two million keys.
-    pub fn create_cache64_tofit_zstride_drop_2m(path: &Path) -> Res<Supdb> {
-        Supdb::with_policy(path, Policy::cache64_tofit_zstride_drop_first(2_000_000))
-    }
-
-    /// `supdb-cache64tofitzstridedrop3m`: the first three million keys.
-    pub fn create_cache64_tofit_zstride_drop_3m(path: &Path) -> Res<Supdb> {
-        Supdb::with_policy(path, Policy::cache64_tofit_zstride_drop_first(3_000_000))
-    }
-
     /// `supdb-cache64tofitzpagesdrop` with its block-coded groups written by
     /// the parsing encoder (`Options::zpages_parse`),
     /// `supdb-cache64tofitzpagesdropparse`: the same block format in fewer
@@ -11061,7 +11009,6 @@ impl Supdb {
             zperrun,
             zmemo_mib,
             zstride,
-            zstride_first,
             zstride_room,
             zstride_convert,
             zaskdropped,
@@ -11700,11 +11647,6 @@ impl Supdb {
             } else {
                 supdb::Options::default().zpages_stride
             }),
-            zpages_stride_below: zstride_first.map(|n| {
-                let mut key = [0u8; 16];
-                crate::workload::db_key_into(n, &mut key);
-                std::sync::Arc::from(&key[..])
-            }),
             zpages_stride_room: zstride_room
                 .unwrap_or(!zpages && supdb::Options::default().zpages_stride_room),
             zpages_stride_convert: zstride_convert
@@ -12202,7 +12144,6 @@ impl Supdb {
             zperrun,
             zmemo_mib,
             zstride,
-            zstride_first,
             zstride_room,
             zstride_convert,
             zaskdropped,
@@ -12782,15 +12723,7 @@ impl Engine for Supdb {
         // The stride form's before every other forced shape, since each of
         // them would also match a store that forces the stride form.
         if self.budget == 64 << 20 && self.tofit && self.zpages && zstride {
-            return if zdropraw && self.zstride_first == Some(2_000_000) {
-                "supdb-cache64tofitzstridedrop2m"
-            } else if zdropraw && self.zstride_first == Some(3_000_000) {
-                "supdb-cache64tofitzstridedrop3m"
-            } else if zdropraw && self.zstride_first == Some(5_000_000) {
-                "supdb-cache64tofitzstridedrop5m"
-            } else if zdropraw && self.zstride_first == Some(7_000_000) {
-                "supdb-cache64tofitzstridedrop7m"
-            } else if zdropraw {
+            return if zdropraw {
                 "supdb-cache64tofitzstridedrop"
             } else if self.zpages_prefetch {
                 "supdb-cache64tofitzstrideprefetch"
@@ -13083,7 +13016,7 @@ impl Engine for Supdb {
         {
             return "supdb-zstrideconv";
         }
-        if zstride && !self.zpages && self.zstride_first.is_none() {
+        if zstride && !self.zpages {
             return match (on(self.zstride_room), on(self.zstride_convert)) {
                 (true, true)
                     if on(self.zaskdropped)
@@ -16789,10 +16722,6 @@ pub fn guarantee(arm: &str) -> Option<Guarantee> {
         | "supdb-cache64tofitzstride"
         | "supdb-cache64tofitzstrideprefetch"
         | "supdb-cache64tofitzstridedrop"
-        | "supdb-cache64tofitzstridedrop2m"
-        | "supdb-cache64tofitzstridedrop3m"
-        | "supdb-cache64tofitzstridedrop5m"
-        | "supdb-cache64tofitzstridedrop7m"
         | "supdb-nocachezpagesrankwalk"
         | "supdb-nocachezpagesonegroup"
         | "supdb-nocachezpagesgroup1k"
@@ -17522,18 +17451,6 @@ pub fn open(arm: &str, dir: &Path, map_gb: usize) -> Res<Box<dyn Engine>> {
         }
         "supdb-cache64tofitzstridedrop" => {
             supdb_arm(Supdb::create_cache64_tofit_zstride_drop, dir)?
-        }
-        "supdb-cache64tofitzstridedrop2m" => {
-            supdb_arm(Supdb::create_cache64_tofit_zstride_drop_2m, dir)?
-        }
-        "supdb-cache64tofitzstridedrop3m" => {
-            supdb_arm(Supdb::create_cache64_tofit_zstride_drop_3m, dir)?
-        }
-        "supdb-cache64tofitzstridedrop5m" => {
-            supdb_arm(Supdb::create_cache64_tofit_zstride_drop_5m, dir)?
-        }
-        "supdb-cache64tofitzstridedrop7m" => {
-            supdb_arm(Supdb::create_cache64_tofit_zstride_drop_7m, dir)?
         }
         "supdb-cache64tofitzpagesstored" => {
             supdb_arm(Supdb::create_cache64_tofit_zpages_stored, dir)?
@@ -24393,10 +24310,7 @@ mod tests {
                     assert_eq!(z.features(), base.features(), "{name}");
                     let o = z.db.as_ref().unwrap().options();
                     assert_eq!(seven(o), want, "{name}");
-                    assert!(
-                        o.zpages == b.zpages && o.zpages_stride_below.is_none(),
-                        "{name}"
-                    );
+                    assert!(o.zpages == b.zpages, "{name}");
                     assert!(o.zpages_hot_raw == b.zpages_hot_raw, "{name}");
                     let beside = if name == "supdb" {
                         two(b)
@@ -26058,87 +25972,6 @@ mod tests {
             drop(arm);
             drop(base);
             let opened = root.join(format!("{i}-open"));
-            std::fs::create_dir_all(&opened).unwrap();
-            let e = open(name, &opened, 1).unwrap();
-            assert_eq!(e.name(), name, "the dispatch");
-            assert_eq!(
-                e.zpages_state().map(|z| (z.forced, z.stride)),
-                Some((true, true))
-            );
-        }
-        let _ = std::fs::remove_dir_all(&root);
-    }
-
-    /// The two-form arms are the stride arm with one field moved, the key
-    /// number their names say, and open with the key of that number as the
-    /// line the stride form is asked under (`Options::zpages_stride_below`)
-    /// where the stride arm opens with none; nothing else of the options the
-    /// stride arm's own test holds moves, and the dispatch reaches each.
-    #[test]
-    fn each_two_form_arm_is_the_stride_arm_and_the_key_its_name_says() {
-        let root =
-            std::env::temp_dir().join(format!("supdb-bench-ztwoform-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&root);
-        assert!(supdb::Options::default().zpages_stride_below.is_none());
-        type Make = fn(&Path) -> Res<Supdb>;
-        let cases: [(&str, u64, Make); 4] = [
-            (
-                "supdb-cache64tofitzstridedrop2m",
-                2_000_000,
-                Supdb::create_cache64_tofit_zstride_drop_2m,
-            ),
-            (
-                "supdb-cache64tofitzstridedrop3m",
-                3_000_000,
-                Supdb::create_cache64_tofit_zstride_drop_3m,
-            ),
-            (
-                "supdb-cache64tofitzstridedrop5m",
-                5_000_000,
-                Supdb::create_cache64_tofit_zstride_drop_5m,
-            ),
-            (
-                "supdb-cache64tofitzstridedrop7m",
-                7_000_000,
-                Supdb::create_cache64_tofit_zstride_drop_7m,
-            ),
-        ];
-        let sib = "supdb-cache64tofitzstridedrop";
-        for (name, first, make) in cases {
-            let mut p = Policy::cache64_tofit_zstride_drop();
-            assert_ne!(p, Policy::cache64_tofit_zstride_drop_first(first));
-            p.zstride_first = Some(first);
-            assert_eq!(p, Policy::cache64_tofit_zstride_drop_first(first), "{name}");
-            let new = |which: &str, make: Make| {
-                let d = root.join(format!("{name}-{which}"));
-                std::fs::create_dir_all(&d).unwrap();
-                make(&d).unwrap()
-            };
-            let arm = new("arm", make);
-            let base = new("base", Supdb::create_cache64_tofit_zstride_drop);
-            assert_eq!((arm.name(), base.name()), (name, sib));
-            assert_eq!(guarantee(name), guarantee(sib));
-            assert_eq!(arm.features(), base.features(), "{name}");
-            let (a, b) = (
-                arm.db.as_ref().unwrap().options(),
-                base.db.as_ref().unwrap().options(),
-            );
-            let mut key = [0u8; 16];
-            crate::workload::db_key_into(first, &mut key);
-            assert_eq!(a.zpages_stride_below.as_deref(), Some(&key[..]), "{name}");
-            assert!(b.zpages_stride_below.is_none(), "{sib}");
-            assert!(
-                a.zpages_stride == supdb::ZStride::Forced && b.zpages_stride == a.zpages_stride
-            );
-            assert!(a.zpages == supdb::ZPages::Always && b.zpages == supdb::ZPages::Always);
-            assert_eq!(a.scan_block_cache, b.scan_block_cache);
-            assert_eq!(a.scan_cache_bytes, b.scan_cache_bytes);
-            assert_eq!(a.zpages_drop_raw, b.zpages_drop_raw);
-            assert_eq!(a.zpages_scan_prefetch, b.zpages_scan_prefetch);
-            assert_eq!(a.zpages_stride_trust_built, b.zpages_stride_trust_built);
-            drop(arm);
-            drop(base);
-            let opened = root.join(format!("{name}-open"));
             std::fs::create_dir_all(&opened).unwrap();
             let e = open(name, &opened, 1).unwrap();
             assert_eq!(e.name(), name, "the dispatch");
