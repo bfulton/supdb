@@ -2878,53 +2878,63 @@ fn a_copy_of_fixed_size_records_is_one_stream_until_a_write_it_cannot_take() {
 /// the look was two tables behind a list of one, the upkeep thread gave its
 /// forms up at its next step, and every copy was dropped (site 7): one run
 /// in a hundred of the two tests before, which take the same two seals.
+/// And a look that lands after the publish, between the ask's read of the
+/// kept list and its read of the position, asks nothing either: read the
+/// other way round, the position from before the look and the list the
+/// look trimmed made the same ask.
 #[test]
 fn a_look_that_lands_inside_a_freeze_asks_the_upkeep_to_give_nothing_up() {
-    let dir = scratch("look-inside-a-freeze");
-    let (mut db, keys, mut want, by_part) = copies_of_fixed_records(&dir, common::options());
-    let (p0, n0) = db.block_cache_packed();
-    assert_eq!(n0, by_part.len(), "every partition's block a copy");
-    let abandons = db.upkeep_abandons();
-    let merges_before = db.seal_waits().merges;
-    db.hold_seal_durable(true);
-    for round in 0..2u8 {
-        if round == 1 {
-            db.look_inside_a_freeze();
+    for between_the_reads in [false, true] {
+        let dir = scratch(&format!("look-inside-a-freeze-{between_the_reads}"));
+        let (mut db, keys, mut want, by_part) = copies_of_fixed_records(&dir, common::options());
+        let (p0, n0) = db.block_cache_packed();
+        assert_eq!(n0, by_part.len(), "every partition's block a copy");
+        let abandons = db.upkeep_abandons();
+        let merges_before = db.seal_waits().merges;
+        db.hold_seal_durable(true);
+        for round in 0..2u8 {
+            if round == 1 {
+                db.look_inside_a_freeze(between_the_reads);
+            }
+            for k in keys.iter().step_by(5) {
+                db.put(k, &[b'a' + round; 100]);
+                want.insert(k.clone(), vec![vec![b'a' + round; 100]]);
+            }
+            db.commit().unwrap();
+            db.seal().unwrap();
         }
-        for k in keys.iter().step_by(5) {
-            db.put(k, &[b'a' + round; 100]);
-            want.insert(k.clone(), vec![vec![b'a' + round; 100]]);
-        }
-        db.commit().unwrap();
-        db.seal().unwrap();
+        let both = db.look_inside_a_freeze_held();
+        // Read with the look still held after its trim: nothing of the
+        // upkeep's has moved what the freeze left.
+        let (asked, kept, lives, look) = db.upkeep_abandon_state();
+        db.let_the_look_go();
+        let at = between_the_reads;
+        assert!(
+            both,
+            "{at}: the look and the writer each held: the look moved inside the window"
+        );
+        assert_eq!(
+            (lives - look, kept),
+            (1, 1),
+            "{at}: the look one table behind, and that table kept for it"
+        );
+        assert!(
+            !asked,
+            "{at}: no ask to give the forms up for a current look"
+        );
+        db.hold_seal_durable(false);
+        merged_past(&mut db, merges_before);
+        assert_eq!(db.upkeep_abandons(), abandons, "{at}: nothing given up");
+        assert_eq!(
+            db.block_cache_packed(),
+            (p0, n0),
+            "{at}: the copies carried across the merge; drops by site and refusals {:?}",
+            db.forms_drop_reasons()
+        );
+        assert!(scan_model(&db) == want);
+        drop(db);
+        let _ = std::fs::remove_dir_all(&dir);
     }
-    let both = db.look_inside_a_freeze_held();
-    // Read with the look still held after its trim: nothing of the
-    // upkeep's has moved what the freeze left.
-    let (asked, kept, lives, look) = db.upkeep_abandon_state();
-    db.let_the_look_go();
-    assert!(
-        both,
-        "the look and the freeze each held: the look moved inside the freeze"
-    );
-    assert_eq!(
-        (lives - look, kept),
-        (1, 1),
-        "the look one table behind, and that table kept for it"
-    );
-    assert!(!asked, "no ask to give the forms up for a current look");
-    db.hold_seal_durable(false);
-    merged_past(&mut db, merges_before);
-    assert_eq!(db.upkeep_abandons(), abandons, "nothing given up");
-    assert_eq!(
-        db.block_cache_packed(),
-        (p0, n0),
-        "the copies carried across the merge; drops by site and refusals {:?}",
-        db.forms_drop_reasons()
-    );
-    assert!(scan_model(&db) == want);
-    drop(db);
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 /// A packed copy that makes no claim to its ranks -- built over keys the
