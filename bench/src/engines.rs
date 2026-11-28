@@ -1824,11 +1824,6 @@ pub struct Supdb {
     /// `supdb-cache64tofitautozpagesflexdec` against
     /// `supdb-cache64tofitautozpages`.
     zflexdec: bool,
-    /// Its raw pages dropped at each attach whatever the gate, as before the
-    /// drop waited for the install (`Options::zpages_drop_at_install` off):
-    /// `supdb-cache64tofitautozpagesdropattach` against
-    /// `supdb-cache64tofitautozpagesdrop`.
-    zdropattach: bool,
     /// The builds ahead from this percent of the budget, beside the seals
     /// that land (`Options::zpages_land_pct`): the `...dropland<pct>` arms
     /// against `supdb-cache64tofitautozpagesdrop`. `None` follows the
@@ -3324,10 +3319,6 @@ struct Policy {
     /// off): `supdb-cache64tofitzpagesdropflexdec`,
     /// `supdb-cache64tofitautozpagesflexdec`.
     zflexdec: bool,
-    /// Its raw pages dropped at each attach whatever the gate
-    /// (`Options::zpages_drop_at_install` off):
-    /// `supdb-cache64tofitautozpagesdropattach`.
-    zdropattach: bool,
     /// The builds ahead from this percent of the budget
     /// (`Options::zpages_land_pct`).
     zlandpct: Option<u32>,
@@ -3920,7 +3911,6 @@ impl Default for Policy {
             znoflat: false,
             znohotfill: false,
             zflexdec: false,
-            zdropattach: false,
             zlandpct: None,
             zsampleidle: false,
             zattachwarm: false,
@@ -10374,25 +10364,6 @@ impl Supdb {
         )
     }
 
-    /// `supdb-cache64tofitautozpagesdrop` with the raw pages dropped at each
-    /// attach whatever the gate (`Options::zpages_drop_at_install` off),
-    /// `supdb-cache64tofitautozpagesdropattach`: the drop's shape before it
-    /// waited for the install.
-    pub fn create_cache64_tofit_auto_zpages_drop_attach(path: &Path) -> Res<Supdb> {
-        Supdb::with_policy(
-            path,
-            Policy {
-                budget: 64 << 20,
-                tofit: true,
-                zpages_auto: true,
-                zdropraw: Some(true),
-                zdropattach: true,
-                zlandpct: Some(0),
-                ..Policy::default()
-            },
-        )
-    }
-
     /// `supdb-cache64tofitautozpages` with its block-coded groups written by
     /// the parsing encoder (`Options::zpages_parse`),
     /// `supdb-cache64tofitautozpagesparse`: the shipping combined arm, where
@@ -11246,7 +11217,6 @@ impl Supdb {
             znoflat,
             znohotfill,
             zflexdec,
-            zdropattach,
             zlandpct,
             zsampleidle,
             zattachwarm,
@@ -11802,7 +11772,6 @@ impl Supdb {
             zpages_inplace_walk: !zdecodewalk,
             zpages_raw_tails_first: zhotfirst,
             zpages_drop_raw: zdropraw.unwrap_or(supdb::Options::default().zpages_drop_raw),
-            zpages_drop_at_install: !zdropattach,
             zpages_land_pct: if noland {
                 0
             } else {
@@ -12408,7 +12377,6 @@ impl Supdb {
             znoflat,
             znohotfill,
             zflexdec,
-            zdropattach,
             zlandpct,
             zsampleidle,
             zattachwarm,
@@ -12962,8 +12930,6 @@ impl Engine for Supdb {
                     100 => "supdb-cache64tofitautozpagesdropland100",
                     _ => "supdb-cache64tofitautozpagesdropland",
                 }
-            } else if zdropraw && self.zdropattach {
-                "supdb-cache64tofitautozpagesdropattach"
             } else if zdropraw {
                 "supdb-cache64tofitautozpagesdrop"
             } else if self.zcacheraw {
@@ -17070,7 +17036,6 @@ pub fn guarantee(arm: &str) -> Option<Guarantee> {
         | "supdb-cache64tofitautozpagesparse"
         | "supdb-cache64tofitautozpagesflexdec"
         | "supdb-cache64tofitautozpagesdrop"
-        | "supdb-cache64tofitautozpagesdropattach"
         | "supdb-cache64tofitautozpagesdropland25"
         | "supdb-cache64tofitautozpagesdropland50"
         | "supdb-cache64tofitautozpagesdropland75"
@@ -17850,9 +17815,6 @@ pub fn open(arm: &str, dir: &Path, map_gb: usize) -> Res<Box<dyn Engine>> {
         }
         "supdb-cache64tofitautozpagesdrop" => {
             supdb_arm(Supdb::create_cache64_tofit_auto_zpages_drop, dir)?
-        }
-        "supdb-cache64tofitautozpagesdropattach" => {
-            supdb_arm(Supdb::create_cache64_tofit_auto_zpages_drop_attach, dir)?
         }
         "supdb-cache64tofitautozpagesdropland25" => supdb_arm(
             |d| Supdb::create_cache64_tofit_auto_zpages_drop_land(d, 25),
@@ -22735,73 +22697,58 @@ mod tests {
     /// `zpages_own_decoder` and nothing else: named, durable like them,
     /// opened under their names by the dispatch, and the engine's defaults
     /// off.
-    /// The combined arm with the raw drop, and with the drop at each attach,
-    /// differ from their bases in the drop's two options alone, and open
-    /// under their names; the engine's default waits for the install.
+    /// The combined arm with the raw drop differs from its base in the
+    /// drop's option alone, and opens under its name; the drop waits for
+    /// the install, as the engine's default does.
     #[test]
-    fn the_auto_drop_arms_differ_from_their_bases_in_the_drop_alone() {
+    fn the_auto_drop_arm_differs_from_its_base_in_the_drop_alone() {
         let root = std::env::temp_dir().join(format!("supdb-bench-zdrop-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
         assert!(supdb::Options::default().zpages_drop_at_install);
-        for (name, make, base_name, base_make, drop_raw, at_install) in [
+        let (name, base_name) = (
+            "supdb-cache64tofitautozpagesdrop",
+            "supdb-cache64tofitautozpages",
+        );
+        let d = root.join(name);
+        std::fs::create_dir_all(&d).unwrap();
+        let arm = Supdb::create_cache64_tofit_auto_zpages_drop(&d).unwrap();
+        let bd = root.join(base_name);
+        std::fs::create_dir_all(&bd).unwrap();
+        let base = Supdb::create_cache64_tofit_auto_zpages(&bd).unwrap();
+        assert_eq!(arm.name(), name);
+        assert_eq!(base.name(), base_name);
+        assert_eq!(guarantee(arm.name()), guarantee(base.name()));
+        let (a, b) = (
+            arm.db.as_ref().unwrap().options(),
+            base.db.as_ref().unwrap().options(),
+        );
+        assert_eq!(
+            (a.zpages_drop_raw, a.zpages_drop_at_install),
+            (true, true),
+            "{name}: the drop's options"
+        );
+        assert_eq!(
             (
-                "supdb-cache64tofitautozpagesdrop",
-                Supdb::create_cache64_tofit_auto_zpages_drop as fn(&Path) -> Res<Supdb>,
-                "supdb-cache64tofitautozpages",
-                Supdb::create_cache64_tofit_auto_zpages as fn(&Path) -> Res<Supdb>,
-                true,
-                true,
+                a.zpages,
+                a.zpages_coding_auto,
+                a.zpages_own_decoder,
+                a.scan_cache_bytes,
+                a.forms_to_fit
             ),
             (
-                "supdb-cache64tofitautozpagesdropattach",
-                Supdb::create_cache64_tofit_auto_zpages_drop_attach,
-                "supdb-cache64tofitautozpagesdrop",
-                Supdb::create_cache64_tofit_auto_zpages_drop,
-                true,
-                false,
+                b.zpages,
+                b.zpages_coding_auto,
+                b.zpages_own_decoder,
+                b.scan_cache_bytes,
+                b.forms_to_fit
             ),
-        ] {
-            let d = root.join(name);
-            std::fs::create_dir_all(&d).unwrap();
-            let arm = make(&d).unwrap();
-            let bd = root.join(base_name);
-            std::fs::create_dir_all(&bd).unwrap();
-            let base = base_make(&bd).unwrap();
-            assert_eq!(arm.name(), name);
-            assert_eq!(base.name(), base_name);
-            assert_eq!(guarantee(arm.name()), guarantee(base.name()));
-            let (a, b) = (
-                arm.db.as_ref().unwrap().options(),
-                base.db.as_ref().unwrap().options(),
-            );
-            assert_eq!(
-                (a.zpages_drop_raw, a.zpages_drop_at_install),
-                (drop_raw, at_install),
-                "{name}: the drop's options"
-            );
-            assert_eq!(
-                (
-                    a.zpages,
-                    a.zpages_coding_auto,
-                    a.zpages_own_decoder,
-                    a.scan_cache_bytes,
-                    a.forms_to_fit
-                ),
-                (
-                    b.zpages,
-                    b.zpages_coding_auto,
-                    b.zpages_own_decoder,
-                    b.scan_cache_bytes,
-                    b.forms_to_fit
-                ),
-                "{name}: the rest as {base_name}'s"
-            );
-            drop(arm);
-            drop(base);
-            let od = root.join(format!("{name}-open"));
-            std::fs::create_dir_all(&od).unwrap();
-            assert_eq!(open(name, &od, 1).unwrap().name(), name);
-        }
+            "{name}: the rest as {base_name}'s"
+        );
+        drop(arm);
+        drop(base);
+        let od = root.join(format!("{name}-open"));
+        std::fs::create_dir_all(&od).unwrap();
+        assert_eq!(open(name, &od, 1).unwrap().name(), name);
         let _ = std::fs::remove_dir_all(&root);
     }
 
