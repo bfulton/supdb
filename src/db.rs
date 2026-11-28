@@ -33466,7 +33466,7 @@ impl Reader {
     }
 
     #[inline(always)]
-    fn read_all_in<F: FnMut(&[u8]), const PAGED: bool>(&self, key: &[u8], mut f: F) -> Result<u64> {
+    fn read_all_in<F: FnMut(&[u8]), const PAGED: bool>(&self, key: &[u8], f: F) -> Result<u64> {
         // The census's test at the read's start (`zcensus_begin`), written
         // out so that a store under a cipher, whose bit is in the same two
         // bytes, takes a read of its own from here (`read_all_paged`). A
