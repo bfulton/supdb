@@ -1,0 +1,19 @@
+--- a/tests/cipher.rs	2026-11-28 09:53:58.451876599 +0000
++++ b/tests/cipher.rs	2026-11-28 09:53:58.453268933 +0000
+@@ -2152,12 +2152,16 @@
+     fill(&mut db, n);
+     db.flush().unwrap();
+     db.settle().unwrap();
++    eprintln!("PROBE after the load: {:?}", db.cipher_counts().unwrap().cache);
++    db.restart_cipher_peak();
+     let size = stored_bytes(&dir);
++    eprintln!("PROBE reads begin");
+     assert!(
+         size > 4 * (4 << 20),
+         "the store is {size} bytes, not several times its room"
+     );
+     holds(&db, n);
++    eprintln!("PROBE after the reads: {:?}", db.cipher_counts().unwrap().cache);
+     let c = until(&db, "under the first room", &|c| c.held <= c.budget);
+     assert!(c.rooms > 0, "the room was never read: {c:?}");
+     assert!(c.budget <= 4 << 20, "a budget past the room: {c:?}");
