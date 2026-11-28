@@ -14116,29 +14116,6 @@ impl SegmentWriter {
             }
             ext
         };
-        self.put_record(
-            layout,
-            start,
-            len,
-            std::slice::from_ref(&ext),
-            inline,
-            value_len,
-        )
-    }
-
-    /// The record of the key at `start` (`len` bytes in the arena), naming
-    /// `exts`, its run inline in the record where `inline` says so: written
-    /// to the records as the layout lays them, the one place either is.
-    #[inline(always)]
-    fn put_record(
-        &mut self,
-        layout: Layout,
-        start: usize,
-        len: usize,
-        exts: &[Ext],
-        inline: bool,
-        value_len: usize,
-    ) -> Result<()> {
         match layout {
             Layout::RecordsFirst => {
                 let key = &self.key_arena[start..start + len];
@@ -14147,7 +14124,7 @@ impl SegmentWriter {
                 let (wrote, tail_at) = flatindex::stream_record_tail_at(
                     &mut self.rec_buf,
                     key,
-                    exts,
+                    &[ext],
                     tail,
                     self.compact_records,
                 )
@@ -14189,14 +14166,11 @@ impl SegmentWriter {
                 if inline {
                     let ts = self.tails.len();
                     self.tails.extend_from_slice(&self.run);
-                    self.tail_spans.push((ts, self.run.len()));
+                    self.tail_spans.push((ts, n));
                 } else {
                     self.tail_spans.push((0, 0));
                 }
-                self.exts.push(match exts {
-                    [one] => Extents::One(*one),
-                    many => Extents::Many(many.to_vec()),
-                });
+                self.exts.push(Extents::One(ext));
             }
         }
         self.spans.push((start, len));
@@ -14209,8 +14183,12 @@ impl SegmentWriter {
     /// as every reader reads a record of several extents: the counts
     /// summed, the values walked extent after extent, a tombstone on any
     /// one of them the record's. A value is never cut, and one of 4 GiB
-    /// less a byte, alone in its run, fits. Off every path but a key's run
-    /// past 4 GiB in one segment.
+    /// less a byte fits alone. Off every path but a key's run past 4 GiB in
+    /// one segment, and kept off the functions `end_with` inlines -- its
+    /// runs encoded here, prefixed, and its record written by
+    /// `FlatIndex::encode_record` -- since a second caller of either moved them out
+    /// of `end_with` (71 instructions a key more on the seal by the cost
+    /// count).
     #[cold]
     #[inline(never)]
     fn end_cut(&mut self, start: usize, len: usize, tombstone: bool) -> Result<()> {
@@ -14232,8 +14210,9 @@ impl SegmentWriter {
         let lens = std::mem::take(&mut self.lens);
         let layout = self.layout()?;
         let uvarint = |l: u32| (64 - (u64::from(l) | 1).leading_zeros() as usize).div_ceil(7);
+        let tomb = if tombstone { Ext::TOMBSTONE } else { 0 };
         let mut exts = Vec::new();
-        let (mut g, mut at, mut from) = (0usize, 0usize, 0usize);
+        let (mut g, mut from) = (0usize, 0usize);
         while g < lens.len() {
             // The group from `g`: one value at least, then each that keeps
             // its run, prefixed, within the limit.
@@ -14247,11 +14226,29 @@ impl SegmentWriter {
                 size += more;
                 end += 1;
             }
-            let bytes: usize = lens[g..end].iter().map(|&l| l as usize).sum();
-            at += bytes;
-            let (last, flag) =
-                crate::index::encode_run(&raw[from..at], &lens[g..end], &mut self.run);
-            from = at;
+            let to = from + lens[g..end].iter().map(|&l| l as usize).sum::<usize>();
+            self.run.clear();
+            let (last, flag) = if size > self.max_extent {
+                // One value whose prefix would carry it past the limit: the
+                // fixed form, the value itself.
+                self.run.extend_from_slice(&raw[from..to]);
+                (0, Ext::FIXED)
+            } else {
+                let (mut last, mut at) = (0u32, from);
+                for &l in &lens[g..end] {
+                    last = self.run.len() as u32;
+                    let mut v = u64::from(l);
+                    while v >= 0x80 {
+                        self.run.push(v as u8 | 0x80);
+                        v >>= 7;
+                    }
+                    self.run.push(v as u8);
+                    self.run.extend_from_slice(&raw[at..at + l as usize]);
+                    at += l as usize;
+                }
+                (last, 0)
+            };
+            from = to;
             let n = self.run.len();
             if n > u32::MAX as usize {
                 return Err(err("segment writer: a value exceeds 4 GiB"));
@@ -14265,7 +14262,7 @@ impl SegmentWriter {
                 off,
                 len: n as u32,
                 last,
-                count: (end - g) as u32 | flag | if tombstone { Ext::TOMBSTONE } else { 0 },
+                count: (end - g) as u32 | flag | tomb,
             });
             if self.builder.len() >= self.block_size {
                 self.flush_block()?;
@@ -14279,7 +14276,44 @@ impl SegmentWriter {
         self.lens.clear();
         self.last = 0;
         self.run.clear();
-        self.put_record(layout, start, len, &exts, false, 0)
+        match layout {
+            Layout::RecordsFirst => {
+                let key = &self.key_arena[start..start + len];
+                // The full form, the one a record of several extents takes,
+                // and the bytes `stream_record_tail_at` writes for it.
+                if exts.len() >= usize::from(flatindex::COMPACT) {
+                    return Err(err(
+                        "segment writer: record exceeds the flat index's limits",
+                    ));
+                }
+                let rec = flatindex::FlatIndex::encode_record(key, &exts)
+                    .ok_or_else(|| err("segment writer: record exceeds the flat index's limits"))?;
+                let wrote = rec.len();
+                self.rec_buf.clear();
+                self.rec_buf.extend_from_slice(&rec);
+                if self.marks {
+                    self.batch_buf.extend_from_slice(&self.rec_buf);
+                } else {
+                    self.out.write_all(&self.rec_buf)?;
+                }
+                self.last_value = (0, 0);
+                self.pos += wrote as u64;
+                self.rec_offs.push(self.recs_len as u32);
+                self.recs_len += wrote;
+                self.hashes.push(flatindex::key_hash(key));
+                if self.recs_len > flatindex::MAX_RECS {
+                    return Err(err(
+                        "segment writer: key section exceeds the flat index's limits",
+                    ));
+                }
+            }
+            Layout::BlocksFirst => {
+                self.tail_spans.push((0, 0));
+                self.exts.push(Extents::Many(exts));
+            }
+        }
+        self.spans.push((start, len));
+        Ok(())
     }
 
     /// `begin`, one `value` and `end`, as one call, for a key with one
