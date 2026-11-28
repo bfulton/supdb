@@ -1858,7 +1858,7 @@ fn ord_names(d: &std::path::Path) -> Vec<String> {
 
 /// A frozen table is probed by its own hash, whatever table is live over
 /// it. A hashed table folds a sixteen-byte key's two words where every
-/// other key takes its FNV word (`Options::mem_hash_fold`), and an ordered
+/// other key takes its FNV word, and an ordered
 /// table, the live one while a run of ordered ingest is open, folds none:
 /// the general read hashed the key once by the live table and probed the
 /// frozen tables with it, so beside an open run a frozen table's sixteen-
@@ -2452,31 +2452,25 @@ fn a_point_read_hashed_once_answers_as_the_model() {
     }
 }
 
-/// A store's tables take back the blocks the tables before them gave
-/// (`Options::blocks_pool_bytes`): the live table made at a freeze maps its
+/// A store's tables take back the blocks the tables before them gave: the
+/// live table made at a freeze maps its
 /// blocks while the frozen one is in flight, and the tables after the first
 /// two take theirs from the pool. A store of many seals takes blocks from
 /// its pool and answers every key as the model does, with the store
 /// reopened over what it wrote; with the gate away from the raw form the
-/// pool holds nothing and takes nothing; and a store with no pool counts
-/// none. The controller is off, since its every step stores its own gate
+/// pool holds nothing and takes nothing. The controller is off, since its every step stores its own gate
 /// over the one a test sets (`Db::zgate_set`).
 #[test]
 fn a_store_takes_back_the_blocks_its_tables_gave() {
     // The controller's gate at the raw form, and at its census.
     const RAW: u8 = 0;
     const CENSUS: u8 = 1;
-    for (name, pool, gate) in [
-        ("blockpool", true, RAW),
-        ("blockpool-census", true, CENSUS),
-        ("blockpool-none", false, RAW),
-    ] {
+    for (name, gate) in [("blockpool", RAW), ("blockpool-census", CENSUS)] {
         let d = dir(name);
         // The controller off, so the gate stays where the test sets it:
         // its step stores its own gate, and the pool's state with it.
         let opts = Options {
             seal_bytes: 1 << 20,
-            blocks_pool_bytes: if pool { 64 << 20 } else { 0 },
             zpages: supdb::ZPages::Off,
             ..common::options()
         };
@@ -2484,7 +2478,7 @@ fn a_store_takes_back_the_blocks_its_tables_gave() {
         db.zgate_set(gate);
         assert_eq!(
             db.block_pool_on(),
-            pool && gate == RAW,
+            gate == RAW,
             "{name}: the pool on with the raw form alone"
         );
         let mut want: BTreeMap<Vec<u8>, Vec<u8>> = BTreeMap::new();
@@ -2499,7 +2493,7 @@ fn a_store_takes_back_the_blocks_its_tables_gave() {
             db.settle().unwrap();
         }
         let (held, takes, gives) = db.block_pool_counts();
-        if pool && gate == RAW {
+        if gate == RAW {
             assert!(
                 takes > 0 && gives > 0,
                 "{name}: no block taken back: held {held} takes {takes} gives {gives}"

@@ -880,10 +880,6 @@ pub struct Supdb {
     /// `Options::flush_waits_manifest` was off. `supdb-waitmanifest`, and
     /// `supdb-ingestwaitmanifest` buffered.
     waitmanifest: bool,
-    /// The writer's buffers populated a window ahead of their fill
-    /// (`Options::prefault`). `supdb-populate`, and `supdb-ingestpopulate`
-    /// buffered.
-    populate: bool,
     /// Segments written in 256 KB pieces (`SegmentOptions::write_piece`),
     /// a quarter of the default's fresh pages for the piece buffer.
     /// `supdb-piece256`, and `supdb-ingestpiece256` buffered.
@@ -1044,14 +1040,6 @@ pub struct Supdb {
     /// before `Options::direct_recycle`. `supdb-norecycle`, and
     /// `supdb-ingestnorecycle` buffered.
     norecycle: bool,
-    /// The engine's large blocks from the global allocator, the shape
-    /// before `Options::blocks_mapped`. `supdb-heapblocks`, and
-    /// `supdb-ingestheapblocks` buffered.
-    heapblocks: bool,
-    /// No pool of the blocks a store's tables gave back, every one
-    /// unmapped at its drop (`Options::blocks_pool_bytes` of zero):
-    /// `supdb-nopool`, and `supdb-ingestnopool` buffered.
-    nopool: bool,
     /// A streamed table keeping a copy of every key, the shape before
     /// `Options::direct_keys_in_stream`. `supdb-keysarena`, and
     /// `supdb-ingestkeysarena` buffered.
@@ -1555,10 +1543,6 @@ pub struct Supdb {
     /// off): `supdb-indexzeropage`, and `supdb-heldindexzeropage` under
     /// the held log with no frames.
     indexzeropage: bool,
-    /// Every memtable key hashed by its FNV word and a finish, sixteen
-    /// bytes or not (`Options::mem_hash_fold` off): `supdb-memfnv`, and
-    /// `supdb-heldmemfnv` under the held log with no frames.
-    memfnv: bool,
     /// A put of a value of the length it replaces overwritten in place
     /// (`Options::put_in_place`), under the held log with no frames, the
     /// block cache off and the upkeep the writer's: `supdb-heldinplace`,
@@ -1576,58 +1560,22 @@ pub struct Supdb {
     /// ingest. Its writer threads write through their own handles and
     /// take the one writer only to freeze a table they found full.
     shared: bool,
-    /// The shared table's puts appending, nothing reused
-    /// (`Options::shared_recycles` off): `supdb-heldsharednorecycle`.
-    sharednorecycle: bool,
     /// The shared table sized from the store's keys, as FASTER's log is
     /// (`Options::shared_table_bytes`, `faster_sizes`): four times its
     /// records, where the engine's own cap is the seal's share of the
     /// store: `supdb-heldsharedbig`.
     sharedbig: bool,
-    /// The big shared table's probe reading the chain's head only once the
-    /// key has compared (`Options::shared_chunk_ahead` off):
-    /// `supdb-heldsharedbignoahead`.
-    sharednoahead: bool,
     /// The big shared table's index sized from its cap and not from the
     /// store's keys (`Options::shared_index_slots` zero):
     /// `supdb-heldsharedbigcapindex`.
     sharedcapindex: bool,
-    /// The big shared table's keys as entries and chunks apart, not as
-    /// records (`Options::shared_records` off): `supdb-heldsharedbignorecords`.
-    sharednorecords: bool,
-    /// The big shared table's puts laying their values down where they
-    /// replace one of their length, nothing overwritten in place
-    /// (`Options::shared_in_place` off): `supdb-heldsharedbignoinplace`.
-    sharednoinplace: bool,
-    /// The big shared table's operations all through the layered path,
-    /// none through the record's address (`Options::shared_lean` off):
-    /// `supdb-heldsharedbignolean`.
-    sharednolean: bool,
-    /// The big shared table's value arena and index on small pages
-    /// (`Options::shared_huge` off): `supdb-heldsharedbignohuge`.
-    sharednohuge: bool,
-    /// The big shared table's inserts each carrying the slab's length
-    /// (`Options::shared_len_lazy` off): `supdb-heldsharedbigeagerlen`.
-    sharedeagerlen: bool,
-    /// The big shared table's reads asking for their partition's slot only
-    /// once the live table has said it lacks the key
-    /// (`Options::shared_fall_ahead` off): `supdb-heldsharedbignofall`.
-    sharednofall: bool,
     /// The big shared table's reads all asking for their partition's slot
     /// ahead of the live table's probe (`Options::shared_fall_always`):
     /// `supdb-heldsharedbigfallalways`.
     sharedfallalways: bool,
-    /// The big shared table's read-modify-writes of a key the table lacks
-    /// probing it again before they read below it
-    /// (`Options::shared_rmw_absent` off): `supdb-heldsharedbigrmwprobes`.
-    sharedrmwprobes: bool,
     /// The live table never shared with a handle's writes
     /// (`Options::share_on_write` off): `supdb-heldnoshare`.
     noshare: bool,
-    /// The shared table the writer installs for its handles made as its
-    /// writers reach it (`Options::shared_populates` off):
-    /// `supdb-heldnopopulate`.
-    nopopulate: bool,
     /// EXPERIMENT: the arm's own updates and reads made through a handle
     /// claimed to write (`Db::writer`), a write at a time with no batch
     /// behind a commit, as FASTER's session makes them:
@@ -2027,10 +1975,6 @@ struct Policy {
     /// `Options::flush_waits_manifest` was off. `supdb-waitmanifest`, and
     /// `supdb-ingestwaitmanifest` buffered.
     waitmanifest: bool,
-    /// The writer's buffers populated a window ahead of their fill
-    /// (`Options::prefault`). `supdb-populate`, and `supdb-ingestpopulate`
-    /// buffered.
-    populate: bool,
     /// Segments written in 256 KB pieces (`SegmentOptions::write_piece`),
     /// a quarter of the default's fresh pages for the piece buffer.
     /// `supdb-piece256`, and `supdb-ingestpiece256` buffered.
@@ -2191,14 +2135,6 @@ struct Policy {
     /// before `Options::direct_recycle`. `supdb-norecycle`, and
     /// `supdb-ingestnorecycle` buffered.
     norecycle: bool,
-    /// The engine's large blocks from the global allocator, the shape
-    /// before `Options::blocks_mapped`. `supdb-heapblocks`, and
-    /// `supdb-ingestheapblocks` buffered.
-    heapblocks: bool,
-    /// No pool of the blocks a store's tables gave back, every one
-    /// unmapped at its drop (`Options::blocks_pool_bytes` of zero):
-    /// `supdb-nopool`, and `supdb-ingestnopool` buffered.
-    nopool: bool,
     /// A streamed table keeping a copy of every key, the shape before
     /// `Options::direct_keys_in_stream`. `supdb-keysarena`, and
     /// `supdb-ingestkeysarena` buffered.
@@ -2598,9 +2534,6 @@ struct Policy {
     /// (`Options::index_populated` off): `supdb-indexzeropage`,
     /// `supdb-heldindexzeropage`.
     indexzeropage: bool,
-    /// The memtable's hash taken from FNV for every key
-    /// (`Options::mem_hash_fold` off): `supdb-memfnv`, `supdb-heldmemfnv`.
-    memfnv: bool,
     /// Puts overwritten in place (`Options::put_in_place`):
     /// `supdb-heldinplace`.
     inplace: bool,
@@ -2610,48 +2543,17 @@ struct Policy {
     /// Every thread's handle writing the live table
     /// (`Options::shared_writers`): `supdb-heldshared`.
     shared: bool,
-    /// Its puts appending (`Options::shared_recycles` off):
-    /// `supdb-heldsharednorecycle`.
-    sharednorecycle: bool,
     /// Its table sized as FASTER's log (`Options::shared_table_bytes`):
     /// `supdb-heldsharedbig`.
     sharedbig: bool,
-    /// Its probe asking nothing ahead (`Options::shared_chunk_ahead` off):
-    /// `supdb-heldsharedbignoahead`.
-    sharednoahead: bool,
     /// The big shared table's index sized from its cap and not from the
     /// store's keys (`Options::shared_index_slots` zero):
     /// `supdb-heldsharedbigcapindex`.
     sharedcapindex: bool,
-    /// The big shared table's keys as entries and chunks apart, not as
-    /// records (`Options::shared_records` off): `supdb-heldsharedbignorecords`.
-    sharednorecords: bool,
-    /// The big shared table's puts laying their values down where they
-    /// replace one of their length, nothing overwritten in place
-    /// (`Options::shared_in_place` off): `supdb-heldsharedbignoinplace`.
-    sharednoinplace: bool,
-    /// The big shared table's operations all through the layered path,
-    /// none through the record's address (`Options::shared_lean` off):
-    /// `supdb-heldsharedbignolean`.
-    sharednolean: bool,
-    /// The big shared table's value arena and index on small pages
-    /// (`Options::shared_huge` off): `supdb-heldsharedbignohuge`.
-    sharednohuge: bool,
-    /// The big shared table's inserts each carrying the slab's length
-    /// (`Options::shared_len_lazy` off): `supdb-heldsharedbigeagerlen`.
-    sharedeagerlen: bool,
-    /// The big shared table's reads asking for their partition's slot only
-    /// once the live table has said it lacks the key
-    /// (`Options::shared_fall_ahead` off): `supdb-heldsharedbignofall`.
-    sharednofall: bool,
     /// The big shared table's reads all asking for their partition's slot
     /// ahead of the live table's probe (`Options::shared_fall_always`):
     /// `supdb-heldsharedbigfallalways`.
     sharedfallalways: bool,
-    /// The big shared table's read-modify-writes of a key the table lacks
-    /// probing it again before they read below it
-    /// (`Options::shared_rmw_absent` off): `supdb-heldsharedbigrmwprobes`.
-    sharedrmwprobes: bool,
     /// The live table the one writer's whoever writes, a handle's write
     /// refused (`Options::share_on_write` off), under the held log with no
     /// frames: `supdb-heldnoshare`, `supdb-heldnoframes` as it was before
@@ -2661,10 +2563,6 @@ struct Policy {
     /// `supdb-heldsharedbig` while one does, its shared table sized from
     /// the store's keys as that arm's is.
     noshare: bool,
-    /// `supdb-heldnopopulate`: `supdb-heldnoframes` with the table it
-    /// installs for its handles made as they write it
-    /// (`Options::shared_populates` off), its first touches the writers'.
-    nopopulate: bool,
     /// EXPERIMENT, `supdb-heldhandle`: `supdb-heldnoframes` with its own
     /// updates and reads through a handle claimed to write, a write at a
     /// time and no batch behind a commit, which is FASTER's one level.
@@ -2768,7 +2666,6 @@ impl Default for Policy {
             manifestrename: false,
             manifestpending: false,
             waitmanifest: false,
-            populate: false,
             piece256: false,
             recordsteps: false,
             copyvals: false,
@@ -2807,8 +2704,6 @@ impl Default for Policy {
             walaheadflat: false,
             walaheadbeside: false,
             norecycle: false,
-            heapblocks: false,
-            nopool: false,
             keysarena: false,
             noalert: false,
             ordlog: false,
@@ -2911,24 +2806,13 @@ impl Default for Policy {
             holdmarch: false,
             noframes: false,
             indexzeropage: false,
-            memfnv: false,
             inplace: false,
             upkeepbatch: None,
             shared: false,
-            sharednorecycle: false,
             sharedbig: false,
-            sharednoahead: false,
             sharedcapindex: false,
-            sharednorecords: false,
-            sharednoinplace: false,
-            sharednolean: false,
-            sharednohuge: false,
-            sharedeagerlen: false,
-            sharednofall: false,
             sharedfallalways: false,
-            sharedrmwprobes: false,
             noshare: false,
-            nopopulate: false,
             ownhandle: false,
             aheadmin: None,
             lazyforms: false,
@@ -3471,19 +3355,10 @@ impl Supdb {
     /// (`SharedShape`).
     pub fn create_held_shared(path: &Path, shape: SharedShape) -> Res<Supdb> {
         let SharedShape {
-            norecycle,
             big,
-            noahead,
             capindex,
-            norecords,
-            noinplace,
-            nolean,
             asym,
-            nohuge,
-            eagerlen,
-            nofall,
             fallalways,
-            rmwprobes,
         } = shape;
         Supdb::with_policy(
             path,
@@ -3495,18 +3370,9 @@ impl Supdb {
                 block_cache: false,
                 upkeep: Some(supdb::Upkeep::Inline),
                 shared: true,
-                sharednorecycle: norecycle,
                 sharedbig: big,
-                sharednoahead: noahead,
                 sharedcapindex: capindex,
-                sharednorecords: norecords,
-                sharednoinplace: noinplace,
-                sharednolean: nolean,
-                sharednohuge: nohuge,
-                sharedeagerlen: eagerlen,
-                sharednofall: nofall,
                 sharedfallalways: fallalways,
-                sharedrmwprobes: rmwprobes,
                 asympin: asym,
                 ..Policy::default()
             },
@@ -6236,31 +6102,6 @@ impl Supdb {
         )
     }
 
-    /// `supdb` with its buffers' pages populated ahead of the fill
-    /// (`Options::prefault`).
-    pub fn create_populate(path: &Path) -> Res<Supdb> {
-        Supdb::with_policy(
-            path,
-            Policy {
-                populate: true,
-                ..Policy::default()
-            },
-        )
-    }
-
-    /// `supdb-ingest` as `supdb-populate`.
-    pub fn create_ingest_populate(path: &Path) -> Res<Supdb> {
-        Supdb::with_policy(
-            path,
-            Policy {
-                partition: false,
-                durable: false,
-                populate: true,
-                ..Policy::default()
-            },
-        )
-    }
-
     /// `supdb` writing its segments in 256 KB pieces
     /// (`SegmentOptions::write_piece`).
     pub fn create_piece256(path: &Path) -> Res<Supdb> {
@@ -7007,31 +6848,6 @@ impl Supdb {
                 partition: false,
                 durable: false,
                 norecycle: true,
-                ..Policy::default()
-            },
-        )
-    }
-
-    /// `supdb` with its large blocks from the global allocator, the shape
-    /// before `Options::blocks_mapped`.
-    pub fn create_heapblocks(path: &Path) -> Res<Supdb> {
-        Supdb::with_policy(
-            path,
-            Policy {
-                heapblocks: true,
-                ..Policy::default()
-            },
-        )
-    }
-
-    /// `supdb-ingest` as `supdb-heapblocks`.
-    pub fn create_ingest_heapblocks(path: &Path) -> Res<Supdb> {
-        Supdb::with_policy(
-            path,
-            Policy {
-                partition: false,
-                durable: false,
-                heapblocks: true,
                 ..Policy::default()
             },
         )
@@ -7931,7 +7747,6 @@ impl Supdb {
             manifestrename,
             manifestpending,
             waitmanifest,
-            populate,
             piece256,
             recordsteps,
             copyvals,
@@ -7970,8 +7785,6 @@ impl Supdb {
             walaheadflat,
             walaheadbeside,
             norecycle,
-            heapblocks,
-            nopool,
             keysarena,
             noalert,
             ordlog,
@@ -8090,24 +7903,13 @@ impl Supdb {
             holdmarch,
             noframes,
             indexzeropage,
-            memfnv,
             inplace,
             upkeepbatch,
             shared,
-            sharednorecycle,
             sharedbig,
-            sharednoahead,
             sharedcapindex,
-            sharednorecords,
-            sharednoinplace,
-            sharednolean,
-            sharednohuge,
-            sharedeagerlen,
-            sharednofall,
             sharedfallalways,
-            sharedrmwprobes,
             noshare,
-            nopopulate,
             ownhandle,
         } = policy;
         // The table a held store with no frames makes for its handles'
@@ -8388,17 +8190,10 @@ impl Supdb {
             wal_ahead_bytes: if walprefill { 0 } else { 1 << 20 },
             wal_ahead_small_runs: !walaheadflat,
             wal_ahead_beside: walaheadbeside,
-            prefault: populate,
             direct_put_one: !recordsteps,
             direct_stream: !copyvals && !refvals,
             direct_derive_keys: !keycopies,
             direct_recycle: !norecycle,
-            blocks_mapped: !heapblocks,
-            blocks_pool_bytes: if nopool {
-                0
-            } else {
-                supdb::Options::default().blocks_pool_bytes
-            },
             direct_keys_in_stream: !keysarena,
             upkeep_alert: !noalert,
             direct_log_range: !ordlog,
@@ -8612,12 +8407,9 @@ impl Supdb {
             wal_hold_reuses: !holdmarch,
             held_frames: !noframes,
             index_populated: !indexzeropage,
-            mem_hash_fold: !memfnv,
             put_in_place: inplace,
             shared_writers: shared,
             share_on_write: !noshare,
-            shared_populates: !nopopulate,
-            shared_recycles: !sharednorecycle,
             // The big table's sizing for the table a held store with no
             // frames shares on demand too, which holds the store as
             // FASTER's log does: `shares_big`.
@@ -8626,15 +8418,7 @@ impl Supdb {
             } else {
                 0
             },
-            shared_chunk_ahead: !sharednoahead,
-            shared_records: !sharednorecords,
-            shared_in_place: !sharednoinplace,
-            shared_lean: !sharednolean,
-            shared_huge: !sharednohuge,
-            shared_len_lazy: !sharedeagerlen,
-            shared_fall_ahead: !sharednofall,
             shared_fall_always: sharedfallalways,
-            shared_rmw_absent: !sharedrmwprobes,
             shared_index_slots: if (sharedbig && !sharedcapindex) || shares_big {
                 shared_index_slots()
             } else {
@@ -8780,7 +8564,6 @@ impl Supdb {
             manifestrename,
             manifestpending,
             waitmanifest,
-            populate,
             piece256,
             recordsteps,
             copyvals,
@@ -8819,8 +8602,6 @@ impl Supdb {
             walaheadflat,
             walaheadbeside,
             norecycle,
-            heapblocks,
-            nopool,
             keysarena,
             noalert,
             ordlog,
@@ -8938,24 +8719,13 @@ impl Supdb {
             holdmarch,
             noframes,
             indexzeropage,
-            memfnv,
             inplace,
             upkeepbatch,
             shared,
-            sharednorecycle,
             sharedbig,
-            sharednoahead,
             sharedcapindex,
-            sharednorecords,
-            sharednoinplace,
-            sharednolean,
-            sharednohuge,
-            sharedeagerlen,
-            sharednofall,
             sharedfallalways,
-            sharedrmwprobes,
             noshare,
-            nopopulate,
             ownhandle,
             own: None,
             ord_threads: Default::default(),
@@ -9276,8 +9046,6 @@ impl Engine for Supdb {
             if self.noframes {
                 return if self.noshare {
                     "supdb-heldnoshare"
-                } else if self.nopopulate {
-                    "supdb-heldnopopulate"
                 } else if self.heldfiles && self.pacelends {
                     "supdb-heldpacelends"
                 } else if self.heldfiles && self.paced {
@@ -9286,30 +9054,12 @@ impl Engine for Supdb {
                     "supdb-heldfiles"
                 } else if self.ownhandle {
                     "supdb-heldhandle"
-                } else if self.shared && self.sharednorecycle {
-                    "supdb-heldsharednorecycle"
-                } else if self.shared && self.sharedbig && self.sharednoahead {
-                    "supdb-heldsharedbignoahead"
                 } else if self.shared && self.sharedbig && self.sharedcapindex {
                     "supdb-heldsharedbigcapindex"
-                } else if self.shared && self.sharedbig && self.sharednorecords {
-                    "supdb-heldsharedbignorecords"
-                } else if self.shared && self.sharedbig && self.sharednoinplace {
-                    "supdb-heldsharedbignoinplace"
-                } else if self.shared && self.sharedbig && self.sharednolean {
-                    "supdb-heldsharedbignolean"
                 } else if self.shared && self.sharedbig && self.asympin {
                     "supdb-heldsharedbigasym"
-                } else if self.shared && self.sharedbig && self.sharednohuge {
-                    "supdb-heldsharedbignohuge"
-                } else if self.shared && self.sharedbig && self.sharedeagerlen {
-                    "supdb-heldsharedbigeagerlen"
-                } else if self.shared && self.sharedbig && self.sharednofall {
-                    "supdb-heldsharedbignofall"
                 } else if self.shared && self.sharedbig && self.sharedfallalways {
                     "supdb-heldsharedbigfallalways"
-                } else if self.shared && self.sharedbig && self.sharedrmwprobes {
-                    "supdb-heldsharedbigrmwprobes"
                 } else if self.shared && self.sharedbig {
                     "supdb-heldsharedbig"
                 } else if self.shared {
@@ -9322,8 +9072,6 @@ impl Engine for Supdb {
                     "supdb-heldnfnocache"
                 } else if self.indexzeropage {
                     "supdb-heldindexzeropage"
-                } else if self.memfnv {
-                    "supdb-heldmemfnv"
                 } else if self.upkeepbatch.is_some() {
                     "supdb-heldbatch1"
                 } else if self.noalert {
@@ -9349,9 +9097,6 @@ impl Engine for Supdb {
         }
         if self.indexzeropage {
             return "supdb-indexzeropage";
-        }
-        if self.memfnv {
-            return "supdb-memfnv";
         }
         // The probe's combinations first, which the single fields below
         // would name by one of their parts.
@@ -10173,13 +9918,6 @@ impl Engine for Supdb {
                 "supdb-ingestmanifestpending"
             };
         }
-        if self.populate {
-            return if self.partition {
-                "supdb-populate"
-            } else {
-                "supdb-ingestpopulate"
-            };
-        }
         if self.piece256 {
             return if self.partition {
                 "supdb-piece256"
@@ -10363,20 +10101,6 @@ impl Engine for Supdb {
                 "supdb-norecycle"
             } else {
                 "supdb-ingestnorecycle"
-            };
-        }
-        if self.heapblocks {
-            return if self.partition {
-                "supdb-heapblocks"
-            } else {
-                "supdb-ingestheapblocks"
-            };
-        }
-        if self.nopool {
-            return if self.partition {
-                "supdb-nopool"
-            } else {
-                "supdb-ingestnopool"
             };
         }
         if self.keysarena {
@@ -10755,8 +10479,7 @@ impl Engine for Supdb {
                 "share_leaves",
                 (db.share_counts()[1] + db.share_counts()[2]) as f64,
             ),
-            // The bytes of those tables made whole at their install
-            // (`Options::shared_populates`).
+            // The bytes of those tables made whole at their install.
             ("share_populated", db.share_populated() as f64),
             // What the forms' upkeep did: see `Db::forms_events`.
             ("blk_by_upkeep", ev[0] as f64),
@@ -12006,38 +11729,19 @@ pub fn set_store_bound(bytes: Option<u64>) {
 /// (`POINT_OPS_BOUND`). A bound too small for that is refused rather than
 /// sized into a store that cannot hold its own minimum.
 /// A shared arm's shape beside `supdb-heldshared`'s
-/// (`Supdb::create_held_shared`): its puts appending,
-/// `supdb-heldsharednorecycle`; its table sized as FASTER's log,
-/// `supdb-heldsharedbig`, and that with its probe asking nothing ahead,
-/// `supdb-heldsharedbignoahead`, or its index sized from its cap,
-/// `supdb-heldsharedbigcapindex`, or its keys apart from their chains,
-/// `supdb-heldsharedbignorecords`, or its puts overwriting nothing in
-/// place, `supdb-heldsharedbignoinplace`, or its operations all through
-/// the layered path, `supdb-heldsharedbignolean`; and the big arm with its
-/// pins plain stores the sweep fences for (`Options::asym_pins`),
-/// `supdb-heldsharedbigasym`, or its table on small pages,
-/// `supdb-heldsharedbignohuge`, or its inserts each carrying the slab's
-/// length, `supdb-heldsharedbigeagerlen`, or its reads asking for their
-/// partition's slot only once the live table lacks the key,
-/// `supdb-heldsharedbignofall`, or all of them asking for it ahead of the
-/// table's probe, `supdb-heldsharedbigfallalways`, or its read-modify-writes
-/// of a key the table lacks probing it again before they read below it,
-/// `supdb-heldsharedbigrmwprobes`.
+/// (`Supdb::create_held_shared`): its table sized as FASTER's log,
+/// `supdb-heldsharedbig`, and that with its index sized from its cap,
+/// `supdb-heldsharedbigcapindex`; and the big arm with its pins plain
+/// stores the sweep fences for (`Options::asym_pins`),
+/// `supdb-heldsharedbigasym`, or all its reads asking for their
+/// partition's slot ahead of the table's probe,
+/// `supdb-heldsharedbigfallalways`.
 #[derive(Clone, Copy, Default)]
 pub struct SharedShape {
-    pub norecycle: bool,
     pub big: bool,
-    pub noahead: bool,
     pub capindex: bool,
-    pub norecords: bool,
-    pub noinplace: bool,
-    pub nolean: bool,
     pub asym: bool,
-    pub nohuge: bool,
-    pub eagerlen: bool,
-    pub nofall: bool,
     pub fallalways: bool,
-    pub rmwprobes: bool,
 }
 
 /// The slots `supdb-heldsharedbig`'s shared index takes
@@ -12838,7 +12542,6 @@ pub fn guarantee(arm: &str) -> Option<Guarantee> {
         | "supdb-noadvice"
         | "supdb-advicerandom"
         | "supdb-indexzeropage"
-        | "supdb-memfnv"
         | "supdb-nocache"
         | "supdb-dirkey"
         | "supdb-cipher"
@@ -12985,7 +12688,6 @@ pub fn guarantee(arm: &str) -> Option<Guarantee> {
         | "supdb-cache256tofitnosweep"
         | "supdb-manifestrename"
         | "supdb-manifestpending"
-        | "supdb-populate"
         | "supdb-piece256"
         | "supdb-recordsteps"
         | "supdb-copyvals"
@@ -13022,8 +12724,6 @@ pub fn guarantee(arm: &str) -> Option<Guarantee> {
         | "supdb-walaheadflat"
         | "supdb-walaheadbeside"
         | "supdb-norecycle"
-        | "supdb-heapblocks"
-        | "supdb-nopool"
         | "supdb-keysarena"
         | "supdb-noalert"
         | "supdb-ordlog"
@@ -13185,7 +12885,6 @@ pub fn guarantee(arm: &str) -> Option<Guarantee> {
         | "supdb-ingesttofit"
         | "supdb-ingestmanifestrename"
         | "supdb-ingestmanifestpending"
-        | "supdb-ingestpopulate"
         | "supdb-ingestpiece256"
         | "supdb-ingestrecordsteps"
         | "supdb-ingestcopyvals"
@@ -13193,8 +12892,6 @@ pub fn guarantee(arm: &str) -> Option<Guarantee> {
         | "supdb-ingestfillplain"
         | "supdb-ingestlatesync"
         | "supdb-ingestnorecycle"
-        | "supdb-ingestheapblocks"
-        | "supdb-ingestnopool"
         | "supdb-ingestkeysarena"
         | "supdb-ingestnoalert"
         | "supdb-ingestordlog"
@@ -13240,25 +12937,14 @@ pub fn guarantee(arm: &str) -> Option<Guarantee> {
         | "supdb-heldnoalert"
         | "supdb-heldinline"
         | "supdb-heldindexzeropage"
-        | "supdb-heldmemfnv"
         | "supdb-heldinplace"
         | "supdb-heldnfinline"
         | "supdb-heldshared"
-        | "supdb-heldsharednorecycle"
         | "supdb-heldsharedbig"
-        | "supdb-heldsharedbignoahead"
         | "supdb-heldsharedbigcapindex"
-        | "supdb-heldsharedbignorecords"
-        | "supdb-heldsharedbignoinplace"
-        | "supdb-heldsharedbignolean"
         | "supdb-heldsharedbigasym"
-        | "supdb-heldsharedbignohuge"
-        | "supdb-heldsharedbigeagerlen"
-        | "supdb-heldsharedbignofall"
         | "supdb-heldsharedbigfallalways"
-        | "supdb-heldsharedbigrmwprobes"
         | "supdb-heldnoshare"
-        | "supdb-heldnopopulate"
         | "supdb-heldhandle"
         | "supdb-heldfiles"
         | "supdb-heldpaced"
@@ -13579,34 +13265,6 @@ pub fn open(arm: &str, dir: &Path, map_gb: usize) -> Res<Box<dyn Engine>> {
             },
             dir,
         )?,
-        "supdb-heldmemfnv" => supdb_arm(
-            |d| {
-                Supdb::with_policy(
-                    d,
-                    Policy {
-                        partition: false,
-                        durable: false,
-                        held: true,
-                        noframes: true,
-                        memfnv: true,
-                        ..Policy::default()
-                    },
-                )
-            },
-            dir,
-        )?,
-        "supdb-memfnv" => supdb_arm(
-            |d| {
-                Supdb::with_policy(
-                    d,
-                    Policy {
-                        memfnv: true,
-                        ..Policy::default()
-                    },
-                )
-            },
-            dir,
-        )?,
         "supdb-heldinline" => supdb_arm(
             |d| {
                 Supdb::with_policy(
@@ -13680,18 +13338,6 @@ pub fn open(arm: &str, dir: &Path, map_gb: usize) -> Res<Box<dyn Engine>> {
             |d| Supdb::create_held_shared(d, SharedShape::default()),
             dir,
         )?,
-        "supdb-heldsharednorecycle" => supdb_arm(
-            |d| {
-                Supdb::create_held_shared(
-                    d,
-                    SharedShape {
-                        norecycle: true,
-                        ..SharedShape::default()
-                    },
-                )
-            },
-            dir,
-        )?,
         "supdb-heldnoshare" => supdb_arm(
             |d| {
                 Supdb::with_policy(
@@ -13702,22 +13348,6 @@ pub fn open(arm: &str, dir: &Path, map_gb: usize) -> Res<Box<dyn Engine>> {
                         held: true,
                         noframes: true,
                         noshare: true,
-                        ..Policy::default()
-                    },
-                )
-            },
-            dir,
-        )?,
-        "supdb-heldnopopulate" => supdb_arm(
-            |d| {
-                Supdb::with_policy(
-                    d,
-                    Policy {
-                        partition: false,
-                        durable: false,
-                        held: true,
-                        noframes: true,
-                        nopopulate: true,
                         ..Policy::default()
                     },
                 )
@@ -13811,45 +13441,6 @@ pub fn open(arm: &str, dir: &Path, map_gb: usize) -> Res<Box<dyn Engine>> {
             },
             dir,
         )?,
-        "supdb-heldsharedbignoahead" => supdb_arm(
-            |d| {
-                Supdb::create_held_shared(
-                    d,
-                    SharedShape {
-                        big: true,
-                        noahead: true,
-                        ..SharedShape::default()
-                    },
-                )
-            },
-            dir,
-        )?,
-        "supdb-heldsharedbignoinplace" => supdb_arm(
-            |d| {
-                Supdb::create_held_shared(
-                    d,
-                    SharedShape {
-                        big: true,
-                        noinplace: true,
-                        ..SharedShape::default()
-                    },
-                )
-            },
-            dir,
-        )?,
-        "supdb-heldsharedbignolean" => supdb_arm(
-            |d| {
-                Supdb::create_held_shared(
-                    d,
-                    SharedShape {
-                        big: true,
-                        nolean: true,
-                        ..SharedShape::default()
-                    },
-                )
-            },
-            dir,
-        )?,
         "supdb-heldsharedbigasym" => supdb_arm(
             |d| {
                 Supdb::create_held_shared(
@@ -13857,45 +13448,6 @@ pub fn open(arm: &str, dir: &Path, map_gb: usize) -> Res<Box<dyn Engine>> {
                     SharedShape {
                         big: true,
                         asym: true,
-                        ..SharedShape::default()
-                    },
-                )
-            },
-            dir,
-        )?,
-        "supdb-heldsharedbignohuge" => supdb_arm(
-            |d| {
-                Supdb::create_held_shared(
-                    d,
-                    SharedShape {
-                        big: true,
-                        nohuge: true,
-                        ..SharedShape::default()
-                    },
-                )
-            },
-            dir,
-        )?,
-        "supdb-heldsharedbigeagerlen" => supdb_arm(
-            |d| {
-                Supdb::create_held_shared(
-                    d,
-                    SharedShape {
-                        big: true,
-                        eagerlen: true,
-                        ..SharedShape::default()
-                    },
-                )
-            },
-            dir,
-        )?,
-        "supdb-heldsharedbignofall" => supdb_arm(
-            |d| {
-                Supdb::create_held_shared(
-                    d,
-                    SharedShape {
-                        big: true,
-                        nofall: true,
                         ..SharedShape::default()
                     },
                 )
@@ -13915,33 +13467,7 @@ pub fn open(arm: &str, dir: &Path, map_gb: usize) -> Res<Box<dyn Engine>> {
             },
             dir,
         )?,
-        "supdb-heldsharedbigrmwprobes" => supdb_arm(
-            |d| {
-                Supdb::create_held_shared(
-                    d,
-                    SharedShape {
-                        big: true,
-                        rmwprobes: true,
-                        ..SharedShape::default()
-                    },
-                )
-            },
-            dir,
-        )?,
 
-        "supdb-heldsharedbignorecords" => supdb_arm(
-            |d| {
-                Supdb::create_held_shared(
-                    d,
-                    SharedShape {
-                        big: true,
-                        norecords: true,
-                        ..SharedShape::default()
-                    },
-                )
-            },
-            dir,
-        )?,
         "supdb-heldsharedbigcapindex" => supdb_arm(
             |d| {
                 Supdb::create_held_shared(
@@ -14954,8 +14480,6 @@ pub fn open(arm: &str, dir: &Path, map_gb: usize) -> Res<Box<dyn Engine>> {
         "supdb-manifestpending" => supdb_arm(Supdb::create_manifestpending, dir)?,
         "supdb-ingestmanifestrename" => supdb_arm(Supdb::create_ingest_manifestrename, dir)?,
         "supdb-ingestmanifestpending" => supdb_arm(Supdb::create_ingest_manifestpending, dir)?,
-        "supdb-populate" => supdb_arm(Supdb::create_populate, dir)?,
-        "supdb-ingestpopulate" => supdb_arm(Supdb::create_ingest_populate, dir)?,
         "supdb-piece256" => supdb_arm(Supdb::create_piece256, dir)?,
         "supdb-ingestpiece256" => supdb_arm(Supdb::create_ingest_piece256, dir)?,
         "supdb-recordsteps" => supdb_arm(Supdb::create_recordsteps, dir)?,
@@ -15010,34 +14534,6 @@ pub fn open(arm: &str, dir: &Path, map_gb: usize) -> Res<Box<dyn Engine>> {
         "supdb-ingestlatesync" => supdb_arm(Supdb::create_ingest_latesync, dir)?,
         "supdb-norecycle" => supdb_arm(Supdb::create_norecycle, dir)?,
         "supdb-ingestnorecycle" => supdb_arm(Supdb::create_ingest_norecycle, dir)?,
-        "supdb-heapblocks" => supdb_arm(Supdb::create_heapblocks, dir)?,
-        "supdb-ingestheapblocks" => supdb_arm(Supdb::create_ingest_heapblocks, dir)?,
-        "supdb-nopool" => supdb_arm(
-            |d| {
-                Supdb::with_policy(
-                    d,
-                    Policy {
-                        nopool: true,
-                        ..Policy::default()
-                    },
-                )
-            },
-            dir,
-        )?,
-        "supdb-ingestnopool" => supdb_arm(
-            |d| {
-                Supdb::with_policy(
-                    d,
-                    Policy {
-                        partition: false,
-                        durable: false,
-                        nopool: true,
-                        ..Policy::default()
-                    },
-                )
-            },
-            dir,
-        )?,
         "supdb-keysarena" => supdb_arm(Supdb::create_keysarena, dir)?,
         "supdb-ingestkeysarena" => supdb_arm(Supdb::create_ingest_keysarena, dir)?,
         "supdb-noalert" => supdb_arm(Supdb::create_noalert, dir)?,
@@ -15474,10 +14970,8 @@ mod tests {
             ("supdb-heldnoalert", |a| !a.upkeep_alert),
             ("supdb-heldinline", |a| a.upkeep == supdb::Upkeep::Inline),
             ("supdb-heldindexzeropage", |a| !a.index_populated),
-            ("supdb-heldmemfnv", |a| !a.mem_hash_fold),
             ("supdb-heldbatch1", |a| a.upkeep_batch_pct == 1),
             ("supdb-heldnoshare", |a| !a.share_on_write),
-            ("supdb-heldnopopulate", |a| !a.shared_populates),
         ] {
             let e = open(arm, &root.join(arm), 1).unwrap();
             assert_eq!(e.name(), arm);
@@ -15497,20 +14991,12 @@ mod tests {
                     indexzeropage: true,
                     ..Policy::default()
                 },
-                "supdb-heldmemfnv" => Policy {
-                    memfnv: true,
-                    ..Policy::default()
-                },
                 "supdb-heldbatch1" => Policy {
                     upkeepbatch: Some(1),
                     ..Policy::default()
                 },
                 "supdb-heldnoshare" => Policy {
                     noshare: true,
-                    ..Policy::default()
-                },
-                "supdb-heldnopopulate" => Policy {
-                    nopopulate: true,
                     ..Policy::default()
                 },
                 _ => Policy {
@@ -15542,17 +15028,6 @@ mod tests {
         assert_eq!(e.name(), "supdb-indexzeropage");
         assert_eq!(guarantee("supdb-indexzeropage"), guarantee("supdb"));
         drop(e);
-        let mf = Supdb::with_policy(
-            &root.join("memfnv-policy"),
-            Policy {
-                memfnv: true,
-                ..Policy::default()
-            },
-        )
-        .unwrap();
-        assert_eq!(mf.name(), "supdb-memfnv");
-        assert!(!mf.db.as_ref().unwrap().options().mem_hash_fold);
-        drop(mf);
         let e = open("supdb", &root.join("supdb"), 1).unwrap();
         drop((e, nof));
         assert!(
@@ -15610,100 +15085,31 @@ mod tests {
             assert!(!o.held_frames && !o.scan_block_cache && !o.put_in_place);
             assert_eq!(o.upkeep, supdb::Upkeep::Inline);
         }
-        assert!(so.shared_recycles && so.shared_table_bytes == 0);
+        assert!(so.shared_table_bytes == 0);
         drop((s, b));
         // And its siblings, each the arm, or the big arm, but for one
         // option.
-        let shape = |norecycle, big, noahead, capindex, norecords| SharedShape {
-            norecycle,
+        let shape = |big, capindex| SharedShape {
             big,
-            noahead,
             capindex,
-            norecords,
-            noinplace: false,
-            nolean: false,
             asym: false,
-            nohuge: false,
-            eagerlen: false,
-            nofall: false,
             fallalways: false,
-            rmwprobes: false,
         };
         for (arm, s) in [
-            (
-                "supdb-heldsharednorecycle",
-                shape(true, false, false, false, false),
-            ),
-            (
-                "supdb-heldsharedbig",
-                shape(false, true, false, false, false),
-            ),
-            (
-                "supdb-heldsharedbignoahead",
-                shape(false, true, true, false, false),
-            ),
-            (
-                "supdb-heldsharedbigcapindex",
-                shape(false, true, false, true, false),
-            ),
-            (
-                "supdb-heldsharedbignorecords",
-                shape(false, true, false, false, true),
-            ),
-            (
-                "supdb-heldsharedbignoinplace",
-                SharedShape {
-                    noinplace: true,
-                    ..shape(false, true, false, false, false)
-                },
-            ),
-            (
-                "supdb-heldsharedbignolean",
-                SharedShape {
-                    nolean: true,
-                    ..shape(false, true, false, false, false)
-                },
-            ),
+            ("supdb-heldsharedbig", shape(true, false)),
+            ("supdb-heldsharedbigcapindex", shape(true, true)),
             (
                 "supdb-heldsharedbigasym",
                 SharedShape {
                     asym: true,
-                    ..shape(false, true, false, false, false)
-                },
-            ),
-            (
-                "supdb-heldsharedbignohuge",
-                SharedShape {
-                    nohuge: true,
-                    ..shape(false, true, false, false, false)
-                },
-            ),
-            (
-                "supdb-heldsharedbigeagerlen",
-                SharedShape {
-                    eagerlen: true,
-                    ..shape(false, true, false, false, false)
-                },
-            ),
-            (
-                "supdb-heldsharedbignofall",
-                SharedShape {
-                    nofall: true,
-                    ..shape(false, true, false, false, false)
+                    ..shape(true, false)
                 },
             ),
             (
                 "supdb-heldsharedbigfallalways",
                 SharedShape {
                     fallalways: true,
-                    ..shape(false, true, false, false, false)
-                },
-            ),
-            (
-                "supdb-heldsharedbigrmwprobes",
-                SharedShape {
-                    rmwprobes: true,
-                    ..shape(false, true, false, false, false)
+                    ..shape(true, false)
                 },
             ),
         ] {
@@ -15715,19 +15121,10 @@ mod tests {
             assert_eq!(a.name(), arm);
             let ao = a.db.as_ref().unwrap().options().clone();
             assert!(ao.shared_writers && !ao.direct_ingest, "{arm}");
-            assert_eq!(ao.shared_recycles, !s.norecycle, "{arm}");
             assert_eq!(ao.shared_table_bytes > 0, s.big, "{arm}");
-            assert_eq!(ao.shared_chunk_ahead, !s.noahead, "{arm}");
             assert_eq!(ao.shared_index_slots > 0, s.big && !s.capindex, "{arm}");
-            assert_eq!(ao.shared_records, !s.norecords, "{arm}");
-            assert_eq!(ao.shared_in_place, !s.noinplace, "{arm}");
-            assert_eq!(ao.shared_lean, !s.nolean, "{arm}");
             assert_eq!(ao.asym_pins, s.asym, "{arm}");
-            assert_eq!(ao.shared_huge, !s.nohuge, "{arm}");
-            assert_eq!(ao.shared_len_lazy, !s.eagerlen, "{arm}");
-            assert_eq!(ao.shared_fall_ahead, !s.nofall, "{arm}");
             assert_eq!(ao.shared_fall_always, s.fallalways, "{arm}");
-            assert_eq!(ao.shared_rmw_absent, !s.rmwprobes, "{arm}");
         }
         let _ = std::fs::remove_dir_all(&root);
     }
@@ -15752,15 +15149,12 @@ mod tests {
         for arm in [
             "supdb-ingest",
             "supdb-heldshared",
-            "supdb-heldsharednorecycle",
             // The table shared on demand: the threads' first writes are
             // refused by the one writer's table, the commit one of them
             // makes installs a shared one, and each write is made again.
             "supdb-heldnoframes",
             // And the same store with its table the one writer's.
             "supdb-heldnoshare",
-            // And with its shared table made as the threads write it.
-            "supdb-heldnopopulate",
             "lmdb-nosync",
             "rocksdb-tuned-nosync",
         ] {
@@ -17548,21 +16942,6 @@ mod tests {
                 assert_eq!(z.features(), base.features());
                 let o = z.db.as_ref().unwrap().options();
                 assert!(o.forms_convert_from == 0 && b.forms_convert_from == 4);
-            }
-            {
-                let z = Supdb::with_policy(
-                    &dir("nopool"),
-                    Policy {
-                        nopool: true,
-                        ..Policy::default()
-                    },
-                )
-                .unwrap();
-                assert_eq!(z.name(), "supdb-nopool");
-                assert_eq!(z.features(), base.features());
-                let o = z.db.as_ref().unwrap().options();
-                assert!(o.blocks_pool_bytes == 0 && b.blocks_pool_bytes > 0);
-                assert!(o.blocks_mapped, "the one option moved");
             }
             {
                 let z = Supdb::with_policy(

@@ -66,8 +66,7 @@
 //!   the process in a quarter of the seeds (`SyncPolicy::Explicit`,
 //!   `Cfg::hold_small`), dropped at half its reopens and closed at the
 //!   rest; and in half of those builds no frames (`Cfg::held_frames`),
-//!   closed at every reopen; and in a quarter of the seeds hashes a
-//!   memtable's keys by FNV alone (`Cfg::mem_fold`);
+//!   closed at every reopen;
 //!   and in a quarter of the seeds that hold their log overwrites a put's
 //!   value of the put's length where it lies on the `z` store, its handles
 //!   claimed only with nothing staged (`Cfg::in_place`).
@@ -434,12 +433,6 @@ struct Cfg {
     /// layered read's. Such a seed's store is closed at every reopen, since
     /// a drop keeps nothing a drain has not covered.
     held_frames: bool,
-    /// A memtable hashes a sixteen-byte key by the fold of its words
-    /// (`Options::mem_hash_fold`): off in a quarter of the seeds under
-    /// `ZFUZZ_OPTVARY`, the side generator's draw after the two that
-    /// `point_record_ahead` and `point_live_first` took,
-    /// and on otherwise, as the engine has it.
-    mem_fold: bool,
     /// The `z` store's puts overwrite a value of their length where it lies
     /// (`Options::put_in_place`): in a quarter of the seeds that hold their
     /// log, the side generator's draw after the memtable hash's, with the
@@ -789,7 +782,8 @@ fn pick_cfg(rng: &mut Rng, want_cache: bool) -> Cfg {
     // that the draws after them stand.
     let _ = side.chance(25);
     let _ = side.chance(25);
-    let mem_fnv = side.chance(25);
+    // The draw `mem_hash_fold` took, kept so that the draws after it stand.
+    let _ = side.chance(25);
     let in_place = side.chance(25);
     let spare_off = side.chance(25);
     let _ = side.chance(25);
@@ -886,7 +880,6 @@ fn pick_cfg(rng: &mut Rng, want_cache: bool) -> Cfg {
         merge_quiet_any: vary && !quiet_on && quiet_any,
         hold_small: vary && explicit_on && hold_small,
         held_frames: !(vary && explicit_on && no_frames),
-        mem_fold: !(vary && mem_fnv),
         in_place: vary && explicit_on && in_place,
         run_spare: !(vary && spare_off),
         copy_span: vary && copy_span,
@@ -930,7 +923,6 @@ fn opts(c: &Cfg) -> Options {
         merge_parallel_quiet: if c.merge_quiet { 3 } else { 0 },
         merge_quiet_any_gate: c.merge_quiet_any,
         held_frames: c.held_frames,
-        mem_hash_fold: c.mem_fold,
         wal_hold_bytes: if c.hold_small {
             2 << 10
         } else {
@@ -2946,7 +2938,6 @@ fn run_range() {
     let mut held = [0u64; 2];
     let mut reads = [0u64; 3];
     let mut frameless = 0u64;
-    let mut mem_fnv = 0u64;
     let mut in_place = [0u64; 2];
     let mut share = [0u64; 4];
     let mut sharing_seeds = 0u64;
@@ -2959,9 +2950,6 @@ fn run_range() {
         let drawn = seed_draws(seed, want_cache).0;
         if !drawn.held_frames {
             frameless += 1;
-        }
-        if !drawn.mem_fold {
-            mem_fnv += 1;
         }
         if drawn.in_place {
             in_place[0] += 1;
@@ -3004,7 +2992,7 @@ fn run_range() {
         }
     }
     eprintln!(
-        "seeds {from}..{to}: reopens {reopens}, abandons {abandons}, bindings {bindings}, merges beside {beside}, cache units given back {evicted}, chunks decrypted {fills}, reads through a form {zreads}, forms-off switches {switches}, sparse forms recut {recuts}, heads owned {} given back {}, point parts {} admits {} key hits {} walk owned {} walk parts {} hot starts {} copy starts {} stale exits {} cursor steps {} bounds by head {} landings left {} quiet merges {} key sequences kept {} rank patches {} rank starts {} copies packed {} unpacked {}, log frames dropped {} spilled {}, held logs with no frames {frameless}, memtables hashed by FNV {mem_fnv}, overwriting puts {} overwrites {}, point reads two-source {} layered {} placed {}, FAILURES {}",
+        "seeds {from}..{to}: reopens {reopens}, abandons {abandons}, bindings {bindings}, merges beside {beside}, cache units given back {evicted}, chunks decrypted {fills}, reads through a form {zreads}, forms-off switches {switches}, sparse forms recut {recuts}, heads owned {} given back {}, point parts {} admits {} key hits {} walk owned {} walk parts {} hot starts {} copy starts {} stale exits {} cursor steps {} bounds by head {} landings left {} quiet merges {} key sequences kept {} rank patches {} rank starts {} copies packed {} unpacked {}, log frames dropped {} spilled {}, held logs with no frames {frameless}, overwriting puts {} overwrites {}, point reads two-source {} layered {} placed {}, FAILURES {}",
         heads[0],
         heads[1],
         point[0],

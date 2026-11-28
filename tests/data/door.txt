@@ -27,7 +27,6 @@ allow	src/db/vault.rs	<file>	1	the door itself
 allow	src/db.rs	idle_io_priority	1	syscall(SYS_ioprio_set): a thread's I/O class, not a file
 allow	src/db.rs	with_idle_io	1	syscall(SYS_ioprio_get/set): a thread's I/O class, not a file
 allow	src/db.rs	io_priority_class	1	syscall(SYS_ioprio_get): a thread's I/O class, not a file
-allow	src/db.rs	populate_ahead	1	madvise(POPULATE_WRITE) on the writer's anonymous buffer
 allow	src/db.rs	register_membarrier	1	syscall(SYS_membarrier): not a file
 allow	src/db.rs	membarrier_all_threads	1	syscall(SYS_membarrier): not a file
 # The engine: on a handle the door gave (S1: the typed handle's methods).
@@ -69,7 +68,6 @@ cfgout	src/block.rs	crc32c_hw	1	aarch64: the CRC instructions
 cfgout	src/db.rs	Reader::convert_walked	1	not debug_assertions: a binding the check below uses
 cfgout	src/db.rs	io_priority_class	1	not Linux: no I/O class
 cfgout	src/db.rs	mod heap	1	not glibc: no allocator counts
-cfgout	src/db.rs	populate_ahead	1	not Linux: nothing populated
 cfgout	src/db.rs	prefetch_lines	1	not x86_64: no prefetch
 cfgout	src/db.rs	with_idle_io	1	not Linux: the call as it is
 cfgout	src/db/zfile.rs	<file>	2	not Linux: drop_behind and ask_ahead do nothing

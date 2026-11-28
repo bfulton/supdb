@@ -357,13 +357,11 @@ table and makes it whole, its index and its arena populated, as FASTER's
 log and index stand from its open, so that a cell times its operations and
 not the first touches of a table made inside it. `supdb-heldnoshare` is
 that arm with the table the one writer's whoever writes, its threads
-taking the writer in turn; `supdb-heldnopopulate` installs the table at the
-claim and leaves its memory to the writes that reach it; and
-`supdb-heldsharedbig` is the arm whose every table is shared, with what a
+taking the writer in turn; and `supdb-heldsharedbig` is the arm whose every table is shared, with what a
 shared table refuses turned off for the store's life. `supdb-heldhandle`
 makes the arm's own updates a write at a time through such a handle, with
 no batch behind a commit, which is the one isolation level FASTER has, and
-never leaves the shared table. All four are for pricing.
+never leaves the shared table. All three are for pricing.
 
 A burst of its own writer's -- the lag sweep's -- is lent to the upkeep
 thread and never filed by a commit or waited for
@@ -648,7 +646,7 @@ the lag sweep's full rewrite, not the engine's live bytes, and three
 things set that. The memtables' blocks came from the allocator's heap
 and stayed there when their tables dropped, so the default arm held
 1.3 GB at that point with the engine holding a third, until the engine
-mapped its blocks from the kernel itself (`Options::blocks_mapped`). The
+mapped its blocks from the kernel itself. The
 cache arm whose budget counts contents (`supdb-cache256`) keeps its
 budget only where a scan builds a block, so the full rewrite builds the
 whole store's forms and the first scan sheds them into the allocator's
@@ -914,9 +912,6 @@ other batch within the backlog bound (`Options::upkeep_pace_syncs_model`);
 buying commit has synced, where the default writes it ahead of the
 commit's frames on the writer's path (`Options::wal_ahead_beside`,
 refuted);
-`supdb-nopool` and `supdb-ingestnopool` unmap every block a table gives
-back at its drop, where the default keeps them for the next tables
-(`Options::blocks_pool_bytes`);
 `supdb-zhotresident` is `supdb` with the hot-raw fill asking for the
 partitions the reads have not skewed by how much of their records the cache
 holds, most first (`Options::zpages_hot_fill_resident_first`);

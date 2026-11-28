@@ -1,7 +1,7 @@
 //! Where the engine's large blocks come from: a memtable's arena blocks,
 //! its entry slabs and its hash index, and a scan snapshot's arena blocks.
 //!
-//! By `Options::blocks_mapped` a block of `MAP_FROM` bytes or more is
+//! A table's or a snapshot's block of `MAP_FROM` bytes or more is
 //! mapped from the kernel (`mmap`, anonymous and private) and unmapped at
 //! its drop, so what a store frees goes back at once. From the global
 //! allocator instead, a freed block stays in the allocator's heap for the
@@ -14,7 +14,7 @@
 //! glibc told to map every allocation of a megabyte or more held 0-135.
 //! A mapped block's pages are fresh at their first touch, where a heap's
 //! retained pages were touched before; a block below `MAP_FROM` comes from
-//! the allocator whatever the option, since a mapping costs a system call
+//! the allocator whatever the source, since a mapping costs a system call
 //! and a fault a page that a small block does not earn.
 //!
 //! The bytes mapped and not yet unmapped are counted (`mapped_bytes`): the
@@ -34,7 +34,7 @@
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Mutex;
 
-/// A block of at least this many bytes is mapped when the option says so;
+/// A block of at least this many bytes is mapped where its source maps;
 /// glibc's own threshold starts here, before its first large free raises
 /// it.
 pub(crate) const MAP_FROM: usize = 128 << 10;
@@ -242,8 +242,8 @@ pub(crate) unsafe fn free(p: *mut u8, len: usize, mapped: bool) {
 }
 
 /// Where a structure's blocks come from and go back to: mapped from the
-/// kernel or not (`Options::blocks_mapped`), and for a mapped block the
-/// store's pool first, where it has one (`Options::blocks_pool_bytes`). A
+/// kernel or not, and for a mapped block the
+/// store's pool first, where it has one. A
 /// table's arenas, slabs and index each keep one, so a block goes back to
 /// the pool it could have come from, whichever thread drops the table.
 #[derive(Clone)]
@@ -254,7 +254,7 @@ pub(crate) struct Source {
     /// handed out (`Options::index_populated`, `populate_write`).
     populate: bool,
     /// A mapped block of `HUGE` bytes or more is mapped on huge pages
-    /// (`map_huge`, `Options::shared_huge`), and neither taken from the
+    /// (`map_huge`), and neither taken from the
     /// pool nor given to it, whose blocks of its length are not.
     huge: bool,
 }
@@ -270,7 +270,7 @@ impl Source {
     }
 
     /// This source with its mapped blocks of `HUGE` bytes or more mapped on
-    /// huge pages, or not (`Options::shared_huge`).
+    /// huge pages, or not.
     pub(crate) fn huge(mut self, on: bool) -> Source {
         self.huge = on;
         self
@@ -349,8 +349,8 @@ impl Source {
 }
 
 /// A store's mapped blocks given back by the tables it dropped, kept for
-/// its next tables' blocks of the same lengths instead of unmapped
-/// (`Options::blocks_pool_bytes`). A table's blocks are mapped fresh, and
+/// its next tables' blocks of the same lengths instead of unmapped.
+/// A table's blocks are mapped fresh, and
 /// every page of them is a fault at its first touch -- a microsecond and
 /// more on this guest, half of an update's time where the writer faulted
 /// once every dozen updates -- and the table after it asks for the same
