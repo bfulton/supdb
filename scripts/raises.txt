@@ -180,3 +180,4 @@ tests/data/cost-entries.txt	Reader::hold_own_seals	0	1	a test seam that holds th
 tests/data/cost-entries.txt	Reader::own_seal_held	0	1	a test seam that says the writer's own write waits in that hold, read by tests/shared.rs, at no key, entry, block or step of an operation
 tests/data/cost-entries.txt	Reader::release_own_seal	0	1	a test seam that lets that write go, read by tests/shared.rs, at no key, entry, block or step of an operation
 tests/data/door.txt	thread src/db.rs *	118	119	the conditional write's test holds (Reader::hold_cond_inserts, Reader::hold_rmw_reads, Reader::hold_own_seals) wait on their word in one sleep between looks (cond_hold_wait), as the other holds wait; no thread is made
+tests/data/cost-entries.txt	Db::mapped_by_length	0	1	the engine's mapped blocks alive by length, read by the suite's watch beside a bounded pass (SUPDB_BLOCKS_WATCH), at no key, entry, block or step of an operation

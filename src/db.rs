@@ -58913,6 +58913,20 @@ impl Db {
         blocks::mapped_resident_bytes()
     }
 
+    /// The engine's mapped blocks alive by length, process-wide, the most
+    /// bytes first: for each length, how many blocks have it, the bytes of
+    /// them the kernel has resident, and how many a pool holds idle
+    /// (`Options::blocks_pool_bytes`, `Options::jobs_pooled`). What owns
+    /// the mapped bytes, read beside the process's anonymous mappings,
+    /// which the kernel merges where two lie side by side and so cannot
+    /// say alone which are the engine's. It takes the list's lock for a
+    /// copy and asks the kernel each block's pages, and takes nothing of a
+    /// store's, so a thread beside a pass can read it. For the suite.
+    #[doc(hidden)]
+    pub fn mapped_by_length() -> Vec<(usize, usize, usize, usize)> {
+        blocks::by_length()
+    }
+
     /// The bytes the trim counts its stride by at this moment, by the
     /// store's option. For a test.
     #[doc(hidden)]
