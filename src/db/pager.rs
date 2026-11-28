@@ -425,6 +425,10 @@ const ROOM_SWAMP: u64 = 32 << 20;
 struct Follow {
     room: Box<dyn Room>,
     at: Mutex<Followed>,
+    /// A test's hold on the evictor's looks at the room, from its first,
+    /// until the test lets it go (`Pager::following_held`).
+    #[cfg(test)]
+    held: AtomicBool,
 }
 
 /// Where a following cache stands with its room.
@@ -521,11 +525,34 @@ impl Pager {
     /// runs (`Room`), with its evictor started. A gibibyte until the
     /// platform first says.
     pub(crate) fn following(room: Box<dyn Room>) -> Arc<Pager> {
+        Pager::following_from(room, false)
+    }
+
+    /// `following`, with the evictor's looks at the room held from its
+    /// first until `release_looks`: a test's, for what the cache does
+    /// between its first reading and the evictor's first look.
+    #[cfg(all(test, target_os = "linux"))]
+    pub(crate) fn following_held(room: Box<dyn Room>) -> Arc<Pager> {
+        Pager::following_from(room, true)
+    }
+
+    /// A test's: the evictor's looks at the room let go
+    /// (`following_held`).
+    #[cfg(all(test, target_os = "linux"))]
+    pub(crate) fn release_looks(&self) {
+        if let Some(f) = &self.follow {
+            f.held.store(false, Ordering::SeqCst);
+        }
+    }
+
+    fn following_from(room: Box<dyn Room>, _held: bool) -> Arc<Pager> {
         let p = Pager::make(
             1 << 30,
             Some(Follow {
                 room,
                 at: Mutex::new(Followed::default()),
+                #[cfg(test)]
+                held: AtomicBool::new(_held),
             }),
         );
         p.follow_room();
@@ -611,6 +638,11 @@ impl Pager {
         let Some(f) = &self.follow else {
             return;
         };
+        #[cfg(test)]
+        while f.held.load(Ordering::SeqCst) && std::thread::current().name() == Some("supdb-pager")
+        {
+            std::thread::sleep(Duration::from_millis(1));
+        }
         let mut at = lock(&f.at);
         let now = std::time::Instant::now();
         let evicted = self.counts.evicted_bytes.load(Ordering::Relaxed);
@@ -636,6 +668,7 @@ impl Pager {
         } else {
             ROOM_SELDOM
         };
+        let first = at.read.is_none();
         if at.read.is_none_or(|t| now.duration_since(t) >= every) {
             if let Some(room) = f.room.read(self.held()) {
                 at.read = Some(now);
@@ -643,7 +676,17 @@ impl Pager {
                 Counts::bump(&self.counts.rooms);
                 self.counts.spared.store(spare, Ordering::Relaxed);
                 let (was, now) = (self.budget(), room.saturating_sub(spare).max(floor));
-                at.debt += was.saturating_sub(now);
+                // The first reading replaces the budget the cache was made
+                // with, which is a placeholder and not a budget anything was
+                // held to: its fall is no debt. Booked as one, it stood
+                // against every overshoot until a look found the cache under
+                // its budget, and a cache that went past its room before the
+                // evictor's first look never spared what it overshot.
+                if first {
+                    at.debt = 0;
+                } else {
+                    at.debt += was.saturating_sub(now);
+                }
                 self.set_budget(now);
                 return;
             }
@@ -4024,7 +4067,10 @@ mod tests {
         let unit = (unit_chunks() * CHUNK) as u64;
         let bytes = plain(12 * unit as usize, 4);
         let room = Arc::new(AtomicU64::new(8 * unit));
-        let pager = Pager::following(Box::new(TestRoom {
+        // The evictor's looks held until the file is adopted: the cache is
+        // past its room at its first look, as a store that fills before the
+        // evictor's thread is on a core is.
+        let pager = Pager::following_held(Box::new(TestRoom {
             room: room.clone(),
             quiet: Arc::new(AtomicBool::new(false)),
             claimed: Arc::new(AtomicU64::new(0)),
@@ -4035,6 +4081,7 @@ mod tests {
         let p = Paged::adopt(&pager, &mem, bytes.len() as u64, "unbacked").unwrap();
         drop(mem);
         assert_eq!(pager.held(), 12 * unit);
+        pager.release_looks();
         // Four units past the room, none of it the cache's to give back.
         until("the overshoot kept back", || pager.budget() == 4 * unit);
         for _ in 0..10 {
