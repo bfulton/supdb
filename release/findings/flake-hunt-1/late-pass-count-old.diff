@@ -1,0 +1,104 @@
+--- a/src/db.rs	2026-11-28 16:43:54.489919210 +0000
++++ b/src/db.rs	2026-11-28 16:43:54.492406527 +0000
+@@ -54028,6 +54028,14 @@
+                 }
+             }
+             short_since = None;
++            // PROBE (flake-hunt-1): the thread kept from taking the upkeep
++            // out while the file `PROBE_HOLD_TAKE` names stands, as a thread
++            // off its core is.
++            if let Some(h) = std::env::var_os("PROBE_HOLD_TAKE") {
++                while std::path::Path::new(&h).exists() {
++                    std::thread::sleep(std::time::Duration::from_millis(1));
++                }
++            }
+             let Some((fs, to)) = lend.take_out() else {
+                 // Alert, the park is capped at a poll; past it, the
+                 // back-off climbs as before (`Options::upkeep_alert`).
+@@ -54061,6 +54069,25 @@
+                 thread_cpu_ns().saturating_sub(cpu0),
+                 AtomicOrdering::Relaxed,
+             );
++            // PROBE (flake-hunt-1): the count of the pass that published
++            // forms beside a frozen table -- the carry's -- held until the
++            // test says it has read the position and the count, through
++            // the file `PROBE_LATE_PASS_COUNT` names, or for twenty seconds.
++            if let Some(go) = std::env::var_os("PROBE_LATE_PASS_COUNT") {
++                let carried = {
++                    let _e = self.enter();
++                    let st = self.state();
++                    !st.frozen.is_empty()
++                        && st.forms_at.load(AtomicOrdering::Acquire) != usize::MAX
++                };
++                let t = std::time::Instant::now();
++                while carried
++                    && !std::path::Path::new(&go).exists()
++                    && t.elapsed() < std::time::Duration::from_secs(20)
++                {
++                    std::thread::sleep(std::time::Duration::from_millis(1));
++                }
++            }
+             lend.passes.fetch_add(1, AtomicOrdering::Relaxed);
+             match pass {
+                 Ok((fs, ran, whole, done)) => {
+--- a/tests/db.rs	2026-11-28 16:43:54.517078098 +0000
++++ b/tests/db.rs	2026-11-28 16:43:54.522484425 +0000
+@@ -19705,14 +19705,47 @@
+     db.hold_seal_landing(true);
+     let value = "x".repeat(200);
+     let mut round = 0u32;
++    // PROBE (flake-hunt-1): each commit's sample taken with no pass in
++    // flight and the thread kept from its next, so the commit's lend and
++    // its freeze are one pass after the sample; the carry pass's
++    // count then waits for the word this test writes once it has read the
++    // position and the count.
++    let probe = std::env::var_os("PROBE_LATE_PASS_COUNT");
++    if let Some(p) = &probe {
++        let _ = std::fs::remove_file(p);
++    }
++    let said = || {
++        if let Some(p) = &probe {
++            let _ = std::fs::write(p, b"");
++        }
++    };
+     // The thread's passes before the commit that froze, which wakes it.
+     let mut passes = db.upkeep_counts()[0];
+     while db.frozen_tables() == 0 {
+         for k in (round % 7..1500u32).step_by(7) {
+             m.append(&mut db, &key(k), &value);
+         }
++        // The thread kept from its next pass, and none in flight: the
++        // sample is of every pass, and the commit's lend and its freeze
++        // are taken in one pass after it.
++        let hold = std::env::var_os("PROBE_HOLD_TAKE");
++        if let Some(h) = &hold {
++            std::fs::write(h, b"").unwrap();
++            let t = std::time::Instant::now();
++            loop {
++                let ended = db.upkeep_passes_ended();
++                if db.upkeep_passes_begun() == ended {
++                    break;
++                }
++                assert!(t.elapsed().as_secs() < 20, "PROBE: a pass ended");
++                std::thread::sleep(std::time::Duration::from_micros(100));
++            }
++        }
+         passes = db.upkeep_counts()[0];
+         db.commit().unwrap();
++        if let Some(h) = &hold {
++            let _ = std::fs::remove_file(h);
++        }
+         round += 1;
+         assert!(round < 200, "a commit froze");
+     }
+@@ -19724,7 +19757,9 @@
+         );
+         std::thread::sleep(std::time::Duration::from_millis(1));
+     }
+-    assert!(db.upkeep_counts()[0] > passes, "the thread made the pass");
++    let counted = db.upkeep_counts()[0];
++    said();
++    assert!(counted > passes, "the thread made the pass");
+     m.check(&r, "a handle over the forms the thread carried");
+     m.check(&db, "the writer");
+     db.hold_seal_landing(false);
