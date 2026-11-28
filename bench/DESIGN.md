@@ -158,7 +158,38 @@ reader being there.
 The load's two byte quantities are taken apart, and they are not the same
 question. Device bytes written per byte stored is a flow: the device's
 write counter across the load, what the engine made the disk do to take
-the keys durably, amplification included. Bytes on disk per byte stored is
+the keys durably, amplification included. It is read from the `stat` of
+the block device the store's directory is on (sectors written,
+`env::device_stat_of`), with the filesystem synced (`syncfs`) before the
+load's first batch and again after the arm's `sync`, both outside the
+clock: the first so that the window holds nothing an earlier pass left
+for the kernel to write, the second so that it holds everything this load
+did, the files an engine leaves to the kernel's writeback included
+(supdb writes its ordered indexes unsynced, since it rebuilds them) and
+the filesystem's journal and metadata. Where no such device is under the
+store -- off Linux, an overlay, a tmpfs -- the quantity is omitted, never
+taken from another counter. The device is the machine's, so another
+writer on it inside the window is counted too; the syncs leave the
+window only the load's own length for one.
+
+In the rows banked before it was read at the device, the quantity is the
+process's `write_bytes` from `/proc/self/io`, which is a count of pages the process
+dirtied and not of what the device wrote: it charges a whole folio
+re-dirtied after a sync where the device writes the blocks that changed,
+so durable LMDB read 2.006 bytes a byte stored at three hundred thousand
+keys where its device wrote 1.362; it charges a page dropped dirty, which
+the device never sees; and it leaves out the journal. Where every page
+is dirtied once and synced once, as in `lmdb-nosync` and
+`rocksdb-tuned-nosync`, the two read the same to three places. The first
+row read at the device is a definition step for this quantity, banked
+on its controls with the quantity's own regression against a window of
+the old counter read as the definition's and not the engine's; its
+history is the device's from there. The sync ahead of the load moved
+its rate by no more than the sitting moved the shuffled load, which no
+sync reaches
+(`bench/CLAUDE.md`, the device bytes that were the process's).
+
+Bytes on disk per byte stored is
 a state: what the store's files hold once the load is done and before any
 read, every file under the arm's directory at any depth, in allocated
 blocks rather than lengths, since a map file's length can run past what
@@ -1378,9 +1409,9 @@ it does.
 Either control withholds; neither ever fails. A floor or a comparator below
 its window is the machine, and the run did not choose its machine. What
 keeps its verdict whatever they say is `device_bytes_per_byte` and
-`bytes_on_disk_per_byte`: arithmetic on what the engine stored, which came
-back identical to three decimals across hosts that moved every rate by
-half.
+`bytes_on_disk_per_byte`: counts of what the engine wrote and stored,
+which came back identical to three decimals across hosts that moved every
+rate by half, and the device's count repeats to four between reps.
 
 The case this answers cost a day. A quick row failed with 121 of 1,106
 quantities regressed; LMDB's scan at three hundred thousand keys read a

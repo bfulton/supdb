@@ -2786,8 +2786,9 @@ fn read_phase(
     Ok(read_s)
 }
 
-/// The pass's store loaded in key order, its seconds and the device bytes it
-/// wrote returned. Then the question whether a forced arm's form covers it:
+/// The pass's store loaded in key order, its seconds and the bytes its
+/// device wrote returned, or no bytes where the store is on no device the
+/// kernel counts (`env::device_stat_of`). Then the question whether a forced arm's form covers it:
 /// the form files are made by the `sync` the load ends in, so a forced arm
 /// that is not covered, or a stride arm with no stride file, is refused here
 /// and not after the hour its reads would take.
@@ -2799,72 +2800,45 @@ fn ordered_load(
     payload: &Payload,
     counting: &mut Counting<'_>,
 ) -> Result<(f64, Option<u64>), String> {
-    // PROBE (`SUPDB_DEVBYTES_SYNC`): where the filesystem is synced around
-    // the device's reading -- `none`, `after` the load's sync, or `both`
-    // before the load's first batch and after its sync -- and a
-    // `loadbytes` line per load with every reading.
-    let mode = std::env::var("SUPDB_DEVBYTES_SYNC").unwrap_or_else(|_| "after".into());
+    // The device's writes across the load (`bench/DESIGN.md`): the
+    // filesystem synced before the first batch, so that the window holds
+    // nothing an earlier pass left the kernel to write, and again after
+    // the arm's `sync`, so that it holds everything this load handed the
+    // kernel -- what an engine leaves to writeback (supdb's ordered
+    // indexes, unsynced by design), the journal and the metadata. Both are
+    // outside the clock, which `load` keeps. Where the store is on no
+    // device the kernel counts, the quantity is omitted.
     let dev = || {
         counting
             .store_dev
             .as_deref()
             .and_then(env::device_written_bytes)
     };
-    let pre0 = dev();
-    if mode == "both" {
-        env::sync_filesystem(&counting.store_dir)?;
-    }
+    env::sync_filesystem(&counting.store_dir)?;
     let d0 = dev();
     let c0 = counting.begin();
     let (secs, process) = load(e, size, plan, payload, |i| i)?;
     let d1 = dev();
-    // PROBE: what each of the store's files still had dirty after the
-    // load's sync, file by file.
-    if std::env::var_os("SUPDB_LOAD_DIRTY").is_some() {
-        let mut stack = vec![counting.store_dir.clone()];
-        while let Some(d) = stack.pop() {
-            for ent in std::fs::read_dir(&d).map_err(|e| e.to_string())?.flatten() {
-                let p = ent.path();
-                if p.is_dir() {
-                    stack.push(p);
-                    continue;
-                }
-                let a = dev();
-                if let Ok(f) = std::fs::File::open(&p) {
-                    let _ = f.sync_all();
-                }
-                let b = dev();
-                if let (Some(a), Some(b)) = (a, b) {
-                    if b > a {
-                        eprintln!("loaddirty {arm} {size} {} {}", p.display(), b - a);
-                    }
-                }
-            }
-        }
-    }
-    if mode != "none" {
-        env::sync_filesystem(&counting.store_dir)?;
-    }
+    env::sync_filesystem(&counting.store_dir)?;
     let d2 = dev();
     counting.end(c0, "load", "", None, size);
-    let mb = |b: u64| b as f64 / 1e6;
-    if std::env::var_os("SUPDB_LOAD_BYTES").is_some() {
-        if let (Some(p), Some(a), Some(b), Some(c)) = (pre0, d0, d1, d2) {
-            eprintln!(
-                "loadbytes {arm} {size} mode {mode} proc_mb {:.4} dev_mb {:.4} | pending_mb {:.4} window_mb {:.4} after_mb {:.4}",
-                mb(process),
-                mb(c - a),
-                mb(a - p),
-                mb(b - a),
-                mb(c - b)
-            );
-        }
-    }
-    zpages_refusal(arm, size, ZStage::Loaded, e.zpages_state())?;
     let device = match (d0, d2) {
         (Some(a), Some(c)) => Some(c.saturating_sub(a)),
         _ => None,
     };
+    // Beside the load's phases: the process's count of what it dirtied
+    // (`/proc/self/io`) next to the device's, and the part of the device's
+    // that only the sync after the arm's own found to write.
+    if std::env::var_os("SUPDB_LOAD_PHASES").is_some() {
+        let mb = |b: Option<u64>| b.map_or("n/a".to_string(), |b| format!("{:.4}", b as f64 / 1e6));
+        eprintln!(
+            "loadbytes {arm} size {size} device_mb {} process_mb {} after_sync_mb {}",
+            mb(device),
+            mb(Some(process)),
+            mb(d2.zip(d1).map(|(c, b)| c.saturating_sub(b)))
+        );
+    }
+    zpages_refusal(arm, size, ZStage::Loaded, e.zpages_state())?;
     Ok((secs, device))
 }
 

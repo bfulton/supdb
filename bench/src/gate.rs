@@ -121,9 +121,10 @@ pub fn is_comparator(arm: &str) -> bool {
     )
 }
 
-/// Whether a quantity moves with the machine. The byte ratios are
-/// arithmetic on what the engine stored -- they came back identical to
-/// three decimals across hosts that moved every rate by half -- so they
+/// Whether a quantity moves with the machine. The byte ratios are counts
+/// of what the engine wrote and stored -- they came back identical to
+/// three decimals across hosts that moved every rate by half, and the
+/// device's count of the load repeats to four between reps -- so they
 /// are judged whatever the floors say. Everything else is a rate or a
 /// latency, and a bounded row's counts per operation are the device's
 /// and the kernel's as much as the engine's: readahead, reclaim and the

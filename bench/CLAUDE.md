@@ -1129,6 +1129,51 @@ position independence for a library -- is read for what each compiler
 infers from it, by compiling one function both ways under each, before the
 build is called one policy.
 
+**The device bytes that were the process's.** `DESIGN.md` called the
+load's `device_bytes_per_byte` the device's write counter, and it was the
+process's `write_bytes` from `/proc/self/io`: a count of pages dirtied,
+charged as a page goes from clean to dirty. Read beside the device's own
+counter (sectors written in the `stat` of the store's block device) over
+the roster's loads, the two agreed where every page is dirtied once and
+synced once -- `lmdb-nosync` 1.2076 and 1.2076 at ten thousand keys, four
+reps of four -- and parted wherever a page is dirtied again after a sync:
+durable LMDB read 2.006 by the process at three hundred thousand keys and
+1.362 by its device, the count charging the whole folio each commit
+re-dirtied where the device writes the blocks that changed. And it parts
+the other way where a page is dropped dirty: 32 MiB written and removed
+before writeback is 32 MiB to the process and 16 KB to the device
+(`tests/devbytes.rs`). The quantity is read at the device now, and the
+device's counter is the machine's: read across the load alone it took
+the writeback the pass before had left -- `lmdb-nosync` 1.27-1.30 at ten
+thousand keys where synced first it is 1.2076 in every rep, and one rep
+of `supdb` at 259 bytes a byte, the 300 MB of the scan floor's file going
+out in its window -- and it missed what the engine leaves to writeback,
+which for supdb is its ordered indexes, 2.3 MB at three hundred thousand
+keys (written unsynced on purpose, `Options::ord_durable`; a probe synced
+the store's files one at a time and read the device after each). So the
+filesystem is synced before the load's first batch and after the arm's
+`sync`, both outside the clock, and the comparators' reps then agree to
+four places (`SUPDB_LOAD_BYTES=1 SUPDB_DEVBYTES_SYNC=none|after|both
+bench run --scale quick --reps 3 --passes load --out DIR`, at `fee70e8`).
+The sync ahead of the load changes the state the timed load starts in,
+and was priced by alternating runs with and without it, three of each, in
+two sittings with the order reversed (`SUPDB_DEVBYTES_SYNC=after|both
+bench run --scale quick --reps 3 --passes load --out DIR`, at `dba6b69`):
+the ordered load's ratio, median over arms, read 0.98-1.01 by rung in the
+first sitting and 0.96-1.04 in the second, the shuffled load, which no
+sync reaches, 0.98-1.01 and 1.00-1.04, and the three arms that leaned
+past a twentieth both times leaned both ways on one load path (`supdb`
+0.90 and 0.94 at ten thousand keys, `supdb-settle` 1.22 and 1.10), which
+is position. No effect resolved. Off Linux, and on a filesystem with no
+block device under it, the quantity is omitted, never taken from another
+counter. The first row read at the device is a definition step for this
+quantity, banked on its controls. The rules: a quantity named for a
+counter is read from that counter, and a counter that is the machine's is
+read across a window the work has been made to fill and nothing else to
+enter; and the process's count is still printed beside the device's
+(`SUPDB_LOAD_PHASES`), since where they part says which pages were
+written twice.
+
 ## One repository
 
 The suite was a separate repository carrying the engine as a submodule for
