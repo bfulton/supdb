@@ -426,66 +426,6 @@ fn idle_io_priority() {
     }
 }
 
-/// `f` run with the calling thread's I/O priority at the idle class and the
-/// priority it had given back after, whatever `f` does: for a readahead
-/// the thread asks for beside a writer whose commits sync, so that the
-/// requests wait behind the syncs at the device and not ahead of them
-/// (`Options::zpages_hot_ask_idle`). Linux only; elsewhere `f` runs as it
-/// is.
-// The door (tests/data/door.txt): not a file: a thread's I/O class.
-#[allow(clippy::disallowed_methods)]
-fn with_idle_io<T>(f: impl FnOnce() -> T) -> T {
-    #[cfg(target_os = "linux")]
-    {
-        // SAFETY: two syscalls on this thread's own I/O priority, read and
-        // set, with no pointer passed; a failure of either is ignored on
-        // purpose, as `idle_io_priority` ignores one.
-        let before =
-            unsafe { libc::syscall(libc::SYS_ioprio_get, 1 as libc::c_int, 0 as libc::c_int) };
-        idle_io_priority();
-        let out = f();
-        if before >= 0 {
-            unsafe {
-                let _ = libc::syscall(
-                    libc::SYS_ioprio_set,
-                    1 as libc::c_int,
-                    0 as libc::c_int,
-                    before as libc::c_int,
-                );
-            }
-        }
-        out
-    }
-    #[cfg(not(target_os = "linux"))]
-    {
-        f()
-    }
-}
-
-#[cfg(all(test, target_os = "linux"))]
-mod io_class_tests {
-    /// The idle class holds for the call and the thread's own priority is
-    /// given back after it, class none included.
-    #[test]
-    fn the_idle_class_is_held_for_the_call_and_given_back() {
-        let before = super::io_priority_class();
-        let inside = super::with_idle_io(super::io_priority_class);
-        assert_eq!(inside, 3, "idle inside the call");
-        assert_eq!(
-            super::io_priority_class(),
-            before,
-            "the thread's class after"
-        );
-        let twice = super::with_idle_io(|| super::with_idle_io(super::io_priority_class));
-        assert_eq!(twice, 3);
-        assert_eq!(
-            super::io_priority_class(),
-            before,
-            "given back through a nested call"
-        );
-    }
-}
-
 /// The calling thread's I/O class as the kernel reports it: 3 idle, 2 best
 /// effort, 1 real time, 0 none, which the kernel serves as best effort at
 /// the thread's nice level. Zero where the call is not had or fails.
@@ -1122,7 +1062,7 @@ pub struct ZCounts {
     pub hot_asks: u64,
     pub hot_dropped: u64,
     /// Its asks for a raw partition's form file pages ahead of the way back
-    /// (`Options::zpages_hot_back_ask`), and the backs taken at the wait's
+    /// (`Maint::z_hot_back_or_ask`), and the backs taken at the wait's
     /// end with the pages short of the share.
     pub hot_back_asks: u64,
     pub hot_back_waited: u64,
@@ -5877,11 +5817,12 @@ pub struct Options {
     /// of its reads on one partition of twenty-nine at ten million keys, so
     /// under a bound LMDB's B-tree fits whole the form that fits the bound
     /// lost the mixes to the decode (`docs/engine.md`). On as shipped;
-    /// `supdb-znohotraw` is the shape with every covered partition served
-    /// from its form file. Stands down beside the stride form
+    /// off, every covered partition served from its form file, is a test's
+    /// seam. Stands down beside the stride form
     /// (`zpages_stride`), whose files count no decode or open: rated at no
     /// heat, each was a partition of the median a block file's skew is read
     /// against at nothing, until the heat and the median are counted by form.
+    #[doc(hidden)]
     pub zpages_hot_raw: bool,
     /// EXPERIMENT: with the hot-raw policy, a release's room is the group's
     /// unused memory -- its limit less its anonymous memory and its page
@@ -5904,47 +5845,6 @@ pub struct Options {
     /// hot, and E's half second is too short for the asks to land. On;
     /// `supdb-zhotline` is the line and the look's own window.
     pub zpages_hot_raw_slack: bool,
-    /// Under `zpages_hot_raw_slack`, a partition's skew is read over the
-    /// shortest run of the latest looks whose sampled events reach
-    /// `HOT_RAW_MIN_SAMPLES`, as events a key a look, where it was read
-    /// over the whole window of `HOT_RAW_WINDOW` looks: the floor is what
-    /// keeps a look's noise from reading as heat, and a partition that
-    /// passes it in one look has its heat measured in that look, where the
-    /// window's earlier looks -- a uniform pass before a Zipfian mix --
-    /// held its skew under `HOT_RAW_SKEW` until the mix was nearly over. A
-    /// partition read thinly still sums as many looks as it needs, up to
-    /// the window. Off: the whole window, the shape before;
-    /// `supdb-zhotfast` prices it with `zpages_hot_release_resident`.
-    /// Priced on C at ten million keys under 1.25 GiB it asked for the
-    /// Zipfian head a look sooner and read C level (1.02x in three pairs
-    /// of three): C divided is a third of a second, the head's raw pages
-    /// are not resident at its start, and a look to see the skew and a
-    /// device read of the partition land the release at C's end in every
-    /// rep (`bench ab --arms supdb,supdb-zhotfast --size 10000000 --bound
-    /// 1342177280 --passes
-    /// load,read,read-threaded,scan,scan-threaded,mixes,scan-mixed,mixes-scrambled
-    /// --ops-div 10 --reps 3` with `SUPDB_ZPAGES_TRACE=1`, at `96cb2af`).
-    #[doc(hidden)]
-    pub zpages_hot_raw_evidence: bool,
-    /// A fill's ask for a partition whose raw records the cache already
-    /// holds to `HOT_RAW_RESIDENT` releases it in the same look, where it
-    /// waited a look for pages that were there.
-    #[doc(hidden)]
-    pub zpages_hot_release_resident: bool,
-    /// EXPERIMENT: the hot-raw policy's ask -- the raw pages of a partition
-    /// it will release, asked of the kernel at the look before the release
-    /// (`MADV_WILLNEED`, 42 MB a partition at ten million keys) -- is issued
-    /// under the idle I/O class, the segment work's thread lowered for the
-    /// call and given back after (`with_idle_io`), so that the readahead's
-    /// requests wait behind the writer's fdatasyncs at the device and not
-    /// ahead of them: mq-deadline serves reads first, and three asks inside
-    /// A at ten million keys under 1.25 GiB took A's 833 durable commits
-    /// from 0.48-0.54 s to 0.59-0.60 s in both reps of a sitting. Paired in
-    /// the row's shape the class moved nothing the pairing resolves (E
-    /// 1.05x in both reps, D 0.95x in both, A split), so the ask keeps the
-    /// thread's own class and the idle class is the arm,
-    /// `supdb-zhotaskidle` (`docs/engine.md`).
-    pub zpages_hot_ask_idle: bool,
     /// With `zpages_hot_raw_slack`, the share of the budget a release leaves
     /// of the group's unused memory for the process's growth through a
     /// write mix, in percent: ten as shipped (`HOT_RAW_GROWTH`), what the
@@ -6192,68 +6092,6 @@ pub struct Options {
     /// gate's heads the page cache's, `supdb-headsgate`.
     #[doc(hidden)]
     pub heads_owned_past_fill: bool,
-    /// The hot-raw policy's skew bar read against the room
-    /// (`Maint::z_hot_look`): the candidate partition is asked for where its
-    /// raw bytes fit the group's unused memory and it is read more a key
-    /// than the median partition at all, and over the median by
-    /// `HOT_RAW_SKEW` only where it would not fit and a swap is the move.
-    /// The bar held the Zipfian's sixth partition back at 1.1x the median
-    /// with two partitions' worth of room unused at ten million keys under
-    /// 1.25 GiB, five releases in one rep and eight in another, and E's
-    /// covered scans, eight group decodes each, are what the room buys
-    /// back (`docs/engine.md`). Priced again with the bound on each pass
-    /// alone, in the row's order at ten million keys under 1.25 GiB, it
-    /// released seven or eight partitions a rep in the uniform read pass
-    /// and gave some back at every pass that grew the process, and read
-    /// the threaded point reads 1.15x, the scans on three threads 1.07x and
-    /// C 1.25x and 1.58x in both orders, against E at 0.83x and 0.75x, the
-    /// hot partitions bought by swaps inside it, and the mixed scans at
-    /// 0.89-0.98x (`pair.sh supdb supdb-zhotskewroom 10000000 --bound
-    /// 1342177280 --passes
-    /// load,read,read-threaded,scan,scan-threaded,mixes,scan-mixed,mixes-scrambled
-    /// --ops-div 10 --reps 2` at `c9599c2`): a trade. Off, the bar whatever
-    /// the room, is the default; `supdb-zhotskewroom` is the arm.
-    pub zpages_hot_skew_room: bool,
-    /// EXPERIMENT: with `zpages_hot_skew_room`, a release the room alone
-    /// buys -- a candidate under `HOT_RAW_SKEW` of the median -- is asked
-    /// only where the form files and the raw partitions after it stay this
-    /// share of the budget, in percent, under the fill line the way back
-    /// is taken at; a candidate over the skew bar keeps the line itself.
-    /// The room's releases otherwise filled the line and went back at the
-    /// next pass that grew the process -- three threads' handles took the
-    /// budget down by a share of it -- and were asked for again when they
-    /// left, a device read each way, and left no room for the hot
-    /// partition the mixes then wanted, which a swap inside the mix bought.
-    /// With five the room's releases stood through the read and scan
-    /// passes, E read level and C 1.38x and 1.18x, the scans on two and
-    /// three threads 1.06-1.12x, in both orders, and scrambled D 0.87x and
-    /// 0.85x with no fault in either arm, so the margin turned the room's
-    /// trade into a smaller one and not into a gain (`pair.sh supdb
-    /// supdb-zhotskewroomhyst 10000000 --bound 1342177280 --passes
-    /// load,read,read-threaded,scan,scan-threaded,mixes,scan-mixed,mixes-scrambled
-    /// --ops-div 10 --reps 2`). Zero, the line itself, is the default;
-    /// `supdb-zhotskewroomhyst` is the room's bar with five.
-    pub zpages_hot_room_margin_pct: u8,
-    /// The hot-raw policy sends a raw partition back to its form file once
-    /// its reads a key over the look's window fall under the median
-    /// partition's by `HOT_RAW_BACK_SKEW`, coldest first and one a look,
-    /// whatever the room (`Maint::z_hot_look`); without it a raw partition
-    /// goes back only once the files and the raw partitions together pass
-    /// the fill. Released on a skew of `HOT_RAW_SKEW`, a partition is held
-    /// raw down to the median, the gap between the two bars the hysteresis.
-    /// The partitions the unscrambled Zipfian's head made raw stayed raw
-    /// into the scrambled mixes, where no partition is hot and a raw one
-    /// holds its records in a cache the form files need, and went back one
-    /// a look under pressure in the middle of the scrambled E: at ten
-    /// million keys under 1.25 GiB that E took 0.077 major faults an
-    /// operation against 0.021 with the line's three releases
-    /// (`docs/engine.md`). With the scans counted in the groups a form walk
-    /// would open, paired in the row's shape against the shape before, the
-    /// cold way back made 15-19 moves back a sitting and read the
-    /// unscrambled E 0.73x in one sitting and level in the next, the
-    /// scrambled E 1.42x and 1.12x: a trade, so off keeps a raw partition
-    /// raw until the fill and `supdb-zhotcoldback` is the arm.
-    pub zpages_hot_cold_back: bool,
     /// Under the hot-raw policy with its room read from the
     /// group (`zpages_hot_raw`, `zpages_hot_raw_slack`), the policy fills
     /// the room with raw partitions whatever their skew: at each look the
@@ -6296,28 +6134,9 @@ pub struct Options {
     /// fewer major faults in every one; under 1 GiB, where the room holds a
     /// partition or two, B 1.17x and the rest level; no cell behind in both
     /// orders by more than the loads, which it cannot reach, leaned. On;
-    /// `supdb-znohotfill` is the shape before it.
+    /// off, the shape before it, is a test's seam.
     #[doc(hidden)]
     pub zpages_hot_fill: bool,
-    /// EXPERIMENT: under the fill (`zpages_hot_fill`), the candidates the
-    /// reads have not skewed are asked for by how much of their records the
-    /// cache holds, most first, after the skewed ones by heat. Under the
-    /// uniform read pass every partition's heat is the same but for noise,
-    /// so the fill released seven to nine partitions as the noise ranked
-    /// them, at ten million keys under 1.25 GiB, most of each read from the
-    /// device inside the pass -- the background threads read about a
-    /// gigabyte in the slow read passes and 0.4 in the fast -- while the
-    /// load had left a few hundred megabytes of raw records in the cache.
-    /// Run beside the default in one process (`bench ab --arms
-    /// supdb,supdb-zhotresident --size 10000000 --bound 1342177280 --passes
-    /// load,read,read-threaded,scan,scan-threaded,mixes --ops-div 10 --reps
-    /// 6`, at `84d4ce4`) the read pass read in two shapes under both arms,
-    /// 3.1-3.3 s or 4.4-5.4, the default in its fast shape once in six and
-    /// the arm three times, with the same seven to ten partitions released
-    /// a pass: the order of the asks does not decide the shape. Off;
-    /// `supdb-zhotresident` turns it on.
-    #[doc(hidden)]
-    pub zpages_hot_fill_resident_first: bool,
     /// EXPERIMENT: under the fill (`zpages_hot_fill`), a quiet look --
     /// nothing committed since the last and no merge in flight -- fills
     /// the room with the growth share in it (`zpages_hot_growth_pct`), the
@@ -6341,21 +6160,6 @@ pub struct Options {
     /// `supdb-zhotfillquiet` turns it on.
     #[doc(hidden)]
     pub zpages_hot_fill_quiet: bool,
-    /// The hot-raw policy's way back -- a raw partition's form file attached
-    /// again, at the fill, a swap or the cold way back -- in the release's
-    /// two steps: the form file's pages asked of the kernel at one look
-    /// (`MADV_WILLNEED` over the file, under the ask's I/O class) while
-    /// the raw form serves, and the file attached at a later one, once
-    /// `HOT_RAW_RESIDENT` of its pages are resident or `HOT_RAW_ASK_WAIT`
-    /// has passed. The form file is advised random from its attach, so a
-    /// file attached cold was read a page a fault by the reads it served:
-    /// every mix with major faults at ten million keys under 1.25 GiB was
-    /// one with a back move in it, two in the scrambled E as its block
-    /// cache took the budget down, about two form files' pages in faults,
-    /// and the mixes with releases alone, whose pages are asked ahead,
-    /// took none. Off attaches the file at the look that decides it,
-    /// `supdb-zbacknow`.
-    pub zpages_hot_back_ask: bool,
     /// Out of core with the form installed, where scans come back after a
     /// stretch of `zpages_rewarm_quiet_ms` without one, every form file the page
     /// cache holds under `HOT_RAW_RESIDENT` of is asked for whole
@@ -7287,12 +7091,8 @@ impl Default for Options {
             zpages_suspect_at_crossing: true,
             zpages_hot_raw: true,
             zpages_hot_raw_slack: true,
-            zpages_hot_raw_evidence: false,
-            zpages_hot_release_resident: false,
-            zpages_hot_ask_idle: false,
             zpages_hot_growth_pct: 10,
             zpages_hot_fill_quiet: false,
-            zpages_hot_fill_resident_first: false,
             sweep_remembers_pin: true,
             settle_form_ahead: 6,
             settle_seek_ahead: 8,
@@ -7308,11 +7108,7 @@ impl Default for Options {
             heads_owned: true,
             heads_owned_beside_copies: true,
             heads_owned_past_fill: true,
-            zpages_hot_skew_room: false,
-            zpages_hot_room_margin_pct: 0,
-            zpages_hot_cold_back: false,
             zpages_hot_fill: true,
-            zpages_hot_back_ask: true,
             zpages_rewarm_scans: true,
             zpages_rewarm_at_install: false,
             zpages_settle_joins_asks: true,
@@ -58341,10 +58137,6 @@ mod hot_growth_tests {
 }
 const HOT_RAW_TAU: std::time::Duration = std::time::Duration::from_secs(1);
 const HOT_RAW_SKEW: f64 = 1.5;
-/// The share of the median partition's reads a key under which a raw
-/// partition goes back to its form file (`Options::zpages_hot_cold_back`).
-#[doc(hidden)]
-pub const HOT_RAW_BACK_SKEW: f64 = 1.0;
 #[doc(hidden)]
 pub const HOT_RAW_MIN_SAMPLES: u64 = 128;
 /// With `Options::zpages_hot_raw_slack`, the looks whose sampled events a
@@ -58836,7 +58628,7 @@ struct Maint {
     /// write moves.
     z_hot_fill_asks: Vec<(Vec<u8>, std::time::Duration)>,
     z_hot_fill_writes: Option<(u64, usize)>,
-    /// The way back asked at a look before (`Options::zpages_hot_back_ask`):
+    /// The way back asked at a look before (`Maint::z_hot_back_or_ask`):
     /// the raw partition by its lower fence, when, and a mapping of its form
     /// file on disk for the residency of its pages.
     z_hot_back_ask: Option<(Vec<u8>, std::time::Duration, MmapBytes)>,
@@ -62465,10 +62257,6 @@ impl Maint {
             /// reads, one in sixteen.
             rated: bool,
             delta: u64,
-            /// The looks `delta` was summed over
-            /// (`Options::zpages_hot_raw_evidence`); one otherwise, the
-            /// skew read from the count alone.
-            looks: u64,
         }
         // A served form file: its attach's identity, its coding, its bytes
         // with the kept file's, its decode time, its decodes and its opens,
@@ -62602,29 +62390,15 @@ impl Maint {
             // sampled events of the last `HOT_RAW_WINDOW` looks summed, so
             // that a partition read thinly a look but steadily across them
             // is rated on enough of them; else the look's own.
-            let evidence = self.opts.zpages_hot_raw_evidence;
-            let (window, looks) = if self.opts.zpages_hot_raw_slack {
+            let window = if self.opts.zpages_hot_raw_slack {
                 let q = self.z_hot_win.entry(seg.lo.clone()).or_default();
                 q.push_back(delta.unwrap_or(0));
                 while q.len() > HOT_RAW_WINDOW {
                     q.pop_front();
                 }
-                if evidence {
-                    // The latest looks, newest first, until the floor.
-                    let (mut sum, mut n) = (0u64, 0u64);
-                    for &d in q.iter().rev() {
-                        sum += d;
-                        n += 1;
-                        if sum >= HOT_RAW_MIN_SAMPLES {
-                            break;
-                        }
-                    }
-                    (sum, n.max(1))
-                } else {
-                    (q.iter().sum::<u64>(), 1)
-                }
+                q.iter().sum::<u64>()
             } else {
-                (delta.unwrap_or(0), 1)
+                delta.unwrap_or(0)
             };
             let old = self.z_hot_heat.get(&seg.lo).copied().unwrap_or(0.0);
             // Risen at once and decayed over `RECODE_TAU`: a release costs
@@ -62660,7 +62434,6 @@ impl Maint {
                 heat,
                 rated: delta.is_some(),
                 delta: window,
-                looks,
                 seg,
             });
         }
@@ -62696,7 +62469,7 @@ impl Maint {
         // The skew is read from the window: a partition's sampled events a
         // key against the median partition's, over the partitions rated this
         // look, raw ones among them.
-        let per_key = |p: &Part| p.delta as f64 / p.keys.max(1) as f64 / p.looks as f64;
+        let per_key = |p: &Part| p.delta as f64 / p.keys.max(1) as f64;
         let median = {
             let mut v: Vec<f64> = parts.iter().filter(|p| p.rated).map(per_key).collect();
             v.sort_by(|a, b| a.total_cmp(b));
@@ -62862,20 +62635,6 @@ impl Maint {
                 })
                 .collect();
             cands.sort_by(|a, b| per_key(b).total_cmp(&per_key(a)));
-            // The skewed first, and among the rest the one whose records
-            // the cache holds most of (`Options::zpages_hot_fill_resident_first`):
-            // a release of resident records reads nothing from the device.
-            if self.opts.zpages_hot_fill_resident_first {
-                let mut keyed: Vec<(&Part, bool, u64)> = cands
-                    .iter()
-                    .map(|p| {
-                        let need = (p.raw_bytes as f64 * (1.0 - p.seg.records_resident())) as u64;
-                        (*p, per_key(p) >= HOT_RAW_SKEW * median, need)
-                    })
-                    .collect();
-                keyed.sort_by(|a, b| b.1.cmp(&a.1).then(a.2.cmp(&b.2)));
-                cands = keyed.into_iter().map(|(p, _, _)| p).collect();
-            }
             let reserve = cands.iter().map(|p| p.raw_bytes).max().unwrap_or(0);
             let mut avail = room.saturating_sub(pending);
             let mut fill_avail = avail.saturating_sub(reserve);
@@ -62898,23 +62657,10 @@ impl Maint {
                 avail -= need;
                 fill_avail = fill_avail.saturating_sub(need);
                 total_after = after;
-                if self.opts.zpages_hot_release_resident
-                    && p.seg.records_resident() >= HOT_RAW_RESIDENT
-                {
-                    // The pages are there: released now, not a look on.
-                    if self.z_trace {
-                        trace("fill-release-now", Some(p));
-                    }
-                    let seg = p.seg.clone();
-                    self.z_hot_release(seg);
-                    zfile::ZEvents::add(&self.shared.z.hot_asks, 1);
-                    asked += 1;
-                    continue;
-                }
                 if self.z_trace {
                     trace("fill-ask", Some(p));
                 }
-                Maint::z_hot_ask(&p.seg, self.opts.zpages_hot_ask_idle);
+                Maint::z_hot_ask(&p.seg);
                 self.z_hot_fill_asks.push((p.seg.lo.clone(), now));
                 zfile::ZEvents::add(&self.shared.z.hot_asks, 1);
                 asked += 1;
@@ -63010,23 +62756,6 @@ impl Maint {
             }
             return;
         }
-        // A raw partition no longer read more than the median goes back
-        // (`Options::zpages_hot_cold_back`): the coldest under the bar by
-        // its reads a key over the window, one a look.
-        if self.opts.zpages_hot_cold_back && median > 0.0 {
-            let cold = parts
-                .iter()
-                .filter(|p| p.raw && p.rated && per_key(p) < HOT_RAW_BACK_SKEW * median)
-                .min_by(|a, b| per_key(a).total_cmp(&per_key(b)));
-            if let Some(q) = cold {
-                if self.z_trace {
-                    trace("cold-back", Some(q));
-                }
-                let seg = q.seg.clone();
-                self.z_hot_back_or_ask(seg, now);
-                return;
-            }
-        }
         if self.z_hot_hold.is_some_and(|t| now < t) {
             return;
         }
@@ -63048,24 +62777,9 @@ impl Maint {
             Some(r) => p.raw_bytes <= r && after <= fill,
             None => after <= line,
         };
-        // Hot: past the floor, its window not thin, and over the median --
-        // by `HOT_RAW_SKEW` where it would not fit and a swap is the move,
-        // at all where it fits the room (`Options::zpages_hot_skew_room`):
-        // room nobody else uses buys the partition read most whatever its
-        // skew, and the way back returns it should the room go.
-        // A release the room alone buys stops short of the fill line by the
-        // margin (`Options::zpages_hot_room_margin_pct`), so that the next
-        // pass's growth does not send it back and a hot partition after it
-        // finds the room without a swap.
-        let margin =
-            (budget as f64 * f64::from(self.opts.zpages_hot_room_margin_pct) / 100.0) as u64;
-        let fits_room = fits && after <= fill.saturating_sub(margin);
-        let bar = if fits_room && self.opts.zpages_hot_skew_room {
-            1.0
-        } else {
-            HOT_RAW_SKEW
-        };
-        let skewed = p.delta >= HOT_RAW_MIN_SAMPLES && per_key(p) >= bar * median;
+        // Hot: past the floor, its window not thin, and over the median by
+        // `HOT_RAW_SKEW`.
+        let skewed = p.delta >= HOT_RAW_MIN_SAMPLES && per_key(p) >= HOT_RAW_SKEW * median;
         if p.heat < RECODE_FLOOR_NS || !skewed {
             if self.z_trace {
                 trace("cold", Some(p));
@@ -63076,7 +62790,7 @@ impl Maint {
             if self.z_trace {
                 trace("ask", Some(p));
             }
-            Maint::z_hot_ask(&p.seg, self.opts.zpages_hot_ask_idle);
+            Maint::z_hot_ask(&p.seg);
             self.z_hot_ask = Some((p.seg.lo.clone(), now));
             zfile::ZEvents::add(&self.shared.z.hot_asks, 1);
             return;
@@ -63116,21 +62830,12 @@ impl Maint {
     /// `seg`'s raw pages asked of the kernel ahead of the reads the hot-raw
     /// policy sends raw: the index section from its hash slots through its
     /// records (`Blob::raw_read_span`), and the ordered index's heads.
-    /// With `idle`, under the idle I/O class for the call
-    /// (`Options::zpages_hot_ask_idle`).
-    fn z_hot_ask(seg: &Seg, idle: bool) {
-        let ask = || {
-            let raw = seg.blob.for_zfile();
-            if let Some((off, len)) = raw.raw_read_span() {
-                raw.willneed_span(off, len as usize);
-            }
-            seg.ord.willneed_heads_all();
-        };
-        if idle {
-            with_idle_io(ask)
-        } else {
-            ask()
+    fn z_hot_ask(seg: &Seg) {
+        let raw = seg.blob.for_zfile();
+        if let Some((off, len)) = raw.raw_read_span() {
+            raw.willneed_span(off, len as usize);
         }
+        seg.ord.willneed_heads_all();
     }
 
     /// `seg` released to the raw form under the hot-raw policy, its raw pages
@@ -63630,28 +63335,17 @@ impl Maint {
         }
     }
 
-    /// The way back for `seg` under `Options::zpages_hot_back_ask`: its form
-    /// file on disk mapped and its pages asked of the kernel, under the
-    /// release's ask's I/O class, and the back taken at a later look
-    /// (`z_hot_look`); without the option, or where the file does not map,
-    /// the back now.
+    /// The way back for `seg`: its form file on disk mapped and its pages
+    /// asked of the kernel, and the back taken at a later look
+    /// (`z_hot_look`); where the file does not map, the back now.
     fn z_hot_back_or_ask(&mut self, seg: std::sync::Arc<Seg>, now: std::time::Duration) {
-        if self.opts.zpages_hot_back_ask {
-            if let (Some(id), Some(end)) = (Db::name_id(&seg.name), Db::name_end_seq(&seg.name)) {
-                let path = self.dir.join(zfile::zpg_name(id, end));
-                if let Ok(map) = vault::map(&path) {
-                    let ask = || {
-                        let _ = crate::bytes::Bytes::advise_willneed(&map, 0, map_len(&map));
-                    };
-                    if self.opts.zpages_hot_ask_idle {
-                        with_idle_io(ask)
-                    } else {
-                        ask()
-                    }
-                    zfile::ZEvents::add(&self.shared.z.hot_back_asks, 1);
-                    self.z_hot_back_ask = Some((seg.lo.clone(), now, map));
-                    return;
-                }
+        if let (Some(id), Some(end)) = (Db::name_id(&seg.name), Db::name_end_seq(&seg.name)) {
+            let path = self.dir.join(zfile::zpg_name(id, end));
+            if let Ok(map) = vault::map(&path) {
+                let _ = crate::bytes::Bytes::advise_willneed(&map, 0, map_len(&map));
+                zfile::ZEvents::add(&self.shared.z.hot_back_asks, 1);
+                self.z_hot_back_ask = Some((seg.lo.clone(), now, map));
+                return;
             }
         }
         self.z_hot_back(seg);
@@ -65676,7 +65370,7 @@ impl Maint {
                     {
                         continue;
                     }
-                    Maint::z_hot_ask(s, false);
+                    Maint::z_hot_ask(s);
                     zfile::ZEvents::add(&self.shared.z.cross_raw_asks, 1);
                     if self.z_trace {
                         eprintln!(
