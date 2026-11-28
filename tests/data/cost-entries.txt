@@ -347,8 +347,6 @@ Blob::scan_counts_fixed	-	a caller's walk of counts, no probe counts it (a gap)
 Blob::prefetch_scan	-	an ask or a drop of the page cache, made out of core or at a build; a store in core makes none of them on an operation
 Blob::scan	-	seek and scan_at, one call each, which the scan_at probe counts
 Blob::scan_at	scan_at
-Blob::scan_at_paced	-	the engine's paced walk out of core, a store in core does not take it
-Blob::run_walk	-	the engine's reader of a segment: reached through Reader::read_all and Reader::scan, whose probes count what the engine inlines of it
 Db::job_pool_counts	-	a test seam or a counter: reads or sets the store's bookkeeping, at no key, entry, block or step of an operation
 Db::job_pool_takes	-	a test seam or a counter: reads or sets the store's bookkeeping, at no key, entry, block or step of an operation
 Db::snapshot_lean_builds	-	a test seam or a counter: reads or sets the store's bookkeeping, at no key, entry, block or step of an operation

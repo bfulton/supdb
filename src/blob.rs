@@ -2897,36 +2897,7 @@ impl<B: Bytes> Blob<B> {
         limit: usize,
         f: F,
     ) -> Result<usize> {
-        self.scan_at_with::<false, F>(from_rank, limit, 0, f)
-    }
-
-    /// `scan_at`, asking for the records `lead` bytes ahead of the one
-    /// being read as the walk goes: the first `lead` bytes at the start,
-    /// then each line as the walk comes within `lead` of it, so the fetch
-    /// runs beside the walk rather than before it. A hint, nothing waited
-    /// for; the common record shape only, as the walk's fast loop is.
-    /// A source that lends by the piece is refused with `Unsupported`
-    /// before anything is walked, as every walk for a reader that holds
-    /// its key section whole refuses it; `scan_at` walks such a source.
-    #[cfg(not(target_family = "wasm"))]
-    pub fn scan_at_paced<F: FnMut(&[u8], &[u8])>(
-        &self,
-        from_rank: usize,
-        limit: usize,
-        lead: usize,
-        f: F,
-    ) -> Result<usize> {
-        self.scan_at_with::<true, F>(from_rank, limit, lead, f)
-    }
-
-    /// A walker over this segment's records for several runs in turn, the
-    /// record regions resolved once (`RunWalk::scan_at`): what a sparse
-    /// block's walk takes between its deltas, a run at a time.
-    pub fn run_walk(&self) -> RunWalk<'_, B> {
-        RunWalk {
-            blob: self,
-            walk: self.walk_regions(),
-        }
+        self.scan_at_with(from_rank, limit, f)
     }
 
     /// The flat index and its record region and directory, as a walk over
@@ -2936,18 +2907,17 @@ impl<B: Bytes> Blob<B> {
             .and_then(|(sec, idx)| idx.regions(sec).map(|(recs, dir)| (idx, recs, dir)))
     }
 
-    fn scan_at_with<const PACE: bool, F: FnMut(&[u8], &[u8])>(
+    fn scan_at_with<F: FnMut(&[u8], &[u8])>(
         &self,
         from_rank: usize,
         limit: usize,
-        lead: usize,
         f: F,
     ) -> Result<usize> {
         // The regions once, not once a key: `exts_at_full` re-resolves the
         // section and re-slices the directory and the records every call, and
         // that plumbing rather than the record read is most of what resolving
         // a rank costs.
-        self.scan_at_in::<PACE, F>(self.walk_regions(), from_rank, limit, lead, f)
+        self.scan_at_in(self.walk_regions(), from_rank, limit, f)
     }
 
     /// `scan_at_with` over regions the caller resolved (`walk_regions`).
@@ -2955,12 +2925,11 @@ impl<B: Bytes> Blob<B> {
     /// `scan_whole` once it had that caller alone it counted a twentieth
     /// more instructions a record, by the registers its caller kept.
     #[inline(never)]
-    fn scan_at_in<const PACE: bool, F: FnMut(&[u8], &[u8])>(
+    fn scan_at_in<F: FnMut(&[u8], &[u8])>(
         &self,
         walk: Option<(&FlatIndex, &[u8], &[u8])>,
         from_rank: usize,
         limit: usize,
-        lead: usize,
         f: F,
     ) -> Result<usize> {
         let mut f = f;
@@ -3015,13 +2984,6 @@ impl<B: Bytes> Blob<B> {
                 .unwrap_or(&[])
                 .as_chunks::<4>()
                 .0;
-            // The next byte of the records not yet asked for, under `PACE`;
-            // the engine's prefetch is not built for wasm, and neither is a
-            // caller that paces.
-            #[cfg(not(target_family = "wasm"))]
-            let mut asked = 0usize;
-            #[cfg(target_family = "wasm")]
-            let _ = lead;
             walk_fixed!(
                 recs,
                 true,
@@ -3031,20 +2993,7 @@ impl<B: Bytes> Blob<B> {
                 rank,
                 w,
                 off,
-                let off = {
-                    let off = u32::from_le_bytes(*w) as usize;
-                    #[cfg(not(target_family = "wasm"))]
-                    if PACE {
-                        let want = off.saturating_add(lead).min(recs.len());
-                        let from = asked.max(off);
-                        if from < want {
-                            // SAFETY: `[from, want)` lies inside `recs`.
-                            crate::db::prefetch_lines(unsafe { recs.as_ptr().add(from) }, want - from);
-                            asked = want;
-                        }
-                    }
-                    off
-                }
+                let off = u32::from_le_bytes(*w) as usize
             );
         } else if self.src.piecewise() {
             return Err(by_the_piece());
@@ -3061,29 +3010,6 @@ impl<B: Bytes> Blob<B> {
             rank += 1;
         }
         Ok(seen)
-    }
-}
-
-/// A segment's record regions resolved once, for a walk that reads several
-/// runs of its records in turn (`Blob::run_walk`): each `scan_at` is the
-/// blob's own over the same regions, without resolving them again.
-pub struct RunWalk<'a, B: Bytes> {
-    blob: &'a Blob<B>,
-    walk: Option<(&'a FlatIndex, &'a [u8], &'a [u8])>,
-}
-
-impl<B: Bytes> RunWalk<'_, B> {
-    /// `Blob::scan_at` over the regions this walker holds, for a reader
-    /// that holds its key section whole: a source that lends by the piece
-    /// is refused with `Unsupported` before anything is walked.
-    pub fn scan_at<F: FnMut(&[u8], &[u8])>(
-        &self,
-        from_rank: usize,
-        limit: usize,
-        f: F,
-    ) -> Result<usize> {
-        self.blob
-            .scan_at_in::<false, F>(self.walk, from_rank, limit, 0, f)
     }
 }
 
