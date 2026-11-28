@@ -1,0 +1,591 @@
+diff -ruN a/.github/workflows/apple-silicon.yml b/.github/workflows/apple-silicon.yml
+--- a/.github/workflows/apple-silicon.yml
++++ b/.github/workflows/apple-silicon.yml
+@@ -35,7 +35,9 @@
+     # minutes, and three times that on a slow runner.
+     timeout-minutes: 60
+     steps:
+-      - uses: actions/checkout@v7
++      - uses: actions/checkout@<sha of v7> # v7
++        with:
++          persist-credentials: false
+       # The toolchain rust-toolchain.toml names, the one the local gate runs
+       # under; no workflow names a version or a channel of its own.
+       - name: The pinned toolchain
+@@ -50,7 +52,7 @@
+       # `workspace -> target`, the target a path inside its workspace: see
+       # the `test` job of ci.yml. The key is the one every job that builds
+       # the suite's binary alone shares: see the `quick` job there.
+-      - uses: Swatinem/rust-cache@v2
++      - uses: Swatinem/rust-cache@<sha of v2> # v2
+         with:
+           workspaces: bench -> target
+           shared-key: bench
+diff -ruN a/.github/workflows/bank-row.yml b/.github/workflows/bank-row.yml
+--- a/.github/workflows/bank-row.yml
++++ b/.github/workflows/bank-row.yml
+@@ -21,8 +21,7 @@
+   workflow_dispatch:
+ 
+ permissions:
+-  contents: write
+-  pull-requests: write
++  contents: read
+ 
+ env:
+   CARGO_TERM_COLOR: always
+@@ -38,7 +37,9 @@
+     # GitHub's six hours.
+     timeout-minutes: 90
+     steps:
+-      - uses: actions/checkout@v7
++      - uses: actions/checkout@<sha of v7> # v7
++        with:
++          persist-credentials: false
+       # The toolchain rust-toolchain.toml names, the one the local gate runs
+       # under; no workflow names a version or a channel of its own.
+       - name: The pinned toolchain
+@@ -53,7 +54,7 @@
+       # `workspace -> target`, the target a path inside its workspace: see
+       # the `test` job of ci.yml. The key is the one every job that builds
+       # the suite's binary alone shares: see the `quick` job there.
+-      - uses: Swatinem/rust-cache@v2
++      - uses: Swatinem/rust-cache@<sha of v2> # v2
+         with:
+           workspaces: bench -> target
+           shared-key: bench
+@@ -69,7 +70,7 @@
+           ./target/release/bench run --scale quick --out runs-ci
+           ./target/release/bench gate runs-ci/quick/*.json --runs runs > runs-ci/gate.txt 2>&1 || true
+           cat runs-ci/gate.txt
+-      - uses: actions/upload-artifact@v7
++      - uses: actions/upload-artifact@<sha of v7> # v7
+         if: always()
+         with:
+           name: row-${{ matrix.runner }}
+@@ -79,10 +80,15 @@
+   propose:
+     needs: row
+     if: always()
++    # The one job that writes: it pushes the branch and opens the pull
++    # request, so its checkout keeps the token for `git push`.
++    permissions:
++      contents: write
++      pull-requests: write
+     runs-on: ubuntu-24.04
+     timeout-minutes: 60
+     steps:
+-      - uses: actions/checkout@v7
++      - uses: actions/checkout@<sha of v7> # v7
+       # The toolchain rust-toolchain.toml names, the one the local gate runs
+       # under; no workflow names a version or a channel of its own.
+       - name: The pinned toolchain
+@@ -97,11 +103,11 @@
+       # `workspace -> target`, the target a path inside its workspace: see
+       # the `test` job of ci.yml. The key is the one every job that builds
+       # the suite's binary alone shares: see the `quick` job there.
+-      - uses: Swatinem/rust-cache@v2
++      - uses: Swatinem/rust-cache@<sha of v2> # v2
+         with:
+           workspaces: bench -> target
+           shared-key: bench
+-      - uses: actions/download-artifact@v8
++      - uses: actions/download-artifact@<sha of v8> # v8
+         with:
+           pattern: row-*
+           path: rows
+diff -ruN a/.github/workflows/ci.yml b/.github/workflows/ci.yml
+--- a/.github/workflows/ci.yml
++++ b/.github/workflows/ci.yml
+@@ -23,6 +23,9 @@
+         required: false
+         default: ''
+ 
++permissions:
++  contents: read
++
+ env:
+   CARGO_TERM_COLOR: always
+ 
+@@ -64,7 +67,9 @@
+     # slower than usual at RocksDB's build.
+     timeout-minutes: 120
+     steps:
+-      - uses: actions/checkout@v7
++      - uses: actions/checkout@<sha of v7> # v7
++        with:
++          persist-credentials: false
+       # The toolchain rust-toolchain.toml names, the one the local gate runs
+       # under; no workflow names a version or a channel of its own.
+       - name: The pinned toolchain
+@@ -88,7 +93,7 @@
+       # script runs (`bindgen-runtime`, bench/Cargo.toml), so no cached
+       # output names its directory. While the build script linked it, one
+       # did, and a restored build whose directory had gone failed there.
+-      - uses: Swatinem/rust-cache@v2
++      - uses: Swatinem/rust-cache@<sha of v2> # v2
+         with:
+           workspaces: |
+             . -> target
+@@ -110,7 +115,9 @@
+     runs-on: ubuntu-24.04
+     timeout-minutes: 90
+     steps:
+-      - uses: actions/checkout@v7
++      - uses: actions/checkout@<sha of v7> # v7
++        with:
++          persist-credentials: false
+       # The toolchain rust-toolchain.toml names, the one the local gate runs
+       # under; no workflow names a version or a channel of its own.
+       - name: The pinned toolchain
+@@ -135,7 +142,7 @@
+       # that builds anything beside the binary keeps a key of its own, as
+       # `rocksdb-alloc` does, or what it alone builds would never be
+       # cached. `bench/scripts/workflows.sh` holds both.
+-      - uses: Swatinem/rust-cache@v2
++      - uses: Swatinem/rust-cache@<sha of v2> # v2
+         with:
+           workspaces: bench -> target
+           shared-key: bench
+@@ -144,7 +151,7 @@
+           ARMS: ${{ inputs.arms }}
+           KEYS: ${{ inputs.keys }}
+         run: sh scripts/check.sh quick
+-      - uses: actions/upload-artifact@v7
++      - uses: actions/upload-artifact@<sha of v7> # v7
+         if: always()
+         with:
+           name: quick-row
+@@ -160,8 +167,9 @@
+     runs-on: ubuntu-24.04
+     timeout-minutes: 15
+     steps:
+-      - uses: actions/checkout@v7
++      - uses: actions/checkout@<sha of v7> # v7
+         with:
++          persist-credentials: false
+           fetch-depth: 0
+       - name: The lists, against the base
+         env:
+@@ -174,12 +182,14 @@
+     runs-on: ubuntu-24.04
+     timeout-minutes: 30
+     steps:
+-      - uses: actions/checkout@v7
++      - uses: actions/checkout@<sha of v7> # v7
++        with:
++          persist-credentials: false
+       # The toolchain rust-toolchain.toml names, the one the local gate runs
+       # under; no workflow names a version or a channel of its own.
+       - name: The pinned toolchain
+         run: sh scripts/toolchain.sh aarch64-unknown-linux-gnu
+-      - uses: Swatinem/rust-cache@v2
++      - uses: Swatinem/rust-cache@<sha of v2> # v2
+       # The target's C library is named: the compiler's package only
+       # recommends it, and scripts/apt.sh installs no recommended extras.
+       - name: Cross toolchain
+@@ -204,7 +214,9 @@
+     # from a cold cache: a test leg's RocksDB build twice over.
+     timeout-minutes: 120
+     steps:
+-      - uses: actions/checkout@v7
++      - uses: actions/checkout@<sha of v7> # v7
++        with:
++          persist-credentials: false
+       # The toolchain rust-toolchain.toml names, the one the local gate runs
+       # under; no workflow names a version or a channel of its own.
+       - name: The pinned toolchain
+@@ -219,7 +231,7 @@
+         run: sh scripts/apt.sh libssl-dev
+       # The encrypted build's own target directory, under a key of its own:
+       # nothing else builds it.
+-      - uses: Swatinem/rust-cache@v2
++      - uses: Swatinem/rust-cache@<sha of v2> # v2
+         with:
+           workspaces: bench -> target-enc
+       - name: The encrypted comparators, built, tested and run once
+@@ -234,12 +246,14 @@
+     runs-on: ubuntu-24.04
+     timeout-minutes: 45
+     steps:
+-      - uses: actions/checkout@v7
++      - uses: actions/checkout@<sha of v7> # v7
++        with:
++          persist-credentials: false
+       # The toolchain rust-toolchain.toml names, the one the local gate runs
+       # under; no workflow names a version or a channel of its own.
+       - name: The pinned toolchain
+         run: sh scripts/toolchain.sh
+-      - uses: Swatinem/rust-cache@v2
++      - uses: Swatinem/rust-cache@<sha of v2> # v2
+       - name: A filesystem that can encrypt
+         run: sudo sh scripts/fscrypt.sh up /mnt/supdb-fscrypt "$(id -u):$(id -g)" >> "$GITHUB_ENV"
+       - name: A store under a key
+@@ -254,12 +268,14 @@
+     runs-on: ubuntu-24.04
+     timeout-minutes: 15
+     steps:
+-      - uses: actions/checkout@v7
++      - uses: actions/checkout@<sha of v7> # v7
++        with:
++          persist-credentials: false
+       # The toolchain rust-toolchain.toml names, the one the local gate runs
+       # under; no workflow names a version or a channel of its own.
+       - name: The pinned toolchain
+         run: sh scripts/toolchain.sh
+-      - uses: Swatinem/rust-cache@v2
++      - uses: Swatinem/rust-cache@<sha of v2> # v2
+       # The group also runs web/crypt.test.mjs under the runner's own Node:
+       # the browser's decrypter against the envelope the Rust tests hold the
+       # writer to.
+diff -ruN a/.github/workflows/comparators.yml b/.github/workflows/comparators.yml
+--- a/.github/workflows/comparators.yml
++++ b/.github/workflows/comparators.yml
+@@ -18,6 +18,9 @@
+   schedule:
+     - cron: '17 6 * * 1'
+ 
++permissions:
++  contents: read
++
+ env:
+   CARGO_TERM_COLOR: always
+ 
+@@ -31,7 +34,9 @@
+     runs-on: ${{ matrix.runner }}
+     timeout-minutes: 300
+     steps:
+-      - uses: actions/checkout@v7
++      - uses: actions/checkout@<sha of v7> # v7
++        with:
++          persist-credentials: false
+       # The toolchain rust-toolchain.toml names, the one the local gate runs
+       # under; no workflow names a version or a channel of its own.
+       - name: The pinned toolchain
+@@ -52,7 +57,7 @@
+       # may find it gone and build. Restored here and saved by a step of
+       # its own after the table: the one action that does both saves only
+       # where the job passed, and a cell under the margin fails the job.
+-      - uses: actions/cache/restore@v6
++      - uses: actions/cache/restore@<sha of v6> # v6
+         id: tools
+         with:
+           path: bench/comparators-tools
+@@ -72,7 +77,7 @@
+       # `workspace -> target`, the target a path inside its workspace: see
+       # the `test` job of ci.yml. The key is the one every job that builds
+       # the suite's binary alone shares: see the `quick` job there.
+-      - uses: Swatinem/rust-cache@v2
++      - uses: Swatinem/rust-cache@<sha of v2> # v2
+         with:
+           workspaces: bench -> target
+           shared-key: bench
+@@ -81,12 +86,12 @@
+           COMPARATORS_TOOLS: ${{ github.workspace }}/bench/comparators-tools
+         run: sh bench/scripts/comparators.sh comparators-ci
+       # The db_bench this run built, whatever the table said of the cells.
+-      - uses: actions/cache/save@v6
++      - uses: actions/cache/save@<sha of v6> # v6
+         if: always() && steps.tools.outputs.cache-hit != 'true' && hashFiles('bench/comparators-tools/db_bench-*') != ''
+         with:
+           path: bench/comparators-tools
+           key: ${{ steps.tools.outputs.cache-primary-key }}
+-      - uses: actions/upload-artifact@v7
++      - uses: actions/upload-artifact@<sha of v7> # v7
+         if: always()
+         with:
+           name: comparators
+diff -ruN a/.github/workflows/cost.yml b/.github/workflows/cost.yml
+--- a/.github/workflows/cost.yml
++++ b/.github/workflows/cost.yml
+@@ -20,6 +20,9 @@
+         required: false
+         default: ''
+ 
++permissions:
++  contents: read
++
+ env:
+   CARGO_TERM_COLOR: always
+ 
+@@ -28,8 +31,9 @@
+     runs-on: ubuntu-24.04
+     timeout-minutes: 150
+     steps:
+-      - uses: actions/checkout@v7
++      - uses: actions/checkout@<sha of v7> # v7
+         with:
++          persist-credentials: false
+           fetch-depth: 0
+       # The toolchain rust-toolchain.toml names, the one the local gate runs
+       # under; no workflow names a version or a channel of its own.
+@@ -48,7 +52,7 @@
+       # shares (ci.yml's `quick` job): the probes build on the binary's
+       # dependencies, RocksDB's among them, which the key restores, and
+       # what they build beside it is the job's own each run.
+-      - uses: Swatinem/rust-cache@v2
++      - uses: Swatinem/rust-cache@<sha of v2> # v2
+         with:
+           workspaces: bench -> target
+           shared-key: bench
+diff -ruN a/.github/workflows/ooc-hosted.yml b/.github/workflows/ooc-hosted.yml
+--- a/.github/workflows/ooc-hosted.yml
++++ b/.github/workflows/ooc-hosted.yml
+@@ -34,6 +34,9 @@
+         required: false
+         default: '1'
+ 
++permissions:
++  contents: read
++
+ env:
+   CARGO_TERM_COLOR: always
+ 
+@@ -42,7 +45,9 @@
+     runs-on: ubuntu-24.04
+     timeout-minutes: 360
+     steps:
+-      - uses: actions/checkout@v7
++      - uses: actions/checkout@<sha of v7> # v7
++        with:
++          persist-credentials: false
+       # The toolchain rust-toolchain.toml names, the one the local gate runs
+       # under; no workflow names a version or a channel of its own.
+       - name: The pinned toolchain
+@@ -57,7 +62,7 @@
+       # `workspace -> target`, the target a path inside its workspace: see
+       # the `test` job of ci.yml. The key is the one every job that builds
+       # the suite's binary alone shares: see the `quick` job there.
+-      - uses: Swatinem/rust-cache@v2
++      - uses: Swatinem/rust-cache@<sha of v2> # v2
+         with:
+           workspaces: bench -> target
+           shared-key: bench
+@@ -107,7 +112,7 @@
+       - name: The figures from the row
+         working-directory: bench
+         run: ./target/release/bench figures --runs runs-ci --out runs-ci/figures --scale ooc
+-      - uses: actions/upload-artifact@v7
++      - uses: actions/upload-artifact@<sha of v7> # v7
+         if: always()
+         with:
+           name: ooc-row
+diff -ruN a/.github/workflows/quiet-bench.yml b/.github/workflows/quiet-bench.yml
+--- a/.github/workflows/quiet-bench.yml
++++ b/.github/workflows/quiet-bench.yml
+@@ -28,7 +28,6 @@
+         default: '10'
+ 
+ permissions:
+-  actions: write
+   contents: read
+ 
+ concurrency:
+@@ -37,12 +36,21 @@
+ 
+ jobs:
+   check:
+-    uses: bfulton/localmost/.github/workflows/check.yaml@main
++    # What localmost's check reads; confirm against check.yaml at the
++    # pinned commit, which is another repository's.
++    permissions:
++      actions: read
++      contents: read
++    uses: bfulton/localmost/.github/workflows/check.yaml@<sha of main> # main, pinned on <date>
+ 
+   pickup-watchdog:
+     needs: [check]
+     if: needs.check.outputs.runner == 'self-hosted'
+     runs-on: ubuntu-24.04
++    # Lists the run's jobs and cancels the run: the one job that needs
++    # more than the tree. It checks out nothing and runs only `gh`.
++    permissions:
++      actions: write
+     steps:
+       - name: Wait for a self-hosted runner to claim the run
+         env:
+@@ -104,7 +112,9 @@
+     # days; this is three, and the pickup watchdog still bounds the queue.
+     timeout-minutes: 4320
+     steps:
+-      - uses: actions/checkout@v7
++      - uses: actions/checkout@<sha of v7> # v7
++        with:
++          persist-credentials: false
+       # The toolchain rust-toolchain.toml names where this machine's cargo
+       # is rustup's, which reads the file whatever this step does; a cargo
+       # from anywhere else never sees the file, and the row is that
+@@ -148,7 +158,7 @@
+       # the timeout or cancelled by hand still has the rungs that completed
+       # on disk -- and this step being conditional on success is what threw
+       # them away twice. `always()` covers cancellation too.
+-      - uses: actions/upload-artifact@v7
++      - uses: actions/upload-artifact@<sha of v7> # v7
+         if: always()
+         with:
+           name: full-row
+diff -ruN a/.github/workflows/rocksdb-alloc.yml b/.github/workflows/rocksdb-alloc.yml
+--- a/.github/workflows/rocksdb-alloc.yml
++++ b/.github/workflows/rocksdb-alloc.yml
+@@ -14,6 +14,9 @@
+   schedule:
+     - cron: '41 7 * * 1'
+ 
++permissions:
++  contents: read
++
+ env:
+   CARGO_TERM_COLOR: always
+ 
+@@ -22,7 +25,9 @@
+     runs-on: ubuntu-24.04
+     timeout-minutes: 240
+     steps:
+-      - uses: actions/checkout@v7
++      - uses: actions/checkout@<sha of v7> # v7
++        with:
++          persist-credentials: false
+       # The toolchain rust-toolchain.toml names, the one the local gate runs
+       # under; no workflow names a version or a channel of its own.
+       - name: The pinned toolchain
+@@ -42,7 +47,7 @@
+       # since none of them builds the second directory. GitHub removes a
+       # cache nothing has read for seven days and this job's schedule is
+       # weekly, so a scheduled run may find its cache gone and build both.
+-      - uses: Swatinem/rust-cache@v2
++      - uses: Swatinem/rust-cache@<sha of v2> # v2
+         with:
+           workspaces: |
+             bench -> target
+@@ -67,7 +72,7 @@
+           set -eu
+           python3 scripts/alloc_compare.py runs-glibc runs-jemalloc | tee alloc.md
+           cat alloc.md >> "$GITHUB_STEP_SUMMARY"
+-      - uses: actions/upload-artifact@v7
++      - uses: actions/upload-artifact@<sha of v7> # v7
+         if: always()
+         with:
+           name: rocksdb-alloc
+diff -ruN a/.github/workflows/runner-smoke.yml b/.github/workflows/runner-smoke.yml
+--- a/.github/workflows/runner-smoke.yml
++++ b/.github/workflows/runner-smoke.yml
+@@ -20,12 +20,16 @@
+   workflow_dispatch:
+ 
+ permissions:
+-  actions: read
+   contents: read
+ 
+ jobs:
+   check:
+-    uses: bfulton/localmost/.github/workflows/check.yaml@main
++    # What localmost's check reads; confirm against check.yaml at the
++    # pinned commit, which is another repository's.
++    permissions:
++      actions: read
++      contents: read
++    uses: bfulton/localmost/.github/workflows/check.yaml@<sha of main> # main, pinned on <date>
+ 
+   smoke:
+     needs: check
+diff -ruN a/tests/source.rs b/tests/source.rs
+--- a/tests/source.rs
++++ b/tests/source.rs
+@@ -4753,36 +4753,41 @@
+ /// Actions a step may use, matched whole: each fetches, installs or
+ /// publishes, and none checks.
+ const CI_ACTIONS: &[(&str, &str)] = &[
+-    ("actions/checkout@v7", "the tree"),
+-    ("Swatinem/rust-cache@v2", "the build cache"),
+-    ("actions/upload-artifact@v7", "publishes the quick row"),
++    ("actions/checkout@<sha of v7>", "the tree"),
++    ("Swatinem/rust-cache@<sha of v2>", "the build cache"),
++    ("actions/upload-artifact@<sha of v7>", "publishes the quick row"),
+ ];
+ 
+ /// Inputs an action may be given, matched by action and name: none
+ /// chooses what is checked.
+ const CI_WITH: &[(&str, &str, &str)] = &[
+     (
+-        "actions/checkout@v7",
++        "actions/checkout@<sha of v7>",
+         "fetch-depth",
+         "the whole history, which the base needs",
+     ),
+     (
+-        "Swatinem/rust-cache@v2",
++        "actions/checkout@<sha of v7>",
++        "persist-credentials",
++        "the job token is not left in .git/config for the steps after the checkout",
++    ),
++    (
++        "Swatinem/rust-cache@<sha of v2>",
+         "workspaces",
+         "which target directories to cache",
+     ),
+     (
+-        "Swatinem/rust-cache@v2",
++        "Swatinem/rust-cache@<sha of v2>",
+         "shared-key",
+         "the one key every job that builds the suite's binary alone restores",
+     ),
+-    ("actions/upload-artifact@v7", "name", "the artifact's name"),
++    ("actions/upload-artifact@<sha of v7>", "name", "the artifact's name"),
+     (
+-        "actions/upload-artifact@v7",
++        "actions/upload-artifact@<sha of v7>",
+         "if-no-files-found",
+         "a run that wrote no row publishes nothing",
+     ),
+-    ("actions/upload-artifact@v7", "path", "what is published"),
++    ("actions/upload-artifact@<sha of v7>", "path", "what is published"),
+ ];
+ 
+ /// The environment a workflow, a job or a step may set, matched whole,
+@@ -4823,7 +4828,7 @@
+ /// check runs.
+ const CI_IF: &[(&str, &str, &str)] = &[(
+     "always()",
+-    "actions/upload-artifact@v7",
++    "actions/upload-artifact@<sha of v7>",
+     "the quick row is published whether or not the run passed: it decides nothing",
+ )];
+ 
+@@ -5108,7 +5113,9 @@
+                         true
+                     }
+                     "uses" => {
+-                        st.uses = Some((ln, v.to_string()));
++                        // A pin's tag rides after it as a comment.
++                        let a = v.split_once(" #").map_or(v, |(a, _)| a).trim_end();
++                        st.uses = Some((ln, a.to_string()));
+                         true
+                     }
+                     "run" => {
+@@ -6050,7 +6057,7 @@
+     let e = ci_check(
+         &ci_edit(
+             &yaml,
+-            "uses: Swatinem/rust-cache@v2",
++            "uses: Swatinem/rust-cache@<sha of v2> # v2",
+             "uses: actions-rs/clippy-check@v1",
+         ),
+         &sh,
+@@ -6088,7 +6095,7 @@
+         ("  wasm:\n", "  wasm:\n    env:\n      COST_BASE: HEAD\n", "the environment `COST_BASE: HEAD`"),
+         ("  wasm:\n", "  wasm:\n    defaults:\n      run:\n        working-directory: bench\n", "the key `defaults`"),
+         (lists, "        working-directory: bench\n        run: sh scripts/check.sh lists\n", "the key `working-directory`"),
+-        ("        with:\n          fetch-depth: 0\n", "        with:\n          fetch-depth: 0\n          ref: HEAD~1\n", "the input `ref` of `actions/checkout@v7`"),
++        ("        with:\n          fetch-depth: 0\n", "        with:\n          fetch-depth: 0\n          ref: HEAD~1\n", "the input `ref` of `actions/checkout@<sha of v7>`"),
+         (lists, "        uses: actions/checkout@v7\n        run: sh scripts/check.sh lists\n", "both a run and an action"),
+         (cross, "      - <<: *anchor\n      - name: Build and test under emulation\n", "a step the test cannot read"),
+         (cross, "      - name: x\n        <<: *anchor\n        run: cargo test\n      - name: Build and test under emulation\n", "a step the test cannot read"),
+@@ -6098,7 +6105,7 @@
+         // A name the test lists, with a value it does not.
+         ("          SUPDB_PR_BASE: ${{ github.event.pull_request.base.sha }}\n", "          SUPDB_PR_BASE: HEAD~1\n", "the environment `SUPDB_PR_BASE: HEAD~1`"),
+         // An input the test lists for another action.
+-        ("        with:\n          fetch-depth: 0\n", "        with:\n          fetch-depth: 0\n          path: elsewhere\n", "the input `path` of `actions/checkout@v7`"),
++        ("        with:\n          fetch-depth: 0\n", "        with:\n          fetch-depth: 0\n          path: elsewhere\n", "the input `path` of `actions/checkout@<sha of v7>`"),
+         // A list where the workflow has none, and a step's keys with no step.
+         ("env:\n  CARGO_TERM_COLOR: always\n", "env:\n  - CARGO_TERM_COLOR: always\n", "a list outside a job's steps"),
+         ("  wasm:\n", "  wasm:\n    steps:\n      name: x\n", "a key before any step"),

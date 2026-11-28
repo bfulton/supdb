@@ -23,7 +23,7 @@ branch into main, for Bright to review and merge before the tag.
 | 0 | Baseline at C0 | measurement agent, cloud session `supdb: baseline measurement at C0` | `release/baseline.md`; rows on `release-measure` | prepared and verified; static counts measured; the cost count of C0 against itself running here; the measurement session started at 17:59 ET on the rows and the floor | nothing |
 | 1 | Delete: options ledger, dead code, API surface | coordinator's subagents | `release/options.csv`, `release/phase1.md`; #38 (the cost gate), `rc/phase1-pr1` | #38 open and in review: the count of C0 reads green against itself three times; PR1 being written | Bright's merge of #38 |
 | 2 | Reshape: split `src/db.rs`, style | not assigned | none | not started | phase 1 |
-| 3 | Verify: audits, then fixes | not assigned | `release/findings/` | not started; inputs from the history audit: `bank-row.yml`'s write token, unpinned actions, five workflows without `permissions:` | phase 2, decisions 4 and 7 |
+| 3 | Verify: audits, then fixes | coordinator's subagents | `release/findings/` | four read-only audits done (guarantees, format, encryption, supply chain); hostile input and `unsafe` audits wait for a quiet compiler; fixes wait for phase 1 | phase 1, then decision 4 (default: format 2 promised, one-file and cipher stores experimental) |
 | 4 | Tests: flake loop, runtime, coverage | not assigned | none | not started | the last fix of phase 3, decision 5 |
 | 5 | Words: roadmap, docs, release files | not assigned | none | begun on main by #37 (`CLAUDE.md` as rules, the roadmap as short items) | the last fix of phase 3, decision 6 |
 | 6 | Measure at the last code commit | measurement agent | none | not started | phase 5 |
@@ -39,8 +39,8 @@ still open below is what changes what ships.
 |---|---|---|---|
 | 1 | Experimental options: stay in the public `Options` type, or move to a sub-struct or a feature | phase 1 | default taken: they stay in `Options`, hidden from the docs; no `#[non_exhaustive]`, which would break 667 struct literals in the tests, the suite and the examples; Bright may overrule |
 | 2 | Is encryption in this tag | phase 3's scope | yes: the tag is of main, and encryption is on main since #35 |
-| 3 | Version and tag name; whether to publish to crates.io | phases 5 and 7 | open; `Cargo.toml` says 0.1.0 |
-| 4 | The format compatibility promise that starts at the tag | phase 3 | open |
+| 3 | Version and tag name; whether to publish to crates.io | phases 5 and 7 | open; `Cargo.toml` says 0.1.0; until decided, `publish = false` goes in, since a crates.io upload cannot be taken back |
+| 4 | The format compatibility promise that starts at the tag | phase 3 | default taken unless Bright overrules: format 2 promised; one-file and cipher stores experimental (`release/findings/format.md`) |
 | 5 | Gate runtime budget and the number of flake-loop runs | phase 4 | open |
 | 6 | Target size of `CLAUDE.md`, and what stays in it | phase 5 | largely made by #37 (24.7 KB of rules); confirm, and the same for `bench/CLAUDE.md` (80 KB) |
 | 7 | Whether to commission the outside crypto review | phase 3 | open |

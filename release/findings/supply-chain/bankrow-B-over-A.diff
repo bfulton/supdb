@@ -1,0 +1,86 @@
+--- a/.github/workflows/bank-row.yml
++++ b/.github/workflows/bank-row.yml
+@@ -80,15 +80,18 @@
+   propose:
+     needs: row
+     if: always()
+-    # The one job that writes: it pushes the branch and opens the pull
+-    # request, so its checkout keeps the token for `git push`.
+-    permissions:
+-      contents: write
+-      pull-requests: write
+     runs-on: ubuntu-24.04
+     timeout-minutes: 60
++    # The rows and the figures, made with the workflow's read-only token:
++    # this job builds and runs the suite, every crate's build script with
++    # it, so it holds nothing that can write. What it made goes to `push`
++    # as a patch.
++    outputs:
++      rows: ${{ steps.rows.outputs.rows }}
+     steps:
+       - uses: actions/checkout@<sha of v7> # v7
++        with:
++          persist-credentials: false
+       # The toolchain rust-toolchain.toml names, the one the local gate runs
+       # under; no workflow names a version or a channel of its own.
+       - name: The pinned toolchain
+@@ -140,8 +143,34 @@
+           fi
+           sh bench/scripts/figures.sh
+           sh bench/scripts/figures.sh --check
+-      - name: Propose the rows as a pull request
++          mkdir -p bank
++          git add bench/runs/quick docs/figures
++          git diff --cached --binary > bank/rows.patch
++          cp body.md bank/body.md
++      - uses: actions/upload-artifact@<sha of v7> # v7
+         if: steps.rows.outputs.rows != '0'
++        with:
++          name: bank
++          path: bank/
++          if-no-files-found: error
++
++  push:
++    needs: propose
++    if: needs.propose.outputs.rows != '0'
++    runs-on: ubuntu-24.04
++    timeout-minutes: 10
++    # The one job that writes, and it builds nothing: a checkout, the
++    # patch, git and gh. Its checkout keeps the token for `git push`.
++    permissions:
++      contents: write
++      pull-requests: write
++    steps:
++      - uses: actions/checkout@<sha of v7> # v7
++      - uses: actions/download-artifact@<sha of v8> # v8
++        with:
++          name: bank
++          path: bank
++      - name: Propose the rows as a pull request
+         env:
+           GH_TOKEN: ${{ github.token }}
+           RUN_ID: ${{ github.run_id }}
+@@ -152,13 +181,20 @@
+           git config user.name "github-actions[bot]"
+           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+           git checkout -b "$branch"
+-          git add bench/runs/quick docs/figures
++          # The patch was made by a job that ran the suite's build: it may
++          # touch the rows and the figures and nothing else of the tree.
++          git apply --index --include='bench/runs/quick/*' --include='docs/figures/*' bank/rows.patch
++          other=$(git diff --cached --name-only | grep -v -E '^(bench/runs/quick/|docs/figures/)' || true)
++          if [ -n "$other" ]; then
++            echo "the patch touches more than the rows and the figures: $other" >&2
++            exit 1
++          fi
+           git commit -q -F - <<MSG
+           Bank the hosted quick rows from run $RUN_ID
+ 
+-          $(cat body.md)
++          $(cat bank/body.md)
+           MSG
+           git push -u origin "$branch"
+           gh pr create --base main --head "$branch" \
+             --title "Bank quick rows at $(git rev-parse --short "$SHA") from the hosted runners" \
+-            --body-file body.md || echo "the pull request was not created; the rows are on branch $branch"
++            --body-file bank/body.md || echo "the pull request was not created; the rows are on branch $branch"

@@ -1,0 +1,25 @@
+--- a/.github/workflows/ooc-hosted.yml
++++ b/.github/workflows/ooc-hosted.yml
+@@ -88,6 +88,10 @@
+           REPS: ${{ inputs.reps }}
+         run: |
+           set -eu
++          # Digits only: bash evaluates a variable named in $(( )) as an
++          # expression, and an array subscript in it runs a command.
++          case "$BOUND_MIB" in ''|*[!0-9]*) echo "bound_mib is whole MiB: '$BOUND_MIB'" >&2; exit 2 ;; esac
++          case "$REPS" in ''|*[!0-9]*) echo "reps is a count: '$REPS'" >&2; exit 2 ;; esac
+           BOUND=$(( BOUND_MIB * 1048576 ))
+           ARM_FLAG=""
+           if [ -n "$ARMS" ] && [ "$ARMS" != all ]; then ARM_FLAG="--arms $ARMS"; fi
+--- a/.github/workflows/quiet-bench.yml
++++ b/.github/workflows/quiet-bench.yml
+@@ -60,6 +60,9 @@
+           WINDOW: ${{ inputs.pickup_timeout_minutes || '10' }}
+         run: |
+           set -uo pipefail
++          # Digits only: bash evaluates a variable named in $(( )) as an
++          # expression, and an array subscript in it runs a command.
++          case "$WINDOW" in ''|*[!0-9]*) echo "pickup_timeout_minutes is whole minutes: '$WINDOW'" >&2; exit 2 ;; esac
+           deadline=$(( WINDOW * 2 ))   # polls, at 30s each
+           for i in $(seq 1 "$deadline"); do
+             job=$(gh api "repos/$REPO/actions/runs/$RUN_ID/jobs" \
