@@ -6823,18 +6823,9 @@ pub struct Options {
     /// each, beside C's reads, and the install waited for them; with two
     /// the install came a second into C where it had come three to four,
     /// and C read 1.46x and 1.39x in two sittings (`docs/engine.md`). 1 is
-    /// the one builder, `supdb-zahead1`.
+    /// the one builder.
+    #[doc(hidden)]
     pub zpages_ahead_builders: usize,
-    /// EXPERIMENT: the controller's sample asked for before a build ahead
-    /// takes the builder its last one left, where the sample waits for no
-    /// build ahead in flight (`z_prebuild_pending`): the next build ahead
-    /// started in the same tick, so the sample, meant to price the files
-    /// on disk as an attach and the rest as the builds they are, waited
-    /// for the last build ahead instead. Beside two builders ahead the
-    /// builds are done by the time the order would matter, and paired so
-    /// it read C 0.97x, the install at the same moment either way: off is
-    /// the order before it; `supdb-zsamplegap` is the arm.
-    pub zpages_sample_between: bool,
     /// A partition with no form file attached whose raw records
     /// are resident (at least `LAND_RESIDENT` of them, by `mincore`), or
     /// whose build ahead is in flight, counts as covered beside a form at
@@ -8561,7 +8552,6 @@ impl Default for Options {
             wal_hold_reuses: true,
             held_frames: true,
             zpages_ahead_builders: 2,
-            zpages_sample_between: false,
             zpages_cover_resident: true,
             zpages_under_cipher: true,
             zpages_suspect_at_crossing: true,
@@ -67528,19 +67518,12 @@ impl Maint {
                 }
             }
         }
-        // The sample first where the option says, while the builder the
-        // last build ahead left is still free, and after the next build
-        // ahead otherwise, which leaves it waiting for the last one.
-        let between = self.opts.zpages_sample_between;
-        if between {
-            self.z_sample_due(d);
-        }
+        // The sample after the next build ahead, which leaves it waiting
+        // for the last one.
         if !d.build {
             self.z_prebuild_step();
         }
-        if !between {
-            self.z_sample_due(d);
-        }
+        self.z_sample_due(d);
     }
 
     /// A build ahead landed dormant (`Options::zpages_ahead_past_scans`), or

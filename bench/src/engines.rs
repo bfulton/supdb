@@ -764,13 +764,6 @@ pub struct Supdb {
     /// drops them a megabyte at a time (`Options::wal_drop_bytes` zero).
     /// `supdb-walkeep`, durable.
     walkeep: bool,
-    /// One of the controller's builds ahead at a time, where the default
-    /// runs two (`Options::zpages_ahead_builders`). `supdb-zahead1`,
-    /// durable.
-    zahead1: bool,
-    /// The controller's sample asked for between builds ahead
-    /// (`Options::zpages_sample_between`). `supdb-zsamplegap`, durable.
-    zsamplegap: bool,
     /// The install as it was before it came at the load's end: no
     /// partition counted as covered but by its form file, and the
     /// controller suspecting on two hot readings
@@ -2420,13 +2413,6 @@ struct Policy {
     /// drops them a megabyte at a time (`Options::wal_drop_bytes` zero).
     /// `supdb-walkeep`, durable.
     walkeep: bool,
-    /// One of the controller's builds ahead at a time, where the default
-    /// runs two (`Options::zpages_ahead_builders`). `supdb-zahead1`,
-    /// durable.
-    zahead1: bool,
-    /// The controller's sample asked for between builds ahead
-    /// (`Options::zpages_sample_between`). `supdb-zsamplegap`, durable.
-    zsamplegap: bool,
     /// The install as it was before it came at the load's end: no
     /// partition counted as covered but by its form file, and the
     /// controller suspecting on two hot readings
@@ -3676,8 +3662,6 @@ impl Default for Policy {
             sealfloorooc: false,
             nofitshort: false,
             walkeep: false,
-            zahead1: false,
-            zsamplegap: false,
             zinstallwaits: false,
             zrecodeauto: false,
             zreparse: false,
@@ -7293,31 +7277,6 @@ impl Supdb {
         )
     }
 
-    /// `supdb` with one of the controller's builds ahead at a time
-    /// (`Options::zpages_ahead_builders` 1): against `supdb` it prices the
-    /// load's last partitions built in pace with it under a bound.
-    pub fn create_zahead1(path: &Path) -> Res<Supdb> {
-        Supdb::with_policy(
-            path,
-            Policy {
-                zahead1: true,
-                ..Policy::default()
-            },
-        )
-    }
-
-    /// `supdb` whose controller asks for its sample between builds ahead
-    /// (`Options::zpages_sample_between`).
-    pub fn create_zsamplegap(path: &Path) -> Res<Supdb> {
-        Supdb::with_policy(
-            path,
-            Policy {
-                zsamplegap: true,
-                ..Policy::default()
-            },
-        )
-    }
-
     /// `supdb` whose controller counts a partition as covered by its form
     /// file alone and suspects on two hot readings a second apart
     /// (`Options::zpages_cover_resident`, `Options::zpages_suspect_at_crossing`
@@ -10885,8 +10844,6 @@ impl Supdb {
             sealfloorooc,
             nofitshort,
             walkeep,
-            zahead1,
-            zsamplegap,
             zinstallwaits,
             zrecodeauto,
             zreparse,
@@ -11396,12 +11353,6 @@ impl Supdb {
             },
             seal_floor_out_of_core: sealfloorooc,
             forms_fit_when_short: !nofitshort,
-            zpages_ahead_builders: if zahead1 {
-                1
-            } else {
-                supdb::Options::default().zpages_ahead_builders
-            },
-            zpages_sample_between: zsamplegap,
             zpages_cover_resident: !zinstallwaits,
             zpages_suspect_at_crossing: !zinstallwaits,
             zpages_recode_auto: zrecodeauto,
@@ -12039,8 +11990,6 @@ impl Supdb {
             sealfloorooc,
             nofitshort,
             walkeep,
-            zahead1,
-            zsamplegap,
             zinstallwaits,
             zrecodeauto,
             zreparse,
@@ -13755,9 +13704,6 @@ impl Engine for Supdb {
         if self.walkeep {
             return "supdb-walkeep";
         }
-        if self.zahead1 {
-            return "supdb-zahead1";
-        }
         if self.zinstallwaits {
             return "supdb-zinstallwaits";
         }
@@ -13793,9 +13739,6 @@ impl Engine for Supdb {
         }
         if self.znohotfill {
             return "supdb-znohotfill";
-        }
-        if self.zsamplegap {
-            return "supdb-zsamplegap";
         }
         if self.nofitshort {
             return if self.zpages_off {
@@ -17004,8 +16947,6 @@ pub fn guarantee(arm: &str) -> Option<Guarantee> {
         | "supdb-cacheraw"
         | "supdb-nofitshort"
         | "supdb-walkeep"
-        | "supdb-zahead1"
-        | "supdb-zsamplegap"
         | "supdb-zinstallwaits"
         | "supdb-zrecodeauto"
         | "supdb-zreparse"
@@ -19336,8 +19277,6 @@ pub fn open(arm: &str, dir: &Path, map_gb: usize) -> Res<Box<dyn Engine>> {
         "supdb-cacheraw" => supdb_arm(Supdb::create_cacheraw, dir)?,
         "supdb-nofitshort" => supdb_arm(Supdb::create_nofitshort, dir)?,
         "supdb-walkeep" => supdb_arm(Supdb::create_walkeep, dir)?,
-        "supdb-zahead1" => supdb_arm(Supdb::create_zahead1, dir)?,
-        "supdb-zsamplegap" => supdb_arm(Supdb::create_zsamplegap, dir)?,
         "supdb-zinstallwaits" => supdb_arm(Supdb::create_zinstallwaits, dir)?,
         "supdb-zrecodeauto" => supdb_arm(Supdb::create_zrecodeauto, dir)?,
         "supdb-zreparse" => supdb_arm(Supdb::create_zreparse, dir)?,
@@ -22984,8 +22923,6 @@ mod tests {
             "supdb-cacheraw",
             "supdb-nofitshort",
             "supdb-walkeep",
-            "supdb-zahead1",
-            "supdb-zsamplegap",
             "supdb-zinstallwaits",
             "supdb-zrecodeauto",
             "supdb-zparse",
@@ -23006,36 +22943,6 @@ mod tests {
         let raw = Supdb::create_cacheraw(&dir("raw")).unwrap();
         let short = Supdb::create_nofitshort(&dir("short")).unwrap();
         {
-            for (make, builders, between) in [
-                (Supdb::create_zahead1 as fn(&Path) -> Res<Supdb>, 1, false),
-                (Supdb::create_zsamplegap, 2, true),
-            ] {
-                let z = make(&dir(&format!("zahead{builders}{between}"))).unwrap();
-                assert_eq!(z.features(), base.features());
-                let o = z.db.as_ref().unwrap().options();
-                assert_eq!(
-                    (o.zpages_ahead_builders, o.zpages_sample_between),
-                    (builders, between)
-                );
-                assert_eq!(
-                    (b.zpages_ahead_builders, b.zpages_sample_between),
-                    (2, false)
-                );
-                assert_eq!(
-                    (
-                        o.zpages,
-                        o.zpages_land_pct,
-                        o.wal_drop_bytes,
-                        o.forms_fit_when_short
-                    ),
-                    (
-                        b.zpages,
-                        b.zpages_land_pct,
-                        b.wal_drop_bytes,
-                        b.forms_fit_when_short
-                    )
-                );
-            }
             {
                 let z = Supdb::create_mergeahead(&dir("mergeahead")).unwrap();
                 assert_eq!(z.features(), base.features());
@@ -23075,18 +22982,8 @@ mod tests {
                 assert!(b.zpages_cover_resident && b.zpages_suspect_at_crossing);
                 assert!(!o.zpages_cover_resident && !o.zpages_suspect_at_crossing);
                 assert_eq!(
-                    (
-                        o.zpages_ahead_builders,
-                        o.zpages,
-                        o.wal_drop_bytes,
-                        o.zpages_sample_between
-                    ),
-                    (
-                        b.zpages_ahead_builders,
-                        b.zpages,
-                        b.wal_drop_bytes,
-                        b.zpages_sample_between
-                    )
+                    (o.zpages_ahead_builders, o.zpages, o.wal_drop_bytes),
+                    (b.zpages_ahead_builders, b.zpages, b.wal_drop_bytes)
                 );
             }
             {
