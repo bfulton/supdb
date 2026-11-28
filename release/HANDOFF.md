@@ -35,7 +35,7 @@ Rounds run on the merged tree (`release/tools/round.sh`):
 | 1 | `793cec2b` | all green | green | green |
 | 2 | `abeecbdd` | all green but one test: the settle copy's abandon, twice (named since: an engine race, fix in `claude/supdb-pretag-flake-settle`) | red: `compact_run` +2.0 and `Reader::settle_each` +13.9 an op, both spills carried (below) | green |
 | 3 | `e927955f` | all green | green | green |
-| 4 | `68c68ad0` | running: track C's fix to PR14 (`607ed7d0`: removing a flag from `Db::z_attach`'s positional tuple shifted the raw-drop test onto the decode timer's slot, so a store with `zpages_drop_raw` off dropped anyway; now a named struct and a test), and the six hostile-input fixes, whose own count is red by their checks (below) | | |
+| 4 | `68c68ad0` | all green; holds track C's fix to PR14 (`607ed7d0`: removing a flag from `Db::z_attach`'s positional tuple shifted the raw-drop test onto the decode timer's slot, so a store with `zpages_drop_raw` off dropped anyway; now a named struct and a test) and the six hostile-input fixes | red by the hostile-input fixes' checks: `Db::append_batch` +13.8 an op (probes +4.8), `merge_walk::main` +2.0, `SegmentWriter::end_with` +1.0, the open path's few hundred over the run; and `compact_run` +13.5 an op on `merge`, being read by instruction (likely the writer's checks inlined into the compaction loop, where keys come from the store's own segments) | green |
 
 ## Branches still to merge
 
