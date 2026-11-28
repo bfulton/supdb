@@ -735,16 +735,16 @@ pub struct ZCounts {
     pub cuts: u64,
     pub cut_records: u64,
     /// Pieces' runs a block's build asked the kernel for ahead of reading
-    /// them, out of core (`Options::pieces_willneed`).
+    /// them, out of core (`Reader::pieces_willneed`).
     pub piece_willneeds: u64,
     /// Raw partition spans a scan asked the kernel for ahead of walking
-    /// them, out of core (`Options::blocks_willneed`).
+    /// them, out of core (`Reader::blocks_willneed`).
     pub block_willneeds: u64,
     /// Of the spans counted above, those submitted to the kernel: the rest
     /// had their first page resident and were left alone.
     pub willneed_asks: u64,
     /// Runs and strides of heads a settle asked for ahead of the resolves
-    /// that seek them, and those submitted (`Options::heads_willneed`).
+    /// that seek them, and those submitted (`OrdIndex::willneed_heads`).
     pub head_asks: u64,
     pub head_submitted: u64,
     /// Looks at whether a partition's heads are all resident, which stand
@@ -755,12 +755,12 @@ pub struct ZCounts {
     /// (`Options::boundary_keys_from_top`).
     pub top_keys: u64,
     /// Piece runs whose directory words a block's build asked for ahead of
-    /// its record asks, and those submitted (`Options::pieces_dir_willneed`).
+    /// its record asks, and those submitted (`Blob::willneed_dir`).
     pub dir_willneeds: u64,
     pub dir_asks: u64,
     /// Pieces whose heads a bounds walk asked for whole ahead of the walk,
     /// at a landing or a table's making, and those submitted
-    /// (`Options::bounds_heads_willneed`).
+    /// (`ask_bounds_heads`).
     pub bounds_head_asks: u64,
     pub bounds_head_submitted: u64,
     /// Block boundaries a bounds walk placed by the boundary's head, no
@@ -4449,8 +4449,8 @@ pub struct Options {
     #[doc(hidden)]
     pub upkeep_pace_syncs_census: bool,
     /// EXPERIMENT: the head asks that are for a store out of core -- the
-    /// settle's ahead of its resolves (`heads_willneed`) and the bounds'
-    /// ahead of their walk (`bounds_heads_willneed`) -- made where the
+    /// settle's ahead of its resolves (`OrdIndex::willneed_heads`) and the
+    /// bounds' ahead of their walk (`ask_bounds_heads`) -- made where the
     /// compact form is installed (`zselect::GATE_Z`), the controller's
     /// verdict, and not wherever the gate has left the raw form: the lag
     /// sweep's store at three million keys under 1.25 GiB sits at the census
@@ -5724,47 +5724,6 @@ pub struct Options {
     /// rank the walk was about to reach anyway. On, `supdb-rankswhole`
     /// and `supdb-ingestrankswhole`.
     pub piece_ranks_whole: bool,
-    /// Out of core, a block's build asks the kernel for every piece's
-    /// records over the block before it reads any of them
-    /// (`Blob::willneed_ranks`), where it read them as it met them, one
-    /// fault at a time. After a burst a block's updates sit in as many
-    /// pieces as the burst's seals that touched its range, a page in
-    /// each, and under 1.25 GiB at ten million keys the ten-percent lag
-    /// pass read nine major faults a scan at some 260 us a scan, each
-    /// fault a device round trip taken alone, while LMDB's scan over the
-    /// same keys took one. Asked only while the controller's gate is away
-    /// from the raw form -- the census running or the compact form served
-    /// (`Options::zpages`) -- which is the store's own measure of being
-    /// out of core; in core the gate is raw and nothing is asked, since
-    /// an `madvise` a piece a block would cost a build more than it
-    /// builds. Off, `supdb-nowillneed` and `supdb-ingestnowillneed`.
-    pub pieces_willneed: bool,
-    /// Out of core, a scan asks the kernel for the raw partition records
-    /// it is about to walk before it walks them -- a clean block's records
-    /// from the seek, and a block's records ahead of its build
-    /// (`Blob::willneed_ranks`, at most `WILLNEED_CAP` bytes an ask) --
-    /// where the records were read as the walk met them, a fault a page
-    /// each, and a scan of a hundred keys over a drained store took three
-    /// to four, in turn. Asked only for a partition no form file serves
-    /// and while the controller's gate is away from the raw form, as
-    /// `pieces_willneed` is. Off, `supdb-noblockwillneed` and
-    /// `supdb-ingestnoblockwillneed`.
-    pub blocks_willneed: bool,
-    /// Out of core, the heads a settle's resolves will seek asked of the
-    /// kernel ahead of them (`OrdIndex::willneed_heads`): runs of them
-    /// where the batch is dense in a partition, the strides of the keys a
-    /// window ahead where it is sparse (`SETTLE_RUN`, `SETTLE_LEAD`,
-    /// `SETTLE_AHEAD`). A
-    /// burst's batch resolved one fault at a time was the whole of the
-    /// first scan after it under 1.25 GiB at ten million keys, ten to
-    /// fourteen thousand faults in a row on one thread. A block's build
-    /// asks nothing for the seek its cuts make: their one page faults
-    /// beside the records' ask already, and asked the microsecond before
-    /// it was seized it saved nothing and took more major faults. Gated as
-    /// `blocks_willneed` is: the gate away from raw, a partition no form
-    /// file serves. Off, `supdb-noheadwillneed` and
-    /// `supdb-ingestnoheadwillneed`.
-    pub heads_willneed: bool,
     /// A merge's landing plans the next merge while reads are around -- a
     /// scan since the last landing -- as a seal's durable landing plans
     /// one (`Maint::collect`): the planner ran at a seal's landing alone,
@@ -5910,25 +5869,6 @@ pub struct Options {
     /// for that: `supdb-boundarytop` and `supdb-ingestboundarytop` read the
     /// top.
     pub boundary_keys_from_top: bool,
-    /// Out of core a block's build asks for its pieces' directory words
-    /// together before it asks for their records (`Blob::willneed_dir`):
-    /// the record asks read each piece's directory word for the run's
-    /// start, a page cold under a bound, one fault at a time -- fifteen
-    /// thousand of the full-rewrite pass's eighty-five thousand major
-    /// faults at ten million keys under 1.25 GiB were those reads. Gated
-    /// as `pieces_willneed` is. Off, `supdb-nodirwillneed` and
-    /// `supdb-ingestnodirwillneed`.
-    pub pieces_dir_willneed: bool,
-    /// Out of core a walk of a piece's keys against a partition's block
-    /// boundaries (`block_bounds_of`), at a landing or a table's making,
-    /// asks for the piece's heads over the partition's range together
-    /// before it reads them in order: the heads are advised random, so the
-    /// walk took a fault a page, ten thousand of the full-rewrite pass's
-    /// major faults, each table remade over a partition a chained merge
-    /// had just rewritten. Gated on the controller's gate away from raw.
-    /// Off, `supdb-noboundsheadwillneed` and
-    /// `supdb-ingestnoboundsheadwillneed`.
-    pub bounds_heads_willneed: bool,
     /// A walk of a source's keys against a partition's block boundaries
     /// (`block_bounds_of`) places a boundary by its head where the head is
     /// not the whole of its key, and reads the boundary's record only
@@ -6860,7 +6800,8 @@ pub struct Options {
     pub settle_convert_fills: bool,
     /// EXPERIMENT: how long a look at whether a partition's heads are all
     /// in the page cache stands, in milliseconds, for the asks a settle
-    /// makes ahead of its resolves out of core (`heads_willneed`): while a
+    /// makes ahead of its resolves out of core (`OrdIndex::willneed_heads`):
+    /// while a
     /// look says they are, the settle asks for none of them (0, the
     /// default: every ask reads its own page's residency). An ask is
     /// refused where its first page is resident, which it learns by a
@@ -8072,9 +8013,6 @@ impl Default for Options {
             seal_snapshot_far: false,
             land_ranks_far: false,
             piece_ranks_whole: false,
-            pieces_willneed: true,
-            blocks_willneed: true,
-            heads_willneed: true,
             merge_chains: true,
             merge_chains_writes: true,
             merge_chains_writes_uncovered: true,
@@ -8084,8 +8022,6 @@ impl Default for Options {
             merge_parallel_quiet: 3,
             merge_quiet_any_gate: false,
             boundary_keys_from_top: false,
-            pieces_dir_willneed: true,
-            bounds_heads_willneed: true,
             bounds_by_heads: true,
             land_bounds_read: true,
             seal_put_one: true,
@@ -17929,17 +17865,17 @@ struct Slot {
     zcuts: AtomicU64,
     zcutrecs: AtomicU64,
     /// Pieces' runs a block's build asked the kernel for ahead of reading
-    /// them (`Options::pieces_willneed`).
+    /// them (`Reader::pieces_willneed`).
     zwillneeds: AtomicU64,
     /// Raw partition spans a scan asked the kernel for ahead of walking
-    /// them (`Options::blocks_willneed`).
+    /// them (`Reader::blocks_willneed`).
     zblkwillneeds: AtomicU64,
     /// Of the spans above, pieces' and partitions', those the kernel was
     /// asked for: the rest had their first page resident and were not.
     zwillneedasks: AtomicU64,
     /// Runs and strides of a partition's heads a settle asked for ahead
     /// of the resolves that seek them, and those submitted
-    /// (`Options::heads_willneed`).
+    /// (`OrdIndex::willneed_heads`).
     zheadasks: AtomicU64,
     zheadsubmitted: AtomicU64,
     /// Looks at a partition's heads' residency whole
@@ -25937,7 +25873,7 @@ fn block_bounds_of(
 const FROZEN_CAP: usize = 3;
 
 /// A settle's asks for the heads ahead of its resolves
-/// (`Options::heads_willneed`). Where a batch is dense in a partition --
+/// (`OrdIndex::willneed_heads`). Where a batch is dense in a partition --
 /// each key's page the one before's or the next -- the asks are runs of
 /// `SETTLE_RUN` heads, sixty-four kilobytes and sixteen pages each, one
 /// device request, issued from the page after the one the key resolved to
@@ -25958,7 +25894,7 @@ const SETTLE_AHEAD: usize = 64;
 const SETTLE_PLANS: usize = 16;
 
 /// The most a scan asks the kernel for ahead of one walk
-/// (`Options::blocks_willneed`, `Options::pieces_willneed`): a scan's
+/// (`Reader::blocks_willneed`, `Reader::pieces_willneed`): a scan's
 /// limit can be every rank of a partition, and a block's records are a
 /// few pages.
 const WILLNEED_CAP: usize = 64 << 10;
@@ -33249,20 +33185,25 @@ impl Reader {
     }
 
     /// Whether a block's build asks for its pieces' pages ahead
-    /// (`Options::pieces_willneed`): the option, and the gate away from the
-    /// raw form, which is the store's own measure of being out of core.
+    /// (`Blob::willneed_ranks`): where the gate is away from the raw form,
+    /// which is the store's own measure of being out of core. After a
+    /// burst a block's updates sit in as many pieces as the burst's seals
+    /// that touched its range, a page in each, and under 1.25 GiB at ten
+    /// million keys the ten-percent lag pass read nine major faults a scan
+    /// without the asks, each a device round trip taken alone; in core
+    /// nothing is asked, since an `madvise` a piece a block would cost a
+    /// build more than it builds.
     fn pieces_willneed(&self) -> bool {
-        self.opts.pieces_willneed && self.shared.zgate.load() != zselect::GATE_RAW
+        self.shared.zgate.load() != zselect::GATE_RAW
     }
 
     /// Whether a scan asks for the raw partition records it is about to
-    /// walk (`Options::blocks_willneed`): the option, the gate away from
-    /// the raw form, and no form file serving the partition, whose pages
-    /// are then the form file's and not these.
+    /// walk: the gate away from the raw form, and no form file serving the
+    /// partition, whose pages are then the form file's and not these.
+    /// Walked as it met them, a scan of a hundred keys over a drained store
+    /// out of core took three to four faults in turn.
     fn blocks_willneed(&self, seg: &Seg) -> bool {
-        self.opts.blocks_willneed
-            && self.shared.zgate.load() != zselect::GATE_RAW
-            && self.zc(seg).is_none()
+        self.shared.zgate.load() != zselect::GATE_RAW && self.zc(seg).is_none()
     }
 
     /// The heads of ranks `lo..hi` of `seg` asked for ahead of a seek over
@@ -39751,7 +39692,7 @@ impl Reader {
         let lazy = self.opts.zpages_settle_span && !self.opts.forms_pieces_only;
         let mut lazy_n = 0u64;
         // Out of core, the heads a resolve will seek asked for ahead of it
-        // (`Options::heads_willneed`): a resolve is a seek over one stride
+        // (`OrdIndex::willneed_heads`): a resolve is a seek over one stride
         // of a partition's heads, a page cold under a bound, and a burst's
         // batch resolved one fault at a time was the whole of the first
         // scan after it, ten to fourteen thousand faults in a row on one
@@ -39765,8 +39706,7 @@ impl Reader {
         // ask a key whatever the density cost a syscall a key, half a
         // second of the full rewrite's settles.
         let page = crate::bytes::os_page_size();
-        let asking =
-            self.opts.heads_willneed && out_of_core(&self.opts, self.shared.zgate.load()) && np > 0;
+        let asking = out_of_core(&self.opts, self.shared.zgate.load()) && np > 0;
         // One look a partition first (`Options::heads_look_ms`): the raw
         // partitions whose heads are not all resident are the ones asked
         // for, and with none there is no asking in this settle.
@@ -41117,7 +41057,8 @@ impl Reader {
 
     /// A block with no form in this handle's table built and filed into it,
     /// as the block walk does on reaching one: the block's records asked of
-    /// the kernel where the store is out of core (`blocks_willneed`), the
+    /// the kernel where the store is out of core (`Reader::blocks_willneed`),
+    /// the
     /// form materialized from the sources and the snapshot, counted by its
     /// kind, and its bytes listed and shed against the budget.
     #[allow(clippy::too_many_arguments)]
@@ -56615,11 +56556,11 @@ struct AskCounts {
     /// (`Options::boundary_keys_from_top`).
     top_keys: AtomicU64,
     /// Piece runs whose directory words a block's build asked for, and
-    /// those submitted (`Options::pieces_dir_willneed`).
+    /// those submitted (`Blob::willneed_dir`).
     dir_runs: AtomicU64,
     dir_submitted: AtomicU64,
     /// Pieces whose heads a bounds walk asked for, at a landing or a
-    /// table's making, and those submitted (`Options::bounds_heads_willneed`).
+    /// table's making, and those submitted (`ask_bounds_heads`).
     bounds_heads: AtomicU64,
     bounds_submitted: AtomicU64,
     /// Block boundaries a bounds walk placed by the boundary's head with
@@ -56637,13 +56578,13 @@ struct AskCounts {
 }
 
 /// The most heads a bounds walk asks for at once
-/// (`Options::bounds_heads_willneed`): eight megabytes, a million keys, past
+/// (`ask_bounds_heads`): eight megabytes, a million keys, past
 /// which the walk reads as it goes.
 const BOUNDS_ASK_HEADS: usize = 1 << 20;
 
 /// The heads of the piece `p` a walk of its keys against partition `seg`'s
 /// block boundaries will read (`block_bounds_of`), asked of the kernel
-/// together ahead of it (`Options::bounds_heads_willneed`): the piece's
+/// together ahead of it (`ask_bounds_heads`): the piece's
 /// ranks from where the partition's lower fence falls to where its upper
 /// one does, by the top level's strides in memory, at most
 /// `BOUNDS_ASK_HEADS`. The walk reads them in order and the heads are
@@ -56826,9 +56767,7 @@ impl<'s> BuildCtx<'s> {
             let at = match p.bounds.get(against) {
                 Some(at) => at,
                 None => {
-                    if self.rd.opts.bounds_heads_willneed
-                        && out_of_core(&self.rd.opts, self.rd.shared.zgate.load())
-                    {
+                    if out_of_core(&self.rd.opts, self.rd.shared.zgate.load()) {
                         ask_bounds_heads(&self.rd.shared, seg, p);
                     }
                     let at = std::sync::Arc::new(block_bounds_of(
@@ -57304,10 +57243,13 @@ impl<'s> BuildCtx<'s> {
         // before any is read: a block's updates sit in as many pieces as
         // touched its range, a page in each, and read one fault at a time
         // each page was a device round trip of its own
-        // (`Options::pieces_willneed`).
-        if self.rd.pieces_willneed() && self.rd.opts.pieces_dir_willneed {
+        // (`Reader::pieces_willneed`).
+        if self.rd.pieces_willneed() {
             // The directory words first, every piece's together: the
-            // record asks below read them, a cold page each.
+            // record asks below read them, a cold page each -- fifteen
+            // thousand of the full-rewrite pass's eighty-five thousand
+            // major faults at ten million keys under 1.25 GiB were those
+            // reads.
             for (j, run, _) in pieces {
                 if run.start < run.end {
                     let n = src.l0[*j]
@@ -61389,9 +61331,7 @@ impl Maint {
                     .fetch_add(1, AtomicOrdering::Relaxed);
                 return Ok(());
             }
-            let ask = (self.opts.bounds_heads_willneed
-                && out_of_core(&self.opts, self.shared.zgate.load()))
-            .then_some(&*self.shared);
+            let ask = out_of_core(&self.opts, self.shared.zgate.load()).then_some(&*self.shared);
             let by_heads = (self.opts.bounds_by_heads, &self.shared.asks);
             bound_pieces_of(segs, ask, by_heads, &self.shared.asks.land_bounds)?;
         }

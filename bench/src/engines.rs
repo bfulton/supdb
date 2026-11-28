@@ -698,18 +698,6 @@ pub struct Supdb {
     /// (`Options::piece_ranks_whole`). `supdb-ingestrankswhole`, and
     /// `supdb-rankswhole` durable.
     rankswhole: bool,
-    /// A block's build reads each piece's records over it as it meets
-    /// them, one fault at a time, where the default asks the kernel for
-    /// every piece's run before any is read once the store is out of core
-    /// (`Options::pieces_willneed` off). `supdb-ingestnowillneed`, and
-    /// `supdb-nowillneed` durable.
-    nowillneed: bool,
-    /// A scan reads a raw partition's records as it meets them, a fault a
-    /// page, where the default asks the kernel for the span it is about
-    /// to walk once the store is out of core (`Options::blocks_willneed`
-    /// off). `supdb-ingestnoblockwillneed`, and `supdb-noblockwillneed`
-    /// durable.
-    noblockwillneed: bool,
     /// A merge's first pass reads its inputs' keys off the records, as
     /// before the heads carried them (`Options::merge_keys_by_heads` off).
     /// `supdb-ingestmergerecordkeys`, and `supdb-mergerecordkeys` durable.
@@ -732,11 +720,6 @@ pub struct Supdb {
     /// second pass (`Options::merge_drop_behind`, refuted and off).
     /// `supdb-ingestmergedropbehind`, and `supdb-mergedropbehind` durable.
     mergedropbehind: bool,
-    /// A settle's resolves read the heads they seek as they meet them,
-    /// where the default asks for them ahead once the store is out of core
-    /// (`Options::heads_willneed` off). `supdb-ingestnoheadwillneed`, and
-    /// `supdb-noheadwillneed` durable.
-    noheadwillneed: bool,
     /// A merge's landing plans nothing, as a seal's landing alone did, so a
     /// store nothing writes keeps its pieces however long it is read
     /// (`Options::merge_chains` off). `supdb-ingestnomergechain`, and
@@ -792,15 +775,6 @@ pub struct Supdb {
     /// (`Options::boundary_keys_from_top`). `supdb-ingestboundarytop`, and
     /// `supdb-boundarytop` durable.
     boundarytop: bool,
-    /// A block's build asks for its pieces' records without asking for
-    /// their directory words first (`Options::pieces_dir_willneed` off).
-    /// `supdb-ingestnodirwillneed`, and `supdb-nodirwillneed` durable.
-    nodirwillneed: bool,
-    /// A bounds walk reads a piece's heads as it meets them
-    /// (`Options::bounds_heads_willneed` off).
-    /// `supdb-ingestnoboundsheadwillneed`, and `supdb-noboundsheadwillneed`
-    /// durable.
-    noboundsheadwillneed: bool,
     /// The builder ahead starts in core alone, the shape before it ran out
     /// of core for the partitions in memory (`Options::ahead_out_of_core`
     /// off). `supdb-ingestaheadincore`, and `supdb-aheadincore` durable.
@@ -2230,18 +2204,6 @@ struct Policy {
     /// (`Options::piece_ranks_whole`). `supdb-ingestrankswhole`, and
     /// `supdb-rankswhole` durable.
     rankswhole: bool,
-    /// A block's build reads each piece's records over it as it meets
-    /// them, one fault at a time, where the default asks the kernel for
-    /// every piece's run before any is read once the store is out of core
-    /// (`Options::pieces_willneed` off). `supdb-ingestnowillneed`, and
-    /// `supdb-nowillneed` durable.
-    nowillneed: bool,
-    /// A scan reads a raw partition's records as it meets them, a fault a
-    /// page, where the default asks the kernel for the span it is about
-    /// to walk once the store is out of core (`Options::blocks_willneed`
-    /// off). `supdb-ingestnoblockwillneed`, and `supdb-noblockwillneed`
-    /// durable.
-    noblockwillneed: bool,
     /// A merge's first pass reads its inputs' keys off the records, as
     /// before the heads carried them (`Options::merge_keys_by_heads` off).
     /// `supdb-ingestmergerecordkeys`, and `supdb-mergerecordkeys` durable.
@@ -2264,11 +2226,6 @@ struct Policy {
     /// second pass (`Options::merge_drop_behind`, refuted and off).
     /// `supdb-ingestmergedropbehind`, and `supdb-mergedropbehind` durable.
     mergedropbehind: bool,
-    /// A settle's resolves read the heads they seek as they meet them,
-    /// where the default asks for them ahead once the store is out of core
-    /// (`Options::heads_willneed` off). `supdb-ingestnoheadwillneed`, and
-    /// `supdb-noheadwillneed` durable.
-    noheadwillneed: bool,
     /// A merge's landing plans nothing, as a seal's landing alone did, so a
     /// store nothing writes keeps its pieces however long it is read
     /// (`Options::merge_chains` off). `supdb-ingestnomergechain`, and
@@ -2324,15 +2281,6 @@ struct Policy {
     /// (`Options::boundary_keys_from_top`). `supdb-ingestboundarytop`, and
     /// `supdb-boundarytop` durable.
     boundarytop: bool,
-    /// A block's build asks for its pieces' records without asking for
-    /// their directory words first (`Options::pieces_dir_willneed` off).
-    /// `supdb-ingestnodirwillneed`, and `supdb-nodirwillneed` durable.
-    nodirwillneed: bool,
-    /// A bounds walk reads a piece's heads as it meets them
-    /// (`Options::bounds_heads_willneed` off).
-    /// `supdb-ingestnoboundsheadwillneed`, and `supdb-noboundsheadwillneed`
-    /// durable.
-    noboundsheadwillneed: bool,
     /// The builder ahead starts in core alone, the shape before it ran out
     /// of core for the partitions in memory (`Options::ahead_out_of_core`
     /// off). `supdb-ingestaheadincore`, and `supdb-aheadincore` durable.
@@ -3442,14 +3390,11 @@ impl Default for Policy {
             sealcopyfar: false,
             ranksfar: false,
             rankswhole: false,
-            nowillneed: false,
-            noblockwillneed: false,
             mergerecordkeys: false,
             mergewalkrescan: false,
             mergenoverify: false,
             mmapthr: false,
             mergedropbehind: false,
-            noheadwillneed: false,
             nomergechain: false,
             mergeuncapped: false,
             mergeone: false,
@@ -3463,8 +3408,6 @@ impl Default for Policy {
             bgidle: false,
             mergeahead: false,
             boundarytop: false,
-            nodirwillneed: false,
-            noboundsheadwillneed: false,
             aheadincore: false,
             aheadcold: false,
             aheadeager: false,
@@ -6607,64 +6550,6 @@ impl Supdb {
         )
     }
 
-    /// `supdb` whose block builds read each piece's records as they meet
-    /// them, one fault at a time, where the default asks the kernel for
-    /// every piece's run over the block first once the store is out of
-    /// core (`Options::pieces_willneed`): against `supdb` under a bound it
-    /// prices the asking.
-    pub fn create_nowillneed(path: &Path) -> Res<Supdb> {
-        Supdb::with_policy(
-            path,
-            Policy {
-                nowillneed: true,
-                ..Policy::default()
-            },
-        )
-    }
-
-    /// `supdb-ingest` reading its pieces as it meets them, as
-    /// `supdb-nowillneed`.
-    pub fn create_ingest_nowillneed(path: &Path) -> Res<Supdb> {
-        Supdb::with_policy(
-            path,
-            Policy {
-                partition: false,
-                durable: false,
-                nowillneed: true,
-                ..Policy::default()
-            },
-        )
-    }
-
-    /// `supdb` whose scans read a raw partition's records as they meet
-    /// them, a fault a page, where the default asks the kernel for the
-    /// span first once the store is out of core
-    /// (`Options::blocks_willneed`): against `supdb` under a bound it
-    /// prices the asking.
-    pub fn create_noblockwillneed(path: &Path) -> Res<Supdb> {
-        Supdb::with_policy(
-            path,
-            Policy {
-                noblockwillneed: true,
-                ..Policy::default()
-            },
-        )
-    }
-
-    /// `supdb-ingest` reading a raw partition's records as it meets them,
-    /// as `supdb-noblockwillneed`.
-    pub fn create_ingest_noblockwillneed(path: &Path) -> Res<Supdb> {
-        Supdb::with_policy(
-            path,
-            Policy {
-                partition: false,
-                durable: false,
-                noblockwillneed: true,
-                ..Policy::default()
-            },
-        )
-    }
-
     /// `supdb` whose merges read their inputs' keys off the records in the
     /// first pass, as before the heads carried them
     /// (`Options::merge_keys_by_heads`): against `supdb` under a bound it
@@ -6770,34 +6655,6 @@ impl Supdb {
                 partition: false,
                 durable: false,
                 mergedropbehind: true,
-                ..Policy::default()
-            },
-        )
-    }
-
-    /// `supdb` whose settles read the heads they seek as they meet them,
-    /// where the default asks for them ahead once the store is out of core
-    /// (`Options::heads_willneed`): against `supdb` under a bound it
-    /// prices the asking.
-    pub fn create_noheadwillneed(path: &Path) -> Res<Supdb> {
-        Supdb::with_policy(
-            path,
-            Policy {
-                noheadwillneed: true,
-                ..Policy::default()
-            },
-        )
-    }
-
-    /// `supdb-ingest` reading its heads as it meets them, as
-    /// `supdb-noheadwillneed`.
-    pub fn create_ingest_noheadwillneed(path: &Path) -> Res<Supdb> {
-        Supdb::with_policy(
-            path,
-            Policy {
-                partition: false,
-                durable: false,
-                noheadwillneed: true,
                 ..Policy::default()
             },
         )
@@ -9194,8 +9051,8 @@ impl Supdb {
 
     /// `supdb` with the read advice pinned to `MADV_RANDOM` for the store's
     /// life (`ReadAdvice::Random`): out of core a scan asks the kernel for
-    /// the spans it will walk (`Options::blocks_willneed`,
-    /// `Options::pieces_willneed`), which the kernel reads whatever the
+    /// the spans it will walk (`Reader::blocks_willneed`,
+    /// `Reader::pieces_willneed`), which the kernel reads whatever the
     /// advice, and the random advice takes away the read-around each fault
     /// adds beside them.
     pub fn create_advicerandom(path: &Path) -> Res<Supdb> {
@@ -10320,14 +10177,11 @@ impl Supdb {
             sealcopyfar,
             ranksfar,
             rankswhole,
-            nowillneed,
-            noblockwillneed,
             mergerecordkeys,
             mergewalkrescan,
             mergenoverify,
             mmapthr,
             mergedropbehind,
-            noheadwillneed,
             nomergechain,
             mergeuncapped,
             mergeone,
@@ -10341,8 +10195,6 @@ impl Supdb {
             bgidle,
             mergeahead,
             boundarytop,
-            nodirwillneed,
-            noboundsheadwillneed,
             aheadincore,
             aheadcold,
             aheadeager,
@@ -10790,8 +10642,6 @@ impl Supdb {
             seal_snapshot_far: sealcopyfar,
             land_ranks_far: ranksfar,
             piece_ranks_whole: rankswhole,
-            pieces_willneed: !nowillneed,
-            blocks_willneed: !noblockwillneed,
             merge_keys_by_heads: !mergerecordkeys,
             merge_walk_cached: !mergewalkrescan,
             merge_verifies_inputs: !mergenoverify,
@@ -10799,7 +10649,6 @@ impl Supdb {
             merge_drop_behind: mergedropbehind,
             merge_drops_covered: mergedropscovered,
             same_blocks_from_index: !sameblocksrecords,
-            heads_willneed: !noheadwillneed,
             merge_chains: !nomergechain,
             merge_bytes_cap: if mergeuncapped {
                 0
@@ -10833,8 +10682,6 @@ impl Supdb {
                 supdb::Options::default().wal_drop_bytes
             },
             boundary_keys_from_top: boundarytop,
-            pieces_dir_willneed: !nodirwillneed,
-            bounds_heads_willneed: !noboundsheadwillneed,
             ahead_out_of_core: !aheadincore,
             ahead_resident_pct: if aheadcold {
                 0
@@ -11398,14 +11245,11 @@ impl Supdb {
             sealcopyfar,
             ranksfar,
             rankswhole,
-            nowillneed,
-            noblockwillneed,
             mergerecordkeys,
             mergewalkrescan,
             mergenoverify,
             mmapthr,
             mergedropbehind,
-            noheadwillneed,
             nomergechain,
             mergeuncapped,
             mergeone,
@@ -11419,8 +11263,6 @@ impl Supdb {
             bgidle,
             mergeahead,
             boundarytop,
-            nodirwillneed,
-            noboundsheadwillneed,
             aheadincore,
             aheadcold,
             aheadeager,
@@ -12877,20 +12719,6 @@ impl Engine for Supdb {
                 "supdb-ingestrankswhole"
             };
         }
-        if self.nowillneed {
-            return if self.partition {
-                "supdb-nowillneed"
-            } else {
-                "supdb-ingestnowillneed"
-            };
-        }
-        if self.noblockwillneed {
-            return if self.partition {
-                "supdb-noblockwillneed"
-            } else {
-                "supdb-ingestnoblockwillneed"
-            };
-        }
         if self.mergerecordkeys {
             return if self.partition {
                 "supdb-mergerecordkeys"
@@ -12924,13 +12752,6 @@ impl Engine for Supdb {
                 "supdb-mergedropbehind"
             } else {
                 "supdb-ingestmergedropbehind"
-            };
-        }
-        if self.noheadwillneed {
-            return if self.partition {
-                "supdb-noheadwillneed"
-            } else {
-                "supdb-ingestnoheadwillneed"
             };
         }
         if self.nomergechain {
@@ -13010,20 +12831,6 @@ impl Engine for Supdb {
                 "supdb-boundarytop"
             } else {
                 "supdb-ingestboundarytop"
-            };
-        }
-        if self.nodirwillneed {
-            return if self.partition {
-                "supdb-nodirwillneed"
-            } else {
-                "supdb-ingestnodirwillneed"
-            };
-        }
-        if self.noboundsheadwillneed {
-            return if self.partition {
-                "supdb-noboundsheadwillneed"
-            } else {
-                "supdb-ingestnoboundsheadwillneed"
             };
         }
         if self.aheadincore {
@@ -16147,14 +15954,11 @@ pub fn guarantee(arm: &str) -> Option<Guarantee> {
         | "supdb-sealcopyfar"
         | "supdb-ranksfar"
         | "supdb-rankswhole"
-        | "supdb-nowillneed"
-        | "supdb-noblockwillneed"
         | "supdb-mergerecordkeys"
         | "supdb-mergewalkrescan"
         | "supdb-mergenoverify"
         | "supdb-mmapthr"
         | "supdb-mergedropbehind"
-        | "supdb-noheadwillneed"
         | "supdb-nomergechain"
         | "supdb-mergeuncapped"
         | "supdb-mergeone"
@@ -16172,8 +15976,6 @@ pub fn guarantee(arm: &str) -> Option<Guarantee> {
         | "supdb-nozpagesnofitshort"
         | "supdb-nozpagesmergeone"
         | "supdb-boundarytop"
-        | "supdb-nodirwillneed"
-        | "supdb-noboundsheadwillneed"
         | "supdb-aheadincore"
         | "supdb-aheadcold"
         | "supdb-aheadeager"
@@ -16459,20 +16261,15 @@ pub fn guarantee(arm: &str) -> Option<Guarantee> {
         | "supdb-ingestsealcopyfar"
         | "supdb-ingestranksfar"
         | "supdb-ingestrankswhole"
-        | "supdb-ingestnowillneed"
-        | "supdb-ingestnoblockwillneed"
         | "supdb-ingestmergerecordkeys"
         | "supdb-ingestmergewalkrescan"
         | "supdb-ingestmergenoverify"
         | "supdb-ingestmmapthr"
         | "supdb-ingestmergedropbehind"
-        | "supdb-ingestnoheadwillneed"
         | "supdb-ingestnomergechain"
         | "supdb-ingestmergeuncapped"
         | "supdb-ingestmergeone"
         | "supdb-ingestboundarytop"
-        | "supdb-ingestnodirwillneed"
-        | "supdb-ingestnoboundsheadwillneed"
         | "supdb-ingestaheadincore"
         | "supdb-ingestnochainwrites"
         | "supdb-ingestnoland"
@@ -17972,10 +17769,6 @@ pub fn open(arm: &str, dir: &Path, map_gb: usize) -> Res<Box<dyn Engine>> {
         "supdb-ingestranksfar" => supdb_arm(Supdb::create_ingest_ranksfar, dir)?,
         "supdb-rankswhole" => supdb_arm(Supdb::create_rankswhole, dir)?,
         "supdb-ingestrankswhole" => supdb_arm(Supdb::create_ingest_rankswhole, dir)?,
-        "supdb-nowillneed" => supdb_arm(Supdb::create_nowillneed, dir)?,
-        "supdb-ingestnowillneed" => supdb_arm(Supdb::create_ingest_nowillneed, dir)?,
-        "supdb-noblockwillneed" => supdb_arm(Supdb::create_noblockwillneed, dir)?,
-        "supdb-ingestnoblockwillneed" => supdb_arm(Supdb::create_ingest_noblockwillneed, dir)?,
         "supdb-mergerecordkeys" => supdb_arm(Supdb::create_mergerecordkeys, dir)?,
         "supdb-ingestmergerecordkeys" => supdb_arm(Supdb::create_ingest_mergerecordkeys, dir)?,
         "supdb-mergewalkrescan" => supdb_arm(Supdb::create_mergewalkrescan, dir)?,
@@ -18010,8 +17803,6 @@ pub fn open(arm: &str, dir: &Path, map_gb: usize) -> Res<Box<dyn Engine>> {
         "supdb-ingestmergenoverify" => supdb_arm(Supdb::create_ingest_mergenoverify, dir)?,
         "supdb-mergedropbehind" => supdb_arm(Supdb::create_mergedropbehind, dir)?,
         "supdb-ingestmergedropbehind" => supdb_arm(Supdb::create_ingest_mergedropbehind, dir)?,
-        "supdb-noheadwillneed" => supdb_arm(Supdb::create_noheadwillneed, dir)?,
-        "supdb-ingestnoheadwillneed" => supdb_arm(Supdb::create_ingest_noheadwillneed, dir)?,
         "supdb-nomergechain" => supdb_arm(Supdb::create_nomergechain, dir)?,
         "supdb-ingestnomergechain" => supdb_arm(Supdb::create_ingest_nomergechain, dir)?,
         "supdb-mergeuncapped" => supdb_arm(Supdb::create_mergeuncapped, dir)?,
@@ -18048,58 +17839,6 @@ pub fn open(arm: &str, dir: &Path, map_gb: usize) -> Res<Box<dyn Engine>> {
         "supdb-ingestmergeone" => supdb_arm(Supdb::create_ingest_mergeone, dir)?,
         "supdb-boundarytop" => supdb_arm(Supdb::create_boundarytop, dir)?,
         "supdb-ingestboundarytop" => supdb_arm(Supdb::create_ingest_boundarytop, dir)?,
-        "supdb-nodirwillneed" => supdb_arm(
-            |d| {
-                Supdb::with_policy(
-                    d,
-                    Policy {
-                        nodirwillneed: true,
-                        ..Policy::default()
-                    },
-                )
-            },
-            dir,
-        )?,
-        "supdb-ingestnodirwillneed" => supdb_arm(
-            |d| {
-                Supdb::with_policy(
-                    d,
-                    Policy {
-                        partition: false,
-                        durable: false,
-                        nodirwillneed: true,
-                        ..Policy::default()
-                    },
-                )
-            },
-            dir,
-        )?,
-        "supdb-noboundsheadwillneed" => supdb_arm(
-            |d| {
-                Supdb::with_policy(
-                    d,
-                    Policy {
-                        noboundsheadwillneed: true,
-                        ..Policy::default()
-                    },
-                )
-            },
-            dir,
-        )?,
-        "supdb-ingestnoboundsheadwillneed" => supdb_arm(
-            |d| {
-                Supdb::with_policy(
-                    d,
-                    Policy {
-                        partition: false,
-                        durable: false,
-                        noboundsheadwillneed: true,
-                        ..Policy::default()
-                    },
-                )
-            },
-            dir,
-        )?,
         "supdb-aheadincore" => supdb_arm(
             |d| {
                 Supdb::with_policy(
