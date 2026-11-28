@@ -2648,6 +2648,8 @@ impl<B: Bytes> Blob<B> {
     /// Every record's key in key order, a record with no value among them,
     /// and how many: the walk an index of the segment's records is built
     /// from, in O(extents) with no block touched, as `scan_counts` walks.
+    /// The store's alone, which wasm does not build.
+    #[cfg(not(target_family = "wasm"))]
     pub(crate) fn for_each_record_key<F: FnMut(&[u8])>(&self, mut f: F) -> Result<usize> {
         let mut rank = 0usize;
         let walk = self
