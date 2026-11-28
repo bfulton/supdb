@@ -60,4 +60,5 @@ Tree Borrows.
 Nothing is in progress. Left for others: the cost raises above (the
 parent's call), and a key's values past 4 GiB in total across appends,
 which the store takes and its seal then refuses (`SegmentWriter::end_with`)
--- not a narrowing, and not touched here.
+-- found by reading `end_with`'s check, not run; not a narrowing, and not
+touched here.
