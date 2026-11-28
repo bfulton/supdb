@@ -55,10 +55,52 @@ Tree Borrows.
   reason is the new refusals' checks and their error strings in the
   readers. No budget is enforced (`web/build.sh` prints the sizes).
 
+## A key past 4 GiB in total across appends
+
+Before (14:39 UTC, on `1a723c5`), 66 appends of 64 MiB to one key, a commit
+each, `common::options()`: every commit `Ok`; `flush` `InvalidData:
+"segment writer: a key's values exceed 4 GiB in one segment"`; `count` 66;
+a later commit `Ok`; `close` the same error; reopen `Ok`, `read_all`
+4,429,185,024 bytes; `close` the same error again.
+
+Fixed (the parent's choice (b)): `ba3015d`, reworked in `68d3c10`. The
+segment writer cuts a key's run past an extent's 32-bit length into several
+extents of one record (`SegmentWriter::end_cut`), a shape every reader reads
+(`Blob` mapped and copying, `SparseBlob`: counts summed, extents walked in
+turn, a tombstone on any extent the record's); the browser reader never
+meets one, as its host refuses an object of 4 GiB or more at open. Test:
+`a_run_past_an_extent_is_cut_into_several_and_read_as_one_key` (the limit
+set to 100 bytes by `set_max_extent`), red without the cut. The real case
+after, on `68d3c10` (15:27 UTC; the probe is not committed): every commit,
+`flush`, a later commit, `close`, the reopen and the second `close` answer
+`Ok`; `count` 66; `read_all` `Ok(66)`, 4,429,185,024 bytes, in the order
+written.
+
+Count on the writer's probes after `68d3c10`
+(`sh scripts/cost.sh 515d2cde seal merge load_durable`): `seal` -11 and
+`merge` -18.5 instructions a key in total; by function, `end_with` and the
+seal's loop gain 63 a key where `key_hash` and `BigVec::push` are now
+inlined into them and fall by as much or more. `ba3015d` alone had read the
+seal at +71 and the merge at +10.
+
+## On the merged tree (`cbe4db2`: this branch merged with `68c68ad0`)
+
+Count, `sh scripts/cost.sh e927955f merge` (16:00 UTC; once more with
+valgrind given `--dump-instr=yes` through a `PATH` shim, counts identical):
+`merge` 1,547,405,355 -> 1,543,199,900, -21.03 an op in total. By function:
+`SegmentWriter::end_with` +63.7 an op where `key_hash` (-55.0) and
+`BigVec::push` (-32.7) are now inlined into it; `compact_run` +13.5 an op.
+`compact_run` by instruction: moves +2,599,985, jumps +400,004, adds
+-400,006, padding changed, no new compare or branch on a length (the six
+compares against all-ones words are on both sides). By source line: the
+merge's key walk inlined into it (`let Some(k) = *c else`, `*c = key(i,
+rank[i])?`, the key compare) laid out again, and the call of `end_with` one
+instruction a key. No writer check sits in it; the parent read this as
+inlining that moved and passed it.
+
+Gate on `cbe4db2`: `all checks passed: build test stride onefile lint wasm
+bench lists` (15:47 to 16:19 UTC). wasm module 133,574 bytes, 54,198 gzip.
+
 ## Next
 
-Nothing is in progress. Left for others: the cost raises above (the
-parent's call), and a key's values past 4 GiB in total across appends,
-which the store takes and its seal then refuses (`SegmentWriter::end_with`)
--- found by reading `end_with`'s check, not run; not a narrowing, and not
-touched here.
+Nothing in progress. The parent merges `cbe4db2` onward, the cut included.
