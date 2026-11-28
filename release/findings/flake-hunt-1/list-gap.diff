@@ -1,0 +1,19 @@
+diff --git a/tests/zpages.rs b/tests/zpages.rs
+index e3a5ef74..0045efea 100644
+--- a/tests/zpages.rs
++++ b/tests/zpages.rs
+@@ -18893,7 +18893,13 @@ fn a_merges_outputs_are_built_in_the_block_form_where_the_room_is_short() {
+         c.finish_builds >= 1 && c.stride_builds == 0 && c.stride_no_room >= 1,
+         "{what}: every output built in the block form, the refusals counted: {c:?}"
+     );
+-    let stride_on_disk = form_files(&dir)
++    // PROBE (flake-hunt-1): the listing printed, and a gap before the reads.
++    let listed = form_files(&dir);
++    eprintln!("PROBE listed {listed:?}");
++    if let Some(ms) = std::env::var("PROBE_LIST_GAP_MS").ok().and_then(|v| v.parse().ok()) {
++        std::thread::sleep(std::time::Duration::from_millis(ms));
++    }
++    let stride_on_disk = listed
+         .iter()
+         .filter(|f| {
+             let b = common::store_file(f);

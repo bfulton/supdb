@@ -1,0 +1,15 @@
+diff --git a/src/db.rs b/src/db.rs
+index 5b17b0a9..738dae99 100644
+--- a/src/db.rs
++++ b/src/db.rs
+@@ -54048,6 +54048,10 @@ impl Reader {
+                 thread_cpu_ns().saturating_sub(cpu0),
+                 AtomicOrdering::Relaxed,
+             );
++            // PROBE (flake-hunt-1): the count of a pass taken late.
++            if std::env::var_os("PROBE_LATE_PASS_COUNT").is_some() {
++                std::thread::sleep(std::time::Duration::from_millis(300));
++            }
+             lend.passes.fetch_add(1, AtomicOrdering::Relaxed);
+             match pass {
+                 Ok((fs, ran, whole, done)) => {
