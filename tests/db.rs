@@ -12188,10 +12188,8 @@ fn a_held_logs_burst_is_lent_and_never_waited_for() {
 
 /// As the options stand, a buffered burst's batches are filed by their
 /// commits, the ones after the first as the first is: none is lent to the
-/// upkeep thread and no commit holds for it, where a share of the store
-/// paced (`Options::upkeep_pace_pct` above zero) lends each batch within
-/// the share and holds for its filing. The batches here are within a
-/// hundredth of the store's keys, which a pace of one would lend.
+/// upkeep thread and no commit holds for it. The batches here are within a
+/// hundredth of the store's keys.
 #[test]
 fn a_default_burst_is_filed_by_its_commits() {
     let d = dir("default-burst-filed");
@@ -21314,31 +21312,21 @@ fn the_oracle_holds_with_loose_rotations() {
 }
 
 /// A buffered commit near reads whose batch is worth waking the thread for
-/// files it in the commit only where a scan preceded the commit; the
-/// batches after that one, up to a share of the store's keys each, are
-/// lent and paced behind the thread (`Options::upkeep_pace_pct`): after
-/// every such commit the thread trails by at most the share, every paced
-/// commit held for that, the scan after the burst finds nothing left to
-/// settle, and every key reads as written through the writer and through
-/// a handle. A batch over the share, or every batch at zero, is filed in
-/// the commit: nothing is lent and the thread makes no pass. Held for its
-/// filing (`Options::upkeep_pace_holds`), a paced commit returns with the
-/// thread trailing by nothing, where lent within the share it returns
-/// with its own batch unfiled.
+/// files it in the commit, the first after a scan and every one after it:
+/// nothing is lent and the thread makes no pass, no commit holds for it,
+/// the scan after the burst finds nothing left to settle, and every key
+/// reads as written through the writer and through a handle.
 #[test]
-fn a_bursts_batches_after_the_first_are_lent_a_batch_behind_the_thread() {
+fn a_bursts_batches_are_filed_in_their_commits() {
     // Batches of a thousand over twenty thousand keys: five percent of
-    // the store, paced at a share of ten and filed at one.
-    let run = |name: &str, pace_pct: usize, hold: bool| {
-        let pace = pace_pct >= 5;
+    // the store.
+    let run = |name: &str| {
         let d = dir(name);
         let mut db = Db::create(
             &d,
             Options {
                 sync: supdb::SyncPolicy::EveryN(u32::MAX),
                 upkeep: supdb::Upkeep::Background(1),
-                upkeep_pace_pct: pace_pct,
-                upkeep_pace_holds: hold,
                 partition_bytes: Some(256 << 10),
                 seal_max_pct: 0,
                 ..common::options()
@@ -21372,9 +21360,8 @@ fn a_bursts_batches_after_the_first_are_lent_a_batch_behind_the_thread() {
         // Reads around: a scan over the store.
         check(&db, &want, "before the burst");
         let before = db.upkeep_counts();
-        // The burst: eight commits of a thousand random puts. The first is
-        // the commit after the scan, filed in the commit; the rest are
-        // paced, or filed too with the pace off.
+        // The burst: eight commits of a thousand random puts, each filed in
+        // its commit.
         let mut x = 0x2545_F491_4F6C_DD1Du64;
         for round in 0..8u32 {
             for _ in 0..1000 {
@@ -21386,24 +21373,6 @@ fn a_bursts_batches_after_the_first_are_lent_a_batch_behind_the_thread() {
                 want.insert(k, format!("b{round}"));
             }
             db.commit().unwrap();
-            // The count is of writes lent and not filed by the thread's
-            // report, meaningful once a commit has lent: the first commit
-            // files in the commit and lends nothing.
-            if pace && round > 0 {
-                let behind = db.upkeep_behind_writes();
-                let share = keys as u64 * pace_pct as u64 / 100;
-                if hold {
-                    assert_eq!(
-                        behind, 0,
-                        "commit {round}: held, the thread trails by nothing"
-                    );
-                } else {
-                    assert!(
-                        behind <= share,
-                        "commit {round}: the thread trails by at most the share {share}, not {behind}"
-                    );
-                }
-            }
         }
         let after = db.upkeep_counts();
         let (passes, holds) = (after[0] - before[0], after[4] - before[4]);
@@ -21417,140 +21386,28 @@ fn a_bursts_batches_after_the_first_are_lent_a_batch_behind_the_thread() {
         check(&h, &want, "through a handle after the burst");
         (passes, holds, by_scan)
     };
-    for (name, hold) in [("paced-burst", false), ("held-burst", true)] {
-        let (passes, holds, by_scan) = run(name, 10, hold);
-        assert!(
-            passes >= 1,
-            "{name}: the thread filed the lent batches: {passes} passes"
-        );
-        assert_eq!(
-            holds, 7,
-            "{name}: every commit after the first held for the thread"
-        );
-        assert_eq!(
-            by_scan, 0,
-            "{name}: the scan after the burst found nothing left to settle"
-        );
-    }
-    let (passes, holds, by_scan) = run("unpaced-burst", 0, false);
+    let (passes, holds, by_scan) = run("unpaced-burst");
     assert_eq!(
         (passes, holds, by_scan),
         (0, 0, 0),
         "filed in the commits: no pass, no hold, nothing for the scan"
     );
-    let (passes, holds, by_scan) = run("over-the-share-burst", 1, false);
-    assert_eq!(
-        (passes, holds, by_scan),
-        (0, 0, 0),
-        "a batch over the share is filed in the commit"
-    );
 }
 
-/// A syncing commit's paced batch of at least a twentieth of the store is
-/// held until the thread trails by the share alone, so the first scan after
-/// the burst meets nothing of it (`Options::upkeep_pace_syncs_to_share`);
-/// a smaller batch, and every batch with the option off, may leave the
-/// thread up to the batch behind. Every key reads as written after.
-#[test]
-fn a_syncing_commits_large_batch_is_held_to_the_share() {
-    let run = |name: &str, to_share: bool, batch: u32| {
-        let d = dir(name);
-        let mut db = Db::create(
-            &d,
-            Options {
-                upkeep: supdb::Upkeep::Background(1),
-                upkeep_pace_syncs_model: false,
-                upkeep_pace_syncs_to_share: to_share,
-                zpages: supdb::ZPages::Off,
-                partition_bytes: Some(256 << 10),
-                seal_max_pct: 0,
-                ..common::options()
-            },
-        )
-        .unwrap();
-        assert!(matches!(db.options().sync, supdb::SyncPolicy::Always));
-        let keys = 10_000u32;
-        let key = |k: u32| format!("key-{k:06}").into_bytes();
-        let mut want: HashMap<u32, String> = HashMap::new();
-        for k in 0..keys {
-            db.append(&key(k), b"0");
-        }
-        db.commit().unwrap();
-        db.flush().unwrap();
-        let check = |db: &Reader, want: &HashMap<u32, String>, when: &str| {
-            let mut seen = 0u32;
-            db.scan(
-                &key(0),
-                keys as usize,
-                kv(&mut |k, v| {
-                    let kn: u32 = std::str::from_utf8(&k[4..]).unwrap().parse().unwrap();
-                    let expect = want.get(&kn).map_or("0", |s| s.as_str());
-                    assert_eq!(
-                        std::str::from_utf8(v).unwrap(),
-                        expect,
-                        "{name}: key {kn} {when}"
-                    );
-                    seen += 1;
-                }),
-            )
-            .unwrap();
-            assert_eq!(seen, keys, "{name}: every key {when}");
-        };
-        check(&db, &want, "before the burst");
-        let share = keys as u64 * db.options().upkeep_pace_syncs_bp as u64 / 10_000;
-        let held_to_share = to_share && batch as u64 * 20 >= keys as u64 && batch <= 2048;
-        let mut x = 0x9E37_79B9_7F4A_7C15u64;
-        let mut over = 0u32;
-        for round in 0..6u32 {
-            for _ in 0..batch {
-                x ^= x << 13;
-                x ^= x >> 7;
-                x ^= x << 17;
-                let k = (x % keys as u64) as u32;
-                db.put(&key(k), format!("b{round}").as_bytes());
-                want.insert(k, format!("b{round}"));
-            }
-            db.commit().unwrap();
-            let behind = db.upkeep_behind_writes();
-            let bound = if held_to_share {
-                share
-            } else {
-                share.max(batch as u64)
-            };
-            assert!(
-                behind <= bound,
-                "{name}: commit {round}: the thread trails by at most {bound}, not {behind}"
-            );
-            over += u32::from(behind > share);
-        }
-        db.settle().unwrap();
-        check(&db, &want, "after the burst");
-        over
-    };
-    assert_eq!(run("pace-share-large", true, 1000), 0, "held to the share");
-    run("pace-share-small", true, 400);
-    run("pace-share-huge", true, 3000);
-    run("pace-share-off", false, 1000);
-}
-
-/// Under `Options::upkeep_pace_syncs_model` a syncing commit holds for its
-/// batch's filing where a scan is the likelier next operation, by the
+/// A syncing commit holds for its batch's filing where a scan is the likelier next operation, by the
 /// store's own runs of commits between scans: once a burst of one commit
 /// followed by a scan is on record, each such commit returns with the
 /// thread caught up, so the scan after it meets nothing to file, and a
-/// small batch is paced as a large one is. With the model off, the commit
-/// returns as soon as the batch is lent and the thread is still filing it.
-/// Every key reads as written after each scan.
+/// small batch is paced as a large one is. Every key reads as written
+/// after each scan.
 #[test]
 fn a_syncing_commit_a_scan_follows_holds_for_its_filing() {
-    let run = |name: &str, model: bool, batch: u32| -> (u32, u32) {
+    let run = |name: &str, batch: u32| -> (u32, u32) {
         let d = dir(name);
         let mut db = Db::create(
             &d,
             Options {
                 upkeep: supdb::Upkeep::Background(1),
-                upkeep_pace_syncs_model: model,
-                upkeep_pace_syncs_to_share: false,
                 zpages: supdb::ZPages::Off,
                 partition_bytes: Some(256 << 10),
                 seal_max_pct: 0,
@@ -21598,17 +21455,6 @@ fn a_syncing_commit_a_scan_follows_holds_for_its_filing() {
                 db.put(&key(k), format!("b{round}").as_bytes());
                 want.insert(k, format!("b{round}"));
             }
-            // With the model off the commit does not wait for the thread,
-            // and the thread is held before its pass here so that "still
-            // filing" is a state the test holds and not a turn it bets on:
-            // unheld, a host whose fsync outlasts the thread's pass found
-            // every batch filed at the commit's return, and the whole
-            // binary failed two runs in five there. A commit that did
-            // wait would never return, which the watchdog says.
-            let held = (!model).then(|| {
-                db.hold_upkeep_pass(true);
-                Watchdog::arm("a commit with the model off waited for the held thread")
-            });
             db.commit().unwrap();
             // The first burst has no run on record; from the second on, a
             // burst of one commit has one.
@@ -21619,30 +21465,13 @@ fn a_syncing_commit_a_scan_follows_holds_for_its_filing() {
                     behind_any += 1;
                 }
             }
-            if held.is_some() {
-                db.hold_upkeep_pass(false);
-            }
-            drop(held);
             check(&db, &want, &format!("after burst {round}"));
         }
         db.settle().unwrap();
         (caught_up, behind_any)
     };
-    assert_eq!(
-        run("pace-model-large", true, 1000),
-        (5, 0),
-        "held, large batches"
-    );
-    assert_eq!(
-        run("pace-model-small", true, 100),
-        (5, 0),
-        "held, small batches"
-    );
-    assert_eq!(
-        run("pace-model-off", false, 1000),
-        (0, 5),
-        "with the model off a commit returns with its batch unfiled"
-    );
+    assert_eq!(run("pace-model-large", 1000), (5, 0), "held, large batches");
+    assert_eq!(run("pace-model-small", 100), (5, 0), "held, small batches");
 }
 
 /// A syncing commit lends every batch to the upkeep thread, which files
@@ -21652,23 +21481,21 @@ fn a_syncing_commit_a_scan_follows_holds_for_its_filing() {
 /// trails by at most the share of the store's keys, every commit of the
 /// burst held for that, and every key reads as written through the
 /// writer and through a handle. Off, the commits lend unpaced and hold
-/// for nothing. In core is every gate but the compact form's
-/// (`Options::upkeep_pace_syncs_census`): the burst holds at the census's
-/// gate as at the raw form's, and at the compact form's holds for nothing;
-/// with the option off the census's gate holds for nothing too. The gate
+/// for nothing. In core is every gate but the compact form's: the burst
+/// holds at the census's gate as at the raw form's, and at the compact
+/// form's holds for nothing. The gate
 /// is set by hand, the controller off so that nothing moves it.
 #[test]
 fn a_syncing_commits_burst_batches_are_paced_behind_the_thread() {
     // Batches of a thousand over twenty thousand keys, paced within a
     // tenth of the store: two thousand writes, two batches.
-    let run = |name: &str, bp: usize, gate: u8, census: bool| {
+    let run = |name: &str, bp: usize, gate: u8| {
         let d = dir(name);
         let mut db = Db::create(
             &d,
             Options {
                 upkeep: supdb::Upkeep::Background(1),
                 upkeep_pace_syncs_bp: bp,
-                upkeep_pace_syncs_census: census,
                 zpages: supdb::ZPages::Off,
                 partition_bytes: Some(256 << 10),
                 seal_max_pct: 0,
@@ -21708,7 +21535,7 @@ fn a_syncing_commits_burst_batches_are_paced_behind_the_thread() {
         // Reads around: a scan over the store.
         check(&db, &want, "before the burst");
         db.zgate_set(gate);
-        let paced = bp > 0 && if census { gate != 2 } else { gate == 0 };
+        let paced = bp > 0 && gate != 2;
         let before = db.upkeep_counts();
         let share = keys as u64 * bp as u64 / 10_000;
         let mut x = 0x2545_F491_4F6C_DD1Du64;
@@ -21739,22 +21566,20 @@ fn a_syncing_commits_burst_batches_are_paced_behind_the_thread() {
         check(&h, &want, "through a handle after the burst");
         (passes, holds)
     };
-    for (name, bp, gate, census, want_holds) in [
-        ("paced-sync-burst", 1000, 0u8, true, 8u64),
-        ("paced-sync-burst-census", 1000, 1, true, 8),
-        ("paced-sync-burst-compact", 1000, 2, true, 0),
-        ("paced-sync-burst-raw-only", 1000, 0, false, 8),
-        ("paced-sync-burst-census-raw-only", 1000, 1, false, 0),
-        ("unpaced-sync-burst", 0, 0, true, 0),
+    for (name, bp, gate, want_holds) in [
+        ("paced-sync-burst", 1000, 0u8, 8u64),
+        ("paced-sync-burst-census", 1000, 1, 8),
+        ("paced-sync-burst-compact", 1000, 2, 0),
+        ("unpaced-sync-burst", 0, 0, 0),
     ] {
-        let (passes, holds) = run(name, bp, gate, census);
+        let (passes, holds) = run(name, bp, gate);
         assert!(
             passes >= 1,
             "{name}: the thread filed the lent batches: {passes} passes"
         );
         assert_eq!(
             holds, want_holds,
-            "{name}: gate {gate}, census {census}: the commits that held for the thread"
+            "{name}: gate {gate}: the commits that held for the thread"
         );
     }
 }

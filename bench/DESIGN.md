@@ -371,12 +371,8 @@ and scans nothing, and the scan pass straight after a burst is the one
 that pays for the block forms the burst did not file. That pass has no
 cell in `faster` to stand beside, and reads against the arm's own rows.
 `supdb-heldfiles` files a burst's batches in their commits, as the engine
-does under every other policy; `supdb-heldpaced` lends the batches after a
-burst's first and holds each commit until the thread has filed its batch,
-which was the engine's shape, and `supdb-heldpacelends` lets the thread
-trail by a hundredth of the store; `supdb-heldnfnocache`, with no block
-cache, files nothing at all. For pricing, as `supdb-ingestpaced` and
-`supdb-ingestpacelends` are of the buffered arm.
+does under every other policy; `supdb-heldnfnocache`, with no block
+cache, files nothing at all.
 
 What filing a batch costs is the settle's, and the settle's four lean
 shapes each have the shape before as an arm under the durable, the
@@ -975,14 +971,6 @@ writer's fills, the yields and the walk's crossing from `CONVWRITER`,
 `CONVSTRICT` and `CONVWALK` (`Options::forms_convert_reads`,
 `forms_convert_light_writer`, `forms_convert_light_yields`,
 `forms_convert_at_walk`);
-`supdb-pacesyncsbatch` holds a syncing commit's paced batch within the
-share or the batch, the larger, and `supdb-pacesyncsthresholds` holds a
-batch of a twentieth of the store and at most 2048 writes within the share
-alone and paces no batch under 256 writes
-(`Options::upkeep_pace_syncs_to_share`), where the default holds a
-commit for its batch's filing where the store's own runs of commits
-between scans make a scan the likelier next operation, and paces every
-other batch within the backlog bound (`Options::upkeep_pace_syncs_model`);
 `supdb-walaheadbeside` writes the log's pre-write on a helper once the
 buying commit has synced, where the default writes it ahead of the
 commit's frames on the writer's path (`Options::wal_ahead_beside`,

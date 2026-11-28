@@ -4083,91 +4083,9 @@ pub struct Options {
     /// the share the thread filed beside the burst, which a durable
     /// commit keeps because its thread works through the fsync. Off,
     /// every commit lends, a seam the tests hold that shape with
-    /// (`docs/engine.md`). With `upkeep_pace_pct`, only the first
-    /// such batch after a scan is filed in the commit and the rest, up to
-    /// a share of the store, are lent a batch behind the thread.
+    /// (`docs/engine.md`).
     #[doc(hidden)]
     pub upkeep_inline_bursts: bool,
-    /// Of the batches `upkeep_inline_bursts` would file in the commit,
-    /// one of at most this percentage of the store's keys is instead
-    /// lent to the thread and paced, unless it is the first after a scan:
-    /// the commit returns once the thread trails by at most that share
-    /// of the store (`Hand::Pace`), so the thread's core files a burst
-    /// behind the writer's commits, the writer waits only where the
-    /// thread has fallen the share behind, and the first scan after the
-    /// burst meets at most the share and the pass in flight. Filing every
-    /// batch in the commit put the whole fill on the writer: paired
-    /// against lending every batch at five rungs, the inline fill read
-    /// the lag sweep's burst plus twice its pass at 1.1-1.4x of lending's
-    /// from a hundred thousand keys up and 2.3x at three million, while
-    /// lending left the scans after a burst 1.8-3.5x slower, the thread's
-    /// pass in flight and its residue the first scan's to wait out and
-    /// settle. The share is what the first scan's wait is measured
-    /// against: the scan waits for the pass in flight, a fill of a
-    /// microsecond or two a write, and a pass over the store is a
-    /// hundredth of its keys in scans of a hundred entries at tens of
-    /// nanoseconds each, so a share of a hundredth is a wait of a third
-    /// of the pass at most, and a batch over the share -- a tenth of the
-    /// store at ten thousand keys -- would be several passes: paced
-    /// there, the burst gained a third and its scans after lost two
-    /// thirds. The share is the pipeline's depth as well: paced a batch
-    /// deep, every batch was a pass of the thread's, and a pass has a
-    /// fixed part -- the log read, the snapshot moved, the bounds walked
-    /// -- that doubled the thread's cost a batch at three million keys
-    /// and read the sweep's weighted sum a third worse than lending at a
-    /// million. The thread gathering half the share before a pass, for
-    /// longer passes while the writer ran ahead, read level and is not
-    /// kept: the thread trails the writer and takes what it finds, so
-    /// its passes over a full rewrite held four batches at a million
-    /// keys and fourteen at three million already, the gather made them
-    /// five and fifteen, and a gather of the whole share would idle the
-    /// thread while the writer fills to it and then hold the writer for
-    /// the pass. The trail the share bounds is what lending's passes of
-    /// hundreds of batches amortise -- the fixed part, and a visit a
-    /// block a pass -- and only a longer trail, which is the first
-    /// scan's wait, buys it (`docs/engine.md`). The first batch after a
-    /// scan stays in the commit because
-    /// a burst of one commit with scans at once behind it, the lag
-    /// sweep's bursts at the small rungs, gains nothing from a thread
-    /// that has to be woken and whose pass the first scan then waits
-    /// out. A paced batch is held for its filing by default
-    /// (`upkeep_pace_holds`), the trail the share allows read as the first
-    /// scan's to pay, so the share draws which batches the thread files
-    /// while the commit waits and which the commit files itself.
-    /// Zero, the default, files every such batch in the commit. A batch
-    /// held for its filing is the commit's own filing with a hand-over to
-    /// another core in front of it and the batch's lines read from that
-    /// core: the writer waits for all of it and nothing runs beside it.
-    /// Paired against the share at a hundredth with the hold, the inline
-    /// fill read the bursts faster and the passes after them level or
-    /// faster at every rung from a hundred thousand keys to three
-    /// million, in both orders (`docs/engine.md`, what a burst costs
-    /// under the held log). `supdb-ingestpaced` is the share at a
-    /// hundredth, held, and `supdb-ingestpacelends` it with the trail.
-    pub upkeep_pace_pct: usize,
-    /// A buffered commit's batch that `upkeep_pace_pct` paces is held
-    /// until the thread has filed it (`Hand::Pace(0)`), where the share
-    /// lets the thread trail by the batch and the pass before it. The
-    /// trail is a linear trade: every write of it saves the burst its
-    /// filing at every batch and costs the first scan after the burst its
-    /// filing once, so a sum over the burst and the pass (the suite's
-    /// `weighted_ms`) reads lending ahead at any depth, while the pass,
-    /// read against its comparator, is where the trail lands: at a
-    /// hundred thousand keys the share is one batch, the first scan after
-    /// the full rewrite waited out the pass in flight and settled the
-    /// batch after it, 0.6-1.1 ms of a pass of 4.5-6, and the pass read
-    /// 0.89-0.92x of `lmdb-nosync` with the burst 2.0x. Held, the first
-    /// scan settles nothing and takes 20 µs, the pass reads 1.2-1.3x and
-    /// the burst 1.5-1.6x; at three hundred thousand keys the passes gain
-    /// a tenth and the bursts, 2-5x of the comparator's, a third to a half. The
-    /// thread still files, so the forms stand built where the inline fill
-    /// (`upkeep_pace_pct` at zero) leaves them to the scans. A syncing
-    /// commit's pace is its own (`upkeep_pace_syncs_bp`). Off is the batch
-    /// lent within the share; `supdb-ingestpacelends` is the arm. Nothing
-    /// is paced at the default share of zero, so the option acts only
-    /// where `upkeep_pace_pct` is set.
-    #[doc(hidden)]
-    pub upkeep_pace_holds: bool,
     /// Under the held log (`SyncPolicy::Explicit`), a burst's batches --
     /// the commits `upkeep_inline_bursts` would file themselves -- are
     /// lent to the upkeep thread and never filed by the commit or waited
@@ -4187,9 +4105,9 @@ pub struct Options {
     /// policy. Off: a burst under the held log filed by its commits, as
     /// under any other; `supdb-heldfiles` is the arm.
     pub held_bursts_lend: bool,
-    /// A syncing commit's batch of a burst lent and paced as
-    /// `upkeep_pace_pct` paces a buffered one, within this share of the
-    /// store's keys in basis points, while the store is in core: the
+    /// A syncing commit's batch of a burst lent and paced, within this
+    /// share of the store's keys in basis points, while the store is in
+    /// core: the
     /// commit returns, after its fsync, once the upkeep thread trails by
     /// at most the share or the batch, whichever is larger. A syncing
     /// commit lends every batch, since the thread works through the
@@ -4210,73 +4128,6 @@ pub struct Options {
     /// lends unpaced, the shape before: `supdb-nopacesyncs`.
     #[doc(hidden)]
     pub upkeep_pace_syncs_bp: usize,
-    /// A syncing commit's paced batch held until the thread trails by the
-    /// share alone, where it was the share or the batch, whichever is
-    /// larger: the batch term lets a writer run a batch ahead of a thread
-    /// that has no barrier to file beside, and a syncing commit's thread
-    /// files through the fsync. Where a batch is more than the share --
-    /// stores under about four hundred thousand keys, whose share is under
-    /// the suite's thousand-write batch -- the last batch of a burst was the
-    /// first scan's to wait out: the ten-percent burst at ten thousand keys
-    /// is one commit of a thousand, filed in one pass of 0.6-0.9 ms beside
-    /// an fsync of a few tenths, and the first scan waited up to half a
-    /// millisecond of it in a pass LMDB runs in a quarter of one. Held to
-    /// the share, that pass read 1.50x and 1.77x in two orders and the
-    /// burst 0.78x, ahead of both comparators still; at a hundred thousand
-    /// keys, where a batch is a hundredth of the store and the pass after a
-    /// burst ten times as long, the bursts paid 11-25% for passes won
-    /// already. So the hold is to the share only for a batch of at least a
-    /// twentieth of the store's keys (`PACE_SYNCS_SHARE_FROM`), where the
-    /// leftover is the pass after it, and of at most a couple of thousand
-    /// writes (`PACE_SYNCS_SHARE_MAX_BATCH`), so the writer waits out a
-    /// millisecond or two of filing and never a large batch's whole. Off
-    /// holds within the batch, the shape before (`supdb-pacesyncsbatch`).
-    #[doc(hidden)]
-    pub upkeep_pace_syncs_to_share: bool,
-    /// A syncing commit's pace decided by what it costs and saves, in
-    /// place of `upkeep_pace_syncs_to_share`'s cut-offs on the batch and
-    /// the store. Holding a commit until the upkeep thread has filed its
-    /// batch moves that filing from the next scan to the commit, and buys
-    /// nothing when a commit comes next instead, since the thread files it
-    /// beside the next batch anyway; so the hold pays, by the suite's own
-    /// trade between a burst and the pass after it (`weighted_ms`, the
-    /// burst plus twice the pass: `PACE_READ_WEIGHT`), where twice the
-    /// probability that a scan comes before the next commit passes one.
-    /// That probability is read off the store's own history: the runs of
-    /// commits between scans, each begun while reads were around, give
-    /// for the run's commit `k` the share of the runs that reached `k` and
-    /// ended there, under the uniform prior (`PaceRuns`). A burst of one
-    /// commit between scans holds; the later commits of a longer burst,
-    /// and the commits of a mix with no scan between them, hold only to
-    /// the backlog bound (the share or the batch, the larger), whatever
-    /// the batch's size, with no cut-off on the batch or the store -- a
-    /// batch under `UPKEEP_WAKE_WRITES` was not paced before. Priced
-    /// against the cut-offs in the row's whole order from ten to three
-    /// hundred thousand keys, in both orders: at ten thousand keys the
-    /// full rewrite's burst read 1.14-1.18x, since the cut-offs held every
-    /// one of its commits, and its first scan waited for nothing in either
-    /// arm, the thread having built every block of the store by then in
-    /// both; elsewhere nothing moved by more than the cells neither arm
-    /// treats differently, and the small batches now paced waited at most
-    /// two milliseconds a mix, in the scrambled write mixes at a hundred
-    /// thousand keys. Off, `upkeep_pace_syncs_to_share` decides as it did:
-    /// `supdb-pacesyncsthresholds`.
-    #[doc(hidden)]
-    pub upkeep_pace_syncs_model: bool,
-    /// "In core" for `upkeep_pace_syncs_bp` is every gate but the compact
-    /// form's: the pace holds through the controller's census and stops
-    /// once the form is installed. The census is entered on the group's
-    /// refault rate, and a full rewrite raises it itself: at three million
-    /// keys under 1.25 GiB the lag sweep's full rewrite went SUSPECT four
-    /// seconds into its burst with the store still read from memory, the
-    /// pace stopped there, and the first scan after the burst settled
-    /// 40-130 ms of the trail the rest of the burst left, in passes of
-    /// 99-245 ms where LMDB's took 28. Where the hold cost the writer, at
-    /// ten million keys, the form was installed during the load and every
-    /// burst ran at its gate. Off, the pace stops at any gate but the raw
-    /// form's, the shape before: `supdb-pacesyncsraw`.
-    #[doc(hidden)]
-    pub upkeep_pace_syncs_census: bool,
     /// EXPERIMENT: the head asks that are for a store out of core -- the
     /// settle's ahead of its resolves (`OrdIndex::willneed_heads`) and the
     /// bounds' ahead of their walk (`ask_bounds_heads`) -- made where the
@@ -7290,13 +7141,8 @@ impl Default for Options {
             upkeep_alert: true,
             upkeep_alert_poll_us: 200,
             upkeep_inline_bursts: true,
-            upkeep_pace_pct: 0,
-            upkeep_pace_holds: true,
             held_bursts_lend: true,
             upkeep_pace_syncs_bp: 25,
-            upkeep_pace_syncs_to_share: true,
-            upkeep_pace_syncs_model: true,
-            upkeep_pace_syncs_census: true,
             out_of_core_installed: false,
             scan_timers: false,
             upkeep_batch_pct: 0,
@@ -28150,7 +27996,7 @@ pub struct Db {
     since_point: u64,
     upkeep_life: u64,
     upkeep_since_scan: u64,
-    /// The runs of commits between scans (`Options::upkeep_pace_syncs_model`).
+    /// The runs of commits between scans.
     pace_runs: PaceRuns,
     /// The pre-writes the log's closed files made and the writer's time on
     /// them (`Wal::ahead_writes`), for `Db::wal_ahead_counts`.
@@ -28331,8 +28177,7 @@ enum Hand {
     /// Lent, and the commit returns once the thread trails by at most
     /// this many writes, a share of the store's keys: a burst's batches
     /// are filed on the thread's core behind the writer's commits, the
-    /// thread never further behind than the share
-    /// (`Options::upkeep_pace_pct`).
+    /// thread never further behind than the share.
     Pace(u64),
 }
 
@@ -53640,19 +53485,7 @@ const UPKEEP_POLL_MAX: std::time::Duration = std::time::Duration::from_millis(20
 const UPKEEP_ALERT: std::time::Duration = std::time::Duration::from_millis(100);
 const UPKEEP_WAKE_WRITES: usize = 256;
 
-/// A syncing commit's paced batch is held to the share alone where the
-/// batch times this is at least the store's keys -- a batch of a twentieth
-/// of the store or more (`Options::upkeep_pace_syncs_to_share`).
-const PACE_SYNCS_SHARE_FROM: u64 = 20;
-
-/// The largest batch held to the share alone: the hold waits out the
-/// thread's filing of the batch, under a microsecond a write in core, so a
-/// batch of this many is a millisecond or two of it, and a larger one is
-/// left a batch behind as before rather than holding the writer for its
-/// whole filing (`Options::upkeep_pace_syncs_to_share`).
-const PACE_SYNCS_SHARE_MAX_BATCH: usize = 2048;
-
-/// The weight `Options::upkeep_pace_syncs_model` gives the scan's wait
+/// The weight the syncing pace's model (`PaceRuns`) gives the scan's wait
 /// against the commit's: the suite's `weighted_ms`, which trades a burst
 /// against the pass after it, counts the pass twice.
 const PACE_READ_WEIGHT: u64 = 2;
@@ -53661,8 +53494,8 @@ const PACE_READ_WEIGHT: u64 = 2;
 /// runs longer than this share its last count.
 const PACE_RUN_HIST: usize = 64;
 
-/// The runs of syncing commits between scans, for
-/// `Options::upkeep_pace_syncs_model`: the run in progress, whether reads
+/// The runs of syncing commits between scans, for the syncing pace's
+/// hold (`Options::upkeep_pace_syncs_bp`): the run in progress, whether reads
 /// were around at its first commit, and how many of the runs that were
 /// ended after each count of commits.
 struct PaceRuns {
@@ -54590,10 +54423,9 @@ impl Db {
         // the fsync: see `Options::upkeep_inline_bursts`, and
         // `UPKEEP_WAKE_WRITES` for where "worth waking for" is drawn.
         let mut pace = false;
-        let mut pace_syncs = false;
         // The share of the store's keys a paced batch is within and the
-        // thread may trail by (`Options::upkeep_pace_pct`).
-        let mut share = (keys as u64).saturating_mul(self.opts.upkeep_pace_pct as u64) / 100;
+        // thread may trail by (`Options::upkeep_pace_syncs_bp`).
+        let mut share = 0u64;
         // Under the held log a burst's batch is lent and never filed here
         // or waited for (`Options::held_bursts_lend`).
         let burst_lent = self.opts.held_bursts_lend
@@ -54606,16 +54438,11 @@ impl Db {
             && reads_around
             && batch >= UPKEEP_WAKE_WRITES
         {
-            // The first such batch after a scan is filed here, and so is
-            // one over the share of the store the first scan's wait is
-            // measured against; the rest are lent and paced behind the
-            // thread, the hand set once the batch is lent below.
-            if batch as u64 > share || self.upkeep_since_scan == 0 {
-                self.upkeep_hand = Hand::File;
-                self.upkeep_file_first = self.upkeep_since_scan == 0;
-                return;
-            }
-            pace = true;
+            // Filed here, the first such batch after a scan and every one
+            // after it.
+            self.upkeep_hand = Hand::File;
+            self.upkeep_file_first = self.upkeep_since_scan == 0;
+            return;
         }
         // A syncing commit's batch of a burst paced as well, within its own
         // share, while the store is in core (`Options::upkeep_pace_syncs_bp`):
@@ -54623,24 +54450,18 @@ impl Db {
         // what the first scan after the burst meets. Out of core a resolve
         // is a major fault, and the hold would pace the writer by the device;
         // out of core is the compact form installed, the census being one a
-        // full rewrite in core can enter (`Options::upkeep_pace_syncs_census`).
-        let gate = self.shared.zgate.load();
-        let in_core = if self.opts.upkeep_pace_syncs_census {
-            gate != zselect::GATE_Z
-        } else {
-            gate == zselect::GATE_RAW
-        };
+        // full rewrite in core can enter, which the raw gate alone read as
+        // out of core.
+        let in_core = self.shared.zgate.load() != zselect::GATE_Z;
         if level == 1
             && syncs
             && self.opts.upkeep_pace_syncs_bp > 0
             && reads_around
             && batch > 0
-            && (self.opts.upkeep_pace_syncs_model || batch >= UPKEEP_WAKE_WRITES)
             && in_core
         {
             share = (keys as u64).saturating_mul(self.opts.upkeep_pace_syncs_bp as u64) / 10_000;
             pace = true;
-            pace_syncs = true;
         }
         // A smaller batch with a scan since the last commit: the scans
         // behind it take the batch back before the thread's first poll,
@@ -54758,27 +54579,9 @@ impl Db {
         // the thread at three million keys against 1.5 of filing, and
         // the writer waited for all of it.
         if pace && self.upkeep_hand == Hand::Lend {
-            // A syncing batch within the share alone: its thread filed it
-            // beside the fsync, and what is left is the first scan's to wait
-            // for otherwise (`Options::upkeep_pace_syncs_to_share`).
-            let within = if pace_syncs && self.opts.upkeep_pace_syncs_model {
-                // The batch's filing held for where a scan is the likelier
-                // next, the backlog bound otherwise
-                // (`Options::upkeep_pace_syncs_model`).
-                if self.pace_runs.hold_pays() {
-                    0
-                } else {
-                    share.max(batch as u64)
-                }
-            } else if pace_syncs
-                && self.opts.upkeep_pace_syncs_to_share
-                && batch as u64 * PACE_SYNCS_SHARE_FROM >= keys as u64
-                && batch <= PACE_SYNCS_SHARE_MAX_BATCH
-            {
-                share
-            } else if !pace_syncs && self.opts.upkeep_pace_holds {
-                // Held for its filing: the first scan after the burst
-                // meets no trail (`Options::upkeep_pace_holds`).
+            // A syncing batch's filing held for where a scan is the likelier
+            // next, the backlog bound otherwise (`PaceRuns::hold_pays`).
+            let within = if self.pace_runs.hold_pays() {
                 0
             } else {
                 share.max(batch as u64)
@@ -54827,7 +54630,7 @@ impl Db {
             // A burst's batch lent: the thread brought within a share of
             // the store of the writer before the next batch is committed,
             // so the thread files behind the writer and the backlog never
-            // grows past the share (`Options::upkeep_pace_pct`).
+            // grows past the share (`Options::upkeep_pace_syncs_bp`).
             Hand::Pace(within) => {
                 self.hold_within(within);
                 Ok(true)
@@ -55316,8 +55119,7 @@ impl Db {
     }
 
     /// Writes lent to the upkeep thread and not yet filed, by its last
-    /// report: what a paced commit holds to at most its batch
-    /// (`Options::upkeep_pace_pct`).
+    /// report: what a paced commit holds to at most its batch.
     #[doc(hidden)]
     pub fn upkeep_behind_writes(&self) -> u64 {
         self.upkeep_behind()

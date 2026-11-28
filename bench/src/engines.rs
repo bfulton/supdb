@@ -645,18 +645,6 @@ pub struct Supdb {
     /// Who keeps the writer's upkeep, where not the engine's own choice:
     /// the writer itself, as before the thread. `supdb-inline`.
     upkeep: Option<supdb::Upkeep>,
-    /// A buffered commit near reads lends the batches of a burst after
-    /// its first, each at most a hundredth of the store's keys, and holds
-    /// until the thread has filed each, where the engine files them in
-    /// the commit (`Options::upkeep_pace_pct` at one).
-    /// `supdb-ingestpaced`, and `supdb-heldpaced` under the held log; a
-    /// durable store's commits lend either way, so it has no durable
-    /// twin.
-    paced: bool,
-    /// With `paced`, a paced batch lent within the share and not held
-    /// for (`Options::upkeep_pace_holds` off). `supdb-ingestpacelends`,
-    /// `supdb-heldpacelends`.
-    pacelends: bool,
     /// Under the held log, a burst's batches filed by their commits as
     /// under any other policy, where the engine lends them
     /// (`Options::held_bursts_lend` off). `supdb-heldfiles`.
@@ -1109,9 +1097,6 @@ pub struct Supdb {
     /// A syncing commit's batches of a burst lent unpaced, the shape before
     /// `Options::upkeep_pace_syncs_bp`. `supdb-nopacesyncs`.
     nopacesyncs: bool,
-    /// The syncing pace stopped at any gate but the raw form's, the shape
-    /// before `Options::upkeep_pace_syncs_census`. `supdb-pacesyncsraw`.
-    pacesyncsraw: bool,
     /// The syncing pace at five basis points of the store's keys where
     /// `Options::upkeep_pace_syncs_bp` ships 25. `supdb-pacesyncs5`.
     pacesyncs5: bool,
@@ -1357,14 +1342,6 @@ pub struct Supdb {
     /// before light forms converted (`Options::forms_convert_from`):
     /// `supdb-convert16` and `supdb-ingestconvert16`.
     convert16: bool,
-    /// A syncing commit's paced batch held within the share or the batch,
-    /// the larger (`Options::upkeep_pace_syncs_model` and
-    /// `upkeep_pace_syncs_to_share` off): `supdb-pacesyncsbatch`.
-    pacesyncsbatch: bool,
-    /// A syncing commit's pace by the cut-offs on the batch and the store
-    /// (`Options::upkeep_pace_syncs_model` off):
-    /// `supdb-pacesyncsthresholds`.
-    pacesyncsthresholds: bool,
     /// EXPERIMENT: the deltas from which the upkeep thread converts a sparse
     /// form the walks have read `CONVREADS` entries of to a copy
     /// (`Options::forms_convert_from`, `forms_convert_reads`), from
@@ -2004,18 +1981,6 @@ struct Policy {
     /// Who keeps the writer's upkeep, where not the engine's own choice:
     /// the writer itself, as before the thread. `supdb-inline`.
     upkeep: Option<supdb::Upkeep>,
-    /// A buffered commit near reads lends the batches of a burst after
-    /// its first, each at most a hundredth of the store's keys, and holds
-    /// until the thread has filed each, where the engine files them in
-    /// the commit (`Options::upkeep_pace_pct` at one).
-    /// `supdb-ingestpaced`, and `supdb-heldpaced` under the held log; a
-    /// durable store's commits lend either way, so it has no durable
-    /// twin.
-    paced: bool,
-    /// With `paced`, a paced batch lent within the share and not held
-    /// for (`Options::upkeep_pace_holds` off). `supdb-ingestpacelends`,
-    /// `supdb-heldpacelends`.
-    pacelends: bool,
     /// Under the held log, a burst's batches filed by their commits as
     /// under any other policy, where the engine lends them
     /// (`Options::held_bursts_lend` off). `supdb-heldfiles`.
@@ -2468,9 +2433,6 @@ struct Policy {
     /// A syncing commit's batches of a burst lent unpaced, the shape before
     /// `Options::upkeep_pace_syncs_bp`. `supdb-nopacesyncs`.
     nopacesyncs: bool,
-    /// The syncing pace stopped at any gate but the raw form's, the shape
-    /// before `Options::upkeep_pace_syncs_census`. `supdb-pacesyncsraw`.
-    pacesyncsraw: bool,
     /// The syncing pace at five basis points of the store's keys where
     /// `Options::upkeep_pace_syncs_bp` ships 25. `supdb-pacesyncs5`.
     pacesyncs5: bool,
@@ -2680,10 +2642,6 @@ struct Policy {
     densefrom: usize,
     /// Conversions at the dense count alone: `...convert16`.
     convert16: bool,
-    /// Syncing batches held within the batch: `supdb-pacesyncsbatch`.
-    pacesyncsbatch: bool,
-    /// The syncing pace by cut-offs: `supdb-pacesyncsthresholds`.
-    pacesyncsthresholds: bool,
     /// A filed burst's builds in the commit: `...settlebuildsfiled`.
     settlebuildsfiled: bool,
     /// The walk's own decodes: `supdb-zwalkowns`.
@@ -3090,8 +3048,6 @@ impl Default for Policy {
             oidxsync: false,
             refvals: false,
             rowatclose: false,
-            paced: false,
-            pacelends: false,
             heldfiles: false,
             walsync: false,
             nodrainsnap: false,
@@ -3200,7 +3156,6 @@ impl Default for Policy {
             settleroomstill: false,
             settlespan: false,
             nopacesyncs: false,
-            pacesyncsraw: false,
             pacesyncs5: false,
             oocz: false,
             walappend: false,
@@ -3249,8 +3204,6 @@ impl Default for Policy {
             settlesources: false,
             densefrom: 0,
             convert16: false,
-            pacesyncsbatch: false,
-            pacesyncsthresholds: false,
             settlebuildsfiled: false,
             zwalkowns: false,
             zviewperopen: false,
@@ -5845,37 +5798,6 @@ impl Supdb {
         )
     }
 
-    /// `supdb-ingest` with the batches of a burst after its first lent to
-    /// the upkeep thread and held for until it has filed each
-    /// (`Options::upkeep_pace_pct` at one), where the engine files them
-    /// in the commit: against `supdb-ingest` it prices the hand-over.
-    pub fn create_ingest_paced(path: &Path) -> Res<Supdb> {
-        Supdb::with_policy(
-            path,
-            Policy {
-                partition: false,
-                durable: false,
-                paced: true,
-                ..Policy::default()
-            },
-        )
-    }
-
-    /// `supdb-ingestpaced` lending a paced batch within the share, the
-    /// thread left to trail by it (`Options::upkeep_pace_holds` off).
-    pub fn create_ingest_pacelends(path: &Path) -> Res<Supdb> {
-        Supdb::with_policy(
-            path,
-            Policy {
-                partition: false,
-                durable: false,
-                paced: true,
-                pacelends: true,
-                ..Policy::default()
-            },
-        )
-    }
-
     /// `supdb` whose flush fsyncs the WAL before its seal, as before. Its
     /// commits sync, so the log holds nothing to sync at a flush: against
     /// `supdb` it is a null pairing.
@@ -7917,18 +7839,6 @@ impl Supdb {
         )
     }
 
-    /// `supdb` whose syncing pace stops at any gate but the raw form's
-    /// (`Options::upkeep_pace_syncs_census` off).
-    pub fn create_pacesyncsraw(path: &Path) -> Res<Supdb> {
-        Supdb::with_policy(
-            path,
-            Policy {
-                pacesyncsraw: true,
-                ..Policy::default()
-            },
-        )
-    }
-
     /// `supdb` whose covered partitions' settle files a key by the form's
     /// span alone (`Options::settle_covered_samples` off).
     pub fn create_settlespan(path: &Path) -> Res<Supdb> {
@@ -9327,8 +9237,6 @@ impl Supdb {
             oidxsync,
             refvals,
             rowatclose,
-            paced,
-            pacelends,
             heldfiles,
             walsync,
             nodrainsnap,
@@ -9437,7 +9345,6 @@ impl Supdb {
             settleroomstill,
             settlespan,
             nopacesyncs,
-            pacesyncsraw,
             pacesyncs5,
             oocz,
             walappend,
@@ -9505,8 +9412,6 @@ impl Supdb {
             settlesources,
             densefrom,
             convert16,
-            pacesyncsbatch,
-            pacesyncsthresholds,
             settlebuildsfiled,
             zwalkowns,
             zviewperopen,
@@ -9748,12 +9653,6 @@ impl Supdb {
             forms_settle_keys_all: settleall,
             // The upkeep where the arm puts it, or where the engine does.
             upkeep: upkeep.unwrap_or(supdb::Options::default().upkeep),
-            upkeep_pace_pct: if paced {
-                1
-            } else {
-                supdb::Options::default().upkeep_pace_pct
-            },
-            upkeep_pace_holds: !pacelends,
             held_bursts_lend: !heldfiles,
             drain_syncs_wal: walsync,
             drain_snapshot: !nodrainsnap,
@@ -9927,7 +9826,6 @@ impl Supdb {
             } else {
                 supdb::Options::default().upkeep_pace_syncs_bp
             },
-            upkeep_pace_syncs_census: !pacesyncsraw,
             out_of_core_installed: oocz,
             recycle_wal: !walappend,
             wal_ahead_bytes: if walprefill { 0 } else { 1 << 20 },
@@ -10095,8 +9993,6 @@ impl Supdb {
                 && std::env::var("CONVWRITER").as_deref() == Ok("1"),
             forms_convert_light_yields: densefrom > 0
                 && std::env::var("CONVSTRICT").as_deref() == Ok("1"),
-            upkeep_pace_syncs_to_share: !pacesyncsbatch,
-            upkeep_pace_syncs_model: !pacesyncsbatch && !pacesyncsthresholds,
             forms_settle_builds_filed: settlebuildsfiled,
             zpages_rewarm_quiet_ms: if zrewarmwait {
                 supdb::db::REWARM_QUIET_BEFORE_MS
@@ -10311,8 +10207,6 @@ impl Supdb {
             oidxsync,
             refvals,
             rowatclose,
-            paced,
-            pacelends,
             heldfiles,
             walsync,
             nodrainsnap,
@@ -10421,7 +10315,6 @@ impl Supdb {
             settleroomstill,
             settlespan,
             nopacesyncs,
-            pacesyncsraw,
             pacesyncs5,
             oocz,
             walappend,
@@ -10489,8 +10382,6 @@ impl Supdb {
             settlesources,
             densefrom,
             convert16,
-            pacesyncsbatch,
-            pacesyncsthresholds,
             settlebuildsfiled,
             zwalkowns,
             zviewperopen,
@@ -10929,10 +10820,6 @@ impl Engine for Supdb {
             if self.noframes {
                 return if self.noshare {
                     "supdb-heldnoshare"
-                } else if self.heldfiles && self.pacelends {
-                    "supdb-heldpacelends"
-                } else if self.heldfiles && self.paced {
-                    "supdb-heldpaced"
                 } else if self.heldfiles {
                     "supdb-heldfiles"
                 } else if self.ownhandle {
@@ -11527,12 +11414,6 @@ impl Engine for Supdb {
                 "supdb-ingestrowatclose"
             };
         }
-        if self.pacelends {
-            return "supdb-ingestpacelends";
-        }
-        if self.paced {
-            return "supdb-ingestpaced";
-        }
         if self.settlebuilds == Some(false) {
             return if self.partition {
                 "supdb-settlelate"
@@ -11546,12 +11427,6 @@ impl Engine for Supdb {
             } else {
                 "supdb-ingestsettlegated"
             };
-        }
-        if self.pacesyncsbatch {
-            return "supdb-pacesyncsbatch";
-        }
-        if self.pacesyncsthresholds {
-            return "supdb-pacesyncsthresholds";
         }
         if self.convert16 {
             return if self.partition {
@@ -12161,9 +12036,6 @@ impl Engine for Supdb {
         }
         if self.nopacesyncs {
             return "supdb-nopacesyncs";
-        }
-        if self.pacesyncsraw {
-            return "supdb-pacesyncsraw";
         }
         if self.pacesyncs5 {
             return "supdb-pacesyncs5";
@@ -14888,7 +14760,6 @@ pub fn guarantee(arm: &str) -> Option<Guarantee> {
         | "supdb-zgroup1k"
         | "supdb-settlespan"
         | "supdb-nopacesyncs"
-        | "supdb-pacesyncsraw"
         | "supdb-pacesyncs5"
         | "supdb-oocz"
         | "supdb-walappend"
@@ -14940,8 +14811,6 @@ pub fn guarantee(arm: &str) -> Option<Guarantee> {
         | "supdb-ingestdensefrom"
         | "supdb-convert16"
         | "supdb-ingestconvert16"
-        | "supdb-pacesyncsbatch"
-        | "supdb-pacesyncsthresholds"
         | "supdb-settlebuildsfiled"
         | "supdb-ingestsettlebuildsfiled"
         | "supdb-ingestpromote"
@@ -15041,14 +14910,12 @@ pub fn guarantee(arm: &str) -> Option<Guarantee> {
         | "supdb-ingestoidxsync"
         | "supdb-ingestrefvals"
         | "supdb-ingestrowatclose"
-        | "supdb-ingestpaced"
         | "supdb-ingestsettleloads"
         | "supdb-ingestsettlesortstwice"
         | "supdb-ingestsettlestaged"
         | "supdb-ingestsettlenoconvert"
         | "supdb-ingestsettleconvertquiet"
         | "supdb-ingestsettlefat"
-        | "supdb-ingestpacelends"
         | "supdb-ingestsettlelate"
         | "supdb-ingestwalsync"
         | "supdb-ingestnodrainsnap"
@@ -15145,8 +15012,6 @@ pub fn guarantee(arm: &str) -> Option<Guarantee> {
         | "supdb-heldsettlestaged"
         | "supdb-heldsettlenoconvert"
         | "supdb-heldsettlefat"
-        | "supdb-heldpaced"
-        | "supdb-heldpacelends"
         | "supdb-heldbatch1"
         | "proto-shared"
         | "faster" => Guarantee::Memory,
@@ -15684,46 +15549,6 @@ pub fn open(arm: &str, dir: &Path, map_gb: usize) -> Res<Box<dyn Engine>> {
             },
             dir,
         )?,
-        // `supdb-heldfiles` with the batches of a burst after its first
-        // lent and held for until the thread has filed each
-        // (`Options::upkeep_pace_pct` at one).
-        "supdb-heldpaced" => supdb_arm(
-            |d| {
-                Supdb::with_policy(
-                    d,
-                    Policy {
-                        partition: false,
-                        durable: false,
-                        held: true,
-                        noframes: true,
-                        heldfiles: true,
-                        paced: true,
-                        ..Policy::default()
-                    },
-                )
-            },
-            dir,
-        )?,
-        // `supdb-heldpaced` with a paced batch lent within the share and
-        // not held for (`Options::upkeep_pace_holds` off).
-        "supdb-heldpacelends" => supdb_arm(
-            |d| {
-                Supdb::with_policy(
-                    d,
-                    Policy {
-                        partition: false,
-                        durable: false,
-                        held: true,
-                        noframes: true,
-                        heldfiles: true,
-                        paced: true,
-                        pacelends: true,
-                        ..Policy::default()
-                    },
-                )
-            },
-            dir,
-        )?,
         "supdb-heldsharedbig" => supdb_arm(
             |d| {
                 Supdb::create_held_shared(
@@ -15869,30 +15694,6 @@ pub fn open(arm: &str, dir: &Path, map_gb: usize) -> Res<Box<dyn Engine>> {
                         partition: false,
                         durable: false,
                         settlebuildsfiled: true,
-                        ..Policy::default()
-                    },
-                )
-            },
-            dir,
-        )?,
-        "supdb-pacesyncsthresholds" => supdb_arm(
-            |d| {
-                Supdb::with_policy(
-                    d,
-                    Policy {
-                        pacesyncsthresholds: true,
-                        ..Policy::default()
-                    },
-                )
-            },
-            dir,
-        )?,
-        "supdb-pacesyncsbatch" => supdb_arm(
-            |d| {
-                Supdb::with_policy(
-                    d,
-                    Policy {
-                        pacesyncsbatch: true,
                         ..Policy::default()
                     },
                 )
@@ -16239,8 +16040,6 @@ pub fn open(arm: &str, dir: &Path, map_gb: usize) -> Res<Box<dyn Engine>> {
         "supdb-ingestbg" => supdb_arm(Supdb::create_ingest_bg, dir)?,
         "supdb-bglag" => supdb_arm(Supdb::create_bglag, dir)?,
         "supdb-ingestbglag" => supdb_arm(Supdb::create_ingest_bglag, dir)?,
-        "supdb-ingestpaced" => supdb_arm(Supdb::create_ingest_paced, dir)?,
-        "supdb-ingestpacelends" => supdb_arm(Supdb::create_ingest_pacelends, dir)?,
         "supdb-settlelate" => supdb_arm(Supdb::create_settlelate, dir)?,
         "supdb-ingestsettlelate" => supdb_arm(Supdb::create_ingest_settlelate, dir)?,
         "supdb-walsync" => supdb_arm(Supdb::create_walsync, dir)?,
@@ -17171,7 +16970,6 @@ pub fn open(arm: &str, dir: &Path, map_gb: usize) -> Res<Box<dyn Engine>> {
         "supdb-zgroup1k" => supdb_arm(Supdb::create_zgroup1k, dir)?,
         "supdb-settlespan" => supdb_arm(Supdb::create_settlespan, dir)?,
         "supdb-nopacesyncs" => supdb_arm(Supdb::create_nopacesyncs, dir)?,
-        "supdb-pacesyncsraw" => supdb_arm(Supdb::create_pacesyncsraw, dir)?,
         "supdb-pacesyncs5" => supdb_arm(Supdb::create_pacesyncs5, dir)?,
         "supdb-oocz" => supdb_arm(Supdb::create_oocz, dir)?,
         "supdb-walappend" => supdb_arm(Supdb::create_walappend, dir)?,
@@ -19952,36 +19750,6 @@ mod tests {
             }
             {
                 let z = Supdb::with_policy(
-                    &dir("pacesyncsthresholds"),
-                    Policy {
-                        pacesyncsthresholds: true,
-                        ..Policy::default()
-                    },
-                )
-                .unwrap();
-                assert_eq!(z.name(), "supdb-pacesyncsthresholds");
-                assert_eq!(z.features(), base.features());
-                let o = z.db.as_ref().unwrap().options();
-                assert!(!o.upkeep_pace_syncs_model && b.upkeep_pace_syncs_model);
-                assert!(o.upkeep_pace_syncs_to_share);
-            }
-            {
-                let z = Supdb::with_policy(
-                    &dir("pacesyncsbatch"),
-                    Policy {
-                        pacesyncsbatch: true,
-                        ..Policy::default()
-                    },
-                )
-                .unwrap();
-                assert_eq!(z.name(), "supdb-pacesyncsbatch");
-                assert_eq!(z.features(), base.features());
-                let o = z.db.as_ref().unwrap().options();
-                assert!(!o.upkeep_pace_syncs_to_share && b.upkeep_pace_syncs_to_share);
-                assert!(!o.upkeep_pace_syncs_model);
-            }
-            {
-                let z = Supdb::with_policy(
                     &dir("settlebuildsfiled"),
                     Policy {
                         settlebuildsfiled: true,
@@ -20590,13 +20358,6 @@ mod tests {
                 assert_eq!(z.features(), base.features());
                 let o = z.db.as_ref().unwrap().options();
                 assert!(o.upkeep_pace_syncs_bp == 0 && b.upkeep_pace_syncs_bp > 0);
-            }
-            {
-                let z = Supdb::create_pacesyncsraw(&dir("pacesyncsraw")).unwrap();
-                assert_eq!(z.name(), "supdb-pacesyncsraw");
-                assert_eq!(z.features(), base.features());
-                let o = z.db.as_ref().unwrap().options();
-                assert!(!o.upkeep_pace_syncs_census && b.upkeep_pace_syncs_census);
             }
             {
                 let z = Supdb::create_pacesyncs5(&dir("pacesyncs5")).unwrap();
