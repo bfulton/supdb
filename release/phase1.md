@@ -28,9 +28,10 @@ those mechanically.
 
 ## The order
 
-All of phase 1 is one branch, one commit a cluster, landed on
-`release-candidate` once its whole gate is green; there is one pull request
-in all, `release-candidate` into main at the end. The map of option to
+All of phase 1 is one branch, one commit a cluster, merged by batch onto
+the working branch (`claude/supdb-pretag-coordination-4qj5t4`) once its
+whole gate is green and it is reviewed; there is one pull request in all,
+that branch into main at the end. The map of option to
 cluster is `release/phase1-clusters.csv`; its `pr` column is the reviewer's
 grouping, kept only as the order the clusters are taken in. What each
 cluster must carry and the test functions it touches are in
@@ -86,5 +87,5 @@ not on each piece.
 
 | batch | clusters (the reviewer's grouping) | branch | state |
 |---|---|---|---|
-| 1 | PR1: adaptive-lag, fit-trim, zpages-drop, seal-shape, upkeep-wake | `rc/phase1-pr1`, `2eca03bd` to `31c90d38` | full gate green; cost read by function (one spill, net -3 a read); an independent review passed every removal as keeping the default's behaviour |
-| 2 | PR2, PR3, PR4 | the same branch | being written |
+| 1 | PR1: adaptive-lag, fit-trim, zpages-drop, seal-shape, upkeep-wake | `rc/phase1-pr1`, `2eca03bd` to `31c90d38` | full gate green; cost read by function (one spill, net -3 a read); an independent review passed every removal as keeping the default's behaviour; merged onto the working branch at `98e4e8f4` |
+| 2 | PR2, PR3, PR4 | the same branch, `9fc05328` to `08b28998` | written; in its gate and cost count. Removing the held walker let the compiler inline the raw scan walk into `scan_whole`, a twentieth more a scan record; `08b28998` keeps the walk out of line, as at the base |
