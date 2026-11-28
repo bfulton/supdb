@@ -36,8 +36,9 @@
 #   G. the group: `check.sh cost` exits non-zero where cost-red.sh fails, and
 #      stops there, and where cost.sh fails; and cost.sh over a BASE that
 #      names no commit exits 2 and names it, before anything is made, as it
-#      does where COST_HEAD_TARGET or COST_BASE_TARGET is set, a target a
-#      side that one build directory has no use for.
+#      does where COST_TARGET, COST_HEAD_TARGET or COST_BASE_TARGET is set,
+#      a target the build's fixed paths have no room for, and where another
+#      count holds the build's lock.
 #   V. the job over a scratch copy whose suite's `supdb_get` reads a value's
 #      length and not the value, and over one whose sink is `#[inline(never)]`:
 #      exit 2 before anything is built, the suite's per-operation code
@@ -75,11 +76,10 @@
 #      every key twice, against HEAD: exit 0, `cost: green` -- the probe is
 #      the head's on both sides, so a probe that changes is no cost.
 # S, B, T and C count the point read alone, U the scan and K the ordered
-# load, and all six share one target directory, so
-# RocksDB is built once. Everything is made under COST_RED_DIR (default
-# $TMPDIR/supdb-cost-red-PID) and removed at the end, pass or fail; the
-# shared target is COST_RED_TARGET where that is set, and is then kept, so
-# that runs one after another build RocksDB once between them.
+# load, and all six build in the count's own target, at its fixed path
+# (scripts/cost.sh), which keeps RocksDB built from one run to the next.
+# Everything else is made under COST_RED_DIR (default
+# $TMPDIR/supdb-cost-red-PID) and removed at the end, pass or fail.
 # COST_RED_STEPS (default `A G V S B U K T C`) runs the steps it names, in the order
 # named, and each step's checks are the ones above whichever runs. The last
 # line is `cost-red: ok` or names the step that went wrong; exit 0 or 1.
@@ -319,13 +319,9 @@ if s.count(old) != 1:
 open(path, "w").write(s.replace(old, new))
 PY
 }
-RT=${COST_RED_TARGET:-$R/t}
-# Every step's copy is made at $R/h and removed when the step ends. The job
-# builds both its sides at one path, $R/w/src, into the shared target, so
-# whichever step runs, the target holds one build of the engine, the suite
-# and the probes and RocksDB's: cargo keys a path package's artifacts by its
-# path, and a build directory of its own a step would leave another build in
-# the shared target, a gigabyte and more each. S, B, T and C count copies of this tree against HEAD, so the engine and the
+# Every step's copy is made at $R/h and removed when the step ends; the job
+# builds both its sides at the count's fixed paths whatever the copy's.
+# S, B, T and C count copies of this tree against HEAD, so the engine and the
 # suite in the tree have to be HEAD's: an uncommitted change to either would
 # read as the job's fault in S and hide behind it in B.
 anchored() { [ -n "${COST_RED_ANCHORS:-}" ]; }
@@ -340,7 +336,7 @@ job() { # copy step [probe] -> the job's exit status; its output in $R/<step>.lo
         return 0
     fi
     st=0
-    env -u COST_BASE_TARGET -u COST_HEAD_TARGET COST_DIR="$R/w" COST_HEAD="$1" COST_TARGET="$RT" \
+    env -u COST_TARGET -u COST_BASE_TARGET -u COST_HEAD_TARGET COST_DIR="$R/w" COST_HEAD="$1" \
         sh "$ROOT/scripts/cost.sh" HEAD "${3:-read}" >"$R/$2.log" 2>&1 || st=$?
     echo "$st"
 }
@@ -430,14 +426,24 @@ env -u COST_DIR sh "$ROOT/scripts/cost.sh" cost-red-no-such-ref seal >"$R/G3.log
 shown G3
 [ "$st" = 2 ] && grep -q "BASE 'cost-red-no-such-ref' names no commit" "$R/G3.log" ||
     fail "G: cost.sh exited $st over a BASE that names no commit"
-# A target a side is refused by name before anything is made.
-for v in COST_HEAD_TARGET COST_BASE_TARGET; do
+# A target of the caller's is refused by name before anything is made.
+for v in COST_TARGET COST_HEAD_TARGET COST_BASE_TARGET; do
     st=0
-    env -u COST_DIR "$v=$R/no-such-target" sh "$ROOT/scripts/cost.sh" HEAD seal >"$R/G4.log" 2>&1 || st=$?
+    env -u COST_DIR -u COST_TARGET -u COST_HEAD_TARGET -u COST_BASE_TARGET "$v=$R/no-such-target" \
+        sh "$ROOT/scripts/cost.sh" HEAD seal >"$R/G4.log" 2>&1 || st=$?
     shown G4
-    [ "$st" = 2 ] && grep -q 'COST_BASE_TARGET and COST_HEAD_TARGET are gone' "$R/G4.log" &&
+    [ "$st" = 2 ] && grep -q 'COST_TARGET, COST_BASE_TARGET and COST_HEAD_TARGET are gone' "$R/G4.log" &&
         [ ! -e "$R/no-such-target" ] || fail "G: cost.sh exited $st where $v was set"
 done
+# A count beside one that holds the build's lock is refused before it makes
+# anything.
+mkdir -p /tmp/supdb-cost
+st=0
+flock -n /tmp/supdb-cost/lock env -u COST_TARGET -u COST_HEAD_TARGET -u COST_BASE_TARGET COST_DIR="$R/g5" \
+    sh "$ROOT/scripts/cost.sh" HEAD seal >"$R/G5.log" 2>&1 || st=$?
+shown G5
+[ "$st" = 2 ] && grep -q 'another count holds /tmp/supdb-cost/lock' "$R/G5.log" && [ ! -e "$R/g5" ] ||
+    fail "G: cost.sh exited $st beside a count that holds the build's lock"
 echo "cost-red: G ok"
 }
 

@@ -18,7 +18,10 @@ fn main() {
     let shuffled = args.get(4).is_some_and(|s| s == "shuffled");
     let perm = Permutation::new(size, 0x5EED);
     let payload = Payload::new(100, 0.5, 0xE1);
-    let root = std::env::temp_dir().join(format!("supdb-loadonly-{}", std::process::id()));
+    // Named without the process id, so its path is as long in every run:
+    // the cost count (scripts/cost.sh) compares two runs' file calls by
+    // their instructions. Two runs at once want a TMPDIR each.
+    let root = std::env::temp_dir().join("supdb-loadonly");
     let mut kb = [0u8; 16];
     for rep in 0..reps {
         let dir = root.join(format!("r{rep}"));

@@ -6,21 +6,33 @@
 # suite's build definition (bench/.cargo/config.toml) are the head's in both
 # builds, so the two differ in the engine alone.
 #
-# Both sides are built in one directory at one path, $COST_DIR/src, into one
-# target, one after the other: a worktree of BASE there, built, its probes
-# copied out to $COST_DIR/bin/base; then the head's tree synced over it --
-# each file that differs written, each file of BASE's the head lacks
-# removed, .git and the targets left alone -- built again, its probes copied
-# out to $COST_DIR/bin/head; and each side counted from its copies, whose
-# paths are as long as each other. Built at two paths, the two sides
-# differed in more than the engine: the path is in every crate's metadata
-# hash and in the paths the binaries carry, so their layout moved with it.
-# Counted against itself from two checkouts, b3a043dc read libc's compare in
-# scan_s at 19 instructions a scan on one side and 23 on the other, and at
-# one checkout's path valgrind read no symbols of scan_at_probe at all --
-# of sixteen probe binaries, the one whose RELRO segment ended on a page
-# boundary -- so the toggle never fired and the probe read empty on every
-# count.
+# Both sides are built in one directory, /tmp/supdb-cost/src, into one
+# target, /tmp/supdb-cost/t, one after the other: a worktree of BASE there,
+# built, its probes copied out to /tmp/supdb-cost/bin/base; then the head's
+# tree synced over it -- each file that differs written, each file of
+# BASE's the head lacks removed, .git and the targets left alone -- built
+# again, its probes copied out to /tmp/supdb-cost/bin/head; and each side
+# counted from its copies, with its stores under /tmp/supdb-cost too. Built
+# at two paths, the two sides differed in more than the engine: the path is
+# in every crate's metadata hash and in the paths the binaries carry, so
+# their layout moved with it. Counted against itself from two checkouts,
+# b3a043dc read libc's compare in scan_s at 19 instructions a scan on one
+# side and 23 on the other, and at one checkout's path valgrind read no
+# symbols of scan_at_probe at all -- of sixteen probe binaries, the one
+# whose RELRO segment ended on a page boundary -- so the toggle never fired
+# and the probe read empty on every count. Built at one path under
+# COST_DIR, the layout still followed COST_DIR: of one tree at two of them,
+# valgrind read scan_at_probe's symbols at one and at the other none, and
+# with the path padded to one length the two builds' segments were still
+# sixteen bytes apart, since the crate's hash, and with it how its code is
+# cut and laid out, follows what the path says and not only its length; the
+# target's path is in the binaries as well (bench/src/env.rs includes a
+# file the build writes). So the paths are fixed: one tree builds to one
+# layout on any machine and for anyone who counts it, whose binaries
+# valgrind reads or does not every time. One count at a time holds them,
+# by a lock (/tmp/supdb-cost/lock) a second count is refused at; the target
+# is kept from one count to the next, so RocksDB is built once, and
+# `rm -rf /tmp/supdb-cost` takes it back.
 #
 #   sh scripts/cost.sh BASE [probe ...]
 #
@@ -42,33 +54,45 @@
 #
 # The environment, all of it that the script reads:
 #   COST_DIR     the working directory (default $TMPDIR/supdb-cost-PID),
-#                emptied at the start; the build directory and the copied
-#                probes are removed at the end, and the outputs stay in
-#                $COST_DIR/out
+#                emptied at the start, where the outputs stay
+#                ($COST_DIR/out)
 #   COST_HEAD    the tree counted as the head (default this one), read and
 #                never written: its files as git lists them, tracked and
 #                untracked but not ignored, or every file but .git and the
 #                targets where it is no git work tree. A copy of this tree
 #                with an edit is how scripts/cost-red.sh makes its red input
-#   COST_TARGET  the one cargo target both sides build in (default
-#                $COST_DIR/t, removed at the end). A target kept from run to
-#                run builds RocksDB once between them (scripts/cost-red.sh
-#                shares one across its steps); never a checkout's own
-#                bench/target, whose binaries the count's would overwrite
-# COST_BASE_TARGET and COST_HEAD_TARGET, a target a side when the sides
-# were built at two paths, are refused: a caller still setting them is
-# counting with a layout this script no longer has.
+# COST_TARGET, COST_BASE_TARGET and COST_HEAD_TARGET, the targets of the
+# layouts before this one, are refused: the target's path is in the
+# binaries, so it is fixed with the build directory's.
+#
+# The count is otherwise sensitive to the memory group's state: the compact
+# form's controller reads the group's room and refaults on a clock, so on a
+# box whose other work fills the group's page cache near its limit one side
+# can be counted through the census and the asks out of core (in a count of
+# b3a043dc against itself in #38's review, scan_long's base ran
+# `zcensus_begin_slow`, `Blob::willneed_ranks` and `mincore` and its head
+# did not, -390 an op on the same binaries). Each probe's run starts with
+# the page cache dropped where /proc/sys/vm/drop_caches is writable, as
+# bench/scripts/room.sh drops it; where it is not, the count says so and
+# each side meets the group as the box leaves it. The drop is the whole
+# machine's page cache, so nothing else may run beside a count -- no other
+# check.sh, cargo test or test binary: a zpages test that reads what the
+# cache holds failed under a count's drops. The counts of the store's own
+# clock-driven work move with the machine's load as well
+# (scripts/cost-hot.txt).
 set -eu
 BASE=${1:?usage: cost.sh BASE [probe ...]}
 shift
 ROOT=$(git rev-parse --show-toplevel)
 HEAD_TREE=${COST_HEAD:-$ROOT}
 W=${COST_DIR:-${TMPDIR:-/tmp}/supdb-cost-$$}
-T=${COST_TARGET:-$W/t}
-# The build directory, the one path both sides are built at.
-SRC=$W/src
-if [ -n "${COST_BASE_TARGET:-}${COST_HEAD_TARGET:-}" ]; then
-    echo "cost: COST_BASE_TARGET and COST_HEAD_TARGET are gone: both sides build in COST_TARGET; nothing built"
+# The build's paths, fixed (the header says why).
+BUILD=/tmp/supdb-cost
+SRC=$BUILD/src
+T=$BUILD/t
+BIN=$BUILD/bin
+if [ -n "${COST_TARGET:-}${COST_BASE_TARGET:-}${COST_HEAD_TARGET:-}" ]; then
+    echo "cost: COST_TARGET, COST_BASE_TARGET and COST_HEAD_TARGET are gone: both sides build in $T, at a fixed path, since a target's path is in the binaries; nothing built"
     exit 2
 fi
 PROBES=${*:-read read_z read_s scan scan_long scan_z scan_long_z scan_s scan_long_s load_durable load_buffered commit_durable commit_buffered work merge land seal scan_at}
@@ -111,17 +135,27 @@ if ! git -C "$ROOT" rev-parse --verify --quiet "$BASE^{commit}" >/dev/null; then
     echo "cost: BASE '$BASE' names no commit of this repository; nothing built"
     exit 2
 fi
+mkdir -p "$T" || { echo "cost: cannot make $T"; exit 2; }
+# One count at a time on the build's fixed paths: a second is refused, and
+# the lock goes with this process.
+exec 9>"$BUILD/lock"
+if ! flock -n 9; then
+    echo "cost: another count holds $BUILD/lock; nothing built"
+    exit 2
+fi
 rm -rf "$W"
-mkdir -p "$W/out" "$T" || { echo "cost: cannot make $W/out or $T"; exit 2; }
+mkdir -p "$W/out" || { echo "cost: cannot make $W/out"; exit 2; }
 # Absolute, since the builds and the listings run from the build directory.
-W=$(cd "$W" && pwd -P) T=$(cd "$T" && pwd -P)
-SRC=$W/src
+W=$(cd "$W" && pwd -P)
 cleanup() {
     git -C "$ROOT" worktree remove --force "$SRC" 2>/dev/null || true
-    rm -rf "$W/t" "$SRC" "$W/bin"
+    rm -rf "$SRC" "$BIN" "$BUILD"/tmp-*
 }
+# What a count killed before its end left on the fixed paths, its worktree
+# among them.
+cleanup
 trap cleanup EXIT
-if ! git -C "$ROOT" worktree add --detach "$SRC" "$BASE" >"$W/out/worktree.log" 2>&1; then
+if ! git -C "$ROOT" worktree add -f --detach "$SRC" "$BASE" >"$W/out/worktree.log" 2>&1; then
     echo "cost: the worktree of BASE '$BASE' could not be made; see $W/out/worktree.log"
     exit 2
 fi
@@ -292,12 +326,12 @@ build() { # side: the build directory built into the one target, its probes copi
         echo "cost: the $1 build failed; see $W/out/build-$1.log"
         exit 2
     fi
-    mkdir -p "$W/bin/$1"
+    mkdir -p "$BIN/$1"
     for e in $EX; do
-        cp "$T/release/examples/$e" "$W/bin/$1/$e" ||
+        cp "$T/release/examples/$e" "$BIN/$1/$e" ||
             { echo "cost: the $1 build's $e could not be copied out of $T"; exit 2; }
     done
-    (cd "$W/bin/$1" && sha256sum $EX) >"$W/out/bin-$1.sha256"
+    (cd "$BIN/$1" && sha256sum $EX) >"$W/out/bin-$1.sha256"
 }
 run() { # side name
     side=$1 name=$2
@@ -306,16 +340,22 @@ run() { # side name
     tog=$(echo "$spec" | cut -d'|' -f2)
     bin=$(echo "$spec" | cut -d'|' -f3)
     args=$(echo "$spec" | cut -d'|' -f4)
-    t="$W/tmp-$side-$name"
+    t="$BUILD/tmp-$side-$name"
     mkdir -p "$t"
     if [ -n "$tog" ]; then
         set -- "$@" --collect-atstart=no "--toggle-collect=$tog"
+    fi
+    # Both sides' runs meet the memory group alike: the page cache dropped
+    # first where that can be done (the header says why).
+    if [ -n "$DROP" ]; then
+        { sync && echo 1 >/proc/sys/vm/drop_caches; } 2>/dev/null ||
+            { echo "cost: the page cache could not be dropped before $side $name"; exit 2; }
     fi
     # `-v` for valgrind's line that it read the binary's symbols, and
     # nothing of the program's: valgrind's own messages go to the .vg file.
     # shellcheck disable=SC2086
     if ! TMPDIR="$t" valgrind -v --tool=callgrind --callgrind-out-file="$W/out/$side.$name.out" "$@" \
-        "$W/bin/$side/$bin" $args >"$W/out/$side.$name.stdout" 2>"$W/out/$side.$name.vg"; then
+        "$BIN/$side/$bin" $args >"$W/out/$side.$name.stdout" 2>"$W/out/$side.$name.vg"; then
         echo "cost: $side $name exited non-zero; see $W/out/$side.$name.vg"
         exit 2
     fi
@@ -323,7 +363,7 @@ run() { # side name
     # A binary valgrind read no symbols of has no function it can name: a
     # toggle never fires and a listing names nothing of it. Said so, and red.
     if ! grep -q "Reading syms from .*/bin/$side/$bin\$" "$W/out/$side.$name.vg"; then
-        echo "cost: valgrind read no symbols from $W/bin/$side/$bin ($side $name), so it can name none of its functions; see $W/out/$side.$name.vg"
+        echo "cost: valgrind read no symbols from $BIN/$side/$bin ($side $name), so it can name none of its functions; see $W/out/$side.$name.vg"
         echo "$side" >>"$W/out/$name.nosyms"
     fi
     # From the build directory: callgrind_annotate names a source under the
@@ -341,6 +381,13 @@ side() { # side: build the build directory, then count every probe on its copies
         run "$1" "$p"
     done
 }
+DROP=""
+if [ -w /proc/sys/vm/drop_caches ]; then
+    DROP=1
+    echo "cost: the page cache is dropped before each probe's run"
+else
+    echo "cost: the page cache cannot be dropped here (not root, or the sysctl is read-only): each side meets the memory group as the box leaves it"
+fi
 side base
 sync_head "$HEAD_TREE" "$SRC"
 side head

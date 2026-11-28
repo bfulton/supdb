@@ -43,9 +43,9 @@ jobs:
         run: sh bench/scripts/faster.sh
       - name: valgrind
         run: sh scripts/apt.sh valgrind
-      # No cache of the suite's build: the count builds both its sides in a
-      # target of its own (scripts/cost.sh, COST_TARGET), and the red input
-      # its steps in another, so a restored bench/target is read by nothing.
+      # No cache of the suite's build: the count and its red input build in
+      # the count's own target at a fixed path (scripts/cost.sh), so a
+      # restored bench/target is read by nothing.
       # The base the person named, or none, which scripts/base.sh reads as
       # the merge-base with main.
       - name: The plain store's cost, by function

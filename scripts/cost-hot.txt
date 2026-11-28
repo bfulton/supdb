@@ -87,22 +87,30 @@ supdb::db::zlz4::
 # +0.010, z_step +0.008; load_durable: join_seal +0.007). Every other
 # function of the segment work and the writer's sweep is held to the
 # mode's slack there, and to the toggle's in `land`, whose toggle runs the
-# segment work on the writer's thread.
+# segment work on the writer's thread. These follow the run's wall time,
+# and so the box: two counts of b3a043dc against itself made beside
+# another worktree's test binaries had two of their four load_durable
+# runs' commits at twice their usual time, and read
+# parse_kb there at 18,276 to 27,414 over the run (0.091 an op) where
+# twelve listings on a quieter box read 18,276 to 19,799, and join_seal in
+# load_buffered at 585 to 4,984 (0.044 an op).
 ~supdb::db::zfile::read_budget 2.5
 ~supdb::db::zselect::parse_mount 3
-~supdb::db::zselect::parse_kb 0.06
+~supdb::db::zselect::parse_kb 0.28
 ~supdb::db::Maint::z_tick 0.12
 ~supdb::db::Maint::collect 0.035
 ~supdb::db::Maint::sweep_spares 0.03
 ~supdb::db::Maint::z_step 0.025
-~supdb::db::Maint::join_seal 0.02
+~supdb::db::Maint::join_seal 0.14
 # In the loads, a partition's records' residency, which the controller's
 # tick asks of the segment's mapping once a run (`Seg::records_resident`):
 # 3,718 instructions or none, 0.037 an op, since where the tick's steps fall
 # against the partition's landing follows the clock. load_durable read none
 # in one of ten listings of b3a043dc counted against itself five times and
 # in two of six counted three times with both sides built at one path,
-# load_buffered in one of those six.
+# load_buffered in one of those six. The merge holds the function at a
+# hundredth an op, where it read 25,861 in every listing; no probe with a
+# toggle runs it.
 ~load_durable,load_buffered: supdb::bytes::MmapBytes::resident_share 0.12
 # In the merge alone, whose writer's operations end while a background
 # thread's pin holds what they would free, so the sweep at an operation's
@@ -115,25 +123,46 @@ supdb::db::zlz4::
 # files were kept, and the whole of that count's move. Ten listings of
 # b3a043dc counted against itself five times read main 12,757,004 to
 # 12,824,236 over the run, 0.34 an op between the least and the most, all
-# of the spread in its rows of src/db.rs, red in one count of five. And the
-# writer's wait for room in the frozen list (`Db::land_seal`), a look and a
-# park of a tenth of a millisecond for as long as the seal it waits for
-# runs: 254,322 to 424,152 over the run in the same ten, 0.85 an op, red in
-# two counts of five. `land` holds the sweep to the instruction.
+# of the spread in its rows of src/db.rs, red in one count of five. Those
+# rows are the writer's inlined append path and the operation's end, and
+# `work` holds them at a hundredth an op: of main's 4,050,103 instructions
+# on lines of src/db.rs in one listing, all but the sweep's call (150,000)
+# and 84 on 24 lines that run a few times a run are on lines inlined into
+# `work_probe::main` too, which no `~` line bounds. And the writer's wait
+# for room in the frozen list (`Db::land_seal`), a look and a park of a
+# tenth of a millisecond for as long as the seal it waits for runs: 254,322
+# to 424,152 over the run in the same ten, 0.85 an op, red in two counts of
+# five. Where it does not wait, the loads hold it at a hundredth an op (63
+# instructions in every listing) and `land`, its seal joined inline, under
+# the toggle's slack (320); its park, the part that moves, no other probe
+# runs, so nothing holds that closer than this line. `land` holds the sweep
+# to the instruction.
 ~merge: supdb::db::Reader::sweep_retired_states 35
 ~merge: supdb::db::Readers::oldest_for 6
 ~merge: supdb::db::WriterOp::drop 1.2
+# And the engine's free of its mapped blocks, as many as the seals and the
+# merges leave (`blocks::free`): 11,324 to 14,510 over the run in sixteen
+# one-path listings, 0.016 an op; the loads read it at 568 in every one.
+~merge: supdb::db::blocks::free 0.05
 ~merge: merge_walk::main 1.1
 ~merge: supdb::db::Db::land_seal 2.6
+# And the census of the frozen tables' bytes that wait makes where the list
+# is full (`MemTable::census`, from `land_seal`, 84,648 instructions a
+# call): three calls in 34 listings of 38, and two, one or none in the four
+# made beside other work.
+~merge: supdb::db::MemTable::census 3.9
 # Under a toggle: the seal's wait in `land` (join_seal +332 over the run,
 # its clock +64) and the segment writer's look at its helper thread in the
 # commit probes (landed +63). The wait's line was 0.01 on that first pair,
 # and five later counts of one source read 5,752 5,835 5,918 6,001 and
 # 7,080 instructions over the run's 100,000 operations, 1,328 between the
 # least and the most: a bound under what the function moves by itself reads
-# red on no change.
-~land: supdb::db::Maint::join_seal 0.04
-~land: std::sys::pal::unix::time::Timespec::now 0.002
+# red on no change. The wait lasts as long as the seal's thread takes, so
+# it follows the box: 34 listings of b3a043dc counted against itself read
+# join_seal at 6,163 to 7,337 on a quiet box and up to 24,020 beside other
+# work, its clock at 3,440 to 3,696 and up to 6,912.
+~land: supdb::db::Maint::join_seal 0.54
+~land: std::sys::pal::unix::time::Timespec::now 0.11
 ~commit_durable,commit_buffered: supdb::db::AlignedWriter::landed 0.002
 # A library function a `~` line names, under a toggle, is held to its bound
 # in place of the library tests (scripts/cost-diff.py): here glibc's, whose
@@ -145,12 +174,25 @@ supdb::db::zlz4::
 # run's 1,000 operations, 14.5 an op between the least and the most, red in
 # one count; its `_int_malloc` at 1,047,726 to 1,141,163, 93 an op, and two
 # of the one-path listings 5.9% apart, past the library tests; and libc's
-# compare in the stride form's scans at 19 or 23 instructions a scan, 4 an
-# op, red in scan_long_s in two one-path counts of three and in scan_s in
-# two two-path counts.
+# compare in the stride form's reads and scans at 19 or 23 instructions a
+# scan, or a read, 4 an op, red in scan_long_s in two one-path counts of
+# three and in scan_s in two two-path counts. read_s read 3,800,000 over
+# its run's 200,000 reads in every one of the 22 here, and 4,600,000 or
+# 3,800,000 in the three counts of #38's review, moving in two.
 ~scan_long_z: unlink_chunk.isra.0 44
 ~scan_long_z: _int_malloc 281
-~scan_s,scan_long_s: __memcmp_avx2_movbe 12
+~read_s,scan_s,scan_long_s: __memcmp_avx2_movbe 12
+# And where 42 listings of b3a043dc (eight counts at two paths, eleven at
+# one, two at the fixed paths) put the allocator and libc's copy past the
+# library tests between two runs, one count's base among them on a quiet
+# machine: scan_z's `_int_malloc` at 454,286 to 495,402 over the run, 41
+# an op, and its unlink at 3,354 to 9,819, 6.5 an op; land's `_int_malloc`
+# at 2,029,236 to 2,475,419, 4.5 an op, and its copy at 16,001,670 to
+# 16,971,571, 9.7 an op, as many bytes as the run's seals and merges move.
+~scan_z: _int_malloc 124
+~scan_z: unlink_chunk.isra.0 20
+~land: _int_malloc 14
+~land: __memcpy_avx_unaligned_erms 30
 # The writer (load_durable, load_buffered, work, merge): a commit, its log,
 # the memtable and the ordered run's stream.
 supdb::db::Db::commit
