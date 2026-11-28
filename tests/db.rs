@@ -20086,43 +20086,26 @@ fn a_seal_named_the_first_partition_ahead_composes_no_bloom() {
 }
 
 /// A landing makes an empty live table only for a table it retires that
-/// is still the live one (`Options::land_fresh_lazy`): a drain, whose
-/// writer froze its table, makes none, and a `sync` that hands the live
-/// table and lands before the writer writes again makes the one it
-/// installs; with the option off every landing that retires a table
-/// makes one. The writes after read back either way.
+/// is still the live one: a drain, whose writer froze its table, makes
+/// none, and a `sync` that hands the live table and lands before the
+/// writer writes again makes the one it installs. The writes after read
+/// back.
 #[test]
 fn a_landing_makes_a_fresh_table_only_where_it_installs_one() {
-    for (lazy, drained) in [(true, 0u64), (false, 1)] {
+    {
         let keys = drain_keys(true, 3000);
-        let d = dir(&format!("landfresh-drain-{lazy}"));
-        let opts = Options {
-            land_fresh_lazy: lazy,
-            ..common::options()
-        };
-        let mut db = Db::create(&d, opts).unwrap();
+        let d = dir("landfresh-drain");
+        let mut db = Db::create(&d, common::options()).unwrap();
         drain_load(&mut db, &keys);
         db.flush().unwrap();
         db.settle().unwrap();
-        assert_eq!(
-            db.seal_waits().landing_tables,
-            drained,
-            "lazy {lazy}: {:?}",
-            db.seal_waits()
-        );
+        assert_eq!(db.seal_waits().landing_tables, 0, "{:?}", db.seal_waits());
         drain_check(&db, &keys, "after the drain");
     }
-    for lazy in [true, false] {
-        let d = dir(&format!("landfresh-handed-{lazy}"));
+    {
+        let d = dir("landfresh-handed");
         let n = 14_000u32;
-        let mut db = load_ordered_with_tail_opts(
-            &d,
-            n,
-            Options {
-                land_fresh_lazy: lazy,
-                ..load_ordered_with_tail_options()
-            },
-        );
+        let mut db = load_ordered_with_tail_opts(&d, n, load_ordered_with_tail_options());
         // The run's mid-load seal landed first, so the count read here is
         // every landing's but the sync's.
         wait_for("the mid-load seal's landing", || !db.in_flight().0);
@@ -20140,7 +20123,7 @@ fn a_landing_makes_a_fresh_table_only_where_it_installs_one() {
         assert_eq!(
             db.seal_waits().landing_tables - before,
             1,
-            "lazy {lazy}: the table it installed"
+            "the table it installed"
         );
         for k in (0..n).step_by(7) {
             db.put(&tail_key(k), &tail_val(2));

@@ -4234,7 +4234,7 @@ fn acknowledged_direct_run_commits_survive_a_power_cut_that_loses_the_logs_unsyn
 
 /// A buffered store: commits never sync, and a flush acknowledges them by
 /// a segment and a manifest without syncing the log
-/// (`Options::drain_syncs_wal` off; and `drain_syncs_beside` off, which
+/// (`Options::drain_syncs_beside` off, which
 /// syncs the log beside a store's first drain and so never leaves this
 /// state there, where a later drain's does). The log's header and frames may then
 /// never be synced in the file's life, and a power cut can leave its first
@@ -8229,15 +8229,6 @@ fn a_publish_after_a_drains_owed_slot_never_overwrites_the_last_durable_slot_und
 #[test]
 fn every_arm_that_writes_a_slot_keeps_the_last_durable_one() {
     a_publish_after_a_slot(
-        "waits",
-        Options {
-            flush_waits_manifest: true,
-            ..Options::default()
-        },
-        OS_KEYS / 4,
-        |t| t.writes.iter().any(|w| w.armed && !w.deferred),
-    );
-    a_publish_after_a_slot(
         "pending",
         Options {
             manifest_pending: true,
@@ -8261,15 +8252,6 @@ fn every_arm_that_writes_a_slot_keeps_the_last_durable_one() {
         "inline",
         Options {
             publish_in_background: false,
-            ..Options::default()
-        },
-        OS_KEYS / 4,
-        |t| t.reached(false),
-    );
-    a_publish_after_a_slot(
-        "walsync",
-        Options {
-            drain_syncs_wal: true,
             ..Options::default()
         },
         OS_KEYS / 4,

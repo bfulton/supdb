@@ -674,10 +674,6 @@ pub struct Supdb {
     /// `supdb-ingestlazysettle`, and `supdb-lazysettle` durable, where the
     /// commits sync and so lend either way.
     lazysettle: bool,
-    /// A flush fsyncs the WAL before its seal whatever the policy, as
-    /// before (`Options::drain_syncs_wal`). `supdb-ingestwalsync`, and
-    /// `supdb-walsync` durable, where every commit synced already.
-    walsync: bool,
     /// A landing far from reads takes its pieces' ranks and bounds as any
     /// landing did (`Options::land_ranks_far`). `supdb-ingestranksfar`,
     /// and `supdb-ranksfar` durable.
@@ -943,10 +939,6 @@ pub struct Supdb {
     /// segments pending (`Options::manifest_pending`). `supdb-manifestpending`,
     /// and `supdb-ingestmanifestpending` buffered.
     manifestpending: bool,
-    /// A flush waiting for its manifest slot's fdatasync, the shape before
-    /// `Options::flush_waits_manifest` was off. `supdb-waitmanifest`, and
-    /// `supdb-ingestwaitmanifest` buffered.
-    waitmanifest: bool,
     /// The writer's buffers populated a window ahead of their fill
     /// (`Options::prefault`). `supdb-populate`, and `supdb-ingestpopulate`
     /// buffered.
@@ -1071,9 +1063,7 @@ pub struct Supdb {
     /// A flush over writes no sync has covered pays the sync it owes
     /// beside its seal and is answered at the seal's readable landing
     /// (`Options::drain_syncs_beside`), `None` for the engine's default:
-    /// `supdb-ingestsyncbeside` and `supdb-syncbeside` pin it on, and
-    /// `supdb-ingestsyncafter` is the buffered drain that waits for its
-    /// slot, the shape before.
+    /// `supdb-ingestsyncbeside` and `supdb-syncbeside` pin it on.
     syncbeside: Option<bool>,
     /// A direct run's append and commit without the per-record work the
     /// records no longer need (`Options::direct_lean_append`), `None` for
@@ -1090,11 +1080,6 @@ pub struct Supdb {
     /// `supdb-bloomalways` and `supdb-ingestbloomalways` compose it for
     /// every seal.
     bloompieces: Option<bool>,
-    /// A landing's empty live table made only where the table it retires
-    /// is still live (`Options::land_fresh_lazy`), `None` for the
-    /// engine's default: `supdb-landfresh` and `supdb-ingestlandfresh`
-    /// make it at every landing that retires a table.
-    landfresh: Option<bool>,
     /// A run of ordered ingest begun in a file made ahead of it
     /// (`Options::run_spare`), `None` for the engine's default:
     /// `supdb-runcreate` and `supdb-ingestruncreate` make the file at the
@@ -1237,10 +1222,6 @@ pub struct Supdb {
     /// as before `Options::copy_exact`. `supdb-copyslack`, and
     /// `supdb-ingestcopyslack` buffered.
     copyslack: bool,
-    /// A drain landing its lone piece and promoting it under a second
-    /// manifest, as before `Options::drain_names_partition`:
-    /// `supdb-ingestdrainpromote`.
-    drainpromote: bool,
     /// A manifest publish that renames over the old manifest and frees it
     /// on the path, as before `Options::manifest_spare`. `supdb-manifestfree`,
     /// and `supdb-ingestmanifestfree` buffered.
@@ -2133,10 +2114,6 @@ struct Policy {
     /// `supdb-ingestlazysettle`, and `supdb-lazysettle` durable, where the
     /// commits sync and so lend either way.
     lazysettle: bool,
-    /// A flush fsyncs the WAL before its seal whatever the policy, as
-    /// before (`Options::drain_syncs_wal`). `supdb-ingestwalsync`, and
-    /// `supdb-walsync` durable, where every commit synced already.
-    walsync: bool,
     /// A landing far from reads takes its pieces' ranks and bounds as any
     /// landing did (`Options::land_ranks_far`). `supdb-ingestranksfar`,
     /// and `supdb-ranksfar` durable.
@@ -2402,10 +2379,6 @@ struct Policy {
     /// segments pending (`Options::manifest_pending`). `supdb-manifestpending`,
     /// and `supdb-ingestmanifestpending` buffered.
     manifestpending: bool,
-    /// A flush waiting for its manifest slot's fdatasync, the shape before
-    /// `Options::flush_waits_manifest` was off. `supdb-waitmanifest`, and
-    /// `supdb-ingestwaitmanifest` buffered.
-    waitmanifest: bool,
     /// The writer's buffers populated a window ahead of their fill
     /// (`Options::prefault`). `supdb-populate`, and `supdb-ingestpopulate`
     /// buffered.
@@ -2530,9 +2503,7 @@ struct Policy {
     /// A flush over writes no sync has covered pays the sync it owes
     /// beside its seal and is answered at the seal's readable landing
     /// (`Options::drain_syncs_beside`), `None` for the engine's default:
-    /// `supdb-ingestsyncbeside` and `supdb-syncbeside` pin it on, and
-    /// `supdb-ingestsyncafter` is the buffered drain that waits for its
-    /// slot, the shape before.
+    /// `supdb-ingestsyncbeside` and `supdb-syncbeside` pin it on.
     syncbeside: Option<bool>,
     /// A direct run's append and commit without the per-record work the
     /// records no longer need (`Options::direct_lean_append`), `None` for
@@ -2549,11 +2520,6 @@ struct Policy {
     /// `supdb-bloomalways` and `supdb-ingestbloomalways` compose it for
     /// every seal.
     bloompieces: Option<bool>,
-    /// A landing's empty live table made only where the table it retires
-    /// is still live (`Options::land_fresh_lazy`), `None` for the
-    /// engine's default: `supdb-landfresh` and `supdb-ingestlandfresh`
-    /// make it at every landing that retires a table.
-    landfresh: Option<bool>,
     /// A run of ordered ingest begun in a file made ahead of it
     /// (`Options::run_spare`), `None` for the engine's default:
     /// `supdb-runcreate` and `supdb-ingestruncreate` make the file at the
@@ -2695,10 +2661,6 @@ struct Policy {
     /// as before `Options::copy_exact`. `supdb-copyslack`, and
     /// `supdb-ingestcopyslack` buffered.
     copyslack: bool,
-    /// A drain landing its lone piece and promoting it under a second
-    /// manifest, as before `Options::drain_names_partition`:
-    /// `supdb-ingestdrainpromote`.
-    drainpromote: bool,
     /// A manifest publish that renames over the old manifest and frees it
     /// on the path, as before `Options::manifest_spare`. `supdb-manifestfree`,
     /// and `supdb-ingestmanifestfree` buffered.
@@ -3280,7 +3242,6 @@ impl Default for Policy {
             inlinemaint: false,
             convertsources: false,
             copyslack: false,
-            drainpromote: false,
             manifestfree: false,
             oidxsync: false,
             refvals: false,
@@ -3290,7 +3251,6 @@ impl Default for Policy {
             heldfiles: false,
             inlineall: false,
             lazysettle: false,
-            walsync: false,
             ranksfar: false,
             rankswhole: false,
             mergerecordkeys: false,
@@ -3355,7 +3315,6 @@ impl Default for Policy {
             nosweep: false,
             manifestrename: false,
             manifestpending: false,
-            waitmanifest: false,
             populate: false,
             piece256: false,
             recordsteps: false,
@@ -3388,7 +3347,6 @@ impl Default for Policy {
             directlean: None,
             closereadable: None,
             bloompieces: None,
-            landfresh: None,
             runspare: None,
             formsoffbuilt: None,
             formson: false,
@@ -6017,21 +5975,6 @@ impl Supdb {
         )
     }
 
-    /// `supdb-ingest` whose drain lands its lone piece and promotes it
-    /// under a second manifest, as before `Options::drain_names_partition`:
-    /// against `supdb-ingest` it prices naming the partition at the close.
-    pub fn create_ingest_drainpromote(path: &Path) -> Res<Supdb> {
-        Supdb::with_policy(
-            path,
-            Policy {
-                partition: false,
-                durable: false,
-                drainpromote: true,
-                ..Policy::default()
-            },
-        )
-    }
-
     /// `supdb` whose manifest publish frees the old manifest on its path,
     /// as before `Options::manifest_spare`: against `supdb` it prices the
     /// spare link and the deferred unlink.
@@ -6226,34 +6169,6 @@ impl Supdb {
                 partition: false,
                 durable: false,
                 lazysettle: true,
-                ..Policy::default()
-            },
-        )
-    }
-
-    /// `supdb` whose flush fsyncs the WAL before its seal, as before. Its
-    /// commits sync, so the log holds nothing to sync at a flush: against
-    /// `supdb` it is a null pairing.
-    pub fn create_walsync(path: &Path) -> Res<Supdb> {
-        Supdb::with_policy(
-            path,
-            Policy {
-                walsync: true,
-                ..Policy::default()
-            },
-        )
-    }
-
-    /// `supdb-ingest` whose flush fsyncs the WAL before its seal, as
-    /// before a buffered drain was answered behind its slot instead:
-    /// against `supdb-ingest` it prices that fdatasync on the drain.
-    pub fn create_ingest_walsync(path: &Path) -> Res<Supdb> {
-        Supdb::with_policy(
-            path,
-            Policy {
-                partition: false,
-                durable: false,
-                walsync: true,
                 ..Policy::default()
             },
         )
@@ -7789,8 +7704,8 @@ impl Supdb {
     /// `supdb` whose flush pays the sync it owes beside its seal and is
     /// answered at the seal's readable landing, the option pinned on
     /// (`Options::drain_syncs_beside`, the engine's default): a durable
-    /// store owes nothing, so against `supdb-syncafter` it prices the
-    /// option's cost where it does nothing. `supdb-syncbeside`.
+    /// store owes nothing, so it prices the option's cost where it does
+    /// nothing. `supdb-syncbeside`.
     pub fn create_syncbeside(path: &Path) -> Res<Supdb> {
         Supdb::with_policy(
             path,
@@ -7813,34 +7728,6 @@ impl Supdb {
                 partition: false,
                 durable: false,
                 syncbeside: Some(true),
-                ..Policy::default()
-            },
-        )
-    }
-
-    /// `supdb` whose drain never pays a sync beside its seal
-    /// (`Options::drain_syncs_beside` off), the shape before.
-    /// `supdb-syncafter`.
-    pub fn create_syncafter(path: &Path) -> Res<Supdb> {
-        Supdb::with_policy(
-            path,
-            Policy {
-                syncbeside: Some(false),
-                ..Policy::default()
-            },
-        )
-    }
-
-    /// `supdb-ingest` whose buffered drain waits for its slot's fdatasync
-    /// (`Options::drain_syncs_beside` off), the shape before.
-    /// `supdb-ingestsyncafter`.
-    pub fn create_ingest_syncafter(path: &Path) -> Res<Supdb> {
-        Supdb::with_policy(
-            path,
-            Policy {
-                partition: false,
-                durable: false,
-                syncbeside: Some(false),
                 ..Policy::default()
             },
         )
@@ -7907,32 +7794,6 @@ impl Supdb {
                 partition: false,
                 durable: false,
                 bloompieces: Some(false),
-                ..Policy::default()
-            },
-        )
-    }
-
-    /// `supdb` whose every landing that retires a table makes an empty
-    /// live one, installed or not (`Options::land_fresh_lazy` off), the
-    /// shape before. `supdb-landfresh`.
-    pub fn create_landfresh(path: &Path) -> Res<Supdb> {
-        Supdb::with_policy(
-            path,
-            Policy {
-                landfresh: Some(false),
-                ..Policy::default()
-            },
-        )
-    }
-
-    /// `supdb-ingest` as `supdb-landfresh`. `supdb-ingestlandfresh`.
-    pub fn create_ingest_landfresh(path: &Path) -> Res<Supdb> {
-        Supdb::with_policy(
-            path,
-            Policy {
-                partition: false,
-                durable: false,
-                landfresh: Some(false),
                 ..Policy::default()
             },
         )
@@ -8529,31 +8390,6 @@ impl Supdb {
                 partition: false,
                 durable: false,
                 fatentries: true,
-                ..Policy::default()
-            },
-        )
-    }
-
-    /// `supdb` with a flush waiting for its manifest slot's fdatasync, the
-    /// shape before `Options::flush_waits_manifest` was off.
-    pub fn create_waitmanifest(path: &Path) -> Res<Supdb> {
-        Supdb::with_policy(
-            path,
-            Policy {
-                waitmanifest: true,
-                ..Policy::default()
-            },
-        )
-    }
-
-    /// `supdb-ingest` as `supdb-waitmanifest`.
-    pub fn create_ingest_waitmanifest(path: &Path) -> Res<Supdb> {
-        Supdb::with_policy(
-            path,
-            Policy {
-                partition: false,
-                durable: false,
-                waitmanifest: true,
                 ..Policy::default()
             },
         )
@@ -9802,7 +9638,6 @@ impl Supdb {
             inlinemaint,
             convertsources,
             copyslack,
-            drainpromote,
             manifestfree,
             oidxsync,
             refvals,
@@ -9812,7 +9647,6 @@ impl Supdb {
             heldfiles,
             inlineall,
             lazysettle,
-            walsync,
             ranksfar,
             rankswhole,
             mergerecordkeys,
@@ -9877,7 +9711,6 @@ impl Supdb {
             nosweep,
             manifestrename,
             manifestpending,
-            waitmanifest,
             populate,
             piece256,
             recordsteps,
@@ -9910,7 +9743,6 @@ impl Supdb {
             directlean,
             closereadable,
             bloompieces,
-            landfresh,
             runspare,
             formsoffbuilt,
             formson,
@@ -10198,7 +10030,6 @@ impl Supdb {
             freeze_settles: settlefreeze,
             convert_from_form: !convertsources,
             copy_exact: !copyslack,
-            drain_names_partition: !drainpromote,
             manifest_spare: !manifestfree,
             ord_durable: oidxsync,
             direct_table_refs: refvals,
@@ -10256,7 +10087,6 @@ impl Supdb {
                 supdb::Options::default().upkeep_inline_min
             },
             upkeep_settle_after_scans: !lazysettle,
-            drain_syncs_wal: walsync,
             land_ranks_far: ranksfar,
             piece_ranks_whole: rankswhole,
             merge_keys_by_heads: !mergerecordkeys,
@@ -10378,7 +10208,6 @@ impl Supdb {
             forms_fit_sweep: !nosweep,
             manifest_slots: !manifestrename,
             manifest_pending: manifestpending,
-            flush_waits_manifest: waitmanifest,
             close_presync: !latesync,
             ahead_sends_bounds: !installreads,
             upkeep_abandons: !noabandon,
@@ -10416,7 +10245,6 @@ impl Supdb {
             close_readable_inline: closereadable
                 .unwrap_or(supdb::Options::default().close_readable_inline),
             bloom_pieces_only: bloompieces.unwrap_or(supdb::Options::default().bloom_pieces_only),
-            land_fresh_lazy: landfresh.unwrap_or(supdb::Options::default().land_fresh_lazy),
             run_spare: runspare.unwrap_or(supdb::Options::default().run_spare),
             scan_forms_off_counts_built: formsoffbuilt
                 .unwrap_or(supdb::Options::default().scan_forms_off_counts_built),
@@ -10837,7 +10665,6 @@ impl Supdb {
             inlinemaint,
             convertsources,
             copyslack,
-            drainpromote,
             manifestfree,
             oidxsync,
             refvals,
@@ -10847,7 +10674,6 @@ impl Supdb {
             heldfiles,
             inlineall,
             lazysettle,
-            walsync,
             ranksfar,
             rankswhole,
             mergerecordkeys,
@@ -10912,7 +10738,6 @@ impl Supdb {
             nosweep,
             manifestrename,
             manifestpending,
-            waitmanifest,
             populate,
             piece256,
             recordsteps,
@@ -10945,7 +10770,6 @@ impl Supdb {
             directlean,
             closereadable,
             bloompieces,
-            landfresh,
             runspare,
             formsoffbuilt,
             formson,
@@ -12105,9 +11929,6 @@ impl Engine for Supdb {
                 "supdb-ingestcopyslack"
             };
         }
-        if self.drainpromote {
-            return "supdb-ingestdrainpromote";
-        }
         if self.manifestfree {
             return if self.partition {
                 "supdb-manifestfree"
@@ -12250,13 +12071,6 @@ impl Engine for Supdb {
                 "supdb-settlebuildsfiled"
             } else {
                 "supdb-ingestsettlebuildsfiled"
-            };
-        }
-        if self.walsync {
-            return if self.partition {
-                "supdb-walsync"
-            } else {
-                "supdb-ingestwalsync"
             };
         }
         if self.ranksfar {
@@ -12724,13 +12538,6 @@ impl Engine for Supdb {
                 "supdb-ingestsyncbeside"
             };
         }
-        if self.syncbeside == Some(false) {
-            return if self.partition {
-                "supdb-syncafter"
-            } else {
-                "supdb-ingestsyncafter"
-            };
-        }
         if self.directlean == Some(false) {
             return if self.partition {
                 "supdb-directfull"
@@ -12750,13 +12557,6 @@ impl Engine for Supdb {
                 "supdb-bloomalways"
             } else {
                 "supdb-ingestbloomalways"
-            };
-        }
-        if self.landfresh == Some(false) {
-            return if self.partition {
-                "supdb-landfresh"
-            } else {
-                "supdb-ingestlandfresh"
             };
         }
         if self.runspare == Some(false) {
@@ -12882,13 +12682,6 @@ impl Engine for Supdb {
                 "supdb-fatentries"
             } else {
                 "supdb-ingestfatentries"
-            };
-        }
-        if self.waitmanifest {
-            return if self.partition {
-                "supdb-waitmanifest"
-            } else {
-                "supdb-ingestwaitmanifest"
             };
         }
         if self.rankrecords {
@@ -15477,7 +15270,6 @@ pub fn guarantee(arm: &str) -> Option<Guarantee> {
         | "supdb-inlineall"
         | "supdb-lazysettle"
         | "supdb-settlelate"
-        | "supdb-walsync"
         | "supdb-ranksfar"
         | "supdb-rankswhole"
         | "supdb-mergerecordkeys"
@@ -15613,7 +15405,6 @@ pub fn guarantee(arm: &str) -> Option<Guarantee> {
         | "supdb-noalert"
         | "supdb-ordlog"
         | "supdb-fatentries"
-        | "supdb-waitmanifest"
         | "supdb-inlinemaint"
         | "supdb-rotate"
         | "supdb-nofrozen"
@@ -15703,11 +15494,9 @@ pub fn guarantee(arm: &str) -> Option<Guarantee> {
         | "supdb-drainreadable"
         | "supdb-drainstrict"
         | "supdb-syncbeside"
-        | "supdb-syncafter"
         | "supdb-directfull"
         | "supdb-closeseal"
         | "supdb-bloomalways"
-        | "supdb-landfresh"
         | "supdb-runcreate"
         | "supdb-jobspooled"
         | "supdb-zslabjobs"
@@ -15759,7 +15548,6 @@ pub fn guarantee(arm: &str) -> Option<Guarantee> {
         | "supdb-ingestpiecesonly"
         | "supdb-ingestconvertsources"
         | "supdb-ingestcopyslack"
-        | "supdb-ingestdrainpromote"
         | "supdb-ingestmanifestfree"
         | "supdb-ingestoidxsync"
         | "supdb-ingestrefvals"
@@ -15775,7 +15563,6 @@ pub fn guarantee(arm: &str) -> Option<Guarantee> {
         | "supdb-ingestinlineall"
         | "supdb-ingestlazysettle"
         | "supdb-ingestsettlelate"
-        | "supdb-ingestwalsync"
         | "supdb-ingestranksfar"
         | "supdb-ingestrankswhole"
         | "supdb-ingestmergerecordkeys"
@@ -15795,11 +15582,9 @@ pub fn guarantee(arm: &str) -> Option<Guarantee> {
         | "supdb-ingestcloseinline"
         | "supdb-ingesttimers"
         | "supdb-ingestsyncbeside"
-        | "supdb-ingestsyncafter"
         | "supdb-ingestdirectfull"
         | "supdb-ingestcloseseal"
         | "supdb-ingestbloomalways"
-        | "supdb-ingestlandfresh"
         | "supdb-ingestruncreate"
         | "supdb-ingestsettlefar"
         | "supdb-ingesttofit"
@@ -15818,7 +15603,6 @@ pub fn guarantee(arm: &str) -> Option<Guarantee> {
         | "supdb-ingestnoalert"
         | "supdb-ingestordlog"
         | "supdb-ingestfatentries"
-        | "supdb-ingestwaitmanifest"
         | "supdb-ingestrebuild"
         | "supdb-rankrecords"
         | "supdb-ingestrankrecords"
@@ -16750,7 +16534,6 @@ pub fn open(arm: &str, dir: &Path, map_gb: usize) -> Res<Box<dyn Engine>> {
         "supdb-refvals" => supdb_arm(Supdb::create_refvals, dir)?,
         "supdb-ingestconvertsources" => supdb_arm(Supdb::create_ingest_convertsources, dir)?,
         "supdb-ingestcopyslack" => supdb_arm(Supdb::create_ingest_copyslack, dir)?,
-        "supdb-ingestdrainpromote" => supdb_arm(Supdb::create_ingest_drainpromote, dir)?,
         "supdb-ingestmanifestfree" => supdb_arm(Supdb::create_ingest_manifestfree, dir)?,
         "supdb-ingestoidxsync" => supdb_arm(Supdb::create_ingest_oidxsync, dir)?,
         "supdb-ingestrefvals" => supdb_arm(Supdb::create_ingest_refvals, dir)?,
@@ -17219,15 +17002,11 @@ pub fn open(arm: &str, dir: &Path, map_gb: usize) -> Res<Box<dyn Engine>> {
         "supdb-drainstrict" => supdb_arm(Supdb::create_drainstrict, dir)?,
         "supdb-syncbeside" => supdb_arm(Supdb::create_syncbeside, dir)?,
         "supdb-ingestsyncbeside" => supdb_arm(Supdb::create_ingest_syncbeside, dir)?,
-        "supdb-syncafter" => supdb_arm(Supdb::create_syncafter, dir)?,
-        "supdb-ingestsyncafter" => supdb_arm(Supdb::create_ingest_syncafter, dir)?,
         "supdb-directfull" => supdb_arm(Supdb::create_directfull, dir)?,
         "supdb-closeseal" => supdb_arm(Supdb::create_closeseal, dir)?,
         "supdb-ingestcloseseal" => supdb_arm(Supdb::create_ingest_closeseal, dir)?,
         "supdb-bloomalways" => supdb_arm(Supdb::create_bloomalways, dir)?,
         "supdb-ingestbloomalways" => supdb_arm(Supdb::create_ingest_bloomalways, dir)?,
-        "supdb-landfresh" => supdb_arm(Supdb::create_landfresh, dir)?,
-        "supdb-ingestlandfresh" => supdb_arm(Supdb::create_ingest_landfresh, dir)?,
         "supdb-runcreate" => supdb_arm(Supdb::create_runcreate, dir)?,
         "supdb-ingestruncreate" => supdb_arm(Supdb::create_ingest_runcreate, dir)?,
         "supdb-ingestdirectfull" => supdb_arm(Supdb::create_ingest_directfull, dir)?,
@@ -17265,8 +17044,6 @@ pub fn open(arm: &str, dir: &Path, map_gb: usize) -> Res<Box<dyn Engine>> {
         "supdb-settlelate" => supdb_arm(Supdb::create_settlelate, dir)?,
         "supdb-ingestsettlelate" => supdb_arm(Supdb::create_ingest_settlelate, dir)?,
         "supdb-ingestlazysettle" => supdb_arm(Supdb::create_ingest_lazysettle, dir)?,
-        "supdb-walsync" => supdb_arm(Supdb::create_walsync, dir)?,
-        "supdb-ingestwalsync" => supdb_arm(Supdb::create_ingest_walsync, dir)?,
         "supdb-ranksfar" => supdb_arm(Supdb::create_ranksfar, dir)?,
         "supdb-ingestranksfar" => supdb_arm(Supdb::create_ingest_ranksfar, dir)?,
         "supdb-rankswhole" => supdb_arm(Supdb::create_rankswhole, dir)?,
@@ -18268,8 +18045,6 @@ pub fn open(arm: &str, dir: &Path, map_gb: usize) -> Res<Box<dyn Engine>> {
         "supdb-ingestordlog" => supdb_arm(Supdb::create_ingest_ordlog, dir)?,
         "supdb-fatentries" => supdb_arm(Supdb::create_fatentries, dir)?,
         "supdb-ingestfatentries" => supdb_arm(Supdb::create_ingest_fatentries, dir)?,
-        "supdb-waitmanifest" => supdb_arm(Supdb::create_waitmanifest, dir)?,
-        "supdb-ingestwaitmanifest" => supdb_arm(Supdb::create_ingest_waitmanifest, dir)?,
         "supdb-ingestsettlefreeze" => supdb_arm(Supdb::create_ingest_settlefreeze, dir)?,
         "supdb-ingestconvertcap" => supdb_arm(Supdb::create_ingest_convertcap, dir)?,
         "supdb-ingestshortpass" => supdb_arm(Supdb::create_ingest_shortpass, dir)?,
@@ -21427,9 +21202,7 @@ mod tests {
                     assert_eq!(o.drain_answers_readable, on);
                     let drain = |o: &supdb::Options| {
                         (
-                            o.flush_waits_manifest,
                             o.close_presync,
-                            o.drain_syncs_wal,
                             o.manifest_slots,
                             o.drain_names_partition,
                             o.zpages_buy_crosses,
@@ -21445,8 +21218,8 @@ mod tests {
                     assert_eq!(guarantee(arm), guarantee("supdb"), "{arm}");
                 }
                 // A drain that pays the sync it owes beside its seal, pinned
-                // on, and the shape before, durable and buffered, each
-                // differing from its sibling by that alone.
+                // on, durable and buffered, each differing from its sibling
+                // by that alone.
                 let sib = Supdb::create_ingest(&dir("ingestsib")).unwrap();
                 for (z, s, arm, on) in [
                     (
@@ -21461,18 +21234,6 @@ mod tests {
                         "supdb-ingestsyncbeside",
                         true,
                     ),
-                    (
-                        Supdb::create_syncafter(&dir("syncafter")).unwrap(),
-                        &base,
-                        "supdb-syncafter",
-                        false,
-                    ),
-                    (
-                        Supdb::create_ingest_syncafter(&dir("ingestsyncafter")).unwrap(),
-                        &sib,
-                        "supdb-ingestsyncafter",
-                        false,
-                    ),
                 ] {
                     assert_eq!(z.name(), arm);
                     assert_eq!(z.features(), s.features(), "{arm}");
@@ -21481,12 +21242,8 @@ mod tests {
                     assert_eq!(o.drain_syncs_beside, on, "{arm}");
                     assert!(so.drain_syncs_beside, "the engine's default pays beside");
                     assert_eq!(
-                        (o.drain_answers_readable, o.close_presync, o.drain_syncs_wal),
-                        (
-                            so.drain_answers_readable,
-                            so.close_presync,
-                            so.drain_syncs_wal
-                        ),
+                        (o.drain_answers_readable, o.close_presync),
+                        (so.drain_answers_readable, so.close_presync),
                         "{arm}"
                     );
                     assert_eq!(
@@ -21556,33 +21313,17 @@ mod tests {
                     );
                     assert_eq!(guarantee(arm), guarantee(s.name()), "{arm}");
                 }
-                for (z, s, arm, bloom, fresh) in [
+                for (z, s, arm, bloom) in [
                     (
                         Supdb::create_bloomalways(&dir("bloomalways")).unwrap(),
                         &base,
                         "supdb-bloomalways",
                         false,
-                        true,
                     ),
                     (
                         Supdb::create_ingest_bloomalways(&dir("ingestbloomalways")).unwrap(),
                         &sib,
                         "supdb-ingestbloomalways",
-                        false,
-                        true,
-                    ),
-                    (
-                        Supdb::create_landfresh(&dir("landfresh")).unwrap(),
-                        &base,
-                        "supdb-landfresh",
-                        true,
-                        false,
-                    ),
-                    (
-                        Supdb::create_ingest_landfresh(&dir("ingestlandfresh")).unwrap(),
-                        &sib,
-                        "supdb-ingestlandfresh",
-                        true,
                         false,
                     ),
                 ] {
@@ -21590,15 +21331,8 @@ mod tests {
                     assert_eq!(z.features(), s.features(), "{arm}");
                     let o = z.db.as_ref().unwrap().options();
                     let so = s.db.as_ref().unwrap().options();
-                    assert_eq!(
-                        (o.bloom_pieces_only, o.land_fresh_lazy),
-                        (bloom, fresh),
-                        "{arm}"
-                    );
-                    assert!(
-                        so.bloom_pieces_only && so.land_fresh_lazy,
-                        "the engine's defaults"
-                    );
+                    assert_eq!(o.bloom_pieces_only, bloom, "{arm}");
+                    assert!(so.bloom_pieces_only, "the engine's default");
                     assert_eq!(
                         open(arm, &dir(&format!("{arm}-open")), 1).unwrap().name(),
                         arm
@@ -21624,16 +21358,8 @@ mod tests {
                     assert!(!o.run_spare, "{arm}");
                     assert!(so.run_spare, "the engine's default");
                     assert_eq!(
-                        (
-                            o.bloom_pieces_only,
-                            o.land_fresh_lazy,
-                            o.close_readable_inline
-                        ),
-                        (
-                            so.bloom_pieces_only,
-                            so.land_fresh_lazy,
-                            so.close_readable_inline
-                        ),
+                        (o.bloom_pieces_only, o.close_readable_inline),
+                        (so.bloom_pieces_only, so.close_readable_inline),
                         "{arm}: the arm differs in the run's file alone"
                     );
                     assert_eq!(

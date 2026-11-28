@@ -5256,7 +5256,8 @@ pub struct Options {
     /// ms of a drain of 8.5 at ten thousand keys on the buffered arm, whose
     /// seals leave pieces so that its reads take the piece path, and whose
     /// drain then promoted the one piece the load left. Off, the two
-    /// publishes, kept for pricing as `supdb-ingestdrainpromote`.
+    /// publishes: a seam for the tests that hold a drain's piece.
+    #[doc(hidden)]
     pub drain_names_partition: bool,
     /// Whether a manifest publish keeps the manifest it replaces linked
     /// under a spare name until the segment work's idle tick, or at open,
@@ -5325,18 +5326,6 @@ pub struct Options {
     /// it. On, `supdb-manifestpending` and `supdb-ingestmanifestpending`.
     /// Needs the slots; under the rename shape it does nothing.
     pub manifest_pending: bool,
-    /// A flush waits for the seal's manifest slot to be durable before it
-    /// returns. Off, the slot is written before the drain is answered and
-    /// fdatasynced after it, on the segment work's thread, with the WAL and
-    /// temp names it covers retired behind that sync: the segments are
-    /// durable either way, the slot's own round trip -- a quarter to half
-    /// a millisecond here, a tenth of a ten-thousand-key drain -- is off
-    /// the writer's wait, and a crash inside it leaves a torn or absent
-    /// newest slot, which the open ignores for the slot before it and
-    /// recovers the run from its temp name. `settle` and the close sync
-    /// the owed slot first. Kept for pricing as `supdb-waitmanifest` and
-    /// `supdb-ingestwaitmanifest`. Only with `manifest_slots`.
-    pub flush_waits_manifest: bool,
     /// A flush whose writes were all durable before it -- every commit
     /// synced, by `SyncPolicy::Always`, so that nothing is owed a sync
     /// (`Db::owes_sync`) and the drain's own run of ordered ingest, if it
@@ -5386,7 +5375,9 @@ pub struct Options {
     /// such a seal was a fsync of the whole log for nothing. Nor under
     /// `SyncPolicy::Explicit`, whose log is held in the process and a
     /// frameless drain writes to no file. On by default; off, a buffered
-    /// drain waits for its slot as before, `supdb-ingestsyncafter`.
+    /// drain waits for its slot as before: a seam for the tests that hold
+    /// a drain behind its slot.
+    #[doc(hidden)]
     pub drain_syncs_beside: bool,
     /// A direct run's writer path without the work its records need no
     /// longer: an ordered table's append takes no memtable hash for a key
@@ -5411,18 +5402,6 @@ pub struct Options {
     /// `supdb-directfull` and `supdb-ingestdirectfull`, the walk.
     #[doc(hidden)]
     pub direct_lean_append: bool,
-    /// A flush's commit of what is staged fsyncs the WAL whatever the
-    /// policy, before the seal is handed over: the buffered arm's drain
-    /// at ten thousand keys began with a 2.4 ms fdatasync of a log the
-    /// landing retires, a fifth of the shuffled load's drain, for frames
-    /// the segment makes durable before the flush is answered. Off, the
-    /// flush commits under the policy as a commit does, and a drain whose
-    /// WAL holds unsynced frames is answered only once its slot is
-    /// durable, as under `flush_waits_manifest`, since the log's
-    /// durability was what covered the window between the answer and the
-    /// slot's fdatasync. Kept for pricing as `supdb-walsync` and
-    /// `supdb-ingestwalsync`.
-    pub drain_syncs_wal: bool,
     /// EXPERIMENT, refuted and kept as an arm: a flush's close of a direct
     /// run composes the segment's trailer on the writer's own thread,
     /// which waits for the drain anyway and is warm, while the records'
@@ -5470,20 +5449,6 @@ pub struct Options {
     /// `supdb-ingestbloomalways`, the Bloom for every seal.
     #[doc(hidden)]
     pub bloom_pieces_only: bool,
-    /// A landing makes the empty live table it installs only where the
-    /// table it retires is still the live one, the one branch that
-    /// installs it; a landing that retires the oldest frozen table, which
-    /// is a drain's after the writer's freeze, makes none. The table had
-    /// been made for every landing that retired one and dropped unused by
-    /// all of those, on the landing's path: its three slabs' and three
-    /// arenas' tables of blocks, a quarter megabyte zeroed and freed, 394
-    /// thousand of a drain's landing's 451 thousand instructions at ten
-    /// thousand keys, and the durable ordered load's drain reads 1.05-1.06
-    /// ms against 1.13-1.15 for the arm in both orders. On; off,
-    /// `supdb-landfresh` and `supdb-ingestlandfresh`, the table for every
-    /// landing.
-    #[doc(hidden)]
-    pub land_fresh_lazy: bool,
     /// A run of ordered ingest begins in a file made ahead of it: an empty
     /// file under the run's temp name whose entry in the directory is
     /// behind a sync before the run asks for it, so the run's first commit
@@ -7807,15 +7772,12 @@ impl Default for Options {
             manifest_spare: true,
             manifest_slots: true,
             manifest_pending: false,
-            flush_waits_manifest: false,
             drain_answers_readable: true,
             drain_syncs_beside: true,
             direct_lean_append: true,
-            drain_syncs_wal: false,
             close_finish_inline: false,
             close_readable_inline: true,
             bloom_pieces_only: true,
-            land_fresh_lazy: true,
             run_spare: true,
             seal_snapshot_far: false,
             land_ranks_far: false,
@@ -47058,10 +47020,9 @@ impl Db {
         if self.mem().ordered {
             self.commit_direct()
         } else {
-            // Under the policy, as `commit` is: the sync `Wal::commit`
-            // made whatever the policy was cost a buffered drain a
-            // fdatasync of the whole log before its seal began
-            // (`Options::drain_syncs_wal`). A sync owed and not yet paid
+            // Under the policy, as `commit` is: a sync `Wal::commit` made
+            // whatever the policy was cost a buffered drain a fdatasync of
+            // the whole log before its seal began. A sync owed and not yet paid
             // -- the staged frames under `Always`, or what an `EveryN`
             // left -- is paid here; one the log holds nothing for is
             // skipped. A failed one is never owed: it is kept
@@ -47072,12 +47033,11 @@ impl Db {
             if staged {
                 self.unsynced = self.unsynced.saturating_add(1);
             }
-            let due = self.opts.drain_syncs_wal
-                || match self.opts.sync {
-                    SyncPolicy::Always => true,
-                    SyncPolicy::EveryN(n) => self.unsynced >= n.max(1),
-                    SyncPolicy::Explicit => false,
-                };
+            let due = match self.opts.sync {
+                SyncPolicy::Always => true,
+                SyncPolicy::EveryN(n) => self.unsynced >= n.max(1),
+                SyncPolicy::Explicit => false,
+            };
             if due
                 && (self.log_unsynced()
                     || !self.loose_wals.is_empty()
@@ -60365,8 +60325,7 @@ impl Maint {
             }
             SealCounts::add(&self.shared.seal_counts.dir_owed_syncs, 1);
         }
-        let defer =
-            draining && !self.opts.flush_waits_manifest && !self.pending_on() && !wal_unsynced;
+        let defer = draining && !self.pending_on() && !wal_unsynced;
         let out = self.land_durable(t, wal, tmp, defer);
         self.shared.drain_steps.stamp(11);
         // Counted out once the manifest names the segments, or the landing
@@ -60921,7 +60880,7 @@ impl Maint {
         // One fresh table for every attempt: a landing that lost the swap
         // installs the same empty table on its retry. Made where an attempt
         // finds the table it retires still live, the one branch that
-        // installs it (`Options::land_fresh_lazy`): a landing that retires
+        // installs it: a landing that retires
         // the oldest frozen table installs none, and the table made for it
         // anyway was built and dropped on the landing's path, which is a
         // drain's.
@@ -60933,9 +60892,6 @@ impl Maint {
             ))
         };
         let mut fresh: Option<std::sync::Arc<MemTable>> = None;
-        if landed.is_some() && !self.opts.land_fresh_lazy {
-            fresh = Some(make_fresh(self));
-        }
         debug_assert!(
             Self::partitions_tile(&segs),
             "a segment publish left partitions that do not tile the key space: {:?}",
