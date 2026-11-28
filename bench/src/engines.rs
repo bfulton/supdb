@@ -466,6 +466,12 @@ pub trait ThreadWriter {
     fn rmw(&mut self, _key: &[u8], _value: &[u8]) -> Option<Res<usize>> {
         None
     }
+    /// The end of this thread's share, inside the clock: what the handle
+    /// holds back committed now (`SupdbWriter::rmw`'s staged puts).
+    /// Nothing for an engine that holds nothing back.
+    fn finish(&mut self) -> Res<()> {
+        Ok(())
+    }
     /// What this handle counted of its own operations, read on its thread
     /// once its share is done and outside the clock: the threaded mixes'
     /// `threadcounters` line (`SUPDB_THREADED_COUNTERS`). Nothing for an
@@ -12839,10 +12845,22 @@ fn handle_counters(r: &supdb::Reader) -> Vec<(&'static str, u64)> {
 }
 
 /// A writer thread's supdb: a `Reader` of its own for the reads, and the
-/// store's one writer, shared with the other threads, for the batches.
+/// store's one writer, shared with the other threads, for the batches and
+/// the conditional puts.
 struct SupdbWriter<'a> {
     db: std::sync::Arc<std::sync::Mutex<&'a mut supdb::Db>>,
     r: supdb::Reader,
+    /// The conditional puts every thread staged since the writer's last
+    /// commit (`rmw`), changed only under the writer's lock.
+    staged: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    /// The key's newest value as this thread's read found it, kept for
+    /// the next read to write over.
+    newest: Vec<u8>,
+    /// The conditional puts of this thread's refused (`rmw`).
+    refused: std::cell::Cell<u64>,
+    /// Whether the handle reads the writer's staged batch, as it does from
+    /// its first read-modify-write (`rmw`).
+    dirty: bool,
 }
 
 impl ThreadWriter for SupdbWriter<'_> {
@@ -12850,15 +12868,90 @@ impl ThreadWriter for SupdbWriter<'_> {
         supdb_get(&self.r, key)
     }
     fn counters(&self) -> Vec<(&'static str, u64)> {
-        handle_counters(&self.r)
+        let mut c = handle_counters(&self.r);
+        c.push(("refused", self.refused.get()));
+        c
     }
     fn update_batch(&mut self, items: &[(&[u8], &[u8])]) -> Res<()> {
-        let mut db = self
-            .db
-            .lock()
-            .map_err(|_| "a writer thread panicked holding the store".to_string())?;
+        let mut db = self.lock()?;
         db.put_batch(items);
         db.commit().map_err(|e| e.to_string())
+    }
+    /// A read-modify-write through the conditional put: the key read
+    /// through this thread's handle, which takes no lock, and the value put
+    /// by the store's writer only where the key's newest value is still the
+    /// one read (`Db::put_if`). The puts are staged and committed a hundred
+    /// at a time, as `update_batch` commits a batch, and the rest at
+    /// `finish`; the handle reads the staged batch (`Isolation::Dirty`),
+    /// as a shared table's handles and FASTER's sessions read every write
+    /// as it lands, so that a thread reads its own put and the others'. A
+    /// write of the key between the read and the put refuses it, and the
+    /// key is read again by the writer, under its lock, so that the second
+    /// put lands.
+    fn rmw(&mut self, key: &[u8], value: &[u8]) -> Option<Res<usize>> {
+        if !self.dirty {
+            self.r.set_isolation(supdb::Isolation::Dirty);
+            self.dirty = true;
+        }
+        Some((|| {
+            let newest = &mut self.newest;
+            let mut n = 0usize;
+            let mut read = false;
+            let mut take = |v: &[u8]| {
+                n += consume(v);
+                newest.clear();
+                newest.extend_from_slice(v);
+                read = true;
+            };
+            self.r.read_all(key, &mut take).map_err(|e| e.to_string())?;
+            let mut db = self
+                .db
+                .lock()
+                .map_err(|_| "a writer thread panicked holding the store".to_string())?;
+            let landed = db
+                .put_if(key, read.then_some(newest.as_slice()), value)
+                .map_err(|e| e.to_string())?;
+            if !landed {
+                self.refused.set(self.refused.get() + 1);
+                (n, read) = (0, false);
+                let mut take = |v: &[u8]| {
+                    n += consume(v);
+                    newest.clear();
+                    newest.extend_from_slice(v);
+                    read = true;
+                };
+                db.read_all(key, &mut take).map_err(|e| e.to_string())?;
+                if !db
+                    .put_if(key, read.then_some(newest.as_slice()), value)
+                    .map_err(|e| e.to_string())?
+                {
+                    return Err(
+                        "a put refused on the writer's own read, under its lock".to_string()
+                    );
+                }
+            }
+            use std::sync::atomic::Ordering::Relaxed;
+            if self.staged.fetch_add(1, Relaxed) + 1 >= crate::run::YCSB_BATCH {
+                self.staged.store(0, Relaxed);
+                db.commit().map_err(|e| e.to_string())?;
+            }
+            Ok(n)
+        })())
+    }
+    fn finish(&mut self) -> Res<()> {
+        let mut db = self.lock()?;
+        if self.staged.swap(0, std::sync::atomic::Ordering::Relaxed) > 0 {
+            db.commit().map_err(|e| e.to_string())?;
+        }
+        Ok(())
+    }
+}
+
+impl<'a> SupdbWriter<'a> {
+    fn lock(&self) -> Res<std::sync::MutexGuard<'_, &'a mut supdb::Db>> {
+        self.db
+            .lock()
+            .map_err(|_| "a writer thread panicked holding the store".to_string())
     }
 }
 
@@ -12886,6 +12979,7 @@ impl ThreadWriter for SupdbSharedWriter<'_> {
         let mut c = handle_counters(&self.r);
         c.push(("lean", self.r.shared_lean_ops()));
         c.push(("rmw_below", self.r.shared_rmw_below()));
+        c.push(("rmw_again", self.r.cond_again()));
         c.push(("fall_asks", self.r.shared_fall_asks()));
         c.push(("freezes", self.freezes.get()));
         c.push(("freeze_us", self.freeze_us.get()));
@@ -12901,7 +12995,9 @@ impl ThreadWriter for SupdbSharedWriter<'_> {
     }
     /// The handle's own read-modify-write (`Reader::rmw`): one probe of
     /// the live table where it holds the key's whole read, as FASTER's
-    /// `Rmw` is one operation.
+    /// `Rmw` is one operation, and a read and a put on condition that the
+    /// key's newest value is still the one read where it does not, both
+    /// again where another thread's write of the key came between.
     fn rmw(&mut self, key: &[u8], value: &[u8]) -> Option<Res<usize>> {
         Some((|| loop {
             // Counted afresh at each try: a try that read through the older
@@ -15673,10 +15769,11 @@ impl Engine for Supdb {
             });
         }
         let db = std::sync::Arc::new(std::sync::Mutex::new(db));
+        let staged = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
         Ok(readers
             .into_iter()
             .map(|r| {
-                let db = db.clone();
+                let (db, staged) = (db.clone(), staged.clone());
                 Box::new(move || {
                     Ok(if shared {
                         Box::new(SupdbSharedWriter {
@@ -15686,7 +15783,14 @@ impl Engine for Supdb {
                             freeze_us: std::cell::Cell::new(0),
                         }) as Box<dyn ThreadWriter + '_>
                     } else {
-                        Box::new(SupdbWriter { db, r }) as Box<dyn ThreadWriter + '_>
+                        Box::new(SupdbWriter {
+                            db,
+                            r,
+                            staged,
+                            newest: Vec::new(),
+                            refused: std::cell::Cell::new(0),
+                            dirty: false,
+                        }) as Box<dyn ThreadWriter + '_>
                     })
                 }) as WriterOpener<'_>
             })

@@ -105,6 +105,8 @@ tx.append(b"user:42", b"logged out");
 tx.delete(b"config");
 tx.commit()?;
 
+db.put_if(b"config", None, b"v3")?;  // only where the newest value is the one named
+
 db.read_all(b"user:42", |v| println!("{}", String::from_utf8_lossy(v)))?;
 let n = db.count(b"user:42")?;       // costs a lookup, not a read
 db.scan(b"user:", 100, |key, value| { /* in key order */ })?;

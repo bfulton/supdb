@@ -422,3 +422,11 @@ Reader::put	-	main #30: a write through a handle under the held log (Options::sh
 Reader::append	-	main #30: a write through a handle under the held log (Options::shared_writers, share_on_write), an operation on no probe of scripts/cost.sh: the gap, owed a probe beside the writer's own put
 Reader::delete	-	main #30: a write through a handle under the held log (Options::shared_writers, share_on_write), an operation on no probe of scripts/cost.sh: the gap, owed a probe beside the writer's own put
 Reader::rmw	-	main #30: a write through a handle under the held log (Options::shared_writers, share_on_write), an operation on no probe of scripts/cost.sh: the gap, owed a probe beside the writer's own put
+Reader::put_if	-	a write on condition through a handle under the held log (Options::shared_writers, share_on_write), an operation on no probe of scripts/cost.sh: the gap, owed a probe beside the writer's own put, as Reader::put
+Reader::delete_if	-	the same write's delete, as Reader::delete
+Reader::cond_again	-	a test seam or a counter: reads or sets the store's bookkeeping, at no key, entry, block or step of an operation
+Reader::cond_insert_held	-	a test seam or a counter: reads or sets the store's bookkeeping, at no key, entry, block or step of an operation
+Reader::hold_cond_inserts	-	a test seam that holds a conditional write between its probe and its insert, at no key, entry, block or step of an operation
+Reader::hold_rmw_reads	-	a test seam that holds a read-modify-write between its read and its put on condition, at no key, entry, block or step of an operation
+Db::put_if	-	a write on condition: a point read, which the read probes count through read_all, and Db::put's path past its pin, which work and land count through Db::put; no probe writes on condition
+Db::delete_if	-	the same write's delete: the point read, and Db::delete's path, which work counts

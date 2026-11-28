@@ -6443,6 +6443,134 @@ fn an_open_verifies_the_key_sections_unless_told_not_to() {
     let _ = std::fs::remove_dir_all(&d);
 }
 
+/// A conditional write applies only where the key's newest value is the
+/// one expected (`Db::put_if`, `Db::delete_if`, and a transaction's): the
+/// writer's check reads its staged writes, a transaction's its own staged
+/// operations, a key with no value is expected as none and a deleted key
+/// reads as one, and wherever the key's values lie -- unsealed, in a piece,
+/// in a partition. A refused write leaves the store and the staged batch as
+/// they were: the writer reads what it read before, the batch commits
+/// what was staged, and the store a crash and a reopen leave holds every
+/// applied write and no refused one.
+#[test]
+fn a_conditional_write_applies_only_where_the_key_is_as_it_was_read() {
+    let d = dir("put-if");
+    let o = common::options();
+    let mut db = Db::create(&d, o.clone()).unwrap();
+    for (state, step) in ["unsealed", "in a piece", "in a partition"].iter().zip(0..) {
+        let k = |s: &str| format!("{step}-{s}").into_bytes();
+        db.put(&k("a"), b"1");
+        db.commit().unwrap();
+        match step {
+            1 => {
+                db.seal().unwrap();
+                db.settle().unwrap();
+            }
+            2 => db.flush().unwrap(),
+            _ => {}
+        }
+        assert!(
+            db.put_if(&k("a"), Some(b"1"), b"2").unwrap(),
+            "{state}: as read"
+        );
+        assert_eq!(
+            read_vec(&db, &k("a")),
+            vec![b"2".to_vec()],
+            "{state}: the staged put read"
+        );
+        let staged = db.unsealed_keys();
+        assert!(
+            !db.put_if(&k("a"), Some(b"1"), b"3").unwrap(),
+            "{state}: read before the put"
+        );
+        assert!(
+            !db.delete_if(&k("a"), Some(b"1")).unwrap(),
+            "{state}: a stale delete"
+        );
+        assert!(
+            !db.put_if(&k("a"), None, b"3").unwrap(),
+            "{state}: a key with a value"
+        );
+        assert!(
+            !db.put_if(&k("new"), Some(b"x"), b"3").unwrap(),
+            "{state}: a key with none"
+        );
+        assert_eq!(
+            db.unsealed_keys(),
+            staged,
+            "{state}: nothing staged by a refusal"
+        );
+        assert_eq!(
+            read_vec(&db, &k("a")),
+            vec![b"2".to_vec()],
+            "{state}: refused, unchanged"
+        );
+        assert!(
+            db.put_if(&k("new"), None, b"1").unwrap(),
+            "{state}: a key with no value"
+        );
+        assert!(
+            db.delete_if(&k("a"), Some(b"2")).unwrap(),
+            "{state}: a delete as read"
+        );
+        assert!(
+            db.put_if(&k("a"), None, b"4").unwrap(),
+            "{state}: a deleted key reads none"
+        );
+        db.commit().unwrap();
+        // A transaction's: its own staged operations are what it reads.
+        let mut tx = db.begin();
+        assert!(
+            tx.put_if(&k("tx"), None, b"1").unwrap(),
+            "{state}: a transaction's first"
+        );
+        let n = tx.len();
+        assert!(
+            !tx.put_if(&k("tx"), None, b"x").unwrap(),
+            "{state}: its own put read"
+        );
+        assert!(
+            !tx.delete_if(&k("a"), Some(b"2")).unwrap(),
+            "{state}: the store's value read"
+        );
+        assert_eq!(tx.len(), n, "{state}: nothing staged by a refusal");
+        assert!(
+            tx.put_if(&k("tx"), Some(b"1"), b"2").unwrap(),
+            "{state}: over its own"
+        );
+        assert!(
+            tx.delete_if(&k("new"), Some(b"1")).unwrap(),
+            "{state}: the store's, deleted"
+        );
+        tx.commit().unwrap();
+        assert_eq!(read_vec(&db, &k("tx")), vec![b"2".to_vec()]);
+        assert_eq!(read_vec(&db, &k("new")), Vec::<Vec<u8>>::new());
+        assert_eq!(read_vec(&db, &k("a")), vec![b"4".to_vec()]);
+    }
+    db.crash();
+    let db = Db::open(&d, o).unwrap();
+    for step in 0..3 {
+        let k = |s: &str| format!("{step}-{s}").into_bytes();
+        assert_eq!(
+            read_vec(&db, &k("a")),
+            vec![b"4".to_vec()],
+            "step {step} reopened"
+        );
+        assert_eq!(
+            read_vec(&db, &k("tx")),
+            vec![b"2".to_vec()],
+            "step {step} reopened"
+        );
+        assert_eq!(
+            read_vec(&db, &k("new")),
+            Vec::<Vec<u8>>::new(),
+            "step {step} reopened"
+        );
+    }
+    db.close().unwrap();
+    let _ = std::fs::remove_dir_all(&d);
+}
+
 /// The bulk walk over partitions with unsealed keys laid over it, held to
 /// the merge it stands in for, in every state the store passes through.
 ///

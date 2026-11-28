@@ -1292,11 +1292,36 @@ The first and the last are built, with the second:
 - **A handle's read-modify-write** (`Reader::rmw`) is one probe and one hold
   of the key's stripe where the live chain holds a tombstone. That covers
   every key a put has reached, and is FASTER's `Rmw` as one operation.
-  Elsewhere it is a read and then a put.
+  Elsewhere it is a read and then a put on condition that the key's newest
+  value is still the one read, both made again where another writer's
+  write of the key came between, as a conditional write is made (below).
 - **`supdb-heldsharedbig`** sizes the table at twice the store's records as
   FASTER's log counts them (`Options::shared_table_bytes`), so the table
   holds every key with room for the ranges not yet reused. Its index is
   twice the bytes of FASTER's.
+
+A conditional write puts or deletes a key only where its newest value is
+the one its caller names, none for a key that reads no value (`put_if`
+and `delete_if`, on a `Reader`, the `Db` and a `Txn`). A handle's
+check is made where no write of the key can come between it and the write:
+- **A key the live table holds** is checked at the head of its chain under
+  the key's stripe, and written under the same hold
+  (`MemTable::chain_shared_if`).
+- **A key it does not hold** is read below the table in the handle's pin,
+  whose sources no write changes, and laid down by a compare-and-swap of the
+  slot the probe found vacant. Another writer's insert there may be of the
+  key, so a lost slot is probed again and the check made on what the slot
+  now holds (`MemTable::insert_shared_if`).
+
+The writer's own check reads its staged writes with the store's, and its
+write is staged as any put is. A `Txn` checks against what it sees, its own
+staged operations included, and a refused write stages nothing. Under
+`Options::shared_writers` a handle's write landing between a transaction's
+check and its commit is not seen by the check, where `Db::put_if` makes the
+check in the one hold a handle's does. In `threads-RMW` the one-writer arms
+read through each thread's handle and put through the writer on that
+condition, reading again under the writer's lock where the put is refused,
+so that no arm of the engine's loses an update.
 
 Paired at `7b895b9`, with the same passes and reps as above:
 - **Against FASTER** (`pair.sh supdb-heldsharedbig faster 300000`), the

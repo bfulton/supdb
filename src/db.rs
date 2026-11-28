@@ -17186,6 +17186,44 @@ const LEAN_COPY: usize = 256;
 /// ahead of its key compare (`MemTable::ask_record`).
 const LEAN_AHEAD: usize = 128;
 
+/// What a conditional write came to (`Reader::put_if`, `Db::put_if`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CondWrite {
+    /// The key's newest value was the one expected, and the write was made.
+    Applied,
+    /// The key's newest value was another, and nothing was written.
+    Refused,
+    /// A handle's write found the live table full, or the one writer's, and
+    /// nothing was read or written, as a handle's `put` answers `false`:
+    /// the writer's commit makes room, and the write is asked again.
+    Full,
+}
+
+/// What `MemTable::write_shared_if` came to.
+enum SharedIf {
+    /// The key was in the table, and the write was checked there.
+    Done(CondWrite),
+    /// The key was not, and would take this vacant slot.
+    Vacant(usize),
+}
+
+/// The newest of the values `vals` holds, the end of each in `ends`
+/// (`Reader::read_values`): none where the key read no value.
+fn newest_of<'v>(vals: &'v [u8], ends: &[usize]) -> Option<&'v [u8]> {
+    match *ends {
+        [] => None,
+        [end] => Some(&vals[..end]),
+        [.., start, end] => Some(&vals[start..end]),
+    }
+}
+
+/// The bits of `Shared::cond_hold`: the two hold points a test may set
+/// (`Reader::hold_cond_inserts`, `Reader::hold_rmw_reads`), and the one a
+/// write held at either sets while it waits.
+const HOLD_COND_INSERT: u8 = 1;
+const COND_HELD: u8 = 2;
+const HOLD_RMW_READ: u8 = 4;
+
 /// What a shared read-modify-write came to (`MemTable::rmw_shared`).
 enum SharedRmw {
     /// Read and written in the one probe, or not, the table full.
@@ -21059,6 +21097,75 @@ impl MemTable {
         }
     }
 
+    /// Shared, on condition (`Reader::put_if`): `w` over `key` where its
+    /// newest value is `expect`. Where the table holds the key, checked and
+    /// written under the key's stripe (`chain_shared_if`). Where it does
+    /// not, the slot the key would take is answered (`SharedIf::Vacant`)
+    /// for the caller to read the key's newest value below the table and,
+    /// where it is `expect`, to lay the write down at that slot
+    /// (`insert_shared_if`), which a writer that takes the slot first
+    /// refuses.
+    fn write_shared_if(
+        &self,
+        l: &mut TableLocal,
+        rd: Option<&Readers>,
+        hash: u64,
+        key: &[u8],
+        w: SharedWrite<'_>,
+        expect: Option<&[u8]>,
+    ) -> SharedIf {
+        let st = self.shared.as_deref().expect("a shared table's");
+        if l.uid != st.uid {
+            *l = TableLocal {
+                uid: st.uid,
+                rewrites: l.rewrites,
+                ..TableLocal::default()
+            };
+        }
+        let idx = self.index().expect("a hashed table has an index");
+        let tag = hash & !0xffff_ffff;
+        let mut i = slot_of(hash, idx.mask);
+        loop {
+            let s = idx.slots[i].load(AtomicOrdering::Acquire);
+            if s == 0 {
+                return SharedIf::Vacant(i);
+            }
+            if s & !0xffff_ffff == tag {
+                if s & 0xffff_ffff == SLOT_TENTATIVE {
+                    // An insert in flight with this tag may be of this key.
+                    std::hint::spin_loop();
+                    continue;
+                }
+                let (id, e) = self.slot_entry(s & 0xffff_ffff);
+                self.ask_head(e);
+                if crate::flatindex::key_eq(self.key_of(e), key) {
+                    return SharedIf::Done(self.chain_shared_if(st, l, rd, id, e, w, expect));
+                }
+            }
+            i = (i + 1) & idx.mask;
+        }
+    }
+
+    /// `write_shared_if`'s write of a key the table did not hold, at slot
+    /// `i`, which the probe found vacant: `Lost` where another writer took
+    /// the slot first, whose key may be this one, for the caller to probe
+    /// again; the key's newest value below the table was `expect`, read in
+    /// the pin this runs in, whose sources nothing writes.
+    #[allow(clippy::too_many_arguments)]
+    fn insert_shared_if(
+        &self,
+        l: &mut TableLocal,
+        rd: Option<&Readers>,
+        i: usize,
+        hash: u64,
+        key: &[u8],
+        w: SharedWrite<'_>,
+    ) -> SharedInsert {
+        let st = self.shared.as_deref().expect("a shared table's");
+        let idx = self.index().expect("a hashed table has an index");
+        self.insert_shared(st, l, rd, idx, i, hash, key, w)
+    }
+
     /// Shared: `w` at the head of entry `id`'s chain under the entry's
     /// stripe, its count kept as the one writer keeps it: one value after a
     /// put, none after a delete, one more after an append.
@@ -21079,6 +21186,61 @@ impl MemTable {
     ) -> bool {
         let c = self.key_cells(st, id, e);
         let v = shared_lock(c.lock);
+        self.chain_write_locked(st, l, rd, &c, v, w)
+    }
+
+    /// `chain_shared` on condition: under the entry's stripe, `w` laid down
+    /// only where the key's newest value is `expect` -- the value at the
+    /// head of its chain, or none where a tombstone heads it -- the check
+    /// and the write in the one hold, so that no write of the key comes
+    /// between them.
+    #[allow(clippy::too_many_arguments)]
+    fn chain_shared_if(
+        &self,
+        st: &SharedTable,
+        l: &mut TableLocal,
+        rd: Option<&Readers>,
+        id: usize,
+        e: Entry<'_>,
+        w: SharedWrite<'_>,
+        expect: Option<&[u8]>,
+    ) -> CondWrite {
+        let c = self.key_cells(st, id, e);
+        let v = shared_lock(c.lock);
+        let head = match c.head.load(AtomicOrdering::Acquire) {
+            0 => NO_CHUNK,
+            h => h - 1,
+        };
+        // An entry is published with its chain's head written
+        // (`insert_shared`), so a chain the probe found has one; the chunk
+        // at its head is the key's newest write, and under the lock no
+        // write of the key is in flight.
+        debug_assert!(head != NO_CHUNK, "a published entry has a chain");
+        let newest = (head != NO_CHUNK)
+            .then(|| self.vals.chunk(head as usize))
+            .and_then(|ch| (ch.len != TOMB_LEN).then(|| ch.value()));
+        if newest != expect {
+            c.lock.store(v, AtomicOrdering::Release);
+            return CondWrite::Refused;
+        }
+        if self.chain_write_locked(st, l, rd, &c, v, w) {
+            CondWrite::Applied
+        } else {
+            CondWrite::Full
+        }
+    }
+
+    /// `chain_shared` past the stripe's lock, which this releases: `v` the
+    /// lock's reading when it was taken.
+    fn chain_write_locked(
+        &self,
+        st: &SharedTable,
+        l: &mut TableLocal,
+        rd: Option<&Readers>,
+        c: &KeyCells<'_>,
+        v: u32,
+        w: SharedWrite<'_>,
+    ) -> bool {
         let head = match c.head.load(AtomicOrdering::Acquire) {
             0 => NO_CHUNK,
             h => h - 1,
@@ -27503,6 +27665,10 @@ struct Shared {
     /// A test's: the store writes as a release from before `Seg::bare`
     /// did (`Db::write_as_older_release`).
     as_older: std::sync::atomic::AtomicBool,
+    /// A test's: the first conditional write of a key the live table lacks
+    /// to reach its insert waits there while bit 0 stands
+    /// (`Reader::hold_cond_inserts`); bit 1 says one is waiting.
+    cond_hold: std::sync::atomic::AtomicU8,
     /// What building and attaching form files did over the store's life
     /// (`Options::zpages`), counted by the thread that did it; a read's
     /// own counts are on its slot's line. See `Db::zpage_counts`.
@@ -29016,6 +29182,10 @@ pub struct Reader {
     /// The gets, puts and read-modify-writes the lean path answered
     /// (`Options::shared_lean`).
     lean_ops: std::cell::Cell<u64>,
+    /// Conditional writes whose insert of a key the table lacked lost its
+    /// slot to another writer and probed again (`Reader::put_if`), for the
+    /// test that must know the path was taken.
+    cond_again: std::cell::Cell<u64>,
     /// This handle's last read found no record of its key in the live
     /// table (`Options::shared_fall_ahead`).
     lean_fell: std::cell::Cell<bool>,
@@ -30364,6 +30534,234 @@ impl Reader {
         self.write_shared(key, SharedWrite::Delete)
     }
 
+    /// `put` on condition: `value` put over `key` only where the key's
+    /// newest value is `expect` -- what this handle read of it, `None`
+    /// where it read no value -- the check and the write made in one hold
+    /// of the key, so that threads read-modify-writing a key through their
+    /// handles lose no write between a read and a put. `Refused`, with
+    /// nothing written, where the newest value is another; `Full` where
+    /// `put` would answer `false`.
+    pub fn put_if(&self, key: &[u8], expect: Option<&[u8]>, value: &[u8]) -> Result<CondWrite> {
+        self.write_shared_if(key, expect, SharedWrite::Put(value))
+    }
+
+    /// `delete` on condition, as `put_if` writes: see there.
+    pub fn delete_if(&self, key: &[u8], expect: Option<&[u8]>) -> Result<CondWrite> {
+        self.write_shared_if(key, expect, SharedWrite::Delete)
+    }
+
+    /// A handle's conditional write: in the live table where it holds the
+    /// key, under the key's stripe; and where it does not, the key's newest
+    /// value read below the table, in this pin, whose sources no write
+    /// changes and whose table no freeze closes before the pin moves on,
+    /// then the write laid down in the slot the key would take, which
+    /// another writer's insert of the key takes first, the probe made
+    /// again.
+    fn write_shared_if(
+        &self,
+        key: &[u8],
+        expect: Option<&[u8]>,
+        w: SharedWrite<'_>,
+    ) -> Result<CondWrite> {
+        self.may_write_shared()?;
+        let _e = self.enter();
+        let st = self.state();
+        if st.mem.shared.is_none() || st.mem.closed.load(AtomicOrdering::SeqCst) {
+            // As `write_shared` answers a put to the one writer's table or
+            // to a table its freeze has closed.
+            return Ok(CondWrite::Full);
+        }
+        // The handle's table-local state taken out of its cell for the
+        // write, since the read below the table reads through this handle.
+        let mut l = std::mem::take(&mut *self.shared_local.borrow_mut());
+        let r = self.cond_shared(&mut l, st, key, expect, w);
+        *self.shared_local.borrow_mut() = l;
+        r
+    }
+
+    /// The conditional write into `st`'s shared live table, its writer's
+    /// table-local state `l`: a handle's (`write_shared_if`) or the
+    /// writer's own (`Db::put_if`).
+    fn cond_shared(
+        &self,
+        l: &mut TableLocal,
+        st: &State,
+        key: &[u8],
+        expect: Option<&[u8]>,
+        w: SharedWrite<'_>,
+    ) -> Result<CondWrite> {
+        let mem = &st.mem;
+        let hash = mem.hash(key);
+        let rd = Some(&self.shared.readers);
+        let (mut vals, mut ends) = (Vec::new(), Vec::new());
+        loop {
+            let i = match mem.write_shared_if(l, rd, hash, key, w, expect) {
+                SharedIf::Done(done) => return Ok(done),
+                SharedIf::Vacant(i) => i,
+            };
+            self.read_values(st, key, (true, None), &mut vals, &mut ends)?;
+            if newest_of(&vals, &ends) != expect {
+                return Ok(CondWrite::Refused);
+            }
+            if let Some(done) = self.cond_insert(l, mem, i, hash, key, w) {
+                return Ok(done);
+            }
+        }
+    }
+
+    /// `key`'s values in `st`, read in this pin into `vals`, the end of
+    /// each in `ends`, oldest first as `read_all` gives them: below the
+    /// table alone at `hint`'s word that the table lacks the key, with the
+    /// slot its partition's read takes asked for ahead (`read_below`). The
+    /// read a conditional write draws its condition from, through the one
+    /// closure, so that the read path is compiled once for every caller.
+    fn read_values(
+        &self,
+        st: &State,
+        key: &[u8],
+        hint: (bool, Option<(u64, usize)>),
+        vals: &mut Vec<u8>,
+        ends: &mut Vec<usize>,
+    ) -> Result<()> {
+        vals.clear();
+        ends.clear();
+        self.read_begin();
+        self.read_below(st, key, hint.0, hint.1, |v| {
+            vals.extend_from_slice(v);
+            ends.push(vals.len());
+        })?;
+        Ok(())
+    }
+
+    /// A conditional write's insert of a key the table lacked, at the slot
+    /// `i` its probe found vacant, past the read below the table its
+    /// condition was drawn from: `None` where another writer's insert took
+    /// the slot first, which may be of this key, counted (`cond_again`) for
+    /// the caller to probe again.
+    fn cond_insert(
+        &self,
+        l: &mut TableLocal,
+        mem: &MemTable,
+        i: usize,
+        hash: u64,
+        key: &[u8],
+        w: SharedWrite<'_>,
+    ) -> Option<CondWrite> {
+        if self.shared.cond_hold.load(AtomicOrdering::Relaxed) & HOLD_COND_INSERT != 0 {
+            self.hold_cond(HOLD_COND_INSERT);
+        }
+        match mem.insert_shared_if(l, Some(&self.shared.readers), i, hash, key, w) {
+            SharedInsert::Done => Some(CondWrite::Applied),
+            SharedInsert::Full => Some(CondWrite::Full),
+            SharedInsert::Lost => {
+                self.cond_again.set(self.cond_again.get() + 1);
+                None
+            }
+        }
+    }
+
+    /// `Reader::rmw` where the live table does not hold the key's whole
+    /// read: the key's values read in this pin (`read_values`, `hint` as
+    /// there), and `value` put on condition that the key's newest value is
+    /// still the one read, under the key's stripe where the table holds the
+    /// key (`MemTable::write_shared_if`) and, where it does not, at the slot
+    /// the key would take (`cond_insert`), the read having found nothing of
+    /// the table's and the sources below it changing in no pin. Read and put
+    /// again where another writer's write of the key came between, and `f`
+    /// handed the values of the read the put was made over, once it is.
+    fn rmw_spread(
+        &self,
+        st: &State,
+        hash: u64,
+        key: &[u8],
+        value: &[u8],
+        mut hint: (bool, Option<(u64, usize)>),
+        f: &mut dyn FnMut(&[u8]),
+    ) -> Result<bool> {
+        let mem = &st.mem;
+        let w = SharedWrite::Put(value);
+        let rd = Some(&self.shared.readers);
+        let (mut vals, mut ends) = (Vec::new(), Vec::new());
+        loop {
+            self.read_values(st, key, hint, &mut vals, &mut ends)?;
+            hint = (false, None);
+            if self.shared.cond_hold.load(AtomicOrdering::Relaxed) & HOLD_RMW_READ != 0 {
+                self.hold_cond(HOLD_RMW_READ);
+            }
+            let mut l = self.shared_local.borrow_mut();
+            let done = match mem.write_shared_if(&mut l, rd, hash, key, w, newest_of(&vals, &ends))
+            {
+                SharedIf::Done(done) => Some(done),
+                SharedIf::Vacant(i) => self.cond_insert(&mut l, mem, i, hash, key, w),
+            };
+            drop(l);
+            match done {
+                Some(CondWrite::Applied) => break,
+                Some(CondWrite::Full) => return Ok(false),
+                Some(CondWrite::Refused) => self.cond_again.set(self.cond_again.get() + 1),
+                // Counted where the slot was lost.
+                None => {}
+            }
+        }
+        let mut start = 0;
+        for &end in &ends {
+            f(&vals[start..end]);
+            start = end;
+        }
+        Ok(true)
+    }
+
+    /// A test's: the wait of `Reader::hold_cond_inserts` and
+    /// `Reader::hold_rmw_reads`, at the hold point `at` names, for the
+    /// first write to reach one; a write that finds one waiting goes on.
+    #[cold]
+    fn hold_cond(&self, at: u8) {
+        let h = &self.shared.cond_hold;
+        if h.fetch_or(COND_HELD, AtomicOrdering::AcqRel) & COND_HELD != 0 {
+            return;
+        }
+        while h.load(AtomicOrdering::Acquire) & at != 0 {
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        h.fetch_and(!COND_HELD, AtomicOrdering::AcqRel);
+    }
+
+    /// A test's: while `on`, the first conditional write of a key the live
+    /// table lacks to reach its insert waits between its probe and the
+    /// insert, past its read below the table (`Reader::put_if`,
+    /// `Reader::rmw`), so that another writer's write of the key can be
+    /// made in between.
+    #[doc(hidden)]
+    pub fn hold_cond_inserts(&self, on: bool) {
+        Db::set_hold_bit(&self.shared.cond_hold, HOLD_COND_INSERT, on);
+    }
+
+    /// A test's: while `on`, the first read-modify-write whose read the
+    /// live table does not hold whole to finish its read waits between the
+    /// read and the put on its condition (`Reader::rmw`), so that another
+    /// writer's write of the key can be made in between.
+    #[doc(hidden)]
+    pub fn hold_rmw_reads(&self, on: bool) {
+        Db::set_hold_bit(&self.shared.cond_hold, HOLD_RMW_READ, on);
+    }
+
+    /// A test's: whether a conditional write waits in a hold of
+    /// `Reader::hold_cond_inserts` or `Reader::hold_rmw_reads`.
+    #[doc(hidden)]
+    pub fn cond_insert_held(&self) -> bool {
+        self.shared.cond_hold.load(AtomicOrdering::Acquire) & COND_HELD != 0
+    }
+
+    /// A test's: the conditional writes this handle made again -- an
+    /// insert of a key the live table lacked that lost its slot to another
+    /// writer's insert (`Reader::put_if`), or a read-modify-write that
+    /// another writer's write of the key came after the read of
+    /// (`Reader::rmw`) -- and so probed, or read and probed, again.
+    #[doc(hidden)]
+    pub fn cond_again(&self) -> u64 {
+        self.cond_again.get()
+    }
+
     /// A test's: `Db::shared_writes_held`, through a handle, for a test
     /// whose writer is inside the commit the held write is to land in.
     #[doc(hidden)]
@@ -30495,80 +30893,84 @@ impl Reader {
     }
 
     /// EXPERIMENT (`Options::shared_writers`): `key`'s values given to `f`,
-    /// oldest first, as `read_all` gives them, and `value` put over them.
-    /// Where the live table holds the whole of what the key reads -- an
-    /// entry whose chain a tombstone ends, which every put leaves -- the two
-    /// are one probe and one hold of the key's stripe
-    /// (`MemTable::rmw_shared`), as FASTER's `Rmw` is one operation; `f`
-    /// runs inside the hold and must not write the store. Otherwise the
-    /// read is made and then the put. `false`, nothing read or written,
-    /// where the live table is full, as `put` answers.
+    /// oldest first, as `read_all` gives them, and `value` put over them,
+    /// with no write of the key between the read and the put. Where the
+    /// live table holds the whole of what the key reads -- an entry whose
+    /// chain a tombstone ends, which every put leaves -- the two are one
+    /// probe and one hold of the key's stripe (`MemTable::rmw_shared`), as
+    /// FASTER's `Rmw` is one operation; `f` runs inside the hold and must
+    /// not write the store. Otherwise the read is made and then the put on
+    /// condition that the key's newest value is still the one read, as
+    /// `put_if` puts, both again where another writer's write of the key
+    /// came between, and `f` is given the values of the read the put was
+    /// made over. `false` where the live table is full, as `put` answers,
+    /// nothing written, and what `f` was given then no read of the key's.
     pub fn rmw(&self, key: &[u8], value: &[u8], mut f: impl FnMut(&[u8])) -> Result<bool> {
         self.may_write_shared()?;
-        {
-            let _e = self.enter();
-            let st = self.state();
-            let mem = &st.mem;
-            if mem.shared.is_none() {
-                // As a put to the one writer's table is answered
-                // (`write_shared`).
-                return Ok(false);
-            }
-            // And as a put to a table its freeze has closed is.
-            if mem.closed.load(AtomicOrdering::SeqCst) {
-                return Ok(false);
-            }
-            let mut l = self.shared_local.borrow_mut();
-            let hash = mem.hash(key);
-            if self.opts.shared_lean && mem.records {
-                // A key the table lacks is read below it in this pin, from
-                // the state the probe was made in, with its partition's
-                // slot asked for ahead of the probe where the last read
-                // fell below the table (`Options::shared_rmw_absent`).
-                let absent_below = self.opts.shared_rmw_absent;
-                let pre = if absent_below {
-                    self.fall_ask(st, key)
-                } else {
-                    None
-                };
-                match mem.lean_overwrite(&mut l, hash, key, value, Some(&mut f)) {
-                    LeanWrite::Done => {
-                        self.lean_ops.set(self.lean_ops.get() + 1);
-                        if absent_below {
-                            self.lean_fell.set(false);
-                        }
-                        return Ok(true);
+        let _e = self.enter();
+        let st = self.state();
+        let mem = &st.mem;
+        if mem.shared.is_none() {
+            // As a put to the one writer's table is answered
+            // (`write_shared`).
+            return Ok(false);
+        }
+        // And as a put to a table its freeze has closed is.
+        if mem.closed.load(AtomicOrdering::SeqCst) {
+            return Ok(false);
+        }
+        let hash = mem.hash(key);
+        let mut l = self.shared_local.borrow_mut();
+        // The read past the table's: the general one, unless the lean
+        // probe found no record of the key.
+        let mut hint = (false, None);
+        let lean = self.opts.shared_lean && mem.records;
+        let mut absent = false;
+        if lean {
+            // A key the table lacks is read below it in this pin, from the
+            // state the probe was made in, with its partition's slot asked
+            // for ahead of the probe where the last read fell below the
+            // table (`Options::shared_rmw_absent`).
+            let absent_below = self.opts.shared_rmw_absent;
+            let pre = if absent_below {
+                self.fall_ask(st, key)
+            } else {
+                None
+            };
+            match mem.lean_overwrite(&mut l, hash, key, value, Some(&mut f)) {
+                LeanWrite::Done => {
+                    self.lean_ops.set(self.lean_ops.get() + 1);
+                    if absent_below {
+                        self.lean_fell.set(false);
                     }
-                    LeanWrite::Absent if absent_below => {
-                        drop(l);
-                        self.lean_fell.set(true);
-                        self.rmw_below.set(self.rmw_below.get() + 1);
-                        self.read_begin();
-                        self.read_below(st, key, true, pre, &mut f)?;
-                        // The put into the table the probe found the key
-                        // absent from, with the hash taken for it, as a
-                        // handle's put lays it down past its lean probe.
-                        let mut l = self.shared_local.borrow_mut();
-                        let rd = Some(&self.shared.readers);
-                        return Ok(mem.write_shared(
-                            &mut l,
-                            rd,
-                            hash,
-                            key,
-                            SharedWrite::Put(value),
-                        ));
-                    }
-                    _ => {}
+                    return Ok(true);
                 }
+                LeanWrite::Absent if absent_below => {
+                    self.lean_fell.set(true);
+                    self.rmw_below.set(self.rmw_below.get() + 1);
+                    hint = (true, pre);
+                }
+                LeanWrite::Absent => absent = true,
+                LeanWrite::Other => {}
             }
+        }
+        if !hint.0 {
             let rd = Some(&self.shared.readers);
             match mem.rmw_shared(&mut l, rd, hash, key, value, &mut f) {
                 SharedRmw::Whole(done) => return Ok(done),
                 SharedRmw::Spread => {}
             }
+            if lean {
+                // The table probed again, the read is as a point read past
+                // its lean probe takes it (`read_all`): the partition's
+                // slot asked for where the last read fell below the table,
+                // and the table known to lack a key it has no record of.
+                hint = (absent, self.fall_ask(st, key));
+                self.lean_fell.set(absent);
+            }
         }
-        self.read_all(key, &mut f)?;
-        self.write_shared(key, SharedWrite::Put(value))
+        drop(l);
+        self.rmw_spread(st, hash, key, value, hint, &mut f)
     }
 
     /// Whether this handle may write the shared live table, its slot among
@@ -46352,6 +46754,7 @@ impl Db {
             ord_rebuilt: AtomicU64::new(0),
             bare_walks: [AtomicU64::new(0), AtomicU64::new(0)],
             as_older: std::sync::atomic::AtomicBool::new(false),
+            cond_hold: std::sync::atomic::AtomicU8::new(0),
             z: zfile::ZEvents::default(),
             retired_z: RetireList::new(),
             retired_heads: RetireList::new(),
@@ -46533,6 +46936,7 @@ impl Db {
             ord_served: std::cell::Cell::new(0),
             lone_reads: std::cell::Cell::new(0),
             lean_ops: std::cell::Cell::new(0),
+            cond_again: std::cell::Cell::new(0),
             lean_fell: std::cell::Cell::new(false),
             fall_asks: std::cell::Cell::new(0),
             rmw_below: std::cell::Cell::new(0),
@@ -47823,6 +48227,7 @@ impl Db {
             ord_rebuilt: AtomicU64::new(ord_rebuilt),
             bare_walks: [AtomicU64::new(bare_walked), AtomicU64::new(bare_found)],
             as_older: std::sync::atomic::AtomicBool::new(false),
+            cond_hold: std::sync::atomic::AtomicU8::new(0),
             z: zev,
             retired_z: RetireList::new(),
             retired_heads: RetireList::new(),
@@ -48004,6 +48409,7 @@ impl Db {
             ord_served: std::cell::Cell::new(0),
             lone_reads: std::cell::Cell::new(0),
             lean_ops: std::cell::Cell::new(0),
+            cond_again: std::cell::Cell::new(0),
             lean_fell: std::cell::Cell::new(false),
             fall_asks: std::cell::Cell::new(0),
             rmw_below: std::cell::Cell::new(0),
@@ -48991,6 +49397,71 @@ impl Db {
         self.mem_bytes += key.len() + 16;
     }
 
+    /// `put` on condition: `value` put over `key` only where the key's newest
+    /// value, as this writer reads it -- its staged writes with it -- is
+    /// `expect` (`None` where it reads no value), and whether it was. A
+    /// refused write leaves the store and the staged batch as they were. In
+    /// a store whose handles write a shared live table
+    /// (`Options::shared_writers`) the check and the write are made in one
+    /// hold of the key, as a handle's `put_if` makes them.
+    pub fn put_if(&mut self, key: &[u8], expect: Option<&[u8]>, value: &[u8]) -> Result<bool> {
+        self.write_if(key, expect, SharedWrite::Put(value))
+    }
+
+    /// `delete` on condition, as `put_if` writes: see there.
+    pub fn delete_if(&mut self, key: &[u8], expect: Option<&[u8]>) -> Result<bool> {
+        self.write_if(key, expect, SharedWrite::Delete)
+    }
+
+    fn write_if(&mut self, key: &[u8], expect: Option<&[u8]>, w: SharedWrite<'_>) -> Result<bool> {
+        let _op = self.op();
+        if self.mem().shared.is_some() {
+            return self.write_shared_own_if(key, expect, w);
+        }
+        // The one writer's: nothing else writes the store between this
+        // read, which sees the staged writes, and the stage below.
+        let mut newest: Option<Vec<u8>> = None;
+        self.read_all(key, |v| {
+            let n = newest.get_or_insert_with(Vec::new);
+            n.clear();
+            n.extend_from_slice(v);
+        })?;
+        if newest.as_deref() != expect {
+            return Ok(false);
+        }
+        match w {
+            SharedWrite::Put(v) => self.put_pinned(key, v),
+            SharedWrite::Delete => self.delete(key),
+            SharedWrite::Append(v) => self.append_pinned(key, v),
+        }
+        Ok(true)
+    }
+
+    /// `write_if` into a shared live table, as `write_shared_own` writes:
+    /// a table it finds full sealed on the spot and the write asked again
+    /// of the fresh one, whose check reads the key afresh.
+    fn write_shared_own_if(
+        &mut self,
+        key: &[u8],
+        expect: Option<&[u8]>,
+        w: SharedWrite<'_>,
+    ) -> Result<bool> {
+        loop {
+            if self.mem().shared.is_none() {
+                return self.write_if(key, expect, w);
+            }
+            let mut l = std::mem::take(&mut self.shared_local);
+            let done = self.r.cond_shared(&mut l, self.r.state(), key, expect, w);
+            self.shared_local = l;
+            match done? {
+                CondWrite::Applied => return Ok(true),
+                CondWrite::Refused => return Ok(false),
+                // Asked again of a fresh table, as `write_shared_own` asks.
+                CondWrite::Full => self.seal()?,
+            }
+        }
+    }
+
     /// The writer's own write to a shared live table, beside the handles'
     /// (`Options::shared_writers`): a table it finds full sealed on the spot
     /// and the write made into the fresh one. Nothing is logged -- the
@@ -48999,9 +49470,12 @@ impl Db {
     fn write_shared_own(&mut self, key: &[u8], w: SharedWrite<'_>) {
         self.share_own += 1;
         let mut l = std::mem::take(&mut self.shared_local);
-        // A fresh table takes any write a full one refused; one that
-        // refuses the write too is a write larger than a table.
-        for _ in 0..3 {
+        // A fresh table takes any write a full one refused: a table takes a
+        // write of any length while its values stand below its cap
+        // (`ByteArena::reserve_shared`), so a write is refused only by a
+        // table other writes filled, and is asked again of the next as often
+        // as the handles' writes fill it first.
+        loop {
             let done = {
                 let mem = self.mem();
                 if mem.shared.is_none() {
@@ -49023,13 +49497,11 @@ impl Db {
                 return;
             }
             if let Err(e) = self.seal() {
+                self.shared_local = l;
                 self.pending_err.get_or_insert(e);
                 return;
             }
         }
-        self.pending_err.get_or_insert(err(
-            "a write larger than a shared live table takes (Options::shared_writers)",
-        ));
     }
 
     /// The start of every write: the live table a `sync` handed to a seal
@@ -52505,6 +52977,7 @@ impl Reader {
             ord_served: std::cell::Cell::new(0),
             lone_reads: std::cell::Cell::new(0),
             lean_ops: std::cell::Cell::new(0),
+            cond_again: std::cell::Cell::new(0),
             lean_fell: std::cell::Cell::new(false),
             fall_asks: std::cell::Cell::new(0),
             rmw_below: std::cell::Cell::new(0),
@@ -52559,6 +53032,7 @@ impl Reader {
                 ord_served: std::cell::Cell::new(0),
                 lone_reads: std::cell::Cell::new(0),
                 lean_ops: std::cell::Cell::new(0),
+                cond_again: std::cell::Cell::new(0),
                 lean_fell: std::cell::Cell::new(false),
                 fall_asks: std::cell::Cell::new(0),
                 rmw_below: std::cell::Cell::new(0),
@@ -52638,6 +53112,7 @@ impl Reader {
             ord_served: std::cell::Cell::new(0),
             lone_reads: std::cell::Cell::new(0),
             lean_ops: std::cell::Cell::new(0),
+            cond_again: std::cell::Cell::new(0),
             lean_fell: std::cell::Cell::new(false),
             fall_asks: std::cell::Cell::new(0),
             rmw_below: std::cell::Cell::new(0),
@@ -55225,6 +55700,46 @@ impl Txn<'_> {
         self.ops.push((key.to_vec(), None));
     }
 
+    /// A put staged on condition: `value` put over `key` only where the
+    /// key's newest value as this transaction sees it -- the store's with
+    /// its own staged operations over it (`read_all`) -- is `expect`
+    /// (`None` where it sees no value), and whether it was. A refused put
+    /// stages nothing. The transaction holds the store's writer, so no
+    /// write of the writer's comes between the check and the commit; in a
+    /// store whose handles write a shared live table
+    /// (`Options::shared_writers`) a handle's write of the key in between
+    /// is not seen by the check, which `Db::put_if` and `Reader::put_if`
+    /// make in one hold of the key.
+    pub fn put_if(&mut self, key: &[u8], expect: Option<&[u8]>, value: &[u8]) -> Result<bool> {
+        if !self.holds_newest(key, expect)? {
+            return Ok(false);
+        }
+        self.delete(key);
+        self.append(key, value);
+        Ok(true)
+    }
+
+    /// A delete staged on condition, as `put_if` stages a put: see there.
+    pub fn delete_if(&mut self, key: &[u8], expect: Option<&[u8]>) -> Result<bool> {
+        if !self.holds_newest(key, expect)? {
+            return Ok(false);
+        }
+        self.delete(key);
+        Ok(true)
+    }
+
+    /// Whether `key`'s newest value as this transaction sees it is
+    /// `expect`.
+    fn holds_newest(&self, key: &[u8], expect: Option<&[u8]>) -> Result<bool> {
+        let mut newest: Option<Vec<u8>> = None;
+        self.read_all(key, |v| {
+            let n = newest.get_or_insert_with(Vec::new);
+            n.clear();
+            n.extend_from_slice(v);
+        })?;
+        Ok(newest.as_deref() == expect)
+    }
+
     /// Staged operations so far.
     pub fn len(&self) -> usize {
         self.ops.len()
@@ -56922,6 +57437,7 @@ impl Reader {
             ord_served: std::cell::Cell::new(0),
             lone_reads: std::cell::Cell::new(0),
             lean_ops: std::cell::Cell::new(0),
+            cond_again: std::cell::Cell::new(0),
             lean_fell: std::cell::Cell::new(false),
             fall_asks: std::cell::Cell::new(0),
             rmw_below: std::cell::Cell::new(0),

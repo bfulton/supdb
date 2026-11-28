@@ -168,3 +168,11 @@ tests/data/cost-entries.txt	Db::bare_walks	0	1	a test seam that counts the parti
 tests/data/cost-entries.txt	Db::write_as_older_release	0	1	a test seam that has the store write as a release from before MANIFEST_CLEAN did, read by tests/db.rs, at no key, entry, block or step of an operation
 tests/data/door.txt	cfgout src/block.rs crc32c_hw_x4	0	1	the ARM twin of the open verification's four-way CRC (block::crc32_x4), as crc32c_hw has one
 tests/data/couplings.txt	src/blob.rs piecewise/ASK_PIECES code	8	10	a scan from a key dispatches on the source kind as scan_at does, the key count (Blob::scan) where scan_at counts records
+tests/data/cost-entries.txt	Reader::put_if	0	1	a write on condition through a handle (ROADMAP, a conditional write), on no probe as Reader::put is
+tests/data/cost-entries.txt	Reader::delete_if	0	1	the conditional write's delete through a handle, on no probe as Reader::delete is
+tests/data/cost-entries.txt	Reader::cond_again	0	1	a counter of the conditional writes a handle made again, read by tests/shared.rs and the suite's threadcounters, at no key, entry, block or step of an operation
+tests/data/cost-entries.txt	Reader::cond_insert_held	0	1	a test seam that says a conditional write waits in a hold, read by tests/shared.rs, at no key, entry, block or step of an operation
+tests/data/cost-entries.txt	Reader::hold_cond_inserts	0	1	a test seam that holds a conditional insert past its probe, read by tests/shared.rs, at no key, entry, block or step of an operation
+tests/data/cost-entries.txt	Reader::hold_rmw_reads	0	1	a test seam that holds a read-modify-write past its read, read by tests/shared.rs, at no key, entry, block or step of an operation
+tests/data/cost-entries.txt	Db::put_if	0	1	a write on condition on the writer (ROADMAP, a conditional write): a point read and Db::put's path, which the read probes and work and land count
+tests/data/cost-entries.txt	Db::delete_if	0	1	the conditional write's delete on the writer: a point read and Db::delete's path, which the read probes and work count

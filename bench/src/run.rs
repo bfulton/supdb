@@ -435,7 +435,9 @@ const YCSB_ORDER: [char; 6] = ['C', 'B', 'A', 'F', 'D', 'E'];
 /// The salt on the second family's key seeds; the first family's seeds are
 /// the ones every row so far drew with, unsalted.
 const YCSBS_SEED_SALT: u64 = 0x5300;
-const YCSB_BATCH: usize = 100;
+/// The updates a mix commits at once, the threaded mixes' a thread's, and
+/// a read-modify-write's that stages its puts (`SupdbWriter::rmw`).
+pub(crate) const YCSB_BATCH: usize = 100;
 const YCSB_SCAN: usize = 50;
 
 /// What each operation of a threaded mix is.
@@ -4978,7 +4980,9 @@ struct ThreadedMixed {
 /// value stream seeded apart from the others'. A thread's updates are
 /// batched by `YCSB_BATCH` and committed as the mixes commit theirs, its
 /// tail inside its window; an engine with a read-modify-write of its own
-/// runs it, one operation at a time (`ThreadWriter::rmw`). The clock is
+/// runs it, one operation at a time (`ThreadWriter::rmw`), and what it
+/// holds back is committed inside the window too (`ThreadWriter::finish`).
+/// The clock is
 /// `threaded`'s: the threads are released together and the result is the
 /// span from the first release to the last finish.
 ///
@@ -5065,6 +5069,7 @@ fn threaded_mix(
                         }
                     }
                     wbuf.flush_updates_to(w.as_mut())?;
+                    w.finish()?;
                     let end = Instant::now();
                     let mut counts = if counting { w.counters() } else { Vec::new() };
                     if let Some([user, sys, minflt, majflt]) = before {

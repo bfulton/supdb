@@ -1065,6 +1065,7 @@ fn a_handles_point_operations_leave_the_shared_length_and_a_scan_carries_it() {
 
 #[test]
 fn a_handles_rmw_reads_what_the_key_held_and_puts_its_value() {
+    let _w = Watchdog::arm("the rmw's test waited a minute");
     let d = scratch("rmw");
     let mut db = Db::create(&d, options(1 << 20)).unwrap();
     db.put(b"loaded", b"base");
@@ -1166,6 +1167,566 @@ fn rmws_on_threads_each_replace_the_value_they_read() {
             assert_eq!(n, 1, "{}: read by {n} rmws", String::from_utf8_lossy(w));
         }
     }
+    db.flush().unwrap();
+    drop(db);
+    let _ = std::fs::remove_dir_all(&d);
+}
+
+/// Handles on four threads read-modify-write three hot keys
+/// (`Reader::rmw`), each putting a value of its own, under a table small
+/// enough to freeze many times over, so that each fresh table lacks each
+/// key and its first write of it is a read below the table and an insert
+/// the threads race for. Of each key, every value but the last is read by
+/// exactly one of them and the last by none. The race is made wide by a
+/// hold in `a_handles_rmw_that_another_write_comes_between_reads_again`;
+/// here it is run as it comes, the reads below counted.
+#[test]
+fn rmws_on_threads_over_keys_a_fresh_table_lacks_each_replace_the_value_they_read() {
+    const THREADS: usize = 4;
+    const HOT: usize = 3;
+    const EACH: usize = 3000;
+    let _w = Watchdog::arm("the spread rmw test waited a minute");
+    let d = scratch("rmwspread");
+    let mut db = Db::create(&d, options(32 << 10)).unwrap();
+    let hot = |k: usize| format!("hot-{k}").into_bytes();
+    for k in 0..HOT {
+        db.put(&hot(k), b"start");
+    }
+    db.commit().unwrap();
+    let handles: Vec<supdb::Reader> = (0..THREADS).map(|_| db.reader().unwrap()).collect();
+    let seals0 = db.seal_waits().joins;
+    let db = Mutex::new(db);
+    let go = std::sync::Barrier::new(THREADS);
+    type Seen = Vec<(usize, Vec<u8>, Vec<u8>)>;
+    let (seen, (below, again)): (Vec<Seen>, (u64, u64)) = std::thread::scope(|s| {
+        let threads: Vec<_> = handles
+            .into_iter()
+            .enumerate()
+            .map(|(t, r)| {
+                let (db, go) = (&db, &go);
+                s.spawn(move || {
+                    go.wait();
+                    let mut mine = Vec::with_capacity(EACH * HOT);
+                    for i in 0..EACH {
+                        let k = (i + t) % HOT;
+                        let v = format!("{t}-{i}").into_bytes();
+                        let mut read = Vec::new();
+                        // Ballast with each, so the table fills.
+                        let ballast = [b'o'; 100];
+                        write(db, || r.put(&own_key(t, i), &ballast));
+                        write(db, || {
+                            read.clear();
+                            r.rmw(&hot(k), &v, vf(&mut |x| read.push(x.to_vec())))
+                        });
+                        assert_eq!(read.len(), 1, "one value read: {read:?}");
+                        mine.push((k, read.pop().unwrap(), v));
+                    }
+                    (mine, (r.shared_rmw_below(), r.cond_again()))
+                })
+            })
+            .collect();
+        let mut counts = (0, 0);
+        let seen = threads
+            .into_iter()
+            .map(|h| {
+                let (mine, (below, again)) = h.join().unwrap();
+                counts.0 += below;
+                counts.1 += again;
+                mine
+            })
+            .collect();
+        (seen, counts)
+    });
+    let mut db = db.into_inner().unwrap();
+    // The seals land on the segment work's thread, some still in flight as
+    // the writes end: counted once they have.
+    db.settle().unwrap();
+    assert!(
+        db.seal_waits().joins > seals0 + 3,
+        "the table froze between the rmws"
+    );
+    assert!(
+        below > HOT as u64 * 3,
+        "the rmws read the keys below a fresh table: {below}"
+    );
+    eprintln!("rmws read below the table {below}, made again {again}");
+    let seen: Vec<_> = seen.into_iter().flatten().collect();
+    for k in 0..HOT {
+        let mut read = std::collections::HashMap::<&[u8], usize>::new();
+        let mut written = Vec::new();
+        for (_, r, w) in seen.iter().filter(|(kk, _, _)| *kk == k) {
+            *read.entry(r.as_slice()).or_default() += 1;
+            written.push(w.as_slice());
+        }
+        let last = values(&db, &hot(k));
+        assert_eq!(last.len(), 1, "hot key {k}: one value");
+        assert_eq!(
+            read.get(b"start".as_slice()),
+            Some(&1),
+            "hot key {k}: the first value read once"
+        );
+        for w in written {
+            let n = read.get(w).copied().unwrap_or(0);
+            let want = usize::from(w != last[0].as_slice());
+            assert_eq!(
+                n,
+                want,
+                "hot key {k}: {} read by {n} rmws",
+                String::from_utf8_lossy(w)
+            );
+        }
+    }
+    drop(db);
+    let _ = std::fs::remove_dir_all(&d);
+}
+
+/// A handle's read-modify-write of a key the live table lacks, held past
+/// its read of the key below the table (`Reader::hold_rmw_reads`), while
+/// another handle puts the key: the held one finds the key in the table
+/// with a newer value than it read, reads again, and replaces the other's
+/// value, handed that value and not the one below. And held past its probe
+/// instead (`Reader::hold_cond_inserts`), over a key that is nowhere: the
+/// other's insert takes the slot, and the held one reads again the same.
+#[test]
+fn a_handles_rmw_that_another_write_comes_between_reads_again() {
+    let _w = Watchdog::arm("the held rmw test waited a minute");
+    let d = scratch("rmwagain");
+    let mut db = Db::create(&d, options(64 << 20)).unwrap();
+    db.put(b"seen", b"below");
+    db.commit().unwrap();
+    db.flush().unwrap();
+    let (mut a, b) = (db.reader().unwrap(), db.reader().unwrap());
+    for (n, (what, key)) in [("read", b"seen".as_slice()), ("insert", b"fresh")]
+        .into_iter()
+        .enumerate()
+    {
+        let hold = |on: bool| {
+            if what == "read" {
+                b.hold_rmw_reads(on)
+            } else {
+                b.hold_cond_inserts(on)
+            }
+        };
+        hold(true);
+        let (got, back) = std::thread::scope(|s| {
+            let h = s.spawn(move || {
+                let mut got = Vec::new();
+                assert!(a
+                    .rmw(key, b"from a", vf(&mut |x| got.push(x.to_vec())))
+                    .unwrap());
+                (got, a)
+            });
+            while !b.cond_insert_held() {
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+            assert!(b.put(key, b"from b").unwrap(), "{what}: the other's put");
+            hold(false);
+            h.join().unwrap()
+        });
+        a = back;
+        assert_eq!(
+            got,
+            vec![b"from b".to_vec()],
+            "{what}: the value the put replaced"
+        );
+        assert_eq!(a.cond_again() as usize, n + 1, "{what}: read again once");
+        assert_eq!(
+            handle_values(&a, key),
+            vec![b"from a".to_vec()],
+            "{what}: the held one's value last"
+        );
+    }
+    drop((a, b));
+    db.flush().unwrap();
+    assert_eq!(values(&db, b"seen"), vec![b"from a".to_vec()]);
+    assert_eq!(values(&db, b"fresh"), vec![b"from a".to_vec()]);
+    drop(db);
+    let _ = std::fs::remove_dir_all(&d);
+}
+
+/// Handles on four threads increment three hot keys, each read and then
+/// put back one more on condition (`Reader::put_if`), a refused put tried
+/// again from a fresh read, under a table small enough to freeze many
+/// times over, so each key stands now below the live table and now in it,
+/// and each fresh table's first write of it is an insert the threads race
+/// for. Every increment lands: each key reads the number of them, on the
+/// handles, the writer, and after a flush and a reopen; puts were refused
+/// on the way, and the writer's own conditional puts beside them land too.
+#[test]
+fn threads_incrementing_hot_keys_on_condition_lose_no_update() {
+    const THREADS: usize = 4;
+    const HOT: usize = 3;
+    const EACH: usize = 2500;
+    let _w = Watchdog::arm("the conditional writes' test waited a minute");
+    let d = scratch("putif-hot");
+    let mut db = Db::create(&d, options(32 << 10)).unwrap();
+    let hot = |k: usize| format!("hot-{k}").into_bytes();
+    for k in 0..HOT {
+        assert!(
+            db.put_if(&hot(k), None, b"0").unwrap(),
+            "a key with no value is expected as none"
+        );
+    }
+    // Ballast, so a table fills and freezes between the increments.
+    for i in 0..400 {
+        db.put(&own_key(9, i), &[b'b'; 100]);
+    }
+    db.commit().unwrap();
+    let handles: Vec<supdb::Reader> = (0..THREADS).map(|_| db.reader().unwrap()).collect();
+    let seals0 = db.seal_waits().joins;
+    let db = Mutex::new(db);
+    let go = std::sync::Barrier::new(THREADS + 1);
+    let (refused, lost) = std::thread::scope(|s| {
+        let threads: Vec<_> = handles
+            .into_iter()
+            .enumerate()
+            .map(|(t, r)| {
+                let (db, go) = (&db, &go);
+                s.spawn(move || {
+                    go.wait();
+                    let mut refused = 0u64;
+                    for i in 0..EACH {
+                        for k in 0..HOT {
+                            let key = hot(k);
+                            loop {
+                                let cur = handle_values(&r, &key);
+                                assert_eq!(cur.len(), 1, "one value: {cur:?}");
+                                let n: u64 = std::str::from_utf8(&cur[0]).unwrap().parse().unwrap();
+                                let next = (n + 1).to_string();
+                                // The window between the read and the put
+                                // given to the other threads, so that they
+                                // race in it however the machine runs them.
+                                std::thread::yield_now();
+                                match r.put_if(&key, Some(&cur[0]), next.as_bytes()).unwrap() {
+                                    supdb::CondWrite::Applied => break,
+                                    supdb::CondWrite::Refused => refused += 1,
+                                    supdb::CondWrite::Full => db.lock().unwrap().commit().unwrap(),
+                                }
+                            }
+                            // Ballast of this thread's own between them.
+                            if i % 4 == 0 {
+                                write(db, || r.put(&own_key(t, i * HOT + k), &[b'o'; 100]));
+                            }
+                        }
+                    }
+                    (refused, r.cond_again())
+                })
+            })
+            .collect();
+        // The writer increments beside them, through its own put_if.
+        go.wait();
+        let mut writer_refused = 0u64;
+        for _ in 0..200 {
+            let mut db = db.lock().unwrap();
+            loop {
+                let cur = values(&db, &hot(0));
+                let n: u64 = std::str::from_utf8(&cur[0]).unwrap().parse().unwrap();
+                if db
+                    .put_if(&hot(0), Some(&cur[0]), (n + 1).to_string().as_bytes())
+                    .unwrap()
+                {
+                    break;
+                }
+                writer_refused += 1;
+            }
+            db.commit().unwrap();
+        }
+        let mut sum = (writer_refused, 0u64);
+        for h in threads {
+            let (r, l) = h.join().unwrap();
+            sum.0 += r;
+            sum.1 += l;
+        }
+        sum
+    });
+    let mut db = db.into_inner().unwrap();
+    let want = |k: usize| {
+        (THREADS * EACH + if k == 0 { 200 } else { 0 })
+            .to_string()
+            .into_bytes()
+    };
+    for k in 0..HOT {
+        assert_eq!(
+            values(&db, &hot(k)),
+            vec![want(k)],
+            "hot key {k}: every increment landed"
+        );
+    }
+    assert!(
+        refused > 0,
+        "the threads met each other's writes: no put was refused"
+    );
+    // The seals land on the segment work's thread, some still in flight as
+    // the writes end: counted once they have.
+    db.settle().unwrap();
+    assert!(
+        db.seal_waits().joins > seals0 + 3,
+        "the table froze between the increments"
+    );
+    eprintln!("refused {refused}, inserts that lost their slot {lost}");
+    db.flush().unwrap();
+    for k in 0..HOT {
+        assert_eq!(
+            values(&db, &hot(k)),
+            vec![want(k)],
+            "hot key {k} after the flush"
+        );
+    }
+    drop(db);
+    let db = Db::open(&d, options(32 << 10)).unwrap();
+    for k in 0..HOT {
+        assert_eq!(values(&db, &hot(k)), vec![want(k)], "hot key {k} reopened");
+    }
+    drop(db);
+    let _ = std::fs::remove_dir_all(&d);
+}
+
+/// A handle's conditional write checks the key's newest value wherever it
+/// lies: the last of several values a key appended, in the live table and
+/// below it, and none for a key nowhere or deleted. Each refused write
+/// leaves the key's values as they were.
+#[test]
+fn a_handles_conditional_write_checks_the_newest_value_wherever_it_lies() {
+    let d = scratch("putif-newest");
+    let mut db = Db::create(&d, options(64 << 20)).unwrap();
+    db.append(b"below", b"x");
+    db.append(b"below", b"y");
+    db.commit().unwrap();
+    db.flush().unwrap();
+    let r = db.reader().unwrap();
+    assert!(r.put(b"live", b"p").unwrap());
+    assert!(r.append(b"live", b"q").unwrap());
+    use supdb::CondWrite::{Applied, Refused};
+    let cases: [(&[u8], &[u8], &[u8]); 2] = [(b"below", b"x", b"y"), (b"live", b"p", b"q")];
+    for (key, older, newest) in cases {
+        let what = String::from_utf8_lossy(key);
+        let was = handle_values(&r, key);
+        assert_eq!(
+            r.put_if(key, Some(older), b"z").unwrap(),
+            Refused,
+            "{what}: an older value"
+        );
+        assert_eq!(
+            r.put_if(key, None, b"z").unwrap(),
+            Refused,
+            "{what}: a key with values"
+        );
+        assert_eq!(
+            r.delete_if(key, Some(older)).unwrap(),
+            Refused,
+            "{what}: a delete of an older value"
+        );
+        assert_eq!(handle_values(&r, key), was, "{what}: refused, unchanged");
+        assert_eq!(
+            r.put_if(key, Some(newest), b"z").unwrap(),
+            Applied,
+            "{what}: the newest"
+        );
+        assert_eq!(handle_values(&r, key), vec![b"z".to_vec()], "{what}");
+        assert_eq!(
+            r.delete_if(key, Some(b"z")).unwrap(),
+            Applied,
+            "{what}: a delete as read"
+        );
+        assert_eq!(
+            r.put_if(key, Some(b"z"), b"w").unwrap(),
+            Refused,
+            "{what}: deleted, it holds none"
+        );
+        assert_eq!(
+            r.put_if(key, None, b"w").unwrap(),
+            Applied,
+            "{what}: deleted, expected as none"
+        );
+        assert_eq!(handle_values(&r, key), vec![b"w".to_vec()], "{what}");
+    }
+    assert_eq!(
+        r.put_if(b"nowhere", Some(b"x"), b"1").unwrap(),
+        Refused,
+        "a key nowhere holds none"
+    );
+    assert_eq!(handle_values(&r, b"nowhere"), Vec::<Vec<u8>>::new());
+    assert_eq!(r.put_if(b"nowhere", None, b"1").unwrap(), Applied);
+    drop(r);
+    db.flush().unwrap();
+    for key in [b"below".as_slice(), b"live"] {
+        assert_eq!(values(&db, key), vec![b"w".to_vec()]);
+    }
+    assert_eq!(values(&db, b"nowhere"), vec![b"1".to_vec()]);
+    drop(db);
+    let _ = std::fs::remove_dir_all(&d);
+}
+
+/// A handle's read-modify-write of a key a full live table lacks reads it
+/// and writes nothing: `false`, its callback not called, the key as it
+/// was, and after the commit that freezes the table the same call reads
+/// the key and replaces it. A key below the table and one nowhere alike.
+#[test]
+fn a_handles_rmw_of_a_key_a_full_table_lacks_writes_nothing_and_says_so() {
+    let d = scratch("rmw-full");
+    let mut db = Db::create(&d, options(32 << 10)).unwrap();
+    db.put(b"below", b"was");
+    db.commit().unwrap();
+    db.flush().unwrap();
+    let r = db.reader().unwrap();
+    for (key, was) in [
+        (b"below".as_slice(), Some(b"was".to_vec())),
+        (b"nowhere", None),
+    ] {
+        let what = String::from_utf8_lossy(key);
+        let mut i = 0;
+        while r.put(&own_key(0, i), &[b'f'; 100]).unwrap() {
+            i += 1;
+        }
+        let mut got = Vec::new();
+        assert!(
+            !r.rmw(key, b"new", vf(&mut |v| got.push(v.to_vec())))
+                .unwrap(),
+            "{what}: the full table refuses"
+        );
+        assert!(got.is_empty(), "{what}: nothing handed over: {got:?}");
+        assert_eq!(
+            handle_values(&r, key),
+            was.iter().cloned().collect::<Vec<_>>(),
+            "{what}: as it was"
+        );
+        db.commit().unwrap();
+        assert!(
+            r.rmw(key, b"new", vf(&mut |v| got.push(v.to_vec())))
+                .unwrap(),
+            "{what}: the next table takes it"
+        );
+        assert_eq!(got, was.iter().cloned().collect::<Vec<_>>(), "{what}");
+        assert_eq!(handle_values(&r, key), vec![b"new".to_vec()], "{what}");
+    }
+    drop(r);
+    drop(db);
+    let _ = std::fs::remove_dir_all(&d);
+}
+
+/// The writer's own write into a shared live table the handles filled is
+/// made in the next table, a conditional one and a plain one alike, and
+/// one of a value larger than a table's cap as well: a table takes a write
+/// of any length while its values stand below the cap, and one that takes
+/// it past the cap refuses the handles' next writes until the writer's
+/// commit freezes it.
+#[test]
+fn the_writers_write_a_full_table_refuses_lands_in_the_next() {
+    let _w = Watchdog::arm("the full table's test waited a minute");
+    let d = scratch("own-full");
+    let mut db = Db::create(&d, options(32 << 10)).unwrap();
+    let r = db.reader().unwrap();
+    let fill = |r: &supdb::Reader| {
+        let mut i = 0;
+        while r.put(&own_key(0, i), &[b'f'; 100]).unwrap() {
+            i += 1;
+        }
+        assert!(i > 10, "the handle filled the table with {i} puts");
+    };
+    let huge = vec![b'h'; 256 << 10];
+    let seals0 = db.seal_waits().joins;
+    for (n, (key, value)) in [(b"cond", b"1".as_slice()), (b"huge", &huge)]
+        .into_iter()
+        .enumerate()
+    {
+        fill(&r);
+        assert!(
+            db.put_if(key, None, value).unwrap(),
+            "made in the next table"
+        );
+        assert_eq!(
+            r.put(b"between", b"1").unwrap(),
+            n == 0,
+            "the next table full only where the value took it past its cap"
+        );
+        db.commit().unwrap();
+        fill(&r);
+        db.put(&[key.as_slice(), b"-plain"].concat(), value);
+        db.commit().unwrap();
+        db.settle().unwrap();
+        assert!(
+            db.seal_waits().joins >= seals0 + 2 * (n as u64 + 1),
+            "each write found the table full and sealed it"
+        );
+    }
+    // The last value took its table past the cap too: the commit after the
+    // refusal freezes it, and the handle writes the next.
+    assert!(
+        !r.put(b"after", b"1").unwrap(),
+        "the last table past its cap"
+    );
+    db.commit().unwrap();
+    assert!(r.put(b"after", b"1").unwrap(), "the handle writes the next");
+    drop(r);
+    db.flush().unwrap();
+    assert_eq!(values(&db, b"cond"), vec![b"1".to_vec()]);
+    assert_eq!(values(&db, b"cond-plain"), vec![b"1".to_vec()]);
+    assert_eq!(values(&db, b"huge"), vec![huge.clone()]);
+    assert_eq!(values(&db, b"huge-plain"), vec![huge]);
+    assert_eq!(values(&db, b"after"), vec![b"1".to_vec()]);
+    assert_eq!(values(&db, b"between"), vec![b"1".to_vec()]);
+    drop(db);
+    let _ = std::fs::remove_dir_all(&d);
+}
+
+/// Two handles' conditional puts of a key the live table lacks, each
+/// having read it below the table as the value both expect: the one held
+/// between its read and its insert (`Reader::hold_cond_inserts`) finds the
+/// other's insert in the slot it read vacant, probes again, finds the key
+/// in the table with the other's value, and is refused; the key holds the
+/// other's value alone, and a delete made on condition the same way is
+/// refused as well.
+#[test]
+fn a_conditional_insert_that_loses_its_slot_is_checked_again() {
+    let _w = Watchdog::arm("the lost insert's test waited a minute");
+    let d = scratch("putif-lost");
+    let mut db = Db::create(&d, options(64 << 20)).unwrap();
+    db.put(b"seen", b"below");
+    db.commit().unwrap();
+    db.flush().unwrap();
+    let (mut a, b) = (db.reader().unwrap(), db.reader().unwrap());
+    for (what, delete) in [("put", false), ("delete", true)] {
+        let key: &'static [u8] = if delete { b"seen" } else { b"fresh" };
+        let expect: Option<&'static [u8]> = if delete { Some(b"below") } else { None };
+        b.hold_cond_inserts(true);
+        let (held, back) = std::thread::scope(|s| {
+            let h = s.spawn(move || {
+                let r = if delete {
+                    a.delete_if(key, expect).unwrap()
+                } else {
+                    a.put_if(key, expect, b"from a").unwrap()
+                };
+                (r, a)
+            });
+            while !b.cond_insert_held() {
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+            assert_eq!(
+                b.put_if(key, expect, b"from b").unwrap(),
+                supdb::CondWrite::Applied,
+                "{what}: the other's write made while the first is held"
+            );
+            b.hold_cond_inserts(false);
+            h.join().unwrap()
+        });
+        a = back;
+        assert_eq!(
+            held,
+            supdb::CondWrite::Refused,
+            "{what}: checked again and refused"
+        );
+        assert_eq!(
+            a.cond_again(),
+            if delete { 2 } else { 1 },
+            "{what}: the insert lost its slot"
+        );
+        assert_eq!(
+            handle_values(&a, key),
+            vec![b"from b".to_vec()],
+            "{what}: the other's value alone"
+        );
+    }
+    drop((a, b));
     db.flush().unwrap();
     drop(db);
     let _ = std::fs::remove_dir_all(&d);
