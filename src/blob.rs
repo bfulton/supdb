@@ -1616,16 +1616,6 @@ impl<B: Bytes> Blob<B> {
         Some(self.index_offset() + recs_at as u64 + a as u64)
     }
 
-    /// The pages of the records in `from..to` (file offsets, as
-    /// `record_offset` gives them) unmapped from the process
-    /// (`Bytes::advise_dontneed_range`), for a walk that has read them once
-    /// and will not again; the caller drops the file's cache behind.
-    pub fn drop_records(&self, from: u64, to: u64) {
-        if to > from {
-            self.src.advise_dontneed_range(from, (to - from) as usize);
-        }
-    }
-
     /// PROTOTYPE: a hint to fetch the directory's lines for the ranks
     /// `rank` to `n` on, ahead of a seek that will read one of them;
     /// nothing is waited for and nothing is read. A scan's start was three

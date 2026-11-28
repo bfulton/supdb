@@ -1508,66 +1508,6 @@ pub struct Options {
     /// worse. Zero; the arm is `supdb-mmapthr`.
     #[doc(hidden)]
     pub malloc_mmap_threshold: usize,
-    /// REFUTED: a merge drops its inputs' record pages from the page cache
-    /// as its second pass leaves them behind (`Blob::drop_records` and
-    /// `POSIX_FADV_DONTNEED`, every `merge_drop_chunk` bytes, a page short
-    /// of the record it stands on), on the reading that the inputs are read
-    /// once and retired at the landing, so the pages it has streamed stand
-    /// in the cache as the newest for nothing and push out what the scans
-    /// beside it are reading. The reading was wrong about who reads them:
-    /// a merge's inputs are the live pieces and the partition under
-    /// rewrite, which is what every scan beside it reads until the landing,
-    /// and the kernel's recency was keeping exactly those. Paired at ten
-    /// million keys under 1.25 GiB the drop read slower in every sweep: the
-    /// drained lag point 1.13-1.26 s against 0.88-1.05, the ten-percent
-    /// point 3.1 s against 2.2-2.4, the full rewrite 9.8-10.7 against
-    /// 9.3-9.9, with more read from the device at each. Off; the arm
-    /// `supdb-mergedropbehind` and `supdb-ingestmergedropbehind` drops.
-    pub merge_drop_behind: bool,
-    /// EXPERIMENT: a merge drops behind its second pass the record pages
-    /// of an input partition its form file serves (`merge_drop_behind` for
-    /// those inputs alone): the gate at the form and a form file in the
-    /// partition's cell when the merge starts. The drop of every input was
-    /// refuted because a merge's inputs are what the scans beside it read;
-    /// a partition its form serves is read through its form file by every
-    /// read path, and its raw records, dropped at the install
-    /// (`zpages_drop_raw`), come back for the merge and stand as the
-    /// cache's newest pages through the landing. At the pass after the lag
-    /// sweep's full rewrite at ten million keys under 1.25 GiB one sweep
-    /// had 118 MB of raw partition pages resident and 200 MB of its form
-    /// files out, and took 4,700 major faults; one with none took none.
-    /// Priced, the drop first cost the burst its merges: the landing's
-    /// same-blocks question read the old partition's records
-    /// (`same_blocks_from_index`), now out of the cache, half a second a
-    /// landing on the thread every landing goes through, and the pass met
-    /// 124 pieces where it met 26-31. With that answered from the indexes,
-    /// the burst landed its merges as without the drop, and the pass read
-    /// 314-665 ms in three reps against 400-428 without it, the faults
-    /// both ways. Off; `supdb-mergedropscovered` is the arm.
-    pub merge_drops_covered: bool,
-    /// The landing's question of a partition a merge rewrote over the same
-    /// fences -- does it cut the same blocks, so the writer's forms over
-    /// the old one carry (`Options::forms_rebase`) -- answered from the
-    /// two ordered indexes where their heads are whole keys, the block's
-    /// first ranks being the top level's, in memory (`Db::same_blocks`).
-    /// Asked of the records, it read the old partition's key at every
-    /// sixty-fourth rank, a page or two a block across its record region,
-    /// on the thread every landing goes through: out of core those are the
-    /// pages the merge has just read past, and with the merge dropping
-    /// them behind it (`merge_drops_covered`) every landing of the lag
-    /// sweep's full rewrite at ten million keys under 1.25 GiB read half a
-    /// partition back from the device a page at a time, half a second a
-    /// landing, while the next merge waited to be planned: 21 merges in
-    /// the burst where 72 ran without the drop, and 124 pieces left for
-    /// the pass (`docs/engine.md`). Keys a head cannot hold whole are
-    /// compared through the records still. Off asks the records always;
-    /// `supdb-sameblocksrecords` is the arm.
-    pub same_blocks_from_index: bool,
-    /// How far a merge's second pass runs past the pages it last dropped
-    /// before it drops again (`merge_drop_behind`): a drop is two
-    /// syscalls, and two megabytes is a few hundred records a page. A
-    /// test lowers it to reach a drop over a store of kilobytes.
-    pub merge_drop_chunk: u64,
     /// A merge asks the kernel for each input's key section this many
     /// bytes ahead of the walk that reads it, a window at a time (the next
     /// window asked as the walk comes within half a window of the asks'
@@ -7612,10 +7552,6 @@ impl Default for Options {
             merge_walk_cached: true,
             merge_verifies_inputs: true,
             malloc_mmap_threshold: 0,
-            merge_drop_behind: false,
-            merge_drops_covered: false,
-            same_blocks_from_index: true,
-            merge_drop_chunk: 2 << 20,
             merge_read_ahead: 0,
             merge_read_ahead_cipher: MERGE_AHEAD_WINDOW,
             merge_ahead_shares: true,
@@ -22274,14 +22210,6 @@ struct MergePlan {
     /// counted (`Shared::merge_head_inputs`).
     heads: bool,
     counts: Option<std::sync::Arc<Shared>>,
-    /// The inputs' pages dropped behind the second pass, every this many
-    /// bytes (`Options::merge_drop_behind`, `Options::merge_drop_chunk`),
-    /// and with it off the inputs whose pages are dropped all the same,
-    /// one flag an input: the partitions a form file serves
-    /// (`Options::merge_drops_covered`).
-    drop_behind: bool,
-    drop_covered: Vec<bool>,
-    drop_chunk: u64,
     /// The window the second pass asks ahead of its walk of each input
     /// (`Options::merge_read_ahead`); zero asks nothing.
     read_ahead: usize,
@@ -23281,9 +23209,6 @@ fn compact_run<R: MergeRest>(plan: MergePlan, rest: R) -> Result<MergeOut> {
         ord_durable,
         heads,
         counts,
-        drop_behind,
-        drop_covered,
-        drop_chunk,
         walk_cached,
         read_ahead,
         ahead_shares,
@@ -23425,49 +23350,6 @@ fn compact_run<R: MergeRest>(plan: MergePlan, rest: R) -> Result<MergeOut> {
     // key the inputs older than its newest flagged extent are dropped, the
     // flag itself is not carried, and a key with nothing live is left out
     // -- which is how a delete gets its bytes back.
-    // The inputs' files beside their mappings, for the drop of the pages
-    // behind the second pass (`Options::merge_drop_behind`): each input's
-    // records dropped from its last drop to a page short of the record the
-    // walk stands on, once the walk is a chunk past the last drop.
-    // Which inputs: every one under `merge_drop_behind`, else the
-    // partitions a form file serves (`Options::merge_drops_covered`).
-    let drops: Vec<bool> = (0..inputs.len())
-        .map(|i| drop_behind || drop_covered.get(i).copied().unwrap_or(false))
-        .collect();
-    let files: Vec<Option<vault::File>> = inputs
-        .iter()
-        .zip(&drops)
-        .map(|(name, &d)| {
-            if d {
-                vault::open(dir.join(name)).ok()
-            } else {
-                None
-            }
-        })
-        .collect();
-    let mut dropped_to: Vec<u64> = blobs
-        .iter()
-        .map(|b| b.record_offset(0).unwrap_or(0))
-        .collect();
-    let mut dropped_bytes = 0u64;
-    let mut drop_at = |i: usize, rank: usize| {
-        if !drops[i] {
-            return;
-        }
-        let Some(off) = blobs[i].record_offset(rank) else {
-            return;
-        };
-        let to = off.saturating_sub(4096) & !4095;
-        if to < dropped_to[i].saturating_add(drop_chunk.max(4096)) {
-            return;
-        }
-        blobs[i].drop_records(dropped_to[i], to);
-        if let Some(f) = files.get(i).and_then(|f| f.as_ref()) {
-            f.drop_range(dropped_to[i], to - dropped_to[i]);
-        }
-        dropped_bytes += to - dropped_to[i];
-        dropped_to[i] = to;
-    };
     let mut ahead = MergeAhead::new(&blobs, read_ahead, ahead_shares, counts.clone());
     // The inputs that are partitions: a key none of them holds is one the
     // output's range did not have (`Emitter::fresh`).
@@ -23480,7 +23362,6 @@ fn compact_run<R: MergeRest>(plan: MergePlan, rest: R) -> Result<MergeOut> {
                 if let Some(a) = ahead.as_mut() {
                     a.at(&blobs, i, rank);
                 }
-                drop_at(i, rank);
                 let Some((_, exts)) = blobs[i].exts_at(rank) else {
                     return Err(err("segment key walk: a rank the index does not have"));
                 };
@@ -23540,10 +23421,6 @@ fn compact_run<R: MergeRest>(plan: MergePlan, rest: R) -> Result<MergeOut> {
                 Ok(())
             })?;
         }
-    }
-    if let Some(c) = &counts {
-        c.merge_dropped_bytes
-            .fetch_add(dropped_bytes, AtomicOrdering::Relaxed);
     }
     steps.step("values");
     if let Some(c) = &counts {
@@ -26403,9 +26280,6 @@ struct Shared {
     /// `Db::merge_ahead`).
     merge_ahead_asks: AtomicU64,
     merge_ahead_bytes: AtomicU64,
-    /// Bytes of input records a merge's second pass dropped from the page
-    /// cache behind itself (`Options::merge_drop_behind`).
-    merge_dropped_bytes: AtomicU64,
     /// The syncs merge writers made behind them (`Options::merge_sync_ahead`).
     merge_syncs: AtomicU64,
     /// The merge outputs whose writers started a helper.
@@ -32339,9 +32213,6 @@ impl Reader {
         )
     }
 
-    /// Bytes of input records the merges' second passes dropped from the
-    /// page cache behind themselves over the store's life
-    /// (`Options::merge_drop_behind`).
     /// The syncs merge writers made behind them over the store's life
     /// (`Options::merge_sync_ahead`).
     #[doc(hidden)]
@@ -32354,12 +32225,6 @@ impl Reader {
     #[doc(hidden)]
     pub fn merge_helpers(&self) -> u64 {
         self.shared.merge_helpers.load(AtomicOrdering::Relaxed)
-    }
-
-    pub fn merge_dropped_bytes(&self) -> u64 {
-        self.shared
-            .merge_dropped_bytes
-            .load(AtomicOrdering::Relaxed)
     }
 
     /// How many segments' ordered companions were advised `MADV_RANDOM`, and
@@ -44452,7 +44317,6 @@ impl Db {
             merge_record_inputs: AtomicU64::new(0),
             merge_ahead_asks: AtomicU64::new(0),
             merge_ahead_bytes: AtomicU64::new(0),
-            merge_dropped_bytes: AtomicU64::new(0),
             merge_syncs: AtomicU64::new(0),
             merge_helpers: AtomicU64::new(0),
             reads_near: std::sync::atomic::AtomicBool::new(false),
@@ -45868,7 +45732,6 @@ impl Db {
             merge_record_inputs: AtomicU64::new(0),
             merge_ahead_asks: AtomicU64::new(0),
             merge_ahead_bytes: AtomicU64::new(0),
-            merge_dropped_bytes: AtomicU64::new(0),
             merge_syncs: AtomicU64::new(0),
             merge_helpers: AtomicU64::new(0),
             reads_near: std::sync::atomic::AtomicBool::new(false),
@@ -50084,7 +49947,7 @@ impl Db {
 
     /// The landings' questions whether a rewritten partition cuts the same
     /// blocks, by how each was answered: from the ordered indexes and from
-    /// the records (`Options::same_blocks_from_index`).
+    /// the records, for keys a head cannot hold whole (`Db::same_blocks`).
     pub fn same_blocks_asked(&self) -> [u64; 2] {
         let a = &self.shared.same_blocks_asked;
         [
@@ -50627,7 +50490,6 @@ impl Db {
         cur: &State,
         segs: &[std::sync::Arc<Seg>],
         rebase: bool,
-        from_index: bool,
         asked: &[AtomicU64; 2],
         rd: Option<&Reader>,
     ) -> Vec<u64> {
@@ -50639,7 +50501,7 @@ impl Db {
                 let was = parts.iter().position(|q| q.lo == seg.lo && q.hi == seg.hi);
                 match was {
                     Some(q) if std::sync::Arc::ptr_eq(&parts[q], seg) => cur.layout[q],
-                    Some(q) if rebase && Db::same_blocks(&parts[q], seg, from_index, asked, rd) => {
+                    Some(q) if rebase && Db::same_blocks(&parts[q], seg, asked, rd) => {
                         cur.layout[q]
                     }
                     _ => seg.blob.id(),
@@ -50670,7 +50532,7 @@ impl Db {
     /// rank and at the last. Read from the two ordered indexes where both
     /// hold whole keys in their heads (`OrdIndex::whole_key_at`), the
     /// block's first ranks being the top level's, in memory, and from the
-    /// records otherwise (`Options::same_blocks_from_index`).
+    /// records otherwise.
     ///
     /// A key a block of both partitions is, read from the records, for
     /// records of a hundred bytes a read of most of the pages of both, and
@@ -50681,19 +50543,13 @@ impl Db {
     /// past its budget: at the landing of a merge over a whole store this
     /// walk read the store into a cache an eighth of its size, on the
     /// segment work's one pin, in fifty milliseconds.
-    fn same_blocks(
-        a: &Seg,
-        b: &Seg,
-        from_index: bool,
-        asked: &[AtomicU64; 2],
-        rd: Option<&Reader>,
-    ) -> bool {
+    fn same_blocks(a: &Seg, b: &Seg, asked: &[AtomicU64; 2], rd: Option<&Reader>) -> bool {
         let n = a.blob.keys();
         if n != b.blob.keys() || a.level != b.level || a.lo != b.lo || a.hi != b.hi {
             return false;
         }
         let ranks = || (0..n).step_by(CACHE_BLOCK).chain(n.checked_sub(1));
-        if from_index && a.ord.uniform() && b.ord.uniform() {
+        if a.ord.uniform() && b.ord.uniform() {
             let (mut x, mut y) = (Vec::new(), Vec::new());
             let mut whole = true;
             let same = ranks().all(|r| {
@@ -61421,7 +61277,6 @@ impl Maint {
                 cur,
                 &segs,
                 !tier && self.opts.forms_rebase,
-                self.opts.same_blocks_from_index,
                 &self.shared.same_blocks_asked,
                 Some(&self.r),
             );
@@ -68085,28 +67940,6 @@ impl Maint {
         let inline_max = self.opts.inline_bytes;
         let ord_durable = self.opts.ord_durable;
         let heads = self.opts.merge_keys_by_heads;
-        let drop_behind = self.opts.merge_drop_behind;
-        // The inputs a form file serves, by the gate and the cell as they
-        // stand now: a partition whose form is attached or taken out while
-        // the merge runs is read back from the device by whoever reads its
-        // raw records next, which is a cost and never a wrong answer.
-        let drop_covered: Vec<bool> =
-            if self.opts.merge_drops_covered && self.shared.zgate.load() == zselect::GATE_Z {
-                // Pinned, as every look into a cell is.
-                let _op = self.op();
-                inputs
-                    .iter()
-                    .map(|n| {
-                        self.segs()
-                            .iter()
-                            .find(|s| &s.name == n)
-                            .is_some_and(|s| s.level > 0 && s.z.get().is_some())
-                    })
-                    .collect()
-            } else {
-                Vec::new()
-            };
-        let drop_chunk = self.opts.merge_drop_chunk;
         let walk_cached = self.opts.merge_walk_cached;
         let verify_inputs = self.opts.merge_verifies_inputs;
         let read_ahead = self.merge_window();
@@ -68142,9 +67975,6 @@ impl Maint {
                 ord_durable,
                 heads,
                 counts: Some(held.clone()),
-                drop_behind,
-                drop_covered,
-                drop_chunk,
                 walk_cached,
                 read_ahead,
                 ahead_shares,

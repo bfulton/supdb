@@ -716,10 +716,6 @@ pub struct Supdb {
     /// that size or more is mapped and unmapped at its free.
     /// `supdb-ingestmmapthr`, and `supdb-mmapthr` durable.
     mmapthr: bool,
-    /// A merge drops its inputs' pages from the page cache behind its
-    /// second pass (`Options::merge_drop_behind`, refuted and off).
-    /// `supdb-ingestmergedropbehind`, and `supdb-mergedropbehind` durable.
-    mergedropbehind: bool,
     /// A merge's landing plans nothing, as a seal's landing alone did, so a
     /// store nothing writes keeps its pieces however long it is read
     /// (`Options::merge_chains` off). `supdb-ingestnomergechain`, and
@@ -1135,14 +1131,6 @@ pub struct Supdb {
     /// has no tables to carry (`Options::snapshot_stands` off).
     /// `supdb-snapdrops`.
     snapdrops: bool,
-    /// A merge drops behind it the raw records of an input partition its
-    /// form file serves (`Options::merge_drops_covered`).
-    /// `supdb-mergedropscovered`.
-    mergedropscovered: bool,
-    /// The landing's same-blocks check read from the records whatever the
-    /// indexes hold (`Options::same_blocks_from_index` off).
-    /// `supdb-sameblocksrecords`.
-    sameblocksrecords: bool,
     /// The fills' room closed for a second by any growth of the group's
     /// refaults since the last reading, however old the reading
     /// (`Options::forms_settle_room_pressure` off). `supdb-settleroomstill`.
@@ -2188,10 +2176,6 @@ struct Policy {
     /// that size or more is mapped and unmapped at its free.
     /// `supdb-ingestmmapthr`, and `supdb-mmapthr` durable.
     mmapthr: bool,
-    /// A merge drops its inputs' pages from the page cache behind its
-    /// second pass (`Options::merge_drop_behind`, refuted and off).
-    /// `supdb-ingestmergedropbehind`, and `supdb-mergedropbehind` durable.
-    mergedropbehind: bool,
     /// A merge's landing plans nothing, as a seal's landing alone did, so a
     /// store nothing writes keeps its pieces however long it is read
     /// (`Options::merge_chains` off). `supdb-ingestnomergechain`, and
@@ -2607,14 +2591,6 @@ struct Policy {
     /// has no tables to carry (`Options::snapshot_stands` off).
     /// `supdb-snapdrops`.
     snapdrops: bool,
-    /// A merge drops behind it the raw records of an input partition its
-    /// form file serves (`Options::merge_drops_covered`).
-    /// `supdb-mergedropscovered`.
-    mergedropscovered: bool,
-    /// The landing's same-blocks check read from the records whatever the
-    /// indexes hold (`Options::same_blocks_from_index` off).
-    /// `supdb-sameblocksrecords`.
-    sameblocksrecords: bool,
     /// The fills' room closed for a second by any growth of the group's
     /// refaults since the last reading, however old the reading
     /// (`Options::forms_settle_room_pressure` off). `supdb-settleroomstill`.
@@ -3340,7 +3316,6 @@ impl Default for Policy {
             mergewalkrescan: false,
             mergenoverify: false,
             mmapthr: false,
-            mergedropbehind: false,
             nomergechain: false,
             mergeuncapped: false,
             mergeone: false,
@@ -3439,8 +3414,6 @@ impl Default for Policy {
             formson: false,
             formsoffkept: false,
             snapdrops: false,
-            mergedropscovered: false,
-            sameblocksrecords: false,
             settleroomstill: false,
             settlespan: false,
             nopacesyncs: false,
@@ -6573,33 +6546,6 @@ impl Supdb {
         )
     }
 
-    /// `supdb` whose merges drop their inputs' pages from the page cache
-    /// behind the second pass (`Options::merge_drop_behind`, refuted):
-    /// against `supdb` under a bound it prices the drop.
-    pub fn create_mergedropbehind(path: &Path) -> Res<Supdb> {
-        Supdb::with_policy(
-            path,
-            Policy {
-                mergedropbehind: true,
-                ..Policy::default()
-            },
-        )
-    }
-
-    /// `supdb-ingest` whose merges drop their inputs' pages, as
-    /// `supdb-mergedropbehind`.
-    pub fn create_ingest_mergedropbehind(path: &Path) -> Res<Supdb> {
-        Supdb::with_policy(
-            path,
-            Policy {
-                partition: false,
-                durable: false,
-                mergedropbehind: true,
-                ..Policy::default()
-            },
-        )
-    }
-
     /// `supdb` whose merge landings plan nothing, where the default plans
     /// the next merge at each (`Options::merge_chains`): against `supdb`
     /// under a bound it prices the pieces a read pass meets.
@@ -8453,47 +8399,6 @@ impl Supdb {
         )
     }
 
-    /// `supdb` whose landings ask the records whether a rewritten
-    /// partition cuts the same blocks, whatever the ordered indexes hold
-    /// (`Options::same_blocks_from_index` off).
-    pub fn create_sameblocksrecords(path: &Path) -> Res<Supdb> {
-        Supdb::with_policy(
-            path,
-            Policy {
-                sameblocksrecords: true,
-                ..Policy::default()
-            },
-        )
-    }
-
-    /// `supdb` whose merges drop behind them the raw records of an input
-    /// partition its form file serves (`Options::merge_drops_covered`)
-    /// with the landing's same-blocks question asked of the records
-    /// (`Options::same_blocks_from_index` off): the shape that first priced
-    /// the drop, whose landings read back the pages the merge had dropped.
-    pub fn create_mergedropsrecords(path: &Path) -> Res<Supdb> {
-        Supdb::with_policy(
-            path,
-            Policy {
-                mergedropscovered: true,
-                sameblocksrecords: true,
-                ..Policy::default()
-            },
-        )
-    }
-
-    /// `supdb` whose merges drop behind them the raw records of an input
-    /// partition its form file serves (`Options::merge_drops_covered`).
-    pub fn create_mergedropscovered(path: &Path) -> Res<Supdb> {
-        Supdb::with_policy(
-            path,
-            Policy {
-                mergedropscovered: true,
-                ..Policy::default()
-            },
-        )
-    }
-
     /// `supdb` whose writer, its forms given up on a reading of its scans,
     /// keeps them off until its next scan whatever it commits meanwhile
     /// (`Options::scan_forms_off_stale_writes` zero).
@@ -9913,7 +9818,6 @@ impl Supdb {
             mergewalkrescan,
             mergenoverify,
             mmapthr,
-            mergedropbehind,
             nomergechain,
             mergeuncapped,
             mergeone,
@@ -10012,8 +9916,6 @@ impl Supdb {
             formson,
             formsoffkept,
             snapdrops,
-            mergedropscovered,
-            sameblocksrecords,
             settleroomstill,
             settlespan,
             nopacesyncs,
@@ -10372,9 +10274,6 @@ impl Supdb {
             merge_walk_cached: !mergewalkrescan,
             merge_verifies_inputs: !mergenoverify,
             malloc_mmap_threshold: if mmapthr { 128 << 10 } else { 0 },
-            merge_drop_behind: mergedropbehind,
-            merge_drops_covered: mergedropscovered,
-            same_blocks_from_index: !sameblocksrecords,
             merge_chains: !nomergechain,
             merge_bytes_cap: if mergeuncapped {
                 0
@@ -10968,7 +10867,6 @@ impl Supdb {
             mergewalkrescan,
             mergenoverify,
             mmapthr,
-            mergedropbehind,
             nomergechain,
             mergeuncapped,
             mergeone,
@@ -11067,8 +10965,6 @@ impl Supdb {
             formson,
             formsoffkept,
             snapdrops,
-            mergedropscovered,
-            sameblocksrecords,
             settleroomstill,
             settlespan,
             nopacesyncs,
@@ -12441,13 +12337,6 @@ impl Engine for Supdb {
                 "supdb-ingestmergenoverify"
             };
         }
-        if self.mergedropbehind {
-            return if self.partition {
-                "supdb-mergedropbehind"
-            } else {
-                "supdb-ingestmergedropbehind"
-            };
-        }
         if self.nomergechain {
             return if self.partition {
                 "supdb-nomergechain"
@@ -12944,15 +12833,6 @@ impl Engine for Supdb {
         if self.snapdrops {
             return "supdb-snapdrops";
         }
-        if self.mergedropscovered && self.sameblocksrecords {
-            return "supdb-mergedropsrecords";
-        }
-        if self.mergedropscovered {
-            return "supdb-mergedropscovered";
-        }
-        if self.sameblocksrecords {
-            return "supdb-sameblocksrecords";
-        }
         if self.settleroomstill {
             return "supdb-settleroomstill";
         }
@@ -13382,10 +13262,6 @@ impl Engine for Supdb {
             ("merge_record_inputs", db.merge_key_sources().1 as f64),
             ("merge_ahead_asks", db.merge_ahead().0 as f64),
             ("merge_ahead_mb", db.merge_ahead().1 as f64 / 1048576.0),
-            (
-                "merge_dropped_mb",
-                db.merge_dropped_bytes() as f64 / 1048576.0,
-            ),
             ("unsealed_keys", db.unsealed_keys() as f64),
             // The writer's point reads by the path that answered them: the
             // partition and the live table alone, and the layered read of
@@ -15630,7 +15506,6 @@ pub fn guarantee(arm: &str) -> Option<Guarantee> {
         | "supdb-mergewalkrescan"
         | "supdb-mergenoverify"
         | "supdb-mmapthr"
-        | "supdb-mergedropbehind"
         | "supdb-nomergechain"
         | "supdb-mergeuncapped"
         | "supdb-mergeone"
@@ -15739,9 +15614,6 @@ pub fn guarantee(arm: &str) -> Option<Guarantee> {
         | "supdb-formson"
         | "supdb-formsoffkept"
         | "supdb-snapdrops"
-        | "supdb-mergedropscovered"
-        | "supdb-mergedropsrecords"
-        | "supdb-sameblocksrecords"
         | "supdb-settleroomstill"
         | "supdb-zgroup1k"
         | "supdb-settlespan"
@@ -15935,7 +15807,6 @@ pub fn guarantee(arm: &str) -> Option<Guarantee> {
         | "supdb-ingestmergewalkrescan"
         | "supdb-ingestmergenoverify"
         | "supdb-ingestmmapthr"
-        | "supdb-ingestmergedropbehind"
         | "supdb-ingestnomergechain"
         | "supdb-ingestmergeuncapped"
         | "supdb-ingestmergeone"
@@ -17446,8 +17317,6 @@ pub fn open(arm: &str, dir: &Path, map_gb: usize) -> Res<Box<dyn Engine>> {
             dir,
         )?,
         "supdb-ingestmergenoverify" => supdb_arm(Supdb::create_ingest_mergenoverify, dir)?,
-        "supdb-mergedropbehind" => supdb_arm(Supdb::create_mergedropbehind, dir)?,
-        "supdb-ingestmergedropbehind" => supdb_arm(Supdb::create_ingest_mergedropbehind, dir)?,
         "supdb-nomergechain" => supdb_arm(Supdb::create_nomergechain, dir)?,
         "supdb-ingestnomergechain" => supdb_arm(Supdb::create_ingest_nomergechain, dir)?,
         "supdb-mergeuncapped" => supdb_arm(Supdb::create_mergeuncapped, dir)?,
@@ -18350,9 +18219,6 @@ pub fn open(arm: &str, dir: &Path, map_gb: usize) -> Res<Box<dyn Engine>> {
         "supdb-formson" => supdb_arm(Supdb::create_formson, dir)?,
         "supdb-formsoffkept" => supdb_arm(Supdb::create_formsoffkept, dir)?,
         "supdb-snapdrops" => supdb_arm(Supdb::create_snapdrops, dir)?,
-        "supdb-mergedropscovered" => supdb_arm(Supdb::create_mergedropscovered, dir)?,
-        "supdb-mergedropsrecords" => supdb_arm(Supdb::create_mergedropsrecords, dir)?,
-        "supdb-sameblocksrecords" => supdb_arm(Supdb::create_sameblocksrecords, dir)?,
         "supdb-settleroomstill" => supdb_arm(Supdb::create_settleroomstill, dir)?,
         "supdb-zgroup1k" => supdb_arm(Supdb::create_zgroup1k, dir)?,
         "supdb-settlespan" => supdb_arm(Supdb::create_settlespan, dir)?,
@@ -21872,27 +21738,6 @@ mod tests {
                 assert_eq!(z.features(), base.features());
                 let o = z.db.as_ref().unwrap().options();
                 assert!(!o.snapshot_stands && b.snapshot_stands);
-            }
-            {
-                let z = Supdb::create_mergedropscovered(&dir("mergedropscovered")).unwrap();
-                assert_eq!(z.name(), "supdb-mergedropscovered");
-                assert_eq!(z.features(), base.features());
-                let o = z.db.as_ref().unwrap().options();
-                assert!(o.merge_drops_covered && !b.merge_drops_covered);
-            }
-            {
-                let z = Supdb::create_mergedropsrecords(&dir("mergedropsrecords")).unwrap();
-                assert_eq!(z.name(), "supdb-mergedropsrecords");
-                assert_eq!(z.features(), base.features());
-                let o = z.db.as_ref().unwrap().options();
-                assert!(o.merge_drops_covered && !o.same_blocks_from_index);
-            }
-            {
-                let z = Supdb::create_sameblocksrecords(&dir("sameblocksrecords")).unwrap();
-                assert_eq!(z.name(), "supdb-sameblocksrecords");
-                assert_eq!(z.features(), base.features());
-                let o = z.db.as_ref().unwrap().options();
-                assert!(!o.same_blocks_from_index && b.same_blocks_from_index);
             }
             {
                 let z = Supdb::with_policy(

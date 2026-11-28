@@ -29,7 +29,6 @@ Reader::merge_key_sources	-	a test seam or a counter: reads or sets the store's 
 Reader::merge_ahead	-	a test seam or a counter: reads or sets the store's bookkeeping, at no key, entry, block or step of an operation
 Reader::merge_syncs	-	a test seam or a counter: reads or sets the store's bookkeeping, at no key, entry, block or step of an operation
 Reader::merge_helpers	-	a test seam or a counter: reads or sets the store's bookkeeping, at no key, entry, block or step of an operation
-Reader::merge_dropped_bytes	-	a test seam or a counter: reads or sets the store's bookkeeping, at no key, entry, block or step of an operation
 Reader::ords_advised	-	a test seam or a counter: reads or sets the store's bookkeeping, at no key, entry, block or step of an operation
 Reader::zpages_advised	-	a test seam or a counter: reads or sets the store's bookkeeping, at no key, entry, block or step of an operation
 Reader::raw_touches	-	a test seam or a counter: reads or sets the store's bookkeeping, at no key, entry, block or step of an operation
@@ -312,8 +311,7 @@ Blob::willneed_dir	-	an ask or a drop of the page cache, made out of core or at 
 Blob::willneed_at	-	an ask or a drop of the page cache, made out of core or at a build; a store in core makes none of them on an operation
 Blob::willneed_span	-	an ask or a drop of the page cache, made out of core or at a build; a store in core makes none of them on an operation
 Blob::open_ahead	-	an ask or a drop of the page cache, made out of core or at a build; a store in core makes none of them on an operation
-Blob::record_offset	-	a fact a merge reads once an input, and a rank at a time only under merge_drop_behind, merge_drops_covered or merge_read_ahead, each off by default and run by no probe
-Blob::drop_records	-	an ask or a drop of the page cache, made out of core or at a build; a store in core makes none of them on an operation
+Blob::record_offset	-	a fact a merge reads once an input, and a rank at a time only under merge_read_ahead, off by default and run by no probe
 Blob::prefetch_dir	-	an ask or a drop of the page cache, made out of core or at a build; a store in core makes none of them on an operation
 Blob::prefetch_ranks_est	-	an ask or a drop of the page cache, made out of core or at a build; a store in core makes none of them on an operation
 Blob::record_region_bytes	-	a fact a form file's build or the controller reads, once a build or a sample
