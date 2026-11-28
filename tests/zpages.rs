@@ -7814,6 +7814,7 @@ const JOB_WALL: std::time::Duration = std::time::Duration::from_secs(300);
 /// (`Options::zpages_drive_at_job_end`, once a tick has ended and left a
 /// decision for that turn to drive by). Elsewhere a returned job waits for
 /// a tick, and a wait for it ticks.
+#[cfg(target_os = "linux")]
 fn running(db: &Db, c: &supdb::db::ZCounts) -> bool {
     if db.zpage_build_held() {
         return false;
@@ -7835,6 +7836,7 @@ fn running(db: &Db, c: &supdb::db::ZCounts) -> bool {
 /// that counted its ticks ran out of them with the build still running.
 /// Held, a job takes no time on the clock, as on a host fast enough to
 /// finish it between two ticks.
+#[cfg(target_os = "linux")]
 fn while_running(db: &Db) -> bool {
     let t = std::time::Instant::now();
     while running(db, &db.zpage_counts()) {
@@ -7848,6 +7850,7 @@ fn while_running(db: &Db) -> bool {
 
 /// `while_running`, and a job still running at `JOB_WALL` a failure: what
 /// every move of the injected clock past a store's open waits for first.
+#[cfg(target_os = "linux")]
 fn jobs_ended(db: &Db) {
     assert!(
         while_running(db),
@@ -12961,6 +12964,7 @@ fn a_partition_its_form_serves_drops_its_raw_pages_when_asked() {
 }
 
 /// The keys of the `i`th partition by key order, as the model has them.
+#[cfg(target_os = "linux")]
 fn keys_of_partition(db: &Db, model: &Model, i: usize) -> Vec<Vec<u8>> {
     let heat = db.zpage_heat();
     let lo = heat[i].lo.clone();
@@ -12973,6 +12977,7 @@ fn keys_of_partition(db: &Db, model: &Model, i: usize) -> Vec<Vec<u8>> {
 }
 
 /// Each partition's coding by key order, from its form file.
+#[cfg(target_os = "linux")]
 fn codings(db: &Db) -> Vec<bool> {
     db.zpage_heat().iter().map(|h| h.coded).collect()
 }
@@ -15151,6 +15156,7 @@ fn the_hot_raw_policy_releases_into_the_groups_unused_memory_where_the_line_woul
 }
 
 /// `n` reads of `keys`, round and round: decodes for the heat.
+#[cfg(target_os = "linux")]
 fn heat_up(db: &Db, keys: &[Vec<u8>], n: usize) {
     for i in 0..n {
         let k = &keys[i % keys.len()];
