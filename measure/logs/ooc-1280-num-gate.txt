@@ -1,0 +1,31 @@
+gate: class x86_64/intel-r-xeon-r-processor-2.10ghz/4c/16g/hypervisor/b1280m scale ooc -- 10 prior rows (window 10)
+host: floors within the window (8 of 8)
+comparators: 1 below their window (rocksdb-tuned load device_bytes_per_byte); an arm's regression in those workloads gets no verdict
+  flagged   lag-burst      lmdb-nordahead    3000000  read_us_per_io_lag100pct [0.00, 0.00] us/io; prior CIs span [670.21, 38100] (better than every prior row -- a win or a broken measurement)
+  flagged   lag-burst      supdb             3000000  refaults_per_op_lag100pct [0.00, 0.00] refaults/op; prior CIs span [0.00, 0.09] (better than every prior row -- a win or a broken measurement)
+  flagged   lag-burst      supdb-nozpages    3000000  bg_read_bytes_per_op_lag100pct [0.00, 0.12] B/op; prior CIs span [1.44, 38.95] (better than every prior row -- a win or a broken measurement)
+  REGRESSED lag-burst      supdb-nozpages    3000000  read_us_per_io_lag100pct [187.50, 357.14] us/io; prior CIs span [43.77, 165.37]
+  flagged   lag-burst      supdb-nozpages    3000000  refaults_per_op_lag100pct [0.00, 0.00] refaults/op; prior CIs span [0.00, 0.01] (better than every prior row -- a win or a broken measurement)
+  REGRESSED lag-burst      supdb-nocache    10000000  bg_read_bytes_per_op_lag100pct [649.75, 673.16] B/op; prior CIs span [541.16, 649.73]
+  REGRESSED lag-burst      supdb-nozpages   10000000  read_us_per_io_lag1pct [68.18, 500.00] us/io; prior CIs span [0.00, 48.73]
+  REGRESSED load           rocksdb-tuned    10000000  device_bytes_per_byte  [1.99, 1.99] B/B; prior CIs span [1.99, 1.99]
+  flagged   read           supdb-cache256tofit  10000000  reads_per_s_2t         [4690088, 4783435] reads/s; prior CIs span [649852, 4549916] (better than every prior row -- a win or a broken measurement)
+  flagged   read           supdb-noadvice   10000000  reads_per_s_2t         [4375740, 4875263] reads/s; prior CIs span [671781, 3941285] (better than every prior row -- a win or a broken measurement)
+  flagged   read           supdb-noadvice   10000000  reads_per_s_3t         [6939628, 7127217] reads/s; prior CIs span [988432, 6439802] (better than every prior row -- a win or a broken measurement)
+  flagged   read           supdb-nocache    10000000  reads_per_s_2t         [4427926, 4872720] reads/s; prior CIs span [705472, 4367291] (better than every prior row -- a win or a broken measurement)
+  flagged   scan           supdb-noadvice   10000000  entries_per_s_3t       [109554623, 110622281] entries/s; prior CIs span [22890380, 108311445] (better than every prior row -- a win or a broken measurement)
+  REGRESSED scan-lag       supdb-noadvice   10000000  read_us_per_io_lag100pct [26483, 35586] us/io; prior CIs span [1949, 21103]
+  flagged   scan-lag       supdb-nocache    10000000  entries_per_s_lag100pct [2193028, 2651772] entries/s; prior CIs span [322560, 2009124] (better than every prior row -- a win or a broken measurement)
+  flagged   scan-lag       supdb-nocache    10000000  entries_per_s_lag1pct  [15607280, 18630023] entries/s; prior CIs span [2346712, 14950196] (better than every prior row -- a win or a broken measurement)
+  REGRESSED scan-lag       supdb-nozpages   10000000  majfaults_per_op_lag10pct [2.66, 2.80] faults/op; prior CIs span [0.00, 2.60]
+  REGRESSED scan-lag       supdb-nozpages   10000000  read_bytes_per_op_lag10pct [10911, 11483] B/op; prior CIs span [1.23, 10659]
+  REGRESSED scan-lag       supdb-nozpages   10000000  refaults_per_op_lag10pct [2.66, 2.80] refaults/op; prior CIs span [0.00, 2.60]
+  flagged   scan-mixed     supdb-nozpages   10000000  majfaults_per_op_2t    [0.55, 0.56] faults/op; prior CIs span [0.57, 0.85] (better than every prior row -- a win or a broken measurement)
+  flagged   scan-mixed     supdb-nozpages   10000000  read_bytes_per_op_2t   [2273, 2307] B/op; prior CIs span [2314, 3497] (better than every prior row -- a win or a broken measurement)
+  flagged   scan-mixed     supdb-nozpages   10000000  refaults_per_op_2t     [0.55, 0.56] refaults/op; prior CIs span [0.57, 0.85] (better than every prior row -- a win or a broken measurement)
+  flagged   ycsb-C         supdb-noadvice    3000000  ops_per_s              [3185646, 3509592] ops/s; prior CIs span [1251681, 3148476] (better than every prior row -- a win or a broken measurement)
+  flagged   ycsb-C         supdb            10000000  ops_per_s              [3577282, 3882933] ops/s; prior CIs span [596203, 3522486] (better than every prior row -- a win or a broken measurement)
+  flagged   ycsb-E         rocksdb-tuned-lz4   3000000  ops_per_s              [21466, 22389] ops/s; prior CIs span [12068, 21280] (better than every prior row -- a win or a broken measurement)
+  flagged   ycsbs-C        supdb-noadvice   10000000  ops_per_s              [2101971, 2454374] ops/s; prior CIs span [382164, 2088562] (better than every prior row -- a win or a broken measurement)
+  no band yet for 520 of 3078 quantities (fewer than 3 prior rows)
+REGRESSED: 7 of 3078 quantities are worse than every row in the window

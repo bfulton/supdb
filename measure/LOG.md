@@ -52,3 +52,16 @@ and copied here under `measure/rows/` at the same relative path.
 - Read: `python3 scripts/encrow.py <row>` → `measure/logs/encrow.txt`
   (supdb-cipher against lmdb3-enc: ahead 111, behind 17, unresolved 16;
   against rocksdb-tuned-enc: ahead 114, behind 9, unresolved 21; the rest in the file).
+
+## 3. Bounded row, 1.25 GiB, numbered keys
+
+- Command: `cd /home/user/c0/bench && TMPDIR=/home/user/base/tmp/ooc-1280-num sh scripts/ooc.sh 1342177280 --out /home/user/base/rows`
+- Start 2026-11-28T00:09:38Z, verdict `ooc.sh: bounded run under 1342177280 bytes banked`
+  by 03:12:53Z; the run's own clock 10,981 s (3 h 03 m), one sitting. No kill.
+- Row: `measure/rows/ooc/20261128T000943Z-b3a043d.json` (10 arms, rungs 3M and 10M, 3 reps).
+- Gate `bench gate <row> --runs runs` (exit 1; `measure/logs/ooc-1280-num-gate.txt`):
+  10 prior rows of class `.../b1280m`, floors within the window (8 of 8);
+  7 of 3078 quantities worse than every row in the window, all lag-burst and
+  scan-lag cells of supdb-nozpages, supdb-nocache and supdb-noadvice, plus
+  rocksdb-tuned load device_bytes_per_byte at 10M (a comparator below its
+  window); no band yet for 520.
