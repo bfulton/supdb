@@ -400,6 +400,7 @@ Reader::shared_rmw_below	-	main #30-#33: a test seam or a counter: reads or sets
 Reader::shared_writes_held	-	main #30-#33: a test seam or a counter: reads or sets the store's bookkeeping, at no key, entry, block or step of an operation
 Reader::unshare_holding	-	main #30-#33: a test seam or a counter: reads or sets the store's bookkeeping, at no key, entry, block or step of an operation
 Reader::upkeep_passes_ended	-	main #30-#33: a test seam or a counter: reads or sets the store's bookkeeping, at no key, entry, block or step of an operation
+Reader::upkeep_passes_begun	-	a test seam: the upkeep thread's passes begun, read by tests/db.rs beside upkeep_passes_ended, at no key, entry, block or step of an operation
 Db::writer	-	main #30: claims a handle that writes (Options::shared_writers, share_on_write), once a handle
 Reader::put	-	main #30: a write through a handle under the held log (Options::shared_writers, share_on_write), an operation on no probe of scripts/cost.sh: the gap, owed a probe beside the writer's own put
 Reader::append	-	main #30: a write through a handle under the held log (Options::shared_writers, share_on_write), an operation on no probe of scripts/cost.sh: the gap, owed a probe beside the writer's own put

@@ -32131,6 +32131,14 @@ impl Reader {
         self.shared.upkeep.passes.load(AtomicOrdering::Relaxed)
     }
 
+    /// A test's: the passes the store's upkeep thread has begun. Where it
+    /// equals `upkeep_passes_ended`, read after it, no pass is in flight,
+    /// so a count of the passes taken then is of every pass begun before.
+    #[doc(hidden)]
+    pub fn upkeep_passes_begun(&self) -> u64 {
+        self.shared.upkeep.begun.load(AtomicOrdering::Acquire)
+    }
+
     /// Of the layered reads `point_lean_reads` counts, the ones the read
     /// that places its sources first answered
     /// (`Reader::read_placed`); the rest
@@ -53296,6 +53304,10 @@ struct Lend {
     /// took the upkeep back, the times it waited for a pass in flight,
     /// and the nanoseconds it waited.
     passes: AtomicU64,
+    /// A test's: the passes the thread has begun, counted as each takes the
+    /// upkeep out and before it walks anything; with `passes`, whether a
+    /// pass is in flight. Only the thread writes it.
+    begun: AtomicU64,
     takes: AtomicU64,
     waits: AtomicU64,
     wait_ns: AtomicU64,
@@ -54036,6 +54048,7 @@ impl Reader {
                 continue;
             };
             alert_until = std::time::Instant::now() + UPKEEP_ALERT;
+            lend.begun.fetch_add(1, AtomicOrdering::Relaxed);
             Reader::upkeep_held(&shared, 1);
             let began = std::time::Instant::now();
             let cpu0 = thread_cpu_ns();
