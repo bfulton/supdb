@@ -53,9 +53,13 @@ not on each piece.
   green, once the gate reads C0 green against itself (the first pull
   request, `rc/cost-floor`, is that fix).
 - In phase 1 a count may move down or sideways. A red passes only where
-  every gained function is shown, by instruction, to be inlining that moved
-  with a net at or under zero, or padding by a sum by mnemonic
-  (`release/baseline.md`, 3.1).
+  every gained function is shown, by instruction, to be inlining that
+  moved, padding by a sum by mnemonic, or register allocation in a function
+  whose source the removal changed (a spill and its reload, named by
+  instruction), with the probe's net at or under zero
+  (`release/baseline.md`, 3.1). The first batch's one red was the last kind:
+  `Reader::read_layers` +2 an op, a spill and a reload of `rsi`, in probes
+  whose totals fell by 3 a read.
 - The lists that only go down are lowered in the same commit:
   `tests/data/cost-entries.txt` for a removed seam, `tests/data/couplings.txt`
   for a removed branch that held a counted token.
@@ -71,8 +75,16 @@ not on each piece.
 - Decision 1 is revised: `Options` does not become `#[non_exhaustive]`.
   That attribute forbids struct literals outside the crate, and the tests,
   the suite and the examples hold 667 of them. Kept experimental and
-  test-seam fields are hidden from the docs, and that is all PR30 does.
+  test-seam fields are hidden from the docs, and that is all the last
+  cluster does.
 - `CLAUDE.md`'s sentence that the comparison arms are not dead code names
   four options that go (`cursor_merge` stays as a test seam;
   `scan_merge`, `scan_snapshot_arena`, `flush_ranges` go). The pull request
   that removes the last of them rewrites the sentence.
+
+## Batches
+
+| batch | clusters (the reviewer's grouping) | branch | state |
+|---|---|---|---|
+| 1 | PR1: adaptive-lag, fit-trim, zpages-drop, seal-shape, upkeep-wake | `rc/phase1-pr1`, `2eca03bd` to `31c90d38` | full gate green; cost read by function (one spill, net -3 a read); an independent review passed every removal as keeping the default's behaviour |
+| 2 | PR2, PR3, PR4 | the same branch | being written |
