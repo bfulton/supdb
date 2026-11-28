@@ -1024,10 +1024,7 @@ or three times, holding the blocks it walks as copies under the form
 `supdb-settleroomstill` is `supdb` with the room its commits' fills build in closed
 for a second by any growth of the memory group's refaults since the last
 reading, however old (`Options::forms_settle_room_pressure` off);
-`supdb-snapdrops` is `supdb` whose handles, and whose writer on the merge
-paths, drop their scan snapshot at every publish their look has no tables
-to carry across, a merge's or a seal's landing among them
-(`Options::snapshot_stands` off); `supdb-mergedropscovered` with its
+`supdb-mergedropscovered` is `supdb` with its
 merges dropping behind them the raw records of an input partition its form
 file serves (`Options::merge_drops_covered`), and
 `supdb-sameblocksrecords` with the landing's question whether a rewritten

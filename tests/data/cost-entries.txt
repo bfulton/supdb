@@ -50,7 +50,6 @@ Reader::forget_form_unretracted	-	a test seam or a counter: reads or sets the st
 Reader::published_kind	-	a test seam or a counter: reads or sets the store's bookkeeping, at no key, entry, block or step of an operation
 Reader::form_choices	-	a test seam or a counter: reads or sets the store's bookkeeping, at no key, entry, block or step of an operation
 Reader::hot_start_counts	-	a test seam or a counter: reads or sets the store's bookkeeping, at no key, entry, block or step of an operation
-Reader::lazy_scans	-	a test seam or a counter: reads or sets the store's bookkeeping, at no key, entry, block or step of an operation
 Reader::settle_density	-	a test seam or a counter: reads or sets the store's bookkeeping, at no key, entry, block or step of an operation
 Reader::start_cache_counts	-	a test seam or a counter: reads or sets the store's bookkeeping, at no key, entry, block or step of an operation
 Reader::canonical_forms	-	a test seam or a counter: reads or sets the store's bookkeeping, at no key, entry, block or step of an operation

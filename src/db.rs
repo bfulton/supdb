@@ -4463,27 +4463,6 @@ pub struct Options {
     /// buffered arm. `supdb-shortpass` and `supdb-ingestshortpass` keep
     /// the two-percent bound (`docs/engine.md`).
     pub upkeep_pass_pct: usize,
-    /// EXPERIMENT: a scan builds the snapshot only when a block it
-    /// reaches needs one. A block held as a sparse form, a copy or a
-    /// clean one is walked from the form and the partition alone; only a
-    /// block to be built, a wide form, a table to be made or the
-    /// builder's forms to be installed read the snapshot. So a scan that
-    /// finds the snapshot gone -- dropped at the publish before it, and
-    /// not yet rebuilt by a commit -- walks what it can without one and,
-    /// at the first block that needs it, builds it and goes on from that
-    /// block's first key, which is exact: everything it emitted is below
-    /// that key and everything after is at or above it.
-    ///
-    /// The first scan after the lag burst at three hundred thousand keys
-    /// rebuilt the snapshot for 4.4-6.5 ms of its 7-10 over a pass that
-    /// built no block, and so never read what it had built. In the suite
-    /// it prices flat: `bench ab` against `supdb-lazysnap` at a hundred
-    /// thousand and three hundred thousand keys marks nothing that holds
-    /// for the table, and the snapshots built over a pass come out level
-    /// -- the scan's builds are a tenth of a pass's, and the commits'
-    /// maintenance makes the rest either way. Off until a measurement
-    /// says otherwise; `docs/engine.md` has the two fixes it needed first.
-    pub scan_lazy_snapshot: bool,
     /// Out of core -- the compact form installed -- the writer whose scans
     /// start in the blocks recent scans started in under an eighth of the
     /// time keeps no block forms and takes the merge path, as the arm with
@@ -4578,80 +4557,6 @@ pub struct Options {
     /// first scan after -- so what it buys is the pass and what it costs
     /// is the burst. `supdb-snapcarry` prices it.
     pub snapshot_carry: bool,
-    /// A handle's scan snapshot stands across a publish that leaves the
-    /// memtables it is of: a merge's landing, a promotion, and a seal's
-    /// landing, whose frozen table goes with its base and leaves the live
-    /// runs. The snapshot is a function of the memtables, and what it
-    /// keeps against a partition, its bounds, it keeps under the
-    /// partition's blob id, so a publish that changes the segments alone
-    /// changes nothing it holds. The look that carries the writer's
-    /// tables across such a publish (`rebase_tables`) kept it already; the
-    /// look of a handle with no tables to carry -- every reader handle,
-    /// and the writer on the merge paths, which is where it scans once it
-    /// has given its forms up (`scan_forms_off_unreused`) -- dropped it
-    /// with the log position, and the next scan sorted every unsealed key
-    /// again. The pass after the lag sweep's full rewrite at ten million
-    /// keys under 1.25 GiB runs beside the merge chain's landings on that
-    /// path with 388,000 keys unsealed: one build at its first scan, and
-    /// one to three more at 50-60 ms each, a tenth to a fifth of the
-    /// pass, where the chain landed inside it (`docs/engine.md`). Off
-    /// drops it at every publish; `supdb-snapdrops` is the arm.
-    pub snapshot_stands: bool,
-    /// The snapshot's extension pushes each key of its batch without
-    /// comparing it with the key before it (`Snapshot::extend`). The
-    /// compare was for a fold that cannot happen there: the batch and the
-    /// run it is merged into are entries of one live table, which gives a
-    /// key one slot, so no two of them hold the same key. The batch's keys
-    /// are appended to the arena in the table's order and pushed in key
-    /// order, so each compare read two arena slices at random: at the lag
-    /// sweep's ten-percent point at ten million keys under 1 GiB, the first
-    /// scan extends an empty run by 309,000 keys, and the merge loop was
-    /// two fifths of the scanning thread's samples over that scan, the
-    /// radix a fifth and the rest fresh pages. The batch key's own bytes
-    /// are read now only while the run has entries left to walk past. At
-    /// the one-percent point, whose first scan extends an empty run by
-    /// 99,500 keys, the merge took 1.4 ms against 6.2, and over the full
-    /// rewrite at three million keys, where the run and the batch are
-    /// alike in size and the walk reads the run's keys, 222 ms of the
-    /// extensions' merges against 246. Off is the compare;
-    /// `supdb-snapfolded` is the arm, and `supdb-snapold` the arm with
-    /// `snapshot_build_lean` off too.
-    pub snapshot_extend_unfolded: bool,
-    /// The snapshot's build and extension keep a key's place as one
-    /// offset word where they kept a pending entry of six, and the build
-    /// copies the keys in the table's entry order. It sorted the entries
-    /// by their keys' offsets first, from when the table was walked in
-    /// the order of its hash slots, whose keys lie at random; the entries
-    /// are walked in the order they were made now, which for a hash
-    /// table is the order its keys were copied in, so the sort was three
-    /// radix passes and two arrays of twelve bytes a key over an order
-    /// the entries already had, and both paths kept a twenty-four-byte
-    /// entry a key beside the records they sort. Where a snapshot puts a
-    /// key in its own arena says nothing about its order, which the
-    /// records' sort gives, so an ordered table, whose straddling keys
-    /// are copied apart from its stream, takes the same path. Under a
-    /// bound every byte of that is a fresh page the group reclaims a
-    /// cached one for: at the lag sweep's ten-percent point at ten
-    /// million keys under 1 GiB the first scan's sort of 309,000 keys
-    /// took 41 ms, about 25 of them in the first touches of 42 MB, and
-    /// this takes 13.6 MB of them away. A snapshot that copies the runs
-    /// (`snapshot_runs`) builds as before. With the extension unfolded,
-    /// the first scans' snapshot phase there read 30 ms at the median of
-    /// six against 54, at the one-percent point 10.6 against 16.8 and
-    /// after the full rewrite 47 against 56, and the ten-percent pass
-    /// ahead in both orders (`pair.sh supdb supdb-snapold 10000000 --bound
-    /// 1073741824 --reps 3 --ops-div 10 --passes load,lag` under
-    /// `SUPDB_LAG_COUNTERS=1`). Off is the shape before; `supdb-snapfat`
-    /// is the arm.
-    pub snapshot_build_lean: bool,
-    /// A frozen table keeps its own sorted snapshot (`FrozenSnaps`): the
-    /// seal, a freeze's carry, the keeper or the first scan sets it, and
-    /// every later reader of the table -- the seal for its records, a
-    /// scan over a state published while the seal runs -- carries it
-    /// forward instead of sorting the table again. Off is the shape
-    /// before it, where each sorted the table for itself; `supdb-nofrozen`
-    /// prices it.
-    pub frozen_snaps: bool,
     /// EXPERIMENT: keys of one block in a settle's backlog from which
     /// the block is dropped and built once rather than patched key by
     /// key. A patch resolves one key's run against every source and
@@ -6079,13 +5984,6 @@ pub struct Options {
     /// did (`promote_entries`). Off, the walk marks the tables for the next
     /// fill.
     pub forms_convert_at_walk: bool,
-    /// How the ordered scan builds its sorted snapshot of the unsealed keys.
-    /// `true` keeps the keys in one arena and sorts 24-byte records (a
-    /// 16-byte key prefix and an index), touching the arena only on a shared
-    /// prefix; `false` is the build before it -- a `Vec<u8>` per key, sorted
-    /// through two heap pointers per compare -- kept as the comparison arm.
-    /// The build runs on the first scan after a commit and cost 300 ns a key.
-    pub scan_snapshot_arena: bool,
     /// The block cache costs what its forms' buffers allocate, and its
     /// budget (`scan_cache_bytes`) bounds that. A form's bytes were
     /// counted by what its vectors held, and the vectors cost more: a
@@ -7730,11 +7628,6 @@ impl Default for Options {
             upkeep_batch_pct: 0,
             upkeep_pass_pct: 0,
             snapshot_carry: false,
-            snapshot_stands: true,
-            snapshot_extend_unfolded: true,
-            snapshot_build_lean: true,
-            frozen_snaps: true,
-            scan_lazy_snapshot: false,
             scan_forms_off_unreused: true,
             scan_forms_off_counts_built: false,
             scan_forms_off_stale_writes: 512,
@@ -7824,7 +7717,6 @@ impl Default for Options {
             forms_rebase: true,
             copy_prefetch_span: false,
             piece_ranks_by_heads: true,
-            scan_snapshot_arena: true,
             forms_to_fit: false,
             forms_fit_shed: true,
             forms_fit_sweep: true,
@@ -26144,9 +26036,8 @@ struct Shared {
     /// EXPERIMENT: scan snapshots built over this store's life, which is
     /// what publishing one is meant to bring down; for a test.
     snap_builds: AtomicU64,
-    /// Snapshots kept across a publish that left their memtables
-    /// (`Options::snapshot_stands`), by the looks that had no tables to
-    /// carry.
+    /// Snapshots kept across a publish that left their memtables, by the
+    /// looks that had no tables to carry (`Reader::snapshot_stands`).
     snap_stood: AtomicU64,
     /// A landing's same-blocks questions (`Db::same_blocks`), by how each
     /// was answered: from the ordered indexes, from the records.
@@ -26448,8 +26339,8 @@ struct Shared {
     /// rise where `snap_builds` stops.
     snap_extends: AtomicU64,
     /// Builds that kept a key's place as an offset and copied the keys
-    /// in the table's order (`Options::snapshot_build_lean`), of
-    /// `snap_builds`.
+    /// in the table's order, of `snap_builds`: every build that copies no
+    /// runs.
     snap_lean_builds: AtomicU64,
     /// Snapshots republished with their stale runs copied again
     /// (`Snapshot::refreshed`).
@@ -28134,11 +28025,6 @@ struct FormsState {
     /// The chain-offset scratch a build or a walk's emissions use,
     /// `BuildCtx::take_offs`.
     emit_offs: std::cell::RefCell<Vec<usize>>,
-    /// The key a block scan resumes from (`Walk::Resume`), kept between
-    /// resumes: copied into a fresh `Vec` it was a malloc and a free on
-    /// every scan that met a block without a form, 132 of a pass of a
-    /// hundred scans after a burst.
-    resume_key: std::cell::RefCell<Vec<u8>>,
     /// EXPERIMENT: whether any table holds a block built or patched
     /// since the last publish; the writer's own handle alone sets it.
     dirty_any: std::cell::Cell<bool>,
@@ -28287,10 +28173,6 @@ struct FormsState {
     /// and not taken up by the other, and the store's forms waited for a
     /// scan to build them.
     fill_owed: std::cell::Cell<bool>,
-    /// What the lazy snapshot did, for a measurement and for the test
-    /// that must know the path was taken: scans that finished without a
-    /// snapshot, and scans that stopped to build one and went on.
-    lazy_scans: Counts<2>,
     /// EXPERIMENT: what the settles met, for a measurement of the
     /// backlog's density: settles, keys, blocks those keys fall in, and
     /// blocks at or past `Options::forms_settle_rebuild_from`.
@@ -28397,7 +28279,6 @@ impl FormsState {
             settle_offs: std::cell::RefCell::new(Vec::new()),
             clean: std::sync::Arc::new(Cached::Clean),
             emit_offs: std::cell::RefCell::new(Vec::new()),
-            resume_key: std::cell::RefCell::new(Vec::new()),
             dirty_any: std::cell::Cell::new(false),
             tables_complete: std::cell::Cell::new(false),
             abandoned: std::cell::Cell::new(u64::MAX),
@@ -28442,7 +28323,6 @@ impl FormsState {
             pass_batch: std::cell::Cell::new(0),
             log_short: std::cell::Cell::new(false),
             fill_owed: std::cell::Cell::new(false),
-            lazy_scans: Counts::new(),
             settle_density: Counts::new(),
             settle_refused: Counts::new(),
             settle_blocks: std::cell::RefCell::new(Vec::new()),
@@ -29852,17 +29732,6 @@ struct Snapshot {
     bounds: std::sync::Arc<SnapById>,
 }
 
-/// What `scan_blocks` did: walked to the limit or the store's end, or
-/// stopped at a block that needs the snapshot it was not given, with the
-/// entries emitted so far and the key the walk goes on from.
-enum Walk {
-    Done(usize),
-    /// The key to resume from is in `FormsState::resume_key`.
-    Resume {
-        seen: usize,
-    },
-}
-
 /// Entries a filing may leave in `fresh` before it is folded into `side`.
 const SNAP_FRESH: usize = 256;
 
@@ -30186,14 +30055,7 @@ impl Snapshot {
     /// over one burst of writes. Only for a run with nothing filed into
     /// it: a handle's side runs are that handle's own and are not what
     /// gets published.
-    fn extend(
-        &self,
-        mem: &MemTable,
-        to: usize,
-        runs: bool,
-        unfolded: bool,
-        lean: bool,
-    ) -> Snapshot {
+    fn extend(&self, mem: &MemTable, to: usize, runs: bool) -> Snapshot {
         debug_assert!(
             self.ents.iter().all(|e| e.frozen == u32::MAX),
             "an extension is of live runs; a frozen table's own is a base"
@@ -30204,10 +30066,10 @@ impl Snapshot {
         let log_at = mem.log_len();
         let arena = self.arena.clone();
         let mut rscratch: Vec<(u64, u32)> = Vec::new();
-        // Under `snapshot_build_lean` a batch key's place is one offset
-        // word, its keys back to back in one reservation, its length the
-        // next offset less its own and its slot its place in the batch.
-        let lean = lean && !runs;
+        // Without the runs a batch key's place is one offset word, its
+        // keys back to back in one reservation, its length the next
+        // offset less its own and its slot its place in the batch.
+        let lean = !runs;
         let mut batch: Vec<SnapKey> = Vec::with_capacity(if lean { 0 } else { to - from });
         let mut offs: Vec<u32> = Vec::with_capacity(if lean { to - from + 1 } else { 0 });
         // The batch's order from its keys' prefix words, as the build
@@ -30319,10 +30181,9 @@ impl Snapshot {
         let mut i = 0usize;
         for r in &recs {
             let b = batch_at(r.2 as usize);
-            // With the run walked to its end the key is not read at all
-            // under `snapshot_extend_unfolded`: what is left of the batch
-            // follows the run whole.
-            let at = if unfolded && i == self.ents.len() {
+            // With the run walked to its end the key is not read at all:
+            // what is left of the batch follows the run whole.
+            let at = if i == self.ents.len() {
                 i
             } else {
                 let key = key_at(&b);
@@ -30339,18 +30200,14 @@ impl Snapshot {
             };
             out.ents.extend_from_slice(&self.ents[i..at]);
             i = at;
-            if unfolded {
-                // One table's entries: a key is in one of them, so the
-                // fold `push_sorted` asks after never happens here, and
-                // the order the merge made is what a checked build holds.
-                debug_assert!(
-                    out.ents.last().is_none_or(|l| self.key_of(l) < key_at(&b)),
-                    "an extension's batch key at or below the entry before it"
-                );
-                out.push_folded(b, false);
-            } else {
-                out.push_sorted(b);
-            }
+            // One table's entries: a key is in one of them, so no fold
+            // happens here, and the order the merge made is what a
+            // checked build holds.
+            debug_assert!(
+                out.ents.last().is_none_or(|l| self.key_of(l) < key_at(&b)),
+                "an extension's batch key at or below the entry before it"
+            );
+            out.push_folded(b, false);
         }
         out.ents.extend_from_slice(&self.ents[i..]);
         // A run written again since this snapshot copied it, found by
@@ -30433,15 +30290,6 @@ impl Snapshot {
         }
         self.ents.partition_point(|e| key(e) < from)
     }
-    /// Merge a run of entries sorted by key into `ents`, folding a key
-    /// present in both tables into one entry carrying both indices.
-    fn push_sorted(&mut self, e: SnapKey) {
-        let same = self.ents.last().is_some_and(|last| {
-            self.arena.slice(last.off, last.len) == self.arena.slice(e.off, e.len)
-        });
-        self.push_folded(e, same);
-    }
-
     /// `push_sorted` with the comparison against the last entry made by
     /// the caller: `same` folds `e` into it.
     fn push_folded(&mut self, e: SnapKey, same: bool) {
@@ -31352,21 +31200,6 @@ impl Reader {
                     .store(0, AtomicOrdering::Relaxed);
             }
         }
-    }
-
-    /// The census's note of a scan's emitted keys, onto the window.
-    #[inline(always)]
-    fn zcensus_scanned(&self, n: usize) {
-        if self.attn & ATTN_CENSUS != 0 && self.attn_open.get() & ATTN_OPEN != 0 {
-            self.zcensus_scanned_slow(n);
-        }
-    }
-
-    #[inline(never)]
-    fn zcensus_scanned_slow(&self, n: usize) {
-        let mut w = self.zwin.get();
-        w.skeys = w.skeys.saturating_add(n as u64);
-        self.zwin.set(w);
     }
 
     /// Closes the window before this operation: the readings after its
@@ -34556,8 +34389,7 @@ impl Reader {
     }
 
     /// The sorted snapshot of every unsealed key (frozen table first, then
-    /// live), one entry per key. Two builds behind `scan_snapshot_arena`;
-    /// both walk the hash tables once and both end in the same `Snapshot`.
+    /// live), one entry per key.
     /// The snapshot over the frozen table and the live one's first
     /// `live_len` entries: the count is the caller's, taken once, since
     /// the writer may be appending while this builds, and what the
@@ -34615,13 +34447,12 @@ impl Reader {
         };
         let mut rscratch: Vec<(u64, u32)> = Vec::new();
         // The tables in the order the build takes them, the frozen one's
-        // entries first, and the key bytes each will copy
-        // (`snapshot_build_lean`).
+        // entries first, and the key bytes each will copy.
         let tables = [
             (frozen, frozen.map_or(0, |f| f.len())),
             (live.map(|(m, _)| m), live_len),
         ];
-        let lean = self.opts.snapshot_build_lean && self.opts.scan_snapshot_arena && !runs;
+        let lean = !runs;
         if lean {
             let mut bytes = [0usize; 2];
             for (t, &(m, upto)) in tables.iter().enumerate() {
@@ -34713,7 +34544,7 @@ impl Reader {
                 snap.push_folded(e, same);
                 last = Some((r.0, r.1, e.len));
             }
-        } else if self.opts.scan_snapshot_arena {
+        } else {
             // Arena build. The hash table is walked in slot order, which
             // visits the key bytes in random order -- one cache miss a key,
             // and at 428k keys that walk, not the sort, was most of the
@@ -34824,48 +34655,6 @@ impl Reader {
                 });
                 snap.push_folded(e, same);
                 last = Some((r.0, r.1, e.len));
-            }
-        } else {
-            // The build before it: one allocation per key, sorted through
-            // the pointers, then copied into the arena the merge expects.
-            struct Old {
-                key: Vec<u8>,
-                mem: u32,
-                frozen: u32,
-                run: u32,
-            }
-            let mut all: Vec<Old> = Vec::with_capacity(n);
-            let mut take = |mem: &MemTable, live: bool| {
-                let upto = if live { live_len } else { mem.len() };
-                for (i, e) in (0..upto).map(|i| (i, mem.entry(i))) {
-                    all.push(Old {
-                        key: mem.key_of(e).to_vec(),
-                        mem: if live { i as u32 } else { u32::MAX },
-                        frozen: if live { u32::MAX } else { i as u32 },
-                        run: if runs {
-                            snap.copy_run(mem, e, &mut rscratch)
-                        } else {
-                            NO_RUN
-                        },
-                    });
-                }
-            };
-            if let Some(fr) = frozen {
-                take(fr, false);
-            }
-            if let Some((m, _)) = live {
-                take(m, true);
-            }
-            all.sort_by(|a, b| a.key.cmp(&b.key));
-            for o in all {
-                snap.push_sorted(SnapKey {
-                    off: snap.arena.append(&o.key),
-                    len: o.key.len() as u32,
-                    mem: o.mem,
-                    frozen: o.frozen,
-                    lrun: if o.mem != u32::MAX { o.run } else { NO_RUN },
-                    frun: if o.frozen != u32::MAX { o.run } else { NO_RUN },
-                });
             }
         }
         snap
@@ -35153,44 +34942,6 @@ impl Reader {
             self.settle_pending()?;
             self.scan_tick(2, t);
         }
-        // No snapshot of this state in hand: walk without one, and build
-        // it at the first block that needs it. See
-        // `Options::scan_lazy_snapshot`.
-        // With nothing unsealed the snapshot is empty and costs nothing to
-        // build, and walking without one gives up the clean partition's
-        // one walk: the drained scan pass at three hundred thousand keys
-        // ran lazily every scan, block by block, and read 0.92x.
-        let absent = self
-            .fs()
-            .scan_keys
-            .borrow()
-            .as_ref()
-            .is_none_or(|(g, _)| *g != gen);
-        let unsealed_any = !self.mem().is_empty() || !self.frozen().is_empty();
-        if use_cache && absent && unsealed_any && self.opts.scan_lazy_snapshot {
-            let (seen, from) = match self.scan_blocks(from, limit, None, false, &mut f)? {
-                Walk::Done(n) => {
-                    self.fs().lazy_scans.add(0, 1);
-                    self.zcensus_scanned(n);
-                    return Ok(n);
-                }
-                Walk::Resume { seen } => (
-                    seen,
-                    std::mem::take(&mut *self.fs().resume_key.borrow_mut()),
-                ),
-            };
-            self.fs().lazy_scans.add(1, 1);
-            self.refresh_snapshot(gen, use_cache, true);
-            let cache = self.fs().scan_keys.borrow();
-            let unsealed: &Snapshot = &cache.as_ref().expect("scan snapshot").1;
-            let walked = self.scan_blocks(&from, limit - seen, Some(unsealed), true, &mut f);
-            // The buffer back for the next resume, whatever the walk said.
-            *self.fs().resume_key.borrow_mut() = from;
-            return match walked? {
-                Walk::Done(n) => Ok(seen + n),
-                Walk::Resume { .. } => Err(err("block scan: resumed without a snapshot")),
-            };
-        }
         let t = self.tick_start();
         self.refresh_snapshot(gen, use_cache, moved);
         self.scan_tick(3, t);
@@ -35203,10 +34954,7 @@ impl Reader {
         // store of three million keys, half a microsecond of a far scan's
         // three, for a number nothing read.
         if use_cache {
-            return match self.scan_blocks(from, limit, Some(unsealed), false, &mut f)? {
-                Walk::Done(n) => Ok(n),
-                Walk::Resume { .. } => Err(err("block scan: stopped with a snapshot in hand")),
-            };
+            return self.scan_blocks(from, limit, unsealed, &mut f);
         }
         let mc = unsealed.cursor(from);
 
@@ -35346,8 +35094,8 @@ impl Reader {
     }
 
     /// Whether this handle's scan snapshot stands in `st`, a state
-    /// published since the one its log position is of
-    /// (`Options::snapshot_stands`), and the snapshot made `st`'s where it
+    /// published since the one its log position is of, and the snapshot
+    /// made `st`'s where it
     /// does: the live table the one the note names, by identity and by
     /// `State::lives`, and the frozen tables the ones it names or what the
     /// landings since left of them. Landings retire the front of the list,
@@ -35359,9 +35107,6 @@ impl Reader {
     /// and stand with it. Offered to `st` for the handles after, since a
     /// publish starts a state with no snapshot.
     fn snapshot_stands(&self, st: &State) -> bool {
-        if !self.opts.snapshot_stands {
-            return false;
-        }
         let kept = {
             let over = self.fs().over.borrow();
             let Some(over) = over.as_ref() else {
@@ -36198,23 +35943,6 @@ impl Reader {
         self.fs().pending_frozen.borrow_mut().clear();
     }
 
-    /// PROTOTYPE: the forms the builder ahead has sent, installed: each
-    /// into its partition's table, made here if the partition has none,
-    /// if the segment set is still the one it was built at and the block
-    /// is unbuilt and not past the wide bound; then the memtable's keys
-    /// over the block spliced in -- the snapshot's run over it and the
-    /// keys filed since, which is what a build here would have merged --
-    /// so the installed block equals one built here.
-    /// Whether the builder ahead has forms waiting to be installed, which
-    /// `install_ahead` would take; nothing is taken here.
-    fn ahead_posted(&self) -> bool {
-        self.fs()
-            .ahead
-            .borrow()
-            .as_ref()
-            .is_some_and(|a| !a.done.get() && a.posted.load(std::sync::atomic::Ordering::Acquire))
-    }
-
     fn install_ahead(&self, unsealed: &Snapshot) -> Result<()> {
         let mut ahead = self.fs().ahead.borrow_mut();
         let Some(a) = ahead.as_mut() else {
@@ -36438,13 +36166,7 @@ impl Reader {
                 self.shared
                     .snap_extends
                     .fetch_add(1, AtomicOrdering::Relaxed);
-                std::sync::Arc::new(s.extend(
-                    self.mem(),
-                    to,
-                    self.opts.snapshot_runs,
-                    self.opts.snapshot_extend_unfolded,
-                    self.opts.snapshot_build_lean,
-                ))
+                std::sync::Arc::new(s.extend(self.mem(), to, self.opts.snapshot_runs))
             }
             None => std::sync::Arc::new(self.build_snapshot(to)),
         };
@@ -36456,7 +36178,7 @@ impl Reader {
     /// sorted the table first set on it, and otherwise sorted here, alone,
     /// by the build a scan would make, and set for whoever comes next.
     fn frozen_snapshot(&self, fr: &MemTable) -> std::sync::Arc<Snapshot> {
-        if !self.opts.share_snapshot || !self.opts.frozen_snaps {
+        if !self.opts.share_snapshot {
             // Each its own, sorted from nothing: what those arms price.
             return std::sync::Arc::new(self.build_over(None, Some(fr), 0));
         }
@@ -36484,7 +36206,7 @@ impl Reader {
     /// snapshots are shared: unshared, each handle builds its own from
     /// nothing, which is that arm's meaning.
     fn frozen_base(&self) -> Option<std::sync::Arc<Snapshot>> {
-        if !self.opts.share_snapshot || !self.opts.frozen_snaps || self.frozen().is_empty() {
+        if !self.opts.share_snapshot || self.frozen().is_empty() {
             return None;
         }
         let bases: Vec<std::sync::Arc<Snapshot>> = self
@@ -36503,7 +36225,6 @@ impl Reader {
     /// chains.
     fn upgrade_base(&self, s: std::sync::Arc<Snapshot>) -> std::sync::Arc<Snapshot> {
         if !self.opts.share_snapshot
-            || !self.opts.frozen_snaps
             || s.bases.len() != self.frozen().len()
             || s.bases.iter().all(|b| b.runs)
         {
@@ -37260,15 +36981,6 @@ impl Reader {
     /// blocks those keys fall in, and the blocks at or past
     /// `Options::forms_settle_rebuild_from`. Keys over blocks is what
     /// decides a patch against a build.
-    /// Scans that finished without building the snapshot, and scans
-    /// that built it at a block that needed it and went on; see
-    /// `Options::scan_lazy_snapshot`.
-    #[doc(hidden)]
-    pub fn lazy_scans(&self) -> (u64, u64) {
-        let v = self.fs().lazy_scans.get();
-        (v[0], v[1])
-    }
-
     #[doc(hidden)]
     pub fn settle_density(&self) -> [u64; 4] {
         self.fs().settle_density.get()
@@ -37338,15 +37050,6 @@ impl Reader {
             Cached::Clean => self.fs().clean.clone(),
             form => std::sync::Arc::new(form),
         }
-    }
-
-    /// `Walk::Resume` from `seen` entries at `key`, the key kept in the
-    /// forms state's buffer rather than a fresh `Vec`.
-    fn resume_at(&self, seen: usize, key: &[u8]) -> Walk {
-        let mut k = self.fs().resume_key.borrow_mut();
-        k.clear();
-        k.extend_from_slice(key);
-        Walk::Resume { seen }
     }
 
     /// The deltas from which a fill converts a sparse form to a copy
@@ -37468,7 +37171,7 @@ impl Reader {
         };
         // A snapshot of this state holds a base for each frozen table it
         // has, or none: a landing that retires one trims its base where
-        // the snapshot stands (`snapshot_stands`, `rebase_tables`), and a
+        // the snapshot stands (`Reader::snapshot_stands`, `rebase_tables`), and a
         // base left behind would hold the landed table for the
         // snapshot's life while every read took the tables as they are.
         debug_assert!(
@@ -40397,24 +40100,16 @@ impl Reader {
     /// block by block: a cached copy is walked, a clean block is walked in
     /// the partition, a sparse one with its deltas, and a block not yet
     /// seen is built first.
-    /// With `unsealed` absent the walk goes as far as it can without the
-    /// snapshot and returns `Walk::Resume` at the first block that needs
-    /// it, before emitting anything from that block; `resumed` is the
-    /// same scan going on, which counts nothing twice.
     fn scan_blocks<F: FnMut(&[u8], &[u8])>(
         &self,
         from: &[u8],
         limit: usize,
-        unsealed: Option<&Snapshot>,
-        resumed: bool,
+        unsealed: &Snapshot,
         f: &mut F,
-    ) -> Result<Walk> {
-        let lazy = unsealed.is_none();
+    ) -> Result<usize> {
         let np = self.segs().partition_point(|s| s.level > 0);
         let l0 = &self.segs()[np..];
-        let tick = if resumed {
-            self.fs().scan_tick.get()
-        } else {
+        let tick = {
             let t = self.fs().scan_tick.get().wrapping_add(1);
             self.fs().scan_tick.set(t);
             t
@@ -40436,25 +40131,16 @@ impl Reader {
                 .borrow()
                 .as_ref()
                 .is_none_or(|a| a.gen != gen)
-            && !lazy
             && self.ahead_scanned()
         {
             let t = self.tick_start();
             self.start_ahead();
             self.scan_tick(4, t);
         }
-        match unsealed {
-            Some(unsealed) => {
-                let t = self.tick_start();
-                self.install_ahead(unsealed)?;
-                self.scan_tick(5, t);
-            }
-            // The builder's forms are spliced against the snapshot, so a
-            // scan with forms waiting starts from the snapshot.
-            None if self.ahead_posted() => {
-                return Ok(self.resume_at(0, from));
-            }
-            None => {}
+        {
+            let t = self.tick_start();
+            self.install_ahead(unsealed)?;
+            self.scan_tick(5, t);
         }
         // EXPERIMENT: a reader handle whose watermark is the commit the
         // canonical forms were maintained at walks them and builds
@@ -40467,7 +40153,7 @@ impl Reader {
         // handle says so once per commit -- the count is compared, not
         // read -- so four handles scanning do not bump one line a
         // thousand times a millisecond.
-        if (self.opts.commit_forms || self.opts.snapshot_keeper) && !resumed {
+        if self.opts.commit_forms || self.opts.snapshot_keeper {
             let now = (st.gen, self.mem().committed_log());
             let signal = self.slot.is_none() || self.signalled.replace(now) != now;
             if signal {
@@ -40482,7 +40168,7 @@ impl Reader {
             && self
                 .forms_bound()
                 .is_some_and(|n| st.forms_at.load(AtomicOrdering::Acquire) == n);
-        if self.opts.commit_forms && self.forms_bound().is_some() && !resumed {
+        if self.opts.commit_forms && self.forms_bound().is_some() {
             match self.slot {
                 Some(slot) => {
                     let s = &self.shared.readers.slots[slot];
@@ -40566,7 +40252,7 @@ impl Reader {
             // handle holds it as a copy the copy is walked from the key by
             // its own search, the seek through the form not made. A key
             // whose head ties a sample names no block, and is sought.
-            let hot_on = hot_n > 0 && !lazy && self.zc(seg).is_some();
+            let hot_on = hot_n > 0 && self.zc(seg).is_some();
             let hot_b = if hot_on && scan_start {
                 seg.ord.floor_stride(cursor)
             } else {
@@ -40618,17 +40304,12 @@ impl Reader {
             let mut held = tables[pi].borrow_mut();
             if held.is_none() {
                 // A table is made against the snapshot's bounds.
-                let Some(unsealed) = unsealed else {
-                    return Ok(self.resume_at(seen, cursor));
-                };
                 *held = Some(self.make_table(seg, l0, unsealed)?);
                 self.fs().cache_used.set(true);
             }
             let table = held.as_mut().expect("just made");
-            if let Some(unsealed) = unsealed {
-                if table.snap_gen != self.fs().snap_gen.get() {
-                    table.resnap(seg, unsealed, self.fs().snap_gen.get());
-                }
+            if table.snap_gen != self.fs().snap_gen.get() {
+                table.resnap(seg, unsealed, self.fs().snap_gen.get());
             }
             // The start counted against its block, and the scan hot from
             // the `promote_starts`-th on: the block the samples named, or
@@ -40686,7 +40367,7 @@ impl Reader {
                 && self.opts.promote_entries > 0
                 && self.zc(seg).is_some())
                 || (hot_on && (hot || hot_copy));
-            if unsealed.is_some() && table.clean_throughout() && !canonical && !promote_copies {
+            if table.clean_throughout() && !canonical && !promote_copies {
                 // The suite's scan workload, and any store between a flush
                 // and its next write: one walk from the seek, as the bulk
                 // walk makes it. Measured through the blocks it was a
@@ -40758,34 +40439,6 @@ impl Reader {
                         None if complete => Some(&Cached::Clean),
                         None => None,
                     };
-                // A block to build, or one held wide, reads the
-                // snapshot: without one the walk stops here, before this
-                // block emits anything, and goes on from the block's
-                // first key -- the scan's own start for its first block,
-                // the partition's record at the block's first rank for
-                // any after, since every key a block holds is at or
-                // above that record and every key before it belongs to
-                // a block already walked.
-                let wants_snapshot = canon.is_none()
-                    && matches!(table.slots[b].as_deref(), None | Some(Cached::Wide(_)));
-                let unsealed = match unsealed {
-                    Some(u) => u,
-                    None if wants_snapshot => {
-                        self.count_takes(takes);
-                        let mut kbuf = Vec::new();
-                        let from: &[u8] = if first {
-                            cursor
-                        } else if self.cache_key_at(seg, lo, &mut kbuf) {
-                            &kbuf
-                        } else {
-                            return Err(err("block scan: a block's first rank did not resolve"));
-                        };
-                        return Ok(self.resume_at(seen, from));
-                    }
-                    // Nothing below reads it for a block held as another
-                    // form; the empty one stands in.
-                    None => &NO_SNAPSHOT,
-                };
                 if canon.is_none() && table.slots[b].is_none() {
                     self.build_slot(&ctx, src, None, table, pi, b, unsealed)?;
                 }
@@ -41049,7 +40702,6 @@ impl Reader {
                         while b + 1 < nblocks && run_hi - start < limit - seen {
                             let next = b + 1;
                             if self.opts.scan_run_builds
-                                && !lazy
                                 && table.slots[next].is_none()
                                 && !(canonical && complete)
                                 && (!canonical
@@ -41197,7 +40849,7 @@ impl Reader {
                 // a block walked as a copy has nothing to promote.
                 // A copy is built from the snapshot; a walk without one
                 // leaves the promotion to the next.
-                if promote > 0 && !lazy && !(in_slot && walked_kind == 0) {
+                if promote > 0 && !(in_slot && walked_kind == 0) {
                     // The blocks this turn walked -- one, or the clean run's
                     // several -- each credited with the keys the walk took
                     // from it, and each judged on its own ranks: a run's
@@ -41287,7 +40939,7 @@ impl Reader {
                 None => break,
             }
         }
-        Ok(Walk::Done(seen))
+        Ok(seen)
     }
 
     /// PROTOTYPE: the cache's blocks by kind, for a measurement: clean,
@@ -41911,7 +41563,6 @@ impl Reader {
             + fs.settle_run.borrow().capacity()
             + fs.settle_offs.borrow().capacity() * 8
             + fs.emit_offs.borrow().capacity() * 8
-            + fs.resume_key.borrow().capacity()
             + fs.start_cache.borrow().bytes()
             + fs.pending_frozen
                 .borrow()
@@ -47993,7 +47644,6 @@ impl Db {
             None
         };
         let from_snapshot = self.opts.seal_from_snapshot;
-        let frozen_snaps = self.opts.frozen_snaps;
         // Reads around the table being sealed, by the writes of the
         // tables sealed since the store's scan count last moved: a seal
         // far from every scan builds no copy for scans that are not
@@ -48057,7 +47707,7 @@ impl Db {
                     whole,
                     "a frozen table's snapshot holds every entry of it once"
                 );
-                frozen_snaps && whole
+                whole
             });
             let order: blocks::BigVec<u32> = match &have {
                 Some(h) => {
@@ -48117,9 +47767,7 @@ impl Db {
                             built.bounds = h.bounds.clone();
                         }
                         let built = std::sync::Arc::new(built);
-                        if !frozen_snaps {
-                            built
-                        } else if mem.snaps.copied.set(built.clone()) {
+                        if mem.snaps.copied.set(built.clone()) {
                             shared.snap_on_table.fetch_add(1, AtomicOrdering::Release);
                             built
                         } else {
@@ -49537,7 +49185,7 @@ impl Db {
     }
 
     /// Scan snapshots kept across a publish that left their memtables, by
-    /// a look with no tables to carry (`Options::snapshot_stands`).
+    /// a look with no tables to carry (`Reader::snapshot_stands`).
     pub fn snapshots_stood(&self) -> u64 {
         self.shared.snap_stood.load(AtomicOrdering::Relaxed)
     }
@@ -49559,8 +49207,8 @@ impl Db {
         self.shared.snap_extends.load(AtomicOrdering::Relaxed)
     }
 
-    /// Snapshot builds that took the lean path
-    /// (`Options::snapshot_build_lean`), of `snapshot_builds`.
+    /// Snapshot builds that took the lean path, every build that copies
+    /// no runs, of `snapshot_builds`.
     pub fn snapshot_lean_builds(&self) -> u64 {
         self.shared.snap_lean_builds.load(AtomicOrdering::Relaxed)
     }
@@ -53382,13 +53030,7 @@ impl Reader {
                 self.shared
                     .snap_extends
                     .fetch_add(1, AtomicOrdering::Relaxed);
-                std::sync::Arc::new(s.extend(
-                    mem,
-                    len,
-                    self.opts.snapshot_runs,
-                    self.opts.snapshot_extend_unfolded,
-                    self.opts.snapshot_build_lean,
-                ))
+                std::sync::Arc::new(s.extend(mem, len, self.opts.snapshot_runs))
             }
             None => std::sync::Arc::new(self.build_snapshot(len)),
         };
@@ -53466,26 +53108,22 @@ impl Reader {
             let mut bases = s.bases.clone();
             // The table's own snapshot, where its seal or a scan set one
             // first: the same keys in the same order, made already.
-            let own = match live.snaps.best().filter(|_| self.opts.frozen_snaps) {
+            let own = match live.snaps.best() {
                 Some(have) => have,
                 None => {
                     let own = self.own_snapshot(s, live);
-                    if !self.opts.frozen_snaps {
+                    // Offered to the table, which is final now, for the
+                    // seal and every reader after: with every chain, as
+                    // the seal's own copy is, or as an order alone.
+                    let cell = if own.runs && own.ents.iter().all(|e| e.frun != NO_RUN) {
+                        &live.snaps.copied
+                    } else {
+                        &live.snaps.sorted
+                    };
+                    if cell.set(own.clone()) {
                         own
                     } else {
-                        // Offered to the table, which is final now, for the
-                        // seal and every reader after: with every chain, as
-                        // the seal's own copy is, or as an order alone.
-                        let cell = if own.runs && own.ents.iter().all(|e| e.frun != NO_RUN) {
-                            &live.snaps.copied
-                        } else {
-                            &live.snaps.sorted
-                        };
-                        if cell.set(own.clone()) {
-                            own
-                        } else {
-                            live.snaps.best().expect("set by whoever won")
-                        }
+                        live.snaps.best().expect("set by whoever won")
                     }
                 }
             };
@@ -53507,13 +53145,7 @@ impl Reader {
             self.shared
                 .snap_extends
                 .fetch_add(1, AtomicOrdering::Relaxed);
-            std::sync::Arc::new(s.extend(
-                live,
-                live.len(),
-                s.runs,
-                self.opts.snapshot_extend_unfolded,
-                self.opts.snapshot_build_lean,
-            ))
+            std::sync::Arc::new(s.extend(live, live.len(), s.runs))
         } else {
             s
         };

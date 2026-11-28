@@ -12557,7 +12557,7 @@ fn a_piece_kept_across_a_merge_is_ranked_against_the_partition_it_meets() {
 }
 
 /// A handle's scan snapshot is the sorted keys of the memtables, and it
-/// stands across a publish that leaves them (`Options::snapshot_stands`): a
+/// stands across a publish that leaves them: a
 /// merge's landing, which changes the segments alone, and a seal's, whose
 /// frozen table leaves with its base. The look that carries the writer's
 /// tables kept it across both; the look with no tables to carry -- the
@@ -12569,19 +12569,17 @@ fn a_piece_kept_across_a_merge_is_ranked_against_the_partition_it_meets() {
 /// The merge is held before its landing (`Db::hold_merge_landing`) while
 /// the unsealed keys are written and scanned, so the snapshot is built
 /// over a state the landing then replaces, every run; the seal likewise
-/// (`Db::hold_seal_landing`). Without the option each landing is a build,
-/// and with it none is, the scans the same against the model either way:
-/// before the publish, after it, and after writes filed into the snapshot
-/// that stood.
+/// (`Db::hold_seal_landing`). No landing is a build, and the scans answer
+/// as the model before the publish, after it, and after writes filed into
+/// the snapshot that stood.
 #[test]
 fn a_scan_snapshot_stands_across_a_publish_that_leaves_the_memtables() {
-    for (label, stands, block_cache, runs) in [
-        ("stands", true, false, false),
-        ("drops", false, false, false),
-        ("stands-cache", true, true, false),
+    for (label, block_cache, runs) in [
+        ("stands", false, false),
+        ("stands-cache", true, false),
         // With the runs copied, so the slots written since the copy, which
         // a stood snapshot keeps reading the chains for, matter.
-        ("stands-runs", true, false, true),
+        ("stands-runs", false, true),
     ] {
         let d = dir(&format!("snap-stands-{label}"));
         let opts = Options {
@@ -12589,7 +12587,6 @@ fn a_scan_snapshot_stands_across_a_publish_that_leaves_the_memtables() {
             partition_bytes: Some(64 << 20),
             l0_trigger: 2,
             scan_block_cache: block_cache,
-            snapshot_stands: stands,
             snapshot_runs: runs,
             // The builds counted below are the scans' own.
             forms_settle_backlog_pct: 0,
@@ -12702,27 +12699,19 @@ fn a_scan_snapshot_stands_across_a_publish_that_leaves_the_memtables() {
         assert_eq!(db.levels(), (1, 0), "{label}: the pieces merged");
         m.check(&db, &format!("{label}: the writer after the landing"));
         m.check(&reader, &format!("{label}: a handle after the landing"));
-        if stands {
-            assert_eq!(
-                db.snapshot_builds(),
-                builds,
-                "{label}: nothing sorted again across the merge's landing"
-            );
-            // The handle's look has no tables to carry; the writer's has
-            // them with the cache and carries the snapshot with them.
-            let want = if block_cache { 1 } else { 2 };
-            assert!(
-                db.snapshots_stood() >= stood + want,
-                "{label}: the snapshot stood for the writer and the handle: {} from {stood}",
-                db.snapshots_stood()
-            );
-        } else {
-            assert!(
-                db.snapshot_builds() > builds,
-                "{label}: without the option the landing is a build"
-            );
-            assert_eq!(db.snapshots_stood(), 0, "{label}: and nothing stands");
-        }
+        assert_eq!(
+            db.snapshot_builds(),
+            builds,
+            "{label}: nothing sorted again across the merge's landing"
+        );
+        // The handle's look has no tables to carry; the writer's has
+        // them with the cache and carries the snapshot with them.
+        let want = if block_cache { 1 } else { 2 };
+        assert!(
+            db.snapshots_stood() >= stood + want,
+            "{label}: the snapshot stood for the writer and the handle: {} from {stood}",
+            db.snapshots_stood()
+        );
         // Writes after it: updates of keys the snapshot holds and keys
         // created since, filed into the snapshot that stood.
         for k in (5..6000u32).step_by(17) {
@@ -12770,22 +12759,15 @@ fn a_scan_snapshot_stands_across_a_publish_that_leaves_the_memtables() {
             &reader,
             &format!("{label}: a handle after the seal's landing"),
         );
-        if stands {
-            assert_eq!(
-                db.snapshot_builds(),
-                builds,
-                "{label}: nothing sorted again across the seal's landing"
-            );
-            assert!(
-                db.snapshots_stood() > stood,
-                "{label}: the snapshot stood without the landed table's base"
-            );
-        } else {
-            assert!(
-                db.snapshot_builds() > builds,
-                "{label}: without the option the seal's landing is a build"
-            );
-        }
+        assert_eq!(
+            db.snapshot_builds(),
+            builds,
+            "{label}: nothing sorted again across the seal's landing"
+        );
+        assert!(
+            db.snapshots_stood() > stood,
+            "{label}: the snapshot stood without the landed table's base"
+        );
         for k in (7..6000u32).step_by(23) {
             m.append(&mut db, &key(k), "x");
         }
@@ -12999,19 +12981,17 @@ fn a_snapshot_carried_forward_on_the_merge_path_folds_it_too() {
 /// bytes and written out of order, half between the run's keys, carried
 /// forward by the walk. Keys of every batch are checked at every start.
 fn extend_order_model(block_cache: bool) {
-    extend_order_model_with(block_cache, false, false)
+    extend_order_model_with(block_cache)
 }
 
-fn extend_order_model_with(block_cache: bool, unfolded: bool, lean: bool) {
-    let d = dir(&format!("extend-order-{block_cache}-{unfolded}-{lean}"));
+fn extend_order_model_with(block_cache: bool) {
+    let d = dir(&format!("extend-order-{block_cache}"));
     let opts = Options {
         seal_bytes: 1 << 20,
         partition_bytes: Some(2 << 10),
         scan_block_cache: block_cache,
         scan_cache_ahead: false,
         share_snapshot: true,
-        snapshot_extend_unfolded: unfolded,
-        snapshot_build_lean: lean,
         // The seal's copy is what is tested, and nothing scans the
         // store before its seal: built whatever the reads
         // (`Options::seal_snapshot_far`).
@@ -13094,8 +13074,8 @@ fn the_extension_orders_a_batch_alike_through_sixteen_bytes_on_the_merge_path() 
     extend_order_model(false);
 }
 
-/// The extension's batch pushed without the fold's compare
-/// (`Options::snapshot_extend_unfolded`): the same model through the
+/// The extension's batch pushed without the fold's compare: the same
+/// model through the
 /// sparse gallop, the dense walk with keys alike through sixteen bytes,
 /// and the run walked to its end, where the rest of the batch is pushed
 /// without reading a key, on both scan paths; and the carry over a
@@ -13107,19 +13087,16 @@ fn the_extension_orders_a_batch_alike_through_sixteen_bytes_on_the_merge_path() 
 /// held, so the walk is the dense one, into a run of interleaved keys
 /// with some alike through sixteen bytes, then a batch above every key
 /// -- the run walked to its end at the batch's first key, the rest
-/// pushed without a read under `Options::snapshot_extend_unfolded` --
-/// and one below every key. Each scan extends and none sorts again, and
-/// the model holds the answer, under either shape and on either path.
-fn extend_live_run_model(block_cache: bool, unfolded: bool, lean: bool) {
-    let d = dir(&format!("extend-live-{block_cache}-{unfolded}-{lean}"));
+/// pushed without a read -- and one below every key. Each scan extends
+/// and none sorts again, and the model holds the answer on either path.
+fn extend_live_run_model(block_cache: bool) {
+    let d = dir(&format!("extend-live-{block_cache}"));
     let opts = Options {
         seal_bytes: 256 << 20,
         partition_bytes: Some(2 << 10),
         scan_block_cache: block_cache,
         scan_cache_ahead: false,
         share_snapshot: true,
-        snapshot_extend_unfolded: unfolded,
-        snapshot_build_lean: lean,
         ..common::options()
     };
     let mut db = Db::create(&d, opts).unwrap();
@@ -13147,7 +13124,7 @@ fn extend_live_run_model(block_cache: bool, unfolded: bool, lean: bool) {
     assert_eq!(db.snapshot_builds(), b0 + 1, "the run is one sort");
     assert_eq!(
         db.snapshot_lean_builds(),
-        l0 + u64::from(lean),
+        l0 + 1,
         "a hash table's keys lie in its order: the lean build takes them"
     );
     let (b1, e1) = (db.snapshot_builds(), db.snapshot_extends());
@@ -13199,18 +13176,12 @@ fn extend_live_run_model(block_cache: bool, unfolded: bool, lean: bool) {
 
 #[test]
 fn a_scan_extends_its_live_run_without_the_fold_compare() {
-    extend_live_run_model(true, true, false);
-    extend_live_run_model(false, true, false);
+    extend_live_run_model(true);
+    extend_live_run_model(false);
 }
 
-#[test]
-fn a_scan_extends_its_live_run_with_the_fold_compare() {
-    extend_live_run_model(true, false, false);
-    extend_live_run_model(false, false, false);
-}
-
-/// The lean build over an ordered table, a direct run in progress
-/// (`Options::snapshot_build_lean`): with short keys every key is read
+/// The lean build over an ordered table, a direct run in progress: with
+/// short keys every key is read
 /// in the run's stream, and with keys of a kilobyte most block seams
 /// fall inside one and the key is copied apart from the stream, past
 /// the bias, so the table's keys do not lie in its entries' order. The
@@ -13219,8 +13190,6 @@ fn lean_ordered_model(n: u32, val: usize, pad: usize) {
     let d = dir(&format!("lean-ordered-{n}-{val}-{pad}"));
     let opts = Options {
         seal_bytes: 256 << 20,
-        snapshot_build_lean: true,
-        snapshot_extend_unfolded: true,
         ..common::options()
     };
     let mut db = Db::create(&d, opts).unwrap();
@@ -13252,45 +13221,18 @@ fn the_lean_snapshot_of_an_ordered_table_takes_its_copied_keys_too() {
     lean_ordered_model(20000, 100, 900);
 }
 
-/// The lean build and extension (`Options::snapshot_build_lean`): a
-/// key's place an offset word and the keys copied in the table's order,
-/// through every model the extension is held to, folded and not, on
-/// both scan paths, over a frozen table's base and with the pieces'
-/// fold alone in the forms.
-#[test]
-fn the_lean_snapshot_answers_every_model() {
-    for unfolded in [true, false] {
-        extend_live_run_model(true, unfolded, true);
-        extend_live_run_model(false, unfolded, true);
-        extend_order_model_with(true, unfolded, true);
-        extend_order_model_with(false, unfolded, true);
-        carry_model_with(true, unfolded, true);
-        carry_model_with(false, unfolded, true);
-    }
-}
-
-#[test]
-fn the_extension_without_the_fold_compare_answers_every_model() {
-    extend_order_model_with(true, true, false);
-    extend_order_model_with(false, true, false);
-    carry_model_with(true, true, false);
-    carry_model_with(false, true, false);
-}
-
 fn carry_model(block_cache: bool) {
-    carry_model_with(block_cache, false, false)
+    carry_model_with(block_cache)
 }
 
-fn carry_model_with(block_cache: bool, unfolded: bool, lean: bool) {
-    let d = dir(&format!("extend-snap-{block_cache}-{unfolded}-{lean}"));
+fn carry_model_with(block_cache: bool) {
+    let d = dir(&format!("extend-snap-{block_cache}"));
     let opts = Options {
         seal_bytes: 1 << 20,
         partition_bytes: Some(2 << 10),
         scan_block_cache: block_cache,
         scan_cache_ahead: false,
         share_snapshot: true,
-        snapshot_extend_unfolded: unfolded,
-        snapshot_build_lean: lean,
         // The seal's copy is what is tested, and nothing scans the
         // store before its seal: built whatever the reads
         // (`Options::seal_snapshot_far`).
@@ -15731,16 +15673,13 @@ fn a_replacing_write_patches_a_copy_in_place() {
 }
 
 /// A scan that finds no snapshot of its state -- dropped at the publish
-/// before it -- walks the forms it holds without building one, and at the
-/// first block that needs one builds it and goes on from that block's
-/// first key. Both halves against the model, and each held to having taken
-/// the path it is about: a scan over held forms alone, which builds
-/// nothing, and one that runs from held blocks into blocks with no form,
-/// which builds once and must answer what one uninterrupted walk would.
+/// before it -- builds one and walks: over held forms alone, from held
+/// blocks into blocks with no form, and from a first block with no form,
+/// each against the model.
 #[test]
-fn a_scan_builds_the_snapshot_only_where_a_block_needs_it() {
-    for lazy in [true, false] {
-        let d = dir(if lazy { "lazysnap" } else { "lazysnap-off" });
+fn a_scan_over_held_forms_and_bare_blocks_answers_the_model() {
+    {
+        let d = dir("lazysnap-off");
         let opts = Options {
             seal_bytes: 1 << 20,
             partition_bytes: Some(4 << 10),
@@ -15751,7 +15690,6 @@ fn a_scan_builds_the_snapshot_only_where_a_block_needs_it() {
             forms_from_reader_scans: 0,
             commit_forms: true,
             forms_carry: true,
-            scan_lazy_snapshot: lazy,
             // The commit's own maintenance, step by step: on the thread,
             // which commit a pass files is the thread's timing.
             upkeep: supdb::Upkeep::Inline,
@@ -15802,38 +15740,13 @@ fn a_scan_builds_the_snapshot_only_where_a_block_needs_it() {
         m.append(&mut db, &key(2500), "v9");
         db.commit().unwrap();
 
-        let (done0, resumed0) = db.lazy_scans();
-        let built0 = db.snapshot_builds();
         m.check_one(&db, key(100).as_bytes(), 200, "held forms only");
-        let (done1, resumed1) = db.lazy_scans();
-        if lazy {
-            assert_eq!(
-                (done1 - done0, resumed1 - resumed0),
-                (1, 0),
-                "the first scan walked held forms without a snapshot"
-            );
-            assert_eq!(db.snapshot_builds(), built0, "and built none");
-        }
-        let built1 = db.snapshot_builds();
         m.check_one(
             &db,
             key(1400).as_bytes(),
             500,
             "held forms into bare blocks",
         );
-        let (done2, resumed2) = db.lazy_scans();
-        if lazy {
-            assert_eq!(
-                (done2 - done1, resumed2 - resumed1),
-                (0, 1),
-                "the second scan stopped at a block with no form"
-            );
-            assert_eq!(
-                db.snapshot_builds(),
-                built1 + 1,
-                "and built the snapshot once"
-            );
-        }
         // A second landing, and a scan whose very first block has no form:
         // the walk stops before emitting anything and goes on from the
         // scan's own start.
@@ -15845,18 +15758,9 @@ fn a_scan_builds_the_snapshot_only_where_a_block_needs_it() {
         db.settle().unwrap();
         m.append(&mut db, &key(2600), "v9");
         db.commit().unwrap();
-        let (done3, resumed3) = db.lazy_scans();
         m.check_one(&db, key(2100).as_bytes(), 50, "a bare first block");
-        let (done4, resumed4) = db.lazy_scans();
-        if lazy {
-            assert_eq!(
-                (done4 - done3, resumed4 - resumed3),
-                (0, 1),
-                "the scan stopped at its first block"
-            );
-        }
         // Everything, now that the snapshot stands.
-        m.check(&db, if lazy { "lazy, after" } else { "eager, after" });
+        m.check(&db, "eager, after");
     }
 }
 
@@ -16842,11 +16746,10 @@ fn the_pieces_are_ranked_whole_only_under_the_arm() {
 
 #[test]
 fn a_frozen_tables_snapshot_outlives_the_state_it_was_published_in() {
-    for frozen_snaps in [true, false] {
+    {
         let (mut db, mut m) = seal_snapshot_store_with(
-            &format!("frozen-snap-on-table-{frozen_snaps}"),
+            "frozen-snap-on-table-true",
             Options {
-                frozen_snaps,
                 seal_snapshot_far: true,
                 ..common::options()
             },
@@ -16862,18 +16765,11 @@ fn a_frozen_tables_snapshot_outlives_the_state_it_was_published_in() {
         let r = db.reader().unwrap();
         m.check(&r, "a handle over the switched state");
         m.check(&db, "the writer over the switched state");
-        if frozen_snaps {
-            assert_eq!(
-                db.snapshot_builds(),
-                0,
-                "the handle and the writer carried the table's snapshot forward"
-            );
-        } else {
-            assert!(
-                db.snapshot_builds() > 0,
-                "off, a reader of the switched state sorts the table itself"
-            );
-        }
+        assert_eq!(
+            db.snapshot_builds(),
+            0,
+            "the handle and the writer carried the table's snapshot forward"
+        );
         assert_eq!(db.frozen_sorts(), 0, "nobody sorted the frozen table alone");
         assert!(db.in_flight().0, "nothing landed the seal");
         db.hold_seal_landing(false);
@@ -17048,10 +16944,9 @@ fn a_live_write_over_the_frozen_table_is_one_key_on_every_scan_path() {
 }
 
 /// The scan paths a frozen table's keys reach a scan through, each the
-/// arm that keeps it: the block cache's, the merge over unrouted sources, the lazy snapshot, the snapshot's runs, a
-/// snapshot each handle builds alone, and frozen tables with no snapshot
-/// of their own.
-fn scan_path_arms() -> [(&'static str, Options); 9] {
+/// arm that keeps it: the block cache's, the merge over unrouted sources,
+/// the snapshot's runs and a snapshot each handle builds alone.
+fn scan_path_arms() -> [(&'static str, Options); 7] {
     [
         ("default", common::options()),
         // The compact form forced, with the block cache and without it: the
@@ -17093,13 +16988,6 @@ fn scan_path_arms() -> [(&'static str, Options); 9] {
             },
         ),
         (
-            "lazy",
-            Options {
-                scan_lazy_snapshot: true,
-                ..common::options()
-            },
-        ),
-        (
             "runs",
             Options {
                 snapshot_runs: true,
@@ -17110,13 +16998,6 @@ fn scan_path_arms() -> [(&'static str, Options); 9] {
             "unshared",
             Options {
                 share_snapshot: false,
-                ..common::options()
-            },
-        ),
-        (
-            "nofrozen",
-            Options {
-                frozen_snaps: false,
                 ..common::options()
             },
         ),
@@ -18205,13 +18086,13 @@ fn readers_on_threads_keep_answering_beside_three_frozen_tables() {
 /// writer's next write freezes it, and the first scan over that state, a
 /// handle's, carries the seal's copy forward with the live key alone. The
 /// seal publishes into a state only a snapshot of that state's own frozen
-/// table, which a handed table was not when the seal made it, so off,
-/// the handle sorts the handed table again. The seal is held before it
+/// table, which a handed table was not when the seal made it. The seal
+/// is held before it
 /// writes, so the write freezes the table on every run.
 #[test]
 fn a_handed_tables_seal_snapshot_serves_the_state_that_freezes_it() {
-    for frozen_snaps in [true, false] {
-        let d = dir(&format!("handed-snap-{frozen_snaps}"));
+    {
+        let d = dir("handed-snap-true");
         let mut db = Db::create(
             &d,
             Options {
@@ -18219,7 +18100,6 @@ fn a_handed_tables_seal_snapshot_serves_the_state_that_freezes_it() {
                 // Never on its own: the whole table is the sync's to hand.
                 seal_bytes: 1 << 40,
                 partition_bytes: Some(64 << 20),
-                frozen_snaps,
                 // The seal's copy is what is tested, and nothing scans
                 // the store before its seal: built whatever the reads
                 // (`Options::seal_snapshot_far`).
@@ -18239,9 +18119,9 @@ fn a_handed_tables_seal_snapshot_serves_the_state_that_freezes_it() {
         db.sync().unwrap();
         assert!(db.in_flight().0, "the handed table's seal is in flight");
         // The copy made, its publish refused -- the seal's time is counted
-        // after both -- and, on, set on the table.
+        // after both -- and set on the table.
         wait_for("the seal's snapshot", || {
-            db.seal_waits().seal_snap_ns > 0 && db.seal_table_snapshots() == u64::from(frozen_snaps)
+            db.seal_waits().seal_snap_ns > 0 && db.seal_table_snapshots() == 1
         });
         assert_eq!(
             db.seal_snapshots(),
@@ -18254,18 +18134,11 @@ fn a_handed_tables_seal_snapshot_serves_the_state_that_freezes_it() {
         let builds = db.snapshot_builds();
         let r = db.reader().unwrap();
         m.check(&r, "a handle over the frozen handed table");
-        if frozen_snaps {
-            assert_eq!(
-                db.snapshot_builds(),
-                builds,
-                "the handle carried the seal's copy forward"
-            );
-        } else {
-            assert!(
-                db.snapshot_builds() > builds,
-                "off, the handle sorts the handed table itself"
-            );
-        }
+        assert_eq!(
+            db.snapshot_builds(),
+            builds,
+            "the handle carried the seal's copy forward"
+        );
         m.check(&db, "the writer over the frozen handed table");
         assert_eq!(db.frozen_sorts(), 0, "nobody sorted the handed table alone");
         db.hold_seal_landing(false);

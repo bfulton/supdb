@@ -623,9 +623,6 @@ pub struct Supdb {
     /// The writer's scan snapshot carried across a publish rather than
     /// dropped. `supdb-snapcarry`.
     snapcarry: bool,
-    /// A scan builds the snapshot only at a block that needs it rather
-    /// than before it walks anything. `supdb-lazysnap`.
-    lazysnap: bool,
     /// Every record written with its extent, as before the compact
     /// record. `supdb-fullrec`.
     fullrec: bool,
@@ -1046,17 +1043,6 @@ pub struct Supdb {
     /// default: `supdb-zrewarmturn` looks at every turn, `supdb-zrewarmtick`
     /// at the controller's step alone.
     zrewarmturn: Option<bool>,
-    /// The snapshot's extension pushing its batch without the fold's
-    /// compare (`Options::snapshot_extend_unfolded`), `None` for the
-    /// engine's default: `supdb-snapfolded` compares each key with the
-    /// one before it.
-    snapunfolded: Option<bool>,
-    /// The snapshot's build and extension keeping a key's place as an
-    /// offset word and copying the keys in the table's order
-    /// (`Options::snapshot_build_lean`), `None` for the engine's default:
-    /// `supdb-snapfat` is the shape before, and `supdb-snapold` the shape
-    /// before of both.
-    snaplean: Option<bool>,
     /// The partitions' heads copied at the controller's census while the
     /// block cache holds the raw records' place, whatever the model says
     /// of the raw form (`Options::heads_owned_beside_copies`), `None` for
@@ -1126,10 +1112,6 @@ pub struct Supdb {
     /// the shape before `Options::scan_forms_off_unreused`.
     /// `supdb-formson`.
     formson: bool,
-    /// A handle's scan snapshot dropped at every publish, where its look
-    /// has no tables to carry (`Options::snapshot_stands` off).
-    /// `supdb-snapdrops`.
-    snapdrops: bool,
     /// A merge drops behind it the raw records of an input partition its
     /// form file serves (`Options::merge_drops_covered`).
     /// `supdb-mergedropscovered`.
@@ -1276,7 +1258,6 @@ pub struct Supdb {
     /// `Options::adaptive_shape`. `supdb-ingestshape`.
     shape: bool,
     rotate: bool,
-    nofrozen: bool,
     idle: bool,
     /// Segments written in 2 MB pieces, `SegmentOptions::write_piece`.
     /// `supdb-pmd`, and `supdb-ingestpmd` buffered.
@@ -2084,9 +2065,6 @@ struct Policy {
     /// The writer's scan snapshot carried across a publish rather than
     /// dropped. `supdb-snapcarry`.
     snapcarry: bool,
-    /// A scan builds the snapshot only at a block that needs it rather
-    /// than before it walks anything. `supdb-lazysnap`.
-    lazysnap: bool,
     /// Every record written with its extent, as before the compact
     /// record. `supdb-fullrec`.
     fullrec: bool,
@@ -2507,17 +2485,6 @@ struct Policy {
     /// default: `supdb-zrewarmturn` looks at every turn, `supdb-zrewarmtick`
     /// at the controller's step alone.
     zrewarmturn: Option<bool>,
-    /// The snapshot's extension pushing its batch without the fold's
-    /// compare (`Options::snapshot_extend_unfolded`), `None` for the
-    /// engine's default: `supdb-snapfolded` compares each key with the
-    /// one before it.
-    snapunfolded: Option<bool>,
-    /// The snapshot's build and extension keeping a key's place as an
-    /// offset word and copying the keys in the table's order
-    /// (`Options::snapshot_build_lean`), `None` for the engine's default:
-    /// `supdb-snapfat` is the shape before, and `supdb-snapold` the shape
-    /// before of both.
-    snaplean: Option<bool>,
     /// The partitions' heads copied at the controller's census while the
     /// block cache holds the raw records' place, whatever the model says
     /// of the raw form (`Options::heads_owned_beside_copies`), `None` for
@@ -2587,10 +2554,6 @@ struct Policy {
     /// the shape before `Options::scan_forms_off_unreused`.
     /// `supdb-formson`.
     formson: bool,
-    /// A handle's scan snapshot dropped at every publish, where its look
-    /// has no tables to carry (`Options::snapshot_stands` off).
-    /// `supdb-snapdrops`.
-    snapdrops: bool,
     /// A merge drops behind it the raw records of an input partition its
     /// form file serves (`Options::merge_drops_covered`).
     /// `supdb-mergedropscovered`.
@@ -2738,10 +2701,6 @@ struct Policy {
     /// A seal syncs and rotates the WAL, the shape before seals kept it,
     /// `Options::seal_rotates_wal`. `supdb-rotate`, `supdb-shaperotate`.
     rotate: bool,
-    /// Each reader of a frozen table sorts it for itself, as before the
-    /// table kept its own snapshot: `Options::frozen_snaps` off.
-    /// `supdb-nofrozen`, and `supdb-shapenofrozen` under the shape.
-    nofrozen: bool,
     /// A commit under the threshold seals whenever no seal is writing
     /// (`Options::seal_idle`). `supdb-idle`, and `supdb-shapeidle` under
     /// the shape.
@@ -3382,8 +3341,6 @@ impl Default for Policy {
             rewarmrawscans: None,
             rewarmrawmaps: None,
             zrewarmturn: None,
-            snapunfolded: None,
-            snaplean: None,
             headscopies: None,
             zbuycross: None,
             copiesfit: None,
@@ -3397,7 +3354,6 @@ impl Default for Policy {
             runspare: None,
             formsoffbuilt: None,
             formson: false,
-            snapdrops: false,
             mergedropscovered: false,
             sameblocksrecords: false,
             settleroomstill: false,
@@ -3421,7 +3377,6 @@ impl Default for Policy {
             rankrecords: false,
             shape: false,
             rotate: false,
-            nofrozen: false,
             idle: false,
             pmd: false,
             settlefreeze: false,
@@ -3579,7 +3534,6 @@ impl Default for Policy {
             carry: true,
             rebuild: 0,
             snapcarry: false,
-            lazysnap: false,
             fullrec: false,
             norebase: false,
             sealfile: false,
@@ -4246,19 +4200,6 @@ impl Supdb {
             path,
             Policy {
                 rotate: true,
-                ..Policy::default()
-            },
-        )
-    }
-
-    /// `supdb` whose readers of a frozen table each sort it for
-    /// themselves (`Options::frozen_snaps` off), the shape before the
-    /// table kept its own snapshot.
-    pub fn create_nofrozen(path: &Path) -> Res<Supdb> {
-        Supdb::with_policy(
-            path,
-            Policy {
-                nofrozen: true,
                 ..Policy::default()
             },
         )
@@ -5436,23 +5377,6 @@ impl Supdb {
         )
     }
 
-    /// `supdb-ingestshape` whose readers of a frozen table each sort it
-    /// for themselves, as `supdb-nofrozen`: the arm a `sync` hands its
-    /// table to a seal under, which the table's own snapshot is for.
-    pub fn create_shape_nofrozen(path: &Path) -> Res<Supdb> {
-        Supdb::with_policy(
-            path,
-            Policy {
-                partition: false,
-                drain: false,
-                durable: false,
-                shape: true,
-                nofrozen: true,
-                ..Policy::default()
-            },
-        )
-    }
-
     /// EXPERIMENT: `supdb` whose commits seal whenever no seal is writing
     /// (`Options::seal_idle`).
     pub fn create_idle(path: &Path) -> Res<Supdb> {
@@ -5636,20 +5560,6 @@ impl Supdb {
             path,
             Policy {
                 snapcarry: true,
-                ..Policy::default()
-            },
-        )
-    }
-
-    /// `supdb` with the scan snapshot built only at a block that needs
-    /// it, rather than before a scan walks anything. Against `supdb` it
-    /// prices the lazy snapshot: the first scan after a publish over forms
-    /// the writer holds.
-    pub fn create_lazysnap(path: &Path) -> Res<Supdb> {
-        Supdb::with_policy(
-            path,
-            Policy {
-                lazysnap: true,
                 ..Policy::default()
             },
         )
@@ -8115,45 +8025,6 @@ impl Supdb {
         )
     }
 
-    /// `supdb` with the snapshot's extension comparing each batch key with
-    /// the one before it for a fold (`Options::snapshot_extend_unfolded`
-    /// off).
-    pub fn create_snapfolded(path: &Path) -> Res<Supdb> {
-        Supdb::with_policy(
-            path,
-            Policy {
-                snapunfolded: Some(false),
-                ..Policy::default()
-            },
-        )
-    }
-
-    /// `supdb` with the snapshot's build and extension as they were
-    /// (`Options::snapshot_build_lean` off).
-    pub fn create_snapfat(path: &Path) -> Res<Supdb> {
-        Supdb::with_policy(
-            path,
-            Policy {
-                snaplean: Some(false),
-                ..Policy::default()
-            },
-        )
-    }
-
-    /// `supdb` with the snapshot's build and extension both as they were
-    /// (`Options::snapshot_build_lean` and
-    /// `Options::snapshot_extend_unfolded` off).
-    pub fn create_snapold(path: &Path) -> Res<Supdb> {
-        Supdb::with_policy(
-            path,
-            Policy {
-                snaplean: Some(false),
-                snapunfolded: Some(false),
-                ..Policy::default()
-            },
-        )
-    }
-
     /// `supdb` whose selector makes the crossing at its first buy where
     /// the land look has not by then (`Options::zpages_buy_crosses`): the
     /// form files built ahead are asked back before they are attached,
@@ -8234,19 +8105,6 @@ impl Supdb {
             path,
             Policy {
                 settleroomstill: true,
-                ..Policy::default()
-            },
-        )
-    }
-
-    /// `supdb` whose handles drop their scan snapshot at every publish
-    /// their look has no tables to carry across
-    /// (`Options::snapshot_stands` off).
-    pub fn create_snapdrops(path: &Path) -> Res<Supdb> {
-        Supdb::with_policy(
-            path,
-            Policy {
-                snapdrops: true,
                 ..Policy::default()
             },
         )
@@ -9926,8 +9784,6 @@ impl Supdb {
             rewarmrawscans,
             rewarmrawmaps,
             zrewarmturn,
-            snapunfolded,
-            snaplean,
             headscopies,
             zbuycross,
             copiesfit,
@@ -9941,7 +9797,6 @@ impl Supdb {
             runspare,
             formsoffbuilt,
             formson,
-            snapdrops,
             mergedropscovered,
             sameblocksrecords,
             settleroomstill,
@@ -9971,7 +9826,6 @@ impl Supdb {
             carry,
             rebuild,
             snapcarry,
-            lazysnap,
             fullrec,
             norebase,
             sealfile,
@@ -9983,7 +9837,6 @@ impl Supdb {
             aheadpub,
             leave,
             rotate,
-            nofrozen,
             idle,
             pmd,
             settlefreeze,
@@ -10421,9 +10274,6 @@ impl Supdb {
                 .unwrap_or(supdb::Options::default().zpages_rewarm_raw_maps),
             zpages_rewarm_every_turn: zrewarmturn
                 .unwrap_or(supdb::Options::default().zpages_rewarm_every_turn),
-            snapshot_extend_unfolded: snapunfolded
-                .unwrap_or(supdb::Options::default().snapshot_extend_unfolded),
-            snapshot_build_lean: snaplean.unwrap_or(supdb::Options::default().snapshot_build_lean),
             heads_owned_beside_copies: headscopies
                 .unwrap_or(supdb::Options::default().heads_owned_beside_copies),
             zpages_buy_crosses: zbuycross.unwrap_or(supdb::Options::default().zpages_buy_crosses),
@@ -10481,8 +10331,6 @@ impl Supdb {
                 || std::env::var_os("SUPDB_MIX_COUNTERS").is_some(),
             forms_settle_rebuild_from: rebuild,
             snapshot_carry: snapcarry,
-            snapshot_stands: !snapdrops,
-            scan_lazy_snapshot: lazysnap,
             // The pieces over a range merged into one piece beside the
             // partition merge, or left for it as the engine has it.
             tier_pieces: tier.unwrap_or(supdb::Options::default().tier_pieces),
@@ -10714,7 +10562,6 @@ impl Supdb {
             publish_in_background: !(inlinemaint || nopin),
             adaptive_shape: shape,
             seal_rotates_wal: rotate,
-            frozen_snaps: !nofrozen,
             seal_idle: idle,
             // Below this the builder declines and the writer fills the
             // forms inline on the commit path instead, which is the
@@ -10951,8 +10798,6 @@ impl Supdb {
             rewarmrawscans,
             rewarmrawmaps,
             zrewarmturn,
-            snapunfolded,
-            snaplean,
             headscopies,
             zbuycross,
             copiesfit,
@@ -10966,7 +10811,6 @@ impl Supdb {
             runspare,
             formsoffbuilt,
             formson,
-            snapdrops,
             mergedropscovered,
             sameblocksrecords,
             settleroomstill,
@@ -10996,7 +10840,6 @@ impl Supdb {
             carry,
             rebuild,
             snapcarry,
-            lazysnap,
             fullrec,
             norebase,
             sealfile,
@@ -11008,7 +10851,6 @@ impl Supdb {
             aheadpub,
             leave,
             rotate,
-            nofrozen,
             idle,
             pmd,
             settlefreeze,
@@ -11991,13 +11833,6 @@ impl Engine for Supdb {
                 "supdb-ingestbglag"
             };
         }
-        if self.nofrozen {
-            return if self.shape {
-                "supdb-shapenofrozen"
-            } else {
-                "supdb-nofrozen"
-            };
-        }
         if self.rotate {
             return if self.shape {
                 "supdb-shaperotate"
@@ -12020,9 +11855,6 @@ impl Engine for Supdb {
         }
         if self.snapcarry {
             return "supdb-snapcarry";
-        }
-        if self.lazysnap {
-            return "supdb-lazysnap";
         }
         if self.fullrec {
             return "supdb-fullrec";
@@ -12724,15 +12556,6 @@ impl Engine for Supdb {
         if self.zrewarmturn == Some(false) {
             return "supdb-zrewarmtick";
         }
-        if self.snaplean == Some(false) && self.snapunfolded == Some(false) {
-            return "supdb-snapold";
-        }
-        if self.snapunfolded == Some(false) {
-            return "supdb-snapfolded";
-        }
-        if self.snaplean == Some(false) {
-            return "supdb-snapfat";
-        }
         if self.headscopies == Some(false) {
             return "supdb-headsmodel";
         }
@@ -12814,9 +12637,6 @@ impl Engine for Supdb {
         }
         if self.formson {
             return "supdb-formson";
-        }
-        if self.snapdrops {
-            return "supdb-snapdrops";
         }
         if self.mergedropscovered && self.sameblocksrecords {
             return "supdb-mergedropsrecords";
@@ -13184,8 +13004,6 @@ impl Engine for Supdb {
             ("one_reused", one(|c| c.reused)),
             ("one_end_at_end", one(|c| c.end)),
             ("one_free_at_end", one(|c| c.free)),
-            ("lazy_scans_done", db.lazy_scans().0 as f64),
-            ("lazy_scans_resumed", db.lazy_scans().1 as f64),
             ("seals", db.seal_waits().joins as f64),
             ("publishes", db.seal_waits().publishes as f64),
             ("seals_idle", db.seal_waits().idle_seals as f64),
@@ -15362,7 +15180,6 @@ pub fn guarantee(arm: &str) -> Option<Guarantee> {
         | "supdb-nocarry"
         | "supdb-rebuild"
         | "supdb-snapcarry"
-        | "supdb-lazysnap"
         | "supdb-fullrec"
         | "supdb-norebase"
         | "supdb-sealfile"
@@ -15601,9 +15418,6 @@ pub fn guarantee(arm: &str) -> Option<Guarantee> {
         | "supdb-rewarmrawnomap"
         | "supdb-zrewarmturn"
         | "supdb-zrewarmtick"
-        | "supdb-snapfolded"
-        | "supdb-snapfat"
-        | "supdb-snapold"
         | "supdb-headsmodel"
         | "supdb-zbuycross"
         | "supdb-jobsmappedbuycross"
@@ -15615,7 +15429,6 @@ pub fn guarantee(arm: &str) -> Option<Guarantee> {
         | "supdb-nozjobs"
         | "supdb-nozjobsrewarm"
         | "supdb-formson"
-        | "supdb-snapdrops"
         | "supdb-mergedropscovered"
         | "supdb-mergedropsrecords"
         | "supdb-sameblocksrecords"
@@ -15641,7 +15454,6 @@ pub fn guarantee(arm: &str) -> Option<Guarantee> {
         | "supdb-waitmanifest"
         | "supdb-inlinemaint"
         | "supdb-rotate"
-        | "supdb-nofrozen"
         | "supdb-idle"
         | "supdb-pmd"
         | "supdb-hold"
@@ -15770,7 +15582,6 @@ pub fn guarantee(arm: &str) -> Option<Guarantee> {
         | "supdb-ingestinline"
         | "supdb-ingestshape"
         | "supdb-shaperotate"
-        | "supdb-shapenofrozen"
         | "supdb-shapeidle"
         | "supdb-ingestpmd"
         | "supdb-ingestsettlefreeze"
@@ -15986,7 +15797,6 @@ pub fn open(arm: &str, dir: &Path, map_gb: usize) -> Res<Box<dyn Engine>> {
         "supdb-rebuild" => supdb_arm(Supdb::create_rebuild, dir)?,
         "supdb-ingestrebuild" => supdb_arm(Supdb::create_ingest_rebuild, dir)?,
         "supdb-snapcarry" => supdb_arm(Supdb::create_snapcarry, dir)?,
-        "supdb-lazysnap" => supdb_arm(Supdb::create_lazysnap, dir)?,
         "supdb-fullrec" => supdb_arm(Supdb::create_fullrec, dir)?,
         "supdb-norebase" => supdb_arm(Supdb::create_norebase, dir)?,
         "supdb-sealfile" => supdb_arm(Supdb::create_sealfile, dir)?,
@@ -16783,9 +16593,7 @@ pub fn open(arm: &str, dir: &Path, map_gb: usize) -> Res<Box<dyn Engine>> {
         "supdb-ingestsync" => supdb_arm(Supdb::create_ingest_sync, dir)?,
         "supdb-ingestshape" => supdb_arm(Supdb::create_ingest_shape, dir)?,
         "supdb-rotate" => supdb_arm(Supdb::create_rotate, dir)?,
-        "supdb-nofrozen" => supdb_arm(Supdb::create_nofrozen, dir)?,
         "supdb-shaperotate" => supdb_arm(Supdb::create_shape_rotate, dir)?,
-        "supdb-shapenofrozen" => supdb_arm(Supdb::create_shape_nofrozen, dir)?,
         "supdb-pmd" => supdb_arm(Supdb::create_pmd, dir)?,
         "supdb-ingestpmd" => supdb_arm(Supdb::create_ingest_pmd, dir)?,
         "supdb-settlefreeze" => supdb_arm(Supdb::create_settlefreeze, dir)?,
@@ -18216,9 +18024,6 @@ pub fn open(arm: &str, dir: &Path, map_gb: usize) -> Res<Box<dyn Engine>> {
         "supdb-rewarmrawnomap" => supdb_arm(Supdb::create_rewarmrawnomap, dir)?,
         "supdb-zrewarmturn" => supdb_arm(Supdb::create_zrewarmturn, dir)?,
         "supdb-zrewarmtick" => supdb_arm(Supdb::create_zrewarmtick, dir)?,
-        "supdb-snapfolded" => supdb_arm(Supdb::create_snapfolded, dir)?,
-        "supdb-snapfat" => supdb_arm(Supdb::create_snapfat, dir)?,
-        "supdb-snapold" => supdb_arm(Supdb::create_snapold, dir)?,
         "supdb-headsmodel" => supdb_arm(Supdb::create_headsmodel, dir)?,
         "supdb-zbuycross" => supdb_arm(Supdb::create_zbuycross, dir)?,
         "supdb-jobsmappedbuycross" => supdb_arm(Supdb::create_jobsmapped_buycross, dir)?,
@@ -18230,7 +18035,6 @@ pub fn open(arm: &str, dir: &Path, map_gb: usize) -> Res<Box<dyn Engine>> {
         "supdb-nozjobs" => supdb_arm(Supdb::create_nozjobs, dir)?,
         "supdb-nozjobsrewarm" => supdb_arm(Supdb::create_nozjobsrewarm, dir)?,
         "supdb-formson" => supdb_arm(Supdb::create_formson, dir)?,
-        "supdb-snapdrops" => supdb_arm(Supdb::create_snapdrops, dir)?,
         "supdb-mergedropscovered" => supdb_arm(Supdb::create_mergedropscovered, dir)?,
         "supdb-mergedropsrecords" => supdb_arm(Supdb::create_mergedropsrecords, dir)?,
         "supdb-sameblocksrecords" => supdb_arm(Supdb::create_sameblocksrecords, dir)?,
@@ -21380,22 +21184,6 @@ mod tests {
                     let o = z.db.as_ref().unwrap().options();
                     assert_eq!(o.zpages_rewarm_every_turn, on, "{arm}");
                 }
-                assert!(b.snapshot_extend_unfolded && b.snapshot_build_lean);
-                let z = Supdb::create_snapfolded(&dir("snapfolded")).unwrap();
-                assert_eq!(z.name(), "supdb-snapfolded");
-                assert_eq!(z.features(), base.features());
-                let o = z.db.as_ref().unwrap().options();
-                assert!(!o.snapshot_extend_unfolded && o.snapshot_build_lean);
-                let z = Supdb::create_snapfat(&dir("snapfat")).unwrap();
-                assert_eq!(z.name(), "supdb-snapfat");
-                assert_eq!(z.features(), base.features());
-                let o = z.db.as_ref().unwrap().options();
-                assert!(o.snapshot_extend_unfolded && !o.snapshot_build_lean);
-                let z = Supdb::create_snapold(&dir("snapold")).unwrap();
-                assert_eq!(z.name(), "supdb-snapold");
-                assert_eq!(z.features(), base.features());
-                let o = z.db.as_ref().unwrap().options();
-                assert!(!o.snapshot_extend_unfolded && !o.snapshot_build_lean);
             }
             {
                 let z = Supdb::create_headsmodel(&dir("headsmodel")).unwrap();
@@ -21744,13 +21532,6 @@ mod tests {
                 assert_eq!(z.features(), base.features());
                 let o = z.db.as_ref().unwrap().options();
                 assert!(!o.scan_forms_off_unreused && b.scan_forms_off_unreused);
-            }
-            {
-                let z = Supdb::create_snapdrops(&dir("snapdrops")).unwrap();
-                assert_eq!(z.name(), "supdb-snapdrops");
-                assert_eq!(z.features(), base.features());
-                let o = z.db.as_ref().unwrap().options();
-                assert!(!o.snapshot_stands && b.snapshot_stands);
             }
             {
                 let z = Supdb::create_mergedropscovered(&dir("mergedropscovered")).unwrap();
