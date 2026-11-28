@@ -531,14 +531,14 @@ impl Pager {
     /// `following`, with the evictor's looks at the room held from its
     /// first until `release_looks`: a test's, for what the cache does
     /// between its first reading and the evictor's first look.
-    #[cfg(test)]
+    #[cfg(all(test, target_os = "linux"))]
     pub(crate) fn following_held(room: Box<dyn Room>) -> Arc<Pager> {
         Pager::following_from(room, true)
     }
 
     /// A test's: the evictor's looks at the room let go
     /// (`following_held`).
-    #[cfg(test)]
+    #[cfg(all(test, target_os = "linux"))]
     pub(crate) fn release_looks(&self) {
         if let Some(f) = &self.follow {
             f.held.store(false, Ordering::SeqCst);
