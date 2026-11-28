@@ -811,7 +811,7 @@ impl<B: Bytes> Bytes for Advised<B> {
 }
 
 /// What a reader answers and advises for the ranks of a segment: every
-/// record's offset, the record region's place, and the asks and drops of
+/// record's offset, the record region's place, and the asks of
 /// a fixed set of calls, each with the advice it gave.
 type AdviceTrace = (
     Vec<Option<u64>>,
@@ -842,10 +842,6 @@ fn advice_trace<B: Bytes>(blob: &Blob<Advised<B>>) -> AdviceTrace {
         let got = blob.willneed_dir(rank, n);
         calls.push((got, src.take()));
     }
-    if let (Some(a), Some(b)) = (offsets[1], offsets[keys / 2]) {
-        blob.drop_records(a, b);
-    }
-    calls.push((0, src.take()));
     (offsets, place, calls)
 }
 
@@ -1085,18 +1081,11 @@ fn holds_to_the_file<B: Bytes>(
             "{name}: the word at {d} names record {r}"
         );
     }
-    // The asks over ranks start at the first rank's record and the drop
-    // runs between the two offsets it was given.
+    // The asks over ranks start at the first rank's record.
     assert_eq!(
         calls[1].1.first(),
         Some(&Advice::Willneed(offsets[0].unwrap(), calls[1].0)),
         "{name}: the ask for rank 0"
-    );
-    let (a, b) = (offsets[1].unwrap(), offsets[keys / 2].unwrap());
-    assert_eq!(
-        calls.last().unwrap().1,
-        vec![Advice::Dontneed(a, (b - a) as usize)],
-        "{name}: the drop"
     );
     // An ask whose first page is resident is skipped, by the residency of
     // the offset the ask would start at and of no other.
@@ -1654,84 +1643,6 @@ fn a_walk_by_the_piece_across_its_windows_answers_as_the_mapped_one() {
             }
         }
     }
-}
-
-#[test]
-fn a_paced_walk_hands_out_what_the_plain_walk_does() {
-    // `scan_at_paced` asks for the records ahead of its walk and is
-    // otherwise `scan_at`: held to it at every seventh start, over the
-    // record shapes the fast loop takes and the ones it leaves to the
-    // general loop, at leads short of a record, longer than one, and past
-    // the record region's end.
-    for compact in [false, true] {
-        let path = scratch(if compact { "paced-compact" } else { "paced" });
-        build_opts(&path, 300, false, 256, compact);
-        let blob = Blob::open(MmapBytes::open(&path).expect("map")).expect("open");
-        let keys = blob.keys();
-        assert!(keys > 100);
-        for from in (0..=keys).step_by(7) {
-            for limit in [1usize, 5, 100, usize::MAX] {
-                let mut plain = Vec::new();
-                let n = blob
-                    .scan_at(from, limit, |k, v| plain.push((k.to_vec(), v.to_vec())))
-                    .expect("scan");
-                for lead in [0usize, 64, 1000, 1 << 20] {
-                    let mut paced = Vec::new();
-                    let m = blob
-                        .scan_at_paced(from, limit, lead, |k, v| {
-                            paced.push((k.to_vec(), v.to_vec()))
-                        })
-                        .expect("paced");
-                    assert_eq!(
-                        (m, &paced),
-                        (n, &plain),
-                        "compact={compact} from={from} limit={limit} lead={lead}"
-                    );
-                }
-            }
-        }
-    }
-}
-
-/// The walks over a reader that holds its key section whole --
-/// `scan_at_paced` and a `run_walk`'s -- refuse a source that lends by the
-/// piece before they walk anything, with `Unsupported`: that refusal is the
-/// engine's word that a segment is to be walked by the piece, a window of
-/// records an ask, and a walk that took such a source a record at a time
-/// would answer the same and ask for every record on its own. `scan_at`
-/// walks it.
-#[test]
-fn the_whole_walks_refuse_a_source_that_lends_by_the_piece() {
-    let path = scratch("whole-walks-refuse");
-    build_opts(&path, 300, false, 256, false);
-    let raw = std::fs::read(&path).unwrap();
-    let blob = Blob::open(Piecewise::new(raw, 4080)).expect("open by the piece");
-    let keys = blob.keys();
-    assert!(keys > 100);
-    let mut seen = 0usize;
-    let mut count = |_: &[u8], _: &[u8]| seen += 1;
-    let cb: &mut dyn FnMut(&[u8], &[u8]) = &mut count;
-    for lead in [0usize, 64] {
-        let e = blob
-            .scan_at_paced(0, keys, lead, &mut *cb)
-            .expect_err("a paced walk over a source by the piece is refused");
-        assert_eq!(e.kind(), std::io::ErrorKind::Unsupported, "lead={lead}");
-    }
-    let e = blob
-        .run_walk()
-        .scan_at(0, keys, &mut *cb)
-        .expect_err("a run walk over a source by the piece is refused");
-    assert_eq!(e.kind(), std::io::ErrorKind::Unsupported);
-    let walked = blob.scan_at(0, keys, &mut *cb).expect("scan_at walks it");
-    assert_eq!(walked, keys);
-    let after = seen;
-    let mut seen = 0usize;
-    let mut count = |_: &[u8], _: &[u8]| seen += 1;
-    let cb: &mut dyn FnMut(&[u8], &[u8]) = &mut count;
-    let _ = blob.scan_at_paced(0, keys, 0, &mut *cb);
-    let _ = blob.run_walk().scan_at(0, keys, &mut *cb);
-    assert!(after > 0, "`scan_at` handed out the records");
-    assert_eq!(seen, 0, "a refused walk handed nothing out");
 }
 
 /// A source that lends whole until it is told to stop, and then lends

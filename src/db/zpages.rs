@@ -938,9 +938,9 @@ pub fn decode_group<'a>(
 }
 
 /// The LZ4 decoder a block-coded group is decoded by: `lz4_flex`'s, the
-/// engine's own fast loop (`Options::zpages_own_decoder`), or the engine's
-/// own with its flat loop ahead of the fast one
-/// (`Options::zpages_flat_decode`, `zlz4::decompress_in_flat`). The same
+/// engine's own fast loop, or the engine's own with its flat loop ahead of
+/// the fast one (`zlz4::decompress_in_flat`), which a store's form files
+/// take. The same
 /// bytes from every block and the same refusals of every damage, from all
 /// three. A `bool` is the choice before the flat loop: the engine's own
 /// decoder or `lz4_flex`.
@@ -951,7 +951,7 @@ pub enum Dec {
     Own,
     Flat,
     /// The flat loop given the room it runs to the group's end in
-    /// (`zlz4::FLAT_SLACK`, `Options::zpages_flat_slack`).
+    /// (`zlz4::FLAT_SLACK`), the store's.
     FlatEnd,
 }
 
@@ -2169,24 +2169,20 @@ pub struct FillScratch {
     /// which a record alone that only the block holds is the block's
     /// (`compress`).
     pub coding: u8,
-    /// Every group stored verbatim, LZ4 never tried (`Options::zpages_store_all`):
-    /// a decode is the payload itself, and the form is the records' bytes.
-    pub store_all: bool,
     /// Under the record coding, every tail stored raw and LZ4 never tried on
     /// one (`Options::zpages_raw_tails`): the heads front-coded, the values
     /// the records' own bytes, a decode a copy a record.
     pub raw_tails: bool,
     /// The block coding's groups written by the parsing encoder
-    /// (`Options::zpages_parse`, `super::zlz4`) and not `lz4_flex`'s greedy
-    /// one: the same format in fewer sequences.
+    /// (`super::zlz4`) and not `lz4_flex`'s greedy one: the same format in
+    /// fewer sequences.
     pub parse: bool,
     /// Under `parse`, the parse's search: zero the shipped lazy parse
     /// (`zlz4::Effort::SHIPPED`), else a greedy parse over that many of
-    /// each position's chain (`Options::zpages_parse_chains`).
+    /// each position's chain.
     pub parse_chains: u32,
-    /// The pages the fill writes read back through the engine's own decoder
-    /// (`Options::zpages_own_decoder`), as the readers of the store that
-    /// builds them will read them.
+    /// The pages the fill writes read back through the engine's own decoder,
+    /// as the readers of the store that builds them will read them.
     pub own_decode: bool,
     /// That encoder's tables, made at its first group.
     parser: Option<Box<super::zlz4::Encoder>>,
@@ -2217,7 +2213,6 @@ impl FillScratch {
             group_bytes: ZGROUP_BYTES,
             hint: 0,
             coding: ZCODING_BLOCK,
-            store_all: false,
             raw_tails: false,
             parse: false,
             parse_chains: 0,
@@ -2287,17 +2282,6 @@ impl FillScratch {
     /// compressor failed, which a buffer sized for the largest group makes
     /// unreachable.
     fn classify(&mut self, ulen: usize, room: usize) -> Option<Class> {
-        if self.store_all {
-            // The lightest coding: the images are the payload, and a group
-            // that passes the room is trimmed to one that does not, never
-            // compressed to fit.
-            self.stats.calls += 1;
-            return Some(if ulen <= room {
-                Class::Stored
-            } else {
-                Class::TooBig(ulen)
-            });
-        }
         let (n, coded) = self.compress(ulen, room)?;
         self.stats.calls += 1;
         Some(if n >= ulen && ulen <= room {

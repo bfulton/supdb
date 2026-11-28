@@ -20,6 +20,9 @@ A reader passes a case when it returns an error, or answers what was written. It
 | HI-4 | **high** | **The browser reader traps on a key-section header word that the 64-bit reader refuses.** `parse_head` computes `recs_cap = rd_u64(104).max(recs_len) as usize`. On wasm32, `0x1_0000_0000` or `1 << 62` narrows to 0, and the next line's `clamp(recs_len, recs_cap)` has min > max and panics. Under `panic = "abort"` that is `unreachable`, and the instance is dead. This happens in `openMemory` and `openCached`, in all six shapes (24 traps), with the row recomputed. The native reader refuses the same bytes. `format.md` F13 named this narrowing by reading, and this is its reproducer. | `src/flatindex.rs:2181-2182` (`parse_head`); every `rd_u64(..) as usize` in `parse_head`, `Header::parse`, `Super::decode` | Use `usize::try_from(..).ok()?` for each u64 word on every path the wasm build compiles. Never `clamp` file values: use `min`/`max`, which cannot panic. Run `wasm/drive.mjs` in CI over a dumped set. |
 | HI-5 | **high** | **A key over 65,535 bytes is stored as a different key, silently, in release** (`format.md` F1, now run). `db.put` of a 65,536-byte key, then a commit, stores it under the **empty key** (`65536 as u16 == 0`): a read of the real key answers nothing, and a scan shows a 0-byte key, so the write lands on another key's values. A 70,000-byte key is stored as its first 4,464 bytes. A checked build panics (`a key fits a record's length word`) instead. 65,535 bytes round-trips through the memtable, a flush and a reopen. | `src/db.rs:19773` (the debug assertion); the `key.len() as u16` sites `format.md` F1 lists | `format.md` F1's: refuse a key over 65,535 bytes at every write entry point, and test 65,536 at put, read, flush and reopen. |
 | HM-1 | medium | **A changed byte in the middle of the newest WAL reads as a torn tail.** The open drops every acknowledged, synced commit after it, with no error, in all three kinds of store. A single-bit flip at any of bytes 8..511 of the newest log opens at an earlier state in 504 of 512 cases (the other 8 refuse), in the plain store, under a cipher and in one file alike. Over the whole file, 848 of 3,000 plain-WAL mutations (900 of 3,000 under a cipher) open at an earlier state. The commits after the damage are still in the file, intact, with consecutive sequence numbers. The walk does not look past the first frame that fails. `crypto.md` reported this under a cipher, by argument, for the log header; it holds for every frame, and for the plain store. | `src/db.rs:10272-10295` (`Wal::replay_frames`: a frame that does not verify `break`s the walk) | Where a frame fails, scan on for a later frame that verifies with a sequence above the last applied one. If one is found, refuse as damage (`Db::lost`), not as a tear. A torn tail has nothing valid after it; damage does. |
+| HM-2 | medium | **A valid segment from the public writer is refused on read: a key with no values, written with `set_inline_max(0)`.** All three `Blob` readers answer "a partial block read needs per-chunk checksums" for each such key, on the file exactly as `SegmentWriter` wrote it, in a process of its own: 3 of 302 keys, which are the shape's three keys with no values. The other five shapes, which inline small runs, read every key. This is not hostile input. It is a valid file that a reader refuses, found by the harness's pristine check. | `src/blob.rs:2063-2071` (`verify`'s `whole` arm, reached from `with_extent` for an empty block extent) | Read a zero-length extent as an empty run without touching its block, or have the writer inline an empty run whatever `inline_max` says. Add the shape (no values, `inline_max = 0`) to `tests/segwriter.rs`. |
+| HL-3 | low | **A segment lent from an address that is not 8-aligned is refused.** `MappedBlocks::parse`/`get` and `parse_record_tail` check that the bytes they are about to view as `BlockRec` or `Ext` are aligned, and refuse where they are not. That keeps the `unsafe` casts sound, but it makes a valid file's readability depend on where the caller's buffer starts. Every shape, lent through `SliceBytes(&buf[k..])` for k = 1..7, is refused at open ("the block table is not readable"): 42 of 42 cases. Miri found it first: three `flatindex` unit tests fail under Miri because Miri does not give a `Vec<u8>` the 16-byte alignment a native `malloc` does (`unsafe.md`). Mapped and copied sections are aligned in practice, which is why nothing native had seen this. | `src/flatindex.rs:731`, `3824-3826`, `3877-3879` | Read `BlockRec` with `ptr::read_unaligned` (it is `Copy`, all integers). For `&[Ext]`, borrow where aligned and copy into a small buffer where not, rather than refusing. |
+| HL-4 | low | **`format.md` F5, now run: a segment written with checksums off becomes unreadable once a writer with checksums on runs in the same process.** Shape 4 (checksums off) reads every key when it is the only segment its process wrote. Written beside segments with checksums on, 178 of its 302 keys answer "block checksum mismatch" in all three readers. | `block::CHECKSUMS` (`format.md` F5) | `format.md` F5's: record the setting in the file, and pass it per writer. |
 | HL-1 | low | **Under a cipher, a damaged derived file refuses the whole store.** A changed byte in an ordered index's envelope (`x-<token>.o`) fails its tag, and the open answers "a file of the store under its cipher did not read, and nothing read from the store since is to be trusted". The same damage in a plain store's `ord-*.oidx` is rebuilt (`Db::ord_rebuilt`). This is availability, not safety: nothing is misread. | `src/db/pager.rs` (`Back::open_chunk`, the poison); `src/db/vault.rs` | Treat a failed tag on a `.o` or `.z` envelope as the plain store treats a bad ordered index: rebuild it from the segment. `pager.rs`'s `regenerable` already does this for form files. |
 | HL-2 | low | **`Db::crash` keeps about 10 mappings and 0.5 MB of the process for good, each call.** 500 open-and-crash cycles grow the process from 73 mappings and 20 MB resident to 5,062 mappings and 329 MB. After about 7,000 the open fails with `block: out of memory (mmap)` at `src/db/blocks.rs:1267`. Open-and-close holds steady at 70 mappings and 20 MB. The seam is `#[doc(hidden)]` and keeps its store by design (`ManuallyDrop`). A test that crashes thousands of times in one process will run out of mappings, as this harness did at first. | `src/db.rs:53553` (`Db::crash`) | Say in its doc that the memory is kept for good. Or free the store's anonymous memory in `crash` once its threads have ended, since a dead process's memory is gone anyway. |
 
@@ -57,6 +60,11 @@ Single reproducers:
 - HI-2: `HOSTILE_BT=1 ./target/release/hostile segment 52 53` (4,294,967,295 bytes at `bytes.rs:296`), `segment 9967 9968` (4,294,907,220 bytes at `blob.rs:2170`), and `HOSTILE_BT=1 ./target/release/hostile segforge 6936 6937` (capacity overflow, `Sec::read` at `blob.rs:494` under `Blob::open`).
 - HI-3: `./target/release/hostile superfields 2>&1 | grep f3=`.
 
+The pristine files, read whole through each `Blob` reader (`lent`, `copying`, and `mapped` over a real file mapping):
+- `./target/release/hostile pristine` with all six shapes written in one process: shape 1 has 3 errors (HM-2) and shape 4 has 178 (HL-4).
+- `HOSTILE_ONLY_SHAPE=N ./target/release/hostile pristine`, one shape a process: shape 1 has 3 errors (HM-2), and every other shape reads every key. `HOSTILE_WHY=1` names the erring keys, which are those with no values.
+- `./target/release/hostile unaligned`: each shape lent at +0..+7 bytes from an 8-aligned address. Every +1..+7 case is refused at open (HL-3), 42 of 42.
+
 Each misread line names only the first reader that answered wrong, which is the lent `Blob` because it runs first. The three `Blob` sources and `SparseBlob` share the key section's parse. The browser reader's 50 misreads under `crcoff` (below) are the same defect in a different reader.
 
 ### Store directories
@@ -76,6 +84,31 @@ Each misread line names only the first reader that answered wrong, which is the 
 | mappings over repeated opens | `./target/release/hostile leak 0 501 crash`, `... close` | 501 each | | | 73→5,062 mappings and 20→329 MB (crash); 70→70 and 20→20 MB (close) (HL-2) |
 
 HL-1: `HOSTILE_WHY=1 HOSTILE_TRACE=1 ./target/release/hostile cipher 0 20` prints each case's file and its refusal. In the run here, seed 17 changed `x-<token>.o` and the open refused the store. Under a cipher, tokens are random, and a store's seals and merges land on the upkeep's schedule, so the file list, and so the file a seed picks, can differ between runs. The store rows' counts therefore move a little from one run to the next, and their zeros of failures do not.
+
+### Under AddressSanitizer
+
+The `unsafe` code past each reader's checks (the `&[Ext]` and `BlockRec` views, the LZ4 decoder, the mapping lends, the pager) is checked for out-of-bounds access by building the harness under ASan:
+
+```sh
+cd release/findings/hostile-input/harness
+CARGO_TARGET_DIR=$(mktemp -d) RUSTFLAGS=-Zsanitizer=address \
+  cargo +nightly build -Zbuild-std --target x86_64-unknown-linux-gnu --release
+ASAN_OPTIONS=detect_leaks=0:allocator_may_return_null=1 HOSTILE_SECS=300 \
+  $CARGO_TARGET_DIR/x86_64-unknown-linux-gnu/release/hostile TARGET FROM TO
+```
+
+The result is **0 AddressSanitizer reports** in 22,410 cases. The table gives the harness's own failures, which are the findings above:
+
+| target | cases | harness failures |
+|---|---|---|
+| `segment 0 5000` | 5,000 | 11 (HI-1, HI-2) |
+| `segforge 0 5000` | 5,000 | 4 (HI-2, HI-3) |
+| `superfields` | 8,064 | 24 (HI-3) |
+| `crcoff 0 120` | 120 | 69 (HI-1) |
+| `envelope 0 1000` | 1,326 | 0 |
+| `store 0 1500` | 1,500 | 0 |
+| `onefile 0 800` | 800 | 0 |
+| `cipher 0 800` | 800 | 0 |
 
 ### The browser reader
 
@@ -114,5 +147,5 @@ The gate runs 0..24 of each. Nothing failed past it.
 - **Form files** (`zpg-*.zpg`, `x-*.z`): no store the harness built kept one under the default options, so no case changed one. Their trailer and page checks were read in `format.md` and not driven here. A `ZFUZZ_ZPAGES`-shaped store in `build_store` would reach them.
 - **Values or records of 4 GiB or more** (`format.md` F9, F13's 4 GiB object): not run, because they need many gigabytes of input per case.
 - **A newer sealed-slot version** (`format.md` F3's medium): this is a refusal a later release would need, not a damage case. Not run.
-- **AddressSanitizer:** not run. The native harness catches out-of-bounds access only where safe code bounds-checks it. The `unsafe` audit (`unsafe.md`) traced every file-derived length into `unsafe` code and found each bounded first. A nightly `-Zsanitizer=address -Zbuild-std` build of the harness is the next run.
+- **AddressSanitizer over the whole store paths' longer ranges:** the ASan runs below are shorter than the plain runs, because ASan is slower. The plain runs' ranges were not repeated under it.
 - **An attacker who rewrites a mapped file while it is open:** a `MAP_SHARED` file truncated or rewritten by another process under a live reader is SIGBUS, or bytes changing under a borrow. That is a contract of the mapping (`unsafe.md`) and not something a harness over copies can show.

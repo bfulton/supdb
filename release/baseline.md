@@ -482,7 +482,7 @@ the owner may overrule any of them in `release/STATUS.md`.
 6. **Every row is retaken at C0.** All existing rows predate #35.
 7. **Banking.** The baseline rows are committed on a measurement branch,
    `release-measure`, cut from `release-candidate`, and not to main. They
-   and phase 6's rows go into `release-candidate` together after the last
+   and phase 6's rows go onto the working branch together after the last
    code commit, which the plan allows.
 8. **The gate's band.** Where a class has no prior rows the gate reads "no
    band yet", and the pairings carry the verdict.
@@ -502,6 +502,16 @@ the owner may overrule any of them in `release/STATUS.md`.
     before anything moves.
 16. **The wasm size** at C0 (131,556 bytes, 53,550 under gzip) is the figure
     phases 1 and 2 may not exceed without a reason in the pull request.
+17. **Two host classes.** The measurement container restarted at about
+    11:00Z on 2026-11-28 and came back on
+    `x86_64/intel-r-xeon-r-processor-2.30ghz/4c/16g/hypervisor`. The five
+    rows before it (quick numbered, enc quick, ooc 1.25 GiB numbered, ooc
+    1 GiB numbered, ooc 1.25 GiB ids) are of the 2.10GHz class; the rest
+    are taken on the new class as a second series: the quick numbered row
+    again as the bridge, the floor, the full rows, and the ooc 1 GiB ids row
+    from its start (the cut one stays under `measure/rows/inflight/`, unread).
+    No verdict compares rows of two classes; phase 6 pairs C0's kept
+    binaries against the last commit's on its own host (item 11).
 
 ## 8. Open defects and what is not verified
 

@@ -382,7 +382,6 @@ fn forced_files(extra: impl FnOnce(&mut Options)) -> Options {
 fn oracle_opts(z: bool, inline: bool, raw_tails: bool) -> Options {
     let o = Options {
         zpages: if z { ZPages::Always } else { ZPages::Off },
-        zpages_record_coding: raw_tails,
         zpages_raw_tails: raw_tails,
         scan_block_cache: false,
         zpages_min_bytes: 0,
@@ -2765,87 +2764,6 @@ fn a_scan_from_a_key_a_scan_started_at_takes_its_block_from_the_start_cache() {
     round(&stores, "sealed into a piece");
 }
 
-/// A merge drops behind its second pass the raw records of an input
-/// partition its form file serves (`Options::merge_drops_covered`), and only
-/// there: the gate at the form and a form file in the partition's cell. A
-/// served partition's raw records are read by nothing but the merge, which
-/// reads them back and would leave them the cache's newest pages; under the
-/// raw gate with the cells kept, with every partition declined its form, or
-/// with the option off, the merge drops nothing. The reads after it are the
-/// model's in every case.
-#[cfg(target_os = "linux")]
-#[test]
-fn a_merge_drops_the_raw_records_of_an_input_its_form_serves() {
-    for (label, zpages, gate_raw, declined, drops, want) in [
-        ("served", ZPages::Always, false, false, true, true),
-        ("kept", ZPages::Always, false, false, false, false),
-        ("gate-raw", ZPages::Always, true, false, true, false),
-        ("declined", ZPages::Always, false, true, true, false),
-        ("raw", ZPages::Off, false, false, true, false),
-    ] {
-        let dir = scratch(&format!("merge-drops-{label}"));
-        let mut db = Db::create(
-            &dir,
-            forced(|o| {
-                o.zpages = zpages;
-                o.partition_bytes = Some(160 << 10);
-                o.inline_bytes = 1 << 16;
-                o.l0_trigger = 2;
-                o.merge_drops_covered = drops;
-                // A drop every sixteen kilobytes, so a partition of a
-                // hundred and sixty reaches several.
-                o.merge_drop_chunk = 16 << 10;
-                if declined {
-                    o.zpages_min_bytes = 1 << 40;
-                }
-            }),
-        )
-        .unwrap();
-        let mut model = ordered_load(&mut db, 6000, 0xD80F);
-        db.zpages_settle().unwrap();
-        db.settle().unwrap();
-        let c = db.zpage_counts();
-        if zpages == ZPages::Always && !declined {
-            assert!(
-                c.partitions >= 3 && c.form_files == c.partitions,
-                "{label}: {c:?}"
-            );
-        } else {
-            assert_eq!(c.form_files, 0, "{label}: {c:?}");
-        }
-        if gate_raw {
-            db.zgate_set(0);
-        }
-        let keys: Vec<Vec<u8>> = model.keys().cloned().collect();
-        let mut rng = Rng(0xD80F1);
-        // Two pieces over every partition's range, so that each is merged.
-        for round in 0..2 {
-            for k in keys.iter().step_by(5 + round) {
-                let v = suite_value(&mut rng);
-                db.append(k, &v);
-                model.entry(k.clone()).or_default().push(v);
-            }
-            db.commit().unwrap();
-            db.seal().unwrap();
-        }
-        db.settle().unwrap();
-        assert_eq!(db.levels().1, 0, "{label}: the pieces merged");
-        let dropped = db.merge_dropped_bytes();
-        assert_eq!(
-            dropped > 0,
-            want,
-            "{label}: the merges dropped {dropped} bytes"
-        );
-        if gate_raw {
-            db.zgate_set(2);
-        }
-        check(&db, &model, &keys, label);
-        check_scan(&db, &model, label);
-        db.close().unwrap();
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-}
-
 /// The body of the three tests above: the store, its phases and the reads
 /// under each, counted on the writer and a handle. With `via_form` the
 /// count is held to zero; without it the touches are summed and returned.
@@ -3083,22 +3001,15 @@ fn no_raw_touches(name: &str, cache: bool, via_form: bool) -> u64 {
 /// and the hits the rest, on the writer and a handle alike since the memo
 /// is the thread's. With it off every read of a compressed page decodes
 /// and the memo counts nothing. The memo serves groups decoded whole, the
-/// block coding's point read; under the record coding a point read of a
-/// verified page decodes its one record and asks the memo nothing, so the
-/// memo is never hit and every read decodes, with the memo on or off.
+/// block coding's point read.
 #[test]
 fn the_memo_serves_repeated_reads_of_a_partition_and_off_every_read_decodes() {
-    for (memo, record) in [(true, false), (false, false), (true, true), (false, true)] {
-        let dir = scratch(&format!(
-            "memo-{}-{}",
-            if memo { "on" } else { "off" },
-            if record { "record" } else { "block" }
-        ));
+    for memo in [true, false] {
+        let dir = scratch(&format!("memo-{}", if memo { "on" } else { "off" }));
         let mut db = Db::create(
             &dir,
             forced(|o| {
                 o.zpages_memo = memo;
-                o.zpages_record_coding = record;
                 // The memo as it serves every open: a point read's partial
                 // decode of a first touch and its key table have a test of
                 // their own below.
@@ -3134,17 +3045,7 @@ fn the_memo_serves_repeated_reads_of_a_partition_and_off_every_read_decodes() {
         let c = db.zpage_counts();
         let (reads, decodes) = (c.reads - c0.reads, c.decodes - c0.decodes);
         assert_eq!(reads, 6000, "{c:?}");
-        if record {
-            // The one-record point read: no memo asked once a page is
-            // verified, a decode a read; the memo's misses are the pages'
-            // first decodes, through the group opened whole.
-            assert_eq!(
-                c.memo_hits, 0,
-                "no read of a verified page asks the memo: {c:?}"
-            );
-            assert!(c.memo_misses <= 2 * 16 * c0.pages, "{c:?}");
-            assert_eq!(decodes, reads, "every read decodes its record: {c:?}");
-        } else if memo {
+        if memo {
             assert_eq!(
                 c.memo_hits + c.memo_misses,
                 reads,
@@ -3631,8 +3532,6 @@ fn a_settle_asks_for_the_heads_its_resolves_will_seek_only_out_of_core() {
             scan_block_cache: true,
             upkeep: supdb::Upkeep::Inline,
             publish_in_background: false,
-            // Every ask its own look: what is counted here is the asks.
-            heads_look_ms: 0,
             ..Options::default()
         },
     )
@@ -3707,138 +3606,6 @@ fn a_settle_asks_for_the_heads_its_resolves_will_seek_only_out_of_core() {
     check(&db, &model, "the gate at raw");
     db.close().unwrap();
     let _ = std::fs::remove_dir_all(&dir);
-}
-
-/// An ask for a run or a stride of heads is refused where its first page
-/// is resident, which it learns by a `mincore` of its own, so over an
-/// ordered index that is all in the page cache a settle's asks are those
-/// calls and nothing else. One look at each partition's whole stands in
-/// for them while it says the heads are resident
-/// (`Options::heads_look_ms`): such a settle looks and asks for nothing;
-/// with the indexes put out of the cache a look that has run out is made
-/// again, says so, and the asks go to the kernel as they did; a look that
-/// still stands is believed, a page gone since being a fault at the seek
-/// as it is with no ask; and zero is every ask's own look.
-#[cfg(target_os = "linux")]
-#[test]
-fn a_look_at_a_partitions_heads_stands_in_for_the_asks_while_they_are_resident() {
-    for look_ms in [0u32, 1, 600_000] {
-        let dir = scratch(&format!("head-looks-{look_ms}"));
-        let mut db = Db::create(
-            &dir,
-            Options {
-                zpages: ZPages::Off,
-                partition_bytes: Some(160 << 10),
-                scan_block_cache: true,
-                upkeep: supdb::Upkeep::Inline,
-                publish_in_background: false,
-                heads_look_ms: look_ms,
-                ..Options::default()
-            },
-        )
-        .unwrap();
-        let mut model = ordered_load(&mut db, 4000, 0x3B10E);
-        let check = |db: &Db, model: &Model, what: &str| {
-            for start in [b"".to_vec(), spaced_key(1000), spaced_key(2500)] {
-                for limit in [1usize, 57, 300] {
-                    same_window(
-                        &scanned(db, &start, limit),
-                        &window(model, &start, limit),
-                        &format!(
-                            "{what}, from {:?} for {limit}",
-                            String::from_utf8_lossy(&start)
-                        ),
-                    );
-                }
-            }
-        };
-        db.zgate_set(1);
-        // A scan first, so the commits after it file their batches.
-        check(&db, &model, "drained, the gate at the census");
-        let keys: Vec<Vec<u8>> = model.keys().cloned().collect();
-        let mut rng = Rng(0x3B10E1);
-        // The indexes resident, as the load left them.
-        let (size, resident) = resident_under(&dir, "ord-");
-        // Counted in whole pages, so not under the files' bytes.
-        assert!(
-            size > 0 && resident >= size,
-            "{resident} of {size} resident"
-        );
-        for k in keys.iter().step_by(5) {
-            let v = suite_value(&mut rng);
-            db.append(k, &v);
-            model.entry(k.clone()).or_default().push(v);
-        }
-        db.commit().unwrap();
-        let first = db.zpage_counts();
-        if look_ms == 0 {
-            assert!(
-                first.head_asks > 0 && first.head_looks == 0,
-                "every ask its own look: {} asks, {} looks",
-                first.head_asks,
-                first.head_looks
-            );
-        } else {
-            assert!(
-                first.head_asks == 0 && first.head_looks > 0,
-                "{look_ms} ms: the looks stood in for the asks: {} asks, {} looks",
-                first.head_asks,
-                first.head_looks
-            );
-        }
-        check(&db, &model, "a batch settled over resident heads");
-        // The indexes out of the page cache, and past the short look's time.
-        for path in common::store_paths(&dir) {
-            let name = path.file_name().unwrap().to_string_lossy().into_owned();
-            if name.starts_with("ord-") {
-                unmap_pages(&path);
-                evict(&path);
-            }
-        }
-        let (size, resident) = resident_under(&dir, "ord-");
-        assert!(
-            resident < size / 2,
-            "{resident} of {size} resident after the eviction"
-        );
-        std::thread::sleep(std::time::Duration::from_millis(20));
-        for k in keys.iter().skip(2).step_by(7) {
-            let v = suite_value(&mut rng);
-            db.append(k, &v);
-            model.entry(k.clone()).or_default().push(v);
-        }
-        db.commit().unwrap();
-        let second = db.zpage_counts();
-        match look_ms {
-            0 => assert!(
-                second.head_asks > first.head_asks && second.head_submitted > first.head_submitted,
-                "every ask its own look, and the kernel asked: {} asks, {} submitted",
-                second.head_asks,
-                second.head_submitted
-            ),
-            1 => assert!(
-                second.head_looks > first.head_looks
-                    && second.head_asks > 0
-                    && second.head_submitted > 0,
-                "a look run out is made again and the asks go: {} looks, {} asks, {} submitted",
-                second.head_looks,
-                second.head_asks,
-                second.head_submitted
-            ),
-            _ => assert!(
-                second.head_looks == first.head_looks && second.head_asks == 0,
-                "a look that stands is believed: {} looks, {} asks",
-                second.head_looks,
-                second.head_asks
-            ),
-        }
-        check(
-            &db,
-            &model,
-            "a batch settled over heads put out of the cache",
-        );
-        db.close().unwrap();
-        let _ = std::fs::remove_dir_all(&dir);
-    }
 }
 
 /// Away from the raw gate a mapping's pages leave the page cache between
@@ -4149,24 +3916,20 @@ fn under_the_forms_gate_a_declined_partitions_heads_are_copied_and_a_waiting_one
 /// still counted against it, and the grant stands only far from the point
 /// reads whose faults buy a form. At the census a misfit withholds the
 /// copies of the heads, so every partition landed after the grant read
-/// them through a mapping the bound could take. Under
-/// `Options::heads_owned_beside_copies` a grant standing reads as the store
-/// left raw, and every partition's heads are copied; without it none is,
-/// the model's word alone; and a grant a point read took back leaves the
-/// model's word alone under the option too. The page cache's budget is the
+/// them through a mapping the bound could take. A grant standing reads as
+/// the store left raw, and every partition's heads are copied; and a grant
+/// a point read took back leaves the model's word alone. The page cache's budget is the
 /// test's seam and falls by what the cache holds, as the platform's does.
 #[cfg(target_os = "linux")]
 #[test]
 fn a_cache_in_the_records_place_has_the_heads_copied_at_the_census() {
     #[derive(Clone, Copy, Debug, PartialEq)]
     enum Case {
-        /// The option, a grant standing.
+        /// A grant standing.
         Beside,
-        /// A grant standing, the option off.
-        ModelAlone,
-        /// The option, the grant taken back by a point read.
+        /// The grant taken back by a point read.
         TakenBack,
-        /// The option, and no grant: the cache's own budget never binds,
+        /// No grant: the cache's own budget never binds,
         /// and the misfit is its bytes all the same.
         NoGrant,
         /// No grant, the misfit the cache's, and a point read near.
@@ -4197,7 +3960,6 @@ fn a_cache_in_the_records_place_has_the_heads_copied_at_the_census() {
                 o.scan_cache_auto_room = true;
                 o.scan_cache_copies_fit = !no_grant(case);
                 o.heads_owned = true;
-                o.heads_owned_beside_copies = case != Case::ModelAlone;
                 o.upkeep = supdb::Upkeep::Inline;
             },
             |_| {},
@@ -4327,7 +4089,6 @@ fn a_cache_in_the_records_place_has_the_heads_copied_at_the_census() {
         let _ = std::fs::remove_dir_all(&dir);
     };
     run("heads-beside-copies", Case::Beside);
-    run("heads-beside-model", Case::ModelAlone);
     run("heads-beside-taken-back", Case::TakenBack);
     run("heads-beside-no-grant", Case::NoGrant);
     run("heads-beside-no-grant-near", Case::NoGrantNear);
@@ -4342,9 +4103,8 @@ fn a_cache_in_the_records_place_has_the_heads_copied_at_the_census() {
 /// its limit whatever the model says, and the kernel takes the pages
 /// written once and never read first, the ordered indexes of partitions
 /// just landed. So past that line the heads of a scanned store are copied
-/// under the raw gate too (`Options::heads_owned_past_fill`), and of every
-/// partition landed after, the line crossed back or not; at the line, or
-/// with the option off, none is.
+/// under the raw gate too, and of every partition landed after, the line
+/// crossed back or not; at the line none is.
 #[cfg(target_os = "linux")]
 #[test]
 fn under_the_raw_gate_heads_are_copied_once_the_stores_files_outgrow_the_fill() {
@@ -4362,107 +4122,82 @@ fn under_the_raw_gate_heads_are_copied_once_the_stores_files_outgrow_the_fill() 
             "{what}: FITS, the raw gate: {c:?}"
         );
     };
-    for on in [true, false] {
-        let (dir, mut db, mut model, inject) = auto_store_with(
-            &format!("heads-past-fill-{on}"),
-            1 << 40,
-            0.0,
-            FAULT_40US,
-            |o| o.heads_owned_past_fill = on,
-            |_| {},
-        );
-        let parts = db.zpage_counts().partitions;
-        // Scanned, the budget far over the store: nothing.
-        scan(&db, &model, "the raw gate, scanned");
-        wait_secs(&db, 3, 1);
-        raw_gate(&db, "a budget far over the store");
-        assert_eq!(db.heads_owned_counts(), (0, 0, 0), "far under the line");
-        // The store whole is more than the pages a read touches: the
-        // ordered indexes are in it.
-        let c = db.zpage_counts();
-        let whole = c.model_whole_bytes;
-        let touched = c.model_hash_bytes + c.model_record_bytes;
-        assert!(
-            whole >= touched + 8 * model.len() as u64,
-            "the store whole holds its indexes: {whole} over {touched}"
-        );
-        // The budget whose fill share is the store whole, to the byte: at
-        // the line and not past it, and the model's populations well
-        // inside it. Nothing.
-        let mut at = whole * 100 / 85;
-        while fill(at) < whole {
-            at += 1;
-        }
-        assert_eq!(fill(at), whole);
-        assert!(fill(at - 1) < whole && touched < at - 1);
-        inject.set_budget(at);
-        scan(&db, &model, "at the line");
-        wait_secs(&db, 3, 1);
-        raw_gate(&db, "at the line");
-        assert_eq!(db.heads_owned_counts(), (0, 0, 0), "at the line, not past");
-        // One byte less of budget: past the line, and every partition's
-        // heads are copied, where the option says so.
-        inject.set_budget(at - 1);
-        scan(&db, &model, "past the line");
-        let t = std::time::Instant::now();
-        while on && db.heads_owned_counts().0 < parts && t.elapsed().as_secs() < 20 {
-            wait_secs(&db, 1, 1);
-        }
-        if !on {
-            wait_secs(&db, 3, 1);
-        }
-        raw_gate(&db, "past the line");
-        let (made, given, bytes) = db.heads_owned_counts();
-        if on {
-            assert_eq!((made, given), (parts, 0), "every partition's heads copied");
-            assert_eq!(bytes, 8 * model.len() as u64);
-            assert_eq!(db.heads_past_fill(), parts, "each for the line");
-        } else {
-            assert_eq!((made, given, bytes), (0, 0, 0), "the mapping throughout");
-            assert_eq!(db.heads_past_fill(), 0);
-        }
-        assert_eq!(db.heads_beside_copies(), 0);
-        scan(&db, &model, "after the look");
-        // Past once, the store is one whose cache the kernel shrinks: with
-        // the budget far over it again, the partitions a rewrite lands
-        // have their heads copied all the same, and none is given back.
-        inject.set_budget(1 << 40);
-        wait_secs(&db, 3, 1);
-        rewrite_every_key(&mut db, &mut model, "after");
-        scan(&db, &model, "rewritten");
-        let landed = db.zpage_counts().partitions;
-        let t = std::time::Instant::now();
-        while on && db.heads_owned_counts().2 < 8 * model.len() as u64 && t.elapsed().as_secs() < 20
-        {
-            wait_secs(&db, 1, 1);
-        }
-        if !on {
-            wait_secs(&db, 3, 1);
-        }
-        raw_gate(&db, "rewritten");
-        let (made2, given2, bytes2) = db.heads_owned_counts();
-        if on {
-            assert_eq!(
-                bytes2,
-                8 * model.len() as u64,
-                "the landed partitions' heads"
-            );
-            assert_eq!((made2, given2), (made + landed, 0));
-            assert_eq!(db.heads_past_fill(), made2);
-        } else {
-            assert_eq!((made2, given2, bytes2), (0, 0, 0));
-        }
-        scan(&db, &model, "the copies of the landed partitions");
-        drop(db);
-        let _ = std::fs::remove_dir_all(&dir);
+    let (dir, mut db, mut model, inject) =
+        auto_store_with("heads-past-fill", 1 << 40, 0.0, FAULT_40US, |_| {}, |_| {});
+    let parts = db.zpage_counts().partitions;
+    // Scanned, the budget far over the store: nothing.
+    scan(&db, &model, "the raw gate, scanned");
+    wait_secs(&db, 3, 1);
+    raw_gate(&db, "a budget far over the store");
+    assert_eq!(db.heads_owned_counts(), (0, 0, 0), "far under the line");
+    // The store whole is more than the pages a read touches: the
+    // ordered indexes are in it.
+    let c = db.zpage_counts();
+    let whole = c.model_whole_bytes;
+    let touched = c.model_hash_bytes + c.model_record_bytes;
+    assert!(
+        whole >= touched + 8 * model.len() as u64,
+        "the store whole holds its indexes: {whole} over {touched}"
+    );
+    // The budget whose fill share is the store whole, to the byte: at
+    // the line and not past it, and the model's populations well
+    // inside it. Nothing.
+    let mut at = whole * 100 / 85;
+    while fill(at) < whole {
+        at += 1;
     }
+    assert_eq!(fill(at), whole);
+    assert!(fill(at - 1) < whole && touched < at - 1);
+    inject.set_budget(at);
+    scan(&db, &model, "at the line");
+    wait_secs(&db, 3, 1);
+    raw_gate(&db, "at the line");
+    assert_eq!(db.heads_owned_counts(), (0, 0, 0), "at the line, not past");
+    // One byte less of budget: past the line, and every partition's
+    // heads are copied.
+    inject.set_budget(at - 1);
+    scan(&db, &model, "past the line");
+    let t = std::time::Instant::now();
+    while db.heads_owned_counts().0 < parts && t.elapsed().as_secs() < 20 {
+        wait_secs(&db, 1, 1);
+    }
+    raw_gate(&db, "past the line");
+    let (made, given, bytes) = db.heads_owned_counts();
+    assert_eq!((made, given), (parts, 0), "every partition's heads copied");
+    assert_eq!(bytes, 8 * model.len() as u64);
+    assert_eq!(db.heads_past_fill(), parts, "each for the line");
+    assert_eq!(db.heads_beside_copies(), 0);
+    scan(&db, &model, "after the look");
+    // Past once, the store is one whose cache the kernel shrinks: with
+    // the budget far over it again, the partitions a rewrite lands
+    // have their heads copied all the same, and none is given back.
+    inject.set_budget(1 << 40);
+    wait_secs(&db, 3, 1);
+    rewrite_every_key(&mut db, &mut model, "after");
+    scan(&db, &model, "rewritten");
+    let landed = db.zpage_counts().partitions;
+    let t = std::time::Instant::now();
+    while db.heads_owned_counts().2 < 8 * model.len() as u64 && t.elapsed().as_secs() < 20 {
+        wait_secs(&db, 1, 1);
+    }
+    raw_gate(&db, "rewritten");
+    let (made2, given2, bytes2) = db.heads_owned_counts();
+    assert_eq!(
+        bytes2,
+        8 * model.len() as u64,
+        "the landed partitions' heads"
+    );
+    assert_eq!((made2, given2), (made + landed, 0));
+    assert_eq!(db.heads_past_fill(), made2);
+    scan(&db, &model, "the copies of the landed partitions");
+    drop(db);
+    let _ = std::fs::remove_dir_all(&dir);
 }
 
 /// The store whole is the level-0 pieces' files with the partitions': a
 /// burst seals pieces into the cache beside partitions the model goes on
 /// reading as fitting, the pieces being in neither population a read
-/// touches, and it is they that carry the store past the line
-/// (`Options::heads_owned_past_fill`).
+/// touches, and it is they that carry the store past the line.
 #[cfg(target_os = "linux")]
 #[test]
 fn a_bursts_pieces_carry_a_store_past_the_fill_line() {
@@ -4477,7 +4212,6 @@ fn a_bursts_pieces_carry_a_store_past_the_fill_line() {
         0.0,
         FAULT_40US,
         |o| {
-            o.heads_owned_past_fill = true;
             // The burst's piece stands until the test is done with it.
             o.l0_trigger = 1 << 20;
         },
@@ -7090,7 +6824,7 @@ fn an_eager_auto_store_buys_the_form_before_any_read() {
     }
 }
 
-/// Under `Options::zpages_coding_auto`, as shipped, the selector chooses
+/// Under `ZPages::Auto` the selector chooses
 /// the coding the form files are built in: the sampler sizes the raw-tail
 /// record coding beside the block coding, and the raw tails are built where
 /// the model predicts that form faults nothing against `zselect::FORM_FILL`
@@ -7101,8 +6835,7 @@ fn an_eager_auto_store_buys_the_form_before_any_read() {
 /// percent over the raw-tail form's own bytes, which that form fits whole
 /// and fills past the share -- the shape a line at the budget itself
 /// picked the raw tails for, at ten million keys under 1.25 GiB
-/// (`docs/engine.md`). With the option off the options' block coding is
-/// built under 64 MiB too, nothing chosen and nothing raw-tailed; and the
+/// (`docs/engine.md`). The
 /// first case's store with no reader before its pick builds the block
 /// coding, the raw tails waiting for a reader (`ZCounts::coding_unread`),
 /// since a pick made before any read is made partway through the store's
@@ -7115,10 +6848,6 @@ fn an_eager_auto_store_buys_the_form_before_any_read() {
 #[test]
 fn the_selector_builds_the_raw_tails_where_that_form_fits_the_fill_share_and_the_block_coding_otherwise(
 ) {
-    assert!(
-        Options::default().zpages_coding_auto,
-        "the selector's coding as shipped"
-    );
     // A case's budget: bytes, or a percentage of the first case's raw-tail
     // form, which every case's store sizes alike (the same keys and values,
     // the sampler's ranks evenly spaced).
@@ -7129,14 +6858,13 @@ fn the_selector_builds_the_raw_tails_where_that_form_fits_the_fill_share_and_the
     // The last case is the first's store with no reader before the pick:
     // the raw tails wait for one, and the block coding is chosen.
     let cases = [
-        (At::Bytes(64 << 20), true, true, true),
-        (At::Bytes(1536 << 10), true, false, true),
-        (At::OfRaw(105), true, false, true),
-        (At::Bytes(64 << 20), false, false, true),
-        (At::Bytes(64 << 20), true, false, false),
+        (At::Bytes(64 << 20), true, true),
+        (At::Bytes(1536 << 10), false, true),
+        (At::OfRaw(105), false, true),
+        (At::Bytes(64 << 20), false, false),
     ];
     let mut raw_w_z = 0u64;
-    for (i, (at, gear, raw, read)) in cases.into_iter().enumerate() {
+    for (i, (at, raw, read)) in cases.into_iter().enumerate() {
         let edge = matches!(at, At::OfRaw(_));
         let budget = match at {
             At::Bytes(b) => b,
@@ -7147,7 +6875,7 @@ fn the_selector_builds_the_raw_tails_where_that_form_fits_the_fill_share_and_the
         };
         let fill = supdb::db::zselect::form_fill(budget);
         let what = format!(
-            "case {i}: budget {budget} (fill {fill}), gear {gear}, raw tails expected {raw}, a reader {read}"
+            "case {i}: budget {budget} (fill {fill}), raw tails expected {raw}, a reader {read}"
         );
         let dir = scratch(&format!("coding-auto-{i}"));
         let inject = std::sync::Arc::new(supdb::ZInject::new());
@@ -7161,7 +6889,6 @@ fn the_selector_builds_the_raw_tails_where_that_form_fits_the_fill_share_and_the
                 zpages: ZPages::Auto,
                 zpages_min_bytes: 0,
                 zpages_build_eager: true,
-                zpages_coding_auto: gear && Options::default().zpages_coding_auto,
                 zpages_inject: Some(inject.clone()),
                 ..Options::default()
             },
@@ -7189,23 +6916,11 @@ fn the_selector_builds_the_raw_tails_where_that_form_fits_the_fill_share_and_the
         if i == 0 {
             raw_w_z = c.sample_w_z_raw_bytes;
         }
-        if !gear {
-            assert_eq!(
-                (c.coding_picks_raw, c.coding_picks_block, c.builds_raw_tails),
-                (0, 0, 0),
-                "{what}: nothing chosen, nothing raw-tailed: {c:?}"
-            );
-            assert!(
-                c.sample_w_z_bytes > 0 && c.sample_w_z_raw_bytes == 0,
-                "{what}: the options' coding sized alone: {c:?}"
-            );
-        } else {
-            assert!(
-                c.sample_w_z_raw_bytes > 0 && c.sample_w_z_bytes > 0,
-                "{what}: both codings sized: {c:?}"
-            );
-        }
-        if gear && raw {
+        assert!(
+            c.sample_w_z_raw_bytes > 0 && c.sample_w_z_bytes > 0,
+            "{what}: both codings sized: {c:?}"
+        );
+        if raw {
             assert!(
                 c.coding_picks_raw >= 1 && c.coding_picks_block == 0,
                 "{what}: the raw tails chosen: {c:?}"
@@ -7222,7 +6937,7 @@ fn the_selector_builds_the_raw_tails_where_that_form_fits_the_fill_share_and_the
                 c.sample_w_z_raw_bytes <= fill,
                 "{what}: the raw-tail form within the fill share: {c:?}"
             );
-        } else if gear && !read {
+        } else if !read {
             assert!(
                 c.coding_picks_block >= 1 && c.coding_picks_raw == 0 && c.coding_unread >= 1,
                 "{what}: the block coding chosen for want of a reader: {c:?}"
@@ -7232,7 +6947,7 @@ fn the_selector_builds_the_raw_tails_where_that_form_fits_the_fill_share_and_the
                 c.sample_w_z_raw_bytes <= fill,
                 "{what}: where the raw tails fit the fill share: {c:?}"
             );
-        } else if gear {
+        } else {
             assert!(
                 c.coding_picks_block >= 1 && c.coding_picks_raw == 0 && c.coding_unread == 0,
                 "{what}: the block coding chosen: {c:?}"
@@ -7895,6 +7610,7 @@ const JOB_WALL: std::time::Duration = std::time::Duration::from_secs(300);
 /// (`Options::zpages_drive_at_job_end`, once a tick has ended and left a
 /// decision for that turn to drive by). Elsewhere a returned job waits for
 /// a tick, and a wait for it ticks.
+#[cfg(target_os = "linux")]
 fn running(db: &Db, c: &supdb::db::ZCounts) -> bool {
     if db.zpage_build_held() {
         return false;
@@ -7916,6 +7632,7 @@ fn running(db: &Db, c: &supdb::db::ZCounts) -> bool {
 /// that counted its ticks ran out of them with the build still running.
 /// Held, a job takes no time on the clock, as on a host fast enough to
 /// finish it between two ticks.
+#[cfg(target_os = "linux")]
 fn while_running(db: &Db) -> bool {
     let t = std::time::Instant::now();
     while running(db, &db.zpage_counts()) {
@@ -7929,6 +7646,7 @@ fn while_running(db: &Db) -> bool {
 
 /// `while_running`, and a job still running at `JOB_WALL` a failure: what
 /// every move of the injected clock past a store's open waits for first.
+#[cfg(target_os = "linux")]
 fn jobs_ended(db: &Db) {
     assert!(
         while_running(db),
@@ -10209,6 +9927,101 @@ fn a_build_ahead_that_declines_is_collected_and_no_build_is_in_flight_after_it()
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// The controller's reading waits for the last build ahead: past its budget
+/// a store's controller wants a sample while its builds ahead go on, and at
+/// the tick that takes one build ahead in the next one takes the builder
+/// before the sample is asked for, so no reading starts between two builds
+/// ahead -- neither the fill sample, which the files on disk do not yet
+/// cover the keys for, nor one from the files. Once the last build ahead
+/// is in the reading is taken, and from the form files on disk, which by
+/// then cover the store (`Maint::z_reading_from_files`).
+#[cfg(target_os = "linux")]
+#[test]
+fn the_sample_waits_for_the_last_build_ahead() {
+    let (dir, db, _model, inject, raw) = land_store_with("auto-sample-after-ahead", 50, |o| {
+        // One builder, so that the builds ahead run one after another and
+        // every turn that takes one in starts the next.
+        o.zpages_ahead_builders = 1;
+        o.partition_bytes = Some(400 << 10);
+        // The sample's wait for a build ahead, which a store whose
+        // resident and in-flight partitions count as covered never makes,
+        // and the build ahead started before the sample, which a
+        // controller suspecting at the crossing does not give it time for.
+        o.zpages_cover_resident = false;
+        o.zpages_suspect_at_crossing = false;
+    });
+    let reading = |c: &supdb::db::ZCounts| c.samples + c.sample_from_files;
+    // Past the whole budget the builds ahead run, and the model calls for
+    // the controller's sample: the first build ahead is held at its rename
+    // until the controller is past FITS, so the sample is wanted while
+    // builds ahead are still due, and the hold is then lifted.
+    db.hold_zpage_rename(true);
+    inject.set_budget(raw / 2);
+    assert!(
+        tick_until(&db, 400, |c| c.phase >= 1 && c.build_starts >= 1),
+        "past FITS with a build ahead in flight: {:?}",
+        db.zpage_counts()
+    );
+    let t = std::time::Instant::now();
+    while !db.zpage_build_waiting() {
+        assert!(t.elapsed() < JOB_WALL, "the build never reached its hold");
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+    wait_steps(&db, 3);
+    assert_eq!(
+        reading(&db.zpage_counts()),
+        0,
+        "a reading beside a build ahead in flight"
+    );
+    // The next build ahead held at its start and the first let go: the
+    // turn that takes the first in chooses between the sample and the next
+    // build, and the choice is read with the next one held, since read at
+    // the next tick it is read after however many builds the chain ran
+    // meanwhile.
+    db.hold_zpage_build(true);
+    db.hold_zpage_rename(false);
+    assert!(
+        tick_until(&db, 400, |c| c.build_collected >= 1 && c.build_starts >= 2),
+        "the first build ahead in, the next started: {:?}",
+        db.zpage_counts()
+    );
+    let t = std::time::Instant::now();
+    while !db.zpage_build_waiting() {
+        assert!(
+            t.elapsed() < JOB_WALL,
+            "the next build never reached its hold"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(2));
+    }
+    let f = db.zpage_counts();
+    assert!(f.partitions >= 3, "{f:?}");
+    let left = f.partitions - (f.prebuilt + f.ahead_cold).min(f.partitions);
+    assert!(left > 0, "builds ahead still due: {f:?}");
+    assert_eq!(
+        (f.samples, f.sample_from_files),
+        (0, 0),
+        "a reading between builds ahead: {f:?}"
+    );
+    // The rest of the builds ahead let go: the reading waits for the last.
+    db.hold_zpage_build(false);
+    assert!(
+        tick_until(&db, 400, |c| reading(c) > 0),
+        "no reading: {:?}",
+        db.zpage_counts()
+    );
+    let c = db.zpage_counts();
+    assert!(
+        c.prebuilt + c.ahead_cold >= c.partitions,
+        "the reading after the last build ahead: {c:?}"
+    );
+    assert!(
+        c.samples == 0 && c.sample_from_files > 0,
+        "the reading from the files the builds ahead left: {c:?}"
+    );
+    db.close().unwrap();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// The builds ahead at landing wait while scans are near
 /// (`Options::zpages_land_scans_far`): a store scanned, its raw
 /// populations past the percent of its budget, builds nothing ahead, and
@@ -11662,7 +11475,6 @@ fn the_sample_waits_for_a_seal_in_flight_where_the_controller_suspects_at_the_cr
 #[cfg(target_os = "linux")]
 #[test]
 fn a_raw_tail_pick_is_taken_back_once_the_store_grows_past_the_fill_share() {
-    assert!(Options::default().zpages_coding_auto);
     for grow in [true, false] {
         let what = format!("grow {grow}");
         let (dir, mut db, mut model, inject) = auto_store_with(
@@ -11787,7 +11599,7 @@ fn a_raw_tail_pick_is_taken_back_once_the_store_grows_past_the_fill_share() {
 #[cfg(target_os = "linux")]
 #[test]
 fn a_form_file_built_at_a_merges_finish_in_a_coding_taken_back_is_built_again() {
-    assert!(Options::default().zpages_coding_auto && Options::default().zpages_build_at_finish);
+    assert!(Options::default().zpages_build_at_finish);
     let (dir, mut db, mut model, inject) = auto_store_with(
         "coding-repick-finish",
         1 << 40,
@@ -11888,7 +11700,6 @@ fn a_form_file_built_at_a_merges_finish_in_a_coding_taken_back_is_built_again() 
 #[cfg(target_os = "linux")]
 #[test]
 fn a_form_file_built_ahead_in_the_coding_the_pick_refuses_is_built_again() {
-    assert!(Options::default().zpages_coding_auto);
     let (dir, db, model, inject, raw) = land_store_with("auto-land-recode", 50, |o| {
         o.partition_bytes = Some(160 << 10);
         o.zpages_build_eager = true;
@@ -13041,36 +12852,49 @@ fn a_partition_its_form_serves_drops_its_raw_pages_when_asked() {
     );
 }
 
-/// The re-code policy's next look waited for (`Options::zpages_recode`):
-/// the injected clock moved `by`, and the counts read once the segment
-/// work's turn has looked at it.
-fn recode_look(db: &Db, by: std::time::Duration) {
-    let inject = db.options().zpages_inject.clone().unwrap();
-    jobs_ended(db);
-    let was = db.zpage_counts().recode_looks;
-    inject.advance(by);
-    let t = std::time::Instant::now();
-    while db.zpage_counts().recode_looks == was && t.elapsed().as_secs() < 60 {
-        std::thread::sleep(std::time::Duration::from_millis(2));
+/// A store opened over form files attaches them at the open
+/// (`Db::z_attach`), and drops the raw pages of the partitions they serve
+/// there only when asked (`Options::zpages_drop_raw`): every attach dropped
+/// with the option and none without it, whatever else the options time.
+/// The attach's flags were a tuple read by position, and the drop read the
+/// decode timer's slot once a flag before them went, so a store opened
+/// without the drop dropped every partition (the settle's own attaches,
+/// which pass no tuple, were right).
+#[cfg(target_os = "linux")]
+#[test]
+fn an_open_drops_the_raw_pages_of_the_partitions_its_forms_serve_only_when_asked() {
+    for cold in [false, true] {
+        let what = format!("open drop raw {cold}");
+        let dir = scratch(&format!("open-drop-raw-{cold}"));
+        let opts = |o: &mut Options| {
+            o.partition_bytes = Some(160 << 10);
+            o.zpages_drop_raw = cold;
+        };
+        let mut db = Db::create(&dir, forced(opts)).unwrap();
+        let model = ordered_load(&mut db, 5000, 0x0DD5);
+        db.zpages_settle().unwrap();
+        drop(db);
+        let db = Db::open(&dir, forced(opts)).unwrap();
+        assert!(
+            db.options().zpages_hot_raw || db.options().zpages_stride_convert,
+            "{what}: the premise, the form files' decodes are timed"
+        );
+        let c = db.zpage_counts();
+        assert!(c.form_files >= 3, "{what}: the form files attached: {c:?}");
+        assert_eq!(
+            c.raw_dropped,
+            if cold { c.form_files } else { 0 },
+            "{what}: the open's attaches drop as asked: {c:?}"
+        );
+        let keys: Vec<Vec<u8>> = model.keys().cloned().collect();
+        check(&db, &model, &keys, &what);
+        drop(db);
+        let _ = std::fs::remove_dir_all(&dir);
     }
-    assert!(
-        db.zpage_counts().recode_looks > was,
-        "the re-code policy looked"
-    );
-}
-
-/// Whether `cond` comes to hold of the counts within a minute of real time:
-/// a re-code the look started is collected at a later turn of the segment
-/// work, whatever the injected clock says.
-fn recode_until(db: &Db, cond: impl Fn(&supdb::db::ZCounts) -> bool) -> bool {
-    let t = std::time::Instant::now();
-    while !cond(&db.zpage_counts()) && t.elapsed().as_secs() < 60 {
-        std::thread::sleep(std::time::Duration::from_millis(2));
-    }
-    cond(&db.zpage_counts())
 }
 
 /// The keys of the `i`th partition by key order, as the model has them.
+#[cfg(target_os = "linux")]
 fn keys_of_partition(db: &Db, model: &Model, i: usize) -> Vec<Vec<u8>> {
     let heat = db.zpage_heat();
     let lo = heat[i].lo.clone();
@@ -13083,139 +12907,9 @@ fn keys_of_partition(db: &Db, model: &Model, i: usize) -> Vec<Vec<u8>> {
 }
 
 /// Each partition's coding by key order, from its form file.
+#[cfg(target_os = "linux")]
 fn codings(db: &Db) -> Vec<bool> {
     db.zpage_heat().iter().map(|h| h.coded).collect()
-}
-
-/// Under the controller with the re-code (`Options::zpages_recode_auto`),
-/// once the form is installed, the partition whose decodes cost the most is
-/// re-coded to the raw tails while the form with their extra stays within
-/// the fill share of the budget, the partitions under their share of the
-/// decode time are left block-coded, and once the budget falls under the
-/// form past the evict share the raw tails go back; every read answers as
-/// the raw form does across each swap. Without the option nothing is
-/// re-coded however hot a partition reads.
-#[cfg(target_os = "linux")]
-#[test]
-fn the_controller_recodes_the_hottest_partition_within_the_budget() {
-    for on in [true, false] {
-        let what = format!("recode auto {on}");
-        let (dir, db, model, inject) = auto_store_with(
-            &format!("auto-recode-{on}"),
-            1 << 20,
-            1_000_000.0,
-            FAULT_1MS,
-            |o| {
-                o.zpages_recode_auto = on;
-                o.zpages_memo = false;
-                o.partition_bytes = Some(400 << 10);
-            },
-            |_| {},
-        );
-        let keys: Vec<Vec<u8>> = model.keys().cloned().collect();
-        let r = db.reader().unwrap();
-        let mut at = 0usize;
-        assert!(
-            drive_to(&db, &r, &keys, &inject, &mut at, 640, 1, 3, 400),
-            "{what}: COMPACT: {:?}",
-            db.zpage_counts()
-        );
-        // Every file attached and warmed: the policy's turn comes once the
-        // builder has nothing due.
-        assert!(
-            tick_until_built(&db, |c| c.attached >= c.partitions
-                && c.warms >= c.partitions),
-            "{what}: every file attached and warmed: {:?}",
-            db.zpage_counts()
-        );
-        // A decode priced by the seam, so that the heat is the decodes.
-        inject.set_decode_cost(std::time::Duration::from_micros(10));
-        assert!(
-            codings(&db).iter().all(|c| !c),
-            "{what}: built in the block coding: {:?}",
-            codings(&db)
-        );
-        let c = db.zpage_counts();
-        assert!(
-            c.form_files >= 5,
-            "{what}: partitions to choose from: {c:?}"
-        );
-        let total = c.file_bytes;
-        // A partition hot, and one past the floor and under its share of
-        // the decode time: a hundred thousand reads to three thousand.
-        let hot = keys_of_partition(&db, &model, 2);
-        let warm = keys_of_partition(&db, &model, 4);
-        let heat = |db: &Db| {
-            heat_up(db, &hot, 100_000);
-            heat_up(db, &warm, 3_000);
-        };
-        if on {
-            // The fill share of the budget the form itself: no room.
-            inject.set_budget(total * 100 / 85 + 1);
-            recode_look(&db, std::time::Duration::from_secs(1));
-            heat(&db);
-            recode_look(&db, std::time::Duration::from_secs(1));
-            wait_steps(&db, 5);
-            let c = db.zpage_counts();
-            assert_eq!(c.recodes, 0, "{what}: no room in the fill: {c:?}");
-            // Room within the fill share for a partition's raw tails.
-            inject.set_budget(total * 2);
-            heat(&db);
-            recode_look(&db, std::time::Duration::from_secs(1));
-            // The re-code is collected at a later step of the controller,
-            // which the injected clock paces.
-            assert!(
-                tick_until(&db, 400, |c| c.recodes >= 1),
-                "{what}: the hot partition re-coded: {:?} {:?}",
-                db.zpage_counts(),
-                db.zpage_heat()
-            );
-            let coded = codings(&db);
-            assert!(
-                coded[2] && coded.iter().filter(|c| **c).count() == 1,
-                "{what}: the hot partition alone raw-tailed: {coded:?} {:?}",
-                db.zpage_heat()
-            );
-            // The warm one under its share: a look more re-codes nothing.
-            heat(&db);
-            recode_look(&db, std::time::Duration::from_secs(1));
-            wait_steps(&db, 5);
-            assert_eq!(
-                codings(&db).iter().filter(|c| **c).count(),
-                1,
-                "{what}: one raw-tailed: {:?}",
-                db.zpage_heat()
-            );
-            check(&r, &model, &keys, &format!("{what}: raw-tailed"));
-            // The budget under the form past the evict share: given back.
-            inject.set_budget(db.zpage_counts().file_bytes);
-            recode_look(&db, std::time::Duration::from_secs(1));
-            assert!(
-                tick_until(&db, 400, |c| c.recodes_back >= 1),
-                "{what}: given back: {:?} {:?}",
-                db.zpage_counts(),
-                db.zpage_heat()
-            );
-            assert!(
-                codings(&db).iter().all(|c| !c),
-                "{what}: all block-coded again: {:?}",
-                codings(&db)
-            );
-        } else {
-            inject.set_budget(total * 2);
-            for _ in 0..3 {
-                heat(&db);
-                advance_tick(&db, std::time::Duration::from_secs(1));
-            }
-            wait_steps(&db, 5);
-            let c = db.zpage_counts();
-            assert_eq!((c.recodes, c.recode_looks), (0, 0), "{what}: {c:?}");
-        }
-        check(&r, &model, &keys, &format!("{what}: after"));
-        drop(r);
-        db.close().unwrap();
-        let _ = std::fs::remove_dir_all(&dir);
-    }
 }
 
 /// The hot-raw policy's next look waited for (`Options::zpages_hot_raw`):
@@ -15391,188 +15085,8 @@ fn the_hot_raw_policy_releases_into_the_groups_unused_memory_where_the_line_woul
     }
 }
 
-/// Under the controller with the re-parse (`Options::zpages_reparse`), once
-/// the form is installed, the block-coded partition whose decodes cost the
-/// most is built again by the parsing encoder and swapped in -- its form
-/// file smaller, as only the parse makes it, its coding the same -- once
-/// while its segment lives, and a partition under its share of the decode
-/// time is left as it was; every read answers as the raw form does across
-/// the swap. Without the option nothing is re-parsed however hot a
-/// partition reads.
-#[cfg(target_os = "linux")]
-#[test]
-fn the_controller_reparses_the_hottest_partition_once() {
-    for on in [true, false] {
-        let what = format!("reparse {on}");
-        let (dir, db, model, inject) = auto_store_with(
-            &format!("auto-reparse-{on}"),
-            1 << 20,
-            1_000_000.0,
-            FAULT_1MS,
-            |o| {
-                o.zpages_reparse = on;
-                o.zpages_memo = false;
-                o.partition_bytes = Some(400 << 10);
-            },
-            |_| {},
-        );
-        let keys: Vec<Vec<u8>> = model.keys().cloned().collect();
-        let r = db.reader().unwrap();
-        let mut at = 0usize;
-        assert!(
-            drive_to(&db, &r, &keys, &inject, &mut at, 640, 1, 3, 400),
-            "{what}: COMPACT: {:?}",
-            db.zpage_counts()
-        );
-        assert!(
-            tick_until_built(&db, |c| c.attached >= c.partitions
-                && c.warms >= c.partitions),
-            "{what}: every file attached and warmed: {:?}",
-            db.zpage_counts()
-        );
-        // A decode priced by the seam, so that the heat is the decodes: at
-        // twenty microseconds the warm partition's thousand reads a look are
-        // past the floor and a hundredth of the hot one's, under its share
-        // through the heat's average, which lags the rates, and through the
-        // look after the swap, when the hot partition's new file gives no
-        // rate yet.
-        inject.set_decode_cost(std::time::Duration::from_micros(20));
-        inject.set_budget(db.zpage_counts().file_bytes * 2);
-        assert!(
-            codings(&db).iter().all(|c| !c),
-            "{what}: built in the block coding: {:?}",
-            codings(&db)
-        );
-        assert!(
-            db.zpage_counts().form_files >= 5,
-            "{what}: partitions to choose from: {:?}",
-            db.zpage_counts()
-        );
-        let bytes =
-            |db: &Db| -> Vec<u64> { db.zpage_heat().iter().map(|h| h.file_bytes).collect() };
-        let before = bytes(&db);
-        let hot = keys_of_partition(&db, &model, 2);
-        let warm = keys_of_partition(&db, &model, 4);
-        let heat = |db: &Db| {
-            heat_up(db, &hot, 100_000);
-            heat_up(db, &warm, 1_000);
-        };
-        if on {
-            recode_look(&db, std::time::Duration::from_secs(1));
-            heat(&db);
-            recode_look(&db, std::time::Duration::from_secs(1));
-            assert!(
-                tick_until(&db, 400, |c| c.reparses >= 1),
-                "{what}: the hot partition re-parsed: {:?} {:?}",
-                db.zpage_counts(),
-                db.zpage_heat()
-            );
-            let after = bytes(&db);
-            assert!(
-                after[2] < before[2],
-                "{what}: the parse's smaller file: {before:?} -> {after:?}"
-            );
-            for (i, (a, b)) in after.iter().zip(&before).enumerate() {
-                if i != 2 {
-                    assert_eq!(a, b, "{what}: partition {i} as it was");
-                }
-            }
-            assert!(
-                codings(&db).iter().all(|c| !c),
-                "{what}: still block-coded: {:?}",
-                codings(&db)
-            );
-            // The hot one again and the warm one under its share: more
-            // looks re-parse nothing. The reads are checked after them,
-            // since a read of every key is a heat of its own.
-            for _ in 0..3 {
-                heat(&db);
-                recode_look(&db, std::time::Duration::from_secs(1));
-            }
-            wait_steps(&db, 5);
-            let c = db.zpage_counts();
-            assert_eq!(
-                (c.reparses, c.recodes, c.recodes_back),
-                (1, 0, 0),
-                "{what}: {c:?}"
-            );
-            assert_eq!(bytes(&db), after, "{what}: nothing built again");
-        } else {
-            for _ in 0..3 {
-                heat(&db);
-                advance_tick(&db, std::time::Duration::from_secs(1));
-            }
-            wait_steps(&db, 5);
-            let c = db.zpage_counts();
-            assert_eq!((c.reparses, c.recode_looks), (0, 0), "{what}: {c:?}");
-            assert_eq!(bytes(&db), before, "{what}: nothing built again");
-        }
-        check(&r, &model, &keys, &format!("{what}: after"));
-        drop(r);
-        db.close().unwrap();
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-}
-
-/// A forced store whose served partitions the re-code policy re-codes, the
-/// raw pages dropped and every read decoding (no memo), its budget and its
-/// refaults the seam's: loaded, settled, and looked at once.
-fn recode_store(name: &str, budget: u64) -> (PathBuf, Db, Model, std::sync::Arc<supdb::ZInject>) {
-    recode_store_with(name, budget, |_| {})
-}
-
-/// `recode_store` with `extra` applied to its options.
-fn recode_store_with(
-    name: &str,
-    budget: u64,
-    extra: impl FnOnce(&mut Options),
-) -> (PathBuf, Db, Model, std::sync::Arc<supdb::ZInject>) {
-    recode_store_before_settle(name, budget, extra, |_| {})
-}
-
-/// `recode_store_with`, with `before` called on the loaded store ahead of
-/// its settle.
-fn recode_store_before_settle(
-    name: &str,
-    budget: u64,
-    extra: impl FnOnce(&mut Options),
-    before: impl FnOnce(&Db),
-) -> (PathBuf, Db, Model, std::sync::Arc<supdb::ZInject>) {
-    let dir = scratch(name);
-    let inject = std::sync::Arc::new(supdb::ZInject::new());
-    inject.set_budget(budget);
-    inject.set_refault_rate(0.0);
-    // A decode priced by the seam, so that a partition's heat is its
-    // decodes and not the build profile's speed: the checked build decodes
-    // twenty thousand groups in 13 ms, under the floor once decayed, where
-    // the dev build takes 155.
-    inject.set_decode_cost(std::time::Duration::from_micros(10));
-    inject.advance(std::time::Duration::from_millis(1));
-    let mut db = Db::create(
-        &dir,
-        forced(|o| {
-            o.partition_bytes = Some(160 << 10);
-            o.zpages_drop_raw = true;
-            // The re-code moves the block body between its codings and is
-            // refused beside the stride form (`check_options`).
-            o.zpages_stride = ZStride::Off;
-            o.zpages_recode = true;
-            o.zpages_memo = false;
-            o.zpages_inject = Some(inject.clone());
-            extra(o);
-        }),
-    )
-    .unwrap();
-    let model = ordered_load(&mut db, 20_000, 0x2EC0);
-    before(&db);
-    db.zpages_settle().unwrap();
-    // A look over the settled form files, whose decode time the next look
-    // differences against: the looks during the load saw none of them.
-    recode_look(&db, std::time::Duration::from_secs(1));
-    (dir, db, model, inject)
-}
-
 /// `n` reads of `keys`, round and round: decodes for the heat.
+#[cfg(target_os = "linux")]
 fn heat_up(db: &Db, keys: &[Vec<u8>], n: usize) {
     for i in 0..n {
         let k = &keys[i % keys.len()];
@@ -15580,515 +15094,20 @@ fn heat_up(db: &Db, keys: &[Vec<u8>], n: usize) {
     }
 }
 
+/// The record coding with its tails stored raw (`Options::zpages_raw_tails`,
+/// off): the form answers reads, counts and scans as the block coding does,
+/// its files are larger than the compressed ones, and a scan reads its
+/// groups in place, where the block coding's are LZ4 blocks.
 #[test]
-fn the_partition_whose_decodes_cost_most_is_recoded_while_it_serves() {
-    // Under `Options::zpages_recode` the segment work reads each form
-    // file's decode time once a period and re-codes the block-coded
-    // partition whose decodes cost the most to the raw tails, by a build
-    // beside the served file and a swap of the cell; the refaults past the
-    // floor give the last re-code back, and the form files' bytes are held
-    // where that leaves them until the hold passes. Every read, count and
-    // scan answers as the raw form does across each swap.
-    let (dir, db, model, inject) = recode_store("recode", 1 << 40);
-    let c = db.zpage_counts();
-    assert!(c.form_files >= 4, "partitions to choose from: {c:?}");
-    assert!(
-        codings(&db).iter().all(|c| !c),
-        "every form file built in the block coding: {:?}",
-        codings(&db)
-    );
-    let keys: Vec<Vec<u8>> = model.keys().cloned().collect();
-    let hot = keys_of_partition(&db, &model, 2);
-    heat_up(&db, &hot, 20_000);
-    recode_look(&db, std::time::Duration::from_secs(1));
-    assert!(
-        recode_until(&db, |c| c.recodes >= 1),
-        "the hot partition re-coded: {:?} {:?}",
-        db.zpage_counts(),
-        db.zpage_heat()
-    );
-    let coded = codings(&db);
-    assert!(
-        coded[2] && coded.iter().filter(|c| **c).count() == 1,
-        "the hot partition alone raw-tailed: {coded:?} {:?}",
-        db.zpage_heat()
-    );
-    check(&db, &model, &keys, "re-coded");
-    check_scan(&db, &model, "re-coded");
-    // Over the refault floor: the re-code given back.
-    inject.set_refault_rate(1000.0);
-    recode_look(&db, std::time::Duration::from_secs(1));
-    assert!(
-        recode_until(&db, |c| c.recodes_back >= 1),
-        "the re-code given back: {:?}",
-        db.zpage_counts()
-    );
-    assert!(
-        codings(&db).iter().all(|c| !c),
-        "the partition back in the block coding: {:?}",
-        codings(&db)
-    );
-    check(&db, &model, &keys, "given back");
-    check_scan(&db, &model, "given back");
-    // Under the floor again and as hot: held by the ceiling.
-    inject.set_refault_rate(0.0);
-    heat_up(&db, &hot, 20_000);
-    recode_look(&db, std::time::Duration::from_secs(1));
-    let c = db.zpage_counts();
-    assert_eq!(c.recodes, 1, "held at the ceiling: {c:?}");
-    // The hold past, and hot again: re-coded again.
-    recode_look(&db, std::time::Duration::from_secs(61));
-    heat_up(&db, &hot, 20_000);
-    recode_look(&db, std::time::Duration::from_secs(1));
-    assert!(
-        recode_until(&db, |c| c.recodes >= 2),
-        "re-coded once the hold has passed: {:?}",
-        db.zpage_counts()
-    );
-    let c = db.zpage_counts();
-    assert_eq!(c.recode_failed, 0, "{c:?}");
-    assert_eq!(c.fallbacks, 0, "no read fell back to the raw form: {c:?}");
-    check(&db, &model, &keys, "re-coded again");
-    check_scan(&db, &model, "re-coded again");
-    db.close().unwrap();
-    let _ = std::fs::remove_dir_all(&dir);
-}
-
-#[test]
-fn a_kept_form_file_makes_every_later_recode_an_exchange() {
-    // Under `Options::zpages_recode_keep` the form file a re-code replaced
-    // stays attached beside the served one: the partition's first re-code
-    // is a build, and its give-back and its re-code after the hold are the
-    // two files exchanged in the cell, no build started, the kept file
-    // read by nothing, and every read, count and scan answering as the raw
-    // form does across each exchange.
-    let (dir, db, model, inject) =
-        recode_store_with("recode-keep", 1 << 40, |o| o.zpages_recode_keep = true);
-    let keys: Vec<Vec<u8>> = model.keys().cloned().collect();
-    let hot = keys_of_partition(&db, &model, 2);
-    heat_up(&db, &hot, 20_000);
-    recode_look(&db, std::time::Duration::from_secs(1));
-    assert!(
-        recode_until(&db, |c| c.recodes >= 1),
-        "the hot partition re-coded: {:?}",
-        db.zpage_counts()
-    );
-    let c = db.zpage_counts();
-    assert_eq!(
-        (c.recode_flips, c.spare_files),
-        (0, 1),
-        "the first re-code a build, the block-coded file kept: {c:?}"
-    );
-    let built = c.build_starts;
-    let coded = codings(&db);
-    assert!(
-        coded[2] && coded.iter().filter(|c| **c).count() == 1,
-        "the hot partition alone raw-tailed: {coded:?}"
-    );
-    check(&db, &model, &keys, "re-coded, kept");
-    check_scan(&db, &model, "re-coded, kept");
-    // Over the refault floor: given back by the exchange, at the look.
-    inject.set_refault_rate(1000.0);
-    recode_look(&db, std::time::Duration::from_secs(1));
-    let c = db.zpage_counts();
-    assert_eq!(
-        (
-            c.recodes_back,
-            c.recode_flips,
-            c.build_starts,
-            c.spare_files
-        ),
-        (1, 1, built, 1),
-        "given back without a build: {c:?}"
-    );
-    assert!(
-        codings(&db).iter().all(|c| !c),
-        "the partition served block-coded: {:?}",
-        codings(&db)
-    );
-    check(&db, &model, &keys, "given back, kept");
-    check_scan(&db, &model, "given back, kept");
-    // The hold past and hot again: re-coded by the exchange.
-    inject.set_refault_rate(0.0);
-    recode_look(&db, std::time::Duration::from_secs(61));
-    heat_up(&db, &hot, 20_000);
-    recode_look(&db, std::time::Duration::from_secs(1));
-    let c = db.zpage_counts();
-    assert_eq!(
-        (c.recodes, c.recode_flips, c.build_starts, c.spare_files),
-        (2, 2, built, 1),
-        "re-coded again without a build: {c:?}"
-    );
-    assert!(codings(&db)[2], "raw-tailed again: {:?}", codings(&db));
-    assert_eq!(c.recode_failed, 0, "{c:?}");
-    assert_eq!(c.fallbacks, 0, "no read fell back to the raw form: {c:?}");
-    check(&db, &model, &keys, "re-coded again, kept");
-    check_scan(&db, &model, "re-coded again, kept");
-    db.close().unwrap();
-    // A reopen serves the coding that holds the name, the last one built,
-    // and keeps nothing.
-    let mut db = Db::open(
-        &dir,
-        forced(|o| {
-            o.partition_bytes = Some(160 << 10);
-            o.zpages_drop_raw = true;
-            o.zpages_stride = ZStride::Off;
-            o.zpages_recode = true;
-            o.zpages_recode_keep = true;
-            o.zpages_memo = false;
-        }),
-    )
-    .unwrap();
-    db.zpages_settle().unwrap();
-    let c = db.zpage_counts();
-    assert_eq!(c.spare_files, 0, "nothing kept across the reopen: {c:?}");
-    assert!(
-        codings(&db)[2],
-        "the name's coding served: {:?}",
-        codings(&db)
-    );
-    check(&db, &model, &keys, "reopened");
-    db.close().unwrap();
-    let _ = std::fs::remove_dir_all(&dir);
-}
-
-#[test]
-fn a_spare_started_as_a_settle_ends_is_not_the_settles_to_sweep() {
-    // A settle of the form ends with a sweep of the form files and temp
-    // names no live segment claims, and under `Options::zpages_both` the
-    // segment work starts its first spare the moment the settle has its
-    // answer. Swept by the settle's caller after the answer, the sweep met
-    // that spare in flight on a runner slow enough to start it first,
-    // removed its temp name, and the spare's rename failed: a partition
-    // counted `spare_failed` and never given its spare, which the test
-    // below waited a minute for. The seam stands the spare there every
-    // time: the builds after the answer held before their renames, and the
-    // settle returning only once one is parked. A spare starts whenever no
-    // settle runs, and the forced store's served form files are built
-    // during its load, so on a runner that gave the segment work the time
-    // before the test's settle every spare was built and none was left to
-    // park (once on a hosted x86 runner, every run with the settle half a
-    // second late): the seam starts none until a settle has answered, and
-    // the store is held to that before its settle -- its served files in,
-    // the segment work given the time, and no spare started.
-    let (_dir, db, _model, _inject) = recode_store_before_settle(
-        "sparesweep",
-        1 << 40,
-        |o| {
-            o.zpages_recode_keep = true;
-            o.zpages_both = true;
-            o.zpages_hold_after_settle = true;
-        },
-        |db| {
-            let t = std::time::Instant::now();
-            while db.zpage_counts().form_files < db.zpage_counts().partitions {
-                assert!(
-                    t.elapsed() < JOB_WALL,
-                    "the served form files built during the load: {:?}",
-                    db.zpage_counts()
-                );
-                std::thread::sleep(std::time::Duration::from_millis(5));
-            }
-            std::thread::sleep(std::time::Duration::from_millis(200));
-            let c = db.zpage_counts();
-            assert_eq!(
-                (c.spare_builds, c.spare_files),
-                (0, 0),
-                "no spare before the settle under the seam: {c:?}"
-            );
-        },
-    );
-    assert!(
-        db.zpage_build_waiting(),
-        "a spare parked at its rename as the settle ended: {:?}",
-        db.zpage_counts()
-    );
-    db.hold_zpage_after_settle(false);
-    db.hold_zpage_rename(false);
-    let n = db.zpage_counts().form_files;
-    assert!(n >= 4, "partitions to give spares: {n}");
-    assert!(
-        recode_until(&db, |c| c.spare_files == n),
-        "a spare for every partition: {:?}",
-        db.zpage_counts()
-    );
-    let c = db.zpage_counts();
-    assert_eq!((c.spare_builds, c.spare_failed), (n, 0), "{c:?}");
-}
-
-#[test]
-fn both_codings_are_built_at_write_time_and_the_policy_only_exchanges_them() {
-    // Under `Options::zpages_both` every served partition gets its form file
-    // in the other coding too, built once the served ones are in and kept
-    // unserved; from then on the policy chooses the raw-tailed set by heat
-    // and exchanges files, never building. Heat on one partition flips it;
-    // with room for one, heat moved to another flips the first back and the
-    // second in; a store at rest flips nothing. Every read, count and scan
-    // answers as the raw form does throughout.
-    let (dir, db, model, inject) = recode_store_with("both", 1 << 40, |o| {
-        o.zpages_recode_keep = true;
-        o.zpages_both = true;
-    });
-    let n = db.zpage_counts().form_files;
-    assert!(n >= 4, "partitions to choose from: {n}");
-    assert!(
-        recode_until(&db, |c| c.spare_files == n),
-        "a spare for every partition: {:?}",
-        db.zpage_counts()
-    );
-    let c = db.zpage_counts();
-    assert_eq!((c.spare_builds, c.spare_failed), (n, 0), "{c:?}");
-    assert!(
-        codings(&db).iter().all(|c| !c),
-        "the served files as built, block-coded: {:?}",
-        codings(&db)
-    );
-    assert!(
-        c.spare_bytes > c.file_bytes,
-        "the spares raw-tailed, the larger: {c:?}"
-    );
-    let built = c.build_starts;
-    // The store's form with every partition block-coded.
-    let blocks = c.file_bytes;
-    let keys: Vec<Vec<u8>> = model.keys().cloned().collect();
-    // One hot partition: flipped to its raw tails at the look, no build.
-    // Heated before any check reads the store, so that it alone is past the
-    // floor at the look whatever the budget.
-    let first = keys_of_partition(&db, &model, 1);
-    heat_up(&db, &first, 20_000);
-    recode_look(&db, std::time::Duration::from_millis(200));
-    let c = db.zpage_counts();
-    assert!(
-        c.recode_flips >= 1 && c.build_starts == built,
-        "flipped, not built: {c:?}"
-    );
-    let coded = codings(&db);
-    assert!(
-        coded[1] && coded.iter().filter(|c| **c).count() == 1,
-        "the hot one alone raw-tailed: {coded:?}"
-    );
-    check(&db, &model, &keys, "flipped, spares kept");
-    check_scan(&db, &model, "flipped, spares kept");
-    // Room for one partition's raw tails and a half: the heat moved to
-    // another flips the first back and the second in, by exchange alone.
-    let extra = c.file_bytes - blocks;
-    let budget = blocks + extra + extra / 2;
-    inject.set_budget(budget);
-    let second = keys_of_partition(&db, &model, 3);
-    let mut looks = 0;
-    while !(codings(&db)[3] && !codings(&db)[1]) {
-        assert!(
-            looks < 60,
-            "no exchange in {looks} looks: {:?} {:?}",
-            db.zpage_counts(),
-            codings(&db)
-        );
-        heat_up(&db, &second, 20_000);
-        recode_look(&db, std::time::Duration::from_millis(200));
-        looks += 1;
-    }
-    let c = db.zpage_counts();
-    assert!(
-        c.file_bytes <= budget,
-        "the served files within the budget: {} > {budget}, {:?}",
-        c.file_bytes,
-        codings(&db)
-    );
-    let c = db.zpage_counts();
-    assert_eq!(c.build_starts, built, "nothing built while serving: {c:?}");
-    assert_eq!(c.recode_failed, 0, "{c:?}");
-    assert_eq!(c.fallbacks, 0, "no read fell back to the raw form: {c:?}");
-    check(&db, &model, &keys, "exchanged");
-    check_scan(&db, &model, "exchanged");
-    // At rest: the checks' reads taken into the heat at one look, then a
-    // minute with no read, and nothing flips.
-    recode_look(&db, std::time::Duration::from_millis(200));
-    let before = (codings(&db), db.zpage_counts().recode_flips);
-    recode_look(&db, std::time::Duration::from_secs(60));
-    recode_look(&db, std::time::Duration::from_millis(200));
-    assert_eq!(
-        (codings(&db), db.zpage_counts().recode_flips),
-        before,
-        "a store at rest flips nothing"
-    );
-    db.close().unwrap();
-    let _ = std::fs::remove_dir_all(&dir);
-}
-
-#[test]
-fn a_partition_the_reads_have_left_gives_its_raw_tails_to_one_they_have_come_to() {
-    // With room in the budget for one raw-tailed partition, the first one
-    // heated is re-coded; heat moved to another, the policy gives the first
-    // back once the second's decayed heat is twice its own, and re-codes
-    // the second into the room. Every read and scan answers as the raw form
-    // does across both swaps.
-    let (dir, db, model, inject) = recode_store("recode-swap", 1);
-    let files = db.zpage_counts().file_bytes;
-    // One partition's extra fits, at the records' bytes or the raw tails'
-    // own ratio; two do not.
-    inject.set_budget(files + files / 20);
-    let first = keys_of_partition(&db, &model, 1);
-    let second = keys_of_partition(&db, &model, 3);
-    heat_up(&db, &first, 20_000);
-    recode_look(&db, std::time::Duration::from_secs(1));
-    assert!(
-        recode_until(&db, |c| c.recodes >= 1),
-        "the first re-coded: {:?}",
-        db.zpage_counts()
-    );
-    assert!(codings(&db)[1], "the first: {:?}", codings(&db));
-    let mut looks = 0;
-    while !(db.zpage_counts().recodes >= 2 && db.zpage_counts().recodes_back >= 1) {
-        assert!(
-            looks < 20,
-            "no swap in {looks} looks: {:?} {:?}",
-            db.zpage_counts(),
-            codings(&db)
-        );
-        heat_up(&db, &second, 20_000);
-        // Read before the look: a build the look starts can be collected
-        // before a reading after it, which then waits for a second.
-        let was = db.zpage_counts();
-        recode_look(&db, std::time::Duration::from_secs(1));
-        // A re-code the look started is collected at a later turn.
-        if db.zpage_counts().build_starts > was.build_starts {
-            assert!(
-                recode_until(&db, |c| {
-                    c.recodes + c.recodes_back + c.recode_failed
-                        > was.recodes + was.recodes_back + was.recode_failed
-                }),
-                "the re-code the look started is collected: {:?}",
-                db.zpage_counts()
-            );
-        }
-        looks += 1;
-    }
-    let coded = codings(&db);
-    assert!(
-        coded[3] && !coded[1] && coded.iter().filter(|c| **c).count() == 1,
-        "the second raw-tailed in the first's room: {coded:?}"
-    );
-    let c = db.zpage_counts();
-    assert_eq!(c.recode_failed, 0, "{c:?}");
-    let keys: Vec<Vec<u8>> = model.keys().cloned().collect();
-    check(&db, &model, &keys, "swapped");
-    check_scan(&db, &model, "swapped");
-    db.close().unwrap();
-    let _ = std::fs::remove_dir_all(&dir);
-}
-
-#[test]
-fn no_partition_is_recoded_past_the_budget() {
-    // The raw tails' extra bytes are held to the budget: with no room past
-    // the form files' own bytes nothing is re-coded however hot, and with
-    // room it is.
-    let (dir, db, model, inject) = recode_store("recode-budget", 1);
-    let files = db.zpage_counts().file_bytes;
-    inject.set_budget(files);
-    let hot = keys_of_partition(&db, &model, 1);
-    for _ in 0..3 {
-        heat_up(&db, &hot, 20_000);
-        recode_look(&db, std::time::Duration::from_secs(1));
-    }
-    let c = db.zpage_counts();
-    assert_eq!(c.recodes, 0, "no room, no re-code: {c:?}");
-    inject.set_budget(files * 4);
-    heat_up(&db, &hot, 20_000);
-    recode_look(&db, std::time::Duration::from_secs(1));
-    assert!(
-        recode_until(&db, |c| c.recodes >= 1),
-        "room, a re-code: {:?}",
-        db.zpage_counts()
-    );
-    assert!(codings(&db)[1], "the hot one: {:?}", codings(&db));
-    let keys: Vec<Vec<u8>> = model.keys().cloned().collect();
-    check(&db, &model, &keys, "budget");
-    db.close().unwrap();
-    let _ = std::fs::remove_dir_all(&dir);
-}
-
-/// The first partitions by key order in the raw-tail coding and the rest in
-/// the block coding (`Options::zpages_raw_tails_first`): the store answers
-/// every read, count and scan as the raw form does, exactly the first
-/// partitions' builds are raw-tailed, a scan across the boundary reads the
-/// first partitions' groups in place, and the raw-tailed form files are the
-/// larger for the keys they hold.
-#[test]
-fn the_first_partitions_raw_tailed_and_the_rest_block_coded_answer_as_one_form() {
-    let dir = scratch("raw-tails-first");
-    let mut db = Db::create(
-        &dir,
-        forced(|o| {
-            o.partition_bytes = Some(160 << 10);
-            o.zpages_raw_tails_first = 2;
-        }),
-    )
-    .unwrap();
-    let model = ordered_load(&mut db, 5000, 0x2F17);
-    db.zpages_settle().unwrap();
-    let c = db.zpage_counts();
-    assert!(c.form_files >= 4, "the form files: {c:?}");
-    assert_eq!(
-        c.builds_raw_tails, 2,
-        "the first two partitions raw-tailed: {c:?}"
-    );
-    let keys: Vec<Vec<u8>> = model.keys().cloned().collect();
-    check(&db, &model, &keys, "raw tails first");
-    check_scan(&db, &model, "raw tails first");
-    for (i, limit) in [(0usize, 5000usize), (1234, 70), (4990, 40)] {
-        same_window(
-            &scanned(&db, &keys[i], limit),
-            &window(&model, &keys[i], limit),
-            "raw tails first",
-        );
-    }
-    let c = db.zpage_counts();
-    assert!(
-        c.inplace_groups > 0,
-        "the scans read the first partitions' groups in place: {c:?}"
-    );
-    // By key order the form files are the first partitions' first: the
-    // raw-tailed ones hold their records' own bytes.
-    let heat = db.zpage_heat();
-    assert!(heat.len() >= 4);
-    let per_key = |i: usize| heat[i].file_bytes as f64 / heat[i].keys.max(1) as f64;
-    assert!(
-        per_key(0) > per_key(2) * 1.2 && per_key(1) > per_key(3) * 1.2,
-        "the raw-tailed form files are the larger a key: {:?}",
-        heat.iter()
-            .map(|h| (h.keys, h.file_bytes))
-            .collect::<Vec<_>>()
-    );
-    // The reads decoded the block-coded partitions' groups, and the heat
-    // counts them where they were made, in sixteens.
-    assert!(
-        heat.iter().all(|h| h.decodes % 16 == 0) && heat.iter().any(|h| h.decodes > 0),
-        "the heat's decodes, in sixteens: {:?}",
-        heat.iter().map(|h| h.decodes).collect::<Vec<_>>()
-    );
-    drop(db);
-    let _ = std::fs::remove_dir_all(&dir);
-}
-
-/// Every group stored verbatim (`Options::zpages_store_all`, off): the form
-/// answers reads, counts and scans as the compressed one does, its files are
-/// the records' own bytes and larger than the compressed ones by more than a
-/// quarter at the suite's shape, and a read through it decodes nothing,
-/// since a stored group's payload is the group.
-#[test]
-fn a_form_stored_whole_answers_as_the_compressed_one_and_decodes_nothing() {
+fn a_form_with_raw_tails_answers_as_the_compressed_one_and_its_scans_read_in_place() {
     let mut bytes = Vec::new();
-    // Compressed, stored whole, and the record coding with raw tails: the
-    // third answers as the others and sits between them in size.
-    for (stored, raw) in [(false, false), (true, false), (false, true)] {
-        let what = format!("stored {stored} raw tails {raw}");
-        let dir = scratch(&format!("stored-whole-{stored}-{raw}"));
+    for raw in [false, true] {
+        let what = format!("raw tails {raw}");
+        let dir = scratch(&format!("raw-tails-{raw}"));
         let mut db = Db::create(
             &dir,
             forced(|o| {
                 o.partition_bytes = Some(160 << 10);
-                o.zpages_store_all = stored;
-                o.zpages_record_coding = raw;
                 o.zpages_raw_tails = raw;
             }),
         )
@@ -16108,15 +15127,7 @@ fn a_form_stored_whole_answers_as_the_compressed_one_and_decodes_nothing() {
         }
         let c = db.zpage_counts();
         assert!(c.reads > 0, "{what}: the reads went through the form");
-        if stored {
-            assert_eq!(c.decodes, 0, "{what}: a stored group decodes nothing");
-        } else {
-            assert!(c.decodes > 0, "{what}: the compressed groups decode");
-        }
-        // A scan of the raw-tail form reads its groups in place
-        // (`Options::zpages_inplace_walk`); the block coding's are LZ4
-        // blocks and the stored form's are parsed where they lie as they
-        // were, neither through the in-place walk.
+        assert!(c.decodes > 0, "{what}: the compressed groups decode");
         assert_eq!(
             c.inplace_groups > 0,
             raw,
@@ -16133,96 +15144,32 @@ fn a_form_stored_whole_answers_as_the_compressed_one_and_decodes_nothing() {
         let _ = std::fs::remove_dir_all(&dir);
     }
     assert!(
-        bytes[1] > bytes[0] + bytes[0] / 4,
-        "the stored form is the records' bytes: {bytes:?}"
-    );
-    assert!(
-        bytes[0] < bytes[2] && bytes[2] < bytes[1],
-        "the raw-tail form sits between the compressed and the stored: {bytes:?}"
+        bytes[0] < bytes[1],
+        "the raw-tail form is larger than the compressed one: {bytes:?}"
     );
 }
 
-/// The form's groups decoded by the engine's own decoder
-/// (`Options::zpages_own_decoder`): a store opened with it reads every key,
-/// count and window as the model has it, as a store opened without does, and
-/// each store decodes by its own options while the other is open beside it.
+/// The block coding's groups written by the parsing encoder (`db::zlz4`)
+/// where the parse wins, many short matches: the same format in fewer
+/// sequences, so the form answers every read, count and scan as the model
+/// has it; the builder's own check decodes every group it writes against
+/// the records, so a group the encoder got wrong would have failed the
+/// build. The values are half random bytes and half words of four to seven
+/// letters drawn from a dozen, where the motif `suite_value` repeats is one
+/// long match either encoder finds.
 #[test]
-fn a_form_read_through_the_engines_own_decoder_answers_as_through_lz4_flexs() {
-    let mut open = Vec::new();
-    for own in [true, false] {
-        let what = format!("own decoder {own}");
-        let dir = scratch(&format!("own-decoder-{own}"));
-        let mut db = Db::create(
-            &dir,
-            forced(|o| {
-                o.partition_bytes = Some(160 << 10);
-                o.zpages_own_decoder = own;
-            }),
-        )
-        .unwrap();
-        let model = ordered_load(&mut db, 5000, 0x0D3C);
-        db.zpages_settle().unwrap();
-        let keys: Vec<Vec<u8>> = model.keys().cloned().collect();
-        check(&db, &model, &keys, &what);
-        check_scan(&db, &model, &what);
-        for (i, limit) in [(1234usize, 70usize), (0, 3), (4990, 40)] {
-            same_window(
-                &scanned(&db, &keys[i], limit),
-                &window(&model, &keys[i], limit),
-                &what,
-            );
-        }
-        let c = db.zpage_counts();
-        assert!(
-            c.reads > 0 && c.decodes > 0,
-            "{what}: read and decoded: {c:?}"
-        );
-        assert_eq!((c.fallbacks, c.bad_pages), (0, 0), "{what}: {c:?}");
-        assert!(c.form_files > 0, "{what}: {c:?}");
-        let by_own = if own { c.form_files } else { 0 };
-        assert_eq!(
-            c.own_decoder_files, by_own,
-            "{what}: the decoder its own: {c:?}"
-        );
-        open.push((db, model, keys, what, dir, by_own));
-    }
-    // Both read again with both open, the second opened last, each through
-    // the decoder of its own options.
-    for (db, model, keys, what, _, by_own) in &open {
-        check(db, model, keys, what);
-        check_scan(db, model, what);
-        assert_eq!(db.zpage_counts().own_decoder_files, *by_own, "{what}");
-    }
-    for (db, _, _, _, dir, _) in open {
-        drop(db);
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-}
-
-/// The block coding's groups written by the parsing encoder
-/// (`Options::zpages_parse`): the same format in fewer sequences, so the
-/// form answers every read, count and scan as the greedy encoder's does,
-/// through the same decoder, and its files are smaller; the builder's own
-/// check decodes every group it writes against the records, so a group the
-/// encoder got wrong would have failed the build. The values are the shape
-/// the parse wins on, many short matches: half random bytes and half words
-/// of four to seven letters drawn from a dozen, where the motif
-/// `suite_value` repeats is one long match either encoder finds.
-#[test]
-fn a_form_the_parsing_encoder_wrote_answers_as_the_greedy_ones_in_fewer_bytes() {
+fn a_form_the_parsing_encoder_wrote_over_short_matches_answers_as_the_model() {
     const WORDS: [&[u8]; 12] = [
         b"oak ", b"birch ", b"pine ", b"elm ", b"cedar ", b"fir ", b"ash ", b"larch ", b"maple ",
         b"yew ", b"alder ", b"beech ",
     ];
-    let mut bytes = Vec::new();
-    for parse in [false, true] {
-        let what = format!("parse {parse}");
-        let dir = scratch(&format!("parse-{parse}"));
+    {
+        let what = "parse".to_string();
+        let dir = scratch("parse");
         let mut db = Db::create(
             &dir,
             forced(|o| {
                 o.partition_bytes = Some(160 << 10);
-                o.zpages_parse = parse;
             }),
         )
         .unwrap();
@@ -16262,19 +15209,9 @@ fn a_form_the_parsing_encoder_wrote_answers_as_the_greedy_ones_in_fewer_bytes() 
             "{what}: read and decoded: {c:?}"
         );
         assert_eq!(c.fallbacks, 0, "{what}: nothing fell back to the raw form");
-        bytes.push(
-            form_files(&dir)
-                .iter()
-                .map(|p| common::store_file(p).len() as u64)
-                .sum::<u64>(),
-        );
         drop(db);
         let _ = std::fs::remove_dir_all(&dir);
     }
-    assert!(
-        bytes[1] < bytes[0],
-        "the parsing encoder's form is the smaller: {bytes:?}"
-    );
 }
 
 /// The census window's busy wall is taken from one operation in sixteen
@@ -19683,6 +18620,136 @@ fn partitions_keep_why_the_stride_form_does_not_hold_them(background: bool) {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// The stride form asked for only where the store in it fits the room
+/// (`Options::zpages_stride_room`): a store written with no form and opened
+/// under the forced stride form, so that every partition is built with the
+/// store whole and no piece beside it, against an injected budget. The
+/// stride form of the store is its values alone, six thousand of a hundred
+/// bytes: at a budget of exactly that every partition is asked and holds the
+/// stride form, and a byte under it none is asked, each is built in the
+/// block form with no reason kept, and the builds that asked nothing are
+/// counted. A budget of the payload's size would pass both, and a rule that
+/// counted the keys would refuse the first. A store the room moved under
+/// between its builds is in two forms, the files on disk attached as they
+/// are.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_build_asks_for_the_stride_form_only_where_the_store_in_it_fits_the_room() {
+    const KEYS: usize = 6000;
+    const WIDTH: usize = 100;
+    let values = (KEYS * WIDTH) as u64;
+    let room = |budget: u64| {
+        let inject = std::sync::Arc::new(supdb::ZInject::new());
+        inject.set_budget(budget);
+        let handle = inject.clone();
+        let opts = stride_forced(move |o| {
+            o.partition_bytes = Some(160 << 10);
+            o.publish_in_background = true;
+            o.zpages_stride_room = true;
+            o.zpages_inject = Some(inject);
+        });
+        (opts, handle)
+    };
+    for (budget, fits) in [(values, true), (values - 1, false)] {
+        let what = &format!("the stride form held to a room of {budget} bytes");
+        let dir = scratch(&format!("stride-room-{fits}"));
+        let model = {
+            let mut db = Db::create(
+                &dir,
+                Options {
+                    partition_bytes: Some(160 << 10),
+                    ..off()
+                },
+            )
+            .unwrap();
+            let model = numbered_load(&mut db, KEYS, WIDTH, 0x5EA7);
+            db.settle().unwrap();
+            db.close().unwrap();
+            model
+        };
+        let mut db = Db::open(&dir, room(budget).0).unwrap();
+        db.zpages_settle().unwrap();
+        let c = db.zpage_counts();
+        assert!(c.partitions > 2, "{what}: several partitions: {c:?}");
+        assert_eq!(
+            c.form_files, c.partitions,
+            "{what}: a form file each: {c:?}"
+        );
+        if fits {
+            assert_eq!(
+                (c.stride_files, c.stride_no_room),
+                (c.partitions, 0),
+                "{what}: every partition asked and held in the stride form: {c:?}"
+            );
+        } else {
+            assert_eq!(c.stride_files, 0, "{what}: none in the stride form: {c:?}");
+            assert!(
+                c.stride_no_room >= c.partitions,
+                "{what}: every build asked nothing, counted: {c:?}"
+            );
+        }
+        let nos = db.zpage_stride_nos();
+        assert!(
+            nos.iter().all(|&n| n == 0),
+            "{what}: a partition not asked keeps no reason: {nos:?}"
+        );
+        let keys: Vec<Vec<u8>> = model.keys().cloned().collect();
+        check(&db, &model, &keys, what);
+        let c = db.zpage_counts();
+        assert_eq!(c.fallbacks, 0, "{what}: {c:?}");
+        assert_eq!(
+            c.stride_reads > 0,
+            fits,
+            "{what}: reads through the form the room chose: {c:?}"
+        );
+        db.close().unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+    // The room gone between a store's builds: the first half built with
+    // room for it, the second written after the budget fell to a byte (the
+    // seam reads zero as no budget injected).
+    let what = "the room gone between a store's builds";
+    let dir = scratch("stride-room-moved");
+    let (opts, inject) = room(u64::MAX);
+    let mut db = Db::create(&dir, opts).unwrap();
+    let mut model = numbered_load(&mut db, KEYS / 2, WIDTH, 0x5EA8);
+    db.zpages_settle().unwrap();
+    let first = db.zpage_counts();
+    assert!(
+        first.stride_files > 0 && first.stride_files == first.form_files,
+        "{what}: the first half in the stride form: {first:?}"
+    );
+    inject.set_budget(1);
+    let mut rng = Rng(0x5EA9);
+    for i in KEYS / 2..KEYS {
+        let v: Vec<u8> = (0..WIDTH).map(|_| (rng.next() >> 24) as u8).collect();
+        let k = numbered_key(i);
+        db.append(&k, &v);
+        model.insert(k, vec![v]);
+    }
+    db.commit().unwrap();
+    db.flush().unwrap();
+    db.zpages_settle().unwrap();
+    let c = db.zpage_counts();
+    assert_eq!(
+        c.form_files, c.partitions,
+        "{what}: a form file each: {c:?}"
+    );
+    assert!(
+        c.stride_files > 0 && c.stride_files < c.form_files && c.stride_no_room > 0,
+        "{what}: a store in two forms: {c:?}"
+    );
+    let keys: Vec<Vec<u8>> = model.keys().cloned().collect();
+    check(&db, &model, &keys, what);
+    let c = db.zpage_counts();
+    assert!(
+        c.stride_reads > 0 && c.reads > c.stride_reads && c.fallbacks == 0,
+        "{what}: reads through both files: {c:?}"
+    );
+    db.close().unwrap();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// The room at a merge's output finish (`Options::zpages_stride_room`): the
 /// store past a budget its values alone fit with fifty kilobytes to spare,
 /// every key put again and the pieces merged. The finish's plan is made
@@ -19691,8 +18758,8 @@ fn partitions_keep_why_the_stride_form_does_not_hold_them(background: bool) {
 /// output is built in the block form at its finish with the refusal counted
 /// -- where the same store with the room not asked builds its outputs in
 /// the stride form
-/// (`a_merges_outputs_are_built_in_the_form_their_side_of_the_key_has`), and
-/// a rule that left the pieces out would.
+/// (`a_merges_outputs_are_built_in_the_stride_form_at_their_finish`), and a
+/// rule that left the pieces out would.
 #[cfg(target_os = "linux")]
 #[test]
 fn a_merges_outputs_are_built_in_the_block_form_where_the_room_is_short() {
@@ -20548,8 +19615,8 @@ fn the_controller_converts_a_partition_between_the_block_and_the_stride_forms() 
         // By a build, synced as the one that brought it in was.
         let c = db.zpage_counts();
         assert_eq!(
-            (c.build_starts, c.build_synced, c.recode_flips),
-            (asked + 1, 2, 0),
+            (c.build_starts, c.build_synced),
+            (asked + 1, 2),
             "{what}: the way back a build: {c:?}"
         );
         check(&r, &model, &keys, &format!("{what}: after"));
@@ -20591,7 +19658,6 @@ fn a_partition_built_in_the_stride_form_is_converted_out_and_in_again() {
     assert!(
         c.build_starts > c0.build_starts
             && c.build_synced > c0.build_synced
-            && c.recode_flips == 0
             && c.recode_failed == 0,
         "{what}: by a build, synced: {c:?}"
     );
@@ -20629,7 +19695,7 @@ fn a_partition_built_in_the_stride_form_is_converted_out_and_in_again() {
     );
     let c = db.zpage_counts();
     assert!(
-        c.build_starts > before.build_starts && c.recode_flips == 0 && strides(&db)[back],
+        c.build_starts > before.build_starts && strides(&db)[back],
         "{what}: by a build: {c:?} {:?}",
         strides(&db)
     );
@@ -22041,7 +21107,6 @@ fn the_words_kept_for_stride_files_are_held_to_the_live_partitions() {
 #[cfg(target_os = "linux")]
 #[test]
 fn a_stride_file_built_ahead_is_not_given_back_when_the_pick_moves() {
-    assert!(Options::default().zpages_coding_auto);
     let what = "a stride file built ahead, the pick the raw tails";
     let (dir, db, model, inject, raw) = land_store_loaded(
         "auto-land-stride-pick",
@@ -22114,86 +21179,6 @@ fn a_stride_file_built_ahead_is_not_given_back_when_the_pick_moves() {
     );
     db.close().unwrap();
     let _ = std::fs::remove_dir_all(&dir);
-}
-
-/// The re-code policies build the block body's other coding over a served
-/// file's name and read a stride file as the block coding: the stride form
-/// is refused at the open beside each of the three in the mode it starts
-/// such builds in -- `zpages_recode` under the forced form,
-/// `zpages_recode_auto` and `zpages_reparse` under the controller -- each set
-/// alone, and each opens without it. What starts none is not refused: each
-/// of the three in the other mode, and the two that only shape what those
-/// three do -- the file a re-code replaced kept, the spares. Beside the
-/// stride form those open, and under the forced form the store gives its
-/// partition a stride file and reads through it; the refusal by the options'
-/// names alone refused the first three of them.
-#[test]
-fn the_stride_form_is_refused_beside_the_recode_policies() {
-    type Set = fn(&mut Options);
-    let auto = |o: &mut Options| o.zpages = ZPages::Auto;
-    let always = |_: &mut Options| {};
-    let refused: [(&str, Set, Set); 3] = [
-        ("recode", always, |o| o.zpages_recode = true),
-        ("recode-auto", auto, |o| o.zpages_recode_auto = true),
-        ("reparse", auto, |o| o.zpages_reparse = true),
-    ];
-    for (name, mode, set) in refused {
-        let dir = scratch(&format!("stride-refused-{name}"));
-        let e = Db::create(
-            &dir,
-            stride_forced(|o| {
-                mode(o);
-                set(o);
-            }),
-        )
-        .err()
-        .unwrap_or_else(|| panic!("{name}: opened"));
-        assert!(e.to_string().contains("zpages_stride"), "{name}: {e}");
-        let _ = std::fs::remove_dir_all(&dir);
-        let block = |o: &mut Options| {
-            o.zpages_stride = ZStride::Off;
-            mode(o);
-            set(o);
-        };
-        let db = Db::create(&dir, forced(block)).unwrap_or_else(|e| panic!("{name}: {e}"));
-        db.close().unwrap();
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-    // In the mode that starts nothing of theirs: the controller's for the
-    // forced form's policy, and the forced form's for the controller's.
-    let dir = scratch("stride-alone-recode-auto-mode");
-    let db = Db::create(
-        &dir,
-        stride_forced(|o| {
-            auto(o);
-            o.zpages_recode = true;
-        }),
-    )
-    .unwrap_or_else(|e| panic!("recode under the controller: {e}"));
-    db.close().unwrap();
-    let _ = std::fs::remove_dir_all(&dir);
-    let alone: [(&str, Set); 4] = [
-        ("recode-auto", |o| o.zpages_recode_auto = true),
-        ("reparse", |o| o.zpages_reparse = true),
-        ("recode-keep", |o| o.zpages_recode_keep = true),
-        ("both", |o| o.zpages_both = true),
-    ];
-    for (name, set) in alone {
-        let dir = scratch(&format!("stride-alone-{name}"));
-        let mut db = Db::create(&dir, stride_forced(set)).unwrap_or_else(|e| panic!("{name}: {e}"));
-        let model = numbered_load(&mut db, 2000, 100, 0xA1);
-        db.zpages_settle().unwrap();
-        let c = db.zpage_counts();
-        assert_eq!((c.stride_files, c.partitions), (1, 1), "{name}: {c:?}");
-        let keys: Vec<Vec<u8>> = model.keys().cloned().collect();
-        check(&db, &model, &keys, name);
-        assert!(
-            db.zpage_counts().stride_reads > 0,
-            "{name}: through the file"
-        );
-        db.close().unwrap();
-        let _ = std::fs::remove_dir_all(&dir);
-    }
 }
 
 /// Bytes of a stride file, one at a time in a copy, its value pages, its

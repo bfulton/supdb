@@ -1664,7 +1664,7 @@ fn claim_across_rewrite(name: &str, part: usize, key: impl Fn(usize) -> Vec<u8>)
     let (_, _, copies, _) = db.block_cache_kinds();
     assert!(copies >= 1, "the block is a copy: {copies}");
     // A commit after the scan, which files its batch as the first commit
-    // after a scan does (`Options::upkeep_settle_after_scans`), so that the
+    // after a scan does, so that the
     // batch after it is left to the backlog bound.
     db.put(b"zz-elsewhere", b"elsewhere");
     want.insert(b"zz-elsewhere".to_vec(), vec![b"elsewhere".to_vec()]);
@@ -2117,8 +2117,27 @@ fn copies_of_records(
         inside.len()
     );
     let _ = scan_model(&db);
+    // Seven keys of eight written again, so every partition's block is
+    // dense with them and a copy at this settle, as `copies_of_fixed_records`
+    // writes them. With three of four a partition of twenty keys stood a
+    // light form wherever a form file served (`common::options` under the
+    // stride switch), converted to a copy by the upkeep whenever its pass
+    // came: after a merge's publish, the copy was built over the rewritten
+    // partition and claimed its key sequence where the test read a copy
+    // carried across.
+    let written = |i: usize| !i.is_multiple_of(8);
+    let fences = partition_fences(dir);
+    assert!(
+        fences.iter().all(|(lo, hi)| keys
+            .iter()
+            .enumerate()
+            .filter(|(i, k)| written(*i) && **k >= *lo && hi.as_ref().is_none_or(|h| **k < *h))
+            .count()
+            >= 16),
+        "every partition dense with the keys written again"
+    );
     for (i, k) in keys.iter().enumerate() {
-        if i % 4 != 0 {
+        if written(i) {
             db.put(k, b"updated");
             want.insert(k.clone(), vec![b"updated".to_vec()]);
         }
@@ -2128,8 +2147,10 @@ fn copies_of_records(
     assert_eq!(scan_model(&db), want);
     let (claimed, holds) = db.block_cache_identity();
     assert!(
-        claimed >= 4 && holds == claimed,
-        "copies of their partitions' records: {claimed} claimed, {holds} of their partitions"
+        claimed == fences.len() && holds == claimed,
+        "a copy of its partition's records in every partition: {claimed} claimed, {holds} of \
+         their partitions, {} partitions",
+        fences.len()
     );
     (db, keys, want, inside)
 }

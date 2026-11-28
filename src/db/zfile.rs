@@ -3535,13 +3535,13 @@ pub(super) struct ZFile {
     /// never sees a stride file, so it stays a plain field beside the body
     /// rather than a branch inside it.
     bind: u32,
-    /// The block coding's groups decoded by the engine's own decoder
-    /// (`Options::zpages_own_decoder`), set by the store after the attach
-    /// as `inplace` is; `lz4_flex`'s where not.
+    /// The block coding's groups decoded by the engine's own decoder, set
+    /// by the store after the attach as `inplace` is; `lz4_flex`'s where
+    /// not.
     pub(super) own_decoder: bool,
     /// The engine's own decoder runs its flat loop ahead of its fast one
-    /// (`Options::zpages_flat_decode`), set beside `own_decoder`; and runs
-    /// it to the group's end (`Options::zpages_flat_slack`).
+    /// (`zlz4::decompress_in_flat`), set beside `own_decoder`; and runs it
+    /// to the group's end (`zlz4::FLAT_SLACK`).
     pub(super) flat_decoder: bool,
     pub(super) flat_slack: bool,
     /// One bit per page: the first-decode checks passed in this process,
@@ -3582,8 +3582,8 @@ pub(super) struct ZFile {
     /// write on every decode from every reader thread.
     pub(super) decodes16: AtomicU64,
     /// The time those counted decodes took, nanoseconds, where this form
-    /// file times them (`ZFile::time_decodes`): the heat a re-code prices
-    /// (`Options::zpages_recode`), since a decode the predictor and the
+    /// file times them (`ZFile::time_decodes`): the heat the hot-raw policy
+    /// prices (`Options::zpages_hot_raw`), since a decode the predictor and the
     /// cache have warm costs a tenth of a cold one and the count reads them
     /// alike -- the first partition's decodes at five million keys were
     /// worth 0.13 µs each to a raw tail, the next three's 1.4.
@@ -3592,7 +3592,7 @@ pub(super) struct ZFile {
     /// record, a seek over the heads, a walk in place -- counted in
     /// sixteens per thread where the decodes are timed: a raw-tailed form
     /// file decodes nothing, so its heat is the groups it opens, priced at
-    /// what a decode costs (`Options::zpages_recode`).
+    /// what a decode costs (`Options::zpages_hot_raw`).
     pub(super) opens16: AtomicU64,
     /// The ranks a block form's group of this stride file's partition would
     /// hold, `ZGROUP_BYTES` of values, as a shift: the power of two at or
@@ -3620,7 +3620,7 @@ pub(super) struct ZFile {
     /// form's records passed every test that held the store to no touch.
     /// `Reader::raw_touches` sums it beside them.
     raw_reads: AtomicU64,
-    /// The counted decodes are timed (`Options::zpages_recode`).
+    /// The counted decodes are timed (`Options::z_times_decodes`).
     pub(super) time_decodes: bool,
     /// The sampled pages' groups are record-coded ([`ZCODING_RECORD`]):
     /// the coding this form file was built in, read from its own
@@ -5884,23 +5884,14 @@ impl ZFile {
 
     /// This form file's pages out of the cache: the mapping's entries
     /// dropped (`MADV_DONTNEED`), then the file's clean pages
-    /// (`POSIX_FADV_DONTNEED`), which a drop of a mapped page skips. For the
-    /// form file a re-code took out of service and kept
-    /// (`Options::zpages_recode_keep`): a reader still walking it faults the
-    /// page back, and the bytes are the same.
+    /// (`POSIX_FADV_DONTNEED`), which a drop of a mapped page skips. A
+    /// reader still walking it faults the page back, and the bytes are the
+    /// same.
     pub(super) fn drop_cache(&self) {
         self.map.advise_dontneed();
         if let Some(f) = &self.file {
             f.drop_all();
         }
-    }
-
-    /// The whole file asked for in the background, in the pieces the
-    /// kernel reads whole (`MmapBytes::advise_willneed`): the form file a
-    /// re-code put back in service, whose pages its drop took. The bytes
-    /// submitted.
-    pub(super) fn prefetch_all(&self) -> u64 {
-        self.map.advise_willneed(0, self.map.len() as usize) as u64
     }
 
     /// The decoded bytes of every group the file holds, as its trailer says;
@@ -6485,29 +6476,6 @@ impl ZCell {
         self.p.swap(Box::into_raw(Box::new(z)), Ordering::AcqRel)
     }
 
-    /// The cell's form file and `kept`'s exchanged, where `kept` holds one:
-    /// a reader finds the old or the new, never an empty cell, and one that
-    /// loaded the old keeps it, since `kept` holds it on and frees nothing.
-    /// A cell of kept form files is never read by a reader, and only the
-    /// segment work's thread changes one, so the two stores need not be
-    /// one. Whether there was one to exchange.
-    pub(super) fn flip(&self, kept: &ZCell) -> bool {
-        let k = kept.p.load(Ordering::Acquire);
-        if k.is_null() {
-            return false;
-        }
-        let old = self.p.swap(k, Ordering::AcqRel);
-        kept.p.store(old, Ordering::Release);
-        true
-    }
-
-    /// `p`, a form file taken out of another cell, kept in this one; what
-    /// this one held is handed back for the caller to retire through the
-    /// epoch, as `take`'s is.
-    pub(super) fn keep(&self, p: *mut ZFile) -> *mut ZFile {
-        self.p.swap(p, Ordering::AcqRel)
-    }
-
     /// `z` installed if the cell is empty; whether it was.
     pub(super) fn install(&self, z: ZFile) -> bool {
         let p = Box::into_raw(Box::new(z));
@@ -6562,17 +6530,10 @@ pub(super) struct ZEvents {
     pub build_retries: AtomicU64,
     pub rebuilds: AtomicU64,
     pub declined_damage: AtomicU64,
-    /// Partitions re-coded while served (`Options::zpages_recode`): to the
-    /// raw tails, back to the block coding, and re-codes that built nothing
-    /// to install -- failed, declined, cancelled or outrun.
-    pub recodes: AtomicU64,
-    pub recodes_back: AtomicU64,
+    /// Re-codes of a served partition into the other form
+    /// (`Options::zpages_stride_convert`) that built nothing to install --
+    /// failed, declined, cancelled or outrun.
     pub recode_failed: AtomicU64,
-    /// Block-coded partitions built again by the parsing encoder while
-    /// served (`Options::zpages_reparse`), and swapped in.
-    pub reparses: AtomicU64,
-    /// The re-code policy's looks, one a period it read the heat at.
-    pub recode_looks: AtomicU64,
     /// The hot-raw policy's (`Options::zpages_hot_raw`): partitions released
     /// to the raw form, partitions whose form file it attached again, and
     /// its looks, one a period it read the heat at.
@@ -6621,12 +6582,6 @@ pub(super) struct ZEvents {
     /// milliseconds the mapping took.
     pub raw_maps: AtomicU64,
     pub raw_map_ms: AtomicU64,
-    /// Re-codes made by exchanging the served form file with the kept one.
-    pub recode_flips: AtomicU64,
-    /// Spares built and kept (`Options::zpages_both`), and spares that kept
-    /// nothing.
-    pub spare_builds: AtomicU64,
-    pub spare_failed: AtomicU64,
     /// Builds started on the builder's thread, and builds its cancel flag
     /// stopped: a merge took the target as an input, or the store closed.
     pub build_starts: AtomicU64,
@@ -6834,7 +6789,7 @@ pub(super) struct ZEvents {
     pub model_records: AtomicU64,
     /// The store's files whole as the tick last summed them, bytes: every
     /// segment's hash region, record region and ordered index, the
-    /// level-0 pieces' with the partitions' (`Options::heads_owned_past_fill`).
+    /// level-0 pieces' with the partitions'.
     pub model_whole: AtomicU64,
     /// Form files the controller retired: taken out of their cells through
     /// the epoch and given dead names for the idle sweep.
@@ -7584,24 +7539,20 @@ pub(super) struct BuildPlan {
     pub group_bytes: usize,
     /// The coding of the groups that compress (`FillScratch::coding`):
     /// `ZCODING_BLOCK` as the options give it (`Options::z_coding`), and
-    /// `ZCODING_RECORD` under the arm `Options::zpages_record_coding` or
+    /// `ZCODING_RECORD` under `Options::zpages_raw_tails` or
     /// where the selector picks the raw-tail form under `ZPages::Auto`
     /// (`zselect::choose_coding`).
     pub coding: u8,
-    /// Every group stored verbatim, LZ4 never tried
-    /// (`Options::zpages_store_all`, `FillScratch::store_all`).
-    pub store_all: bool,
     /// Under the record coding, every tail stored raw
     /// (`Options::zpages_raw_tails`, `FillScratch::raw_tails`).
     pub raw_tails: bool,
     /// The block coding's groups written by the parsing encoder
-    /// (`Options::zpages_parse`, `FillScratch::parse`), its search
-    /// (`Options::zpages_parse_chains`, `FillScratch::parse_chains`).
+    /// (`FillScratch::parse`), its search (`FillScratch::parse_chains`):
+    /// the controller's builds, and not a merge's output finish.
     pub parse: bool,
     pub parse_chains: u32,
     /// The pages the build writes checked through the engine's own decoder
-    /// (`Options::zpages_own_decoder`, `FillScratch::own_decode`), the one
-    /// the store's readers take.
+    /// (`FillScratch::own_decode`), the one the store's readers take.
     pub own_decode: bool,
     /// A build on a thread of its own looks here once a page: set, the
     /// build stops, removes its temp file and answers `Outcome::Cancelled`.
@@ -7686,7 +7637,6 @@ impl BuildPlan {
             ahead: 0,
             group_bytes: ZGROUP_BYTES,
             coding: ZCODING_BLOCK,
-            store_all: false,
             raw_tails: false,
             parse: false,
             parse_chains: 0,
@@ -8520,7 +8470,6 @@ fn write_pages<I: Images, W: Walked>(
     let mut scratch = FillScratch::new();
     scratch.group_bytes = plan.group_bytes;
     scratch.coding = plan.coding;
-    scratch.store_all = plan.store_all;
     scratch.raw_tails = plan.raw_tails;
     scratch.parse = plan.parse;
     scratch.parse_chains = plan.parse_chains;
@@ -10131,9 +10080,9 @@ impl ZInject {
     }
 
     /// The decode of a page the sampler prices the compact form by, in
-    /// place of the one it times; and the decode the re-code policy prices
-    /// a form file's decodes at, in place of the time they took
-    /// (`Options::zpages_recode`).
+    /// place of the one it times; and the decode the policies that read the
+    /// heat price a form file's decodes at, in place of the time they took
+    /// (`Options::zpages_hot_raw`).
     pub fn set_decode_cost(&self, d: Duration) {
         let ns = u64::try_from(d.as_nanos()).unwrap_or(u64::MAX).max(1);
         self.decode_cost_ns.store(ns, Ordering::Release);
@@ -10258,14 +10207,13 @@ pub(super) const SAMPLE_CHAIN: usize = 3;
 /// the partition is declined (`Options::zpages_min_bytes`).
 /// The fill's shape a sample and a build take from the options: the
 /// decoded bytes a group is cut at, the coding of the groups that compress,
-/// whether every group is stored verbatim or every tail raw, and which
-/// encoder writes the block coding's groups (`Options::zpages_group_bytes`,
-/// `z_coding`, `zpages_store_all`, `zpages_raw_tails`, `zpages_parse`).
+/// whether every tail is stored raw, and which encoder writes the block
+/// coding's groups (`zpages::ZGROUP_BYTES`, `z_coding`, `zpages_raw_tails`,
+/// the parse at the controller's builds).
 #[derive(Clone, Copy, Debug)]
 pub(super) struct FillShape {
     pub group_bytes: usize,
     pub coding: u8,
-    pub store_all: bool,
     pub raw_tails: bool,
     pub parse: bool,
     pub parse_chains: u32,
@@ -10277,7 +10225,6 @@ impl Default for FillShape {
         FillShape {
             group_bytes: ZGROUP_BYTES,
             coding: ZCODING_BLOCK,
-            store_all: false,
             raw_tails: false,
             parse: false,
             parse_chains: 0,
@@ -10291,7 +10238,6 @@ impl FillShape {
     fn apply(&self, scratch: &mut FillScratch) {
         scratch.group_bytes = self.group_bytes;
         scratch.coding = self.coding;
-        scratch.store_all = self.store_all;
         scratch.raw_tails = self.raw_tails;
         scratch.parse = self.parse;
         scratch.parse_chains = self.parse_chains;

@@ -792,9 +792,6 @@ pub struct ZCounts {
     /// that seek them, and those submitted (`OrdIndex::willneed_heads`).
     pub head_asks: u64,
     pub head_submitted: u64,
-    /// Looks at whether a partition's heads are all resident, which stand
-    /// in for those asks while they say so (`Options::heads_look_ms`).
-    pub head_looks: u64,
     /// Block-boundary keys the block cache read off an ordered index's top
     /// level, in memory, where it read a record before
     /// (`Options::boundary_keys_from_top`).
@@ -1152,13 +1149,9 @@ pub struct ZCounts {
     pub stride_convert_held: u64,
     pub stride_convert_fill: u64,
     pub builds_raw_tails: u64,
-    /// Partitions re-coded while served (`Options::zpages_recode`): to the
-    /// raw tails, back to the block coding, and re-codes that installed
-    /// nothing.
-    pub recodes: u64,
-    pub recodes_back: u64,
+    /// Re-codes of a served partition into the other form
+    /// (`Options::zpages_stride_convert`) that installed nothing.
     pub recode_failed: u64,
-    pub recode_looks: u64,
     /// The hot-raw policy's (`Options::zpages_hot_raw`): partitions released
     /// to the raw form, form files attached again, its looks, and the
     /// partitions it holds raw now.
@@ -1210,20 +1203,6 @@ pub struct ZCounts {
     /// (`Options::zpages_rewarm_raw_maps`).
     pub raw_maps: u64,
     pub raw_map_ms: u64,
-    /// Block-coded partitions re-parsed while served
-    /// (`Options::zpages_reparse`).
-    pub reparses: u64,
-    /// Re-codes made by exchanging the served form file with the kept one
-    /// (`Options::zpages_recode_keep`), counted among `recodes` and
-    /// `recodes_back` by the coding they served; the kept form files now,
-    /// and their bytes on disk.
-    pub recode_flips: u64,
-    pub spare_files: u64,
-    pub spare_bytes: u64,
-    /// Form files built in the other coding to be kept beside the served
-    /// one (`Options::zpages_both`), and such builds that kept nothing.
-    pub spare_builds: u64,
-    pub spare_failed: u64,
     /// The partitions whose raw pages were dropped at their form file's
     /// install (`Options::zpages_drop_raw`).
     pub raw_dropped: u64,
@@ -1263,7 +1242,7 @@ pub struct ZCounts {
     pub model_hash_bytes: u64,
     pub model_record_bytes: u64,
     /// The store's files whole as the tick last summed them, the level-0
-    /// pieces' with the partitions' (`Options::heads_owned_past_fill`).
+    /// pieces' with the partitions'.
     pub model_whole_bytes: u64,
     /// Form files the controller retired.
     pub retired: u64,
@@ -1295,9 +1274,6 @@ pub struct ZCounts {
     /// thing, and one whose partitions could not be is another.
     pub partitions: u64,
     pub form_files: u64,
-    /// The form files whose block-coded groups decode through the engine's
-    /// own decoder (`Options::zpages_own_decoder`), counted as `form_files`.
-    pub own_decoder_files: u64,
     pub small_partitions: u64,
     pub damaged: u64,
     pub pages: u64,
@@ -1311,7 +1287,7 @@ pub struct ZCounts {
 /// One partition's form file as `Db::zpage_heat` reports it: the partition's
 /// lower fence and keys, the file's bytes, the groups decoded from it over
 /// its life, counted in sixteens (`zfile::ZFile::decodes16`), the time those
-/// decodes took where the form file times them (`Options::zpages_recode`),
+/// decodes took where the form file times them (`Options::z_times_decodes`),
 /// and whether it is the record coding's.
 #[doc(hidden)]
 #[derive(Clone, Debug)]
@@ -1391,43 +1367,16 @@ pub struct Options {
     /// Memtable bytes that trigger a seal at the next commit. Sealing is off
     /// the commit path in cost accounting but runs on the committing thread
     /// in milestone 1; the brief's "Segment size" question owns this number.
-    /// With `seal_grows` this is the floor: see there.
+    ///
+    /// It is the floor: the seal grows with the store, to the store's size
+    /// over `4 * l0_trigger`, so a merge takes in at least a quarter of
+    /// what it rewrites and level-0 stays a few pieces a range.
     pub seal_bytes: usize,
-    /// Let the seal grow with the store, so a merge takes in at least a
-    /// quarter of what it rewrites. A seal of a fixed size drops a slice
-    /// into every range, and the slice shrinks as ranges multiply: on a
-    /// store of thirty million keys a 32 MiB seal put 0.3 MB into each of
-    /// 104 ranges, `l0_trigger` of them made 1.2 MB, and merging them
-    /// rewrote a 64 MB partition -- fifty times the bytes -- while twenty
-    /// more seals landed on the ranges the job covered. Level-0 reached 24
-    /// pieces a range and every read checked 24 Blooms. With the seal at
-    /// a sixteenth of the partitions' bytes, level-0 stayed under three,
-    /// and D went from 35k to 533k ops/s, E from 14k to 334k. The divisor
-    /// is `4 * l0_trigger`: the bytes a merge rewrites over the bytes it
-    /// takes in, held to four. Off, the seal is `seal_bytes` and nothing
-    /// else, the shape the suite's arms were measured in before this.
-    pub seal_grows: bool,
-    /// EXPERIMENT: with `seal_grows`, the seal holds at `seal_bytes` while
-    /// the compact form's gate is away from the raw form -- the store out
-    /// of core -- and grows with the store only in core. Grown, the
-    /// memtable is the store's bytes over four times `l0_trigger`, 77 MB at
-    /// ten million keys, and under a bound it and the scan snapshot's copy
-    /// of it are anonymous memory beside the form files' page cache, where
-    /// LMDB holds 17 MB; the floor leaves the unsealed writes in pieces on
-    /// disk instead, at the price of more and smaller pieces for the scans
-    /// to fold and the merges to take. Refuted: paired undivided at ten
-    /// million keys under 1.25 GiB, two pairs, the floor held E's
-    /// anonymous memory at 230-249 MB against 381-404 and its major faults
-    /// to 0.6x, and read E at 0.70x, D and F at 0.78x and A, B and C at
-    /// 0.92-0.95x in both pairs, the pieces' folds and merges costing more
-    /// than the memory freed. Off: the seal grows whatever the gate.
-    /// `supdb-sealfloorooc` is the arm.
-    pub seal_floor_out_of_core: bool,
     /// EXPERIMENT: the share of the store's bytes the memtable may reach
     /// before a commit seals, as a cap on `seal_threshold` rather than a
     /// floor under it; zero is no cap.
     ///
-    /// `seal_bytes` and `seal_grows` are both floors, so on a store
+    /// `seal_bytes` and the grown seal are both floors, so on a store
     /// smaller than the floor the memtable can hold the whole of it and
     /// never seal: a hundred thousand keys are six megabytes against a
     /// 32 MiB seal, so the lag sweep's every point sits unsealed. That is
@@ -1450,14 +1399,6 @@ pub struct Options {
     /// one-sided on the ladder: ycsb-E is the only mix this engine loses
     /// to LMDB, at 0.74x-0.87x, and ycsb-F it wins by 2.84x-6.27x.
     pub seal_max_pct: usize,
-    /// Size the store for `seal_grows` and `seal_max_pct` by its
-    /// partitions' file bytes (`true`, the rule before) rather than by the
-    /// key and value bytes they hold (`false`). The file's length moves
-    /// with the record format -- compact records cut a tenth of it at the
-    /// suite's shape -- so under the file rule a denser format seals more
-    /// often, and pricing the format priced the cadence with it. Kept as
-    /// the comparison arm.
-    pub seal_on_file: bool,
     /// Ordered ingest goes straight into a segment. Keys arriving above the
     /// store's greatest, with values the record holds inline
     /// (`inline_bytes`), while the memtable is empty, fill an ordered
@@ -1571,66 +1512,6 @@ pub struct Options {
     /// worse. Zero; the arm is `supdb-mmapthr`.
     #[doc(hidden)]
     pub malloc_mmap_threshold: usize,
-    /// REFUTED: a merge drops its inputs' record pages from the page cache
-    /// as its second pass leaves them behind (`Blob::drop_records` and
-    /// `POSIX_FADV_DONTNEED`, every `merge_drop_chunk` bytes, a page short
-    /// of the record it stands on), on the reading that the inputs are read
-    /// once and retired at the landing, so the pages it has streamed stand
-    /// in the cache as the newest for nothing and push out what the scans
-    /// beside it are reading. The reading was wrong about who reads them:
-    /// a merge's inputs are the live pieces and the partition under
-    /// rewrite, which is what every scan beside it reads until the landing,
-    /// and the kernel's recency was keeping exactly those. Paired at ten
-    /// million keys under 1.25 GiB the drop read slower in every sweep: the
-    /// drained lag point 1.13-1.26 s against 0.88-1.05, the ten-percent
-    /// point 3.1 s against 2.2-2.4, the full rewrite 9.8-10.7 against
-    /// 9.3-9.9, with more read from the device at each. Off; the arm
-    /// `supdb-mergedropbehind` and `supdb-ingestmergedropbehind` drops.
-    pub merge_drop_behind: bool,
-    /// EXPERIMENT: a merge drops behind its second pass the record pages
-    /// of an input partition its form file serves (`merge_drop_behind` for
-    /// those inputs alone): the gate at the form and a form file in the
-    /// partition's cell when the merge starts. The drop of every input was
-    /// refuted because a merge's inputs are what the scans beside it read;
-    /// a partition its form serves is read through its form file by every
-    /// read path, and its raw records, dropped at the install
-    /// (`zpages_drop_raw`), come back for the merge and stand as the
-    /// cache's newest pages through the landing. At the pass after the lag
-    /// sweep's full rewrite at ten million keys under 1.25 GiB one sweep
-    /// had 118 MB of raw partition pages resident and 200 MB of its form
-    /// files out, and took 4,700 major faults; one with none took none.
-    /// Priced, the drop first cost the burst its merges: the landing's
-    /// same-blocks question read the old partition's records
-    /// (`same_blocks_from_index`), now out of the cache, half a second a
-    /// landing on the thread every landing goes through, and the pass met
-    /// 124 pieces where it met 26-31. With that answered from the indexes,
-    /// the burst landed its merges as without the drop, and the pass read
-    /// 314-665 ms in three reps against 400-428 without it, the faults
-    /// both ways. Off; `supdb-mergedropscovered` is the arm.
-    pub merge_drops_covered: bool,
-    /// The landing's question of a partition a merge rewrote over the same
-    /// fences -- does it cut the same blocks, so the writer's forms over
-    /// the old one carry (`Options::forms_rebase`) -- answered from the
-    /// two ordered indexes where their heads are whole keys, the block's
-    /// first ranks being the top level's, in memory (`Db::same_blocks`).
-    /// Asked of the records, it read the old partition's key at every
-    /// sixty-fourth rank, a page or two a block across its record region,
-    /// on the thread every landing goes through: out of core those are the
-    /// pages the merge has just read past, and with the merge dropping
-    /// them behind it (`merge_drops_covered`) every landing of the lag
-    /// sweep's full rewrite at ten million keys under 1.25 GiB read half a
-    /// partition back from the device a page at a time, half a second a
-    /// landing, while the next merge waited to be planned: 21 merges in
-    /// the burst where 72 ran without the drop, and 124 pieces left for
-    /// the pass (`docs/engine.md`). Keys a head cannot hold whole are
-    /// compared through the records still. Off asks the records always;
-    /// `supdb-sameblocksrecords` is the arm.
-    pub same_blocks_from_index: bool,
-    /// How far a merge's second pass runs past the pages it last dropped
-    /// before it drops again (`merge_drop_behind`): a drop is two
-    /// syscalls, and two megabytes is a few hundred records a page. A
-    /// test lowers it to reach a drop over a store of kilobytes.
-    pub merge_drop_chunk: u64,
     /// A merge asks the kernel for each input's key section this many
     /// bytes ahead of the walk that reads it, a window at a time (the next
     /// window asked as the walk comes within half a window of the asks'
@@ -1743,127 +1624,6 @@ pub struct Options {
     /// 1.1x and 0.97x on reads, so the fence stays and this is the arm.
     /// A kernel without `membarrier` has the fence whatever this says.
     pub asym_pins: bool,
-    /// EXPERIMENT: a point read takes a segment's extents by value from
-    /// `Blob::lookup_full`, the shape before `Blob::with_lookup` lent them
-    /// on the index's frame; kept to price it. `supdb-extsval`.
-    pub exts_by_value: bool,
-    /// A point read of a store whose sources hold the key in their common
-    /// shape reads them in one pass, newest first, on its own frame. Two
-    /// reads stand in for the general one. A store with no frozen table
-    /// and no level-0 piece, which is every store between a drain and the
-    /// next seal, is read as its partition and the live table alone
-    /// (`Reader::read_lone`): the key hashed once, the live table's chain
-    /// for it read once to its newest tombstone, the partition found by
-    /// its fence and the record read where no tombstone masks it. A store
-    /// with pieces or frozen tables is read the same way over each of them
-    /// (`Reader::read_layers`), a piece asked once for its record, which
-    /// is kept. The general read is written for a key in any number of
-    /// sources in any record shape: the newest tombstone found by a pass
-    /// of its own, what it probed carried in a structure, the pieces over
-    /// the range found by two searches, the frozen tables and the live one
-    /// each asked in turn, a chain's offsets in a vector; with one source
-    /// it still set each of those up, about three hundred instructions of
-    /// a get's 747 over a store just loaded once the record was read in
-    /// place, by callgrind at a hundred thousand keys
-    /// (`bench/examples/point_ops.rs`). The same values in the same order:
-    /// the newest tombstone the pass finds is the newest of the read's
-    /// sources, and with none the partition's values come first. A
-    /// partition a form file may serve, a run of ordered ingest in
-    /// progress, a store with no partition yet, a chain of more live
-    /// values than the read's frame holds, a range under more pieces than
-    /// it holds, a record of another shape in a piece and a store under
-    /// any option that reads a partition another way (`point_via_ord`,
-    /// `exts_by_value`) take the general read; `Reader::point_lean_reads`
-    /// counts the reads that did not. Off: `supdb-pointsources`, and
-    /// `supdb-ingestpointsources` buffered.
-    pub point_lone: bool,
-    /// The layered read asks its sources in the order of what each costs,
-    /// sets up for none it does not reach, and asks for the partition's
-    /// first line before it reads anything (`Reader::read_placed`). A
-    /// store a write mix has sealed once is a partition, a piece and a
-    /// live table for as long as the piece waits for its merge, with a
-    /// frozen table beside them for the milliseconds of each seal, and
-    /// `read_layers` over it executes 1,052 instructions a get where the
-    /// read of a store just loaded executes 497 and FASTER's whole get
-    /// 417, by callgrind at a hundred thousand keys with the seal landed
-    /// (`bench/examples/point_ops.rs` under `POINT_OPS_LAND=1`, the
-    /// `reads_dirty` phase, `supdb-ingestlayersasone`; this read 838),
-    /// and no line of it over three in a hundred:
-    /// the partitions counted and the key's found by two searches of the
-    /// segments, the pieces over it by two more, a frame of eight hundred
-    /// bytes cleared for three frozen tables and eight pieces where one
-    /// piece stood, each chunk of a table's chain reached by three
-    /// lookups of its block, and all of it ahead of the one probe that
-    /// answers three reads in ten, the live table's, whose tombstone
-    /// masks everything older.
-    ///
-    /// Here the partitions' count and each one's run of pieces are the
-    /// state's, taken at its publish (`State::placing`), and a store of
-    /// one partition is not searched; the live table is asked first, and
-    /// a tombstone there ends the read with the table's own values; the
-    /// frozen tables are asked after it, newest first, the same way; a
-    /// chunk's header is one lookup and its value another
-    /// (`MemTable::live_small_hashed`); and the pieces' records and the
-    /// tables' values are kept in the order found, on a frame nothing
-    /// clears. The same values in the same order as `read_layers` hands
-    /// over, from the same sources.
-    ///
-    /// And the partition's first hash slot is asked for as soon as the
-    /// key is hashed, ahead of the tables' probes and the pieces' filters.
-    /// A get over keys the cache does not
-    /// hold waits on two lines of the partition, the slot and then the
-    /// record, and what a loop of gets costs is how far those waits
-    /// overlap from one get to the next: sampled by phase
-    /// (`perf record --call-graph dwarf` over the same probe), the load
-    /// of a partition's record took half again the samples a read in the
-    /// layered read that it takes in the read of a store just loaded,
-    /// behind a longer path and the live table's probe, whose branch no
-    /// predictor learns. The ask starts the first wait before either.
-    ///
-    /// A frozen table that was a run of ordered ingest is `read_layers`'
-    /// still, with everything it leaves to the general read.
-    /// `Reader::point_placed_reads` counts the reads this one answered.
-    /// Needs `point_lone`. Off: `supdb-layersasone`, and
-    /// `supdb-ingestlayersasone` buffered.
-    pub point_layers_lean: bool,
-    /// The placed read (`point_layers_lean`) takes a range under any
-    /// number of pieces, and leaves to the general read only a key with
-    /// more records than its frame keeps (`LAYERS_PIECES`) above the newest
-    /// tombstone, where it had left every range under more than that many
-    /// pieces. A put's tombstone ends the walk at the newest piece that
-    /// holds the key, so under puts a read keeps one or two. It asks for
-    /// the newest pieces' filters, at most `PLACED_ASKS` of them, as it did
-    /// for all of them. Beside a writer that appends faster than its merges
-    /// fold -- a live handle beside the overwriting arm's writer, the
-    /// threaded writers' mixes -- ten to thirty pieces stood over a
-    /// partition and every read took the general path. Off: the bound by
-    /// the pieces, `supdb-heldinplacepieces`.
-    pub point_placed_runs: bool,
-    /// A point read finds the key's partition by the partitions' upper
-    /// fences held as words (`State::fence_words`): each fence's bytes
-    /// big-endian in a `u128`, zero-padded, beside its length, and the
-    /// key's first sixteen bytes the same way, so that a step of the
-    /// search is two integer compares where it was a call to `memcmp`
-    /// through each partition's `Seg`. A fence of a word or less, which is
-    /// every fence a store names (`FENCE_MAX`), orders against a key as
-    /// its word and length do, the length breaking a tie of the words: a
-    /// tie says the fence is a prefix of the key's first sixteen bytes
-    /// padded with zeros, so the shorter of the two sorts first. A state
-    /// with a fence longer than a word searches the fences' bytes. The
-    /// placed partition's own fences are not compared again by the read:
-    /// the partitions tile the key space, so the one placed holds the key
-    /// in its range. Off: the search compares the fences' bytes.
-    pub point_fence_words: bool,
-    /// A point read that the shared table's lean probe found absent from
-    /// the live table (`Options::shared_lean`) takes the read of a store
-    /// that is a partition and the live table alone (`Reader::read_lone`)
-    /// where the store has no piece and no frozen table, with the table
-    /// left unread: that read refused any table that rewrites in place,
-    /// since such a table is read through a copy, and a key the probe has
-    /// found no record of has nothing in the table to copy. Off: such a
-    /// read takes the placed read (`Reader::read_placed`), which sets up
-    /// for frozen tables and pieces the store does not have.
-    pub point_lone_absent: bool,
     /// EXPERIMENT: a point read of a partition whose ordered index holds
     /// whole keys (`OrdIndex::uniform`: every key one length, no longer
     /// than the common prefix and eight bytes) finds its rank through the
@@ -1956,14 +1716,6 @@ pub struct Options {
     /// (`Options::manifest_pending`).
     #[doc(hidden)]
     pub fail_open_pending_sync: bool,
-    /// A test's: a settle of the form, once its segment work has answered,
-    /// holds the builds after it before their renames and returns only
-    /// once the next has parked there (`Db::hold_zpage_after_settle`), so a
-    /// test can stand a build in flight at the instant a settle ends; and no
-    /// spare (`zpages_both`) starts before the first such settle has
-    /// answered, so the build that parks is a spare started as it ended.
-    #[doc(hidden)]
-    pub zpages_hold_after_settle: bool,
     /// Under `ZPages::Always`, a partition's form file is built as soon as
     /// the partition lands, on the builder's thread at idle priority,
     /// rather than at the next settle of the form, which then waits for
@@ -2380,8 +2132,7 @@ pub struct Options {
     /// half way at the mean and was decoded to its end, by a decoder that
     /// is sequential and whose cost is its tokens. For a page already
     /// verified, as the point read's partial decode is
-    /// (`zpages_point_part`), for the engine's own decoder
-    /// (`zpages_own_decoder`), and for a cursor that holds its page's view
+    /// (`zpages_point_part`), for the engine's own decoder, and for a cursor that holds its page's view
     /// across the page's groups (`zpages_cursor_view`).
     /// `supdb-zwalkwhole` decodes every group a walk opens whole.
     pub zpages_walk_part: bool,
@@ -2987,60 +2738,9 @@ pub struct Options {
     /// `supdb-zblock` is the three off together.
     #[doc(hidden)]
     pub zpages_ask_dropped: bool,
-    /// The decoded bytes a form file's page is cut into groups at, each
-    /// compressed on its own, so that a point read decodes the group its
-    /// record is in and not the page (`zpages::ZGROUP_BYTES`, two
-    /// kibibytes: four groups a page at the suite's shape, 6% of the
-    /// form's bytes for a point read's decode a quarter of the page's;
-    /// `bench/examples/zdecode.rs` priced the cut). Zero is the page as one
-    /// group, the shape before the cut; `supdb-cache64tofitautozpagesonegroup`
-    /// is that arm, and `...group1k` cuts at a kibibyte, 12% of the bytes
-    /// for a decode a seventh.
-    #[doc(hidden)]
-    pub zpages_group_bytes: usize,
-    /// Whether a form file's groups hold their records one by one, each
-    /// decodable alone (`zpages::ZCODING_RECORD`: an offset table, each
-    /// record's head front-coded against the group's first and its tail
-    /// LZ4-compressed against the first record's, which is stored raw), so
-    /// that a point read decodes one record where the block coding
-    /// (`zpages::ZCODING_BLOCK`, one LZ4 block a group) decodes a group of
-    /// about fourteen. Off: the record coding is an arm
-    /// (`supdb-cache64tofitautozpagesrecord`, `supdb-nocachezpagesrecord`),
-    /// since paired at five million keys under 640 MiB it reads the point-read
-    /// mixes a quarter to a third faster and E's scans a fifth slower -- a
-    /// group decoded whole through its records, which a scan's memo miss
-    /// does, costs 2.2x the block decode's instructions -- and E is the cell
-    /// the compact form has left to win (`bench/scripts/pair.sh
-    /// supdb-cache64tofitautozpages supdb-cache64tofitautozpagesrecord 5000000
-    /// --reps 5 --bound 671088640 --passes
-    /// read,read-threaded,scan,scan-threaded,mixes --ops-div 10` at `589e7df`).
-    /// Priced again on the default as the gear's compressed pick
-    /// (`supdb-zrecord`) at ten million keys under 1.25 GiB it lost the point
-    /// reads too: C 0.70x, the read pass 0.83x, E 0.75x and the scan pass
-    /// 0.49x of the default, since the block coding's point read has gained
-    /// the partial decode, the memo's admission and the key table and the
-    /// record coding's has none of them, and still decodes its tails with
-    /// `lz4_flex` and seeks its heads one by one (`bench ab --arms
-    /// supdb,supdb-zrecord --size 10000000 --bound 1342177280 --passes
-    /// load,read,read-threaded,scan,scan-threaded,mixes,scan-mixed,mixes-scrambled
-    /// --ops-div 10 --reps 2` at `3ef8f79`).
-    #[doc(hidden)]
-    pub zpages_record_coding: bool,
-    /// EXPERIMENT: the form file's groups stored verbatim, every one, LZ4
-    /// never tried -- the lightest coding, whose decode is the payload
-    /// itself (`zpages::GroupEntry::stored`, which the fill gave a group that
-    /// LZ4 did not shrink) and whose form is the records' own bytes, about
-    /// 120 a record at the suite's shape against 68 under LZ4. Built for the
-    /// E mix at five million keys under 640 MiB, where the LZ4 form's decode
-    /// is three quarters of E's loss to LMDB and the stored form would hold
-    /// about 600 MB beside the process's 77: the gear is the lightest coding
-    /// that fits the bound. Off; `supdb-nocachezpagesstored` is the forced
-    /// arm and `supdb-cache64tofitzpagesstored` the forced form with the
-    /// block cache, against `supdb-cache64tofitzpages`.
-    #[doc(hidden)]
-    pub zpages_store_all: bool,
-    /// EXPERIMENT: under the record coding (`zpages_record_coding`), every
-    /// record's tail stored raw and LZ4 never tried on one: the heads
+    /// EXPERIMENT: the form file's groups in the record coding
+    /// (`zpages::ZCODING_RECORD`), every record's tail stored raw and LZ4
+    /// never tried on one: the heads
     /// front-coded against the group's first record as that coding has
     /// them, the values the records' own bytes, so a decode is a copy a
     /// record and a point read copies one. About 108 bytes a record at the
@@ -3053,158 +2753,6 @@ pub struct Options {
     /// cache, against `supdb-cache64tofitzpages`.
     #[doc(hidden)]
     pub zpages_raw_tails: bool,
-    /// The block coding's groups written by the engine's parsing encoder
-    /// (`db::zlz4`, its search `zpages_parse_chains`) and not `lz4_flex`'s
-    /// greedy one: the same block format, which any LZ4
-    /// decoder reads, in fewer and longer sequences -- a hash-chain search
-    /// for the longest match at each position and a shortest path over
-    /// the group priced in the bytes it writes. On the form's own groups it
-    /// writes 0.96 of the greedy encoder's bytes in 0.84 of its sequences,
-    /// as liblz4's high-compression mode does, and the cold decode is a
-    /// sixth faster for the fewer tokens, at about seven times the
-    /// encoder's CPU, which is the builder's (`bench/examples/zdecode.rs`,
-    /// `--rhc`). Off: under `Auto` the builds ahead carry the build beside
-    /// the load, and at twice their CPU they fall behind it, so the install
-    /// comes later (`supdb-zparse`, `docs/engine.md`). Priced again with the
-    /// bound on each pass alone, at ten million keys under 1.25 GiB in the
-    /// row's order, the install came within a tenth of a second of the
-    /// default's in all four loads and the scans read 1.09-1.14x on two
-    /// and three threads in both orders, the rest by position; on the lag
-    /// sweep the pass after the full rewrite read 0.68x and 0.91x, since a
-    /// merge's form file is built at its finish and the chain draining the
-    /// rewrite ran at the encoder's price (`pair.sh supdb supdb-zparse
-    /// 10000000 --bound 1342177280 --passes
-    /// load,read,read-threaded,scan,scan-threaded,mixes,scan-mixed,mixes-scrambled
-    /// --ops-div 10 --reps 2`, and `--passes load,lag`, at `c9599c2`). The
-    /// encoder's price is its search and not its inserts:
-    /// `zlz4::Effort::sparse` took 8.7 µs a group to 6.3 against the greedy
-    /// encoder's 2. The record coding's tails keep `lz4_flex`. On, at the
-    /// controller's builds alone and over four chain positions
-    /// (`zpages_parse_finish` off, `zpages_parse_chains` at four), which is
-    /// the search the builds can afford beside the load; `supdb-zgreedy` is
-    /// the greedy encoder everywhere, the shape before.
-    #[doc(hidden)]
-    pub zpages_parse: bool,
-    /// Under `zpages_parse`, the form files a merge's outputs are given at
-    /// their finish (`zpages_build_at_finish`) written by the parsing
-    /// encoder as well. Off, those builds keep the greedy encoder
-    /// and the parse is the controller's builds' alone -- the builds ahead
-    /// and the bought builds, which carry the load's partitions -- since
-    /// the finish's builds are on the merge chain's path, and the chain
-    /// draining a full rewrite under a bound is what paid the parse's
-    /// encoder in the lag sweep (`zpages_parse`). On, the parse as it was
-    /// priced; `supdb-zparse` sets it, `supdb-zparsestart` does not. Paired
-    /// at ten million keys under 1.25 GiB, `supdb-zparsestart` against
-    /// `supdb` in both orders read the scan passes 1.12-1.16x, the threaded
-    /// scans beside the mixes 1.09-1.18x and C 1.07-1.09x, and the lag
-    /// sweep's weighted passes no worse (0.93 and 0.78 of the time); and the
-    /// single-threaded read pass 0.89-0.94x with four times the major
-    /// faults, since at the encoder's price the builds ahead trail the load
-    /// and the install comes after the read pass has begun (`pair.sh supdb
-    /// supdb-zparsestart 10000000 --bound 1342177280 --passes
-    /// load,read,read-threaded,scan,scan-threaded,mixes,scan-mixed,mixes-scrambled
-    /// --ops-div 10 --reps 2`, and `--passes load,lag`).
-    #[doc(hidden)]
-    pub zpages_parse_finish: bool,
-    /// Under `zpages_parse`, the parse's search: zero the lazy parse over
-    /// sixteen positions of each chain (`zlz4::Effort::SHIPPED`), else a
-    /// greedy parse over that many (`zlz4::Effort::of_chains`). The parse
-    /// buys its decode in fewer sequences and pays in the builder's CPU,
-    /// which is what put the install behind the load: the greedy parse over
-    /// four positions writes 0.91 of the greedy encoder's sequences in 2.2
-    /// times its encode, where the lazy one writes 0.84 in 4.2
-    /// (`bench/examples/zdecode.rs --rhc N:0:8:1:0:1`), and the form's
-    /// pages at 0.973 and 0.957 of the greedy encoder's
-    /// (`bench/examples/zsize.rs --parse N`). Paired at ten million keys
-    /// with four reps a sitting in both orders, four positions against the
-    /// greedy encoder read the three-thread scans 1.03-1.04x under 1.25 GiB
-    /// in all eight pairs and 1.07-1.08x under 1 GiB, the two-thread scans
-    /// 1.05-1.15x, the threaded scans beside the mixes 1.02-1.07x and the
-    /// scrambled E 1.02-1.05x, the single-threaded reads level, and the
-    /// ordered load under 1 GiB 0.96-0.98x in seven pairs of eight, the
-    /// builder's CPU (1.19x) beside it; the lazy parse at the same builds
-    /// read the single-threaded reads 0.78-0.84x with two to five times the
-    /// faults and the load 0.92-0.93x, the install behind the load
-    /// (`pair.sh supdb supdb-zparsestart 10000000 --bound 1342177280
-    /// --passes load,read,read-threaded,scan,scan-threaded,mixes,scan-mixed,mixes-scrambled
-    /// --ops-div 10 --reps 4`). Four; `supdb-zparsestart` is the lazy
-    /// parse at the same builds.
-    #[doc(hidden)]
-    pub zpages_parse_chains: u32,
-    /// The form's block-coded groups decoded by the engine's own LZ4 decoder
-    /// (`db::zlz4::decompress_in`) and not `lz4_flex`'s: the same bytes for
-    /// every block, by liblz4's fast loop in Rust -- a run of fewer than
-    /// fifteen literals one sixteen-byte move, a short match moves of
-    /// eight, eight and two, the long ones moves of sixteen, a group with
-    /// the rest of its page after it read with no input bound but its
-    /// block's -- into a buffer with the slack the loop runs to the group's
-    /// end in, and held to every damaged block of its tests under Miri as
-    /// well as against `lz4_flex`. It decodes a form group in a fifth fewer
-    /// instructions than `lz4_flex` and a little fewer than liblz4, and
-    /// cold in about six sevenths of `lz4_flex`'s time
-    /// (`bench/examples/zdecode.rs`). A form file takes it at its attach
-    /// (`ZFile::own_decoder`) and a build checks its pages through it, so
-    /// each store decodes by its own options. On;
-    /// `supdb-cache64tofitautozpagesflexdec` and
-    /// `supdb-cache64tofitzpagesdropflexdec` are the arms with it off.
-    #[doc(hidden)]
-    pub zpages_own_decoder: bool,
-    /// The engine's own decoder (`zpages_own_decoder`) runs
-    /// its flat loop ahead of its fast one wherever a group is followed by
-    /// the rest of its page (`zlz4::decompress_in_flat`): a sequence a turn
-    /// with no branch on its lengths -- the one length byte a run or a
-    /// match of fifteen or more carries read whether or not the token asks
-    /// for it and taken by a select, the run one move of sixty-four and
-    /// the match two of thirty-two -- and a sequence outside that shape
-    /// one turn of the fast loop. The fast loop's tests of a run under
-    /// fifteen, a match under nineteen and one over thirty-two are a coin
-    /// a sequence on the form's records, and a group the predictor has not
-    /// seen pays a miss for most of them: on the form's own groups the
-    /// flat loop decodes a cold group in 0.72-0.78 of the fast loop's time
-    /// and a hot one in 1.15-1.35 of it, since its turn's chain is longer
-    /// than a predicted turn's (`bench/examples/zdecode.rs`, the `flat
-    /// loop` and `warm input` lines). A group decoded in the engine is one
-    /// the memo did not hold, cold for the predictor. The same bytes and
-    /// the same refusals as the fast loop for every input. Paired at ten
-    /// million keys under 1.25 GiB in both orders, the same decodes in both
-    /// arms, the scan passes read 1.17-1.29x, the threaded scans beside the
-    /// mixes 1.16-1.25x, C 1.08-1.20x, the scrambled E 1.11-1.12x, and every
-    /// lag pass 1.02-1.42x, with the load level (`pair.sh supdb supdb-zflat
-    /// 10000000 --bound 1342177280 --passes
-    /// load,read,read-threaded,scan,scan-threaded,mixes,scan-mixed,mixes-scrambled
-    /// --ops-div 10 --reps 2`, and `--passes load,lag`, at `186e0ef`). On;
-    /// `supdb-znoflat` is the fast loop alone.
-    #[doc(hidden)]
-    pub zpages_flat_decode: bool,
-    /// Under `zpages_flat_decode`, a group decoded into its buffer with the
-    /// room the flat loop runs to the group's end in (`zlz4::FLAT_SLACK`,
-    /// `Dec::FlatEnd`). The buffer is a whole page and a group a few
-    /// kibibytes, so the room was there and only the slack the decoder was
-    /// lent stopped the flat loop a turn short of the end, the last
-    /// sequences of every group going the fast loop's branchy way: a
-    /// seventh of the decoder's time in a profile of the threaded scans at
-    /// ten million keys under 1.25 GiB. The same bytes and the same
-    /// refusals. `supdb-zflatshort` lends the fast loop's slack alone, the
-    /// shape before.
-    #[doc(hidden)]
-    pub zpages_flat_slack: bool,
-    /// EXPERIMENT: the first this many partitions by key order are built
-    /// in the record coding with raw tails, and the rest as the options say
-    /// (`zpages_raw_tails` off). The upper bound of a coding chosen per
-    /// partition by its heat: under the suite's unscrambled Zipfian half of
-    /// the E mix's decodes at five million keys fall in the first of
-    /// nineteen partitions and three quarters in the first four, so raw
-    /// tails there cost tens of megabytes over the block form where the
-    /// whole raw-tail form overran the budget by about its seventh. Key
-    /// order stands in for a heat no build can know before the reads; the
-    /// shipping choice would be the measured one. With four, the Zipfian
-    /// mixes read 12-21% faster, D level, and the uniform read pass a fifth
-    /// slower on the faults of 44 MB past the fit; with one, the point-read
-    /// mixes 10-15% faster, the read pass level, and E level, since the
-    /// first partition's decodes run warm and a raw tail saves the cold
-    /// ones. Zero, off.
-    #[doc(hidden)]
-    pub zpages_raw_tails_first: usize,
     /// Once a form file serves a partition, the partition's raw
     /// file and its ordered index are dropped from the page cache: the
     /// store's own mappings of them unmapped (`MADV_DONTNEED`), since a cache
@@ -3239,84 +2787,6 @@ pub struct Options {
     /// beside the form it returned to.
     #[doc(hidden)]
     pub zpages_drop_at_install: bool,
-    /// EXPERIMENT: under the forced form (`ZPages::Always`), a partition's
-    /// form file is built again in the other coding while it serves, by
-    /// what its decodes cost: once a second the segment work reads each
-    /// form file's decode time (one decode in sixteen timed,
-    /// `ZFile::decode_ns16`) and a raw-tailed one's group opens priced at a
-    /// decode (`ZFile::opens16`), into a heat decayed over ten seconds; it
-    /// re-codes the hottest block-coded partition to the raw-tail record
-    /// coding, where its decodes would be in-place walks, while the form
-    /// files' bytes with the raw tails' extra stay within the budget the
-    /// platform gives (`zfile::read_budget`), and where they would not,
-    /// gives the coldest raw-tailed one back to make the room if the hot
-    /// one is twice as hot; and when the group's file refaults pass a
-    /// floor, the coldest raw-tailed partition goes back to the block
-    /// coding and the form files' bytes are held where that leaves them for
-    /// a while. The new form file is built beside the old under the same
-    /// name and swapped into the cell, the old retired under the epoch.
-    /// The budget counts the form files alone, so it is the shape for a
-    /// store whose raw pages go (`zpages_drop_raw`). Off.
-    #[doc(hidden)]
-    pub zpages_recode: bool,
-    /// EXPERIMENT: with `zpages_recode`, a partition keeps the form file a
-    /// re-code replaced, attached and unserved beside the one it serves, so
-    /// that every re-code of the partition after its first is the two
-    /// exchanged in the cell -- no build, no bytes written, no device flush
-    /// for the durable commits beside it -- with the incoming file's pages
-    /// asked for and the outgoing one's dropped from the cache. The kept
-    /// file has no name once the build's rename replaced it, and goes with
-    /// the segment; a reopen serves whichever coding holds the name. Off.
-    #[doc(hidden)]
-    pub zpages_recode_keep: bool,
-    /// EXPERIMENT: with `zpages_recode` and `zpages_recode_keep`, every
-    /// served partition gets its form file in the other coding too, built
-    /// on the builder's thread at idle priority once the served ones are in,
-    /// the hottest partition first, and kept attached and unserved with its
-    /// pages dropped: the store holds both codings of every partition from
-    /// write time, and the policy never builds while it serves. It chooses
-    /// the raw-tailed set whole once a period -- the hottest partitions
-    /// whose raw tails fit the budget, a served raw-tailed partition's heat
-    /// counted `RECODE_SWAP` times so that it does not flip on noise -- and
-    /// exchanges each partition whose coding differs, at most
-    /// `RECODE_FLIP_BYTES` of incoming pages a look, a look every
-    /// `RECODE_PERIOD_BOTH` whether or not a build is in flight, since a flip
-    /// costs a prefetch and not a build; and a partition's heat rises to the
-    /// rate it shows at once and fades over `RECODE_TAU`. Off.
-    #[doc(hidden)]
-    pub zpages_both: bool,
-    /// Under `ZPages::Auto`, the coding the form files are built in is the
-    /// selector's to choose (`zselect::choose_coding`): the sampler sizes
-    /// the record coding with raw tails beside the block coding, and the raw
-    /// tails are built where the model predicts that form faults nothing
-    /// against `zselect::FORM_FILL` of the budget, the rest left to the page
-    /// cache's other tenants and to the budget's fall through a mix, the
-    /// block coding otherwise -- the gear is the coding that fits with the
-    /// fewest decodes. Where both fit the raw-tail
-    /// form reads every mix at or above the block form's, the point reads
-    /// 1.25-1.95x, and where it does not fit it faults, 1.4-1.5x slower in D
-    /// and E (`docs/engine.md`). A pick holds for the builds after it; the
-    /// files already built keep their coding, each file naming its own. On;
-    /// `supdb-cache64tofitautozpagescodingfixed` is the shape before, the
-    /// options' coding. The pick that is not the raw tails is the options'
-    /// compressed coding: the block coding, or the record coding with its
-    /// tails compressed where `zpages_record_coding` is on (`supdb-zrecord`).
-    /// Nothing under `Always`, whose coding is `zpages_record_coding` and
-    /// `zpages_raw_tails`.
-    #[doc(hidden)]
-    pub zpages_coding_auto: bool,
-    /// A raw-tail coded group (`zpages_record_coding` with
-    /// `zpages_raw_tails`, or the selector's pick under
-    /// `zpages_coding_auto`) read where it lies by the block cache's cursor:
-    /// each record's key assembled from the group's first head and its
-    /// suffix, its values parsed from the raw tail in the page
-    /// (`flatindex::parse_record_tail`), nothing decoded and nothing put in
-    /// the memo. Off, the group is decoded whole into the cursor's buffer,
-    /// a parse and a copy a record, which read the scan pass at 0.70x of
-    /// the block coding's where both forms fit. On; `supdb-cache64tofitzpagesrecordrawdecode`
-    /// is the shape before. Nothing changes for the block coding, whose
-    /// groups are LZ4 blocks.
-    pub zpages_inplace_walk: bool,
     /// Whether the controller buys its first form at SUSPECT on the model's
     /// prediction, once the sampler has priced it and the partitions have
     /// stood for `zselect::EAGER_SETTLE` with nothing of the segment work in
@@ -3425,11 +2895,6 @@ pub struct Options {
     /// either, since the idle seals put partitions under a load nobody
     /// reads.
     pub seal_idle: bool,
-    /// How a flush drains level 0 once partitions exist: merge only the
-    /// ranges that hold pieces, under the live fences (`true`), or
-    /// re-partition everything from every key (`false`, the original), kept
-    /// as the comparison arm.
-    pub flush_ranges: bool,
     /// Runs of values up to this many bytes are stored inline in the index
     /// record rather than in a block, so a point read of such a key touches
     /// the hash slot and the record and nothing else. Zero disables.
@@ -3875,29 +3340,6 @@ pub struct Options {
     /// copy at the commit instead, on a thread of the store's own, and
     /// is the write-time structure this is the read half of.
     pub snapshot_runs: bool,
-    /// The seal thread publishes the frozen table's scan snapshot, with
-    /// every key's chain copied beside it in key order, into the state
-    /// the freeze made, as soon as it has sorted the table: a store whose
-    /// only content is the table being sealed is read on the merge path
-    /// for the seal's whole run, and without this the first handle to
-    /// scan sorted the same table again and every scan after chased each
-    /// key's entry, chain and value through the memtable. It is
-    /// published as the base of a snapshot of no live entry, a handle's
-    /// extension carries it as its base, and a handle whose base is an
-    /// order without the chains takes the copy as its base at its next
-    /// scan. The copy is set on the table as well (`FrozenSnaps`), where
-    /// a state published later finds it, and is built from the order a
-    /// freeze, a scan or the keeper set there first rather than from a
-    /// sort of its own. The copy is about the table's key and value
-    /// bytes, held until the seal lands. Off is the shape before it, kept
-    /// to price it.
-    pub seal_snapshot: bool,
-    /// The seal writes its records from that snapshot's arena -- the keys
-    /// and the copied chains in key order, one sequential read -- instead
-    /// of walking each entry's chain through the memtable, three dependent
-    /// misses a key. Nothing without `seal_snapshot`. Off is the walk,
-    /// kept to price it.
-    pub seal_from_snapshot: bool,
     /// EXPERIMENT: the run keeper, a thread of the store's own at idle
     /// priority that keeps the published scan snapshot current to the
     /// commits. Polling them once a scan has happened over the store,
@@ -4285,25 +3727,12 @@ pub struct Options {
     /// a page-copying one and the pass starts clean; what it gives up is
     /// the share the thread filed beside the burst, which a durable
     /// commit keeps because its thread works through the fsync. Off,
-    /// every commit lends: `supdb-ingestlendbursts` is that arm, and
-    /// `supdb-lendbursts` the durable store, whose commits lend either
-    /// way (`docs/engine.md`). With `upkeep_pace_pct`, only the first
+    /// every commit lends, a seam the tests hold that shape with
+    /// (`docs/engine.md`). With `upkeep_pace_pct`, only the first
     /// such batch after a scan is filed in the commit and the rest, up to
     /// a share of the store, are lent a batch behind the thread.
+    #[doc(hidden)]
     pub upkeep_inline_bursts: bool,
-    /// The smallest batch `upkeep_inline_bursts` files in the commit;
-    /// below it the batch is lent, as a mix's batches of a hundred are,
-    /// so the alert thread can file them beside the reads. The lag
-    /// sweep's one-percent burst at ten thousand keys is one batch of a
-    /// hundred: lent, and the scans start within a microsecond of the
-    /// commit's return, so the first scan takes it back before the
-    /// thread's first poll and pays the settle and the forms itself --
-    /// 570,000 instructions over a pass of a hundred scans, 41% of the
-    /// pass, and the one lag point on the ladder that read level with
-    /// LMDB for twelve rows while the three-hundred-write burst at
-    /// thirty thousand keys, filed inline, read 1.3x. `supdb-inlineall`
-    /// and `supdb-ingestinlineall` file every batch.
-    pub upkeep_inline_min: usize,
     /// Of the batches `upkeep_inline_bursts` would file in the commit,
     /// one of at most this percentage of the store's keys is instead
     /// lent to the thread and paced, unless it is the first after a scan:
@@ -4466,7 +3895,7 @@ pub struct Options {
     /// and the commits of a mix with no scan between them, hold only to
     /// the backlog bound (the share or the batch, the larger), whatever
     /// the batch's size, with no cut-off on the batch or the store -- a
-    /// batch under `upkeep_inline_min` was not paced before. Priced
+    /// batch under `UPKEEP_WAKE_WRITES` was not paced before. Priced
     /// against the cut-offs in the row's whole order from ten to three
     /// hundred thousand keys, in both orders: at ten thousand keys the
     /// full rewrite's burst read 1.14-1.18x, since the cut-offs held every
@@ -4512,22 +3941,6 @@ pub struct Options {
     /// it is off, and `supdb-oocz` is the arm with it on.
     #[doc(hidden)]
     pub out_of_core_installed: bool,
-    /// A buffered commit near reads whose batch is under
-    /// `upkeep_inline_min` settles it here when a scan ran since the last
-    /// commit, and lends the rest -- the forms the scans will walk, built
-    /// by those scans block by block as before. The shape it is for is a
-    /// small burst with scans at once behind it: the batch was lent to a
-    /// thread whose first poll comes two hundred microseconds later, and
-    /// the first scan took it back untouched a microsecond after the
-    /// commit returned and paid the settle itself, 145,000 instructions
-    /// of a pass of a hundred scans at ten thousand keys. Filing the whole
-    /// batch at the commit instead (`supdb-ingestinlineall`) cost the
-    /// burst 427,000, under LMDB's, and the mixes with no scan between
-    /// their commits a sixth to a half; the settle alone is a third of
-    /// that, and a mix whose commits no scan separates never reaches it.
-    /// `supdb-lazysettle` and `supdb-ingestlazysettle` leave the settle
-    /// to the scan.
-    pub upkeep_settle_after_scans: bool,
     /// Time the phases a scan runs before its walk -- the upkeep taken
     /// back, the log read, the settle, the snapshot's refresh, the builder
     /// started and its forms installed -- into `Db::scan_phases`, for the
@@ -4648,36 +4061,9 @@ pub struct Options {
     /// took four hundred. A burst's batches, the lag sweep's, are larger
     /// than the line and leave the reading standing: filing a burst is the
     /// writer's cost, where a mix's commits are filed by the upkeep thread
-    /// beside its reads. Zero keeps the reading until a scan
-    /// (`supdb-formsoffkept`).
+    /// beside its reads. Zero keeps the reading until a scan.
     #[doc(hidden)]
     pub scan_forms_off_stale_writes: u32,
-    /// EXPERIMENT, refuted: while the writer's forms are given up for the
-    /// merge path (`scan_forms_off_unreused`) and scans are near, the
-    /// commit's maintenance keeps the merge path's scan snapshot to the
-    /// commit (`Reader::keep_merge_snapshot`): the log read and the keys
-    /// created since filed into the snapshot, as a scan's preamble does,
-    /// on the upkeep thread where the upkeep is lent. With the forms off
-    /// the maintenance does nothing -- nine hundred passes of the thread
-    /// in 1.3 ms over the lag sweep's ten-percent burst at ten million
-    /// keys -- and the first scan after a burst sorts every unsealed key
-    /// itself: 16-22 ms of the pass after the one-percent burst there,
-    /// 45-115 after the ten-percent and 42-118 after the full rewrite, a
-    /// tenth to a fifth of each divided pass under either bound. Kept, the
-    /// scan's snapshot phase read 2-4 ms, 5-18 and 0.5-8, and the passes
-    /// no faster: a snapshot does not stand across a freeze, so the
-    /// maintenance built one from every unsealed key at each, 173 builds
-    /// and 120 carried forward in a sweep where the scans make three, 14 s
-    /// of the thread over a full rewrite of 28, and what those builds
-    /// freed stayed in the process -- 70-80 MB more anonymous memory at
-    /// the pass after the full rewrite, which under 1 GiB was a quarter
-    /// more major faults on the scanning thread and the pass at 0.82x and
-    /// 0.84x, and under 1.25 GiB took a store that had fitted, thirteen
-    /// faults a pass, to 4,400 and the pass to 0.62x and 0.44x
-    /// (`docs/engine.md`). Off: the first scan builds it.
-    /// `supdb-snapkept` is the arm.
-    #[doc(hidden)]
-    pub forms_off_snapshot_kept: bool,
     /// The scans a window of `scan_forms_off_unreused`'s share is taken
     /// over. A test sets a few.
     #[doc(hidden)]
@@ -4806,30 +4192,6 @@ pub struct Options {
     /// before, and the write-driven rebuilds a burst made, one per block,
     /// wait for a read to ask. `supdb-bg` and `supdb-ingestbg` turn it off.
     pub forms_convert_unread: bool,
-    /// Dense sparse forms a fill rebuilds as copies at most, per fill;
-    /// zero, the default, is unbounded, and the upkeep thread's fill
-    /// yields instead (`forms_convert_yield`). A copy repays its build
-    /// only through later walks, and a fill that rebuilt every dense
-    /// form of a burst made the thread's pass ten to fifteen
-    /// milliseconds, which the writer's freeze or first scan waited out.
-    /// Capped, with the builder beside a reader's first scan converting
-    /// the rest (`ahead_converts`), it lost: a dense form the cap leaves
-    /// sparse is patched on until its replaced runs outweigh the live
-    /// ones, then dropped and built fresh, so on the durable arm at three
-    /// hundred thousand keys the thread made twice the fresh builds, its
-    /// last pass ran forty milliseconds longer and the first scan waited
-    /// it out -- the pass at a fifth of the rate, the burst plus twice
-    /// the pass at 1.13x (8/8). `supdb-convertcap` and
-    /// `supdb-ingestconvertcap` keep it (`docs/engine.md`).
-    pub forms_convert_cap: usize,
-    /// Whether the builder ahead of a reader also builds copies for the
-    /// blocks the writer holds as dense sparse forms, so a pass after a
-    /// burst finds copies installed beside it instead of walking sixty
-    /// deltas a block or converting them itself. Off by default, with
-    /// `forms_convert_cap`: installing the builder's copies cost the
-    /// first scan about what the copies returned over the pass. The arms
-    /// that cap the conversions turn it on.
-    pub ahead_converts: bool,
     /// Whether the builder ahead sends each form with the keys that bound
     /// its block -- the block's first record's key and the next block's,
     /// or the partition's fences at the ends -- read on its own thread
@@ -4891,25 +4253,6 @@ pub struct Options {
     /// drops the tables when it falls behind. `supdb-noabandon` is the arm
     /// that files on.
     pub upkeep_abandons: bool,
-    /// Whether the upkeep thread files a burst's batch at once: a pass
-    /// lent a commit of at least `UPKEEP_WAKE_WRITES` writes since the
-    /// thread was last caught up, with reads around, settles what it was
-    /// lent whatever the backlog bound (`forms_settle_backlog_pct`) says.
-    /// The bound is for the mixes, whose commits are a hundred operations
-    /// with reads between them -- the commit's own size tells them apart,
-    /// never the sum lent, which three of a mix's commits cross -- and
-    /// for a commit that files on the writer's own path; a burst is
-    /// batches of a thousand writes over keys the writer never touches
-    /// again, lent to a thread that otherwise waits for two percent of
-    /// the store to pile up and leaves the rest to the first scan. At
-    /// three million keys under a bound the lag sweep's one-percent point
-    /// read a 1000-scan pass of 26 ms with 14 of it the first scan's
-    /// settle of the burst's thirty thousand keys, and the ten-percent
-    /// point 50 of 69, with the thread lent every batch and filing none:
-    /// 0.35x and 0.27x of LMDB, where the drained point reads 1.8x. Off:
-    /// the thread waits for the bound, as a commit that files itself
-    /// does. `supdb-deferbursts` is the arm that waits.
-    pub upkeep_files_bursts: bool,
     /// Whether a pass on the upkeep thread gives the writer its upkeep
     /// back at the pass's next step once the writer wants it: the log is
     /// read and settled `UPKEEP_YIELD_ENTRIES` entries at a time and the
@@ -4920,7 +4263,7 @@ pub struct Options {
     /// bounded by `upkeep_pass_pct` leaves it. The writer takes
     /// its upkeep back at every scan and at most of its publishes, waiting
     /// for the pass in flight, and with the thread filing a burst's
-    /// batches (`upkeep_files_bursts`) that pass covers whatever was lent
+    /// batches that pass covers whatever was lent
     /// since the thread's last: at three million keys under a bound the
     /// first scan after the ten-percent burst waited 30-65 ms for it in
     /// half the reps and 3-6 in the rest, a pass of two shapes, where the
@@ -5038,7 +4381,7 @@ pub struct Options {
     /// since nothing logs a handle's write, and nothing that reads a live
     /// table's values beside the writer or keeps a copy of them:
     /// `Upkeep::Inline`, and `scan_block_cache`, `snapshot_keeper`,
-    /// `forms_off_snapshot_kept`, `snapshot_runs`, `direct_ingest` and
+    /// `snapshot_runs`, `direct_ingest` and
     /// `put_in_place` off. Off: the one writer's table, and a handle that
     /// writes is refused.
     pub shared_writers: bool,
@@ -5197,7 +4540,7 @@ pub struct Options {
     /// It acts only where a handle's write may go unlogged and nothing
     /// else keeps a copy of a live table's values (`Options::shares`):
     /// `SyncPolicy::Explicit` with `held_frames` off, and
-    /// `snapshot_keeper`, `forms_off_snapshot_kept`, `snapshot_runs`,
+    /// `snapshot_keeper`, `snapshot_runs`,
     /// `put_in_place` and `adaptive_shape` off. Elsewhere, and off, a
     /// handle that writes is refused, as it was: on, the option changes
     /// nothing of a store no handle writes. Off:
@@ -5339,62 +4682,6 @@ pub struct Options {
     /// behind would take both; `supdb-noyield` and `supdb-ingestnoyield`
     /// keep the fill that does not yield (`docs/engine.md`).
     pub forms_convert_yield: bool,
-    /// How far behind the writer, in writes lent past the commit its pass
-    /// is bringing the upkeep to, the upkeep thread must be before a
-    /// posted commit makes its fill yield its conversions; the writer's
-    /// own wait yields always. Zero yields at any posted commit: that
-    /// deferred every dense block of a burst to one rebuild after the
-    /// landing, on the durable arm at three hundred thousand keys 4,700
-    /// blocks built fresh in one pass of 23-56 ms, which the first scan
-    /// after the burst waited out whenever the landing fell at the
-    /// burst's end (`supdb-postedyield`, `supdb-ingestpostedyield`).
-    /// `usize::MAX`, the default, yields to the writer's wait alone and
-    /// converts whatever the pass finds dense, behind or not. A thousand
-    /// was the default while the measure of "behind" was the log position
-    /// the pass may read to less the position it had read, which on the
-    /// thread is zero in every pass, so it yielded to the writer's wait
-    /// alone in effect; measured as written, with the writer's lead, the
-    /// thread converted a third of the rewriting burst's forms, the scans
-    /// after it walked the rest as sixty-four-delta sparse forms and read
-    /// 0.65x on the buffered arm, and the durable arm's thread spent a
-    /// tenth more patching forms kept sparse. `supdb-behindyield` and
-    /// `supdb-ingestbehindyield` keep the thousand for pricing.
-    pub forms_convert_behind: usize,
-    /// Whether a dense sparse form is converted into a copy from its own
-    /// deltas and the partition's records, or built again from the
-    /// sources. A sparse form holds every key written over the block with
-    /// its run resolved -- the partition's values for an equal key, then
-    /// the pieces' and the memtables', a tombstone masking the older --
-    /// kept current by every settle, so the copy is one streaming merge
-    /// of the form with the block's records, by the cuts the form holds.
-    /// The build from the sources gathered every key's run again, a seek
-    /// of each piece standing and a chain walk in the memtable per key:
-    /// about 11 µs of the thread's time a block at three hundred thousand
-    /// keys with five to nine pieces against 7 from the form, timed in
-    /// one process (`Db::convert_us`), and a burst that rewrites the
-    /// store converts every block, on the thread that has the burst's
-    /// writes to file; the buffered lag point's scans after such a burst
-    /// read 1.1x with the form's. Off, the build from the sources, kept
-    /// for pricing as `supdb-convertsources` and
-    /// `supdb-ingestconvertsources`.
-    pub convert_from_form: bool,
-    /// Whether the copy a dense form converts to is sized to what it will
-    /// hold -- the form's keys, runs and entries plus a key, a run and an
-    /// entry for each record the form does not replace -- or with room
-    /// for a further record's worth per record of the block, as a copy
-    /// built from the sources is. Sized with that room, a copy of a block
-    /// whose every record the form replaces asks for twice the form's
-    /// bytes, fits no chunk the forms before it freed, and takes fresh
-    /// pages: a burst that rewrites a store of three hundred thousand keys
-    /// grew the heap by about ninety megabytes and the upkeep thread took
-    /// twelve to fourteen thousand page faults, each a first touch, at
-    /// 0.7 µs where the guest still backed the page and about 9 µs where
-    /// its balloon had handed the page to the host -- the thread's whole
-    /// slow mode, 57% of its samples zeroing pages in the slow reps
-    /// against 6-15% in the fast. Sized exactly, each block's copy fits
-    /// the chunks the block before it freed. Off, the room, kept for
-    /// pricing as `supdb-copyslack` and `supdb-ingestcopyslack`.
-    pub copy_exact: bool,
     /// Whether a sparse form outlives the merge that rewrites its
     /// partition over the same blocks, as a copy does. A delta names its
     /// place by a rank in the partition's records, and a rewrite moves the
@@ -5693,45 +4980,22 @@ pub struct Options {
     /// first commit, `supdb-runcreate` and `supdb-ingestruncreate`.
     #[doc(hidden)]
     pub run_spare: bool,
-    /// EXPERIMENT, refuted and kept as an arm: a drain's seal copies the
-    /// frozen table's chains into a snapshot for the scans over the
-    /// store while the seal runs, as any seal does (`seal_snapshot`),
-    /// and under a drain the writer waits and reads nothing, so the copy
-    /// -- 1.0 to 1.5 ms of a shuffled load's drain at ten thousand keys
-    /// and 5 to 7 of 17 at thirty, in the drain's stamps (`snapped`) --
-    /// read as a cost paid for nobody. Taken away, the records phase grew
-    /// by the same amount at both rungs and the drain ended level: the
-    /// copy is the cheaper of two walks over the table, one pass with
-    /// its lookahead and a sequential read after it against a walk
-    /// interleaved with the writer's work, and its pages were not the
-    /// price. On, the default, the copy whatever the seal's reason. Off,
-    /// a drain's seal builds none and writes its records from the
-    /// table's chains with the copy's lookahead, a copy someone set on
-    /// the table already taken as it is: `supdb-nodrainsnap` and
-    /// `supdb-ingestnodrainsnap`.
-    pub drain_snapshot: bool,
-    /// A seal far from reads builds its snapshot copy as any seal does
-    /// (`seal_snapshot`). Off, the default, a seal of a table frozen with
+    /// A seal far from reads builds its snapshot copy as any seal does.
+    /// Off, the default, a seal of a table frozen with
     /// no scan around (`reads_around`: none in the store's life, or two
     /// stores' worth of writes since the last) builds none and writes its
-    /// records from the table's chains with the copy's lookahead, as a
-    /// drain's under `drain_snapshot` off; a copy someone set on the
-    /// table already is taken as it is. The copy is the table's key and
+    /// records from the table's chains with the copy's lookahead; a copy
+    /// someone set on the table already is taken as it is. The copy is the table's key and
     /// value bytes again, held with the table until the seal lands, and
     /// a load whose seals fall behind holds it for every table frozen:
     /// a shuffled load of five million keys under 640 MiB held three
     /// frozen tables and their three copies, 380 MB of the bound, and
     /// the bound killed it, where the arm without the block cache, its
     /// seals landing ahead of the next freeze, held one. A drain's seal
-    /// builds its copy as `drain_snapshot` says, far from reads or not:
-    /// one table's copy at a drain is not what the bound killed, and the
-    /// scans after a shuffled load of thirty thousand keys without it read
-    /// 0.89-0.97x in six sittings, at the same instructions and over the
-    /// same segment byte for byte, where two arms that differ in nothing
-    /// there read 0.92-1.09x -- the memory those scans run over, which
-    /// says nothing either way, so the drain keeps the shape its rows
-    /// were taken in. On, `supdb-sealcopyfar` and
-    /// `supdb-ingestsealcopyfar`.
+    /// builds its copy, far from reads or not: one table's copy at a drain
+    /// is not what the bound killed. A seam for the tests that hold a
+    /// seal's copy.
+    #[doc(hidden)]
     pub seal_snapshot_far: bool,
     /// A landing far from reads takes its pieces' bounds -- and their
     /// ranks, under `piece_ranks_whole` -- against their partitions before
@@ -5948,16 +5212,6 @@ pub struct Options {
     /// `supdb-landboundsalways`, and `supdb-boundsold` with the records.
     #[doc(hidden)]
     pub land_bounds_read: bool,
-    /// A seal writes a key whose chain holds one value and no tombstone
-    /// -- every key of a load, and most of any table -- through the
-    /// writer's one-value path (`SegmentWriter::put_one`), the record
-    /// laid out once, where the general path staged the value, encoded
-    /// the run from the staging and encoded the record from the run:
-    /// callgrind over the seal's job counted the general path at some
-    /// 950 instructions a record of the job's 2,350. Off, every key takes
-    /// the general path, as before: `supdb-sealrun` and
-    /// `supdb-ingestsealrun`.
-    pub seal_put_one: bool,
     /// At a flush's close of a direct run, the writer fdatasyncs the run's
     /// file -- the records committed to it so far, hinted to the page
     /// cache as they were written and flushed to the device by nothing yet
@@ -6260,14 +5514,6 @@ pub struct Options {
     /// past that commit. That is a comparison rather than a rule, so the
     /// scan makes it and builds its own where it has staged writes.
     pub forms_to_writer: bool,
-    /// EXPERIMENT: overlay keys in a block from which the writer's
-    /// canonical form is a merged copy rather than resolved deltas; zero
-    /// is `CACHE_DENSE`, the threshold a handle building for itself
-    /// uses, and one is a copy of every overlaid block. The arm exists
-    /// because a form built once and patched per write has different
-    /// economics from one rebuilt on a read: `CACHE_DENSE` was measured
-    /// against the rebuilding cache.
-    pub form_dense_from: usize,
     /// The deltas a sparse form the patches grew must hold before a fill
     /// converts it to a merged copy; zero is `CACHE_DENSE`. A copy is walked
     /// as one buffer, where a sparse form alternates the partition's
@@ -6314,21 +5560,6 @@ pub struct Options {
     /// did (`promote_entries`). Off, the walk marks the tables for the next
     /// fill.
     pub forms_convert_at_walk: bool,
-    /// EXPERIMENT, refuted: light conversions (`forms_convert_from` under
-    /// `CACHE_DENSE`) on the writer's fills as well as the upkeep thread's.
-    /// A burst's first batch, filed inline, converted every light form the
-    /// burst had made: the ten-percent burst at thirty thousand keys read
-    /// 0.61x, two milliseconds of its five in conversions on the writer.
-    pub forms_convert_light_writer: bool,
-    /// EXPERIMENT, refuted: a light conversion on the upkeep thread yields
-    /// to any commit posted and to the writer's wait, where a dense one
-    /// yields to a posted commit only past `forms_convert_behind`. The
-    /// write mixes post a commit every few hundred operations, and the
-    /// conversions the scrambled E gains by are theirs, so it made almost
-    /// none: the scrambled E read 1.01x in twenty pairs at a hundred
-    /// thousand keys. The burst passes are skipped by `Reader::burst_pass`
-    /// either way.
-    pub forms_convert_light_yields: bool,
     /// How the ordered scan builds its sorted snapshot of the unsealed keys.
     /// `true` keeps the keys in one arena and sorts 24-byte records (a
     /// 16-byte key prefix and an index), touching the arena only on a shared
@@ -6553,48 +5784,6 @@ pub struct Options {
     /// ticks.
     #[doc(hidden)]
     pub zpages_suspect_at_crossing: bool,
-    /// EXPERIMENT: under the controller (`ZPages::Auto`), once the form is
-    /// installed, the re-code policy (`zpages_recode`) re-codes the hottest
-    /// partitions to the raw tails while they serve, where their decodes
-    /// would be walks in place: a partition holding at least
-    /// `RECODE_AUTO_SHARE` of the store's decode time, while the form with
-    /// its raw tails' extra stays within `zselect::FORM_FILL` of the budget,
-    /// the rest of the budget left to the page cache's other tenants -- the
-    /// partitions the form does not cover yet, the files a write mix lands,
-    /// the indexes; and a raw-tailed partition goes back, coldest first,
-    /// only once the form passes `RECODE_AUTO_EVICT` of it. Under the forced
-    /// form the policy filled the budget to its edge with the form's bytes
-    /// alone and gave raw tails back at the group's refaults: the budget
-    /// falls a tenth through a write mix as the process's memory grows, the
-    /// write mixes refault whatever the form does, and at ten million keys
-    /// under 1.25 GiB the policy made 77 re-codes and 229 give-backs over
-    /// the mixes, E 0.68x and D 0.64x. Refuted there too: the policy took
-    /// the raw tails of the three hottest partitions in B and of two more in
-    /// D and gave those two back in E, with no flip after, and E read 0.87x
-    /// in both reps with the major faults the default does not take, since
-    /// E's own memory takes a fifth of the budget from the page cache and
-    /// the 36 MB the raw tails added were past what was left
-    /// (`docs/engine.md`). Off; `supdb-zrecodeauto` is the arm.
-    #[doc(hidden)]
-    pub zpages_recode_auto: bool,
-    /// EXPERIMENT: under the controller (`ZPages::Auto`), once the form is
-    /// installed and the builder has nothing due, the hottest block-coded
-    /// partitions are built again by the parsing encoder (`zpages_parse`)
-    /// and swapped into their cells while they serve (`ZKind::Reparse`):
-    /// the builds the install waits for keep the greedy encoder, whose CPU
-    /// keeps the builds ahead level with the load, and the decodes the
-    /// parse makes cheaper are bought where the builder is free. A
-    /// partition holding at least `RECODE_AUTO_SHARE` of the store's decode
-    /// time, timed as the re-code policy times it, is re-parsed once while
-    /// its segment lives; the form only shrinks, so no budget is checked,
-    /// and no build starts while a seal or a merge runs. Refuted at ten
-    /// million keys under 1.25 GiB: eight partitions re-parsed a rep took
-    /// E's scans 1.4% faster, and the write mixes they were built in paid
-    /// for their bytes at the durable commits' fsyncs, D's commits a fifth
-    /// slower and A's a tenth (`docs/engine.md`). Off; `supdb-zreparse` is
-    /// the arm.
-    #[doc(hidden)]
-    pub zpages_reparse: bool,
     /// Under the controller (`ZPages::Auto`), once the form is installed,
     /// the hot-raw policy: the partitions whose reads cost the most are
     /// served from the raw form, their pages held in the page cache beside
@@ -6620,8 +5809,7 @@ pub struct Options {
     /// under a bound LMDB's B-tree fits whole the form that fits the bound
     /// lost the mixes to the decode (`docs/engine.md`). On as shipped;
     /// `supdb-znohotraw` is the shape with every covered partition served
-    /// from its form file. Stands down where the re-code policy runs
-    /// (`zpages_recode_auto`, `zpages_reparse`), and beside the stride form
+    /// from its form file. Stands down beside the stride form
     /// (`zpages_stride`), whose files count no decode or open: rated at no
     /// heat, each was a partition of the median a block file's skew is read
     /// against at nothing, until the heat and the median are counted by form.
@@ -6843,28 +6031,6 @@ pub struct Options {
     /// walked them. `supdb-settleconvertquiet` is the conversion with no
     /// walk left.
     pub settle_convert_fills: bool,
-    /// EXPERIMENT: how long a look at whether a partition's heads are all
-    /// in the page cache stands, in milliseconds, for the asks a settle
-    /// makes ahead of its resolves out of core (`OrdIndex::willneed_heads`):
-    /// while a
-    /// look says they are, the settle asks for none of them (0, the
-    /// default: every ask reads its own page's residency). An ask is
-    /// refused where its first page is resident, which it learns by a
-    /// `mincore` of its own, so a store that reads as out of core with
-    /// most of its ordered indexes in memory -- three million keys under
-    /// 1.25 GiB at the controller's census -- pays a call a key to be told
-    /// so, a tenth of the upkeep thread over the full rewrite's burst. One
-    /// look a partition every hundred milliseconds took that tenth off the
-    /// thread's CPU and put more than it back as waiting: under the bound
-    /// the indexes' pages leave the cache all through the burst, three to
-    /// five thousand of the thread's seeks faulted on one gone since its
-    /// partition's look where six hundred did with an ask a key, the
-    /// writer was held a quarter to a half longer and the burst read one
-    /// to three percent longer in both orders (`docs/engine.md`). The
-    /// calls are the price of pages that will not stay, and the lever is
-    /// keeping them. `supdb-headslook` is the look, at a hundred
-    /// milliseconds.
-    pub heads_look_ms: u32,
     /// Whether a partition's ordered-index heads are held in anonymous
     /// memory while the store reads as out of core and the controller
     /// leaves the partition to the raw form (`Maint::z_heads_look`), and
@@ -6881,72 +6047,6 @@ pub struct Options {
     /// through its own cache (`OrdIndex::mapped_heads`).
     /// `supdb-headsmapped` reads the mapping throughout.
     pub heads_owned: bool,
-    /// Whether the heads are copied (`heads_owned`) at the controller's
-    /// census while the block cache holds the raw records' place
-    /// (`scan_cache_copies_fit`), whatever the controller's model says of
-    /// the raw form. At the census a copy is made while the model
-    /// says the raw form fits and none while it says it does not, since a
-    /// misfit there is the stretch between a crossing and the install its
-    /// reads' faults buy (`Maint::z_heads_look`). A grant of the records'
-    /// place makes the model say so of a store nothing will be bought
-    /// for: the page cache's budget is the limit less the process's
-    /// anonymous memory, the copies are that memory, and the records they
-    /// stand in for are still counted as pages the raw form needs -- at
-    /// three million keys under 1 GiB a budget of 880 MB before the lag
-    /// sweep's full rewrite and 265 after the grant, against records of
-    /// 372 -- while the grant stands only far from point reads, whose
-    /// faults are what buys a form. So every partition a merge landed
-    /// after the grant kept its heads in a mapping, eight megabytes of
-    /// them at the pass after the burst, the burst's writes pushed their
-    /// pages out, and the scans' start seeks read them back a page a
-    /// fault behind a merge's reads: every major fault of the scanning
-    /// thread in six traced passes but one was `Reader::scan_seek` on one
-    /// such index, nine to thirty-six a pass and a hundred and ninety in
-    /// the slowest of twelve paired, a hundred and fifty to a hundred and
-    /// eighty in the two slow reps of three a row took. Under this option
-    /// a grant standing reads as the store left raw: the scanning thread
-    /// took a fault at most in twenty-four passes paired, where the
-    /// model's word alone left passes of sixty-three to a hundred and
-    /// ninety. A process with less beside the cache has room for every
-    /// copy with no grant, the cache's own budget never binding, and the
-    /// same misfit by the same count: with the jobs' arrays mapped
-    /// (`jobs_mapped`) no grant was made in six sweeps of six, thirteen
-    /// partitions of twenty had their heads copied, and two passes of six
-    /// took 49 and 178 faults on the late indexes, 47 and 55 ms where the
-    /// others ran 16 to 23. So the look asks the model's question with
-    /// the cache's bytes given back to the budget
-    /// (`Maint::z_misfit_is_the_caches`), far from point reads, grant or
-    /// none. On; `supdb-headsmodel` is the model's word alone.
-    #[doc(hidden)]
-    pub heads_owned_beside_copies: bool,
-    /// The heads of a partition the raw form serves are copied while the
-    /// controller's model says the raw form fits and it is asking nothing
-    /// -- the raw gate, where `z_heads_look` made no copy -- wherever the
-    /// store's files whole -- every segment's hash region, record region
-    /// and ordered index, the level-0 pieces' with the partitions' --
-    /// have stood past the fill share of its budget (`zselect::FORM_FILL`,
-    /// the share that leaves the cache's other tenants theirs) at a
-    /// reading of the model, and from then on. The model's fit is of the
-    /// pages a read touches, the partitions' two populations, and a burst
-    /// puts a store's worth of pieces in the cache beside them: the group
-    /// comes to its limit, and the kernel takes the pages written once
-    /// and never read first, the ordered indexes of the partitions the
-    /// burst's merges had just landed. With the copies of fixed-size
-    /// records a fifth smaller (`Options::copy_packed`) a store of three
-    /// million keys under 1.25 GiB never left the raw gate through a full
-    /// rewrite, no head was copied, and half the passes after it took two
-    /// hundred major faults on their scans' seeks, three times a pass's
-    /// length, where the larger process had tripped the census and had
-    /// its seventeen partitions' heads copied. The line is the store's own
-    /// arithmetic and not a reading of the group, so it is crossed in the
-    /// middle of the burst, seconds ahead of the limit: read as the
-    /// group's unused memory less the margin, once a second, the limit
-    /// was seen in half the sweeps, and read as the kernel's count of the
-    /// times the limit was met (`memory.failcnt`) in a third, the group
-    /// first meeting its limit as the burst ends. On; off leaves the raw
-    /// gate's heads the page cache's, `supdb-headsgate`.
-    #[doc(hidden)]
-    pub heads_owned_past_fill: bool,
     /// The hot-raw policy's skew bar read against the room
     /// (`Maint::z_hot_look`): the candidate partition is asked for where its
     /// raw bytes fit the group's unused memory and it is read more a key
@@ -7345,13 +6445,7 @@ pub struct Options {
     /// sum level and the pass after the one-percent burst 0.88x and 0.82x.
     /// In core nothing of it acts (`docs/engine.md` has the commands).
     /// `supdb-zloadend` is the engine before them, `supdb-zstridealldropagain`
-    /// and `supdb-zstrideallcdrop` each take one back. Refused beside a re-code policy under the
-    /// mode it starts builds in, each of which builds over a served file's
-    /// name on its own -- `zpages_recode` under `ZPages::Always`, and
-    /// `zpages_recode_auto` and `zpages_reparse` under `ZPages::Auto` --
-    /// and not beside any of the three under the other mode, where it starts
-    /// none, nor beside `zpages_recode_keep` or `zpages_both`, which act only
-    /// on the paths those start (`check_options` says why). Every read
+    /// and `supdb-zstrideallcdrop` each take one back. Every read
     /// path serves a stride partition from its file: the point reads, the
     /// counts and a scan's walks by rank by its arms (`ZFile::stride`), and
     /// the block cache's reads, the merge path's walks and the covered walk
@@ -7535,11 +6629,11 @@ pub struct Options {
 
 impl Options {
     /// Whether a point read takes the two-source or the layered read
-    /// where the store allows one (`point_lone`): the option, and none of
-    /// the arms that read a partition another way.
+    /// where the store allows one: none of the arms that read a partition
+    /// another way.
     #[inline(always)]
     fn point_lone_on(&self) -> bool {
-        self.point_lone && !self.exts_by_value && !self.point_via_ord
+        !self.point_via_ord
     }
 
     /// Whether the store keeps `Shared::points_far`, for the options that
@@ -7550,19 +6644,16 @@ impl Options {
 
     /// Whether a form file times one decode in sixteen and counts a
     /// raw-tailed group's opens (`zfile::ZFile::time_decodes`): the heat the
-    /// re-code policy reads, under the forced form or the controller.
+    /// hot-raw policy and the conversion read.
     pub(crate) fn z_times_decodes(&self) -> bool {
-        self.zpages_recode
-            || self.zpages_recode_auto
-            || self.zpages_reparse
-            || self.zpages_hot_raw
-            || self.zpages_stride_convert
+        self.zpages_hot_raw || self.zpages_stride_convert
     }
 
-    /// The form file's group coding the options ask for
-    /// (`zpages_record_coding`), as the builder's plan and the sampler take it.
+    /// The form file's group coding the options ask for: the record coding
+    /// where its tails are stored raw (`zpages_raw_tails`), the block coding
+    /// otherwise, as the builder's plan and the sampler take it.
     pub(crate) fn z_coding(&self) -> u8 {
-        if self.zpages_record_coding {
+        if self.zpages_raw_tails {
             zpages::ZCODING_RECORD
         } else {
             zpages::ZCODING_BLOCK
@@ -7574,8 +6665,8 @@ impl Options {
     /// partition's form takes its `stride` from (`zfile::BuildPlan::stride`)
     /// -- `z_give`'s, `z_start`'s builds and rebuilds and its builds ahead,
     /// the builds at a merge's output finish -- so that no site restates
-    /// the option. A re-code's, a spare's and a re-parse's plans build the
-    /// other block coding of a served block file and ask nothing.
+    /// the option. A conversion's plan asks for the form its partition is
+    /// not served in (`Maint::z_start`).
     fn z_stride_ask(&self) -> zfile::StrideAsk {
         match self.zpages_stride {
             ZStride::Off | ZStride::Chosen => zfile::StrideAsk::No,
@@ -7638,7 +6729,7 @@ impl Options {
     /// groups' buffers the allocator's.
     fn memo_cell(&self) -> Option<usize> {
         self.zpages_memo_slab
-            .then(|| zfile::memo_cell_bytes(self.zpages_group_bytes))
+            .then(|| zfile::memo_cell_bytes(zpages::ZGROUP_BYTES))
             .flatten()
     }
 
@@ -7714,7 +6805,6 @@ impl Options {
             && !self.shared_writers
             && !self.held_frames
             && !self.snapshot_keeper
-            && !self.forms_off_snapshot_kept
             && !self.snapshot_runs
             && !self.put_in_place
             && !self.adaptive_shape
@@ -7779,9 +6869,6 @@ impl Default for Options {
             // bytes.
             seal_bytes: 32 << 20,
             seal_max_pct: 10,
-            seal_on_file: false,
-            seal_grows: true,
-            seal_floor_out_of_core: false,
             direct_ingest: true,
             segment: SegmentOptions::default(),
             l0_trigger: 4,
@@ -7793,10 +6880,6 @@ impl Default for Options {
             merge_walk_cached: true,
             merge_verifies_inputs: true,
             malloc_mmap_threshold: 0,
-            merge_drop_behind: false,
-            merge_drops_covered: false,
-            same_blocks_from_index: true,
-            merge_drop_chunk: 2 << 20,
             merge_read_ahead: 0,
             merge_read_ahead_cipher: MERGE_AHEAD_WINDOW,
             merge_ahead_shares: true,
@@ -7805,17 +6888,10 @@ impl Default for Options {
             seal_sync_every: 0,
             inline_bytes: 256,
             partition_bytes: Some(64 << 20),
-            flush_ranges: true,
             promote: true,
             flush_schedules: true,
             writer_pins: true,
             asym_pins: false,
-            exts_by_value: false,
-            point_lone: true,
-            point_layers_lean: true,
-            point_placed_runs: true,
-            point_fence_words: true,
-            point_lone_absent: true,
             point_via_ord: false,
             zpages: ZPages::Auto,
             zpages_min_bytes: zfile::ZMIN_RECS,
@@ -7829,7 +6905,6 @@ impl Default for Options {
             fail_open_alt_removal: false,
             tear_open_slot_write: false,
             fail_open_pending_sync: false,
-            zpages_hold_after_settle: false,
             zpages_eager: true,
             zpages_warm: true,
             zpages_memo: true,
@@ -7894,24 +6969,9 @@ impl Default for Options {
             zpages_drop_again: true,
             zpages_ahead_past_scans: false,
             zpages_build_at_finish: true,
-            zpages_group_bytes: zpages::ZGROUP_BYTES,
-            zpages_record_coding: false,
-            zpages_store_all: false,
             zpages_raw_tails: false,
-            zpages_parse: true,
-            zpages_parse_finish: false,
-            zpages_parse_chains: 4,
-            zpages_own_decoder: true,
-            zpages_flat_decode: true,
-            zpages_flat_slack: true,
-            zpages_raw_tails_first: 0,
             zpages_drop_raw: true,
             zpages_drop_at_install: true,
-            zpages_recode: false,
-            zpages_recode_keep: false,
-            zpages_both: false,
-            zpages_coding_auto: true,
-            zpages_inplace_walk: true,
             zpages_build_eager: false,
             zpages_inject: None,
             forms_pieces_only: false,
@@ -7937,8 +6997,6 @@ impl Default for Options {
             forms_convert_from: 4,
             forms_convert_reads: 0,
             forms_convert_at_walk: false,
-            forms_convert_light_writer: false,
-            forms_convert_light_yields: false,
             forms_copy_hot_wide: true,
             scan_cache_ahead_min_blocks: 1024,
             ahead_out_of_core: true,
@@ -7951,8 +7009,6 @@ impl Default for Options {
             share_snapshot: true,
             snapshot_adopt_behind: 0,
             snapshot_runs: false,
-            seal_snapshot: true,
-            seal_from_snapshot: true,
             snapshot_keeper: false,
             snapshot_keeper_recent_pct: 100,
             promote_entries: 0,
@@ -7974,7 +7030,6 @@ impl Default for Options {
             upkeep_alert: true,
             upkeep_alert_poll_us: 200,
             upkeep_inline_bursts: true,
-            upkeep_inline_min: UPKEEP_WAKE_WRITES,
             upkeep_pace_pct: 0,
             upkeep_pace_holds: true,
             held_bursts_lend: true,
@@ -7983,7 +7038,6 @@ impl Default for Options {
             upkeep_pace_syncs_model: true,
             upkeep_pace_syncs_census: true,
             out_of_core_installed: false,
-            upkeep_settle_after_scans: true,
             scan_timers: false,
             upkeep_batch_pct: 0,
             upkeep_pass_pct: 0,
@@ -7996,19 +7050,15 @@ impl Default for Options {
             scan_forms_off_unreused: true,
             scan_forms_off_counts_built: false,
             scan_forms_off_stale_writes: 512,
-            forms_off_snapshot_kept: false,
             scan_forms_off_window: 512,
             scan_forms_off_ghost_bits: 10,
             scan_forms_off_flip: false,
             forms_settle_rebuild_from: 0,
             forms_convert_unread: true,
-            forms_convert_cap: 0,
-            ahead_converts: false,
             ahead_sends_bounds: true,
             upkeep_keep_bytes: 0,
             frozen_bytes: 0,
             upkeep_abandons: true,
-            upkeep_files_bursts: true,
             upkeep_yields: false,
             blocks_mapped: true,
             blocks_pool_bytes: 64 << 20,
@@ -8035,9 +7085,6 @@ impl Default for Options {
             jobs_pooled: false,
             one_file: false,
             forms_convert_yield: true,
-            forms_convert_behind: usize::MAX,
-            convert_from_form: true,
-            copy_exact: true,
             rebase_recuts_sparse: true,
             prefault: false,
             drain_names_partition: true,
@@ -8054,7 +7101,6 @@ impl Default for Options {
             bloom_pieces_only: true,
             land_fresh_lazy: true,
             run_spare: true,
-            drain_snapshot: true,
             seal_snapshot_far: false,
             land_ranks_far: false,
             piece_ranks_whole: false,
@@ -8069,7 +7115,6 @@ impl Default for Options {
             boundary_keys_from_top: false,
             bounds_by_heads: true,
             land_bounds_read: true,
-            seal_put_one: true,
             close_presync: true,
             ord_durable: false,
             direct_table_refs: false,
@@ -8089,7 +7134,6 @@ impl Default for Options {
             copy_prefetch_span: false,
             piece_ranks_by_heads: true,
             forms_to_writer: false,
-            form_dense_from: 0,
             scan_snapshot_arena: true,
             forms_to_fit: false,
             forms_fit_shed: true,
@@ -8104,8 +7148,6 @@ impl Default for Options {
             zpages_cover_resident: true,
             zpages_under_cipher: true,
             zpages_suspect_at_crossing: true,
-            zpages_recode_auto: false,
-            zpages_reparse: false,
             zpages_hot_raw: true,
             zpages_hot_raw_slack: true,
             zpages_hot_raw_evidence: false,
@@ -8126,10 +7168,7 @@ impl Default for Options {
             settle_patch_in_place: true,
             settle_converts: true,
             settle_convert_fills: true,
-            heads_look_ms: 0,
             heads_owned: true,
-            heads_owned_beside_copies: true,
-            heads_owned_past_fill: true,
             zpages_hot_skew_room: false,
             zpages_hot_room_margin_pct: 0,
             zpages_walk_owns_decodes: false,
@@ -9919,8 +8958,7 @@ fn fence_lo(min_key: &[u8]) -> Vec<u8> {
 /// partition whose range holds it, where `words` are the upper fences of
 /// every partition but the last, in order (`State::part_of`).
 ///
-/// A fence or a key as the search compares it (`fence_word`,
-/// `Options::point_fence_words`) is its first sixteen
+/// A fence or a key as the search compares it (`fence_word`) is its first sixteen
 /// bytes big-endian in a word, padded with zeros, and how many of them it
 /// has. For a fence `h` of sixteen bytes or fewer, `h <= k` exactly where
 /// `fence_word(h) <= fence_word(k)`: words that differ differ first at a
@@ -10398,17 +9436,9 @@ struct ZBuild {
     /// unless the controller wants builds by the time it is collected, and
     /// a decision that wants none does not cancel it.
     dormant: bool,
-    /// A re-code of a served partition (`ZKind::Recode`): collected by a
-    /// swap of the cell, and a build that installs nothing leaves the
-    /// partition as it was served.
-    recode: bool,
-    /// A re-code collected into the cell of kept form files and not the
-    /// served one (`ZKind::Spare`).
-    spare: bool,
-    /// A re-code in the served coding by the parsing encoder
-    /// (`ZKind::Reparse`).
-    reparse: bool,
-    /// A re-code into the other form (`ZKind::Convert`).
+    /// A re-code of a served partition into the other form
+    /// (`ZKind::Convert`): collected by a swap of the cell, and a build that
+    /// installs nothing leaves the partition as it was served.
     convert: bool,
 }
 
@@ -10678,22 +9708,13 @@ impl ZJob {
 /// Why a partition is given a job: it has no form file, its last build
 /// failed and the backoff has passed, or its form file failed a check; or its
 /// form file is attached and cold to this process, and is to be warmed; or
-/// its form file serves and is to be built again in the other coding.
+/// its form file serves and is to be built again in the other form.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum ZKind {
     Build,
     Retry,
     Rebuild,
     Warm,
-    /// The served form file built again in the other coding
-    /// (`Options::zpages_recode`).
-    Recode,
-    /// The served form file built in the other coding to be kept beside
-    /// it, unserved (`Options::zpages_both`).
-    Spare,
-    /// The served block-coded form file built again in its coding by the
-    /// parsing encoder and swapped in (`Options::zpages_reparse`).
-    Reparse,
     /// The served form file built again in the other form, the stride form
     /// for a block file and the block form for a stride file, and swapped
     /// in (`Options::zpages_stride_convert`).
@@ -10729,16 +9750,6 @@ fn z_take_cell(shared: &Shared, seg: &Seg, drop: bool) -> bool {
         unsafe { &*p }.drop_cache();
     }
     shared.retired_z.push(tag, RetiredZ(p));
-    // The kept form file goes with the served one: it was served once, and
-    // a reader pinned then may still be walking it.
-    let k = seg.z_spare.take();
-    if !k.is_null() {
-        if drop {
-            // SAFETY: as above.
-            unsafe { &*k }.drop_cache();
-        }
-        shared.retired_z.push(tag, RetiredZ(k));
-    }
     shared.retired_z.sweep(|low| shared.readers.oldest_for(low));
     true
 }
@@ -10925,12 +9936,6 @@ struct Seg {
     /// with an empty cell, and its reads go to the raw form until the
     /// form file is attached again.
     z: zfile::ZCell,
-    /// The form file a re-code took out of `z`, in the other coding, kept
-    /// attached and unserved (`Options::zpages_recode_keep`): the next
-    /// re-code of the partition exchanges the two (`ZCell::flip`). Read by
-    /// no reader but one that loaded it while it served, changed only by
-    /// the segment work's thread, and freed with the segment.
-    z_spare: zfile::ZCell,
     /// Why a partition was given no form file, for the life of the segment,
     /// as `zfile::Decline::code` numbers the reasons (`zfile::DECLINED_FAILED`
     /// a build that failed), or zero: what keeps a settle from looking
@@ -15889,7 +14894,6 @@ impl Seg {
                 tombs,
                 data,
                 z: zfile::ZCell::new(),
-                z_spare: zfile::ZCell::new(),
                 hot_reads16: AtomicU64::new(0),
                 z_declined: std::sync::atomic::AtomicU8::new(0),
                 z_hot_asked: std::sync::atomic::AtomicU8::new(0),
@@ -15939,7 +14943,6 @@ impl Seg {
                 tombs: false,
                 data,
                 z: zfile::ZCell::new(),
-                z_spare: zfile::ZCell::new(),
                 hot_reads16: AtomicU64::new(0),
                 z_declined: std::sync::atomic::AtomicU8::new(0),
                 z_hot_asked: std::sync::atomic::AtomicU8::new(0),
@@ -15981,7 +14984,6 @@ impl Seg {
             tombs,
             data,
             z: zfile::ZCell::new(),
-            z_spare: zfile::ZCell::new(),
             hot_reads16: AtomicU64::new(0),
             z_declined: std::sync::atomic::AtomicU8::new(0),
             z_hot_asked: std::sync::atomic::AtomicU8::new(0),
@@ -16895,12 +15897,12 @@ const LIVE_SMALL: usize = 8;
 /// The pieces over a range a point read keeps the records of on its own
 /// frame (`Reader::read_layers`); a range under more takes the general
 /// read. The placed read keeps the records of the pieces that hold the key
-/// down to the newest tombstone, and with `Options::point_placed_runs` it
-/// is that count it bounds (`Reader::read_placed`).
+/// down to the newest tombstone, and it is that count it bounds
+/// (`Reader::read_placed`).
 const LAYERS_PIECES: usize = 8;
 
 /// The most pieces' filters a placed read asks for ahead of its probes, the
-/// newest (`Reader::place`, `Options::point_placed_runs`).
+/// newest (`Reader::place`).
 const PLACED_ASKS: usize = 4 * LAYERS_PIECES;
 
 /// No watermark: every chunk in a chain is visible, committed or not.
@@ -18087,9 +17089,6 @@ struct Slot {
     /// (`OrdIndex::willneed_heads`).
     zheadasks: AtomicU64,
     zheadsubmitted: AtomicU64,
-    /// Looks at a partition's heads' residency whole
-    /// (`Options::heads_look_ms`).
-    zheadlooks: AtomicU64,
     /// Partition walks of a scan served by a form file, the groups decoded
     /// for them, and the runs of records no page holds the raw form walked
     /// inside them.
@@ -18193,7 +17192,6 @@ impl Slot {
             zwillneedasks: AtomicU64::new(0),
             zheadasks: AtomicU64::new(0),
             zheadsubmitted: AtomicU64::new(0),
-            zheadlooks: AtomicU64::new(0),
             zscanz: AtomicU64::new(0),
             zscangroups: AtomicU64::new(0),
             znopagescans: AtomicU64::new(0),
@@ -18235,20 +17233,21 @@ impl Slot {
     }
 }
 
-// Five lines: the nine words that were here, the second form's thirteen
+// Four lines: the nine words that were here, the second form's thirteen
 // counters and the census's seventeen sums, thirty-nine words, were a
 // 384-byte slot since the census, the cursor's two counts (`zviews`,
 // `zaheads`) took it past forty-eight words into a fourth line, and the
 // count of a sparse stride walk's keys stepped by the field
 // (`zstride.direct`), the word after the cursor's steps (`zsteps`) filled
-// the fourth, took it into a fifth. What the layout is for is that no
+// the fourth, took it into a fifth, and the look at a partition's heads'
+// residency gone (`zheadlooks`) took it back to four. What the layout is for is that no
 // other thread writes a slot's lines, which the lines a handle owns keep
 // as one did; the first line's sixteen words were full at the seventh
 // second-form counter, the second's at the census's third sum, the
 // third's at the cursor's first count, the fourth's at its steps. The
 // size is pinned so that a counter added moves it here and not in a
 // threaded cell.
-const _: () = assert!(std::mem::align_of::<Slot>() >= 128 && std::mem::size_of::<Slot>() == 640);
+const _: () = assert!(std::mem::align_of::<Slot>() >= 128 && std::mem::size_of::<Slot>() == 512);
 
 const READER_SLOTS: usize = 256;
 
@@ -21543,13 +20542,12 @@ fn check_options(opts: &Options) -> Result<()> {
         && (!matches!(opts.sync, SyncPolicy::Explicit)
             || opts.scan_block_cache
             || opts.snapshot_keeper
-            || opts.forms_off_snapshot_kept
             || opts.upkeep != Upkeep::Inline)
     {
         return Err(err(
             "put_in_place overwrites a live table's values under the writer alone: \
-             it needs SyncPolicy::Explicit, Upkeep::Inline, and scan_block_cache, \
-             snapshot_keeper and forms_off_snapshot_kept off",
+             it needs SyncPolicy::Explicit, Upkeep::Inline, and scan_block_cache and \
+             snapshot_keeper off",
         ));
     }
     if opts.one_file && (!opts.manifest_slots || opts.manifest_pending) {
@@ -21563,7 +20561,6 @@ fn check_options(opts: &Options) -> Result<()> {
             || opts.held_frames
             || opts.scan_block_cache
             || opts.snapshot_keeper
-            || opts.forms_off_snapshot_kept
             || opts.snapshot_runs
             || opts.direct_ingest
             || opts.put_in_place
@@ -21573,7 +20570,7 @@ fn check_options(opts: &Options) -> Result<()> {
         return Err(err(
             "shared_writers writes the live table from every thread with nothing logged: \
              it needs SyncPolicy::Explicit with held_frames off, Upkeep::Inline, and \
-             scan_block_cache, snapshot_keeper, forms_off_snapshot_kept, snapshot_runs, \
+             scan_block_cache, snapshot_keeper, snapshot_runs, \
              direct_ingest, put_in_place and adaptive_shape off",
         ));
     }
@@ -21603,38 +20600,6 @@ fn check_options(opts: &Options) -> Result<()> {
         return Err(err(
             "zpages Always needs writer_pins: a form file is freed with its segment \
              under the epoch, and an unpinned writer reads it unpinned",
-        ));
-    }
-    // The re-code policies tell a served form file's coding by
-    // `ZFile::coded`, one of the block body's two, and a stride file reads
-    // there as the block coding: the re-code's and the re-parse's looks take
-    // it for a block-coded candidate, the spare builder (`zpages_both`) for
-    // a served file with no spare -- the first by key order among equal
-    // heats, and a stride file's heat is its decodes, none -- and each
-    // builds the other block coding of the file under the name, renamed
-    // over it. Held back from a stride file, the same look picks it again
-    // at every turn and the spares of the partitions after it are never
-    // built. What each moves is the block body, so the stride form waits
-    // until their records tell the bodies apart. Three of them start those
-    // builds, each under one mode and on its own (`Maint::z_recode_tick`):
-    // `zpages_recode` under the forced form (`Maint::z_step`), and
-    // `zpages_recode_auto` and `zpages_reparse` under the controller
-    // (`Maint::z_tick`). Each under the other mode, and `zpages_recode_keep`
-    // and `zpages_both` under either, start none -- the last two keep what a
-    // re-code's collect replaced and shape the look and the spares, read
-    // only on the paths the three start -- so beside the stride form they do
-    // nothing and are not refused: the refusal is of what acts.
-    let recodes = match opts.zpages {
-        ZPages::Always => opts.zpages_recode,
-        ZPages::Auto => opts.zpages_recode_auto || opts.zpages_reparse,
-        ZPages::Off => false,
-    };
-    if opts.zpages_stride != ZStride::Off && recodes {
-        return Err(err(
-            "zpages_stride Forced is refused beside a re-code policy that starts \
-             builds (zpages_recode under ZPages::Always, zpages_recode_auto or \
-             zpages_reparse under ZPages::Auto): each reads a stride file as the \
-             block coding and builds a block coding over its name",
         ));
     }
     Ok(())
@@ -22703,14 +21668,6 @@ struct MergePlan {
     /// counted (`Shared::merge_head_inputs`).
     heads: bool,
     counts: Option<std::sync::Arc<Shared>>,
-    /// The inputs' pages dropped behind the second pass, every this many
-    /// bytes (`Options::merge_drop_behind`, `Options::merge_drop_chunk`),
-    /// and with it off the inputs whose pages are dropped all the same,
-    /// one flag an input: the partitions a form file serves
-    /// (`Options::merge_drops_covered`).
-    drop_behind: bool,
-    drop_covered: Vec<bool>,
-    drop_chunk: u64,
     /// The window the second pass asks ahead of its walk of each input
     /// (`Options::merge_read_ahead`); zero asks nothing.
     read_ahead: usize,
@@ -23710,9 +22667,6 @@ fn compact_run<R: MergeRest>(plan: MergePlan, rest: R) -> Result<MergeOut> {
         ord_durable,
         heads,
         counts,
-        drop_behind,
-        drop_covered,
-        drop_chunk,
         walk_cached,
         read_ahead,
         ahead_shares,
@@ -23854,49 +22808,6 @@ fn compact_run<R: MergeRest>(plan: MergePlan, rest: R) -> Result<MergeOut> {
     // key the inputs older than its newest flagged extent are dropped, the
     // flag itself is not carried, and a key with nothing live is left out
     // -- which is how a delete gets its bytes back.
-    // The inputs' files beside their mappings, for the drop of the pages
-    // behind the second pass (`Options::merge_drop_behind`): each input's
-    // records dropped from its last drop to a page short of the record the
-    // walk stands on, once the walk is a chunk past the last drop.
-    // Which inputs: every one under `merge_drop_behind`, else the
-    // partitions a form file serves (`Options::merge_drops_covered`).
-    let drops: Vec<bool> = (0..inputs.len())
-        .map(|i| drop_behind || drop_covered.get(i).copied().unwrap_or(false))
-        .collect();
-    let files: Vec<Option<vault::File>> = inputs
-        .iter()
-        .zip(&drops)
-        .map(|(name, &d)| {
-            if d {
-                vault::open(dir.join(name)).ok()
-            } else {
-                None
-            }
-        })
-        .collect();
-    let mut dropped_to: Vec<u64> = blobs
-        .iter()
-        .map(|b| b.record_offset(0).unwrap_or(0))
-        .collect();
-    let mut dropped_bytes = 0u64;
-    let mut drop_at = |i: usize, rank: usize| {
-        if !drops[i] {
-            return;
-        }
-        let Some(off) = blobs[i].record_offset(rank) else {
-            return;
-        };
-        let to = off.saturating_sub(4096) & !4095;
-        if to < dropped_to[i].saturating_add(drop_chunk.max(4096)) {
-            return;
-        }
-        blobs[i].drop_records(dropped_to[i], to);
-        if let Some(f) = files.get(i).and_then(|f| f.as_ref()) {
-            f.drop_range(dropped_to[i], to - dropped_to[i]);
-        }
-        dropped_bytes += to - dropped_to[i];
-        dropped_to[i] = to;
-    };
     let mut ahead = MergeAhead::new(&blobs, read_ahead, ahead_shares, counts.clone());
     // The inputs that are partitions: a key none of them holds is one the
     // output's range did not have (`Emitter::fresh`).
@@ -23909,7 +22820,6 @@ fn compact_run<R: MergeRest>(plan: MergePlan, rest: R) -> Result<MergeOut> {
                 if let Some(a) = ahead.as_mut() {
                     a.at(&blobs, i, rank);
                 }
-                drop_at(i, rank);
                 let Some((_, exts)) = blobs[i].exts_at(rank) else {
                     return Err(err("segment key walk: a rank the index does not have"));
                 };
@@ -23969,10 +22879,6 @@ fn compact_run<R: MergeRest>(plan: MergePlan, rest: R) -> Result<MergeOut> {
                 Ok(())
             })?;
         }
-    }
-    if let Some(c) = &counts {
-        c.merge_dropped_bytes
-            .fetch_add(dropped_bytes, AtomicOrdering::Relaxed);
     }
     steps.step("values");
     if let Some(c) = &counts {
@@ -24986,7 +23892,7 @@ impl CachedBlock {
     /// Whether this copy holds what `other` holds, entry for entry, and
     /// claims the identity at least where `other` does: the check the
     /// conversion from a form makes against the build from the sources
-    /// in the checked profile (`Options::convert_from_form`).
+    /// in the checked profile.
     #[cfg(debug_assertions)]
     fn agrees(&self, other: &CachedBlock) -> bool {
         let (this, other) = (self.unpacked(), other.unpacked());
@@ -26263,7 +25169,7 @@ struct State {
     mean_key_bytes: usize,
     /// The partitions' bytes on disk, refreshed with the segment set: what
     /// a merge rewrites, and what the seal was sized against before
-    /// `data_bytes` (`Options::seal_on_file`).
+    /// `data_bytes`.
     store_bytes: u64,
     /// The partitions' key and value bytes (`Seg::data`), refreshed with
     /// the segment set: what the seal is sized against, so the cadence
@@ -26282,11 +25188,11 @@ struct State {
     /// and then a read consults them all. What `pieces_aligned_over`
     /// finds by two searches of the pieces, taken once where the segments
     /// are published (`State::placing`) for the point read that asks at
-    /// every key (`pieces_placed`, `Options::point_layers_lean`).
+    /// every key (`pieces_placed`, `Reader::read_placed`).
     piece_runs: Vec<(u32, u32)>,
     /// The upper fence of every partition but the last, which has none,
     /// as a word and a length (`fence_word`), for the point read's search
-    /// (`State::part_of`, `Options::point_fence_words`); empty where a
+    /// (`State::part_of`); empty where a
     /// fence is longer than a word, and then the search compares bytes.
     /// Taken once where the segments are published (`State::placing`).
     fence_words: std::sync::Arc<[(u128, u8)]>,
@@ -26691,8 +25597,7 @@ struct Shared {
     retired_heads: RetireList<HeadsBuf>,
     /// Copies of heads made, copies given up, and of the copies made
     /// those made for a grant of the records' place alone, the model
-    /// saying the raw form does not fit
-    /// (`Options::heads_owned_beside_copies`).
+    /// saying the raw form does not fit.
     heads_events: [AtomicU64; 4],
     /// The dead names given to retired form files (`zfile::zpg_dead_name`).
     next_dead: AtomicU64,
@@ -26750,8 +25655,6 @@ struct Shared {
     /// the segment work's next look (`Db::zpages_redrop_owe`,
     /// `Maint::z_redrop_look`).
     z_redrop_owe: std::sync::atomic::AtomicBool,
-    /// A test's: `Options::zpages_hold_after_settle`, as it stands.
-    zsettle_hold: std::sync::atomic::AtomicBool,
     /// Direct runs whose mapping was grown past the file's end
     /// (`Options::direct_table_refs`); see `Db::run_remaps`.
     run_remaps: AtomicU64,
@@ -26832,9 +25735,6 @@ struct Shared {
     /// `Db::merge_ahead`).
     merge_ahead_asks: AtomicU64,
     merge_ahead_bytes: AtomicU64,
-    /// Bytes of input records a merge's second pass dropped from the page
-    /// cache behind itself (`Options::merge_drop_behind`).
-    merge_dropped_bytes: AtomicU64,
     /// The syncs merge writers made behind them (`Options::merge_sync_ahead`).
     merge_syncs: AtomicU64,
     /// The merge outputs whose writers started a helper.
@@ -27102,9 +26002,6 @@ struct Shared {
     /// PROTOTYPE: handles that took the published snapshot over their
     /// own under the keeper's rule; for a test.
     snap_switched: AtomicU64,
-    /// The times a commit's maintenance kept the merge path's snapshot to
-    /// its commit with the forms off (`Options::forms_off_snapshot_kept`).
-    snaps_kept: AtomicU64,
     /// Snapshots the seal thread published over the frozen table it was
     /// writing (`Options::seal_snapshot`); for a test.
     snap_sealed: AtomicU64,
@@ -27143,7 +26040,7 @@ struct Shared {
     /// Whether a grant of the raw records' place stands
     /// (`Options::scan_cache_copies_fit`): set by the writer's side where
     /// it grants one and cleared where it takes one back, for the segment
-    /// work's look at the heads (`Options::heads_owned_beside_copies`),
+    /// work's look at the heads,
     /// which cannot read the writer's own record of it.
     copies_stand: std::sync::atomic::AtomicBool,
     /// The writer's block cache, bytes, as its last commit's maintenance
@@ -28148,8 +27045,7 @@ pub struct Reader {
     /// threaded cells it is meant to be read beside would price.
     ord_served: std::cell::Cell<u64>,
     /// Point reads this handle answered by the two-source read and by the
-    /// layered one (`Reader::read_lone`, `Reader::read_layers`,
-    /// `Options::point_lone`), for a test that has to know which read its
+    /// layered one (`Reader::read_lone`, `Reader::read_layers`), for a test that has to know which read its
     /// store took (`point_lean_reads`).
     lone_reads: std::cell::Cell<u64>,
     /// The gets, puts and read-modify-writes the lean path answered
@@ -28168,8 +27064,7 @@ pub struct Reader {
     /// which a read the lean probe found absent from it makes none of.
     placed_live_probes: std::cell::Cell<u64>,
     layer_reads: std::cell::Cell<u64>,
-    /// Of `layer_reads`, the ones `read_placed` answered
-    /// (`Options::point_layers_lean`).
+    /// Of `layer_reads`, the ones `read_placed` answered.
     placed_reads: std::cell::Cell<u64>,
     /// Of the lean reads, the ones a tombstone in the live table's chain
     /// ended: answered by the live table alone, whatever the store below
@@ -28736,10 +27631,6 @@ struct FormsState {
     /// The settle's resolves whose stride was planned ahead
     /// (`Options::settle_seek_ahead`).
     seeks_planned: std::cell::Cell<u64>,
-    /// Per partition by position, the last look at its heads' residency:
-    /// the segment looked at, when, and whether every page was resident
-    /// (`Options::heads_look_ms`).
-    heads_looks: std::cell::RefCell<Vec<Option<(u64, std::time::Instant, bool)>>>,
     /// The settle's patches whose lines were asked for by the cut
     /// (`Options::settle_patch_at_cut`).
     patch_asks: std::cell::Cell<u64>,
@@ -28753,15 +27644,10 @@ struct FormsState {
     /// take the rest in its next pass (`Options::upkeep_pass_pct`). Zero
     /// is unbounded, which the writer's own looks are.
     read_cap: std::cell::Cell<usize>,
-    /// For a pass on the upkeep thread: `UpkeepTo::lent` of the commit
-    /// the pass brings the upkeep to, against which the conversions'
-    /// yield measures how far the writer has gone on
-    /// (`Options::forms_convert_behind`).
-    pass_lent: std::cell::Cell<u64>,
     /// The largest commit lent to the pass in flight on the upkeep thread
     /// since the thread was last caught up (`UpkeepTo::big`), for
-    /// `settle_due` to tell a burst's batch from a mix's
-    /// (`Options::upkeep_files_bursts`); zero off the thread.
+    /// `settle_due` to tell a burst's batch from a mix's;
+    /// zero off the thread.
     pass_batch: std::cell::Cell<u64>,
     log_short: std::cell::Cell<bool>,
     /// A fill the upkeep thread left for a later pass because the writer
@@ -28923,11 +27809,9 @@ impl FormsState {
             lazy_cuts: Counts::new(),
             settle_short: Counts::new(),
             seeks_planned: std::cell::Cell::new(0),
-            heads_looks: std::cell::RefCell::new(Vec::new()),
             patch_asks: std::cell::Cell::new(0),
             settle_ahead: Counts::new(),
             read_cap: std::cell::Cell::new(0),
-            pass_lent: std::cell::Cell::new(0),
             pass_batch: std::cell::Cell::new(0),
             log_short: std::cell::Cell::new(false),
             fill_owed: std::cell::Cell::new(false),
@@ -29356,7 +28240,7 @@ enum Hand {
     /// the settle bound says (`Options::upkeep_inline_bursts`).
     File,
     /// The batch settled here and its forms left to the scans that walk
-    /// them (`Options::upkeep_settle_after_scans`).
+    /// them.
     Settle,
     /// Lent, and the commit returns once the thread trails by at most
     /// this many writes, a share of the store's keys: a burst's batches
@@ -32353,17 +31237,16 @@ impl State {
     }
 
     /// The partition whose range holds `key`: the first whose upper fence
-    /// is above it. By the fences' words where `words` asks and the state
-    /// has them (`Options::point_fence_words`), else by their bytes; the
-    /// two agree for every fence a word holds (`fence_word`).
+    /// is above it. By the fences' words where the state has them, else by
+    /// their bytes; the two agree for every fence a word holds
+    /// (`fence_word`).
     #[inline(always)]
-    fn part_of(&self, key: &[u8], words: bool) -> usize {
+    fn part_of(&self, key: &[u8]) -> usize {
         let np = self.parts;
         if np <= 1 {
             return 0;
         }
-        let words = words.then_some(&*self.fence_words);
-        part_by(words, np, key, || {
+        part_by(Some(&*self.fence_words), np, key, || {
             self.segs[..np].partition_point(|s| s.hi.as_ref().is_some_and(|h| h.as_slice() <= key))
         })
     }
@@ -32411,12 +31294,11 @@ const SEAL_CAP_FLOOR: usize = 1 << 20;
 const DATA_PER_FILE: (u64, u64) = (5, 7);
 
 impl Reader {
-    /// The memtable bytes at which the next commit seals: `seal_bytes`, or
-    /// with `seal_grows` the larger of that and the store's size over four
-    /// times `l0_trigger`, capped by `seal_max_pct` of the store's size.
-    /// The store's size is its partitions' key and value bytes in file
-    /// bytes at the calibrated ratio (`DATA_PER_FILE`), or their file bytes
-    /// themselves under `seal_on_file`.
+    /// The memtable bytes at which the next commit seals: the larger of
+    /// `seal_bytes` and the store's size over four times `l0_trigger`,
+    /// capped by `seal_max_pct` of the store's size. The store's size is
+    /// its partitions' key and value bytes in file bytes at the calibrated
+    /// ratio (`DATA_PER_FILE`).
     pub fn seal_threshold(&self) -> usize {
         self.threshold_for(false)
     }
@@ -32431,21 +31313,12 @@ impl Reader {
     fn threshold_for(&self, idle: bool) -> usize {
         let _e = self.enter();
         let st = self.state();
-        let sized = if self.opts.seal_on_file {
-            st.store_bytes
-        } else {
-            st.data_bytes.saturating_mul(DATA_PER_FILE.1) / DATA_PER_FILE.0
-        };
-        let floored =
-            self.opts.seal_floor_out_of_core && self.shared.zgate.load() != zselect::GATE_RAW;
-        let base = if !self.opts.seal_grows || floored {
-            self.opts.seal_bytes
-        } else {
-            let grown = sized / self.opts.l0_trigger.max(1).saturating_mul(4) as u64;
-            self.opts
-                .seal_bytes
-                .max(usize::try_from(grown).unwrap_or(usize::MAX))
-        };
+        let sized = st.data_bytes.saturating_mul(DATA_PER_FILE.1) / DATA_PER_FILE.0;
+        let grown = sized / self.opts.l0_trigger.max(1).saturating_mul(4) as u64;
+        let base = self
+            .opts
+            .seal_bytes
+            .max(usize::try_from(grown).unwrap_or(usize::MAX));
         if idle {
             return base;
         }
@@ -32775,9 +31648,6 @@ impl Reader {
         )
     }
 
-    /// Bytes of input records the merges' second passes dropped from the
-    /// page cache behind themselves over the store's life
-    /// (`Options::merge_drop_behind`).
     /// The syncs merge writers made behind them over the store's life
     /// (`Options::merge_sync_ahead`).
     #[doc(hidden)]
@@ -32790,12 +31660,6 @@ impl Reader {
     #[doc(hidden)]
     pub fn merge_helpers(&self) -> u64 {
         self.shared.merge_helpers.load(AtomicOrdering::Relaxed)
-    }
-
-    pub fn merge_dropped_bytes(&self) -> u64 {
-        self.shared
-            .merge_dropped_bytes
-            .load(AtomicOrdering::Relaxed)
     }
 
     /// How many segments' ordered companions were advised `MADV_RANDOM`, and
@@ -32977,7 +31841,6 @@ impl Reader {
             willneed_asks: rd.stat(|s| &s.zwillneedasks),
             head_asks: rd.stat(|s| &s.zheadasks),
             head_submitted: rd.stat(|s| &s.zheadsubmitted),
-            head_looks: rd.stat(|s| &s.zheadlooks),
             top_keys: get(&self.shared.asks.top_keys),
             dir_willneeds: get(&self.shared.asks.dir_runs),
             dir_asks: get(&self.shared.asks.dir_submitted),
@@ -33114,10 +31977,7 @@ impl Reader {
             stride_convert_held: get(&ev.stride_convert_held),
             stride_convert_fill: get(&ev.stride_convert_fill),
             builds_raw_tails: get(&ev.builds_raw_tails),
-            recodes: get(&ev.recodes),
-            recodes_back: get(&ev.recodes_back),
             recode_failed: get(&ev.recode_failed),
-            recode_looks: get(&ev.recode_looks),
             hot_raw: get(&ev.hot_raw),
             hot_back: get(&ev.hot_back),
             hot_looks: get(&ev.hot_looks),
@@ -33141,10 +32001,6 @@ impl Reader {
             raw_settle_ms: get(&ev.raw_settle_ms),
             raw_maps: get(&ev.raw_maps),
             raw_map_ms: get(&ev.raw_map_ms),
-            reparses: get(&ev.reparses),
-            recode_flips: get(&ev.recode_flips),
-            spare_builds: get(&ev.spare_builds),
-            spare_failed: get(&ev.spare_failed),
             raw_dropped: get(&ev.raw_dropped),
             raw_dropped_at_install: get(&ev.raw_dropped_at_install),
             build_wall_us: get(&ev.build_wall_us),
@@ -33178,7 +32034,6 @@ impl Reader {
             if let Some(z) = seg.z.get() {
                 c.form_files += 1;
                 c.stride_files += u64::from(z.kind() == zfile::FileCoding::Stride);
-                c.own_decoder_files += u64::from(z.own_decoder);
                 c.damaged += u64::from(z.damaged());
                 c.pages += z.pages() as u64;
                 c.verified_pages += z.verified_pages();
@@ -33186,11 +32041,6 @@ impl Reader {
                 c.resident_bytes += z.resident_bytes() as u64;
                 c.file_bytes += z.file_bytes();
                 c.group_bytes += z.group_bytes();
-                if let Some(k) = seg.z_spare.get() {
-                    c.spare_files += 1;
-                    c.spare_bytes += k.file_bytes();
-                    c.resident_bytes += k.resident_bytes() as u64;
-                }
             } else {
                 match seg.z_declined.load(AtomicOrdering::Relaxed) {
                     zfile::DECLINED_SMALL => c.small_partitions += 1,
@@ -33214,8 +32064,7 @@ impl Reader {
 
     /// Point reads this handle answered by the read of a partition and
     /// the live table alone, and by the layered read of every source in
-    /// its common shape (`Options::point_lone`); both zero without the
-    /// option, and a read counted in neither took the general read. A
+    /// its common shape; a read counted in neither took the general read. A
     /// handle's own count, as `ord_point_reads` is.
     /// A test's: the length of the live table this handle reads as it was
     /// last carried, not carried here (`Options::shared_len_lazy`).
@@ -33268,7 +32117,7 @@ impl Reader {
 
     /// Of the layered reads `point_lean_reads` counts, the ones the read
     /// that places its sources first answered
-    /// (`Options::point_layers_lean`, `Reader::read_placed`); the rest
+    /// (`Reader::read_placed`); the rest
     /// were `read_layers`'. A handle's own count.
     pub fn point_placed_reads(&self) -> u64 {
         self.placed_reads.get()
@@ -33439,27 +32288,6 @@ impl Reader {
         if seg.ord.willneed_heads(lo, hi) > 0 {
             self.zbump(|s| &s.zheadsubmitted);
         }
-    }
-
-    /// Whether partition `at`'s heads were all resident at the last look,
-    /// the look made again once it is `Options::heads_look_ms` old or the
-    /// partition there is another segment (`OrdIndex::heads_all_resident`).
-    fn heads_warm(&self, at: usize, seg: &Seg, now: std::time::Instant) -> bool {
-        let id = seg.blob.id();
-        let mut looks = self.fs().heads_looks.borrow_mut();
-        if looks.len() <= at {
-            looks.resize(at + 1, None);
-        }
-        let stands = std::time::Duration::from_millis(u64::from(self.opts.heads_look_ms));
-        if let Some((seen, when, warm)) = looks[at] {
-            if seen == id && now.saturating_duration_since(when) < stands {
-                return warm;
-            }
-        }
-        let warm = seg.ord.heads_all_resident();
-        self.zbump(|s| &s.zheadlooks);
-        looks[at] = Some((id, now, warm));
-        warm
     }
 
     /// The partition `key` falls in, of the first `np` segments: stepped to
@@ -34418,7 +33246,7 @@ impl Reader {
             return None;
         }
         let fnv = crate::flatindex::key_hash(key);
-        let at = st.part_of(key, self.opts.point_fence_words);
+        let at = st.part_of(key);
         if let Some(seg) = st.segs[..st.parts].get(at) {
             seg.prefetch_slot(fnv);
         }
@@ -34452,18 +33280,13 @@ impl Reader {
     }
 
     /// Whether the partition `seg`, which the read placed for `key`
-    /// (`State::part_of`), may hold it: its filter alone where the
-    /// placement is by the fences' words (`Options::point_fence_words`),
-    /// since the partitions tile the key space and the one placed holds
-    /// the key in its range, and its fences and filter otherwise.
+    /// (`State::part_of`), may hold it: its filter alone, since the
+    /// partitions tile the key space and the one placed holds the key in
+    /// its range.
     #[inline(always)]
     fn placed_may_hold(&self, seg: &Seg, key: &[u8], fnv: u64) -> bool {
-        if self.opts.point_fence_words {
-            debug_assert!(!seg.below_lo(key) && seg.hi.as_ref().is_none_or(|h| key < h.as_slice()));
-            seg.bloom.as_ref().is_none_or(|b| b.maybe_contains_fnv(fnv))
-        } else {
-            seg.may_hold_fnv(key, fnv)
-        }
+        debug_assert!(!seg.below_lo(key) && seg.hi.as_ref().is_none_or(|h| key < h.as_slice()));
+        seg.bloom.as_ref().is_none_or(|b| b.maybe_contains_fnv(fnv))
     }
 
     /// The live table's read of `key` where it is a shared table of
@@ -34479,7 +33302,7 @@ impl Reader {
     }
 
     /// `read_layers` with its sources asked in the order of what each
-    /// costs (`Options::point_layers_lean`): `None`, with nothing handed to
+    /// costs: `None`, with nothing handed to
     /// `f`, for every store and key that read leaves to the general one,
     /// and for a store with a frozen table that was a run of ordered
     /// ingest, which is that read's.
@@ -34505,7 +33328,7 @@ impl Reader {
         pre: Option<(u64, usize)>,
         f: &mut F,
     ) -> Option<Result<u64>> {
-        if !self.opts.point_layers_lean || !self.opts.point_lone_on() {
+        if !self.opts.point_lone_on() {
             return None;
         }
         let (segs, mem) = (&st.segs, &*st.mem);
@@ -34530,8 +33353,8 @@ impl Reader {
             None => crate::flatindex::key_hash(key),
         };
         let (at, l0) = match pre {
-            Some((_, at)) => Reader::place_at(&self.opts, st, at, fnv, false)?,
-            None => Reader::place(&self.opts, st, key, fnv)?,
+            Some((_, at)) => Reader::place_at(st, at, fnv, false),
+            None => Reader::place(st, key, fnv),
         };
         // The live table first: the values of the key's chain newest
         // first, the first `live_n` of `live`. They are slices of the
@@ -34616,8 +33439,7 @@ impl Reader {
                 }
                 if let Some(c) = seg.raw().find_fixed_hashed(key, fnv)? {
                     // More records above the newest tombstone than the
-                    // frame keeps: the general read's
-                    // (`Options::point_placed_runs`).
+                    // frame keeps: the general read's.
                     if held == LAYERS_PIECES {
                         return None;
                     }
@@ -34668,7 +33490,7 @@ impl Reader {
 
     /// A point read over a partition, the pieces over its range, the
     /// frozen tables and the live one, where each holds the key in its
-    /// common shape (`Options::point_lone`): `None`, with nothing handed
+    /// common shape: `None`, with nothing handed
     /// to `f`, for any other store or key, which `read_sources` reads.
     ///
     /// One pass, newest source first, to the newest tombstone: the live
@@ -34704,7 +33526,7 @@ impl Reader {
         if np == 0 {
             return None;
         }
-        let at = st.part_of(key, self.opts.point_fence_words);
+        let at = st.part_of(key);
         let l0 = st.pieces_over(np, at);
         if l0.len() > LAYERS_PIECES {
             return None;
@@ -34784,11 +33606,10 @@ impl Reader {
     }
 
     /// A point read where the key's sources are the partition and the
-    /// live table (`Options::point_lone`): `None`, with nothing handed to
+    /// live table: `None`, with nothing handed to
     /// `f`, for every other store, which `read_sources` reads. With
     /// `live_absent`, the shared table's lean probe has found no record of
-    /// the key in the live table, which is then left unread
-    /// (`Options::point_lone_absent`). `pre` is the key's FNV word and
+    /// the key in the live table, which is then left unread. `pre` is the key's FNV word and
     /// partition where the read took them ahead of the live table's probe
     /// (`Options::shared_fall_ahead`).
     #[inline(always)]
@@ -34814,7 +33635,7 @@ impl Reader {
         // A table that rewrites in place is read through a copy, which the
         // general read takes (`MemTable::live_values`), unless the lean
         // probe found nothing of the key there to copy.
-        let absent = live_absent && self.opts.point_lone_absent;
+        let absent = live_absent;
         if !absent && mem.rewrites_now() {
             return None;
         }
@@ -34854,7 +33675,7 @@ impl Reader {
             };
             let at = match pre {
                 Some((_, at)) => at,
-                None => st.part_of(key, self.opts.point_fence_words),
+                None => st.part_of(key),
             };
             if let Some(seg) = segs.get(at).filter(|s| self.placed_may_hold(s, key, fnv)) {
                 match seg.raw().read_all_fixed_hashed(key, fnv, f) {
@@ -34874,40 +33695,30 @@ impl Reader {
     }
 
     /// The placed read's partition for `key` and the pieces over it, with
-    /// the asks for the lines their probes load first; `None` where the
-    /// pieces are more than the
-    /// read takes. Inlined at both of the read's places for it, since as a
-    /// closure it was a call and fifty instructions of every read.
+    /// the asks for the lines their probes load first. Inlined at both of
+    /// the read's places for it, since as a closure it was a call and fifty
+    /// instructions of every read.
     #[inline(always)]
-    fn place<'s>(
-        opts: &Options,
-        st: &'s State,
-        key: &[u8],
-        fnv: u64,
-    ) -> Option<(usize, &'s [std::sync::Arc<Seg>])> {
-        let at = st.part_of(key, opts.point_fence_words);
-        Reader::place_at(opts, st, at, fnv, true)
+    fn place<'s>(st: &'s State, key: &[u8], fnv: u64) -> (usize, &'s [std::sync::Arc<Seg>]) {
+        let at = st.part_of(key);
+        Reader::place_at(st, at, fnv, true)
     }
 
     /// `place` for a key whose partition `at` the read has, its slot
     /// asked for already where `ask_slot` is false.
     #[inline(always)]
-    fn place_at<'s>(
-        opts: &Options,
-        st: &'s State,
+    fn place_at(
+        st: &State,
         at: usize,
         fnv: u64,
         ask_slot: bool,
-    ) -> Option<(usize, &'s [std::sync::Arc<Seg>])> {
+    ) -> (usize, &[std::sync::Arc<Seg>]) {
         let (segs, np) = (&st.segs, st.parts);
         let l0 = st.pieces_placed(at);
         debug_assert!(
             std::ptr::eq(l0, st.pieces_over(np, at)),
             "the pieces a publish placed over a partition are the ones a search finds"
         );
-        if !opts.point_placed_runs && l0.len() > LAYERS_PIECES {
-            return None;
-        }
         // The partition's slot first: it is the read's longest wait where
         // no tombstone masks the partition, and the tables' probes and the
         // pieces' filters are the lead for it. The newest pieces' filters,
@@ -34918,7 +33729,7 @@ impl Reader {
         for seg in l0.iter().rev().take(PLACED_ASKS) {
             seg.prefetch_probe(fnv);
         }
-        Some((at, l0))
+        (at, l0)
     }
 
     /// A point read over every source that may hold the key: the
@@ -34943,7 +33754,7 @@ impl Reader {
             mem.prefetch_hashed(mem.hash_with(key, fnv))
         };
         let np = segs.partition_point(|s| s.level > 0);
-        let at = st.part_of(key, self.opts.point_fence_words);
+        let at = st.part_of(key);
         let holds = |s: &Seg| s.may_hold_fnv(key, fnv);
         let part = segs[..np].get(at).filter(|s| holds(s));
         let l0 = st.pieces_over(np, at);
@@ -34988,16 +33799,11 @@ impl Reader {
             (0, Probed::default())
         };
         let mut n = 0u64;
-        // The segment read lends the extents on the index's frame; the arm
-        // takes them by value, the shape before (`Options::exts_by_value`).
-        let by_value = self.opts.exts_by_value;
+        // The segment read lends the extents on the index's frame.
         let seg_read = |seg: &Seg, f: &mut F| {
-            if by_value {
-                seg.raw().read_all_by_value(key, f)
-            } else {
-                seg.raw().read_all_fixed_hashed(key, fnv, f)
-            }
-            .map_err(|e| err(&format!("segment read: {e}")))
+            seg.raw()
+                .read_all_fixed_hashed(key, fnv, f)
+                .map_err(|e| err(&format!("segment read: {e}")))
         };
         if start == 0 {
             if let Some(seg) = part {
@@ -36883,19 +35689,10 @@ impl Reader {
                 if b >= table.slots.len() || BuildCtx::overlay_count(table, b) > WIDE {
                     continue;
                 }
-                // A dense sparse form the builder made a copy for goes;
-                // any other form the writer holds stands.
-                match table.slots[b].as_deref() {
-                    None => {}
-                    Some(Cached::Sparse(sb))
-                        if self.opts.ahead_converts && sb.ents.len() >= CACHE_DENSE =>
-                    {
-                        self.unlist(pi, b, table);
-                    }
-                    Some(_) => {
-                        self.shared.forms_events[11].fetch_add(1, AtomicOrdering::Relaxed);
-                        continue;
-                    }
+                // A form the writer holds stands.
+                if table.slots[b].is_some() {
+                    self.shared.forms_events[11].fetch_add(1, AtomicOrdering::Relaxed);
+                    continue;
                 }
                 // The form as built, current to the builder's commit, is
                 // every handle's at that position; this handle's copy is
@@ -37990,13 +36787,7 @@ impl Reader {
     fn convert_from(&self) -> usize {
         match self.opts.forms_convert_from {
             0 => CACHE_DENSE,
-            n if n >= CACHE_DENSE
-                || self.understudy
-                || self.opts.forms_convert_light_writer
-                || self.opts.forms_convert_reads > 0 =>
-            {
-                n
-            }
+            n if n >= CACHE_DENSE || self.understudy || self.opts.forms_convert_reads > 0 => n,
             _ => CACHE_DENSE,
         }
     }
@@ -38010,19 +36801,11 @@ impl Reader {
             mem: self.mem(),
             frozen: self.frozen(),
             tombs: self.has_tombstones(),
-            dense_from: if self.opts.commit_forms && self.slot.is_none() {
-                match self.opts.form_dense_from {
-                    0 => CACHE_DENSE,
-                    n => n,
-                }
-            } else {
-                CACHE_DENSE
-            },
+            dense_from: CACHE_DENSE,
             stale: self.fs().snap_stale.borrow(),
             offs: Some(&self.fs().emit_offs),
             copy_dense: false,
             wide_copy: false,
-            copy_exact: self.opts.copy_exact,
             fit: self.fits(),
             pieces_only: self.opts.forms_pieces_only,
             ranks_by_heads: self.opts.piece_ranks_by_heads,
@@ -38049,9 +36832,6 @@ impl Reader {
         gen: u64,
         mine: Option<&(u64, std::sync::Arc<Snapshot>)>,
     ) -> bool {
-        if !self.opts.seal_snapshot {
-            return false;
-        }
         let st = self.state();
         if st.frozen.is_empty() {
             return false;
@@ -38125,7 +36905,7 @@ impl Reader {
             let added = self.fs().snap_added.borrow().len();
             stale = behind(held, added);
         }
-        if !stale && moved && self.opts.seal_snapshot {
+        if !stale && moved {
             // The log moved and the seal's snapshot is published: the
             // switch above asks only when nothing moved.
             stale = self.seal_snapshot_ahead(gen, cache.as_ref());
@@ -38320,40 +37100,10 @@ impl Reader {
                 .cache_seen
                 .store(self.fs().cache_bytes.get(), AtomicOrdering::Relaxed);
         }
-        self.keep_merge_snapshot();
         if self.settle_due(true) != Some(true) {
             return Ok(());
         }
         self.fill_forms()
-    }
-
-    /// The merge path's scan snapshot kept to this commit while the
-    /// writer's forms are given up (`Options::forms_off_snapshot_kept`):
-    /// what a scan's preamble does before its walk -- the log read to the
-    /// commit, the keys created since the snapshot filed into its side
-    /// runs, or the snapshot carried forward or built where it is behind
-    /// or absent (`refresh_snapshot`) -- done at the commit's maintenance,
-    /// so that the first scan after a burst reads the log from where the
-    /// last pass left it and files that much. Only while scans are near,
-    /// by the seals' reading of it (`Shared::scans_far_at`): a store
-    /// nobody scans keeps nothing. The writer's own upkeep alone: a handle
-    /// keeps no forms to give up.
-    fn keep_merge_snapshot(&self) {
-        if !self.opts.forms_off_snapshot_kept || self.slot.is_some() || !self.fs().forms_off.get() {
-            return;
-        }
-        // The forms go off at a scan, so the store has been scanned: far
-        // is the seals' mark at the scan count as it stands.
-        let life = self.shared.scans_life.load(AtomicOrdering::Relaxed)
-            + self.shared.scans_merged.load(AtomicOrdering::Relaxed);
-        if self.shared.scans_far_at.load(AtomicOrdering::Acquire) == life {
-            return;
-        }
-        let gen = self.state().gen;
-        if self.sync_log() {
-            self.refresh_snapshot(gen, false, true);
-            self.shared.snaps_kept.fetch_add(1, AtomicOrdering::Relaxed);
-        }
     }
 
     /// Under `forms_pieces_only`, on the writer's upkeep: once a
@@ -38544,13 +37294,11 @@ impl Reader {
             return Some(false);
         }
         let quiet = self.opts.seal_idle && self.mode_note.quiet.get() && far;
-        // A burst's batch on the upkeep thread is filed at once
-        // (`Options::upkeep_files_bursts`): the bound below is for a mix's
-        // small commits and for a commit that files on its own path.
-        let burst = self.understudy
-            && self.opts.upkeep_files_bursts
-            && !far
-            && self.fs().pass_batch.get() >= UPKEEP_WAKE_WRITES as u64;
+        // A burst's batch on the upkeep thread is filed at once: the bound
+        // below is for a mix's small commits and for a commit that files on
+        // its own path.
+        let burst =
+            self.understudy && !far && self.fs().pass_batch.get() >= UPKEEP_WAKE_WRITES as u64;
         let recent = !quiet
             && (self.opts.forms_settle_recent_pct == 0
                 || writes - self.fs().writes_at_scan.get()
@@ -38987,7 +37735,6 @@ impl Reader {
     /// ahead does on a spare core, done here for the store the builder
     /// declined (too small) or has not reached.
     fn complete_forms(&self, unsealed: &Snapshot) -> Result<bool> {
-        let mut converted = 0usize;
         // The fill's walk and its builds apart, on the thread's clock, for
         // `Db::pass_steps`, recorded at every exit.
         struct FillStamp<'a> {
@@ -39099,14 +37846,13 @@ impl Reader {
                     return Ok(false);
                 }
                 // An empty slot with an overlay, or a form the patches
-                // grew to what a build would have copied -- the latter up
-                // to a cap, if one is set, and on the upkeep thread only
-                // while nothing newer is posted and the writer does not
-                // want the upkeep back: a conversion repays only through
-                // later walks, and a pass that converted every dense form
-                // of a burst ran ten to fifteen milliseconds, which the
+                // grew to what a build would have copied -- the latter, on
+                // the upkeep thread, only while the writer does not want
+                // the upkeep back: a conversion repays only through later
+                // walks, and a pass that converted every dense form of a
+                // burst ran ten to fifteen milliseconds, which the
                 // writer's next freeze or scan waited out
-                // (`Options::forms_convert_cap`, `forms_convert_yield`).
+                // (`Options::forms_convert_yield`).
                 let dense = self.fs().convert_dense.get()
                     && matches!(
                         table.slots[b].as_deref(),
@@ -39117,39 +37863,18 @@ impl Reader {
                                     && self.shared.zgate.load() == zselect::GATE_RAW))
                     );
                 if dense {
-                    let cap = self.opts.forms_convert_cap;
-                    // The writer's wait yields always; a posted commit
-                    // only once the thread is behind it by more than the
-                    // allowance (`Options::forms_convert_behind`).
+                    // The writer's wait yields; a posted commit does not.
                     let state = self.shared.upkeep.state.load(AtomicOrdering::Acquire);
-                    // A light form, one converted under `CACHE_DENSE`
-                    // (`Options::forms_convert_from`), yields to any commit
-                    // posted: its copy repays only through walks, and the
-                    // burst the post belongs to is paced by this thread.
-                    let light = matches!(
-                        table.slots[b].as_deref(),
-                        Some(Cached::Sparse(sb)) if sb.ents.len() < CACHE_DENSE
-                    );
-                    let yielding = (light
-                        && self.opts.forms_convert_light_yields
-                        && state & (LEND_WANT | LEND_POSTED) != 0)
-                        || (self.opts.forms_convert_yield
-                            && self.understudy
-                            && (state & LEND_WANT != 0
-                                || (state & LEND_POSTED != 0 && self.convert_behind())));
-                    if (cap > 0 && converted >= cap) || yielding {
+                    let yielding =
+                        self.opts.forms_convert_yield && self.understudy && state & LEND_WANT != 0;
+                    if yielding {
                         continue;
                     }
-                    converted += 1;
                     let t_total = std::time::Instant::now();
                     // From the form itself where it can be: every delta's
                     // run is in it, resolved, so the copy is a merge of the
-                    // form with the block's records and reads no source;
-                    // the build from the sources gathered every key's run
-                    // again (`Options::convert_from_form`).
-                    let from_form = if self.opts.convert_from_form
-                        && BuildCtx::overlay_count(table, b) <= WIDE
-                    {
+                    // form with the block's records and reads no source.
+                    let from_form = if BuildCtx::overlay_count(table, b) <= WIDE {
                         table.slots[b].clone()
                     } else {
                         None
@@ -39275,26 +38000,6 @@ impl Reader {
     /// forms in eight milliseconds and read 0.56x.
     fn burst_pass(&self) -> bool {
         self.understudy && self.fs().pass_batch.get() >= UPKEEP_WAKE_WRITES as u64
-    }
-
-    /// Whether the upkeep thread is behind the writer by more than the
-    /// conversions' allowance: the writes the writer has lent past the
-    /// commit this pass brings the upkeep to
-    /// (`Options::forms_convert_behind`). The first version measured the
-    /// log position this handle may read to less the position it had
-    /// read, and on the thread the first is the pass's own bound, which
-    /// the log read has just reached: zero in every pass, so no posted
-    /// commit ever yielded a conversion and only the writer's wait did.
-    fn convert_behind(&self) -> bool {
-        let allow = self.opts.forms_convert_behind;
-        if allow == 0 {
-            return true;
-        }
-        if allow == usize::MAX {
-            return false;
-        }
-        let lent = self.shared.upkeep.to.load().lent;
-        lent.saturating_sub(self.fs().pass_lent.get()) > allow as u64
     }
 
     /// The block cache's budget: the one given (`scan_cache_bytes`), or
@@ -39933,21 +38638,6 @@ impl Reader {
         // second of the full rewrite's settles.
         let page = crate::bytes::os_page_size();
         let asking = out_of_core(&self.opts, self.shared.zgate.load()) && np > 0;
-        // One look a partition first (`Options::heads_look_ms`): the raw
-        // partitions whose heads are not all resident are the ones asked
-        // for, and with none there is no asking in this settle.
-        let cold: Vec<bool> = if asking && self.opts.heads_look_ms > 0 {
-            let now = std::time::Instant::now();
-            self.segs()[..np]
-                .iter()
-                .enumerate()
-                .map(|(p, s)| self.zc(s).is_none() && !self.heads_warm(p, s, now))
-                .collect()
-        } else {
-            Vec::new()
-        };
-        let asking = asking && (self.opts.heads_look_ms == 0 || cold.iter().any(|&c| c));
-        let asked_of = |p: usize| cold.get(p).copied().unwrap_or(true);
         // Per partition: the rank the asks have reached, the page of the
         // last resolve and whether the batch reads dense there; then the
         // sparse cursor's position in the batch and its partition.
@@ -40048,7 +38738,7 @@ impl Reader {
                     let Some(s) = self.segs()[..np].get(at_ahead) else {
                         continue;
                     };
-                    if dense[at_ahead] || self.zc(s).is_some() || !asked_of(at_ahead) {
+                    if dense[at_ahead] || self.zc(s).is_some() {
                         continue;
                     }
                     if let Some((lo, hi)) = s.ord.stride_window(k) {
@@ -40089,7 +38779,7 @@ impl Reader {
             // after this one -- this one is resident, the resolve just
             // seized it, and an ask that starts on a resident page asks
             // nothing -- until the frontier stands the lead past the rank.
-            if asking && cut != LAZY_CUT && self.zc(seg).is_none() && asked_of(at) {
+            if asking && cut != LAZY_CUT && self.zc(seg).is_none() {
                 let rank = (cut >> 1) as usize;
                 let pg = seg.ord.head_page(rank, page);
                 dense[at] = last_page[at] != usize::MAX && pg.saturating_sub(last_page[at]) <= 1;
@@ -40166,7 +38856,7 @@ impl Reader {
         let tfar = self.opts.settle_table_ahead;
         let value_ahead = CHUNK_HDR + self.opts.settle_value_ahead;
         let in_place = self.opts.settle_patch_in_place;
-        let converts = self.opts.settle_converts && self.opts.convert_from_form;
+        let converts = self.opts.settle_converts;
         let mut placed = 0u64;
         let mut asked = 0u64;
         let mut ahead_asks = [0u64; 2];
@@ -43647,7 +42337,7 @@ impl Reader {
             mem.prefetch_hashed(mem.hash_with(key, fnv))
         };
         let np = segs.partition_point(|s| s.level > 0);
-        let at = st.part_of(key, self.opts.point_fence_words);
+        let at = st.part_of(key);
         let holds = |s: &Seg| s.may_hold_fnv(key, fnv);
         let raw_count = |s: &Seg| {
             s.raw()
@@ -44872,7 +43562,6 @@ impl Db {
             fail_zbuild: std::sync::atomic::AtomicBool::new(false),
             z_convert_ask: AtomicU64::new(0),
             z_redrop_owe: std::sync::atomic::AtomicBool::new(false),
-            zsettle_hold: std::sync::atomic::AtomicBool::new(opts.zpages_hold_after_settle),
             zgate: ZGate::new(opts.zpages),
             block_pool: block_pool.clone(),
             asks: AskCounts::default(),
@@ -44900,7 +43589,6 @@ impl Db {
             merge_record_inputs: AtomicU64::new(0),
             merge_ahead_asks: AtomicU64::new(0),
             merge_ahead_bytes: AtomicU64::new(0),
-            merge_dropped_bytes: AtomicU64::new(0),
             merge_syncs: AtomicU64::new(0),
             merge_helpers: AtomicU64::new(0),
             reads_near: std::sync::atomic::AtomicBool::new(false),
@@ -44966,7 +43654,6 @@ impl Db {
             snap_kept: AtomicU64::new(0),
             snap_carried: AtomicU64::new(0),
             snap_switched: AtomicU64::new(0),
-            snaps_kept: AtomicU64::new(0),
             snap_sealed: AtomicU64::new(0),
             snap_on_table: AtomicU64::new(0),
             upkeep: Lend::default(),
@@ -46106,18 +44793,15 @@ impl Db {
                     opts.zpages_scan_prefetch,
                     opts.zpages_trusted_views,
                     opts.zpages_memo_first,
-                    (
-                        Db::fence_search(&opts),
-                        opts.zpages_memo_ahead,
-                        opts.zpages_inplace_walk,
-                        opts.zpages_drop_raw,
-                        opts.z_times_decodes(),
-                        zpages::Dec::of(opts.zpages_own_decoder, opts.zpages_flat_decode)
-                            .with_slack(opts.zpages_flat_slack),
-                        opts.zpages_cursor_view,
-                        opts.zpages_group_ahead,
-                        opts.zpages_walk_owns_decodes,
-                    ),
+                    ZAttachLines {
+                        fence: Db::fence_search(&opts),
+                        memo_ahead: opts.zpages_memo_ahead,
+                        drop_raw: opts.zpages_drop_raw,
+                        time_decodes: opts.z_times_decodes(),
+                        cursor_view: opts.zpages_cursor_view,
+                        group_ahead: opts.zpages_group_ahead,
+                        walk_owns: opts.zpages_walk_owns_decodes,
+                    },
                     &opts.z_stride_attach(),
                     &zev,
                 );
@@ -46288,7 +44972,6 @@ impl Db {
             fail_zbuild: std::sync::atomic::AtomicBool::new(false),
             z_convert_ask: AtomicU64::new(0),
             z_redrop_owe: std::sync::atomic::AtomicBool::new(false),
-            zsettle_hold: std::sync::atomic::AtomicBool::new(opts.zpages_hold_after_settle),
             zgate: ZGate::new(opts.zpages),
             block_pool: block_pool.clone(),
             asks: AskCounts::default(),
@@ -46316,7 +44999,6 @@ impl Db {
             merge_record_inputs: AtomicU64::new(0),
             merge_ahead_asks: AtomicU64::new(0),
             merge_ahead_bytes: AtomicU64::new(0),
-            merge_dropped_bytes: AtomicU64::new(0),
             merge_syncs: AtomicU64::new(0),
             merge_helpers: AtomicU64::new(0),
             reads_near: std::sync::atomic::AtomicBool::new(false),
@@ -46382,7 +45064,6 @@ impl Db {
             snap_kept: AtomicU64::new(0),
             snap_carried: AtomicU64::new(0),
             snap_switched: AtomicU64::new(0),
-            snaps_kept: AtomicU64::new(0),
             snap_sealed: AtomicU64::new(0),
             snap_on_table: AtomicU64::new(0),
             upkeep: Lend::default(),
@@ -49011,7 +47692,7 @@ impl Db {
         // handle adopts a published snapshot under no pin, and a swap
         // from another thread between its load and its clone would free
         // what it took.
-        let snap_reader = if self.opts.seal_snapshot && self.opts.writer_pins {
+        let snap_reader = if self.opts.writer_pins {
             let r = self.seal_reader();
             // Every engine slot has a claimant by name, and one more would
             // take a seal's silently: the fast path would go, and no
@@ -49024,7 +47705,6 @@ impl Db {
         } else {
             None
         };
-        let from_snapshot = self.opts.seal_from_snapshot;
         let frozen_snaps = self.opts.frozen_snaps;
         // Reads around the table being sealed, by the writes of the
         // tables sealed since the store's scan count last moved: a seal
@@ -49054,12 +47734,7 @@ impl Db {
         self.shared
             .reads_near
             .store(near || self.draining, AtomicOrdering::Release);
-        let build_copy = if self.draining {
-            self.opts.drain_snapshot
-        } else {
-            near || self.opts.seal_snapshot_far
-        };
-        let put_one = self.opts.seal_put_one;
+        let build_copy = self.draining || near || self.opts.seal_snapshot_far;
         let bloom_pieces_only = self.opts.bloom_pieces_only;
         // As the seal's writer has them (`Shared::job_buffers`, above).
         let jobs_mapped = opts.maps();
@@ -49141,7 +47816,8 @@ impl Db {
                 });
                 let snap = match copied {
                     Some(h) => h.clone(),
-                    // A drain's seal builds none (`Options::drain_snapshot`).
+                    // A seal far from reads builds none
+                    // (`Options::seal_snapshot_far`).
                     None if !build_copy => return None,
                     None => {
                         let mut built = Snapshot::from_frozen(&mem, &order)?;
@@ -49202,7 +47878,7 @@ impl Db {
             // one: the keys and the chains in key order, one sequential
             // read, where the walk through the memtable was the entry,
             // the chain and the value, three dependent misses a key.
-            let stream = snap.as_ref().filter(|_| from_snapshot);
+            let stream = snap.as_ref();
             // The table itself, one pointer for the walk to keep, where
             // the walk through the capture reloaded the capture and then
             // the table from it at each of a key's eight uses.
@@ -49276,8 +47952,8 @@ impl Db {
                                 let (n, v) = s.arena.run(e.frun);
                                 let (range, tomb) = Snapshot::run_visible(n, v, SEE_ALL);
                                 // One value and no tombstone: the record
-                                // laid out once (`Options::seal_put_one`).
-                                if put_one && !tomb && range.len() >= 12 {
+                                // laid out once (`SegmentWriter::put_one`).
+                                if !tomb && range.len() >= 12 {
                                     let len = u32::from_le_bytes(
                                         v[range.start + 8..range.start + 12]
                                             .try_into()
@@ -49323,7 +47999,7 @@ impl Db {
                                 // Only what is live after the newest
                                 // tombstone, and the flag if there was one.
                                 let tomb = mem.live_offs_into(e, &mut offs, SEE_ALL);
-                                if put_one && !tomb && offs.len() == 1 {
+                                if !tomb && offs.len() == 1 {
                                     w.put_one(key, mem.value_at(offs[0]))?;
                                     continue;
                                 }
@@ -50578,7 +49254,7 @@ impl Db {
 
     /// The landings' questions whether a rewritten partition cuts the same
     /// blocks, by how each was answered: from the ordered indexes and from
-    /// the records (`Options::same_blocks_from_index`).
+    /// the records, for keys a head cannot hold whole (`Db::same_blocks`).
     pub fn same_blocks_asked(&self) -> [u64; 2] {
         let a = &self.shared.same_blocks_asked;
         [
@@ -50601,13 +49277,6 @@ impl Db {
 
     /// EXPERIMENT: snapshots republished with their stale runs copied
     /// again; see `Snapshot::refreshed`.
-    /// The times a commit's maintenance kept the merge path's snapshot to
-    /// its commit with the forms off (`Options::forms_off_snapshot_kept`).
-    #[doc(hidden)]
-    pub fn snapshots_kept(&self) -> u64 {
-        self.shared.snaps_kept.load(AtomicOrdering::Relaxed)
-    }
-
     pub fn snapshot_refreshes(&self) -> u64 {
         self.shared.snap_refreshes.load(AtomicOrdering::Relaxed)
     }
@@ -50651,7 +49320,7 @@ impl Db {
     /// forms installed from a builder, writes settled against no table,
     /// the fill's dense conversions and fresh builds, the builder's skips
     /// and builds, the installs dropped and skipped, and the dense
-    /// conversions made from the form itself (`Options::convert_from_form`).
+    /// conversions made from the form itself.
     pub fn forms_events(&self) -> [u64; 14] {
         let mut out = [0u64; 14];
         out[0] = self.shared.blk_upkeep.load(AtomicOrdering::Relaxed);
@@ -51121,7 +49790,6 @@ impl Db {
         cur: &State,
         segs: &[std::sync::Arc<Seg>],
         rebase: bool,
-        from_index: bool,
         asked: &[AtomicU64; 2],
         rd: Option<&Reader>,
     ) -> Vec<u64> {
@@ -51133,7 +49801,7 @@ impl Db {
                 let was = parts.iter().position(|q| q.lo == seg.lo && q.hi == seg.hi);
                 match was {
                     Some(q) if std::sync::Arc::ptr_eq(&parts[q], seg) => cur.layout[q],
-                    Some(q) if rebase && Db::same_blocks(&parts[q], seg, from_index, asked, rd) => {
+                    Some(q) if rebase && Db::same_blocks(&parts[q], seg, asked, rd) => {
                         cur.layout[q]
                     }
                     _ => seg.blob.id(),
@@ -51164,7 +49832,7 @@ impl Db {
     /// rank and at the last. Read from the two ordered indexes where both
     /// hold whole keys in their heads (`OrdIndex::whole_key_at`), the
     /// block's first ranks being the top level's, in memory, and from the
-    /// records otherwise (`Options::same_blocks_from_index`).
+    /// records otherwise.
     ///
     /// A key a block of both partitions is, read from the records, for
     /// records of a hundred bytes a read of most of the pages of both, and
@@ -51175,19 +49843,13 @@ impl Db {
     /// past its budget: at the landing of a merge over a whole store this
     /// walk read the store into a cache an eighth of its size, on the
     /// segment work's one pin, in fifty milliseconds.
-    fn same_blocks(
-        a: &Seg,
-        b: &Seg,
-        from_index: bool,
-        asked: &[AtomicU64; 2],
-        rd: Option<&Reader>,
-    ) -> bool {
+    fn same_blocks(a: &Seg, b: &Seg, asked: &[AtomicU64; 2], rd: Option<&Reader>) -> bool {
         let n = a.blob.keys();
         if n != b.blob.keys() || a.level != b.level || a.lo != b.lo || a.hi != b.hi {
             return false;
         }
         let ranks = || (0..n).step_by(CACHE_BLOCK).chain(n.checked_sub(1));
-        if from_index && a.ord.uniform() && b.ord.uniform() {
+        if a.ord.uniform() && b.ord.uniform() {
             let (mut x, mut y) = (Vec::new(), Vec::new());
             let mut whole = true;
             let same = ranks().all(|r| {
@@ -51369,12 +50031,9 @@ impl Reader {
                 since.file(mem, e.key_off, e.key_len());
             }
         }
-        // Per block: 0 for no form, 1 for a form the builder leaves
-        // alone, whether or not it is published, and 2 for a sparse form
-        // grown dense, which the builder builds a copy for
-        // (`Options::ahead_converts`).
-        let converts = self.opts.ahead_converts;
-        let held: Vec<Vec<u8>> = self
+        // Per block: whether the writer holds a form, which the builder
+        // leaves alone, whether or not it is published.
+        let held: Vec<Vec<bool>> = self
             .fs()
             .tables
             .borrow()
@@ -51382,20 +50041,7 @@ impl Reader {
             .map(|cell| {
                 cell.borrow()
                     .as_ref()
-                    .map(|t| {
-                        t.slots
-                            .iter()
-                            .map(|s| match s.as_deref() {
-                                None => 0u8,
-                                Some(Cached::Sparse(sb))
-                                    if converts && sb.ents.len() >= CACHE_DENSE =>
-                                {
-                                    2
-                                }
-                                Some(_) => 1,
-                            })
-                            .collect()
-                    })
+                    .map(|t| t.slots.iter().map(|s| s.is_some()).collect())
                     .unwrap_or_default()
             })
             .collect();
@@ -52982,17 +51628,35 @@ impl Db {
     }
 }
 
+/// The parsing encoder's search at the controller's builds: a greedy parse
+/// over four positions of each hash chain (`zlz4::Effort::of_chains`).
+/// The parse buys its decode in fewer sequences and pays in the builder's
+/// CPU, which is what put the install behind the load: the greedy parse
+/// over four positions writes 0.91 of the greedy encoder's sequences in
+/// 2.2 times its encode, where the lazy one over sixteen writes 0.84 in
+/// 4.2 (`bench/examples/zdecode.rs --rhc N:0:8:1:0:1`), and the form's
+/// pages at 0.973 and 0.957 of the greedy encoder's
+/// (`bench/examples/zsize.rs --parse N`).
+const ZPARSE_CHAINS: u32 = 4;
+
+/// What `Db::z_attach` sets on a form file it attaches beyond the file's
+/// own shape, by name: a tuple of flags read by position lost the raw
+/// drop to the decode timer's slot when a flag before them went.
+struct ZAttachLines {
+    fence: zpages::FenceSearch,
+    memo_ahead: bool,
+    drop_raw: bool,
+    time_decodes: bool,
+    cursor_view: bool,
+    group_ahead: bool,
+    walk_owns: bool,
+}
+
 /// Rounds `zpages_settle` makes at most over the partitions that lack a
 /// form file: a merge that lands while one is built makes partitions the next
 /// round gives theirs, and a store that keeps merging stops being waited
 /// for.
 const ZSETTLE_ROUNDS: usize = 4;
-
-/// How long a settle under `Options::zpages_hold_after_settle` waits for
-/// the build after it to park at its rename: a test's bound, so that a
-/// seam that never sees its build fails the test's assertion and does not
-/// hang it.
-const ZSETTLE_HOLD_WAIT: std::time::Duration = std::time::Duration::from_secs(30);
 
 /// Where in a round of `Db::zpages_settle_with` its seam is called.
 #[doc(hidden)]
@@ -53068,17 +51732,7 @@ impl Db {
         prefetch: bool,
         trusted: bool,
         memo_first: bool,
-        lines: (
-            zpages::FenceSearch,
-            bool,
-            bool,
-            bool,
-            bool,
-            zpages::Dec,
-            bool,
-            bool,
-            bool,
-        ),
+        lines: ZAttachLines,
         stride: &zfile::StrideAttach,
         ev: &zfile::ZEvents,
     ) -> bool {
@@ -53098,23 +51752,22 @@ impl Db {
             prefetch,
             trusted,
             memo_first,
-            lines.0,
-            lines.1,
+            lines.fence,
+            lines.memo_ahead,
             stride,
         ) {
             Ok(mut side) => {
-                side.inplace = lines.2;
-                side.time_decodes = lines.4;
-                side.own_decoder = lines.5.own();
-                side.flat_decoder = lines.5.flat();
-                side.flat_slack = lines.5 == zpages::Dec::FlatEnd;
-                side.cursor_view = lines.6;
-                side.group_ahead = lines.7;
-                side.walk_owns = lines.8;
+                side.time_decodes = lines.time_decodes;
+                side.own_decoder = true;
+                side.flat_decoder = true;
+                side.flat_slack = true;
+                side.cursor_view = lines.cursor_view;
+                side.group_ahead = lines.group_ahead;
+                side.walk_owns = lines.walk_owns;
                 let installed = seg.z.install(side);
                 if installed {
                     zfile::ZEvents::add(&ev.attached, 1);
-                    if lines.3 {
+                    if lines.drop_raw {
                         seg.drop_raw_pages(dir, ev);
                     }
                 }
@@ -53162,18 +51815,15 @@ impl Db {
                 self.opts.zpages_scan_prefetch,
                 self.opts.zpages_trusted_views,
                 self.opts.zpages_memo_first,
-                (
-                    Db::fence_search(&self.opts),
-                    self.opts.zpages_memo_ahead,
-                    self.opts.zpages_inplace_walk,
-                    z_drop_now(&self.opts, &self.shared),
-                    self.opts.z_times_decodes(),
-                    zpages::Dec::of(self.opts.zpages_own_decoder, self.opts.zpages_flat_decode)
-                        .with_slack(self.opts.zpages_flat_slack),
-                    self.opts.zpages_cursor_view,
-                    self.opts.zpages_group_ahead,
-                    self.opts.zpages_walk_owns_decodes,
-                ),
+                ZAttachLines {
+                    fence: Db::fence_search(&self.opts),
+                    memo_ahead: self.opts.zpages_memo_ahead,
+                    drop_raw: z_drop_now(&self.opts, &self.shared),
+                    time_decodes: self.opts.z_times_decodes(),
+                    cursor_view: self.opts.zpages_cursor_view,
+                    group_ahead: self.opts.zpages_group_ahead,
+                    walk_owns: self.opts.zpages_walk_owns_decodes,
+                },
                 &self.opts.z_stride_attach(),
                 ev,
             )
@@ -53188,13 +51838,12 @@ impl Db {
                 let mut plan =
                     zfile::BuildPlan::new(self.opts.zpages_min_bytes, self.opts.zpages_drop_behind);
                 plan.ahead = self.opts.zpages_build_ahead;
-                plan.group_bytes = self.opts.zpages_group_bytes;
+                plan.group_bytes = zpages::ZGROUP_BYTES;
                 plan.coding = self.opts.z_coding();
-                plan.store_all = self.opts.zpages_store_all;
                 plan.raw_tails = self.opts.zpages_raw_tails;
-                plan.parse = self.opts.zpages_parse;
-                plan.parse_chains = self.opts.zpages_parse_chains;
-                plan.own_decode = self.opts.zpages_own_decoder;
+                plan.parse = true;
+                plan.parse_chains = ZPARSE_CHAINS;
+                plan.own_decode = true;
                 plan.stride = self.opts.z_stride_ask();
                 plan.stride_sparse = self.opts.zpages_stride_sparse;
                 plan
@@ -53225,11 +51874,10 @@ impl Db {
                     &self.opts.z_stride_attach_built(&b),
                 ) {
                     Ok(mut side) => {
-                        side.inplace = self.opts.zpages_inplace_walk;
                         side.time_decodes = self.opts.z_times_decodes();
-                        side.own_decoder = self.opts.zpages_own_decoder;
-                        side.flat_decoder = self.opts.zpages_flat_decode;
-                        side.flat_slack = self.opts.zpages_flat_slack;
+                        side.own_decoder = true;
+                        side.flat_decoder = true;
+                        side.flat_slack = true;
                         side.cursor_view = self.opts.zpages_cursor_view;
                         side.group_ahead = self.opts.zpages_group_ahead;
                         side.walk_owns = self.opts.zpages_walk_owns_decodes;
@@ -53339,12 +51987,6 @@ impl Db {
         if matches!(self.maint, MaintHome::Away(_)) {
             self.settle()?;
             self.maint_request(MaintAsk::ZSettle)?;
-            if self.shared.zsettle_hold.load(AtomicOrdering::Acquire) {
-                let t = std::time::Instant::now();
-                while !self.zpage_build_waiting() && t.elapsed() < ZSETTLE_HOLD_WAIT {
-                    std::thread::sleep(std::time::Duration::from_millis(1));
-                }
-            }
             return self.z_settle_end();
         }
         for _ in 0..ZSETTLE_ROUNDS {
@@ -53531,13 +52173,6 @@ impl Db {
     #[doc(hidden)]
     pub fn hold_zpage_rename(&self, on: bool) {
         Db::set_zhold(&self.shared.zbuild_hold, ZHOLD_RENAME, on);
-    }
-
-    /// A test's: `Options::zpages_hold_after_settle` set or cleared. The
-    /// rename hold it arms stays until `hold_zpage_rename(false)`.
-    #[doc(hidden)]
-    pub fn hold_zpage_after_settle(&self, on: bool) {
-        self.shared.zsettle_hold.store(on, AtomicOrdering::Release);
     }
 
     /// Whether the builder's thread is parked at one of the holds. A test
@@ -54097,7 +52732,7 @@ impl Reader {
         stop: &std::sync::atomic::AtomicU8,
         tx: &std::sync::mpsc::Sender<Built>,
         posted: &std::sync::atomic::AtomicBool,
-        held: &[Vec<u8>],
+        held: &[Vec<bool>],
     ) -> Result<()> {
         if !self.pin_at(&at) {
             return Ok(());
@@ -54192,11 +52827,12 @@ impl Reader {
                     .get(pi)
                     .and_then(|f| f.get(b))
                     .is_some_and(|s| !s.load(AtomicOrdering::Acquire).is_null());
-                // A block the writer holds a form for, or one published
-                // already, has nothing to build for; one the writer holds
-                // as a dense sparse form gets a copy.
-                let code = held.get(pi).and_then(|h| h.get(b)).copied().unwrap_or(0);
-                if code == 1 || (published && code != 2) {
+                let writers = held
+                    .get(pi)
+                    .and_then(|h| h.get(b))
+                    .copied()
+                    .unwrap_or(false);
+                if writers || published {
                     self.shared.forms_events[7].fetch_add(1, AtomicOrdering::Relaxed);
                     continue;
                 }
@@ -54630,8 +53266,8 @@ struct UpkeepTo {
     cap: u64,
     /// The writes of the largest commit lent since the thread was last
     /// seen caught up, this one included: what tells a burst's batch,
-    /// a commit of a thousand writes, from a mix's hundred, for
-    /// `Options::upkeep_files_bursts`. The sum of the commits lent would
+    /// a commit of a thousand writes, from a mix's hundred, for the thread
+    /// to file a burst's at once. The sum of the commits lent would
     /// not, since three of a mix's commits unfiled sum past any burst's
     /// one.
     big: u64,
@@ -55511,7 +54147,6 @@ impl Reader {
             self.wm.set(to.wm);
             self.force_due.set(to.force);
             self.fs().read_cap.set(to.cap as usize);
-            self.fs().pass_lent.set(to.lent);
             self.fs().pass_batch.set(to.big);
             self.fs().log_short.set(false);
             // Asked to give the forms up before the pass began: nothing of
@@ -55771,8 +54406,7 @@ impl Db {
         // by a commit that does not sync, and the thread is lent nothing
         // of it; one that syncs lends it, since the thread works through
         // the fsync: see `Options::upkeep_inline_bursts`, and
-        // `Options::upkeep_inline_min` for where "worth waking for" is
-        // drawn.
+        // `UPKEEP_WAKE_WRITES` for where "worth waking for" is drawn.
         let mut pace = false;
         let mut pace_syncs = false;
         // The share of the store's keys a paced batch is within and the
@@ -55782,13 +54416,13 @@ impl Db {
         // or waited for (`Options::held_bursts_lend`).
         let burst_lent = self.opts.held_bursts_lend
             && matches!(self.opts.sync, SyncPolicy::Explicit)
-            && batch >= self.opts.upkeep_inline_min;
+            && batch >= UPKEEP_WAKE_WRITES;
         if level == 1
             && self.opts.upkeep_inline_bursts
             && !burst_lent
             && !syncs
             && reads_around
-            && batch >= self.opts.upkeep_inline_min
+            && batch >= UPKEEP_WAKE_WRITES
         {
             // The first such batch after a scan is filed here, and so is
             // one over the share of the store the first scan's wait is
@@ -55819,7 +54453,7 @@ impl Db {
             && self.opts.upkeep_pace_syncs_bp > 0
             && reads_around
             && batch > 0
-            && (self.opts.upkeep_pace_syncs_model || batch >= self.opts.upkeep_inline_min)
+            && (self.opts.upkeep_pace_syncs_model || batch >= UPKEEP_WAKE_WRITES)
             && in_core
         {
             share = (keys as u64).saturating_mul(self.opts.upkeep_pace_syncs_bp as u64) / 10_000;
@@ -55829,11 +54463,10 @@ impl Db {
         // A smaller batch with a scan since the last commit: the scans
         // behind it take the batch back before the thread's first poll,
         // so its settle runs here and the forms wait for the scans that
-        // walk them (`Options::upkeep_settle_after_scans`). `since_scan`
-        // is zero only where the scan count moved since the last commit.
+        // walk them. `since_scan` is zero only where the scan count moved
+        // since the last commit.
         if level == 1
             && self.opts.upkeep_inline_bursts
-            && self.opts.upkeep_settle_after_scans
             && !burst_lent
             && !syncs
             && reads_around
@@ -56202,8 +54835,7 @@ impl Db {
     }
 
     /// Microseconds the fill's dense conversions spent building their
-    /// copies, and in the whole conversion, over the store's life
-    /// (`Options::convert_from_form`).
+    /// copies, and in the whole conversion, over the store's life.
     pub fn convert_us(&self) -> (u64, u64) {
         (
             self.shared.convert_build_ns.load(AtomicOrdering::Relaxed) / 1000,
@@ -56231,16 +54863,14 @@ impl Db {
     }
 
     /// The copies of heads made under the raw gate, the store's files
-    /// whole past the fill share of its budget
-    /// (`Options::heads_owned_past_fill`).
+    /// whole past the fill share of its budget.
     #[doc(hidden)]
     pub fn heads_past_fill(&self) -> u64 {
         self.shared.heads_events[3].load(AtomicOrdering::Relaxed)
     }
 
     /// The copies of heads made for a grant of the records' place alone,
-    /// the controller's model saying the raw form does not fit
-    /// (`Options::heads_owned_beside_copies`).
+    /// the controller's model saying the raw form does not fit.
     #[doc(hidden)]
     pub fn heads_beside_copies(&self) -> u64 {
         self.shared.heads_events[2].load(AtomicOrdering::Relaxed)
@@ -56985,8 +55615,6 @@ struct BuildCtx<'s> {
     /// (`Options::forms_copy_hot_wide`), where the build would answer the
     /// wide form.
     wide_copy: bool,
-    /// See `Options::copy_exact`.
-    copy_exact: bool,
     /// See `Options::forms_to_fit`.
     fit: bool,
     /// `Options::forms_pieces_only`: the forms hold the pieces' fold alone
@@ -58864,7 +57492,7 @@ impl<'s> BuildCtx<'s> {
     /// them: the form's keys at their cuts, each with the run the form
     /// holds, and the partition's records between, streamed. What
     /// `copy_block` builds over the overlay, from the form instead of
-    /// from the sources; see `Options::convert_from_form`.
+    /// from the sources.
     fn copy_from_deltas(
         &self,
         src: Sources,
@@ -58874,14 +57502,10 @@ impl<'s> BuildCtx<'s> {
         let seg = src.seg;
         let (lo, hi) = (ranks.start, ranks.end);
         // Sized to the form plus the records it does not replace: a copy
-        // with room for a record's worth more per record fit no chunk the
-        // forms before it freed and faulted in fresh pages for the whole
-        // burst (`Options::copy_exact`).
-        let kept = if self.copy_exact {
-            (hi - lo).saturating_sub(sb.ents.iter().filter(|e| e.same).count())
-        } else {
-            hi - lo
-        };
+        // with room for a record's worth more per record fits no chunk the
+        // forms before it freed and faults in fresh pages for the whole
+        // burst.
+        let kept = (hi - lo).saturating_sub(sb.ents.iter().filter(|e| e.same).count());
         let mut blk = CopyBuild::new(
             seg.keyseq,
             (
@@ -59668,46 +58292,16 @@ const SLOT_TOLD_ONE: u8 = 2;
 const ONE_RIDE_WAIT: std::time::Duration = std::time::Duration::from_secs(1);
 const MAINT_LAND_POLL: std::time::Duration = std::time::Duration::from_micros(100);
 
-/// The re-code policy's period (`Options::zpages_recode`); the decode time
-/// a second below which a partition is not re-coded, two milliseconds, a
-/// fifth of a percent of a core; the group's file refaults a second over
-/// which the last re-code is given back, fifty, which at the 0.1-0.2 ms a
-/// refault costs this device is the decode time a few hot partitions'
-/// raw tails save; and how long the ceiling a give-back sets on the form
-/// files' bytes stands once the refaults fall under that floor.
-const RECODE_PERIOD: std::time::Duration = std::time::Duration::from_secs(1);
+/// The heat the hot-raw policy reads (`Options::zpages_hot_raw`): the
+/// decode time a second below which a partition is not hot, two
+/// milliseconds, a fifth of a percent of a core; the time its decay takes a
+/// partition's heat down by e; how much hotter a partition has to be than
+/// the coldest raw one to take its room; and the decode's price a raw
+/// partition's reads are read at before any form file has counted one.
 const RECODE_FLOOR_NS: f64 = 2.0e6;
-const RECODE_REFAULTS: f64 = 50.0;
-const RECODE_HOLD: std::time::Duration = std::time::Duration::from_secs(60);
-/// The re-code policy's heat: the time its decay takes a partition's heat
-/// down by e, so a uniform pass of a few seconds does not settle where the
-/// raw tails go; how much hotter a block-coded partition has to be than the
-/// coldest raw-tailed one to take its room; and the decode's price a
-/// raw-tailed partition's opens are read at before any block-coded form
-/// file has counted one.
 const RECODE_TAU: std::time::Duration = std::time::Duration::from_secs(10);
-/// The policy's period where every partition keeps both codings
-/// (`Options::zpages_both`): a flip costs the prefetch of the incoming
-/// file, a partition's 20-30 MB at the device's 150 MB/s here, about a
-/// fifth of a second, so a look a fifth of a second.
-const RECODE_PERIOD_BOTH: std::time::Duration = std::time::Duration::from_millis(200);
-/// The incoming pages a look asks for at most, beyond its first flip: what
-/// the device reads in one period.
-const RECODE_FLIP_BYTES: u64 = 32 << 20;
 const RECODE_SWAP: f64 = 2.0;
 const RECODE_DECODE_NS: f64 = 1000.0;
-/// The re-code policy under the controller (`Options::zpages_recode_auto`):
-/// the share of the store's decode time a partition holds before its raw
-/// tails are built -- at ten million keys the suite's Zipfian put a fifth
-/// to a quarter of E's decode time on each of its two hottest partitions
-/// and a fiftieth on each of the tail's -- and the share of the budget
-/// past which raw tails are given back. The share the form with its raw
-/// tails may fill is `zselect::FORM_FILL`, the coding pick's line too, the
-/// rest left to the page cache's other tenants; the budget falls a tenth
-/// through a write mix, so the gap between the two is the hold that keeps
-/// a raw-tailed set from flipping at each move.
-const RECODE_AUTO_SHARE: f64 = 0.05;
-const RECODE_AUTO_EVICT: f64 = 0.95;
 /// The conversion between the block and the stride forms
 /// (`Options::zpages_stride_convert`): its period; what a build costs a
 /// byte of the form it writes before any build has been timed, seconds --
@@ -60073,14 +58667,6 @@ struct Maint {
     /// Inside a `ZSettle` answer: every kind of build is due, where the
     /// loop's own turns start only the builds of partitions with none.
     z_settling: bool,
-    /// A test's seam (`Options::zpages_hold_after_settle`): no spare is
-    /// started (`Options::zpages_both`) until a settle of the form has
-    /// answered, so that the first spare is the one that starts as a settle
-    /// ends. Spares start whenever no settle runs, and a store whose
-    /// served form files were built during its load had every spare built
-    /// before the test's settle, on a runner that gave the segment work
-    /// the time first, and nothing was left to stand at the rename.
-    z_spares_after_settle: bool,
     /// The controller (`ZPages::Auto`): the selector, whether it runs under
     /// these options, whether its decisions are traced
     /// (`SUPDB_ZPAGES_TRACE`), the epoch its clock counts from, when it
@@ -60144,8 +58730,7 @@ struct Maint {
     z_misfit_caches: bool,
     /// Whether the store's files whole have stood past the fill share of
     /// its budget at a reading of the model (`z_model`): what
-    /// `z_heads_look` copies heads on under the raw gate
-    /// (`Options::heads_owned_past_fill`).
+    /// `z_heads_look` copies heads on under the raw gate.
     z_past_fill: bool,
     /// The coding the selector chose at its last reading
     /// (`Options::zpages_coding_auto`, `zselect::choose_coding`), which the
@@ -60203,14 +58788,6 @@ struct Maint {
     /// (`Seg::z_stride_no`), which was not live while it was built. Held to
     /// the live partitions' names as the codings' record is.
     z_finish_stride: std::collections::HashMap<String, u8>,
-    /// The re-code policy's (`Options::zpages_recode`): when it last
-    /// looked; each form file's decode time and opens then, by its attach's
-    /// identity; each partition's decayed heat, by its name; the group's
-    /// file refaults then; and the ceiling a give-back set on the form
-    /// files' bytes, with when refaults last held it.
-    z_recode_last: Option<std::time::Duration>,
-    z_recode_seen: std::collections::HashMap<u64, (u64, u64)>,
-    z_recode_heat: std::collections::HashMap<String, f64>,
     /// The conversion between the two forms' (`Options::zpages_stride_convert`):
     /// when it last looked; each form file's decodes and opens then, with
     /// its decode time and its decodes, by its attach's identity; each
@@ -60260,21 +58837,10 @@ struct Maint {
     /// file, and the next merge's plan, made at the landing, takes it for
     /// the form its range had.
     z_stride_spans: Vec<(Vec<u8>, Vec<u8>)>,
-    z_recode_refaults: Option<u64>,
-    z_recode_ceiling: Option<(u64, std::time::Duration)>,
-    /// Partitions whose spare build kept nothing (`Options::zpages_both`),
-    /// not built a spare again.
-    z_spare_failed: std::collections::HashSet<String>,
-    /// The partitions re-parsed while served (`Options::zpages_reparse`),
-    /// by segment name, so that each is re-parsed once while it lives.
-    z_reparsed: std::collections::HashSet<String>,
     /// The builds at a merge's output finish counted at the last tick
     /// (`Options::zpages_build_at_finish`): a tick that finds more asks
     /// the selector for a fresh reading where their files cover the keys.
     z_finish_seen: u64,
-    /// The last look's refaults were past `RECODE_REFAULTS`: a flip asks
-    /// for none of the incoming file's pages.
-    z_recode_pressed: bool,
     /// The hot-raw policy's (`Options::zpages_hot_raw`): when it last
     /// looked; each served form file's decodes and opens then, by its
     /// attach's identity, and each raw partition's counted reads, by its
@@ -60558,17 +59124,13 @@ impl Maint {
                 }
                 // Swept here, where nothing is building and nothing starts
                 // before the answer, and not by the caller after it, which
-                // met the spare this thread started next in flight
+                // could meet a build this thread started next in flight
                 // (`Maint::z_sweep_settled`).
                 let swept = if self.shared.maint_stop.load(AtomicOrdering::Acquire) {
                     Ok(())
                 } else {
                     self.z_sweep_settled()
                 };
-                if self.shared.zsettle_hold.load(AtomicOrdering::Acquire) {
-                    Db::set_zhold(&self.shared.zbuild_hold, ZHOLD_RENAME, true);
-                }
-                self.z_spares_after_settle = false;
                 self.z_settling = false;
                 swept?;
                 self.sync_owed_slot()
@@ -60990,7 +59552,6 @@ impl Maint {
             .manifest_seq
             .store(manifest_seq, AtomicOrdering::Release);
         let z_auto = r.opts.zpages == ZPages::Auto && !z_auto_inert(&r.opts);
-        let z_spares_after_settle = r.opts.zpages_hold_after_settle;
         let z_eager = r.opts.zpages_build_eager;
         let z_attach_eager = r.opts.zpages_attach_eager;
         let z_suspect_crossing = r.opts.zpages_suspect_at_crossing;
@@ -61035,7 +59596,6 @@ impl Maint {
             zahead: None,
             z_last_d: None,
             z_settling: false,
-            z_spares_after_settle,
             zsel: {
                 let mut sel = zselect::ZSelect::default();
                 sel.set_eager(z_eager);
@@ -61082,9 +59642,6 @@ impl Maint {
             z_land_due: false,
             z_ahead_coding: std::collections::HashMap::new(),
             z_finish_stride: std::collections::HashMap::new(),
-            z_recode_last: None,
-            z_recode_seen: std::collections::HashMap::new(),
-            z_recode_heat: std::collections::HashMap::new(),
             z_conv_last: None,
             z_conv_seen: std::collections::HashMap::new(),
             z_conv_heat: std::collections::HashMap::new(),
@@ -61096,12 +59653,7 @@ impl Maint {
             z_anon_peak: std::cell::Cell::new(zselect::WindowMax::new(zselect::RETAIN_FLOOR)),
             z_conv_decode: None,
             z_stride_spans: Vec::new(),
-            z_recode_refaults: None,
-            z_recode_ceiling: None,
-            z_spare_failed: std::collections::HashSet::new(),
-            z_reparsed: std::collections::HashSet::new(),
             z_finish_seen: 0,
-            z_recode_pressed: false,
             z_hot_last: None,
             z_hot_seen: std::collections::HashMap::new(),
             z_hot_raw_seen: std::collections::HashMap::new(),
@@ -61866,20 +60418,15 @@ impl Maint {
             }
             return Ok(());
         }
-        // With `flush_ranges`, each round merges only the ranges that hold
-        // pieces, under the live fences -- one piece is enough to be due
-        // here, where the background trigger waits for several -- so a
-        // flush after an ordered or skewed load rewrites the partitions it
-        // touched and not the store. Without it, or before the first
-        // partitioning, everything is re-partitioned from every key.
+        // Each round merges only the ranges that hold pieces, under the
+        // live fences -- one piece is enough to be due here, where the
+        // background trigger waits for several -- so a flush after an
+        // ordered or skewed load rewrites the partitions it touched and not
+        // the store. Before the first partitioning everything is
+        // partitioned from every key.
         let mut rounds = 0usize;
         while self.segs().iter().any(|s| s.level == 0) {
-            let plan = if self.opts.flush_ranges {
-                self.merge_due(1)
-            } else {
-                None
-            };
-            match plan {
+            match self.merge_due(1) {
                 Some(fences) if !fences.is_empty() => {
                     let fences = if self.opts.promote {
                         self.promote_ranges(fences)?
@@ -61988,7 +60535,6 @@ impl Maint {
                 cur,
                 &segs,
                 !tier && self.opts.forms_rebase,
-                self.opts.same_blocks_from_index,
                 &self.shared.same_blocks_asked,
                 Some(&self.r),
             );
@@ -63065,7 +61611,7 @@ impl Maint {
     /// the census being the group's pressure, and none while the model
     /// says it does not, which is the stretch between a crossing and the
     /// install its reads' faults buy -- but for a store whose block cache
-    /// holds the raw records' place (`Options::heads_owned_beside_copies`),
+    /// holds the raw records' place,
     /// where the misfit is the cache's own bytes and no read is near to
     /// buy anything. The first version copied whatever
     /// the raw form was serving at the look: at ten million keys under the
@@ -63099,23 +61645,22 @@ impl Maint {
         // them while the store fits -- and does not once the store's
         // files whole have outgrown the cache's share of the budget,
         // whatever the model says of the pages a read touches
-        // (`Options::heads_owned_past_fill`).
-        let past_fill = self.opts.heads_owned_past_fill && self.z_past_fill;
-        if gate == zselect::GATE_RAW && !past_fill {
+        // (`ZEvents::model_whole`).
+        if gate == zselect::GATE_RAW && !self.z_past_fill {
             return;
         }
         let near = self.scans_near();
-        // A grant of the records' place reads as the store left raw
-        // (`Options::heads_owned_beside_copies`): the model's misfit is
-        // then the grant's own bytes, and it stands only far from the
-        // point reads whose faults would buy a form.
+        // A grant of the records' place reads as the store left raw: the
+        // model's misfit is then the grant's own bytes, and it stands only
+        // far from the point reads whose faults would buy a form; the
+        // model's word alone charged the block cache's copies and the
+        // records they stand in for both.
         // And so does a cache that holds that place with no grant, its
         // own budget never having bound: the misfit is its bytes either
         // way (`z_misfit_is_the_caches`), and no point read is near to
         // buy anything.
-        let beside = self.opts.heads_owned_beside_copies
-            && (self.shared.copies_stand.load(AtomicOrdering::Acquire)
-                || (self.z_misfit_caches && self.shared.points_far.load(AtomicOrdering::Acquire)));
+        let beside = self.shared.copies_stand.load(AtomicOrdering::Acquire)
+            || (self.z_misfit_caches && self.shared.points_far.load(AtomicOrdering::Acquire));
         let model_raw = !self.z_auto || self.z_leaves_raw;
         let census_raw = model_raw || beside;
         let _op = self.op();
@@ -63172,18 +61717,14 @@ impl Maint {
     /// of a partition that has none, the retry of one that failed once
     /// its backoff has passed, the rebuild of a form file a check took out
     /// of service; the loop's own turns build only for partitions with
-    /// none, and only under `Options::zpages_eager`; and outside a settle,
-    /// with nothing else to build, the re-code policy has its turn
-    /// (`Options::zpages_recode`).
+    /// none, and only under `Options::zpages_eager`.
     fn z_step(&mut self) {
         self.z_heads_look();
         if self.z_auto {
             self.z_tick();
             return;
         }
-        if self.opts.zpages != ZPages::Always
-            || !(self.z_settling || self.opts.zpages_eager || self.opts.zpages_recode)
-        {
+        if self.opts.zpages != ZPages::Always || !(self.z_settling || self.opts.zpages_eager) {
             return;
         }
         if self.zbuild.as_ref().is_some_and(|b| b.job.is_finished()) {
@@ -63193,13 +61734,6 @@ impl Maint {
             drop(op);
         }
         if self.zbuild.is_some() {
-            // A look needs no builder where the policy only exchanges files
-            // (`Options::zpages_both`): with the spares' builds holding the
-            // builder for most of a pass, the looks it waited on came seven
-            // seconds apart.
-            if self.opts.zpages_both && self.opts.zpages_recode && !self.z_settling {
-                self.z_recode_tick();
-            }
             return;
         }
         if self.z_settling || self.opts.zpages_eager {
@@ -63213,30 +61747,13 @@ impl Maint {
             }
         }
         self.z_convert_asked();
-        if self.opts.zpages_recode && !self.z_settling {
-            self.z_recode_tick();
-            if self.zbuild.is_none() && self.opts.zpages_both && !self.z_spares_after_settle {
-                let next = {
-                    let _op = self.op();
-                    self.z_next_spare()
-                };
-                if let Some(seg) = next {
-                    self.z_start(seg, ZKind::Spare, false);
-                }
-            }
-        }
     }
 
     /// The form files no live segment claims swept (`Db::z_sweep`) at the
     /// end of a settle of the form, by the side that starts the builds: a
     /// build in flight is finished and collected first, and none starts
     /// before this returns, so no temp name it removes is a build's in
-    /// flight. Swept by the settle's caller once the segment work had
-    /// answered, it met the spare that work started next
-    /// (`Options::zpages_both`) with its temp name written, removed the
-    /// name, and the spare's rename failed: a partition counted
-    /// `spare_failed` and never given its spare, on a runner slow enough to
-    /// start the spare first.
+    /// flight.
     fn z_sweep_settled(&mut self) -> Result<()> {
         for b in [self.zbuild.take(), self.zahead.take()]
             .into_iter()
@@ -63253,517 +61770,6 @@ impl Maint {
         let swept = Db::z_sweep(&self.dir, names.iter().map(String::as_str))?;
         zfile::ZEvents::add(&self.shared.z.swept, swept);
         Ok(())
-    }
-
-    /// The served partition to build a spare for next (`Options::zpages_both`):
-    /// one with no kept form file, the hottest by the policy's heat and the
-    /// first by key order among equals, none while a seal or a merge is
-    /// rewriting the partitions.
-    fn z_next_spare(&self) -> Option<std::sync::Arc<Seg>> {
-        if !self.compacting.is_empty() || self.tiering.is_some() || !self.sealing.is_empty() {
-            return None;
-        }
-        let mut best: Option<(f64, std::sync::Arc<Seg>)> = None;
-        for s in self.segs().iter().filter(|s| s.level > 0) {
-            if self.in_flight_input(&s.name)
-                || s.z_spare.get().is_some()
-                || !s.z.get().is_some_and(|z| !z.damaged())
-                || self.z_spare_failed.contains(&s.name)
-            {
-                continue;
-            }
-            let heat = self.z_recode_heat.get(&s.name).copied().unwrap_or(0.0);
-            if best.as_ref().is_none_or(|(h, _)| heat > *h) {
-                best = Some((heat, s.clone()));
-            }
-        }
-        best.map(|(_, s)| s)
-    }
-
-    /// The re-code policy's turn (`Options::zpages_recode`), with no build
-    /// in flight: once a `RECODE_PERIOD`, each served form file's decode
-    /// time a second over the period, the group's file refaults a second,
-    /// and the platform's budget; then at most one re-code. A partition's
-    /// heat is its decode time a second, or for a raw-tailed one its opens
-    /// priced at a decode, decayed over `RECODE_TAU`. Over the refault
-    /// floor, the coldest raw-tailed partition goes back to the block
-    /// coding and the form files' bytes are held where that leaves them
-    /// until `RECODE_HOLD` passes under the floor; under it, the hottest
-    /// block-coded partition, past `RECODE_FLOOR_NS`, is re-coded to the
-    /// raw tails if the form files' bytes with its estimated extra stay
-    /// within the budget and the ceiling, and where they would not, the
-    /// coldest raw-tailed one goes back to make the room if the hot one is
-    /// `RECODE_SWAP` times hotter. Nothing is decided while a seal or a
-    /// merge is rewriting the partitions, and nothing without a budget.
-    fn z_recode_tick(&mut self) {
-        let now = self.z_now();
-        let period = if self.opts.zpages_both {
-            RECODE_PERIOD_BOTH
-        } else {
-            RECODE_PERIOD
-        };
-        if self
-            .z_recode_last
-            .is_some_and(|t| now.saturating_sub(t) < period)
-        {
-            return;
-        }
-        let dt = self.z_recode_last.map(|t| now.saturating_sub(t));
-        self.z_recode_last = Some(now);
-        self.z_recode_look(now, dt);
-        // Counted once the look is done, so that a test that waits for a
-        // look reads the decision it made.
-        zfile::ZEvents::add(&self.shared.z.recode_looks, 1);
-    }
-
-    /// One look of the re-code policy at `now`, `dt` after the last one
-    /// (none at the first): see `z_recode_tick`.
-    fn z_recode_look(&mut self, now: std::time::Duration, dt: Option<std::time::Duration>) {
-        let inject = self.opts.zpages_inject.clone();
-        let platform = zfile::read_budget();
-        let budget = inject
-            .as_ref()
-            .and_then(|i| i.budget())
-            .or(platform.map(|b| b.budget));
-        let refault_rate = match inject.as_ref().and_then(|i| i.refault_rate()) {
-            Some(r) => r,
-            None => {
-                let refaults = platform.and_then(|b| b.refaults);
-                let rate = match (refaults, self.z_recode_refaults, dt) {
-                    (Some(r), Some(r0), Some(d)) if !d.is_zero() => {
-                        r.saturating_sub(r0) as f64 / d.as_secs_f64()
-                    }
-                    _ => 0.0,
-                };
-                self.z_recode_refaults = refaults;
-                rate
-            }
-        };
-        self.z_recode_pressed = refault_rate > RECODE_REFAULTS;
-        // Each served partition by its form file: its coding, its bytes, its
-        // records' bytes, and what its form file has counted -- the decode
-        // time, the decodes and the record-coded groups opened in place.
-        struct Served {
-            seg: std::sync::Arc<Seg>,
-            coded: bool,
-            bytes: u64,
-            records: u64,
-            heat: f64,
-        }
-        type Row = (std::sync::Arc<Seg>, u64, bool, u64, u64, u64, u64, u64);
-        let rows: Vec<Row> = {
-            let _op = self.op();
-            self.segs()
-                .iter()
-                .filter(|s| s.level > 0 && !self.in_flight_input(&s.name))
-                .filter_map(|s| {
-                    let z = s.z.get().filter(|z| !z.damaged())?;
-                    Some((
-                        s.clone(),
-                        z.id(),
-                        z.coded(),
-                        z.file_bytes(),
-                        s.foot().1,
-                        16 * z.decode_ns16.load(AtomicOrdering::Relaxed),
-                        16 * z.decodes16.load(AtomicOrdering::Relaxed),
-                        16 * z.opens16.load(AtomicOrdering::Relaxed),
-                    ))
-                })
-                .collect()
-        };
-        // A decode's time where a test has priced one through the seam: a
-        // form file's decode time is then its decodes at that price, since
-        // the time a decode takes is the build profile's and a test does not
-        // choose it.
-        let priced = inject
-            .as_ref()
-            .and_then(|i| i.decode_cost())
-            .map(|c| c.as_nanos().min(u64::MAX as u128) as u64);
-        let rows: Vec<Row> = match priced {
-            Some(c) => rows
-                .into_iter()
-                .map(|mut r| {
-                    r.5 = r.6.saturating_mul(c);
-                    r
-                })
-                .collect(),
-            None => rows,
-        };
-        // What a decode costs, from the block-coded files' counts: the price
-        // a raw-tailed file's opens are read at, since it decodes nothing.
-        let (ns_all, decodes_all) = rows
-            .iter()
-            .filter(|r| !r.2)
-            .fold((0u64, 0u64), |(n, d), r| (n + r.5, d + r.6));
-        let per_decode = if decodes_all == 0 {
-            RECODE_DECODE_NS
-        } else {
-            ns_all as f64 / decodes_all as f64
-        };
-        // A partition's heat, kept by its name across its re-codes: the
-        // period's rate folded into what the periods before left, decayed
-        // over `RECODE_TAU`, so that a pass a few seconds long does not
-        // settle where the decodes are; a form file first seen gives no rate
-        // and its partition's heat only decays.
-        let keep = dt.map(|d| (-d.as_secs_f64() / RECODE_TAU.as_secs_f64()).exp());
-        let mut seen = std::collections::HashMap::with_capacity(rows.len());
-        let mut heats = std::collections::HashMap::with_capacity(rows.len());
-        let mut parts = Vec::with_capacity(rows.len());
-        for (seg, id, coded, bytes, records, ns, _decodes, opens) in rows {
-            let rate = match (self.z_recode_seen.get(&id), dt) {
-                (Some(&(ns0, opens0)), Some(d)) if !d.is_zero() => Some(if coded {
-                    opens.saturating_sub(opens0) as f64 * per_decode / d.as_secs_f64()
-                } else {
-                    ns.saturating_sub(ns0) as f64 / d.as_secs_f64()
-                }),
-                _ => None,
-            };
-            let old = self.z_recode_heat.get(&seg.name).copied().unwrap_or(0.0);
-            // Where both codings are kept a flip is a prefetch, and the heat
-            // rises to the rate a partition shows at once and fades over
-            // `RECODE_TAU`: the suite's mixes are a quarter to three quarters
-            // of a second each, so an average over seconds gave the head of
-            // a Zipfian mix its raw tails after the mix, and a uniform mix
-            // between two Zipfian ones took them away. Elsewhere a flip is a
-            // build, and the heat is the average.
-            let heat = match (rate, keep) {
-                (Some(r), Some(a)) if self.opts.zpages_both => (a * old).max(r),
-                (Some(r), Some(a)) => a * old + (1.0 - a) * r,
-                (None, Some(a)) => a * old,
-                _ => old,
-            };
-            seen.insert(id, (ns, opens));
-            heats.insert(seg.name.clone(), heat);
-            parts.push(Served {
-                seg,
-                coded,
-                bytes,
-                records,
-                heat,
-            });
-        }
-        self.z_recode_seen = seen;
-        self.z_recode_heat = heats;
-        let rewriting =
-            !self.compacting.is_empty() || self.tiering.is_some() || !self.sealing.is_empty();
-        let (Some(budget), Some(_)) = (budget, dt) else {
-            return;
-        };
-        if rewriting {
-            if self.z_trace {
-                eprintln!("zrecode t={:.1} busy", now.as_secs_f64());
-            }
-            return;
-        }
-        let total: u64 = parts.iter().map(|p| p.bytes).sum();
-        // A record's bytes in each coding, from the form files built in it:
-        // until a raw-tail one is, the records' own bytes, which the raw
-        // tails come to within a few percent at the suite's shape.
-        let ratio = |coded: bool, none: f64| {
-            let (b, r) = parts
-                .iter()
-                .filter(|p| p.coded == coded)
-                .fold((0u64, 0u64), |(b, r), p| (b + p.bytes, r + p.records));
-            if r == 0 {
-                none
-            } else {
-                b as f64 / r as f64
-            }
-        };
-        let (raw_ratio, block_ratio) = (ratio(true, 1.0), ratio(false, 0.6));
-        let trace = |what: &str, p: Option<&Served>, ceiling: Option<u64>| {
-            eprintln!(
-                "zrecode t={:.1} {what} seg={} heat_ms_s={:.2} total={} budget={budget} ceiling={} refaults_s={refault_rate:.1}",
-                now.as_secs_f64(),
-                p.map_or("-", |p| p.seg.name.as_str()),
-                p.map_or(0.0, |p| p.heat / 1e6),
-                total,
-                ceiling.map_or_else(|| "-".to_string(), |c| c.to_string()),
-            );
-        };
-        let coldest_raw = parts
-            .iter()
-            .filter(|p| p.coded)
-            .min_by(|a, b| a.heat.total_cmp(&b.heat));
-        // The re-parse under the controller (`Options::zpages_reparse`):
-        // the hottest block-coded partition not yet re-parsed, at least
-        // `RECODE_AUTO_SHARE` of the decode time, built again by the
-        // parsing encoder. The form shrinks by it, so no budget is checked.
-        if self.opts.zpages == ZPages::Auto
-            && self.opts.zpages_reparse
-            && !self.opts.zpages_recode_auto
-        {
-            let live: std::collections::HashSet<&str> =
-                parts.iter().map(|p| p.seg.name.as_str()).collect();
-            self.z_reparsed.retain(|n| live.contains(n.as_str()));
-            let heat_all: f64 = parts.iter().map(|p| p.heat).sum();
-            let Some(p) = parts
-                .iter()
-                .filter(|p| !p.coded && !self.z_reparsed.contains(&p.seg.name))
-                .max_by(|a, b| a.heat.total_cmp(&b.heat))
-            else {
-                return;
-            };
-            if p.heat < RECODE_FLOOR_NS || p.heat < RECODE_AUTO_SHARE * heat_all {
-                if self.z_trace {
-                    trace("cold", Some(p), None);
-                }
-                return;
-            }
-            if self.z_trace {
-                trace("reparse", Some(p), None);
-            }
-            let seg = p.seg.clone();
-            self.z_reparsed.insert(seg.name.clone());
-            self.z_start(seg, ZKind::Reparse, false);
-            return;
-        }
-        // Under the controller (`Options::zpages_recode_auto`): the hottest
-        // block-coded partition, at least `RECODE_AUTO_SHARE` of the decode
-        // time, re-coded to the raw tails where the form with their extra
-        // stays within `zselect::FORM_FILL` of the budget, else the room made
-        // by the coldest raw-tailed one if the hot one is `RECODE_SWAP`
-        // times hotter; and past `RECODE_AUTO_EVICT` of the budget the
-        // coldest raw-tailed partition given back. The refaults decide
-        // nothing: the write mixes raise them whatever the form does.
-        if self.opts.zpages == ZPages::Auto {
-            let heat_all: f64 = parts.iter().map(|p| p.heat).sum();
-            let fill = zselect::form_fill(budget);
-            let evict = (budget as f64 * RECODE_AUTO_EVICT) as u64;
-            if total > evict {
-                if self.z_trace {
-                    trace("back", coldest_raw, Some(evict));
-                }
-                if let Some(p) = coldest_raw {
-                    let seg = p.seg.clone();
-                    self.z_recode(seg);
-                }
-                return;
-            }
-            let Some(p) = parts
-                .iter()
-                .filter(|p| !p.coded)
-                .max_by(|a, b| a.heat.total_cmp(&b.heat))
-            else {
-                return;
-            };
-            if p.heat < RECODE_FLOOR_NS || p.heat < RECODE_AUTO_SHARE * heat_all {
-                if self.z_trace {
-                    trace("cold", Some(p), Some(fill));
-                }
-                return;
-            }
-            let extra = ((p.records as f64 * raw_ratio) as u64).saturating_sub(p.bytes);
-            if total.saturating_add(extra) <= fill {
-                if self.z_trace {
-                    trace("raw", Some(p), Some(fill));
-                }
-                let seg = p.seg.clone();
-                self.z_recode(seg);
-                return;
-            }
-            match coldest_raw {
-                Some(q) if q.heat * RECODE_SWAP < p.heat => {
-                    if self.z_trace {
-                        trace("swap", Some(q), Some(fill));
-                    }
-                    let seg = q.seg.clone();
-                    self.z_recode(seg);
-                }
-                _ => {
-                    if self.z_trace {
-                        trace("full", Some(p), Some(fill));
-                    }
-                }
-            }
-            return;
-        }
-        if refault_rate > RECODE_REFAULTS {
-            let ceiling = match coldest_raw {
-                Some(p) => total.saturating_sub(p.bytes).saturating_add(
-                    p.seg
-                        .z_spare
-                        .get()
-                        .map_or((p.records as f64 * block_ratio) as u64, |k| k.file_bytes()),
-                ),
-                None => total,
-            };
-            self.z_recode_ceiling = Some((ceiling, now));
-            if self.z_trace {
-                trace("back", coldest_raw, Some(ceiling));
-            }
-            if let Some(p) = coldest_raw {
-                let seg = p.seg.clone();
-                self.z_recode(seg);
-            }
-            return;
-        }
-        if self
-            .z_recode_ceiling
-            .is_some_and(|(_, since)| now.saturating_sub(since) >= RECODE_HOLD)
-        {
-            self.z_recode_ceiling = None;
-        }
-        if self.opts.zpages_both {
-            // The raw-tailed set chosen whole among the partitions that keep
-            // both codings, the rest held at the coding they serve: the
-            // hottest whose raw tails fit, by heat with a served raw-tailed
-            // partition's counted `RECODE_SWAP` times, against the order and
-            // the floor alike, so that one serving its raw tails keeps them
-            // until it is that much colder than what would take them; then
-            // each partition whose coding differs exchanged, the ones going
-            // back first since they make the room, at most
-            // `RECODE_FLIP_BYTES` of incoming pages a look and one at least.
-            // Nothing moves while nothing reads: a store at rest would give
-            // its raw tails back as the heat decays and take them again at
-            // the next pass, a prefetch each way for nothing.
-            let limit = self.z_recode_ceiling.map_or(budget, |(c, _)| c.min(budget));
-            let heat_all: f64 = parts.iter().map(|p| p.heat).sum();
-            if heat_all < RECODE_FLOOR_NS {
-                if self.z_trace {
-                    trace("idle", None, self.z_recode_ceiling.map(|c| c.0));
-                }
-                return;
-            }
-            // (index into parts, raw-tailed bytes, block-coded bytes)
-            let mut two: Vec<(usize, u64, u64)> = Vec::new();
-            let mut fixed = 0u64;
-            for (i, p) in parts.iter().enumerate() {
-                match p.seg.z_spare.get() {
-                    Some(k) if p.coded => two.push((i, p.bytes, k.file_bytes())),
-                    Some(k) => two.push((i, k.file_bytes(), p.bytes)),
-                    None => fixed += p.bytes,
-                }
-            }
-            let rank = |t: &(usize, u64, u64)| {
-                let p = &parts[t.0];
-                p.heat * if p.coded { RECODE_SWAP } else { 1.0 }
-            };
-            two.sort_by(|a, b| rank(b).total_cmp(&rank(a)));
-            let mut total = fixed + two.iter().map(|t| t.2).sum::<u64>();
-            let want: Vec<bool> = two
-                .iter()
-                .map(|t| {
-                    let extra = t.1.saturating_sub(t.2);
-                    let ok = rank(t) >= RECODE_FLOOR_NS && total.saturating_add(extra) <= limit;
-                    if ok {
-                        total += extra;
-                    }
-                    ok
-                })
-                .collect();
-            let mut moved = 0u64;
-            for to_raw in [false, true] {
-                for (t, &w) in two.iter().zip(&want) {
-                    let p = &parts[t.0];
-                    if p.coded == w || w != to_raw {
-                        continue;
-                    }
-                    let incoming = if w { t.1 } else { t.2 };
-                    if moved > 0 && moved.saturating_add(incoming) > RECODE_FLIP_BYTES {
-                        continue;
-                    }
-                    moved = moved.saturating_add(incoming);
-                    if self.z_trace {
-                        trace(
-                            if w { "raw" } else { "back" },
-                            Some(p),
-                            self.z_recode_ceiling.map(|c| c.0),
-                        );
-                    }
-                    self.z_recode(p.seg.clone());
-                }
-            }
-            return;
-        }
-        let Some(p) = parts
-            .iter()
-            .filter(|p| !p.coded)
-            .max_by(|a, b| a.heat.total_cmp(&b.heat))
-        else {
-            return;
-        };
-        if p.heat < RECODE_FLOOR_NS {
-            if self.z_trace {
-                trace("cold", Some(p), self.z_recode_ceiling.map(|c| c.0));
-            }
-            return;
-        }
-        // The raw tails' extra: the kept file's own bytes where the
-        // partition keeps one, else the estimate.
-        let extra = match p.seg.z_spare.get() {
-            Some(k) => k.file_bytes().saturating_sub(p.bytes),
-            None => ((p.records as f64 * raw_ratio) as u64).saturating_sub(p.bytes),
-        };
-        let limit = self.z_recode_ceiling.map_or(budget, |(c, _)| c.min(budget));
-        if total.saturating_add(extra) <= limit {
-            if self.z_trace {
-                trace("raw", Some(p), self.z_recode_ceiling.map(|c| c.0));
-            }
-            let seg = p.seg.clone();
-            self.z_recode(seg);
-            return;
-        }
-        // No room: made by the coldest raw-tailed partition where the
-        // hottest block-coded one is `RECODE_SWAP` times hotter, and taken
-        // by it at a later look. A swap sets no ceiling: the room is made,
-        // not found wanting.
-        match coldest_raw {
-            Some(q) if q.heat * RECODE_SWAP < p.heat => {
-                if self.z_trace {
-                    trace("swap", Some(q), self.z_recode_ceiling.map(|c| c.0));
-                }
-                let seg = q.seg.clone();
-                self.z_recode(seg);
-            }
-            _ => {
-                if self.z_trace {
-                    trace("full", Some(p), self.z_recode_ceiling.map(|c| c.0));
-                }
-            }
-        }
-    }
-
-    /// `seg` re-coded: its kept form file exchanged with the served one
-    /// where it keeps one (`Options::zpages_recode_keep`) -- the incoming
-    /// file's pages asked for and the outgoing one's dropped, no build --
-    /// else built again in the other coding (`ZKind::Recode`).
-    fn z_recode(&mut self, seg: std::sync::Arc<Seg>) {
-        let shared = self.shared.clone();
-        let ev = &shared.z;
-        // A kept file a check failed in while it served is retired, not
-        // put back: the partition is built again instead.
-        if seg.z_spare.get().is_some_and(|k| k.damaged()) {
-            let k = seg.z_spare.take();
-            let tag = shared.readers.bump();
-            shared.retired_z.push(tag, RetiredZ(k));
-            shared.retired_z.sweep(|low| shared.readers.oldest_for(low));
-        }
-        if seg.z.flip(&seg.z_spare) {
-            // Both live while the segment does, and the kept one is this
-            // thread's alone.
-            if let Some(k) = seg.z_spare.get() {
-                k.drop_cache();
-            }
-            if let Some(z) = seg.z.get() {
-                // Under refaults the reads fault in only the pages they
-                // touch: a whole file asked for there queues behind the
-                // faults on the device it is short of.
-                if !self.z_recode_pressed {
-                    z.prefetch_all();
-                }
-                if z.coded() {
-                    zfile::ZEvents::add(&ev.recodes, 1);
-                } else {
-                    zfile::ZEvents::add(&ev.recodes_back, 1);
-                }
-            }
-            zfile::ZEvents::add(&ev.recode_flips, 1);
-            return;
-        }
-        if self.zbuild.is_none() {
-            self.z_start(seg, ZKind::Recode, false);
-        }
     }
 
     /// The conversion's turn (`Options::zpages_stride_convert`), with the
@@ -64524,7 +62530,7 @@ impl Maint {
                             Some((
                                 z.id(),
                                 z.coded(),
-                                z.file_bytes() + s.z_spare.get().map_or(0, |k| k.file_bytes()),
+                                z.file_bytes(),
                                 16 * z.decode_ns16.load(AtomicOrdering::Relaxed),
                                 16 * z.decodes16.load(AtomicOrdering::Relaxed),
                                 16 * z.opens16.load(AtomicOrdering::Relaxed),
@@ -64549,7 +62555,7 @@ impl Maint {
             (rows, live)
         };
         // A decode priced through the seam: a form file's decode time is
-        // then its decodes at that price, as the re-code policy reads it.
+        // then its decodes at that price.
         let priced = inject
             .as_ref()
             .and_then(|i| i.decode_cost())
@@ -65328,7 +63334,7 @@ impl Maint {
     }
 
     /// Whether the misfit the model reads under `budget` is the block
-    /// cache's own bytes (`Options::heads_owned_beside_copies`): the raw
+    /// cache's own bytes: the raw
     /// populations within the budget once what the writer's cache holds
     /// is given back to it. The model's budget is the limit less the
     /// process's anonymous memory, the cache's copies are in that memory,
@@ -65690,13 +63696,11 @@ impl Maint {
     }
 
     /// Whether the hot-raw policy is this store's: on, under the controller,
-    /// and standing down where the re-code policy runs and, but under
-    /// `Options::zpages_hot_raw_beside_stride`, beside the stride form
-    /// (`Options::zpages_hot_raw`).
+    /// and standing down, but under `Options::zpages_hot_raw_beside_stride`,
+    /// beside the stride form (`Options::zpages_hot_raw`).
     fn z_hot_runs(&self) -> bool {
         self.opts.zpages_hot_raw
             && self.opts.zpages == ZPages::Auto
-            && !(self.opts.zpages_recode_auto || self.opts.zpages_reparse)
             && (self.opts.zpages_stride == ZStride::Off || self.opts.zpages_hot_raw_beside_stride)
     }
 
@@ -65825,7 +63829,7 @@ impl Maint {
         self.z_leaves_raw =
             heads_left_raw(self.z_leaves_raw, &d, model.as_ref().map(|m| m.phi_raw));
         // And whose the misfit is, where the model was read
-        // (`Options::heads_owned_beside_copies`).
+        // (`Db::z_misfit_is_the_caches`).
         if let Some(m) = model.as_ref() {
             self.z_misfit_caches = self.z_misfit_is_the_caches(m.budget);
         }
@@ -65998,26 +64002,19 @@ impl Maint {
             self.z_generation()
         };
         let floor = self.opts.zpages_min_bytes;
-        let group_bytes = self.opts.zpages_group_bytes;
+        let group_bytes = zpages::ZGROUP_BYTES;
         let coding = self.opts.z_coding();
-        let store_all = self.opts.zpages_store_all;
         let raw_tails = self.opts.zpages_raw_tails;
-        let parse = self.opts.zpages_parse;
-        let parse_chains = self.opts.zpages_parse_chains;
-        let own_decode = self.opts.zpages_own_decoder;
         // Where the selector chooses the coding, the raw-tail record coding
         // is sized beside the options' (`zselect::choose_coding`).
-        let second = (self.opts.zpages_coding_auto && !raw_tails && !store_all).then_some(
-            zfile::FillShape {
-                group_bytes,
-                coding: zpages::ZCODING_RECORD,
-                store_all: false,
-                raw_tails: true,
-                parse,
-                parse_chains,
-                own_decode,
-            },
-        );
+        let second = (!raw_tails).then_some(zfile::FillShape {
+            group_bytes,
+            coding: zpages::ZCODING_RECORD,
+            raw_tails: true,
+            parse: true,
+            parse_chains: ZPARSE_CHAINS,
+            own_decode: true,
+        });
         let wake = self.wake.clone();
         zfile::ZEvents::add(&self.shared.z.samples, 1);
         let idle = self.opts.zpages_sample_idle;
@@ -66056,11 +64053,10 @@ impl Maint {
                         let r = take(zfile::FillShape {
                             group_bytes,
                             coding,
-                            store_all,
                             raw_tails,
-                            parse,
-                            parse_chains,
-                            own_decode,
+                            parse: true,
+                            parse_chains: ZPARSE_CHAINS,
+                            own_decode: true,
                         });
                         let r2 = second.map(take);
                         (s, r, r2)
@@ -66166,26 +64162,23 @@ impl Maint {
         // `zselect::FORM_FILL`); the reading fed
         // to the selector is the chosen form's. A reading that sized the raw
         // tails for fewer partitions than the block coding chooses nothing.
-        let pick = (self.opts.zpages_coding_auto
-            && raw.counted > 0
-            && raw.counted == block.counted)
-            .then(|| {
-                let budget = self.z_budget().unwrap_or(0);
-                let c = zselect::choose_coding(
-                    budget,
-                    zselect::FormSize {
-                        w_z: raw.w_z,
-                        resident: raw.resident,
-                    },
-                );
-                let c = if c == zselect::Coding::RawTails && !self.z_pick_raw_ok() {
-                    zfile::ZEvents::add(&ev.coding_unread, 1);
-                    zselect::Coding::Block
-                } else {
-                    c
-                };
-                (c, budget)
-            });
+        let pick = (raw.counted > 0 && raw.counted == block.counted).then(|| {
+            let budget = self.z_budget().unwrap_or(0);
+            let c = zselect::choose_coding(
+                budget,
+                zselect::FormSize {
+                    w_z: raw.w_z,
+                    resident: raw.resident,
+                },
+            );
+            let c = if c == zselect::Coding::RawTails && !self.z_pick_raw_ok() {
+                zfile::ZEvents::add(&ev.coding_unread, 1);
+                zselect::Coding::Block
+            } else {
+                c
+            };
+            (c, budget)
+        });
         if let Some((c, budget)) = pick {
             let idx = usize::from(c == zselect::Coding::RawTails);
             zfile::ZEvents::add(&ev.coding_picks[idx], 1);
@@ -66397,7 +64390,6 @@ impl Maint {
                 .collect();
             (segs, self.z_generation())
         };
-        let own = self.opts.zpages_own_decoder;
         let advise = Db::z_advise(&self.opts);
         let stride = self.opts.z_stride_attach();
         let mut sums = ZSums::default();
@@ -66436,9 +64428,15 @@ impl Maint {
             }
             on_block += 1;
             if timed < READING_TIMED_FILES {
-                if let Some(d) =
-                    zfile::time_file_decodes(&path, blob, id, end, READING_TIMED_PAGES, own, advise)
-                {
+                if let Some(d) = zfile::time_file_decodes(
+                    &path,
+                    blob,
+                    id,
+                    end,
+                    READING_TIMED_PAGES,
+                    true,
+                    advise,
+                ) {
                     sums.decode_ns = sums.decode_ns.saturating_add(d.decode_ns);
                     sums.zgroups = sums.zgroups.saturating_add(d.zgroups);
                     sums.records = sums.records.saturating_add(d.records);
@@ -66486,26 +64484,24 @@ impl Maint {
         // and the records are the conservative side of the fit the pick is
         // made against (`zselect::FORM_FILL`).
         let raw_w_z = sums.recs_len;
-        if self.opts.zpages_coding_auto {
-            let budget = self.z_budget().unwrap_or(0);
-            let pick = zselect::choose_coding(
-                budget,
-                zselect::FormSize {
-                    w_z: raw_w_z,
-                    resident: sums.resident,
-                },
-            );
-            let pick = if pick == zselect::Coding::RawTails && !self.z_pick_raw_ok() {
-                zfile::ZEvents::add(&self.shared.z.coding_unread, 1);
-                zselect::Coding::Block
-            } else {
-                pick
-            };
-            let idx = usize::from(pick == zselect::Coding::RawTails);
-            zfile::ZEvents::add(&self.shared.z.coding_picks[idx], 1);
-            self.z_coding_pick = Some(pick);
-            self.z_pick_size = Some((sums.recs_len, raw_w_z, sums.resident, budget));
-        }
+        let budget = self.z_budget().unwrap_or(0);
+        let pick = zselect::choose_coding(
+            budget,
+            zselect::FormSize {
+                w_z: raw_w_z,
+                resident: sums.resident,
+            },
+        );
+        let pick = if pick == zselect::Coding::RawTails && !self.z_pick_raw_ok() {
+            zfile::ZEvents::add(&self.shared.z.coding_unread, 1);
+            zselect::Coding::Block
+        } else {
+            pick
+        };
+        let idx = usize::from(pick == zselect::Coding::RawTails);
+        zfile::ZEvents::add(&self.shared.z.coding_picks[idx], 1);
+        self.z_coding_pick = Some(pick);
+        self.z_pick_size = Some((sums.recs_len, raw_w_z, sums.resident, budget));
         self.shared
             .z
             .sample_w_z_raw
@@ -66732,9 +64728,7 @@ impl Maint {
         // the form installed, whatever the builder is at: it starts a
         // build only with the builder free and nothing of the store's own
         // due it.
-        let recode = self.opts.zpages_recode_auto || self.opts.zpages_reparse;
-        let converts = !recode
-            && self.opts.zpages_stride_convert
+        let converts = self.opts.zpages_stride_convert
             && self.opts.zpages_stride != ZStride::Off
             && d.build
             && self.zsel.phase() == zselect::Phase::Compact
@@ -66807,41 +64801,28 @@ impl Maint {
             self.z_finish_seen = finished;
             self.z_prebuilt_landed();
         }
-        // Once the form is installed and the builder has nothing due, the
-        // re-code policy's turn (`Options::zpages_recode_auto`,
-        // `Options::zpages_reparse`); or, where it does not run, the hot-raw
-        // policy's (`Options::zpages_hot_raw`) at every tick with the form
-        // installed, since a release builds nothing and a build in flight for
+        // Once the form is installed, the hot-raw policy's turn
+        // (`Options::zpages_hot_raw`) at every tick, since a release builds nothing and a build in flight for
         // another partition is no reason to wait -- the mixes at the bounded
         // rung run beside the builds of the files the load's drain left, and
         // a policy that waited for the builder never looked through them.
         if d.build && self.zsel.phase() == zselect::Phase::Compact && !self.z_settling {
-            if recode {
+            if converts {
+                // A test's request, taken with the builder free and
+                // nothing due it: the policy's own look is above.
                 let idle = self.zbuild.is_none() && {
                     let _op = self.op();
                     self.z_next().is_none()
                 };
                 if idle {
-                    self.z_recode_tick();
+                    self.z_convert_asked();
                 }
-            } else {
-                if converts {
-                    // A test's request, taken with the builder free and
-                    // nothing due it: the policy's own look is above.
-                    let idle = self.zbuild.is_none() && {
-                        let _op = self.op();
-                        self.z_next().is_none()
-                    };
-                    if idle {
-                        self.z_convert_asked();
-                    }
-                }
-                // The hot-raw policy's turn, beside the conversion's where
-                // the option has it run beside the stride form: a release
-                // builds nothing.
-                if self.z_hot_runs() {
-                    self.z_hot_raw_tick();
-                }
+            }
+            // The hot-raw policy's turn, beside the conversion's where
+            // the option has it run beside the stride form: a release
+            // builds nothing.
+            if self.z_hot_runs() {
+                self.z_hot_raw_tick();
             }
         }
         // The sample after the next build ahead, which leaves it waiting
@@ -67057,10 +65038,7 @@ impl Maint {
     /// the attach gives it back and builds the partition again
     /// (`Maint::z_attach_on_disk`), so the files' cover leaves it out.
     fn z_file_refused(&self, name: &str) -> bool {
-        let want = self
-            .z_coding_pick
-            .filter(|_| self.opts.zpages_coding_auto)
-            .map(|c| c == zselect::Coding::RawTails);
+        let want = self.z_coding_pick.map(|c| c == zselect::Coding::RawTails);
         matches!((want, self.z_ahead_coding.get(name)), (Some(w), Some(&b)) if b != w)
     }
 
@@ -67104,7 +65082,7 @@ impl Maint {
     /// it refuses (`ZCounts::finish_refused`).
     fn z_repick(&mut self) {
         self.z_take_finish_codings();
-        if !self.opts.zpages_coding_auto || self.z_coding_pick != Some(zselect::Coding::RawTails) {
+        if self.z_coding_pick != Some(zselect::Coding::RawTails) {
             return;
         }
         let Some((at_recs, at_w_z, at_resident, budget)) = self.z_pick_size else {
@@ -67399,25 +65377,20 @@ impl Maint {
         plan.sync = self.opts.zpages_build_sync && plan.drop_output;
         (plan.stride_sparse, plan.stride_sparse_later) = self.z_sparse_now();
         plan.ahead = self.opts.zpages_build_ahead;
-        plan.group_bytes = self.opts.zpages_group_bytes;
+        plan.group_bytes = zpages::ZGROUP_BYTES;
         let (coding, raw_tails) = match self.z_coding_pick {
-            Some(zselect::Coding::RawTails) if self.opts.zpages_coding_auto => {
-                (zpages::ZCODING_RECORD, true)
-            }
-            // The compressed pick is the options' compressed coding: the
-            // block coding, or the record coding with its tails compressed
-            // (`Options::zpages_record_coding`).
-            Some(zselect::Coding::Block) if self.opts.zpages_coding_auto => {
-                (self.opts.z_coding(), false)
-            }
-            _ => (self.opts.z_coding(), self.opts.zpages_raw_tails),
+            Some(zselect::Coding::RawTails) => (zpages::ZCODING_RECORD, true),
+            Some(zselect::Coding::Block) => (zpages::ZCODING_BLOCK, false),
+            None => (self.opts.z_coding(), self.opts.zpages_raw_tails),
         };
         plan.coding = coding;
-        plan.store_all = self.opts.zpages_store_all;
         plan.raw_tails = raw_tails;
-        plan.parse = self.opts.zpages_parse && self.opts.zpages_parse_finish;
-        plan.parse_chains = self.opts.zpages_parse_chains;
-        plan.own_decode = self.opts.zpages_own_decoder;
+        // A merge's output finish keeps the greedy encoder: the finish's
+        // builds are on the merge chain's path, and the parse there is what
+        // the lag sweep paid for.
+        plan.parse = false;
+        plan.parse_chains = ZPARSE_CHAINS;
+        plan.own_decode = true;
         (plan.stride, plan.stride_spans) = self.z_stride_ask_finish();
         plan.hold = Some(self.shared.zbuild_hold.clone());
         plan.life = Some(self.shared.life.clone());
@@ -68021,8 +65994,7 @@ impl Maint {
             .model_whole
             .store(whole, AtomicOrdering::Relaxed);
         self.z_past_budget = hash.saturating_add(records) > budget;
-        // The store whole past the fill share of its budget
-        // (`Options::heads_owned_past_fill`): the cache then holds more of
+        // The store whole past the fill share of its budget: the cache then holds more of
         // the store's than the budget leaves it, whatever the model says
         // of the pages a read touches, and the kernel is taking some. Once
         // past, the store is one whose cache the kernel shrinks: a merge
@@ -68270,10 +66242,7 @@ impl Maint {
             seg.z_stride_no.store(code, AtomicOrdering::Relaxed);
         }
         if !dormant {
-            let want = self
-                .z_coding_pick
-                .filter(|_| self.opts.zpages_coding_auto)
-                .map(|c| c == zselect::Coding::RawTails);
+            let want = self.z_coding_pick.map(|c| c == zselect::Coding::RawTails);
             if let (Some(want), Some(&built)) = (want, self.z_ahead_coding.get(&name)) {
                 // A build ahead cancelled or failed left no file to give.
                 if built != want && Db::z_on_disk(&self.dir, &seg.name) {
@@ -68298,18 +66267,15 @@ impl Maint {
                 self.opts.zpages_scan_prefetch,
                 self.opts.zpages_trusted_views,
                 self.opts.zpages_memo_first,
-                (
-                    Db::fence_search(&self.opts),
-                    self.opts.zpages_memo_ahead,
-                    self.opts.zpages_inplace_walk,
-                    z_drop_now(&self.opts, &self.shared),
-                    self.opts.z_times_decodes(),
-                    zpages::Dec::of(self.opts.zpages_own_decoder, self.opts.zpages_flat_decode)
-                        .with_slack(self.opts.zpages_flat_slack),
-                    self.opts.zpages_cursor_view,
-                    self.opts.zpages_group_ahead,
-                    self.opts.zpages_walk_owns_decodes,
-                ),
+                ZAttachLines {
+                    fence: Db::fence_search(&self.opts),
+                    memo_ahead: self.opts.zpages_memo_ahead,
+                    drop_raw: z_drop_now(&self.opts, &self.shared),
+                    time_decodes: self.opts.z_times_decodes(),
+                    cursor_view: self.opts.zpages_cursor_view,
+                    group_ahead: self.opts.zpages_group_ahead,
+                    walk_owns: self.opts.zpages_walk_owns_decodes,
+                },
                 &self.opts.z_stride_attach_sealed(seal),
                 ev,
             )
@@ -68348,29 +66314,18 @@ impl Maint {
                 zfile::ZEvents::add(&ev.rebuilds, 1);
             }
             ZKind::Retry => zfile::ZEvents::add(&ev.build_retries, 1),
-            ZKind::Build
-            | ZKind::Warm
-            | ZKind::Recode
-            | ZKind::Spare
-            | ZKind::Reparse
-            | ZKind::Convert => {}
+            ZKind::Build | ZKind::Warm | ZKind::Convert => {}
         }
         let refused = seg.z_declined.load(AtomicOrdering::Relaxed) == zfile::DECLINED_REFUSED;
-        // A re-code's partition is served by the file under the name, which
-        // is the one being replaced.
-        // A spare is built as a re-code is, the other coding of the served
-        // file, and kept where a re-code swaps.
-        let spare = kind == ZKind::Spare;
-        let reparse = kind == ZKind::Reparse;
-        // A conversion is a re-code into the other form: started, collected
-        // and failed as one, with the body its plan asks for its own.
+        // A conversion re-codes the served partition into the other form:
+        // the partition is served by the file under the name, which is the
+        // one being replaced.
         let convert = kind == ZKind::Convert;
-        let recode = kind == ZKind::Recode || spare || reparse || convert;
-        if !recode && self.z_attach_on_disk(&seg, id, end, dormant, refused) {
+        if !convert && self.z_attach_on_disk(&seg, id, end, dormant, refused) {
             return;
         }
         let failed = |why: u8| {
-            if recode {
+            if convert {
                 // The partition is served as it was.
                 zfile::ZEvents::add(&ev.recode_failed, 1);
                 return;
@@ -68435,92 +66390,35 @@ impl Maint {
         // million keys on the thread racing the eviction front.
         plan.sync = self.opts.zpages_build_sync && plan.drop_output;
         plan.ahead = self.opts.zpages_build_ahead;
-        plan.group_bytes = self.opts.zpages_group_bytes;
-        // The coding: the other one for a re-code, the selector's pick where
-        // it chooses one (`Options::zpages_coding_auto`), taken again
-        // against the partitions as they stand (`Maint::z_repick`), else the
-        // options'.
-        if !(reparse || recode) || convert {
-            self.z_repick();
-        }
-        // A re-code, a spare and a re-parse build the other block coding of
-        // the block file the partition serves, and a stride file has none:
-        // the policies that start them are refused beside the stride form
-        // (`check_options`), which is what this rests on.
-        let stride_served = recode && seg.z.get().is_some_and(|z| z.is_stride());
-        debug_assert!(
-            convert || !stride_served,
-            "a re-code, spare or re-parse of a stride file, which check_options refuses"
-        );
-        if stride_served && !convert {
-            return;
-        }
+        plan.group_bytes = zpages::ZGROUP_BYTES;
+        // The coding: the selector's pick where it chooses one
+        // (`Options::zpages_coding_auto`), taken again against the
+        // partitions as they stand (`Maint::z_repick`), else the options'.
+        self.z_repick();
+        let stride_served = convert && seg.z.get().is_some_and(|z| z.is_stride());
         // Nothing serves it any more: nothing to convert.
         if convert && seg.z.get().is_none() {
             return;
         }
-        let served_coded = seg.z.get().map(|z| z.coded());
+        // A conversion out of the stride form builds the block body a build
+        // of the partition's own would; into it the body is the stride
+        // form's and no coding is read.
         let (coding, raw_tails) = match self.z_coding_pick {
-            // A re-parse keeps the served block coding.
-            _ if reparse => match served_coded {
-                Some(false) => (zpages::ZCODING_BLOCK, false),
-                _ => return,
-            },
-            // A conversion out of the stride form builds the block body a
-            // build of the partition's own would, by the arms below; into
-            // it the body is the stride form's and no coding is read.
-            _ if recode && !convert => match served_coded {
-                Some(true) => (zpages::ZCODING_BLOCK, false),
-                Some(false) => (zpages::ZCODING_RECORD, true),
-                // Nothing serves it any more: nothing to re-code.
-                None => return,
-            },
-            Some(zselect::Coding::RawTails) if self.opts.zpages_coding_auto => {
-                (zpages::ZCODING_RECORD, true)
-            }
-            Some(zselect::Coding::Block) if self.opts.zpages_coding_auto => {
-                (self.opts.z_coding(), false)
-            }
-            _ => {
-                // The first partitions by key order raw-tailed
-                // (`Options::zpages_raw_tails_first`), the rest as the
-                // options say.
-                let first = self.opts.zpages_raw_tails_first;
-                let hot = first > 0 && !self.opts.zpages_raw_tails && {
-                    let _op = self.op();
-                    self.segs()
-                        .iter()
-                        .filter(|s| s.level > 0 && s.lo < seg.lo)
-                        .count()
-                        < first
-                };
-                if hot {
-                    (zpages::ZCODING_RECORD, true)
-                } else {
-                    (self.opts.z_coding(), self.opts.zpages_raw_tails)
-                }
-            }
+            Some(zselect::Coding::RawTails) => (zpages::ZCODING_RECORD, true),
+            Some(zselect::Coding::Block) => (zpages::ZCODING_BLOCK, false),
+            None => (self.opts.z_coding(), self.opts.zpages_raw_tails),
         };
         plan.coding = coding;
-        plan.store_all = self.opts.zpages_store_all;
         plan.raw_tails = raw_tails;
         if dormant {
             self.z_ahead_coding
                 .insert(zfile::zpg_name(id, end), z_coded_record(&plan));
         }
-        plan.parse = self.opts.zpages_parse || reparse;
-        // A re-parse is the shipped lazy parse whatever the builds' search,
-        // since it is bought for the decode alone.
-        plan.parse_chains = if reparse {
-            0
-        } else {
-            self.opts.zpages_parse_chains
-        };
-        plan.own_decode = self.opts.zpages_own_decoder;
+        plan.parse = true;
+        plan.parse_chains = ZPARSE_CHAINS;
+        plan.own_decode = true;
         // A partition's own build -- its first, a retry, a rebuild, a build
-        // ahead -- asks what the options ask of the stride form; a re-code,
-        // a spare and a re-parse build the other block coding of the block
-        // file they replace or keep beside, and ask nothing.
+        // ahead -- asks what the options ask of the stride form.
         // A conversion's file is kept, serves at once and was written whole
         // into the page cache beside the mixes it is bought under: synced
         // here, on the builder's thread, where the builds sync theirs, or
@@ -68534,7 +66432,7 @@ impl Maint {
         // form declines serves on as it was, and nothing of a stride file's.
         plan.stride = if convert && !stride_served {
             zfile::StrideAsk::Only
-        } else if recode {
+        } else if convert {
             zfile::StrideAsk::No
         } else {
             self.z_stride_ask_now()
@@ -68596,9 +66494,6 @@ impl Maint {
                     cancel,
                     refused,
                     dormant,
-                    recode,
-                    spare,
-                    reparse,
                     convert,
                 });
             }
@@ -68624,9 +66519,6 @@ impl Maint {
             started,
             refused,
             dormant,
-            recode,
-            spare,
-            reparse,
             convert,
             ..
         } = b;
@@ -68704,7 +66596,7 @@ impl Maint {
             .find(|s| zfile::zpg_fields(&s.name) == Some((id, end)))
             .cloned();
         let failed = |why: u8| {
-            if recode {
+            if convert {
                 // The partition is served as it was.
                 zfile::ZEvents::add(&ev.recode_failed, 1);
                 return;
@@ -68712,13 +66604,6 @@ impl Maint {
             zfile::ZEvents::add(&ev.build_failed, 1);
             seg.z_declined.store(why, AtomicOrdering::Relaxed);
             seg.z_schedule_retry(retry_ms);
-        };
-        // A spare that kept nothing: counted, and its partition not built
-        // a spare again, so that a build that cannot succeed is not retried
-        // at every turn.
-        let spare_failed = |me: &mut Self| {
-            zfile::ZEvents::add(&ev.spare_failed, 1);
-            me.z_spare_failed.insert(seg.name.clone());
         };
         if let Ok(o) = &outcome {
             o.note_stride(&seg.z_stride_no);
@@ -68738,64 +66623,12 @@ impl Maint {
             }
         }
         match outcome {
-            // A spare: attached beside the served file and kept, its pages
-            // dropped -- the served one is unchanged, though the build's
-            // rename gave the spare its name -- and the raw pages the build
-            // read dropped again where the store drops them.
-            Ok(zfile::Outcome::Built(built)) if spare && live.is_some() => {
-                let target = live.expect("checked");
-                match zfile::ZFile::attach(
-                    &out,
-                    target.blob.for_zfile(),
-                    id,
-                    end,
-                    Db::z_advise(&self.opts),
-                    Db::z_memo(&self.opts),
-                    self.opts.zpages_scan_prefetch,
-                    self.opts.zpages_trusted_views,
-                    self.opts.zpages_memo_first,
-                    Db::fence_search(&self.opts),
-                    self.opts.zpages_memo_ahead,
-                    &self.opts.z_stride_attach(),
-                ) {
-                    Ok(mut side) => {
-                        side.inplace = self.opts.zpages_inplace_walk;
-                        side.time_decodes = self.opts.z_times_decodes();
-                        side.own_decoder = self.opts.zpages_own_decoder;
-                        side.flat_decoder = self.opts.zpages_flat_decode;
-                        side.flat_slack = self.opts.zpages_flat_slack;
-                        side.cursor_view = self.opts.zpages_cursor_view;
-                        side.group_ahead = self.opts.zpages_group_ahead;
-                        side.walk_owns = self.opts.zpages_walk_owns_decodes;
-                        side.drop_cache();
-                        let old = target.z_spare.keep(Box::into_raw(Box::new(side)));
-                        if !old.is_null() {
-                            let tag = shared.readers.bump();
-                            shared.retired_z.push(tag, RetiredZ(old));
-                            shared.retired_z.sweep(|low| shared.readers.oldest_for(low));
-                        }
-                        ev.built(&built);
-                        zfile::ZEvents::add(&ev.attached, 1);
-                        zfile::ZEvents::add(&ev.spare_builds, 1);
-                        if z_drop_now(&self.opts, &self.shared) {
-                            target.drop_raw_pages(&self.dir, ev);
-                        }
-                    }
-                    Err(_) => spare_failed(self),
-                }
-            }
-            Ok(zfile::Outcome::Cancelled) if spare => {
-                zfile::ZEvents::add(&ev.build_cancelled, 1);
-            }
-            // A spare whose partition a merge retired meanwhile falls to the
-            // dead name below, as a re-code's does.
-            Ok(zfile::Outcome::Declined(_)) | Err(_) if spare => spare_failed(self),
             // A re-code: the new form file attached and swapped into the
             // cell, the old one retired through the epoch -- the build's
             // rename unlinked its name, so there is nothing to rename -- and
             // the raw pages the build read dropped again where the store
             // drops them.
-            Ok(zfile::Outcome::Built(built)) if recode && live.is_some() => {
+            Ok(zfile::Outcome::Built(built)) if convert && live.is_some() => {
                 let target = live.expect("checked");
                 // A file its build dropped as it wrote it
                 // (`Options::zpages_convert_drops_output`) is asked of the
@@ -68830,28 +66663,15 @@ impl Maint {
                     &self.opts.z_stride_attach_built(&built),
                 ) {
                     Ok(mut side) => {
-                        side.inplace = self.opts.zpages_inplace_walk;
                         side.time_decodes = self.opts.z_times_decodes();
-                        side.own_decoder = self.opts.zpages_own_decoder;
-                        side.flat_decoder = self.opts.zpages_flat_decode;
-                        side.flat_slack = self.opts.zpages_flat_slack;
+                        side.own_decoder = true;
+                        side.flat_decoder = true;
+                        side.flat_slack = true;
                         side.cursor_view = self.opts.zpages_cursor_view;
                         side.group_ahead = self.opts.zpages_group_ahead;
                         side.walk_owns = self.opts.zpages_walk_owns_decodes;
-                        let coded = side.coded();
                         let stride = side.is_stride();
-                        let mut old = target.z.replace(side);
-                        // Kept where the option keeps it, its pages dropped,
-                        // and whatever the cell kept before retired in its
-                        // place: a build starts only where none is kept.
-                        if self.opts.zpages_recode_keep && !old.is_null() {
-                            // SAFETY: the form file just taken out of
-                            // service, alive until retired or freed with
-                            // the segment; the cell of kept files is this
-                            // thread's alone.
-                            unsafe { &*old }.drop_cache();
-                            old = target.z_spare.keep(old);
-                        }
+                        let old = target.z.replace(side);
                         if !old.is_null() {
                             let tag = shared.readers.bump();
                             shared.retired_z.push(tag, RetiredZ(old));
@@ -68859,18 +66679,10 @@ impl Maint {
                         }
                         ev.built(&built);
                         zfile::ZEvents::add(&ev.attached, 1);
-                        if convert {
-                            if stride {
-                                zfile::ZEvents::add(&ev.stride_converts, 1);
-                            } else {
-                                zfile::ZEvents::add(&ev.stride_converts_back, 1);
-                            }
-                        } else if reparse {
-                            zfile::ZEvents::add(&ev.reparses, 1);
-                        } else if coded {
-                            zfile::ZEvents::add(&ev.recodes, 1);
+                        if stride {
+                            zfile::ZEvents::add(&ev.stride_converts, 1);
                         } else {
-                            zfile::ZEvents::add(&ev.recodes_back, 1);
+                            zfile::ZEvents::add(&ev.stride_converts_back, 1);
                         }
                         if z_drop_now(&self.opts, &self.shared) {
                             target.drop_raw_pages(&self.dir, ev);
@@ -68885,11 +66697,11 @@ impl Maint {
                     }
                 }
             }
-            Ok(zfile::Outcome::Cancelled) if recode => {
+            Ok(zfile::Outcome::Cancelled) if convert => {
                 zfile::ZEvents::add(&ev.build_cancelled, 1);
                 zfile::ZEvents::add(&ev.recode_failed, 1);
             }
-            Ok(zfile::Outcome::Declined(_)) | Err(_) if recode => {
+            Ok(zfile::Outcome::Declined(_)) | Err(_) if convert => {
                 zfile::ZEvents::add(&ev.recode_failed, 1);
             }
             // Built ahead and not wanted yet: on disk, dormant, for the
@@ -68952,11 +66764,10 @@ impl Maint {
                         &self.opts.z_stride_attach_built(&built),
                     ) {
                         Ok(mut side) => {
-                            side.inplace = self.opts.zpages_inplace_walk;
                             side.time_decodes = self.opts.z_times_decodes();
-                            side.own_decoder = self.opts.zpages_own_decoder;
-                            side.flat_decoder = self.opts.zpages_flat_decode;
-                            side.flat_slack = self.opts.zpages_flat_slack;
+                            side.own_decoder = true;
+                            side.flat_decoder = true;
+                            side.flat_slack = true;
                             side.cursor_view = self.opts.zpages_cursor_view;
                             side.group_ahead = self.opts.zpages_group_ahead;
                             side.walk_owns = self.opts.zpages_walk_owns_decodes;
@@ -69062,9 +66873,6 @@ impl Maint {
                 cancel,
                 refused: false,
                 dormant: false,
-                recode: false,
-                spare: false,
-                reparse: false,
                 convert: false,
             });
         }
@@ -69359,28 +67167,6 @@ impl Maint {
         let inline_max = self.opts.inline_bytes;
         let ord_durable = self.opts.ord_durable;
         let heads = self.opts.merge_keys_by_heads;
-        let drop_behind = self.opts.merge_drop_behind;
-        // The inputs a form file serves, by the gate and the cell as they
-        // stand now: a partition whose form is attached or taken out while
-        // the merge runs is read back from the device by whoever reads its
-        // raw records next, which is a cost and never a wrong answer.
-        let drop_covered: Vec<bool> =
-            if self.opts.merge_drops_covered && self.shared.zgate.load() == zselect::GATE_Z {
-                // Pinned, as every look into a cell is.
-                let _op = self.op();
-                inputs
-                    .iter()
-                    .map(|n| {
-                        self.segs()
-                            .iter()
-                            .find(|s| &s.name == n)
-                            .is_some_and(|s| s.level > 0 && s.z.get().is_some())
-                    })
-                    .collect()
-            } else {
-                Vec::new()
-            };
-        let drop_chunk = self.opts.merge_drop_chunk;
         let walk_cached = self.opts.merge_walk_cached;
         let verify_inputs = self.opts.merge_verifies_inputs;
         let read_ahead = self.merge_window();
@@ -69416,9 +67202,6 @@ impl Maint {
                 ord_durable,
                 heads,
                 counts: Some(held.clone()),
-                drop_behind,
-                drop_covered,
-                drop_chunk,
                 walk_cached,
                 read_ahead,
                 ahead_shares,

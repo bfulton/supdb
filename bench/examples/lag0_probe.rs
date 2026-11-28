@@ -21,7 +21,7 @@ fn main() {
     let arms: Vec<String> = args
         .get(1)
         .cloned()
-        .unwrap_or("supdb,supdb-sealcopyfar".into())
+        .unwrap_or("supdb".into())
         .split(',')
         .map(String::from)
         .collect();

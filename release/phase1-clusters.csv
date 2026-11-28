@@ -121,7 +121,7 @@ Options,zpages_build_sync,zpages-ahead,PR12
 Options,zpages_land_cold_past,zpages-ahead,PR30
 Options,zpages_land_cache_pct,zpages-ahead,-
 Options,zpages_cross_asks_raw,zpages-crossing,-
-Options,zpages_buy_crosses,zpages-crossing,PR2
+Options,zpages_buy_crosses,zpages-crossing,PR7
 Options,zpages_drop_again,zpages-crossing,-
 Options,zpages_drive_at_job_end,zpages-crossing,-
 Options,zpages_hot_raw_beside_stride,zpages-crossing,-

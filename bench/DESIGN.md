@@ -797,15 +797,7 @@ priced in, and `supdb-cache64tofitautozpagespromote` is the combined arm
 with a block that reads have walked a block's worth of entries held as a
 merged copy in its slot under the form, a clean block included
 (`Options::zpages_promote_copies`), so the hot blocks are walked without
-a group decoded. The form's page is a container of groups, each
-compressed on its own and cut at `Options::zpages_group_bytes` of
-records, so that a point read decodes the group its record is in and not
-the page: `supdb-cache64tofitautozpagesonegroup` is the combined arm with
-the target at zero, the page as one group, the shape before the cut,
-`supdb-nocachezpagesonegroup` is the forced arm with the same, which
-prices the cut on a point read through the form from the pass's first
-read, and `supdb-cache64tofitautozpagesgroup1k` cuts at a kibibyte where
-the default cuts at two. `supdb-cache64tofitautozpagesprebuild` is the
+a group decoded. `supdb-cache64tofitautozpagesprebuild` is the
 combined arm with the form files built ahead of the controller's
 decision once the store outgrows its budget and left dormant on disk
 (`Options::zpages_prebuild`), so that the shift to the form is an attach
@@ -826,11 +818,6 @@ combined arm with every view of a form file's page checked and the memo
 asked after it (`Options::zpages_trusted_views` off), where the default
 reads a verified page's directory trusted, and `supdb-nocachezpagescheckedviews`
 is the forced arm with the same, the pair against `supdb-nocachezpages`;
-`supdb-cache64tofitautozpagesrecord` is the combined arm with the form
-file's groups holding their records one by one, each decodable alone
-(`Options::zpages_record_coding`), where the default holds a group as one
-LZ4 block, and `supdb-nocachezpagesrecord` is the forced arm with the same,
-the pair against `supdb-nocachezpages`;
 `supdb-cache64tofitautozpagesmemofirst` is the combined arm with a
 verified page's group asked of the memo before any view of the page
 (`Options::zpages_memo_first`), where the default asks after it;
@@ -847,44 +834,17 @@ scan started skipping the partition's seek, where the default seeks every
 start; `supdb-cache128tofitautozpages` and `supdb-cache256tofitautozpages`
 are the combined arm with the block cache's budget at 128 and 256 MB
 (`Options::scan_cache_bytes`), where the combined arm's is 64;
-`supdb-nocachezpagesstored` is the forced form with every group stored
-verbatim (`Options::zpages_store_all`), no LZ4, where the default compresses
-every group that shrinks; `supdb-cache64tofitzpages` is the forced form with
+`supdb-cache64tofitzpages` is the forced form with
 the combined arm's block cache and budget, the form installed from the start
-whatever the controller would decide, and `supdb-cache64tofitzpagesstored`
-the same with every group stored; `supdb-nocachezpagesrecordraw` and
+whatever the controller would decide; `supdb-nocachezpagesrecordraw` and
 `supdb-cache64tofitzpagesrecordraw` are the two under the record coding with
 every tail stored raw (`Options::zpages_raw_tails`), the heads front-coded
 and the values the records' own bytes;
-`supdb-cache64tofitzpageshot4` and `supdb-cache64tofitzpageshot1` are
-`supdb-cache64tofitzpages` with the first four, or the first, partitions by
-key order in the raw-tail coding and the rest in the block coding
-(`Options::zpages_raw_tails_first`), the upper bound of a coding chosen per
-partition by its heat;
-`supdb-cache64tofitzpagesdrop` and `supdb-cache64tofitzpageshot4drop` are
-`supdb-cache64tofitzpages` and its hot4 arm with each partition's raw file
-and ordered index unmapped and dropped from the page cache once its form
-file serves it (`Options::zpages_drop_raw`);
-`supdb-cache64tofitzpageshot8drop` is the hot4 drop arm with the first
-eight partitions raw-tailed, `supdb-cache64tofitzpageshot8dropsettleevery`
-the same with every commit near reads settling its batch into the forms
-(`Options::forms_settle_every`), where the update mixes' writes are
-otherwise filed by ycsb-E's first scans,
-`supdb-cache64tofitzpageshot8dropsettlebuilds` that with the commit's fill
-building a form for every block its settle filed into that held none
-(`Options::forms_settle_builds`), and `supdb-cache64tofitzpagesrecordrawdrop`
-`supdb-cache64tofitzpagesrecordraw` with the drop, the two sides of the fit
-line the drop moves;
-`supdb-cache64tofitzpagesrecodedrop` is `supdb-cache64tofitzpagesdrop` with
-its partitions re-coded while served by what their decodes cost
-(`Options::zpages_recode`), the policy the key-order arms bound, and
-`supdb-cache64tofitzpagesrecodekeepdrop` the same with the form file a
-re-code replaced kept beside the served one, so that a partition's later
-re-codes exchange the two without a build (`Options::zpages_recode_keep`);
-`supdb-cache64tofitzpagesbothdrop` is that with both codings of every
-partition built at write time, the other beside each served file on the
-builder's thread, and the policy only exchanging them
-(`Options::zpages_both`);
+`supdb-cache64tofitzpagesdrop` is `supdb-cache64tofitzpages` with each
+partition's raw file and ordered index unmapped and dropped from the page
+cache once its form file serves it (`Options::zpages_drop_raw`), and
+`supdb-cache64tofitzpagesrecordrawdrop` `supdb-cache64tofitzpagesrecordraw`
+with the drop, the two sides of the fit line the drop moves;
 `supdb-nocachezstride` is `supdb-nocachezpages` with every build of a form
 file asking for the stride form -- a partition's values alone at their
 stride, where its keys are one run of numbers at one width and every record
@@ -928,9 +888,6 @@ form's header read where its buffers are asked for
 without its value (`Options::settle_value_ahead`), the block table's own
 lines not asked for (`Options::settle_table_ahead`) -- and
 `supdb-settlenoahead` with all five, the loops as they stood;
-`supdb-headslook` is `supdb` with one look at a partition's heads'
-residency standing in for a settle's asks of the kernel for a hundred
-milliseconds (`Options::heads_look_ms`);
 `supdb-headsmapped` is `supdb` with the ordered indexes' heads read
 through their mappings throughout, no copy of a raw-served partition's
 held in the process's own memory out of core (`Options::heads_owned`
@@ -958,9 +915,7 @@ its own decode of the group it ends inside made only as far as it reads
 ask made for the next group of a page as well as the next page's head
 (`Options::zpages_bulk_ahead_within`), and `supdb-zbulksearch` with the
 fence searched at every page and the memo asked twice a group
-(`Options::zpages_bulk_steps` off), and `supdb-zflatshort` with the flat
-LZ4 decoder lent the fast loop's slack alone, so each group's last
-sequences go the fast loop's way (`Options::zpages_flat_slack` off);
+(`Options::zpages_bulk_steps` off);
 `supdb-settlegated` and `supdb-ingestsettlegated` are `supdb` and
 `supdb-ingest` filing a commit's batch at the write only where the
 partitions' data passes the last-level cache
@@ -976,9 +931,7 @@ copy only at the dense count, the shape before a light form of four deltas
 or more converted (`Options::forms_convert_from`), and
 `supdb-densefrom` and `supdb-ingestdensefrom` take the line from
 `DENSEFROM`, with the reads a form takes first from `CONVREADS` and the
-writer's fills, the yields and the walk's crossing from `CONVWRITER`,
-`CONVSTRICT` and `CONVWALK` (`Options::forms_convert_reads`,
-`forms_convert_light_writer`, `forms_convert_light_yields`,
+walk's crossing from `CONVWALK` (`Options::forms_convert_reads`,
 `forms_convert_at_walk`);
 `supdb-pacesyncsbatch` holds a syncing commit's paced batch within the
 share or the batch, the larger, and `supdb-pacesyncsthresholds` holds a
@@ -992,19 +945,9 @@ other batch within the backlog bound (`Options::upkeep_pace_syncs_model`);
 buying commit has synced, where the default writes it ahead of the
 commit's frames on the writer's path (`Options::wal_ahead_beside`,
 refuted);
-`supdb-pointsources` and `supdb-ingestpointsources` have every point read
-take the general read of its sources, where the default reads a partition
-and the live table alone, or the partition, its pieces, the frozen tables
-and the live one in a single pass, wherever each holds the key in its
-common shape (`Options::point_lone`), and
 `supdb-nopool` and `supdb-ingestnopool` unmap every block a table gives
 back at its drop, where the default keeps them for the next tables
 (`Options::blocks_pool_bytes`);
-`supdb-layersasone` and `supdb-ingestlayersasone` have that single pass
-set up for every source before it asks one, where the default asks the
-live table first and ends there at a tombstone, with the pieces over the
-key's partition placed at the state's publish
-(`Options::point_layers_lean`);
 `supdb-zhotresident` is `supdb` with the hot-raw fill asking for the
 partitions the reads have not skewed by how much of their records the cache
 holds, most first (`Options::zpages_hot_fill_resident_first`);
@@ -1023,42 +966,13 @@ seek through the form; `supdb-zhotstarts2` and `supdb-zhotstarts3` are
 `supdb` with a scan that starts in a block scans have started in twice,
 or three times, holding the blocks it walks as copies under the form
 (`Options::promote_starts`), and `supdb-nohotstarts` with none held so;
-`supdb-formsoffkept` is `supdb` whose writer, its block forms given up on a
-reading of its scans, keeps them off until its next scan whatever it
-commits meanwhile (`Options::scan_forms_off_stale_writes` at zero), and
-`supdb-settleroomstill` with the room its commits' fills build in closed
+`supdb-settleroomstill` is `supdb` with the room its commits' fills build in closed
 for a second by any growth of the memory group's refaults since the last
 reading, however old (`Options::forms_settle_room_pressure` off);
 `supdb-snapdrops` is `supdb` whose handles, and whose writer on the merge
 paths, drop their scan snapshot at every publish their look has no tables
 to carry across, a merge's or a seal's landing among them
-(`Options::snapshot_stands` off); `supdb-mergedropscovered` with its
-merges dropping behind them the raw records of an input partition its form
-file serves (`Options::merge_drops_covered`), and
-`supdb-sameblocksrecords` with the landing's question whether a rewritten
-partition cuts the same blocks asked of the records whatever the ordered
-indexes hold (`Options::same_blocks_from_index` off), and
-`supdb-mergedropsrecords` with both, the shape the drop was first priced
-in;
-`supdb-zgroup1k` is `supdb` with the form's pages cut into groups of a
-kibibyte of records where the default cuts at two
-(`Options::zpages_group_bytes`);
-`supdb-cache64tofitzpagesdropparse` and `supdb-cache64tofitautozpagesparse`
-are the forced form with the drop and the combined arm with their
-block-coded groups written by the engine's parsing encoder
-(`Options::zpages_parse`), the same block format in fewer sequences;
-`supdb-cache64tofitzpagesdropflexdec` and `supdb-cache64tofitautozpagesflexdec`
-are the same two with their groups decoded by `lz4_flex` and not the engine's
-own LZ4 decoder (`Options::zpages_own_decoder` off);
-`supdb-cache64tofitautozpagescodingfixed` is the combined arm with the coding
-of its form files the options' block coding wherever the controller builds
-(`Options::zpages_coding_auto` off), where the default's selector picks the
-raw tails where the model predicts that form fits the fill share of the
-budget (`zselect::FORM_FILL`) and the block coding otherwise;
-`supdb-cache64tofitzpagesrecordrawdecode` is the forced raw-tail form with
-the block cache whose scans decode a group whole before walking it
-(`Options::zpages_inplace_walk` off), where the default reads a raw-tail
-group record by record where it lies;
+(`Options::snapshot_stands` off);
 `supdb-cache64tofitautozpagesperrun` is the combined arm with a block read
 through a cursor a run, a seek a cut and a read by rank a replaced record
 (`Options::zpages_block_cursor` off), where the default reads a block through

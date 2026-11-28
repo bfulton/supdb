@@ -1,0 +1,172 @@
+diff --git a/src/db/pager.rs b/src/db/pager.rs
+index 75f9382..5ad09bb 100644
+--- a/src/db/pager.rs
++++ b/src/db/pager.rs
+@@ -471,6 +471,7 @@ pub(crate) struct Pager {
+     /// there is somewhere to read it again from.
+     unbacked: AtomicU64,
+     peak: AtomicU64,
++    probe_added: AtomicU64,
+     /// `StoreCipher::chunks_apart`.
+     apart: AtomicBool,
+     /// `StoreCipher::merges_beside_cache`.
+@@ -542,6 +543,7 @@ impl Pager {
+             held: AtomicU64::new(0),
+             unbacked: AtomicU64::new(0),
+             peak: AtomicU64::new(0),
++            probe_added: AtomicU64::new(0),
+             apart: AtomicBool::new(false),
+             beside: AtomicBool::new(false),
+             drops_keep: AtomicBool::new(false),
+@@ -717,6 +719,30 @@ impl Pager {
+         self.unbacked.load(Ordering::Relaxed)
+     }
+ 
++    /// PROBE: every live file's label, plaintext length, whether it has an
++    /// envelope, chunks present, and units LIVE / not.
++    #[cfg(test)]
++    pub(crate) fn probe_files(&self) -> Vec<String> {
++        let files: Vec<Arc<Paged>> = lock(&self.files).iter().filter_map(Weak::upgrade).collect();
++        files
++            .iter()
++            .filter(|f| f.present.load(Ordering::Relaxed) > 0)
++            .map(|f| {
++                let states: Vec<u8> = f.state.iter().map(|s| s.load(Ordering::Relaxed)).collect();
++                let units: Vec<u8> = f.unit.iter().map(|s| s.load(Ordering::Relaxed)).collect();
++                format!(
++                    "{} len {} backed {} present {} chunk-states {:?} unit-states {:?}",
++                    f.label,
++                    f.len,
++                    f.back.get().is_some(),
++                    f.present.load(Ordering::Relaxed),
++                    states,
++                    units
++                )
++            })
++            .collect()
++    }
++
+     /// Whether `bytes` more would fit under the budget.
+     pub(crate) fn room_for(&self, bytes: u64) -> bool {
+         self.held().saturating_add(bytes) <= self.budget()
+@@ -841,6 +867,7 @@ impl Pager {
+ 
+     fn add(&self, bytes: u64) {
+         let now = self.held.fetch_add(bytes, Ordering::Relaxed) + bytes;
++        self.probe_added.fetch_add(bytes, Ordering::Relaxed);
+         if now > self.peak.load(Ordering::Relaxed) {
+             self.peak.fetch_max(now, Ordering::Relaxed);
+         }
+@@ -998,8 +1025,17 @@ impl Pager {
+     /// readers waited out once for all of them, and whichever were not
+     /// taken back meanwhile given back. False when nothing was marked.
+     fn pass(&self) -> bool {
++        let r = self.pass_inner();
++        r
++    }
++
++    fn pass_inner(&self) -> bool {
++        let filled = self.probe_added.swap(0, Ordering::Relaxed);
++        let t0 = std::time::Instant::now();
++        let held0 = self.held();
+         let (mut marked, dropped) = self.mark_dropped();
+         let over = self.over();
++        let probe = std::env::var("SUPDB_PROBE_PASS").is_ok();
+         if over > 0 {
+             Counts::bump(&self.counts.passes);
+             // Under the budget by a margin, so that the next fill does not
+@@ -1014,8 +1050,26 @@ impl Pager {
+             }
+             if marked.is_empty() {
+                 Counts::bump(&self.counts.stalls);
++                if probe {
++                    let tid = self.tid.load(Ordering::Relaxed);
++                let delay = std::fs::read_to_string(format!("/proc/self/task/{tid}/schedstat")).ok().and_then(|x| x.split_whitespace().nth(1)?.parse::<u64>().ok()).unwrap_or(0);
++                static T0: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
++                let at = T0.get_or_init(std::time::Instant::now).elapsed().as_micros();
++                eprintln!("PASS at_us {at} delay_ns {delay} tid {} held {held0} budget {budget} unbacked {} over {over} goal {goal} marked 0 freed 0 filled_since {filled} stall", self.tid.load(Ordering::Relaxed), self.unbacked());
++                }
+                 return false;
+             }
++            let mbytes: u64 = marked.iter().map(|(f, u)| f.unit_bytes(*u)).sum();
++            let w0 = self.counts.waited_us.load(Ordering::Relaxed);
++            let freed = self.give(&marked);
++            if probe {
++                let tid = self.tid.load(Ordering::Relaxed);
++                let delay = std::fs::read_to_string(format!("/proc/self/task/{tid}/schedstat")).ok().and_then(|x| x.split_whitespace().nth(1)?.parse::<u64>().ok()).unwrap_or(0);
++                static T0: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
++                let at = T0.get_or_init(std::time::Instant::now).elapsed().as_micros();
++                eprintln!("PASS at_us {at} delay_ns {delay} tid {} held {held0} budget {budget} unbacked {} over {over} goal {goal} marked_units {} marked_bytes~{mbytes} freed {freed} filled_since {filled} wait_us {} pass_us {}", self.tid.load(Ordering::Relaxed), self.unbacked(), marked.len(), self.counts.waited_us.load(Ordering::Relaxed) - w0, t0.elapsed().as_micros());
++            }
++            return true;
+         } else if marked.is_empty() {
+             return false;
+         }
+@@ -1052,7 +1106,8 @@ impl Pager {
+     /// have been lent a byte of them has gone, unless a reader took a unit
+     /// back meanwhile, those a drop asked for counted apart. Nothing is
+     /// given back where the store is closing.
+-    fn give(&self, marked: &[(Arc<Paged>, usize)]) {
++    fn give(&self, marked: &[(Arc<Paged>, usize)]) -> u64 {
++        let mut freed_sum = 0u64;
+         // Every reader that could have been lent a byte of a marked unit
+         // pinned before now. The epoch and the era move after the marks,
+         // and the pins are read after they move.
+@@ -1076,7 +1131,7 @@ impl Pager {
+                     f.unmark(*u);
+                     f.dropping[*u].store(false, Ordering::Relaxed);
+                 }
+-                return;
++                return freed_sum;
+             }
+             std::thread::sleep(nap);
+             nap = (nap * 2).min(Duration::from_millis(2));
+@@ -1088,6 +1143,7 @@ impl Pager {
+             .fetch_max(waited, Ordering::Relaxed);
+         for (f, u) in marked {
+             let freed = f.free(*u);
++            freed_sum += freed;
+             if freed > 0 {
+                 self.freed_era.fetch_max(era, Ordering::Relaxed);
+                 Counts::bump(&self.counts.evicted_units);
+@@ -1104,6 +1160,7 @@ impl Pager {
+                 }
+             }
+         }
++        freed_sum
+     }
+ 
+     /// Mark units for a pass, from where the hand stands and at most twice
+@@ -1464,6 +1521,9 @@ impl Paged {
+             pager.counts.adopted_bytes.fetch_add(len, Ordering::Relaxed);
+             pager.unbacked.fetch_add(len, Ordering::Relaxed);
+             pager.add(len);
++            if std::env::var("SUPDB_PROBE_PASS").is_ok() && len >= 256 << 10 {
++                eprintln!("ADOPT {label} len {len} held_after {} unbacked {}", pager.held(), pager.unbacked());
++            }
+         }
+         lock(&pager.files).push(Arc::downgrade(&p));
+         Ok(p)
+@@ -1550,6 +1610,9 @@ impl Paged {
+         trace_back(&self.label, &back);
+         if self.back.set(back).is_ok() {
+             self.pager.unbacked.fetch_sub(self.len, Ordering::Relaxed);
++            if std::env::var("SUPDB_PROBE_PASS").is_ok() && self.len >= 256 << 10 {
++                eprintln!("BACKED {} len {} held {} present {}", self.label, self.len, self.pager.held(), self.present.load(Ordering::Relaxed));
++            }
+         }
+         // The advice the view was given before it had an envelope. Read
+         // after the set, as `advise` writes the word before it reads the
+@@ -1828,6 +1891,12 @@ impl Paged {
+     /// The evictor's look at unit `u`: its chunks read since the last look
+     /// marked unread and nothing else, or, with none read, the unit marked
+     /// and every chunk present in it dying. The bytes marked.
++    fn unit_bytes(&self, u: usize) -> u64 {
++        let lo = u * self.unit_chunks;
++        let hi = (lo + self.unit_chunks).min(self.state.len());
++        (lo..hi).map(|c| self.chunk_len(c) as u64).sum()
++    }
++
+     fn mark(&self, u: usize) -> u64 {
+         let lo = u * self.unit_chunks;
+         let hi = (lo + self.unit_chunks).min(self.state.len());

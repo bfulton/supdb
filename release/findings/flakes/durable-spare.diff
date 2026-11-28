@@ -1,0 +1,16 @@
+--- a/tests/durable.rs	2026-11-28 09:53:58.413209105 +0000
++++ b/tests/durable.rs	2026-11-28 09:53:58.408220770 +0000
+@@ -13876,8 +13876,13 @@
+     );
+     let (upto, _) = db.run_written_and_held().expect("the run is open");
+     assert!(upto > 0, "the premise, the run's records are on its file");
++    // Probe: the next run's file made before the test names the run's.
++    if std::env::var("PROBE_WAIT_SPARE").is_ok() {
++        wait_for("probe: the next run's file", || db.seal_waits().run_spares_made >= 1);
++    }
+     let ino = run_ino(&d);
+     let tmp = run_tmp_name(&d);
++    eprintln!("PROBE named {tmp:?}");
+     let traced = db.wal_syncs_traced();
+     let h = db.reader().unwrap();
+     let (dd, cc) = (d.clone(), crash.clone());
