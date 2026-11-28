@@ -1,0 +1,2 @@
+room.sh: page cache dropped; the group this shell is in holds 402 MB of a limit of 13674 MB (/sys/fs/cgroup/memory/process_api/01a21f3b-037a-71a5-9d30-73176c892571/claude-code-bash)
+ooc.sh: bounded run under 1073741824 bytes banked

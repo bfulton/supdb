@@ -65,3 +65,15 @@ and copied here under `measure/rows/` at the same relative path.
   scan-lag cells of supdb-nozpages, supdb-nocache and supdb-noadvice, plus
   rocksdb-tuned load device_bytes_per_byte at 10M (a comparator below its
   window); no band yet for 520.
+
+## 4. Bounded row, 1 GiB, numbered keys
+
+- Command: `cd /home/user/c0/bench && TMPDIR=/home/user/base/tmp/ooc-1024-num sh scripts/ooc.sh 1073741824 --out /home/user/base/rows`
+- Start 2026-11-28T03:13:17Z, verdict `ooc.sh: bounded run under 1073741824 bytes banked`
+  by 07:25:26Z; the run's own clock 15,117 s (4 h 12 m), one sitting. No kill.
+- Row: `measure/rows/ooc/20261128T031319Z-b3a043d.json` (10 arms, rungs 3M and 10M, 3 reps).
+- Gate (exit 0; `measure/logs/ooc-1024-num-gate.txt`): 4 prior rows of class
+  `.../b1024m`; `host: OUT OF BAND` on wal-floor (median 1,092,387 ops/s
+  against the window's [1,328,102, 1,934,464]); 19 of 3131 no-verdict,
+  nothing the engine's own, 18 flagged; 8 comparator cells below their
+  window (lmdb-nordahead, rocksdb-tuned-lz4); no band yet for 1770.

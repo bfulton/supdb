@@ -1,0 +1,51 @@
+gate: class x86_64/intel-r-xeon-r-processor-2.10ghz/4c/16g/hypervisor/b1024m scale ooc -- 4 prior rows (window 10)
+host: OUT OF BAND -- wal-floor ops_per_s median 1092387 against the window's medians [1328102, 1934464]. Every quantity that moves with the machine gets no verdict.
+comparators: 8 below their window (lmdb-nordahead lag-burst read_us_per_io_lag10pct, lmdb-nordahead lag-burst read_us_per_io_lag1pct, lmdb-nordahead read p99_us, lmdb-nordahead read read_us_per_io, lmdb-nordahead read reads_per_s, lmdb-nordahead scan-lag read_us_per_io_lag0pct, ...); an arm's regression in those workloads gets no verdict
+  REGRESSED lag-burst      lmdb-nordahead   10000000  read_us_per_io_lag10pct [39.56, 41.78] us/io; prior CIs span [31.50, 37.07]
+  REGRESSED lag-burst      lmdb-nordahead   10000000  read_us_per_io_lag1pct [39.22, 41.44] us/io; prior CIs span [30.85, 38.14]
+  no verdict lag-burst      supdb            10000000  bg_read_bytes_per_op_lag100pct [687.01, 697.92] B/op; prior CIs span [627.40, 660.53] (worse than the window, and so are the floors)
+  no verdict lag-burst      supdb            10000000  read_us_per_io_lag100pct [810.78, 884.41] us/io; prior CIs span [465.71, 757.99] (worse than the window, and so are the floors)
+  no verdict lag-burst      supdb-cache256tofit  10000000  bg_read_bytes_per_op_lag100pct [677.71, 705.26] B/op; prior CIs span [608.34, 662.31] (worse than the window, and so are the floors)
+  no verdict lag-burst      supdb-cache256tofit  10000000  read_us_per_io_lag100pct [787.24, 949.14] us/io; prior CIs span [467.92, 766.39] (worse than the window, and so are the floors)
+  flagged   lag-burst      supdb-cache256tofit  10000000  refaults_per_op_lag100pct [0.02, 0.02] refaults/op; prior CIs span [0.02, 0.03] (better than every prior row -- a win or a broken measurement)
+  no verdict lag-burst      supdb-noadvice   10000000  read_us_per_io_lag100pct [914.16, 1047] us/io; prior CIs span [485.82, 795.28] (worse than the window, and so are the floors)
+  no verdict lag-burst      supdb-nocache    10000000  bg_read_bytes_per_op_lag100pct [686.22, 696.50] B/op; prior CIs span [605.13, 675.57] (worse than the window, and so are the floors)
+  no verdict lag-burst      supdb-nocache    10000000  read_us_per_io_lag100pct [778.74, 878.84] us/io; prior CIs span [464.07, 746.65] (worse than the window, and so are the floors)
+  flagged   lag-burst      supdb-nozpages   10000000  bg_read_bytes_per_op_lag1pct [1.68, 2.38] B/op; prior CIs span [11.39, 352.05] (better than every prior row -- a win or a broken measurement)
+  no verdict lag-burst      supdb-nozpages   10000000  read_us_per_io_lag1pct [100.00, 116.28] us/io; prior CIs span [27.03, 57.14] (worse than the window, and so are the floors)
+  flagged   lag-burst      supdb-nozpages   10000000  refaults_per_op_lag1pct [0.00, 0.00] refaults/op; prior CIs span [0.00, 0.09] (better than every prior row -- a win or a broken measurement)
+  flagged   load           supdb-cache256tofit  10000000  refaults_per_op        [0.00, 0.00] refaults/op; prior CIs span [0.00, 0.00] (better than every prior row -- a win or a broken measurement)
+  no verdict load           supdb-nozpages   10000000  ops_per_s              [900003, 947850] ops/s; prior CIs span [978246, 1498471] (worse than the window, and so are the floors)
+  flagged   load-shuffled  supdb            10000000  bg_read_bytes_per_op   [418.09, 572.77] B/op; prior CIs span [583.67, 722.89] (better than every prior row -- a win or a broken measurement)
+  flagged   load-shuffled  supdb            10000000  refaults_per_op        [0.08, 0.09] refaults/op; prior CIs span [0.09, 0.12] (better than every prior row -- a win or a broken measurement)
+  flagged   load-shuffled  supdb-cache256tofit  10000000  bg_read_bytes_per_op   [393.44, 450.03] B/op; prior CIs span [507.26, 698.93] (better than every prior row -- a win or a broken measurement)
+  no verdict load-shuffled  supdb-cache256tofit  10000000  read_us_per_io         [1075, 2344] us/io; prior CIs span [439.91, 963.41] (worse than the window, and so are the floors)
+  flagged   load-shuffled  supdb-noadvice   10000000  refaults_per_op        [0.08, 0.09] refaults/op; prior CIs span [0.09, 0.12] (better than every prior row -- a win or a broken measurement)
+  no verdict load-shuffled  supdb-nozpages   10000000  read_us_per_io         [178.91, 203.91] us/io; prior CIs span [78.89, 159.54] (worse than the window, and so are the floors)
+  REGRESSED read           lmdb-nordahead   10000000  p99_us                 [75.78, 78.85] µs; prior CIs span [54.02, 71.17]
+  REGRESSED read           lmdb-nordahead   10000000  read_us_per_io         [35.26, 36.51] us/io; prior CIs span [29.02, 32.32]
+  REGRESSED read           lmdb-nordahead   10000000  reads_per_s            [78990, 82074] reads/s; prior CIs span [84673, 101975]
+  flagged   read           supdb-cache256tofit  10000000  majfaults_per_op       [0.02, 0.03] faults/op; prior CIs span [0.03, 0.04] (better than every prior row -- a win or a broken measurement)
+  flagged   read           supdb-cache256tofit  10000000  read_bytes_per_op      [89.35, 105.30] B/op; prior CIs span [105.37, 172.80] (better than every prior row -- a win or a broken measurement)
+  no verdict scan           supdb-cache256tofit  10000000  bg_read_bytes_per_op_3t [159.50, 216.27] B/op; prior CIs span [0.00, 133.01] (worse than the window, and so are the floors)
+  REGRESSED scan-lag       lmdb-nordahead   10000000  read_us_per_io_lag0pct [36.27, 53.06] us/io; prior CIs span [27.23, 35.71]
+  flagged   scan-lag       supdb            10000000  bg_read_bytes_per_op_lag10pct [21782, 25122] B/op; prior CIs span [25766, 35489] (better than every prior row -- a win or a broken measurement)
+  flagged   scan-lag       supdb            10000000  refaults_per_op_lag10pct [5.32, 6.20] refaults/op; prior CIs span [6.39, 9.13] (better than every prior row -- a win or a broken measurement)
+  flagged   scan-lag       supdb-cache256tofit  10000000  bg_read_bytes_per_op_lag10pct [19892, 22511] B/op; prior CIs span [24914, 33863] (better than every prior row -- a win or a broken measurement)
+  flagged   scan-lag       supdb-cache256tofit  10000000  refaults_per_op_lag10pct [4.95, 5.57] refaults/op; prior CIs span [6.20, 8.78] (better than every prior row -- a win or a broken measurement)
+  flagged   scan-lag       supdb-noadvice   10000000  bg_read_bytes_per_op_lag100pct [19085, 30844] B/op; prior CIs span [33238, 57552] (better than every prior row -- a win or a broken measurement)
+  flagged   scan-lag       supdb-noadvice   10000000  refaults_per_op_lag100pct [9.37, 12.33] refaults/op; prior CIs span [12.78, 22.64] (better than every prior row -- a win or a broken measurement)
+  flagged   scan-lag       supdb-nocache    10000000  bg_read_bytes_per_op_lag10pct [19414, 21187] B/op; prior CIs span [21305, 31447] (better than every prior row -- a win or a broken measurement)
+  flagged   scan-lag       supdb-nocache    10000000  entries_per_s_lag10pct [2947190, 3544552] entries/s; prior CIs span [1409613, 2746931] (better than every prior row -- a win or a broken measurement)
+  no verdict scan-lag       supdb-nozpages   10000000  entries_per_s_lag10pct [585930, 666626] entries/s; prior CIs span [682287, 1877872] (worse than the window, and so are the floors)
+  no verdict scan-lag       supdb-nozpages   10000000  read_us_per_io_lag100pct [152.46, 171.05] us/io; prior CIs span [104.08, 151.37] (worse than the window, and so are the floors)
+  no verdict scan-lag       supdb-nozpages   10000000  updates_per_s_lag10pct [352619, 362374] ops/s; prior CIs span [372569, 543026] (worse than the window, and so are the floors)
+  REGRESSED scan-mixed     rocksdb-tuned-lz4  10000000  read_us_per_io_3t      [44.91, 48.76] us/io; prior CIs span [37.25, 44.88]
+  REGRESSED wal-floor      floor                      ops_per_s              [887160, 1199625] ops/s; prior CIs span [1328102, 1934464]
+  no verdict ycsb-A         supdb-nozpages   10000000  read_us_per_io         [38.78, 38.98] us/io; prior CIs span [30.26, 38.17] (worse than the window, and so are the floors)
+  no verdict ycsb-F         supdb-cache256tofit  10000000  ops_per_s              [245949, 294796] ops/s; prior CIs span [299534, 478984] (worse than the window, and so are the floors)
+  no verdict ycsbs-A        supdb-nozpages   10000000  read_us_per_io         [36.93, 38.45] us/io; prior CIs span [25.90, 36.86] (worse than the window, and so are the floors)
+  no verdict ycsbs-D        supdb-nozpages   10000000  read_us_per_io         [38.12, 39.34] us/io; prior CIs span [24.68, 36.08] (worse than the window, and so are the floors)
+  REGRESSED ycsbs-E        lmdb-nordahead   10000000  read_us_per_io         [36.60, 37.33] us/io; prior CIs span [29.03, 36.45]
+  no band yet for 1770 of 3131 quantities (fewer than 3 prior rows)
+no verdict: 19 of 3131 quantities are worse than the window and so is the machine under them; nothing the engine's own (18 flagged)
