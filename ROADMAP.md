@@ -8,10 +8,6 @@ a tenth behind its comparator or behind a shape the engine already reaches.
 
 ## High priority
 
-- [ ] **The held arm through a full rewrite at ten million keys.**
-  `supdb-heldpart` was killed once under 1.25 GiB, and the kill's owner was
-  never read. Done when a run sampled from outside the process names it,
-  which needs a count of the engine's mapped blocks by length.
 - [ ] **The scan pass after a lent burst.** Under the held log a burst is
   lent to the upkeep thread, and the first scan waits for the thread's pass
   and settles its trail: the pass after a full rewrite reads 0.15x to 0.35x

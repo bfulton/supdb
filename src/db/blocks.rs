@@ -104,13 +104,69 @@ pub(crate) fn big_maps() -> Vec<(&'static str, usize)> {
         .collect()
 }
 
-/// The mapped blocks alive, each by its address and length, for the
-/// resident count. A block comes and goes once per megabytes written, so
-/// the lock is nobody's wait.
-static LIVE: Mutex<Vec<(usize, usize)>> = Mutex::new(Vec::new());
+/// The mapped blocks alive, each by its address, its length and whether a
+/// pool holds it idle (`BlockPool`, `Pool`), for the resident count and
+/// the census by length (`by_length`). A block comes and goes once per
+/// megabytes written, so the lock is nobody's wait.
+static LIVE: Mutex<Vec<(usize, usize, bool)>> = Mutex::new(Vec::new());
 
-fn live() -> std::sync::MutexGuard<'static, Vec<(usize, usize)>> {
+fn live() -> std::sync::MutexGuard<'static, Vec<(usize, usize, bool)>> {
     LIVE.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// The block at `p` of `len` bytes marked as a pool's idle block or as
+/// in a structure's hands again. Called under the pool's own lock, so a
+/// block given and taken by two threads is marked in the order the pool
+/// saw them.
+fn set_idle(p: usize, len: usize, idle: bool) {
+    if let Some(e) = live().iter_mut().find(|e| e.0 == p && e.1 == len) {
+        e.2 = idle;
+    }
+}
+
+/// One length of the mapped blocks alive (`by_length`): the length, how
+/// many blocks have it, the bytes of them the kernel has resident, and how
+/// many a pool holds idle.
+pub(crate) type LengthCount = (usize, usize, usize, usize);
+
+/// The mapped blocks alive by length, the most bytes first: what owns the
+/// mapped bytes, since a structure's blocks are of the lengths it asks for
+/// (a table's arena blocks four megabytes each, its index a power of two,
+/// a job's arrays what they grew to). Read beside the process's anonymous
+/// mappings, which the kernel merges where two lie side by side, so that
+/// what of the process's anonymous memory is the engine's, and in which
+/// structure, can be told from what is the allocator's. Each block's
+/// resident bytes are read from the kernel (`resident_of`), every byte of
+/// it where the kernel cannot be asked.
+pub(crate) fn by_length() -> Vec<LengthCount> {
+    let blocks: Vec<(usize, usize, bool)> = live().clone();
+    let mut by: std::collections::BTreeMap<usize, (usize, usize, usize)> = Default::default();
+    for (p, len, idle) in blocks {
+        let e = by.entry(len).or_default();
+        e.0 += 1;
+        e.1 += block_resident(p, len);
+        e.2 += usize::from(idle);
+    }
+    let mut out: Vec<LengthCount> = by
+        .into_iter()
+        .map(|(len, (n, res, idle))| (len, n, res, idle))
+        .collect();
+    out.sort_by_key(|&(len, n, _, _)| std::cmp::Reverse(len * n));
+    out
+}
+
+/// A live block's resident bytes: the kernel's count where it can be
+/// asked, the block whole where not.
+fn block_resident(p: usize, len: usize) -> usize {
+    #[cfg(target_os = "linux")]
+    {
+        resident_of(p as *mut u8, len)
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = p;
+        len
+    }
 }
 
 /// The bytes of the blocks mapped and not yet unmapped, process-wide.
@@ -125,10 +181,10 @@ pub(crate) fn mapped_bytes() -> usize {
 /// between the listing and its read counts nothing.
 #[cfg(target_os = "linux")]
 pub(crate) fn mapped_resident_bytes() -> usize {
-    let blocks: Vec<(usize, usize)> = live().clone();
+    let blocks: Vec<(usize, usize, bool)> = live().clone();
     blocks
         .iter()
-        .map(|&(p, len)| resident_of(p as *mut u8, len))
+        .map(|&(p, len, _)| resident_of(p as *mut u8, len))
         .sum()
 }
 
@@ -173,7 +229,7 @@ pub(crate) fn alloc(len: usize, zeroed: bool, mapped: bool) -> *mut u8 {
     if maps(len, mapped) {
         let p = map(len);
         MAPPED.fetch_add(len, Ordering::Relaxed);
-        live().push((p as usize, len));
+        live().push((p as usize, len, false));
         return p;
     }
     let layout = std::alloc::Layout::from_size_align(len, ALIGN).expect("block layout");
@@ -227,7 +283,7 @@ pub(crate) unsafe fn free(p: *mut u8, len: usize, mapped: bool) {
     if maps(len, mapped) {
         {
             let mut l = live();
-            if let Some(i) = l.iter().position(|&(a, n)| a == p as usize && n == len) {
+            if let Some(i) = l.iter().position(|&(a, n, _)| a == p as usize && n == len) {
                 l.swap_remove(i);
             }
         }
@@ -416,6 +472,7 @@ impl BlockPool {
         let mut held = self.held();
         let i = held.iter().rposition(|&(_, n)| n == len)?;
         let (p, _) = held.remove(i);
+        set_idle(p, len, false);
         self.bytes.fetch_sub(len, Ordering::Relaxed);
         self.takes.fetch_add(1, Ordering::Relaxed);
         Some(p as *mut u8)
@@ -432,6 +489,7 @@ impl BlockPool {
             return false;
         }
         held.push((p as usize, len));
+        set_idle(p as usize, len, true);
         self.bytes.fetch_add(len, Ordering::Relaxed);
         self.gives.fetch_add(1, Ordering::Relaxed);
         true
@@ -510,8 +568,8 @@ pub(crate) unsafe fn regrow(
             assert!(q != libc::MAP_FAILED, "block: out of memory (mremap)");
             {
                 let mut l = live();
-                if let Some(i) = l.iter().position(|&(a, n)| a == p as usize && n == old) {
-                    l[i] = (q as usize, new);
+                if let Some(i) = l.iter().position(|&(a, n, _)| a == p as usize && n == old) {
+                    l[i] = (q as usize, new, false);
                 }
             }
             MAPPED.fetch_add(new - old, Ordering::Relaxed);
@@ -666,6 +724,7 @@ impl Pool {
         }
         let i = fit.or(if or_largest { largest } else { None })?;
         let (p, len, _) = kept.swap_remove(i);
+        set_idle(p, len, false);
         self.bytes.fetch_sub(len, Ordering::Relaxed);
         self.counts[0].fetch_add(1, Ordering::Relaxed);
         self.takes[site as usize].fetch_add(1, Ordering::Relaxed);
@@ -702,6 +761,7 @@ impl Pool {
                 out.push((p as usize, len));
             } else {
                 kept.push((p as usize, len, site));
+                set_idle(p as usize, len, true);
                 self.bytes.fetch_add(len, Ordering::Relaxed);
                 self.counts[1].fetch_add(1, Ordering::Relaxed);
                 let room = self.peak[site as usize]
@@ -1330,7 +1390,7 @@ fn map_huge(len: usize) -> *mut u8 {
 fn alloc_huge(len: usize) -> *mut u8 {
     let p = map_huge(len);
     MAPPED.fetch_add(len, Ordering::Relaxed);
-    live().push((p as usize, len));
+    live().push((p as usize, len, false));
     p
 }
 
@@ -1957,7 +2017,7 @@ mod tests {
             assert_eq!(
                 live()
                     .iter()
-                    .any(|&(a, n)| a == b.as_ptr() as usize && n == b.capacity() * 24),
+                    .any(|&(a, n, _)| a == b.as_ptr() as usize && n == b.capacity() * 24),
                 mapped,
                 "a mapped buffer is listed for the resident count"
             );
@@ -2100,12 +2160,12 @@ mod tests {
             // The registry the resident count walks names the block as it
             // is now, and no longer as it was.
             assert_eq!(
-                live().iter().any(|&(a, n)| a == q as usize && n == new),
+                live().iter().any(|&(a, n, _)| a == q as usize && n == new),
                 maps(new, mapped),
                 "{old} -> {new} {mapped}: the grown block listed"
             );
             assert!(
-                !live().iter().any(|&(a, n)| a == p as usize && n == old),
+                !live().iter().any(|&(a, n, _)| a == p as usize && n == old),
                 "{old} -> {new} {mapped}: the old block still listed"
             );
             // SAFETY: `new` bytes, the first `old` written.
@@ -2121,6 +2181,72 @@ mod tests {
             // SAFETY: from `regrow` with this length, read no more.
             unsafe { free(q, new, mapped) };
         }
+    }
+
+    /// The census by length counts a mapped block at its length while it
+    /// lives, its touched pages as its resident bytes, and as idle while a
+    /// pool holds it, a store's block pool and the jobs' pool alike; and
+    /// not at all once it is unmapped. Lengths no other test's blocks have,
+    /// since the registry is the process's.
+    #[test]
+    fn the_census_by_length_counts_each_block_where_it_stands() {
+        let at = |len: usize| {
+            by_length()
+                .into_iter()
+                .find(|e| e.0 == len)
+                .map_or((0, 0, 0), |e| (e.1, e.2, e.3))
+        };
+        let len = MAP_FROM + 13 * 4096;
+        assert_eq!(at(len), (0, 0, 0), "no block of the length yet");
+        let pool = std::sync::Arc::new(BlockPool::new(4 * len, true));
+        let src = Source::new(true, Some(pool.clone()));
+        let a = src.alloc(len, false);
+        let b = src.alloc(len, false);
+        // SAFETY: `len` bytes just mapped, three of their pages written.
+        unsafe {
+            for i in 0..3 {
+                *a.add(i * 4096) = 1;
+            }
+        }
+        let touched = if cfg!(target_os = "linux") {
+            3 * 4096
+        } else {
+            2 * len
+        };
+        assert_eq!(at(len), (2, touched, 0), "two blocks, three pages touched");
+        // SAFETY: from this source with this length, read no more.
+        unsafe { src.free(a, len) };
+        assert_eq!(pool.counts().0, len, "the pool kept it");
+        assert_eq!(at(len), (2, touched, 1), "kept, and so idle");
+        let c = src.alloc(len, false);
+        assert_eq!(c, a, "the kept block taken again");
+        assert_eq!(at(len), (2, touched, 0), "in a table's hands again");
+        pool.set_on(false);
+        // SAFETY: from this source with this length, read no more.
+        unsafe {
+            src.free(c, len);
+            src.free(b, len);
+        }
+        assert_eq!(at(len), (0, 0, 0), "unmapped, and counted nowhere");
+
+        // The jobs' pool: a vector's buffer kept at its drop is idle, and
+        // taken by the next vector of its array it is not.
+        let jobs: &'static Pool = Box::leak(Box::new(Pool::new()));
+        let n = (MAP_FROM + 17 * 4096) / 8;
+        let blen = n * 8;
+        {
+            let mut v: BigVec<u64> = BigVec::new_in(Site::Test, true, Some(jobs));
+            v.reserve(n);
+            assert!(v.is_mapped());
+            assert_eq!(at(blen), (1, 0, 0), "a job's buffer, untouched");
+        }
+        assert_eq!(at(blen), (1, 0, 1), "kept by the jobs' pool at its drop");
+        let mut w: BigVec<u64> = BigVec::new_in(Site::Test, true, Some(jobs));
+        w.reserve(n);
+        assert_eq!(at(blen), (1, 0, 0), "taken by the next job's array");
+        drop(w);
+        jobs.drain();
+        assert_eq!(at(blen), (0, 0, 0), "drained, and counted nowhere");
     }
 
     /// A mapped block's resident bytes are the pages it has touched, read

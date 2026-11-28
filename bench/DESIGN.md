@@ -800,7 +800,15 @@ under `runs/killed/<scale>/`, where neither the gate's history nor the
 figures read, with the command's status the kill's, 137, once it is.
 A roster the bound does not fit is not a measurement of the bound, and
 the number to move is the bound; what the other arms measured stands,
-and the kill says where to look. The reps stay interleaved as they
+and the kill says where to look. Where it says to look is read from outside
+the pass, since the pass dies with what it knew: the group's
+`memory.stat` every 10 ms and the process's mappings every 100 ms
+(`scripts/groupmem.py`, whose `end` lays out a pass's last samples and
+its largest charge), beside the engine's mapped blocks by length printed
+by a thread of the pass at each new peak (`SUPDB_BLOCKS_WATCH`), which
+says what of the anonymous memory the kernel's merged mappings hide is
+the engine's and in which structure, and each thread's stack at the
+limit (`scripts/stallwatch.py`). The reps stay interleaved as they
 were, and each store opens from nothing; with every pass in a process
 of its own there is no warmup rep, since a warmup warms a process and
 under a bound every rep costs what the first does (`run::first_rep`).
@@ -1193,6 +1201,10 @@ partition cuts the same blocks asked of the records whatever the ordered
 indexes hold (`Options::same_blocks_from_index` off), and
 `supdb-mergedropsrecords` with both, the shape the drop was first priced
 in;
+`supdb-applydeaf` and `supdb-heldpartapplydeaf` are `supdb` and
+`supdb-heldpart` with the upkeep thread's settle hearing the ask to give
+its forms up only once a batch's writes are applied, the shape before it
+heard it between them (`Options::settle_apply_looks` off);
 `supdb-zgroup1k` is `supdb` with the form's pages cut into groups of a
 kibibyte of records where the default cuts at two
 (`Options::zpages_group_bytes`);

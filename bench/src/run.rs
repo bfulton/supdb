@@ -3113,6 +3113,7 @@ pub fn one_pass_child(spec_path: &Path) -> Result<(), String> {
         None => None,
     };
     let room = spec.plan.bound.as_ref().and_then(|b| b.room_above());
+    blocks_watch(&spec.arm, spec.rep);
     let payload = Payload::new(spec.plan.value_size, spec.plan.compress, 0xE1);
     let seam = std::env::var(KILL_AFTER).ok();
     let trace = PhaseTrace::new(&spec.dir, &spec.arm, spec.rep, seam.as_deref());
@@ -6122,6 +6123,132 @@ pub fn release_freed_memory() {
     }
 }
 
+/// The engine's mapped blocks counted by length through a pass, for a
+/// reading of the pass's memory sampled from outside it: under
+/// `SUPDB_BLOCKS_WATCH=MS` a thread of the pass's process looks at the
+/// engine's mapped bytes every `MS` milliseconds and, at each new peak a
+/// four-megabyte block above the last printed, and every ten looks while
+/// they or the process's anonymous bytes move, prints the census by
+/// length (`Db::mapped_by_length`) on stderr: `blockwatch PID ARM REP
+/// MONO peak|tick`, the mapped and resident megabytes, the process's
+/// anonymous ones, and the allocator's own totals (`mallinfo2`: the bytes
+/// its arenas took from the system, those in use and free, and its
+/// chunks mapped on their own), then each length with its count, its
+/// resident megabytes and how many a pool holds idle, the most bytes
+/// first. Stamped on the monotonic clock, as `scripts/groupmem.py` stamps
+/// the pass's group and its mappings, which the kernel merges where two
+/// lie side by side and so cannot say alone which are the engine's and
+/// which the allocator's; a line is written whole before the next, so a
+/// pass the bound kills leaves the last census it reached. The look is
+/// an atomic load, and a line a copy of the engine's list, a `mincore` a
+/// block and the allocator's totals, which take each arena's lock for a
+/// walk of its bins; a pass watched this way is a probe's and not a
+/// row's.
+fn blocks_watch(arm: &str, rep: usize) {
+    let Some(ms) = std::env::var("SUPDB_BLOCKS_WATCH")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .filter(|&ms| ms > 0)
+    else {
+        return;
+    };
+    let arm = arm.to_string();
+    let spawned = std::thread::Builder::new()
+        .name("blockwatch".into())
+        .spawn(move || {
+            const STEP: usize = 4 << 20;
+            let pid = std::process::id();
+            let mut peak = 0usize;
+            let mut last = (usize::MAX, u64::MAX);
+            let mut looks = 0u64;
+            loop {
+                let mapped = supdb::Db::mapped_bytes();
+                let at_peak = mapped >= peak + STEP;
+                looks += 1;
+                let due = looks.is_multiple_of(10) && {
+                    let now = (mapped, anon_resident_bytes().unwrap_or(0) >> 20);
+                    now != last
+                };
+                if at_peak || due {
+                    if at_peak {
+                        peak = mapped;
+                    }
+                    eprintln!(
+                        "{}",
+                        blocks_watch_line(
+                            pid,
+                            &arm,
+                            rep,
+                            if at_peak { "peak" } else { "tick" },
+                            mapped,
+                            &supdb::Db::mapped_by_length(),
+                        )
+                    );
+                    last = (mapped, anon_resident_bytes().unwrap_or(0) >> 20);
+                }
+                std::thread::sleep(std::time::Duration::from_millis(ms));
+            }
+        });
+    if let Err(e) = spawned {
+        eprintln!("blockwatch: no thread ({e}); the pass runs unwatched");
+    }
+}
+
+/// One `blockwatch` line (`blocks_watch`) from the census by length: the
+/// twelve lengths of the most bytes, and the rest summed.
+fn blocks_watch_line(
+    pid: u32,
+    arm: &str,
+    rep: usize,
+    why: &str,
+    mapped: usize,
+    census: &[(usize, usize, usize, usize)],
+) -> String {
+    let mb = |b: usize| b as f64 / (1u64 << 20) as f64;
+    let mut ts = libc::timespec {
+        tv_sec: 0,
+        tv_nsec: 0,
+    };
+    // SAFETY: a clock read into a timespec on the stack.
+    unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut ts) };
+    let resident: usize = census.iter().map(|e| e.2).sum();
+    #[cfg(all(target_os = "linux", target_env = "gnu"))]
+    let heap = {
+        // SAFETY: mallinfo2 reads the allocator's own totals.
+        let mi = unsafe { libc::mallinfo2() };
+        [mi.arena, mi.uordblks, mi.fordblks, mi.hblkhd]
+    };
+    #[cfg(not(all(target_os = "linux", target_env = "gnu")))]
+    let heap = [0usize; 4];
+    let mut parts: Vec<String> = census
+        .iter()
+        .take(12)
+        .map(|&(len, n, res, idle)| format!("{:.3}mb x{n} res {:.1} idle {idle}", mb(len), mb(res)))
+        .collect();
+    let rest = &census[census.len().min(12)..];
+    if !rest.is_empty() {
+        parts.push(format!(
+            "rest x{} {:.1}mb res {:.1}",
+            rest.iter().map(|e| e.1).sum::<usize>(),
+            mb(rest.iter().map(|e| e.0 * e.1).sum()),
+            mb(rest.iter().map(|e| e.2).sum())
+        ));
+    }
+    format!(
+        "blockwatch {pid} {arm} {rep} {}.{:09} {why} mapped_mb {:.1} resident_mb {:.1} anon_mb {} heap_mb {:.1} inuse_mb {:.1} free_mb {:.1} mmapped_mb {:.1} | {}",
+        ts.tv_sec,
+        ts.tv_nsec,
+        mb(mapped),
+        mb(resident),
+        anon_resident_bytes().map_or(0, |b| b >> 20),
+        mb(heap[0]),
+        mb(heap[1]),
+        mb(heap[2]),
+        mb(heap[3]),
+        parts.join(" | ")
+    )
+}
+
 /// This process's anonymous resident bytes (Linux `RssAnon`): the memory
 /// a bound charges that the page cache cannot give back. `resident_bytes`
 /// counts the mapped segments' pages too.
@@ -6165,6 +6292,29 @@ pub fn full_top(mem_total_kb: u64, value_size: usize) -> u64 {
 
 #[cfg(test)]
 mod tests {
+    /// The watch's line says what the census says: each of the twelve
+    /// lengths of the most bytes with its count, resident megabytes and
+    /// idle blocks, the rest summed, and the resident total over every
+    /// length, the rest's included.
+    #[test]
+    fn a_blockwatch_line_carries_the_census() {
+        let mut census: Vec<(usize, usize, usize, usize)> = (0..14)
+            .map(|i| ((20 - i) << 20, 1, 1 << 20, usize::from(i == 0)))
+            .collect();
+        census[0].1 = 3;
+        let line = super::blocks_watch_line(7, "supdb-heldpart", 2, "peak", 100 << 20, &census);
+        let (head, rest) = line.split_once(" | ").unwrap();
+        let w: Vec<&str> = head.split_whitespace().collect();
+        assert_eq!(&w[..4], &["blockwatch", "7", "supdb-heldpart", "2"]);
+        assert_eq!(w[5], "peak");
+        assert_eq!(&w[6..10], &["mapped_mb", "100.0", "resident_mb", "14.0"]);
+        let parts: Vec<&str> = rest.split(" | ").collect();
+        assert_eq!(parts.len(), 13, "twelve lengths and the rest: {line}");
+        assert_eq!(parts[0], "20.000mb x3 res 1.0 idle 1");
+        assert_eq!(parts[11], "9.000mb x1 res 1.0 idle 0");
+        assert_eq!(parts[12], "rest x2 15.0mb res 2.0");
+    }
+
     /// A bounded pass's start enters the row with the rest of the pass
     /// (`pass_measurements`), through the one push that refuses a quantity
     /// the gate has no direction for: a pass with all three of its start's
