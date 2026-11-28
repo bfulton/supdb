@@ -491,11 +491,10 @@ off:
   whole at the open of a segment this process did not write -- a merge's
   output, every segment of a reopened store (`Options::verify_at_open`)
   -- and at no read; an ordered index's file carries a CRC, checked at
-  its open. A form file's page
-  carries a CRC, checked at the page's first decode in a process and not
-  again, except in a stride file this process built and read back from
-  the device, whose pages it trusts; only the bounded roster builds form
-  files. The switch the arms turn off reaches the blocks alone, and the
+  its open. A form file's page carries a CRC, checked at the page's first
+  decode in a process and not again, except in a stride file this process
+  built and read back from the device, whose pages it trusts; only the
+  bounded roster builds form files. The switch the arms turn off reaches the blocks alone, and the
   suite's stores hold none: no segment of `supdb` or `supdb-ingest`
   holds a block after the ordered load, the shuffled load or a full
   rewrite of either, at three hundred thousand keys or three million,
@@ -529,11 +528,15 @@ off:
 - `rocksdb-tuned-enc`. The same, under an Env whose AES-256-CTR has no
   tag: a changed byte decrypts to a changed byte, and the block checksums
   over the plaintext, which would see it, are the ones its reads leave
-  unchecked (`shim/rocks_enc.cc`). The arm authenticates nothing.
+  unchecked (`shim/rocks_enc.cc`). The arm authenticates nothing. Its
+  tables are the plain arm's: none at three hundred thousand keys, one
+  and seven at three million (the same example in the encrypted build,
+  `cargo run --release --no-default-features --features enc --target-dir
+  target-enc --example check_reach -- 3000000 rocksdb-tuned-enc`).
 - LMDB. Nothing: its pages carry no checksum. `lmdb3-enc` checks a page's
   GCM tag at every decryption LMDB asks of its hook, and refuses a page
-  whose tag does not match (`shim/lmdb_enc.c`); LMDB decrypts a page again
-  for each transaction that reads it first.
+  whose tag does not match (`shim/lmdb_enc.c`); LMDB decrypts a page, and
+  checks its tag, once for each transaction that reads it.
 - FASTER. Nothing: its log records carry no checksum.
 
 What the matching leaves is the work no setting removes, and it falls on
