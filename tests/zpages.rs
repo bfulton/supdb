@@ -19821,8 +19821,8 @@ fn a_build_asks_for_the_stride_form_only_where_the_store_in_it_fits_the_room() {
 /// output is built in the block form at its finish with the refusal counted
 /// -- where the same store with the room not asked builds its outputs in
 /// the stride form
-/// (`a_merges_outputs_are_built_in_the_form_their_side_of_the_key_has`), and
-/// a rule that left the pieces out would.
+/// (`a_merges_outputs_are_built_in_the_stride_form_at_their_finish`), and a
+/// rule that left the pieces out would.
 #[cfg(target_os = "linux")]
 #[test]
 fn a_merges_outputs_are_built_in_the_block_form_where_the_room_is_short() {
