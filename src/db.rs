@@ -747,9 +747,6 @@ pub struct ZCounts {
     /// that seek them, and those submitted (`OrdIndex::willneed_heads`).
     pub head_asks: u64,
     pub head_submitted: u64,
-    /// Looks at whether a partition's heads are all resident, which stand
-    /// in for those asks while they say so (`Options::heads_look_ms`).
-    pub head_looks: u64,
     /// Block-boundary keys the block cache read off an ordered index's top
     /// level, in memory, where it read a record before
     /// (`Options::boundary_keys_from_top`).
@@ -1218,7 +1215,7 @@ pub struct ZCounts {
     pub model_hash_bytes: u64,
     pub model_record_bytes: u64,
     /// The store's files whole as the tick last summed them, the level-0
-    /// pieces' with the partitions' (`Options::heads_owned_past_fill`).
+    /// pieces' with the partitions'.
     pub model_whole_bytes: u64,
     /// Form files the controller retired.
     pub retired: u64,
@@ -1698,127 +1695,6 @@ pub struct Options {
     /// 1.1x and 0.97x on reads, so the fence stays and this is the arm.
     /// A kernel without `membarrier` has the fence whatever this says.
     pub asym_pins: bool,
-    /// EXPERIMENT: a point read takes a segment's extents by value from
-    /// `Blob::lookup_full`, the shape before `Blob::with_lookup` lent them
-    /// on the index's frame; kept to price it. `supdb-extsval`.
-    pub exts_by_value: bool,
-    /// A point read of a store whose sources hold the key in their common
-    /// shape reads them in one pass, newest first, on its own frame. Two
-    /// reads stand in for the general one. A store with no frozen table
-    /// and no level-0 piece, which is every store between a drain and the
-    /// next seal, is read as its partition and the live table alone
-    /// (`Reader::read_lone`): the key hashed once, the live table's chain
-    /// for it read once to its newest tombstone, the partition found by
-    /// its fence and the record read where no tombstone masks it. A store
-    /// with pieces or frozen tables is read the same way over each of them
-    /// (`Reader::read_layers`), a piece asked once for its record, which
-    /// is kept. The general read is written for a key in any number of
-    /// sources in any record shape: the newest tombstone found by a pass
-    /// of its own, what it probed carried in a structure, the pieces over
-    /// the range found by two searches, the frozen tables and the live one
-    /// each asked in turn, a chain's offsets in a vector; with one source
-    /// it still set each of those up, about three hundred instructions of
-    /// a get's 747 over a store just loaded once the record was read in
-    /// place, by callgrind at a hundred thousand keys
-    /// (`bench/examples/point_ops.rs`). The same values in the same order:
-    /// the newest tombstone the pass finds is the newest of the read's
-    /// sources, and with none the partition's values come first. A
-    /// partition a form file may serve, a run of ordered ingest in
-    /// progress, a store with no partition yet, a chain of more live
-    /// values than the read's frame holds, a range under more pieces than
-    /// it holds, a record of another shape in a piece and a store under
-    /// any option that reads a partition another way (`point_via_ord`,
-    /// `exts_by_value`) take the general read; `Reader::point_lean_reads`
-    /// counts the reads that did not. Off: `supdb-pointsources`, and
-    /// `supdb-ingestpointsources` buffered.
-    pub point_lone: bool,
-    /// The layered read asks its sources in the order of what each costs,
-    /// sets up for none it does not reach, and asks for the partition's
-    /// first line before it reads anything (`Reader::read_placed`). A
-    /// store a write mix has sealed once is a partition, a piece and a
-    /// live table for as long as the piece waits for its merge, with a
-    /// frozen table beside them for the milliseconds of each seal, and
-    /// `read_layers` over it executes 1,052 instructions a get where the
-    /// read of a store just loaded executes 497 and FASTER's whole get
-    /// 417, by callgrind at a hundred thousand keys with the seal landed
-    /// (`bench/examples/point_ops.rs` under `POINT_OPS_LAND=1`, the
-    /// `reads_dirty` phase, `supdb-ingestlayersasone`; this read 838),
-    /// and no line of it over three in a hundred:
-    /// the partitions counted and the key's found by two searches of the
-    /// segments, the pieces over it by two more, a frame of eight hundred
-    /// bytes cleared for three frozen tables and eight pieces where one
-    /// piece stood, each chunk of a table's chain reached by three
-    /// lookups of its block, and all of it ahead of the one probe that
-    /// answers three reads in ten, the live table's, whose tombstone
-    /// masks everything older.
-    ///
-    /// Here the partitions' count and each one's run of pieces are the
-    /// state's, taken at its publish (`State::placing`), and a store of
-    /// one partition is not searched; the live table is asked first, and
-    /// a tombstone there ends the read with the table's own values; the
-    /// frozen tables are asked after it, newest first, the same way; a
-    /// chunk's header is one lookup and its value another
-    /// (`MemTable::live_small_hashed`); and the pieces' records and the
-    /// tables' values are kept in the order found, on a frame nothing
-    /// clears. The same values in the same order as `read_layers` hands
-    /// over, from the same sources.
-    ///
-    /// And the partition's first hash slot is asked for as soon as the
-    /// key is hashed, ahead of the tables' probes and the pieces' filters.
-    /// A get over keys the cache does not
-    /// hold waits on two lines of the partition, the slot and then the
-    /// record, and what a loop of gets costs is how far those waits
-    /// overlap from one get to the next: sampled by phase
-    /// (`perf record --call-graph dwarf` over the same probe), the load
-    /// of a partition's record took half again the samples a read in the
-    /// layered read that it takes in the read of a store just loaded,
-    /// behind a longer path and the live table's probe, whose branch no
-    /// predictor learns. The ask starts the first wait before either.
-    ///
-    /// A frozen table that was a run of ordered ingest is `read_layers`'
-    /// still, with everything it leaves to the general read.
-    /// `Reader::point_placed_reads` counts the reads this one answered.
-    /// Needs `point_lone`. Off: `supdb-layersasone`, and
-    /// `supdb-ingestlayersasone` buffered.
-    pub point_layers_lean: bool,
-    /// The placed read (`point_layers_lean`) takes a range under any
-    /// number of pieces, and leaves to the general read only a key with
-    /// more records than its frame keeps (`LAYERS_PIECES`) above the newest
-    /// tombstone, where it had left every range under more than that many
-    /// pieces. A put's tombstone ends the walk at the newest piece that
-    /// holds the key, so under puts a read keeps one or two. It asks for
-    /// the newest pieces' filters, at most `PLACED_ASKS` of them, as it did
-    /// for all of them. Beside a writer that appends faster than its merges
-    /// fold -- a live handle beside the overwriting arm's writer, the
-    /// threaded writers' mixes -- ten to thirty pieces stood over a
-    /// partition and every read took the general path. Off: the bound by
-    /// the pieces, `supdb-heldinplacepieces`.
-    pub point_placed_runs: bool,
-    /// A point read finds the key's partition by the partitions' upper
-    /// fences held as words (`State::fence_words`): each fence's bytes
-    /// big-endian in a `u128`, zero-padded, beside its length, and the
-    /// key's first sixteen bytes the same way, so that a step of the
-    /// search is two integer compares where it was a call to `memcmp`
-    /// through each partition's `Seg`. A fence of a word or less, which is
-    /// every fence a store names (`FENCE_MAX`), orders against a key as
-    /// its word and length do, the length breaking a tie of the words: a
-    /// tie says the fence is a prefix of the key's first sixteen bytes
-    /// padded with zeros, so the shorter of the two sorts first. A state
-    /// with a fence longer than a word searches the fences' bytes. The
-    /// placed partition's own fences are not compared again by the read:
-    /// the partitions tile the key space, so the one placed holds the key
-    /// in its range. Off: the search compares the fences' bytes.
-    pub point_fence_words: bool,
-    /// A point read that the shared table's lean probe found absent from
-    /// the live table (`Options::shared_lean`) takes the read of a store
-    /// that is a partition and the live table alone (`Reader::read_lone`)
-    /// where the store has no piece and no frozen table, with the table
-    /// left unread: that read refused any table that rewrites in place,
-    /// since such a table is read through a copy, and a key the probe has
-    /// found no record of has nothing in the table to copy. Off: such a
-    /// read takes the placed read (`Reader::read_placed`), which sets up
-    /// for frozen tables and pieces the store does not have.
-    pub point_lone_absent: bool,
     /// EXPERIMENT: a point read of a partition whose ordered index holds
     /// whole keys (`OrdIndex::uniform`: every key one length, no longer
     /// than the common prefix and eight bytes) finds its rank through the
@@ -4240,25 +4116,12 @@ pub struct Options {
     /// a page-copying one and the pass starts clean; what it gives up is
     /// the share the thread filed beside the burst, which a durable
     /// commit keeps because its thread works through the fsync. Off,
-    /// every commit lends: `supdb-ingestlendbursts` is that arm, and
-    /// `supdb-lendbursts` the durable store, whose commits lend either
-    /// way (`docs/engine.md`). With `upkeep_pace_pct`, only the first
+    /// every commit lends, a seam the tests hold that shape with
+    /// (`docs/engine.md`). With `upkeep_pace_pct`, only the first
     /// such batch after a scan is filed in the commit and the rest, up to
     /// a share of the store, are lent a batch behind the thread.
+    #[doc(hidden)]
     pub upkeep_inline_bursts: bool,
-    /// The smallest batch `upkeep_inline_bursts` files in the commit;
-    /// below it the batch is lent, as a mix's batches of a hundred are,
-    /// so the alert thread can file them beside the reads. The lag
-    /// sweep's one-percent burst at ten thousand keys is one batch of a
-    /// hundred: lent, and the scans start within a microsecond of the
-    /// commit's return, so the first scan takes it back before the
-    /// thread's first poll and pays the settle and the forms itself --
-    /// 570,000 instructions over a pass of a hundred scans, 41% of the
-    /// pass, and the one lag point on the ladder that read level with
-    /// LMDB for twelve rows while the three-hundred-write burst at
-    /// thirty thousand keys, filed inline, read 1.3x. `supdb-inlineall`
-    /// and `supdb-ingestinlineall` file every batch.
-    pub upkeep_inline_min: usize,
     /// Of the batches `upkeep_inline_bursts` would file in the commit,
     /// one of at most this percentage of the store's keys is instead
     /// lent to the thread and paced, unless it is the first after a scan:
@@ -4421,7 +4284,7 @@ pub struct Options {
     /// and the commits of a mix with no scan between them, hold only to
     /// the backlog bound (the share or the batch, the larger), whatever
     /// the batch's size, with no cut-off on the batch or the store -- a
-    /// batch under `upkeep_inline_min` was not paced before. Priced
+    /// batch under `UPKEEP_WAKE_WRITES` was not paced before. Priced
     /// against the cut-offs in the row's whole order from ten to three
     /// hundred thousand keys, in both orders: at ten thousand keys the
     /// full rewrite's burst read 1.14-1.18x, since the cut-offs held every
@@ -4467,22 +4330,6 @@ pub struct Options {
     /// it is off, and `supdb-oocz` is the arm with it on.
     #[doc(hidden)]
     pub out_of_core_installed: bool,
-    /// A buffered commit near reads whose batch is under
-    /// `upkeep_inline_min` settles it here when a scan ran since the last
-    /// commit, and lends the rest -- the forms the scans will walk, built
-    /// by those scans block by block as before. The shape it is for is a
-    /// small burst with scans at once behind it: the batch was lent to a
-    /// thread whose first poll comes two hundred microseconds later, and
-    /// the first scan took it back untouched a microsecond after the
-    /// commit returned and paid the settle itself, 145,000 instructions
-    /// of a pass of a hundred scans at ten thousand keys. Filing the whole
-    /// batch at the commit instead (`supdb-ingestinlineall`) cost the
-    /// burst 427,000, under LMDB's, and the mixes with no scan between
-    /// their commits a sixth to a half; the settle alone is a third of
-    /// that, and a mix whose commits no scan separates never reaches it.
-    /// `supdb-lazysettle` and `supdb-ingestlazysettle` leave the settle
-    /// to the scan.
-    pub upkeep_settle_after_scans: bool,
     /// Time the phases a scan runs before its walk -- the upkeep taken
     /// back, the log read, the settle, the snapshot's refresh, the builder
     /// started and its forms installed -- into `Db::scan_phases`, for the
@@ -4795,25 +4642,6 @@ pub struct Options {
     /// drops the tables when it falls behind. `supdb-noabandon` is the arm
     /// that files on.
     pub upkeep_abandons: bool,
-    /// Whether the upkeep thread files a burst's batch at once: a pass
-    /// lent a commit of at least `UPKEEP_WAKE_WRITES` writes since the
-    /// thread was last caught up, with reads around, settles what it was
-    /// lent whatever the backlog bound (`forms_settle_backlog_pct`) says.
-    /// The bound is for the mixes, whose commits are a hundred operations
-    /// with reads between them -- the commit's own size tells them apart,
-    /// never the sum lent, which three of a mix's commits cross -- and
-    /// for a commit that files on the writer's own path; a burst is
-    /// batches of a thousand writes over keys the writer never touches
-    /// again, lent to a thread that otherwise waits for two percent of
-    /// the store to pile up and leaves the rest to the first scan. At
-    /// three million keys under a bound the lag sweep's one-percent point
-    /// read a 1000-scan pass of 26 ms with 14 of it the first scan's
-    /// settle of the burst's thirty thousand keys, and the ten-percent
-    /// point 50 of 69, with the thread lent every batch and filing none:
-    /// 0.35x and 0.27x of LMDB, where the drained point reads 1.8x. Off:
-    /// the thread waits for the bound, as a commit that files itself
-    /// does. `supdb-deferbursts` is the arm that waits.
-    pub upkeep_files_bursts: bool,
     /// Whether a pass on the upkeep thread gives the writer its upkeep
     /// back at the pass's next step once the writer wants it: the log is
     /// read and settled `UPKEEP_YIELD_ENTRIES` entries at a time and the
@@ -4824,7 +4652,7 @@ pub struct Options {
     /// bounded by `upkeep_pass_pct` leaves it. The writer takes
     /// its upkeep back at every scan and at most of its publishes, waiting
     /// for the pass in flight, and with the thread filing a burst's
-    /// batches (`upkeep_files_bursts`) that pass covers whatever was lent
+    /// batches that pass covers whatever was lent
     /// since the thread's last: at three million keys under a bound the
     /// first scan after the ten-percent burst waited 30-65 ms for it in
     /// half the reps and 3-6 in the rest, a pass of two shapes, where the
@@ -6668,28 +6496,6 @@ pub struct Options {
     /// walked them. `supdb-settleconvertquiet` is the conversion with no
     /// walk left.
     pub settle_convert_fills: bool,
-    /// EXPERIMENT: how long a look at whether a partition's heads are all
-    /// in the page cache stands, in milliseconds, for the asks a settle
-    /// makes ahead of its resolves out of core (`OrdIndex::willneed_heads`):
-    /// while a
-    /// look says they are, the settle asks for none of them (0, the
-    /// default: every ask reads its own page's residency). An ask is
-    /// refused where its first page is resident, which it learns by a
-    /// `mincore` of its own, so a store that reads as out of core with
-    /// most of its ordered indexes in memory -- three million keys under
-    /// 1.25 GiB at the controller's census -- pays a call a key to be told
-    /// so, a tenth of the upkeep thread over the full rewrite's burst. One
-    /// look a partition every hundred milliseconds took that tenth off the
-    /// thread's CPU and put more than it back as waiting: under the bound
-    /// the indexes' pages leave the cache all through the burst, three to
-    /// five thousand of the thread's seeks faulted on one gone since its
-    /// partition's look where six hundred did with an ask a key, the
-    /// writer was held a quarter to a half longer and the burst read one
-    /// to three percent longer in both orders (`docs/engine.md`). The
-    /// calls are the price of pages that will not stay, and the lever is
-    /// keeping them. `supdb-headslook` is the look, at a hundred
-    /// milliseconds.
-    pub heads_look_ms: u32,
     /// Whether a partition's ordered-index heads are held in anonymous
     /// memory while the store reads as out of core and the controller
     /// leaves the partition to the raw form (`Maint::z_heads_look`), and
@@ -6706,72 +6512,6 @@ pub struct Options {
     /// through its own cache (`OrdIndex::mapped_heads`).
     /// `supdb-headsmapped` reads the mapping throughout.
     pub heads_owned: bool,
-    /// Whether the heads are copied (`heads_owned`) at the controller's
-    /// census while the block cache holds the raw records' place
-    /// (`scan_cache_copies_fit`), whatever the controller's model says of
-    /// the raw form. At the census a copy is made while the model
-    /// says the raw form fits and none while it says it does not, since a
-    /// misfit there is the stretch between a crossing and the install its
-    /// reads' faults buy (`Maint::z_heads_look`). A grant of the records'
-    /// place makes the model say so of a store nothing will be bought
-    /// for: the page cache's budget is the limit less the process's
-    /// anonymous memory, the copies are that memory, and the records they
-    /// stand in for are still counted as pages the raw form needs -- at
-    /// three million keys under 1 GiB a budget of 880 MB before the lag
-    /// sweep's full rewrite and 265 after the grant, against records of
-    /// 372 -- while the grant stands only far from point reads, whose
-    /// faults are what buys a form. So every partition a merge landed
-    /// after the grant kept its heads in a mapping, eight megabytes of
-    /// them at the pass after the burst, the burst's writes pushed their
-    /// pages out, and the scans' start seeks read them back a page a
-    /// fault behind a merge's reads: every major fault of the scanning
-    /// thread in six traced passes but one was `Reader::scan_seek` on one
-    /// such index, nine to thirty-six a pass and a hundred and ninety in
-    /// the slowest of twelve paired, a hundred and fifty to a hundred and
-    /// eighty in the two slow reps of three a row took. Under this option
-    /// a grant standing reads as the store left raw: the scanning thread
-    /// took a fault at most in twenty-four passes paired, where the
-    /// model's word alone left passes of sixty-three to a hundred and
-    /// ninety. A process with less beside the cache has room for every
-    /// copy with no grant, the cache's own budget never binding, and the
-    /// same misfit by the same count: with the jobs' arrays mapped
-    /// (`jobs_mapped`) no grant was made in six sweeps of six, thirteen
-    /// partitions of twenty had their heads copied, and two passes of six
-    /// took 49 and 178 faults on the late indexes, 47 and 55 ms where the
-    /// others ran 16 to 23. So the look asks the model's question with
-    /// the cache's bytes given back to the budget
-    /// (`Maint::z_misfit_is_the_caches`), far from point reads, grant or
-    /// none. On; `supdb-headsmodel` is the model's word alone.
-    #[doc(hidden)]
-    pub heads_owned_beside_copies: bool,
-    /// The heads of a partition the raw form serves are copied while the
-    /// controller's model says the raw form fits and it is asking nothing
-    /// -- the raw gate, where `z_heads_look` made no copy -- wherever the
-    /// store's files whole -- every segment's hash region, record region
-    /// and ordered index, the level-0 pieces' with the partitions' --
-    /// have stood past the fill share of its budget (`zselect::FORM_FILL`,
-    /// the share that leaves the cache's other tenants theirs) at a
-    /// reading of the model, and from then on. The model's fit is of the
-    /// pages a read touches, the partitions' two populations, and a burst
-    /// puts a store's worth of pieces in the cache beside them: the group
-    /// comes to its limit, and the kernel takes the pages written once
-    /// and never read first, the ordered indexes of the partitions the
-    /// burst's merges had just landed. With the copies of fixed-size
-    /// records a fifth smaller (`Options::copy_packed`) a store of three
-    /// million keys under 1.25 GiB never left the raw gate through a full
-    /// rewrite, no head was copied, and half the passes after it took two
-    /// hundred major faults on their scans' seeks, three times a pass's
-    /// length, where the larger process had tripped the census and had
-    /// its seventeen partitions' heads copied. The line is the store's own
-    /// arithmetic and not a reading of the group, so it is crossed in the
-    /// middle of the burst, seconds ahead of the limit: read as the
-    /// group's unused memory less the margin, once a second, the limit
-    /// was seen in half the sweeps, and read as the kernel's count of the
-    /// times the limit was met (`memory.failcnt`) in a third, the group
-    /// first meeting its limit as the burst ends. On; off leaves the raw
-    /// gate's heads the page cache's, `supdb-headsgate`.
-    #[doc(hidden)]
-    pub heads_owned_past_fill: bool,
     /// The hot-raw policy's skew bar read against the room
     /// (`Maint::z_hot_look`): the candidate partition is asked for where its
     /// raw bytes fit the group's unused memory and it is read more a key
@@ -7360,11 +7100,11 @@ pub struct Options {
 
 impl Options {
     /// Whether a point read takes the two-source or the layered read
-    /// where the store allows one (`point_lone`): the option, and none of
-    /// the arms that read a partition another way.
+    /// where the store allows one: none of the arms that read a partition
+    /// another way.
     #[inline(always)]
     fn point_lone_on(&self) -> bool {
-        self.point_lone && !self.exts_by_value && !self.point_via_ord
+        !self.point_via_ord
     }
 
     /// Whether the store keeps `Shared::points_far`, for the options that
@@ -7634,12 +7374,6 @@ impl Default for Options {
             flush_schedules: true,
             writer_pins: true,
             asym_pins: false,
-            exts_by_value: false,
-            point_lone: true,
-            point_layers_lean: true,
-            point_placed_runs: true,
-            point_fence_words: true,
-            point_lone_absent: true,
             point_via_ord: false,
             zpages: ZPages::Auto,
             zpages_min_bytes: zfile::ZMIN_RECS,
@@ -7796,7 +7530,6 @@ impl Default for Options {
             upkeep_alert: true,
             upkeep_alert_poll_us: 200,
             upkeep_inline_bursts: true,
-            upkeep_inline_min: UPKEEP_WAKE_WRITES,
             upkeep_pace_pct: 0,
             upkeep_pace_holds: true,
             held_bursts_lend: true,
@@ -7805,7 +7538,6 @@ impl Default for Options {
             upkeep_pace_syncs_model: true,
             upkeep_pace_syncs_census: true,
             out_of_core_installed: false,
-            upkeep_settle_after_scans: true,
             scan_timers: false,
             upkeep_batch_pct: 0,
             upkeep_pass_pct: 0,
@@ -7827,7 +7559,6 @@ impl Default for Options {
             upkeep_keep_bytes: 0,
             frozen_bytes: 0,
             upkeep_abandons: true,
-            upkeep_files_bursts: true,
             upkeep_yields: false,
             blocks_mapped: true,
             blocks_pool_bytes: 64 << 20,
@@ -7941,10 +7672,7 @@ impl Default for Options {
             settle_patch_in_place: true,
             settle_converts: true,
             settle_convert_fills: true,
-            heads_look_ms: 0,
             heads_owned: true,
-            heads_owned_beside_copies: true,
-            heads_owned_past_fill: true,
             zpages_hot_skew_room: false,
             zpages_hot_room_margin_pct: 0,
             zpages_walk_owns_decodes: false,
@@ -9734,8 +9462,7 @@ fn fence_lo(min_key: &[u8]) -> Vec<u8> {
 /// partition whose range holds it, where `words` are the upper fences of
 /// every partition but the last, in order (`State::part_of`).
 ///
-/// A fence or a key as the search compares it (`fence_word`,
-/// `Options::point_fence_words`) is its first sixteen
+/// A fence or a key as the search compares it (`fence_word`) is its first sixteen
 /// bytes big-endian in a word, padded with zeros, and how many of them it
 /// has. For a fence `h` of sixteen bytes or fewer, `h <= k` exactly where
 /// `fence_word(h) <= fence_word(k)`: words that differ differ first at a
@@ -16546,12 +16273,12 @@ const LIVE_SMALL: usize = 8;
 /// The pieces over a range a point read keeps the records of on its own
 /// frame (`Reader::read_layers`); a range under more takes the general
 /// read. The placed read keeps the records of the pieces that hold the key
-/// down to the newest tombstone, and with `Options::point_placed_runs` it
-/// is that count it bounds (`Reader::read_placed`).
+/// down to the newest tombstone, and it is that count it bounds
+/// (`Reader::read_placed`).
 const LAYERS_PIECES: usize = 8;
 
 /// The most pieces' filters a placed read asks for ahead of its probes, the
-/// newest (`Reader::place`, `Options::point_placed_runs`).
+/// newest (`Reader::place`).
 const PLACED_ASKS: usize = 4 * LAYERS_PIECES;
 
 /// No watermark: every chunk in a chain is visible, committed or not.
@@ -17738,9 +17465,6 @@ struct Slot {
     /// (`OrdIndex::willneed_heads`).
     zheadasks: AtomicU64,
     zheadsubmitted: AtomicU64,
-    /// Looks at a partition's heads' residency whole
-    /// (`Options::heads_look_ms`).
-    zheadlooks: AtomicU64,
     /// Partition walks of a scan served by a form file, the groups decoded
     /// for them, and the runs of records no page holds the raw form walked
     /// inside them.
@@ -17844,7 +17568,6 @@ impl Slot {
             zwillneedasks: AtomicU64::new(0),
             zheadasks: AtomicU64::new(0),
             zheadsubmitted: AtomicU64::new(0),
-            zheadlooks: AtomicU64::new(0),
             zscanz: AtomicU64::new(0),
             zscangroups: AtomicU64::new(0),
             znopagescans: AtomicU64::new(0),
@@ -17886,20 +17609,21 @@ impl Slot {
     }
 }
 
-// Five lines: the nine words that were here, the second form's thirteen
+// Four lines: the nine words that were here, the second form's thirteen
 // counters and the census's seventeen sums, thirty-nine words, were a
 // 384-byte slot since the census, the cursor's two counts (`zviews`,
 // `zaheads`) took it past forty-eight words into a fourth line, and the
 // count of a sparse stride walk's keys stepped by the field
 // (`zstride.direct`), the word after the cursor's steps (`zsteps`) filled
-// the fourth, took it into a fifth. What the layout is for is that no
+// the fourth, took it into a fifth, and the look at a partition's heads'
+// residency gone (`zheadlooks`) took it back to four. What the layout is for is that no
 // other thread writes a slot's lines, which the lines a handle owns keep
 // as one did; the first line's sixteen words were full at the seventh
 // second-form counter, the second's at the census's third sum, the
 // third's at the cursor's first count, the fourth's at its steps. The
 // size is pinned so that a counter added moves it here and not in a
 // threaded cell.
-const _: () = assert!(std::mem::align_of::<Slot>() >= 128 && std::mem::size_of::<Slot>() == 640);
+const _: () = assert!(std::mem::align_of::<Slot>() >= 128 && std::mem::size_of::<Slot>() == 512);
 
 const READER_SLOTS: usize = 256;
 
@@ -25921,11 +25645,11 @@ struct State {
     /// and then a read consults them all. What `pieces_aligned_over`
     /// finds by two searches of the pieces, taken once where the segments
     /// are published (`State::placing`) for the point read that asks at
-    /// every key (`pieces_placed`, `Options::point_layers_lean`).
+    /// every key (`pieces_placed`, `Reader::read_placed`).
     piece_runs: Vec<(u32, u32)>,
     /// The upper fence of every partition but the last, which has none,
     /// as a word and a length (`fence_word`), for the point read's search
-    /// (`State::part_of`, `Options::point_fence_words`); empty where a
+    /// (`State::part_of`); empty where a
     /// fence is longer than a word, and then the search compares bytes.
     /// Taken once where the segments are published (`State::placing`).
     fence_words: std::sync::Arc<[(u128, u8)]>,
@@ -26330,8 +26054,7 @@ struct Shared {
     retired_heads: RetireList<HeadsBuf>,
     /// Copies of heads made, copies given up, and of the copies made
     /// those made for a grant of the records' place alone, the model
-    /// saying the raw form does not fit
-    /// (`Options::heads_owned_beside_copies`).
+    /// saying the raw form does not fit.
     heads_events: [AtomicU64; 4],
     /// The dead names given to retired form files (`zfile::zpg_dead_name`).
     next_dead: AtomicU64,
@@ -26779,7 +26502,7 @@ struct Shared {
     /// Whether a grant of the raw records' place stands
     /// (`Options::scan_cache_copies_fit`): set by the writer's side where
     /// it grants one and cleared where it takes one back, for the segment
-    /// work's look at the heads (`Options::heads_owned_beside_copies`),
+    /// work's look at the heads,
     /// which cannot read the writer's own record of it.
     copies_stand: std::sync::atomic::AtomicBool,
     /// The writer's block cache, bytes, as its last commit's maintenance
@@ -27784,8 +27507,7 @@ pub struct Reader {
     /// threaded cells it is meant to be read beside would price.
     ord_served: std::cell::Cell<u64>,
     /// Point reads this handle answered by the two-source read and by the
-    /// layered one (`Reader::read_lone`, `Reader::read_layers`,
-    /// `Options::point_lone`), for a test that has to know which read its
+    /// layered one (`Reader::read_lone`, `Reader::read_layers`), for a test that has to know which read its
     /// store took (`point_lean_reads`).
     lone_reads: std::cell::Cell<u64>,
     /// The gets, puts and read-modify-writes the lean path answered
@@ -27804,8 +27526,7 @@ pub struct Reader {
     /// which a read the lean probe found absent from it makes none of.
     placed_live_probes: std::cell::Cell<u64>,
     layer_reads: std::cell::Cell<u64>,
-    /// Of `layer_reads`, the ones `read_placed` answered
-    /// (`Options::point_layers_lean`).
+    /// Of `layer_reads`, the ones `read_placed` answered.
     placed_reads: std::cell::Cell<u64>,
     /// Of the lean reads, the ones a tombstone in the live table's chain
     /// ended: answered by the live table alone, whatever the store below
@@ -28372,10 +28093,6 @@ struct FormsState {
     /// The settle's resolves whose stride was planned ahead
     /// (`Options::settle_seek_ahead`).
     seeks_planned: std::cell::Cell<u64>,
-    /// Per partition by position, the last look at its heads' residency:
-    /// the segment looked at, when, and whether every page was resident
-    /// (`Options::heads_look_ms`).
-    heads_looks: std::cell::RefCell<Vec<Option<(u64, std::time::Instant, bool)>>>,
     /// The settle's patches whose lines were asked for by the cut
     /// (`Options::settle_patch_at_cut`).
     patch_asks: std::cell::Cell<u64>,
@@ -28391,8 +28108,8 @@ struct FormsState {
     read_cap: std::cell::Cell<usize>,
     /// The largest commit lent to the pass in flight on the upkeep thread
     /// since the thread was last caught up (`UpkeepTo::big`), for
-    /// `settle_due` to tell a burst's batch from a mix's
-    /// (`Options::upkeep_files_bursts`); zero off the thread.
+    /// `settle_due` to tell a burst's batch from a mix's;
+    /// zero off the thread.
     pass_batch: std::cell::Cell<u64>,
     log_short: std::cell::Cell<bool>,
     /// A fill the upkeep thread left for a later pass because the writer
@@ -28554,7 +28271,6 @@ impl FormsState {
             lazy_cuts: Counts::new(),
             settle_short: Counts::new(),
             seeks_planned: std::cell::Cell::new(0),
-            heads_looks: std::cell::RefCell::new(Vec::new()),
             patch_asks: std::cell::Cell::new(0),
             settle_ahead: Counts::new(),
             read_cap: std::cell::Cell::new(0),
@@ -28986,7 +28702,7 @@ enum Hand {
     /// the settle bound says (`Options::upkeep_inline_bursts`).
     File,
     /// The batch settled here and its forms left to the scans that walk
-    /// them (`Options::upkeep_settle_after_scans`).
+    /// them.
     Settle,
     /// Lent, and the commit returns once the thread trails by at most
     /// this many writes, a share of the store's keys: a burst's batches
@@ -31976,17 +31692,16 @@ impl State {
     }
 
     /// The partition whose range holds `key`: the first whose upper fence
-    /// is above it. By the fences' words where `words` asks and the state
-    /// has them (`Options::point_fence_words`), else by their bytes; the
-    /// two agree for every fence a word holds (`fence_word`).
+    /// is above it. By the fences' words where the state has them, else by
+    /// their bytes; the two agree for every fence a word holds
+    /// (`fence_word`).
     #[inline(always)]
-    fn part_of(&self, key: &[u8], words: bool) -> usize {
+    fn part_of(&self, key: &[u8]) -> usize {
         let np = self.parts;
         if np <= 1 {
             return 0;
         }
-        let words = words.then_some(&*self.fence_words);
-        part_by(words, np, key, || {
+        part_by(Some(&*self.fence_words), np, key, || {
             self.segs[..np].partition_point(|s| s.hi.as_ref().is_some_and(|h| h.as_slice() <= key))
         })
     }
@@ -32600,7 +32315,6 @@ impl Reader {
             willneed_asks: rd.stat(|s| &s.zwillneedasks),
             head_asks: rd.stat(|s| &s.zheadasks),
             head_submitted: rd.stat(|s| &s.zheadsubmitted),
-            head_looks: rd.stat(|s| &s.zheadlooks),
             top_keys: get(&self.shared.asks.top_keys),
             dir_willneeds: get(&self.shared.asks.dir_runs),
             dir_asks: get(&self.shared.asks.dir_submitted),
@@ -32837,8 +32551,7 @@ impl Reader {
 
     /// Point reads this handle answered by the read of a partition and
     /// the live table alone, and by the layered read of every source in
-    /// its common shape (`Options::point_lone`); both zero without the
-    /// option, and a read counted in neither took the general read. A
+    /// its common shape; a read counted in neither took the general read. A
     /// handle's own count, as `ord_point_reads` is.
     /// A test's: the length of the live table this handle reads as it was
     /// last carried, not carried here (`Options::shared_len_lazy`).
@@ -32891,7 +32604,7 @@ impl Reader {
 
     /// Of the layered reads `point_lean_reads` counts, the ones the read
     /// that places its sources first answered
-    /// (`Options::point_layers_lean`, `Reader::read_placed`); the rest
+    /// (`Reader::read_placed`); the rest
     /// were `read_layers`'. A handle's own count.
     pub fn point_placed_reads(&self) -> u64 {
         self.placed_reads.get()
@@ -33062,27 +32775,6 @@ impl Reader {
         if seg.ord.willneed_heads(lo, hi) > 0 {
             self.zbump(|s| &s.zheadsubmitted);
         }
-    }
-
-    /// Whether partition `at`'s heads were all resident at the last look,
-    /// the look made again once it is `Options::heads_look_ms` old or the
-    /// partition there is another segment (`OrdIndex::heads_all_resident`).
-    fn heads_warm(&self, at: usize, seg: &Seg, now: std::time::Instant) -> bool {
-        let id = seg.blob.id();
-        let mut looks = self.fs().heads_looks.borrow_mut();
-        if looks.len() <= at {
-            looks.resize(at + 1, None);
-        }
-        let stands = std::time::Duration::from_millis(u64::from(self.opts.heads_look_ms));
-        if let Some((seen, when, warm)) = looks[at] {
-            if seen == id && now.saturating_duration_since(when) < stands {
-                return warm;
-            }
-        }
-        let warm = seg.ord.heads_all_resident();
-        self.zbump(|s| &s.zheadlooks);
-        looks[at] = Some((id, now, warm));
-        warm
     }
 
     /// The partition `key` falls in, of the first `np` segments: stepped to
@@ -34041,7 +33733,7 @@ impl Reader {
             return None;
         }
         let fnv = crate::flatindex::key_hash(key);
-        let at = st.part_of(key, self.opts.point_fence_words);
+        let at = st.part_of(key);
         if let Some(seg) = st.segs[..st.parts].get(at) {
             seg.prefetch_slot(fnv);
         }
@@ -34075,18 +33767,13 @@ impl Reader {
     }
 
     /// Whether the partition `seg`, which the read placed for `key`
-    /// (`State::part_of`), may hold it: its filter alone where the
-    /// placement is by the fences' words (`Options::point_fence_words`),
-    /// since the partitions tile the key space and the one placed holds
-    /// the key in its range, and its fences and filter otherwise.
+    /// (`State::part_of`), may hold it: its filter alone, since the
+    /// partitions tile the key space and the one placed holds the key in
+    /// its range.
     #[inline(always)]
     fn placed_may_hold(&self, seg: &Seg, key: &[u8], fnv: u64) -> bool {
-        if self.opts.point_fence_words {
-            debug_assert!(!seg.below_lo(key) && seg.hi.as_ref().is_none_or(|h| key < h.as_slice()));
-            seg.bloom.as_ref().is_none_or(|b| b.maybe_contains_fnv(fnv))
-        } else {
-            seg.may_hold_fnv(key, fnv)
-        }
+        debug_assert!(!seg.below_lo(key) && seg.hi.as_ref().is_none_or(|h| key < h.as_slice()));
+        seg.bloom.as_ref().is_none_or(|b| b.maybe_contains_fnv(fnv))
     }
 
     /// The live table's read of `key` where it is a shared table of
@@ -34102,7 +33789,7 @@ impl Reader {
     }
 
     /// `read_layers` with its sources asked in the order of what each
-    /// costs (`Options::point_layers_lean`): `None`, with nothing handed to
+    /// costs: `None`, with nothing handed to
     /// `f`, for every store and key that read leaves to the general one,
     /// and for a store with a frozen table that was a run of ordered
     /// ingest, which is that read's.
@@ -34128,7 +33815,7 @@ impl Reader {
         pre: Option<(u64, usize)>,
         f: &mut F,
     ) -> Option<Result<u64>> {
-        if !self.opts.point_layers_lean || !self.opts.point_lone_on() {
+        if !self.opts.point_lone_on() {
             return None;
         }
         let (segs, mem) = (&st.segs, &*st.mem);
@@ -34153,8 +33840,8 @@ impl Reader {
             None => crate::flatindex::key_hash(key),
         };
         let (at, l0) = match pre {
-            Some((_, at)) => Reader::place_at(&self.opts, st, at, fnv, false)?,
-            None => Reader::place(&self.opts, st, key, fnv)?,
+            Some((_, at)) => Reader::place_at(st, at, fnv, false),
+            None => Reader::place(st, key, fnv),
         };
         // The live table first: the values of the key's chain newest
         // first, the first `live_n` of `live`. They are slices of the
@@ -34239,8 +33926,7 @@ impl Reader {
                 }
                 if let Some(c) = seg.raw().find_fixed_hashed(key, fnv)? {
                     // More records above the newest tombstone than the
-                    // frame keeps: the general read's
-                    // (`Options::point_placed_runs`).
+                    // frame keeps: the general read's.
                     if held == LAYERS_PIECES {
                         return None;
                     }
@@ -34291,7 +33977,7 @@ impl Reader {
 
     /// A point read over a partition, the pieces over its range, the
     /// frozen tables and the live one, where each holds the key in its
-    /// common shape (`Options::point_lone`): `None`, with nothing handed
+    /// common shape: `None`, with nothing handed
     /// to `f`, for any other store or key, which `read_sources` reads.
     ///
     /// One pass, newest source first, to the newest tombstone: the live
@@ -34327,7 +34013,7 @@ impl Reader {
         if np == 0 {
             return None;
         }
-        let at = st.part_of(key, self.opts.point_fence_words);
+        let at = st.part_of(key);
         let l0 = st.pieces_over(np, at);
         if l0.len() > LAYERS_PIECES {
             return None;
@@ -34407,11 +34093,10 @@ impl Reader {
     }
 
     /// A point read where the key's sources are the partition and the
-    /// live table (`Options::point_lone`): `None`, with nothing handed to
+    /// live table: `None`, with nothing handed to
     /// `f`, for every other store, which `read_sources` reads. With
     /// `live_absent`, the shared table's lean probe has found no record of
-    /// the key in the live table, which is then left unread
-    /// (`Options::point_lone_absent`). `pre` is the key's FNV word and
+    /// the key in the live table, which is then left unread. `pre` is the key's FNV word and
     /// partition where the read took them ahead of the live table's probe
     /// (`Options::shared_fall_ahead`).
     #[inline(always)]
@@ -34437,7 +34122,7 @@ impl Reader {
         // A table that rewrites in place is read through a copy, which the
         // general read takes (`MemTable::live_values`), unless the lean
         // probe found nothing of the key there to copy.
-        let absent = live_absent && self.opts.point_lone_absent;
+        let absent = live_absent;
         if !absent && mem.rewrites_now() {
             return None;
         }
@@ -34477,7 +34162,7 @@ impl Reader {
             };
             let at = match pre {
                 Some((_, at)) => at,
-                None => st.part_of(key, self.opts.point_fence_words),
+                None => st.part_of(key),
             };
             if let Some(seg) = segs.get(at).filter(|s| self.placed_may_hold(s, key, fnv)) {
                 match seg.raw().read_all_fixed_hashed(key, fnv, f) {
@@ -34497,40 +34182,30 @@ impl Reader {
     }
 
     /// The placed read's partition for `key` and the pieces over it, with
-    /// the asks for the lines their probes load first; `None` where the
-    /// pieces are more than the
-    /// read takes. Inlined at both of the read's places for it, since as a
-    /// closure it was a call and fifty instructions of every read.
+    /// the asks for the lines their probes load first. Inlined at both of
+    /// the read's places for it, since as a closure it was a call and fifty
+    /// instructions of every read.
     #[inline(always)]
-    fn place<'s>(
-        opts: &Options,
-        st: &'s State,
-        key: &[u8],
-        fnv: u64,
-    ) -> Option<(usize, &'s [std::sync::Arc<Seg>])> {
-        let at = st.part_of(key, opts.point_fence_words);
-        Reader::place_at(opts, st, at, fnv, true)
+    fn place<'s>(st: &'s State, key: &[u8], fnv: u64) -> (usize, &'s [std::sync::Arc<Seg>]) {
+        let at = st.part_of(key);
+        Reader::place_at(st, at, fnv, true)
     }
 
     /// `place` for a key whose partition `at` the read has, its slot
     /// asked for already where `ask_slot` is false.
     #[inline(always)]
-    fn place_at<'s>(
-        opts: &Options,
-        st: &'s State,
+    fn place_at(
+        st: &State,
         at: usize,
         fnv: u64,
         ask_slot: bool,
-    ) -> Option<(usize, &'s [std::sync::Arc<Seg>])> {
+    ) -> (usize, &[std::sync::Arc<Seg>]) {
         let (segs, np) = (&st.segs, st.parts);
         let l0 = st.pieces_placed(at);
         debug_assert!(
             std::ptr::eq(l0, st.pieces_over(np, at)),
             "the pieces a publish placed over a partition are the ones a search finds"
         );
-        if !opts.point_placed_runs && l0.len() > LAYERS_PIECES {
-            return None;
-        }
         // The partition's slot first: it is the read's longest wait where
         // no tombstone masks the partition, and the tables' probes and the
         // pieces' filters are the lead for it. The newest pieces' filters,
@@ -34541,7 +34216,7 @@ impl Reader {
         for seg in l0.iter().rev().take(PLACED_ASKS) {
             seg.prefetch_probe(fnv);
         }
-        Some((at, l0))
+        (at, l0)
     }
 
     /// A point read over every source that may hold the key: the
@@ -34566,7 +34241,7 @@ impl Reader {
             mem.prefetch_hashed(mem.hash_with(key, fnv))
         };
         let np = segs.partition_point(|s| s.level > 0);
-        let at = st.part_of(key, self.opts.point_fence_words);
+        let at = st.part_of(key);
         let holds = |s: &Seg| s.may_hold_fnv(key, fnv);
         let part = segs[..np].get(at).filter(|s| holds(s));
         let l0 = st.pieces_over(np, at);
@@ -34611,16 +34286,11 @@ impl Reader {
             (0, Probed::default())
         };
         let mut n = 0u64;
-        // The segment read lends the extents on the index's frame; the arm
-        // takes them by value, the shape before (`Options::exts_by_value`).
-        let by_value = self.opts.exts_by_value;
+        // The segment read lends the extents on the index's frame.
         let seg_read = |seg: &Seg, f: &mut F| {
-            if by_value {
-                seg.raw().read_all_by_value(key, f)
-            } else {
-                seg.raw().read_all_fixed_hashed(key, fnv, f)
-            }
-            .map_err(|e| err(&format!("segment read: {e}")))
+            seg.raw()
+                .read_all_fixed_hashed(key, fnv, f)
+                .map_err(|e| err(&format!("segment read: {e}")))
         };
         if start == 0 {
             if let Some(seg) = part {
@@ -38114,13 +37784,11 @@ impl Reader {
             return Some(false);
         }
         let quiet = self.opts.seal_idle && self.mode_note.quiet.get() && far;
-        // A burst's batch on the upkeep thread is filed at once
-        // (`Options::upkeep_files_bursts`): the bound below is for a mix's
-        // small commits and for a commit that files on its own path.
-        let burst = self.understudy
-            && self.opts.upkeep_files_bursts
-            && !far
-            && self.fs().pass_batch.get() >= UPKEEP_WAKE_WRITES as u64;
+        // A burst's batch on the upkeep thread is filed at once: the bound
+        // below is for a mix's small commits and for a commit that files on
+        // its own path.
+        let burst =
+            self.understudy && !far && self.fs().pass_batch.get() >= UPKEEP_WAKE_WRITES as u64;
         let recent = !quiet
             && (self.opts.forms_settle_recent_pct == 0
                 || writes - self.fs().writes_at_scan.get()
@@ -39460,21 +39128,6 @@ impl Reader {
         // second of the full rewrite's settles.
         let page = crate::bytes::os_page_size();
         let asking = out_of_core(&self.opts, self.shared.zgate.load()) && np > 0;
-        // One look a partition first (`Options::heads_look_ms`): the raw
-        // partitions whose heads are not all resident are the ones asked
-        // for, and with none there is no asking in this settle.
-        let cold: Vec<bool> = if asking && self.opts.heads_look_ms > 0 {
-            let now = std::time::Instant::now();
-            self.segs()[..np]
-                .iter()
-                .enumerate()
-                .map(|(p, s)| self.zc(s).is_none() && !self.heads_warm(p, s, now))
-                .collect()
-        } else {
-            Vec::new()
-        };
-        let asking = asking && (self.opts.heads_look_ms == 0 || cold.iter().any(|&c| c));
-        let asked_of = |p: usize| cold.get(p).copied().unwrap_or(true);
         // Per partition: the rank the asks have reached, the page of the
         // last resolve and whether the batch reads dense there; then the
         // sparse cursor's position in the batch and its partition.
@@ -39575,7 +39228,7 @@ impl Reader {
                     let Some(s) = self.segs()[..np].get(at_ahead) else {
                         continue;
                     };
-                    if dense[at_ahead] || self.zc(s).is_some() || !asked_of(at_ahead) {
+                    if dense[at_ahead] || self.zc(s).is_some() {
                         continue;
                     }
                     if let Some((lo, hi)) = s.ord.stride_window(k) {
@@ -39616,7 +39269,7 @@ impl Reader {
             // after this one -- this one is resident, the resolve just
             // seized it, and an ask that starts on a resident page asks
             // nothing -- until the frontier stands the lead past the rank.
-            if asking && cut != LAZY_CUT && self.zc(seg).is_none() && asked_of(at) {
+            if asking && cut != LAZY_CUT && self.zc(seg).is_none() {
                 let rank = (cut >> 1) as usize;
                 let pg = seg.ord.head_page(rank, page);
                 dense[at] = last_page[at] != usize::MAX && pg.saturating_sub(last_page[at]) <= 1;
@@ -43174,7 +42827,7 @@ impl Reader {
             mem.prefetch_hashed(mem.hash_with(key, fnv))
         };
         let np = segs.partition_point(|s| s.level > 0);
-        let at = st.part_of(key, self.opts.point_fence_words);
+        let at = st.part_of(key);
         let holds = |s: &Seg| s.may_hold_fnv(key, fnv);
         let raw_count = |s: &Seg| {
             s.raw()
@@ -54082,8 +53735,8 @@ struct UpkeepTo {
     cap: u64,
     /// The writes of the largest commit lent since the thread was last
     /// seen caught up, this one included: what tells a burst's batch,
-    /// a commit of a thousand writes, from a mix's hundred, for
-    /// `Options::upkeep_files_bursts`. The sum of the commits lent would
+    /// a commit of a thousand writes, from a mix's hundred, for the thread
+    /// to file a burst's at once. The sum of the commits lent would
     /// not, since three of a mix's commits unfiled sum past any burst's
     /// one.
     big: u64,
@@ -55222,8 +54875,7 @@ impl Db {
         // by a commit that does not sync, and the thread is lent nothing
         // of it; one that syncs lends it, since the thread works through
         // the fsync: see `Options::upkeep_inline_bursts`, and
-        // `Options::upkeep_inline_min` for where "worth waking for" is
-        // drawn.
+        // `UPKEEP_WAKE_WRITES` for where "worth waking for" is drawn.
         let mut pace = false;
         let mut pace_syncs = false;
         // The share of the store's keys a paced batch is within and the
@@ -55233,13 +54885,13 @@ impl Db {
         // or waited for (`Options::held_bursts_lend`).
         let burst_lent = self.opts.held_bursts_lend
             && matches!(self.opts.sync, SyncPolicy::Explicit)
-            && batch >= self.opts.upkeep_inline_min;
+            && batch >= UPKEEP_WAKE_WRITES;
         if level == 1
             && self.opts.upkeep_inline_bursts
             && !burst_lent
             && !syncs
             && reads_around
-            && batch >= self.opts.upkeep_inline_min
+            && batch >= UPKEEP_WAKE_WRITES
         {
             // The first such batch after a scan is filed here, and so is
             // one over the share of the store the first scan's wait is
@@ -55270,7 +54922,7 @@ impl Db {
             && self.opts.upkeep_pace_syncs_bp > 0
             && reads_around
             && batch > 0
-            && (self.opts.upkeep_pace_syncs_model || batch >= self.opts.upkeep_inline_min)
+            && (self.opts.upkeep_pace_syncs_model || batch >= UPKEEP_WAKE_WRITES)
             && in_core
         {
             share = (keys as u64).saturating_mul(self.opts.upkeep_pace_syncs_bp as u64) / 10_000;
@@ -55280,11 +54932,10 @@ impl Db {
         // A smaller batch with a scan since the last commit: the scans
         // behind it take the batch back before the thread's first poll,
         // so its settle runs here and the forms wait for the scans that
-        // walk them (`Options::upkeep_settle_after_scans`). `since_scan`
-        // is zero only where the scan count moved since the last commit.
+        // walk them. `since_scan` is zero only where the scan count moved
+        // since the last commit.
         if level == 1
             && self.opts.upkeep_inline_bursts
-            && self.opts.upkeep_settle_after_scans
             && !burst_lent
             && !syncs
             && reads_around
@@ -55681,16 +55332,14 @@ impl Db {
     }
 
     /// The copies of heads made under the raw gate, the store's files
-    /// whole past the fill share of its budget
-    /// (`Options::heads_owned_past_fill`).
+    /// whole past the fill share of its budget.
     #[doc(hidden)]
     pub fn heads_past_fill(&self) -> u64 {
         self.shared.heads_events[3].load(AtomicOrdering::Relaxed)
     }
 
     /// The copies of heads made for a grant of the records' place alone,
-    /// the controller's model saying the raw form does not fit
-    /// (`Options::heads_owned_beside_copies`).
+    /// the controller's model saying the raw form does not fit.
     #[doc(hidden)]
     pub fn heads_beside_copies(&self) -> u64 {
         self.shared.heads_events[2].load(AtomicOrdering::Relaxed)
@@ -59588,8 +59237,7 @@ struct Maint {
     z_misfit_caches: bool,
     /// Whether the store's files whole have stood past the fill share of
     /// its budget at a reading of the model (`z_model`): what
-    /// `z_heads_look` copies heads on under the raw gate
-    /// (`Options::heads_owned_past_fill`).
+    /// `z_heads_look` copies heads on under the raw gate.
     z_past_fill: bool,
     /// The coding the selector chose at its last reading
     /// (`Options::zpages_coding_auto`, `zselect::choose_coding`), which the
@@ -62509,7 +62157,7 @@ impl Maint {
     /// the census being the group's pressure, and none while the model
     /// says it does not, which is the stretch between a crossing and the
     /// install its reads' faults buy -- but for a store whose block cache
-    /// holds the raw records' place (`Options::heads_owned_beside_copies`),
+    /// holds the raw records' place,
     /// where the misfit is the cache's own bytes and no read is near to
     /// buy anything. The first version copied whatever
     /// the raw form was serving at the look: at ten million keys under the
@@ -62543,23 +62191,22 @@ impl Maint {
         // them while the store fits -- and does not once the store's
         // files whole have outgrown the cache's share of the budget,
         // whatever the model says of the pages a read touches
-        // (`Options::heads_owned_past_fill`).
-        let past_fill = self.opts.heads_owned_past_fill && self.z_past_fill;
-        if gate == zselect::GATE_RAW && !past_fill {
+        // (`ZEvents::model_whole`).
+        if gate == zselect::GATE_RAW && !self.z_past_fill {
             return;
         }
         let near = self.scans_near();
-        // A grant of the records' place reads as the store left raw
-        // (`Options::heads_owned_beside_copies`): the model's misfit is
-        // then the grant's own bytes, and it stands only far from the
-        // point reads whose faults would buy a form.
+        // A grant of the records' place reads as the store left raw: the
+        // model's misfit is then the grant's own bytes, and it stands only
+        // far from the point reads whose faults would buy a form; the
+        // model's word alone charged the block cache's copies and the
+        // records they stand in for both.
         // And so does a cache that holds that place with no grant, its
         // own budget never having bound: the misfit is its bytes either
         // way (`z_misfit_is_the_caches`), and no point read is near to
         // buy anything.
-        let beside = self.opts.heads_owned_beside_copies
-            && (self.shared.copies_stand.load(AtomicOrdering::Acquire)
-                || (self.z_misfit_caches && self.shared.points_far.load(AtomicOrdering::Acquire)));
+        let beside = self.shared.copies_stand.load(AtomicOrdering::Acquire)
+            || (self.z_misfit_caches && self.shared.points_far.load(AtomicOrdering::Acquire));
         let model_raw = !self.z_auto || self.z_leaves_raw;
         let census_raw = model_raw || beside;
         let _op = self.op();
@@ -64772,7 +64419,7 @@ impl Maint {
     }
 
     /// Whether the misfit the model reads under `budget` is the block
-    /// cache's own bytes (`Options::heads_owned_beside_copies`): the raw
+    /// cache's own bytes: the raw
     /// populations within the budget once what the writer's cache holds
     /// is given back to it. The model's budget is the limit less the
     /// process's anonymous memory, the cache's copies are in that memory,
@@ -65269,7 +64916,7 @@ impl Maint {
         self.z_leaves_raw =
             heads_left_raw(self.z_leaves_raw, &d, model.as_ref().map(|m| m.phi_raw));
         // And whose the misfit is, where the model was read
-        // (`Options::heads_owned_beside_copies`).
+        // (`Db::z_misfit_is_the_caches`).
         if let Some(m) = model.as_ref() {
             self.z_misfit_caches = self.z_misfit_is_the_caches(m.budget);
         }
@@ -67465,8 +67112,7 @@ impl Maint {
             .model_whole
             .store(whole, AtomicOrdering::Relaxed);
         self.z_past_budget = hash.saturating_add(records) > budget;
-        // The store whole past the fill share of its budget
-        // (`Options::heads_owned_past_fill`): the cache then holds more of
+        // The store whole past the fill share of its budget: the cache then holds more of
         // the store's than the budget leaves it, whatever the model says
         // of the pages a read touches, and the kernel is taking some. Once
         // past, the store is one whose cache the kernel shrinks: a merge

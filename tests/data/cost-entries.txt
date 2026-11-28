@@ -333,7 +333,6 @@ Blob::read_all	-	the engine's reader of a segment: reached through Reader::read_
 Blob::read_all_hashed	-	the engine's reader of a segment: reached through Reader::read_all and Reader::scan, whose probes count what the engine inlines of it
 Blob::lookup_hashed	-	the engine's reader of a segment: reached through Reader::read_all and Reader::scan, whose probes count what the engine inlines of it
 Blob::prefetch_slot	-	an ask or a drop of the page cache, made out of core or at a build; a store in core makes none of them on an operation
-Blob::read_all_by_value	-	a pricing arm's read, supdb-extsval, no probe counts it
 Blob::read_exts	-	the engine's reader of a segment: reached through Reader::read_all and Reader::scan, whose probes count what the engine inlines of it
 Blob::read_exts_inline	-	the engine's reader of a segment: reached through Reader::read_all and Reader::scan, whose probes count what the engine inlines of it
 Blob::read_concat	-	a caller's read into one buffer, no probe counts it (a gap)

@@ -2316,16 +2316,6 @@ impl<B: Bytes> Blob<B> {
         }
     }
 
-    /// EXPERIMENT: `read_all` through `lookup_full`, the extents returned
-    /// by value: the shape before `with_lookup`, kept to price it
-    /// (`Options::exts_by_value`).
-    pub fn read_all_by_value<F: FnMut(&[u8])>(&self, key: &[u8], f: F) -> Result<u64> {
-        let Some((exts, tail)) = self.lookup_full(key) else {
-            return Ok(0);
-        };
-        self.read_exts(&exts, tail, f)
-    }
-
     /// Every value in `exts`, in order -- the extents and tail a
     /// `lookup_full` or `exts_at_full` returned, handed back so a caller that
     /// has already resolved a key and looked at its flags does not resolve it

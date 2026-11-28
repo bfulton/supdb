@@ -1664,7 +1664,7 @@ fn claim_across_rewrite(name: &str, part: usize, key: impl Fn(usize) -> Vec<u8>)
     let (_, _, copies, _) = db.block_cache_kinds();
     assert!(copies >= 1, "the block is a copy: {copies}");
     // A commit after the scan, which files its batch as the first commit
-    // after a scan does (`Options::upkeep_settle_after_scans`), so that the
+    // after a scan does, so that the
     // batch after it is left to the backlog bound.
     db.put(b"zz-elsewhere", b"elsewhere");
     want.insert(b"zz-elsewhere".to_vec(), vec![b"elsewhere".to_vec()]);
