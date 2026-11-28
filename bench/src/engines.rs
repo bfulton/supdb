@@ -805,19 +805,6 @@ pub struct Supdb {
     /// by its rank among them (`Options::settle_patch_at_cut` off):
     /// `supdb-settlepatchwhole`.
     settlepatchwhole: bool,
-    /// The settle's resolve reading each key's write from the pending list
-    /// and its bytes from the table (`Options::settle_gathers` off):
-    /// `supdb-settleloads`.
-    settleloads: bool,
-    /// The settle's batch sorted by key offset ahead of its sort by prefix
-    /// (`Options::settle_sorts_once` off): `supdb-settlesortstwice`.
-    settlesortstwice: bool,
-    /// Every patch of the settle through `patch_block`
-    /// (`Options::settle_patch_in_place` off): `supdb-settlepatchstaged`.
-    settlestaged: bool,
-    /// A form the settle grew dense left for the fill to convert
-    /// (`Options::settle_converts` off): `supdb-settlenoconvert`.
-    settlenoconvert: bool,
     /// A settle's conversion that leaves the fill no walk
     /// (`Options::settle_convert_fills` off): `supdb-settleconvertquiet`,
     /// and `supdb-ingestsettleconvertquiet` on the buffered arm.
@@ -2230,19 +2217,6 @@ struct Policy {
     /// by its rank among them (`Options::settle_patch_at_cut` off):
     /// `supdb-settlepatchwhole`.
     settlepatchwhole: bool,
-    /// The settle's resolve reading each key's write from the pending list
-    /// and its bytes from the table (`Options::settle_gathers` off):
-    /// `supdb-settleloads`.
-    settleloads: bool,
-    /// The settle's batch sorted by key offset ahead of its sort by prefix
-    /// (`Options::settle_sorts_once` off): `supdb-settlesortstwice`.
-    settlesortstwice: bool,
-    /// Every patch of the settle through `patch_block`
-    /// (`Options::settle_patch_in_place` off): `supdb-settlepatchstaged`.
-    settlestaged: bool,
-    /// A form the settle grew dense left for the fill to convert
-    /// (`Options::settle_converts` off): `supdb-settlenoconvert`.
-    settlenoconvert: bool,
     /// A settle's conversion that leaves the fill no walk
     /// (`Options::settle_convert_fills` off): `supdb-settleconvertquiet`,
     /// and `supdb-ingestsettleconvertquiet` on the buffered arm.
@@ -3253,10 +3227,6 @@ impl Default for Policy {
             settleformnear: false,
             settlegallop: false,
             settlepatchwhole: false,
-            settleloads: false,
-            settlesortstwice: false,
-            settlestaged: false,
-            settlenoconvert: false,
             settleconvertquiet: false,
             settlevaluenear: false,
             settletablenear: false,
@@ -9661,10 +9631,6 @@ impl Supdb {
             settleformnear,
             settlegallop,
             settlepatchwhole,
-            settleloads,
-            settlesortstwice,
-            settlestaged,
-            settlenoconvert,
             settleconvertquiet,
             settlevaluenear,
             settletablenear,
@@ -10135,10 +10101,6 @@ impl Supdb {
                 supdb::Options::default().settle_seek_ahead
             },
             settle_patch_at_cut: !settlepatchwhole,
-            settle_gathers: !settleloads,
-            settle_sorts_once: !settlesortstwice,
-            settle_patch_in_place: !settlestaged,
-            settle_converts: !settlenoconvert,
             settle_convert_fills: !settleconvertquiet,
             settle_value_ahead: if settlevaluenear {
                 0
@@ -10667,10 +10629,6 @@ impl Supdb {
             settleformnear,
             settlegallop,
             settlepatchwhole,
-            settleloads,
-            settlesortstwice,
-            settlestaged,
-            settlenoconvert,
             settleconvertquiet,
             settlevaluenear,
             settletablenear,
@@ -11243,25 +11201,6 @@ impl Engine for Supdb {
                     "supdb-heldpartsettleconvertquiet"
                 } else {
                     "supdb-heldnfsettleconvertquiet"
-                };
-            }
-            if self.noframes
-                && (self.settleloads
-                    || self.settlesortstwice
-                    || self.settlestaged
-                    || self.settlenoconvert)
-            {
-                return match (
-                    self.settleloads,
-                    self.settlesortstwice,
-                    self.settlestaged,
-                    self.settlenoconvert,
-                ) {
-                    (true, false, false, false) => "supdb-heldsettleloads",
-                    (false, true, false, false) => "supdb-heldsettlesortstwice",
-                    (false, false, true, false) => "supdb-heldsettlestaged",
-                    (false, false, false, true) => "supdb-heldsettlenoconvert",
-                    _ => "supdb-heldsettlefat",
                 };
             }
             if self.noframes {
@@ -12172,26 +12111,6 @@ impl Engine for Supdb {
                 "supdb-settleconvertquiet"
             } else {
                 "supdb-ingestsettleconvertquiet"
-            };
-        }
-        if self.settleloads || self.settlesortstwice || self.settlestaged || self.settlenoconvert {
-            return match (
-                self.partition,
-                self.settleloads,
-                self.settlesortstwice,
-                self.settlestaged,
-                self.settlenoconvert,
-            ) {
-                (true, true, false, false, false) => "supdb-settleloads",
-                (true, false, true, false, false) => "supdb-settlesortstwice",
-                (true, false, false, true, false) => "supdb-settlepatchstaged",
-                (true, false, false, false, true) => "supdb-settlenoconvert",
-                (true, ..) => "supdb-settlefat",
-                (false, true, false, false, false) => "supdb-ingestsettleloads",
-                (false, false, true, false, false) => "supdb-ingestsettlesortstwice",
-                (false, false, false, true, false) => "supdb-ingestsettlestaged",
-                (false, false, false, false, true) => "supdb-ingestsettlenoconvert",
-                (false, ..) => "supdb-ingestsettlefat",
             };
         }
         if self.settleformnear
@@ -15257,12 +15176,7 @@ pub fn guarantee(arm: &str) -> Option<Guarantee> {
         | "supdb-settleformnear"
         | "supdb-settlegallop"
         | "supdb-settlepatchwhole"
-        | "supdb-settleloads"
-        | "supdb-settlesortstwice"
-        | "supdb-settlepatchstaged"
-        | "supdb-settlenoconvert"
         | "supdb-settleconvertquiet"
-        | "supdb-settlefat"
         | "supdb-settlevaluenear"
         | "supdb-settlenoahead"
         | "supdb-settletablenear"
@@ -15495,12 +15409,7 @@ pub fn guarantee(arm: &str) -> Option<Guarantee> {
         | "supdb-ingestrowatclose"
         | "supdb-ingestlendbursts"
         | "supdb-ingestpaced"
-        | "supdb-ingestsettleloads"
-        | "supdb-ingestsettlesortstwice"
-        | "supdb-ingestsettlestaged"
-        | "supdb-ingestsettlenoconvert"
         | "supdb-ingestsettleconvertquiet"
-        | "supdb-ingestsettlefat"
         | "supdb-ingestpacelends"
         | "supdb-ingestinlineall"
         | "supdb-ingestlazysettle"
@@ -15617,11 +15526,6 @@ pub fn guarantee(arm: &str) -> Option<Guarantee> {
         | "supdb-heldnopopulate"
         | "supdb-heldhandle"
         | "supdb-heldfiles"
-        | "supdb-heldsettleloads"
-        | "supdb-heldsettlesortstwice"
-        | "supdb-heldsettlestaged"
-        | "supdb-heldsettlenoconvert"
-        | "supdb-heldsettlefat"
         | "supdb-heldpaced"
         | "supdb-heldpacelends"
         | "supdb-heldbatch1"
@@ -17114,105 +17018,6 @@ pub fn open(arm: &str, dir: &Path, map_gb: usize) -> Res<Box<dyn Engine>> {
             },
             dir,
         )?,
-        // The settle as it stood before its lean path, a part at a time and
-        // all four: the resolve's loads (`Options::settle_gathers` off), the
-        // batch sorted twice (`Options::settle_sorts_once` off),
-        // every patch staged (`Options::settle_patch_in_place` off) and the
-        // dense forms left to the fill (`Options::settle_converts` off),
-        // for the durable arm, the buffered and the held log's.
-        "supdb-settleloads" => supdb_arm(
-            |d| {
-                Supdb::with_policy(
-                    d,
-                    Policy {
-                        settleloads: true,
-                        ..Policy::default()
-                    },
-                )
-            },
-            dir,
-        )?,
-        "supdb-settlepatchstaged" => supdb_arm(
-            |d| {
-                Supdb::with_policy(
-                    d,
-                    Policy {
-                        settlestaged: true,
-                        ..Policy::default()
-                    },
-                )
-            },
-            dir,
-        )?,
-        "supdb-settlenoconvert" => supdb_arm(
-            |d| {
-                Supdb::with_policy(
-                    d,
-                    Policy {
-                        settlenoconvert: true,
-                        ..Policy::default()
-                    },
-                )
-            },
-            dir,
-        )?,
-        "supdb-settlefat" => supdb_arm(
-            |d| {
-                Supdb::with_policy(
-                    d,
-                    Policy {
-                        settleloads: true,
-                        settlesortstwice: true,
-                        settlestaged: true,
-                        settlenoconvert: true,
-                        ..Policy::default()
-                    },
-                )
-            },
-            dir,
-        )?,
-        "supdb-ingestsettleloads" => supdb_arm(
-            |d| {
-                Supdb::with_policy(
-                    d,
-                    Policy {
-                        partition: false,
-                        durable: false,
-                        settleloads: true,
-                        ..Policy::default()
-                    },
-                )
-            },
-            dir,
-        )?,
-        "supdb-ingestsettlestaged" => supdb_arm(
-            |d| {
-                Supdb::with_policy(
-                    d,
-                    Policy {
-                        partition: false,
-                        durable: false,
-                        settlestaged: true,
-                        ..Policy::default()
-                    },
-                )
-            },
-            dir,
-        )?,
-        "supdb-ingestsettlenoconvert" => supdb_arm(
-            |d| {
-                Supdb::with_policy(
-                    d,
-                    Policy {
-                        partition: false,
-                        durable: false,
-                        settlenoconvert: true,
-                        ..Policy::default()
-                    },
-                )
-            },
-            dir,
-        )?,
         "supdb-heldpartsettleconvertquiet" => supdb_arm(
             |d| {
                 Supdb::with_policy(
@@ -17263,132 +17068,6 @@ pub fn open(arm: &str, dir: &Path, map_gb: usize) -> Res<Box<dyn Engine>> {
                         partition: false,
                         durable: false,
                         settleconvertquiet: true,
-                        ..Policy::default()
-                    },
-                )
-            },
-            dir,
-        )?,
-        "supdb-ingestsettlefat" => supdb_arm(
-            |d| {
-                Supdb::with_policy(
-                    d,
-                    Policy {
-                        partition: false,
-                        durable: false,
-                        settleloads: true,
-                        settlesortstwice: true,
-                        settlestaged: true,
-                        settlenoconvert: true,
-                        ..Policy::default()
-                    },
-                )
-            },
-            dir,
-        )?,
-        "supdb-heldsettleloads" => supdb_arm(
-            |d| {
-                Supdb::with_policy(
-                    d,
-                    Policy {
-                        partition: false,
-                        durable: false,
-                        held: true,
-                        noframes: true,
-                        settleloads: true,
-                        ..Policy::default()
-                    },
-                )
-            },
-            dir,
-        )?,
-        "supdb-heldsettlestaged" => supdb_arm(
-            |d| {
-                Supdb::with_policy(
-                    d,
-                    Policy {
-                        partition: false,
-                        durable: false,
-                        held: true,
-                        noframes: true,
-                        settlestaged: true,
-                        ..Policy::default()
-                    },
-                )
-            },
-            dir,
-        )?,
-        "supdb-heldsettlenoconvert" => supdb_arm(
-            |d| {
-                Supdb::with_policy(
-                    d,
-                    Policy {
-                        partition: false,
-                        durable: false,
-                        held: true,
-                        noframes: true,
-                        settlenoconvert: true,
-                        ..Policy::default()
-                    },
-                )
-            },
-            dir,
-        )?,
-        "supdb-heldsettlefat" => supdb_arm(
-            |d| {
-                Supdb::with_policy(
-                    d,
-                    Policy {
-                        partition: false,
-                        durable: false,
-                        held: true,
-                        noframes: true,
-                        settleloads: true,
-                        settlesortstwice: true,
-                        settlestaged: true,
-                        settlenoconvert: true,
-                        ..Policy::default()
-                    },
-                )
-            },
-            dir,
-        )?,
-        "supdb-settlesortstwice" => supdb_arm(
-            |d| {
-                Supdb::with_policy(
-                    d,
-                    Policy {
-                        settlesortstwice: true,
-                        ..Policy::default()
-                    },
-                )
-            },
-            dir,
-        )?,
-        "supdb-ingestsettlesortstwice" => supdb_arm(
-            |d| {
-                Supdb::with_policy(
-                    d,
-                    Policy {
-                        partition: false,
-                        durable: false,
-                        settlesortstwice: true,
-                        ..Policy::default()
-                    },
-                )
-            },
-            dir,
-        )?,
-        "supdb-heldsettlesortstwice" => supdb_arm(
-            |d| {
-                Supdb::with_policy(
-                    d,
-                    Policy {
-                        partition: false,
-                        durable: false,
-                        held: true,
-                        noframes: true,
-                        settlesortstwice: true,
                         ..Policy::default()
                     },
                 )
@@ -20729,7 +20408,6 @@ mod tests {
                 assert_eq!(z.features(), base.features());
                 let o = z.db.as_ref().unwrap().options();
                 assert!(!o.settle_convert_fills && b.settle_convert_fills);
-                assert!(o.settle_converts);
                 let z = Supdb::with_policy(
                     &dir("ingestsettleconvertquiet"),
                     Policy {

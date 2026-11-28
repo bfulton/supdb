@@ -6382,45 +6382,7 @@ pub struct Options {
     /// form's header as much again. `supdb-settletablenear` asks for
     /// none.
     pub settle_table_ahead: usize,
-    /// Whether a settle's resolve reads its batch from the sorted records:
-    /// the writes' fields gathered once into key order, and a key of at
-    /// most sixteen bytes rebuilt from the two prefix words the batch was
-    /// sorted by. Before it the resolve's loops took each key's write from
-    /// the pending list by the index the sort carried and its bytes from
-    /// the table's arena, both in key order where the list and the arena
-    /// are in arrival order: two loads a key that nothing had asked for,
-    /// inside iterations too long for the core to overlap them, a seventh
-    /// of the upkeep thread's time over a full rewrite at three hundred
-    /// thousand keys. `supdb-settleloads` is the shape before.
-    pub settle_gathers: bool,
-    /// Whether a settle's batch is sorted once, by its keys' prefix words,
-    /// with the writes of keys that tie on them grouped by key afterwards.
-    /// Before it the batch was first sorted by key offset with a
-    /// comparison sort, so that the stable sort by prefix after it would
-    /// leave each key's writes adjacent: a burst's writes arrive nearly in
-    /// that order, new keys ascending with a few rewritten ones among
-    /// them, which is the input a pattern-defeating sort does its whole
-    /// work on, 150 instructions a write to group keys the prefix sort
-    /// separates by itself unless two of them share sixteen bytes.
-    /// `supdb-settlesortstwice` is the shape before.
-    pub settle_sorts_once: bool,
-    /// Whether a put's patch of a copy whose entries are its block's
-    /// records is written where it lies (`Reader::patch_in_place`): one
-    /// value above a tombstone in the key's chain, no longer than the run
-    /// the entry holds, copied over that run from the chain with nothing
-    /// staged, re-counted or searched. `supdb-settlepatchstaged` takes
-    /// every patch through `patch_block`.
-    pub settle_patch_in_place: bool,
-    /// Whether the settle converts a sparse form its batch takes to the
-    /// dense count, before it splices the block's keys of the batch
-    /// (`Reader::convert_settled`), where the fill converted it at the
-    /// pass's end or, on the upkeep thread behind a posted commit, not at
-    /// all (`Reader::fill_deferred`): a burst lent to the
-    /// thread left every form sparse, each patch an insert into a sorted
-    /// run of up to sixty-four deltas, and the scans after it walked them.
-    /// `supdb-settlenoconvert` leaves the conversions to the fill.
-    pub settle_converts: bool,
-    /// Whether a settle that converted a form (`settle_converts`) leaves
+    /// Whether a settle that converted a form leaves
     /// the fill its walk of the tables, as the patch that left a form at
     /// the dense count had. That walk is where the fill meets the light
     /// forms (`forms_convert_from`), and in a store whose every block
@@ -7686,10 +7648,6 @@ impl Default for Options {
             settle_patch_at_cut: true,
             settle_value_ahead: 180,
             settle_table_ahead: 12,
-            settle_gathers: true,
-            settle_sorts_once: true,
-            settle_patch_in_place: true,
-            settle_converts: true,
             settle_convert_fills: true,
             heads_look_ms: 0,
             heads_owned: true,
@@ -26127,12 +26085,10 @@ struct Shared {
     /// Patches that found the form shared with a published copy and had
     /// to copy it before writing (`Arc::make_mut` on a shared form).
     forms_cloned: AtomicU64,
-    /// Patches the settle wrote in place (`Options::settle_patch_in_place`)
-    /// and sparse forms it converted (`Options::settle_converts`).
+    /// Patches the settle wrote in place and sparse forms it converted.
     settle_placed: AtomicU64,
     settle_converted: AtomicU64,
-    /// Writes a settle read from its batch's gathered records
-    /// (`Options::settle_gathers`).
+    /// Writes a settle read from its batch's gathered records.
     settle_gathered: AtomicU64,
     /// Reads that took a canonical form, over this store's life. The
     /// count beside it on `State` is that state's and is zero again at
@@ -30581,19 +30537,18 @@ fn key_prefix(k: &[u8]) -> (u64, u64) {
 }
 
 /// A settle's key for its resolve: rebuilt in `short` from the prefix
-/// words the batch was sorted by where the key is no longer than they are
-/// (`Options::settle_gathers`), which reads nothing of the table, and the
+/// words the batch was sorted by where the key is no longer than they are,
+/// which reads nothing of the table, and the
 /// table's own bytes otherwise. `key_prefix` pads a short key with zeros,
 /// so the words cut to the key's length are the key.
 #[inline]
 fn settle_key<'a>(
-    gathers: bool,
     src: &'a MemTable,
     (a, b): (u64, u64),
     (off, len): (u32, u32),
     short: &'a mut [u8; 16],
 ) -> &'a [u8] {
-    if gathers && len <= 16 {
+    if len <= 16 {
         short[..8].copy_from_slice(&a.to_be_bytes());
         short[8..].copy_from_slice(&b.to_be_bytes());
         debug_assert_eq!(
@@ -38586,9 +38541,8 @@ impl Reader {
             }
             // Sorted by key offset where the budget may cut the batch, so
             // that the cut falls between keys as it did; a batch taken
-            // whole is grouped by the settle itself
-            // (`Options::settle_sorts_once`).
-            if !self.opts.settle_sorts_once || writes.len() > budget {
+            // whole is grouped by the settle itself.
+            if writes.len() > budget {
                 writes.sort_unstable_by_key(|&(off, ..)| off);
             }
             let take = writes.len().min(budget);
@@ -38621,9 +38575,6 @@ impl Reader {
         // files the key into its block's list and the rest are skipped as
         // duplicates, so the order is a correctness order. One integer key,
         // since a tuple compared through a closure was a quarter of a settle.
-        if !self.opts.settle_sorts_once {
-            pending.sort_unstable_by_key(|&(off, _, new, _)| ((off as u64) << 1) | u64::from(!new));
-        }
         // A write that could not be settled leaves the block it landed in
         // stale, so an error drops every table rather than leave one.
         let settled = self.settle_each(&pending, self.mem());
@@ -38669,13 +38620,12 @@ impl Reader {
         }
         let mut scratch = Vec::new();
         radix_by_prefix(&mut keyed, &mut scratch);
-        // The batch arrives in the log's order where it is sorted once
-        // (`Options::settle_sorts_once`), and the sort above is stable, so
+        // The batch arrives in the log's order, and the sort above is stable, so
         // a key's writes are adjacent unless another key shares its prefix
         // words: a run of equal words holding more than one key is grouped
         // by key, each key's writes in the order they came. The suite's
         // keys are sixteen bytes, so no two of its keys tie.
-        if self.opts.settle_sorts_once {
+        {
             let slot_of = |k: &(u64, u64, u32)| pending[k.2 as usize].3;
             let mut i = 0usize;
             while i + 1 < keyed.len() {
@@ -38695,28 +38645,16 @@ impl Reader {
                 i = j;
             }
         }
-        // The writes in key order, gathered once (`Options::settle_gathers`):
-        // the loops below read a key's write beside its prefix words where
-        // they took it from `pending` by the index the sort carried, a
-        // load a key into a list in arrival order.
-        let gathers = self.opts.settle_gathers;
-        let sorted: Vec<(u32, u32, bool, u32)> = if gathers {
-            keyed.iter().map(|&(_, _, i)| pending[i as usize]).collect()
-        } else {
-            Vec::new()
-        };
-        if gathers {
-            self.shared
-                .settle_gathered
-                .fetch_add(sorted.len() as u64, AtomicOrdering::Relaxed);
-        }
-        let write_at = |n: usize| -> (u32, u32, bool, u32) {
-            if gathers {
-                sorted[n]
-            } else {
-                pending[keyed[n].2 as usize]
-            }
-        };
+        // The writes in key order, gathered once: the loops below read a
+        // key's write beside its prefix words where they took it from
+        // `pending` by the index the sort carried, a load a key into a
+        // list in arrival order.
+        let sorted: Vec<(u32, u32, bool, u32)> =
+            keyed.iter().map(|&(_, _, i)| pending[i as usize]).collect();
+        self.shared
+            .settle_gathered
+            .fetch_add(sorted.len() as u64, AtomicOrdering::Relaxed);
+        let write_at = |n: usize| -> (u32, u32, bool, u32) { sorted[n] };
         let mut last = u32::MAX;
         let mut at = 0usize;
         let mut floor = 0usize;
@@ -38797,7 +38735,7 @@ impl Reader {
                     if slot != slot_pre {
                         slot_pre = slot;
                         let mut short = [0u8; 16];
-                        let k = settle_key(gathers, src, (pa, pb), (off, len), &mut short);
+                        let k = settle_key(src, (pa, pb), (off, len), &mut short);
                         let was = at_pre;
                         at_pre = self.settle_partition(np, at_pre, k);
                         if at_pre != was {
@@ -38821,7 +38759,7 @@ impl Reader {
             }
             last = slot;
             let mut short = [0u8; 16];
-            let key = settle_key(gathers, src, (ka, kb), (off, len), &mut short);
+            let key = settle_key(src, (ka, kb), (off, len), &mut short);
             // The partition holding the key: the one before's or a later
             // one in key order (`settle_partition`); the seek's floor and
             // the lazy filing's hint are the partition's.
@@ -38853,7 +38791,7 @@ impl Reader {
                     let (off, len, _, _) = write_at(ahead);
                     ahead += 1;
                     let mut short = [0u8; 16];
-                    let k = settle_key(gathers, src, (aa, ab), (off, len), &mut short);
+                    let k = settle_key(src, (aa, ab), (off, len), &mut short);
                     at_ahead = self.settle_partition(np, at_ahead, k);
                     let Some(s) = self.segs()[..np].get(at_ahead) else {
                         continue;
@@ -38960,8 +38898,6 @@ impl Reader {
         let at_cut = self.opts.settle_patch_at_cut;
         let tfar = self.opts.settle_table_ahead;
         let value_ahead = CHUNK_HDR + self.opts.settle_value_ahead;
-        let in_place = self.opts.settle_patch_in_place;
-        let converts = self.opts.settle_converts;
         let mut placed = 0u64;
         let mut asked = 0u64;
         let mut ahead_asks = [0u64; 2];
@@ -39154,13 +39090,12 @@ impl Reader {
                 }
                 // A sparse form the rest of this block's keys in the batch
                 // take to the dense count is converted before they are
-                // spliced (`Options::settle_converts`): each is then a
+                // spliced: each is then a
                 // patch of the copy, in place where it is an update, and
                 // not an insert into the form's sorted deltas. The writer
                 // waiting for its upkeep leaves the conversion, as it
                 // stops the fill's, and so does a cache at its budget.
-                if converts
-                    && self.fs().convert_dense.get()
+                if self.fs().convert_dense.get()
                     && matches!(
                         table.slots[b].as_deref(),
                         Some(Cached::Sparse(sb)) if sb.ents.len() + (group_end - i) >= CACHE_DENSE
@@ -39187,7 +39122,7 @@ impl Reader {
                         self.fs().tables_complete.set(false);
                     }
                 }
-                if in_place && self.patch_in_place(at, b, table, key, cut, (src, slot)) {
+                if self.patch_in_place(at, b, table, key, cut, (src, slot)) {
                     placed += 1;
                 } else {
                     self.patch_block(at, b, table, key, cut, (src, slot, tombs))?;
@@ -39251,7 +39186,7 @@ impl Reader {
         Ok(())
     }
 
-    /// A put's patch written where it lies (`Options::settle_patch_in_place`):
+    /// A put's patch written where it lies:
     /// whether it was. The copy is block `b`'s and its entries are the
     /// block's records (`CachedBlock::identity_for`), the cut names the
     /// key's own record, the form is this table's alone, and the key's
@@ -39356,8 +39291,8 @@ impl Reader {
     }
 
     /// Block `b`'s sparse form, which the settle's batch takes to the
-    /// dense count, converted to a merged copy from the form itself
-    /// (`Options::settle_converts`), as the fill's conversion makes it and
+    /// dense count, converted to a merged copy from the form itself, as the
+    /// fill's conversion makes it and
     /// counts it. Nothing is withdrawn from the state: the copy holds what
     /// the form held, so the form a state publishes for the block is as
     /// current as it was, to the position it was published at, and the
@@ -54842,10 +54777,9 @@ impl Db {
         self.shared.forms_cloned.load(AtomicOrdering::Relaxed)
     }
 
-    /// Patches the settle has written in place over a copy's own run
-    /// (`Options::settle_patch_in_place`) and sparse forms it has
-    /// converted to copies where it grew them dense
-    /// (`Options::settle_converts`), over the store's life.
+    /// Patches the settle has written in place over a copy's own run and
+    /// sparse forms it has converted to copies where it grew them dense,
+    /// over the store's life.
     #[doc(hidden)]
     pub fn settle_lean(&self) -> (u64, u64) {
         (
@@ -54854,8 +54788,8 @@ impl Db {
         )
     }
 
-    /// Writes the settles have read from their batches' gathered records
-    /// (`Options::settle_gathers`), over the store's life.
+    /// Writes the settles have read from their batches' gathered records,
+    /// over the store's life.
     #[doc(hidden)]
     pub fn settle_gathered(&self) -> u64 {
         self.shared.settle_gathered.load(AtomicOrdering::Relaxed)

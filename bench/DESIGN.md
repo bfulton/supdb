@@ -380,21 +380,6 @@ trail by a hundredth of the store; `supdb-heldnfnocache`, with no block
 cache, files nothing at all. For pricing, as `supdb-ingestpaced` and
 `supdb-ingestpacelends` are of the buffered arm.
 
-What filing a batch costs is the settle's, and the settle's four lean
-shapes each have the shape before as an arm under the durable, the
-buffered and the held log's names: `supdb-settleloads`,
-`supdb-ingestsettleloads` and `supdb-heldsettleloads` read each key's
-write and its bytes by index (`Options::settle_gathers` off);
-`...settlesortstwice` sorts the batch by key offset ahead of its sort by
-prefix (`Options::settle_sorts_once` off); `supdb-settlepatchstaged`,
-`supdb-ingestsettlestaged` and `supdb-heldsettlestaged` stage every patch
-(`Options::settle_patch_in_place` off); `...settlenoconvert` leaves a
-dense form's conversion to the fill (`Options::settle_converts` off); and
-`...settlefat` is the four together, the settle before any of them. For
-pricing: the instruction count is the measure for the arms whose commits
-file (`examples/lag_only.rs` under callgrind, toggled on the engine's
-`maintain_forms`), and the pass after a lent burst for the held log's.
-
 The two differ on the ordered scan and the reopen, which `faster` has not
 got and has no setting for. The check that holds a guarantee's arms to one
 set of features (`engines::check_matched`, where a run starts) refuses

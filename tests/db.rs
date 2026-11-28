@@ -8273,23 +8273,16 @@ fn a_light_form_converts_on_the_upkeep_thread_and_not_over_a_burst() {
 /// no form; then twelve writes take one block's form past the dense count.
 /// With the walk left, the fill converts the light forms behind the settle's
 /// one conversion; without it (`supdb-settleconvertquiet`'s shape) the
-/// settle converts its one form and every light form stays deltas; and with
-/// the conversion left to the fill (`Options::settle_converts` off) the
-/// fill converts them all, the dense one among them. The scans read the
-/// model's answers each way.
+/// settle converts its one form and every light form stays deltas. The
+/// scans read the model's answers each way.
 #[test]
 fn a_settles_conversion_leaves_the_fill_its_walk() {
-    for (name, converts, fills) in [
-        ("fills", true, true),
-        ("quiet", true, false),
-        ("left-to-the-fill", false, true),
-    ] {
+    for (name, fills) in [("fills", true), ("quiet", false)] {
         let d = dir(&format!("settle-convert-{name}"));
         let opts = Options {
             seal_bytes: 1 << 26,
             partition_bytes: Some(1 << 20),
             scan_block_cache: true,
-            settle_converts: converts,
             settle_convert_fills: fills,
             // In memory, the controller's FITS: a light form converts
             // only while the gate is at the raw form.
@@ -8341,14 +8334,10 @@ fn a_settles_conversion_leaves_the_fill_its_walk() {
         let by_settle = db.settle_lean().1;
         let from_form = db.forms_events()[13] - events;
         let (_, sparse, copies, _) = db.block_cache_kinds();
-        if converts {
-            assert_eq!(
-                by_settle, 1,
-                "{name}: the settle converts the block it grew dense"
-            );
-        } else {
-            assert_eq!(by_settle, 0, "{name}: the settle converts nothing");
-        }
+        assert_eq!(
+            by_settle, 1,
+            "{name}: the settle converts the block it grew dense"
+        );
         if fills {
             assert!(
                 from_form >= 31 && copies >= 31,
