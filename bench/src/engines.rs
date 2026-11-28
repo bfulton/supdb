@@ -1265,10 +1265,6 @@ pub struct Supdb {
     /// Every covered partition served from its form file, the shape before
     /// the hot-raw policy (`Options::zpages_hot_raw` off): `supdb-znohotraw`.
     znohotraw: bool,
-    /// Every operation's wall stamped onto the census window, the shape
-    /// before the stamps of one operation in sixteen
-    /// (`Options::zpages_census_sample` off): `supdb-zbusyevery`.
-    zbusyevery: bool,
     /// The hot-raw policy's release asked where the form files and the raw
     /// partitions would stay within the fill line of the budget, the shape
     /// before the ask into the group's unused memory
@@ -1468,11 +1464,6 @@ pub struct Supdb {
     /// must read level, and out of core, where it must reach the form; in
     /// both rosters.
     zpages_off: bool,
-    /// The controller's bounded arm with the form's threads at the
-    /// readers' I/O class (`Options::zpages_io_idle` off):
-    /// `supdb-nocacheautozpagesfairio`, the pair against
-    /// `supdb-nocacheautozpages` under a bound.
-    zpages_fairio: bool,
     /// The controller's bounded arm with its builds asking nothing of the
     /// raw records ahead of their walks (`Options::zpages_build_ahead` at
     /// zero, the shape the window was priced against):
@@ -1595,24 +1586,11 @@ pub struct Supdb {
     /// against `supdb-cache64tofitautozpagesdrop`. `None` follows the
     /// engine; the `cache64tofit` arms pin zero, the shape before.
     zlandpct: Option<u32>,
-    /// The sampler at the idle classes (`Options::zpages_sample_idle`):
-    /// `supdb-cache64tofitautozpagesdropsampleidle` against
-    /// `supdb-cache64tofitautozpagesdrop`.
-    zsampleidle: bool,
-    /// The build turn's attaches one a warm (`Options::zpages_attach_first`
-    /// off): `supdb-cache64tofitautozpagesdropland50attachwarm` against
-    /// `...dropland50`.
-    zattachwarm: bool,
     /// The writer's reads left out of the controller's census
     /// (`Options::zpages_writer_census` off):
     /// `supdb-cache64tofitautozpagesdropnowritercensus` against
     /// `supdb-cache64tofitautozpagesdrop`.
     znowritercensus: bool,
-    /// The attach of form files built ahead left to the rent's evidence
-    /// (`Options::zpages_attach_eager` off):
-    /// `supdb-cache64tofitautozpagesdropland50noattacheager` against
-    /// `...dropland50`.
-    znoattacheager: bool,
     /// The builds ahead keeping the raw records behind them past the
     /// budget too (`Options::zpages_land_drop_past` off):
     /// `supdb-cache64tofitautozpagesdropland50keepbehind` against
@@ -2677,9 +2655,6 @@ struct Policy {
     fencekeys: bool,
     /// No hot-raw policy: `supdb-znohotraw`.
     znohotraw: bool,
-    /// Every operation's wall stamped onto the census window:
-    /// `supdb-zbusyevery`.
-    zbusyevery: bool,
     /// The release's room by the fill line: `supdb-zhotline`.
     zhotline: bool,
     /// The ask under the idle I/O class: `supdb-zhotaskidle`.
@@ -2787,11 +2762,6 @@ struct Policy {
     /// The form the controller's (`Options::zpages` at `ZPages::Auto`):
     /// `supdb-autozpages`, `supdb-nocacheautozpages`.
     zpages_auto: bool,
-    /// The controller's bounded arm with the form's threads at the
-    /// readers' I/O class (`Options::zpages_io_idle` off):
-    /// `supdb-nocacheautozpagesfairio`, the pair against
-    /// `supdb-nocacheautozpages` under a bound.
-    zpages_fairio: bool,
     /// The controller's bounded arm with its builds asking nothing of the
     /// raw records ahead of their walks (`Options::zpages_build_ahead` at
     /// zero): `supdb-nocacheautozpagesnoahead`.
@@ -2872,20 +2842,10 @@ struct Policy {
     /// The builds ahead from this percent of the budget
     /// (`Options::zpages_land_pct`).
     zlandpct: Option<u32>,
-    /// The sampler at the idle classes (`Options::zpages_sample_idle`):
-    /// `supdb-cache64tofitautozpagesdropsampleidle`.
-    zsampleidle: bool,
-    /// The build turn's attaches one a warm (`Options::zpages_attach_first`
-    /// off): `supdb-cache64tofitautozpagesdropland50attachwarm`.
-    zattachwarm: bool,
     /// The writer's reads left out of the controller's census
     /// (`Options::zpages_writer_census` off):
     /// `supdb-cache64tofitautozpagesdropnowritercensus`.
     znowritercensus: bool,
-    /// The attach of form files built ahead left to the rent's evidence
-    /// (`Options::zpages_attach_eager` off):
-    /// `supdb-cache64tofitautozpagesdropland50noattacheager`.
-    znoattacheager: bool,
     /// The builds ahead keeping the raw records behind them past the
     /// budget (`Options::zpages_land_drop_past` off):
     /// `supdb-cache64tofitautozpagesdropland50keepbehind`.
@@ -3325,7 +3285,6 @@ impl Default for Policy {
             noyield: false,
             fencekeys: false,
             znohotraw: false,
-            zbusyevery: false,
             zhotline: false,
             zhotaskidle: false,
             zhotgrowth5: false,
@@ -3372,7 +3331,6 @@ impl Default for Policy {
             zpages_settle: false,
             zpages_auto: false,
             zpages_off: false,
-            zpages_fairio: false,
             zpages_noahead: false,
             zpages_buildeager: false,
             zcacheraw: false,
@@ -3384,10 +3342,7 @@ impl Default for Policy {
             znohotfill: false,
             zflexdec: false,
             zlandpct: None,
-            zsampleidle: false,
-            zattachwarm: false,
             znowritercensus: false,
-            znoattacheager: false,
             zkeepbehind: false,
             znobuildsync: false,
             zcoldskip: false,
@@ -4270,20 +4225,6 @@ impl Supdb {
             path,
             Policy {
                 znohotraw: true,
-                ..Policy::default()
-            },
-        )
-    }
-
-    /// `supdb` whose census stamps every operation's wall onto its window
-    /// (`Options::zpages_census_sample` off): the shape before the stamps
-    /// of one operation in sixteen where a window is a thousand operations
-    /// or longer.
-    pub fn create_zbusyevery(path: &Path) -> Res<Supdb> {
-        Supdb::with_policy(
-            path,
-            Policy {
-                zbusyevery: true,
                 ..Policy::default()
             },
         )
@@ -8889,45 +8830,6 @@ impl Supdb {
         )
     }
 
-    /// `supdb-cache64tofitautozpagesdropland50` with the build turn's
-    /// attaches one a warm (`Options::zpages_attach_first` off),
-    /// `supdb-cache64tofitautozpagesdropland50attachwarm`: the order before
-    /// the attaches went first.
-    pub fn create_cache64_tofit_auto_zpages_drop_land50_attach_warm(path: &Path) -> Res<Supdb> {
-        Supdb::with_policy(
-            path,
-            Policy {
-                budget: 64 << 20,
-                tofit: true,
-                zpages_auto: true,
-                zdropraw: Some(true),
-                zlandpct: Some(50),
-                zattachwarm: true,
-                ..Policy::default()
-            },
-        )
-    }
-
-    /// `supdb-cache64tofitautozpagesdropland50` with the attach of the form
-    /// files built ahead left to the rent's evidence
-    /// (`Options::zpages_attach_eager` off),
-    /// `supdb-cache64tofitautozpagesdropland50noattacheager`: the shape the
-    /// entry was priced against.
-    pub fn create_cache64_tofit_auto_zpages_drop_land50_no_attach_eager(path: &Path) -> Res<Supdb> {
-        Supdb::with_policy(
-            path,
-            Policy {
-                budget: 64 << 20,
-                tofit: true,
-                zpages_auto: true,
-                zdropraw: Some(true),
-                zlandpct: Some(50),
-                znoattacheager: true,
-                ..Policy::default()
-            },
-        )
-    }
-
     /// `supdb-cache64tofitautozpagesdropland50` with the builds ahead
     /// keeping the raw records behind them past the budget as below it
     /// (`Options::zpages_land_drop_past` off),
@@ -8981,25 +8883,6 @@ impl Supdb {
                 zdropraw: Some(true),
                 zlandpct: Some(50),
                 zcoldskip: true,
-                ..Policy::default()
-            },
-        )
-    }
-
-    /// `supdb-cache64tofitautozpagesdrop` with the sampler at the idle
-    /// classes (`Options::zpages_sample_idle`),
-    /// `supdb-cache64tofitautozpagesdropsampleidle`: the sampler's class
-    /// before it read at the readers'.
-    pub fn create_cache64_tofit_auto_zpages_drop_sample_idle(path: &Path) -> Res<Supdb> {
-        Supdb::with_policy(
-            path,
-            Policy {
-                budget: 64 << 20,
-                tofit: true,
-                zpages_auto: true,
-                zdropraw: Some(true),
-                zsampleidle: true,
-                zlandpct: Some(0),
                 ..Policy::default()
             },
         )
@@ -9486,25 +9369,6 @@ impl Supdb {
         )
     }
 
-    /// `supdb-nocacheautozpages` with the form's threads at the readers'
-    /// I/O class (`Options::zpages_io_idle` off): the pair against
-    /// `supdb-nocacheautozpages` differs by that one option and prices,
-    /// under a bound, a build that shares the device with the readers'
-    /// faults against one the device serves after them. Chosen by hand,
-    /// as `ab --arms supdb-nocacheautozpages,supdb-nocacheautozpagesfairio
-    /// --bound ...`.
-    pub fn create_nocache_auto_zpages_fairio(path: &Path) -> Res<Supdb> {
-        Supdb::with_policy(
-            path,
-            Policy {
-                block_cache: false,
-                zpages_auto: true,
-                zpages_fairio: true,
-                ..Policy::default()
-            },
-        )
-    }
-
     /// `supdb-nocacheautozpages` with its builds asking nothing of the raw
     /// records ahead of their walks (`Options::zpages_build_ahead` at zero,
     /// the shape the window was priced against): the pair against
@@ -9746,7 +9610,6 @@ impl Supdb {
             noyield,
             fencekeys,
             znohotraw,
-            zbusyevery,
             zhotline,
             zhotaskidle,
             zhotgrowth5,
@@ -9793,7 +9656,6 @@ impl Supdb {
             zpages_settle,
             zpages_auto,
             zpages_off,
-            zpages_fairio,
             zpages_noahead,
             zpages_buildeager,
             zcacheraw,
@@ -9817,10 +9679,7 @@ impl Supdb {
             znohotfill,
             zflexdec,
             zlandpct,
-            zsampleidle,
-            zattachwarm,
             znowritercensus,
-            znoattacheager,
             zkeepbehind,
             znobuildsync,
             zcoldskip,
@@ -10273,11 +10132,6 @@ impl Supdb {
             } else {
                 supdb::Options::default().zpages_memo
             },
-            zpages_io_idle: if zpages_fairio {
-                false
-            } else {
-                supdb::Options::default().zpages_io_idle
-            },
             zpages_build_ahead: if zpages_noahead {
                 0
             } else {
@@ -10315,10 +10169,7 @@ impl Supdb {
             } else {
                 zlandpct.unwrap_or(supdb::Options::default().zpages_land_pct)
             },
-            zpages_sample_idle: zsampleidle,
-            zpages_attach_first: !zattachwarm,
             zpages_writer_census: !znowritercensus,
-            zpages_attach_eager: !znoattacheager,
             zpages_land_drop_past: !zkeepbehind,
             zpages_build_sync: !znobuildsync,
             zpages_land_cold_past: !zcoldskip,
@@ -10333,7 +10184,6 @@ impl Supdb {
             zpages_fence_tree: zfencetree,
             zpages_fence_words: !fencekeys,
             zpages_hot_raw: !znohotraw,
-            zpages_census_sample: !zbusyevery,
             zpages_hot_raw_slack: !zhotline,
             zpages_hot_ask_idle: zhotaskidle,
             zpages_hot_growth_pct: if zhotgrowth5 { 5 } else { 10 },
@@ -10744,7 +10594,6 @@ impl Supdb {
             noyield,
             fencekeys,
             znohotraw,
-            zbusyevery,
             zhotline,
             zhotaskidle,
             zhotgrowth5,
@@ -10791,7 +10640,6 @@ impl Supdb {
             zpages_settle,
             zpages_auto,
             zpages_off,
-            zpages_fairio,
             zpages_noahead,
             zpages_buildeager,
             zcacheraw,
@@ -10815,10 +10663,7 @@ impl Supdb {
             znohotfill,
             zflexdec,
             zlandpct,
-            zsampleidle,
-            zattachwarm,
             znowritercensus,
-            znoattacheager,
             zkeepbehind,
             znobuildsync,
             zcoldskip,
@@ -11315,18 +11160,12 @@ impl Engine for Supdb {
                 "supdb-cache64tofitautozpagesflexdec"
             } else if zdropraw && self.znowritercensus {
                 "supdb-cache64tofitautozpagesdropnowritercensus"
-            } else if zdropraw && self.zsampleidle {
-                "supdb-cache64tofitautozpagesdropsampleidle"
             } else if zdropraw && zlandpct == 50 && self.zcoldskip {
                 "supdb-cache64tofitautozpagesdropland50coldskip"
             } else if zdropraw && zlandpct == 50 && self.znobuildsync {
                 "supdb-cache64tofitautozpagesdropland50nobuildsync"
             } else if zdropraw && zlandpct == 50 && self.zkeepbehind {
                 "supdb-cache64tofitautozpagesdropland50keepbehind"
-            } else if zdropraw && zlandpct == 50 && self.znoattacheager {
-                "supdb-cache64tofitautozpagesdropland50noattacheager"
-            } else if zdropraw && zlandpct == 50 && self.zattachwarm {
-                "supdb-cache64tofitautozpagesdropland50attachwarm"
             } else if zdropraw && zlandpct > 0 {
                 match zlandpct {
                     25 => "supdb-cache64tofitautozpagesdropland25",
@@ -11484,9 +11323,6 @@ impl Engine for Supdb {
         }
         if self.znohotraw {
             return "supdb-znohotraw";
-        }
-        if self.zbusyevery {
-            return "supdb-zbusyevery";
         }
         if self.zhotline {
             return "supdb-zhotline";
@@ -12607,8 +12443,6 @@ impl Engine for Supdb {
         if self.zpages_auto {
             return if self.block_cache {
                 "supdb-autozpages"
-            } else if self.zpages_fairio {
-                "supdb-nocacheautozpagesfairio"
             } else if self.zpages_noahead {
                 "supdb-nocacheautozpagesnoahead"
             } else if self.zpages_buildeager {
@@ -15098,12 +14932,9 @@ pub fn guarantee(arm: &str) -> Option<Guarantee> {
         | "supdb-cache64tofitautozpagesdropland50"
         | "supdb-cache64tofitautozpagesdropland75"
         | "supdb-cache64tofitautozpagesdropland100"
-        | "supdb-cache64tofitautozpagesdropland50attachwarm"
-        | "supdb-cache64tofitautozpagesdropland50noattacheager"
         | "supdb-cache64tofitautozpagesdropland50keepbehind"
         | "supdb-cache64tofitautozpagesdropland50nobuildsync"
         | "supdb-cache64tofitautozpagesdropland50coldskip"
-        | "supdb-cache64tofitautozpagesdropsampleidle"
         | "supdb-cache64tofitautozpagesdropnowritercensus"
         | "supdb-cache64tofitautozpagessettlebuilds"
         | "supdb-cache64tofitautozpagespromote"
@@ -15122,7 +14953,6 @@ pub fn guarantee(arm: &str) -> Option<Guarantee> {
         | "supdb-cache64tofitautozpagesmemo4"
         | "supdb-cache64tofitautozpagesmemo16"
         | "supdb-cache64tofitautozpagesmemo32"
-        | "supdb-nocacheautozpagesfairio"
         | "supdb-nocacheautozpagesnoahead"
         | "supdb-nocacheautozpageseager"
         | "supdb-cache256"
@@ -15281,7 +15111,6 @@ pub fn guarantee(arm: &str) -> Option<Guarantee> {
         | "supdb-notrim"
         | "supdb-fencekeys"
         | "supdb-znohotraw"
-        | "supdb-zbusyevery"
         | "supdb-zhotline"
         | "supdb-memo64"
         | "supdb-zhotaskidle"
@@ -15770,14 +15599,6 @@ pub fn open(arm: &str, dir: &Path, map_gb: usize) -> Res<Box<dyn Engine>> {
             |d| Supdb::create_cache64_tofit_auto_zpages_drop_land(d, 100),
             dir,
         )?,
-        "supdb-cache64tofitautozpagesdropland50attachwarm" => supdb_arm(
-            Supdb::create_cache64_tofit_auto_zpages_drop_land50_attach_warm,
-            dir,
-        )?,
-        "supdb-cache64tofitautozpagesdropland50noattacheager" => supdb_arm(
-            Supdb::create_cache64_tofit_auto_zpages_drop_land50_no_attach_eager,
-            dir,
-        )?,
         "supdb-cache64tofitautozpagesdropland50keepbehind" => supdb_arm(
             Supdb::create_cache64_tofit_auto_zpages_drop_land50_keep_behind,
             dir,
@@ -15788,10 +15609,6 @@ pub fn open(arm: &str, dir: &Path, map_gb: usize) -> Res<Box<dyn Engine>> {
         )?,
         "supdb-cache64tofitautozpagesdropland50coldskip" => supdb_arm(
             Supdb::create_cache64_tofit_auto_zpages_drop_land50_cold_skip,
-            dir,
-        )?,
-        "supdb-cache64tofitautozpagesdropsampleidle" => supdb_arm(
-            Supdb::create_cache64_tofit_auto_zpages_drop_sample_idle,
             dir,
         )?,
         "supdb-cache64tofitautozpagesdropnowritercensus" => supdb_arm(
@@ -15847,9 +15664,6 @@ pub fn open(arm: &str, dir: &Path, map_gb: usize) -> Res<Box<dyn Engine>> {
             supdb_arm(Supdb::create_cache64_tofit_auto_zpages_memo32, dir)?
         }
         "supdb-nocacheautozpages" => supdb_arm(Supdb::create_nocache_auto_zpages, dir)?,
-        "supdb-nocacheautozpagesfairio" => {
-            supdb_arm(Supdb::create_nocache_auto_zpages_fairio, dir)?
-        }
         "supdb-nocacheautozpagesnoahead" => {
             supdb_arm(Supdb::create_nocache_auto_zpages_noahead, dir)?
         }
@@ -16403,7 +16217,6 @@ pub fn open(arm: &str, dir: &Path, map_gb: usize) -> Res<Box<dyn Engine>> {
         "supdb-notrim" => supdb_arm(Supdb::create_notrim, dir)?,
         "supdb-fencekeys" => supdb_arm(Supdb::create_fencekeys, dir)?,
         "supdb-znohotraw" => supdb_arm(Supdb::create_znohotraw, dir)?,
-        "supdb-zbusyevery" => supdb_arm(Supdb::create_zbusyevery, dir)?,
         "supdb-zhotline" => supdb_arm(Supdb::create_zhotline, dir)?,
         "supdb-memo64" => supdb_arm(Supdb::create_memo64, dir)?,
         "supdb-zhotaskidle" => supdb_arm(Supdb::create_zhotaskidle, dir)?,
@@ -19505,38 +19318,25 @@ mod tests {
     /// dispatch, the form the controller's by the engine's own options and
     /// neither forced nor off, and every other option the base's.
     #[test]
-    fn the_fair_io_arm_differs_from_the_controllers_in_the_io_class_alone() {
-        let root = std::env::temp_dir().join(format!("supdb-bench-fairio-{}", std::process::id()));
+    fn the_controller_arms_differ_from_the_controllers_in_their_option_alone() {
+        let root = std::env::temp_dir().join(format!("supdb-bench-zarms-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
         let new = |name: &str, make: fn(&Path) -> Res<Supdb>| {
             let d = root.join(name);
             std::fs::create_dir_all(&d).unwrap();
             make(&d).unwrap()
         };
-        // The engine's own default: the form's threads at the idle class,
-        // so an arm that does not pin it has the class the engine ships.
-        assert!(supdb::Options::default().zpages_io_idle);
         let base = new("base", Supdb::create_nocache_auto_zpages);
-        let arm = new("fairio", Supdb::create_nocache_auto_zpages_fairio);
         assert_eq!(base.name(), "supdb-nocacheautozpages");
-        assert_eq!(arm.name(), "supdb-nocacheautozpagesfairio");
-        assert_eq!(guarantee(arm.name()), guarantee(base.name()));
-        assert!(base.zpages_auto && arm.zpages_auto, "both the controller's");
-        assert!(!base.zpages_fairio && arm.zpages_fairio);
-        assert_eq!(arm.block_cache, base.block_cache);
-        assert_eq!(arm.features(), base.features());
+        assert!(base.zpages_auto, "the controller's");
         let b = base.db.as_ref().unwrap().options();
-        let a = arm.db.as_ref().unwrap().options();
-        assert!(b.zpages_io_idle && !a.zpages_io_idle, "the one option");
-        assert_eq!(a.zpages_build_ahead, b.zpages_build_ahead);
-        assert_eq!(a.zpages, b.zpages);
         // And the arm that asks nothing ahead: the same base, its one
         // option the window, the engine's own default four mebibytes.
         assert_eq!(supdb::Options::default().zpages_build_ahead, 4 << 20);
         let ahead = new("noahead", Supdb::create_nocache_auto_zpages_noahead);
         assert_eq!(ahead.name(), "supdb-nocacheautozpagesnoahead");
         assert_eq!(guarantee(ahead.name()), guarantee(base.name()));
-        assert!(ahead.zpages_auto && ahead.zpages_noahead && !ahead.zpages_fairio);
+        assert!(ahead.zpages_auto && ahead.zpages_noahead);
         assert_eq!(ahead.block_cache, base.block_cache);
         assert_eq!(ahead.features(), base.features());
         let h = ahead.db.as_ref().unwrap().options();
@@ -19545,7 +19345,6 @@ mod tests {
             (0, 4 << 20),
             "the one option"
         );
-        assert_eq!(h.zpages_io_idle, b.zpages_io_idle);
         assert_eq!(h.zpages, b.zpages);
         drop(ahead);
         // And the eager arm: the same base, its one option the entry.
@@ -19554,7 +19353,7 @@ mod tests {
         assert_eq!(eager.name(), "supdb-nocacheautozpageseager");
         assert_eq!(guarantee(eager.name()), guarantee(base.name()));
         assert!(eager.zpages_auto && eager.zpages_buildeager);
-        assert!(!eager.zpages_noahead && !eager.zpages_fairio);
+        assert!(!eager.zpages_noahead);
         assert_eq!(eager.block_cache, base.block_cache);
         assert_eq!(eager.features(), base.features());
         let e = eager.db.as_ref().unwrap().options();
@@ -19563,16 +19362,15 @@ mod tests {
             "the one option"
         );
         assert_eq!(
-            (e.zpages_build_ahead, e.zpages_io_idle, e.zpages),
-            (b.zpages_build_ahead, b.zpages_io_idle, b.zpages)
+            (e.zpages_build_ahead, e.zpages),
+            (b.zpages_build_ahead, b.zpages)
         );
-        drop(eager);
         assert_eq!(
             (
-                a.zpages_warm,
-                a.zpages_eager,
-                a.zpages_memo,
-                a.zpages_walk_cursor
+                e.zpages_warm,
+                e.zpages_eager,
+                e.zpages_memo,
+                e.zpages_walk_cursor
             ),
             (
                 b.zpages_warm,
@@ -19581,7 +19379,7 @@ mod tests {
                 b.zpages_walk_cursor
             )
         );
-        drop(arm);
+        drop(eager);
         drop(base);
         let _ = std::fs::remove_dir_all(&root);
     }
@@ -19815,9 +19613,8 @@ mod tests {
     }
 
     /// The controller's shift arms -- the builds ahead at landing by
-    /// percent, the sampler at the idle classes, the writer's reads out of
-    /// the census, the build turn's attaches one a warm, the attach left to
-    /// the rent's evidence, the records kept behind the builds ahead past the
+    /// percent, the writer's reads out of the census, the records kept
+    /// behind the builds ahead past the
     /// budget, the form files left unsynced, the residency bar kept past the
     /// line -- differ from their bases in their own option alone, and
     /// open under their names. The arms name their percent, none by default,
@@ -19831,24 +19628,20 @@ mod tests {
         assert_eq!(
             (
                 o.zpages_land_pct,
-                o.zpages_sample_idle,
                 o.zpages_writer_census,
-                o.zpages_attach_first,
                 o.zpages_attach_eager,
                 o.zpages_land_drop_past,
                 o.zpages_build_sync,
                 o.zpages_land_cold_past
             ),
-            (50, false, true, true, true, true, true, true)
+            (50, true, true, true, true, true)
         );
-        type Shape = (u32, bool, bool, bool, bool, bool, bool, bool);
+        type Shape = (u32, bool, bool, bool, bool, bool);
         let shape = |s: &Supdb| -> Shape {
             let o = s.db.as_ref().unwrap().options();
             (
                 o.zpages_land_pct,
-                o.zpages_sample_idle,
                 o.zpages_writer_census,
-                o.zpages_attach_first,
                 o.zpages_attach_eager,
                 o.zpages_land_drop_past,
                 o.zpages_build_sync,
@@ -19860,46 +19653,28 @@ mod tests {
         type Make = Box<dyn Fn(&Path) -> Res<Supdb>>;
         let mut cases: Vec<(&str, Make, &str, Shape)> = vec![
             (
-                "supdb-cache64tofitautozpagesdropsampleidle",
-                Box::new(Supdb::create_cache64_tofit_auto_zpages_drop_sample_idle),
-                "supdb-cache64tofitautozpagesdrop",
-                (0, true, true, true, true, true, true, true),
-            ),
-            (
                 "supdb-cache64tofitautozpagesdropnowritercensus",
                 Box::new(Supdb::create_cache64_tofit_auto_zpages_drop_no_writer_census),
                 "supdb-cache64tofitautozpagesdrop",
-                (0, false, false, true, true, true, true, true),
-            ),
-            (
-                "supdb-cache64tofitautozpagesdropland50attachwarm",
-                Box::new(Supdb::create_cache64_tofit_auto_zpages_drop_land50_attach_warm),
-                "supdb-cache64tofitautozpagesdropland50",
-                (50, false, true, false, true, true, true, true),
-            ),
-            (
-                "supdb-cache64tofitautozpagesdropland50noattacheager",
-                Box::new(Supdb::create_cache64_tofit_auto_zpages_drop_land50_no_attach_eager),
-                "supdb-cache64tofitautozpagesdropland50",
-                (50, false, true, true, false, true, true, true),
+                (0, false, true, true, true, true),
             ),
             (
                 "supdb-cache64tofitautozpagesdropland50keepbehind",
                 Box::new(Supdb::create_cache64_tofit_auto_zpages_drop_land50_keep_behind),
                 "supdb-cache64tofitautozpagesdropland50",
-                (50, false, true, true, true, false, true, true),
+                (50, true, true, false, true, true),
             ),
             (
                 "supdb-cache64tofitautozpagesdropland50nobuildsync",
                 Box::new(Supdb::create_cache64_tofit_auto_zpages_drop_land50_no_build_sync),
                 "supdb-cache64tofitautozpagesdropland50",
-                (50, false, true, true, true, true, false, true),
+                (50, true, true, true, false, true),
             ),
             (
                 "supdb-cache64tofitautozpagesdropland50coldskip",
                 Box::new(Supdb::create_cache64_tofit_auto_zpages_drop_land50_cold_skip),
                 "supdb-cache64tofitautozpagesdropland50",
-                (50, false, true, true, true, true, true, false),
+                (50, true, true, true, true, false),
             ),
         ];
         for pct in [25u32, 50, 75, 100] {
@@ -19909,7 +19684,7 @@ mod tests {
                 name,
                 Box::new(move |p: &Path| Supdb::create_cache64_tofit_auto_zpages_drop_land(p, pct)),
                 "supdb-cache64tofitautozpagesdrop",
-                (pct, false, true, true, true, true, true, true),
+                (pct, true, true, true, true, true),
             ));
         }
         for (name, make, base_name, want) in cases {
@@ -19950,9 +19725,7 @@ mod tests {
             );
             let differ = [
                 a.zpages_land_pct != b.zpages_land_pct,
-                a.zpages_sample_idle != b.zpages_sample_idle,
                 a.zpages_writer_census != b.zpages_writer_census,
-                a.zpages_attach_first != b.zpages_attach_first,
                 a.zpages_attach_eager != b.zpages_attach_eager,
                 a.zpages_land_drop_past != b.zpages_land_drop_past,
                 a.zpages_build_sync != b.zpages_build_sync,
@@ -20231,13 +20004,6 @@ mod tests {
                 assert_eq!(z.features(), base.features());
                 let o = z.db.as_ref().unwrap().options();
                 assert!(!o.scan_run_builds && b.scan_run_builds);
-            }
-            {
-                let z = Supdb::create_zbusyevery(&dir("zbusyevery")).unwrap();
-                assert_eq!(z.name(), "supdb-zbusyevery");
-                assert_eq!(z.features(), base.features());
-                let o = z.db.as_ref().unwrap().options();
-                assert!(!o.zpages_census_sample && b.zpages_census_sample);
             }
             {
                 let z = Supdb::create_zhotline(&dir("zhotline")).unwrap();

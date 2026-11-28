@@ -757,10 +757,7 @@ partition lands, the memo of decoded groups off, a scan's seeks by the
 ordered index's heads instead of the form file's fence, a scan's prefetch
 of the pages it will cross on, and the overlay walk of a covered
 partition cut by rank rather than carried through a cursor; and
-`supdb-nocacheautozpagesfairio` is `supdb-nocacheautozpages` with the
-form's threads at the readers' I/O class rather than the device's idle
-class, for a build under a bound that shares the device with the faults it
-is there to remove, and `supdb-nocacheautozpagesnoahead` the same with its
+`supdb-nocacheautozpagesnoahead` is `supdb-nocacheautozpages` with its
 builds asking nothing of the raw records ahead of their walks, the shape
 before the window, whose every wait fetched the device's readahead and no
 more, and `supdb-nocacheautozpageseager` the controller buying the form at

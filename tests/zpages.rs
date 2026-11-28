@@ -1938,40 +1938,22 @@ fn regions_of(seg: &Path) -> Regions {
 
 #[cfg(target_os = "linux")]
 #[test]
-fn the_forms_threads_take_the_io_class_the_option_names_and_the_build_records_it() {
-    // The build, the warm and the sampler take the device at the idle I/O
-    // class unless `Options::zpages_io_idle` is off, and the build thread
-    // reads its class back from the kernel and counts it: so the option is
-    // held to what the kernel says, not to what the thread asked.
-    assert!(
-        Options::default().zpages_io_idle && forced(|_| {}).zpages_io_idle,
-        "the form's threads are idle unless they are told otherwise"
+fn the_forms_build_thread_takes_the_idle_io_class_and_records_it() {
+    // The build and the warm take the device at the idle I/O class, and the
+    // build thread reads its class back from the kernel and counts it: so
+    // the class is held to what the kernel says, not to what the thread
+    // asked.
+    let dir = scratch("ioclass-true");
+    let mut db = Db::create(&dir, forced(|_| {})).unwrap();
+    let _model = ordered_load(&mut db, 8000, 0xD21);
+    db.zpages_settle().unwrap();
+    let c = db.zpage_counts();
+    assert_eq!(c.form_files, 1);
+    assert!(c.build_starts >= 1, "a build ran");
+    assert_eq!(
+        c.build_io_class, 3,
+        "the build thread's class, as the kernel reports it"
     );
-    for idle in [true, false] {
-        let dir = scratch(&format!("ioclass-{idle}"));
-        let mut db = Db::create(&dir, forced(|o| o.zpages_io_idle = idle)).unwrap();
-        let _model = ordered_load(&mut db, 8000, 0xD21);
-        db.zpages_settle().unwrap();
-        let c = db.zpage_counts();
-        assert_eq!(c.form_files, 1);
-        assert!(c.build_starts >= 1, "a build ran");
-        if idle {
-            assert_eq!(
-                c.build_io_class, 3,
-                "the build thread's class, as the kernel reports it"
-            );
-        } else {
-            assert_ne!(
-                c.build_io_class, 3,
-                "the build thread stays out of the idle class"
-            );
-            assert!(
-                c.build_io_class <= 2,
-                "{}: a class the kernel knows",
-                c.build_io_class
-            );
-        }
-    }
 }
 
 // The page cache is read through `cached_pages` and the regions of a
@@ -11274,40 +11256,35 @@ fn form_files_are_synced_by_their_build_and_only_with_the_option() {
 }
 
 /// The controller's buy of a store whose form files were built ahead
-/// attaches every one of them in the turn that buys
-/// (`Options::zpages_attach_first`), before the warms, which go one a
-/// turn after; with the option off the turn attaches one partition and
-/// warms it before the next, so the install waits for a warm a partition.
-/// Nothing is built past the files made ahead, and the reads after the
+/// attaches every one of them in the turn that buys, before the warms,
+/// which go one a turn after. Nothing is built past the files made ahead, and the reads after the
 /// install answer the model through the form.
 #[cfg(target_os = "linux")]
 #[test]
 fn a_buy_attaches_every_form_file_built_ahead_before_any_warm() {
-    for first in [true, false] {
-        let what = format!("attach first {first}");
-        let (dir, db, model, inject, raw) =
-            land_store_with(&format!("auto-land-attach-{first}"), 50, |o| {
-                // A store of files: the builds' order is read off the
-                // files' times.
-                o.one_file = false;
-                o.partition_bytes = Some(160 << 10);
-                o.zpages_attach_first = first;
-                // One builder ahead, whose order the files' times read:
-                // two finish in whatever order their builds take.
-                o.zpages_ahead_builders = 1;
-                // The turn's order of attach and warm: where resident and
-                // in-flight partitions count as covered, every attach goes
-                // before any warm whether or not it is asked to.
-                o.zpages_cover_resident = false;
-                o.zpages_suspect_at_crossing = false;
-                // And the builder's turn at the controller's step alone:
-                // the order is read off the warms taken in by the install,
-                // a job a step, and with the turn at a job's end as well
-                // (`Options::zpages_drive_at_job_end`) the warms of files
-                // this small are through between two steps in either
-                // order, every one taken in before the install is seen.
-                o.zpages_drive_at_job_end = false;
-            });
+    {
+        let what = "attach first".to_string();
+        let (dir, db, model, inject, raw) = land_store_with("auto-land-attach-true", 50, |o| {
+            // A store of files: the builds' order is read off the
+            // files' times.
+            o.one_file = false;
+            o.partition_bytes = Some(160 << 10);
+            // One builder ahead, whose order the files' times read:
+            // two finish in whatever order their builds take.
+            o.zpages_ahead_builders = 1;
+            // The turn's order of attach and warm: where resident and
+            // in-flight partitions count as covered, every attach goes
+            // before any warm whether or not it is asked to.
+            o.zpages_cover_resident = false;
+            o.zpages_suspect_at_crossing = false;
+            // And the builder's turn at the controller's step alone:
+            // the order is read off the warms taken in by the install,
+            // a job a step, and with the turn at a job's end as well
+            // (`Options::zpages_drive_at_job_end`) the warms of files
+            // this small are through between two steps in either
+            // order, every one taken in before the install is seen.
+            o.zpages_drive_at_job_end = false;
+        });
         inject.set_budget(raw * 3 / 2);
         assert!(
             tick_until(&db, 400, |c| c.prebuilt >= c.partitions),
@@ -11344,30 +11321,16 @@ fn a_buy_attaches_every_form_file_built_ahead_before_any_warm() {
         // The install comes at nine tenths of the footprint covered
         // (`zselect::COVERED_ENOUGH`): attached one a turn, the last of
         // them may come after it.
-        if !first {
-            assert!(
-                tick_until(&db, 400, |c| c.attached >= n),
-                "{what}: every file attached: {:?}",
-                db.zpage_counts()
-            );
-        }
         let c = db.zpage_counts();
         assert_eq!(
             (c.build_starts, c.prebuilt, c.ahead_recoded, c.attached),
             (n, n, 0, n),
             "{what}: attached, not built again: {c:?}"
         );
-        if first {
-            assert!(
-                c.warms + 2 < c.attached,
-                "{what}: attached before the warms: {c:?}"
-            );
-        } else {
-            assert!(
-                c.warms + 2 >= c.attached,
-                "{what}: one attach a warm: {c:?}"
-            );
-        }
+        assert!(
+            c.warms + 2 < c.attached,
+            "{what}: attached before the warms: {c:?}"
+        );
         let some: Vec<Vec<u8>> = keys.iter().step_by(97).cloned().collect();
         check(&r, &model, &some, &what);
         assert!(db.zpage_counts().reads > 0, "{what}: through the form");
@@ -16269,116 +16232,88 @@ fn a_form_the_parsing_encoder_wrote_answers_as_the_greedy_ones_in_fewer_bytes() 
 }
 
 /// The census window's busy wall is taken from one operation in sixteen
-/// once a window is a thousand operations long
-/// (`Options::zpages_census_sample`), and from every operation of a
-/// shorter window or with the option off. A window closed by its count
+/// once a window is a thousand operations long, and from every operation
+/// of a shorter window. A window closed by its count
 /// has its reads' wall alone, so the window after it is a hundred
 /// milliseconds of reads, tens of thousands through the compact form of a
 /// small store, whatever length the drive to COMPACT left; windows closed
-/// through the ticks after it then stamp one read in sixteen with the
-/// option and every read without, and the busy wall a read, scaled from
-/// the stamps, is within a tenth of the wall every stamp gives, since a
-/// wall left unscaled would be a sixteenth of it. Each stamp is priced
-/// by the seam (`ZInject::op_wall_ns`), so the figures are the scaling's
-/// and not the host's: measured, one read the host stalled for a few
-/// milliseconds among the sampled store's two hundred stamps read it at
-/// thirty times the other, once in a gate run. The two stores are open
-/// at once and their windows alternate, and each store's figure is its
-/// median window's: measured one store after the other, the figures
-/// were of two stretches of a loaded host, and the option's read 1561 ns
-/// against 387 once beside three other copies of this binary.
+/// through the ticks after it then stamp one read in sixteen, and the
+/// busy wall a read, scaled from the stamps, is within a tenth of the
+/// price every stamp is given, since a wall left unscaled would be a
+/// sixteenth of it. Each stamp is priced by the seam
+/// (`ZInject::op_wall_ns`), so the figures are the scaling's and not the
+/// host's, and the figure is the median window's.
 #[cfg(target_os = "linux")]
 #[test]
 fn the_census_stamps_a_long_windows_wall_on_one_operation_in_sixteen() {
-    let stores: Vec<_> = [true, false]
-        .into_iter()
-        .map(|on| {
-            let (dir, db, _model, inject, r, keys, at) =
-                compact_store_with(&format!("census-sample-{on}"), 1 << 20, |o| {
-                    o.zpages_census_sample = on;
-                });
-            // The seam's price of a fault cleared, so a window's busy wall
-            // is the stamps' own and not the faults'; no faults are
-            // injected.
-            inject
-                .fault_cost_ns
-                .store(0, std::sync::atomic::Ordering::Release);
-            // And each stamp priced, so a window's busy wall is the
-            // scaling's and not the host's.
-            inject
-                .op_wall_ns
-                .store(500, std::sync::atomic::Ordering::Release);
-            (on, dir, db, inject, r, keys, at)
-        })
-        .collect();
-    let mut stores = stores;
-    // A window closed by its count in each, which sizes the next at a
-    // hundred milliseconds of these reads.
-    for (on, _, db, inject, r, keys, at) in stores.iter_mut() {
-        let was = db.zpage_counts().census_windows;
-        let mut n = 0usize;
-        while db.zpage_counts().census_windows == was {
-            reads(r, keys, inject, 4096, at, 0);
-            n += 4096;
-            assert!(
-                n <= 4 << 20,
-                "census sample {on}: a window closed by its count within four million reads: {:?}",
-                db.zpage_counts()
-            );
-        }
+    const STAMP_NS: u64 = 500;
+    let (dir, db, _model, inject, r, keys, mut at) =
+        compact_store_with("census-sample-true", 1 << 20, |_| {});
+    // The seam's price of a fault cleared, so a window's busy wall is the
+    // stamps' own and not the faults'; no faults are injected.
+    inject
+        .fault_cost_ns
+        .store(0, std::sync::atomic::Ordering::Release);
+    // And each stamp priced, so a window's busy wall is the scaling's and
+    // not the host's.
+    inject
+        .op_wall_ns
+        .store(STAMP_NS, std::sync::atomic::Ordering::Release);
+    // A window closed by its count, which sizes the next at a hundred
+    // milliseconds of these reads.
+    let was = db.zpage_counts().census_windows;
+    let mut n = 0usize;
+    while db.zpage_counts().census_windows == was {
+        reads(&r, &keys, &inject, 4096, &mut at, 0);
+        n += 4096;
+        assert!(
+            n <= 4 << 20,
+            "a window closed by its count within four million reads: {:?}",
+            db.zpage_counts()
+        );
     }
-    // Five windows of each closed through the ticks, the stores in turn:
-    // each window's reads, its stamps and its busy wall.
-    let mut windows: [Vec<(u64, u64, u64)>; 2] = [Vec::new(), Vec::new()];
+    // Five windows closed through the ticks: each window's reads, its
+    // stamps and its busy wall.
+    let mut windows: Vec<(u64, u64, u64)> = Vec::new();
     for _ in 0..5 {
-        for (i, (on, _, db, inject, r, keys, at)) in stores.iter_mut().enumerate() {
-            let b = db.zpage_counts();
-            reads(r, keys, inject, 1024, at, 0);
-            close_window(db, r, &keys[0]);
-            let c = db.zpage_counts();
-            let (dw, dr, ds, dbusy) = (
-                c.census_windows - b.census_windows,
-                c.census_reads - b.census_reads,
-                c.census_stamped - b.census_stamped,
-                c.census_busy_ns - b.census_busy_ns,
-            );
-            assert!(
-                dw >= 1 && dr >= 1024 && dbusy > 0,
-                "census sample {on}: a window closed through the ticks: {c:?}"
-            );
-            windows[i].push((dr, ds, dbusy));
-        }
+        let b = db.zpage_counts();
+        reads(&r, &keys, &inject, 1024, &mut at, 0);
+        close_window(&db, &r, &keys[0]);
+        let c = db.zpage_counts();
+        let (dw, dr, ds, dbusy) = (
+            c.census_windows - b.census_windows,
+            c.census_reads - b.census_reads,
+            c.census_stamped - b.census_stamped,
+            c.census_busy_ns - b.census_busy_ns,
+        );
+        assert!(
+            dw >= 1 && dr >= 1024 && dbusy > 0,
+            "a window closed through the ticks: {c:?}"
+        );
+        windows.push((dr, ds, dbusy));
     }
-    let mut per_read = [0.0f64; 2];
-    for (i, w) in windows.iter().enumerate() {
-        let on = i == 0;
-        if on {
-            for &(dr, ds, _) in w {
-                assert!(
-                    ds >= 1 && ds * 8 <= dr,
-                    "census sample {on}: one read in sixteen stamped: {ds} of {dr}; {w:?}"
-                );
-            }
-        } else {
-            for &(dr, ds, _) in w {
-                assert_eq!(ds, dr, "census sample {on}: every read stamped: {w:?}");
-            }
-        }
-        let mut each: Vec<f64> = w.iter().map(|&(dr, _, b)| b as f64 / dr as f64).collect();
-        each.sort_by(f64::total_cmp);
-        per_read[i] = each[each.len() / 2];
+    for &(dr, ds, _) in &windows {
+        assert!(
+            ds >= 1 && ds * 8 <= dr,
+            "one read in sixteen stamped: {ds} of {dr}; {windows:?}"
+        );
     }
-    for (_, dir, db, _, r, _, _) in stores {
-        drop(r);
-        db.close().unwrap();
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-    let ratio = per_read[0] / per_read[1];
+    let mut each: Vec<f64> = windows
+        .iter()
+        .map(|&(dr, _, b)| b as f64 / dr as f64)
+        .collect();
+    each.sort_by(f64::total_cmp);
+    let per_read = each[each.len() / 2];
+    drop(r);
+    db.close().unwrap();
+    let _ = std::fs::remove_dir_all(&dir);
+    // Every read's wall is the seam's price, so the busy wall a read,
+    // scaled from the stamps, is that price; left unscaled it would be a
+    // sixteenth of it.
+    let ratio = per_read / STAMP_NS as f64;
     assert!(
         (0.9..=1.1).contains(&ratio),
-        "the scaled busy wall a read against every read stamped: {:.0} ns against {:.0} ns; {windows:?}",
-        per_read[0],
-        per_read[1]
+        "the scaled busy wall a read against the stamp's price: {per_read:.0} ns against {STAMP_NS} ns; {windows:?}"
     );
 }
 

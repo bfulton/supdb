@@ -968,7 +968,7 @@ pub struct ZCounts {
     /// (`Options::zpages_build_sync`).
     pub build_synced: u64,
     /// The I/O class the kernel reported for the last build thread, read
-    /// on the thread after it chose: 3 idle (`Options::zpages_io_idle`), 2
+    /// on the thread after it chose: 3 idle, 2
     /// best effort, 0 none, which is best effort at the thread's nice.
     pub build_io_class: u64,
     /// The raw record bytes the builds asked for ahead of their walks
@@ -1034,7 +1034,7 @@ pub struct ZCounts {
     pub census_scans: u64,
     pub census_scan_faults: u64,
     /// Over the windows that counted: the operations whose wall was
-    /// stamped (`Options::zpages_census_sample`), and the busy wall of the
+    /// stamped, and the busy wall of the
     /// windows with no commit inside, nanoseconds, scaled where the stride
     /// skipped operations.
     pub census_stamped: u64,
@@ -2447,37 +2447,6 @@ pub struct Options {
     /// `supdb-cache64tofitautozpagespromote`.
     #[doc(hidden)]
     pub zpages_promote_copies: bool,
-    /// Whether the form's own threads -- the build and the warm, and the
-    /// sampler where `zpages_sample_idle` says -- take the device at the
-    /// idle I/O class, served only when nothing else is waiting on it; off,
-    /// they read at the class the readers have and share the device with
-    /// their faults. Under a bound the readers fault without pause, and a
-    /// build served after them took ten times its CPU in wall while they
-    /// read raw. The class the build thread ends in is read back from the
-    /// kernel and counted (`ZCounts::build_io_class`).
-    /// `supdb-nocacheautozpagesfairio` is the arm with it off.
-    #[doc(hidden)]
-    pub zpages_io_idle: bool,
-    /// Whether the sampler runs at the idle classes, the CPU's
-    /// (`SCHED_IDLE`) and, with `zpages_io_idle`, the device's. Its reads are
-    /// a few groups a partition and its fills a few pages, and beside the
-    /// read pass at five million keys under 640 MiB it took nine to sixteen
-    /// seconds and read its wall less its CPU as six to seven milliseconds
-    /// a fault, where the readers' own took forty microseconds and its own
-    /// with no reader beside it thirty: the price the controller puts on
-    /// the attach of form files built ahead, which came out above their
-    /// build.
-    #[doc(hidden)]
-    pub zpages_sample_idle: bool,
-    /// Whether the controller's build turn attaches every form file on disk
-    /// before it starts a warm: the turn takes the first partition due a
-    /// job, and a partition attached and not yet warmed is due its warm, so
-    /// the attaches of form files built ahead went one a warm, each warm a
-    /// whole file read at idle priority beside the readers, and the install
-    /// waited for every warm before the coverage it counts. Off is that
-    /// order.
-    #[doc(hidden)]
-    pub zpages_attach_first: bool,
     /// Whether the writer's own reads are counted by the controller's
     /// census, as a handle's are, through the writer's engine slot, while
     /// the gate is the census's -- the controller deciding -- and not while
@@ -2489,24 +2458,6 @@ pub struct Options {
     /// million keys under 640 MiB.
     #[doc(hidden)]
     pub zpages_writer_census: bool,
-    /// The census window's busy wall -- the operations' own wall, which
-    /// with the thread's CPU and its major faults prices a fault, the
-    /// `t_f` of the costs -- taken from one operation in `ZBUSY_STRIDE`
-    /// once a window is `ZBUSY_SAMPLED_FROM` operations long, and scaled
-    /// by the window's operations over the ones stamped; every operation
-    /// of a shorter window is stamped. A stamp is two clock reads an
-    /// operation, and in the row's shape at ten million keys under
-    /// 1.25 GiB they were 6% of ycsb-E's thread: 73 of 962 samples in
-    /// `clock_gettime`, 11 of them the harness's own, with the compact
-    /// form serving and a scan a few microseconds. A window of a thousand
-    /// operations or more is one whose operations are under a hundred
-    /// microseconds, the regime where the stamps are a share of the
-    /// operation and the wait they measure is not; a shorter window's
-    /// operations are the faulting ones the price is for, and every one
-    /// of them is stamped. Off, every operation is stamped:
-    /// `supdb-zbusyevery`.
-    #[doc(hidden)]
-    pub zpages_census_sample: bool,
     /// Whether the controller buys on the model's prediction, as the eager
     /// entry buys a build (`zpages_build_eager`), where the sampler finds
     /// form files on disk for the share of the partitions' keys whose
@@ -7418,11 +7369,7 @@ impl Default for Options {
             zpages_walk_cursor: true,
             zpages_block_cache: true,
             zpages_promote_copies: false,
-            zpages_io_idle: true,
-            zpages_sample_idle: false,
-            zpages_attach_first: true,
             zpages_writer_census: true,
-            zpages_census_sample: true,
             zpages_attach_eager: true,
             zpages_build_ahead: 4 << 20,
             zpages_prebuild: false,
@@ -17497,7 +17444,7 @@ struct Slot {
     /// then the windows that counted, the ones with a commit inside, and
     /// the ones dropped: mixed (both classes), or moved (the thread or the
     /// gate changed inside it); and over the windows that counted, the
-    /// operations whose wall was stamped (`Options::zpages_census_sample`).
+    /// operations whose wall was stamped.
     zcreads: AtomicU64,
     zcrflt: AtomicU64,
     zcscans: AtomicU64,
@@ -27589,7 +27536,7 @@ struct ZWindow {
     /// reads, and a put's or a commit's wall is no read's.
     t0: std::time::Instant,
     counting: bool,
-    /// The stamps' stride this window (`Options::zpages_census_sample`):
+    /// The stamps' stride this window:
     /// one operation in `stride` has its wall stamped, `sdown` of them to
     /// go before the next, and `sampled` stamped so far.
     stride: u32,
@@ -27607,7 +27554,7 @@ const ZWINDOW_TARGET: std::time::Duration = std::time::Duration::from_millis(100
 /// three hundred milliseconds, so a sparse handle's window closes too.
 const ZWINDOW_TICKS: u64 = 3;
 /// One operation in this many has its wall stamped onto a window of
-/// `ZBUSY_SAMPLED_FROM` operations or more (`Options::zpages_census_sample`);
+/// `ZBUSY_SAMPLED_FROM` operations or more;
 /// every operation of a shorter window is stamped.
 const ZBUSY_STRIDE: u32 = 16;
 const ZBUSY_SAMPLED_FROM: u32 = 1024;
@@ -31055,7 +31002,7 @@ impl Reader {
         let now = std::time::Instant::now();
         self.attn_open.set(self.attn_open.get() | ATTN_OPEN);
         w.down = w.n;
-        w.stride = if self.opts.zpages_census_sample && w.n >= ZBUSY_SAMPLED_FROM {
+        w.stride = if w.n >= ZBUSY_SAMPLED_FROM {
             ZBUSY_STRIDE
         } else {
             1
@@ -64122,20 +64069,12 @@ impl Maint {
         );
         let wake = self.wake.clone();
         zfile::ZEvents::add(&self.shared.z.samples, 1);
-        let idle = self.opts.zpages_sample_idle;
-        let io_idle = idle && self.opts.zpages_io_idle;
         let dir = self.dir.clone();
         let live = self.shared.life.job();
         let spawned = std::thread::Builder::new()
             .name("supdb-zsample".into())
             .spawn(move || {
                 let _live = live;
-                if io_idle {
-                    idle_io_priority();
-                }
-                if idle {
-                    idle_cpu_priority();
-                }
                 // Under a cipher the records a sample fills its pages from
                 // are read through the store's cache, by a thread with no
                 // slot of the reader table: under a hold, rested between
@@ -64845,9 +64784,9 @@ impl Maint {
             self.z_convert_tick();
         }
         if d.build {
-            // Every form file on disk attached first, where the option says,
-            // so that no attach waits for a warm (`Options::zpages_attach_first`).
-            if self.opts.zpages_attach_first && self.zbuild.is_none() {
+            // Every form file on disk attached first, so that no attach
+            // waits for a warm.
+            if self.zbuild.is_none() {
                 for seg in self.z_unattached_on_disk() {
                     // A file that does not check out starts its build, and
                     // the turn goes on after it as below.
@@ -64865,10 +64804,7 @@ impl Maint {
             // at ten million keys under 1.25 GiB, the drain's last two builds
             // ahead in both slots. A file that does not check out is left for
             // the turn that builds, once the slot is free.
-            if self.opts.zpages_attach_first
-                && self.opts.zpages_cover_resident
-                && self.zbuild.as_ref().is_some_and(|b| b.dormant)
-            {
+            if self.opts.zpages_cover_resident && self.zbuild.as_ref().is_some_and(|b| b.dormant) {
                 for seg in self.z_unattached_on_disk() {
                     let (Some(id), Some(end)) =
                         (Db::name_id(&seg.name), Db::name_end_seq(&seg.name))
@@ -66655,7 +66591,6 @@ impl Maint {
         // the thread's first write and the count, and a test read the
         // temp name as a build nobody had started.
         zfile::ZEvents::add(&ev.build_starts, 1);
-        let io_idle = self.opts.zpages_io_idle;
         let io_ev = shared.clone();
         let live = shared.life.job();
         let spawned = std::thread::Builder::new()
@@ -66664,11 +66599,9 @@ impl Maint {
                 let _live = live;
                 // Derived data, built when the store is short of memory
                 // and the readers are faulting: the readers' cores first,
-                // and the device's queue too unless the option has the
-                // build share it; the class the kernel reports is counted.
-                if io_idle {
-                    idle_io_priority();
-                }
+                // and the device's queue too; the class the kernel reports
+                // is counted.
+                idle_io_priority();
                 io_ev
                     .z
                     .build_io_class
@@ -67131,7 +67064,6 @@ impl Maint {
         let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let flag = cancel.clone();
         let wake = self.wake.clone();
-        let io_idle = self.opts.zpages_io_idle;
         // Counted started before the thread exists, and ended by the thread
         // before its wake, as a build is (`ZCounts::job_ends`).
         zfile::ZEvents::add(&self.shared.z.warm_starts, 1);
@@ -67141,9 +67073,7 @@ impl Maint {
             .name("supdb-zwarm".into())
             .spawn(move || {
                 let _live = live;
-                if io_idle {
-                    idle_io_priority();
-                }
+                idle_io_priority();
                 idle_cpu_priority();
                 let r = zfile::warm_file(&path, Some(&flag));
                 zfile::ZEvents::add(&shared.z.job_ends, 1);

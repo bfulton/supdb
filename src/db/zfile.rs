@@ -9984,7 +9984,7 @@ pub struct ZInject {
     /// look a move falls at is the host's without this.
     pub convert_price_ns: AtomicU64,
     /// The wall of an operation the census stamps, nanoseconds, in place of
-    /// the one it took (`Options::zpages_census_sample`); 0 for the measured
+    /// the one it took; 0 for the measured
     /// one. The census scales its stamps' wall to the window's operations,
     /// one in sixteen of them stamped, so one stamped read the host stalled
     /// for two milliseconds read as thirty in a window of three thousand,
