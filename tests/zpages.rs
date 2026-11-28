@@ -20194,8 +20194,15 @@ fn a_merges_outputs_are_built_in_the_block_form_where_the_room_is_short() {
         c.finish_builds >= 1 && c.stride_builds == 0 && c.stride_no_room >= 1,
         "{what}: every output built in the block form, the refusals counted: {c:?}"
     );
+    // A dead name is a retired file no live segment claims, which the idle
+    // tick unlinks whenever it runs: no output's form, and gone by its read
+    // where the tick came between the listing and the read.
     let stride_on_disk = form_files(&dir)
         .iter()
+        .filter(|f| {
+            !f.file_name()
+                .is_some_and(|n| n.to_string_lossy().starts_with("zpg-dead-"))
+        })
         .filter(|f| {
             let b = common::store_file(f);
             supdb::db::zpages::trailer_magic(&b[b.len() - ZTRAILER..])
