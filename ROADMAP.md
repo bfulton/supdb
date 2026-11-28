@@ -12,12 +12,6 @@ a tenth behind its comparator or behind a shape the engine already reaches.
   `supdb-heldpart` was killed once under 1.25 GiB, and the kill's owner was
   never read. Done when a run sampled from outside the process names it,
   which needs a count of the engine's mapped blocks by length.
-- [ ] **What each engine's checksums verify.** RocksDB reads with
-  `verify_checksums(false)`, in memory, from its files out of core and in
-  `rocksdb-tuned-enc`, whose counter-mode Env has no tag, while a store
-  under a cipher checks a tag on every chunk it reads. Done when RocksDB
-  reads with its default, or the methods say what each engine verifies, the
-  encrypted arms included.
 - [ ] **A kill in a rep taken again.** `Ledger::forget_rep` deletes a cut
   rep's kills with its passes, so a row can lose a kill. Done when the row
   keeps them and the gate reads them.

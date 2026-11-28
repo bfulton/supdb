@@ -53,6 +53,12 @@ mod enc;
 pub struct Features {
     pub durable_commit: bool,
     pub transactions: bool,
+    /// Whether a read checks what it fetches against a checksum the engine
+    /// could have been opened to leave unchecked. Matched downward, since
+    /// LMDB has none, so false for every arm of the rosters.
+    /// What no setting takes back -- a log's CRC at a replay, a segment's
+    /// row at an open, a cipher's tag at a decryption -- is not this axis;
+    /// `bench/DESIGN.md` lists it per engine (what each engine verifies).
     pub checksums: bool,
     pub reopen_for_write: bool,
     pub read_your_writes: bool,
@@ -15981,8 +15987,7 @@ impl Rocks {
             o.set_level_zero_file_num_compaction_trigger(8);
         }
         let db = rocksdb::DB::open(&o, path).map_err(|e| e.to_string())?;
-        let mut read = rocksdb::ReadOptions::default();
-        read.set_verify_checksums(false);
+        let read = rocks_read();
         Ok(Rocks {
             db: std::sync::Arc::new(db),
             path: path.to_path_buf(),
@@ -15994,6 +15999,20 @@ impl Rocks {
             read,
         })
     }
+}
+
+/// The read options of every RocksDB read the suite makes: its defaults
+/// with `verify_checksums` off. The checksum axis is matched downward, as
+/// LMDB has no checksum to turn on (`Features::checksums`), and off is
+/// RocksDB's setting for it: a block a read fetches from a table file goes
+/// unchecked, where a block in the block cache is checked by no read and
+/// the memtable carries nothing to check. What it still checks, and what
+/// the option reaches in the suite's shape, is `bench/DESIGN.md`'s, what
+/// each engine verifies.
+fn rocks_read() -> rocksdb::ReadOptions {
+    let mut read = rocksdb::ReadOptions::default();
+    read.set_verify_checksums(false);
+    read
 }
 
 /// One read through whichever handle: the arm's own or a thread's.
@@ -16011,9 +16030,7 @@ fn rocks_get(db: &rocksdb::DB, read: &rocksdb::ReadOptions, key: &[u8]) -> Res<u
 fn rocks_range(db: &rocksdb::DB, from: &[u8], n: usize) -> Res<usize> {
     // By value, and `ReadOptions` does not clone: one per scan, which is
     // one small allocation against a walk of `n` entries.
-    let mut ro = rocksdb::ReadOptions::default();
-    ro.set_verify_checksums(false);
-    let mut it = db.raw_iterator_opt(ro);
+    let mut it = db.raw_iterator_opt(rocks_read());
     it.seek(from);
     let mut bytes = 0usize;
     let mut seen = 0usize;
@@ -16119,8 +16136,7 @@ impl Engine for Rocks {
         // options, made where they are used.
         let db = self.db.clone();
         Ok(Box::new(move || {
-            let mut read = rocksdb::ReadOptions::default();
-            read.set_verify_checksums(false);
+            let read = rocks_read();
             Ok(Box::new(RocksReader { db, read }) as Box<dyn ThreadReader>)
         }))
     }
@@ -16132,8 +16148,7 @@ impl Engine for Rocks {
             .map(|_| {
                 let db = self.db.clone();
                 Box::new(move || {
-                    let mut read = rocksdb::ReadOptions::default();
-                    read.set_verify_checksums(false);
+                    let read = rocks_read();
                     Ok(Box::new(RocksWriter { db, read, sync }) as Box<dyn ThreadWriter>)
                 }) as WriterOpener<'_>
             })

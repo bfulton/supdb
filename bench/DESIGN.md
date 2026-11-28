@@ -474,6 +474,78 @@ about 140 MB of memtable (`bench/examples/store_size.rs` lists a store's
 files). The arms' compaction trigger is eight level-0 files, and no
 banked row is known to have compacted them.
 
+What each engine verifies. The checksum axis is matched downward: LMDB has
+no checksum to turn on, so every arm that can leave one off at a read does
+(`Features::checksums`, false for every arm of the rosters). The supdb arms
+write their blocks with no CRC (`SegmentOptions::checksums` off) and
+RocksDB reads with `ReadOptions::verify_checksums` off (`rocks_read`).
+What each engine checks beside that is what it has no setting to leave
+off:
+
+- supdb. Every commit's batch in the log carries a CRC-32C, checked where
+  an open replays it, which is the recovery workloads' open, as an
+  ordered load's commit markers in its run's file are, and a manifest
+  slot carries one, checked where an open reads it. A segment's
+  superblock carries a checksum, checked at every open of the segment,
+  and its key section a checksum row whatever the switch says, checked
+  whole at the open of a segment this process did not write -- a merge's
+  output, every segment of a reopened store (`Options::verify_at_open`)
+  -- and at no read; an ordered index's file carries a CRC, checked at
+  its open. A form file's page
+  carries a CRC, checked at the page's first decode in a process and not
+  again, except in a stride file this process built and read back from
+  the device, whose pages it trusts; only the bounded roster builds form
+  files. The switch the arms turn off reaches the blocks alone, and the
+  suite's stores hold none: no segment of `supdb` or `supdb-ingest`
+  holds a block after the ordered load, the shuffled load or a full
+  rewrite of either, at three hundred thousand keys or three million,
+  where a 300-byte value puts 138 in a store of thirty thousand
+  (`cargo run --release --example check_reach -- 3000000
+  supdb,supdb-ingest,rocksdb-tuned,rocksdb-tuned-nosync,lmdb`, and the
+  control `-- 30000 supdb 300`). So it reaches no cell.
+- supdb under a cipher (`supdb-cipher` and its family). Every chunk of
+  every file is under a GCM tag, checked as the chunk is decrypted into
+  the store's cache: at its first read, and again at a read after the
+  cache gave it back. A read of a chunk the cache holds checks nothing.
+  A log record, a manifest slot and an envelope's header are checked as
+  they are read. The key section's row and the ordered index's CRC are
+  not taken, the tags having covered every byte they cover; a form
+  file's page CRC is, as it is in the clear.
+- RocksDB. Every log record carries a CRC-32C, checked where an open
+  replays the log whatever the read's options say (`log::Reader` is made
+  with its checksum on in `db_impl_open.cc`). Every block of a table
+  carries an XXH3 checksum written at the flush (`checksum` is `kXXH3` at
+  10.4.2, the version the suite links), and the flush that wrote a table
+  opens it with checks on, its footer, index and filter included. With
+  `verify_checksums` off, a block a read fetches from a table file is not
+  checked (`BlockFetcher::ProcessTrailerIfPresent`); a block found in the
+  block cache is checked by no read, whatever the option says; and the
+  memtable carries no protection (`memtable_protection_bytes_per_key` is
+  0). At the quick scale no RocksDB arm holds a table file after any
+  load or a full rewrite, so the option reaches no cell there; at three
+  million keys the ordered load leaves one and a full rewrite seven (the
+  same command), and out of core every block-cache miss is a read the
+  option leaves unchecked.
+- `rocksdb-tuned-enc`. The same, under an Env whose AES-256-CTR has no
+  tag: a changed byte decrypts to a changed byte, and the block checksums
+  over the plaintext, which would see it, are the ones its reads leave
+  unchecked (`shim/rocks_enc.cc`). The arm authenticates nothing.
+- LMDB. Nothing: its pages carry no checksum. `lmdb3-enc` checks a page's
+  GCM tag at every decryption LMDB asks of its hook, and refuses a page
+  whose tag does not match (`shim/lmdb_enc.c`); LMDB decrypts a page again
+  for each transaction that reads it first.
+- FASTER. Nothing: its log records carry no checksum.
+
+What the matching leaves is the work no setting removes, and it falls on
+the arms that do it: supdb's checks at an open, at a replay and at a form
+page's first decode, and RocksDB's at its replay, are each engine's price
+for refusing a damaged file rather than answering from it, a price no
+setting of theirs takes back and LMDB's cells do not pay. In the encrypted
+roster, `supdb-cipher` and `lmdb3-enc` authenticate every byte they
+decrypt and `rocksdb-tuned-enc` authenticates none, so a cell of
+`supdb-cipher` against it prices an authenticated store against one that
+is not, and is read so.
+
 Every shipping option is an arm because a user can choose it and deserves the
 number. `supdb-forms` is where the range-read structure is kept at every
 commit: the writer holds every overlaid block's form current whether or not
