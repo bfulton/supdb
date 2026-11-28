@@ -12,10 +12,6 @@ a tenth behind its comparator or behind a shape the engine already reaches.
   `supdb-heldpart` was killed once under 1.25 GiB, and the kill's owner was
   never read. Done when a run sampled from outside the process names it,
   which needs a count of the engine's mapped blocks by length.
-- [ ] **Device bytes measured at the device.** "Device bytes written" is
-  the process's `/proc/self/io` count, which equals bytes on disk for
-  buffered arms, while `bench/DESIGN.md` calls it the device's counter.
-  Done when it reads the device, or is renamed.
 - [ ] **The scan pass after a lent burst.** Under the held log a burst is
   lent to the upkeep thread, and the first scan waits for the thread's pass
   and settles its trail: the pass after a full rewrite reads 0.15x to 0.35x
@@ -574,3 +570,9 @@ a tenth behind its comparator or behind a shape the engine already reaches.
   differential fuzz found the empty key and the long common prefix; the
   guarantee is stated nowhere. Done when the crate docs state it and the
   fuzz draws from the whole of the key and value space under it.
+- [ ] **Device bytes off Linux.** The load's device bytes are read from
+  the Linux kernel's count of the store's block device, and a row from
+  macOS has no cell there. Done when a macOS row reads its disk's own
+  counter (IOKit's `IOBlockStorageDriver` statistics), held to a synced
+  write and a dropped one on a macOS host as `bench/tests/devbytes.rs` is
+  on Linux.
