@@ -1424,14 +1424,6 @@ pub struct Supdb {
     /// (`Options::forms_settle_past_llc`): `supdb-settlegated` and
     /// `supdb-ingestsettlegated`.
     settlegated: bool,
-    /// A point read hashing its key in each source, the shape before one
-    /// hash a read (`Options::read_hash_once` off): `supdb-readhashes` and
-    /// `supdb-ingestreadhashes`.
-    readhashes: bool,
-    /// A point read asking for the memtable's slot alone ahead of its
-    /// probes (`Options::read_lines_ahead` off): `supdb-readnoahead` and
-    /// `supdb-ingestreadnoahead`.
-    readnoahead: bool,
     /// A copy asked for over the entries its walk reads
     /// (`Options::copy_prefetch_span`): `supdb-copyspan` and
     /// `supdb-ingestcopyspan`.
@@ -1471,15 +1463,6 @@ pub struct Supdb {
     /// (`Options::upkeep_pace_syncs_model` off):
     /// `supdb-pacesyncsthresholds`.
     pacesyncsthresholds: bool,
-    /// A point read over a store with tombstones probing every source
-    /// again after its tombstone pass (`Options::read_probes_once` off):
-    /// `supdb-probestwice` and `supdb-ingestprobestwice`.
-    probestwice: bool,
-    /// A point read of every record through its extents, the common
-    /// record rebuilt as one too (`Options::point_fixed` off, which takes
-    /// the reads that stand on it with it): `supdb-pointexts` and
-    /// `supdb-ingestpointexts`.
-    pointexts: bool,
     /// A point read of every store by the general read of its sources,
     /// the two-source and the layered reads off (`Options::point_lone`
     /// off): `supdb-pointsources` and `supdb-ingestpointsources`.
@@ -1938,21 +1921,11 @@ pub struct Supdb {
     holdcap: Option<usize>,
     holdmarch: bool,
     noframes: bool,
-    /// A point read that reads a segment's record as it reaches it, no
-    /// line asked ahead of the header (`Options::point_record_ahead`
-    /// off): `supdb-norecordahead`, and `supdb-heldnorecordahead` under
-    /// the held log with no frames.
-    norecordahead: bool,
     /// A memtable's hash index left to fault as it is probed, its pages'
     /// first touches loads of the zero page (`Options::index_populated`
     /// off): `supdb-indexzeropage`, and `supdb-heldindexzeropage` under
     /// the held log with no frames.
     indexzeropage: bool,
-    /// The placed read's live table asked before its partition is found
-    /// and its lines asked for (`Options::point_live_first` on):
-    /// `supdb-livefirst`, and `supdb-heldlivefirst` under the held log
-    /// with no frames.
-    livefirst: bool,
     /// Every memtable key hashed by its FNV word and a finish, sixteen
     /// bytes or not (`Options::mem_hash_fold` off): `supdb-memfnv`, and
     /// `supdb-heldmemfnv` under the held log with no frames.
@@ -2958,10 +2931,6 @@ struct Policy {
     zhotresident: bool,
     /// Write-time filing past the cache alone: `...settlegated`.
     settlegated: bool,
-    /// A hash a source in the point read: `...readhashes`.
-    readhashes: bool,
-    /// No sources' lines asked ahead of the point read: `...readnoahead`.
-    readnoahead: bool,
     /// A copy's ask over its walk's entries: `...copyspan`.
     copyspan: bool,
     /// A copy's identity by its file: `...identityblob`.
@@ -2984,10 +2953,6 @@ struct Policy {
     pacesyncsbatch: bool,
     /// The syncing pace by cut-offs: `supdb-pacesyncsthresholds`.
     pacesyncsthresholds: bool,
-    /// Every source probed again after the tombstone pass: `...probestwice`.
-    probestwice: bool,
-    /// Every record read through its extents: `...pointexts`.
-    pointexts: bool,
     /// Every point read the general one: `...pointsources`.
     pointsources: bool,
     /// The layered read as one pass over every source: `...layersasone`.
@@ -3327,17 +3292,10 @@ struct Policy {
     /// builds none, and the arm's `sync`, its drain, is the store's.
     /// `supdb-heldnoframes`.
     noframes: bool,
-    /// No record asked ahead of its header (`Options::point_record_ahead`
-    /// off): `supdb-norecordahead`, `supdb-heldnorecordahead`.
-    norecordahead: bool,
     /// The hash index left to its zero-page faults
     /// (`Options::index_populated` off): `supdb-indexzeropage`,
     /// `supdb-heldindexzeropage`.
     indexzeropage: bool,
-    /// The live table before the partition in the placed read
-    /// (`Options::point_live_first` on): `supdb-livefirst`,
-    /// `supdb-heldlivefirst`.
-    livefirst: bool,
     /// The memtable's hash taken from FNV for every key
     /// (`Options::mem_hash_fold` off): `supdb-memfnv`, `supdb-heldmemfnv`.
     memfnv: bool,
@@ -3643,8 +3601,6 @@ impl Default for Policy {
             zrewarminstall: false,
             zhotresident: false,
             settlegated: false,
-            readhashes: false,
-            readnoahead: false,
             copyspan: false,
             identityblob: false,
             copythree: false,
@@ -3656,8 +3612,6 @@ impl Default for Policy {
             convert16: false,
             pacesyncsbatch: false,
             pacesyncsthresholds: false,
-            probestwice: false,
-            pointexts: false,
             pointsources: false,
             layersasone: false,
             settlebuildsfiled: false,
@@ -3752,9 +3706,7 @@ impl Default for Policy {
             holdcap: None,
             holdmarch: false,
             noframes: false,
-            norecordahead: false,
             indexzeropage: false,
-            livefirst: false,
             memfnv: false,
             inplace: false,
             placedpieces: false,
@@ -10546,8 +10498,6 @@ impl Supdb {
             zrewarminstall,
             zhotresident,
             settlegated,
-            readhashes,
-            readnoahead,
             copyspan,
             identityblob,
             copythree,
@@ -10559,8 +10509,6 @@ impl Supdb {
             convert16,
             pacesyncsbatch,
             pacesyncsthresholds,
-            probestwice,
-            pointexts,
             pointsources,
             layersasone,
             settlebuildsfiled,
@@ -10655,9 +10603,7 @@ impl Supdb {
             holdcap,
             holdmarch,
             noframes,
-            norecordahead,
             indexzeropage,
-            livefirst,
             memfnv,
             inplace,
             placedpieces,
@@ -11185,8 +11131,6 @@ impl Supdb {
             zpages_rewarm_at_install: zrewarminstall,
             zpages_hot_fill_resident_first: zhotresident,
             forms_settle_past_llc: settlegated,
-            read_hash_once: !readhashes,
-            read_lines_ahead: !readnoahead,
             copy_prefetch_span: copyspan,
             identity_by_keys: !identityblob,
             copy_packed: !copythree,
@@ -11209,8 +11153,6 @@ impl Supdb {
                 && std::env::var("CONVSTRICT").as_deref() == Ok("1"),
             upkeep_pace_syncs_to_share: !pacesyncsbatch,
             upkeep_pace_syncs_model: !pacesyncsbatch && !pacesyncsthresholds,
-            read_probes_once: !probestwice,
-            point_fixed: !pointexts,
             point_lone: !pointsources,
             point_layers_lean: !layersasone,
             forms_settle_builds_filed: settlebuildsfiled,
@@ -11324,9 +11266,7 @@ impl Supdb {
             wal_hold_bytes: holdcap.unwrap_or(supdb::Options::default().wal_hold_bytes),
             wal_hold_reuses: !holdmarch,
             held_frames: !noframes,
-            point_record_ahead: !norecordahead,
             index_populated: !indexzeropage,
-            point_live_first: livefirst,
             mem_hash_fold: !memfnv,
             put_in_place: inplace,
             point_placed_runs: !placedpieces,
@@ -11636,8 +11576,6 @@ impl Supdb {
             zrewarminstall,
             zhotresident,
             settlegated,
-            readhashes,
-            readnoahead,
             copyspan,
             identityblob,
             copythree,
@@ -11649,8 +11587,6 @@ impl Supdb {
             convert16,
             pacesyncsbatch,
             pacesyncsthresholds,
-            probestwice,
-            pointexts,
             pointsources,
             layersasone,
             settlebuildsfiled,
@@ -11745,9 +11681,7 @@ impl Supdb {
             holdcap,
             holdmarch,
             noframes,
-            norecordahead,
             indexzeropage,
-            livefirst,
             memfnv,
             inplace,
             placedpieces,
@@ -12161,12 +12095,8 @@ impl Engine for Supdb {
                     "supdb-heldnfinline"
                 } else if !self.block_cache {
                     "supdb-heldnfnocache"
-                } else if self.norecordahead {
-                    "supdb-heldnorecordahead"
                 } else if self.indexzeropage {
                     "supdb-heldindexzeropage"
-                } else if self.livefirst {
-                    "supdb-heldlivefirst"
                 } else if self.memfnv {
                     "supdb-heldmemfnv"
                 } else if self.upkeepbatch.is_some() {
@@ -12192,14 +12122,8 @@ impl Engine for Supdb {
                 Some(_) => "supdb-held8m",
             };
         }
-        if self.norecordahead {
-            return "supdb-norecordahead";
-        }
         if self.indexzeropage {
             return "supdb-indexzeropage";
-        }
-        if self.livefirst {
-            return "supdb-livefirst";
         }
         if self.memfnv {
             return "supdb-memfnv";
@@ -12836,39 +12760,11 @@ impl Engine for Supdb {
                 "supdb-ingestsettlegated"
             };
         }
-        if self.readhashes {
-            return if self.partition {
-                "supdb-readhashes"
-            } else {
-                "supdb-ingestreadhashes"
-            };
-        }
-        if self.readnoahead {
-            return if self.partition {
-                "supdb-readnoahead"
-            } else {
-                "supdb-ingestreadnoahead"
-            };
-        }
         if self.pacesyncsbatch {
             return "supdb-pacesyncsbatch";
         }
         if self.pacesyncsthresholds {
             return "supdb-pacesyncsthresholds";
-        }
-        if self.probestwice {
-            return if self.partition {
-                "supdb-probestwice"
-            } else {
-                "supdb-ingestprobestwice"
-            };
-        }
-        if self.pointexts {
-            return if self.partition {
-                "supdb-pointexts"
-            } else {
-                "supdb-ingestpointexts"
-            };
         }
         if self.pointsources {
             return if self.partition {
@@ -16120,9 +16016,7 @@ pub fn guarantee(arm: &str) -> Option<Guarantee> {
         | "supdb-nosnap"
         | "supdb-noadvice"
         | "supdb-advicerandom"
-        | "supdb-norecordahead"
         | "supdb-indexzeropage"
-        | "supdb-livefirst"
         | "supdb-memfnv"
         | "supdb-nocache"
         | "supdb-dirkey"
@@ -16419,10 +16313,6 @@ pub fn guarantee(arm: &str) -> Option<Guarantee> {
         | "supdb-zhotresident"
         | "supdb-settlegated"
         | "supdb-ingestsettlegated"
-        | "supdb-readhashes"
-        | "supdb-ingestreadhashes"
-        | "supdb-readnoahead"
-        | "supdb-ingestreadnoahead"
         | "supdb-copyspan"
         | "supdb-ingestcopyspan"
         | "supdb-identityblob"
@@ -16441,10 +16331,6 @@ pub fn guarantee(arm: &str) -> Option<Guarantee> {
         | "supdb-ingestconvert16"
         | "supdb-pacesyncsbatch"
         | "supdb-pacesyncsthresholds"
-        | "supdb-probestwice"
-        | "supdb-ingestprobestwice"
-        | "supdb-pointexts"
-        | "supdb-ingestpointexts"
         | "supdb-pointsources"
         | "supdb-ingestpointsources"
         | "supdb-layersasone"
@@ -16658,11 +16544,9 @@ pub fn guarantee(arm: &str) -> Option<Guarantee> {
         | "supdb-heldnfsettleconvertquiet"
         | "supdb-heldnoframes"
         | "supdb-heldnfnocache"
-        | "supdb-heldnorecordahead"
         | "supdb-heldnoalert"
         | "supdb-heldinline"
         | "supdb-heldindexzeropage"
-        | "supdb-heldlivefirst"
         | "supdb-heldmemfnv"
         | "supdb-heldinplace"
         | "supdb-heldinplacepieces"
@@ -17063,22 +16947,6 @@ pub fn open(arm: &str, dir: &Path, map_gb: usize) -> Res<Box<dyn Engine>> {
             },
             dir,
         )?,
-        "supdb-heldnorecordahead" => supdb_arm(
-            |d| {
-                Supdb::with_policy(
-                    d,
-                    Policy {
-                        partition: false,
-                        durable: false,
-                        held: true,
-                        noframes: true,
-                        norecordahead: true,
-                        ..Policy::default()
-                    },
-                )
-            },
-            dir,
-        )?,
         "supdb-heldbatch1" => supdb_arm(
             |d| {
                 Supdb::with_policy(
@@ -17123,22 +16991,6 @@ pub fn open(arm: &str, dir: &Path, map_gb: usize) -> Res<Box<dyn Engine>> {
             },
             dir,
         )?,
-        "supdb-heldlivefirst" => supdb_arm(
-            |d| {
-                Supdb::with_policy(
-                    d,
-                    Policy {
-                        partition: false,
-                        durable: false,
-                        held: true,
-                        noframes: true,
-                        livefirst: true,
-                        ..Policy::default()
-                    },
-                )
-            },
-            dir,
-        )?,
         "supdb-heldmemfnv" => supdb_arm(
             |d| {
                 Supdb::with_policy(
@@ -17161,30 +17013,6 @@ pub fn open(arm: &str, dir: &Path, map_gb: usize) -> Res<Box<dyn Engine>> {
                     d,
                     Policy {
                         memfnv: true,
-                        ..Policy::default()
-                    },
-                )
-            },
-            dir,
-        )?,
-        "supdb-livefirst" => supdb_arm(
-            |d| {
-                Supdb::with_policy(
-                    d,
-                    Policy {
-                        livefirst: true,
-                        ..Policy::default()
-                    },
-                )
-            },
-            dir,
-        )?,
-        "supdb-norecordahead" => supdb_arm(
-            |d| {
-                Supdb::with_policy(
-                    d,
-                    Policy {
-                        norecordahead: true,
                         ..Policy::default()
                     },
                 )
@@ -17680,110 +17508,6 @@ pub fn open(arm: &str, dir: &Path, map_gb: usize) -> Res<Box<dyn Engine>> {
                         partition: false,
                         durable: false,
                         settlebuildsfiled: true,
-                        ..Policy::default()
-                    },
-                )
-            },
-            dir,
-        )?,
-        "supdb-readhashes" => supdb_arm(
-            |d| {
-                Supdb::with_policy(
-                    d,
-                    Policy {
-                        readhashes: true,
-                        ..Policy::default()
-                    },
-                )
-            },
-            dir,
-        )?,
-        "supdb-ingestreadhashes" => supdb_arm(
-            |d| {
-                Supdb::with_policy(
-                    d,
-                    Policy {
-                        partition: false,
-                        durable: false,
-                        readhashes: true,
-                        ..Policy::default()
-                    },
-                )
-            },
-            dir,
-        )?,
-        "supdb-readnoahead" => supdb_arm(
-            |d| {
-                Supdb::with_policy(
-                    d,
-                    Policy {
-                        readnoahead: true,
-                        ..Policy::default()
-                    },
-                )
-            },
-            dir,
-        )?,
-        "supdb-ingestreadnoahead" => supdb_arm(
-            |d| {
-                Supdb::with_policy(
-                    d,
-                    Policy {
-                        partition: false,
-                        durable: false,
-                        readnoahead: true,
-                        ..Policy::default()
-                    },
-                )
-            },
-            dir,
-        )?,
-        "supdb-probestwice" => supdb_arm(
-            |d| {
-                Supdb::with_policy(
-                    d,
-                    Policy {
-                        probestwice: true,
-                        ..Policy::default()
-                    },
-                )
-            },
-            dir,
-        )?,
-        "supdb-ingestprobestwice" => supdb_arm(
-            |d| {
-                Supdb::with_policy(
-                    d,
-                    Policy {
-                        partition: false,
-                        durable: false,
-                        probestwice: true,
-                        ..Policy::default()
-                    },
-                )
-            },
-            dir,
-        )?,
-        "supdb-pointexts" => supdb_arm(
-            |d| {
-                Supdb::with_policy(
-                    d,
-                    Policy {
-                        pointexts: true,
-                        ..Policy::default()
-                    },
-                )
-            },
-            dir,
-        )?,
-        "supdb-ingestpointexts" => supdb_arm(
-            |d| {
-                Supdb::with_policy(
-                    d,
-                    Policy {
-                        partition: false,
-                        durable: false,
-                        pointexts: true,
                         ..Policy::default()
                     },
                 )
@@ -19727,23 +19451,19 @@ mod tests {
         )
         .unwrap();
         let fo = nof.db.as_ref().unwrap().options().clone();
-        assert!(
-            fo.point_record_ahead && fo.scan_block_cache && fo.upkeep_alert && fo.index_populated
-        );
+        assert!(fo.scan_block_cache && fo.upkeep_alert && fo.index_populated);
         assert!(
             fo.share_on_write && fo.shared_table_bytes > 0 && fo.shared_index_slots > 0,
             "the roster's arm shares its table on demand, sized as the big shared arm's"
         );
         for (arm, differs) in [
             (
-                "supdb-heldnorecordahead",
-                (|a: &supdb::Options| !a.point_record_ahead) as fn(&supdb::Options) -> bool,
+                "supdb-heldnfnocache",
+                (|a: &supdb::Options| !a.scan_block_cache) as fn(&supdb::Options) -> bool,
             ),
-            ("supdb-heldnfnocache", |a| !a.scan_block_cache),
             ("supdb-heldnoalert", |a| !a.upkeep_alert),
             ("supdb-heldinline", |a| a.upkeep == supdb::Upkeep::Inline),
             ("supdb-heldindexzeropage", |a| !a.index_populated),
-            ("supdb-heldlivefirst", |a| a.point_live_first),
             ("supdb-heldmemfnv", |a| !a.mem_hash_fold),
             ("supdb-heldbatch1", |a| a.upkeep_batch_pct == 1),
             ("supdb-heldnoshare", |a| !a.share_on_write),
@@ -19755,10 +19475,6 @@ mod tests {
             assert_eq!(e.features(), base.features(), "{arm}");
             drop(e);
             let a = match arm {
-                "supdb-heldnorecordahead" => Policy {
-                    norecordahead: true,
-                    ..Policy::default()
-                },
                 "supdb-heldnfnocache" => Policy {
                     block_cache: false,
                     ..Policy::default()
@@ -19769,10 +19485,6 @@ mod tests {
                 },
                 "supdb-heldindexzeropage" => Policy {
                     indexzeropage: true,
-                    ..Policy::default()
-                },
-                "supdb-heldlivefirst" => Policy {
-                    livefirst: true,
                     ..Policy::default()
                 },
                 "supdb-heldmemfnv" => Policy {
@@ -19815,30 +19527,11 @@ mod tests {
                 "{arm}"
             );
         }
-        // And the default arm's: the record read as it is reached.
-        let e = open("supdb-norecordahead", &root.join("norecordahead"), 1).unwrap();
-        assert_eq!(e.name(), "supdb-norecordahead");
-        assert_eq!(guarantee("supdb-norecordahead"), guarantee("supdb"));
-        drop(e);
+        // And the default arm's: the index left to its zero-page faults.
         let e = open("supdb-indexzeropage", &root.join("indexzeropage"), 1).unwrap();
         assert_eq!(e.name(), "supdb-indexzeropage");
         assert_eq!(guarantee("supdb-indexzeropage"), guarantee("supdb"));
         drop(e);
-        let e = open("supdb-livefirst", &root.join("livefirst"), 1).unwrap();
-        assert_eq!(e.name(), "supdb-livefirst");
-        assert_eq!(guarantee("supdb-livefirst"), guarantee("supdb"));
-        drop(e);
-        let ll = Supdb::with_policy(
-            &root.join("livefirst-policy"),
-            Policy {
-                livefirst: true,
-                ..Policy::default()
-            },
-        )
-        .unwrap();
-        assert_eq!(ll.name(), "supdb-livefirst");
-        assert!(ll.db.as_ref().unwrap().options().point_live_first);
-        drop(ll);
         let mf = Supdb::with_policy(
             &root.join("memfnv-policy"),
             Policy {
@@ -19850,7 +19543,7 @@ mod tests {
         assert_eq!(mf.name(), "supdb-memfnv");
         assert!(!mf.db.as_ref().unwrap().options().mem_hash_fold);
         drop(mf);
-        let e = open("supdb", &root.join("livefirst"), 1).unwrap();
+        let e = open("supdb", &root.join("supdb"), 1).unwrap();
         drop((e, nof));
         assert!(
             matches!(mo.sync, supdb::SyncPolicy::Explicit) && mo.wal_hold_bytes == o.wal_hold_bytes
@@ -22047,36 +21740,6 @@ mod tests {
             }
             {
                 let z = Supdb::with_policy(
-                    &dir("readhashes"),
-                    Policy {
-                        readhashes: true,
-                        ..Policy::default()
-                    },
-                )
-                .unwrap();
-                assert_eq!(z.name(), "supdb-readhashes");
-                assert_eq!(z.features(), base.features());
-                let o = z.db.as_ref().unwrap().options();
-                assert!(!o.read_hash_once && b.read_hash_once);
-                assert!(o.read_lines_ahead);
-            }
-            {
-                let z = Supdb::with_policy(
-                    &dir("readnoahead"),
-                    Policy {
-                        readnoahead: true,
-                        ..Policy::default()
-                    },
-                )
-                .unwrap();
-                assert_eq!(z.name(), "supdb-readnoahead");
-                assert_eq!(z.features(), base.features());
-                let o = z.db.as_ref().unwrap().options();
-                assert!(!o.read_lines_ahead && b.read_lines_ahead);
-                assert!(o.read_hash_once);
-            }
-            {
-                let z = Supdb::with_policy(
                     &dir("copyspan"),
                     Policy {
                         copyspan: true,
@@ -22259,35 +21922,6 @@ mod tests {
             }
             {
                 let z = Supdb::with_policy(
-                    &dir("probestwice"),
-                    Policy {
-                        probestwice: true,
-                        ..Policy::default()
-                    },
-                )
-                .unwrap();
-                assert_eq!(z.name(), "supdb-probestwice");
-                assert_eq!(z.features(), base.features());
-                let o = z.db.as_ref().unwrap().options();
-                assert!(!o.read_probes_once && b.read_probes_once);
-            }
-            {
-                let z = Supdb::with_policy(
-                    &dir("pointexts"),
-                    Policy {
-                        pointexts: true,
-                        ..Policy::default()
-                    },
-                )
-                .unwrap();
-                assert_eq!(z.name(), "supdb-pointexts");
-                assert_eq!(z.features(), base.features());
-                let o = z.db.as_ref().unwrap().options();
-                assert!(!o.point_fixed && b.point_fixed);
-                assert!(o.point_lone, "the one option moved");
-            }
-            {
-                let z = Supdb::with_policy(
                     &dir("pointsources"),
                     Policy {
                         pointsources: true,
@@ -22299,7 +21933,6 @@ mod tests {
                 assert_eq!(z.features(), base.features());
                 let o = z.db.as_ref().unwrap().options();
                 assert!(!o.point_lone && b.point_lone);
-                assert!(o.point_fixed, "the one option moved");
             }
             {
                 let z = Supdb::with_policy(
@@ -22329,7 +21962,7 @@ mod tests {
                 assert_eq!(z.features(), base.features());
                 let o = z.db.as_ref().unwrap().options();
                 assert!(!o.point_layers_lean && b.point_layers_lean);
-                assert!(o.point_lone && o.point_fixed, "the one option moved");
+                assert!(o.point_lone, "the one option moved");
             }
             {
                 let z = Supdb::with_policy(

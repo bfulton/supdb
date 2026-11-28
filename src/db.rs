@@ -1702,108 +1702,6 @@ pub struct Options {
     /// `Blob::lookup_full`, the shape before `Blob::with_lookup` lent them
     /// on the index's frame; kept to price it. `supdb-extsval`.
     pub exts_by_value: bool,
-    /// A point read or a count hashes its key once, the index's FNV word
-    /// (`flatindex::key_hash`), and takes every source's hash from it:
-    /// the memtables' slot (`mem_hash_of`), the partition's index and each
-    /// level-0 piece's index and filter (`BlockedBloom::finalize`). Off,
-    /// each source hashed the key itself, a byte at a time and a multiply
-    /// a byte, three times over a read that met a piece: the scrambled D
-    /// mix, which reads the newest inserts in a store the scrambled write
-    /// mixes left a piece in, put a fifth of its thread on the piece's
-    /// `may_hold` at a hundred and three hundred thousand keys, where the
-    /// unscrambled D, with no piece, put a twenty-fifth. Paired on the
-    /// buffered arm, both options against neither, two sittings of eight
-    /// pairs in both orders at a hundred and three hundred thousand keys,
-    /// the scrambled D read 1.24-1.37x in the second sitting, the
-    /// scrambled B, C and F 1.07-1.25x, D 1.12-1.30x and the read pass
-    /// level to 1.14x, with the loads and scans the options cannot reach
-    /// leaning the other way where they leaned (`pair.sh supdb-ingest
-    /// supdb-ingestreadhashes 300000 --reps 8`, and at 100000, at
-    /// `4eb6172`). The first sitting, with
-    /// the partition's slot asked for on every read, read the read pass
-    /// at 0.94x at three hundred thousand keys, which callgrind put at 44
-    /// instructions a read (`read_lines_ahead`). `supdb-readhashes` and
-    /// `supdb-ingestreadhashes` hash per source.
-    pub read_hash_once: bool,
-    /// A point read or a count asks for the lines its later sources'
-    /// first probes will load as soon as it has the key's hash, before it
-    /// reads the earlier ones: each level-0 piece's filter block
-    /// (`BlockedBloom::prefetch_fnv`), beside the memtable's slot it asked
-    /// for already, so the filter's miss overlaps the partition's read
-    /// where it was taken after it; and the partition's first hash slot
-    /// (`Blob::prefetch_slot`) only where the tombstone pass reads the
-    /// newer sources first, since with no pass the lookup follows the ask
-    /// at once and the ask was 44 instructions a read of the read pass
-    /// for nothing (callgrind over `bench/examples/read_only.rs` at three
-    /// hundred thousand keys). Taken away alone on the buffered arm, two
-    /// sittings of eight pairs at three hundred thousand keys, D read
-    /// 0.90-0.95x without it in both and the scrambled D 0.95-0.97x, the
-    /// read pass and the cells with no piece level (`pair.sh supdb-ingest
-    /// supdb-ingestreadnoahead 300000 --reps 8`, at `4eb6172`). Needs
-    /// `read_hash_once`, whose word names the lines. `supdb-readnoahead`
-    /// and `supdb-ingestreadnoahead` ask for the memtable's slot alone.
-    pub read_lines_ahead: bool,
-    /// The read that places its sources (`Reader::read_placed`) asks the
-    /// live table before it finds the key's partition and asks for its
-    /// lines (`read_lines_ahead`), and finds them only where the live
-    /// table's chain did not end the read: a put leaves a tombstone under
-    /// its value, so a read of a key the table has written since its last
-    /// seal ends there, three in five of the mixes A and F at three
-    /// hundred thousand keys under the held log and a fifth to a third of
-    /// the scrambled A, B and F (`SUPDB_MIX_COUNTERS`, `gets ... live`).
-    /// It saves 78 instructions of a read the live table ends and costs
-    /// the others their asks' lead, the live probe: timed by kind in two
-    /// sittings of twelve pairs (`pair.sh SUPDB_MIX_KINDS=1
-    /// supdb-heldnoframes supdb-heldlivelast 300000 --reps 12`, at
-    /// `636f613`, where the order before was the arm), F's gets read 0.99x and 0.95x of the order before and
-    /// the scrambled mixes' 1.04-1.16x slower in both, where a third of
-    /// their gets or fewer end in the live table. Off: the partition and
-    /// its asks first, as before. On: `supdb-livefirst`, and
-    /// `supdb-heldlivefirst` under the held log with no frames.
-    pub point_live_first: bool,
-    /// A point read or a count over a store with tombstones reads each
-    /// source once: the pass that finds the newest tombstone, newest source
-    /// first, keeps what it found of each source it probed -- the live
-    /// table's entry, each frozen table's, and for each piece whether its
-    /// filter and its index hold the key (`Probed`) -- and the reads after
-    /// it take those answers where they had probed every source again. A
-    /// `put` is a delete and an append, so every store an update has
-    /// reached has tombstones, and every point read after the first write
-    /// mix probed the live table, the frozen tables and each piece's filter
-    /// twice. The answers are the same: the state is taken once for the
-    /// read, the segments and frozen tables do not change, and the live
-    /// table's entries are bounded by the mark the read took at its start.
-    /// Off, the value pass probes every source again, the shape before:
-    /// `supdb-probestwice`, and `supdb-ingestprobestwice` buffered.
-    pub read_probes_once: bool,
-    /// A point read takes a key's values from its record where it lies,
-    /// where the record is the common one -- the compact record with a
-    /// fixed run, the shipped writer's for values of one width
-    /// (`FlatIndex::read_fixed_hashed`) -- and reads every other record
-    /// through its extents as before. The general read rebuilds the
-    /// record's extent from its header, hands it up and walks the run by
-    /// it (`with_lookup_hashed`, `Blob::read_exts`), layers a scan's walk
-    /// had been spared since `compact_fixed_at` and the point read had
-    /// not: 354 instructions of a get's 959 over a store just loaded,
-    /// against FASTER's 415 for the whole get, by callgrind at a hundred
-    /// thousand keys (`bench/examples/point_ops.rs`). The values are the
-    /// same bytes in the same order. Needs `read_hash_once`. Off, every
-    /// record is read through its extents: `supdb-pointexts`, and
-    /// `supdb-ingestpointexts` buffered.
-    pub point_fixed: bool,
-    /// A point read of a segment asks for the lines of the key's record
-    /// past its first as soon as the slot names the record, out to the
-    /// section's mean record length (`FlatIndex::ask_record`), and reads
-    /// the header beside them. The value's place is the header's
-    /// arithmetic, so a read without the ask waits on the slot, then on
-    /// the header's line, then on the value's lines: by the samples of
-    /// the scrambled D and F mixes at three hundred thousand keys, the
-    /// slot's load took 34 of the segment read's 225, the header's 107
-    /// and the value's last line 61, and almost none of the rest were
-    /// instructions. Off, the record is read as it is reached:
-    /// `supdb-norecordahead`, and `supdb-heldnorecordahead` under the
-    /// held log.
-    pub point_record_ahead: bool,
     /// A point read of a store whose sources hold the key in their common
     /// shape reads them in one pass, newest first, on its own frame. Two
     /// reads stand in for the general one. A store with no frozen table
@@ -1821,7 +1719,7 @@ pub struct Options {
     /// each asked in turn, a chain's offsets in a vector; with one source
     /// it still set each of those up, about three hundred instructions of
     /// a get's 747 over a store just loaded once the record was read in
-    /// place (`point_fixed`), by callgrind at a hundred thousand keys
+    /// place, by callgrind at a hundred thousand keys
     /// (`bench/examples/point_ops.rs`). The same values in the same order:
     /// the newest tombstone the pass finds is the newest of the read's
     /// sources, and with none the partition's values come first. A
@@ -1831,8 +1729,7 @@ pub struct Options {
     /// it holds, a record of another shape in a piece and a store under
     /// any option that reads a partition another way (`point_via_ord`,
     /// `exts_by_value`) take the general read; `Reader::point_lean_reads`
-    /// counts the reads that did not. Needs `read_hash_once` and
-    /// `point_fixed`. Off: `supdb-pointsources`, and
+    /// counts the reads that did not. Off: `supdb-pointsources`, and
     /// `supdb-ingestpointsources` buffered.
     pub point_lone: bool,
     /// The layered read asks its sources in the order of what each costs,
@@ -1867,8 +1764,8 @@ pub struct Options {
     /// over, from the same sources.
     ///
     /// And the partition's first hash slot is asked for as soon as the
-    /// key is hashed, ahead of the tables' probes and the pieces' filters
-    /// (under `read_lines_ahead`). A get over keys the cache does not
+    /// key is hashed, ahead of the tables' probes and the pieces' filters.
+    /// A get over keys the cache does not
     /// hold waits on two lines of the partition, the slot and then the
     /// record, and what a loop of gets costs is how far those waits
     /// overlap from one get to the next: sampled by phase
@@ -7652,15 +7549,11 @@ pub struct Options {
 
 impl Options {
     /// Whether a point read takes the two-source or the layered read
-    /// where the store allows one (`point_lone`): the option, the two it
-    /// needs, and none of the arms that read a partition another way.
+    /// where the store allows one (`point_lone`): the option, and none of
+    /// the arms that read a partition another way.
     #[inline(always)]
     fn point_lone_on(&self) -> bool {
-        self.point_lone
-            && self.point_fixed
-            && self.read_hash_once
-            && !self.exts_by_value
-            && !self.point_via_ord
+        self.point_lone && !self.exts_by_value && !self.point_via_ord
     }
 
     /// Whether the store keeps `Shared::points_far`, for the options that
@@ -7932,17 +7825,11 @@ impl Default for Options {
             writer_pins: true,
             asym_pins: false,
             exts_by_value: false,
-            read_hash_once: true,
-            point_fixed: true,
-            point_record_ahead: true,
             point_lone: true,
             point_layers_lean: true,
             point_placed_runs: true,
             point_fence_words: true,
             point_lone_absent: true,
-            read_lines_ahead: true,
-            point_live_first: false,
-            read_probes_once: true,
             point_via_ord: false,
             zpages: ZPages::Auto,
             zpages_min_bytes: zfile::ZMIN_RECS,
@@ -10415,7 +10302,7 @@ impl BlockedBloom {
     /// caller has: a point read through a form file hashes its key once
     /// for the key table and for this.
     /// `maybe_contains` for a key whose FNV word (`key_hash`) the caller
-    /// has (`Options::read_hash_once`).
+    /// has: a point read hashes its key once for every source.
     #[inline]
     fn maybe_contains_fnv(&self, fnv: u64) -> bool {
         self.maybe_contains_hash(BlockedBloom::finalize(fnv))
@@ -16078,7 +15965,9 @@ impl Seg {
     }
 
     /// Could this segment hold `key`? A fence answers exactly; a Bloom
-    /// answers with false positives and never a false negative.
+    /// answers with false positives and never a false negative. The reads
+    /// ask `may_hold_fnv`, over the key's one hash; this is the tests'.
+    #[cfg(test)]
     #[inline]
     fn may_hold(&self, key: &[u8]) -> bool {
         if self.below_lo(key) {
@@ -16091,7 +15980,7 @@ impl Seg {
     }
 
     /// `may_hold` for a key whose FNV word (`flatindex::key_hash`) the
-    /// caller has taken (`Options::read_hash_once`).
+    /// caller has taken.
     #[inline(always)]
     fn may_hold_fnv(&self, key: &[u8], fnv: u64) -> bool {
         if self.below_lo(key) {
@@ -16107,8 +15996,7 @@ impl Seg {
 
     /// A hint to fetch the lines a point read of the key with FNV word
     /// `fnv` will load first here: the filter's block, where the segment
-    /// has a filter, else the index's first hash slot
-    /// (`Options::read_lines_ahead`). Nothing is read.
+    /// has a filter, else the index's first hash slot. Nothing is read.
     #[inline]
     fn prefetch_probe(&self, fnv: u64) {
         match &self.bloom {
@@ -16792,7 +16680,8 @@ struct Entry<'a> {
 }
 
 /// What a point read's tombstone pass found of each source it probed, for
-/// the reads after it (`Options::read_probes_once`): `None` where the pass
+/// the reads after it, which take its answers where they probed every
+/// source again: `None` where the pass
 /// did not reach a source, and the probe's answer where it did. A piece is
 /// known by its place in the read's run of pieces, the first sixty-four.
 #[derive(Default)]
@@ -16892,7 +16781,7 @@ fn fold_hash16(key: &[u8; 16]) -> u64 {
 
 /// The memtable's hash from the key's FNV word (`flatindex::key_hash`), the
 /// word the segments' indexes and filters are hashed from too, so a read
-/// over every source hashes the key once (`Options::read_hash_once`).
+/// over every source hashes the key once.
 #[inline]
 fn mem_hash_of(fnv: u64) -> u64 {
     let h = (fnv ^ (fnv >> 30)).wrapping_mul(0xbf58476d1ce4e5b9);
@@ -34183,12 +34072,14 @@ impl Reader {
     /// whose place among the sources (as `read_all` numbers them) is where
     /// live values begin, zero where none does. A piece is asked only where
     /// it has tombstones at all. What the pass found of each source it
-    /// probed comes back beside the cut, for the reads after it to take
-    /// (`Options::read_probes_once`; empty with the option off).
+    /// probed comes back beside the cut, for the reads after it to take: a
+    /// `put` is a delete and an append, so every store an update has
+    /// reached has tombstones, and the value pass probed the live table,
+    /// the frozen tables and each piece's filter a second time, 1,658
+    /// instructions a read against 1,492 by callgrind.
     /// A frozen table's hash of `key`, the table's own (`MemTable::hash`):
-    /// from the key's FNV word where the read took one
-    /// (`Options::read_hash_once`), and for a sixteen-byte key in a table
-    /// that folds, the fold.
+    /// from the key's FNV word, and for a sixteen-byte key in a table that
+    /// folds, the fold.
     ///
     /// The general reads took the live table's hash for the frozen ones,
     /// on the word that every table of a store has one shape. While a run
@@ -34204,12 +34095,8 @@ impl Reader {
     /// lengths (`tests/db.rs`,
     /// `a_frozen_tables_sixteen_byte_key_is_read_beside_an_open_run`).
     #[inline(always)]
-    fn frozen_hash(fr: &MemTable, key: &[u8], fnv: u64, once: bool) -> u64 {
-        if once {
-            fr.hash_with(key, fnv)
-        } else {
-            fr.hash(key)
-        }
+    fn frozen_hash(fr: &MemTable, key: &[u8], fnv: u64) -> u64 {
+        fr.hash_with(key, fnv)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -34223,16 +34110,12 @@ impl Reader {
         mem_empty: bool,
         holds: impl Fn(&Seg) -> bool,
     ) -> (usize, Probed<'s>) {
-        let keep = self.opts.read_probes_once;
-        let once = self.opts.read_hash_once;
         let mem = &*st.mem;
         let fr_ix = 1 + l0.len();
         let mut probed = Probed::default();
         if !mem_empty {
             let got = mem.get_with(hash, key, self.len_bound.get());
-            if keep {
-                probed.mem = Some(got);
-            }
+            probed.mem = Some(got);
             if got.is_some_and(|e| mem.has_tomb(e, self.wm())) {
                 return (fr_ix + st.frozen.len(), probed);
             }
@@ -34240,11 +34123,9 @@ impl Reader {
         // The frozen tables newest first: the newest holding a tombstone is
         // the cut.
         for (i, fr) in st.frozen.iter().enumerate().rev() {
-            let got = fr.get_with(Reader::frozen_hash(fr, key, fnv, once), key, MemTable::ALL);
-            if keep {
-                if let Some(slot) = probed.frozen.get_mut(i) {
-                    *slot = Some(got);
-                }
+            let got = fr.get_with(Reader::frozen_hash(fr, key, fnv), key, MemTable::ALL);
+            if let Some(slot) = probed.frozen.get_mut(i) {
+                *slot = Some(got);
             }
             if got.is_some_and(|e| fr.has_tomb(e, SEE_ALL)) {
                 return (fr_ix + i, probed);
@@ -34256,12 +34137,10 @@ impl Reader {
             }
             let exts = if !holds(seg) {
                 None
-            } else if once {
-                seg.raw().lookup_hashed(key, fnv)
             } else {
-                seg.raw().lookup(key)
+                seg.raw().lookup_hashed(key, fnv)
             };
-            if keep && i < 64 {
+            if i < 64 {
                 if exts.is_some() {
                     probed.held |= 1 << i;
                 } else {
@@ -34470,33 +34349,29 @@ impl Reader {
         if self.opts.zpages != ZPages::Off && self.z_on() {
             return None;
         }
-        // The key's FNV word, which every source below the tables takes,
-        // after the live table where the table is asked first and its
-        // hash is not made from the word (`Options::mem_hash_fold`), so a
-        // read the table ends takes none.
-        // Both taken already where the read asked for its partition ahead
-        // of the live table (`pre`, `Options::shared_fall_ahead`).
-        let late = pre.is_none() && self.opts.point_live_first && mem.folds(key);
-        let fnv0 = match pre {
+        // The key's FNV word, which every source takes, and the key's
+        // partition and the pieces over it with the asks for the lines
+        // their probes will load first, before the live table's probe: both
+        // taken already where the read asked for its partition ahead of the
+        // live table (`pre`, `Options::shared_fall_ahead`). The live table
+        // asked first saved 78 instructions of a read it ends and cost the
+        // others their asks' lead: timed by kind under the held log at
+        // three hundred thousand keys, F's gets read 0.99x and 0.95x of
+        // this order and the scrambled mixes' 1.04-1.16x slower.
+        let fnv = match pre {
             Some((fnv, _)) => fnv,
-            None if late => 0,
             None => crate::flatindex::key_hash(key),
         };
-        // The key's partition and the pieces over it, and the asks for
-        // the lines their probes will load first: before the live table's
-        // probe, or after it where the live table is asked first and its
-        // chain did not end the read (`Options::point_live_first`).
-        let placed = match pre {
-            Some((fnv, at)) => Some(Reader::place_at(&self.opts, st, at, fnv, false)?),
-            None if self.opts.point_live_first => None,
-            None => Some(Reader::place(&self.opts, st, key, fnv0)?),
+        let (at, l0) = match pre {
+            Some((_, at)) => Reader::place_at(&self.opts, st, at, fnv, false)?,
+            None => Reader::place(&self.opts, st, key, fnv)?,
         };
         // The live table first: the values of the key's chain newest
         // first, the first `live_n` of `live`. They are slices of the
         // table's arena, which the state holds for the read. Every table
         // of a store is made with one shape, so the frozen tables below
         // take the live one's hash.
-        let mh = mem.hash_with(key, fnv0);
+        let mh = mem.hash_with(key, fnv);
         // A table that rewrites in place is read through a copy of the
         // chain under its record's lock, and its values are slices of the
         // copy, which outlives them on this frame.
@@ -34541,15 +34416,6 @@ impl Reader {
             }
             live_n = n;
         }
-        let fnv = if late {
-            crate::flatindex::key_hash(key)
-        } else {
-            fnv0
-        };
-        let (at, l0) = match placed {
-            Some(p) => p,
-            None => Reader::place(&self.opts, st, key, fnv)?,
-        };
         // The frozen tables newest first, where a seal is in flight: each
         // one's values as the live table's, the first `frozen_n[i]` of
         // `frozen[i]`, and `since` the oldest the pass reached, which is
@@ -34581,10 +34447,7 @@ impl Reader {
                 if !seg.may_hold_fnv(key, fnv) {
                     continue;
                 }
-                if let Some(c) =
-                    seg.raw()
-                        .find_fixed_hashed(key, fnv, self.opts.point_record_ahead)?
-                {
+                if let Some(c) = seg.raw().find_fixed_hashed(key, fnv)? {
                     // More records above the newest tombstone than the
                     // frame keeps: the general read's
                     // (`Options::point_placed_runs`).
@@ -34609,10 +34472,7 @@ impl Reader {
                 .get(at)
                 .filter(|s| self.placed_may_hold(s, key, fnv))
             {
-                match seg
-                    .raw()
-                    .read_all_fixed_hashed(key, fnv, self.opts.point_record_ahead, f)
-                {
+                match seg.raw().read_all_fixed_hashed(key, fnv, f) {
                     Ok(k) => n += k,
                     Err(e) => return Some(Err(err(&format!("segment read: {e}")))),
                 }
@@ -34684,10 +34544,8 @@ impl Reader {
         }
         let fnv = crate::flatindex::key_hash(key);
         let mh = mem.hash_with(key, fnv);
-        if self.opts.read_lines_ahead {
-            for seg in l0 {
-                seg.prefetch_probe(fnv);
-            }
+        for seg in l0 {
+            seg.prefetch_probe(fnv);
         }
         // Newest first, to the newest tombstone: `cut` once one is found.
         // A source the pass does not reach, being older than the
@@ -34721,10 +34579,7 @@ impl Reader {
                 if !seg.may_hold_fnv(key, fnv) {
                     continue;
                 }
-                if let Some(c) =
-                    seg.raw()
-                        .find_fixed_hashed(key, fnv, self.opts.point_record_ahead)?
-                {
+                if let Some(c) = seg.raw().find_fixed_hashed(key, fnv)? {
                     runs[i] = (c.run, c.records);
                     if c.tomb {
                         cut = true;
@@ -34737,10 +34592,7 @@ impl Reader {
         let mut n = 0u64;
         if !cut {
             if let Some(seg) = segs[..np].get(at).filter(|s| s.may_hold_fnv(key, fnv)) {
-                match seg
-                    .raw()
-                    .read_all_fixed_hashed(key, fnv, self.opts.point_record_ahead, f)
-                {
+                match seg.raw().read_all_fixed_hashed(key, fnv, f) {
                     Ok(k) => n += k,
                     Err(e) => return Some(Err(err(&format!("segment read: {e}")))),
                 }
@@ -34838,10 +34690,7 @@ impl Reader {
                 None => st.part_of(key, self.opts.point_fence_words),
             };
             if let Some(seg) = segs.get(at).filter(|s| self.placed_may_hold(s, key, fnv)) {
-                match seg
-                    .raw()
-                    .read_all_fixed_hashed(key, fnv, self.opts.point_record_ahead, f)
-                {
+                match seg.raw().read_all_fixed_hashed(key, fnv, f) {
                     Ok(k) => below = k,
                     Err(e) => return Some(Err(err(&format!("segment read: {e}")))),
                 }
@@ -34858,8 +34707,8 @@ impl Reader {
     }
 
     /// The placed read's partition for `key` and the pieces over it, with
-    /// the asks for the lines their probes load first where the options
-    /// ask (`read_lines_ahead`); `None` where the pieces are more than the
+    /// the asks for the lines their probes load first; `None` where the
+    /// pieces are more than the
     /// read takes. Inlined at both of the read's places for it, since as a
     /// closure it was a call and fifty instructions of every read.
     #[inline(always)]
@@ -34892,17 +34741,15 @@ impl Reader {
         if !opts.point_placed_runs && l0.len() > LAYERS_PIECES {
             return None;
         }
-        if opts.read_lines_ahead {
-            // The partition's slot first: it is the read's longest wait
-            // where no tombstone masks the partition, and the tables'
-            // probes and the pieces' filters are the lead for it. The
-            // newest pieces' filters, which the walk asks first.
-            if let Some(seg) = segs[..np].get(at).filter(|_| ask_slot) {
-                seg.prefetch_slot(fnv);
-            }
-            for seg in l0.iter().rev().take(PLACED_ASKS) {
-                seg.prefetch_probe(fnv);
-            }
+        // The partition's slot first: it is the read's longest wait where
+        // no tombstone masks the partition, and the tables' probes and the
+        // pieces' filters are the lead for it. The newest pieces' filters,
+        // which the walk asks first.
+        if let Some(seg) = segs[..np].get(at).filter(|_| ask_slot) {
+            seg.prefetch_slot(fnv);
+        }
+        for seg in l0.iter().rev().take(PLACED_ASKS) {
+            seg.prefetch_probe(fnv);
         }
         Some((at, l0))
     }
@@ -34916,49 +34763,36 @@ impl Reader {
     fn read_sources<F: FnMut(&[u8])>(&self, st: &State, key: &[u8], mut f: F) -> Result<u64> {
         let (segs, mem) = (&st.segs, &*st.mem);
         let mem_empty = mem.is_empty();
-        // The key's FNV word once, every source's hash taken from it
-        // (`Options::read_hash_once`); zero where each source hashes.
-        let once = self.opts.read_hash_once;
-        let fnv = if once {
-            crate::flatindex::key_hash(key)
-        } else {
-            0
-        };
-        let mem_h = |k: &[u8]| {
-            if once {
-                mem.hash_with(k, fnv)
-            } else {
-                mem.hash(k)
-            }
-        };
+        // The key's FNV word once, every source's hash taken from it: each
+        // source hashing the key itself, a byte at a time and a multiply a
+        // byte, three times over a read that met a piece, was a fifth of
+        // the scrambled D mix's thread at a hundred and three hundred
+        // thousand keys, where the unscrambled D, with no piece, put a
+        // twenty-fifth on it.
+        let fnv = crate::flatindex::key_hash(key);
         let hash = if mem_empty {
             0
         } else {
-            mem.prefetch_hashed(mem_h(key))
+            mem.prefetch_hashed(mem.hash_with(key, fnv))
         };
         let np = segs.partition_point(|s| s.level > 0);
         let at = st.part_of(key, self.opts.point_fence_words);
-        let holds = |s: &Seg| {
-            if once {
-                s.may_hold_fnv(key, fnv)
-            } else {
-                s.may_hold(key)
-            }
-        };
+        let holds = |s: &Seg| s.may_hold_fnv(key, fnv);
         let part = segs[..np].get(at).filter(|s| holds(s));
         let l0 = st.pieces_over(np, at);
         // The form's dispatch under either option that may serve the
         // partition, and only with the gate at the form (below).
         let part_z = self.opts.zpages != ZPages::Off && self.z_on();
         // The first lines the later sources' probes load, asked for before
-        // the earlier ones are read (`Options::read_lines_ahead`): each
-        // piece's filter block, which the partition's read is the lead
-        // for, and the partition's first hash slot only where the
-        // tombstone pass reads the newer sources ahead of it -- with no
-        // pass the lookup follows the ask at once, and the ask was 44
-        // instructions a read of the read pass for nothing.
+        // the earlier ones are read: each piece's filter block, which the
+        // partition's read is the lead for, and the partition's first hash
+        // slot only where the tombstone pass reads the newer sources ahead
+        // of it -- with no pass the lookup follows the ask at once, and the
+        // ask was 44 instructions a read of the read pass for nothing.
+        // Without them D read 0.90-0.95x and the scrambled D 0.95-0.97x at
+        // three hundred thousand keys.
         let tombs = st.has_tombstones();
-        if once && self.opts.read_lines_ahead && (!l0.is_empty() || tombs) {
+        if !l0.is_empty() || tombs {
             for seg in l0 {
                 seg.prefetch_probe(fnv);
             }
@@ -34980,7 +34814,7 @@ impl Reader {
         let fr_ix = 1 + l0.len();
         let mem_ix = fr_ix + st.frozen.len();
         // The newest-first pass tombstones require, and what it found of
-        // each source it probed (`Options::read_probes_once`).
+        // each source it probed.
         let (start, probed) = if tombs {
             self.tomb_pass(st, l0, key, fnv, hash, mem_empty, holds)
         } else {
@@ -34990,17 +34824,11 @@ impl Reader {
         // The segment read lends the extents on the index's frame; the arm
         // takes them by value, the shape before (`Options::exts_by_value`).
         let by_value = self.opts.exts_by_value;
-        let fixed = self.opts.point_fixed;
-        let ahead = self.opts.point_record_ahead;
         let seg_read = |seg: &Seg, f: &mut F| {
             if by_value {
                 seg.raw().read_all_by_value(key, f)
-            } else if once && fixed {
-                seg.raw().read_all_fixed_hashed(key, fnv, ahead, f)
-            } else if once {
-                seg.raw().read_all_hashed(key, fnv, f)
             } else {
-                seg.raw().read_all(key, f)
+                seg.raw().read_all_fixed_hashed(key, fnv, f)
             }
             .map_err(|e| err(&format!("segment read: {e}")))
         };
@@ -35048,7 +34876,7 @@ impl Reader {
             }
             let got = match probed.frozen.get(i) {
                 Some(&Some(got)) => got,
-                _ => fr.get_with(Reader::frozen_hash(fr, key, fnv, once), key, MemTable::ALL),
+                _ => fr.get_with(Reader::frozen_hash(fr, key, fnv), key, MemTable::ALL),
             };
             if let Some(e) = got {
                 let (offs, _) = fr.live_chain(e, SEE_ALL);
@@ -43644,48 +43472,26 @@ impl Reader {
         let (segs, mem) = (&st.segs, &*st.mem);
         let mem_empty = mem.is_empty();
         // One hash for every source and their first lines asked for
-        // together, as the read takes them (`Options::read_hash_once`,
-        // `Options::read_lines_ahead`).
-        let once = self.opts.read_hash_once;
-        let fnv = if once {
-            crate::flatindex::key_hash(key)
-        } else {
-            0
-        };
-        let mem_h = |k: &[u8]| {
-            if once {
-                mem.hash_with(k, fnv)
-            } else {
-                mem.hash(k)
-            }
-        };
+        // together, as the read takes them.
+        let fnv = crate::flatindex::key_hash(key);
         let hash = if mem_empty {
             0
         } else {
-            mem.prefetch_hashed(mem_h(key))
+            mem.prefetch_hashed(mem.hash_with(key, fnv))
         };
         let np = segs.partition_point(|s| s.level > 0);
         let at = st.part_of(key, self.opts.point_fence_words);
-        let holds = |s: &Seg| {
-            if once {
-                s.may_hold_fnv(key, fnv)
-            } else {
-                s.may_hold(key)
-            }
-        };
+        let holds = |s: &Seg| s.may_hold_fnv(key, fnv);
         let raw_count = |s: &Seg| {
-            if once {
-                s.raw().count_hashed(key, fnv)
-            } else {
-                s.raw().count(key)
-            }
-            .map_err(|e| err(&format!("segment count: {e}")))
+            s.raw()
+                .count_hashed(key, fnv)
+                .map_err(|e| err(&format!("segment count: {e}")))
         };
         let part = segs[..np].get(at).filter(|s| holds(s));
         let l0 = st.pieces_over(np, at);
         let part_z = self.opts.zpages != ZPages::Off && self.z_on();
         let tombs = st.has_tombstones();
-        if once && self.opts.read_lines_ahead && (!l0.is_empty() || tombs) {
+        if !l0.is_empty() || tombs {
             for seg in l0 {
                 seg.prefetch_probe(fnv);
             }
@@ -43698,7 +43504,7 @@ impl Reader {
         let fr_ix = 1 + l0.len();
         let mem_ix = fr_ix + st.frozen.len();
         // The newest-first pass tombstones require, and what it found of
-        // each source it probed (`Options::read_probes_once`).
+        // each source it probed.
         let (start, probed) = if tombs {
             self.tomb_pass(st, l0, key, fnv, hash, mem_empty, holds)
         } else {
@@ -43728,7 +43534,7 @@ impl Reader {
             }
             let got = match probed.frozen.get(i) {
                 Some(&Some(got)) => got,
-                _ => fr.get_with(Reader::frozen_hash(fr, key, fnv, once), key, MemTable::ALL),
+                _ => fr.get_with(Reader::frozen_hash(fr, key, fnv), key, MemTable::ALL),
             };
             if let Some(e) = got {
                 n += u64::from(e.count);

@@ -1795,95 +1795,85 @@ fn a_lone_piece_holding_a_tombstone_still_merges() {
 /// A point read over a store with tombstones in every kind of source --
 /// level-0 pieces carrying puts, a frozen table held short of its landing
 /// with deletes and appends, and the live table over both -- answers the
-/// model with the tombstone pass's probes kept for the reads after it
-/// (`Options::read_probes_once`) and with every source probed again, the
-/// shape before: through the writer, whose reads honour no watermark, and
+/// model with the tombstone pass's probes kept for the reads after it:
+/// through the writer, whose reads honour no watermark, and
 /// through a handle, whose live table is bounded by its mark; `read_all`
 /// and `count` both, every key the model has touched and one no source
 /// holds.
 #[test]
 fn a_point_read_over_tombstones_in_every_source_answers_from_one_probe_of_each() {
-    for once in [true, false] {
-        let name = if once { "probes-once" } else { "probes-twice" };
-        let d = dir(name);
-        let mut db = Db::create(
-            &d,
-            Options {
-                read_probes_once: once,
-                ..common::options()
-            },
-        )
-        .unwrap();
-        let mut m = ScanModel::default();
-        for k in 0u32..3000 {
-            m.append(&mut db, &format!("key-{k:05}"), &format!("v0-{k}"));
-        }
-        db.commit().unwrap();
-        db.flush().unwrap();
-        m.flushed();
-        // Two pieces of puts, each a delete and an append.
-        for round in 1..=2u32 {
-            for k in (round..3000u32).step_by(7) {
-                let key = format!("key-{k:05}");
-                m.delete(&mut db, &key);
-                m.append(&mut db, &key, &format!("v{round}-{k}"));
-            }
-            db.commit().unwrap();
-            db.seal().unwrap();
-            db.settle().unwrap();
-        }
-        let pieces = seg_names(&d)
-            .iter()
-            .filter(|n| !n.starts_with("par-"))
-            .count();
-        assert!(pieces >= 2, "{name}: the pieces: {:?}", seg_names(&d));
-        // A frozen table with deletes and appends, its landing held.
-        db.hold_seal_landing(true);
-        for k in (0..3000u32).step_by(11) {
-            m.delete(&mut db, &format!("key-{k:05}"));
-        }
-        for k in (5..3000u32).step_by(13) {
-            m.append(&mut db, &format!("key-{k:05}"), &format!("v3-{k}"));
+    let name = "probes-once";
+    let d = dir(name);
+    let mut db = Db::create(&d, common::options()).unwrap();
+    let mut m = ScanModel::default();
+    for k in 0u32..3000 {
+        m.append(&mut db, &format!("key-{k:05}"), &format!("v0-{k}"));
+    }
+    db.commit().unwrap();
+    db.flush().unwrap();
+    m.flushed();
+    // Two pieces of puts, each a delete and an append.
+    for round in 1..=2u32 {
+        for k in (round..3000u32).step_by(7) {
+            let key = format!("key-{k:05}");
+            m.delete(&mut db, &key);
+            m.append(&mut db, &key, &format!("v{round}-{k}"));
         }
         db.commit().unwrap();
         db.seal().unwrap();
-        assert_eq!(db.frozen_tables(), 1, "{name}: the frozen table");
-        // The live table over it: puts, second values and a key nothing
-        // older holds.
-        for k in (3..3000u32).step_by(5) {
-            let key = format!("key-{k:05}");
-            m.delete(&mut db, &key);
-            m.append(&mut db, &key, &format!("v4-{k}"));
-        }
-        for k in (1..3000u32).step_by(17) {
-            m.append(&mut db, &format!("key-{k:05}"), &format!("v5-{k}"));
-        }
-        m.append(&mut db, "key-99999", "past-the-end");
-        db.commit().unwrap();
-        let h = db.reader().unwrap();
-        let mut keys: Vec<Vec<u8>> = m.vals.keys().cloned().collect();
-        keys.push(b"key-77777x".to_vec());
-        for k in &keys {
-            let want = m.vals.get(k).cloned().unwrap_or_default();
-            let lossy = String::from_utf8_lossy(k);
-            assert_eq!(read_vec(&db, k), want, "{name}: the writer reads {lossy}");
-            assert_eq!(read_vec(&h, k), want, "{name}: the handle reads {lossy}");
-            assert_eq!(
-                db.count(k).unwrap(),
-                want.len() as u64,
-                "{name}: the writer counts {lossy}"
-            );
-            assert_eq!(
-                h.count(k).unwrap(),
-                want.len() as u64,
-                "{name}: the handle counts {lossy}"
-            );
-        }
-        drop(h);
-        db.hold_seal_landing(false);
         db.settle().unwrap();
-        db.close().unwrap();
     }
+    let pieces = seg_names(&d)
+        .iter()
+        .filter(|n| !n.starts_with("par-"))
+        .count();
+    assert!(pieces >= 2, "{name}: the pieces: {:?}", seg_names(&d));
+    // A frozen table with deletes and appends, its landing held.
+    db.hold_seal_landing(true);
+    for k in (0..3000u32).step_by(11) {
+        m.delete(&mut db, &format!("key-{k:05}"));
+    }
+    for k in (5..3000u32).step_by(13) {
+        m.append(&mut db, &format!("key-{k:05}"), &format!("v3-{k}"));
+    }
+    db.commit().unwrap();
+    db.seal().unwrap();
+    assert_eq!(db.frozen_tables(), 1, "{name}: the frozen table");
+    // The live table over it: puts, second values and a key nothing
+    // older holds.
+    for k in (3..3000u32).step_by(5) {
+        let key = format!("key-{k:05}");
+        m.delete(&mut db, &key);
+        m.append(&mut db, &key, &format!("v4-{k}"));
+    }
+    for k in (1..3000u32).step_by(17) {
+        m.append(&mut db, &format!("key-{k:05}"), &format!("v5-{k}"));
+    }
+    m.append(&mut db, "key-99999", "past-the-end");
+    db.commit().unwrap();
+    let h = db.reader().unwrap();
+    let mut keys: Vec<Vec<u8>> = m.vals.keys().cloned().collect();
+    keys.push(b"key-77777x".to_vec());
+    for k in &keys {
+        let want = m.vals.get(k).cloned().unwrap_or_default();
+        let lossy = String::from_utf8_lossy(k);
+        assert_eq!(read_vec(&db, k), want, "{name}: the writer reads {lossy}");
+        assert_eq!(read_vec(&h, k), want, "{name}: the handle reads {lossy}");
+        assert_eq!(
+            db.count(k).unwrap(),
+            want.len() as u64,
+            "{name}: the writer counts {lossy}"
+        );
+        assert_eq!(
+            h.count(k).unwrap(),
+            want.len() as u64,
+            "{name}: the handle counts {lossy}"
+        );
+    }
+    drop(h);
+    db.hold_seal_landing(false);
+    db.settle().unwrap();
+    db.close().unwrap();
 }
 
 fn ord_names(d: &std::path::Path) -> Vec<String> {
@@ -2295,24 +2285,23 @@ fn ord_probes(shape: OrdShape) -> Vec<Vec<u8>> {
     v
 }
 
-/// `Options::point_record_ahead` changes what a point read asks for ahead
-/// of a segment's record and nothing it returns: the fixture's store -- a
-/// partition, a piece with tombstones and a live table over both -- read
-/// with the option on and off through the writer and through a handle,
-/// answers every probe as the model does over the piece, with a table
+/// A point read asks for a segment's record's lines past its header as the
+/// slot names it, and the ask changes nothing it returns: the fixture's
+/// store -- a partition, a piece with tombstones and a live table over
+/// both -- read through the writer and through a handle answers every
+/// probe as the model does over the piece, with a table
 /// frozen in a held seal, after the seal lands, folded into the partition
 /// and under a live table after that; and under each of the settings that
 /// send those states to the four reads that read a segment's record where
 /// it lies -- the layered read that places its sources first, the one
 /// that does not, the two-source read and the general read. The asks this
-/// thread made say the option fired in each state: some with it on, none
-/// with it off (`flatindex::records_asked`, which counts in a build with
-/// debug assertions alone), since a read that never asked and one that
-/// always did answer the same; and a total over the states would not see
-/// one read that stopped asking beside another that still did.
+/// thread made say the ask was made in each state
+/// (`flatindex::records_asked`, which counts in a build with debug
+/// assertions alone), since a read that never asked and one that always
+/// did answer the same; and a total over the states would not see one
+/// read that stopped asking beside another that still did.
 #[test]
-fn a_point_read_that_asks_for_its_record_answers_as_one_that_does_not() {
-    assert!(Options::default().point_record_ahead, "the default");
+fn a_point_read_that_asks_for_its_record_answers_as_the_model() {
     for shape in [
         OrdShape::Short,
         OrdShape::Mixed,
@@ -2320,186 +2309,26 @@ fn a_point_read_that_asks_for_its_record_answers_as_one_that_does_not() {
         OrdShape::Binary,
     ] {
         for (lone, first) in [(true, true), (true, false), (false, true)] {
-            for ahead in [true, false] {
-                let name = format!("recordahead-{shape:?}-{lone}-{first}-{ahead}");
-                let mut fx = ord_fixture_with(
-                    &name,
-                    shape,
-                    Options {
-                        point_record_ahead: ahead,
-                        point_lone: lone,
-                        point_layers_lean: first,
-                        ..common::options()
-                    },
-                );
-                let key = |k: u32| ord_key(shape, k);
-                let show = |p: &[u8]| String::from_utf8_lossy(p).into_owned();
-                let probes = ord_probes(shape);
-                // Every probe through the writer and through a handle, the
-                // asks they made, and that the option fired as it is set:
-                // not where the compact form is forced, as the stride
-                // switch forces it, whose partitions the general read
-                // dispatches to their form files.
-                let check = |fx: &OrdFixture, when: &str| {
-                    let h = fx.db.reader().unwrap();
-                    let before = supdb::flatindex::records_asked();
-                    for p in &probes {
-                        let want = fx.model.get(p).cloned().unwrap_or_default();
-                        assert_eq!(read_vec(&fx.db, p), want, "{name} {when}: {}", show(p));
-                        assert_eq!(
-                            read_vec(&h, p),
-                            want,
-                            "{name} {when}, a handle: {}",
-                            show(p)
-                        );
-                    }
-                    let asked = supdb::flatindex::records_asked() - before;
-                    if cfg!(debug_assertions) && !common::stride_switch() {
-                        if ahead {
-                            assert!(asked > 0, "{name} {when}: the reads asked for no record");
-                        } else {
-                            assert_eq!(asked, 0, "{name} {when}: asks with the option off");
-                        }
-                    }
-                };
-                check(&fx, "over a piece");
-                // The layered reads ask at two sites, a piece's record and
-                // the partition's, and a total over the probes sees one
-                // site stop asking beside the other: so keys the partition
-                // alone holds (even, no piece's and no table's, by the
-                // fixture's moduli), whose reads only the partition's site
-                // can ask for, and keys whose newest source is the piece's
-                // tombstone and a value, whose reads only the piece's site
-                // can, each read through the writer and a handle.
-                if lone && cfg!(debug_assertions) && !common::stride_switch() {
-                    let h = fx.db.reader().unwrap();
-                    let only_part: Vec<u32> = (0u32..4_000)
-                        .step_by(2)
-                        .filter(|k| {
-                            [2, 4, 8, 10].contains(&(k % 12)) && ![4, 8].contains(&(k % 16))
-                        })
-                        .take(40)
-                        .collect();
-                    // A tombstone and a value after it: a tombstone alone
-                    // is no fixed record, which the placed read declines
-                    // to the read after it, whose site would ask for it.
-                    let piece_tomb: Vec<u32> = (0u32..4_000)
-                        .step_by(24)
-                        .filter(|k| ![4, 8].contains(&(k % 16)))
-                        .take(40)
-                        .collect();
-                    for (what, keys) in [
-                        ("the partition's", &only_part),
-                        ("the piece's", &piece_tomb),
-                    ] {
-                        let before = supdb::flatindex::records_asked();
-                        for &k in keys.iter() {
-                            let want = fx.model.get(&key(k)).cloned().unwrap_or_default();
-                            assert_eq!(read_vec(&fx.db, &key(k)), want, "{name}: {k}");
-                            assert_eq!(read_vec(&h, &key(k)), want, "{name}, a handle: {k}");
-                        }
-                        let asked = supdb::flatindex::records_asked() - before;
-                        let reads = 2 * keys.len() as u64;
-                        if ahead {
-                            assert!(
-                                asked >= reads,
-                                "{name}: {asked} asks at {what} site over {reads} reads"
-                            );
-                        } else {
-                            assert_eq!(asked, 0, "{name}: asks at {what} site with the option off");
-                        }
-                    }
-                }
-                fx.db.hold_seal_landing(true);
-                fx.db.seal().unwrap();
-                assert!(fx.db.frozen_tables() >= 1, "{name}: a frozen table");
-                for k in (3u32..4_010).step_by(11) {
-                    if k.is_multiple_of(3) {
-                        fx.db.delete(&key(k));
-                        fx.model.insert(key(k), Vec::new());
-                    } else {
-                        let v = format!("v5-{k}").into_bytes();
-                        fx.db.append(&key(k), &v);
-                        fx.model.entry(key(k)).or_default().push(v);
-                    }
-                }
-                fx.db.commit().unwrap();
-                check(&fx, "with the seal held");
-                fx.db.hold_seal_landing(false);
-                fx.db.settle().unwrap();
-                check(&fx, "after the landing");
-                fx.db.flush().unwrap();
-                fx.db.settle().unwrap();
-                assert_eq!(fx.db.levels().1, 0, "{name}: no piece after the flush");
-                check(&fx, "over the partitions alone");
-                for k in (0u32..4_020).step_by(7) {
-                    if k.is_multiple_of(2) {
-                        let v = format!("v6-{k}").into_bytes();
-                        fx.db.put(&key(k), &v);
-                        fx.model.insert(key(k), vec![v]);
-                    } else {
-                        fx.db.delete(&key(k));
-                        fx.model.insert(key(k), Vec::new());
-                    }
-                }
-                fx.db.commit().unwrap();
-                check(&fx, "under a live table");
-                fx.db.close().unwrap();
-            }
-        }
-    }
-}
-
-/// `Options::read_hash_once` and `Options::read_lines_ahead` change how a
-/// point read hashes its key and what it asks for ahead, and nothing it
-/// returns: the fixture's store -- a partition, a piece with tombstones and
-/// a live table over both -- with a table frozen in a held seal between
-/// the piece and the live table, read with each of the four settings
-/// through the writer and through a handle, answers every probe as the
-/// model does, held and after the seal lands; and the count with it.
-#[test]
-fn a_point_read_hashed_once_answers_as_one_hashed_per_source() {
-    let d = Options::default();
-    assert!(d.read_hash_once && d.read_lines_ahead, "the default");
-    for shape in [
-        OrdShape::Short,
-        OrdShape::Mixed,
-        OrdShape::Wide,
-        OrdShape::Binary,
-    ] {
-        for (once, ahead) in [(true, true), (true, false), (false, true), (false, false)] {
-            let name = format!("hashonce-{shape:?}-{once}-{ahead}");
+            let name = format!("recordahead-{shape:?}-{lone}-{first}");
             let mut fx = ord_fixture_with(
                 &name,
                 shape,
                 Options {
-                    read_hash_once: once,
-                    read_lines_ahead: ahead,
+                    point_lone: lone,
+                    point_layers_lean: first,
                     ..common::options()
                 },
             );
             let key = |k: u32| ord_key(shape, k);
-            // The table the fixture left live, frozen in a seal that does
-            // not land, and a live table over it with tombstones over all
-            // four sources and values after some.
-            fx.db.hold_seal_landing(true);
-            fx.db.seal().unwrap();
-            assert!(fx.db.frozen_tables() >= 1, "{name}: a frozen table");
-            for k in (1u32..4_010).step_by(9) {
-                if k.is_multiple_of(2) {
-                    fx.db.delete(&key(k));
-                    fx.model.insert(key(k), Vec::new());
-                } else {
-                    let v = format!("v4-{k}").into_bytes();
-                    fx.db.append(&key(k), &v);
-                    fx.model.entry(key(k)).or_default().push(v);
-                }
-            }
-            fx.db.commit().unwrap();
             let show = |p: &[u8]| String::from_utf8_lossy(p).into_owned();
             let probes = ord_probes(shape);
+            // Every probe through the writer and through a handle, the
+            // asks they made, and that the reads asked: not where the compact form is forced, as the stride
+            // switch forces it, whose partitions the general read
+            // dispatches to their form files.
             let check = |fx: &OrdFixture, when: &str| {
                 let h = fx.db.reader().unwrap();
+                let before = supdb::flatindex::records_asked();
                 for p in &probes {
                     let want = fx.model.get(p).cloned().unwrap_or_default();
                     assert_eq!(read_vec(&fx.db, p), want, "{name} {when}: {}", show(p));
@@ -2509,20 +2338,153 @@ fn a_point_read_hashed_once_answers_as_one_hashed_per_source() {
                         "{name} {when}, a handle: {}",
                         show(p)
                     );
-                    assert_eq!(
-                        fx.db.count(p).unwrap(),
-                        want.len() as u64,
-                        "{name} {when}: the count of {}",
-                        show(p)
-                    );
+                }
+                let asked = supdb::flatindex::records_asked() - before;
+                if cfg!(debug_assertions) && !common::stride_switch() {
+                    assert!(asked > 0, "{name} {when}: the reads asked for no record");
                 }
             };
+            check(&fx, "over a piece");
+            // The layered reads ask at two sites, a piece's record and
+            // the partition's, and a total over the probes sees one
+            // site stop asking beside the other: so keys the partition
+            // alone holds (even, no piece's and no table's, by the
+            // fixture's moduli), whose reads only the partition's site
+            // can ask for, and keys whose newest source is the piece's
+            // tombstone and a value, whose reads only the piece's site
+            // can, each read through the writer and a handle.
+            if lone && cfg!(debug_assertions) && !common::stride_switch() {
+                let h = fx.db.reader().unwrap();
+                let only_part: Vec<u32> = (0u32..4_000)
+                    .step_by(2)
+                    .filter(|k| [2, 4, 8, 10].contains(&(k % 12)) && ![4, 8].contains(&(k % 16)))
+                    .take(40)
+                    .collect();
+                // A tombstone and a value after it: a tombstone alone
+                // is no fixed record, which the placed read declines
+                // to the read after it, whose site would ask for it.
+                let piece_tomb: Vec<u32> = (0u32..4_000)
+                    .step_by(24)
+                    .filter(|k| ![4, 8].contains(&(k % 16)))
+                    .take(40)
+                    .collect();
+                for (what, keys) in [
+                    ("the partition's", &only_part),
+                    ("the piece's", &piece_tomb),
+                ] {
+                    let before = supdb::flatindex::records_asked();
+                    for &k in keys.iter() {
+                        let want = fx.model.get(&key(k)).cloned().unwrap_or_default();
+                        assert_eq!(read_vec(&fx.db, &key(k)), want, "{name}: {k}");
+                        assert_eq!(read_vec(&h, &key(k)), want, "{name}, a handle: {k}");
+                    }
+                    let asked = supdb::flatindex::records_asked() - before;
+                    let reads = 2 * keys.len() as u64;
+                    assert!(
+                        asked >= reads,
+                        "{name}: {asked} asks at {what} site over {reads} reads"
+                    );
+                }
+            }
+            fx.db.hold_seal_landing(true);
+            fx.db.seal().unwrap();
+            assert!(fx.db.frozen_tables() >= 1, "{name}: a frozen table");
+            for k in (3u32..4_010).step_by(11) {
+                if k.is_multiple_of(3) {
+                    fx.db.delete(&key(k));
+                    fx.model.insert(key(k), Vec::new());
+                } else {
+                    let v = format!("v5-{k}").into_bytes();
+                    fx.db.append(&key(k), &v);
+                    fx.model.entry(key(k)).or_default().push(v);
+                }
+            }
+            fx.db.commit().unwrap();
             check(&fx, "with the seal held");
             fx.db.hold_seal_landing(false);
             fx.db.settle().unwrap();
             check(&fx, "after the landing");
+            fx.db.flush().unwrap();
+            fx.db.settle().unwrap();
+            assert_eq!(fx.db.levels().1, 0, "{name}: no piece after the flush");
+            check(&fx, "over the partitions alone");
+            for k in (0u32..4_020).step_by(7) {
+                if k.is_multiple_of(2) {
+                    let v = format!("v6-{k}").into_bytes();
+                    fx.db.put(&key(k), &v);
+                    fx.model.insert(key(k), vec![v]);
+                } else {
+                    fx.db.delete(&key(k));
+                    fx.model.insert(key(k), Vec::new());
+                }
+            }
+            fx.db.commit().unwrap();
+            check(&fx, "under a live table");
             fx.db.close().unwrap();
         }
+    }
+}
+
+/// A point read hashes its key once for every source and asks for their
+/// first lines ahead, and nothing it returns moves: the fixture's store --
+/// a partition, a piece with tombstones and a live table over both -- with
+/// a table frozen in a held seal between the piece and the live table,
+/// read through the writer and through a handle, answers every probe as
+/// the model does, held and after the seal lands; and the count with it.
+#[test]
+fn a_point_read_hashed_once_answers_as_the_model() {
+    for shape in [
+        OrdShape::Short,
+        OrdShape::Mixed,
+        OrdShape::Wide,
+        OrdShape::Binary,
+    ] {
+        let name = format!("hashonce-{shape:?}");
+        let mut fx = ord_fixture_with(&name, shape, common::options());
+        let key = |k: u32| ord_key(shape, k);
+        // The table the fixture left live, frozen in a seal that does
+        // not land, and a live table over it with tombstones over all
+        // four sources and values after some.
+        fx.db.hold_seal_landing(true);
+        fx.db.seal().unwrap();
+        assert!(fx.db.frozen_tables() >= 1, "{name}: a frozen table");
+        for k in (1u32..4_010).step_by(9) {
+            if k.is_multiple_of(2) {
+                fx.db.delete(&key(k));
+                fx.model.insert(key(k), Vec::new());
+            } else {
+                let v = format!("v4-{k}").into_bytes();
+                fx.db.append(&key(k), &v);
+                fx.model.entry(key(k)).or_default().push(v);
+            }
+        }
+        fx.db.commit().unwrap();
+        let show = |p: &[u8]| String::from_utf8_lossy(p).into_owned();
+        let probes = ord_probes(shape);
+        let check = |fx: &OrdFixture, when: &str| {
+            let h = fx.db.reader().unwrap();
+            for p in &probes {
+                let want = fx.model.get(p).cloned().unwrap_or_default();
+                assert_eq!(read_vec(&fx.db, p), want, "{name} {when}: {}", show(p));
+                assert_eq!(
+                    read_vec(&h, p),
+                    want,
+                    "{name} {when}, a handle: {}",
+                    show(p)
+                );
+                assert_eq!(
+                    fx.db.count(p).unwrap(),
+                    want.len() as u64,
+                    "{name} {when}: the count of {}",
+                    show(p)
+                );
+            }
+        };
+        check(&fx, "with the seal held");
+        fx.db.hold_seal_landing(false);
+        fx.db.settle().unwrap();
+        check(&fx, "after the landing");
+        fx.db.close().unwrap();
     }
 }
 
@@ -2706,10 +2668,10 @@ fn a_placed_read_takes_a_range_under_more_pieces_than_its_frame_keeps() {
     }
 }
 
-/// `Options::point_fixed` and `Options::point_lone` change the path a point
-/// read takes and nothing it returns: the fixture's store -- a partition, a
-/// piece with tombstones and a live table over both -- read with each of
-/// the four settings through the writer and through a handle answers every
+/// `Options::point_lone` changes the path a point read takes and nothing it
+/// returns: the fixture's store -- a partition, a piece with tombstones and
+/// a live table over both -- read with it and without through the writer
+/// and through a handle answers every
 /// probe as the model does, with a table frozen in a held seal between the
 /// piece and the live table, after the seal lands, and after a flush has
 /// folded everything into the partition, with nothing unsealed and then
@@ -2730,29 +2692,19 @@ fn a_placed_read_takes_a_range_under_more_pieces_than_its_frame_keeps() {
 #[test]
 fn a_lean_point_read_answers_as_the_general_one() {
     let d = Options::default();
-    assert!(
-        d.point_fixed && d.point_lone && d.point_layers_lean,
-        "the default"
-    );
+    assert!(d.point_lone && d.point_layers_lean, "the default");
     for shape in [
         OrdShape::Short,
         OrdShape::Mixed,
         OrdShape::Wide,
         OrdShape::Binary,
     ] {
-        for (fixed, lone, first) in [
-            (true, true, true),
-            (true, true, false),
-            (true, false, true),
-            (false, true, true),
-            (false, false, true),
-        ] {
-            let name = format!("leanread-{shape:?}-{fixed}-{lone}-{first}");
+        for (lone, first) in [(true, true), (true, false), (false, true)] {
+            let name = format!("leanread-{shape:?}-{lone}-{first}");
             let mut fx = ord_fixture_with(
                 &name,
                 shape,
                 Options {
-                    point_fixed: fixed,
                     point_lone: lone,
                     point_layers_lean: first,
                     ..common::options()
@@ -2800,12 +2752,12 @@ fn a_lean_point_read_answers_as_the_general_one() {
                 (after.0 - before.0, after.1 - before.1)
             };
             let reads = probes.len() as u64;
-            // Which read a store may take: both options, or neither path.
-            // And neither where the compact form is forced, as the stride
+            // Which read a store may take: with the option, and with it
+            // off neither path. And neither where the compact form is forced, as the stride
             // switch forces it (`common::stride_switch`): a partition a
             // form file may serve is dispatched by the general read, so
-            // there the four settings are held to the model alone.
-            let lean = fixed && lone && !common::stride_switch();
+            // there the settings are held to the model alone.
+            let lean = lone && !common::stride_switch();
             // A partition, a piece and the live table: the layered read,
             // for every key whose records are the common shape.
             let (two, layered) = check(&fx, "over a piece");

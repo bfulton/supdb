@@ -2237,7 +2237,7 @@ impl<B: Bytes> Blob<B> {
     }
 
     /// `read_all_hashed` with the common record read where it lies
-    /// (`FlatIndex::read_fixed_hashed`, `Options::point_fixed`), and every
+    /// (`FlatIndex::read_fixed_hashed`), and every
     /// other record as `read_all_hashed` reads it, out of line: with the
     /// general read's frame beside it, the common read saved and restored
     /// six registers it never used.
@@ -2246,11 +2246,10 @@ impl<B: Bytes> Blob<B> {
         &self,
         key: &[u8],
         h: u64,
-        ahead: bool,
         f: &mut F,
     ) -> Result<u64> {
         if let Some((sec, idx)) = self.flat() {
-            if let Some(n) = idx.read_fixed_hashed(sec, key, h, ahead, f) {
+            if let Some(n) = idx.read_fixed_hashed(sec, key, h, f) {
                 return Ok(n);
             }
         }
@@ -2268,10 +2267,9 @@ impl<B: Bytes> Blob<B> {
         &self,
         key: &[u8],
         h: u64,
-        ahead: bool,
     ) -> Option<Option<crate::flatindex::CompactFixed<'_>>> {
         let (sec, idx) = self.flat()?;
-        idx.find_fixed_hashed(sec, key, h, ahead)
+        idx.find_fixed_hashed(sec, key, h)
     }
 
     /// `read_all_hashed`, never inlined (`read_all_fixed_hashed`).

@@ -964,12 +964,7 @@ sequences go the fast loop's way (`Options::zpages_flat_slack` off);
 `supdb-settlegated` and `supdb-ingestsettlegated` are `supdb` and
 `supdb-ingest` filing a commit's batch at the write only where the
 partitions' data passes the last-level cache
-(`Options::forms_settle_past_llc`); `supdb-readhashes` and
-`supdb-ingestreadhashes` are `supdb` and `supdb-ingest` with a point read
-hashing its key in each source it consults (`Options::read_hash_once`
-off), and `supdb-readnoahead` and `supdb-ingestreadnoahead` with it asking
-for the memtable's slot alone ahead of its probes
-(`Options::read_lines_ahead` off); `supdb-settlebuildsfiled` and
+(`Options::forms_settle_past_llc`); `supdb-settlebuildsfiled` and
 `supdb-ingestsettlebuildsfiled` are `supdb` and `supdb-ingest` with a
 burst's batch filed in the commit building the forms its settle filed into
 (`Options::forms_settle_builds_filed`); `supdb-ingestpromote` is
@@ -997,14 +992,6 @@ other batch within the backlog bound (`Options::upkeep_pace_syncs_model`);
 buying commit has synced, where the default writes it ahead of the
 commit's frames on the writer's path (`Options::wal_ahead_beside`,
 refuted);
-`supdb-probestwice` and `supdb-ingestprobestwice` have a point read over a
-store with tombstones probe every source again after its tombstone pass,
-where the default keeps what the pass found of each source
-(`Options::read_probes_once`);
-`supdb-pointexts` and `supdb-ingestpointexts` have a point read rebuild
-the extent of every record it reads and walk the run by it, where the
-default takes the values of the common record, the compact record with a
-fixed run, from the record where it lies (`Options::point_fixed`), and
 `supdb-pointsources` and `supdb-ingestpointsources` have every point read
 take the general read of its sources, where the default reads a partition
 and the live table alone, or the partition, its pieces, the frozen tables

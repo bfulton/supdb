@@ -66,11 +66,8 @@
 //!   the process in a quarter of the seeds (`SyncPolicy::Explicit`,
 //!   `Cfg::hold_small`), dropped at half its reopens and closed at the
 //!   rest; and in half of those builds no frames (`Cfg::held_frames`),
-//!   closed at every reopen; and in a quarter of the seeds reads a
-//!   record as it reaches it, no line asked ahead of its header
-//!   (`Cfg::record_ahead`), and in a quarter asks the live table before
-//!   a point read finds its partition (`Cfg::live_first`), and in
-//!   a quarter hashes a memtable's keys by FNV alone (`Cfg::mem_fold`);
+//!   closed at every reopen; and in a quarter of the seeds hashes a
+//!   memtable's keys by FNV alone (`Cfg::mem_fold`);
 //!   and in a quarter of the seeds that hold their log overwrites a put's
 //!   value of the put's length where it lies on the `z` store, its handles
 //!   claimed only with nothing staged (`Cfg::in_place`); and in a quarter
@@ -454,14 +451,12 @@ struct Cfg {
     /// compact form is installed (`Options::merge_quiet_any_gate`): in half
     /// the seeds that draw the third merge.
     merge_quiet_any: bool,
-    /// A point read takes the common record where it lies
-    /// (`Options::point_fixed`) and reads a store's sources in their
-    /// common shape by the two-source and the layered read
-    /// (`Options::point_lone`): each off in a quarter of the seeds under
-    /// `ZFUZZ_OPTVARY`, the side generator's next two draws, and on
-    /// otherwise, as the engine has them, so the general read is held to
-    /// the model beside the reads that stand in for it.
-    point_fixed: bool,
+    /// A point read reads a store's sources in their common shape by the
+    /// two-source and the layered read (`Options::point_lone`): off in a
+    /// quarter of the seeds under `ZFUZZ_OPTVARY`, the side generator's
+    /// draw after the one `point_fixed` took, and on otherwise, as the
+    /// engine has it, so the general read is held to the model beside the
+    /// reads that stand in for it.
     point_lone: bool,
     /// The layered read that places its sources first
     /// (`Options::point_layers_lean`): off in a quarter of the seeds under
@@ -481,19 +476,10 @@ struct Cfg {
     /// layered read's. Such a seed's store is closed at every reopen, since
     /// a drop keeps nothing a drain has not covered.
     held_frames: bool,
-    /// A point read asks for its record's lines past the first as the slot
-    /// names it (`Options::point_record_ahead`): off in a quarter of the
-    /// seeds under `ZFUZZ_OPTVARY`, the side generator's draw after the
-    /// frames', and on otherwise, as the engine has it.
-    record_ahead: bool,
-    /// The read that places its sources asks the live table before it
-    /// finds the partition (`Options::point_live_first`): on in a quarter
-    /// of the seeds under `ZFUZZ_OPTVARY`, the side generator's draw after
-    /// the record ask's, and off otherwise, as the engine has it.
-    live_first: bool,
     /// A memtable hashes a sixteen-byte key by the fold of its words
     /// (`Options::mem_hash_fold`): off in a quarter of the seeds under
-    /// `ZFUZZ_OPTVARY`, the side generator's draw after the live table's,
+    /// `ZFUZZ_OPTVARY`, the side generator's draw after the two that
+    /// `point_record_ahead` and `point_live_first` took,
     /// and on otherwise, as the engine has it.
     mem_fold: bool,
     /// The `z` store's puts overwrite a value of their length where it lies
@@ -857,13 +843,17 @@ fn pick_cfg(rng: &mut Rng, want_cache: bool) -> Cfg {
     let (heads_on, land_on) = (side.chance(50), side.chance(50));
     let quiet_on = side.chance(50);
     let quiet_any = side.chance(50);
-    let (fixed_off, lone_off) = (side.chance(25), side.chance(25));
+    // The draw `point_fixed` took, kept so that the draws after it stand.
+    let _ = side.chance(25);
+    let lone_off = side.chance(25);
     let (explicit_on, hold_small) = (side.chance(25), side.chance(50));
     // After every draw before it, so that it moves none of them.
     let layers_as_one = side.chance(25);
     let no_frames = side.chance(50);
-    let ask_off = side.chance(25);
-    let live_first = side.chance(25);
+    // The draws `point_record_ahead` and `point_live_first` took, kept so
+    // that the draws after them stand.
+    let _ = side.chance(25);
+    let _ = side.chance(25);
     let mem_fnv = side.chance(25);
     let in_place = side.chance(25);
     let spare_off = side.chance(25);
@@ -946,13 +936,10 @@ fn pick_cfg(rng: &mut Rng, want_cache: bool) -> Cfg {
         land_bounds: !(vary && land_on),
         merge_quiet: !(vary && quiet_on),
         merge_quiet_any: vary && !quiet_on && quiet_any,
-        point_fixed: !(vary && fixed_off),
         point_lone: !(vary && lone_off),
         point_layers_lean: !(vary && layers_as_one),
         hold_small: vary && explicit_on && hold_small,
         held_frames: !(vary && explicit_on && no_frames),
-        record_ahead: !(vary && ask_off),
-        live_first: vary && live_first,
         mem_fold: !(vary && mem_fnv),
         in_place: vary && explicit_on && in_place,
         run_spare: !(vary && spare_off),
@@ -1006,12 +993,9 @@ fn opts(c: &Cfg) -> Options {
         land_bounds_read: c.land_bounds,
         merge_parallel_quiet: if c.merge_quiet { 3 } else { 0 },
         merge_quiet_any_gate: c.merge_quiet_any,
-        point_fixed: c.point_fixed,
         point_lone: c.point_lone,
         point_layers_lean: c.point_layers_lean,
         held_frames: c.held_frames,
-        point_record_ahead: c.record_ahead,
-        point_live_first: c.live_first,
         mem_hash_fold: c.mem_fold,
         wal_hold_bytes: if c.hold_small {
             2 << 10
@@ -3084,8 +3068,6 @@ fn run_range() {
     let mut held = [0u64; 2];
     let mut reads = [0u64; 3];
     let mut frameless = 0u64;
-    let mut unasked = 0u64;
-    let mut live_first = 0u64;
     let mut mem_fnv = 0u64;
     let mut in_place = [0u64; 2];
     let mut share = [0u64; 4];
@@ -3099,12 +3081,6 @@ fn run_range() {
         let drawn = seed_draws(seed, want_cache).0;
         if !drawn.held_frames {
             frameless += 1;
-        }
-        if !drawn.record_ahead {
-            unasked += 1;
-        }
-        if drawn.live_first {
-            live_first += 1;
         }
         if !drawn.mem_fold {
             mem_fnv += 1;
@@ -3151,7 +3127,7 @@ fn run_range() {
         }
     }
     eprintln!(
-        "seeds {from}..{to}: reopens {reopens}, abandons {abandons}, bindings {bindings}, merges beside {beside}, cache units given back {evicted}, chunks decrypted {fills}, reads through a form {zreads}, forms-off switches {switches}, sparse forms recut {recuts}, heads owned {} given back {}, point parts {} admits {} key hits {} walk owned {} walk parts {} hot starts {} copy starts {} stale exits {} cursor steps {} bounds by head {} landings left {} quiet merges {} key sequences kept {} rank patches {} rank starts {} copies packed {} unpacked {}, snapshots kept {kept}, log frames dropped {} spilled {}, held logs with no frames {frameless}, reads with no record asked {unasked}, live table asked first {live_first}, memtables hashed by FNV {mem_fnv}, overwriting puts {} overwrites {}, point reads two-source {} layered {} placed {}, FAILURES {}",
+        "seeds {from}..{to}: reopens {reopens}, abandons {abandons}, bindings {bindings}, merges beside {beside}, cache units given back {evicted}, chunks decrypted {fills}, reads through a form {zreads}, forms-off switches {switches}, sparse forms recut {recuts}, heads owned {} given back {}, point parts {} admits {} key hits {} walk owned {} walk parts {} hot starts {} copy starts {} stale exits {} cursor steps {} bounds by head {} landings left {} quiet merges {} key sequences kept {} rank patches {} rank starts {} copies packed {} unpacked {}, snapshots kept {kept}, log frames dropped {} spilled {}, held logs with no frames {frameless}, memtables hashed by FNV {mem_fnv}, overwriting puts {} overwrites {}, point reads two-source {} layered {} placed {}, FAILURES {}",
         heads[0],
         heads[1],
         point[0],
