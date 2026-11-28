@@ -32,7 +32,8 @@ Tree Borrows.
 ## Verdicts
 
 - Gate: `all checks passed: build test stride onefile lint wasm bench lists`
-  on `bb62fa9`. Rerun on `9688c74` in progress (started 14:05).
+  on `bb62fa9`, and again on `9688c74` (14:05 to 14:36), the head's code;
+  `b4d49e5` and after add only this file.
 - Fuzz past the gate's ranges on `bb62fa9`
   (`sh release/findings/hostile-input/fuzz-long.sh MODE 24 3024 50 3`):
   `cipher 24..3024: 60 blocks ok, 0 failed` (180,256 chunks decrypted);
@@ -49,12 +50,14 @@ Tree Borrows.
     `encode_run`.
   - `land`: `Blob::open_with` +270, `Sec::get` +192,
     `MemTable::index_insert` +152 over the run (open-path checks).
-- wasm module: 133,566 bytes against 131,565 at the base (+2,001). The
+- wasm module: 133,566 bytes (54,204 gzip) against 131,565 (53,556) at
+  the base, +2,001 (+648 gzip). The
   reason is the new refusals' checks and their error strings in the
   readers. No budget is enforced (`web/build.sh` prints the sizes).
 
 ## Next
 
-1. Read the gate on `9688c74`: `grep -E "all checks|GATE EXIT" gate log`
-   (rerun: `sh scripts/check.sh`, with a `TMPDIR` of its own).
-2. Report to the parent.
+Nothing is in progress. Left for others: the cost raises above (the
+parent's call), and a key's values past 4 GiB in total across appends,
+which the store takes and its seal then refuses (`SegmentWriter::end_with`)
+-- not a narrowing, and not touched here.
