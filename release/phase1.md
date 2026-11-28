@@ -61,6 +61,11 @@ not on each piece.
   (`release/baseline.md`, 3.1). The first batch's one red was the last kind:
   `Reader::read_layers` +2 an op, a spill and a reload of `rsi`, in probes
   whose totals fell by 3 a read.
+- A spill of the allowed kind whose probe nets above zero, in a function
+  another track also changes, is reported by the track and fixed once on
+  the merged tree, where the function's last change lands. `settle_each`
+  is the first such case: batch 2, track A's PR5 and track B's PR10 each
+  moved it by spills (+0.16, +13.9 and +11.0 an op on `land`).
 - The lists that only go down are lowered in the same commit:
   `tests/data/cost-entries.txt` for a removed seam, `tests/data/couplings.txt`
   for a removed branch that held a counted token.
