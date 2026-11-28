@@ -83,7 +83,24 @@ seal's loop gain 63 a key where `key_hash` and `BigVec::push` are now
 inlined into them and fall by as much or more. `ba3015d` alone had read the
 seal at +71 and the merge at +10.
 
+## On the merged tree (`cbe4db2`: this branch merged with `68c68ad0`)
+
+Count, `sh scripts/cost.sh e927955f merge` (16:00 UTC; once more with
+valgrind given `--dump-instr=yes` through a `PATH` shim, counts identical):
+`merge` 1,547,405,355 -> 1,543,199,900, -21.03 an op in total. By function:
+`SegmentWriter::end_with` +63.7 an op where `key_hash` (-55.0) and
+`BigVec::push` (-32.7) are now inlined into it; `compact_run` +13.5 an op.
+`compact_run` by instruction: moves +2,599,985, jumps +400,004, adds
+-400,006, padding changed, no new compare or branch on a length (the six
+compares against all-ones words are on both sides). By source line: the
+merge's key walk inlined into it (`let Some(k) = *c else`, `*c = key(i,
+rank[i])?`, the key compare) laid out again, and the call of `end_with` one
+instruction a key. No writer check sits in it; the parent read this as
+inlining that moved and passed it.
+
+Gate on `cbe4db2`: `all checks passed: build test stride onefile lint wasm
+bench lists` (15:47 to 16:19 UTC). wasm module 133,574 bytes, 54,198 gzip.
+
 ## Next
 
-In progress: the full count and the gate on `68d3c10` (started 15:29).
-Then this file's verdict lines, push, and the report to the parent.
+Nothing in progress. The parent merges `cbe4db2` onward, the cut included.
