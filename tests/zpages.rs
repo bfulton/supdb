@@ -15498,8 +15498,8 @@ fn a_cursor_holds_a_pages_view_across_its_groups_and_asks_for_the_next() {
 /// search's, and a step for every other -- and none is without it. The
 /// entries come back as the model has them either way, across every page
 /// the walk crossed. A few of the lowest keys are written first so the
-/// partition does not take the bulk walk, which steps by an option of its
-/// own (`Options::zpages_bulk_steps`), and the handle builds its own table
+/// partition does not take the bulk walk, which steps the fence on its
+/// own, and the handle builds its own table
 /// (`commit_forms` off), as the cursor's other tests do.
 #[cfg(target_os = "linux")]
 #[test]
@@ -15570,166 +15570,20 @@ fn a_cursor_steps_to_the_next_fence_entry_where_its_walk_ran_off_one() {
     }
 }
 
-/// A block-cache scan's start over a covered partition is placed once
-/// (`Options::zpages_seek_seeds`): the writer's scan from a key in the
-/// partition's middle goes through the form file's cursor for its seek and
-/// seeds the partition's reader with it -- the seed count moves by one and
-/// the first block's walk resumes the cursor -- where without the option
-/// the seek finds the rank through the fence and a group and the walk
-/// places a second cursor at the rank, which opens the start's group
-/// again out of the memo. The entries come back as the model has them
-/// either way. The lowest keys
-/// are written first so the partition does not take the bulk walk, and the
-/// writer's own table is built by the scan (`commit_forms` off).
-#[cfg(target_os = "linux")]
-#[test]
-fn a_covered_scans_start_seek_seeds_the_partitions_cursor() {
-    let mut by = [(0u64, 0u64, 0u64); 2];
-    for on in [true, false] {
-        let what = format!("seek seeds {on}");
-        let (dir, mut db, model, _inject, r, keys, _at) =
-            compact_store_with(&format!("seek-seeds-{on}"), 1 << 20, |o| {
-                o.zpages_seek_seeds = on;
-                // The memo as every open's, so that the second placement
-                // shows as a hit of it.
-                o.zpages_scan_admit = false;
-                o.commit_forms = false;
-            });
-        drop(r);
-        for k in &keys[..3] {
-            db.append(k, &model[k][0]);
-        }
-        db.commit().unwrap();
-        let want = 64 + 10;
-        let start = keys.len() / 2;
-        assert!(
-            start + want < keys.len(),
-            "{what}: keys enough: {}",
-            keys.len()
-        );
-        let expect: Vec<(Vec<u8>, Vec<u8>)> = keys[start..start + want]
-            .iter()
-            .flat_map(|k| model[k].iter().map(move |v| (k.clone(), v.clone())))
-            .collect();
-        let before = db.zpage_counts();
-        let seeds_before = db.seek_seeds();
-        let mut got: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
-        let n = db
-            .scan(&keys[start], want, |k, v| {
-                got.push((k.to_vec(), v.to_vec()))
-            })
-            .unwrap();
-        let c = db.zpage_counts();
-        let seeds = db.seek_seeds() - seeds_before;
-        assert_eq!(n, want, "{what}: the scan's entries");
-        assert_eq!(got, expect, "{what}: the entries as the model has them");
-        by[usize::from(on)] = (
-            c.scans - before.scans,
-            c.scan_views - before.scan_views,
-            c.memo_hits - before.memo_hits,
-        );
-        if on {
-            assert_eq!(seeds, 1, "{what}: the start seek seeded the reader once");
-        } else {
-            assert_eq!(seeds, 0, "{what}: nothing seeded");
-        }
-        db.close().unwrap();
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-    // The second placement opened the start's group again, out of the
-    // memo the seek had put it in: one memo hit fewer, the scans and the
-    // views no more (the seek's own view is not a cursor's and is not
-    // counted either way).
-    let (seeded, placed) = (by[1], by[0]);
-    assert!(
-        seeded.0 <= placed.0 && seeded.1 <= placed.1 && seeded.2 < placed.2,
-        "the seeded scan opens the start's group once: seeded (scans, views, memo hits) {seeded:?}, placed {placed:?}"
-    );
-}
-
-/// A covered scan's groups after its first are decoded into the cursor's
-/// own buffer (`Options::zpages_walk_owns_decodes`): the form files' count
-/// of walk-owned decodes moves by the groups the walk opened past its
-/// start, the memo's misses by no more than before, and the entries come
-/// back as the model has them; without the option nothing is owned and
-/// every decode goes through the memo. The lowest keys are written first so
-/// the partition does not take the bulk walk.
-#[cfg(target_os = "linux")]
-#[test]
-fn a_walks_groups_after_the_first_are_decoded_into_its_own_buffer() {
-    for on in [true, false] {
-        let what = format!("walk owns decodes {on}");
-        let (dir, mut db, model, _inject, r, keys, _at) =
-            compact_store_with(&format!("walk-owns-{on}"), 1 << 20, |o| {
-                o.zpages_walk_owns_decodes = on;
-                // The walk's own rule alone: a first touch's admission
-                // (`zpages_scan_admit`) owns decodes too, and has its test
-                // beside the memo's.
-                o.zpages_scan_admit = false;
-                o.commit_forms = false;
-            });
-        drop(r);
-        for k in &keys[..3] {
-            db.append(k, &model[k][0]);
-        }
-        db.commit().unwrap();
-        let want = 4 * 64 + 10;
-        let start = keys.len() / 2;
-        assert!(
-            start + want < keys.len(),
-            "{what}: keys enough: {}",
-            keys.len()
-        );
-        let expect: Vec<(Vec<u8>, Vec<u8>)> = keys[start..start + want]
-            .iter()
-            .flat_map(|k| model[k].iter().map(move |v| (k.clone(), v.clone())))
-            .collect();
-        let owned = |db: &Db| db.zpage_counts().walk_owned;
-        let (before, owned0) = (db.zpage_counts(), owned(&db));
-        let mut got: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
-        let n = db
-            .scan(&keys[start], want, |k, v| {
-                got.push((k.to_vec(), v.to_vec()))
-            })
-            .unwrap();
-        let c = db.zpage_counts();
-        let owned = owned(&db) - owned0;
-        assert_eq!(n, want, "{what}: the scan's entries");
-        assert_eq!(got, expect, "{what}: the entries as the model has them");
-        let groups = c.scan_groups - before.scan_groups;
-        assert!(groups >= 3, "{what}: groups decoded: {groups}");
-        if on {
-            // The start's group and a build's go through the memo; the
-            // walk's own after them.
-            assert!(
-                owned >= 1 && owned + 3 >= groups,
-                "{what}: the walk's groups owned: {owned} of {groups} decoded"
-            );
-        } else {
-            assert_eq!(owned, 0, "{what}: every decode through the memo");
-        }
-        db.close().unwrap();
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-}
-
 /// A walk's first touch of a group through a form file is decoded into its
 /// cursor's own buffer and put nowhere, and the handle's memo takes the
-/// group at its second touch (`Options::zpages_scan_admit`): one scan made
-/// three times decodes its groups past the start's as the walk's own, then
-/// into the memo at their admission, then not at all. Without the option
-/// the first scan's decodes are all the memo's and the second scan decodes
-/// nothing. The entries come back as the model has them every time, and the
-/// lowest keys are written first so the partition does not take the bulk
-/// walk.
+/// group at its second touch: one scan made three times decodes its groups
+/// past the start's as the walk's own, then into the memo at their
+/// admission, then not at all. The entries come back as the model has them
+/// every time, and the lowest keys are written first so the partition does
+/// not take the bulk walk.
 #[cfg(target_os = "linux")]
 #[test]
 fn a_scans_first_touch_of_a_group_is_its_own_decode_and_its_second_the_memos() {
-    for on in [true, false] {
-        let what = format!("scan admit {on}");
+    {
+        let what = "scan admit";
         let (dir, mut db, model, _inject, r, keys, _at) =
-            compact_store_with(&format!("scan-admit-{on}"), 1 << 20, |o| {
-                o.zpages_scan_admit = on;
+            compact_store_with("scan-admit", 1 << 20, |o| {
                 o.commit_forms = false;
             });
         drop(r);
@@ -15773,26 +15627,17 @@ fn a_scans_first_touch_of_a_group_is_its_own_decode_and_its_second_the_memos() {
         };
         let (first, second, third) = (pass(&mut db, 1), pass(&mut db, 2), pass(&mut db, 3));
         assert!(first.0 >= 3, "{what}: groups decoded: {first:?}");
-        if on {
-            // The start's group and a build's go through the memo, the
-            // walk's others are its own; the second scan finds their tags
-            // and the memo takes each; the third decodes nothing.
-            assert!(
-                first.1 >= 1 && first.1 + 3 >= first.0 && first.2 == 0,
-                "{what}: the first scan's groups the walk's own: {first:?}"
-            );
-            assert!(
-                second.1 == 0 && second.2 == first.1 && second.0 == first.1,
-                "{what}: the second scan's groups the memo's, each admitted: {first:?} then {second:?}"
-            );
-        } else {
-            assert_eq!(
-                (first.1, first.2),
-                (0, 0),
-                "{what}: every decode the memo's: {first:?}"
-            );
-            assert_eq!(second.0, 0, "{what}: nothing decoded twice: {second:?}");
-        }
+        // The start's group and a build's go through the memo, the walk's
+        // others are its own; the second scan finds their tags and the memo
+        // takes each; the third decodes nothing.
+        assert!(
+            first.1 >= 1 && first.1 + 3 >= first.0 && first.2 == 0,
+            "{what}: the first scan's groups the walk's own: {first:?}"
+        );
+        assert!(
+            second.1 == 0 && second.2 == first.1 && second.0 == first.1,
+            "{what}: the second scan's groups the memo's, each admitted: {first:?} then {second:?}"
+        );
         // All but the few groups the seek and a build hold by other means.
         assert!(
             third.0 == 0 && third.1 == 0 && third.3 + 3 >= first.0,
@@ -15806,16 +15651,15 @@ fn a_scans_first_touch_of_a_group_is_its_own_decode_and_its_second_the_memos() {
 /// The bulk walk through a form file (`ZFile::scan_at`, a handle's scan of
 /// a partition no unsealed key overlays) decodes its first touch of a group
 /// into the thread's own buffer and puts it nowhere, the handle's memo
-/// taking the group at its second touch (`Options::zpages_bulk_admit`), and
-/// asks for the next page's head at a page's last group it walks on past
-/// (`Options::zpages_bulk_ahead`), and for every next group under
-/// `Options::zpages_bulk_ahead_within`: one scan made three times decodes
-/// its groups past the start's as its own and asks ahead at each page it
-/// leaves, or at each group, then into the memo at their admission, then
-/// not at all. Without the options every decode is the memo's, the second
-/// scan decodes nothing, and nothing is asked ahead. The cursor's admission
-/// and asks are off in all three, so every count here is the bulk walk's,
-/// and the entries come back as the model has them every time.
+/// taking the group at its second touch, and asks for the next page's head
+/// at a page's last group it walks on past (`Options::zpages_bulk_ahead`),
+/// and for every next group under `Options::zpages_bulk_ahead_within`: one
+/// scan made three times decodes its groups past the start's as its own
+/// and asks ahead at each page it leaves, or at each group, then into the
+/// memo at their admission, then not at all. Without the asks nothing is
+/// asked ahead. The cursor's asks are off in all three, and the scans the
+/// bulk walk's, and the entries come back as the model has them every
+/// time.
 #[cfg(target_os = "linux")]
 #[test]
 fn a_bulk_walks_first_touch_of_a_group_is_its_own_decode_and_it_asks_for_the_next() {
@@ -15823,10 +15667,8 @@ fn a_bulk_walks_first_touch_of_a_group_is_its_own_decode_and_it_asks_for_the_nex
         let what = format!("bulk {on} within {within}");
         let (dir, db, model, _inject, r, keys, _at) =
             compact_store_with(&format!("bulk-admit-{on}-{within}"), 1 << 20, |o| {
-                o.zpages_bulk_admit = on;
                 o.zpages_bulk_ahead = on;
                 o.zpages_bulk_ahead_within = within;
-                o.zpages_scan_admit = false;
                 o.zpages_group_ahead = false;
                 o.commit_forms = false;
             });
@@ -15878,21 +15720,21 @@ fn a_bulk_walks_first_touch_of_a_group_is_its_own_decode_and_it_asks_for_the_nex
         };
         let (first, second, third) = (pass(1), pass(2), pass(3));
         assert!(first.0 >= 3, "{what}: groups decoded: {first:?}");
+        // The start's group is the seek's, through the memo, as is the first
+        // group of each partition the scan crosses into; the walk's others
+        // are its own, the second scan finds their tags and the memo takes
+        // each, and the third decodes nothing.
+        assert!(
+            first.1 >= 1 && first.1 + 3 >= first.0 && first.2 == 0,
+            "{what}: the first scan's groups the walk's own: {first:?}"
+        );
+        assert!(
+            second.1 == 0 && second.2 == first.1 && second.0 == first.1,
+            "{what}: the second scan's groups the memo's, each admitted: {first:?} then {second:?}"
+        );
+        // Every open but the last asks for the group after it under
+        // `within`, and only a page's last group otherwise.
         if on {
-            // The start's group is the seek's, through the memo, as is the
-            // first group of each partition the scan crosses into; the
-            // walk's others are its own, the second scan finds their tags
-            // and the memo takes each, and the third decodes nothing. Every
-            // open but the last asks for the group after it under `within`,
-            // and only a page's last group otherwise.
-            assert!(
-                first.1 >= 1 && first.1 + 3 >= first.0 && first.2 == 0,
-                "{what}: the first scan's groups the walk's own: {first:?}"
-            );
-            assert!(
-                second.1 == 0 && second.2 == first.1 && second.0 == first.1,
-                "{what}: the second scan's groups the memo's, each admitted: {first:?} then {second:?}"
-            );
             if within {
                 assert!(
                     first.4 + 3 >= first.0,
@@ -15907,12 +15749,7 @@ fn a_bulk_walks_first_touch_of_a_group_is_its_own_decode_and_it_asks_for_the_nex
                 );
             }
         } else {
-            assert_eq!(
-                (first.1, first.2, first.4),
-                (0, 0, 0),
-                "{what}: every decode the memo's, nothing asked ahead: {first:?}"
-            );
-            assert_eq!(second.0, 0, "{what}: nothing decoded twice: {second:?}");
+            assert_eq!(first.4, 0, "{what}: nothing asked ahead: {first:?}");
         }
         assert!(
             third.0 == 0 && third.1 == 0 && third.3 >= first.0,
@@ -15940,7 +15777,6 @@ fn a_bulk_walks_last_group_is_decoded_only_as_far_as_the_scan_reads() {
             compact_store_with(&format!("bulk-part-{on}"), 1 << 20, |o| {
                 o.zpages_bulk_part = on;
                 o.zpages_walk_part = false;
-                o.zpages_scan_admit = false;
                 o.commit_forms = false;
             });
         drop(r);
@@ -16155,50 +15991,44 @@ fn a_scans_last_group_is_decoded_only_as_far_as_the_scan_reads() {
 }
 
 /// A handle's scan over a drained covered store, the clean run every scan
-/// over it takes, places the form file's cursor once with the start seek's
-/// seeded (`Options::zpages_seek_seeds`) as without it: the form's scan
-/// count moves by one a scan either way, and the entries come back as the
-/// model has them. The row's threaded scan passes read two dispatches a
-/// scan with the seed, which this holds at one.
+/// over it takes, places the form file's cursor once: the form's scan count
+/// moves by one a scan at most, and the entries come back as the model has
+/// them. The row's threaded scan passes read two dispatches a scan with the
+/// start seek's cursor seeded into the reader, the shape before, which this
+/// holds at one.
 #[cfg(target_os = "linux")]
 #[test]
-fn a_handles_clean_run_resumes_the_seeded_cursor_and_places_no_second() {
-    let mut by = [(0u64, 0u64); 2];
-    for on in [true, false] {
-        let what = format!("handle clean run seeds {on}");
-        let (dir, db, model, _inject, r, keys, _at) =
-            compact_store_with(&format!("handle-seeds-{on}"), 1 << 20, |o| {
-                o.zpages_seek_seeds = on;
-            });
-        let start = keys.len() / 2;
-        let want = 100;
-        let expect: Vec<(Vec<u8>, Vec<u8>)> = keys[start..start + want]
-            .iter()
-            .flat_map(|k| model[k].iter().map(move |v| (k.clone(), v.clone())))
-            .collect();
-        // One scan first, so the handle's table and the partition's cursor
-        // state are what a pass's later scans meet.
-        r.scan(&keys[start / 2], want, |_k, _v| {}).unwrap();
-        let before = db.zpage_counts();
-        let mut got: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
-        let n = r
-            .scan(&keys[start], want, |k, v| {
-                got.push((k.to_vec(), v.to_vec()))
-            })
-            .unwrap();
-        let c = db.zpage_counts();
-        assert_eq!(n, want, "{what}: the scan's entries");
-        assert_eq!(got, expect, "{what}: the entries as the model has them");
-        by[usize::from(on)] = (c.scans - before.scans, c.scan_views - before.scan_views);
-        drop(r);
-        db.close().unwrap();
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-    let (seeded, placed) = (by[1], by[0]);
+fn a_handles_clean_run_places_the_cursor_once() {
+    let what = "handle clean run";
+    let (dir, db, model, _inject, r, keys, _at) =
+        compact_store_with("handle-seeds", 1 << 20, |_| {});
+    let start = keys.len() / 2;
+    let want = 100;
+    let expect: Vec<(Vec<u8>, Vec<u8>)> = keys[start..start + want]
+        .iter()
+        .flat_map(|k| model[k].iter().map(move |v| (k.clone(), v.clone())))
+        .collect();
+    // One scan first, so the handle's table and the partition's cursor
+    // state are what a pass's later scans meet.
+    r.scan(&keys[start / 2], want, |_k, _v| {}).unwrap();
+    let before = db.zpage_counts();
+    let mut got: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
+    let n = r
+        .scan(&keys[start], want, |k, v| {
+            got.push((k.to_vec(), v.to_vec()))
+        })
+        .unwrap();
+    let c = db.zpage_counts();
+    assert_eq!(n, want, "{what}: the scan's entries");
+    assert_eq!(got, expect, "{what}: the entries as the model has them");
+    let placed = (c.scans - before.scans, c.scan_views - before.scan_views);
     assert!(
-        seeded.0 <= placed.0 && placed.0 <= 1,
-        "the clean run places the cursor once: seeded (scans, views) {seeded:?}, placed {placed:?}"
+        placed.0 <= 1,
+        "the clean run places the cursor once: (scans, views) {placed:?}"
     );
+    drop(r);
+    db.close().unwrap();
+    let _ = std::fs::remove_dir_all(&dir);
 }
 
 /// A scan's blocks over a covered partition read through one cursor
@@ -21456,12 +21286,9 @@ fn hundred(rng: &mut Rng) -> Vec<u8> {
 /// it walks the stride partitions at its stride position, the values it
 /// hands over counted; under the cache read a run at a time
 /// (`Options::zpages_block_cursor` off) the walks are the file's own and no
-/// cursor's. With the seek seeding the reader (`Options::zpages_seek_seeds`)
-/// the writer's scans from a key inside a partition seed its reader with the
-/// seek's cursor at its stride position, counted, every partition being a
-/// stride file's; without it nothing is seeded. Nothing is decoded, no walk
-/// is the raw form's, and the raw form is touched by none of it.
-fn stride_windows(name: &str, cache: bool, block_cursor: bool, seeds: bool) {
+/// cursor's. Nothing is decoded, no walk is the raw form's, and the raw
+/// form is touched by none of it.
+fn stride_windows(name: &str, cache: bool, block_cursor: bool) {
     let counts = cfg!(debug_assertions);
     let dir = scratch(name);
     let mut db = Db::create(
@@ -21470,7 +21297,6 @@ fn stride_windows(name: &str, cache: bool, block_cursor: bool, seeds: bool) {
             o.partition_bytes = Some(160 << 10);
             o.scan_block_cache = cache;
             o.zpages_block_cursor = block_cursor;
-            o.zpages_seek_seeds = seeds;
         }),
     )
     .unwrap();
@@ -21548,14 +21374,12 @@ fn stride_windows(name: &str, cache: bool, block_cursor: bool, seeds: bool) {
         starts.extend(around(k));
     }
     let limits = [1usize, 2, 3, 5, 17, 56, 63, 64, 65, 114, usize::MAX];
-    // Every window through the writer and a handle; the values the cursor's
-    // stride position handed over meanwhile, and the writer's scans whose
-    // start seek seeded a partition's reader.
-    let windows = |db: &Db, model: &Model, what: &str| -> (u64, u64) {
+    // Every window through the writer and a handle, and the values the
+    // cursor's stride position handed over meanwhile.
+    let windows = |db: &Db, model: &Model, what: &str| -> u64 {
         let latest = db.reader().unwrap();
         let w: &Reader = db;
         let before = db.zpage_counts();
-        let seeds_before = db.seek_seeds();
         let touches = (db.raw_touches(), latest.raw_touches());
         for start in &starts {
             for &limit in &limits {
@@ -21587,22 +21411,14 @@ fn stride_windows(name: &str, cache: bool, block_cursor: bool, seeds: bool) {
             c.raw_scans, before.raw_scans,
             "{name}, {what}: no walk the raw form's: {c:?}"
         );
-        (
-            c.stride_cursor_reads - before.stride_cursor_reads,
-            db.seek_seeds() - seeds_before,
-        )
+        c.stride_cursor_reads - before.stride_cursor_reads
     };
     let cursor = !cache || block_cursor;
-    let (through, seeded) = windows(&db, &model, "over a frozen table and the live one");
+    let through = windows(&db, &model, "over a frozen table and the live one");
     assert_eq!(
         through > 0,
         cursor,
         "{name}: {through} values through the cursor's stride position"
-    );
-    assert_eq!(
-        seeded > 0,
-        seeds,
-        "{name}: {seeded} of the writer's scans seeded a stride partition's reader"
     );
     // The seal lands: a piece over the partitions, and more writes over it.
     db.hold_seal_landing(false);
@@ -21615,16 +21431,11 @@ fn stride_windows(name: &str, cache: bool, block_cursor: bool, seeds: bool) {
     );
     write(&mut db, &mut model, &mut rng, 120);
     db.commit().unwrap();
-    let (through, seeded) = windows(&db, &model, "over a piece");
+    let through = windows(&db, &model, "over a piece");
     assert_eq!(
         through > 0,
         cursor,
         "{name}: over a piece, {through} values through the cursor's stride position"
-    );
-    assert_eq!(
-        seeded > 0,
-        seeds,
-        "{name}: over a piece, {seeded} of the writer's scans seeded a stride partition's reader"
     );
     assert!(db.levels().1 >= 1, "the piece stood through the windows");
     let c = db.zpage_counts();
@@ -21635,22 +21446,17 @@ fn stride_windows(name: &str, cache: bool, block_cursor: bool, seeds: bool) {
 
 #[test]
 fn stride_scans_through_the_block_cursor_agree_with_the_model_over_every_window() {
-    stride_windows("stride-windows-cursor", true, true, false);
+    stride_windows("stride-windows-cursor", true, true);
 }
 
 #[test]
 fn stride_scans_through_the_block_cache_a_run_at_a_time_agree_with_the_model_over_every_window() {
-    stride_windows("stride-windows-perrun", true, false, false);
-}
-
-#[test]
-fn stride_scans_with_the_seek_seeding_the_reader_agree_with_the_model_over_every_window() {
-    stride_windows("stride-windows-seeds", true, true, true);
+    stride_windows("stride-windows-perrun", true, false);
 }
 
 #[test]
 fn stride_scans_without_the_block_cache_agree_with_the_model_over_every_window() {
-    stride_windows("stride-windows-nocache", false, true, false);
+    stride_windows("stride-windows-nocache", false, true);
 }
 
 /// What a read of a stride partition touches of the raw form, counted at

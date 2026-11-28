@@ -846,18 +846,10 @@ pub struct Supdb {
     /// (`Options::zpages_hot_raw_evidence`,
     /// `Options::zpages_hot_release_resident`): `supdb-zhotfast`.
     zhotfast: bool,
-    /// Every decode of a walk through a form file put in the memo, no
-    /// first touch decoded into the cursor's own buffer
-    /// (`Options::zpages_scan_admit` off): `supdb-zscanputs`.
-    zscanputs: bool,
     /// Every group a walk opens through a form file decoded whole, none
     /// only as far as the walk reads (`Options::zpages_walk_part` off):
     /// `supdb-zwalkwhole`.
     zwalkwhole: bool,
-    /// The bulk walk through a form file puts every decode in the memo,
-    /// no first touch decoded into the thread's own buffer
-    /// (`Options::zpages_bulk_admit` off): `supdb-zbulkmemo`.
-    zbulkmemo: bool,
     /// The bulk walk asks for no group's lines ahead of its open
     /// (`Options::zpages_bulk_ahead` off): `supdb-zbulknoahead`.
     zbulknoahead: bool,
@@ -867,9 +859,6 @@ pub struct Supdb {
     /// The bulk walk asks for the next group of a page as well as the next
     /// page's head (`Options::zpages_bulk_ahead_within`): `supdb-zbulkaheadwithin`.
     zbulkaheadwithin: bool,
-    /// The bulk walk searches the fence at every page and asks the memo
-    /// twice a group (`Options::zpages_bulk_steps` off): `supdb-zbulksearch`.
-    zbulksearch: bool,
     /// The scans started in a block before its scans hold the blocks they
     /// walk as copies under the form (`Options::promote_starts`), `None`
     /// for the engine's: `supdb-zhotstarts2`, `supdb-zhotstarts3`,
@@ -1322,10 +1311,6 @@ pub struct Supdb {
     /// The fill's quiet looks take the growth share too
     /// (`Options::zpages_hot_fill_quiet`): `supdb-zhotfillquiet`.
     zhotfillquiet: bool,
-    /// A covered scan's start placed once, the seek's cursor kept as the
-    /// partition's reader's (`Options::zpages_seek_seeds` on):
-    /// `supdb-zseekseed`.
-    zseekseed: bool,
     /// A raw partition sent back to its form file once its reads a key fall
     /// under the median partition's (`Options::zpages_hot_cold_back` on):
     /// `supdb-zhotcoldback`.
@@ -1419,9 +1404,6 @@ pub struct Supdb {
     /// filed into (`Options::forms_settle_builds_filed` on):
     /// `supdb-settlebuildsfiled` and `supdb-ingestsettlebuildsfiled`.
     settlebuildsfiled: bool,
-    /// A cursor's walk decoding the groups after its first into its own
-    /// buffer (`Options::zpages_walk_owns_decodes` on): `supdb-zwalkowns`.
-    zwalkowns: bool,
     /// The block path's cursor building a page view at every group open,
     /// the shape before the view held across the page's groups
     /// (`Options::zpages_cursor_view` off): `supdb-zviewperopen`.
@@ -2207,18 +2189,10 @@ struct Policy {
     /// (`Options::zpages_hot_raw_evidence`,
     /// `Options::zpages_hot_release_resident`): `supdb-zhotfast`.
     zhotfast: bool,
-    /// Every decode of a walk through a form file put in the memo, no
-    /// first touch decoded into the cursor's own buffer
-    /// (`Options::zpages_scan_admit` off): `supdb-zscanputs`.
-    zscanputs: bool,
     /// Every group a walk opens through a form file decoded whole, none
     /// only as far as the walk reads (`Options::zpages_walk_part` off):
     /// `supdb-zwalkwhole`.
     zwalkwhole: bool,
-    /// The bulk walk through a form file puts every decode in the memo,
-    /// no first touch decoded into the thread's own buffer
-    /// (`Options::zpages_bulk_admit` off): `supdb-zbulkmemo`.
-    zbulkmemo: bool,
     /// The bulk walk asks for no group's lines ahead of its open
     /// (`Options::zpages_bulk_ahead` off): `supdb-zbulknoahead`.
     zbulknoahead: bool,
@@ -2228,9 +2202,6 @@ struct Policy {
     /// The bulk walk asks for the next group of a page as well as the next
     /// page's head (`Options::zpages_bulk_ahead_within`): `supdb-zbulkaheadwithin`.
     zbulkaheadwithin: bool,
-    /// The bulk walk searches the fence at every page and asks the memo
-    /// twice a group (`Options::zpages_bulk_steps` off): `supdb-zbulksearch`.
-    zbulksearch: bool,
     /// The scans started in a block before its scans hold the blocks they
     /// walk as copies under the form (`Options::promote_starts`), `None`
     /// for the engine's: `supdb-zhotstarts2`, `supdb-zhotstarts3`,
@@ -2679,8 +2650,6 @@ struct Policy {
     /// The fill's quiet looks with the growth share in their room:
     /// `supdb-zhotfillquiet`.
     zhotfillquiet: bool,
-    /// The start placed once: `supdb-zseekseed`.
-    zseekseed: bool,
     /// The cold way back: `supdb-zhotcoldback`.
     zhotcoldback: bool,
     /// The reader table walked at every end: `supdb-sweepwalks`.
@@ -2730,8 +2699,6 @@ struct Policy {
     layersasone: bool,
     /// A filed burst's builds in the commit: `...settlebuildsfiled`.
     settlebuildsfiled: bool,
-    /// The walk's own decodes: `supdb-zwalkowns`.
-    zwalkowns: bool,
     /// A page view an open: `supdb-zviewperopen`.
     zviewperopen: bool,
     /// No group's lines asked ahead: `supdb-znogroupahead`.
@@ -3183,13 +3150,10 @@ impl Default for Policy {
             znopointfilter: false,
             zfilterahead: false,
             zhotfast: false,
-            zscanputs: false,
             zwalkwhole: false,
-            zbulkmemo: false,
             zbulknoahead: false,
             zbulkpart: false,
             zbulkaheadwithin: false,
-            zbulksearch: false,
             zhotstarts: None,
             nochainwrites: false,
             noland: false,
@@ -3280,7 +3244,6 @@ impl Default for Policy {
             zhotaskidle: false,
             zhotgrowth5: false,
             zhotfillquiet: false,
-            zseekseed: false,
             zhotcoldback: false,
             sweepwalks: false,
             zhotskewroom: false,
@@ -3305,7 +3268,6 @@ impl Default for Policy {
             pointsources: false,
             layersasone: false,
             settlebuildsfiled: false,
-            zwalkowns: false,
             zviewperopen: false,
             znogroupahead: false,
             norunbuilds: false,
@@ -4383,19 +4345,6 @@ impl Supdb {
         )
     }
 
-    /// `supdb` whose covered scans place their start once, the seek's
-    /// cursor kept as the partition's reader's (`Options::zpages_seek_seeds`
-    /// on).
-    pub fn create_zseekseed(path: &Path) -> Res<Supdb> {
-        Supdb::with_policy(
-            path,
-            Policy {
-                zseekseed: true,
-                ..Policy::default()
-            },
-        )
-    }
-
     /// `supdb` whose hot-raw policy sends a raw partition back to its form
     /// file once its reads a key fall under the median partition's
     /// (`Options::zpages_hot_cold_back` on), with the fill off as it was
@@ -5156,18 +5105,6 @@ impl Supdb {
             path,
             Policy {
                 zrewarmbeside: true,
-                ..Policy::default()
-            },
-        )
-    }
-
-    /// `supdb` whose cursors' walks decode the groups after their first
-    /// into their own buffers (`Options::zpages_walk_owns_decodes` on).
-    pub fn create_zwalkowns(path: &Path) -> Res<Supdb> {
-        Supdb::with_policy(
-            path,
-            Policy {
-                zwalkowns: true,
                 ..Policy::default()
             },
         )
@@ -9152,13 +9089,10 @@ impl Supdb {
             znopointfilter,
             zfilterahead,
             zhotfast,
-            zscanputs,
             zwalkwhole,
-            zbulkmemo,
             zbulknoahead,
             zbulkpart,
             zbulkaheadwithin,
-            zbulksearch,
             zhotstarts,
             nochainwrites,
             noland,
@@ -9268,7 +9202,6 @@ impl Supdb {
             zhotaskidle,
             zhotgrowth5,
             zhotfillquiet,
-            zseekseed,
             zhotcoldback,
             sweepwalks,
             zhotskewroom,
@@ -9293,7 +9226,6 @@ impl Supdb {
             pointsources,
             layersasone,
             settlebuildsfiled,
-            zwalkowns,
             zviewperopen,
             znogroupahead,
             norunbuilds,
@@ -9641,13 +9573,10 @@ impl Supdb {
             zpages_filter_ahead: zfilterahead,
             zpages_hot_raw_evidence: zhotfast,
             zpages_hot_release_resident: zhotfast,
-            zpages_scan_admit: !zscanputs,
             zpages_walk_part: !zwalkwhole,
-            zpages_bulk_admit: !zbulkmemo,
             zpages_bulk_ahead: !zbulknoahead,
             zpages_bulk_part: zbulkpart,
             zpages_bulk_ahead_within: zbulkaheadwithin,
-            zpages_bulk_steps: !zbulksearch,
             promote_starts: zhotstarts.unwrap_or(supdb::Options::default().promote_starts),
             merge_chains_writes: !nochainwrites,
             zpages_land_scans_far: !landnearscans,
@@ -9845,7 +9774,6 @@ impl Supdb {
             zpages_hot_ask_idle: zhotaskidle,
             zpages_hot_growth_pct: if zhotgrowth5 { 5 } else { 10 },
             zpages_hot_fill_quiet: zhotfillquiet,
-            zpages_seek_seeds: zseekseed,
             zpages_hot_cold_back: zhotcoldback,
             sweep_remembers_pin: !sweepwalks,
             zpages_hot_skew_room: zhotskewroom || zhotskewroomhyst,
@@ -9885,7 +9813,6 @@ impl Supdb {
             } else {
                 supdb::Options::default().zpages_rewarm_quiet_ms
             },
-            zpages_walk_owns_decodes: zwalkowns,
             zpages_cursor_view: !zviewperopen,
             zpages_group_ahead: !znogroupahead,
             scan_run_builds: !norunbuilds,
@@ -10152,13 +10079,10 @@ impl Supdb {
             znopointfilter,
             zfilterahead,
             zhotfast,
-            zscanputs,
             zwalkwhole,
-            zbulkmemo,
             zbulknoahead,
             zbulkpart,
             zbulkaheadwithin,
-            zbulksearch,
             zhotstarts,
             nochainwrites,
             noland,
@@ -10268,7 +10192,6 @@ impl Supdb {
             zhotaskidle,
             zhotgrowth5,
             zhotfillquiet,
-            zseekseed,
             zhotcoldback,
             sweepwalks,
             zhotskewroom,
@@ -10293,7 +10216,6 @@ impl Supdb {
             pointsources,
             layersasone,
             settlebuildsfiled,
-            zwalkowns,
             zviewperopen,
             znogroupahead,
             norunbuilds,
@@ -10973,9 +10895,6 @@ impl Engine for Supdb {
         if self.zhotfillquiet {
             return "supdb-zhotfillquiet";
         }
-        if self.zseekseed {
-            return "supdb-zseekseed";
-        }
         if self.zhotcoldback {
             return "supdb-zhotcoldback";
         }
@@ -11132,9 +11051,6 @@ impl Engine for Supdb {
                 (true, false) => "supdb-zstrideroom",
                 (false, _) => "supdb-zstride",
             };
-        }
-        if self.zwalkowns {
-            return "supdb-zwalkowns";
         }
         if self.zviewperopen {
             return "supdb-zviewperopen";
@@ -11687,9 +11603,6 @@ impl Engine for Supdb {
         if self.znopointkeys {
             return "supdb-znopointkeys";
         }
-        if self.zscanputs {
-            return "supdb-zscanputs";
-        }
         if self.zpromote > 0 && !self.partition && !self.zpages_auto {
             return "supdb-ingestpromote";
         }
@@ -11703,9 +11616,6 @@ impl Engine for Supdb {
         if self.zwalkwhole {
             return "supdb-zwalkwhole";
         }
-        if self.zbulkmemo {
-            return "supdb-zbulkmemo";
-        }
         if self.zbulknoahead {
             return "supdb-zbulknoahead";
         }
@@ -11714,9 +11624,6 @@ impl Engine for Supdb {
         }
         if self.zbulkaheadwithin {
             return "supdb-zbulkaheadwithin";
-        }
-        if self.zbulksearch {
-            return "supdb-zbulksearch";
         }
         if let Some(n) = self.zhotstarts {
             return match n {
@@ -12278,7 +12185,6 @@ impl Engine for Supdb {
         let bk = db.build_kinds();
         let wk = db.forms_walks();
         let cs = db.copy_starts();
-        let ss = db.seek_seeds();
         let hs = db.hot_starts();
         let ph = db.scan_phases();
         let uk = db.upkeep_counts();
@@ -12463,9 +12369,6 @@ impl Engine for Supdb {
             ("patch_search", db.copy_patches()[1] as f64),
             ("copies_packed", db.copy_packs()[0] as f64),
             ("copies_unpacked", db.copy_packs()[1] as f64),
-            // The writer's scans whose start seek seeded the partition's
-            // reader with its cursor (`Options::zpages_seek_seeds`).
-            ("seek_seeds", ss as f64),
             // The writer's scans that started in a block its scans keep
             // starting in, and on a copy with no seek
             // (`Options::promote_starts`).
@@ -12475,7 +12378,7 @@ impl Engine for Supdb {
             // of the reader table (`Options::sweep_remembers_pin`).
             ("sweep_shortcuts", db.sweep_shortcuts() as f64),
             // The groups the walks decoded into their cursors' own buffers
-            // (`Options::zpages_walk_owns_decodes`), over every form file.
+            // (a first touch the memo did not admit), over every form file.
             ("zpage_walk_owned", z.walk_owned as f64),
             // Of those, the groups decoded only as far as their walks read
             // (`Options::zpages_walk_part`), the bytes decoded of them and
@@ -14669,15 +14572,12 @@ pub fn guarantee(arm: &str) -> Option<Guarantee> {
         | "supdb-headslook"
         | "supdb-headsmapped"
         | "supdb-znopointkeys"
-        | "supdb-zscanputs"
         | "supdb-zpromote"
         | "supdb-zpromotestarts"
         | "supdb-zwalkwhole"
-        | "supdb-zbulkmemo"
         | "supdb-zbulknoahead"
         | "supdb-zbulkpart"
         | "supdb-zbulkaheadwithin"
-        | "supdb-zbulksearch"
         | "supdb-zhotstarts2"
         | "supdb-zhotstarts3"
         | "supdb-nohotstarts"
@@ -14801,7 +14701,6 @@ pub fn guarantee(arm: &str) -> Option<Guarantee> {
         | "supdb-settlebuildsfiled"
         | "supdb-ingestsettlebuildsfiled"
         | "supdb-ingestpromote"
-        | "supdb-zseekseed"
         | "supdb-zhotcoldback"
         | "supdb-sweepwalks"
         | "supdb-zhotskewroom"
@@ -14859,7 +14758,6 @@ pub fn guarantee(arm: &str) -> Option<Guarantee> {
         | "supdb-znocrossraw"
         | "supdb-zaskdropped"
         | "supdb-znohotfill"
-        | "supdb-zwalkowns"
         | "supdb-zviewperopen"
         | "supdb-znogroupahead"
         | "supdb-norunbuilds"
@@ -16237,7 +16135,6 @@ pub fn open(arm: &str, dir: &Path, map_gb: usize) -> Res<Box<dyn Engine>> {
             },
             dir,
         )?,
-        "supdb-zseekseed" => supdb_arm(Supdb::create_zseekseed, dir)?,
         "supdb-zhotcoldback" => supdb_arm(Supdb::create_zhotcoldback, dir)?,
         "supdb-sweepwalks" => supdb_arm(Supdb::create_sweepwalks, dir)?,
         "supdb-zhotskewroom" => supdb_arm(Supdb::create_zhotskewroom, dir)?,
@@ -16305,7 +16202,6 @@ pub fn open(arm: &str, dir: &Path, map_gb: usize) -> Res<Box<dyn Engine>> {
         "supdb-znocrossraw" => supdb_arm(Supdb::create_znocrossraw, dir)?,
         "supdb-zloadend" => supdb_arm(Supdb::create_zloadend, dir)?,
         "supdb-zaskdropped" => supdb_arm(Supdb::create_zaskdropped, dir)?,
-        "supdb-zwalkowns" => supdb_arm(Supdb::create_zwalkowns, dir)?,
         "supdb-zviewperopen" => supdb_arm(Supdb::create_zviewperopen, dir)?,
         "supdb-znogroupahead" => supdb_arm(Supdb::create_znogroupahead, dir)?,
         "supdb-norunbuilds" => supdb_arm(Supdb::create_norunbuilds, dir)?,
@@ -16836,18 +16732,6 @@ pub fn open(arm: &str, dir: &Path, map_gb: usize) -> Res<Box<dyn Engine>> {
             },
             dir,
         )?,
-        "supdb-zscanputs" => supdb_arm(
-            |d| {
-                Supdb::with_policy(
-                    d,
-                    Policy {
-                        zscanputs: true,
-                        ..Policy::default()
-                    },
-                )
-            },
-            dir,
-        )?,
         "supdb-zhotstarts2" => supdb_arm(
             |d| {
                 Supdb::with_policy(
@@ -16924,18 +16808,6 @@ pub fn open(arm: &str, dir: &Path, map_gb: usize) -> Res<Box<dyn Engine>> {
             },
             dir,
         )?,
-        "supdb-zbulkmemo" => supdb_arm(
-            |d| {
-                Supdb::with_policy(
-                    d,
-                    Policy {
-                        zbulkmemo: true,
-                        ..Policy::default()
-                    },
-                )
-            },
-            dir,
-        )?,
         "supdb-zbulknoahead" => supdb_arm(
             |d| {
                 Supdb::with_policy(
@@ -16966,18 +16838,6 @@ pub fn open(arm: &str, dir: &Path, map_gb: usize) -> Res<Box<dyn Engine>> {
                     d,
                     Policy {
                         zbulkaheadwithin: true,
-                        ..Policy::default()
-                    },
-                )
-            },
-            dir,
-        )?,
-        "supdb-zbulksearch" => supdb_arm(
-            |d| {
-                Supdb::with_policy(
-                    d,
-                    Policy {
-                        zbulksearch: true,
                         ..Policy::default()
                     },
                 )
@@ -20064,13 +19924,6 @@ mod tests {
                 assert!(!o.zpages_point_filter && b.zpages_point_filter);
             }
             {
-                let z = Supdb::create_zseekseed(&dir("zseekseed")).unwrap();
-                assert_eq!(z.name(), "supdb-zseekseed");
-                assert_eq!(z.features(), base.features());
-                let o = z.db.as_ref().unwrap().options();
-                assert!(o.zpages_seek_seeds && !b.zpages_seek_seeds);
-            }
-            {
                 let z = Supdb::create_zhotcoldback(&dir("zhotcoldback")).unwrap();
                 assert_eq!(z.name(), "supdb-zhotcoldback");
                 assert_eq!(z.features(), base.features());
@@ -20531,21 +20384,6 @@ mod tests {
             }
             {
                 let z = Supdb::with_policy(
-                    &dir("zbulkmemo"),
-                    Policy {
-                        zbulkmemo: true,
-                        ..Policy::default()
-                    },
-                )
-                .unwrap();
-                assert_eq!(z.name(), "supdb-zbulkmemo");
-                assert_eq!(z.features(), base.features());
-                let o = z.db.as_ref().unwrap().options();
-                assert!(!o.zpages_bulk_admit && b.zpages_bulk_admit);
-                assert!(o.zpages_bulk_ahead);
-            }
-            {
-                let z = Supdb::with_policy(
                     &dir("zbulknoahead"),
                     Policy {
                         zbulknoahead: true,
@@ -20557,7 +20395,6 @@ mod tests {
                 assert_eq!(z.features(), base.features());
                 let o = z.db.as_ref().unwrap().options();
                 assert!(!o.zpages_bulk_ahead && b.zpages_bulk_ahead);
-                assert!(o.zpages_bulk_admit);
             }
             {
                 let z = Supdb::with_policy(
@@ -20572,7 +20409,7 @@ mod tests {
                 assert_eq!(z.features(), base.features());
                 let o = z.db.as_ref().unwrap().options();
                 assert!(o.zpages_bulk_part && !b.zpages_bulk_part);
-                assert!(o.zpages_bulk_admit && o.zpages_bulk_ahead);
+                assert!(o.zpages_bulk_ahead);
             }
             {
                 let z = Supdb::with_policy(
@@ -20588,20 +20425,6 @@ mod tests {
                 let o = z.db.as_ref().unwrap().options();
                 assert!(o.zpages_bulk_ahead_within && !b.zpages_bulk_ahead_within);
                 assert!(o.zpages_bulk_ahead);
-            }
-            {
-                let z = Supdb::with_policy(
-                    &dir("zbulksearch"),
-                    Policy {
-                        zbulksearch: true,
-                        ..Policy::default()
-                    },
-                )
-                .unwrap();
-                assert_eq!(z.name(), "supdb-zbulksearch");
-                assert_eq!(z.features(), base.features());
-                let o = z.db.as_ref().unwrap().options();
-                assert!(!o.zpages_bulk_steps && b.zpages_bulk_steps);
             }
             {
                 let z = Supdb::create_settleroomstill(&dir("settleroomstill")).unwrap();
@@ -21073,13 +20896,6 @@ mod tests {
                 assert_eq!(z.features(), base.features());
                 let o = z.db.as_ref().unwrap().options();
                 assert!(!o.zpages_hot_fill && b.zpages_hot_fill);
-            }
-            {
-                let z = Supdb::create_zwalkowns(&dir("zwalkowns")).unwrap();
-                assert_eq!(z.name(), "supdb-zwalkowns");
-                assert_eq!(z.features(), base.features());
-                let o = z.db.as_ref().unwrap().options();
-                assert!(o.zpages_walk_owns_decodes && !b.zpages_walk_owns_decodes);
             }
             {
                 let z = Supdb::create_zviewperopen(&dir("zviewperopen")).unwrap();

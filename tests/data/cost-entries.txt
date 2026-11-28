@@ -127,7 +127,6 @@ Db::forms_walks	-	a test seam or a counter: reads or sets the store's bookkeepin
 Db::build_kinds	-	a test seam or a counter: reads or sets the store's bookkeeping, at no key, entry, block or step of an operation
 Db::wide_walks	-	a test seam or a counter: reads or sets the store's bookkeeping, at no key, entry, block or step of an operation
 Db::copy_starts	-	a test seam or a counter: reads or sets the store's bookkeeping, at no key, entry, block or step of an operation
-Db::seek_seeds	-	a test seam or a counter: reads or sets the store's bookkeeping, at no key, entry, block or step of an operation
 Db::hot_starts	-	a test seam or a counter: reads or sets the store's bookkeeping, at no key, entry, block or step of an operation
 Db::sweep_shortcuts	-	a test seam or a counter: reads or sets the store's bookkeeping, at no key, entry, block or step of an operation
 Db::sweep_walks	-	a test seam or a counter: reads or sets the store's bookkeeping, at no key, entry, block or step of an operation

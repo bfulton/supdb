@@ -2036,29 +2036,6 @@ pub struct Options {
     /// default.
     #[doc(hidden)]
     pub zpages_filter_ahead: bool,
-    /// EXPERIMENT: a walk's first touch of a group through a form file is
-    /// decoded into its cursor's own buffer and put nowhere, and the
-    /// handle's memo takes a group at its second touch while the first's
-    /// tag stands (`zfile::Memo::admit`), the rule a point read's first
-    /// touch has (`zpages_point_part`). Every open of a group the memo did
-    /// not hold decoded it into a buffer of the memo's and displaced
-    /// another, so scans that read their groups once turned the memo's
-    /// slots over under the scans that start where others did.
-    /// `supdb-zscanputs` puts every decode of a walk in the memo.
-    pub zpages_scan_admit: bool,
-    /// The bulk walk through a form file (`zfile::ZFile::scan_at`, what a
-    /// scan of a partition with no unsealed key over it takes) gives a
-    /// group's first touch the rule a cursor's has (`zpages_scan_admit`):
-    /// decoded into the thread's own buffer and put nowhere, the memo
-    /// taking a group at its second touch while the first's tag stands.
-    /// The walk put every decode in the memo: a buffer of the memo's
-    /// written thousands of decodes before, the group's `Arc` allocated
-    /// and the displaced group's freed, for groups a scan over a store
-    /// larger than the memo reads once, and the decoder's hottest
-    /// instructions in a profile of the threaded scans at ten million keys
-    /// under 1.25 GiB were its stores into that buffer.
-    /// `supdb-zbulkmemo` memoises every decode, the shape before.
-    pub zpages_bulk_admit: bool,
     /// The bulk walk asks for the head of the next entry's page at the
     /// last group of a page it walks on past (`zfile::ZFile::ask_next_group`),
     /// the cursor's ask (`zpages_group_ahead`) on the path the cursor's was
@@ -2072,16 +2049,6 @@ pub struct Options {
     /// bytes following the one being walked, which the core's prefetcher
     /// already fetches. `supdb-zbulkaheadwithin` is the arm.
     pub zpages_bulk_ahead_within: bool,
-    /// The bulk walk takes the fence's next entry where it ran to the end
-    /// of one, and asks the memo for a group once: the entry after a page's
-    /// last record is the next one in the fence, found before by a binary
-    /// search over the fence's first ranks at every page, and a group the
-    /// memo was just found not to hold (`ZMemo::holds`) was asked for again
-    /// at its open. The search's dependent loads were a sixth of the walk's
-    /// own time in a profile of the threaded scans at ten million keys under
-    /// 1.25 GiB. `supdb-zbulksearch` searches and asks twice, the shape
-    /// before.
-    pub zpages_bulk_steps: bool,
     /// EXPERIMENT: the block path's cursor over a form file
     /// (`zfile::ZCursor`) steps the fence to the next entry where its walk
     /// ran off the end of one, as the bulk walk does (`zpages_bulk_steps`):
@@ -6123,18 +6090,6 @@ pub struct Options {
     /// under 1.25 GiB. `supdb-zhotgrowth5` leaves five, a release more
     /// where the room allows.
     pub zpages_hot_growth_pct: u8,
-    /// EXPERIMENT: a block-cache scan's start over a covered partition
-    /// (`zpages_scan_cursor`) is placed once: the seek for the start key
-    /// goes through the form file's cursor (`zfile::ZCursor::seek`), which
-    /// the partition's reader then keeps as its own, where before the seek
-    /// found the rank through the fence and a group and the reader placed
-    /// a second cursor at that rank -- a second fence search, a view and a
-    /// walk of the group's records to the rank, over cold lines for the
-    /// Zipfian's tail (`docs/engine.md`). Paired in the row's shape through
-    /// the scrambled mixes it read E 1.20x, 0.91x, 0.89x and 0.97x by
-    /// sitting, the scans level: unresolved, so the two placements, the
-    /// shape before, are the default and `supdb-zseekseed` is the arm.
-    pub zpages_seek_seeds: bool,
     /// The sweep at an operation's end that a pin holds remembers the pin
     /// (`Readers::oldest_for`): the slot the last walk of the reader table
     /// found pinned below every tag waiting, and the epoch it was pinned
@@ -6417,18 +6372,6 @@ pub struct Options {
     /// --ops-div 10 --reps 2`). Zero, the line itself, is the default;
     /// `supdb-zhotskewroomhyst` is the room's bar with five.
     pub zpages_hot_room_margin_pct: u8,
-    /// EXPERIMENT: a cursor's walk decodes the groups after its first into
-    /// the cursor's own buffer (`ZCursor::buf`), the memo asked for each
-    /// and given none; the first group and every other open keep the memo
-    /// as before. A walk reads a group once, and the memo took every one:
-    /// a buffer recycled thousands of decodes ago and cold, an `Arc`
-    /// allocated for it and the displaced entry's freed -- E at ten million
-    /// keys under 1.25 GiB decoded 144,000 groups for 17,000 covered scans
-    /// with the memo answering 7% (`docs/engine.md`). Paired in the row's
-    /// shape the scan pass read 1.02-1.05x for it in three reps of four and
-    /// E both ways by a few percent, unresolved, so the memo's path is the
-    /// default and `supdb-zwalkowns` is the arm.
-    pub zpages_walk_owns_decodes: bool,
     /// The hot-raw policy sends a raw partition back to its form file once
     /// its reads a key over the look's window fall under the median
     /// partition's by `HOT_RAW_BACK_SKEW`, coldest first and one a look,
@@ -7071,14 +7014,10 @@ impl Options {
             .point(self.zpages_point_part, self.zpages_point_keys)
             .point_filter(self.zpages_point_filter)
             .filter_ahead(self.zpages_filter_ahead)
-            .scans(self.zpages_scan_admit, self.zpages_walk_part)
-            .bulk(
-                self.zpages_bulk_admit,
-                self.zpages_bulk_ahead,
-                self.zpages_bulk_part,
-            )
+            .scans(true, self.zpages_walk_part)
+            .bulk(true, self.zpages_bulk_ahead, self.zpages_bulk_part)
             .bulk_within(self.zpages_bulk_ahead_within)
-            .bulk_steps(self.zpages_bulk_steps)
+            .bulk_steps(true)
             .cursor_steps(self.zpages_cursor_steps)
             .stride_direct(self.zpages_stride_step_direct)
     }
@@ -7262,12 +7201,9 @@ impl Default for Options {
             zpages_point_keys: true,
             zpages_point_filter: true,
             zpages_filter_ahead: false,
-            zpages_scan_admit: true,
-            zpages_bulk_admit: true,
             zpages_bulk_ahead: true,
             zpages_bulk_part: false,
             zpages_bulk_ahead_within: false,
-            zpages_bulk_steps: true,
             zpages_cursor_steps: false,
             zpages_stride_step_direct: false,
             zpages_walk_part: true,
@@ -7504,7 +7440,6 @@ impl Default for Options {
             zpages_hot_growth_pct: 10,
             zpages_hot_fill_quiet: false,
             zpages_hot_fill_resident_first: false,
-            zpages_seek_seeds: false,
             sweep_remembers_pin: true,
             settle_form_ahead: 6,
             settle_seek_ahead: 8,
@@ -7522,7 +7457,6 @@ impl Default for Options {
             heads_owned_past_fill: true,
             zpages_hot_skew_room: false,
             zpages_hot_room_margin_pct: 0,
-            zpages_walk_owns_decodes: false,
             zpages_hot_cold_back: false,
             zpages_hot_fill: true,
             zpages_hot_back_ask: true,
@@ -27796,9 +27730,6 @@ struct FormsState {
     /// Copies packed at their build (`Options::copy_packed`), and packed
     /// copies a patch made the three buffers again.
     copy_packs: Counts<2>,
-    /// Scans whose start seek seeded the partition's reader with its cursor
-    /// (`Options::zpages_seek_seeds`).
-    seek_seeds: std::cell::Cell<u64>,
     /// Scans that started in a block scans keep starting in, and scans
     /// that started on a copy with no seek (`Options::promote_starts`).
     hot_starts: Counts<2>,
@@ -28000,7 +27931,6 @@ impl FormsState {
             copy_starts: Counts::new(),
             copy_patches: Counts::new(),
             copy_packs: Counts::new(),
-            seek_seeds: std::cell::Cell::new(0),
             hot_starts: Counts::new(),
             span_starts: std::cell::Cell::new(0),
             start_cache: std::cell::RefCell::new(StartCache::new()),
@@ -32941,51 +32871,6 @@ impl Reader {
         (rank, same)
     }
 
-    /// A block-cache scan's seek of `seg` for `cursor`: the rank of the
-    /// first key at or after it and whether that key is it. Through the
-    /// form file's fence and one group where the handle reads it
-    /// (`cache_seek_exact`); the heads' with the directory's lines asked for
-    /// ahead otherwise.
-    /// `scan_seek` whose cursor the walk may keep
-    /// (`Options::zpages_seek_seeds`): over a covered partition under the
-    /// shared cursor, the seek goes through the form file's cursor, which
-    /// comes back standing at the rank it found for the walk to seed the
-    /// partition's reader with where its first block walks through the
-    /// reader, and to let go where it does not; elsewhere, and where the
-    /// cursor's seek declines, `scan_seek` as before and no cursor.
-    /// The option's test is in the scan and the seek through the form
-    /// file's cursor out of line: called whole, every scan paid the call.
-    #[inline(always)]
-    fn scan_seek_seeded<'a>(
-        &'a self,
-        seg: &'a Seg,
-        cursor: &[u8],
-        on: bool,
-    ) -> (usize, bool, Option<zfile::ZCursor<'a>>) {
-        if self.opts.zpages_seek_seeds && self.opts.zpages_scan_cursor && on {
-            if let Some(seeded) = self.scan_seek_by_cursor(seg, cursor) {
-                return seeded;
-            }
-        }
-        let (rank, same) = self.scan_seek(seg, cursor);
-        (rank, same, None)
-    }
-
-    #[inline(never)]
-    fn scan_seek_by_cursor<'a>(
-        &'a self,
-        seg: &'a Seg,
-        cursor: &[u8],
-    ) -> Option<(usize, bool, Option<zfile::ZCursor<'a>>)> {
-        let z = self.zc(seg)?;
-        let c = zfile::ZCursor::seek(&self.zmemo, z, seg.blob.for_zfile(), cursor).ok()?;
-        let keys = seg.blob.keys();
-        let rank = c.rank().min(keys);
-        let same = rank < keys && c.key() == Some(cursor);
-        self.zmemo_take();
-        Some((rank, same, Some(c)))
-    }
-
     /// The rank of the first of `seg`'s keys not below `cursor`, and
     /// whether it is `cursor`. The seek asks for the partition's directory
     /// words of the stride window its answer lies in at the moment it asks
@@ -33241,21 +33126,6 @@ impl Reader {
     }
 
     /// A partition walk's counts, filed on this handle's line as
-    /// A form file's cursor let go without a walk -- the seek's, where the
-    /// first block walks without the reader (`Options::zpages_seek_seeds`):
-    /// its groups, views and asks filed, and no walk counted, as the seek
-    /// through the file alone counts none.
-    fn pwalk_discard(&self, c: zfile::ZCursor<'_>) {
-        self.zmemo_take();
-        self.zbump_by(|s| &s.zscangroups, c.decoded);
-        self.zbump_by(|s| &s.zinplace, c.inplace);
-        self.zbump_by(|s| &s.znopagescans, c.nopage);
-        self.zbump_by(|s| &s.zprefetches, c.prefetches);
-        self.zbump_by(|s| &s.zviews, c.views);
-        self.zbump_by(|s| &s.zaheads, c.aheads);
-        self.zbump_by(|s| &s.zsteps, c.steps);
-    }
-
     /// `scan_merged` leaves the partition: a served walk with the groups
     /// it decoded and the runs no page holds it met, a fallen one as a
     /// fallback and a raw walk, a raw one as a raw walk -- counted, as
@@ -40595,9 +40465,9 @@ impl Reader {
             } else {
                 None
             };
-            let (mut rank, mut same, mut seed) = match span_b {
-                Some(_) => (usize::MAX, false, None),
-                None => self.scan_seek_seeded(seg, cursor, shared.on),
+            let (mut rank, mut same) = match span_b {
+                Some(_) => (usize::MAX, false),
+                None => self.scan_seek(seg, cursor),
             };
             let owner = if same { rank } else { rank.saturating_sub(1) };
             // The block the seek found, kept for the next scan from this
@@ -40700,20 +40570,8 @@ impl Reader {
                             self.zbump(|s| &s.zwillneedasks);
                         }
                     }
-                    // Through the seek's cursor where it seeded the
-                    // partition's reader (`Options::zpages_seek_seeds`),
-                    // standing at the rank: the bulk walk dispatched
-                    // afresh beside it, and the drained store's scans paid
-                    // the seek's placement and a second.
                     shared.wants(limit - seen);
-                    seen += if let Some(c) = seed.take() {
-                        shared.seed(c, rank);
-                        let fs = self.fs();
-                        fs.seek_seeds.set(fs.seek_seeds.get() + 1);
-                        shared.scan(rank, want, &mut *f)?
-                    } else {
-                        self.cache_scan(seg, rank, want, &mut *f)?
-                    };
+                    seen += self.cache_scan(seg, rank, want, &mut *f)?;
                 }
                 match &seg.hi {
                     Some(h) => {
@@ -40908,25 +40766,6 @@ impl Reader {
                 } else {
                     rank.max(lo)
                 };
-                // The seek's cursor, seeded into the reader where this first
-                // block walks through it -- a sparse block, a clean run --
-                // and let go where it does not, a copy or a wide block, its
-                // counts filed and no walk counted
-                // (`Options::zpages_seek_seeds`): seeded whatever the form,
-                // a copy's walk left it to be closed unused, a dispatch the
-                // counts showed and the promotion's test caught.
-                if first {
-                    if let Some(c) = seed.take() {
-                        match form {
-                            Cached::Sparse(_) | Cached::Clean => {
-                                pr.seed(c, rank);
-                                let fs = self.fs();
-                                fs.seek_seeds.set(fs.seek_seeds.get() + 1);
-                            }
-                            _ => self.pwalk_discard(c),
-                        }
-                    }
-                }
                 // The kind the walk reads, for the promotion after it,
                 // which judges what was walked -- the canonical form as
                 // much as this handle's own.
@@ -45162,7 +45001,6 @@ impl Db {
                         time_decodes: opts.z_times_decodes(),
                         cursor_view: opts.zpages_cursor_view,
                         group_ahead: opts.zpages_group_ahead,
-                        walk_owns: opts.zpages_walk_owns_decodes,
                     },
                     &opts.z_stride_attach(),
                     &zev,
@@ -49705,13 +49543,6 @@ impl Db {
         self.r.fs().copy_packs.get()
     }
 
-    /// The writer's scans whose start seek seeded the partition's reader
-    /// with its cursor (`Options::zpages_seek_seeds`).
-    pub fn seek_seeds(&self) -> u64 {
-        self.take_back_upkeep();
-        self.r.fs().seek_seeds.get()
-    }
-
     /// The writer's scans that started in a block its scans keep starting
     /// in, and those that started on a copy with no seek through the form
     /// (`Options::promote_starts`).
@@ -51992,7 +51823,6 @@ struct ZAttachLines {
     time_decodes: bool,
     cursor_view: bool,
     group_ahead: bool,
-    walk_owns: bool,
 }
 
 /// Rounds `zpages_settle` makes at most over the partitions that lack a
@@ -52081,7 +51911,6 @@ impl Db {
                 side.flat_slack = true;
                 side.cursor_view = lines.cursor_view;
                 side.group_ahead = lines.group_ahead;
-                side.walk_owns = lines.walk_owns;
                 let installed = seg.z.install(side);
                 if installed {
                     zfile::ZEvents::add(&ev.attached, 1);
@@ -52136,7 +51965,6 @@ impl Db {
                     time_decodes: self.opts.z_times_decodes(),
                     cursor_view: self.opts.zpages_cursor_view,
                     group_ahead: self.opts.zpages_group_ahead,
-                    walk_owns: self.opts.zpages_walk_owns_decodes,
                 },
                 &self.opts.z_stride_attach(),
                 ev,
@@ -52193,7 +52021,6 @@ impl Db {
                         side.flat_slack = true;
                         side.cursor_view = self.opts.zpages_cursor_view;
                         side.group_ahead = self.opts.zpages_group_ahead;
-                        side.walk_owns = self.opts.zpages_walk_owns_decodes;
                         if seg.z.install(side) {
                             ev.built(&b);
                             zfile::ZEvents::add(&ev.attached, 1);
@@ -58015,14 +57842,6 @@ impl<'a> PartReader<'a> {
     /// a block before it -- the records overlay keys were emitted in place
     /// of, stepped over -- else one placed afresh, the held one's counts
     /// filed. None where the form file does not serve.
-    /// The seek's cursor kept as this reader's, standing at `at`
-    /// (`Options::zpages_seek_seeds`): the next read from `at` resumes it.
-    fn seed(&mut self, c: zfile::ZCursor<'a>, at: usize) {
-        self.close();
-        self.cur = Some(c);
-        self.at = at;
-    }
-
     fn cursor_at(&mut self, rank: usize, want: usize) -> Option<&mut zfile::ZCursor<'a>> {
         if !self.on {
             return None;
@@ -66597,7 +66416,6 @@ impl Maint {
                     time_decodes: self.opts.z_times_decodes(),
                     cursor_view: self.opts.zpages_cursor_view,
                     group_ahead: self.opts.zpages_group_ahead,
-                    walk_owns: self.opts.zpages_walk_owns_decodes,
                 },
                 &self.opts.z_stride_attach_sealed(seal),
                 ev,
@@ -66991,7 +66809,6 @@ impl Maint {
                         side.flat_slack = true;
                         side.cursor_view = self.opts.zpages_cursor_view;
                         side.group_ahead = self.opts.zpages_group_ahead;
-                        side.walk_owns = self.opts.zpages_walk_owns_decodes;
                         let stride = side.is_stride();
                         let old = target.z.replace(side);
                         if !old.is_null() {
@@ -67091,7 +66908,6 @@ impl Maint {
                             side.flat_slack = true;
                             side.cursor_view = self.opts.zpages_cursor_view;
                             side.group_ahead = self.opts.zpages_group_ahead;
-                            side.walk_owns = self.opts.zpages_walk_owns_decodes;
                             if target.z.install(side) {
                                 ev.built(&built);
                                 zfile::ZEvents::add(&ev.attached, 1);

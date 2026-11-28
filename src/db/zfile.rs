@@ -582,9 +582,6 @@ pub(super) struct ZCursor<'a> {
     /// The fence entries the cursor stepped to from the one before, no
     /// search of the fence made (`Options::zpages_cursor_steps`).
     pub(super) steps: u64,
-    /// The next open is the walk's, decoded into `buf` under
-    /// `ZFile::walk_owns`; taken at the open.
-    owns_next: bool,
     /// Whether the bulk walk has asked for the pages ahead of it
     /// (`walk_until`): once a cursor, as `scan_at` asks once a walk.
     asked: bool,
@@ -638,7 +635,6 @@ impl<'a> ZCursor<'a> {
             views: 0,
             aheads: 0,
             steps: 0,
-            owns_next: false,
             asked: false,
             fell: false,
             last: Vec::new(),
@@ -820,10 +816,6 @@ impl<'a> ZCursor<'a> {
     fn open_at(&mut self, entry: &FenceEntry<'_>, j: usize) -> bool {
         let first = entry.first_rank as usize;
         self.part = None;
-        // Whether a decode goes into the memo: not for the walk's next
-        // group under `ZFile::walk_owns` (`owns_next`, set by `next_group`
-        // for this one open).
-        let memoise = !std::mem::take(&mut self.owns_next);
         self.eidx = entry.index;
         self.page_end = first
             .saturating_add(entry.count as usize)
@@ -847,10 +839,9 @@ impl<'a> ZCursor<'a> {
         // thousands of decodes ago, its `Arc` and the group it displaced,
         // for nothing; scans that start where others did find their groups
         // still held, since the groups read once no longer turn the slots
-        // over. Where the walk's later groups are its own anyway
-        // (`ZFile::walk_owns`) this decides only the first.
-        let mut memoise = memoise;
-        if memoise && self.memo.scan_admit && self.zfile.memo {
+        // over.
+        let mut memoise = true;
+        if self.memo.scan_admit && self.zfile.memo {
             if let Ok(index) = u8::try_from(j) {
                 let (id, hashed) = (self.zfile.id, true);
                 if !self.memo.holds(id, entry.page, index, hashed)
@@ -1145,19 +1136,12 @@ impl<'a> ZCursor<'a> {
             )
         {
             if let Some(entry) = self.zfile.fence.entry(self.eidx, self.zfile.nkeys as u32) {
-                // The walk's next group: decoded into this cursor's own
-                // buffer under `ZFile::walk_owns`, the memo asked and not
-                // written.
-                self.owns_next = self.zfile.walk_owns;
                 if self.open_at(&entry, self.gidx + 1) && !matches!(self.group, Group::Raw) {
                     self.place();
                 }
                 return;
             }
         }
-        // The next page's first group is the walk's as much as the next
-        // group of this page.
-        self.owns_next = self.zfile.walk_owns;
         // The entry after the one held is the rank's wherever the walk ran
         // off the end of an entry's records, which is every time it comes
         // here from inside a block file's run: taken by its index, and held
@@ -1193,7 +1177,6 @@ impl<'a> ZCursor<'a> {
         if !stepped {
             self.load();
         }
-        self.owns_next = false;
     }
 
     /// The record at `off` parsed for its key and the record after it: a
@@ -2628,8 +2611,7 @@ pub(super) struct PointCounts {
     /// (`Options::zpages_point_keys`).
     pub(super) key_hits: u64,
     /// Groups a walk decoded into its cursor's own buffer, each a decode
-    /// the memo would have taken (`Options::zpages_scan_admit`,
-    /// `Options::zpages_walk_owns_decodes`).
+    /// the memo would have taken (`Options::zpages_scan_admit`).
     pub(super) owned: u64,
     /// Of those, groups a walk decoded only as far as it read
     /// (`Options::zpages_walk_part`), the bytes those decodes wrote, and
@@ -3627,10 +3609,6 @@ pub(super) struct ZFile {
     /// (`Options::zpages_group_ahead`, `ZCursor::ask_group_ahead`).
     pub(super) cursor_view: bool,
     pub(super) group_ahead: bool,
-    /// Whether a cursor's walk decodes the groups after its first into its
-    /// own buffer, the memo asked and not written
-    /// (`Options::zpages_walk_owns_decodes`).
-    pub(super) walk_owns: bool,
     /// Whether a decode asks for the line of the memo entry its put will
     /// displace before it begins (`Memo::prefetch_victim`,
     /// `ZFile::open_group`), as the store attaches.
@@ -3969,7 +3947,6 @@ impl ZFile {
             inplace: true,
             cursor_view: false,
             group_ahead: false,
-            walk_owns: false,
             memo_ahead,
             prefetch,
             #[cfg(test)]
@@ -4311,8 +4288,9 @@ impl ZFile {
                 }
             }
             if !memoise {
-                // The walk's own decode (`walk_owns`): into the caller's
-                // buffer below, nothing put in the memo.
+                // The walk's own decode (a first touch the memo did not
+                // admit): into the caller's buffer below, nothing put in
+                // the memo.
                 // Counted on the handle's memo and not on the form file:
                 // a count every reader thread bumps at every such decode
                 // is a line they all write, and the threaded scan pass

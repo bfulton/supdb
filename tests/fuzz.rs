@@ -378,10 +378,6 @@ struct Cfg {
     /// when these were added.
     point_part: bool,
     point_keys: bool,
-    /// A walk's first touch of a group decoded into its cursor's own
-    /// buffer (`Options::zpages_scan_admit`): off in a quarter of the seeds
-    /// under `ZFUZZ_OPTVARY`, from the same side generator.
-    scan_admit: bool,
     /// A walk's own decode of a group taken only as far as the walk reads
     /// (`Options::zpages_walk_part`): off in a quarter of the seeds under
     /// `ZFUZZ_OPTVARY`, the side generator's next draw.
@@ -800,7 +796,9 @@ fn cache_asked(rng: &mut Rng, want_cache: bool) -> bool {
 fn pick_cfg(rng: &mut Rng, want_cache: bool) -> Cfg {
     let vary = std::env::var("ZFUZZ_OPTVARY").is_ok();
     let mut side = Rng::new(rng.0 ^ 0x9017_7A27_0000_0001);
-    let (part_off, keys_off, scan_off) = (side.chance(25), side.chance(25), side.chance(25));
+    // The third is the draw `zpages_scan_admit` took, kept so that the
+    // draws after it stand.
+    let (part_off, keys_off, _) = (side.chance(25), side.chance(25), side.chance(25));
     let walk_off = side.chance(25);
     let hot_two = side.chance(25);
     let (steps_on, direct_on) = (side.chance(50), side.chance(50));
@@ -902,7 +900,6 @@ fn pick_cfg(rng: &mut Rng, want_cache: bool) -> Cfg {
         },
         point_part: !(vary && part_off),
         point_keys: !(vary && keys_off),
-        scan_admit: !(vary && scan_off),
         walk_part: !(vary && walk_off),
         hot_starts: if vary && hot_two {
             2
@@ -959,7 +956,6 @@ fn opts(c: &Cfg) -> Options {
         copy_prefetch_span: c.copy_span,
         identity_by_keys: c.identity_keys,
         copy_packed: c.copy_packed,
-        zpages_scan_admit: c.scan_admit,
         zpages_walk_part: c.walk_part,
         zpages_cursor_steps: c.cursor_steps,
         zpages_stride_step_direct: c.stride_direct,
@@ -2030,7 +2026,7 @@ struct Stats {
     /// part, groups the memo took at a second touch, reads the key table
     /// sent to their record, groups a walk decoded into its own buffer and
     /// of those the groups decoded in part (`Options::zpages_point_part`,
-    /// `zpages_point_keys`, `zpages_scan_admit`, `zpages_walk_part`),
+    /// `zpages_point_keys`, a walk's first touch, `zpages_walk_part`),
     /// summed as `recuts` is: what says a run under `ZFUZZ_ZPAGES` reached
     /// each; then the writers' scans that started in a block gone hot, and
     /// on a copy (`Options::promote_starts`); then the times a writer took

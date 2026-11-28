@@ -880,22 +880,16 @@ held in the process's own memory out of core (`Options::heads_owned`
 off);
 `supdb-znopointkeys` is `supdb` with no table of where the keys read
 through a form file's memo lie (`Options::zpages_point_keys` off);
-`supdb-zscanputs` is `supdb` with every decode of a walk through a form
-file put in the memo, no first touch of a group decoded into the cursor's
-own buffer (`Options::zpages_scan_admit` off); `supdb-zwalkwhole` is `supdb` with every group
+`supdb-zwalkwhole` is `supdb` with every group
 a walk opens through a form file decoded whole, none only as far as the
-walk reads (`Options::zpages_walk_part` off); `supdb-zbulkmemo` is
-`supdb` with every decode of the bulk walk through a form file
-(`ZFile::scan_at`) put in the memo, no first touch decoded into the
-thread's own buffer (`Options::zpages_bulk_admit` off), and
-`supdb-zbulknoahead` with the bulk walk asking for no group's lines ahead
+walk reads (`Options::zpages_walk_part` off);
+`supdb-zbulknoahead` is `supdb` with the bulk walk through a form file
+(`ZFile::scan_at`) asking for no group's lines ahead
 of its open (`Options::zpages_bulk_ahead` off), `supdb-zbulkpart` with
 its own decode of the group it ends inside made only as far as it reads
 (`Options::zpages_bulk_part` on), and `supdb-zbulkaheadwithin` with its
 ask made for the next group of a page as well as the next page's head
-(`Options::zpages_bulk_ahead_within`), and `supdb-zbulksearch` with the
-fence searched at every page and the memo asked twice a group
-(`Options::zpages_bulk_steps` off);
+(`Options::zpages_bulk_ahead_within`);
 `supdb-settlegated` and `supdb-ingestsettlegated` are `supdb` and
 `supdb-ingest` filing a commit's batch at the write only where the
 partitions' data passes the last-level cache
