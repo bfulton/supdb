@@ -8,6 +8,7 @@ Branch `claude/supdb-pretag-p1-a`, from `8e3f9d71`. Times are UTC.
 |---|---|---|---|
 | PR5: point-read-layers, heads, upkeep-burst | 1fa6ec6, f1fce69, bc0fb20 | green: build, test, stride and onefile on the tree before a lifetime fix in 1fa6ec6; build, lint, wasm, bench and lists after it | `sh scripts/cost.sh 8e3f9d7`: RED, `Reader::settle_each` +13.9 an op on `land` (net +13.48), spills and reloads over the whole function after `heads_look_ms`'s `asked_of` went (f1fce69). Taken as reported: the coordinator fixes `settle_each` once on the merged tree, after track B's PR11. |
 | PR6: memory-blocks, shared-table | 17676c4, db68a9b, fac7f89, 11d426f | 11d426f: `all checks passed: build test stride onefile lint wasm bench lists` (fac7f89's lint was red on an unused `mut`, which 11d426f removes) | at db68a9b against bc0fb20: `Db::append_pinned` +0.27 on `work` (a spill and reload of `%rbx`, net -6.86) passes, by the coordinator's reading of a layout change; `supdb_get` +2 on `read` (net +2) is fixed by fac7f89, which takes the shared table's lean read out of line: `read` -23 and `read_s` -10 an op under bc0fb20 (`COST_HEAD=<tree at fac7f89> sh scripts/cost.sh bc0fb20 read read_s`). The whole count at 11d426f (`sh scripts/cost.sh bc0fb20`): its one red is `append_pinned`, passed; read -23, read_s -10, read_z -9.7, land -16.1 an op. |
+| PR7: memory-jobs (+zpages_buy_crosses), ranks-bounds | 2df676b, 9c97dee | 9c97dee: `all checks passed: build test stride onefile lint wasm bench lists` | `sh scripts/cost.sh edd45a6`: RED, two functions, each reproduced to the instruction on a second count. `Db::seal_table::{closure#4}` +0.499 on `merge` (2df676b): one more register copy a step, the BigVec's pool field gone, with the loop's padding `nopl` turned `data16 nopw` at the same count; the probe nets +8.97, then +3.86, swung by the bounded `sweep_retired_states`. `Reader::complete_forms` +0.491 on `land` (9c97dee): eight more stack loads, stores and copies a partition of its loop (5,474 passes), the rank calls gone from it; the probe nets +2.76, then +0.92. Both register allocation in a function whose source the commit changed, both with the probe's net above zero: HELD, reported. |
 
 ## Held back, and why
 
@@ -49,20 +50,20 @@ the counters and arrays that went went whole or are named fields, and
 
 ## In progress
 
-PR7, PR8 and PR19 are written, built under `--profile checked` commit by
+PR8 and PR19 are written, built under `--profile checked` commit by
 commit, and their touched tests, `tests/source.rs`, the suite's `engines::`
 tests and `bench/scripts/policy_defaults.py` pass at each. They sit in the
-worktree `/home/user/supdb-wt`, branch `wt-pr6`, on top of 11d426f:
+worktree `/home/user/supdb-wt`, branch `wt-pr6`, on top of this branch's
+head, not pushed:
 
-| group | commits (worktree) |
+| group | commits (worktree), oldest first |
 |---|---|
-| PR7: memory-jobs (+zpages_buy_crosses), ranks-bounds | 16d860a, 74050d6 |
-| PR8: pace, builder-ahead, upkeep-bounds | 9acf11a, ea4712d, 2fd98e3 |
-| PR19: promote, zpages-scan-seek, the windows' shape, compaction | 5b8363e, 27e19e7, 5d8964f, 5518bcf |
+| PR8: pace, builder-ahead, upkeep-bounds | "The syncing pace is the model's, and the buffered pace goes"; "The builder ahead starts at a scan or a commit, and its refuted triggers go"; "The upkeep's bounds that lost go, and its abandon and conversion are the code" |
+| PR19: promote, zpages-scan-seek, the windows' shape, compaction | "No block is promoted to a copy by its reads or its starts"; "A scan seeks its start through the fence and a group, as shipped"; "The windows' test takes its shape by name"; "No piece merge runs beside the partition merge, as shipped" |
 
 ## Next step
 
-For each group in turn (PR7's base 11d426f, PR8's 74050d6, PR19's 2fd98e3):
+For each group in turn (PR8's base this branch's head, PR19's base PR8's head):
 
     cd /home/user/supdb
     git merge --ff-only <the group's head in wt-pr6>
