@@ -1134,68 +1134,6 @@ fn a_settle_hears_the_ask_between_the_writes_it_applies() {
     }
 }
 
-/// A landing takes its table's copy for scans back
-/// (`Options::seal_copy_lands`): a seal near reads copies its table, the
-/// landing that retires the table counts the copy taken, and the scans
-/// after it, through the segment, read every write; with the option off
-/// the copy is set as before and no landing takes one.
-#[test]
-fn a_landing_takes_its_tables_copy_for_scans_back() {
-    for lands in [true, false] {
-        let d = dir(&format!("copy-lands-{lands}"));
-        let mut db = Db::create(
-            &d,
-            Options {
-                seal_bytes: 64 << 10,
-                seal_copy_lands: lands,
-                ..common::options()
-            },
-        )
-        .unwrap();
-        let mut model: BTreeMap<Vec<u8>, Vec<Vec<u8>>> = BTreeMap::new();
-        for round in 0..6u32 {
-            for i in 0..5_000u32 {
-                let k = format!("k{:08}", (i * 13 + round) % 20_000).into_bytes();
-                let v = format!("v{round}-{i}").into_bytes();
-                db.append(&k, &v);
-                model.entry(k).or_default().push(v);
-            }
-            db.commit().unwrap();
-            // A scan between the rounds keeps the seals near reads.
-            let mut n = 0;
-            db.scan(b"", 50, kv(&mut |_, _| n += 1)).unwrap();
-            assert!(n > 0);
-        }
-        db.sync().unwrap();
-        assert!(
-            db.seal_table_snapshots() > 0,
-            "lands {lands}: no seal copied its table, so nothing was put to the take"
-        );
-        if lands {
-            assert!(
-                db.seal_copies_landed() > 0,
-                "a landing took no copy back of {}",
-                db.seal_table_snapshots()
-            );
-        } else {
-            assert_eq!(db.seal_copies_landed(), 0, "off, no landing takes one");
-        }
-        let mut scanned: BTreeMap<Vec<u8>, Vec<Vec<u8>>> = BTreeMap::new();
-        db.scan(
-            b"",
-            usize::MAX,
-            kv(&mut |k, v| scanned.entry(k.to_vec()).or_default().push(v.to_vec())),
-        )
-        .unwrap();
-        assert!(
-            scanned == model,
-            "lands {lands}: the scan reads every write"
-        );
-        db.close().unwrap();
-        let _ = std::fs::remove_dir_all(&d);
-    }
-}
-
 /// A burst's batch lent to the upkeep thread while reads are around is
 /// filed by the thread at once (`Options::upkeep_files_bursts`), and not
 /// left to the first scan after it as the backlog bound would leave it: the

@@ -1533,10 +1533,6 @@ pub struct Supdb {
     /// (`Options::frozen_bytes` at `usize::MAX`): `supdb-frozencount`, and
     /// `supdb-heldpartfrozencount` under the held log.
     frozencount: bool,
-    /// A landed table's copy for scans kept with the table
-    /// (`Options::seal_copy_lands` off): `supdb-copykept`, and
-    /// `supdb-heldpartcopykept` under the held log.
-    copykept: bool,
     /// The settle's apply deaf to the ask to give the forms up
     /// (`Options::settle_apply_looks` off): `supdb-applydeaf`, and
     /// `supdb-heldpartapplydeaf` under the held log.
@@ -3189,8 +3185,6 @@ struct Policy {
     headsgate: bool,
     /// The frozen tables bounded by their count alone: `...frozencount`.
     frozencount: bool,
-    /// A landed table's copy kept with it: `...copykept`.
-    copykept: bool,
     /// The settle's apply deaf to the ask: `...applydeaf`.
     applydeaf: bool,
     /// The patch's search for an appended key: `...settlesearch`.
@@ -3929,7 +3923,6 @@ impl Default for Policy {
             copythree: false,
             headsgate: false,
             frozencount: false,
-            copykept: false,
             applydeaf: false,
             settlesearch: false,
             settlesources: false,
@@ -11397,7 +11390,6 @@ impl Supdb {
             copythree,
             headsgate,
             frozencount,
-            copykept,
             applydeaf,
             settlesearch,
             settlesources,
@@ -12087,7 +12079,6 @@ impl Supdb {
             copy_packed: !copythree,
             heads_owned_past_fill: !headsgate,
             frozen_bytes: if frozencount { usize::MAX } else { 0 },
-            seal_copy_lands: !copykept,
             settle_apply_looks: !applydeaf,
             settle_append_last: !settlesearch,
             settle_lone_chain: !settlesources,
@@ -12582,7 +12573,6 @@ impl Supdb {
             copythree,
             headsgate,
             frozencount,
-            copykept,
             applydeaf,
             settlesearch,
             settlesources,
@@ -13225,8 +13215,6 @@ impl Engine for Supdb {
             if self.partition {
                 return if self.frozencount {
                     "supdb-heldpartfrozencount"
-                } else if self.copykept {
-                    "supdb-heldpartcopykept"
                 } else if self.applydeaf {
                     "supdb-heldpartapplydeaf"
                 } else {
@@ -14082,9 +14070,6 @@ impl Engine for Supdb {
         }
         if self.frozencount {
             return "supdb-frozencount";
-        }
-        if self.copykept {
-            return "supdb-copykept";
         }
         if self.applydeaf {
             return "supdb-applydeaf";
@@ -15197,10 +15182,8 @@ impl Engine for Supdb {
             ("seal_sort_ms", db.seal_waits().seal_sort_ns as f64 / 1e6),
             ("seal_snap_ms", db.seal_waits().seal_snap_ns as f64 / 1e6),
             ("frozen_sorts", db.frozen_sorts() as f64),
-            // The copies for scans the seals set on their tables, and those
-            // the landings took back (`Options::seal_copy_lands`).
+            // The copies for scans the seals set on their tables.
             ("seal_table_copies", db.seal_table_snapshots() as f64),
-            ("seal_copies_landed", db.seal_copies_landed() as f64),
             // What the upkeep thread spent, and the passes it spent it in.
             ("upkeep_ms", db.upkeep_counts()[6] as f64 / 1e3),
             // The writer's holds for the thread and their time
@@ -17709,7 +17692,6 @@ pub fn guarantee(arm: &str) -> Option<Guarantee> {
         | "supdb-ingestcopythree"
         | "supdb-headsgate"
         | "supdb-frozencount"
-        | "supdb-copykept"
         | "supdb-applydeaf"
         | "supdb-settlesearch"
         | "supdb-ingestsettlesearch"
@@ -17961,7 +17943,6 @@ pub fn guarantee(arm: &str) -> Option<Guarantee> {
         | "supdb-heldmarch"
         | "supdb-heldpart"
         | "supdb-heldpartfrozencount"
-        | "supdb-heldpartcopykept"
         | "supdb-heldpartapplydeaf"
         | "supdb-heldpartsettleconvertquiet"
         | "supdb-heldnfsettleconvertquiet"
@@ -19477,32 +19458,6 @@ pub fn open(arm: &str, dir: &Path, map_gb: usize) -> Res<Box<dyn Engine>> {
                         durable: false,
                         held: true,
                         frozencount: true,
-                        ..Policy::default()
-                    },
-                )
-            },
-            dir,
-        )?,
-        "supdb-copykept" => supdb_arm(
-            |d| {
-                Supdb::with_policy(
-                    d,
-                    Policy {
-                        copykept: true,
-                        ..Policy::default()
-                    },
-                )
-            },
-            dir,
-        )?,
-        "supdb-heldpartcopykept" => supdb_arm(
-            |d| {
-                Supdb::with_policy(
-                    d,
-                    Policy {
-                        durable: false,
-                        held: true,
-                        copykept: true,
                         ..Policy::default()
                     },
                 )
@@ -24019,32 +23974,6 @@ mod tests {
             }
             {
                 let z = Supdb::with_policy(
-                    &dir("copykept"),
-                    Policy {
-                        copykept: true,
-                        ..Policy::default()
-                    },
-                )
-                .unwrap();
-                assert_eq!(z.name(), "supdb-copykept");
-                assert_eq!(z.features(), base.features());
-                let o = z.db.as_ref().unwrap().options();
-                assert!(!o.seal_copy_lands && b.seal_copy_lands);
-                let z = Supdb::with_policy(
-                    &dir("heldpartcopykept"),
-                    Policy {
-                        durable: false,
-                        held: true,
-                        copykept: true,
-                        ..Policy::default()
-                    },
-                )
-                .unwrap();
-                assert_eq!(z.name(), "supdb-heldpartcopykept");
-                assert!(!z.db.as_ref().unwrap().options().seal_copy_lands);
-            }
-            {
-                let z = Supdb::with_policy(
                     &dir("applydeaf"),
                     Policy {
                         applydeaf: true,
@@ -24056,7 +23985,6 @@ mod tests {
                 assert_eq!(z.features(), base.features());
                 let o = z.db.as_ref().unwrap().options();
                 assert!(!o.settle_apply_looks && b.settle_apply_looks);
-                assert!(o.seal_copy_lands);
                 let z = Supdb::with_policy(
                     &dir("heldpartapplydeaf"),
                     Policy {
