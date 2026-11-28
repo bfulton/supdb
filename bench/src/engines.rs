@@ -1067,11 +1067,6 @@ pub struct Supdb {
     /// the engine's default. `supdb-headsmodel` copies them by the model's
     /// word alone.
     headscopies: Option<bool>,
-    /// The merge path's scan snapshot kept to the commit by the commit's
-    /// maintenance while the writer's forms are given up
-    /// (`Options::forms_off_snapshot_kept`), `None` for the engine's
-    /// default. `supdb-snapkept` keeps it.
-    snapkept: Option<bool>,
     /// The selector's first buy makes the crossing where the land look
     /// has not (`Options::zpages_buy_crosses`), `None` for the engine's
     /// default: `supdb-zbuycross`, and beside the jobs' mapped arrays
@@ -1135,10 +1130,6 @@ pub struct Supdb {
     /// the shape before `Options::scan_forms_off_unreused`.
     /// `supdb-formson`.
     formson: bool,
-    /// The forms a reading of the scans gave up kept off until a scan,
-    /// whatever the writer commits meanwhile
-    /// (`Options::scan_forms_off_stale_writes` zero). `supdb-formsoffkept`.
-    formsoffkept: bool,
     /// A handle's scan snapshot dropped at every publish, where its look
     /// has no tables to carry (`Options::snapshot_stands` off).
     /// `supdb-snapdrops`.
@@ -2550,11 +2541,6 @@ struct Policy {
     /// the engine's default. `supdb-headsmodel` copies them by the model's
     /// word alone.
     headscopies: Option<bool>,
-    /// The merge path's scan snapshot kept to the commit by the commit's
-    /// maintenance while the writer's forms are given up
-    /// (`Options::forms_off_snapshot_kept`), `None` for the engine's
-    /// default. `supdb-snapkept` keeps it.
-    snapkept: Option<bool>,
     /// The selector's first buy makes the crossing where the land look
     /// has not (`Options::zpages_buy_crosses`), `None` for the engine's
     /// default: `supdb-zbuycross`, and beside the jobs' mapped arrays
@@ -2618,10 +2604,6 @@ struct Policy {
     /// the shape before `Options::scan_forms_off_unreused`.
     /// `supdb-formson`.
     formson: bool,
-    /// The forms a reading of the scans gave up kept off until a scan,
-    /// whatever the writer commits meanwhile
-    /// (`Options::scan_forms_off_stale_writes` zero). `supdb-formsoffkept`.
-    formsoffkept: bool,
     /// A handle's scan snapshot dropped at every publish, where its look
     /// has no tables to carry (`Options::snapshot_stands` off).
     /// `supdb-snapdrops`.
@@ -3430,7 +3412,6 @@ impl Default for Policy {
             snapunfolded: None,
             snaplean: None,
             headscopies: None,
-            snapkept: None,
             zbuycross: None,
             copiesfit: None,
             chainuncovered: None,
@@ -3443,7 +3424,6 @@ impl Default for Policy {
             runspare: None,
             formsoffbuilt: None,
             formson: false,
-            formsoffkept: false,
             snapdrops: false,
             mergedropscovered: false,
             sameblocksrecords: false,
@@ -8243,21 +8223,6 @@ impl Supdb {
         )
     }
 
-    /// `supdb` with the merge path's scan snapshot kept to the commit by
-    /// the upkeep thread while the writer's forms are given up
-    /// (`Options::forms_off_snapshot_kept`): the first scan after a burst
-    /// files the thread's trail, where the default sorts every unsealed
-    /// key.
-    pub fn create_snapkept(path: &Path) -> Res<Supdb> {
-        Supdb::with_policy(
-            path,
-            Policy {
-                snapkept: Some(true),
-                ..Policy::default()
-            },
-        )
-    }
-
     /// `supdb` whose selector makes the crossing at its first buy where
     /// the land look has not by then (`Options::zpages_buy_crosses`): the
     /// form files built ahead are asked back before they are attached,
@@ -8392,19 +8357,6 @@ impl Supdb {
             path,
             Policy {
                 mergedropscovered: true,
-                ..Policy::default()
-            },
-        )
-    }
-
-    /// `supdb` whose writer, its forms given up on a reading of its scans,
-    /// keeps them off until its next scan whatever it commits meanwhile
-    /// (`Options::scan_forms_off_stale_writes` zero).
-    pub fn create_formsoffkept(path: &Path) -> Res<Supdb> {
-        Supdb::with_policy(
-            path,
-            Policy {
-                formsoffkept: true,
                 ..Policy::default()
             },
         )
@@ -10081,7 +10033,6 @@ impl Supdb {
             snapunfolded,
             snaplean,
             headscopies,
-            snapkept,
             zbuycross,
             copiesfit,
             chainuncovered,
@@ -10094,7 +10045,6 @@ impl Supdb {
             runspare,
             formsoffbuilt,
             formson,
-            formsoffkept,
             snapdrops,
             mergedropscovered,
             sameblocksrecords,
@@ -10583,8 +10533,6 @@ impl Supdb {
             heads_owned_beside_copies: headscopies
                 .unwrap_or(supdb::Options::default().heads_owned_beside_copies),
             zpages_buy_crosses: zbuycross.unwrap_or(supdb::Options::default().zpages_buy_crosses),
-            forms_off_snapshot_kept: snapkept
-                .unwrap_or(supdb::Options::default().forms_off_snapshot_kept),
             scan_cache_copies_fit: copiesfit
                 .unwrap_or(supdb::Options::default().scan_cache_copies_fit),
             merge_chains_writes_uncovered: chainuncovered
@@ -10602,11 +10550,6 @@ impl Supdb {
                 .unwrap_or(supdb::Options::default().scan_forms_off_counts_built),
             scan_forms_off_unreused: !formson,
             forms_settle_room_pressure: !settleroomstill,
-            scan_forms_off_stale_writes: if formsoffkept {
-                0
-            } else {
-                supdb::Options::default().scan_forms_off_stale_writes
-            },
             settle_covered_samples: !settlespan,
             upkeep_pace_syncs_bp: if nopacesyncs {
                 0
@@ -11123,7 +11066,6 @@ impl Supdb {
             snapunfolded,
             snaplean,
             headscopies,
-            snapkept,
             zbuycross,
             copiesfit,
             chainuncovered,
@@ -11136,7 +11078,6 @@ impl Supdb {
             runspare,
             formsoffbuilt,
             formson,
-            formsoffkept,
             snapdrops,
             mergedropscovered,
             sameblocksrecords,
@@ -12918,9 +12859,6 @@ impl Engine for Supdb {
         if self.headscopies == Some(false) {
             return "supdb-headsmodel";
         }
-        if self.snapkept == Some(true) {
-            return "supdb-snapkept";
-        }
         if self.zbuycross == Some(true) {
             return "supdb-zbuycross";
         }
@@ -12999,9 +12937,6 @@ impl Engine for Supdb {
         }
         if self.formson {
             return "supdb-formson";
-        }
-        if self.formsoffkept {
-            return "supdb-formsoffkept";
         }
         if self.snapdrops {
             return "supdb-snapdrops";
@@ -13334,7 +13269,6 @@ impl Engine for Supdb {
             ("snapshots_stood", db.snapshots_stood() as f64),
             ("snapshot_extends", db.snapshot_extends() as f64),
             ("snapshot_refreshes", db.snapshot_refreshes() as f64),
-            ("snapshots_kept", db.snapshots_kept() as f64),
             ("form_takes", db.form_takes() as f64),
             ("blk_by_reader", db.blocks_built().0 as f64),
             ("blk_by_engine", db.blocks_built().1 as f64),
@@ -15804,7 +15738,6 @@ pub fn guarantee(arm: &str) -> Option<Guarantee> {
         | "supdb-snapfat"
         | "supdb-snapold"
         | "supdb-headsmodel"
-        | "supdb-snapkept"
         | "supdb-zbuycross"
         | "supdb-jobsmappedbuycross"
         | "supdb-jobspooledbuycross"
@@ -15815,7 +15748,6 @@ pub fn guarantee(arm: &str) -> Option<Guarantee> {
         | "supdb-nozjobs"
         | "supdb-nozjobsrewarm"
         | "supdb-formson"
-        | "supdb-formsoffkept"
         | "supdb-snapdrops"
         | "supdb-mergedropscovered"
         | "supdb-mergedropsrecords"
@@ -18427,7 +18359,6 @@ pub fn open(arm: &str, dir: &Path, map_gb: usize) -> Res<Box<dyn Engine>> {
         "supdb-snapfat" => supdb_arm(Supdb::create_snapfat, dir)?,
         "supdb-snapold" => supdb_arm(Supdb::create_snapold, dir)?,
         "supdb-headsmodel" => supdb_arm(Supdb::create_headsmodel, dir)?,
-        "supdb-snapkept" => supdb_arm(Supdb::create_snapkept, dir)?,
         "supdb-zbuycross" => supdb_arm(Supdb::create_zbuycross, dir)?,
         "supdb-jobsmappedbuycross" => supdb_arm(Supdb::create_jobsmapped_buycross, dir)?,
         "supdb-jobspooledbuycross" => supdb_arm(Supdb::create_jobspooled_buycross, dir)?,
@@ -18438,7 +18369,6 @@ pub fn open(arm: &str, dir: &Path, map_gb: usize) -> Res<Box<dyn Engine>> {
         "supdb-nozjobs" => supdb_arm(Supdb::create_nozjobs, dir)?,
         "supdb-nozjobsrewarm" => supdb_arm(Supdb::create_nozjobsrewarm, dir)?,
         "supdb-formson" => supdb_arm(Supdb::create_formson, dir)?,
-        "supdb-formsoffkept" => supdb_arm(Supdb::create_formsoffkept, dir)?,
         "supdb-snapdrops" => supdb_arm(Supdb::create_snapdrops, dir)?,
         "supdb-mergedropscovered" => supdb_arm(Supdb::create_mergedropscovered, dir)?,
         "supdb-mergedropsrecords" => supdb_arm(Supdb::create_mergedropsrecords, dir)?,
@@ -21613,11 +21543,6 @@ mod tests {
                 let o = z.db.as_ref().unwrap().options();
                 assert!(!o.heads_owned_beside_copies && b.heads_owned_beside_copies);
                 assert!(o.heads_owned && o.scan_cache_copies_fit);
-                let z = Supdb::create_snapkept(&dir("snapkept")).unwrap();
-                assert_eq!(z.name(), "supdb-snapkept");
-                assert_eq!(z.features(), base.features());
-                let o = z.db.as_ref().unwrap().options();
-                assert!(o.forms_off_snapshot_kept && !b.forms_off_snapshot_kept);
                 // The crossing made at the buy, alone and beside the jobs'
                 // mapped and pooled arrays.
                 assert!(b.zpages_buy_crosses && b.jobs_mapped);
@@ -21958,13 +21883,6 @@ mod tests {
                 assert_eq!(z.features(), base.features());
                 let o = z.db.as_ref().unwrap().options();
                 assert!(!o.scan_forms_off_unreused && b.scan_forms_off_unreused);
-            }
-            {
-                let z = Supdb::create_formsoffkept(&dir("formsoffkept")).unwrap();
-                assert_eq!(z.name(), "supdb-formsoffkept");
-                assert_eq!(z.features(), base.features());
-                let o = z.db.as_ref().unwrap().options();
-                assert!(o.scan_forms_off_stale_writes == 0 && b.scan_forms_off_stale_writes > 0);
             }
             {
                 let z = Supdb::create_snapdrops(&dir("snapdrops")).unwrap();

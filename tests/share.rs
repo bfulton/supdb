@@ -1409,13 +1409,6 @@ fn the_option_stands_down_beside_what_it_cannot_share_under() {
             },
         ),
         (
-            "kept",
-            Options {
-                forms_off_snapshot_kept: true,
-                ..options()
-            },
-        ),
-        (
             "shape",
             Options {
                 adaptive_shape: true,

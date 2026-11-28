@@ -4603,36 +4603,9 @@ pub struct Options {
     /// took four hundred. A burst's batches, the lag sweep's, are larger
     /// than the line and leave the reading standing: filing a burst is the
     /// writer's cost, where a mix's commits are filed by the upkeep thread
-    /// beside its reads. Zero keeps the reading until a scan
-    /// (`supdb-formsoffkept`).
+    /// beside its reads. Zero keeps the reading until a scan.
     #[doc(hidden)]
     pub scan_forms_off_stale_writes: u32,
-    /// EXPERIMENT, refuted: while the writer's forms are given up for the
-    /// merge path (`scan_forms_off_unreused`) and scans are near, the
-    /// commit's maintenance keeps the merge path's scan snapshot to the
-    /// commit (`Reader::keep_merge_snapshot`): the log read and the keys
-    /// created since filed into the snapshot, as a scan's preamble does,
-    /// on the upkeep thread where the upkeep is lent. With the forms off
-    /// the maintenance does nothing -- nine hundred passes of the thread
-    /// in 1.3 ms over the lag sweep's ten-percent burst at ten million
-    /// keys -- and the first scan after a burst sorts every unsealed key
-    /// itself: 16-22 ms of the pass after the one-percent burst there,
-    /// 45-115 after the ten-percent and 42-118 after the full rewrite, a
-    /// tenth to a fifth of each divided pass under either bound. Kept, the
-    /// scan's snapshot phase read 2-4 ms, 5-18 and 0.5-8, and the passes
-    /// no faster: a snapshot does not stand across a freeze, so the
-    /// maintenance built one from every unsealed key at each, 173 builds
-    /// and 120 carried forward in a sweep where the scans make three, 14 s
-    /// of the thread over a full rewrite of 28, and what those builds
-    /// freed stayed in the process -- 70-80 MB more anonymous memory at
-    /// the pass after the full rewrite, which under 1 GiB was a quarter
-    /// more major faults on the scanning thread and the pass at 0.82x and
-    /// 0.84x, and under 1.25 GiB took a store that had fitted, thirteen
-    /// faults a pass, to 4,400 and the pass to 0.62x and 0.44x
-    /// (`docs/engine.md`). Off: the first scan builds it.
-    /// `supdb-snapkept` is the arm.
-    #[doc(hidden)]
-    pub forms_off_snapshot_kept: bool,
     /// The scans a window of `scan_forms_off_unreused`'s share is taken
     /// over. A test sets a few.
     #[doc(hidden)]
@@ -4969,7 +4942,7 @@ pub struct Options {
     /// since nothing logs a handle's write, and nothing that reads a live
     /// table's values beside the writer or keeps a copy of them:
     /// `Upkeep::Inline`, and `scan_block_cache`, `snapshot_keeper`,
-    /// `forms_off_snapshot_kept`, `snapshot_runs`, `direct_ingest` and
+    /// `snapshot_runs`, `direct_ingest` and
     /// `put_in_place` off. Off: the one writer's table, and a handle that
     /// writes is refused.
     pub shared_writers: bool,
@@ -5128,7 +5101,7 @@ pub struct Options {
     /// It acts only where a handle's write may go unlogged and nothing
     /// else keeps a copy of a live table's values (`Options::shares`):
     /// `SyncPolicy::Explicit` with `held_frames` off, and
-    /// `snapshot_keeper`, `forms_off_snapshot_kept`, `snapshot_runs`,
+    /// `snapshot_keeper`, `snapshot_runs`,
     /// `put_in_place` and `adaptive_shape` off. Elsewhere, and off, a
     /// handle that writes is refused, as it was: on, the option changes
     /// nothing of a store no handle writes. Off:
@@ -7566,7 +7539,6 @@ impl Options {
             && !self.shared_writers
             && !self.held_frames
             && !self.snapshot_keeper
-            && !self.forms_off_snapshot_kept
             && !self.snapshot_runs
             && !self.put_in_place
             && !self.adaptive_shape
@@ -7846,7 +7818,6 @@ impl Default for Options {
             scan_forms_off_unreused: true,
             scan_forms_off_counts_built: false,
             scan_forms_off_stale_writes: 512,
-            forms_off_snapshot_kept: false,
             scan_forms_off_window: 512,
             scan_forms_off_ghost_bits: 10,
             scan_forms_off_flip: false,
@@ -21213,13 +21184,12 @@ fn check_options(opts: &Options) -> Result<()> {
         && (!matches!(opts.sync, SyncPolicy::Explicit)
             || opts.scan_block_cache
             || opts.snapshot_keeper
-            || opts.forms_off_snapshot_kept
             || opts.upkeep != Upkeep::Inline)
     {
         return Err(err(
             "put_in_place overwrites a live table's values under the writer alone: \
-             it needs SyncPolicy::Explicit, Upkeep::Inline, and scan_block_cache, \
-             snapshot_keeper and forms_off_snapshot_kept off",
+             it needs SyncPolicy::Explicit, Upkeep::Inline, and scan_block_cache and \
+             snapshot_keeper off",
         ));
     }
     if opts.one_file && (!opts.manifest_slots || opts.manifest_pending) {
@@ -21233,7 +21203,6 @@ fn check_options(opts: &Options) -> Result<()> {
             || opts.held_frames
             || opts.scan_block_cache
             || opts.snapshot_keeper
-            || opts.forms_off_snapshot_kept
             || opts.snapshot_runs
             || opts.direct_ingest
             || opts.put_in_place
@@ -21243,7 +21212,7 @@ fn check_options(opts: &Options) -> Result<()> {
         return Err(err(
             "shared_writers writes the live table from every thread with nothing logged: \
              it needs SyncPolicy::Explicit with held_frames off, Upkeep::Inline, and \
-             scan_block_cache, snapshot_keeper, forms_off_snapshot_kept, snapshot_runs, \
+             scan_block_cache, snapshot_keeper, snapshot_runs, \
              direct_ingest, put_in_place and adaptive_shape off",
         ));
     }
@@ -26772,9 +26741,6 @@ struct Shared {
     /// PROTOTYPE: handles that took the published snapshot over their
     /// own under the keeper's rule; for a test.
     snap_switched: AtomicU64,
-    /// The times a commit's maintenance kept the merge path's snapshot to
-    /// its commit with the forms off (`Options::forms_off_snapshot_kept`).
-    snaps_kept: AtomicU64,
     /// Snapshots the seal thread published over the frozen table it was
     /// writing (`Options::seal_snapshot`); for a test.
     snap_sealed: AtomicU64,
@@ -37954,40 +37920,10 @@ impl Reader {
                 .cache_seen
                 .store(self.fs().cache_bytes.get(), AtomicOrdering::Relaxed);
         }
-        self.keep_merge_snapshot();
         if self.settle_due(true) != Some(true) {
             return Ok(());
         }
         self.fill_forms()
-    }
-
-    /// The merge path's scan snapshot kept to this commit while the
-    /// writer's forms are given up (`Options::forms_off_snapshot_kept`):
-    /// what a scan's preamble does before its walk -- the log read to the
-    /// commit, the keys created since the snapshot filed into its side
-    /// runs, or the snapshot carried forward or built where it is behind
-    /// or absent (`refresh_snapshot`) -- done at the commit's maintenance,
-    /// so that the first scan after a burst reads the log from where the
-    /// last pass left it and files that much. Only while scans are near,
-    /// by the seals' reading of it (`Shared::scans_far_at`): a store
-    /// nobody scans keeps nothing. The writer's own upkeep alone: a handle
-    /// keeps no forms to give up.
-    fn keep_merge_snapshot(&self) {
-        if !self.opts.forms_off_snapshot_kept || self.slot.is_some() || !self.fs().forms_off.get() {
-            return;
-        }
-        // The forms go off at a scan, so the store has been scanned: far
-        // is the seals' mark at the scan count as it stands.
-        let life = self.shared.scans_life.load(AtomicOrdering::Relaxed)
-            + self.shared.scans_merged.load(AtomicOrdering::Relaxed);
-        if self.shared.scans_far_at.load(AtomicOrdering::Acquire) == life {
-            return;
-        }
-        let gen = self.state().gen;
-        if self.sync_log() {
-            self.refresh_snapshot(gen, false, true);
-            self.shared.snaps_kept.fetch_add(1, AtomicOrdering::Relaxed);
-        }
     }
 
     /// Under `forms_pieces_only`, on the writer's upkeep: once a
@@ -44557,7 +44493,6 @@ impl Db {
             snap_kept: AtomicU64::new(0),
             snap_carried: AtomicU64::new(0),
             snap_switched: AtomicU64::new(0),
-            snaps_kept: AtomicU64::new(0),
             snap_sealed: AtomicU64::new(0),
             snap_on_table: AtomicU64::new(0),
             upkeep: Lend::default(),
@@ -45973,7 +45908,6 @@ impl Db {
             snap_kept: AtomicU64::new(0),
             snap_carried: AtomicU64::new(0),
             snap_switched: AtomicU64::new(0),
-            snaps_kept: AtomicU64::new(0),
             snap_sealed: AtomicU64::new(0),
             snap_on_table: AtomicU64::new(0),
             upkeep: Lend::default(),
@@ -50146,13 +50080,6 @@ impl Db {
 
     /// EXPERIMENT: snapshots republished with their stale runs copied
     /// again; see `Snapshot::refreshed`.
-    /// The times a commit's maintenance kept the merge path's snapshot to
-    /// its commit with the forms off (`Options::forms_off_snapshot_kept`).
-    #[doc(hidden)]
-    pub fn snapshots_kept(&self) -> u64 {
-        self.shared.snaps_kept.load(AtomicOrdering::Relaxed)
-    }
-
     pub fn snapshot_refreshes(&self) -> u64 {
         self.shared.snap_refreshes.load(AtomicOrdering::Relaxed)
     }

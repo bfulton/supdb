@@ -97,11 +97,6 @@
 //! - `ZFUZZ_FORMSOFF=1`, with `ZFUZZ_ZPAGES`: the `z` store's handles give
 //!   their block forms up for the merge path and take them back every few
 //!   scans (`Options::scan_forms_off_unreused`), a flag and not a draw.
-//! - `ZFUZZ_SNAPKEPT=1`, with `ZFUZZ_FORMSOFF`: the commits' maintenance
-//!   keeps the merge path's snapshot while the forms are off
-//!   (`Options::forms_off_snapshot_kept`), with the stale exit off so that
-//!   the forms stay off through the commits between two flips; a flag and
-//!   not a draw.
 //! - `ZFUZZ_PARSE=1`: the `z` store's block-coded groups are written by the
 //!   parsing encoder (`Options::zpages_parse`), a flag and not a draw, so
 //!   that every seed's operations are the ones it had without it.
@@ -1102,17 +1097,6 @@ fn opts_z(c: &Cfg) -> Options {
         o.scan_forms_off_flip = true;
         o.scan_forms_off_stale_writes = 3;
     }
-    // Under `ZFUZZ_SNAPKEPT` the commit's maintenance keeps the merge
-    // path's snapshot to the commit while the forms are off
-    // (`Options::forms_off_snapshot_kept`), and the stale exit is off, so
-    // that every commit between two flips of the forms is one the
-    // maintenance keeps at: the freezes, landings and merges between them
-    // are read against the raw store through a snapshot the scan did not
-    // make. A flag and not a draw.
-    if env_flag("ZFUZZ_SNAPKEPT") {
-        o.forms_off_snapshot_kept = true;
-        o.scan_forms_off_stale_writes = 0;
-    }
     // Under `ZFUZZ_FLEXDEC` they are decoded by `lz4_flex` and not the
     // engine's own decoder (`Options::zpages_own_decoder`), read against the
     // raw store.
@@ -1157,7 +1141,6 @@ fn opts_z(c: &Cfg) -> Options {
         o.scan_block_cache = false;
         o.upkeep = Upkeep::Inline;
         o.snapshot_keeper = false;
-        o.forms_off_snapshot_kept = false;
     }
     o
 }
@@ -2052,11 +2035,6 @@ struct Stats {
     /// with no forms (`Options::scan_forms_off_unreused`), summed as
     /// `abandons` is: what says a run under `ZFUZZ_FORMSOFF` switched.
     switches: u64,
-    /// The commits whose maintenance kept the `z` store's merge-path
-    /// snapshot with the forms off (`Options::forms_off_snapshot_kept`),
-    /// summed as `abandons` is: what says a run under `ZFUZZ_SNAPKEPT`
-    /// kept one.
-    kept: u64,
     /// Sparse forms either store kept across a partition's rewrite with
     /// their cuts resolved again (`Options::rebase_recuts_sparse`), summed
     /// as `abandons` is: what says a run with the cache on reached them.
@@ -2449,7 +2427,6 @@ fn run_seed_inner(seed: u64, want_cache: bool, verbose: bool) -> Result<Stats, S
         one: 0,
         zreads: 0,
         switches: 0,
-        kept: 0,
         in_place: 0,
         share: [0; 4],
         recuts: 0,
@@ -2755,7 +2732,6 @@ fn run_seed_inner(seed: u64, want_cache: bool, verbose: bool) -> Result<Stats, S
                     }
                     st.zreads += z.zpage_counts().reads + z.zpage_counts().scans;
                     st.switches += z.forms_off_counts()[..2].iter().sum::<u64>();
-                    st.kept += z.snapshots_kept();
                     st.in_place += z.puts_in_place();
                     st.recuts += z.forms_recut().0 + r.forms_recut().0;
                     count_point(&mut st, &z);
@@ -2959,7 +2935,6 @@ fn run_seed_inner(seed: u64, want_cache: bool, verbose: bool) -> Result<Stats, S
     }
     st.zreads += z.zpage_counts().reads + z.zpage_counts().scans;
     st.switches += z.forms_off_counts()[..2].iter().sum::<u64>();
-    st.kept += z.snapshots_kept();
     st.in_place += z.puts_in_place();
     st.recuts += z.forms_recut().0 + r.forms_recut().0;
     count_point(&mut st, &z);
@@ -3062,7 +3037,6 @@ fn run_range() {
     let (mut bad, mut reopens, mut abandons, mut bindings, mut beside, mut switches) =
         (Vec::new(), 0u64, 0u64, 0u64, 0u64, 0u64);
     let mut recuts = 0u64;
-    let mut kept = 0u64;
     let mut point = [0u64; 17];
     let mut heads = [0u64; 2];
     let mut held = [0u64; 2];
@@ -3107,7 +3081,6 @@ fn run_range() {
                 zreads += s.zreads;
                 switches += s.switches;
                 recuts += s.recuts;
-                kept += s.kept;
                 in_place[1] += s.in_place;
                 for (a, b) in share.iter_mut().zip(s.share) {
                     *a += b;
@@ -3127,7 +3100,7 @@ fn run_range() {
         }
     }
     eprintln!(
-        "seeds {from}..{to}: reopens {reopens}, abandons {abandons}, bindings {bindings}, merges beside {beside}, cache units given back {evicted}, chunks decrypted {fills}, reads through a form {zreads}, forms-off switches {switches}, sparse forms recut {recuts}, heads owned {} given back {}, point parts {} admits {} key hits {} walk owned {} walk parts {} hot starts {} copy starts {} stale exits {} cursor steps {} bounds by head {} landings left {} quiet merges {} key sequences kept {} rank patches {} rank starts {} copies packed {} unpacked {}, snapshots kept {kept}, log frames dropped {} spilled {}, held logs with no frames {frameless}, memtables hashed by FNV {mem_fnv}, overwriting puts {} overwrites {}, point reads two-source {} layered {} placed {}, FAILURES {}",
+        "seeds {from}..{to}: reopens {reopens}, abandons {abandons}, bindings {bindings}, merges beside {beside}, cache units given back {evicted}, chunks decrypted {fills}, reads through a form {zreads}, forms-off switches {switches}, sparse forms recut {recuts}, heads owned {} given back {}, point parts {} admits {} key hits {} walk owned {} walk parts {} hot starts {} copy starts {} stale exits {} cursor steps {} bounds by head {} landings left {} quiet merges {} key sequences kept {} rank patches {} rank starts {} copies packed {} unpacked {}, log frames dropped {} spilled {}, held logs with no frames {frameless}, memtables hashed by FNV {mem_fnv}, overwriting puts {} overwrites {}, point reads two-source {} layered {} placed {}, FAILURES {}",
         heads[0],
         heads[1],
         point[0],
