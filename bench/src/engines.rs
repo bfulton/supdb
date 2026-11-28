@@ -968,10 +968,6 @@ pub struct Supdb {
     /// before `Options::direct_derive_keys`. `supdb-keycopies`, and
     /// `supdb-ingestkeycopies` buffered.
     keycopies: bool,
-    /// The finish's slot and Bloom fills placing each key as it is asked
-    /// for, the shape before `SegmentOptions::lookahead`. `supdb-fillplain`,
-    /// and `supdb-ingestfillplain` buffered.
-    fillplain: bool,
     /// A flush's close with the one fsync at the end, the shape before
     /// `Options::close_presync`. `supdb-latesync`, and
     /// `supdb-ingestlatesync` buffered.
@@ -1239,10 +1235,6 @@ pub struct Supdb {
     /// snapshot (`Options::forms_pieces_only`). `supdb-piecesonly`, and
     /// `supdb-ingestpiecesonly` buffered.
     piecesonly: bool,
-    /// The segment writer leaves every piece dirty and unsynced until the
-    /// closing fsync, as before `SegmentOptions::early_writeback` and
-    /// `sync_ahead`. `supdb-latewb`, and `supdb-ingestlatewb` buffered.
-    latewb: bool,
     /// The segment work driven inline by the writer, as before
     /// `Options::publish_in_background`. `supdb-inlinemaint`.
     inlinemaint: bool,
@@ -1270,10 +1262,6 @@ pub struct Supdb {
     /// of its values (`Options::direct_table_refs`). `supdb-refvals`, and
     /// `supdb-ingestrefvals` buffered.
     refvals: bool,
-    /// The key section's checksum row hashed at the close from the file,
-    /// as before `SegmentOptions::row_on_write`. `supdb-rowatclose`, and
-    /// `supdb-ingestrowatclose` buffered.
-    rowatclose: bool,
     /// A piece's keys ranked over the partition's records, as before
     /// `Options::piece_ranks_by_heads`. `supdb-rankrecords`, and
     /// `supdb-ingestrankrecords` buffered.
@@ -2452,10 +2440,6 @@ struct Policy {
     /// before `Options::direct_derive_keys`. `supdb-keycopies`, and
     /// `supdb-ingestkeycopies` buffered.
     keycopies: bool,
-    /// The finish's slot and Bloom fills placing each key as it is asked
-    /// for, the shape before `SegmentOptions::lookahead`. `supdb-fillplain`,
-    /// and `supdb-ingestfillplain` buffered.
-    fillplain: bool,
     /// A flush's close with the one fsync at the end, the shape before
     /// `Options::close_presync`. `supdb-latesync`, and
     /// `supdb-ingestlatesync` buffered.
@@ -2722,10 +2706,6 @@ struct Policy {
     /// snapshot (`Options::forms_pieces_only`). `supdb-piecesonly`, and
     /// `supdb-ingestpiecesonly` buffered.
     piecesonly: bool,
-    /// The segment writer leaves every piece dirty and unsynced until the
-    /// closing fsync, as before `SegmentOptions::early_writeback` and
-    /// `sync_ahead`. `supdb-latewb`, and `supdb-ingestlatewb` buffered.
-    latewb: bool,
     /// The segment work driven inline by the writer, as before
     /// `Options::publish_in_background`. `supdb-inlinemaint`.
     inlinemaint: bool,
@@ -2753,10 +2733,6 @@ struct Policy {
     /// of its values (`Options::direct_table_refs`). `supdb-refvals`, and
     /// `supdb-ingestrefvals` buffered.
     refvals: bool,
-    /// The key section's checksum row hashed at the close from the file,
-    /// as before `SegmentOptions::row_on_write`. `supdb-rowatclose`, and
-    /// `supdb-ingestrowatclose` buffered.
-    rowatclose: bool,
     /// A piece's keys ranked over the partition's records, as before
     /// `Options::piece_ranks_by_heads`. `supdb-rankrecords`, and
     /// `supdb-ingestrankrecords` buffered.
@@ -3326,7 +3302,6 @@ impl Default for Policy {
             asympin: false,
             extsval: false,
             piecesonly: false,
-            latewb: false,
             inlinemaint: false,
             convertsources: false,
             copyslack: false,
@@ -3334,7 +3309,6 @@ impl Default for Policy {
             manifestfree: false,
             oidxsync: false,
             refvals: false,
-            rowatclose: false,
             lendbursts: false,
             paced: false,
             pacelends: false,
@@ -3412,7 +3386,6 @@ impl Default for Policy {
             recordsteps: false,
             copyvals: false,
             keycopies: false,
-            fillplain: false,
             latesync: false,
             installreads: false,
             noabandon: false,
@@ -6070,20 +6043,6 @@ impl Supdb {
         )
     }
 
-    /// `supdb` with the segment writer leaving every piece dirty and
-    /// unsynced until the closing fsync (`SegmentOptions::early_writeback`
-    /// off and `sync_ahead` zero): against `supdb` it prices the writeback
-    /// the writer starts early and the syncs its thread makes behind it.
-    pub fn create_latewb(path: &Path) -> Res<Supdb> {
-        Supdb::with_policy(
-            path,
-            Policy {
-                latewb: true,
-                ..Policy::default()
-            },
-        )
-    }
-
     /// `supdb` converting a dense sparse form by a build from the sources,
     /// as before `Options::convert_from_form`: against `supdb` it prices
     /// the conversion from the form's own deltas.
@@ -6226,32 +6185,6 @@ impl Supdb {
                 partition: false,
                 durable: false,
                 refvals: true,
-                ..Policy::default()
-            },
-        )
-    }
-
-    /// The checksum row hashed at the close from the file rather than on
-    /// the writer as the bytes are buffered (`SegmentOptions::row_on_write`):
-    /// against `supdb` it prices the read-back on the drain's path.
-    pub fn create_rowatclose(path: &Path) -> Res<Supdb> {
-        Supdb::with_policy(
-            path,
-            Policy {
-                rowatclose: true,
-                ..Policy::default()
-            },
-        )
-    }
-
-    /// `supdb-ingest` hashing the row at the close, as `supdb-rowatclose`.
-    pub fn create_ingest_rowatclose(path: &Path) -> Res<Supdb> {
-        Supdb::with_policy(
-            path,
-            Policy {
-                partition: false,
-                durable: false,
-                rowatclose: true,
                 ..Policy::default()
             },
         )
@@ -7685,31 +7618,6 @@ impl Supdb {
         )
     }
 
-    /// `supdb` with the finish's slot and Bloom fills placing each key as
-    /// it is asked for, the shape before `SegmentOptions::lookahead`.
-    pub fn create_fillplain(path: &Path) -> Res<Supdb> {
-        Supdb::with_policy(
-            path,
-            Policy {
-                fillplain: true,
-                ..Policy::default()
-            },
-        )
-    }
-
-    /// `supdb-ingest` as `supdb-fillplain`.
-    pub fn create_ingest_fillplain(path: &Path) -> Res<Supdb> {
-        Supdb::with_policy(
-            path,
-            Policy {
-                partition: false,
-                durable: false,
-                fillplain: true,
-                ..Policy::default()
-            },
-        )
-    }
-
     /// `supdb` with a flush's close making the one fsync at the end, the
     /// shape before `Options::close_presync`.
     pub fn create_latesync(path: &Path) -> Res<Supdb> {
@@ -8750,20 +8658,6 @@ impl Supdb {
                 partition: false,
                 durable: false,
                 rankrecords: true,
-                ..Policy::default()
-            },
-        )
-    }
-
-    /// `supdb-ingest` with the closing fsync writing everything, as
-    /// `supdb-latewb`.
-    pub fn create_ingest_latewb(path: &Path) -> Res<Supdb> {
-        Supdb::with_policy(
-            path,
-            Policy {
-                partition: false,
-                durable: false,
-                latewb: true,
                 ..Policy::default()
             },
         )
@@ -9984,7 +9878,6 @@ impl Supdb {
             asympin,
             extsval,
             piecesonly,
-            latewb,
             inlinemaint,
             convertsources,
             copyslack,
@@ -9992,7 +9885,6 @@ impl Supdb {
             manifestfree,
             oidxsync,
             refvals,
-            rowatclose,
             lendbursts,
             paced,
             pacelends,
@@ -10070,7 +9962,6 @@ impl Supdb {
             recordsteps,
             copyvals,
             keycopies,
-            fillplain,
             latesync,
             installreads,
             noabandon,
@@ -10316,12 +10207,6 @@ impl Supdb {
             segment: supdb::SegmentOptions {
                 checksums: false,
                 compact_records: !fullrec,
-                early_writeback: !latewb,
-                sync_ahead: if latewb {
-                    0
-                } else {
-                    supdb::SegmentOptions::default().sync_ahead
-                },
                 write_piece: if pmd {
                     2 << 20
                 } else if piece256 {
@@ -10329,8 +10214,6 @@ impl Supdb {
                 } else {
                     supdb::SegmentOptions::default().write_piece
                 },
-                row_on_write: !rowatclose,
-                lookahead: !fillplain,
                 ..Default::default()
             },
             // The engine's own defaults: 32 MB seals over 64 MB partitions,
@@ -11038,7 +10921,6 @@ impl Supdb {
             asympin,
             extsval,
             piecesonly,
-            latewb,
             inlinemaint,
             convertsources,
             copyslack,
@@ -11046,7 +10928,6 @@ impl Supdb {
             manifestfree,
             oidxsync,
             refvals,
-            rowatclose,
             lendbursts,
             paced,
             pacelends,
@@ -11124,7 +11005,6 @@ impl Supdb {
             recordsteps,
             copyvals,
             keycopies,
-            fillplain,
             latesync,
             installreads,
             noabandon,
@@ -12313,13 +12193,6 @@ impl Engine for Supdb {
                 "supdb-ingestpiecesonly"
             };
         }
-        if self.latewb {
-            return if self.partition {
-                "supdb-latewb"
-            } else {
-                "supdb-ingestlatewb"
-            };
-        }
         if self.convertsources {
             return if self.partition {
                 "supdb-convertsources"
@@ -12356,13 +12229,6 @@ impl Engine for Supdb {
                 "supdb-refvals"
             } else {
                 "supdb-ingestrefvals"
-            };
-        }
-        if self.rowatclose {
-            return if self.partition {
-                "supdb-rowatclose"
-            } else {
-                "supdb-ingestrowatclose"
             };
         }
         if self.lendbursts {
@@ -12875,13 +12741,6 @@ impl Engine for Supdb {
                 "supdb-keycopies"
             } else {
                 "supdb-ingestkeycopies"
-            };
-        }
-        if self.fillplain {
-            return if self.partition {
-                "supdb-fillplain"
-            } else {
-                "supdb-ingestfillplain"
             };
         }
         if self.latesync {
@@ -15714,13 +15573,11 @@ pub fn guarantee(arm: &str) -> Option<Guarantee> {
         | "supdb-asympin"
         | "supdb-extsval"
         | "supdb-piecesonly"
-        | "supdb-latewb"
         | "supdb-convertsources"
         | "supdb-copyslack"
         | "supdb-manifestfree"
         | "supdb-oidxsync"
         | "supdb-refvals"
-        | "supdb-rowatclose"
         | "supdb-lendbursts"
         | "supdb-inlineall"
         | "supdb-lazysettle"
@@ -15806,7 +15663,6 @@ pub fn guarantee(arm: &str) -> Option<Guarantee> {
         | "supdb-recordsteps"
         | "supdb-copyvals"
         | "supdb-keycopies"
-        | "supdb-fillplain"
         | "supdb-latesync"
         | "supdb-installreads"
         | "supdb-noabandon"
@@ -16007,14 +15863,12 @@ pub fn guarantee(arm: &str) -> Option<Guarantee> {
         | "supdb-ingestpostedyield"
         | "supdb-ingestbehindyield"
         | "supdb-ingestpiecesonly"
-        | "supdb-ingestlatewb"
         | "supdb-ingestconvertsources"
         | "supdb-ingestcopyslack"
         | "supdb-ingestdrainpromote"
         | "supdb-ingestmanifestfree"
         | "supdb-ingestoidxsync"
         | "supdb-ingestrefvals"
-        | "supdb-ingestrowatclose"
         | "supdb-ingestlendbursts"
         | "supdb-ingestpaced"
         | "supdb-ingestsettleloads"
@@ -16062,7 +15916,6 @@ pub fn guarantee(arm: &str) -> Option<Guarantee> {
         | "supdb-ingestrecordsteps"
         | "supdb-ingestcopyvals"
         | "supdb-ingestkeycopies"
-        | "supdb-ingestfillplain"
         | "supdb-ingestlatesync"
         | "supdb-ingestnorecycle"
         | "supdb-ingestheapblocks"
@@ -16999,23 +16852,19 @@ pub fn open(arm: &str, dir: &Path, map_gb: usize) -> Res<Box<dyn Engine>> {
         "supdb-extsval" => supdb_arm(Supdb::create_extsval, dir)?,
         "supdb-piecesonly" => supdb_arm(Supdb::create_piecesonly, dir)?,
         "supdb-ingestpiecesonly" => supdb_arm(Supdb::create_ingest_piecesonly, dir)?,
-        "supdb-latewb" => supdb_arm(Supdb::create_latewb, dir)?,
         "supdb-convertsources" => supdb_arm(Supdb::create_convertsources, dir)?,
         "supdb-copyslack" => supdb_arm(Supdb::create_copyslack, dir)?,
         "supdb-manifestfree" => supdb_arm(Supdb::create_manifestfree, dir)?,
         "supdb-oidxsync" => supdb_arm(Supdb::create_oidxsync, dir)?,
         "supdb-refvals" => supdb_arm(Supdb::create_refvals, dir)?,
-        "supdb-rowatclose" => supdb_arm(Supdb::create_rowatclose, dir)?,
         "supdb-ingestconvertsources" => supdb_arm(Supdb::create_ingest_convertsources, dir)?,
         "supdb-ingestcopyslack" => supdb_arm(Supdb::create_ingest_copyslack, dir)?,
         "supdb-ingestdrainpromote" => supdb_arm(Supdb::create_ingest_drainpromote, dir)?,
         "supdb-ingestmanifestfree" => supdb_arm(Supdb::create_ingest_manifestfree, dir)?,
         "supdb-ingestoidxsync" => supdb_arm(Supdb::create_ingest_oidxsync, dir)?,
         "supdb-ingestrefvals" => supdb_arm(Supdb::create_ingest_refvals, dir)?,
-        "supdb-ingestrowatclose" => supdb_arm(Supdb::create_ingest_rowatclose, dir)?,
         "supdb-rankrecords" => supdb_arm(Supdb::create_rankrecords, dir)?,
         "supdb-ingestrankrecords" => supdb_arm(Supdb::create_ingest_rankrecords, dir)?,
-        "supdb-ingestlatewb" => supdb_arm(Supdb::create_ingest_latewb, dir)?,
         "supdb-inlinemaint" => supdb_arm(Supdb::create_inlinemaint, dir)?,
         "supdb-ingestinline" => supdb_arm(Supdb::create_ingest_inline, dir)?,
         "supdb-ingestsync" => supdb_arm(Supdb::create_ingest_sync, dir)?,
@@ -18431,8 +18280,6 @@ pub fn open(arm: &str, dir: &Path, map_gb: usize) -> Res<Box<dyn Engine>> {
         "supdb-ingestcopyvals" => supdb_arm(Supdb::create_ingest_copyvals, dir)?,
         "supdb-keycopies" => supdb_arm(Supdb::create_keycopies, dir)?,
         "supdb-ingestkeycopies" => supdb_arm(Supdb::create_ingest_keycopies, dir)?,
-        "supdb-fillplain" => supdb_arm(Supdb::create_fillplain, dir)?,
-        "supdb-ingestfillplain" => supdb_arm(Supdb::create_ingest_fillplain, dir)?,
         "supdb-latesync" => supdb_arm(Supdb::create_latesync, dir)?,
         "supdb-installreads" => supdb_arm(Supdb::create_installreads, dir)?,
         "supdb-noabandon" => supdb_arm(Supdb::create_noabandon, dir)?,

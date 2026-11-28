@@ -1275,7 +1275,7 @@ fn reopen(mem: &OsFile, write: bool, append: bool) -> Result<OsFile> {
 /// for nothing): the device writes the pieces behind while the cipher
 /// works on the piece ahead, and the sync at the end finds most of the file
 /// written. A plain segment's writer does the same for the same reason
-/// (`SegmentOptions::early_writeback`); without it an envelope's sync was
+/// (`AlignedWriter`); without it an envelope's sync was
 /// the whole file's device time after the whole file's cipher time, end to
 /// end.
 struct Ahead {

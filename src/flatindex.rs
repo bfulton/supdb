@@ -1393,7 +1393,7 @@ pub fn stream_record_tail_at(
 /// exactly once for each i in key order -- the directory and the hash
 /// slots are filled in that one pass -- so a caller whose keys live in a
 /// table it already keeps reads each entry once and copies nothing for
-/// the trailer. `lookahead` is the slot fill's (`fill_hash`). Returns
+/// the trailer. The slots are filled asking ahead (`fill_hash`). Returns
 /// (header, trailer, section total).
 ///
 /// The layout is one `FlatIndex::parse` accepts because every region is
@@ -1405,9 +1405,8 @@ pub fn stream_trailer<'a>(
     key_at: &dyn Fn(usize) -> &'a [u8],
     each: &mut dyn FnMut(usize) -> (u32, u64),
     generation: u64,
-    lookahead: bool,
 ) -> Option<(Vec<u8>, Vec<u8>, usize)> {
-    stream_trailer_in(Vec::new(), n, recs_len, key_at, each, generation, lookahead)
+    stream_trailer_in(Vec::new(), n, recs_len, key_at, each, generation)
 }
 
 /// The buffer a trailer is composed in: what `stream_trailer_in` asks of
@@ -1470,7 +1469,6 @@ pub fn stream_trailer_in<'a, B: TrailerBuf>(
     key_at: impl Fn(usize) -> &'a [u8],
     mut each: impl FnMut(usize) -> (u32, u64),
     generation: u64,
-    lookahead: bool,
 ) -> Option<(Vec<u8>, B, usize)> {
     debug_assert!(t.is_empty(), "a trailer composed into an empty buffer");
     if recs_len > MAX_RECS {
@@ -1530,7 +1528,7 @@ pub fn stream_trailer_in<'a, B: TrailerBuf>(
                 dir[i * 4..i * 4 + 4].copy_from_slice(&off.to_le_bytes());
                 (h, off)
             },
-            lookahead,
+            true,
         );
     }
     at += cap * SLOT;
@@ -3081,33 +3079,34 @@ mod fill_tests {
     use super::*;
 
     /// The lookahead fill places every key where the plain fill does, so
-    /// the section is the same bytes either way, and each key is asked
-    /// for once, in order, by both.
+    /// the slots are the same bytes either way, and each key is asked for
+    /// once, in order, by both: the streamed finish fills asking ahead and
+    /// `encode` plainly.
     #[test]
     fn the_lookahead_fill_writes_the_plain_fills_bytes() {
         for n in [0usize, 1, 7, 16, 17, 33, 5000] {
             let keys: Vec<Vec<u8>> = (0..n).map(|i| format!("key-{i:08}").into_bytes()).collect();
+            let cap = hash_cap_for(n).expect("a table within the limits");
             let mut outs = Vec::new();
             for lookahead in [false, true] {
                 let mut asked = Vec::new();
-                let r = stream_trailer(
+                let mut t = vec![0u8; cap * SLOT];
+                fill_hash(
+                    &mut t,
+                    cap - 1,
                     n,
-                    n * 20,
-                    &|i| &keys[i][..],
-                    &mut |i| {
+                    |i| {
                         asked.push(i);
-                        ((i * 20) as u32, key_hash(&keys[i]))
+                        (key_hash(&keys[i]), (i * 20) as u32)
                     },
-                    7,
                     lookahead,
-                )
-                .expect("a section within the limits");
+                );
                 assert_eq!(
                     asked,
                     (0..n).collect::<Vec<_>>(),
                     "{n} keys, each asked once in order"
                 );
-                outs.push(r);
+                outs.push(t);
             }
             assert_eq!(outs[0], outs[1], "{n} keys");
         }
@@ -3135,7 +3134,6 @@ mod fill_tests {
                     &|i| &keys[i][..],
                     &mut |i| ((i * 20) as u32, key_hash(&keys[i])),
                     1,
-                    false,
                 )
                 .expect("a section within the limits");
                 let fence = fence_blob_len(n, |i| keys[i].len());

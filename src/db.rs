@@ -9927,8 +9927,8 @@ pub(crate) struct BlockedBloom {
     magic: u64,
 }
 
-/// A Bloom built from FNV words as they come: `add` takes each word and,
-/// with `lookahead`, hints the word's block to the core and sets the bits
+/// A Bloom built from FNV words as they come: `add` takes each word,
+/// hints the word's block to the core and sets the bits
 /// of the word taken `BLOOM_AHEAD` adds before, whose block has arrived
 /// meanwhile -- a block is a random line of a filter of three hundred and
 /// seventy kilobytes at three hundred thousand keys, and the first store
@@ -9936,7 +9936,6 @@ pub(crate) struct BlockedBloom {
 /// the same whatever order its bits are set in.
 pub(crate) struct BloomFill {
     bloom: BlockedBloom,
-    lookahead: bool,
     ring: [u64; BLOOM_AHEAD],
     n: usize,
 }
@@ -9945,10 +9944,9 @@ pub(crate) struct BloomFill {
 const BLOOM_AHEAD: usize = 16;
 
 impl BloomFill {
-    fn new(bloom: BlockedBloom, lookahead: bool) -> BloomFill {
+    fn new(bloom: BlockedBloom) -> BloomFill {
         BloomFill {
             bloom,
-            lookahead,
             ring: [0; BLOOM_AHEAD],
             n: 0,
         }
@@ -9957,10 +9955,6 @@ impl BloomFill {
     /// One key by its FNV word (`key_hash`).
     #[inline]
     fn add(&mut self, h: u64) {
-        if !self.lookahead {
-            self.bloom.add_fnv(h);
-            return;
-        }
         self.bloom.prefetch_fnv(h);
         let at = self.n % BLOOM_AHEAD;
         if self.n >= BLOOM_AHEAD {
@@ -9973,12 +9967,10 @@ impl BloomFill {
 
     /// The filter, every word added set.
     fn finish(mut self) -> BlockedBloom {
-        if self.lookahead {
-            let held = self.n.min(BLOOM_AHEAD);
-            for k in 0..held {
-                let h = self.ring[(self.n - held + k) % BLOOM_AHEAD];
-                self.bloom.add_fnv(h);
-            }
+        let held = self.n.min(BLOOM_AHEAD);
+        for k in 0..held {
+            let h = self.ring[(self.n - held + k) % BLOOM_AHEAD];
+            self.bloom.add_fnv(h);
         }
         self.bloom
     }
@@ -10059,9 +10051,9 @@ impl BlockedBloom {
     /// FNV words the segment writer kept for the index (`key_hash`): what
     /// the landing takes instead of walking the records it just wrote,
     /// which was three quarters of the segment work's time over an
-    /// ordered load. `lookahead` asks ahead (`BloomFill`) or not.
-    fn from_fnv(hashes: &[u64], lookahead: bool) -> BlockedBloom {
-        let mut f = BloomFill::new(BlockedBloom::with_capacity(hashes.len()), lookahead);
+    /// ordered load. The fill asks ahead (`BloomFill`).
+    fn from_fnv(hashes: &[u64]) -> BlockedBloom {
+        let mut f = BloomFill::new(BlockedBloom::with_capacity(hashes.len()));
         for &h in hashes {
             f.add(h);
         }
@@ -11249,8 +11241,8 @@ struct AlignedWriter {
     /// because every record written asks how far the boundary is, and
     /// worked out it is a divide a record.
     bound: u64,
-    /// Start the device on each piece as it lands
-    /// (`SegmentOptions::early_writeback`).
+    /// Start the device on each piece as it lands: not for a file of a
+    /// store's data file, which hands its writes to the device itself.
     writeback: bool,
     /// `SegmentOptions::sync_ahead`; the thread once the file is that
     /// long; how far the writer's own syncs reach, which the thread syncs
@@ -11278,7 +11270,7 @@ struct AlignedWriter {
     /// the section ends: a segment too small for the helper -- every
     /// segment the small rungs' drains close -- had every piece read back
     /// and hashed at its finish instead, 0.3 ms of a drain of 3 at ten
-    /// thousand keys (`SegmentOptions::row_on_write`). `own_from` is the
+    /// thousand keys. `own_from` is the
     /// first boundary, `own_row` the whole pieces' CRCs from it, `own_at`
     /// the next byte to hash and `own_crc` the piece in progress.
     own_on: bool,
@@ -11332,13 +11324,7 @@ struct HelperRow {
 }
 
 impl AlignedWriter {
-    fn new(
-        file: vault::File,
-        piece: usize,
-        writeback: bool,
-        ahead: u64,
-        prefault: bool,
-    ) -> AlignedWriter {
+    fn new(file: vault::File, piece: usize, ahead: u64, prefault: bool) -> AlignedWriter {
         let piece = piece.max(4096);
         // A file of a store's data file says so in the byte every write
         // and sync of the writer asks (`RUN_FILE_PLACED`), and hands its
@@ -11346,7 +11332,7 @@ impl AlignedWriter {
         // piece: its writes are made off the paths that hint.
         let placed = file.is_placed();
         if placed {
-            file.hint_writes(writeback);
+            file.hint_writes(true);
         }
         AlignedWriter {
             file,
@@ -11360,7 +11346,7 @@ impl AlignedWriter {
             stream_base: None,
             piece: piece as u64,
             bound: 0,
-            writeback: writeback && !placed,
+            writeback: !placed,
             ahead,
             helper: None,
             helper_done: false,
@@ -11619,13 +11605,6 @@ impl AlignedWriter {
     fn set_stream_source(&mut self, table: std::sync::Arc<MemTable>) {
         debug_assert!(table.stream, "a stream source streams");
         self.stream_src = Some(table);
-    }
-
-    /// Whether the writer hashes the section's pieces itself until the
-    /// helper runs (`SegmentOptions::row_on_write`); off, the finish reads
-    /// back whatever the helper did not hash.
-    fn set_row_on_write(&mut self, on: bool) {
-        self.own_on = on;
     }
 
     /// Bytes at file offset `at`, just buffered: the whole pieces they
@@ -12804,11 +12783,6 @@ pub struct SegmentWriter {
     /// what an ordered table keeps in place of the value
     /// (`Options::direct_table_refs`).
     last_value: (u64, u32),
-    /// `SegmentOptions::row_on_write`: whether the writer's own pass yields
-    /// the row, which decides at `set_marks` whether the helper hashes.
-    row_on_write: bool,
-    /// `SegmentOptions::lookahead`: the finish's fills ask ahead and hint.
-    lookahead: bool,
     /// `set_deferred_keys`: how many keys were taken in with no copy of
     /// them kept -- `key_arena`, `spans`, `rec_offs` and `hashes` stay
     /// empty and the finish is handed the keys (`finish_unsynced_from`)
@@ -12992,14 +12966,10 @@ impl SegmentWriter {
         // Read as well as write: `finish` reads the streamed records back to
         // compute the key section's checksum row.
         let file = vault::create_rw(path)?;
-        let mut out = AlignedWriter::new(
-            file,
-            opts.write_piece,
-            opts.early_writeback,
-            opts.sync_ahead,
-            opts.prefault,
-        );
-        out.set_row_on_write(opts.row_on_write);
+        let mut out = AlignedWriter::new(file, opts.write_piece, opts.sync_ahead, opts.prefault);
+        // The writer hashes the section's pieces itself until the helper
+        // runs, as their bytes are buffered and hot.
+        out.own_on = true;
         out.fail_helper = opts.fail_helper_syncs.clone();
         if let Some(f) = &opts.helper_fault {
             out.helper_fault = Some(f.clone());
@@ -13020,8 +12990,6 @@ impl SegmentWriter {
             out,
             pos: crate::format::SUPER,
             last_value: (0, 0),
-            row_on_write: opts.row_on_write,
-            lookahead: opts.lookahead,
             deferred: None,
             last_key: Vec::new(),
             buffers_mapped: opts.maps(),
@@ -13108,7 +13076,7 @@ impl SegmentWriter {
     /// walks as before.
     pub(crate) fn landing_bloom(&self) -> Option<BlockedBloom> {
         (self.mode == Some(Layout::RecordsFirst) && !self.hashes.is_empty())
-            .then(|| BlockedBloom::from_fnv(&self.hashes, self.lookahead))
+            .then(|| BlockedBloom::from_fnv(&self.hashes))
     }
 
     /// A commit marker after the records so far, in the records-first
@@ -13659,7 +13627,7 @@ impl SegmentWriter {
         // No helper thread and no row kept as the bytes land: the records
         // were written by another process, so the finish reads the
         // section back for its checksum row (`row_for`).
-        let mut out = AlignedWriter::new(file, opts.write_piece, opts.early_writeback, 0, false);
+        let mut out = AlignedWriter::new(file, opts.write_piece, 0, false);
         out.written = run.end;
         let mut w = SegmentWriter::over(out, opts);
         w.pos = run.end;
@@ -13688,7 +13656,7 @@ impl SegmentWriter {
         // A marking writer hashes every record for its markers and folds
         // the row's pieces out of the same pass, so the helper only syncs;
         // where the row is left to the close, the helper hashes as before.
-        self.out.set_helper_hashes(!(on && self.row_on_write));
+        self.out.set_helper_hashes(!on);
     }
 
     /// The sequence number this segment's first record takes, for a run
@@ -14326,8 +14294,7 @@ impl SegmentWriter {
                 "segment writer: the key source holds a different count of keys than were written",
             ));
         }
-        let mut b =
-            want_bloom.then(|| BloomFill::new(BlockedBloom::with_capacity(n), self.lookahead));
+        let mut b = want_bloom.then(|| BloomFill::new(BlockedBloom::with_capacity(n)));
         let fence = flatindex::fence_blob_len(n, |i| src.key_at(i).len());
         let (header, trailer, total) = flatindex::stream_trailer_in(
             self.trailer_buf(n, fence),
@@ -14343,7 +14310,6 @@ impl SegmentWriter {
                 (off, h)
             },
             generation,
-            self.lookahead,
         )
         .ok_or_else(|| err("segment writer: key section exceeds the flat index's limits"))?;
         Ok((header, trailer, total, b.map(BloomFill::finish)))
@@ -14407,7 +14373,6 @@ impl SegmentWriter {
                             key_at,
                             |i| (rec_offs[i], hashes[i]),
                             generation,
-                            self.lookahead,
                         )
                         .ok_or_else(limits)?
                     }
@@ -14721,17 +14686,6 @@ pub struct SegmentOptions {
     /// write pays the host's fault for every page of it. `docs/engine.md`
     /// has the figures; `supdb-pmd` and `supdb-ingestpmd` price 2 MB.
     pub write_piece: usize,
-    /// Start the device writing each piece as it is handed to the file
-    /// (`sync_file_range` with the write flag, Linux; nothing elsewhere),
-    /// so the fsync that closes the segment finds most of it written. A
-    /// segment the writer streams is dirty in the page cache until that
-    /// fsync, which then writes all of it at once: forty megabytes at
-    /// three hundred thousand keys, forty milliseconds the load's sync
-    /// waited through while the comparator's sync wrote the same bytes.
-    /// Nothing waits here; the hint costs a syscall a piece. On by
-    /// default; `supdb-latewb` and `supdb-ingestlatewb` price the fsync
-    /// that writes everything at the end.
-    pub early_writeback: bool,
     /// A thread behind the writer, started once the file is this long
     /// (`WriterHelper`): it syncs the file for every this many bytes the
     /// writer has handed it past what is synced, and it hashes the key
@@ -14742,7 +14696,7 @@ pub struct SegmentOptions {
     /// finished, and the row's re-read of the section 11 ms more, both
     /// inside the sync a load ends with, while the writer's own pace
     /// leaves a thread time for both beside it. Zero leaves it all to the
-    /// close. On by default; the `latewb` arms turn it and the hint off.
+    /// close. On by default.
     /// Eight megabytes, and a run under that is synced whole at its
     /// close: a thirty-thousand-key load's close syncs 3 ms of records
     /// on the writer's path, and a lower threshold was priced to take
@@ -14756,22 +14710,6 @@ pub struct SegmentOptions {
     /// presence beside the writer's last pieces and the finish costs
     /// more at those sizes, by a mechanism the stamps did not name.
     pub sync_ahead: u64,
-    /// Whether the writer hashes the key section's checksum pieces itself,
-    /// as their bytes are buffered and hot, until the helper thread runs
-    /// (`sync_ahead`) or the section ends. Off, the finish reads back and
-    /// hashes every piece the helper did not, which for a segment too small
-    /// for the helper is every piece: 0.3 ms of a drain of 3 at ten
-    /// thousand keys, kept for pricing as `supdb-rowatclose` and
-    /// `supdb-ingestrowatclose`.
-    pub row_on_write: bool,
-    /// The finish's slot and Bloom fills ask for each key sixteen ahead of
-    /// placing it and hint its slot and its block to the core meanwhile
-    /// (`flatindex::fill_hash`, `BloomFill`): the probe of a random slot
-    /// in a table that outgrows the core's cache was four fifths of the
-    /// fill's time at three hundred thousand keys. Off, the plain fills,
-    /// the arm `supdb-fillplain` and `supdb-ingestfillplain`. The bytes
-    /// are the same either way.
-    pub lookahead: bool,
     /// EXPERIMENT: the piece buffer's pages populated a window ahead of
     /// the fill rather than faulted one by one as the records land; see
     /// `Options::prefault`, which a `Db` sets this from. Off.
@@ -14922,10 +14860,7 @@ impl Default for SegmentOptions {
             parallel_index: true,
             compact_records: crate::reserve::COMPACT_RECORDS,
             write_piece: 1 << 20,
-            early_writeback: true,
             sync_ahead: 8 << 20,
-            row_on_write: true,
-            lookahead: true,
             prefault: false,
             fail_helper_syncs: None,
             helper_fault: None,
@@ -69644,14 +69579,17 @@ mod landing_facts {
             .iter()
             .map(|k| crate::flatindex::key_hash(k.as_bytes()))
             .collect();
-        let by_hash = BlockedBloom::from_fnv(&hashes, false);
+        let by_hash = BlockedBloom::from_fnv(&hashes);
         assert_eq!(
             by_key.blocks, by_hash.blocks,
             "inserted by key and by FNV word"
         );
         for n in [0usize, 1, 15, 16, 17, 40, 5000] {
-            let plain = BlockedBloom::from_fnv(&hashes[..n], false);
-            let ahead = BlockedBloom::from_fnv(&hashes[..n], true);
+            let mut plain = BlockedBloom::with_capacity(n);
+            for k in &keys[..n] {
+                plain.insert(k.as_bytes());
+            }
+            let ahead = BlockedBloom::from_fnv(&hashes[..n]);
             assert_eq!(plain.blocks, ahead.blocks, "{n} words, asked ahead");
         }
     }
