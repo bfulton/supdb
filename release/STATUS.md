@@ -33,7 +33,7 @@ merges here: the measurement (`release-measure`), the hostile-input and
 | 0 | Baseline at C0 | measurement agent, cloud session `supdb: baseline measurement at C0` | `release/baseline.md`; rows on `release-measure` | prepared and verified; static counts measured; the cost count of C0 against itself running here; the measurement session started at 17:59 ET on the rows and the floor | nothing |
 | 1 | Delete: options ledger, dead code, API surface | coordinator's subagents | batches 1 and 2 written on `rc/phase1-pr1`; batch 3 in four tracks, `claude/supdb-pretag-p1-{a,b,c,d}`; all merged here | the gate's fix (#38's `2fc48db0`) and batches 1 and 2 (the reviewer's groups PR1 to PR4) are merged here at `8e3f9d71`; batch 2's review and the merged tree's gate run on this machine; PR5 to PR29 are being written in four sessions of their own since 2026-11-28 (`release/phase1.md`, Batches) | batch 2's review; each track's groups; then PR30 |
 | 2 | Reshape: split `src/db.rs`, style | not assigned | none | not started | phase 1 |
-| 3 | Verify: audits, then fixes | coordinator's subagents | `release/findings/` | four read-only audits done (guarantees, format, encryption, supply chain); the hostile-input and `unsafe` audits, and the supply-chain fixes, started on 2026-11-28 in sessions of their own; the engine's fixes wait for phase 1 | phase 1, then decision 4 (default: format 2 promised, one-file and cipher stores experimental) |
+| 3 | Verify: audits, then fixes | coordinator's subagents | `release/findings/`; fixes on `claude/supdb-pretag-supply-chain` | four read-only audits done (guarantees, format, encryption, supply chain). The supply-chain fixes are merged here at `8ae4c5f6` (six commits: workflow permissions and pins, bank-row's build and push in two jobs, dispatch inputs held to digits, `publish = false`, `lz4_flex` 0.11.7 with the floors raised, the web reader's trust list); its gate green but for `lists`, green after fetching main, cost green, fuzz past the ranges green. The hostile-input audit has five highs so far (the key section's checksum row turned off by one word, block-table lengths sized before they are checked, superblock offsets unchecked, a header word that narrows on wasm32, and keys over 65,535 bytes stored as another key); a fix session starts from its branch once the reproducers are pushed | phase 1, then decision 4 (default: format 2 promised, one-file and cipher stores experimental) |
 | 4 | Tests: flake loop, runtime, coverage | the flakes session | `claude/supdb-pretag-flakes` | the three known flakes (ARM durable, macOS settle, cipher room) being diagnosed since 2026-11-28; the loop itself not started | the last fix of phase 3, decision 5 |
 | 5 | Words: roadmap, docs, release files | not assigned | none | begun on main by #37 (`CLAUDE.md` as rules, the roadmap as short items) | the last fix of phase 3, decision 6 |
 | 6 | Measure at the last code commit | measurement agent | none | not started | phase 5 |
@@ -90,5 +90,22 @@ where they differ, and each difference is listed once here.
 
 ## Escalations
 
-None. The history audit found no credential. Four questions for Bright
-are in `release/history.md`, "For the owner"; none blocks a pass.
+The hostile-input highs above, sent to Bright on 2026-11-28; none needs
+Bright's decision.
+
+For Bright, none blocking a pass:
+- Four questions in `release/history.md`, "For the owner".
+- `.localmostrc` is unchanged: narrowing its write path to
+  `~/.cargo/registry` and `~/.cargo/git` (SC4, G4) would refuse cargo's
+  `~/.cargo/.package-cache` locks and `~/.cargo/.global-cache`, so a
+  narrowing has to be tried on the runner itself.
+- The workflow changes are held by `tests/source.rs` and a YAML parse, not
+  by a run on GitHub. `ci.yml` runs on the final pull request; a dispatch
+  of `bank-row.yml`, `quiet-bench.yml` and `runner-smoke.yml` is Bright's,
+  since they push branches or run on Bright's machine.
+- `cargo audit` was not run (`cargo install` is not an install through
+  `scripts/apt.sh`); the advisory database at `3eebb903` was matched
+  against both lockfiles by script. Nothing hits the engine's lock;
+  `bench/Cargo.lock` locks `libz-sys` 1.1.29 and `url` 2.5.8 under
+  advisories but builds neither, and `bincode` 1.3.3 is marked
+  unmaintained.
