@@ -11528,9 +11528,10 @@ fn a_buy_attaches_every_form_file_built_ahead_before_any_warm() {
 /// buy attaches the files on disk and installs the form with that one
 /// partition left to the raw form, where without the option the install
 /// waits for its build. The largest partition's file is taken away after
-/// the builds ahead, the builds ahead held off by a scan near and the
-/// controller's own build of it held at its start, so it stays without a
-/// file, a share of the footprint past the tenth the install leaves out.
+/// the builds ahead, with the builds ahead held off by a scan near and the
+/// controller's own build of it held at its start first, so it stays
+/// without a file, a share of the footprint past the tenth the install
+/// leaves out.
 #[cfg(target_os = "linux")]
 #[test]
 fn a_partition_whose_raw_records_are_resident_counts_as_covered() {
@@ -11569,9 +11570,18 @@ fn a_partition_whose_raw_records_are_resident_counts_as_covered() {
             .skip(1)
             .max_by_key(|f| common::store_len(f))
             .unwrap();
-        std::fs::remove_file(&largest).unwrap();
+        // Both holds before the file goes: `tick_until` returns at the
+        // count, which the last build ahead's thread moves before the upkeep
+        // has taken its end in, and the take-in drives the builder
+        // (`Options::zpages_drive_at_job_end`) -- the step after it builds
+        // ahead any partition without a file on disk, which with no scan
+        // yet and no hold was the removed one, once in a gate under load.
+        // A census step runs the same drive, so the removal is followed by
+        // one, and the file has to stay gone through it.
         db.scan(b"", 10, kv(&mut |_, _| {})).unwrap();
         db.hold_zpage_build(true);
+        std::fs::remove_file(&largest).unwrap();
+        wait_steps(&db, 1);
         inject.set_records_resident(1.0);
         inject.set_budget(1 << 20);
         inject.set_refault_rate(1_000_000.0);
