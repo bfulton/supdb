@@ -1778,30 +1778,11 @@ pub struct Supdb {
     /// with `zpages_record_coding`): `supdb-nocachezpagesrecordraw`, and
     /// `supdb-cache64tofitzpagesrecordraw` against `supdb-cache64tofitzpages`.
     zrawtails: bool,
-    /// The allocator trimmed once after the form files' install
-    /// (`Options::zpages_trim_install`); with the memo off and the raw
-    /// tails, the fit check of the raw-tail form at five million keys under
-    /// 640 MiB, `supdb-cache64tofitzpagesrecordrawlean` against
-    /// `supdb-cache64tofitzpages`.
-    ztrim: bool,
     /// The raw-tail form's groups decoded whole for a scan instead of read
     /// in place (`Options::zpages_inplace_walk` off), the shape before the
     /// in-place walk: `supdb-cache64tofitzpagesrecordrawdecode` against
     /// `supdb-cache64tofitzpagesrecordraw`.
     zdecodewalk: bool,
-    /// The trim thread asked to look at every upkeep pass end
-    /// (`Options::upkeep_trim_look`); with the lean arm's two levers, the
-    /// second fit check of the raw-tail form,
-    /// `supdb-cache64tofitzpagesrecordrawleantrim` against
-    /// `supdb-cache64tofitzpages`.
-    ztrimpass: bool,
-    /// The trim thread counting its stride by the resident bytes beyond
-    /// the allocator's use (`Options::trim_by_resident`), the stride eight
-    /// megabytes; with the lean arm's levers and the look, the third fit
-    /// check of the raw-tail form,
-    /// `supdb-cache64tofitzpagesrecordrawleanresident` against
-    /// `supdb-cache64tofitzpages`.
-    ztrimresident: bool,
     /// The first this many partitions by key order raw-tailed and the rest
     /// block-coded (`Options::zpages_raw_tails_first`): the upper bound of a
     /// coding chosen per partition by its heat,
@@ -3314,18 +3295,9 @@ struct Policy {
     /// The record coding with every tail stored raw (`Options::zpages_raw_tails`):
     /// `supdb-nocachezpagesrecordraw`, `supdb-cache64tofitzpagesrecordraw`.
     zrawtails: bool,
-    /// The allocator trimmed once after the form files' install
-    /// (`Options::zpages_trim_install`): `supdb-cache64tofitzpagesrecordrawlean`.
-    ztrim: bool,
     /// Its raw-tail groups decoded whole for a scan
     /// (`Options::zpages_inplace_walk` off): `supdb-cache64tofitzpagesrecordrawdecode`.
     zdecodewalk: bool,
-    /// The trim thread asked to look at every upkeep pass end
-    /// (`Options::upkeep_trim_look`): `supdb-cache64tofitzpagesrecordrawleantrim`.
-    ztrimpass: bool,
-    /// Its trim counting by the resident bytes (`Options::trim_by_resident`):
-    /// `supdb-cache64tofitzpagesrecordrawleanresident`.
-    ztrimresident: bool,
     /// Its first partitions raw-tailed (`Options::zpages_raw_tails_first`):
     /// `supdb-cache64tofitzpageshot4`.
     zhotfirst: usize,
@@ -3967,10 +3939,7 @@ impl Default for Policy {
             zrecord: false,
             zstored: false,
             zrawtails: false,
-            ztrim: false,
             zdecodewalk: false,
-            ztrimpass: false,
-            ztrimresident: false,
             zhotfirst: 0,
             zdropraw: None,
             zrecode: false,
@@ -10109,74 +10078,6 @@ impl Supdb {
         )
     }
 
-    /// `supdb-cache64tofitzpagesrecordraw` with the memo of decoded groups
-    /// off and the allocator trimmed once after the form files' install
-    /// (`Options::zpages_trim_install`), `supdb-cache64tofitzpagesrecordrawlean`:
-    /// the fit check of the raw-tail form at five million keys under
-    /// 640 MiB, where the form's 556 MB beside the block cache left the
-    /// process's anonymous bytes the margin.
-    pub fn create_cache64_tofit_zpages_record_raw_lean(path: &Path) -> Res<Supdb> {
-        Supdb::with_policy(
-            path,
-            Policy {
-                budget: 64 << 20,
-                tofit: true,
-                zpages: true,
-                zrawtails: true,
-                zpages_nomemo: true,
-                ztrim: true,
-                zdropraw: Some(false),
-                ..Policy::default()
-            },
-        )
-    }
-
-    /// `supdb-cache64tofitzpagesrecordrawlean` with the trim thread asked to
-    /// look at the allocator at every upkeep pass end
-    /// (`Options::upkeep_trim_look`), `supdb-cache64tofitzpagesrecordrawleantrim`:
-    /// the second fit check of the raw-tail form, the trim where the mixes
-    /// are and not before them.
-    pub fn create_cache64_tofit_zpages_record_raw_lean_trim(path: &Path) -> Res<Supdb> {
-        Supdb::with_policy(
-            path,
-            Policy {
-                budget: 64 << 20,
-                tofit: true,
-                zpages: true,
-                zrawtails: true,
-                zpages_nomemo: true,
-                ztrim: true,
-                ztrimpass: true,
-                zdropraw: Some(false),
-                ..Policy::default()
-            },
-        )
-    }
-
-    /// `supdb-cache64tofitzpagesrecordrawleantrim` with the trim thread
-    /// counting its stride by the anonymous bytes resident beyond the
-    /// allocator's use (`Options::trim_by_resident`),
-    /// `supdb-cache64tofitzpagesrecordrawleanresident`: the third fit check
-    /// of the raw-tail form, a trim that fires on the pages a dead arena's
-    /// re-use brings back, which the free count never sees.
-    pub fn create_cache64_tofit_zpages_record_raw_lean_resident(path: &Path) -> Res<Supdb> {
-        Supdb::with_policy(
-            path,
-            Policy {
-                budget: 64 << 20,
-                tofit: true,
-                zpages: true,
-                zrawtails: true,
-                zpages_nomemo: true,
-                ztrim: true,
-                ztrimpass: true,
-                ztrimresident: true,
-                zdropraw: Some(false),
-                ..Policy::default()
-            },
-        )
-    }
-
     /// `supdb-cache64tofitzpages` with its first four partitions by key order
     /// built in the record coding with raw tails and the rest in the block
     /// coding (`Options::zpages_raw_tails_first`),
@@ -11336,10 +11237,7 @@ impl Supdb {
             zrecord,
             zstored,
             zrawtails,
-            ztrim,
             zdecodewalk,
-            ztrimpass,
-            ztrimresident,
             zhotfirst,
             zdropraw,
             zparse,
@@ -11715,14 +11613,8 @@ impl Supdb {
             seek_prefetch_dir: !dirplain,
             forms_settle_far: settlefar,
             forms_to_fit: tofit,
-            // The resident count's arm takes a stride of eight megabytes:
-            // at the default's thirty-two the count read 15-25 MB over its
-            // post-install floor through every mix at five million keys
-            // under 640 MiB and fired once over the store's life.
             forms_trim_bytes: if notrim {
                 0
-            } else if ztrimresident {
-                8 << 20
             } else {
                 supdb::Options::default().forms_trim_bytes
             },
@@ -11907,10 +11799,7 @@ impl Supdb {
             zpages_trusted_views: !zcheckedviews,
             zpages_store_all: zstored,
             zpages_raw_tails: zrawtails,
-            zpages_trim_install: ztrim,
             zpages_inplace_walk: !zdecodewalk,
-            upkeep_trim_look: ztrimpass,
-            trim_by_resident: ztrimresident,
             zpages_raw_tails_first: zhotfirst,
             zpages_drop_raw: zdropraw.unwrap_or(supdb::Options::default().zpages_drop_raw),
             zpages_drop_at_install: !zdropattach,
@@ -12510,10 +12399,7 @@ impl Supdb {
             zrecord,
             zstored,
             zrawtails,
-            ztrim,
             zdecodewalk,
-            ztrimpass,
-            ztrimresident,
             zhotfirst,
             zdropraw,
             zparse,
@@ -13170,17 +13056,6 @@ impl Engine for Supdb {
                 "supdb-cache64tofitzpagesdrop"
             } else if self.zhotfirst == 1 {
                 "supdb-cache64tofitzpageshot1"
-            } else if self.zrawtails
-                && self.zpages_nomemo
-                && self.ztrim
-                && self.ztrimpass
-                && self.ztrimresident
-            {
-                "supdb-cache64tofitzpagesrecordrawleanresident"
-            } else if self.zrawtails && self.zpages_nomemo && self.ztrim && self.ztrimpass {
-                "supdb-cache64tofitzpagesrecordrawleantrim"
-            } else if self.zrawtails && self.zpages_nomemo && self.ztrim {
-                "supdb-cache64tofitzpagesrecordrawlean"
             } else if self.zrawtails && self.zdecodewalk {
                 "supdb-cache64tofitzpagesrecordrawdecode"
             } else if self.zrawtails {
@@ -17148,9 +17023,6 @@ pub fn guarantee(arm: &str) -> Option<Guarantee> {
         | "supdb-cache64tofitzpages"
         | "supdb-cache64tofitzpagesstored"
         | "supdb-cache64tofitzpagesrecordraw"
-        | "supdb-cache64tofitzpagesrecordrawlean"
-        | "supdb-cache64tofitzpagesrecordrawleantrim"
-        | "supdb-cache64tofitzpagesrecordrawleanresident"
         | "supdb-cache64tofitzpageshot4"
         | "supdb-cache64tofitzpageshot1"
         | "supdb-cache64tofitzpagesdrop"
@@ -17872,16 +17744,6 @@ pub fn open(arm: &str, dir: &Path, map_gb: usize) -> Res<Box<dyn Engine>> {
         "supdb-cache64tofitzpagesrecordraw" => {
             supdb_arm(Supdb::create_cache64_tofit_zpages_record_raw, dir)?
         }
-        "supdb-cache64tofitzpagesrecordrawlean" => {
-            supdb_arm(Supdb::create_cache64_tofit_zpages_record_raw_lean, dir)?
-        }
-        "supdb-cache64tofitzpagesrecordrawleantrim" => {
-            supdb_arm(Supdb::create_cache64_tofit_zpages_record_raw_lean_trim, dir)?
-        }
-        "supdb-cache64tofitzpagesrecordrawleanresident" => supdb_arm(
-            Supdb::create_cache64_tofit_zpages_record_raw_lean_resident,
-            dir,
-        )?,
         "supdb-cache64tofitzpageshot4" => supdb_arm(Supdb::create_cache64_tofit_zpages_hot4, dir)?,
         "supdb-cache64tofitzpageshot1" => supdb_arm(Supdb::create_cache64_tofit_zpages_hot1, dir)?,
         "supdb-cache64tofitzpagesdrop" => supdb_arm(Supdb::create_cache64_tofit_zpages_drop, dir)?,
@@ -25707,13 +25569,10 @@ mod tests {
             );
             drop(arm);
         }
-        for (name, make, stored, raw, lean, trimpass, decodewalk, resident) in [
+        for (name, make, stored, raw, decodewalk) in [
             (
                 "supdb-cache64tofitzpages",
                 Supdb::create_cache64_tofit_zpages as fn(&Path) -> Res<Supdb>,
-                false,
-                false,
-                false,
                 false,
                 false,
                 false,
@@ -25724,9 +25583,6 @@ mod tests {
                 true,
                 false,
                 false,
-                false,
-                false,
-                false,
             ),
             (
                 "supdb-cache64tofitzpagesrecordraw",
@@ -25734,50 +25590,13 @@ mod tests {
                 false,
                 true,
                 false,
-                false,
-                false,
-                false,
-            ),
-            (
-                "supdb-cache64tofitzpagesrecordrawlean",
-                Supdb::create_cache64_tofit_zpages_record_raw_lean as fn(&Path) -> Res<Supdb>,
-                false,
-                true,
-                true,
-                false,
-                false,
-                false,
-            ),
-            (
-                "supdb-cache64tofitzpagesrecordrawleantrim",
-                Supdb::create_cache64_tofit_zpages_record_raw_lean_trim as fn(&Path) -> Res<Supdb>,
-                false,
-                true,
-                true,
-                true,
-                false,
-                false,
-            ),
-            (
-                "supdb-cache64tofitzpagesrecordrawleanresident",
-                Supdb::create_cache64_tofit_zpages_record_raw_lean_resident
-                    as fn(&Path) -> Res<Supdb>,
-                false,
-                true,
-                true,
-                true,
-                false,
-                true,
             ),
             (
                 "supdb-cache64tofitzpagesrecordrawdecode",
                 Supdb::create_cache64_tofit_zpages_record_raw_decode as fn(&Path) -> Res<Supdb>,
                 false,
                 true,
-                false,
-                false,
                 true,
-                false,
             ),
         ] {
             let arm = new(name, make);
@@ -25789,22 +25608,9 @@ mod tests {
             assert_eq!(g.zpages_store_all, stored, "{name}: the coding");
             assert_eq!(g.zpages_raw_tails, raw, "{name}: the tails");
             assert_eq!(g.zpages_record_coding, raw, "{name}: the record coding");
-            assert_eq!(g.zpages_memo, !lean, "{name}: the memo");
-            assert_eq!(g.zpages_trim_install, lean, "{name}: the trim");
+            assert!(g.zpages_memo, "{name}: the memo");
             assert_eq!(
-                g.upkeep_trim_look, trimpass,
-                "{name}: the look at the pass end"
-            );
-            assert!(!supdb::Options::default().upkeep_trim_look);
-            assert_eq!(g.trim_by_resident, resident, "{name}: the trim's count");
-            assert!(!supdb::Options::default().trim_by_resident);
-            assert_eq!(
-                g.forms_trim_bytes,
-                if resident {
-                    8 << 20
-                } else {
-                    b.forms_trim_bytes
-                },
+                g.forms_trim_bytes, b.forms_trim_bytes,
                 "{name}: the trim's stride"
             );
             assert_eq!(
@@ -25812,10 +25618,7 @@ mod tests {
                 "{name}: the in-place walk"
             );
             assert!(supdb::Options::default().zpages_inplace_walk);
-            assert!(
-                supdb::Options::default().zpages_memo
-                    && !supdb::Options::default().zpages_trim_install
-            );
+            assert!(supdb::Options::default().zpages_memo);
             assert_eq!(
                 (
                     g.scan_cache_bytes,

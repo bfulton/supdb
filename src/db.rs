@@ -3246,52 +3246,6 @@ pub struct Options {
     /// shape before.
     #[doc(hidden)]
     pub zpages_flat_slack: bool,
-    /// EXPERIMENT: the allocator trimmed once (`malloc_trim`) at the end of
-    /// `zpages_settle`, after every partition has its form file: what the
-    /// builds' threads and the load left free in their arenas is given back
-    /// to the kernel, so a form that fits the bound by a margin of tens of
-    /// megabytes has them for its pages. With `zpages_memo` off it is the
-    /// fit check of the raw-tail coding at five million keys under 640 MiB
-    /// (`supdb-cache64tofitzpagesrecordrawlean` against
-    /// `supdb-cache64tofitzpages`), where the form's 556 MB beside the
-    /// block cache left the process's anonymous bytes the margin. Off.
-    #[doc(hidden)]
-    pub zpages_trim_install: bool,
-    /// EXPERIMENT: the trim thread (`forms_to_fit` with `forms_trim_bytes`)
-    /// asked to look at the allocator at the end of every upkeep pass, the
-    /// stride deciding whether it trims (`trim_due`), and not only when a
-    /// handle has freed a stride of forms. The pass is the engine's moment
-    /// inside a run of reads, where the process's resident free pages
-    /// compete with its own file's: the census after each mix under the
-    /// bound read 40-50 MB of free chunks resident in the arenas the seal
-    /// and build threads left and the main arena's churn, with the trim
-    /// after the install (`zpages_trim_install`) taken back by then. With
-    /// that trim and the memo off it is the second fit check of the
-    /// raw-tail coding (`supdb-cache64tofitzpagesrecordrawleantrim`). Off.
-    #[doc(hidden)]
-    pub upkeep_trim_look: bool,
-    /// EXPERIMENT: the trim thread counts its stride by the anonymous bytes
-    /// this process holds resident beyond what the allocator has in use
-    /// (`RssAnon` less `mallinfo2`'s in-use and mmapped bytes) and not by
-    /// the allocator's free count. The free count stands still while a
-    /// thread re-uses a dead arena's free chunks and frees them again --
-    /// the chunks were free before and are free after, and only their
-    /// pages came back -- so at five million keys under 640 MiB the look
-    /// at every pass end (`upkeep_trim_look`) found nothing to trim nine
-    /// hundred and seventy times while 40-50 MB sat resident and free in
-    /// the arenas the seal and build threads left. The resident count
-    /// moves with the pages. An allocation nobody has touched yet counts
-    /// as in use and not as resident, so the count runs under the truth
-    /// by that much and a trim comes late, never for nothing. With the
-    /// lean arm's levers and the look it is the third fit check of the
-    /// raw-tail form (`supdb-cache64tofitzpagesrecordrawleanresident`),
-    /// refuted as its first two were: at a stride of eight megabytes the
-    /// count fired, four to nine trims in the mixes, and the process's
-    /// anonymous bytes through the mixes and the faults read as without
-    /// it, since the pages a trim returns are the pages the mixes touch
-    /// next. Off.
-    #[doc(hidden)]
-    pub trim_by_resident: bool,
     /// EXPERIMENT: the first this many partitions by key order are built
     /// in the record coding with raw tails, and the rest as the options say
     /// (`zpages_raw_tails` off). The upper bound of a coding chosen per
@@ -8430,9 +8384,6 @@ impl Default for Options {
             zpages_own_decoder: true,
             zpages_flat_decode: true,
             zpages_flat_slack: true,
-            zpages_trim_install: false,
-            upkeep_trim_look: false,
-            trim_by_resident: false,
             zpages_raw_tails_first: 0,
             zpages_drop_raw: true,
             zpages_drop_at_install: true,
@@ -27873,7 +27824,7 @@ mod heap {
     /// `mallinfo2`'s in-use bytes in the arenas and its mmapped chunks.
     /// Free chunks' resident pages, mostly, since the engine maps no
     /// anonymous memory of its own; the stacks and the binary's data are a
-    /// constant the trim's floor absorbs, and an allocation not yet touched
+    /// constant a difference of two readings absorbs, and an allocation not yet touched
     /// counts as in use and not as resident, so the reading runs under the
     /// truth and never over it. None where either reading cannot be had.
     // The door (tests/data/door.txt): a /proc read for the trim (G3: Memory).
@@ -27889,22 +27840,11 @@ mod heap {
         // is resident comes out too, read from the kernel and never the
         // blocks whole: a store's tables in flight map tens of megabytes
         // they have barely written, and taken out whole they read a dead
-        // arena of thirty-two megabytes as seven, so the trim that counts
-        // by this never fired on it.
+        // arena of thirty-two megabytes as seven.
         Some(
             anon.saturating_sub(mi.uordblks.saturating_add(mi.hblkhd))
                 .saturating_sub(super::blocks::mapped_resident_bytes()),
         )
-    }
-
-    /// What the trim counts its stride by: the resident bytes beyond use
-    /// (`Options::trim_by_resident`), or the allocator's free count.
-    pub fn held(by_resident: bool) -> Option<usize> {
-        if by_resident {
-            resident_beyond_use()
-        } else {
-            free_bytes()
-        }
     }
 
     /// The pages inside every free chunk of every arena given back,
@@ -27933,10 +27873,6 @@ mod heap {
         None
     }
 
-    pub fn held(_by_resident: bool) -> Option<usize> {
-        None
-    }
-
     pub fn trim() {}
 
     pub fn set_mmap_threshold(_bytes: usize) {}
@@ -27954,12 +27890,12 @@ fn trim_due(held: usize, floor: usize, stride: usize) -> (usize, bool) {
 
 /// Give the system the pages the allocator holds free, if it holds
 /// `stride` more than it did when it was last asked to (`trim_due`), by
-/// the count the store asks for (`heap::held`, `Options::trim_by_resident`).
-/// Pages, not chunks: glibc releases the whole pages inside every free
-/// chunk of every arena, not only a heap's top.
-fn trim_free_memory(shared: &Shared, stride: usize, by_resident: bool) {
+/// its free count (`heap::free_bytes`). Pages, not chunks: glibc releases
+/// the whole pages inside every free chunk of every arena, not only a
+/// heap's top.
+fn trim_free_memory(shared: &Shared, stride: usize) {
     let t = std::time::Instant::now();
-    let Some(held) = heap::held(by_resident) else {
+    let Some(held) = heap::free_bytes() else {
         return;
     };
     let (floor, due) = trim_due(
@@ -27970,7 +27906,7 @@ fn trim_free_memory(shared: &Shared, stride: usize, by_resident: bool) {
     shared.trim_floor.store(floor, AtomicOrdering::Relaxed);
     if due {
         heap::trim();
-        let left = heap::held(by_resident).unwrap_or(held);
+        let left = heap::free_bytes().unwrap_or(held);
         shared.trim_floor.store(left, AtomicOrdering::Relaxed);
         shared.trims.fetch_add(1, AtomicOrdering::Relaxed);
     }
@@ -27999,12 +27935,7 @@ fn mono_secs() -> f64 {
 /// held from landing a seal or answering a flush; and not niced, since it
 /// holds an arena's lock for as long as it trims it and a thread that
 /// could be preempted holding one is the one that keeps the rest waiting.
-fn trim_loop(
-    shared: &Shared,
-    stop: &std::sync::atomic::AtomicBool,
-    stride: usize,
-    by_resident: bool,
-) {
+fn trim_loop(shared: &Shared, stop: &std::sync::atomic::AtomicBool, stride: usize) {
     while !stop.load(AtomicOrdering::Acquire) {
         if shared.trim_wanted.swap(false, AtomicOrdering::AcqRel) {
             shared.trim_begun.fetch_add(1, AtomicOrdering::Release);
@@ -28013,7 +27944,7 @@ fn trim_loop(
             {
                 std::thread::sleep(std::time::Duration::from_millis(1));
             }
-            trim_free_memory(shared, stride, by_resident);
+            trim_free_memory(shared, stride);
             continue;
         }
         std::thread::park();
@@ -28049,10 +27980,9 @@ fn start_trimmer(shared: &std::sync::Arc<Shared>, opts: &Options) {
     let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     let flag = stop.clone();
     let stride = opts.forms_trim_bytes;
-    let by_resident = opts.trim_by_resident;
     let spawned = std::thread::Builder::new()
         .name("supdb-trim".into())
-        .spawn(move || trim_loop(&held, &flag, stride, by_resident));
+        .spawn(move || trim_loop(&held, &flag, stride));
     if let Ok(handle) = spawned {
         let _ = shared.trim_thread.set(handle.thread().clone());
         slot.trimmer = Some(Trimmer {
@@ -54244,24 +54174,10 @@ impl Db {
     /// The end of `zpages_settle`, whichever home the segment work has: the
     /// form files no live segment claims swept, by the segment work
     /// (`Maint::z_sweep_settled`) -- on its own thread the `ZSettle`
-    /// answer has swept already, inline it is swept here -- and under
-    /// `Options::zpages_trim_install` the allocator trimmed once, now that
-    /// every partition has its form file and the builds' threads have left
-    /// what they freed in their arenas.
+    /// answer has swept already, inline it is swept here.
     fn z_settle_end(&mut self) -> Result<()> {
         if matches!(self.maint, MaintHome::Here(_)) {
             self.with_maint(|m| m.z_sweep_settled())?;
-        }
-        if self.opts.zpages_trim_install {
-            heap::trim();
-            // Counted with the trim thread's trims, and the floor its
-            // next stride is counted from set to what is left, so the
-            // census reads this trim and the looks after it start from it.
-            self.shared.trim_floor.store(
-                heap::held(self.opts.trim_by_resident).unwrap_or(0),
-                AtomicOrdering::Relaxed,
-            );
-            self.shared.trims.fetch_add(1, AtomicOrdering::Relaxed);
         }
         Ok(())
     }
@@ -56236,16 +56152,6 @@ impl Reader {
                 AtomicOrdering::Relaxed,
             );
             lend.passes.fetch_add(1, AtomicOrdering::Relaxed);
-            // Under `Options::upkeep_trim_look`, the trim thread is asked
-            // to look at the allocator at every pass end, the stride
-            // deciding (`trim_due`); a store with no trim thread is asked
-            // nothing, as a shed asks nothing.
-            if self.opts.upkeep_trim_look {
-                shared.trim_wanted.store(true, AtomicOrdering::Release);
-                if let Some(t) = shared.trim_thread.get() {
-                    t.unpark();
-                }
-            }
             match pass {
                 Ok((fs, ran, whole, done)) => {
                     // Filed only by a pass that ran, and ran to the commit:
@@ -57476,7 +57382,8 @@ impl Db {
     }
 
     /// This process's anonymous bytes resident beyond the allocator's use,
-    /// the count `Options::trim_by_resident` trims by. For a test.
+    /// what a trim at the rewarm reports giving back
+    /// (`Options::zpages_rewarm_trims`). For a test.
     #[doc(hidden)]
     pub fn resident_beyond_use() -> Option<usize> {
         heap::resident_beyond_use()
@@ -57525,19 +57432,12 @@ impl Db {
     }
 
     /// The bytes of those blocks the kernel has resident, read from it
-    /// (`mincore`), process-wide: what the resident count the trim reads
-    /// (`Options::trim_by_resident`) takes out, since a mapped page never
+    /// (`mincore`), process-wide: what the resident count
+    /// (`Db::resident_beyond_use`) takes out, since a mapped page never
     /// touched is resident nowhere; the mapped bytes whole where the kernel
     /// cannot be asked.
     pub fn mapped_resident_bytes() -> usize {
         blocks::mapped_resident_bytes()
-    }
-
-    /// The bytes the trim counts its stride by at this moment, by the
-    /// store's option. For a test.
-    #[doc(hidden)]
-    pub fn trim_held_bytes(&self) -> Option<usize> {
-        heap::held(self.opts.trim_by_resident)
     }
 
     /// A trim of every arena now, on the calling thread. For a test of what
