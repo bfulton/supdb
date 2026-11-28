@@ -1183,8 +1183,8 @@ fn a_merges_landing_plans_the_next_and_a_cap_lands_a_range_at_a_time() {
 }
 
 /// The chain through a write-only stretch runs only where the writer's
-/// block forms do not cover the store
-/// (`Options::merge_chains_writes_uncovered`). The store is out of core by
+/// block forms do not cover the store (`Maint::forms_uncovered`). The
+/// store is out of core by
 /// the test's gate and chains through writes; two ranges are made due in
 /// turn with the first merge held before its landing, and nothing reads
 /// between the last seal's landing and the merge's, so the landing plans
@@ -1193,7 +1193,7 @@ fn a_merges_landing_plans_the_next_and_a_cap_lands_a_range_at_a_time() {
 /// second range to the seals' plans; one whose store was never scanned, has
 /// no block cache or files none at its commits, has a budget given or its
 /// own bound, has given its forms up for the merge path, or has a point
-/// read near, chains as before, as does every store with the option off.
+/// read near, chains as before.
 #[test]
 fn a_burst_the_writers_forms_cover_is_not_chained_through() {
     #[derive(Clone, Copy, Debug, PartialEq)]
@@ -1214,20 +1214,19 @@ fn a_burst_the_writers_forms_cover_is_not_chained_through() {
         /// block the pieces overlay is covered.
         Shared,
     }
-    for (opt, store, left, merges) in [
-        (false, Store::Covered, 0usize, 2u64),
-        (true, Store::Covered, 2, 1),
-        (true, Store::NeverScanned, 0, 2),
-        (true, Store::NoCache, 0, 2),
-        (true, Store::NoCommitForms, 0, 2),
-        (true, Store::NoCommitFormsKeeper, 0, 2),
-        (true, Store::BudgetGiven, 0, 2),
-        (true, Store::BudgetBound, 0, 2),
-        (true, Store::FormsOff, 0, 2),
-        (true, Store::PointRead, 0, 2),
-        (true, Store::Shared, 0, 2),
+    for (store, left, merges) in [
+        (Store::Covered, 2usize, 1u64),
+        (Store::NeverScanned, 0, 2),
+        (Store::NoCache, 0, 2),
+        (Store::NoCommitForms, 0, 2),
+        (Store::NoCommitFormsKeeper, 0, 2),
+        (Store::BudgetGiven, 0, 2),
+        (Store::BudgetBound, 0, 2),
+        (Store::FormsOff, 0, 2),
+        (Store::PointRead, 0, 2),
+        (Store::Shared, 0, 2),
     ] {
-        let d = scratch(&format!("chain-covered-{opt}-{store:?}"));
+        let d = scratch(&format!("chain-covered-true-{store:?}"));
         let mut db = Db::create(
             &d,
             Options {
@@ -1236,7 +1235,6 @@ fn a_burst_the_writers_forms_cover_is_not_chained_through() {
                 l0_trigger: 2,
                 merge_chains: true,
                 merge_chains_writes: true,
-                merge_chains_writes_uncovered: opt,
                 // The planners here are the seals' landings and the chain.
                 // The scans below would have the segment work's loop plan
                 // as well (`Options::merge_plan_idle`), and its plan is
@@ -1245,7 +1243,7 @@ fn a_burst_the_writers_forms_cover_is_not_chained_through() {
                 // three seals landed, the hold came off, and the last
                 // seal's landing found the first merge finished and planned
                 // the second range itself -- three runs in a hundred of the
-                // covered store under the option, alone, and every run with
+                // covered store alone, and every run with
                 // the last landing held back.
                 merge_plan_idle: false,
                 merge_parallel: 1,
@@ -1382,7 +1380,7 @@ fn a_burst_the_writers_forms_cover_is_not_chained_through() {
         while db.seal_waits().merges < merges0 + merges {
             assert!(
                 t.elapsed().as_secs() < 30,
-                "option {opt} {store:?}: {} merges landed, {merges} expected",
+                "{store:?}: {} merges landed, {merges} expected",
                 db.seal_waits().merges - merges0
             );
             std::thread::sleep(std::time::Duration::from_millis(2));
@@ -1392,14 +1390,11 @@ fn a_burst_the_writers_forms_cover_is_not_chained_through() {
             .iter()
             .filter(|n| !n.starts_with("par-"))
             .count();
-        assert_eq!(
-            pieces, left,
-            "option {opt} {store:?}: pieces left after the landings"
-        );
+        assert_eq!(pieces, left, "{store:?}: pieces left after the landings");
         assert_eq!(
             db.seal_waits().merges - merges0,
             merges,
-            "option {opt} {store:?}: merges landed"
+            "{store:?}: merges landed"
         );
         hold_to(&db, &keys);
         if store == Store::Shared {
@@ -1419,8 +1414,7 @@ fn a_burst_the_writers_forms_cover_is_not_chained_through() {
 /// two, and it does not where the option is off, where a point read comes
 /// before every commit, where a read through the writer or a handle comes
 /// after the last commit and before the seal whose landing would plan it,
-/// or where the store reads the raw form -- unless the room is asked for
-/// at any gate (`Options::merge_quiet_any_gate`). Released, every merge
+/// or where the store reads the raw form. Released, every merge
 /// lands, the partitions tile, and every key reads back.
 #[test]
 fn a_third_merge_runs_only_in_a_stretch_of_writes_nobody_reads() {
@@ -1432,7 +1426,6 @@ fn a_third_merge_runs_only_in_a_stretch_of_writes_nobody_reads() {
         WriterAfterLastCommit,
         HandleAfterLastCommit,
         RawForm,
-        RawFormAnyGate,
     }
     for case in [
         Reads::Off,
@@ -1441,9 +1434,8 @@ fn a_third_merge_runs_only_in_a_stretch_of_writes_nobody_reads() {
         Reads::WriterAfterLastCommit,
         Reads::HandleAfterLastCommit,
         Reads::RawForm,
-        Reads::RawFormAnyGate,
     ] {
-        let raw = matches!(case, Reads::RawForm | Reads::RawFormAnyGate);
+        let raw = case == Reads::RawForm;
         let d = scratch(&format!("merge-quiet-{case:?}"));
         let opts = || Options {
             seal_bytes: 32 << 10,
@@ -1451,7 +1443,6 @@ fn a_third_merge_runs_only_in_a_stretch_of_writes_nobody_reads() {
             l0_trigger: 2,
             merge_parallel: 2,
             merge_parallel_quiet: if case == Reads::Off { 0 } else { 3 },
-            merge_quiet_any_gate: case == Reads::RawFormAnyGate,
             zpages: if raw {
                 supdb::ZPages::Off
             } else {
@@ -1521,11 +1512,7 @@ fn a_third_merge_runs_only_in_a_stretch_of_writes_nobody_reads() {
             );
             std::thread::sleep(std::time::Duration::from_millis(2));
         }
-        let want = if matches!(case, Reads::None | Reads::RawFormAnyGate) {
-            3
-        } else {
-            2
-        };
+        let want = if case == Reads::None { 3 } else { 2 };
         assert_eq!(
             db.merges_in_flight(),
             want,

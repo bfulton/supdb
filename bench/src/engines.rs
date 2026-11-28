@@ -713,20 +713,6 @@ pub struct Supdb {
     /// second pass (`Options::merge_drop_behind`, refuted and off).
     /// `supdb-ingestmergedropbehind`, and `supdb-mergedropbehind` durable.
     mergedropbehind: bool,
-    /// A merge's landing plans nothing, as a seal's landing alone did, so a
-    /// store nothing writes keeps its pieces however long it is read
-    /// (`Options::merge_chains` off). `supdb-ingestnomergechain`, and
-    /// `supdb-nomergechain` durable.
-    nomergechain: bool,
-    /// One merge takes every due range, where the default takes them up to
-    /// a cap of partition bytes and leaves the rest to the landing's plan
-    /// (`Options::merge_bytes_cap` at zero). `supdb-ingestmergeuncapped`,
-    /// and `supdb-mergeuncapped` durable.
-    mergeuncapped: bool,
-    /// One partition merge in flight at a time, where the default runs two
-    /// over disjoint ranges (`Options::merge_parallel` at one).
-    /// `supdb-ingestmergeone`, and `supdb-mergeone` durable.
-    mergeone: bool,
     /// The seal held at its floor while the store is out of core, where the
     /// default grows it with the store (`Options::seal_floor_out_of_core`).
     /// `supdb-sealfloorooc`, durable.
@@ -868,11 +854,6 @@ pub struct Supdb {
     /// for the engine's: `supdb-zhotstarts2`, `supdb-zhotstarts3`,
     /// `supdb-nohotstarts`.
     zhotstarts: Option<u32>,
-    /// Out of core a merge's landing chains the next merge only while
-    /// reads are around, where the default chains through a write-only
-    /// stretch too (`Options::merge_chains_writes` off).
-    /// `supdb-ingestnochainwrites`, and `supdb-nochainwrites` durable.
-    nochainwrites: bool,
     /// The controller builds nothing ahead at a landing, where the default
     /// builds a partition's form file from memory once the raw form passes
     /// a share of the page cache's budget (`Options::zpages_land_pct` at
@@ -1007,16 +988,6 @@ pub struct Supdb {
     /// default: `supdb-zbuycross`, and beside the jobs' mapped arrays
     /// `supdb-jobsmappedbuycross` and `supdb-jobspooledbuycross`.
     zbuycross: Option<bool>,
-    /// The block cache granted the raw records' place where its own budget
-    /// would bind and no point read is near
-    /// (`Options::scan_cache_copies_fit`), `None` for the engine's default.
-    copiesfit: Option<bool>,
-    /// The chain through a write-only stretch only where the writer's
-    /// forms do not cover the store
-    /// (`Options::merge_chains_writes_uncovered`), `None` for the engine's
-    /// default. `supdb-chaincovered` chains through a covered burst, and
-    /// `supdb-nocopiesfitchain` is both shapes before.
-    chainuncovered: Option<bool>,
     /// A flush whose writes were all durable before it answered once its
     /// seal is readable, the seal's fsync and its manifest left to the
     /// segment work's loop (`Options::drain_answers_readable`), `None` for
@@ -1655,17 +1626,10 @@ pub struct Supdb {
     /// every landing near reads, `supdb-landboundsalways`; the engine's
     /// where `None`.
     landboundsread: Option<bool>,
-    /// The partition merges in flight at once (`Options::merge_parallel`):
-    /// three, `supdb-merge3`; the engine's where `None`.
-    mergepar: Option<usize>,
     /// The partition merges in flight in a stretch of writes nobody reads
     /// (`Options::merge_parallel_quiet`): zero, the shape before,
     /// `supdb-quiet0`; the engine's where `None`.
     mergequiet: Option<usize>,
-    /// That room at any gate of the controller and not only where the
-    /// compact form is installed (`Options::merge_quiet_any_gate`):
-    /// `supdb-quietany`; the engine's where `None`.
-    mergequietany: Option<bool>,
     /// A sparse stride walk steps its key by the field
     /// (`Options::zpages_stride_step_direct`): `supdb-zsparsebuildstep`;
     /// the engine's where `None`.
@@ -2029,20 +1993,6 @@ struct Policy {
     /// second pass (`Options::merge_drop_behind`, refuted and off).
     /// `supdb-ingestmergedropbehind`, and `supdb-mergedropbehind` durable.
     mergedropbehind: bool,
-    /// A merge's landing plans nothing, as a seal's landing alone did, so a
-    /// store nothing writes keeps its pieces however long it is read
-    /// (`Options::merge_chains` off). `supdb-ingestnomergechain`, and
-    /// `supdb-nomergechain` durable.
-    nomergechain: bool,
-    /// One merge takes every due range, where the default takes them up to
-    /// a cap of partition bytes and leaves the rest to the landing's plan
-    /// (`Options::merge_bytes_cap` at zero). `supdb-ingestmergeuncapped`,
-    /// and `supdb-mergeuncapped` durable.
-    mergeuncapped: bool,
-    /// One partition merge in flight at a time, where the default runs two
-    /// over disjoint ranges (`Options::merge_parallel` at one).
-    /// `supdb-ingestmergeone`, and `supdb-mergeone` durable.
-    mergeone: bool,
     /// The seal held at its floor while the store is out of core, where the
     /// default grows it with the store (`Options::seal_floor_out_of_core`).
     /// `supdb-sealfloorooc`, durable.
@@ -2184,11 +2134,6 @@ struct Policy {
     /// for the engine's: `supdb-zhotstarts2`, `supdb-zhotstarts3`,
     /// `supdb-nohotstarts`.
     zhotstarts: Option<u32>,
-    /// Out of core a merge's landing chains the next merge only while
-    /// reads are around, where the default chains through a write-only
-    /// stretch too (`Options::merge_chains_writes` off).
-    /// `supdb-ingestnochainwrites`, and `supdb-nochainwrites` durable.
-    nochainwrites: bool,
     /// The controller builds nothing ahead at a landing, where the default
     /// builds a partition's form file from memory once the raw form passes
     /// a share of the page cache's budget (`Options::zpages_land_pct` at
@@ -2323,16 +2268,6 @@ struct Policy {
     /// default: `supdb-zbuycross`, and beside the jobs' mapped arrays
     /// `supdb-jobsmappedbuycross` and `supdb-jobspooledbuycross`.
     zbuycross: Option<bool>,
-    /// The block cache granted the raw records' place where its own budget
-    /// would bind and no point read is near
-    /// (`Options::scan_cache_copies_fit`), `None` for the engine's default.
-    copiesfit: Option<bool>,
-    /// The chain through a write-only stretch only where the writer's
-    /// forms do not cover the store
-    /// (`Options::merge_chains_writes_uncovered`), `None` for the engine's
-    /// default. `supdb-chaincovered` chains through a covered burst, and
-    /// `supdb-nocopiesfitchain` is both shapes before.
-    chainuncovered: Option<bool>,
     /// A flush whose writes were all durable before it answered once its
     /// seal is readable, the seal's fsync and its manifest left to the
     /// segment work's loop (`Options::drain_answers_readable`), `None` for
@@ -2831,15 +2766,9 @@ struct Policy {
     /// and `supdb-landboundsalways` turn each off, `supdb-boundsold` both.
     boundsheads: Option<bool>,
     landboundsread: Option<bool>,
-    /// The partition merges in flight at once (`Options::merge_parallel`):
-    /// three, `supdb-merge3`.
-    mergepar: Option<usize>,
     /// The partition merges in flight in a stretch of writes nobody reads
     /// (`Options::merge_parallel_quiet`): zero, `supdb-quiet0`.
     mergequiet: Option<usize>,
-    /// That room at any gate (`Options::merge_quiet_any_gate`):
-    /// `supdb-quietany`.
-    mergequietany: Option<bool>,
     /// A sparse stride form's walk writes the next key's field where it
     /// lies (`Options::zpages_stride_step_direct`):
     /// `supdb-zsparsebuildstep` beside `supdb-zsparsebuild`.
@@ -3029,9 +2958,6 @@ impl Default for Policy {
             mergenoverify: false,
             mmapthr: false,
             mergedropbehind: false,
-            nomergechain: false,
-            mergeuncapped: false,
-            mergeone: false,
             sealfloorooc: false,
             nofitshort: false,
             walkeep: false,
@@ -3068,7 +2994,6 @@ impl Default for Policy {
             zbulksearch: false,
             zflatshort: false,
             zhotstarts: None,
-            nochainwrites: false,
             noland: false,
             noidleplan: false,
             sealrun: false,
@@ -3100,8 +3025,6 @@ impl Default for Policy {
             zrewarmturn: None,
             headscopies: None,
             zbuycross: None,
-            copiesfit: None,
-            chainuncovered: None,
             drainreadable: None,
             syncbeside: None,
             directlean: None,
@@ -3229,9 +3152,7 @@ impl Default for Policy {
             zcursorsteps: None,
             boundsheads: None,
             landboundsread: None,
-            mergepar: None,
             mergequiet: None,
-            mergequietany: None,
             zstridestep: None,
             jobsmapped: false,
             jobsshort: false,
@@ -4617,19 +4538,6 @@ impl Supdb {
         )
     }
 
-    /// Three partition merges in flight at all times
-    /// (`Options::merge_parallel`): `supdb-merge3`, beside `supdb`, whose
-    /// third merge runs only in a stretch of writes nobody reads.
-    pub fn create_merge3(path: &Path) -> Res<Supdb> {
-        Supdb::with_policy(
-            path,
-            Policy {
-                mergepar: Some(3),
-                ..Policy::default()
-            },
-        )
-    }
-
     /// The engine with no third merge in a stretch of writes nobody reads
     /// (`Options::merge_parallel_quiet` zero): `supdb-quiet0`, beside
     /// `supdb`.
@@ -4638,19 +4546,6 @@ impl Supdb {
             path,
             Policy {
                 mergequiet: Some(0),
-                ..Policy::default()
-            },
-        )
-    }
-
-    /// The engine with its third merge at any gate of the controller
-    /// (`Options::merge_quiet_any_gate`), the shape before the room was
-    /// kept to where the compact form is installed: `supdb-quietany`.
-    pub fn create_quiet_any(path: &Path) -> Res<Supdb> {
-        Supdb::with_policy(
-            path,
-            Policy {
-                mergequietany: Some(true),
                 ..Policy::default()
             },
         )
@@ -5970,75 +5865,6 @@ impl Supdb {
         )
     }
 
-    /// `supdb` whose merge landings plan nothing, where the default plans
-    /// the next merge at each (`Options::merge_chains`): against `supdb`
-    /// under a bound it prices the pieces a read pass meets.
-    pub fn create_nomergechain(path: &Path) -> Res<Supdb> {
-        Supdb::with_policy(
-            path,
-            Policy {
-                nomergechain: true,
-                ..Policy::default()
-            },
-        )
-    }
-
-    /// `supdb-ingest` whose merge landings plan nothing, as
-    /// `supdb-nomergechain`.
-    pub fn create_ingest_nomergechain(path: &Path) -> Res<Supdb> {
-        Supdb::with_policy(
-            path,
-            Policy {
-                partition: false,
-                durable: false,
-                nomergechain: true,
-                ..Policy::default()
-            },
-        )
-    }
-
-    /// `supdb` whose merges take every due range, where the default takes
-    /// them up to a cap of partition bytes (`Options::merge_bytes_cap`):
-    /// against `supdb` under a bound it prices the landing a few ranges at
-    /// a time.
-    pub fn create_mergeuncapped(path: &Path) -> Res<Supdb> {
-        Supdb::with_policy(
-            path,
-            Policy {
-                mergeuncapped: true,
-                ..Policy::default()
-            },
-        )
-    }
-
-    /// `supdb-ingest` whose merges take every due range, as
-    /// `supdb-mergeuncapped`.
-    pub fn create_ingest_mergeuncapped(path: &Path) -> Res<Supdb> {
-        Supdb::with_policy(
-            path,
-            Policy {
-                partition: false,
-                durable: false,
-                mergeuncapped: true,
-                ..Policy::default()
-            },
-        )
-    }
-
-    /// `supdb` with one partition merge in flight at a time
-    /// (`Options::merge_parallel` at one), the shape before two: against
-    /// `supdb` under a bound it prices a burst's merge debt drained one
-    /// merge at a time.
-    pub fn create_mergeone(path: &Path) -> Res<Supdb> {
-        Supdb::with_policy(
-            path,
-            Policy {
-                mergeone: true,
-                ..Policy::default()
-            },
-        )
-    }
-
     /// `supdb` whose seal holds at its floor while the store is out of core
     /// (`Options::seal_floor_out_of_core`): under a bound it prices the
     /// memtable's anonymous memory against the pieces it leaves on disk.
@@ -6219,33 +6045,6 @@ impl Supdb {
             path,
             Policy {
                 zcacheraw: true,
-                ..Policy::default()
-            },
-        )
-    }
-
-    /// `supdb-nozpages` with one merge in flight, as `supdb-mergeone`:
-    /// the pair with `supdb-nozpages` prices the merges with no controller
-    /// in either arm, whose buy moves a lag pass by more than the merges do.
-    pub fn create_nozpages_mergeone(path: &Path) -> Res<Supdb> {
-        Supdb::with_policy(
-            path,
-            Policy {
-                zpages_off: true,
-                mergeone: true,
-                ..Policy::default()
-            },
-        )
-    }
-
-    /// `supdb-ingest` with one merge in flight, as `supdb-mergeone`.
-    pub fn create_ingest_mergeone(path: &Path) -> Res<Supdb> {
-        Supdb::with_policy(
-            path,
-            Policy {
-                partition: false,
-                durable: false,
-                mergeone: true,
                 ..Policy::default()
             },
         )
@@ -7244,20 +7043,6 @@ impl Supdb {
         )
     }
 
-    /// `supdb` chaining its merges through every write-only stretch out of
-    /// core, a burst its forms cover among them
-    /// (`Options::merge_chains_writes_uncovered` off), the shape before.
-    /// The pair against `supdb` differs by that one option.
-    pub fn create_chaincovered(path: &Path) -> Res<Supdb> {
-        Supdb::with_policy(
-            path,
-            Policy {
-                chainuncovered: Some(false),
-                ..Policy::default()
-            },
-        )
-    }
-
     /// `supdb` answering a flush whose writes were all durable before it
     /// once its seal's segments are published, the option pinned on
     /// (`Options::drain_answers_readable`, the engine's default): the
@@ -7475,20 +7260,6 @@ impl Supdb {
             path,
             Policy {
                 drainreadable: Some(false),
-                ..Policy::default()
-            },
-        )
-    }
-
-    /// `supdb-nocopiesfit` and `supdb-chaincovered` together, the shape
-    /// before both: the budget that binds beside the raw form, and the
-    /// chain through a burst the forms cover.
-    pub fn create_nocopiesfitchain(path: &Path) -> Res<Supdb> {
-        Supdb::with_policy(
-            path,
-            Policy {
-                copiesfit: Some(false),
-                chainuncovered: Some(false),
                 ..Policy::default()
             },
         )
@@ -9037,9 +8808,6 @@ impl Supdb {
             mergenoverify,
             mmapthr,
             mergedropbehind,
-            nomergechain,
-            mergeuncapped,
-            mergeone,
             sealfloorooc,
             nofitshort,
             walkeep,
@@ -9076,7 +8844,6 @@ impl Supdb {
             zbulksearch,
             zflatshort,
             zhotstarts,
-            nochainwrites,
             noland,
             noidleplan,
             sealrun,
@@ -9108,8 +8875,6 @@ impl Supdb {
             zrewarmturn,
             headscopies,
             zbuycross,
-            copiesfit,
-            chainuncovered,
             drainreadable,
             syncbeside,
             directlean,
@@ -9254,9 +9019,7 @@ impl Supdb {
             zcursorsteps,
             boundsheads,
             landboundsread,
-            mergepar,
             mergequiet,
-            mergequietany,
             zstridestep,
             jobsmapped,
             jobsshort,
@@ -9444,17 +9207,6 @@ impl Supdb {
             merge_drop_behind: mergedropbehind,
             merge_drops_covered: mergedropscovered,
             same_blocks_from_index: !sameblocksrecords,
-            merge_chains: !nomergechain,
-            merge_bytes_cap: if mergeuncapped {
-                0
-            } else {
-                supdb::Options::default().merge_bytes_cap
-            },
-            merge_parallel: if mergeone {
-                1
-            } else {
-                mergepar.unwrap_or(supdb::Options::default().merge_parallel)
-            },
             seal_floor_out_of_core: sealfloorooc,
             forms_fit_when_short: !nofitshort,
             zpages_recode_auto: zrecodeauto,
@@ -9536,7 +9288,6 @@ impl Supdb {
             zpages_bulk_steps: !zbulksearch,
             zpages_flat_slack: !zflatshort,
             promote_starts: zhotstarts.unwrap_or(supdb::Options::default().promote_starts),
-            merge_chains_writes: !nochainwrites,
             merge_plan_idle: !noidleplan,
             seal_put_one: !sealrun,
             close_finish_inline: closeinline,
@@ -9566,10 +9317,6 @@ impl Supdb {
             heads_owned_beside_copies: headscopies
                 .unwrap_or(supdb::Options::default().heads_owned_beside_copies),
             zpages_buy_crosses: zbuycross.unwrap_or(supdb::Options::default().zpages_buy_crosses),
-            scan_cache_copies_fit: copiesfit
-                .unwrap_or(supdb::Options::default().scan_cache_copies_fit),
-            merge_chains_writes_uncovered: chainuncovered
-                .unwrap_or(supdb::Options::default().merge_chains_writes_uncovered),
             drain_answers_readable: drainreadable
                 .unwrap_or(supdb::Options::default().drain_answers_readable),
             drain_syncs_beside: syncbeside.unwrap_or(supdb::Options::default().drain_syncs_beside),
@@ -9787,8 +9534,6 @@ impl Supdb {
             land_bounds_read: landboundsread.unwrap_or(supdb::Options::default().land_bounds_read),
             merge_parallel_quiet: mergequiet
                 .unwrap_or(supdb::Options::default().merge_parallel_quiet),
-            merge_quiet_any_gate: mergequietany
-                .unwrap_or(supdb::Options::default().merge_quiet_any_gate),
             zpages_stride_step_direct: zstridestep
                 .unwrap_or(supdb::Options::default().zpages_stride_step_direct),
             jobs_mapped: !jobsheap && (jobsmapped || supdb::Options::default().jobs_mapped),
@@ -9975,9 +9720,6 @@ impl Supdb {
             mergenoverify,
             mmapthr,
             mergedropbehind,
-            nomergechain,
-            mergeuncapped,
-            mergeone,
             sealfloorooc,
             nofitshort,
             walkeep,
@@ -10014,7 +9756,6 @@ impl Supdb {
             zbulksearch,
             zflatshort,
             zhotstarts,
-            nochainwrites,
             noland,
             noidleplan,
             sealrun,
@@ -10046,8 +9787,6 @@ impl Supdb {
             zrewarmturn,
             headscopies,
             zbuycross,
-            copiesfit,
-            chainuncovered,
             drainreadable,
             syncbeside,
             directlean,
@@ -10192,9 +9931,7 @@ impl Supdb {
             zcursorsteps,
             boundsheads,
             landboundsread,
-            mergepar,
             mergequiet,
-            mergequietany,
             zstridestep,
             jobsmapped,
             jobsshort,
@@ -10859,14 +10596,8 @@ impl Engine for Supdb {
             (false, true) => return "supdb-landboundsalways",
             (false, false) => {}
         }
-        if self.mergepar == Some(3) {
-            return "supdb-merge3";
-        }
         if self.mergequiet == Some(0) {
             return "supdb-quiet0";
-        }
-        if self.mergequietany == Some(true) {
-            return "supdb-quietany";
         }
         if self.zsparse == Some(true) {
             return match (
@@ -11313,20 +11044,6 @@ impl Engine for Supdb {
                 "supdb-ingestmergedropbehind"
             };
         }
-        if self.nomergechain {
-            return if self.partition {
-                "supdb-nomergechain"
-            } else {
-                "supdb-ingestnomergechain"
-            };
-        }
-        if self.mergeuncapped {
-            return if self.partition {
-                "supdb-mergeuncapped"
-            } else {
-                "supdb-ingestmergeuncapped"
-            };
-        }
         if self.sealfloorooc {
             return "supdb-sealfloorooc";
         }
@@ -11369,15 +11086,6 @@ impl Engine for Supdb {
         }
         if self.zcacheraw && !self.zpages_auto && !self.tofit && self.budget == 0 {
             return "supdb-cacheraw";
-        }
-        if self.mergeone {
-            return if self.zpages_off {
-                "supdb-nozpagesmergeone"
-            } else if self.partition {
-                "supdb-mergeone"
-            } else {
-                "supdb-ingestmergeone"
-            };
         }
         if self.boundarytop {
             return if self.partition {
@@ -11516,13 +11224,6 @@ impl Engine for Supdb {
                 0 => "supdb-nohotstarts",
                 2 => "supdb-zhotstarts2",
                 _ => "supdb-zhotstarts3",
-            };
-        }
-        if self.nochainwrites {
-            return if self.partition {
-                "supdb-nochainwrites"
-            } else {
-                "supdb-ingestnochainwrites"
             };
         }
         if self.noland {
@@ -11730,14 +11431,6 @@ impl Engine for Supdb {
             } else {
                 "supdb-ingestruncreate"
             };
-        }
-        match (
-            self.copiesfit == Some(false),
-            self.chainuncovered == Some(false),
-        ) {
-            (true, true) => return "supdb-nocopiesfitchain",
-            (false, true) => return "supdb-chaincovered",
-            (true, false) | (false, false) => {}
         }
         if self.formsoffbuilt == Some(true) {
             return "supdb-formsoffbuilt";
@@ -14412,9 +14105,6 @@ pub fn guarantee(arm: &str) -> Option<Guarantee> {
         | "supdb-mergenoverify"
         | "supdb-mmapthr"
         | "supdb-mergedropbehind"
-        | "supdb-nomergechain"
-        | "supdb-mergeuncapped"
-        | "supdb-mergeone"
         | "supdb-sealfloorooc"
         | "supdb-cacheraw"
         | "supdb-nofitshort"
@@ -14425,7 +14115,6 @@ pub fn guarantee(arm: &str) -> Option<Guarantee> {
         | "supdb-mergeahead"
         | "supdb-zparse"
         | "supdb-nozpagesnofitshort"
-        | "supdb-nozpagesmergeone"
         | "supdb-boundarytop"
         | "supdb-aheadincore"
         | "supdb-aheadcold"
@@ -14460,7 +14149,6 @@ pub fn guarantee(arm: &str) -> Option<Guarantee> {
         | "supdb-zhotstarts3"
         | "supdb-nohotstarts"
         | "supdb-zmemoplain"
-        | "supdb-nochainwrites"
         | "supdb-noland"
         | "supdb-noidleplan"
         | "supdb-sealrun"
@@ -14495,8 +14183,6 @@ pub fn guarantee(arm: &str) -> Option<Guarantee> {
         | "supdb-zbuycross"
         | "supdb-jobsmappedbuycross"
         | "supdb-jobspooledbuycross"
-        | "supdb-chaincovered"
-        | "supdb-nocopiesfitchain"
         | "supdb-formsoffbuilt"
         | "supdb-nozjobs"
         | "supdb-formson"
@@ -14586,9 +14272,7 @@ pub fn guarantee(arm: &str) -> Option<Guarantee> {
         | "supdb-boundsbyrecord"
         | "supdb-landboundsalways"
         | "supdb-boundsold"
-        | "supdb-merge3"
         | "supdb-quiet0"
-        | "supdb-quietany"
         | "supdb-jobsmapped"
         | "supdb-zstridealldropagainjobs"
         | "supdb-zmemoslab"
@@ -14670,12 +14354,8 @@ pub fn guarantee(arm: &str) -> Option<Guarantee> {
         | "supdb-ingestmergenoverify"
         | "supdb-ingestmmapthr"
         | "supdb-ingestmergedropbehind"
-        | "supdb-ingestnomergechain"
-        | "supdb-ingestmergeuncapped"
-        | "supdb-ingestmergeone"
         | "supdb-ingestboundarytop"
         | "supdb-ingestaheadincore"
-        | "supdb-ingestnochainwrites"
         | "supdb-ingestnoland"
         | "supdb-ingestnoidleplan"
         | "supdb-ingestsealrun"
@@ -15979,9 +15659,7 @@ pub fn open(arm: &str, dir: &Path, map_gb: usize) -> Res<Box<dyn Engine>> {
         "supdb-boundsbyrecord" => supdb_arm(Supdb::create_bounds_by_record, dir)?,
         "supdb-landboundsalways" => supdb_arm(Supdb::create_land_bounds_always, dir)?,
         "supdb-boundsold" => supdb_arm(Supdb::create_bounds_old, dir)?,
-        "supdb-merge3" => supdb_arm(Supdb::create_merge3, dir)?,
         "supdb-quiet0" => supdb_arm(Supdb::create_quiet0, dir)?,
-        "supdb-quietany" => supdb_arm(Supdb::create_quiet_any, dir)?,
         "supdb-zstrideallcdrop" => supdb_arm(Supdb::create_zstride_all_cdrop, dir)?,
         "supdb-zstridealldropagaincdrop" => {
             supdb_arm(Supdb::create_zstride_all_dropagain_cdrop, dir)?
@@ -16085,11 +15763,6 @@ pub fn open(arm: &str, dir: &Path, map_gb: usize) -> Res<Box<dyn Engine>> {
         "supdb-ingestmergenoverify" => supdb_arm(Supdb::create_ingest_mergenoverify, dir)?,
         "supdb-mergedropbehind" => supdb_arm(Supdb::create_mergedropbehind, dir)?,
         "supdb-ingestmergedropbehind" => supdb_arm(Supdb::create_ingest_mergedropbehind, dir)?,
-        "supdb-nomergechain" => supdb_arm(Supdb::create_nomergechain, dir)?,
-        "supdb-ingestnomergechain" => supdb_arm(Supdb::create_ingest_nomergechain, dir)?,
-        "supdb-mergeuncapped" => supdb_arm(Supdb::create_mergeuncapped, dir)?,
-        "supdb-ingestmergeuncapped" => supdb_arm(Supdb::create_ingest_mergeuncapped, dir)?,
-        "supdb-mergeone" => supdb_arm(Supdb::create_mergeone, dir)?,
         "supdb-sealfloorooc" => supdb_arm(Supdb::create_sealfloorooc, dir)?,
         "supdb-cacheraw" => supdb_arm(Supdb::create_cacheraw, dir)?,
         "supdb-nofitshort" => supdb_arm(Supdb::create_nofitshort, dir)?,
@@ -16115,8 +15788,6 @@ pub fn open(arm: &str, dir: &Path, map_gb: usize) -> Res<Box<dyn Engine>> {
         "supdb-znoflat" => supdb_arm(Supdb::create_znoflat, dir)?,
         "supdb-znohotfill" => supdb_arm(Supdb::create_znohotfill, dir)?,
         "supdb-nozpagesnofitshort" => supdb_arm(Supdb::create_nozpages_nofitshort, dir)?,
-        "supdb-nozpagesmergeone" => supdb_arm(Supdb::create_nozpages_mergeone, dir)?,
-        "supdb-ingestmergeone" => supdb_arm(Supdb::create_ingest_mergeone, dir)?,
         "supdb-boundarytop" => supdb_arm(Supdb::create_boundarytop, dir)?,
         "supdb-ingestboundarytop" => supdb_arm(Supdb::create_ingest_boundarytop, dir)?,
         "supdb-aheadincore" => supdb_arm(
@@ -16594,32 +16265,6 @@ pub fn open(arm: &str, dir: &Path, map_gb: usize) -> Res<Box<dyn Engine>> {
             },
             dir,
         )?,
-        "supdb-nochainwrites" => supdb_arm(
-            |d| {
-                Supdb::with_policy(
-                    d,
-                    Policy {
-                        nochainwrites: true,
-                        ..Policy::default()
-                    },
-                )
-            },
-            dir,
-        )?,
-        "supdb-ingestnochainwrites" => supdb_arm(
-            |d| {
-                Supdb::with_policy(
-                    d,
-                    Policy {
-                        partition: false,
-                        durable: false,
-                        nochainwrites: true,
-                        ..Policy::default()
-                    },
-                )
-            },
-            dir,
-        )?,
         "supdb-noland" => supdb_arm(
             |d| {
                 Supdb::with_policy(
@@ -16717,8 +16362,6 @@ pub fn open(arm: &str, dir: &Path, map_gb: usize) -> Res<Box<dyn Engine>> {
         "supdb-zbuycross" => supdb_arm(Supdb::create_zbuycross, dir)?,
         "supdb-jobsmappedbuycross" => supdb_arm(Supdb::create_jobsmapped_buycross, dir)?,
         "supdb-jobspooledbuycross" => supdb_arm(Supdb::create_jobspooled_buycross, dir)?,
-        "supdb-chaincovered" => supdb_arm(Supdb::create_chaincovered, dir)?,
-        "supdb-nocopiesfitchain" => supdb_arm(Supdb::create_nocopiesfitchain, dir)?,
         "supdb-formsoffbuilt" => supdb_arm(Supdb::create_formsoffbuilt, dir)?,
         "supdb-nozjobs" => supdb_arm(Supdb::create_nozjobs, dir)?,
         "supdb-formson" => supdb_arm(Supdb::create_formson, dir)?,
@@ -19124,81 +18767,6 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
-    /// `supdb-cache64tofitautozpagesraw` is `supdb-cache64tofitautozpages`
-    /// with the block cache's reads of a partition sent through the door
-    /// (`Options::zpages_block_cache` off) and nothing else: named, durable
-    /// like it, opened under its name by the dispatch, the cache and the
-    /// controller as the base has them, and the engine's default on.
-    /// Each arm with one merge in flight is named as itself, opened through
-    /// `open` by that name, and differs from its base in the merges alone:
-    /// the arm without the compact form was once named as the plain arm by
-    /// a branch that came before the one for the form.
-    #[test]
-    fn the_parallel_merge_arms_differ_from_their_bases_in_the_merges_alone() {
-        let root =
-            std::env::temp_dir().join(format!("supdb-bench-mergepar-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&root);
-        type Make = fn(&Path) -> Res<Supdb>;
-        let pairs: [(&str, &str, Make, Make); 3] = [
-            (
-                "supdb-mergeone",
-                "supdb",
-                Supdb::create_mergeone,
-                Supdb::create,
-            ),
-            (
-                "supdb-ingestmergeone",
-                "supdb-ingest",
-                Supdb::create_ingest_mergeone,
-                Supdb::create_ingest,
-            ),
-            (
-                "supdb-nozpagesmergeone",
-                "supdb-nozpages",
-                Supdb::create_nozpages_mergeone,
-                Supdb::create_nozpages,
-            ),
-        ];
-        for (arm, base, make_arm, make_base) in pairs {
-            let dir = |n: &str| {
-                let d = root.join(n);
-                std::fs::create_dir_all(&d).unwrap();
-                d
-            };
-            let opened = open(arm, &dir(&format!("{arm}-open")), 1).unwrap();
-            assert_eq!(opened.name(), arm);
-            drop(opened);
-            let (a, b) = (make_arm(&dir(arm)).unwrap(), make_base(&dir(base)).unwrap());
-            assert_eq!((a.name(), b.name()), (arm, base));
-            assert_eq!(guarantee(arm), guarantee(base), "{arm}");
-            assert!(!ARMS.contains(&arm) && !OOC_ARMS.contains(&arm), "{arm}");
-            assert_eq!(a.features(), b.features(), "{arm}");
-            let (oa, ob) = (
-                a.db.as_ref().unwrap().options(),
-                b.db.as_ref().unwrap().options(),
-            );
-            assert_eq!((oa.merge_parallel, ob.merge_parallel), (1, 2), "{arm}");
-            assert_eq!(
-                (
-                    oa.zpages,
-                    oa.sync,
-                    oa.partition_on_flush,
-                    oa.merge_bytes_cap,
-                    oa.scan_block_cache
-                ),
-                (
-                    ob.zpages,
-                    ob.sync,
-                    ob.partition_on_flush,
-                    ob.merge_bytes_cap,
-                    ob.scan_block_cache
-                ),
-                "{arm}"
-            );
-        }
-        let _ = std::fs::remove_dir_all(&root);
-    }
-
     /// The seal-floor and raw-read cache arms are named as themselves,
     /// opened by that name, and differ from `supdb` in their one option.
     #[test]
@@ -19969,21 +19537,6 @@ mod tests {
                 assert!(o.zpages_buy_crosses && o.jobs_mapped && o.jobs_pooled);
             }
             {
-                let z = Supdb::create_chaincovered(&dir("chaincovered")).unwrap();
-                assert_eq!(z.name(), "supdb-chaincovered");
-                assert_eq!(z.features(), base.features());
-                let o = z.db.as_ref().unwrap().options();
-                assert!(!o.merge_chains_writes_uncovered && b.merge_chains_writes_uncovered);
-                assert_eq!(o.scan_cache_copies_fit, b.scan_cache_copies_fit);
-            }
-            {
-                let z = Supdb::create_nocopiesfitchain(&dir("nocopiesfitchain")).unwrap();
-                assert_eq!(z.name(), "supdb-nocopiesfitchain");
-                assert_eq!(z.features(), base.features());
-                let o = z.db.as_ref().unwrap().options();
-                assert!(!o.scan_cache_copies_fit && !o.merge_chains_writes_uncovered);
-            }
-            {
                 let z = Supdb::create_formsoffbuilt(&dir("formsoffbuilt")).unwrap();
                 assert_eq!(z.name(), "supdb-formsoffbuilt");
                 assert_eq!(z.features(), base.features());
@@ -20449,13 +20002,6 @@ mod tests {
                     assert_eq!(o.zpages_cursor_steps, d.zpages_cursor_steps, "{name}");
                     assert_eq!(o.merge_parallel, d.merge_parallel, "{name}");
                 }
-                let z = Supdb::create_merge3(&dir("merge3")).unwrap();
-                assert_eq!(z.name(), "supdb-merge3");
-                assert_eq!(z.features(), base.features());
-                let o = z.db.as_ref().unwrap().options();
-                assert!(o.bounds_by_heads && o.land_bounds_read);
-                assert_eq!((o.merge_parallel, d.merge_parallel), (3, 2));
-                assert_eq!(o.merge_parallel_quiet, d.merge_parallel_quiet);
                 let z = Supdb::create_quiet0(&dir("quiet0")).unwrap();
                 assert_eq!(z.name(), "supdb-quiet0");
                 assert_eq!(z.features(), base.features());
@@ -20463,13 +20009,6 @@ mod tests {
                 assert!(o.bounds_by_heads && o.land_bounds_read);
                 assert_eq!(o.merge_parallel, d.merge_parallel);
                 assert_eq!((o.merge_parallel_quiet, d.merge_parallel_quiet), (0, 3));
-                assert!(!o.merge_quiet_any_gate && !d.merge_quiet_any_gate);
-                let z = Supdb::create_quiet_any(&dir("quietany")).unwrap();
-                assert_eq!(z.name(), "supdb-quietany");
-                assert_eq!(z.features(), base.features());
-                let o = z.db.as_ref().unwrap().options();
-                assert_eq!(o.merge_parallel_quiet, d.merge_parallel_quiet);
-                assert!(o.merge_quiet_any_gate);
                 assert_eq!(
                     (
                         o.zpages_stride_sparse,
@@ -20739,6 +20278,11 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
+    /// `supdb-cache64tofitautozpagesraw` is `supdb-cache64tofitautozpages`
+    /// with the block cache's reads of a partition sent through the door
+    /// (`Options::zpages_block_cache` off) and nothing else: named, durable
+    /// like it, opened under its name by the dispatch, the cache and the
+    /// controller as the base has them, and the engine's default on.
     #[test]
     fn the_raw_cache_arm_differs_from_the_combined_arm_in_the_cache_reads_alone() {
         let root =

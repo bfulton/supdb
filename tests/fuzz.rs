@@ -436,10 +436,6 @@ struct Cfg {
     /// under `ZFUZZ_OPTVARY`, the side generator's next draw, and on
     /// otherwise, as the engine has it.
     merge_quiet: bool,
-    /// That room at any gate of the controller and not only where the
-    /// compact form is installed (`Options::merge_quiet_any_gate`): in half
-    /// the seeds that draw the third merge.
-    merge_quiet_any: bool,
     /// A point read reads a store's sources in their common shape by the
     /// two-source and the layered read (`Options::point_lone`): off in a
     /// quarter of the seeds under `ZFUZZ_OPTVARY`, the side generator's
@@ -812,7 +808,9 @@ fn pick_cfg(rng: &mut Rng, want_cache: bool) -> Cfg {
     let (steps_on, direct_on) = (side.chance(50), side.chance(50));
     let (heads_on, land_on) = (side.chance(50), side.chance(50));
     let quiet_on = side.chance(50);
-    let quiet_any = side.chance(50);
+    // The draw `merge_quiet_any_gate` took, kept so that the draws after
+    // it stand.
+    let _ = side.chance(50);
     // The draw `point_fixed` took, kept so that the draws after it stand.
     let _ = side.chance(25);
     let lone_off = side.chance(25);
@@ -907,7 +905,6 @@ fn pick_cfg(rng: &mut Rng, want_cache: bool) -> Cfg {
         bounds_heads: !(vary && heads_on),
         land_bounds: !(vary && land_on),
         merge_quiet: !(vary && quiet_on),
-        merge_quiet_any: vary && !quiet_on && quiet_any,
         point_lone: !(vary && lone_off),
         point_layers_lean: !(vary && layers_as_one),
         hold_small: vary && explicit_on && hold_small,
@@ -956,7 +953,6 @@ fn opts(c: &Cfg) -> Options {
         bounds_by_heads: c.bounds_heads,
         land_bounds_read: c.land_bounds,
         merge_parallel_quiet: if c.merge_quiet { 3 } else { 0 },
-        merge_quiet_any_gate: c.merge_quiet_any,
         point_lone: c.point_lone,
         point_layers_lean: c.point_layers_lean,
         held_frames: c.held_frames,

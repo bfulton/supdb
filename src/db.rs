@@ -5267,8 +5267,9 @@ pub struct Options {
     /// plans at the base trigger (`l0_trigger`) and not the one reads
     /// lower, which paces the seals' plans and gave a chain no pace: it
     /// rewrote partitions to fold a piece or two each while the
-    /// ten-percent pass read, a quarter slower for it. Off, a landing
-    /// plans nothing: `supdb-nomergechain` and `supdb-ingestnomergechain`.
+    /// ten-percent pass read, a quarter slower for it. Off, a test's: a
+    /// landing plans nothing.
+    #[doc(hidden)]
     pub merge_chains: bool,
     /// The most bytes of partitions one merge rewrites, under
     /// `merge_chains`: the due ranges are taken in key order up to it, at
@@ -5277,9 +5278,9 @@ pub struct Options {
     /// due range landed them all at once at its end -- chained without a
     /// cap, the pass after a full rewrite met the same 336 pieces as
     /// without the chain, the one merge in flight through the whole of it.
-    /// Zero takes every due range: `supdb-mergeuncapped` and
-    /// `supdb-ingestmergeuncapped`. A wide piece's ranges stay one merge
-    /// whatever the cap (`Maint::cover_inputs`).
+    /// Zero, a test's, takes every due range. A wide piece's ranges stay
+    /// one merge whatever the cap (`Maint::cover_inputs`).
+    #[doc(hidden)]
     pub merge_bytes_cap: u64,
     /// The most partition merges in flight at once, each over ranges no
     /// other holds -- its partitions, and every piece over them, no other
@@ -5294,9 +5295,9 @@ pub struct Options {
     /// those fixed, at ten million keys under 1.25 GiB the full rewrite's
     /// pass read 1.56x and 1.88x in two sittings and the clean store's
     /// 1.14x and 1.53x, and in core at three million keys every lag pass
-    /// 1.13-1.80x and its bursts 1.05-1.11x (`docs/engine.md`). One is the
-    /// shape before: `supdb-mergeone`, `supdb-ingestmergeone` and
-    /// `supdb-nozpagesmergeone`.
+    /// 1.13-1.80x and its bursts 1.05-1.11x (`docs/engine.md`). One, a
+    /// test's, is the shape before.
+    #[doc(hidden)]
     pub merge_parallel: usize,
     /// The most partition merges in flight while the writer's commits see
     /// no read at all -- no scan and no point read through the writer or
@@ -5318,24 +5319,13 @@ pub struct Options {
     /// runs to its landing whatever comes after it. Three; zero is the
     /// shape before, `supdb-quiet0`. The room rises only
     /// where the compact form is installed (`zselect::GATE_Z`), the store
-    /// out of core by the controller's verdict, unless
-    /// `merge_quiet_any_gate` says otherwise.
+    /// out of core by the controller's verdict: at any gate the third merge
+    /// read ahead in one cell alone, the pass after the full rewrite over
+    /// random ids at ten million under 1.25 GiB, where the form is
+    /// installed from the load on, so the room is kept to where the debt
+    /// it retires is a device's.
     #[doc(hidden)]
     pub merge_parallel_quiet: usize,
-    /// EXPERIMENT: `merge_parallel_quiet`'s room at any gate of the
-    /// controller, the shape before. The third merge was paired at every
-    /// bounded rung of ten million keys and at three million under
-    /// 1.25 GiB, and read ahead in one cell alone, the pass after the full
-    /// rewrite over random ids at ten million under 1.25 GiB, where the
-    /// form is installed from the load on; at three million, where the
-    /// store sits at the census with no form installed, that pass is the
-    /// first scan's wait for the upkeep thread's last pass in both arms,
-    /// 10-58 ms of a pass of 36-88, and it read 0.69x and 0.74x in one
-    /// pairing and 0.64x and 1.62x in the next, nothing the merges reach.
-    /// So the room is kept to where the debt it retires is a device's:
-    /// `supdb-quietany` is the arm at any gate.
-    #[doc(hidden)]
-    pub merge_quiet_any_gate: bool,
     /// Under `merge_chains`, a merge's landing plans the next merge out of
     /// core -- the controller's gate away from the raw form -- whether or
     /// not a scan has come since the last landing, so the merges a burst's
@@ -5351,25 +5341,15 @@ pub struct Options {
     /// earlier pairing, before the default's own loop planned a merge
     /// when none is in flight (`merge_plan_idle`), read the undivided
     /// weighted sum 1.06x of the default's time and kept it off. In core
-    /// the gate is at raw and nothing changes. On; `supdb-nochainwrites`,
-    /// `supdb-ingestnochainwrites` chain only while reads are around.
+    /// the gate is at raw and nothing changes. The chain runs only where
+    /// the writer's block forms do not cover the store
+    /// (`Maint::forms_uncovered`): no block cache, a budget given or bound,
+    /// the forms given up for the merge path, scans far, or a point read
+    /// near, since a writer that holds a form for every block a piece
+    /// overlays walks no piece at all. Off, a test's: the chain only while
+    /// reads are around.
     #[doc(hidden)]
     pub merge_chains_writes: bool,
-    /// The chain through a write-only stretch
-    /// (`merge_chains_writes`) only where the writer's block forms do not
-    /// cover the store (`Maint::forms_uncovered`): no block cache, a budget
-    /// given or bound, the forms given up for the merge path, scans far, or
-    /// a point read near.
-    /// The chain pays a burst's merge debt beside its writes so that the
-    /// scans after it meet fewer pieces, and a writer that holds a form for
-    /// every block a piece overlays walks no piece at all: at three million
-    /// keys under 1 GiB the chain landed forty merges in the lag sweep where
-    /// the seals' own plans land twenty, and the full rewrite's burst ran
-    /// 9.1 s with it and 6.7 without, its upkeep thread's settle 5.9 s
-    /// against 3.6. On; `supdb-chaincovered` chains through a burst the
-    /// forms cover, and `supdb-nocopiesfitchain` is both shapes before.
-    #[doc(hidden)]
-    pub merge_chains_writes_uncovered: bool,
     /// Under `merge_chains`, the segment work's own loop plans a merge
     /// when none is in flight and a scan has come since its last look,
     /// at the base trigger as a landing's chain does: the chain plans
@@ -6796,12 +6776,6 @@ impl Options {
         self.point_lone && !self.exts_by_value && !self.point_via_ord
     }
 
-    /// Whether the store keeps `Shared::points_far`, for the options that
-    /// read it: `scan_cache_copies_fit` and `merge_chains_writes_uncovered`.
-    fn tracks_points(&self) -> bool {
-        self.scan_cache_copies_fit || self.merge_chains_writes_uncovered
-    }
-
     /// Whether a form file times one decode in sixteen and counts a
     /// raw-tailed group's opens (`zfile::ZFile::time_decodes`): the heat the
     /// re-code policy reads, under the forced form or the controller.
@@ -7283,12 +7257,10 @@ impl Default for Options {
             piece_ranks_whole: false,
             merge_chains: true,
             merge_chains_writes: true,
-            merge_chains_writes_uncovered: true,
             merge_plan_idle: true,
             merge_bytes_cap: 64 << 20,
             merge_parallel: 2,
             merge_parallel_quiet: 3,
-            merge_quiet_any_gate: false,
             boundary_keys_from_top: false,
             bounds_by_heads: true,
             land_bounds_read: true,
@@ -26141,13 +26113,13 @@ struct Shared {
     /// or two stores' worth of writes since the last, as scans are read
     /// (`reads_around`). Published by the writer's commit
     /// (`Db::points_far_now`) and cleared at once by the first point read
-    /// after it, the writer's or a handle's (`Reader::note_read`). Kept
-    /// only where an option reads it (`Options::tracks_points`): the
-    /// cache's grant of the records' place and the chain through writes.
+    /// after it, the writer's or a handle's (`Reader::note_read`). Read by
+    /// the cache's grant of the records' place and the chain through
+    /// writes.
     points_far: std::sync::atomic::AtomicBool,
     /// The writer's own cache budget has bound, so its tables hold no form
     /// for the blocks it sheds (`Reader::bind_cache`): what the chain
-    /// through writes reads (`Options::merge_chains_writes_uncovered`).
+    /// through writes reads (`Maint::forms_uncovered`).
     cache_bound_any: std::sync::atomic::AtomicBool,
     /// The store's scans (`Shared::scans_all`) when a publish kept fewer
     /// tables than the upkeep was behind and asked the thread to give up
@@ -31510,10 +31482,6 @@ impl Reader {
     /// more than once a commit.
     #[inline]
     fn note_read(&self, scan: bool) {
-        if !(self.opts.seal_idle || self.opts.merge_parallel_quiet > 0 || self.opts.tracks_points())
-        {
-            return;
-        }
         let m = &self.mode_note;
         if self.slot.is_none() {
             if scan {
@@ -31550,10 +31518,7 @@ impl Reader {
             shared.fetch_add(1, AtomicOrdering::Relaxed);
             // A handle's point read brings point reads near, said once a
             // commit as its count is (`Shared::points_far`).
-            if !scan
-                && self.opts.tracks_points()
-                && self.shared.points_far.load(AtomicOrdering::Relaxed)
-            {
+            if !scan && self.shared.points_far.load(AtomicOrdering::Relaxed) {
                 self.shared.points_far.store(false, AtomicOrdering::Release);
             }
             // A handle's read ends the write-only stretch too, said once a
@@ -37993,7 +37958,7 @@ impl Reader {
         }
         self.fs().tables_complete.set(false);
         // The writer's tables hold no form for what they shed from here
-        // (`Options::merge_chains_writes_uncovered`); a handle's cache is
+        // (`Maint::forms_uncovered`); a handle's cache is
         // its own and says nothing of them.
         if self.slot.is_none() {
             self.shared
@@ -42621,14 +42586,10 @@ impl Db {
     /// Whether the commit is in a write-only stretch, counted at its look
     /// (`Db::read_mode`).
     fn note_read_mode(&mut self) {
-        if !(self.opts.seal_idle || self.opts.merge_parallel_quiet > 0 || self.opts.tracks_points())
-        {
-            return;
-        }
         let own = &self.mode_note;
         let scans = self.shared.mode_scans.load(AtomicOrdering::Relaxed) + own.scans.get();
         let points = self.shared.mode_points.load(AtomicOrdering::Relaxed) + own.points.get();
-        let far = self.opts.tracks_points() && self.points_far_now(points);
+        let far = self.points_far_now(points);
         let (s0, p0, _) = self.read_mode;
         let quiet = scans == s0 && points == p0;
         self.read_mode = (scans, points, quiet);
@@ -58416,7 +58377,7 @@ impl Maint {
             // beside its writes rather than beside the scans after it.
             let writes = self.opts.merge_chains_writes
                 && self.shared.zgate.load() != zselect::GATE_RAW
-                && (!self.opts.merge_chains_writes_uncovered || self.forms_uncovered());
+                && self.forms_uncovered();
             if (reads || writes) && self.opts.merge_chains && self.opts.compact {
                 let base = self.opts.l0_trigger.max(1);
                 self.merge_why.1 = true;
@@ -59574,9 +59535,10 @@ impl Maint {
     }
 
     /// Whether the writer's block forms leave the store's pieces to its
-    /// scans (`Options::merge_chains_writes_uncovered`): no block cache or
-    /// none kept at commits, a budget given or the store's own bound, so
-    /// that a block may hold no form; the forms given up for the merge
+    /// scans, where the chain through writes runs
+    /// (`Options::merge_chains_writes`): no block cache or none kept at
+    /// commits, a budget given or the store's own bound, so that a block
+    /// may hold no form; the forms given up for the merge
     /// path; scans far, where a commit files into none; or a point read
     /// near (`Shared::points_far`), since a point read probes every piece
     /// over its key whatever the forms hold, and four of the suite's six
@@ -60177,12 +60139,12 @@ impl Maint {
     /// `Options::merge_parallel`, or `merge_parallel_quiet` where it is
     /// more, the writer's last commit saw no read since the one before, no
     /// read having come since (`Shared::write_quiet`), and the compact form
-    /// is installed (`Options::merge_quiet_any_gate` for any gate).
+    /// is installed.
     fn merges_room(&self) -> usize {
         let base = self.opts.merge_parallel.max(1);
         if self.opts.merge_parallel_quiet > base
             && self.shared.write_quiet.load(AtomicOrdering::Acquire)
-            && (self.opts.merge_quiet_any_gate || self.shared.zgate.load() == zselect::GATE_Z)
+            && self.shared.zgate.load() == zselect::GATE_Z
         {
             self.opts.merge_parallel_quiet
         } else {
