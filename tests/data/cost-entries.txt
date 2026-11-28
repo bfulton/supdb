@@ -260,6 +260,9 @@ Db::upkeep_holding	-	a test seam or a counter: reads or sets the store's bookkee
 Db::hold_landing_swap	-	a test seam or a counter: reads or sets the store's bookkeeping, at no key, entry, block or step of an operation
 Db::landing_holding	-	a test seam or a counter: reads or sets the store's bookkeeping, at no key, entry, block or step of an operation
 Db::look_after_a_landing	-	a test seam or a counter: reads or sets the store's bookkeeping, at no key, entry, block or step of an operation
+Db::look_inside_a_freeze	-	a test seam or a counter: reads or sets the store's bookkeeping, at no key, entry, block or step of an operation
+Db::look_inside_a_freeze_held	-	a test seam or a counter: reads or sets the store's bookkeeping, at no key, entry, block or step of an operation
+Db::let_the_look_go	-	a test seam or a counter: reads or sets the store's bookkeeping, at no key, entry, block or step of an operation
 Db::tables_landed	-	a test seam or a counter: reads or sets the store's bookkeeping, at no key, entry, block or step of an operation
 Db::upkeep_abandons	-	a test seam or a counter: reads or sets the store's bookkeeping, at no key, entry, block or step of an operation
 Db::upkeep_abandons_pinned	-	a test seam or a counter: reads or sets the store's bookkeeping, at no key, entry, block or step of an operation

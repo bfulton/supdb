@@ -2870,6 +2870,63 @@ fn a_copy_of_fixed_size_records_is_one_stream_until_a_write_it_cannot_take() {
     }
 }
 
+/// A look of the upkeep thread's that lands inside a freeze, between the
+/// freeze's read of where the look stands and its publish, is a look no
+/// further behind than the tables the publish kept for it: the store asks
+/// the upkeep to give nothing up, and the copies are carried across the
+/// merge after. Judged by the position the freeze read before its publish,
+/// the look was two tables behind a list of one, the upkeep thread gave its
+/// forms up at its next step, and every copy was dropped (site 7): one run
+/// in a hundred of the two tests before, which take the same two seals.
+#[test]
+fn a_look_that_lands_inside_a_freeze_asks_the_upkeep_to_give_nothing_up() {
+    let dir = scratch("look-inside-a-freeze");
+    let (mut db, keys, mut want, by_part) = copies_of_fixed_records(&dir, common::options());
+    let (p0, n0) = db.block_cache_packed();
+    assert_eq!(n0, by_part.len(), "every partition's block a copy");
+    let abandons = db.upkeep_abandons();
+    let merges_before = db.seal_waits().merges;
+    db.hold_seal_durable(true);
+    for round in 0..2u8 {
+        if round == 1 {
+            db.look_inside_a_freeze();
+        }
+        for k in keys.iter().step_by(5) {
+            db.put(k, &[b'a' + round; 100]);
+            want.insert(k.clone(), vec![vec![b'a' + round; 100]]);
+        }
+        db.commit().unwrap();
+        db.seal().unwrap();
+    }
+    let both = db.look_inside_a_freeze_held();
+    // Read with the look still held after its trim: nothing of the
+    // upkeep's has moved what the freeze left.
+    let (asked, kept, lives, look) = db.upkeep_abandon_state();
+    db.let_the_look_go();
+    assert!(
+        both,
+        "the look and the freeze each held: the look moved inside the freeze"
+    );
+    assert_eq!(
+        (lives - look, kept),
+        (1, 1),
+        "the look one table behind, and that table kept for it"
+    );
+    assert!(!asked, "no ask to give the forms up for a current look");
+    db.hold_seal_durable(false);
+    merged_past(&mut db, merges_before);
+    assert_eq!(db.upkeep_abandons(), abandons, "nothing given up");
+    assert_eq!(
+        db.block_cache_packed(),
+        (p0, n0),
+        "the copies carried across the merge; drops by site and refusals {:?}",
+        db.forms_drop_reasons()
+    );
+    assert!(scan_model(&db) == want);
+    drop(db);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// A packed copy that makes no claim to its ranks -- built over keys the
 /// partition did not hold -- is searched by its records' keys: a scan's
 /// start inside it and a patch of a key it holds find their entry by the
