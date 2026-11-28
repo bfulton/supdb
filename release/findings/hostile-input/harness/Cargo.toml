@@ -1,0 +1,28 @@
+# A throwaway harness for the pre-tag hostile-input audit
+# (release/findings/hostile-input.md). Not part of the crate, its tests or
+# its gate: it links the library as a caller does and feeds its readers
+# bytes an attacker made.
+[package]
+name = "hostile"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[workspace]
+
+[dependencies]
+supdb = { path = "../../../.." }
+ring = "0.17"
+
+[profile.release]
+opt-level = 2
+debug = 1
+overflow-checks = true
+debug-assertions = true
+
+# The shipped release profile's checks: no overflow checks, no debug
+# assertions. `--profile plain` shows what a panic above does in release.
+[profile.plain]
+inherits = "release"
+overflow-checks = false
+debug-assertions = false
