@@ -1,0 +1,1707 @@
+[
+  {
+    "workload": "bound-start",
+    "arm": "supdb-nocache",
+    "guarantee": "durable",
+    "size": 3000000,
+    "quantity": "group_bytes",
+    "unit": "B",
+    "samples": [
+      1310720.0
+    ]
+  },
+  {
+    "workload": "bound-start",
+    "arm": "supdb-nocache",
+    "guarantee": "durable",
+    "size": 3000000,
+    "quantity": "process_bytes",
+    "unit": "B",
+    "samples": [
+      13709312.0
+    ]
+  },
+  {
+    "workload": "bound-start",
+    "arm": "supdb-nocache",
+    "guarantee": "durable",
+    "size": 3000000,
+    "quantity": "room_above_bytes",
+    "unit": "B",
+    "samples": [
+      13872451584.0
+    ]
+  },
+  {
+    "workload": "lag-burst",
+    "arm": "supdb-nocache",
+    "guarantee": "durable",
+    "size": 3000000,
+    "quantity": "bg_read_bytes_per_op_lag100pct",
+    "unit": "B/op",
+    "samples": [
+      0.004551111111111111
+    ]
+  },
+  {
+    "workload": "lag-burst",
+    "arm": "supdb-nocache",
+    "guarantee": "durable",
+    "size": 3000000,
+    "quantity": "bg_read_bytes_per_op_lag10pct",
+    "unit": "B/op",
+    "samples": [
+      0.0
+    ]
+  },
+  {
+    "workload": "lag-burst",
+    "arm": "supdb-nocache",
+    "guarantee": "durable",
+    "size": 3000000,
+    "quantity": "bg_read_bytes_per_op_lag1pct",
+    "unit": "B/op",
+    "samples": [
+      0.0
+    ]
+  },
+  {
+    "workload": "lag-burst",
+    "arm": "supdb-nocache",
+    "guarantee": "durable",
+    "size": 3000000,
+    "quantity": "majfaults_per_op_lag100pct",
+    "unit": "faults/op",
+    "samples": [
+      0.0
+    ]
+  },
+  {
+    "workload": "lag-burst",
+    "arm": "supdb-nocache",
+    "guarantee": "durable",
+    "size": 3000000,
+    "quantity": "majfaults_per_op_lag10pct",
+    "unit": "faults/op",
+    "samples": [
+      0.0
+    ]
+  },
+  {
+    "workload": "lag-burst",
+    "arm": "supdb-nocache",
+    "guarantee": "durable",
+    "size": 3000000,
+    "quantity": "majfaults_per_op_lag1pct",
+    "unit": "faults/op",
+    "samples": [
+      0.0
+    ]
+  },
+  {
+    "workload": "lag-burst",
+    "arm": "supdb-nocache",
+    "guarantee": "durable",
+    "size": 3000000,
+    "quantity": "read_bytes_per_op_lag100pct",
+    "unit": "B/op",
+    "samples": [
+      0.018204444444444443
+    ]
+  },
+  {
+    "workload": "lag-burst",
+    "arm": "supdb-nocache",
+    "guarantee": "durable",
+    "size": 3000000,
+    "quantity": "read_bytes_per_op_lag10pct",
+    "unit": "B/op",
+    "samples": [
+      0.0
+    ]
+  },
+  {
+    "workload": "lag-burst",
+    "arm": "supdb-nocache",
+    "guarantee": "durable",
+    "size": 3000000,
+    "quantity": "read_bytes_per_op_lag1pct",
+    "unit": "B/op",
+    "samples": [
+      0.13653333333333334
+    ]
+  },
+  {
+    "workload": "lag-burst",
+    "arm": "supdb-nocache",
+    "guarantee": "durable",
+    "size": 3000000,
+    "quantity": "read_us_per_io_lag100pct",
+    "unit": "us/io",
+    "samples": [
+      200.0
+    ]
+  },
+  {
+    "workload": "lag-burst",
+    "arm": "supdb-nocache",
+    "guarantee": "durable",
+    "size": 3000000,
+    "quantity": "read_us_per_io_lag1pct",
+    "unit": "us/io",
+    "samples": [
+      0.0
+    ]
+  },
+  {
+    "workload": "lag-burst",
+    "arm": "supdb-nocache",
+    "guarantee": "durable",
+    "size": 3000000,
+    "quantity": "refaults_per_op_lag100pct",
+    "unit": "refaults/op",
+    "samples": [
+      4.444444444444444e-6
+    ]
+  },
+  {
+    "workload": "lag-burst",
+    "arm": "supdb-nocache",
+    "guarantee": "durable",
+    "size": 3000000,
+    "quantity": "refaults_per_op_lag10pct",
+    "unit": "refaults/op",
+    "samples": [
+      0.0
+    ]
+  },
+  {
+    "workload": "lag-burst",
+    "arm": "supdb-nocache",
+    "guarantee": "durable",
+    "size": 3000000,
+    "quantity": "refaults_per_op_lag1pct",
+    "unit": "refaults/op",
+    "samples": [
+      0.0
+    ]
+  },
+  {
+    "workload": "load",
+    "arm": "supdb-nocache",
+    "guarantee": "durable",
+    "size": 3000000,
+    "quantity": "bg_read_bytes_per_op",
+    "unit": "B/op",
+    "samples": [
+      0.0
+    ]
+  },
+  {
+    "workload": "load",
+    "arm": "supdb-nocache",
+    "guarantee": "durable",
+    "size": 3000000,
+    "quantity": "bytes_on_disk_per_byte",
+    "unit": "B/B",
+    "samples": [
+      1.3084954482758622
+    ]
+  },
+  {
+    "workload": "load",
+    "arm": "supdb-nocache",
+    "guarantee": "durable",
+    "size": 3000000,
+    "quantity": "device_bytes_per_byte",
+    "unit": "B/B",
+    "samples": [
+      1.34455908045977
+    ]
+  },
+  {
+    "workload": "load",
+    "arm": "supdb-nocache",
+    "guarantee": "durable",
+    "size": 3000000,
+    "quantity": "majfaults_per_op",
+    "unit": "faults/op",
+    "samples": [
+      0.0
+    ]
+  },
+  {
+    "workload": "load",
+    "arm": "supdb-nocache",
+    "guarantee": "durable",
+    "size": 3000000,
+    "quantity": "ops_per_s",
+    "unit": "ops/s",
+    "samples": [
+      1183437.372665837
+    ]
+  },
+  {
+    "workload": "load",
+    "arm": "supdb-nocache",
+    "guarantee": "durable",
+    "size": 3000000,
+    "quantity": "read_bytes_per_op",
+    "unit": "B/op",
+    "samples": [
+      0.0
+    ]
+  },
+  {
+    "workload": "load",
+    "arm": "supdb-nocache",
+    "guarantee": "durable",
+    "size": 3000000,
+    "quantity": "read_us_per_io",
+    "unit": "us/io",
+    "samples": [
+      0.0
+    ]
+  },
+  {
+    "workload": "load",
+    "arm": "supdb-nocache",
+    "guarantee": "durable",
+    "size": 3000000,
+    "quantity": "refaults_per_op",
+    "unit": "refaults/op",
+    "samples": [
+      3.333333333333334e-7
+    ]
+  },
+  {
+    "workload": "load-shuffled",
+    "arm": "supdb-nocache",
+    "guarantee": "durable",
+    "size": 3000000,
+    "quantity": "bg_read_bytes_per_op",
+    "unit": "B/op",
+    "samples": [
+      0.013653333333333332
+    ]
+  },
+  {
+    "workload": "load-shuffled",
+    "arm": "supdb-nocache",
+    "guarantee": "durable",
+    "size": 3000000,
+    "quantity": "majfaults_per_op",
+    "unit": "faults/op",
+    "samples": [
+      0.0
+    ]
+  },
+  {
+    "workload": "load-shuffled",
+    "arm": "supdb-nocache",
+    "guarantee": "durable",
+    "size": 3000000,
+    "quantity": "ops_per_s",
+    "unit": "ops/s",
+    "samples": [
+      496798.8142437697
+    ]
+  },
+  {
+    "workload": "load-shuffled",
+    "arm": "supdb-nocache",
+    "guarantee": "durable",
+    "size": 3000000,
+    "quantity": "read_bytes_per_op",
+    "unit": "B/op",
+    "samples": [
+      0.012288
+    ]
+  },
+  {
+    "workload": "load-shuffled",
+    "arm": "supdb-nocache",
+    "guarantee": "durable",
+    "size": 3000000,
+    "quantity": "read_us_per_io",
+    "unit": "us/io",
+    "samples": [
+      2631.5789473684213
+    ]
+  },
+  {
+    "workload": "load-shuffled",
+    "arm": "supdb-nocache",
+    "guarantee": "durable",
+    "size": 3000000,
+    "quantity": "refaults_per_op",
+    "unit": "refaults/op",
+    "samples": [
+      1.3333333333333334e-6
+    ]
+  },
+  {
+    "workload": "read",
+    "arm": "supdb-nocache",
+    "guarantee": "durable",
+    "size": 3000000,
+    "quantity": "bg_read_bytes_per_op",
+    "unit": "B/op",
+    "samples": [
+      0.0
+    ]
+  },
+  {
+    "workload": "read",
+    "arm": "supdb-nocache",
+    "guarantee": "durable",
+    "size": 3000000,
+    "quantity": "bg_read_bytes_per_op_2t",
+    "unit": "B/op",
+    "samples": [
+      0.0
+    ]
+  },
+  {
+    "workload": "read",
+    "arm": "supdb-nocache",
+    "guarantee": "durable",
+    "size": 3000000,
+    "quantity": "bg_read_bytes_per_op_3t",
+    "unit": "B/op",
+    "samples": [
+      0.0
+    ]
+  },
+  {
+    "workload": "read",
+    "arm": "supdb-nocache",
+    "guarantee": "durable",
+    "size": 3000000,
+    "quantity": "majfaults_per_op",
+    "unit": "faults/op",
+    "samples": [
+      0.0
+    ]
+  },
+  {
+    "workload": "read",
+    "arm": "supdb-nocache",
+    "guarantee": "durable",
+    "size": 3000000,
+    "quantity": "majfaults_per_op_2t",
+    "unit": "faults/op",
+    "samples": [
+      0.0
+    ]
+  },
+  {
+    "workload": "read",
+    "arm": "supdb-nocache",
+    "guarantee": "durable",
+    "size": 3000000,
+    "quantity": "majfaults_per_op_3t",
+    "unit": "faults/op",
+    "samples": [
+      0.0
+    ]
+  },
+  {
+    "workload": "read",
+    "arm": "supdb-nocache",
+    "guarantee": "durable",
+    "size": 3000000,
+    "quantity": "p99_us",
+    "unit": "µs",
+    "samples": [
+      2.687
+    ]
+  },
+  {
+    "workload": "read",
+    "arm": "supdb-nocache",
+    "guarantee": "durable",
+    "size": 3000000,
+    "quantity": "read_bytes_per_op",
+    "unit": "B/op",
+    "samples": [
+      0.0
+    ]
+  },
+  {
+    "workload": "read",
+    "arm": "supdb-nocache",
+    "guarantee": "durable",
+    "size": 3000000,
+    "quantity": "read_bytes_per_op_2t",
+    "unit": "B/op",
+    "samples": [
+      0.0
+    ]
+  },
+  {
+    "workload": "read",
+    "arm": "supdb-nocache",
+    "guarantee": "durable",
+    "size": 3000000,
+    "quantity": "read_bytes_per_op_3t",
+    "unit": "B/op",
+    "samples": [
+      0.0
+    ]
+  },
+  {
+    "workload": "read",
+    "arm": "supdb-nocache",
+    "guarantee": "durable",
+    "size": 3000000,
+    "quantity": "reads_per_s",
+    "unit": "reads/s",
+    "samples": [
+      1411550.2100337308
+    ]
+  },
+  {
+    "workload": "read",
+    "arm": "supdb-nocache",
+    "guarantee": "durable",
+    "size": 3000000,
+    "quantity": "reads_per_s_2t",
+    "unit": "reads/s",
+    "samples": [
+      3993607.432582665
+    ]
+  },
+  {
+    "workload": "read",
+    "arm": "supdb-nocache",
+    "guarantee": "durable",
+    "size": 3000000,
+    "quantity": "reads_per_s_3t",
+    "unit": "reads/s",
+    "samples": [
+      4414821.905127803
+    ]
+  },
+  {
+    "workload": "read",
+    "arm": "supdb-nocache",
+    "guarantee": "durable",
+    "size": 3000000,
+    "quantity": "refaults_per_op",
+    "unit": "refaults/op",
+    "samples": [
+      0.0
+    ]
+  },
+  {
+    "workload": "read",
+    "arm": "supdb-nocache",
+    "guarantee": "durable",
+    "size": 3000000,
+    "quantity": "refaults_per_op_2t",
+    "unit": "refaults/op",
+    "samples": [
+      0.0
+    ]
+  },
+  {
+    "workload": "read",
+    "arm": "supdb-nocache",
+    "guarantee": "durable",
+    "size": 3000000,
+    "quantity": "refaults_per_op_3t",
+    "unit": "refaults/op",
+    "samples": [
+      0.0
+    ]
+  },
+  {
+    "workload": "scan",
+    "arm": "supdb-nocache",
+    "guarantee": "durable",
+    "size": 3000000,
+    "quantity": "bg_read_bytes_per_op",
+    "unit": "B/op",
+    "samples": [
+      0.0
+    ]
+  },
+  {
+    "workload": "scan",
+    "arm": "supdb-nocache",
+    "guarantee": "durable",
+    "size": 3000000,
+    "quantity": "bg_read_bytes_per_op_2t",
+    "unit": "B/op",
+    "samples": [
+      0.0
+    ]
+  },
+  {
+    "workload": "scan",
+    "arm": "supdb-nocache",
+    "guarantee": "durable",
+    "size": 3000000,
+    "quantity": "bg_read_bytes_per_op_3t",
+    "unit": "B/op",
+    "samples": [
+      0.0
+    ]
+  },
+  {
+    "workload": "scan",
+    "arm": "supdb-nocache",
+    "guarantee": "durable",
+    "size": 3000000,
+    "quantity": "entries_per_s",
+    "unit": "entries/s",
+    "samples": [
+      36032067.098434925
+    ]
+  },
+  {
+    "workload": "scan",
+    "arm": "supdb-nocache",
+    "guarantee": "durable",
+    "size": 3000000,
+    "quantity": "entries_per_s_2t",
+    "unit": "entries/s",
+    "samples": [
+      80904425.17540753
+    ]
+  },
+  {
+    "workload": "scan",
+    "arm": "supdb-nocache",
+    "guarantee": "durable",
+    "size": 3000000,
+    "quantity": "entries_per_s_3t",
+    "unit": "entries/s",
+    "samples": [
+      136622268.9428552
+    ]
+  },
+  {
+    "workload": "scan",
+    "arm": "supdb-nocache",
+    "guarantee": "durable",
+    "size": 3000000,
+    "quantity": "majfaults_per_op",
+    "unit": "faults/op",
+    "samples": [
+      0.0
+    ]
+  },
+  {
+    "workload": "scan",
+    "arm": "supdb-nocache",
+    "guarantee": "durable",
+    "size": 3000000,
+    "quantity": "majfaults_per_op_2t",
+    "unit": "faults/op",
+    "samples": [
+      0.0
+    ]
+  },
+  {
+    "workload": "scan",
+    "arm": "supdb-nocache",
+    "guarantee": "durable",
+    "size": 3000000,
+    "quantity": "majfaults_per_op_3t",
+    "unit": "faults/op",
+    "samples": [
+      0.0
+    ]
+  },
+  {
+    "workload": "scan",
+    "arm": "supdb-nocache",
+    "guarantee": "durable",
+    "size": 3000000,
+    "quantity": "read_bytes_per_op",
+    "unit": "B/op",
+    "samples": [
+      0.0
+    ]
+  },
+  {
+    "workload": "scan",
+    "arm": "supdb-nocache",
+    "guarantee": "durable",
+    "size": 3000000,
+    "quantity": "read_bytes_per_op_2t",
+    "unit": "B/op",
+    "samples": [
+      0.0
+    ]
+  },
+  {
+    "workload": "scan",
+    "arm": "supdb-nocache",
+    "guarantee": "durable",
+    "size": 3000000,
+    "quantity": "read_bytes_per_op_3t",
+    "unit": "B/op",
+    "samples": [
+      0.0
+    ]
+  },
+  {
+    "workload": "scan",
+    "arm": "supdb-nocache",
+    "guarantee": "durable",
+    "size": 3000000,
+    "quantity": "refaults_per_op",
+    "unit": "refaults/op",
+    "samples": [
+      0.0
+    ]
+  },
+  {
+    "workload": "scan",
+    "arm": "supdb-nocache",
+    "guarantee": "durable",
+    "size": 3000000,
+    "quantity": "refaults_per_op_2t",
+    "unit": "refaults/op",
+    "samples": [
+      0.0
+    ]
+  },
+  {
+    "workload": "scan",
+    "arm": "supdb-nocache",
+    "guarantee": "durable",
+    "size": 3000000,
+    "quantity": "refaults_per_op_3t",
+    "unit": "refaults/op",
+    "samples": [
+      0.0
+    ]
+  },
+  {
+    "workload": "scan-lag",
+    "arm": "supdb-nocache",
+    "guarantee": "durable",
+    "size": 3000000,
+    "quantity": "bg_read_bytes_per_op_lag0pct",
+    "unit": "B/op",
+    "samples": [
+      0.0
+    ]
+  },
+  {
+    "workload": "scan-lag",
+    "arm": "supdb-nocache",
+    "guarantee": "durable",
+    "size": 3000000,
+    "quantity": "bg_read_bytes_per_op_lag100pct",
+    "unit": "B/op",
+    "samples": [
+      0.0
+    ]
+  },
+  {
+    "workload": "scan-lag",
+    "arm": "supdb-nocache",
+    "guarantee": "durable",
+    "size": 3000000,
+    "quantity": "bg_read_bytes_per_op_lag10pct",
+    "unit": "B/op",
+    "samples": [
+      0.0
+    ]
+  },
+  {
+    "workload": "scan-lag",
+    "arm": "supdb-nocache",
+    "guarantee": "durable",
+    "size": 3000000,
+    "quantity": "bg_read_bytes_per_op_lag1pct",
+    "unit": "B/op",
+    "samples": [
+      0.0
+    ]
+  },
+  {
+    "workload": "scan-lag",
+    "arm": "supdb-nocache",
+    "guarantee": "durable",
+    "size": 3000000,
+    "quantity": "entries_per_s_lag0pct",
+    "unit": "entries/s",
+    "samples": [
+      37477841.22637491
+    ]
+  },
+  {
+    "workload": "scan-lag",
+    "arm": "supdb-nocache",
+    "guarantee": "durable",
+    "size": 3000000,
+    "quantity": "entries_per_s_lag100pct",
+    "unit": "entries/s",
+    "samples": [
+      1982627.045468888
+    ]
+  },
+  {
+    "workload": "scan-lag",
+    "arm": "supdb-nocache",
+    "guarantee": "durable",
+    "size": 3000000,
+    "quantity": "entries_per_s_lag10pct",
+    "unit": "entries/s",
+    "samples": [
+      6692414.61650122
+    ]
+  },
+  {
+    "workload": "scan-lag",
+    "arm": "supdb-nocache",
+    "guarantee": "durable",
+    "size": 3000000,
+    "quantity": "entries_per_s_lag1pct",
+    "unit": "entries/s",
+    "samples": [
+      17437054.1236279
+    ]
+  },
+  {
+    "workload": "scan-lag",
+    "arm": "supdb-nocache",
+    "guarantee": "durable",
+    "size": 3000000,
+    "quantity": "majfaults_per_op_lag0pct",
+    "unit": "faults/op",
+    "samples": [
+      0.0
+    ]
+  },
+  {
+    "workload": "scan-lag",
+    "arm": "supdb-nocache",
+    "guarantee": "durable",
+    "size": 3000000,
+    "quantity": "majfaults_per_op_lag100pct",
+    "unit": "faults/op",
+    "samples": [
+      0.0
+    ]
+  },
+  {
+    "workload": "scan-lag",
+    "arm": "supdb-nocache",
+    "guarantee": "durable",
+    "size": 3000000,
+    "quantity": "majfaults_per_op_lag10pct",
+    "unit": "faults/op",
+    "samples": [
+      0.0
+    ]
+  },
+  {
+    "workload": "scan-lag",
+    "arm": "supdb-nocache",
+    "guarantee": "durable",
+    "size": 3000000,
+    "quantity": "majfaults_per_op_lag1pct",
+    "unit": "faults/op",
+    "samples": [
+      0.0
+    ]
+  },
+  {
+    "workload": "scan-lag",
+    "arm": "supdb-nocache",
+    "guarantee": "durable",
+    "size": 3000000,
+    "quantity": "read_bytes_per_op_lag0pct",
+    "unit": "B/op",
+    "samples": [
+      0.0
+    ]
+  },
+  {
+    "workload": "scan-lag",
+    "arm": "supdb-nocache",
+    "guarantee": "durable",
+    "size": 3000000,
+    "quantity": "read_bytes_per_op_lag100pct",
+    "unit": "B/op",
+    "samples": [
+      0.0
+    ]
+  },
+  {
+    "workload": "scan-lag",
+    "arm": "supdb-nocache",
+    "guarantee": "durable",
+    "size": 3000000,
+    "quantity": "read_bytes_per_op_lag10pct",
+    "unit": "B/op",
+    "samples": [
+      0.0
+    ]
+  },
+  {
+    "workload": "scan-lag",
+    "arm": "supdb-nocache",
+    "guarantee": "durable",
+    "size": 3000000,
+    "quantity": "read_bytes_per_op_lag1pct",
+    "unit": "B/op",
+    "samples": [
+      0.0
+    ]
+  },
+  {
+    "workload": "scan-lag",
+    "arm": "supdb-nocache",
+    "guarantee": "durable",
+    "size": 3000000,
+    "quantity": "refaults_per_op_lag0pct",
+    "unit": "refaults/op",
+    "samples": [
+      0.0
+    ]
+  },
+  {
+    "workload": "scan-lag",
+    "arm": "supdb-nocache",
+    "guarantee": "durable",
+    "size": 3000000,
+    "quantity": "refaults_per_op_lag100pct",
+    "unit": "refaults/op",
+    "samples": [
+      0.0003333333333333333
+    ]
+  },
+  {
+    "workload": "scan-lag",
+    "arm": "supdb-nocache",
+    "guarantee": "durable",
+    "size": 3000000,
+    "quantity": "refaults_per_op_lag10pct",
+    "unit": "refaults/op",
+    "samples": [
+      0.0
+    ]
+  },
+  {
+    "workload": "scan-lag",
+    "arm": "supdb-nocache",
+    "guarantee": "durable",
+    "size": 3000000,
+    "quantity": "refaults_per_op_lag1pct",
+    "unit": "refaults/op",
+    "samples": [
+      0.0
+    ]
+  },
+  {
+    "workload": "scan-lag",
+    "arm": "supdb-nocache",
+    "guarantee": "durable",
+    "size": 3000000,
+    "quantity": "updates_per_s_lag100pct",
+    "unit": "ops/s",
+    "samples": [
+      780709.2896915869
+    ]
+  },
+  {
+    "workload": "scan-lag",
+    "arm": "supdb-nocache",
+    "guarantee": "durable",
+    "size": 3000000,
+    "quantity": "updates_per_s_lag10pct",
+    "unit": "ops/s",
+    "samples": [
+      1120258.81729472
+    ]
+  },
+  {
+    "workload": "scan-lag",
+    "arm": "supdb-nocache",
+    "guarantee": "durable",
+    "size": 3000000,
+    "quantity": "updates_per_s_lag1pct",
+    "unit": "ops/s",
+    "samples": [
+      1374700.0118178376
+    ]
+  },
+  {
+    "workload": "scan-mixed",
+    "arm": "supdb-nocache",
+    "guarantee": "durable",
+    "size": 3000000,
+    "quantity": "bg_read_bytes_per_op_2t",
+    "unit": "B/op",
+    "samples": [
+      0.0
+    ]
+  },
+  {
+    "workload": "scan-mixed",
+    "arm": "supdb-nocache",
+    "guarantee": "durable",
+    "size": 3000000,
+    "quantity": "bg_read_bytes_per_op_3t",
+    "unit": "B/op",
+    "samples": [
+      0.0
+    ]
+  },
+  {
+    "workload": "scan-mixed",
+    "arm": "supdb-nocache",
+    "guarantee": "durable",
+    "size": 3000000,
+    "quantity": "entries_per_s_2t",
+    "unit": "entries/s",
+    "samples": [
+      49853639.85030627
+    ]
+  },
+  {
+    "workload": "scan-mixed",
+    "arm": "supdb-nocache",
+    "guarantee": "durable",
+    "size": 3000000,
+    "quantity": "entries_per_s_3t",
+    "unit": "entries/s",
+    "samples": [
+      87619322.0372011
+    ]
+  },
+  {
+    "workload": "scan-mixed",
+    "arm": "supdb-nocache",
+    "guarantee": "durable",
+    "size": 3000000,
+    "quantity": "majfaults_per_op_2t",
+    "unit": "faults/op",
+    "samples": [
+      0.0
+    ]
+  },
+  {
+    "workload": "scan-mixed",
+    "arm": "supdb-nocache",
+    "guarantee": "durable",
+    "size": 3000000,
+    "quantity": "majfaults_per_op_3t",
+    "unit": "faults/op",
+    "samples": [
+      0.0
+    ]
+  },
+  {
+    "workload": "scan-mixed",
+    "arm": "supdb-nocache",
+    "guarantee": "durable",
+    "size": 3000000,
+    "quantity": "read_bytes_per_op_2t",
+    "unit": "B/op",
+    "samples": [
+      0.0
+    ]
+  },
+  {
+    "workload": "scan-mixed",
+    "arm": "supdb-nocache",
+    "guarantee": "durable",
+    "size": 3000000,
+    "quantity": "read_bytes_per_op_3t",
+    "unit": "B/op",
+    "samples": [
+      0.0
+    ]
+  },
+  {
+    "workload": "scan-mixed",
+    "arm": "supdb-nocache",
+    "guarantee": "durable",
+    "size": 3000000,
+    "quantity": "refaults_per_op_2t",
+    "unit": "refaults/op",
+    "samples": [
+      0.0
+    ]
+  },
+  {
+    "workload": "scan-mixed",
+    "arm": "supdb-nocache",
+    "guarantee": "durable",
+    "size": 3000000,
+    "quantity": "refaults_per_op_3t",
+    "unit": "refaults/op",
+    "samples": [
+      0.0
+    ]
+  },
+  {
+    "workload": "ycsb-A",
+    "arm": "supdb-nocache",
+    "guarantee": "durable",
+    "size": 3000000,
+    "quantity": "bg_read_bytes_per_op",
+    "unit": "B/op",
+    "samples": [
+      0.0
+    ]
+  },
+  {
+    "workload": "ycsb-A",
+    "arm": "supdb-nocache",
+    "guarantee": "durable",
+    "size": 3000000,
+    "quantity": "majfaults_per_op",
+    "unit": "faults/op",
+    "samples": [
+      0.0
+    ]
+  },
+  {
+    "workload": "ycsb-A",
+    "arm": "supdb-nocache",
+    "guarantee": "durable",
+    "size": 3000000,
+    "quantity": "ops_per_s",
+    "unit": "ops/s",
+    "samples": [
+      464251.64385239687
+    ]
+  },
+  {
+    "workload": "ycsb-A",
+    "arm": "supdb-nocache",
+    "guarantee": "durable",
+    "size": 3000000,
+    "quantity": "read_bytes_per_op",
+    "unit": "B/op",
+    "samples": [
+      0.0
+    ]
+  },
+  {
+    "workload": "ycsb-A",
+    "arm": "supdb-nocache",
+    "guarantee": "durable",
+    "size": 3000000,
+    "quantity": "refaults_per_op",
+    "unit": "refaults/op",
+    "samples": [
+      0.0
+    ]
+  },
+  {
+    "workload": "ycsb-B",
+    "arm": "supdb-nocache",
+    "guarantee": "durable",
+    "size": 3000000,
+    "quantity": "bg_read_bytes_per_op",
+    "unit": "B/op",
+    "samples": [
+      0.0
+    ]
+  },
+  {
+    "workload": "ycsb-B",
+    "arm": "supdb-nocache",
+    "guarantee": "durable",
+    "size": 3000000,
+    "quantity": "majfaults_per_op",
+    "unit": "faults/op",
+    "samples": [
+      0.0
+    ]
+  },
+  {
+    "workload": "ycsb-B",
+    "arm": "supdb-nocache",
+    "guarantee": "durable",
+    "size": 3000000,
+    "quantity": "ops_per_s",
+    "unit": "ops/s",
+    "samples": [
+      1464652.730105366
+    ]
+  },
+  {
+    "workload": "ycsb-B",
+    "arm": "supdb-nocache",
+    "guarantee": "durable",
+    "size": 3000000,
+    "quantity": "read_bytes_per_op",
+    "unit": "B/op",
+    "samples": [
+      0.0
+    ]
+  },
+  {
+    "workload": "ycsb-B",
+    "arm": "supdb-nocache",
+    "guarantee": "durable",
+    "size": 3000000,
+    "quantity": "refaults_per_op",
+    "unit": "refaults/op",
+    "samples": [
+      0.0
+    ]
+  },
+  {
+    "workload": "ycsb-C",
+    "arm": "supdb-nocache",
+    "guarantee": "durable",
+    "size": 3000000,
+    "quantity": "bg_read_bytes_per_op",
+    "unit": "B/op",
+    "samples": [
+      0.0
+    ]
+  },
+  {
+    "workload": "ycsb-C",
+    "arm": "supdb-nocache",
+    "guarantee": "durable",
+    "size": 3000000,
+    "quantity": "majfaults_per_op",
+    "unit": "faults/op",
+    "samples": [
+      0.0
+    ]
+  },
+  {
+    "workload": "ycsb-C",
+    "arm": "supdb-nocache",
+    "guarantee": "durable",
+    "size": 3000000,
+    "quantity": "ops_per_s",
+    "unit": "ops/s",
+    "samples": [
+      3116129.353520949
+    ]
+  },
+  {
+    "workload": "ycsb-C",
+    "arm": "supdb-nocache",
+    "guarantee": "durable",
+    "size": 3000000,
+    "quantity": "read_bytes_per_op",
+    "unit": "B/op",
+    "samples": [
+      0.0
+    ]
+  },
+  {
+    "workload": "ycsb-C",
+    "arm": "supdb-nocache",
+    "guarantee": "durable",
+    "size": 3000000,
+    "quantity": "refaults_per_op",
+    "unit": "refaults/op",
+    "samples": [
+      0.0
+    ]
+  },
+  {
+    "workload": "ycsb-D",
+    "arm": "supdb-nocache",
+    "guarantee": "durable",
+    "size": 3000000,
+    "quantity": "bg_read_bytes_per_op",
+    "unit": "B/op",
+    "samples": [
+      0.0
+    ]
+  },
+  {
+    "workload": "ycsb-D",
+    "arm": "supdb-nocache",
+    "guarantee": "durable",
+    "size": 3000000,
+    "quantity": "majfaults_per_op",
+    "unit": "faults/op",
+    "samples": [
+      0.0
+    ]
+  },
+  {
+    "workload": "ycsb-D",
+    "arm": "supdb-nocache",
+    "guarantee": "durable",
+    "size": 3000000,
+    "quantity": "ops_per_s",
+    "unit": "ops/s",
+    "samples": [
+      1291548.5685418495
+    ]
+  },
+  {
+    "workload": "ycsb-D",
+    "arm": "supdb-nocache",
+    "guarantee": "durable",
+    "size": 3000000,
+    "quantity": "read_bytes_per_op",
+    "unit": "B/op",
+    "samples": [
+      0.0
+    ]
+  },
+  {
+    "workload": "ycsb-D",
+    "arm": "supdb-nocache",
+    "guarantee": "durable",
+    "size": 3000000,
+    "quantity": "refaults_per_op",
+    "unit": "refaults/op",
+    "samples": [
+      0.0
+    ]
+  },
+  {
+    "workload": "ycsb-E",
+    "arm": "supdb-nocache",
+    "guarantee": "durable",
+    "size": 3000000,
+    "quantity": "bg_read_bytes_per_op",
+    "unit": "B/op",
+    "samples": [
+      0.0
+    ]
+  },
+  {
+    "workload": "ycsb-E",
+    "arm": "supdb-nocache",
+    "guarantee": "durable",
+    "size": 3000000,
+    "quantity": "majfaults_per_op",
+    "unit": "faults/op",
+    "samples": [
+      0.0
+    ]
+  },
+  {
+    "workload": "ycsb-E",
+    "arm": "supdb-nocache",
+    "guarantee": "durable",
+    "size": 3000000,
+    "quantity": "ops_per_s",
+    "unit": "ops/s",
+    "samples": [
+      180471.40379533457
+    ]
+  },
+  {
+    "workload": "ycsb-E",
+    "arm": "supdb-nocache",
+    "guarantee": "durable",
+    "size": 3000000,
+    "quantity": "read_bytes_per_op",
+    "unit": "B/op",
+    "samples": [
+      0.0
+    ]
+  },
+  {
+    "workload": "ycsb-E",
+    "arm": "supdb-nocache",
+    "guarantee": "durable",
+    "size": 3000000,
+    "quantity": "refaults_per_op",
+    "unit": "refaults/op",
+    "samples": [
+      0.0
+    ]
+  },
+  {
+    "workload": "ycsb-F",
+    "arm": "supdb-nocache",
+    "guarantee": "durable",
+    "size": 3000000,
+    "quantity": "bg_read_bytes_per_op",
+    "unit": "B/op",
+    "samples": [
+      0.0
+    ]
+  },
+  {
+    "workload": "ycsb-F",
+    "arm": "supdb-nocache",
+    "guarantee": "durable",
+    "size": 3000000,
+    "quantity": "majfaults_per_op",
+    "unit": "faults/op",
+    "samples": [
+      0.0
+    ]
+  },
+  {
+    "workload": "ycsb-F",
+    "arm": "supdb-nocache",
+    "guarantee": "durable",
+    "size": 3000000,
+    "quantity": "ops_per_s",
+    "unit": "ops/s",
+    "samples": [
+      550599.2446879561
+    ]
+  },
+  {
+    "workload": "ycsb-F",
+    "arm": "supdb-nocache",
+    "guarantee": "durable",
+    "size": 3000000,
+    "quantity": "read_bytes_per_op",
+    "unit": "B/op",
+    "samples": [
+      0.0
+    ]
+  },
+  {
+    "workload": "ycsb-F",
+    "arm": "supdb-nocache",
+    "guarantee": "durable",
+    "size": 3000000,
+    "quantity": "refaults_per_op",
+    "unit": "refaults/op",
+    "samples": [
+      0.0
+    ]
+  },
+  {
+    "workload": "ycsbs-A",
+    "arm": "supdb-nocache",
+    "guarantee": "durable",
+    "size": 3000000,
+    "quantity": "bg_read_bytes_per_op",
+    "unit": "B/op",
+    "samples": [
+      0.0
+    ]
+  },
+  {
+    "workload": "ycsbs-A",
+    "arm": "supdb-nocache",
+    "guarantee": "durable",
+    "size": 3000000,
+    "quantity": "majfaults_per_op",
+    "unit": "faults/op",
+    "samples": [
+      0.0
+    ]
+  },
+  {
+    "workload": "ycsbs-A",
+    "arm": "supdb-nocache",
+    "guarantee": "durable",
+    "size": 3000000,
+    "quantity": "ops_per_s",
+    "unit": "ops/s",
+    "samples": [
+      571526.0705103372
+    ]
+  },
+  {
+    "workload": "ycsbs-A",
+    "arm": "supdb-nocache",
+    "guarantee": "durable",
+    "size": 3000000,
+    "quantity": "read_bytes_per_op",
+    "unit": "B/op",
+    "samples": [
+      0.0
+    ]
+  },
+  {
+    "workload": "ycsbs-A",
+    "arm": "supdb-nocache",
+    "guarantee": "durable",
+    "size": 3000000,
+    "quantity": "refaults_per_op",
+    "unit": "refaults/op",
+    "samples": [
+      0.0
+    ]
+  },
+  {
+    "workload": "ycsbs-B",
+    "arm": "supdb-nocache",
+    "guarantee": "durable",
+    "size": 3000000,
+    "quantity": "bg_read_bytes_per_op",
+    "unit": "B/op",
+    "samples": [
+      0.0
+    ]
+  },
+  {
+    "workload": "ycsbs-B",
+    "arm": "supdb-nocache",
+    "guarantee": "durable",
+    "size": 3000000,
+    "quantity": "majfaults_per_op",
+    "unit": "faults/op",
+    "samples": [
+      0.0
+    ]
+  },
+  {
+    "workload": "ycsbs-B",
+    "arm": "supdb-nocache",
+    "guarantee": "durable",
+    "size": 3000000,
+    "quantity": "ops_per_s",
+    "unit": "ops/s",
+    "samples": [
+      1189345.5193358087
+    ]
+  },
+  {
+    "workload": "ycsbs-B",
+    "arm": "supdb-nocache",
+    "guarantee": "durable",
+    "size": 3000000,
+    "quantity": "read_bytes_per_op",
+    "unit": "B/op",
+    "samples": [
+      0.0
+    ]
+  },
+  {
+    "workload": "ycsbs-B",
+    "arm": "supdb-nocache",
+    "guarantee": "durable",
+    "size": 3000000,
+    "quantity": "refaults_per_op",
+    "unit": "refaults/op",
+    "samples": [
+      0.0
+    ]
+  },
+  {
+    "workload": "ycsbs-C",
+    "arm": "supdb-nocache",
+    "guarantee": "durable",
+    "size": 3000000,
+    "quantity": "bg_read_bytes_per_op",
+    "unit": "B/op",
+    "samples": [
+      0.0
+    ]
+  },
+  {
+    "workload": "ycsbs-C",
+    "arm": "supdb-nocache",
+    "guarantee": "durable",
+    "size": 3000000,
+    "quantity": "majfaults_per_op",
+    "unit": "faults/op",
+    "samples": [
+      0.0
+    ]
+  },
+  {
+    "workload": "ycsbs-C",
+    "arm": "supdb-nocache",
+    "guarantee": "durable",
+    "size": 3000000,
+    "quantity": "ops_per_s",
+    "unit": "ops/s",
+    "samples": [
+      1970908.911448876
+    ]
+  },
+  {
+    "workload": "ycsbs-C",
+    "arm": "supdb-nocache",
+    "guarantee": "durable",
+    "size": 3000000,
+    "quantity": "read_bytes_per_op",
+    "unit": "B/op",
+    "samples": [
+      0.0
+    ]
+  },
+  {
+    "workload": "ycsbs-C",
+    "arm": "supdb-nocache",
+    "guarantee": "durable",
+    "size": 3000000,
+    "quantity": "refaults_per_op",
+    "unit": "refaults/op",
+    "samples": [
+      0.0
+    ]
+  },
+  {
+    "workload": "ycsbs-D",
+    "arm": "supdb-nocache",
+    "guarantee": "durable",
+    "size": 3000000,
+    "quantity": "bg_read_bytes_per_op",
+    "unit": "B/op",
+    "samples": [
+      0.0
+    ]
+  },
+  {
+    "workload": "ycsbs-D",
+    "arm": "supdb-nocache",
+    "guarantee": "durable",
+    "size": 3000000,
+    "quantity": "majfaults_per_op",
+    "unit": "faults/op",
+    "samples": [
+      0.0
+    ]
+  },
+  {
+    "workload": "ycsbs-D",
+    "arm": "supdb-nocache",
+    "guarantee": "durable",
+    "size": 3000000,
+    "quantity": "ops_per_s",
+    "unit": "ops/s",
+    "samples": [
+      1931813.5498561475
+    ]
+  },
+  {
+    "workload": "ycsbs-D",
+    "arm": "supdb-nocache",
+    "guarantee": "durable",
+    "size": 3000000,
+    "quantity": "read_bytes_per_op",
+    "unit": "B/op",
+    "samples": [
+      0.0
+    ]
+  },
+  {
+    "workload": "ycsbs-D",
+    "arm": "supdb-nocache",
+    "guarantee": "durable",
+    "size": 3000000,
+    "quantity": "refaults_per_op",
+    "unit": "refaults/op",
+    "samples": [
+      0.0
+    ]
+  },
+  {
+    "workload": "ycsbs-E",
+    "arm": "supdb-nocache",
+    "guarantee": "durable",
+    "size": 3000000,
+    "quantity": "bg_read_bytes_per_op",
+    "unit": "B/op",
+    "samples": [
+      0.0
+    ]
+  },
+  {
+    "workload": "ycsbs-E",
+    "arm": "supdb-nocache",
+    "guarantee": "durable",
+    "size": 3000000,
+    "quantity": "majfaults_per_op",
+    "unit": "faults/op",
+    "samples": [
+      0.0
+    ]
+  },
+  {
+    "workload": "ycsbs-E",
+    "arm": "supdb-nocache",
+    "guarantee": "durable",
+    "size": 3000000,
+    "quantity": "ops_per_s",
+    "unit": "ops/s",
+    "samples": [
+      256926.6209451699
+    ]
+  },
+  {
+    "workload": "ycsbs-E",
+    "arm": "supdb-nocache",
+    "guarantee": "durable",
+    "size": 3000000,
+    "quantity": "read_bytes_per_op",
+    "unit": "B/op",
+    "samples": [
+      0.0
+    ]
+  },
+  {
+    "workload": "ycsbs-E",
+    "arm": "supdb-nocache",
+    "guarantee": "durable",
+    "size": 3000000,
+    "quantity": "refaults_per_op",
+    "unit": "refaults/op",
+    "samples": [
+      0.0
+    ]
+  },
+  {
+    "workload": "ycsbs-F",
+    "arm": "supdb-nocache",
+    "guarantee": "durable",
+    "size": 3000000,
+    "quantity": "bg_read_bytes_per_op",
+    "unit": "B/op",
+    "samples": [
+      0.0
+    ]
+  },
+  {
+    "workload": "ycsbs-F",
+    "arm": "supdb-nocache",
+    "guarantee": "durable",
+    "size": 3000000,
+    "quantity": "majfaults_per_op",
+    "unit": "faults/op",
+    "samples": [
+      0.0
+    ]
+  },
+  {
+    "workload": "ycsbs-F",
+    "arm": "supdb-nocache",
+    "guarantee": "durable",
+    "size": 3000000,
+    "quantity": "ops_per_s",
+    "unit": "ops/s",
+    "samples": [
+      510794.6645086342
+    ]
+  },
+  {
+    "workload": "ycsbs-F",
+    "arm": "supdb-nocache",
+    "guarantee": "durable",
+    "size": 3000000,
+    "quantity": "read_bytes_per_op",
+    "unit": "B/op",
+    "samples": [
+      0.0
+    ]
+  },
+  {
+    "workload": "ycsbs-F",
+    "arm": "supdb-nocache",
+    "guarantee": "durable",
+    "size": 3000000,
+    "quantity": "refaults_per_op",
+    "unit": "refaults/op",
+    "samples": [
+      0.0
+    ]
+  }
+]

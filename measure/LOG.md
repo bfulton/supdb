@@ -86,3 +86,18 @@ and copied here under `measure/rows/` at the same relative path.
 - Row: `measure/rows/ooc/20261128T072548Z-b3a043d.json` (10 arms, rungs 3M and 10M, 3 reps).
 - Gate (exit 0; `measure/logs/ooc-1280-ids-gate.txt`): class `.../b1280m/kids`,
   1 prior row: no band yet for any of 3134 quantities.
+
+## 6. Bounded row, 1 GiB, ids — cut by a container restart, not resumed
+
+- Command: `cd /home/user/c0/bench && TMPDIR=/home/user/base/tmp/ooc-1024-ids sh scripts/ooc.sh 1073741824 --keys ids --out /home/user/base/rows`
+- Start 2026-11-28T10:57:17Z. The session's worker and container were
+  restarted about 11:00Z (uptime 0 at 11:00:24Z), in rep 1 of the 3M rung,
+  after 5 whole passes (the last line the run printed is at 121 s). Not a kill under the bound.
+- The container came back on another host class:
+  `x86_64/intel-r-xeon-r-processor-2.30ghz/4c/16g/hypervisor` (every row
+  above is of the 2.10GHz class). A resume on another class is refused, so
+  it was not attempted; that decision is the coordinator's.
+- Ledger kept: `/home/user/base/rows/inflight/20261128T105721Z-b3a043d`
+  (copied to `measure/rows/inflight/`; resume with
+  `sh scripts/ooc.sh 1073741824 --resume <ledger>` on a 2.10GHz host).
+- Not run: this row, the full rows (numbered, ids), the noise floor.

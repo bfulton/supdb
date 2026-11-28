@@ -1,0 +1,98 @@
+[
+  {
+    "workload": "mem-floor",
+    "arm": "floor",
+    "guarantee": "buffered",
+    "quantity": "ops_per_s",
+    "unit": "chases/s",
+    "samples": [
+      6788467.394929781,
+      6800324.485240264,
+      6365171.161797862
+    ]
+  },
+  {
+    "workload": "page-floor",
+    "arm": "floor",
+    "guarantee": "buffered",
+    "quantity": "pages_per_s",
+    "unit": "pages/s",
+    "samples": [
+      685241.8053712518,
+      640094.8140443304,
+      658094.3028570547
+    ]
+  },
+  {
+    "workload": "scan-floor",
+    "arm": "floor",
+    "guarantee": "buffered",
+    "quantity": "bytes_per_s",
+    "unit": "B/s",
+    "samples": [
+      2234849860.3203425,
+      2471256727.783402,
+      2528426791.816237
+    ]
+  },
+  {
+    "workload": "seek-floor",
+    "arm": "floor",
+    "guarantee": "buffered",
+    "quantity": "p50_us",
+    "unit": "us",
+    "samples": [
+      29.164,
+      34.686,
+      23.63
+    ]
+  },
+  {
+    "workload": "seek-floor",
+    "arm": "floor",
+    "guarantee": "buffered",
+    "quantity": "p99_us",
+    "unit": "us",
+    "samples": [
+      75.43299999999999,
+      66.85900000000001,
+      46.763
+    ]
+  },
+  {
+    "workload": "seek-floor-again",
+    "arm": "floor",
+    "guarantee": "buffered",
+    "quantity": "p50_us",
+    "unit": "us",
+    "samples": [
+      35.185,
+      25.899,
+      27.977999999999998
+    ]
+  },
+  {
+    "workload": "seek-floor-again",
+    "arm": "floor",
+    "guarantee": "buffered",
+    "quantity": "p99_us",
+    "unit": "us",
+    "samples": [
+      66.029,
+      53.733000000000004,
+      59.648
+    ]
+  },
+  {
+    "workload": "wal-floor",
+    "arm": "floor",
+    "guarantee": "durable",
+    "quantity": "ops_per_s",
+    "unit": "ops/s",
+    "samples": [
+      1436564.535212402,
+      1772010.662755201,
+      1429731.7375754274
+    ]
+  }
+]
