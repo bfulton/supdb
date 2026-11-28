@@ -275,6 +275,18 @@ for g in $groups; do
       # web/crypt.mjs; tests/data/crypt-v1.bin is what holds the two to one
       # answer, and this is the half of that the test group does not run.
       node web/crypt.test.mjs
+      # The browser reader held to the hostile-input cases the segment
+      # readers are held to (tests/hostile.rs writes them, the module reads
+      # them): a trap, a misread or an open of a case every reader refuses
+      # fails, and so does a dump with no cases in it.
+      hd=$(mktemp -d)
+      SUPDB_HOSTILE_DUMP="$hd" cargo test --profile checked --test hostile || exit 1
+      [ -s "$hd/cases.tsv" ] || {
+        echo "wasm: tests/hostile.rs wrote no cases" >&2
+        exit 1
+      }
+      node web/hostile.test.mjs web/supdb.wasm "$hd" || exit 1
+      rm -rf "$hd"
       ;;
     bench)
       say "bench"

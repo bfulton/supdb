@@ -305,6 +305,12 @@ impl Super {
         if u64::from_le_bytes(buf[SB_FIELDS * 8 + 8..SB_BYTES].try_into().unwrap()) != h {
             return None;
         }
+        // The section lengths are taken as `usize` where they size or bound
+        // a section: a length that does not fit the target's is a damaged
+        // field, refused here rather than narrowed on wasm32.
+        for i in [4, 5, 7, 8] {
+            usize::try_from(f[i]).ok()?;
+        }
         Some(Super {
             generation: f[0],
             timestamp: f[2],
@@ -355,6 +361,17 @@ fn pick_super(head: &[u8], object_len: u64) -> Result<Super> {
             "the superblock describes more bytes than the object holds: it is truncated",
         ));
     }
+    // Each section ends inside what the writer wrote: its high water is the
+    // end of the last byte, the block table's included. An end past it, or
+    // one that does not fit a u64, is a damaged field, refused before any
+    // length of it sizes a buffer or any offset of it is summed.
+    for (off, len) in [(sb.key_off, sb.key_stored), (sb.blk_off, sb.blk_stored)] {
+        if off.checked_add(len).is_none_or(|end| end > sb.high_water) {
+            return Err(corrupt(
+                "the superblock names a section past the end of what was written",
+            ));
+        }
+    }
     // A section that was compressed cannot be addressed where it lies, and
     // this reader has no reason to support the varint formats -- they are
     // what `flat_index` replaced, and a segment this reader is given is
@@ -367,6 +384,21 @@ fn pick_super(head: &[u8], object_len: u64) -> Result<Super> {
         ));
     }
     Ok(sb)
+}
+
+/// A segment's key section names its checksum row: both layouts of the
+/// segment writer write one, as every writer of a segment has since the
+/// first (`STORE_FORMAT_OLDEST`), so a section that names none is a header
+/// word zeroed by damage, never a section without a row. Read as absence,
+/// that one word turned the section's verification off and every other
+/// change in it was answered as fact.
+fn named_row(crc_off: usize) -> Result<()> {
+    if crc_off == 0 {
+        return Err(corrupt(
+            "the key index names no checksum row: its header is damaged",
+        ));
+    }
+    Ok(())
 }
 
 /// Does the arena the superblock names hold a record? Four bytes decide:
@@ -415,6 +447,43 @@ pub fn open_ranges(head: &[u8], object_len: u64) -> Result<Vec<(u64, u64)>> {
     }
     merge_ranges(&mut v);
     Ok(v)
+}
+
+/// `base + off`, an offset into the object out of a sum of file words:
+/// one that does not fit a u64 is a damaged word.
+fn at(base: u64, off: usize) -> Result<u64> {
+    base.checked_add(off as u64)
+        .ok_or_else(|| corrupt("a segment names an offset past the end of any object"))
+}
+
+/// Every range a sparse open plans, held to the object before its ends are
+/// summed: the ranges come from words a forger can write under a valid
+/// FNV (the superblock extension's), and an end past the object is a
+/// damaged word, refused here rather than overflowed or fetched.
+fn in_object(v: &[(u64, u64)], object_len: u64) -> Result<()> {
+    for &(off, len) in v {
+        if off.checked_add(len).is_none_or(|end| end > object_len) {
+            return Err(corrupt(
+                "a segment plans a range past the end of the object",
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// The length of the checksum row `hdr` names in a section of `sec_len`
+/// bytes at object offset `base`, once the row is held inside the section:
+/// a row offset past it is a damaged word, refused before it is summed.
+fn row_len(hdr: &flatindex::Header, sec_len: usize, base: u64) -> Result<usize> {
+    let outside = || corrupt("the key index names a checksum row outside its section");
+    if hdr.crc_off > sec_len {
+        return Err(outside());
+    }
+    let n = flatindex::checksum_row_len(hdr.crc_off, hdr.piece_shift, base);
+    match hdr.crc_off.checked_add(n) {
+        Some(end) if end <= sec_len => Ok(n),
+        _ => Err(outside()),
+    }
 }
 
 /// Sort byte ranges and merge the overlapping and the adjacent.
@@ -490,6 +559,14 @@ impl Sec {
         }
         if src.slice_at(off, len).is_some() {
             return Ok(Sec::Lent { off, len });
+        }
+        // The superblock's length, held to the object before it sizes
+        // anything (`pick_super` holds it to the high water as well).
+        if off
+            .checked_add(len as u64)
+            .is_none_or(|end| end > src.len())
+        {
+            return Err(short(off, len, src.len()));
         }
         let mut v = vec![0u8; len];
         src.read_at(off, &mut v)?;
@@ -1103,11 +1180,12 @@ impl<B: Bytes> Blob<B> {
         // The whole section is resident, so the whole row is checked here,
         // once, and no read path pays anything after.
         let mut open_ahead = (0u64, 0u64);
+        named_row(idx.crc_off)?;
         // A section held by the piece is not asked for whole, here or
         // anywhere: its row is verified a piece an ask where the source
         // has not checked what it lends, and skipped where it has
         // (`verify_row_by_piece`).
-        if idx.crc_off != 0 && opts.verify_index {
+        if opts.verify_index {
             match key.pieces(&src) {
                 Some(p) => verify_row_by_piece(&src, p, idx.crc_off, idx.piece_shift, sb.key_off)?,
                 None => {
@@ -2151,7 +2229,10 @@ impl<B: Bytes> Blob<B> {
                 return f(&raw[a - c0..b - c0]);
             }
             let un = loc.uncompressed as usize;
-            if b > un {
+            // The decode buffer is sized by the table's uncompressed length,
+            // which no checksum covers: held to what the stored bytes can
+            // decode to before it sizes anything.
+            if b > un || un > raw.len().saturating_mul(block::LZ4_MAX_RATIO) {
                 return Err(corrupt("extent runs past its block"));
             }
             let mut dec = SCRATCH.with(|s| s.dec.take());
@@ -3071,6 +3152,7 @@ pub fn open_sparse_ranges_opts(
                     None => x.dir,
                 });
             }
+            in_object(&v, object_len)?;
             round_to_pieces(&mut v, sb.key_off, &hdr);
         }
         None => {
@@ -3116,20 +3198,23 @@ pub fn open_sparse_fence_ranges_opts(
         corrupt("the key index header is not the flat format this reader understands")
     })?;
     let (off, len) = fence_region(&hdr, sb.key_stored as usize)?;
-    let mut v = vec![(sb.key_off + off as u64, len as u64)];
+    let mut v = vec![(at(sb.key_off, off)?, len as u64)];
     if directory {
-        v.push((sb.key_off + hdr.dir_off as u64, hdr.nkeys as u64 * 4));
+        let dir = (hdr.nkeys as u64).saturating_mul(4);
+        v.push((at(sb.key_off, hdr.dir_off)?, dir));
     }
     if hdr.crc_off != 0 {
         // A checksummed index: the row itself, exactly; the header's own
         // piece, so the header is verified before any word of it is trusted
         // past this point; and the fence rounded out to the pieces that
         // verify it.
-        let row = flatindex::checksum_row_len(hdr.crc_off, hdr.piece_shift, sb.key_off);
-        v.push((sb.key_off + hdr.crc_off as u64, row as u64));
+        let row = row_len(&hdr, sb.key_stored as usize, sb.key_off)?;
+        v.push((at(sb.key_off, hdr.crc_off)?, row as u64));
         v.push((sb.key_off, flatindex::HEADER_BYTES as u64));
+        in_object(&v, object_len)?;
         round_to_pieces(&mut v, sb.key_off, &hdr);
     }
+    in_object(&v, object_len)?;
     merge_ranges(&mut v);
     Ok(v)
 }
@@ -3143,7 +3228,9 @@ fn round_to_pieces(v: &mut [(u64, u64)], sec_off: u64, hdr: &flatindex::Header) 
         return;
     }
     let piece = 1u64 << hdr.piece_shift;
-    let end = sec_off + hdr.crc_off as u64;
+    // A bound the ranges are clamped to, not a range: the plans' ranges are
+    // held to the object first (`in_object`).
+    let end = sec_off.saturating_add(hdr.crc_off as u64);
     for r in v.iter_mut() {
         let (a, b) = (r.0, r.0 + r.1);
         if a < sec_off || a >= end || r.1 == 0 {
@@ -3302,20 +3389,17 @@ impl<B: Bytes> SparseBlob<B> {
             }
         }
         if fence_from_section {
-            src.read_at(sb.key_off + foff as u64, &mut fence)?;
+            src.read_at(at(sb.key_off, foff)?, &mut fence)?;
         }
+        named_row(hdr.crc_off)?;
         let mut crcs = Vec::new();
-        if hdr.crc_off != 0 && opts.verify_index {
-            let n = flatindex::checksum_row_len(hdr.crc_off, hdr.piece_shift, sb.key_off);
-            if hdr.crc_off.checked_add(n).is_none_or(|e| e > sec_len) {
-                return Err(corrupt(
-                    "the key index names a checksum row outside its section",
-                ));
-            }
+        if opts.verify_index {
+            let n = row_len(&hdr, sec_len, sb.key_off)?;
             crcs = vec![0u8; n];
-            let row_at = ext
-                .and_then(|x| x.row_copy)
-                .unwrap_or(sb.key_off + hdr.crc_off as u64);
+            let row_at = match ext.and_then(|x| x.row_copy) {
+                Some(o) => o,
+                None => at(sb.key_off, hdr.crc_off)?,
+            };
             src.read_at(row_at, &mut crcs)?;
         }
         let (toff, tlen) = ext
@@ -3341,7 +3425,7 @@ impl<B: Bytes> SparseBlob<B> {
                     }
                     dir_from_section = false;
                 }
-                None => src.read_at(sb.key_off + hdr.dir_off as u64, &mut raw)?,
+                None => src.read_at(at(sb.key_off, hdr.dir_off)?, &mut raw)?,
             }
             Some(
                 raw.as_chunks::<4>()
