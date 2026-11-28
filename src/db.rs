@@ -19343,7 +19343,7 @@ impl MemTable {
     fn index_insert(&self, hash: u64, id: usize, rd: &Readers) {
         let idx = self.index().expect("a hashed table has an index");
         let idx = if self.len() * 2 > idx.slots.len() {
-            self.rebuild_index(idx, rd)
+            self.rebuild_index(rd)
         } else {
             idx
         };
@@ -19374,9 +19374,19 @@ impl MemTable {
 
     /// Writer: a table twice the size with every entry reinserted,
     /// published, the old one retired at the epoch the publish bumps.
-    fn rebuild_index(&self, old: &Index, rd: &Readers) -> &Index {
-        let cap = old.slots.len() * 2;
-        let fresh = Index::with_slots(cap, old.slots.src.clone());
+    ///
+    /// The old index is not an argument: what the rebuild needs of it is
+    /// read in a scope of its own, so no reference to it is live, above all
+    /// none protected as an argument, when it is boxed into `retired` and
+    /// `reclaim` may free it. Taken as `&Index`, that free was undefined
+    /// behaviour on every growth of the index (Miri, under Stacked and Tree
+    /// Borrows).
+    fn rebuild_index(&self, rd: &Readers) -> &Index {
+        let (cap, src) = {
+            let old = self.index().expect("a hashed table has an index");
+            (old.slots.len() * 2, old.slots.src.clone())
+        };
+        let fresh = Index::with_slots(cap, src);
         for id in 0..self.len() {
             let hash = u64::from(self.fat(id).hash) << 32;
             let mut i = slot_of(hash, fresh.mask);
