@@ -369,6 +369,21 @@ fn pick_super(head: &[u8], object_len: u64) -> Result<Super> {
     Ok(sb)
 }
 
+/// A segment's key section names its checksum row: both layouts of the
+/// segment writer write one, as every writer of a segment has since the
+/// first (`STORE_FORMAT_OLDEST`), so a section that names none is a header
+/// word zeroed by damage, never a section without a row. Read as absence,
+/// that one word turned the section's verification off and every other
+/// change in it was answered as fact.
+fn named_row(crc_off: usize) -> Result<()> {
+    if crc_off == 0 {
+        return Err(corrupt(
+            "the key index names no checksum row: its header is damaged",
+        ));
+    }
+    Ok(())
+}
+
 /// Does the arena the superblock names hold a record? Four bytes decide:
 /// replay stops at the first zero length-word, so a nonzero first word is a
 /// record this reader would be ignoring. See `Super::log_off` for why that
@@ -1103,11 +1118,12 @@ impl<B: Bytes> Blob<B> {
         // The whole section is resident, so the whole row is checked here,
         // once, and no read path pays anything after.
         let mut open_ahead = (0u64, 0u64);
+        named_row(idx.crc_off)?;
         // A section held by the piece is not asked for whole, here or
         // anywhere: its row is verified a piece an ask where the source
         // has not checked what it lends, and skipped where it has
         // (`verify_row_by_piece`).
-        if idx.crc_off != 0 && opts.verify_index {
+        if opts.verify_index {
             match key.pieces(&src) {
                 Some(p) => verify_row_by_piece(&src, p, idx.crc_off, idx.piece_shift, sb.key_off)?,
                 None => {
@@ -3398,8 +3414,9 @@ impl<B: Bytes> SparseBlob<B> {
         if fence_from_section {
             src.read_at(sb.key_off + foff as u64, &mut fence)?;
         }
+        named_row(hdr.crc_off)?;
         let mut crcs = Vec::new();
-        if hdr.crc_off != 0 && opts.verify_index {
+        if opts.verify_index {
             let n = flatindex::checksum_row_len(hdr.crc_off, hdr.piece_shift, sb.key_off);
             if hdr.crc_off.checked_add(n).is_none_or(|e| e > sec_len) {
                 return Err(corrupt(

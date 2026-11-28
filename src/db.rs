@@ -14619,11 +14619,14 @@ impl SegmentWriter {
             // pages from where the section will start.
             self.pad_to(8)?;
             let key_off = self.pos;
-            let section = if reserve <= section.len() {
-                flatindex::with_checksums(section, key_off)
-            } else {
-                section
-            };
+            // A section with slack would have no row, which a reader refuses
+            // as damage (`blob::named_row`); a segment never reserves any.
+            if reserve > section.len() {
+                return Err(err(
+                    "segment writer: a key section with slack has no checksum row",
+                ));
+            }
+            let section = flatindex::with_checksums(section, key_off);
             self.out.write_all(&section)?;
             let key_len = reserve.max(section.len());
             if key_len > section.len() {
