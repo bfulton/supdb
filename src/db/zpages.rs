@@ -2169,9 +2169,6 @@ pub struct FillScratch {
     /// which a record alone that only the block holds is the block's
     /// (`compress`).
     pub coding: u8,
-    /// Every group stored verbatim, LZ4 never tried (`Options::zpages_store_all`):
-    /// a decode is the payload itself, and the form is the records' bytes.
-    pub store_all: bool,
     /// Under the record coding, every tail stored raw and LZ4 never tried on
     /// one (`Options::zpages_raw_tails`): the heads front-coded, the values
     /// the records' own bytes, a decode a copy a record.
@@ -2217,7 +2214,6 @@ impl FillScratch {
             group_bytes: ZGROUP_BYTES,
             hint: 0,
             coding: ZCODING_BLOCK,
-            store_all: false,
             raw_tails: false,
             parse: false,
             parse_chains: 0,
@@ -2287,17 +2283,6 @@ impl FillScratch {
     /// compressor failed, which a buffer sized for the largest group makes
     /// unreachable.
     fn classify(&mut self, ulen: usize, room: usize) -> Option<Class> {
-        if self.store_all {
-            // The lightest coding: the images are the payload, and a group
-            // that passes the room is trimmed to one that does not, never
-            // compressed to fit.
-            self.stats.calls += 1;
-            return Some(if ulen <= room {
-                Class::Stored
-            } else {
-                Class::TooBig(ulen)
-            });
-        }
         let (n, coded) = self.compress(ulen, room)?;
         self.stats.calls += 1;
         Some(if n >= ulen && ulen <= room {

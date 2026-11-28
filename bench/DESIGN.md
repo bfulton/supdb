@@ -797,15 +797,7 @@ priced in, and `supdb-cache64tofitautozpagespromote` is the combined arm
 with a block that reads have walked a block's worth of entries held as a
 merged copy in its slot under the form, a clean block included
 (`Options::zpages_promote_copies`), so the hot blocks are walked without
-a group decoded. The form's page is a container of groups, each
-compressed on its own and cut at `Options::zpages_group_bytes` of
-records, so that a point read decodes the group its record is in and not
-the page: `supdb-cache64tofitautozpagesonegroup` is the combined arm with
-the target at zero, the page as one group, the shape before the cut,
-`supdb-nocachezpagesonegroup` is the forced arm with the same, which
-prices the cut on a point read through the form from the pass's first
-read, and `supdb-cache64tofitautozpagesgroup1k` cuts at a kibibyte where
-the default cuts at two. `supdb-cache64tofitautozpagesprebuild` is the
+a group decoded. `supdb-cache64tofitautozpagesprebuild` is the
 combined arm with the form files built ahead of the controller's
 decision once the store outgrows its budget and left dormant on disk
 (`Options::zpages_prebuild`), so that the shift to the form is an attach
@@ -826,11 +818,6 @@ combined arm with every view of a form file's page checked and the memo
 asked after it (`Options::zpages_trusted_views` off), where the default
 reads a verified page's directory trusted, and `supdb-nocachezpagescheckedviews`
 is the forced arm with the same, the pair against `supdb-nocachezpages`;
-`supdb-cache64tofitautozpagesrecord` is the combined arm with the form
-file's groups holding their records one by one, each decodable alone
-(`Options::zpages_record_coding`), where the default holds a group as one
-LZ4 block, and `supdb-nocachezpagesrecord` is the forced arm with the same,
-the pair against `supdb-nocachezpages`;
 `supdb-cache64tofitautozpagesmemofirst` is the combined arm with a
 verified page's group asked of the memo before any view of the page
 (`Options::zpages_memo_first`), where the default asks after it;
@@ -847,12 +834,9 @@ scan started skipping the partition's seek, where the default seeks every
 start; `supdb-cache128tofitautozpages` and `supdb-cache256tofitautozpages`
 are the combined arm with the block cache's budget at 128 and 256 MB
 (`Options::scan_cache_bytes`), where the combined arm's is 64;
-`supdb-nocachezpagesstored` is the forced form with every group stored
-verbatim (`Options::zpages_store_all`), no LZ4, where the default compresses
-every group that shrinks; `supdb-cache64tofitzpages` is the forced form with
+`supdb-cache64tofitzpages` is the forced form with
 the combined arm's block cache and budget, the form installed from the start
-whatever the controller would decide, and `supdb-cache64tofitzpagesstored`
-the same with every group stored; `supdb-nocachezpagesrecordraw` and
+whatever the controller would decide; `supdb-nocachezpagesrecordraw` and
 `supdb-cache64tofitzpagesrecordraw` are the two under the record coding with
 every tail stored raw (`Options::zpages_raw_tails`), the heads front-coded
 and the values the records' own bytes;
@@ -1009,9 +993,6 @@ reading, however old (`Options::forms_settle_room_pressure` off);
 paths, drop their scan snapshot at every publish their look has no tables
 to carry across, a merge's or a seal's landing among them
 (`Options::snapshot_stands` off);
-`supdb-zgroup1k` is `supdb` with the form's pages cut into groups of a
-kibibyte of records where the default cuts at two
-(`Options::zpages_group_bytes`);
 `supdb-cache64tofitzpagesdropparse` and `supdb-cache64tofitautozpagesparse`
 are the forced form with the drop and the combined arm with their
 block-coded groups written by the engine's parsing encoder
@@ -1019,15 +1000,6 @@ block-coded groups written by the engine's parsing encoder
 `supdb-cache64tofitzpagesdropflexdec` and `supdb-cache64tofitautozpagesflexdec`
 are the same two with their groups decoded by `lz4_flex` and not the engine's
 own LZ4 decoder (`Options::zpages_own_decoder` off);
-`supdb-cache64tofitautozpagescodingfixed` is the combined arm with the coding
-of its form files the options' block coding wherever the controller builds
-(`Options::zpages_coding_auto` off), where the default's selector picks the
-raw tails where the model predicts that form fits the fill share of the
-budget (`zselect::FORM_FILL`) and the block coding otherwise;
-`supdb-cache64tofitzpagesrecordrawdecode` is the forced raw-tail form with
-the block cache whose scans decode a group whole before walking it
-(`Options::zpages_inplace_walk` off), where the default reads a raw-tail
-group record by record where it lies;
 `supdb-cache64tofitautozpagesperrun` is the combined arm with a block read
 through a cursor a run, a seek a cut and a read by rank a replaced record
 (`Options::zpages_block_cursor` off), where the default reads a block through

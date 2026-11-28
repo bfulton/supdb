@@ -2862,60 +2862,9 @@ pub struct Options {
     /// `supdb-zblock` is the three off together.
     #[doc(hidden)]
     pub zpages_ask_dropped: bool,
-    /// The decoded bytes a form file's page is cut into groups at, each
-    /// compressed on its own, so that a point read decodes the group its
-    /// record is in and not the page (`zpages::ZGROUP_BYTES`, two
-    /// kibibytes: four groups a page at the suite's shape, 6% of the
-    /// form's bytes for a point read's decode a quarter of the page's;
-    /// `bench/examples/zdecode.rs` priced the cut). Zero is the page as one
-    /// group, the shape before the cut; `supdb-cache64tofitautozpagesonegroup`
-    /// is that arm, and `...group1k` cuts at a kibibyte, 12% of the bytes
-    /// for a decode a seventh.
-    #[doc(hidden)]
-    pub zpages_group_bytes: usize,
-    /// Whether a form file's groups hold their records one by one, each
-    /// decodable alone (`zpages::ZCODING_RECORD`: an offset table, each
-    /// record's head front-coded against the group's first and its tail
-    /// LZ4-compressed against the first record's, which is stored raw), so
-    /// that a point read decodes one record where the block coding
-    /// (`zpages::ZCODING_BLOCK`, one LZ4 block a group) decodes a group of
-    /// about fourteen. Off: the record coding is an arm
-    /// (`supdb-cache64tofitautozpagesrecord`, `supdb-nocachezpagesrecord`),
-    /// since paired at five million keys under 640 MiB it reads the point-read
-    /// mixes a quarter to a third faster and E's scans a fifth slower -- a
-    /// group decoded whole through its records, which a scan's memo miss
-    /// does, costs 2.2x the block decode's instructions -- and E is the cell
-    /// the compact form has left to win (`bench/scripts/pair.sh
-    /// supdb-cache64tofitautozpages supdb-cache64tofitautozpagesrecord 5000000
-    /// --reps 5 --bound 671088640 --passes
-    /// read,read-threaded,scan,scan-threaded,mixes --ops-div 10` at `589e7df`).
-    /// Priced again on the default as the gear's compressed pick
-    /// (`supdb-zrecord`) at ten million keys under 1.25 GiB it lost the point
-    /// reads too: C 0.70x, the read pass 0.83x, E 0.75x and the scan pass
-    /// 0.49x of the default, since the block coding's point read has gained
-    /// the partial decode, the memo's admission and the key table and the
-    /// record coding's has none of them, and still decodes its tails with
-    /// `lz4_flex` and seeks its heads one by one (`bench ab --arms
-    /// supdb,supdb-zrecord --size 10000000 --bound 1342177280 --passes
-    /// load,read,read-threaded,scan,scan-threaded,mixes,scan-mixed,mixes-scrambled
-    /// --ops-div 10 --reps 2` at `3ef8f79`).
-    #[doc(hidden)]
-    pub zpages_record_coding: bool,
-    /// EXPERIMENT: the form file's groups stored verbatim, every one, LZ4
-    /// never tried -- the lightest coding, whose decode is the payload
-    /// itself (`zpages::GroupEntry::stored`, which the fill gave a group that
-    /// LZ4 did not shrink) and whose form is the records' own bytes, about
-    /// 120 a record at the suite's shape against 68 under LZ4. Built for the
-    /// E mix at five million keys under 640 MiB, where the LZ4 form's decode
-    /// is three quarters of E's loss to LMDB and the stored form would hold
-    /// about 600 MB beside the process's 77: the gear is the lightest coding
-    /// that fits the bound. Off; `supdb-nocachezpagesstored` is the forced
-    /// arm and `supdb-cache64tofitzpagesstored` the forced form with the
-    /// block cache, against `supdb-cache64tofitzpages`.
-    #[doc(hidden)]
-    pub zpages_store_all: bool,
-    /// EXPERIMENT: under the record coding (`zpages_record_coding`), every
-    /// record's tail stored raw and LZ4 never tried on one: the heads
+    /// EXPERIMENT: the form file's groups in the record coding
+    /// (`zpages::ZCODING_RECORD`), every record's tail stored raw and LZ4
+    /// never tried on one: the heads
     /// front-coded against the group's first record as that coding has
     /// them, the values the records' own bytes, so a decode is a copy a
     /// record and a point read copies one. About 108 bytes a record at the
@@ -3097,38 +3046,6 @@ pub struct Options {
     /// beside the form it returned to.
     #[doc(hidden)]
     pub zpages_drop_at_install: bool,
-    /// Under `ZPages::Auto`, the coding the form files are built in is the
-    /// selector's to choose (`zselect::choose_coding`): the sampler sizes
-    /// the record coding with raw tails beside the block coding, and the raw
-    /// tails are built where the model predicts that form faults nothing
-    /// against `zselect::FORM_FILL` of the budget, the rest left to the page
-    /// cache's other tenants and to the budget's fall through a mix, the
-    /// block coding otherwise -- the gear is the coding that fits with the
-    /// fewest decodes. Where both fit the raw-tail
-    /// form reads every mix at or above the block form's, the point reads
-    /// 1.25-1.95x, and where it does not fit it faults, 1.4-1.5x slower in D
-    /// and E (`docs/engine.md`). A pick holds for the builds after it; the
-    /// files already built keep their coding, each file naming its own. On;
-    /// `supdb-cache64tofitautozpagescodingfixed` is the shape before, the
-    /// options' coding. The pick that is not the raw tails is the options'
-    /// compressed coding: the block coding, or the record coding with its
-    /// tails compressed where `zpages_record_coding` is on (`supdb-zrecord`).
-    /// Nothing under `Always`, whose coding is `zpages_record_coding` and
-    /// `zpages_raw_tails`.
-    #[doc(hidden)]
-    pub zpages_coding_auto: bool,
-    /// A raw-tail coded group (`zpages_record_coding` with
-    /// `zpages_raw_tails`, or the selector's pick under
-    /// `zpages_coding_auto`) read where it lies by the block cache's cursor:
-    /// each record's key assembled from the group's first head and its
-    /// suffix, its values parsed from the raw tail in the page
-    /// (`flatindex::parse_record_tail`), nothing decoded and nothing put in
-    /// the memo. Off, the group is decoded whole into the cursor's buffer,
-    /// a parse and a copy a record, which read the scan pass at 0.70x of
-    /// the block coding's where both forms fit. On; `supdb-cache64tofitzpagesrecordrawdecode`
-    /// is the shape before. Nothing changes for the block coding, whose
-    /// groups are LZ4 blocks.
-    pub zpages_inplace_walk: bool,
     /// Whether the controller buys its first form at SUSPECT on the model's
     /// prediction, once the sampler has priced it and the partitions have
     /// stood for `zselect::EAGER_SETTLE` with nothing of the segment work in
@@ -7318,10 +7235,11 @@ impl Options {
         self.zpages_hot_raw || self.zpages_stride_convert
     }
 
-    /// The form file's group coding the options ask for
-    /// (`zpages_record_coding`), as the builder's plan and the sampler take it.
+    /// The form file's group coding the options ask for: the record coding
+    /// where its tails are stored raw (`zpages_raw_tails`), the block coding
+    /// otherwise, as the builder's plan and the sampler take it.
     pub(crate) fn z_coding(&self) -> u8 {
-        if self.zpages_record_coding {
+        if self.zpages_raw_tails {
             zpages::ZCODING_RECORD
         } else {
             zpages::ZCODING_BLOCK
@@ -7397,7 +7315,7 @@ impl Options {
     /// groups' buffers the allocator's.
     fn memo_cell(&self) -> Option<usize> {
         self.zpages_memo_slab
-            .then(|| zfile::memo_cell_bytes(self.zpages_group_bytes))
+            .then(|| zfile::memo_cell_bytes(zpages::ZGROUP_BYTES))
             .flatten()
     }
 
@@ -7649,9 +7567,6 @@ impl Default for Options {
             zpages_drop_again: true,
             zpages_ahead_past_scans: false,
             zpages_build_at_finish: true,
-            zpages_group_bytes: zpages::ZGROUP_BYTES,
-            zpages_record_coding: false,
-            zpages_store_all: false,
             zpages_raw_tails: false,
             zpages_parse: true,
             zpages_parse_finish: false,
@@ -7661,8 +7576,6 @@ impl Default for Options {
             zpages_flat_slack: true,
             zpages_drop_raw: true,
             zpages_drop_at_install: true,
-            zpages_coding_auto: true,
-            zpages_inplace_walk: true,
             zpages_build_eager: false,
             zpages_inject: None,
             forms_pieces_only: false,
@@ -45525,7 +45438,6 @@ impl Db {
                     (
                         Db::fence_search(&opts),
                         opts.zpages_memo_ahead,
-                        opts.zpages_inplace_walk,
                         opts.zpages_drop_raw,
                         opts.z_times_decodes(),
                         zpages::Dec::of(opts.zpages_own_decoder, opts.zpages_flat_decode)
@@ -52435,7 +52347,6 @@ impl Db {
             bool,
             bool,
             bool,
-            bool,
             zpages::Dec,
             bool,
             bool,
@@ -52465,14 +52376,13 @@ impl Db {
             stride,
         ) {
             Ok(mut side) => {
-                side.inplace = lines.2;
-                side.time_decodes = lines.4;
-                side.own_decoder = lines.5.own();
-                side.flat_decoder = lines.5.flat();
-                side.flat_slack = lines.5 == zpages::Dec::FlatEnd;
-                side.cursor_view = lines.6;
-                side.group_ahead = lines.7;
-                side.walk_owns = lines.8;
+                side.time_decodes = lines.3;
+                side.own_decoder = lines.4.own();
+                side.flat_decoder = lines.4.flat();
+                side.flat_slack = lines.4 == zpages::Dec::FlatEnd;
+                side.cursor_view = lines.5;
+                side.group_ahead = lines.6;
+                side.walk_owns = lines.7;
                 let installed = seg.z.install(side);
                 if installed {
                     zfile::ZEvents::add(&ev.attached, 1);
@@ -52527,7 +52437,6 @@ impl Db {
                 (
                     Db::fence_search(&self.opts),
                     self.opts.zpages_memo_ahead,
-                    self.opts.zpages_inplace_walk,
                     z_drop_now(&self.opts, &self.shared),
                     self.opts.z_times_decodes(),
                     zpages::Dec::of(self.opts.zpages_own_decoder, self.opts.zpages_flat_decode)
@@ -52550,9 +52459,8 @@ impl Db {
                 let mut plan =
                     zfile::BuildPlan::new(self.opts.zpages_min_bytes, self.opts.zpages_drop_behind);
                 plan.ahead = self.opts.zpages_build_ahead;
-                plan.group_bytes = self.opts.zpages_group_bytes;
+                plan.group_bytes = zpages::ZGROUP_BYTES;
                 plan.coding = self.opts.z_coding();
-                plan.store_all = self.opts.zpages_store_all;
                 plan.raw_tails = self.opts.zpages_raw_tails;
                 plan.parse = self.opts.zpages_parse;
                 plan.parse_chains = self.opts.zpages_parse_chains;
@@ -52587,7 +52495,6 @@ impl Db {
                     &self.opts.z_stride_attach_built(&b),
                 ) {
                     Ok(mut side) => {
-                        side.inplace = self.opts.zpages_inplace_walk;
                         side.time_decodes = self.opts.z_times_decodes();
                         side.own_decoder = self.opts.zpages_own_decoder;
                         side.flat_decoder = self.opts.zpages_flat_decode;
@@ -64745,26 +64652,22 @@ impl Maint {
             self.z_generation()
         };
         let floor = self.opts.zpages_min_bytes;
-        let group_bytes = self.opts.zpages_group_bytes;
+        let group_bytes = zpages::ZGROUP_BYTES;
         let coding = self.opts.z_coding();
-        let store_all = self.opts.zpages_store_all;
         let raw_tails = self.opts.zpages_raw_tails;
         let parse = self.opts.zpages_parse;
         let parse_chains = self.opts.zpages_parse_chains;
         let own_decode = self.opts.zpages_own_decoder;
         // Where the selector chooses the coding, the raw-tail record coding
         // is sized beside the options' (`zselect::choose_coding`).
-        let second = (self.opts.zpages_coding_auto && !raw_tails && !store_all).then_some(
-            zfile::FillShape {
-                group_bytes,
-                coding: zpages::ZCODING_RECORD,
-                store_all: false,
-                raw_tails: true,
-                parse,
-                parse_chains,
-                own_decode,
-            },
-        );
+        let second = (!raw_tails).then_some(zfile::FillShape {
+            group_bytes,
+            coding: zpages::ZCODING_RECORD,
+            raw_tails: true,
+            parse,
+            parse_chains,
+            own_decode,
+        });
         let wake = self.wake.clone();
         zfile::ZEvents::add(&self.shared.z.samples, 1);
         let idle = self.opts.zpages_sample_idle;
@@ -64803,7 +64706,6 @@ impl Maint {
                         let r = take(zfile::FillShape {
                             group_bytes,
                             coding,
-                            store_all,
                             raw_tails,
                             parse,
                             parse_chains,
@@ -64913,26 +64815,23 @@ impl Maint {
         // `zselect::FORM_FILL`); the reading fed
         // to the selector is the chosen form's. A reading that sized the raw
         // tails for fewer partitions than the block coding chooses nothing.
-        let pick = (self.opts.zpages_coding_auto
-            && raw.counted > 0
-            && raw.counted == block.counted)
-            .then(|| {
-                let budget = self.z_budget().unwrap_or(0);
-                let c = zselect::choose_coding(
-                    budget,
-                    zselect::FormSize {
-                        w_z: raw.w_z,
-                        resident: raw.resident,
-                    },
-                );
-                let c = if c == zselect::Coding::RawTails && !self.z_pick_raw_ok() {
-                    zfile::ZEvents::add(&ev.coding_unread, 1);
-                    zselect::Coding::Block
-                } else {
-                    c
-                };
-                (c, budget)
-            });
+        let pick = (raw.counted > 0 && raw.counted == block.counted).then(|| {
+            let budget = self.z_budget().unwrap_or(0);
+            let c = zselect::choose_coding(
+                budget,
+                zselect::FormSize {
+                    w_z: raw.w_z,
+                    resident: raw.resident,
+                },
+            );
+            let c = if c == zselect::Coding::RawTails && !self.z_pick_raw_ok() {
+                zfile::ZEvents::add(&ev.coding_unread, 1);
+                zselect::Coding::Block
+            } else {
+                c
+            };
+            (c, budget)
+        });
         if let Some((c, budget)) = pick {
             let idx = usize::from(c == zselect::Coding::RawTails);
             zfile::ZEvents::add(&ev.coding_picks[idx], 1);
@@ -65233,26 +65132,24 @@ impl Maint {
         // and the records are the conservative side of the fit the pick is
         // made against (`zselect::FORM_FILL`).
         let raw_w_z = sums.recs_len;
-        if self.opts.zpages_coding_auto {
-            let budget = self.z_budget().unwrap_or(0);
-            let pick = zselect::choose_coding(
-                budget,
-                zselect::FormSize {
-                    w_z: raw_w_z,
-                    resident: sums.resident,
-                },
-            );
-            let pick = if pick == zselect::Coding::RawTails && !self.z_pick_raw_ok() {
-                zfile::ZEvents::add(&self.shared.z.coding_unread, 1);
-                zselect::Coding::Block
-            } else {
-                pick
-            };
-            let idx = usize::from(pick == zselect::Coding::RawTails);
-            zfile::ZEvents::add(&self.shared.z.coding_picks[idx], 1);
-            self.z_coding_pick = Some(pick);
-            self.z_pick_size = Some((sums.recs_len, raw_w_z, sums.resident, budget));
-        }
+        let budget = self.z_budget().unwrap_or(0);
+        let pick = zselect::choose_coding(
+            budget,
+            zselect::FormSize {
+                w_z: raw_w_z,
+                resident: sums.resident,
+            },
+        );
+        let pick = if pick == zselect::Coding::RawTails && !self.z_pick_raw_ok() {
+            zfile::ZEvents::add(&self.shared.z.coding_unread, 1);
+            zselect::Coding::Block
+        } else {
+            pick
+        };
+        let idx = usize::from(pick == zselect::Coding::RawTails);
+        zfile::ZEvents::add(&self.shared.z.coding_picks[idx], 1);
+        self.z_coding_pick = Some(pick);
+        self.z_pick_size = Some((sums.recs_len, raw_w_z, sums.resident, budget));
         self.shared
             .z
             .sample_w_z_raw
@@ -65789,10 +65686,7 @@ impl Maint {
     /// the attach gives it back and builds the partition again
     /// (`Maint::z_attach_on_disk`), so the files' cover leaves it out.
     fn z_file_refused(&self, name: &str) -> bool {
-        let want = self
-            .z_coding_pick
-            .filter(|_| self.opts.zpages_coding_auto)
-            .map(|c| c == zselect::Coding::RawTails);
+        let want = self.z_coding_pick.map(|c| c == zselect::Coding::RawTails);
         matches!((want, self.z_ahead_coding.get(name)), (Some(w), Some(&b)) if b != w)
     }
 
@@ -65836,7 +65730,7 @@ impl Maint {
     /// it refuses (`ZCounts::finish_refused`).
     fn z_repick(&mut self) {
         self.z_take_finish_codings();
-        if !self.opts.zpages_coding_auto || self.z_coding_pick != Some(zselect::Coding::RawTails) {
+        if self.z_coding_pick != Some(zselect::Coding::RawTails) {
             return;
         }
         let Some((at_recs, at_w_z, at_resident, budget)) = self.z_pick_size else {
@@ -66131,21 +66025,13 @@ impl Maint {
         plan.sync = self.opts.zpages_build_sync && plan.drop_output;
         (plan.stride_sparse, plan.stride_sparse_later) = self.z_sparse_now();
         plan.ahead = self.opts.zpages_build_ahead;
-        plan.group_bytes = self.opts.zpages_group_bytes;
+        plan.group_bytes = zpages::ZGROUP_BYTES;
         let (coding, raw_tails) = match self.z_coding_pick {
-            Some(zselect::Coding::RawTails) if self.opts.zpages_coding_auto => {
-                (zpages::ZCODING_RECORD, true)
-            }
-            // The compressed pick is the options' compressed coding: the
-            // block coding, or the record coding with its tails compressed
-            // (`Options::zpages_record_coding`).
-            Some(zselect::Coding::Block) if self.opts.zpages_coding_auto => {
-                (self.opts.z_coding(), false)
-            }
-            _ => (self.opts.z_coding(), self.opts.zpages_raw_tails),
+            Some(zselect::Coding::RawTails) => (zpages::ZCODING_RECORD, true),
+            Some(zselect::Coding::Block) => (zpages::ZCODING_BLOCK, false),
+            None => (self.opts.z_coding(), self.opts.zpages_raw_tails),
         };
         plan.coding = coding;
-        plan.store_all = self.opts.zpages_store_all;
         plan.raw_tails = raw_tails;
         plan.parse = self.opts.zpages_parse && self.opts.zpages_parse_finish;
         plan.parse_chains = self.opts.zpages_parse_chains;
@@ -67002,10 +66888,7 @@ impl Maint {
             seg.z_stride_no.store(code, AtomicOrdering::Relaxed);
         }
         if !dormant {
-            let want = self
-                .z_coding_pick
-                .filter(|_| self.opts.zpages_coding_auto)
-                .map(|c| c == zselect::Coding::RawTails);
+            let want = self.z_coding_pick.map(|c| c == zselect::Coding::RawTails);
             if let (Some(want), Some(&built)) = (want, self.z_ahead_coding.get(&name)) {
                 // A build ahead cancelled or failed left no file to give.
                 if built != want && Db::z_on_disk(&self.dir, &seg.name) {
@@ -67033,7 +66916,6 @@ impl Maint {
                 (
                     Db::fence_search(&self.opts),
                     self.opts.zpages_memo_ahead,
-                    self.opts.zpages_inplace_walk,
                     z_drop_now(&self.opts, &self.shared),
                     self.opts.z_times_decodes(),
                     zpages::Dec::of(self.opts.zpages_own_decoder, self.opts.zpages_flat_decode)
@@ -67156,7 +67038,7 @@ impl Maint {
         // million keys on the thread racing the eviction front.
         plan.sync = self.opts.zpages_build_sync && plan.drop_output;
         plan.ahead = self.opts.zpages_build_ahead;
-        plan.group_bytes = self.opts.zpages_group_bytes;
+        plan.group_bytes = zpages::ZGROUP_BYTES;
         // The coding: the selector's pick where it chooses one
         // (`Options::zpages_coding_auto`), taken again against the
         // partitions as they stand (`Maint::z_repick`), else the options'.
@@ -67170,16 +67052,11 @@ impl Maint {
         // of the partition's own would; into it the body is the stride
         // form's and no coding is read.
         let (coding, raw_tails) = match self.z_coding_pick {
-            Some(zselect::Coding::RawTails) if self.opts.zpages_coding_auto => {
-                (zpages::ZCODING_RECORD, true)
-            }
-            Some(zselect::Coding::Block) if self.opts.zpages_coding_auto => {
-                (self.opts.z_coding(), false)
-            }
-            _ => (self.opts.z_coding(), self.opts.zpages_raw_tails),
+            Some(zselect::Coding::RawTails) => (zpages::ZCODING_RECORD, true),
+            Some(zselect::Coding::Block) => (zpages::ZCODING_BLOCK, false),
+            None => (self.opts.z_coding(), self.opts.zpages_raw_tails),
         };
         plan.coding = coding;
-        plan.store_all = self.opts.zpages_store_all;
         plan.raw_tails = raw_tails;
         if dormant {
             self.z_ahead_coding
@@ -67434,7 +67311,6 @@ impl Maint {
                     &self.opts.z_stride_attach_built(&built),
                 ) {
                     Ok(mut side) => {
-                        side.inplace = self.opts.zpages_inplace_walk;
                         side.time_decodes = self.opts.z_times_decodes();
                         side.own_decoder = self.opts.zpages_own_decoder;
                         side.flat_decoder = self.opts.zpages_flat_decode;
@@ -67536,7 +67412,6 @@ impl Maint {
                         &self.opts.z_stride_attach_built(&built),
                     ) {
                         Ok(mut side) => {
-                            side.inplace = self.opts.zpages_inplace_walk;
                             side.time_decodes = self.opts.z_times_decodes();
                             side.own_decoder = self.opts.zpages_own_decoder;
                             side.flat_decoder = self.opts.zpages_flat_decode;

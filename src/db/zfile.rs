@@ -7539,13 +7539,10 @@ pub(super) struct BuildPlan {
     pub group_bytes: usize,
     /// The coding of the groups that compress (`FillScratch::coding`):
     /// `ZCODING_BLOCK` as the options give it (`Options::z_coding`), and
-    /// `ZCODING_RECORD` under the arm `Options::zpages_record_coding` or
+    /// `ZCODING_RECORD` under `Options::zpages_raw_tails` or
     /// where the selector picks the raw-tail form under `ZPages::Auto`
     /// (`zselect::choose_coding`).
     pub coding: u8,
-    /// Every group stored verbatim, LZ4 never tried
-    /// (`Options::zpages_store_all`, `FillScratch::store_all`).
-    pub store_all: bool,
     /// Under the record coding, every tail stored raw
     /// (`Options::zpages_raw_tails`, `FillScratch::raw_tails`).
     pub raw_tails: bool,
@@ -7641,7 +7638,6 @@ impl BuildPlan {
             ahead: 0,
             group_bytes: ZGROUP_BYTES,
             coding: ZCODING_BLOCK,
-            store_all: false,
             raw_tails: false,
             parse: false,
             parse_chains: 0,
@@ -8475,7 +8471,6 @@ fn write_pages<I: Images, W: Walked>(
     let mut scratch = FillScratch::new();
     scratch.group_bytes = plan.group_bytes;
     scratch.coding = plan.coding;
-    scratch.store_all = plan.store_all;
     scratch.raw_tails = plan.raw_tails;
     scratch.parse = plan.parse;
     scratch.parse_chains = plan.parse_chains;
@@ -10213,14 +10208,13 @@ pub(super) const SAMPLE_CHAIN: usize = 3;
 /// the partition is declined (`Options::zpages_min_bytes`).
 /// The fill's shape a sample and a build take from the options: the
 /// decoded bytes a group is cut at, the coding of the groups that compress,
-/// whether every group is stored verbatim or every tail raw, and which
-/// encoder writes the block coding's groups (`Options::zpages_group_bytes`,
-/// `z_coding`, `zpages_store_all`, `zpages_raw_tails`, `zpages_parse`).
+/// whether every tail is stored raw, and which encoder writes the block
+/// coding's groups (`zpages::ZGROUP_BYTES`, `z_coding`, `zpages_raw_tails`,
+/// `zpages_parse`).
 #[derive(Clone, Copy, Debug)]
 pub(super) struct FillShape {
     pub group_bytes: usize,
     pub coding: u8,
-    pub store_all: bool,
     pub raw_tails: bool,
     pub parse: bool,
     pub parse_chains: u32,
@@ -10232,7 +10226,6 @@ impl Default for FillShape {
         FillShape {
             group_bytes: ZGROUP_BYTES,
             coding: ZCODING_BLOCK,
-            store_all: false,
             raw_tails: false,
             parse: false,
             parse_chains: 0,
@@ -10246,7 +10239,6 @@ impl FillShape {
     fn apply(&self, scratch: &mut FillScratch) {
         scratch.group_bytes = self.group_bytes;
         scratch.coding = self.coding;
-        scratch.store_all = self.store_all;
         scratch.raw_tails = self.raw_tails;
         scratch.parse = self.parse;
         scratch.parse_chains = self.parse_chains;
