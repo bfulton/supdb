@@ -896,11 +896,6 @@ pub struct Supdb {
     /// since its last look (`Options::merge_plan_idle` off).
     /// `supdb-ingestnoidleplan`, and `supdb-noidleplan` durable.
     noidleplan: bool,
-    /// A flush's close composes the trailer on the writer's thread while
-    /// a thread syncs the records (`Options::close_finish_inline`), the
-    /// refuted shape. `supdb-ingestcloseinline`, and `supdb-closeinline`
-    /// durable.
-    closeinline: bool,
     /// The scan phases timed on every scan, as before the clock reads
     /// were gated (`Options::scan_timers`). `supdb-timers`, and
     /// `supdb-ingesttimers` buffered.
@@ -960,10 +955,6 @@ pub struct Supdb {
     /// before `Options::direct_derive_keys`. `supdb-keycopies`, and
     /// `supdb-ingestkeycopies` buffered.
     keycopies: bool,
-    /// A flush's close with the one fsync at the end, the shape before
-    /// `Options::close_presync`. `supdb-latesync`, and
-    /// `supdb-ingestlatesync` buffered.
-    latesync: bool,
     /// The install of the builder ahead's forms reads each block's bounds
     /// from the partition itself, `Options::ahead_sends_bounds` off.
     /// `supdb-installreads`.
@@ -1070,16 +1061,6 @@ pub struct Supdb {
     /// the engine's default: `supdb-directfull` and
     /// `supdb-ingestdirectfull` are the walk, the shape before.
     directlean: Option<bool>,
-    /// A drain's close of a synced direct run on the writer up to the
-    /// segment being readable (`Options::close_readable_inline`), `None`
-    /// for the engine's default: `supdb-closeseal` and
-    /// `supdb-ingestcloseseal` leave it to the seal thread.
-    closereadable: Option<bool>,
-    /// A seal's Bloom composed only where it may be named a piece
-    /// (`Options::bloom_pieces_only`), `None` for the engine's default:
-    /// `supdb-bloomalways` and `supdb-ingestbloomalways` compose it for
-    /// every seal.
-    bloompieces: Option<bool>,
     /// A run of ordered ingest begun in a file made ahead of it
     /// (`Options::run_spare`), `None` for the engine's default:
     /// `supdb-runcreate` and `supdb-ingestruncreate` make the file at the
@@ -2336,11 +2317,6 @@ struct Policy {
     /// since its last look (`Options::merge_plan_idle` off).
     /// `supdb-ingestnoidleplan`, and `supdb-noidleplan` durable.
     noidleplan: bool,
-    /// A flush's close composes the trailer on the writer's thread while
-    /// a thread syncs the records (`Options::close_finish_inline`), the
-    /// refuted shape. `supdb-ingestcloseinline`, and `supdb-closeinline`
-    /// durable.
-    closeinline: bool,
     /// The scan phases timed on every scan, as before the clock reads
     /// were gated (`Options::scan_timers`). `supdb-timers`, and
     /// `supdb-ingesttimers` buffered.
@@ -2400,10 +2376,6 @@ struct Policy {
     /// before `Options::direct_derive_keys`. `supdb-keycopies`, and
     /// `supdb-ingestkeycopies` buffered.
     keycopies: bool,
-    /// A flush's close with the one fsync at the end, the shape before
-    /// `Options::close_presync`. `supdb-latesync`, and
-    /// `supdb-ingestlatesync` buffered.
-    latesync: bool,
     /// The install of the builder ahead's forms reads each block's bounds
     /// from the partition itself, `Options::ahead_sends_bounds` off.
     /// `supdb-installreads`.
@@ -2510,16 +2482,6 @@ struct Policy {
     /// the engine's default: `supdb-directfull` and
     /// `supdb-ingestdirectfull` are the walk, the shape before.
     directlean: Option<bool>,
-    /// A drain's close of a synced direct run on the writer up to the
-    /// segment being readable (`Options::close_readable_inline`), `None`
-    /// for the engine's default: `supdb-closeseal` and
-    /// `supdb-ingestcloseseal` leave it to the seal thread.
-    closereadable: Option<bool>,
-    /// A seal's Bloom composed only where it may be named a piece
-    /// (`Options::bloom_pieces_only`), `None` for the engine's default:
-    /// `supdb-bloomalways` and `supdb-ingestbloomalways` compose it for
-    /// every seal.
-    bloompieces: Option<bool>,
     /// A run of ordered ingest begun in a file made ahead of it
     /// (`Options::run_spare`), `None` for the engine's default:
     /// `supdb-runcreate` and `supdb-ingestruncreate` make the file at the
@@ -3306,7 +3268,6 @@ impl Default for Policy {
             noland: false,
             landnearscans: false,
             noidleplan: false,
-            closeinline: false,
             timers: false,
             settlefar: false,
             tofit: false,
@@ -3320,7 +3281,6 @@ impl Default for Policy {
             recordsteps: false,
             copyvals: false,
             keycopies: false,
-            latesync: false,
             installreads: false,
             noabandon: false,
             deferbursts: false,
@@ -3345,8 +3305,6 @@ impl Default for Policy {
             drainreadable: None,
             syncbeside: None,
             directlean: None,
-            closereadable: None,
-            bloompieces: None,
             runspare: None,
             formsoffbuilt: None,
             formson: false,
@@ -6666,35 +6624,6 @@ impl Supdb {
         )
     }
 
-    /// `supdb` whose flush composes the trailer on the writer's thread
-    /// while a thread syncs the records: against `supdb` it prices the
-    /// finish on the writer, which read slower, since the trailer's write
-    /// waits for the records' sync on either thread.
-    pub fn create_closeinline(path: &Path) -> Res<Supdb> {
-        Supdb::with_policy(
-            path,
-            Policy {
-                closeinline: true,
-                ..Policy::default()
-            },
-        )
-    }
-
-    /// `supdb-ingest` whose flush composes the trailer on the writer's
-    /// thread while a thread syncs the records: against `supdb-ingest` it
-    /// prices the finish on the writer, which read slower.
-    pub fn create_ingest_closeinline(path: &Path) -> Res<Supdb> {
-        Supdb::with_policy(
-            path,
-            Policy {
-                partition: false,
-                durable: false,
-                closeinline: true,
-                ..Policy::default()
-            },
-        )
-    }
-
     /// `supdb` timing every scan's phases, as before the clock reads were
     /// gated: against `supdb` it prices the instrument.
     pub fn create_timers(path: &Path) -> Res<Supdb> {
@@ -7455,18 +7384,6 @@ impl Supdb {
         )
     }
 
-    /// `supdb` with a flush's close making the one fsync at the end, the
-    /// shape before `Options::close_presync`.
-    pub fn create_latesync(path: &Path) -> Res<Supdb> {
-        Supdb::with_policy(
-            path,
-            Policy {
-                latesync: true,
-                ..Policy::default()
-            },
-        )
-    }
-
     /// `supdb` with the install of the builder ahead's forms reading
     /// each block's bounds itself.
     pub fn create_installreads(path: &Path) -> Res<Supdb> {
@@ -7742,58 +7659,6 @@ impl Supdb {
             path,
             Policy {
                 directlean: Some(false),
-                ..Policy::default()
-            },
-        )
-    }
-
-    /// `supdb` whose drain leaves a direct run's close to the seal thread
-    /// (`Options::close_readable_inline` off), the shape before.
-    /// `supdb-closeseal`.
-    pub fn create_closeseal(path: &Path) -> Res<Supdb> {
-        Supdb::with_policy(
-            path,
-            Policy {
-                closereadable: Some(false),
-                ..Policy::default()
-            },
-        )
-    }
-
-    /// `supdb-ingest` as `supdb-closeseal`. `supdb-ingestcloseseal`.
-    pub fn create_ingest_closeseal(path: &Path) -> Res<Supdb> {
-        Supdb::with_policy(
-            path,
-            Policy {
-                partition: false,
-                durable: false,
-                closereadable: Some(false),
-                ..Policy::default()
-            },
-        )
-    }
-
-    /// `supdb` whose every seal composes the Bloom a piece's open takes
-    /// (`Options::bloom_pieces_only` off), the shape before.
-    /// `supdb-bloomalways`.
-    pub fn create_bloomalways(path: &Path) -> Res<Supdb> {
-        Supdb::with_policy(
-            path,
-            Policy {
-                bloompieces: Some(false),
-                ..Policy::default()
-            },
-        )
-    }
-
-    /// `supdb-ingest` as `supdb-bloomalways`. `supdb-ingestbloomalways`.
-    pub fn create_ingest_bloomalways(path: &Path) -> Res<Supdb> {
-        Supdb::with_policy(
-            path,
-            Policy {
-                partition: false,
-                durable: false,
-                bloompieces: Some(false),
                 ..Policy::default()
             },
         )
@@ -8227,19 +8092,6 @@ impl Supdb {
             path,
             Policy {
                 settlespan: true,
-                ..Policy::default()
-            },
-        )
-    }
-
-    /// `supdb-ingest` as `supdb-latesync`.
-    pub fn create_ingest_latesync(path: &Path) -> Res<Supdb> {
-        Supdb::with_policy(
-            path,
-            Policy {
-                partition: false,
-                durable: false,
-                latesync: true,
                 ..Policy::default()
             },
         )
@@ -9702,7 +9554,6 @@ impl Supdb {
             noland,
             landnearscans,
             noidleplan,
-            closeinline,
             timers,
             settlefar,
             tofit,
@@ -9716,7 +9567,6 @@ impl Supdb {
             recordsteps,
             copyvals,
             keycopies,
-            latesync,
             installreads,
             noabandon,
             deferbursts,
@@ -9741,8 +9591,6 @@ impl Supdb {
             drainreadable,
             syncbeside,
             directlean,
-            closereadable,
-            bloompieces,
             runspare,
             formsoffbuilt,
             formson,
@@ -10196,7 +10044,6 @@ impl Supdb {
             merge_chains_writes: !nochainwrites,
             zpages_land_scans_far: !landnearscans,
             merge_plan_idle: !noidleplan,
-            close_finish_inline: closeinline,
             forms_settle_far: settlefar,
             forms_to_fit: tofit,
             forms_trim_bytes: if notrim {
@@ -10208,7 +10055,6 @@ impl Supdb {
             forms_fit_sweep: !nosweep,
             manifest_slots: !manifestrename,
             manifest_pending: manifestpending,
-            close_presync: !latesync,
             ahead_sends_bounds: !installreads,
             upkeep_abandons: !noabandon,
             upkeep_files_bursts: !deferbursts,
@@ -10242,9 +10088,6 @@ impl Supdb {
                 .unwrap_or(supdb::Options::default().drain_answers_readable),
             drain_syncs_beside: syncbeside.unwrap_or(supdb::Options::default().drain_syncs_beside),
             direct_lean_append: directlean.unwrap_or(supdb::Options::default().direct_lean_append),
-            close_readable_inline: closereadable
-                .unwrap_or(supdb::Options::default().close_readable_inline),
-            bloom_pieces_only: bloompieces.unwrap_or(supdb::Options::default().bloom_pieces_only),
             run_spare: runspare.unwrap_or(supdb::Options::default().run_spare),
             scan_forms_off_counts_built: formsoffbuilt
                 .unwrap_or(supdb::Options::default().scan_forms_off_counts_built),
@@ -10729,7 +10572,6 @@ impl Supdb {
             noland,
             landnearscans,
             noidleplan,
-            closeinline,
             timers,
             settlefar,
             tofit,
@@ -10743,7 +10585,6 @@ impl Supdb {
             recordsteps,
             copyvals,
             keycopies,
-            latesync,
             installreads,
             noabandon,
             deferbursts,
@@ -10768,8 +10609,6 @@ impl Supdb {
             drainreadable,
             syncbeside,
             directlean,
-            closereadable,
-            bloompieces,
             runspare,
             formsoffbuilt,
             formson,
@@ -12378,13 +12217,6 @@ impl Engine for Supdb {
                 "supdb-ingestnoidleplan"
             };
         }
-        if self.closeinline {
-            return if self.partition {
-                "supdb-closeinline"
-            } else {
-                "supdb-ingestcloseinline"
-            };
-        }
         if self.timers {
             return if self.partition {
                 "supdb-timers"
@@ -12453,13 +12285,6 @@ impl Engine for Supdb {
                 "supdb-keycopies"
             } else {
                 "supdb-ingestkeycopies"
-            };
-        }
-        if self.latesync {
-            return if self.partition {
-                "supdb-latesync"
-            } else {
-                "supdb-ingestlatesync"
             };
         }
         if self.installreads {
@@ -12543,20 +12368,6 @@ impl Engine for Supdb {
                 "supdb-directfull"
             } else {
                 "supdb-ingestdirectfull"
-            };
-        }
-        if self.closereadable == Some(false) {
-            return if self.partition {
-                "supdb-closeseal"
-            } else {
-                "supdb-ingestcloseseal"
-            };
-        }
-        if self.bloompieces == Some(false) {
-            return if self.partition {
-                "supdb-bloomalways"
-            } else {
-                "supdb-ingestbloomalways"
             };
         }
         if self.runspare == Some(false) {
@@ -15335,7 +15146,6 @@ pub fn guarantee(arm: &str) -> Option<Guarantee> {
         | "supdb-noland"
         | "supdb-landnearscans"
         | "supdb-noidleplan"
-        | "supdb-closeinline"
         | "supdb-timers"
         | "supdb-settlefar"
         | "supdb-tofit"
@@ -15350,7 +15160,6 @@ pub fn guarantee(arm: &str) -> Option<Guarantee> {
         | "supdb-recordsteps"
         | "supdb-copyvals"
         | "supdb-keycopies"
-        | "supdb-latesync"
         | "supdb-installreads"
         | "supdb-noabandon"
         | "supdb-deferbursts"
@@ -15495,8 +15304,6 @@ pub fn guarantee(arm: &str) -> Option<Guarantee> {
         | "supdb-drainstrict"
         | "supdb-syncbeside"
         | "supdb-directfull"
-        | "supdb-closeseal"
-        | "supdb-bloomalways"
         | "supdb-runcreate"
         | "supdb-jobspooled"
         | "supdb-zslabjobs"
@@ -15579,12 +15386,9 @@ pub fn guarantee(arm: &str) -> Option<Guarantee> {
         | "supdb-ingestnoland"
         | "supdb-ingestlandnearscans"
         | "supdb-ingestnoidleplan"
-        | "supdb-ingestcloseinline"
         | "supdb-ingesttimers"
         | "supdb-ingestsyncbeside"
         | "supdb-ingestdirectfull"
-        | "supdb-ingestcloseseal"
-        | "supdb-ingestbloomalways"
         | "supdb-ingestruncreate"
         | "supdb-ingestsettlefar"
         | "supdb-ingesttofit"
@@ -15595,7 +15399,6 @@ pub fn guarantee(arm: &str) -> Option<Guarantee> {
         | "supdb-ingestrecordsteps"
         | "supdb-ingestcopyvals"
         | "supdb-ingestkeycopies"
-        | "supdb-ingestlatesync"
         | "supdb-ingestnorecycle"
         | "supdb-ingestheapblocks"
         | "supdb-ingestnopool"
@@ -17003,10 +16806,6 @@ pub fn open(arm: &str, dir: &Path, map_gb: usize) -> Res<Box<dyn Engine>> {
         "supdb-syncbeside" => supdb_arm(Supdb::create_syncbeside, dir)?,
         "supdb-ingestsyncbeside" => supdb_arm(Supdb::create_ingest_syncbeside, dir)?,
         "supdb-directfull" => supdb_arm(Supdb::create_directfull, dir)?,
-        "supdb-closeseal" => supdb_arm(Supdb::create_closeseal, dir)?,
-        "supdb-ingestcloseseal" => supdb_arm(Supdb::create_ingest_closeseal, dir)?,
-        "supdb-bloomalways" => supdb_arm(Supdb::create_bloomalways, dir)?,
-        "supdb-ingestbloomalways" => supdb_arm(Supdb::create_ingest_bloomalways, dir)?,
         "supdb-runcreate" => supdb_arm(Supdb::create_runcreate, dir)?,
         "supdb-ingestruncreate" => supdb_arm(Supdb::create_ingest_runcreate, dir)?,
         "supdb-ingestdirectfull" => supdb_arm(Supdb::create_ingest_directfull, dir)?,
@@ -17921,8 +17720,6 @@ pub fn open(arm: &str, dir: &Path, map_gb: usize) -> Res<Box<dyn Engine>> {
             },
             dir,
         )?,
-        "supdb-closeinline" => supdb_arm(Supdb::create_closeinline, dir)?,
-        "supdb-ingestcloseinline" => supdb_arm(Supdb::create_ingest_closeinline, dir)?,
         "supdb-timers" => supdb_arm(Supdb::create_timers, dir)?,
         "supdb-ingesttimers" => supdb_arm(Supdb::create_ingest_timers, dir)?,
         "supdb-settlefar" => supdb_arm(Supdb::create_settlefar, dir)?,
@@ -17947,7 +17744,6 @@ pub fn open(arm: &str, dir: &Path, map_gb: usize) -> Res<Box<dyn Engine>> {
         "supdb-ingestcopyvals" => supdb_arm(Supdb::create_ingest_copyvals, dir)?,
         "supdb-keycopies" => supdb_arm(Supdb::create_keycopies, dir)?,
         "supdb-ingestkeycopies" => supdb_arm(Supdb::create_ingest_keycopies, dir)?,
-        "supdb-latesync" => supdb_arm(Supdb::create_latesync, dir)?,
         "supdb-installreads" => supdb_arm(Supdb::create_installreads, dir)?,
         "supdb-noabandon" => supdb_arm(Supdb::create_noabandon, dir)?,
         "supdb-deferbursts" => supdb_arm(Supdb::create_deferbursts, dir)?,
@@ -18006,7 +17802,6 @@ pub fn open(arm: &str, dir: &Path, map_gb: usize) -> Res<Box<dyn Engine>> {
             dir,
         )?,
         "supdb-zsettleloose" => supdb_arm(Supdb::create_zsettleloose, dir)?,
-        "supdb-ingestlatesync" => supdb_arm(Supdb::create_ingest_latesync, dir)?,
         "supdb-norecycle" => supdb_arm(Supdb::create_norecycle, dir)?,
         "supdb-ingestnorecycle" => supdb_arm(Supdb::create_ingest_norecycle, dir)?,
         "supdb-heapblocks" => supdb_arm(Supdb::create_heapblocks, dir)?,
@@ -21202,7 +20997,6 @@ mod tests {
                     assert_eq!(o.drain_answers_readable, on);
                     let drain = |o: &supdb::Options| {
                         (
-                            o.close_presync,
                             o.manifest_slots,
                             o.drain_names_partition,
                             o.zpages_buy_crosses,
@@ -21241,11 +21035,7 @@ mod tests {
                     let so = s.db.as_ref().unwrap().options();
                     assert_eq!(o.drain_syncs_beside, on, "{arm}");
                     assert!(so.drain_syncs_beside, "the engine's default pays beside");
-                    assert_eq!(
-                        (o.drain_answers_readable, o.close_presync),
-                        (so.drain_answers_readable, so.close_presync),
-                        "{arm}"
-                    );
+                    assert_eq!(o.drain_answers_readable, so.drain_answers_readable, "{arm}");
                     assert_eq!(
                         open(arm, &dir(&format!("{arm}-open")), 1).unwrap().name(),
                         arm
@@ -21269,20 +21059,6 @@ mod tests {
                         "supdb-ingestdirectfull",
                         false,
                         true,
-                    ),
-                    (
-                        Supdb::create_closeseal(&dir("closeseal")).unwrap(),
-                        &base,
-                        "supdb-closeseal",
-                        true,
-                        false,
-                    ),
-                    (
-                        Supdb::create_ingest_closeseal(&dir("ingestcloseseal")).unwrap(),
-                        &sib,
-                        "supdb-ingestcloseseal",
-                        true,
-                        false,
                     ),
                 ] {
                     assert_eq!(z.name(), arm);
@@ -21313,32 +21089,6 @@ mod tests {
                     );
                     assert_eq!(guarantee(arm), guarantee(s.name()), "{arm}");
                 }
-                for (z, s, arm, bloom) in [
-                    (
-                        Supdb::create_bloomalways(&dir("bloomalways")).unwrap(),
-                        &base,
-                        "supdb-bloomalways",
-                        false,
-                    ),
-                    (
-                        Supdb::create_ingest_bloomalways(&dir("ingestbloomalways")).unwrap(),
-                        &sib,
-                        "supdb-ingestbloomalways",
-                        false,
-                    ),
-                ] {
-                    assert_eq!(z.name(), arm);
-                    assert_eq!(z.features(), s.features(), "{arm}");
-                    let o = z.db.as_ref().unwrap().options();
-                    let so = s.db.as_ref().unwrap().options();
-                    assert_eq!(o.bloom_pieces_only, bloom, "{arm}");
-                    assert!(so.bloom_pieces_only, "the engine's default");
-                    assert_eq!(
-                        open(arm, &dir(&format!("{arm}-open")), 1).unwrap().name(),
-                        arm
-                    );
-                    assert_eq!(guarantee(arm), guarantee(s.name()), "{arm}");
-                }
                 for (z, s, arm) in [
                     (
                         Supdb::create_runcreate(&dir("runcreate")).unwrap(),
@@ -21358,8 +21108,7 @@ mod tests {
                     assert!(!o.run_spare, "{arm}");
                     assert!(so.run_spare, "the engine's default");
                     assert_eq!(
-                        (o.bloom_pieces_only, o.close_readable_inline),
-                        (so.bloom_pieces_only, so.close_readable_inline),
+                        o.close_readable_inline, so.close_readable_inline,
                         "{arm}: the arm differs in the run's file alone"
                     );
                     assert_eq!(

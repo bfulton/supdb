@@ -5402,22 +5402,6 @@ pub struct Options {
     /// `supdb-directfull` and `supdb-ingestdirectfull`, the walk.
     #[doc(hidden)]
     pub direct_lean_append: bool,
-    /// EXPERIMENT, refuted and kept as an arm: a flush's close of a direct
-    /// run composes the segment's trailer on the writer's own thread,
-    /// which waits for the drain anyway and is warm, while the records'
-    /// fdatasync (`close_presync`) runs on a thread of its own, and the
-    /// seal thread takes the rest once the trailer is written. The finish
-    /// at ten thousand keys took 1.1 to 1.3 ms on the seal thread, beside
-    /// a records' sync of the same length, and read as a fresh thread's
-    /// cold millisecond; on the writer it took 1.8 to 1.9, because the
-    /// trailer's write waits for the journal commit the records' fdatasync
-    /// forces, on whichever thread writes it -- the finish ends when the
-    /// sync ends in either shape -- and the seal thread, spawned after the
-    /// finish now, wrote the ordered index 0.3 ms later than before: the
-    /// drain read 3.5 ms against 2.8. Off, the default: the seal thread
-    /// composes the trailer while the writer syncs the records. On,
-    /// `supdb-closeinline` and `supdb-ingestcloseinline`.
-    pub close_finish_inline: bool,
     /// A drain's close of a direct run whose every commit is synced runs
     /// on the writer up to the segment being readable -- the trailer, the
     /// ordered index, the link, the readable signal -- with the seal's
@@ -5425,30 +5409,15 @@ pub struct Options {
     /// writer waits for the drain anyway, the run owes no records' sync to
     /// work beside, and the seal thread spawned at the hand-over cost the
     /// close its spawn and its first turn ahead of the finish, 120 µs of a
-    /// 1.2 ms drain at ten thousand keys, where the finish inline with the
-    /// thread spawned after it (`close_finish_inline`) moved the same cost
-    /// to between the finish and the ordered index. Its readable signal
+    /// 1.2 ms drain at ten thousand keys. Its readable signal
     /// comes before the flush's ask for the drain, so the seal carries the
     /// ask's early answer as a hint and the loop leaves its readable
     /// landing to the ask (`SealJob::early_hint`). The drain is answered
     /// 0.12 ms sooner at ten thousand keys, and the ordered load reads
-    /// 1.03-1.05x of the seal thread's in both orders. On; off,
-    /// `supdb-closeseal` and `supdb-ingestcloseseal`, the seal thread's.
+    /// 1.03-1.05x of the seal thread's in both orders. On; off, the seal
+    /// thread's: a seam for the tests that fail a presync.
     #[doc(hidden)]
     pub close_readable_inline: bool,
-    /// A seal composes the Bloom a landing's open takes only where it may
-    /// be named a piece: a seal its close can name the store's first
-    /// partition before the finish, by an upper bound on the finished
-    /// file's length (`SegmentWriter::finished_len_bound`), composes none,
-    /// since a partition's open takes no Bloom, and is named as before.
-    /// Every drain of a fresh store's load is such a seal, and its finish
-    /// had added every key to a filter the landing dropped: 56 of the
-    /// finish's 502 instructions a key at ten thousand keys, and the
-    /// durable ordered load's drain reads 1.03-1.05 ms against 1.09-1.12
-    /// for the arm in both orders. On; off, `supdb-bloomalways` and
-    /// `supdb-ingestbloomalways`, the Bloom for every seal.
-    #[doc(hidden)]
-    pub bloom_pieces_only: bool,
     /// A run of ordered ingest begins in a file made ahead of it: an empty
     /// file under the run's temp name whose entry in the directory is
     /// behind a sync before the run asks for it, so the run's first commit
@@ -5711,20 +5680,6 @@ pub struct Options {
     /// `supdb-landboundsalways`, and `supdb-boundsold` with the records.
     #[doc(hidden)]
     pub land_bounds_read: bool,
-    /// At a flush's close of a direct run, the writer fdatasyncs the run's
-    /// file -- the records committed to it so far, hinted to the page
-    /// cache as they were written and flushed to the device by nothing yet
-    /// below `SegmentOptions::sync_ahead` -- while the seal thread composes
-    /// the trailer, so the seal's own fsync flushes the trailer alone. The
-    /// drain at ten thousand keys was a millisecond of the seal thread's
-    /// CPU and then a millisecond of the device, in series, with the
-    /// writer idle through both; the device's flush here costs by the
-    /// bytes in its write-back cache, a third of a millisecond and then
-    /// about a millisecond a megabyte. Nothing of durability moves: the
-    /// fsync the landing waits for is still made, over less. Off, the one
-    /// fsync at the end, the arm `supdb-latesync` and
-    /// `supdb-ingestlatesync`.
-    pub close_presync: bool,
     /// Whether a segment's ordered index is fsynced when it is written. The
     /// index is a function of the segment's keys and nothing else, so a
     /// store that finds it missing, torn or describing another segment at
@@ -7775,9 +7730,7 @@ impl Default for Options {
             drain_answers_readable: true,
             drain_syncs_beside: true,
             direct_lean_append: true,
-            close_finish_inline: false,
             close_readable_inline: true,
-            bloom_pieces_only: true,
             run_spare: true,
             seal_snapshot_far: false,
             land_ranks_far: false,
@@ -7793,7 +7746,6 @@ impl Default for Options {
             boundary_keys_from_top: false,
             bounds_by_heads: true,
             land_bounds_read: true,
-            close_presync: true,
             ord_durable: false,
             direct_table_refs: false,
             direct_put_one: true,
@@ -43134,8 +43086,7 @@ impl Reader {
     }
 
     /// A test's: while `on`, the writer's presync of a closing run's
-    /// records (`Options::close_presync`, the arm off the writer's thread
-    /// excepted) waits before it syncs, so a handle on another thread can
+    /// records waits before it syncs, so a handle on another thread can
     /// hold the writer's flush there while the seal thread finishes.
     #[doc(hidden)]
     pub fn hold_presync(&self, on: bool) {
@@ -47644,20 +47595,18 @@ impl Db {
         let tmp = d.tmp;
         let w = d.w;
         let inline_readable = self.draining && self.opts.close_readable_inline && synced && w.3;
-        let presync = (self.draining && self.opts.close_presync && !inline_readable)
+        let presync = (self.draining && !inline_readable)
             .then(|| w.file_clone().ok().map(|f| (f, w.file_written())))
             .flatten();
         let limit = self.partition_limit();
         // A seal the close can name the store's first partition before
         // its finish, by an upper bound on the finished file's length,
-        // composes no Bloom: a partition's open takes none
-        // (`Options::bloom_pieces_only`). Any other is named after the
-        // finish as before, with its Bloom.
+        // composes no Bloom: a partition's open takes none. Any other is
+        // named after the finish as before, with its Bloom.
         // The bound is taken in every checked build as well, and the
         // finished file held to it.
-        let bloom_pieces_only = self.opts.bloom_pieces_only;
         let partition_ahead = move |w: &PieceWriter, src: Option<&dyn KeySource>, tombs: bool| {
-            let wanted = bloom_pieces_only && first_partition && !tombs;
+            let wanted = first_partition && !tombs;
             let bound = (wanted || cfg!(debug_assertions))
                 .then(|| w.finished_len_bound(src))
                 .flatten();
@@ -47755,9 +47704,7 @@ impl Db {
         }
         // The finish: the trailer composed and written, the Bloom and the
         // ordered index with it, from the table where the writer kept no
-        // key copies and from its own copies otherwise. Run on the writer's
-        // thread under `Options::close_finish_inline` at a drain, on the
-        // seal thread otherwise.
+        // key copies and from its own copies otherwise, on the seal thread.
         let finish = {
             let shared = shared.clone();
             move |w: PieceWriter, keys: &MemTable| {
@@ -47788,14 +47735,10 @@ impl Db {
             }
         };
         // The rest, on the seal thread: the ordered index, the link, the
-        // readable signal and the fsyncs, with the records' sync joined
-        // before the trailer's fsync where a thread took it.
+        // readable signal and the fsyncs.
         let after = {
             let shared = shared.clone();
-            move |readable: &SealReadable,
-                  done: Result<DirectFinished>,
-                  presynced: Option<std::thread::JoinHandle<std::io::Result<()>>>|
-                  -> Result<Vec<String>> {
+            move |readable: &SealReadable, done: Result<DirectFinished>| -> Result<Vec<String>> {
                 let (tombs, ahead, seg, ord, fact) = done?;
                 let name = if ahead || (first_partition && !tombs && vault::len(&tmp)? <= limit) {
                     debug_assert!(
@@ -47824,10 +47767,6 @@ impl Db {
                     return Err(err("a test failed this seal's fsync"));
                 }
                 vault::persist(&dir, || Db::with_ords(&names))?;
-                if let Some(t) = presynced {
-                    t.join()
-                        .map_err(|_| err("the records' sync thread panicked"))??;
-                }
                 seg.sync_all()?;
                 shared.drain_steps.stamp(7);
                 if ord_durable {
@@ -47846,39 +47785,11 @@ impl Db {
         // and writes nothing to the log -- so its landing covers the
         // files a size rotation closed as a seal's does.
         let wals = std::mem::take(&mut self.closed_wals);
-        if self.draining && self.opts.close_finish_inline {
-            // The records' sync first, on a thread of its own, so the
-            // device works while this thread composes the trailer
-            // (`Options::close_presync`); a thread that cannot be spawned
-            // leaves the sync to the trailer's fsync, which covers the
-            // records as well. Its error is joined into the finish's
-            // answer, before the seal's own fsync.
-            let presynced = presync.and_then(|(f, upto)| {
-                let shared = self.shared.clone();
-                std::thread::Builder::new()
-                    .name("supdb-presync".into())
-                    .spawn(move || {
-                        let r = if shared.presync_seam.load(AtomicOrdering::Acquire) != 0 {
-                            Db::seamed_presync(&shared, &f, upto, false)
-                        } else {
-                            f.sync_data()
-                        };
-                        shared.drain_steps.stamp(14);
-                        r
-                    })
-                    .ok()
-            });
-            let done = finish(w, &keys);
-            let job = move |readable: &SealReadable| -> Result<Vec<String>> {
-                seal_hold_wait(&shared, SEAL_HOLD_LANDING);
-                after(readable, done, presynced)
-            };
-            self.hand_seal(job, table, wals, Some(retiring), false);
-        } else {
+        {
             let job = move |readable: &SealReadable| -> Result<Vec<String>> {
                 seal_hold_wait(&shared, SEAL_HOLD_LANDING);
                 let done = finish(w, &keys);
-                after(readable, done, None)
+                after(readable, done)
             };
             self.hand_seal(job, table, wals, Some(retiring), presync.is_some());
             // The records' sync, on this thread while the seal thread
@@ -47896,7 +47807,7 @@ impl Db {
                 // The seams' one byte, asked once: a presync no test
                 // armed loads it and syncs.
                 let r = if self.shared.presync_seam.load(AtomicOrdering::Acquire) != 0 {
-                    Db::seamed_presync(&self.shared, &f, upto, true)
+                    Db::seamed_presync(&self.shared, &f, upto)
                 } else {
                     f.sync_data()
                 };
@@ -48319,7 +48230,6 @@ impl Db {
             .reads_near
             .store(near || self.draining, AtomicOrdering::Release);
         let build_copy = self.draining || near || self.opts.seal_snapshot_far;
-        let bloom_pieces_only = self.opts.bloom_pieces_only;
         // As the seal's writer has them (`Shared::job_buffers`, above).
         let jobs_mapped = opts.maps();
         let job = move |readable: &SealReadable| -> Result<Vec<String>> {
@@ -48600,8 +48510,8 @@ impl Db {
                     // Named the store's first partition before the finish,
                     // by an upper bound on the finished file's length, a
                     // seal composes no Bloom, which a partition's open
-                    // takes none of (`Options::bloom_pieces_only`).
-                    let wanted = bloom_pieces_only && whole && first_partition && !tombs;
+                    // takes none of.
+                    let wanted = whole && first_partition && !tombs;
                     let bound = (wanted || cfg!(debug_assertions))
                         .then(|| w.finished_len_bound(None))
                         .flatten();
@@ -51252,20 +51162,15 @@ impl Db {
     }
 
     /// A presync a test armed (`Shared::presync_seam`): held while the
-    /// hold is on, where `holds` (the writer's presync; the thread's on the
-    /// inline arm is not held), saying it waits (`PRESYNC_WAITING`), then the injected failure if one is armed,
+    /// hold is on, saying it waits (`PRESYNC_WAITING`), then the injected
+    /// failure if one is armed,
     /// taken once, or the fdatasync: a store whose queue the failure
     /// stopped still closes runs while its frozen list has room, and their
     /// presyncs sync.
     #[cold]
     #[inline(never)]
-    fn seamed_presync(
-        shared: &Shared,
-        f: &vault::File,
-        upto: u64,
-        holds: bool,
-    ) -> std::io::Result<()> {
-        if holds && shared.presync_seam.load(AtomicOrdering::Acquire) & PRESYNC_HOLD != 0 {
+    fn seamed_presync(shared: &Shared, f: &vault::File, upto: u64) -> std::io::Result<()> {
+        if shared.presync_seam.load(AtomicOrdering::Acquire) & PRESYNC_HOLD != 0 {
             shared
                 .presync_seam
                 .fetch_or(PRESYNC_WAITING, AtomicOrdering::AcqRel);

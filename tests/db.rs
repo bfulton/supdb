@@ -19964,12 +19964,12 @@ fn a_synced_runs_drain_closes_on_the_writer_and_defers_its_directory_sync() {
 }
 
 /// A seal its close can name the store's first partition before the
-/// finish composes no Bloom (`Options::bloom_pieces_only`): a fresh
+/// finish composes no Bloom: a fresh
 /// store's drain, ordered and shuffled, closed on the writer, on the seal
 /// thread, from the writer's key copies, and sealed from a hashed table.
 /// A seal that may be a piece composes it -- one over a partition limit
 /// its finished file passes, and a hashed table's with a tombstone in it
-/// -- and so does every seal with the option off. Every key reads back
+/// --. Every key reads back
 /// through a handle and after a reopen, and each finished file is held to
 /// its bound in a checked build.
 #[test]
@@ -19993,14 +19993,6 @@ fn a_seal_named_the_first_partition_ahead_composes_no_bloom() {
                     ..common::options()
                 },
                 1,
-            ),
-            (
-                "off",
-                Options {
-                    bloom_pieces_only: false,
-                    ..common::options()
-                },
-                0,
             ),
             (
                 "over-limit",

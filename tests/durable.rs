@@ -2144,26 +2144,10 @@ fn a_failed_run_piece_write_is_held_and_written_by_the_next_commit() {
 
 /// A run with a failed write, closed by a flush: the close computes its
 /// offsets from what the writer counts, and the flush answers `Ok` only
-/// over a segment that holds every batch; under every close the arms keep
-/// (`Options::close_presync`, `Options::close_finish_inline`).
+/// over a segment that holds every batch, under every close the arms keep.
 #[test]
 fn a_run_write_that_failed_part_way_is_flushed_whole() {
-    let mut arms = run_arms();
-    arms.push((
-        "latesync",
-        Options {
-            close_presync: false,
-            ..Options::default()
-        },
-    ));
-    arms.push((
-        "finishinline",
-        Options {
-            close_finish_inline: true,
-            ..Options::default()
-        },
-    ));
-    for (tag, o) in arms {
+    for (tag, o) in run_arms() {
         let d = dir(&format!("dur-runflush-{tag}"));
         let mut db = Db::create(&d, o.clone()).unwrap();
         db.append(b"k1", b"v1");
@@ -6499,18 +6483,14 @@ fn ss_val(k: u32) -> Vec<u8> {
 
 /// A run of 3000 keys under `EveryN(1_000_000)`, committed in batches the
 /// file takes a page at a time, then a flush whose presync of the run's
-/// records fails: the presync is the records' first sync. `inline` takes
-/// the arm that syncs on a thread of its own and joins it into the seal
-/// job (`Options::close_finish_inline`).
+/// records fails: the presync is the records' first sync.
 ///
-/// Off the inline arm the presync runs on the writer's thread after the
-/// seal job is handed, and the job's own fsync of the same description
+/// The presync runs on the writer's thread after the seal job is handed, and the job's own fsync of the same description
 /// reports nothing: the landing that names the segment durable has to
 /// wait for the writer's word, and here the writer is held at its presync
 /// (`Reader::hold_presync`) until the seal thread has finished and any
-/// landing that did not wait would have written its slot. On the inline
-/// arm the job fails after its readable landing, which a hold makes come
-/// first (`hold_seal_durable`). Either way the flush answers the failure,
+/// landing that did not wait would have written its slot. The flush
+/// answers the failure,
 /// every `sync` and `flush` after it answers it again, no slot names the
 /// run's segment, and a power cut that loses the pages the failed sync
 /// covered leaves a store that opens.
@@ -6524,11 +6504,10 @@ fn ss_val(k: u32) -> Vec<u8> {
 /// name them durable; the power cut is not taken there, the open's rule
 /// for a pending name being another unit's, and the store is reopened as
 /// the close left it.
-fn ss_failed_presync(tag: &str, inline: bool, both: bool, pending: bool) {
+fn ss_failed_presync(tag: &str, both: bool, pending: bool) {
     let d = dir(&format!("dur-ss-presync-{tag}"));
     let opts = Options {
         sync: SyncPolicy::EveryN(1_000_000),
-        close_finish_inline: inline,
         manifest_pending: pending,
         segment: SegmentOptions {
             // The run's records go to the file at each commit, a page at a
@@ -6547,11 +6526,7 @@ fn ss_failed_presync(tag: &str, inline: bool, both: bool, pending: bool) {
     }
     db.fail_next_presync();
     let h = db.reader().unwrap();
-    if inline {
-        db.hold_seal_durable(true);
-    } else {
-        db.hold_presync(true);
-    }
+    db.hold_presync(true);
     if both {
         db.hold_readable_landing(true);
     }
@@ -6589,8 +6564,6 @@ fn ss_failed_presync(tag: &str, inline: bool, both: bool, pending: bool) {
                 std::thread::sleep(std::time::Duration::from_millis(1));
             }
             h.hold_presync(false);
-        } else if inline {
-            h.hold_seal_durable_from_handle(false);
         } else {
             // The seal thread's finish and fsyncs given their time, and a
             // landing that did not wait for the writer meanwhile: a slot
@@ -6687,24 +6660,18 @@ fn ss_failed_presync(tag: &str, inline: bool, both: bool, pending: bool) {
 
 #[test]
 fn a_flush_after_a_failed_presync_is_not_ok_over_the_lost_records() {
-    ss_failed_presync("writer", false, false, false);
+    ss_failed_presync("writer", false, false);
 }
 
 /// The same, with the seal thread's two phases met by one poll of the
 /// segment work, and with the slot that names the seal's segments pending.
 #[test]
 fn a_flush_after_a_failed_presync_is_not_ok_whichever_way_its_seal_lands() {
-    ss_failed_presync("both", false, true, false);
-    ss_failed_presync("pending", false, false, true);
+    ss_failed_presync("both", true, false);
+    ss_failed_presync("pending", false, true);
 }
 
-#[test]
-fn a_flush_after_a_failed_inline_presync_is_not_ok_over_the_lost_records() {
-    ss_failed_presync("inline", true, false, false);
-}
-
-/// A direct run closed -- by `Db::seal`, or by a flush on either arm of
-/// its finish -- whose seal fails at the step that makes its segment
+/// A direct run closed -- by `Db::seal`, or by a flush -- whose seal fails at the step that makes its segment
 /// durable, after its readable landing: under `Always` every commit of the
 /// run synced its records, so the reopen recovers them from the run's
 /// temp name, which nothing retires; and no later landing names the
@@ -6714,12 +6681,11 @@ fn a_flush_after_a_failed_inline_presync_is_not_ok_over_the_lost_records() {
 /// `drain_answers_readable` off), so the flush answers the failure; as
 /// shipped the drain is answered at the readable landing, every write it
 /// covers durable before it, and the failure is the next commit's.
-fn ss_run_close_fails(tag: &str, by_flush: bool, inline: bool, strict: bool) {
+fn ss_run_close_fails(tag: &str, by_flush: bool, strict: bool) {
     eprintln!("ss_run_close_fails: {tag}");
     let d = dir(&format!("dur-ss-runclose-{tag}"));
     let crash = dir(&format!("dur-ss-runclose-{tag}-crash"));
     let opts = Options {
-        close_finish_inline: inline,
         close_readable_inline: !strict,
         drain_answers_readable: !strict,
         ..Options::default()
@@ -6832,10 +6798,9 @@ fn ss_run_close_fails(tag: &str, by_flush: bool, inline: bool, strict: bool) {
 
 #[test]
 fn a_runs_close_whose_fsync_failed_is_named_by_no_manifest() {
-    ss_run_close_fails("seal", false, false, false);
-    ss_run_close_fails("flush", true, false, true);
-    ss_run_close_fails("flushinline", true, true, true);
-    ss_run_close_fails("flushearly", true, false, false);
+    ss_run_close_fails("seal", false, false);
+    ss_run_close_fails("flush", true, true);
+    ss_run_close_fails("flushearly", true, false);
 }
 
 /// Under `Options::manifest_pending` the slot naming a seal's segments
@@ -15221,10 +15186,9 @@ fn a_drain_lands_its_run_under_a_cipher() {
 
 /// A store for the presync seams' tests: an ordered load under a policy
 /// that leaves the run's records to the presync, written in small pieces.
-fn ps_opts(inline: bool) -> Options {
+fn ps_opts() -> Options {
     Options {
         sync: SyncPolicy::EveryN(1_000_000),
-        close_finish_inline: inline,
         segment: SegmentOptions {
             write_piece: 4096,
             ..Default::default()
@@ -15309,7 +15273,7 @@ fn ps_wait_held(h: &Reader) {
 #[test]
 fn the_presync_seams_hold_and_fail_apart() {
     let d = dir("dur-do-seams");
-    let mut db = Db::create(&d, ps_opts(false)).unwrap();
+    let mut db = Db::create(&d, ps_opts()).unwrap();
     ps_run(&mut db, 0);
     let h = db.reader().unwrap();
     db.hold_presync(true);
@@ -15375,7 +15339,7 @@ fn the_presync_seams_hold_and_fail_apart() {
 #[test]
 fn a_held_presync_takes_the_failure_armed_before_the_hold_after_its_lift() {
     let d = dir("dur-do-seams-both");
-    let mut db = Db::create(&d, ps_opts(false)).unwrap();
+    let mut db = Db::create(&d, ps_opts()).unwrap();
     ps_run(&mut db, 0);
     db.fail_next_presync();
     db.hold_presync(true);
@@ -15417,48 +15381,14 @@ fn a_held_presync_takes_the_failure_armed_before_the_hold_after_its_lift() {
     let _ = std::fs::remove_dir_all(&d);
 }
 
-/// On the arm that finishes a run's close inline, the presync runs on a
-/// thread of its own, which the hold does not hold: with the hold on and
-/// a failure armed, the flush answers the failure with nobody lifting it.
-#[test]
-fn the_inline_arms_presync_is_not_held() {
-    let d = dir("dur-do-seams-inline");
-    let mut db = Db::create(&d, ps_opts(true)).unwrap();
-    ps_run(&mut db, 0);
-    db.hold_presync(true);
-    db.fail_next_presync();
-    let flushed = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-    let watchdog = ps_watchdog(db.reader().unwrap(), flushed.clone(), 20);
-    let r = db.flush();
-    flushed.store(true, std::sync::atomic::Ordering::Release);
-    assert!(
-        !watchdog.join().unwrap(),
-        "the inline arm's presync waited for the hold"
-    );
-    let e = r.expect_err("the flush answers its armed presync failure");
-    assert!(
-        e.to_string()
-            .contains("the records' sync failed (injected)"),
-        "the flush answers the injected presync: {e}"
-    );
-    assert_eq!(
-        db.presync_hold_state(),
-        (true, false),
-        "the presync the hold did not hold took the hold the test armed"
-    );
-    db.hold_presync(false);
-    drop(db);
-    let _ = std::fs::remove_dir_all(&d);
-}
-
 /// An injected presync failure is taken once. A store whose queue the
 /// failure stopped still closes a run while its frozen list has room, and
 /// presyncs it: with nothing armed again that presync syncs and the first
 /// failure's record stands; armed again, the next one fails on the new
 /// run's file, which says the store still presyncs there.
-fn ps_failure_taken_once(tag: &str, inline: bool) {
+fn ps_failure_taken_once(tag: &str) {
     let d = dir(&format!("dur-do-seams-once-{tag}"));
-    let mut db = Db::create(&d, ps_opts(inline)).unwrap();
+    let mut db = Db::create(&d, ps_opts()).unwrap();
     let more = |db: &mut Db, from: u32| {
         for k in from..from + 3000 {
             db.append(&ss_key(k), &ss_val(k));
@@ -15487,9 +15417,7 @@ fn ps_failure_taken_once(tag: &str, inline: bool) {
     db.flush()
         .expect_err("a store whose seal queue stopped answers the stop");
     // The flush answers the stopped queue without waiting for the closed
-    // run's seal job, and on the inline arm (`close_finish_inline`) the
-    // presync runs on a thread of its own, which records its failure when
-    // it gets there: waited for, not read at the answer.
+    // run's seal job: waited for, not read at the answer.
     wait_for(
         &format!("{tag}: a later run's presync took the armed failure"),
         || db.failed_presync_extent().is_some_and(|e| e.0 != first.0),
@@ -15500,12 +15428,7 @@ fn ps_failure_taken_once(tag: &str, inline: bool) {
 
 #[test]
 fn an_injected_presync_failure_is_taken_once() {
-    ps_failure_taken_once("writer", false);
-}
-
-#[test]
-fn an_injected_presync_failure_is_taken_once_inline() {
-    ps_failure_taken_once("inline", true);
+    ps_failure_taken_once("writer");
 }
 
 /// A failure armed while the writer's presync is held is that presync's:
@@ -15514,7 +15437,7 @@ fn an_injected_presync_failure_is_taken_once_inline() {
 #[test]
 fn a_failure_armed_under_a_held_presync_is_taken_at_its_lift() {
     let d = dir("dur-do-seams-during");
-    let mut db = Db::create(&d, ps_opts(false)).unwrap();
+    let mut db = Db::create(&d, ps_opts()).unwrap();
     ps_run(&mut db, 0);
     db.hold_presync(true);
     let h = db.reader().unwrap();
