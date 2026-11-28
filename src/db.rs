@@ -1833,12 +1833,6 @@ pub struct Options {
     /// (`Options::manifest_pending`).
     #[doc(hidden)]
     pub fail_open_pending_sync: bool,
-    /// A test's: a settle of the form, once its segment work has answered,
-    /// holds the builds after it before their renames and returns only
-    /// once the next has parked there (`Db::hold_zpage_after_settle`), so a
-    /// test can stand a build in flight at the instant a settle ends.
-    #[doc(hidden)]
-    pub zpages_hold_after_settle: bool,
     /// Under `ZPages::Always`, a partition's form file is built as soon as
     /// the partition lands, on the builder's thread at idle priority,
     /// rather than at the next settle of the form, which then waits for
@@ -7502,7 +7496,6 @@ impl Default for Options {
             fail_open_alt_removal: false,
             tear_open_slot_write: false,
             fail_open_pending_sync: false,
-            zpages_hold_after_settle: false,
             zpages_eager: true,
             zpages_warm: true,
             zpages_memo: true,
@@ -26111,8 +26104,6 @@ struct Shared {
     /// the segment work's next look (`Db::zpages_redrop_owe`,
     /// `Maint::z_redrop_look`).
     z_redrop_owe: std::sync::atomic::AtomicBool,
-    /// A test's: `Options::zpages_hold_after_settle`, as it stands.
-    zsettle_hold: std::sync::atomic::AtomicBool,
     /// Direct runs whose mapping was grown past the file's end
     /// (`Options::direct_table_refs`); see `Db::run_remaps`.
     run_remaps: AtomicU64,
@@ -44202,7 +44193,6 @@ impl Db {
             fail_zbuild: std::sync::atomic::AtomicBool::new(false),
             z_convert_ask: AtomicU64::new(0),
             z_redrop_owe: std::sync::atomic::AtomicBool::new(false),
-            zsettle_hold: std::sync::atomic::AtomicBool::new(opts.zpages_hold_after_settle),
             zgate: ZGate::new(opts.zpages),
             block_pool: block_pool.clone(),
             asks: AskCounts::default(),
@@ -45616,7 +45606,6 @@ impl Db {
             fail_zbuild: std::sync::atomic::AtomicBool::new(false),
             z_convert_ask: AtomicU64::new(0),
             z_redrop_owe: std::sync::atomic::AtomicBool::new(false),
-            zsettle_hold: std::sync::atomic::AtomicBool::new(opts.zpages_hold_after_settle),
             zgate: ZGate::new(opts.zpages),
             block_pool: block_pool.clone(),
             asks: AskCounts::default(),
@@ -52262,12 +52251,6 @@ impl Db {
 /// for.
 const ZSETTLE_ROUNDS: usize = 4;
 
-/// How long a settle under `Options::zpages_hold_after_settle` waits for
-/// the build after it to park at its rename: a test's bound, so that a
-/// seam that never sees its build fails the test's assertion and does not
-/// hang it.
-const ZSETTLE_HOLD_WAIT: std::time::Duration = std::time::Duration::from_secs(30);
-
 /// Where in a round of `Db::zpages_settle_with` its seam is called.
 #[doc(hidden)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -52608,12 +52591,6 @@ impl Db {
         if matches!(self.maint, MaintHome::Away(_)) {
             self.settle()?;
             self.maint_request(MaintAsk::ZSettle)?;
-            if self.shared.zsettle_hold.load(AtomicOrdering::Acquire) {
-                let t = std::time::Instant::now();
-                while !self.zpage_build_waiting() && t.elapsed() < ZSETTLE_HOLD_WAIT {
-                    std::thread::sleep(std::time::Duration::from_millis(1));
-                }
-            }
             return self.z_settle_end();
         }
         for _ in 0..ZSETTLE_ROUNDS {
@@ -52800,13 +52777,6 @@ impl Db {
     #[doc(hidden)]
     pub fn hold_zpage_rename(&self, on: bool) {
         Db::set_zhold(&self.shared.zbuild_hold, ZHOLD_RENAME, on);
-    }
-
-    /// A test's: `Options::zpages_hold_after_settle` set or cleared. The
-    /// rename hold it arms stays until `hold_zpage_rename(false)`.
-    #[doc(hidden)]
-    pub fn hold_zpage_after_settle(&self, on: bool) {
-        self.shared.zsettle_hold.store(on, AtomicOrdering::Release);
     }
 
     /// Whether the builder's thread is parked at one of the holds. A test
@@ -59772,9 +59742,6 @@ impl Maint {
                 } else {
                     self.z_sweep_settled()
                 };
-                if self.shared.zsettle_hold.load(AtomicOrdering::Acquire) {
-                    Db::set_zhold(&self.shared.zbuild_hold, ZHOLD_RENAME, true);
-                }
                 self.z_settling = false;
                 swept?;
                 self.sync_owed_slot()
