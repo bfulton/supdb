@@ -44567,15 +44567,15 @@ impl Db {
                     opts.zpages_scan_prefetch,
                     opts.zpages_trusted_views,
                     opts.zpages_memo_first,
-                    (
-                        Db::fence_search(&opts),
-                        opts.zpages_memo_ahead,
-                        opts.zpages_drop_raw,
-                        opts.z_times_decodes(),
-                        opts.zpages_cursor_view,
-                        opts.zpages_group_ahead,
-                        opts.zpages_walk_owns_decodes,
-                    ),
+                    ZAttachLines {
+                        fence: Db::fence_search(&opts),
+                        memo_ahead: opts.zpages_memo_ahead,
+                        drop_raw: opts.zpages_drop_raw,
+                        time_decodes: opts.z_times_decodes(),
+                        cursor_view: opts.zpages_cursor_view,
+                        group_ahead: opts.zpages_group_ahead,
+                        walk_owns: opts.zpages_walk_owns_decodes,
+                    },
                     &opts.z_stride_attach(),
                     &zev,
                 );
@@ -51367,6 +51367,19 @@ impl Db {
 /// (`bench/examples/zsize.rs --parse N`).
 const ZPARSE_CHAINS: u32 = 4;
 
+/// What `Db::z_attach` sets on a form file it attaches beyond the file's
+/// own shape, by name: a tuple of flags read by position lost the raw
+/// drop to the decode timer's slot when a flag before them went.
+struct ZAttachLines {
+    fence: zpages::FenceSearch,
+    memo_ahead: bool,
+    drop_raw: bool,
+    time_decodes: bool,
+    cursor_view: bool,
+    group_ahead: bool,
+    walk_owns: bool,
+}
+
 /// Rounds `zpages_settle` makes at most over the partitions that lack a
 /// form file: a merge that lands while one is built makes partitions the next
 /// round gives theirs, and a store that keeps merging stops being waited
@@ -51447,7 +51460,7 @@ impl Db {
         prefetch: bool,
         trusted: bool,
         memo_first: bool,
-        lines: (zpages::FenceSearch, bool, bool, bool, bool, bool, bool),
+        lines: ZAttachLines,
         stride: &zfile::StrideAttach,
         ev: &zfile::ZEvents,
     ) -> bool {
@@ -51467,22 +51480,22 @@ impl Db {
             prefetch,
             trusted,
             memo_first,
-            lines.0,
-            lines.1,
+            lines.fence,
+            lines.memo_ahead,
             stride,
         ) {
             Ok(mut side) => {
-                side.time_decodes = lines.3;
+                side.time_decodes = lines.time_decodes;
                 side.own_decoder = true;
                 side.flat_decoder = true;
                 side.flat_slack = true;
-                side.cursor_view = lines.4;
-                side.group_ahead = lines.5;
-                side.walk_owns = lines.6;
+                side.cursor_view = lines.cursor_view;
+                side.group_ahead = lines.group_ahead;
+                side.walk_owns = lines.walk_owns;
                 let installed = seg.z.install(side);
                 if installed {
                     zfile::ZEvents::add(&ev.attached, 1);
-                    if lines.3 {
+                    if lines.drop_raw {
                         seg.drop_raw_pages(dir, ev);
                     }
                 }
@@ -51530,15 +51543,15 @@ impl Db {
                 self.opts.zpages_scan_prefetch,
                 self.opts.zpages_trusted_views,
                 self.opts.zpages_memo_first,
-                (
-                    Db::fence_search(&self.opts),
-                    self.opts.zpages_memo_ahead,
-                    z_drop_now(&self.opts, &self.shared),
-                    self.opts.z_times_decodes(),
-                    self.opts.zpages_cursor_view,
-                    self.opts.zpages_group_ahead,
-                    self.opts.zpages_walk_owns_decodes,
-                ),
+                ZAttachLines {
+                    fence: Db::fence_search(&self.opts),
+                    memo_ahead: self.opts.zpages_memo_ahead,
+                    drop_raw: z_drop_now(&self.opts, &self.shared),
+                    time_decodes: self.opts.z_times_decodes(),
+                    cursor_view: self.opts.zpages_cursor_view,
+                    group_ahead: self.opts.zpages_group_ahead,
+                    walk_owns: self.opts.zpages_walk_owns_decodes,
+                },
                 &self.opts.z_stride_attach(),
                 ev,
             )
@@ -65977,15 +65990,15 @@ impl Maint {
                 self.opts.zpages_scan_prefetch,
                 self.opts.zpages_trusted_views,
                 self.opts.zpages_memo_first,
-                (
-                    Db::fence_search(&self.opts),
-                    self.opts.zpages_memo_ahead,
-                    z_drop_now(&self.opts, &self.shared),
-                    self.opts.z_times_decodes(),
-                    self.opts.zpages_cursor_view,
-                    self.opts.zpages_group_ahead,
-                    self.opts.zpages_walk_owns_decodes,
-                ),
+                ZAttachLines {
+                    fence: Db::fence_search(&self.opts),
+                    memo_ahead: self.opts.zpages_memo_ahead,
+                    drop_raw: z_drop_now(&self.opts, &self.shared),
+                    time_decodes: self.opts.z_times_decodes(),
+                    cursor_view: self.opts.zpages_cursor_view,
+                    group_ahead: self.opts.zpages_group_ahead,
+                    walk_owns: self.opts.zpages_walk_owns_decodes,
+                },
                 &self.opts.z_stride_attach_sealed(seal),
                 ev,
             )
