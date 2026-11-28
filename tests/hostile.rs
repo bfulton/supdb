@@ -184,6 +184,13 @@ fn forge_ext_header(b: &mut [u8], f: impl FnOnce(&mut [u8])) {
     b[at + n - 8..at + n].copy_from_slice(&h.to_le_bytes());
 }
 
+/// The key section's row computed again over the section as it stands.
+fn forge_row(b: &mut [u8]) {
+    let (ko, co) = key_section(b);
+    let row = flatindex::checksum_row(&b[ko..ko + co], flatindex::PIECE_SHIFT, ko as u64);
+    b[ko + co..ko + co + row.len()].copy_from_slice(&row);
+}
+
 /// What one reader did with one case.
 #[derive(Debug, PartialEq)]
 enum Verdict {
@@ -402,6 +409,94 @@ fn a_length_from_the_file_sizes_nothing_the_object_cannot_hold() {
                     m,
                     true,
                 );
+            }
+        }
+    }
+}
+
+/// The superblock extension's word `i` (at 1024) set to `v`, its FNV
+/// computed again.
+fn forge_ext_word(b: &mut [u8], i: usize, v: u64) {
+    let (at, n) = (1024, supdb::blob::SX_BYTES);
+    b[at + i * 8..at + i * 8 + 8].copy_from_slice(&v.to_le_bytes());
+    let h = fnv(&b[at..at + n - 8]);
+    b[at + n - 8..at + n].copy_from_slice(&h.to_le_bytes());
+}
+
+/// The sparse open's two plans over `b`, as a host that fetches by range
+/// asks for them: each refuses or names ranges inside the object.
+fn plans_hold(name: &str, b: &[u8]) {
+    let len = b.len() as u64;
+    let inside = |v: &[(u64, u64)]| {
+        v.iter()
+            .all(|&(o, l)| o.checked_add(l).is_some_and(|e| e <= len))
+    };
+    for directory in [false, true] {
+        if let Ok(v) = supdb::blob::open_sparse_ranges_opts(&b[..4096], len, directory) {
+            assert!(inside(&v), "{name}: the first plan names {v:?}");
+        }
+        if let Ok(v) = supdb::blob::sparse_open_ranges_via_opts(&SliceBytes(b), directory) {
+            assert!(inside(&v), "{name}: the first plan names {v:?}");
+        }
+        let ko = u64::from_le_bytes(b[24..32].try_into().unwrap()) as usize;
+        if let Some(h) = b.get(ko..ko.saturating_add(flatindex::HEADER_BYTES)) {
+            if let Ok(v) = supdb::blob::open_sparse_fence_ranges_opts(&b[..4096], len, h, directory)
+            {
+                assert!(inside(&v), "{name}: the fence plan names {v:?}");
+            }
+        }
+    }
+}
+
+/// HI-3. The sparse open summed offsets out of the file unchecked: the
+/// superblock's `key_off` at the top of the u64 range under a forged FNV
+/// overflowed the sum of it and the fence's offset (a panic in a checked
+/// build, an index out of the verified-piece bitmap in release), and the
+/// open plans summed the extension's ranges and the key header's offsets
+/// the same way. Every sum is checked now, and every planned range is held
+/// to the object.
+#[test]
+fn an_offset_at_the_top_of_the_range_panics_no_sparse_open() {
+    for (i, (pristine, m)) in shapes().iter().enumerate() {
+        for v in [u64::MAX - 4095, u64::MAX] {
+            for both in [false, true] {
+                let mut b = pristine.clone();
+                b[24..32].copy_from_slice(&v.to_le_bytes());
+                if both {
+                    b[512 + 24..512 + 32].copy_from_slice(&v.to_le_bytes());
+                }
+                forge_super(&mut b);
+                let name = format!("key_off shape{i} {v:#x} both {both}");
+                plans_hold(&name, &b);
+                hold(&name, i, &b, m, true);
+            }
+        }
+        // The extension's fence, directory, hash and row ranges (words 2
+        // to 9) and its copies' offsets (10, 12, 15, 16).
+        for w in [2usize, 3, 4, 5, 6, 7, 8, 9, 10, 12, 15, 16] {
+            for v in [u64::MAX - 4095, u64::MAX, 1 << 62] {
+                let mut b = pristine.clone();
+                forge_ext_word(&mut b, w, v);
+                let name = format!("extension shape{i} w{w}={v:#x}");
+                plans_hold(&name, &b);
+                hold(&name, i, &b, m, false);
+            }
+        }
+        // With the extension gone, the fence plan reads the key header:
+        // its directory and row offsets at the top of the range, the row
+        // computed again.
+        let (ko, _) = key_section(pristine);
+        for w in [10usize, 15, 20] {
+            for v in [u64::MAX - 4095, u64::MAX] {
+                let mut b = pristine.clone();
+                b[1024..1032].fill(0);
+                b[ko + w * 8..ko + w * 8 + 8].copy_from_slice(&v.to_le_bytes());
+                if w != 20 {
+                    forge_row(&mut b);
+                }
+                let name = format!("key header shape{i} w{w}={v:#x}");
+                plans_hold(&name, &b);
+                hold(&name, i, &b, m, false);
             }
         }
     }
