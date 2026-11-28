@@ -63,8 +63,10 @@ after the hunk, since a hunk can end inside a block whose brace is common
 ## Carried on the merged tree
 
 - **Spills.** `Reader::settle_each` (batch 2, track A's PR5, track B's
-  PR10), `Reader::patch_block` (track B's PR10, `splice_run` inlined) and,
-  if track A does not settle it, `supdb_get` on the point read: each read by
+  PR10), `Reader::patch_block` (track B's PR10, `splice_run` inlined),
+  `Reader::scan_blocks` +1 a scan and `Reader::scan` +0.83 an op on `work`
+  (track C's PR16); `supdb_get` on the point read was fixed by track A
+  (`fac7f89`, the shared table's lean read out of line): each read by
   instruction as register allocation after a removal, each with its probe
   above zero. They are fixed once all the tracks that move them are
   merged, and counted against C0 (`release/phase1.md`).
