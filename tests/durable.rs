@@ -8513,6 +8513,69 @@ fn an_open_that_takes_an_unsynced_slot_never_overwrites_the_durable_one_under_a_
     an_open_over_an_owed_slot("cipher", under_cipher());
 }
 
+/// Whether the kernel's word on a page -- its flags (`os_page_unwritten`),
+/// or the page cache's drop of clean pages (`os_page_kept_unwritten`) --
+/// tells a page the device holds from one it does not, in the filesystem
+/// the tests' stores are made in: asked once of a file the probe writes
+/// and fsyncs itself, whose page has to read as written back. On a
+/// filesystem with no device behind it (tmpfs, where `TMPDIR` may be) a
+/// page written is dirty for good and stays in the cache, and an fsync
+/// returns with it so: both words read every page unwritten, and say
+/// nothing of what an fsync made durable. There the instruments answer
+/// `None`, as where the kernel does not say, and the tests that read them
+/// hold the open's calls alone, saying so.
+fn os_pages_track_the_device() -> bool {
+    static TRACK: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *TRACK.get_or_init(|| {
+        use std::io::Write;
+        let p = std::env::temp_dir().join(format!("supdb-next-os-probe-{}", std::process::id()));
+        let mut f = std::fs::File::create(&p).unwrap();
+        f.write_all(&[0x5a; 4096]).unwrap();
+        f.sync_all().unwrap();
+        drop(f);
+        let flags = os_page_flags_unwritten(&p);
+        #[cfg(target_os = "linux")]
+        let cache = os_page_cache_kept_unwritten(&p);
+        #[cfg(not(target_os = "linux"))]
+        let cache: Option<bool> = None;
+        let _ = std::fs::remove_file(&p);
+        let track = flags != Some(true) && cache != Some(true);
+        if !track {
+            eprintln!(
+                "premise: {} keeps a page it fsynced as unwritten (page flags {flags:?}, \
+                 kept by a drop {cache:?}): no device behind it, so the kernel's word on a \
+                 page says nothing of what an fsync made durable there",
+                std::env::temp_dir().display()
+            );
+        }
+        track
+    })
+}
+
+/// The probe above, held to the filesystem's own name for itself: a probe
+/// that answered no device everywhere would let every test that reads the
+/// kernel's word skip it on a disk, and one that answered a device
+/// everywhere would fail them on tmpfs by an instrument and not the store.
+#[cfg(target_os = "linux")]
+#[test]
+fn the_page_probe_reads_a_device_where_the_filesystem_has_one() {
+    use std::os::unix::ffi::OsStrExt;
+    let d = std::ffi::CString::new(std::env::temp_dir().as_os_str().as_bytes()).unwrap();
+    let mut st: libc::statfs = unsafe { std::mem::zeroed() };
+    // SAFETY: a path this function owns and a struct it owns.
+    assert_eq!(unsafe { libc::statfs(d.as_ptr(), &mut st) }, 0);
+    // ramfs's, which the libc crate does not name (linux/magic.h).
+    const RAMFS_MAGIC: libc::c_long = 0x8584_58f6;
+    let memory = [libc::TMPFS_MAGIC, RAMFS_MAGIC].contains(&st.f_type);
+    assert_eq!(
+        os_pages_track_the_device(),
+        !memory,
+        "the probe of {} (filesystem {:#x})",
+        std::env::temp_dir().display(),
+        st.f_type
+    );
+}
+
 /// Whether the page cache holds the first page of `path` dirty or under
 /// writeback -- not yet what the device holds -- read from the kernel
 /// (`/proc/self/pagemap` over a mapping of the file, then
@@ -8521,6 +8584,14 @@ fn an_open_that_takes_an_unsynced_slot_never_overwrites_the_durable_one_under_a_
 /// `SUPDB_TEST_UNPRIVILEGED` set, to nobody, so that a privileged run can
 /// show what the tests hold where the gate runs without the privilege.
 fn os_page_unwritten(path: &Path) -> Option<bool> {
+    if !os_pages_track_the_device() {
+        return None;
+    }
+    os_page_flags_unwritten(path)
+}
+
+/// `os_page_unwritten`'s reading, whatever the filesystem.
+fn os_page_flags_unwritten(path: &Path) -> Option<bool> {
     use std::io::{Read, Seek, SeekFrom};
     if std::env::var_os("SUPDB_TEST_UNPRIVILEGED").is_some() {
         return None;
@@ -8555,6 +8626,15 @@ fn os_page_unwritten(path: &Path) -> Option<bool> {
 /// call fails.
 #[cfg(target_os = "linux")]
 fn os_page_kept_unwritten(path: &Path) -> Option<bool> {
+    if !os_pages_track_the_device() {
+        return None;
+    }
+    os_page_cache_kept_unwritten(path)
+}
+
+/// `os_page_kept_unwritten`'s reading, whatever the filesystem.
+#[cfg(target_os = "linux")]
+fn os_page_cache_kept_unwritten(path: &Path) -> Option<bool> {
     use std::os::fd::AsRawFd;
     let f = std::fs::File::open(path).ok()?;
     // SAFETY: an advice on a descriptor this function owns.
@@ -8626,7 +8706,9 @@ fn an_open_syncs_its_slot(tag: &str, base: Options) {
     // page was written, which is Linux's alone (a drop of clean pages and
     // `mincore` after it); elsewhere the calls' record above is the test.
     #[cfg(target_os = "linux")]
-    if before.iter().any(|b| b.is_none()) {
+    if !os_pages_track_the_device() {
+        eprintln!("{tag}: the kernel's word on a page says nothing of the device here");
+    } else if before.iter().any(|b| b.is_none()) {
         // Without the kernel's page flags, the page cache asked whether
         // each page was written: the control, written and synced by
         // nobody, has to read as not written, or the instrument read
