@@ -26,7 +26,11 @@
 #      name in a file of the workspace; libc's and a library's are not. A `~`
 #      line holds its function to its own bound, red past it, the larger of
 #      two lines' where both name it; one with no bound is refused; one that
-#      names its probes holds in those alone, a toggled one included. A listing whose functions do not sum to its program total,
+#      names its probes holds in those alone, a toggled one included; and
+#      under a toggle one that names libc's function holds it to the bound
+#      in place of the library tests, red past it where the tests read noise
+#      and green under it where they read red, while a library function no
+#      line names in the probe is held to the tests beside it. A listing whose functions do not sum to its program total,
 #      or that has none, is red, and a mode the comparator does not know is
 #      refused.
 #   G. the group: `check.sh cost` exits non-zero where cost-red.sh fails, and
@@ -253,6 +257,28 @@ cp "$R/fx/a25" "$R/fx/a28"
 [ "$(diffs a28 whole "$OWN")" = 0 ] || fail "A: a ~ line naming its probe did not bound its function there"
 [ "$(diffs a28 toggle "$OWN")" = 0 ] || fail "A: a ~ line naming a probe with a toggle did not bound its function there"
 [ "$(diffs a25 whole "$OWN")" = 1 ] || fail "A: a ~ line naming another probe bounded its function in this one"
+# A `~` line that names a library function holds it, under a toggle, to its
+# bound in place of the library tests, both ways: libc's compare at 0.83 an
+# operation, which those tests call noise, is red past a bound of 0.5, and
+# its copy at ten an operation and half again its count, which they call
+# red, is green under a bound of 15. A library function no line names in
+# the probe is held to the tests still, beside one a line names, and in the
+# probe a line does not name.
+printf '%s\n' 'supdb::db::Reader::read_all' '~a29: __memcmp_avx2_movbe 0.5' \
+    '~a30,a31: __memcpy_avx_unaligned_erms 15' >"$hot"
+base_rows 2,000,000 2,083,000 48,000,000 1,000,000 1,000,000 1,000,000 1,000,000 1,000,000 0 >"$R/fx/a29"
+cp "$R/fx/a21" "$R/fx/a30"
+base_rows 3,000,000 2,500,000 48,000,000 1,000,000 1,000,000 1,000,000 1,000,000 1,000,000 0 >"$R/fx/a31"
+[ "$(diffs a29 toggle "$OWN")" = 1 ] &&
+    grep -q 'LIBRARY GAINED: __memcmp_avx2_movbe .*its bound 0.500' "$R/fx/a29.out" ||
+    fail "A: under a toggle, a library function past its ~ line's bound and under the library tests was not red"
+[ "$(diffs a30 toggle "$OWN")" = 0 ] ||
+    fail "A: under a toggle, a library function under its ~ line's bound and past the library tests was red"
+[ "$(diffs a31 toggle "$OWN")" = 1 ] && grep -q 'LIBRARY GAINED: __memcmp_avx2_movbe ' "$R/fx/a31.out" &&
+    ! grep -q 'LIBRARY GAINED: __memcpy' "$R/fx/a31.out" ||
+    fail "A: under a toggle, beside a ~ line's library function, one no line names was not held to the library tests"
+[ "$(diffs a21 toggle "$OWN")" = 1 ] && grep -q 'LIBRARY GAINED: __memcpy_avx_unaligned_erms ' "$R/fx/a21.out" ||
+    fail "A: under a toggle, a library function in a probe its ~ line does not name was not held to the library tests"
 # A listing cut short of its program total: callgrind_annotate's default
 # threshold leaves out the functions under it, and a cost added to one of
 # them would read as nothing on both sides.

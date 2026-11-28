@@ -74,9 +74,11 @@ supdb::db::zpages::
 supdb::db::zlz4::
 # Bounds of their own (`~path BOUND`, instructions an operation), for the
 # functions whose counts move between two runs of one build: each the most
-# it was measured to move in two to four self-checks of each probe (the
+# it was measured to move in two to five self-checks of each probe (the
 # tree against HEAD, and the HEAD builds of the mutant runs beside each
-# other), three times over and rounded up. With no scope a line holds in
+# other; for the lines that name b3a043dc, the least of its ten listings
+# against the most, since a later count may pair any two of them), three
+# times over and rounded up. With no scope a line holds in
 # the probes with no toggle, where they run on the store's own threads or
 # on a clock: the controller's tick and its look at the memory group's
 # budget, a read of a cgroup file (load_buffered: parse_mount +0.98 an op,
@@ -94,14 +96,33 @@ supdb::db::zlz4::
 ~supdb::db::Maint::sweep_spares 0.03
 ~supdb::db::Maint::z_step 0.025
 ~supdb::db::Maint::join_seal 0.02
+# In load_durable, a partition's records' residency, which the controller's
+# tick asks of the segment's mapping once a run (`Seg::records_resident`):
+# ten listings of b3a043dc counted against itself five times read 3,718
+# instructions in nine and none in the tenth, 0.037 an op, since where the
+# tick's steps fall against the partition's landing follows the clock.
+~load_durable: supdb::bytes::MmapBytes::resident_share 0.12
 # In the merge alone, whose writer's operations end while a background
 # thread's pin holds what they would free, so the sweep at an operation's
 # end walks the reader table for as long as the pin stands (two runs of one
 # build: sweep_retired_states +11.6 an op, oldest_for +2.0, WriterOp::drop
-# +0.38). `land` holds the sweep to the instruction.
+# +0.38); and so the probe's own `main`, into which the build of b3a043dc
+# inlines the end of half its operations (`Reader::leave_by`), whose call
+# of the sweep, two instructions, is made at as many of them as end while
+# the pin stands: 47,346 calls and 50,000 in the one count whose callgrind
+# files were kept, and the whole of that count's move. Ten listings of
+# b3a043dc counted against itself five times read main 12,757,004 to
+# 12,824,236 over the run, 0.34 an op between the least and the most, all
+# of the spread in its rows of src/db.rs, red in one count of five. And the
+# writer's wait for room in the frozen list (`Db::land_seal`), a look and a
+# park of a tenth of a millisecond for as long as the seal it waits for
+# runs: 254,322 to 424,152 over the run in the same ten, 0.85 an op, red in
+# two counts of five. `land` holds the sweep to the instruction.
 ~merge: supdb::db::Reader::sweep_retired_states 35
 ~merge: supdb::db::Readers::oldest_for 6
 ~merge: supdb::db::WriterOp::drop 1.2
+~merge: merge_walk::main 1.1
+~merge: supdb::db::Db::land_seal 2.6
 # Under a toggle: the seal's wait in `land` (join_seal +332 over the run,
 # its clock +64) and the segment writer's look at its helper thread in the
 # commit probes (landed +63). The wait's line was 0.01 on that first pair,
@@ -112,6 +133,15 @@ supdb::db::zlz4::
 ~land: supdb::db::Maint::join_seal 0.04
 ~land: std::sys::pal::unix::time::Timespec::now 0.002
 ~commit_durable,commit_buffered: supdb::db::AlignedWriter::landed 0.002
+# A library function a `~` line names, under a toggle, is held to its bound
+# in place of the library tests (scripts/cost-diff.py): glibc's unlink of a
+# free chunk from its bin in scan_long_z, run where a free or an allocation
+# meets a free neighbour, so its count follows the heap the run has left
+# and not the scans. Ten listings of b3a043dc counted against itself five
+# times read it in two shapes, 9,543 to 10,719 and 16,662 to 17,085 over
+# the run's 1,000 operations, 7.5 an op between the least and the most and
+# red in one count of five (scan_z: 6,207 to 7,527, under LIB_SLACK).
+~scan_long_z: unlink_chunk.isra.0 23
 # The writer (load_durable, load_buffered, work, merge): a commit, its log,
 # the memtable and the ordered run's stream.
 supdb::db::Db::commit
