@@ -961,12 +961,7 @@ fence searched at every page and the memo asked twice a group
 (`Options::zpages_bulk_steps` off), and `supdb-zflatshort` with the flat
 LZ4 decoder lent the fast loop's slack alone, so each group's last
 sequences go the fast loop's way (`Options::zpages_flat_slack` off);
-`supdb-noscanrawahead` is `supdb` with a walk of a partition's raw
-records asking for none of them ahead of it (`Options::scan_raw_ahead`
-off), `supdb-scanrawahead` with the ask made on every store, within the
-last-level cache or past it (`Options::scan_raw_ahead_past_llc` off), and
-`supdb-scanrawpaced` with it made a kilobyte ahead as the walk goes
-(`Options::scan_raw_ahead_lead`); `supdb-settlegated` and `supdb-ingestsettlegated` are `supdb` and
+`supdb-settlegated` and `supdb-ingestsettlegated` are `supdb` and
 `supdb-ingest` filing a commit's batch at the write only where the
 partitions' data passes the last-level cache
 (`Options::forms_settle_past_llc`); `supdb-readhashes` and
@@ -989,14 +984,7 @@ or more converted (`Options::forms_convert_from`), and
 writer's fills, the yields and the walk's crossing from `CONVWRITER`,
 `CONVSTRICT` and `CONVWALK` (`Options::forms_convert_reads`,
 `forms_convert_light_writer`, `forms_convert_light_yields`,
-`forms_convert_at_walk`); `supdb-formahead`, `supdb-sparsespan` and
-`supdb-runsheld`, with their `supdb-ingest` siblings, are the scan's seek
-asking for the first two blocks' form headers
-(`Options::scan_form_ahead`), a sparse form asked for over the walk's share
-of it (`Options::scan_prefetch_sparse_span`) and a partition walk's raw
-runs through one walker (`Options::scan_runs_held`), and
-`supdb-scanlevers` and `supdb-ingestscanlevers` the three together;
-`supdb-widewalks` and `supdb-ingestwidewalks` walk a block wide by its
+`forms_convert_at_walk`); `supdb-widewalks` and `supdb-ingestwidewalks` walk a block wide by its
 count of keys past the end for as long as it is, where the default copies
 it once its walks have paid (`Options::forms_copy_hot_wide`), and
 `supdb-widecopyfixed` and `supdb-ingestwidecopyfixed` copy it at the walk a

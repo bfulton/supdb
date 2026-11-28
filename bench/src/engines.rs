@@ -954,14 +954,6 @@ pub struct Supdb {
     /// were gated (`Options::scan_timers`). `supdb-timers`, and
     /// `supdb-ingesttimers` buffered.
     timers: bool,
-    /// The block walk issues no prefetches (`Options::scan_prefetch`
-    /// off). `supdb-noprefetch`, and `supdb-ingestnoprefetch` buffered.
-    noprefetch: bool,
-    /// A scan's seek without the stride window's directory hint, and the
-    /// record hint reading its span's two directory words
-    /// (`Options::seek_prefetch_dir` off). `supdb-dirplain`, and
-    /// `supdb-ingestdirplain` buffered.
-    dirplain: bool,
     /// The commit's maintenance filing its backlog into the forms far
     /// from any scan (`Options::forms_settle_far`), the shape before a
     /// stretch nobody reads filed nothing. `supdb-settlefar`, and
@@ -988,10 +980,6 @@ pub struct Supdb {
     /// alone it prices what the sweep returns.
     /// `supdb-cache256tofitnosweep`.
     nosweep: bool,
-    /// A walk's prefetch reaching a kilobyte into the records rather than
-    /// four (`Options::scan_prefetch_bytes`). `supdb-prefetch1k`, and
-    /// `supdb-ingestprefetch1k` buffered.
-    prefetch1k: bool,
     /// The manifest published by a temp file, a rename and a directory
     /// fsync, as before the two slots (`Options::manifest_slots` off).
     /// `supdb-manifestrename`, and `supdb-ingestmanifestrename` buffered.
@@ -1395,16 +1383,6 @@ pub struct Supdb {
     /// The fill's quiet looks take the growth share too
     /// (`Options::zpages_hot_fill_quiet`): `supdb-zhotfillquiet`.
     zhotfillquiet: bool,
-    /// A raw walk's records asked for ahead of it on every store, within
-    /// the cache or past it (`Options::scan_raw_ahead_past_llc` off):
-    /// `supdb-scanrawahead`.
-    scanrawahead: bool,
-    /// A raw walk asks for nothing ahead of it (`Options::scan_raw_ahead`
-    /// off): `supdb-noscanrawahead`.
-    noscanrawahead: bool,
-    /// The same records asked for paced through the walk, a kilobyte ahead
-    /// (`Options::scan_raw_ahead_lead`): `supdb-scanrawpaced`.
-    scanrawpaced: bool,
     /// A covered scan's start placed once, the seek's cursor kept as the
     /// partition's reader's (`Options::zpages_seek_seeds` on):
     /// `supdb-zseekseed`.
@@ -1461,18 +1439,6 @@ pub struct Supdb {
     /// probes (`Options::read_lines_ahead` off): `supdb-readnoahead` and
     /// `supdb-ingestreadnoahead`.
     readnoahead: bool,
-    /// The seek asking for the first two blocks' form headers
-    /// (`Options::scan_form_ahead`): `supdb-formahead` and
-    /// `supdb-ingestformahead`.
-    formahead: bool,
-    /// A sparse form asked for over the walk's share of it
-    /// (`Options::scan_prefetch_sparse_span`): `supdb-sparsespan` and
-    /// `supdb-ingestsparsespan`.
-    sparsespan: bool,
-    /// A partition walk's runs through one raw walker
-    /// (`Options::scan_runs_held`): `supdb-runsheld` and
-    /// `supdb-ingestrunsheld`.
-    runsheld: bool,
     /// A copy asked for over the entries its walk reads
     /// (`Options::copy_prefetch_span`): `supdb-copyspan` and
     /// `supdb-ingestcopyspan`.
@@ -1500,9 +1466,6 @@ pub struct Supdb {
     /// (`Options::settle_lone_chain` off): `supdb-settlesources` and
     /// `supdb-ingestsettlesources`.
     settlesources: bool,
-    /// The three scan levers together: `supdb-scanlevers` and
-    /// `supdb-ingestscanlevers`.
-    scanlevers: bool,
     /// The fills' conversion to a copy at the dense count alone, the shape
     /// before light forms converted (`Options::forms_convert_from`):
     /// `supdb-convert16` and `supdb-ingestconvert16`.
@@ -2571,14 +2534,6 @@ struct Policy {
     /// were gated (`Options::scan_timers`). `supdb-timers`, and
     /// `supdb-ingesttimers` buffered.
     timers: bool,
-    /// The block walk issues no prefetches (`Options::scan_prefetch`
-    /// off). `supdb-noprefetch`, and `supdb-ingestnoprefetch` buffered.
-    noprefetch: bool,
-    /// A scan's seek without the stride window's directory hint, and the
-    /// record hint reading its span's two directory words
-    /// (`Options::seek_prefetch_dir` off). `supdb-dirplain`, and
-    /// `supdb-ingestdirplain` buffered.
-    dirplain: bool,
     /// The commit's maintenance filing its backlog into the forms far
     /// from any scan (`Options::forms_settle_far`), the shape before a
     /// stretch nobody reads filed nothing. `supdb-settlefar`, and
@@ -2605,10 +2560,6 @@ struct Policy {
     /// alone it prices what the sweep returns.
     /// `supdb-cache256tofitnosweep`.
     nosweep: bool,
-    /// A walk's prefetch reaching a kilobyte into the records rather than
-    /// four (`Options::scan_prefetch_bytes`). `supdb-prefetch1k`, and
-    /// `supdb-ingestprefetch1k` buffered.
-    prefetch1k: bool,
     /// The manifest published by a temp file, a rename and a directory
     /// fsync, as before the two slots (`Options::manifest_slots` off).
     /// `supdb-manifestrename`, and `supdb-ingestmanifestrename` buffered.
@@ -3007,13 +2958,6 @@ struct Policy {
     /// The fill's quiet looks with the growth share in their room:
     /// `supdb-zhotfillquiet`.
     zhotfillquiet: bool,
-    /// A raw walk's records asked for ahead of it on every store:
-    /// `supdb-scanrawahead`.
-    scanrawahead: bool,
-    /// A raw walk asks for nothing ahead of it: `supdb-noscanrawahead`.
-    noscanrawahead: bool,
-    /// Asked for paced through the walk: `supdb-scanrawpaced`.
-    scanrawpaced: bool,
     /// The start placed once: `supdb-zseekseed`.
     zseekseed: bool,
     /// The record coding where a compressed form is picked: `supdb-zrecord`.
@@ -3045,12 +2989,6 @@ struct Policy {
     readhashes: bool,
     /// No sources' lines asked ahead of the point read: `...readnoahead`.
     readnoahead: bool,
-    /// The seek's ask for the first forms: `...formahead`.
-    formahead: bool,
-    /// The sparse form's ask over the walk's share: `...sparsespan`.
-    sparsespan: bool,
-    /// The runs through one raw walker: `...runsheld`.
-    runsheld: bool,
     /// A copy's ask over its walk's entries: `...copyspan`.
     copyspan: bool,
     /// A copy's identity by its file: `...identityblob`.
@@ -3065,8 +3003,6 @@ struct Policy {
     settlesearch: bool,
     /// The patch's walk of the sources for a lone key: `...settlesources`.
     settlesources: bool,
-    /// The three scan levers together: `...scanlevers`.
-    scanlevers: bool,
     /// The writer's copy line from `DENSEFROM`: `...densefrom`.
     densefrom: usize,
     /// Conversions at the dense count alone: `...convert16`.
@@ -3646,14 +3582,11 @@ impl Default for Policy {
             sealrun: false,
             closeinline: false,
             timers: false,
-            noprefetch: false,
-            dirplain: false,
             settlefar: false,
             tofit: false,
             notrim: false,
             noshed: false,
             nosweep: false,
-            prefetch1k: false,
             manifestrename: false,
             manifestpending: false,
             waitmanifest: false,
@@ -3734,9 +3667,6 @@ impl Default for Policy {
             zhotaskidle: false,
             zhotgrowth5: false,
             zhotfillquiet: false,
-            scanrawahead: false,
-            noscanrawahead: false,
-            scanrawpaced: false,
             zseekseed: false,
             zrecorddefault: false,
             zhotcoldback: false,
@@ -3752,9 +3682,6 @@ impl Default for Policy {
             settlegated: false,
             readhashes: false,
             readnoahead: false,
-            formahead: false,
-            sparsespan: false,
-            runsheld: false,
             copyspan: false,
             identityblob: false,
             copythree: false,
@@ -3762,7 +3689,6 @@ impl Default for Policy {
             frozencount: false,
             settlesearch: false,
             settlesources: false,
-            scanlevers: false,
             densefrom: 0,
             convert16: false,
             widewalks: false,
@@ -7481,58 +7407,6 @@ impl Supdb {
         )
     }
 
-    /// `supdb` whose block walks issue no prefetches
-    /// (`Options::scan_prefetch` off).
-    pub fn create_noprefetch(path: &Path) -> Res<Supdb> {
-        Supdb::with_policy(
-            path,
-            Policy {
-                noprefetch: true,
-                ..Policy::default()
-            },
-        )
-    }
-
-    /// `supdb-ingest` as `supdb-noprefetch`.
-    pub fn create_ingest_noprefetch(path: &Path) -> Res<Supdb> {
-        Supdb::with_policy(
-            path,
-            Policy {
-                partition: false,
-                durable: false,
-                noprefetch: true,
-                ..Policy::default()
-            },
-        )
-    }
-
-    /// `supdb` whose scans seek without the stride window's directory
-    /// hint and whose record hint reads its span's two directory words
-    /// (`Options::seek_prefetch_dir` off): against `supdb` it prices
-    /// the fill taken off a scan's start.
-    pub fn create_dirplain(path: &Path) -> Res<Supdb> {
-        Supdb::with_policy(
-            path,
-            Policy {
-                dirplain: true,
-                ..Policy::default()
-            },
-        )
-    }
-
-    /// `supdb-ingest` as `supdb-dirplain`.
-    pub fn create_ingest_dirplain(path: &Path) -> Res<Supdb> {
-        Supdb::with_policy(
-            path,
-            Policy {
-                partition: false,
-                durable: false,
-                dirplain: true,
-                ..Policy::default()
-            },
-        )
-    }
-
     /// `supdb` whose commits file their backlog into the forms far from
     /// any scan (`Options::forms_settle_far`), the shape before: against
     /// `supdb` it prices the filing a stretch nobody reads paid for, in
@@ -8088,32 +7962,6 @@ impl Supdb {
                 partition: false,
                 durable: false,
                 settlefar: true,
-                ..Policy::default()
-            },
-        )
-    }
-
-    /// `supdb` whose walks prefetch a kilobyte of records rather than
-    /// four: against `supdb` it prices the span.
-    pub fn create_prefetch1k(path: &Path) -> Res<Supdb> {
-        Supdb::with_policy(
-            path,
-            Policy {
-                prefetch1k: true,
-                ..Policy::default()
-            },
-        )
-    }
-
-    /// `supdb-ingest` whose walks prefetch a kilobyte of records rather
-    /// than four: against `supdb-ingest` it prices the span.
-    pub fn create_ingest_prefetch1k(path: &Path) -> Res<Supdb> {
-        Supdb::with_policy(
-            path,
-            Policy {
-                partition: false,
-                durable: false,
-                prefetch1k: true,
                 ..Policy::default()
             },
         )
@@ -10688,14 +10536,11 @@ impl Supdb {
             sealrun,
             closeinline,
             timers,
-            noprefetch,
-            dirplain,
             settlefar,
             tofit,
             notrim,
             noshed,
             nosweep,
-            prefetch1k,
             manifestrename,
             manifestpending,
             waitmanifest,
@@ -10795,9 +10640,6 @@ impl Supdb {
             zhotaskidle,
             zhotgrowth5,
             zhotfillquiet,
-            scanrawahead,
-            noscanrawahead,
-            scanrawpaced,
             zseekseed,
             zrecorddefault,
             zhotcoldback,
@@ -10813,9 +10655,6 @@ impl Supdb {
             settlegated,
             readhashes,
             readnoahead,
-            formahead,
-            sparsespan,
-            runsheld,
             copyspan,
             identityblob,
             copythree,
@@ -10823,7 +10662,6 @@ impl Supdb {
             frozencount,
             settlesearch,
             settlesources,
-            scanlevers,
             densefrom,
             convert16,
             widewalks,
@@ -11233,8 +11071,6 @@ impl Supdb {
             merge_plan_idle: !noidleplan,
             seal_put_one: !sealrun,
             close_finish_inline: closeinline,
-            scan_prefetch: !noprefetch,
-            seek_prefetch_dir: !dirplain,
             forms_settle_far: settlefar,
             forms_to_fit: tofit,
             forms_trim_bytes: if notrim {
@@ -11244,7 +11080,6 @@ impl Supdb {
             },
             forms_fit_shed: !noshed,
             forms_fit_sweep: !nosweep,
-            scan_prefetch_bytes: if prefetch1k { 1024 } else { 4096 },
             manifest_slots: !manifestrename,
             manifest_pending: manifestpending,
             flush_waits_manifest: waitmanifest,
@@ -11452,13 +11287,6 @@ impl Supdb {
             zpages_hot_ask_idle: zhotaskidle,
             zpages_hot_growth_pct: if zhotgrowth5 { 5 } else { 10 },
             zpages_hot_fill_quiet: zhotfillquiet,
-            scan_raw_ahead: !noscanrawahead,
-            scan_raw_ahead_past_llc: !(scanrawahead || scanrawpaced),
-            scan_raw_ahead_lead: if scanrawpaced {
-                1024
-            } else {
-                supdb::Options::default().scan_raw_ahead_lead
-            },
             zpages_seek_seeds: zseekseed,
             zpages_hot_cold_back: zhotcoldback,
             sweep_remembers_pin: !sweepwalks,
@@ -11472,9 +11300,6 @@ impl Supdb {
             forms_settle_past_llc: settlegated,
             read_hash_once: !readhashes,
             read_lines_ahead: !readnoahead,
-            scan_form_ahead: formahead || scanlevers,
-            scan_prefetch_sparse_span: sparsespan || scanlevers,
-            scan_runs_held: runsheld || scanlevers,
             copy_prefetch_span: copyspan,
             identity_by_keys: !identityblob,
             copy_packed: !copythree,
@@ -11813,14 +11638,11 @@ impl Supdb {
             sealrun,
             closeinline,
             timers,
-            noprefetch,
-            dirplain,
             settlefar,
             tofit,
             notrim,
             noshed,
             nosweep,
-            prefetch1k,
             manifestrename,
             manifestpending,
             waitmanifest,
@@ -11920,9 +11742,6 @@ impl Supdb {
             zhotaskidle,
             zhotgrowth5,
             zhotfillquiet,
-            scanrawahead,
-            noscanrawahead,
-            scanrawpaced,
             zseekseed,
             zrecorddefault,
             zhotcoldback,
@@ -11938,9 +11757,6 @@ impl Supdb {
             settlegated,
             readhashes,
             readnoahead,
-            formahead,
-            sparsespan,
-            runsheld,
             copyspan,
             identityblob,
             copythree,
@@ -11948,7 +11764,6 @@ impl Supdb {
             frozencount,
             settlesearch,
             settlesources,
-            scanlevers,
             densefrom,
             convert16,
             widewalks,
@@ -12735,15 +12550,6 @@ impl Engine for Supdb {
         if self.zhotfillquiet {
             return "supdb-zhotfillquiet";
         }
-        if self.scanrawahead {
-            return "supdb-scanrawahead";
-        }
-        if self.noscanrawahead {
-            return "supdb-noscanrawahead";
-        }
-        if self.scanrawpaced {
-            return "supdb-scanrawpaced";
-        }
         if self.zseekseed {
             return "supdb-zseekseed";
         }
@@ -13245,34 +13051,6 @@ impl Engine for Supdb {
                 "supdb-ingestdensefrom"
             };
         }
-        if self.scanlevers {
-            return if self.partition {
-                "supdb-scanlevers"
-            } else {
-                "supdb-ingestscanlevers"
-            };
-        }
-        if self.formahead {
-            return if self.partition {
-                "supdb-formahead"
-            } else {
-                "supdb-ingestformahead"
-            };
-        }
-        if self.sparsespan {
-            return if self.partition {
-                "supdb-sparsespan"
-            } else {
-                "supdb-ingestsparsespan"
-            };
-        }
-        if self.runsheld {
-            return if self.partition {
-                "supdb-runsheld"
-            } else {
-                "supdb-ingestrunsheld"
-            };
-        }
         if self.copyspan {
             return if self.partition {
                 "supdb-copyspan"
@@ -13706,20 +13484,6 @@ impl Engine for Supdb {
                 "supdb-ingesttimers"
             };
         }
-        if self.noprefetch {
-            return if self.partition {
-                "supdb-noprefetch"
-            } else {
-                "supdb-ingestnoprefetch"
-            };
-        }
-        if self.dirplain {
-            return if self.partition {
-                "supdb-dirplain"
-            } else {
-                "supdb-ingestdirplain"
-            };
-        }
         if self.settlefar {
             return if self.partition {
                 "supdb-settlefar"
@@ -13732,13 +13496,6 @@ impl Engine for Supdb {
                 "supdb-tofit"
             } else {
                 "supdb-ingesttofit"
-            };
-        }
-        if self.prefetch1k {
-            return if self.partition {
-                "supdb-prefetch1k"
-            } else {
-                "supdb-ingestprefetch1k"
             };
         }
         if self.manifestrename {
@@ -16722,15 +16479,12 @@ pub fn guarantee(arm: &str) -> Option<Guarantee> {
         | "supdb-sealrun"
         | "supdb-closeinline"
         | "supdb-timers"
-        | "supdb-noprefetch"
-        | "supdb-dirplain"
         | "supdb-settlefar"
         | "supdb-tofit"
         | "supdb-cache256tofit"
         | "supdb-cache256tofitnotrim"
         | "supdb-cache256tofitnoshed"
         | "supdb-cache256tofitnosweep"
-        | "supdb-prefetch1k"
         | "supdb-manifestrename"
         | "supdb-manifestpending"
         | "supdb-populate"
@@ -16815,7 +16569,6 @@ pub fn guarantee(arm: &str) -> Option<Guarantee> {
         | "supdb-zhotaskidle"
         | "supdb-zhotgrowth5"
         | "supdb-zhotfillquiet"
-        | "supdb-scanrawahead"
         | "supdb-zrewarminstall"
         | "supdb-zhotresident"
         | "supdb-settlegated"
@@ -16824,12 +16577,6 @@ pub fn guarantee(arm: &str) -> Option<Guarantee> {
         | "supdb-ingestreadhashes"
         | "supdb-readnoahead"
         | "supdb-ingestreadnoahead"
-        | "supdb-formahead"
-        | "supdb-ingestformahead"
-        | "supdb-sparsespan"
-        | "supdb-ingestsparsespan"
-        | "supdb-runsheld"
-        | "supdb-ingestrunsheld"
         | "supdb-copyspan"
         | "supdb-ingestcopyspan"
         | "supdb-identityblob"
@@ -16842,8 +16589,6 @@ pub fn guarantee(arm: &str) -> Option<Guarantee> {
         | "supdb-ingestsettlesearch"
         | "supdb-settlesources"
         | "supdb-ingestsettlesources"
-        | "supdb-scanlevers"
-        | "supdb-ingestscanlevers"
         | "supdb-densefrom"
         | "supdb-ingestdensefrom"
         | "supdb-convert16"
@@ -16865,8 +16610,6 @@ pub fn guarantee(arm: &str) -> Option<Guarantee> {
         | "supdb-settlebuildsfiled"
         | "supdb-ingestsettlebuildsfiled"
         | "supdb-ingestpromote"
-        | "supdb-scanrawpaced"
-        | "supdb-noscanrawahead"
         | "supdb-zseekseed"
         | "supdb-zrecord"
         | "supdb-zhotcoldback"
@@ -17014,8 +16757,6 @@ pub fn guarantee(arm: &str) -> Option<Guarantee> {
         | "supdb-ingestsealrun"
         | "supdb-ingestcloseinline"
         | "supdb-ingesttimers"
-        | "supdb-ingestnoprefetch"
-        | "supdb-ingestdirplain"
         | "supdb-ingestsyncbeside"
         | "supdb-ingestsyncafter"
         | "supdb-ingestdirectfull"
@@ -17025,7 +16766,6 @@ pub fn guarantee(arm: &str) -> Option<Guarantee> {
         | "supdb-ingestruncreate"
         | "supdb-ingestsettlefar"
         | "supdb-ingesttofit"
-        | "supdb-ingestprefetch1k"
         | "supdb-ingestmanifestrename"
         | "supdb-ingestmanifestpending"
         | "supdb-ingestpopulate"
@@ -18070,18 +17810,6 @@ pub fn open(arm: &str, dir: &Path, map_gb: usize) -> Res<Box<dyn Engine>> {
         "supdb-memo64" => supdb_arm(Supdb::create_memo64, dir)?,
         "supdb-zhotaskidle" => supdb_arm(Supdb::create_zhotaskidle, dir)?,
         "supdb-zhotgrowth5" => supdb_arm(Supdb::create_zhotgrowth5, dir)?,
-        "supdb-noscanrawahead" => supdb_arm(
-            |d| {
-                Supdb::with_policy(
-                    d,
-                    Policy {
-                        noscanrawahead: true,
-                        ..Policy::default()
-                    },
-                )
-            },
-            dir,
-        )?,
         "supdb-ingestpromote" => supdb_arm(
             |d| {
                 Supdb::with_policy(
@@ -18354,84 +18082,6 @@ pub fn open(arm: &str, dir: &Path, map_gb: usize) -> Res<Box<dyn Engine>> {
             },
             dir,
         )?,
-        "supdb-formahead" => supdb_arm(
-            |d| {
-                Supdb::with_policy(
-                    d,
-                    Policy {
-                        formahead: true,
-                        ..Policy::default()
-                    },
-                )
-            },
-            dir,
-        )?,
-        "supdb-ingestformahead" => supdb_arm(
-            |d| {
-                Supdb::with_policy(
-                    d,
-                    Policy {
-                        partition: false,
-                        durable: false,
-                        formahead: true,
-                        ..Policy::default()
-                    },
-                )
-            },
-            dir,
-        )?,
-        "supdb-sparsespan" => supdb_arm(
-            |d| {
-                Supdb::with_policy(
-                    d,
-                    Policy {
-                        sparsespan: true,
-                        ..Policy::default()
-                    },
-                )
-            },
-            dir,
-        )?,
-        "supdb-ingestsparsespan" => supdb_arm(
-            |d| {
-                Supdb::with_policy(
-                    d,
-                    Policy {
-                        partition: false,
-                        durable: false,
-                        sparsespan: true,
-                        ..Policy::default()
-                    },
-                )
-            },
-            dir,
-        )?,
-        "supdb-runsheld" => supdb_arm(
-            |d| {
-                Supdb::with_policy(
-                    d,
-                    Policy {
-                        runsheld: true,
-                        ..Policy::default()
-                    },
-                )
-            },
-            dir,
-        )?,
-        "supdb-ingestrunsheld" => supdb_arm(
-            |d| {
-                Supdb::with_policy(
-                    d,
-                    Policy {
-                        partition: false,
-                        durable: false,
-                        runsheld: true,
-                        ..Policy::default()
-                    },
-                )
-            },
-            dir,
-        )?,
         "supdb-copyspan" => supdb_arm(
             |d| {
                 Supdb::with_policy(
@@ -18600,32 +18250,6 @@ pub fn open(arm: &str, dir: &Path, map_gb: usize) -> Res<Box<dyn Engine>> {
             },
             dir,
         )?,
-        "supdb-scanlevers" => supdb_arm(
-            |d| {
-                Supdb::with_policy(
-                    d,
-                    Policy {
-                        scanlevers: true,
-                        ..Policy::default()
-                    },
-                )
-            },
-            dir,
-        )?,
-        "supdb-ingestscanlevers" => supdb_arm(
-            |d| {
-                Supdb::with_policy(
-                    d,
-                    Policy {
-                        partition: false,
-                        durable: false,
-                        scanlevers: true,
-                        ..Policy::default()
-                    },
-                )
-            },
-            dir,
-        )?,
         "supdb-convert16" => supdb_arm(
             |d| {
                 Supdb::with_policy(
@@ -18722,30 +18346,6 @@ pub fn open(arm: &str, dir: &Path, map_gb: usize) -> Res<Box<dyn Engine>> {
                     d,
                     Policy {
                         zrewarminstall: true,
-                        ..Policy::default()
-                    },
-                )
-            },
-            dir,
-        )?,
-        "supdb-scanrawpaced" => supdb_arm(
-            |d| {
-                Supdb::with_policy(
-                    d,
-                    Policy {
-                        scanrawpaced: true,
-                        ..Policy::default()
-                    },
-                )
-            },
-            dir,
-        )?,
-        "supdb-scanrawahead" => supdb_arm(
-            |d| {
-                Supdb::with_policy(
-                    d,
-                    Policy {
-                        scanrawahead: true,
                         ..Policy::default()
                     },
                 )
@@ -19805,10 +19405,6 @@ pub fn open(arm: &str, dir: &Path, map_gb: usize) -> Res<Box<dyn Engine>> {
         "supdb-ingestcloseinline" => supdb_arm(Supdb::create_ingest_closeinline, dir)?,
         "supdb-timers" => supdb_arm(Supdb::create_timers, dir)?,
         "supdb-ingesttimers" => supdb_arm(Supdb::create_ingest_timers, dir)?,
-        "supdb-noprefetch" => supdb_arm(Supdb::create_noprefetch, dir)?,
-        "supdb-ingestnoprefetch" => supdb_arm(Supdb::create_ingest_noprefetch, dir)?,
-        "supdb-dirplain" => supdb_arm(Supdb::create_dirplain, dir)?,
-        "supdb-ingestdirplain" => supdb_arm(Supdb::create_ingest_dirplain, dir)?,
         "supdb-settlefar" => supdb_arm(Supdb::create_settlefar, dir)?,
         "supdb-ingestsettlefar" => supdb_arm(Supdb::create_ingest_settlefar, dir)?,
         "supdb-tofit" => supdb_arm(Supdb::create_tofit, dir)?,
@@ -19817,8 +19413,6 @@ pub fn open(arm: &str, dir: &Path, map_gb: usize) -> Res<Box<dyn Engine>> {
         "supdb-cache256tofitnotrim" => supdb_arm(Supdb::create_cache256_tofit_notrim, dir)?,
         "supdb-cache256tofitnoshed" => supdb_arm(Supdb::create_cache256_tofit_noshed, dir)?,
         "supdb-cache256tofitnosweep" => supdb_arm(Supdb::create_cache256_tofit_nosweep, dir)?,
-        "supdb-prefetch1k" => supdb_arm(Supdb::create_prefetch1k, dir)?,
-        "supdb-ingestprefetch1k" => supdb_arm(Supdb::create_ingest_prefetch1k, dir)?,
         "supdb-manifestrename" => supdb_arm(Supdb::create_manifestrename, dir)?,
         "supdb-manifestpending" => supdb_arm(Supdb::create_manifestpending, dir)?,
         "supdb-ingestmanifestrename" => supdb_arm(Supdb::create_ingest_manifestrename, dir)?,
@@ -21449,60 +21043,6 @@ mod tests {
         );
     }
 
-    /// `supdb-dirplain` and `supdb-ingestdirplain` are the policy with
-    /// `dirplain` alone set over their row's default, open under that
-    /// name, and the options they open the engine with differ from the
-    /// default's in `seek_prefetch_dir` alone on the scan's prefetch
-    /// path -- an arm sound only beside the default it is priced with
-    /// keeps that default's other settings (`CLAUDE.md`).
-    #[test]
-    fn the_dirplain_arms_differ_from_their_defaults_in_the_directory_hint_alone() {
-        let root =
-            std::env::temp_dir().join(format!("supdb-bench-dirplain-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&root);
-        for (name, buffered) in [("supdb-dirplain", false), ("supdb-ingestdirplain", true)] {
-            let d = root.join(name);
-            std::fs::create_dir_all(&d).unwrap();
-            let arm = if buffered {
-                Supdb::create_ingest_dirplain(&d)
-            } else {
-                Supdb::create_dirplain(&d)
-            }
-            .unwrap();
-            assert_eq!(arm.name(), name);
-            assert!(arm.dirplain && !arm.noprefetch && !arm.prefetch1k, "{name}");
-            let base_d = root.join(format!("{name}-base"));
-            std::fs::create_dir_all(&base_d).unwrap();
-            let base = if buffered {
-                Supdb::create_ingest(&base_d)
-            } else {
-                Supdb::create(&base_d)
-            }
-            .unwrap();
-            assert_eq!(arm.partition, base.partition, "{name}: the row's shape");
-            assert_eq!(arm.durable, base.durable, "{name}: the row's guarantee");
-            assert_eq!(arm.features(), base.features(), "{name}");
-            let (a, b) = (
-                arm.db.as_ref().unwrap().options(),
-                base.db.as_ref().unwrap().options(),
-            );
-            assert!(
-                !a.seek_prefetch_dir && b.seek_prefetch_dir,
-                "{name}: the one option"
-            );
-            assert_eq!(a.scan_prefetch, b.scan_prefetch, "{name}");
-            assert_eq!(a.scan_prefetch_bytes, b.scan_prefetch_bytes, "{name}");
-            drop(arm);
-            drop(base);
-            // The dispatch opens the arm by its name.
-            let opened_d = root.join(format!("{name}-open"));
-            std::fs::create_dir_all(&opened_d).unwrap();
-            let e = open(name, &opened_d, 1).unwrap();
-            assert_eq!(e.name(), name, "the dispatch");
-        }
-        let _ = std::fs::remove_dir_all(&root);
-    }
-
     /// `supdb-nocacheordread` is the nocache policy with `ordread` alone
     /// set over `supdb-nocache`: named, durable like it, opened under its
     /// name by the dispatch, and opened on options that differ from
@@ -21545,7 +21085,7 @@ mod tests {
         assert_eq!(arm.budget, base.budget);
         assert_eq!(arm.advice, base.advice);
         assert_eq!(arm.features(), base.features());
-        assert!(!arm.extsval && !arm.dirplain && !arm.forms && !arm.lazyforms);
+        assert!(!arm.extsval && !arm.forms && !arm.lazyforms);
         let (a, b) = (
             arm.db.as_ref().unwrap().options(),
             base.db.as_ref().unwrap().options(),
@@ -21555,8 +21095,6 @@ mod tests {
         assert_eq!(a.scan_block_cache, b.scan_block_cache);
         assert_eq!(a.scan_cache_bytes, b.scan_cache_bytes);
         assert_eq!(a.read_advice, b.read_advice);
-        assert_eq!(a.seek_prefetch_dir, b.seek_prefetch_dir);
-        assert_eq!(a.scan_prefetch, b.scan_prefetch);
         assert_eq!(a.inline_bytes, b.inline_bytes);
         assert_eq!(a.partition_bytes, b.partition_bytes);
         assert_eq!(a.seal_bytes, b.seal_bytes);
@@ -21680,7 +21218,7 @@ mod tests {
         assert_eq!(arm.budget, base.budget);
         assert_eq!(arm.advice, base.advice);
         assert_eq!(arm.features(), base.features());
-        assert!(!arm.ordread && !arm.extsval && !arm.dirplain && !arm.forms && !arm.lazyforms);
+        assert!(!arm.ordread && !arm.extsval && !arm.forms && !arm.lazyforms);
         let (a, b) = (
             arm.db.as_ref().unwrap().options(),
             base.db.as_ref().unwrap().options(),
@@ -21700,8 +21238,6 @@ mod tests {
         assert_eq!(a.scan_block_cache, b.scan_block_cache);
         assert_eq!(a.scan_cache_bytes, b.scan_cache_bytes);
         assert_eq!(a.read_advice, b.read_advice);
-        assert_eq!(a.seek_prefetch_dir, b.seek_prefetch_dir);
-        assert_eq!(a.scan_prefetch, b.scan_prefetch);
         assert_eq!(a.inline_bytes, b.inline_bytes);
         assert_eq!(a.partition_bytes, b.partition_bytes);
         assert_eq!(a.seal_bytes, b.seal_bytes);
@@ -22701,35 +22237,6 @@ mod tests {
             }
             {
                 let z = Supdb::with_policy(
-                    &dir("scanrawahead"),
-                    Policy {
-                        scanrawahead: true,
-                        ..Policy::default()
-                    },
-                )
-                .unwrap();
-                assert_eq!(z.name(), "supdb-scanrawahead");
-                assert_eq!(z.features(), base.features());
-                let o = z.db.as_ref().unwrap().options();
-                assert!(o.scan_raw_ahead && !o.scan_raw_ahead_past_llc);
-                assert!(b.scan_raw_ahead && b.scan_raw_ahead_past_llc);
-            }
-            {
-                let z = Supdb::with_policy(
-                    &dir("noscanrawahead"),
-                    Policy {
-                        noscanrawahead: true,
-                        ..Policy::default()
-                    },
-                )
-                .unwrap();
-                assert_eq!(z.name(), "supdb-noscanrawahead");
-                assert_eq!(z.features(), base.features());
-                let o = z.db.as_ref().unwrap().options();
-                assert!(!o.scan_raw_ahead && b.scan_raw_ahead);
-            }
-            {
-                let z = Supdb::with_policy(
                     &dir("zrewarminstall"),
                     Policy {
                         zrewarminstall: true,
@@ -22800,48 +22307,6 @@ mod tests {
                 let o = z.db.as_ref().unwrap().options();
                 assert!(!o.read_lines_ahead && b.read_lines_ahead);
                 assert!(o.read_hash_once);
-            }
-            {
-                let z = Supdb::with_policy(
-                    &dir("formahead"),
-                    Policy {
-                        formahead: true,
-                        ..Policy::default()
-                    },
-                )
-                .unwrap();
-                assert_eq!(z.name(), "supdb-formahead");
-                assert_eq!(z.features(), base.features());
-                let o = z.db.as_ref().unwrap().options();
-                assert!(o.scan_form_ahead && !b.scan_form_ahead);
-            }
-            {
-                let z = Supdb::with_policy(
-                    &dir("sparsespan"),
-                    Policy {
-                        sparsespan: true,
-                        ..Policy::default()
-                    },
-                )
-                .unwrap();
-                assert_eq!(z.name(), "supdb-sparsespan");
-                assert_eq!(z.features(), base.features());
-                let o = z.db.as_ref().unwrap().options();
-                assert!(o.scan_prefetch_sparse_span && !b.scan_prefetch_sparse_span);
-            }
-            {
-                let z = Supdb::with_policy(
-                    &dir("runsheld"),
-                    Policy {
-                        runsheld: true,
-                        ..Policy::default()
-                    },
-                )
-                .unwrap();
-                assert_eq!(z.name(), "supdb-runsheld");
-                assert_eq!(z.features(), base.features());
-                let o = z.db.as_ref().unwrap().options();
-                assert!(o.scan_runs_held && !b.scan_runs_held);
             }
             {
                 let z = Supdb::with_policy(
@@ -23160,20 +22625,6 @@ mod tests {
             }
             {
                 let z = Supdb::with_policy(
-                    &dir("scanlevers"),
-                    Policy {
-                        scanlevers: true,
-                        ..Policy::default()
-                    },
-                )
-                .unwrap();
-                assert_eq!(z.name(), "supdb-scanlevers");
-                assert_eq!(z.features(), base.features());
-                let o = z.db.as_ref().unwrap().options();
-                assert!(o.scan_form_ahead && o.scan_prefetch_sparse_span && o.scan_runs_held);
-            }
-            {
-                let z = Supdb::with_policy(
                     &dir("settlebuildsfiled"),
                     Policy {
                         settlebuildsfiled: true,
@@ -23185,21 +22636,6 @@ mod tests {
                 assert_eq!(z.features(), base.features());
                 let o = z.db.as_ref().unwrap().options();
                 assert!(o.forms_settle_builds_filed && !b.forms_settle_builds_filed);
-            }
-            {
-                let z = Supdb::with_policy(
-                    &dir("scanrawpaced"),
-                    Policy {
-                        scanrawpaced: true,
-                        ..Policy::default()
-                    },
-                )
-                .unwrap();
-                assert_eq!(z.name(), "supdb-scanrawpaced");
-                assert_eq!(z.features(), base.features());
-                let o = z.db.as_ref().unwrap().options();
-                assert!(o.scan_raw_ahead && o.scan_raw_ahead_lead == 1024);
-                assert!(!o.scan_raw_ahead_past_llc && b.scan_raw_ahead_lead == 0);
             }
             {
                 let z = Supdb::create_zfilterahead(&dir("zfilterahead")).unwrap();
@@ -25996,7 +25432,7 @@ mod tests {
             }
             .unwrap();
             assert_eq!(arm.name(), name);
-            assert!(arm.settlefar && !arm.dirplain && !arm.lazyforms, "{name}");
+            assert!(arm.settlefar && !arm.lazyforms, "{name}");
             let base_d = root.join(format!("{name}-base"));
             std::fs::create_dir_all(&base_d).unwrap();
             let base = if buffered {

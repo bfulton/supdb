@@ -20825,22 +20825,18 @@ fn a_landing_makes_a_fresh_table_only_where_it_installs_one() {
 }
 
 /// A scan's seek hints the directory lines of its stride window and the
-/// record hint estimates its span (`Options::seek_prefetch_dir`); both
-/// are hints, so every answer is the same with them and without, over the
-/// starts that put the window at the index's edges: a key in the last
-/// stride, the last key, above every key, below every key, and from the
-/// empty key, on a partitioned run of many strides, a one-key partition
-/// and an empty store, at a limit of `usize::MAX` -- the span a hint once
-/// wrapped on. Through the writer and through a handle.
+/// record hint estimates its span; both are hints, so every answer is the
+/// store's own, over the starts that put the window at the index's edges:
+/// a key in the last stride, the last key, above every key, below every
+/// key, and from the empty key, on a partitioned run of many strides, a
+/// one-key partition and an empty store, at a limit of `usize::MAX` --
+/// the span a hint once wrapped on. Through the writer and through a
+/// handle.
 #[test]
-fn a_scans_answers_are_the_same_with_the_directory_hint_and_without() {
-    let build = |name: &str, hint: bool, keys: u32| -> (PathBuf, Db) {
-        let d = dir(&format!("{name}-{}", if hint { "hint" } else { "plain" }));
-        let opts = Options {
-            seek_prefetch_dir: hint,
-            ..common::options()
-        };
-        let mut db = Db::create(&d, opts).unwrap();
+fn a_scans_answers_from_its_seeks_window_edges_are_the_stores_own() {
+    let build = |name: &str, keys: u32| -> (PathBuf, Db) {
+        let d = dir(name);
+        let mut db = Db::create(&d, common::options()).unwrap();
         for k in 0..keys {
             db.append(format!("key-{k:06}").as_bytes(), format!("v{k}").as_bytes());
         }
@@ -20870,8 +20866,7 @@ fn a_scans_answers_are_the_same_with_the_directory_hint_and_without() {
         ("dirhint-one", 1),
         ("dirhint-empty", 0),
     ] {
-        let (_da, a) = build(name, true, keys);
-        let (_db, b) = build(name, false, keys);
+        let (_d, a) = build(name, keys);
         let last = keys.saturating_sub(1);
         let starts: Vec<Vec<u8>> = vec![
             Vec::new(),
@@ -20883,34 +20878,24 @@ fn a_scans_answers_are_the_same_with_the_directory_hint_and_without() {
             b"zzz".to_vec(),
         ];
         let ra = a.reader().unwrap();
-        let rb = b.reader().unwrap();
         for from in &starts {
-            let want = (0..keys)
-                .filter(|k| format!("key-{k:06}").as_bytes() >= from.as_slice())
-                .count();
-            let (na, ga) = scan_all(&a, from.as_slice());
-            let (nb, gb) = scan_all(&b, from.as_slice());
+            let want: Seen = (0..keys)
+                .map(|k| {
+                    (
+                        format!("key-{k:06}").into_bytes(),
+                        format!("v{k}").into_bytes(),
+                    )
+                })
+                .filter(|(k, _)| k.as_slice() >= from.as_slice())
+                .collect();
+            let (n, got) = scan_all(&a, from.as_slice());
             assert_eq!(
-                na,
-                want,
-                "{name}: the count from {:?}",
+                (n, &got),
+                (want.len(), &want),
+                "{name}: the writer from {:?}",
                 String::from_utf8_lossy(from)
             );
-            assert_eq!(
-                (na, &ga),
-                (nb, &gb),
-                "{name}: the writer, hint against none"
-            );
-            assert_eq!(
-                scan_all(&ra, from.as_slice()),
-                (na, ga.clone()),
-                "{name}: a handle with the hint"
-            );
-            assert_eq!(
-                scan_all(&rb, from.as_slice()),
-                (nb, gb),
-                "{name}: a handle without"
-            );
+            assert_eq!(scan_all(&ra, from.as_slice()), (n, got), "{name}: a handle");
         }
     }
 }
@@ -21031,76 +21016,6 @@ fn a_seek_counts_its_directory_hint_once_a_scan_and_the_threads_pass_none() {
     );
     assert_eq!(live.dir_prefetches(), crossed, "and none on the handle");
     std::hint::black_box(sink);
-}
-
-/// The directory hint is the reader's: a store written with it and one
-/// without leave the same segment and the same ordered index, byte for
-/// byte, so the magic does not move (`Options::seek_prefetch_dir`).
-#[test]
-fn the_directory_hint_writes_the_segment_and_the_ordered_index_the_default_does() {
-    let mut files: Vec<BTreeMap<String, Vec<u8>>> = Vec::new();
-    for hint in [true, false] {
-        let d = dir(if hint {
-            "dirhint-files"
-        } else {
-            "dirplain-files"
-        });
-        let opts = Options {
-            seek_prefetch_dir: hint,
-            ..common::files(common::options())
-        };
-        let mut db = Db::create(&d, opts).unwrap();
-        for c in 0u32..3000 {
-            let k = format!("k{:04}", (c * 7919) % 2500);
-            db.append(k.as_bytes(), &c.to_le_bytes());
-            if c % 97 == 0 {
-                db.delete(k.as_bytes());
-            }
-            if c % 50 == 49 {
-                db.commit().unwrap();
-            }
-        }
-        db.flush().unwrap();
-        // A scan each way, so the hint ran over what it reads.
-        let mut n = 0usize;
-        db.scan(b"k1000", 100, kv(&mut |_, _| n += 1)).unwrap();
-        assert!(n > 0);
-        drop(db);
-        let mut m = BTreeMap::new();
-        for e in std::fs::read_dir(&d).unwrap() {
-            let p = e.unwrap().path();
-            let name = p.file_name().unwrap().to_str().unwrap().to_string();
-            if name.ends_with(".sup") || name.ends_with(".oidx") || name.starts_with("ord-") {
-                m.insert(name, std::fs::read(&p).unwrap());
-            }
-        }
-        assert!(
-            m.keys().any(|n| n.ends_with(".sup")),
-            "the flush sealed a segment"
-        );
-        assert!(
-            m.keys()
-                .any(|n| n.ends_with(".oidx") || n.starts_with("ord-")),
-            "with its ordered index"
-        );
-        files.push(m);
-    }
-    let (a, b) = (&files[0], &files[1]);
-    assert_eq!(
-        a.keys().collect::<Vec<_>>(),
-        b.keys().collect::<Vec<_>>(),
-        "the same files"
-    );
-    // A segment's superblock carries the second its finish landed in, and
-    // a checksum over it, in each slot: two seals that straddle a second
-    // differ in those and nowhere else (`without_the_clock`).
-    for (name, bytes) in a {
-        let first = first_difference(name, bytes, &b[name]);
-        assert!(
-            first.is_none(),
-            "{name} differs between the two, first at {first:?}"
-        );
-    }
 }
 
 /// Under the idle seals (`seal_idle`) a commit in a stretch nobody reads

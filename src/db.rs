@@ -3743,64 +3743,6 @@ pub struct Options {
     /// keys under 1.25 GiB, 6.5 groups opened a scan where the scan spans
     /// 2.7. `supdb-norunbuilds` is the run that stops.
     pub scan_run_builds: bool,
-    /// A block walk prefetches the lines it is about to read -- the
-    /// form's, or the partition's records over the ranks the scan will
-    /// take -- and the next block's where the scan will cross into it.
-    /// Issuing them was 6% of ycsb-E's time at ten thousand keys, scans
-    /// of fifty over blocks a zipfian mix keeps warm, and taking them
-    /// away there read E 1.04x (unresolved) and the lag passes 1.0-1.09x;
-    /// at three hundred thousand keys, where the store is past the
-    /// cache, the lag passes read 0.80-0.93x and E 0.97x without them,
-    /// 12/12 and 11/12. So they stay; `supdb-noprefetch` and
-    /// `supdb-ingestnoprefetch` are the arm that priced them. The scrambled
-    /// E mix's profile puts a sixth of its thread on the prefetch's own
-    /// instructions at thirty thousand keys, three times the unscrambled
-    /// E's, and those samples are the lines arriving: without the prefetch
-    /// the buffered arm read the scrambled E 0.84x and 0.95x there and
-    /// 0.69x and 0.65x at three hundred thousand, E 0.83x and 0.82x and the
-    /// threaded scans beside the mixes 0.75x at the larger store (`pair.sh
-    /// supdb-ingest supdb-ingestnoprefetch 300000 --reps 8`, at `c703ab1`).
-    pub scan_prefetch: bool,
-    /// How far into the partition's records a walk's prefetch reaches,
-    /// in bytes from the walk's first record: the lines are asked for at
-    /// once, and a core holds a dozen or so line fills in flight, so a
-    /// span of sixty-four lines stalls the asking thread on the fills it
-    /// cannot start -- a tenth of ycsb-E's samples at a hundred thousand
-    /// keys sat on the prefetch instructions themselves. 4096 is the span
-    /// the rows have measured, and a kilobyte read E 1.02x at a hundred
-    /// thousand keys with the drained lag point 0.87x, and the plain scan
-    /// 0.85x at three hundred thousand: no direction held at both rungs.
-    /// `supdb-prefetch1k` and `supdb-ingestprefetch1k` ask for a kilobyte.
-    pub scan_prefetch_bytes: usize,
-    /// EXPERIMENT, refuted: a scan's seek, at the moment the ordered
-    /// index's top level names the stride its answer lies in, asks for the
-    /// form headers of the two blocks that stride spans in the handle's
-    /// table: the first block's form is the scan's next dependent load
-    /// after the seek, a cold line on the scrambled E's spread starts, and
-    /// the second the one the next block's prefetch reads its buffers
-    /// through. With `scan_prefetch_sparse_span` and `scan_runs_held` it
-    /// read the scrambled E 1.00x in six pairs at a hundred thousand keys
-    /// (`supdb-scanlevers`): the scan's stalls there are the lines the
-    /// walk needs, which it executes 5% fewer instructions over than LMDB
-    /// does. `supdb-formahead` is the arm.
-    pub scan_form_ahead: bool,
-    /// EXPERIMENT, refuted with `scan_form_ahead`: a sparse form's buffers
-    /// asked for ahead of its walk only over the part the walk's ranks
-    /// reach, by proportion of the block's sixty-four ranks with two
-    /// entries of margin, where the whole form was asked for: a scan of
-    /// fifty takes about a third of the block after its first. The entries
-    /// and keys a walk's first block searches are asked for whole.
-    /// `supdb-sparsespan` is the arm.
-    pub scan_prefetch_sparse_span: bool,
-    /// EXPERIMENT, refuted with `scan_form_ahead`: a partition walk's runs
-    /// over the raw records through one walker, the record regions resolved
-    /// once for the partition's walk (`Blob::run_walk`), where each run
-    /// resolved the flat index, its regions and the form file's gate again:
-    /// a sparse walk is six runs a scan on the scrambled E, about 190
-    /// instructions of setup each. Not where the raw records are asked for
-    /// ahead (`Options::scan_raw_ahead`), which keeps its own path.
-    /// `supdb-runsheld` is the arm.
-    pub scan_runs_held: bool,
     /// A block wide by its count of keys above the partition -- the last
     /// block, where every insert past the store's greatest key lands --
     /// copied once its walks have paid for the copy, and the copy kept past
@@ -3843,22 +3785,6 @@ pub struct Options {
     /// `supdb-ingestwidecopyfixed`.
     #[doc(hidden)]
     pub forms_copy_wide_priced: bool,
-    /// A scan's seek asks for the partition's directory words of the
-    /// stride window its answer lies in at the moment it asks for the
-    /// stride's heads, and the record hint after it estimates its span
-    /// from the index's mean record length rather than reading the
-    /// directory word at the span's end. A scan's start was three fills
-    /// one behind the other -- the stride's heads, then the directory
-    /// word the record hint had to read before it could issue anything,
-    /// then the first record -- and the window is known before a head is
-    /// read, so the directory's fill rides the heads' and the chain is
-    /// two. The directory is an L3 fill at every quick rung from thirty
-    /// thousand keys and L2-resident at ten thousand, so the regime the
-    /// hint is for is every rung but the smallest. Under `scan_prefetch`
-    /// off nothing issues either way. `supdb-dirplain` and
-    /// `supdb-ingestdirplain` are the arm with the shape before: no
-    /// window hint, and the record hint's two directory reads.
-    pub seek_prefetch_dir: bool,
     /// PROTOTYPE: the partitions' blocks below which no builder starts.
     /// Measured on the probe's E, six rounds interleaved, the builder
     /// against none: at ten thousand keys, 160 blocks, 310k-351k against
@@ -4307,7 +4233,8 @@ pub struct Options {
     pub forms_settle_builds_filed: bool,
     /// EXPERIMENT: `forms_settle_every` and `forms_settle_builds` apply only
     /// where the partitions' key and value bytes pass the last-level cache
-    /// (`llc_bytes`), as `scan_raw_ahead` does. They were priced at three
+    /// (`llc_bytes`), as a raw walk's ask ahead does (`Shared::raw_ahead`).
+    /// They were priced at three
     /// million keys and up, where a scan's first settle of the write mixes'
     /// keys is misses; in a store the cache holds that settle is cheap and
     /// the filing is the writer's cost alone: the buffered arm's one-percent
@@ -7369,58 +7296,11 @@ pub struct Options {
     /// through the threaded scans where the default held eight, and the
     /// three-thread scans read 1.03x and 1.01x: on three threads a raw
     /// entry cost most of a decoded one, its walk stalled on the record
-    /// lines (`scan_raw_ahead`); the threaded reads read 1.11x and 1.15x,
+    /// lines (`Shared::raw_ahead`); the threaded reads read 1.11x and 1.15x,
     /// and F 0.83x and 0.87x for the give-backs the write mixes take. Off;
     /// `supdb-zhotfillquiet` turns it on.
     #[doc(hidden)]
     pub zpages_hot_fill_quiet: bool,
-    /// A walk of a partition's raw records in one run -- the drained
-    /// store's one walk from the seek (`cache_scan`) and a run of the merge
-    /// path's walk (`part_scan_z`) where no form file serves -- asks for the
-    /// run's records ahead of it (`Blob::prefetch_ranks`, at most
-    /// `SCAN_RAW_AHEAD_CAP` bytes), as a block walk asks for the next
-    /// block's, where the records are past the cache
-    /// (`scan_raw_ahead_past_llc`). The walk asked for nothing: on three
-    /// threads at ten million keys under 1.25 GiB two thirds of its samples
-    /// were on the load of a record's header, and a raw entry cost 55 ns
-    /// against a decoded one's 65. Paired there in the row's whole order
-    /// (`pair.sh supdb supdb-scanrawahead 10000000 --bound 1342177280
-    /// --passes
-    /// load,read,read-threaded,scan,scan-threaded,mixes,scan-mixed,mixes-scrambled
-    /// --ops-div 10 --reps 4`, at `0b89622`) the threaded scans read
-    /// 1.03-1.07x with the cells it cannot reach leaning 3-5% the other way
-    /// in one sitting; in core at three million keys (`pair.sh supdb
-    /// supdb-scanrawahead 3000000 --reps 6`) the scan passes read
-    /// 1.31-1.48x and the drained store's lag point 1.35x and 1.56x. At
-    /// three hundred thousand keys, whose records the cache holds, the
-    /// threaded scans read 0.84-0.90x: the asks waited for fill buffers on
-    /// lines the walk would have found in the cache. Paced through the walk
-    /// (`scan_raw_ahead_lead`) it read no better. `supdb-noscanrawahead`
-    /// walks without it.
-    #[doc(hidden)]
-    pub scan_raw_ahead: bool,
-    /// Under `scan_raw_ahead`, ask only where the partitions' key and value
-    /// bytes pass the last-level cache the platform reports (`llc_bytes`,
-    /// read once): within it the records a walk reads are the cache's, and
-    /// asked for they cost the threaded scans at three hundred thousand
-    /// keys a tenth. `supdb-scanrawahead` asks whatever the store's size.
-    #[doc(hidden)]
-    pub scan_raw_ahead_past_llc: bool,
-    /// EXPERIMENT: under `scan_raw_ahead`, the records asked for as the
-    /// walk goes, this many bytes ahead of the record being read
-    /// (`Blob::scan_at_paced`), where zero asks for the run's whole span
-    /// at its start. Asked all at once, the run's two hundred lines waited
-    /// for fill buffers before the walk began: a third of the time the
-    /// ask saved, on three threads at ten million keys under 1.25 GiB.
-    /// Paced a kilobyte ahead against the run asked at its start (`pair.sh
-    /// supdb-scanrawahead supdb-scanrawpaced 10000000 --bound 1342177280`
-    /// in the row's whole order, at `f933e14`) the three-thread scans read
-    /// 0.98x and 1.03x with the cells it cannot reach leaning 2% and 7%
-    /// its way, and the one-thread scan pass 0.85x and 0.90x: the check and
-    /// the ask on every record cost what the wait they spread had. Zero;
-    /// `supdb-scanrawpaced` sets a kilobyte.
-    #[doc(hidden)]
-    pub scan_raw_ahead_lead: usize,
     /// The hot-raw policy's way back -- a raw partition's form file attached
     /// again, at the fill, a swap or the cold way back -- in the release's
     /// two steps: the form file's pages asked of the kernel at one look
@@ -8257,19 +8137,13 @@ impl Default for Options {
             scan_cache_copies_fit: true,
             scan_cache_ahead: true,
             scan_run_builds: true,
-            scan_prefetch: true,
-            scan_prefetch_bytes: 4096,
-            scan_form_ahead: false,
             forms_convert_from: 4,
             forms_convert_reads: 0,
             forms_convert_at_walk: false,
             forms_convert_light_writer: false,
             forms_convert_light_yields: false,
-            scan_prefetch_sparse_span: false,
-            scan_runs_held: false,
             forms_copy_hot_wide: true,
             forms_copy_wide_priced: true,
-            seek_prefetch_dir: true,
             scan_cache_ahead_min_blocks: 1024,
             ahead_out_of_core: true,
             ahead_resident_pct: 90,
@@ -8452,9 +8326,6 @@ impl Default for Options {
             zpages_hot_growth_pct: 10,
             zpages_hot_fill_quiet: false,
             zpages_hot_fill_resident_first: false,
-            scan_raw_ahead: true,
-            scan_raw_ahead_past_llc: true,
-            scan_raw_ahead_lead: 0,
             zpages_seek_seeds: false,
             sweep_remembers_pin: true,
             copy_prefetch_whole: false,
@@ -25537,12 +25408,6 @@ fn copy_entry_at(table: &BlockTable, b: u32, cut: u32) -> Option<(&CachedBlock, 
     (blk.identity_for(table.keyseq) && j < blk.len()).then_some((blk, j))
 }
 
-/// The lines a walk of `form` over the partition's ranks `from` to `n`
-/// on will read, asked for ahead of it: the form's own, and for a form
-/// walked in the partition the records' span, its end read from the
-/// directory or, with `estimate`, put at the mean record length times
-/// the ranks (`Options::seek_prefetch_dir`), since the read is a load
-/// the hint waits for before it can issue.
 /// The prefetch of a copy block paced through the walk of the block before
 /// it (`Options::scan_prefetch_paced`): its three buffers, each asked for
 /// `PACE_BYTES` at a step, a step every `PACE_STEP` entries of the walk,
@@ -25608,6 +25473,25 @@ impl Pace {
     }
 }
 
+/// How far into the partition's records a walk's prefetch reaches, in
+/// bytes from the walk's first record: the lines are asked for at once,
+/// and a core holds a dozen or so line fills in flight, so a span of
+/// sixty-four lines stalls the asking thread on the fills it cannot start
+/// -- a tenth of ycsb-E's samples at a hundred thousand keys sat on the
+/// prefetch instructions themselves. 4096 is the span the rows have
+/// measured, and a kilobyte read E 1.02x at a hundred thousand keys with
+/// the drained lag point 0.87x, and the plain scan 0.85x at three hundred
+/// thousand: no direction held at both rungs.
+const SCAN_PREFETCH_BYTES: usize = 4096;
+
+/// The lines a walk of `form` over the partition's ranks `from` to `n`
+/// on will read, asked for ahead of it: the form's own, and for a form
+/// walked in the partition the records' span, its end put at the mean
+/// record length times the ranks, since a read of the directory is a load
+/// the hint waits for before it can issue. Issuing them was 6% of ycsb-E's
+/// time at ten thousand keys; at three hundred thousand keys, where the
+/// store is past the cache, the lag passes read 0.80-0.93x and E 0.97x
+/// without them.
 #[allow(clippy::too_many_arguments)]
 fn prefetch_block(
     blob: Option<&Blob<MmapBytes>>,
@@ -25615,10 +25499,7 @@ fn prefetch_block(
     at: Option<usize>,
     from: usize,
     n: usize,
-    cap: usize,
-    estimate: bool,
     whole: bool,
-    sparse_span: bool,
     copy_span: Option<bool>,
     packed_at: Option<(usize, bool)>,
 ) {
@@ -25628,11 +25509,7 @@ fn prefetch_block(
     // span needs is a touch of the raw index.
     let ranks = || {
         let Some(blob) = blob else { return };
-        if estimate {
-            blob.prefetch_ranks_est(from, n, cap);
-        } else {
-            blob.prefetch_ranks(from, n, cap);
-        }
+        blob.prefetch_ranks_est(from, n, SCAN_PREFETCH_BYTES);
     };
     match form {
         // An identity copy walked from the entry `at` names is prefetched
@@ -25660,11 +25537,7 @@ fn prefetch_block(
             _ => blk.prefetch(whole),
         },
         Cached::Sparse(sb) => {
-            if sparse_span {
-                sb.prefetch_span(from % CACHE_BLOCK, n);
-            } else {
-                sb.prefetch();
-            }
+            sb.prefetch();
             ranks();
         }
         Cached::Clean => ranks(),
@@ -25855,39 +25728,6 @@ impl SparseBlock {
         );
         prefetch_lines(self.keys.as_ptr(), self.keys.len());
         prefetch_lines(self.vals.as_ptr(), self.vals.len().min(1024));
-    }
-    /// `prefetch` over the part a walk of `n` ranks from rank `off` of the
-    /// block reads (`Options::scan_prefetch_sparse_span`): the deltas are
-    /// taken as spread evenly over the block's ranks, which the entries
-    /// cannot be asked where they are without being read, so the span is
-    /// their share of the walk's ranks with two entries' margin each side,
-    /// and the keys and values the same share of their buffers. A walk
-    /// from inside the block searches its entries by key first, so there
-    /// the entries and keys are asked for whole; a walk from the block's
-    /// start reads them in order from the first.
-    fn prefetch_span(&self, off: usize, n: usize) {
-        let len = self.ents.len();
-        if len == 0 {
-            return;
-        }
-        let a = off.min(CACHE_BLOCK);
-        let z = off.saturating_add(n).min(CACHE_BLOCK);
-        let i0 = (len * a / CACHE_BLOCK).saturating_sub(2);
-        let i1 = ((len * z).div_ceil(CACHE_BLOCK) + 2).min(len);
-        let ent = std::mem::size_of::<DeltaEnt>();
-        let share = |bytes: usize, i: usize| bytes * i / len;
-        if off > 0 {
-            prefetch_lines(self.ents.as_ptr() as *const u8, len * ent);
-            prefetch_lines(self.keys.as_ptr(), self.keys.len());
-        } else {
-            prefetch_lines(self.ents.as_ptr() as *const u8, i1 * ent);
-            prefetch_lines(self.keys.as_ptr(), share(self.keys.len(), i1));
-        }
-        if i0 < i1 {
-            let (v0, v1) = (share(self.vals.len(), i0), share(self.vals.len(), i1));
-            // SAFETY: `v0 <= v1 <= vals.len()`, so the span lies in the buffer.
-            prefetch_lines(unsafe { self.vals.as_ptr().add(v0) }, (v1 - v0).min(1024));
-        }
     }
     fn key(&self, e: &DeltaEnt) -> &[u8] {
         &self.keys[e.key.0 as usize..(e.key.0 + e.key.1) as usize]
@@ -26401,9 +26241,12 @@ const SETTLE_PLANS: usize = 16;
 const WILLNEED_CAP: usize = 64 << 10;
 
 /// Whether a raw walk asks for its records ahead of it, for a store whose
-/// partitions hold `data_bytes` of keys and values (`Shared::raw_ahead`).
-fn raw_ahead_on(opts: &Options, data_bytes: u64) -> bool {
-    opts.scan_raw_ahead && (!opts.scan_raw_ahead_past_llc || data_bytes > llc_bytes())
+/// partitions hold `data_bytes` of keys and values (`Shared::raw_ahead`):
+/// where they pass the last-level cache the platform reports. Within it the
+/// records a walk reads are the cache's, and asked for they cost the
+/// threaded scans at three hundred thousand keys a tenth.
+fn raw_ahead_on(data_bytes: u64) -> bool {
+    data_bytes > llc_bytes()
 }
 
 /// Whether write-time filing applies to a store whose partitions hold
@@ -26413,7 +26256,7 @@ fn settle_write_on(opts: &Options, data_bytes: u64) -> bool {
 }
 
 /// The last-level cache's bytes as the platform reports them, read once:
-/// the line `Options::scan_raw_ahead_past_llc` draws, past which a raw
+/// the line `raw_ahead_on` draws, past which a raw
 /// walk's records come from memory rather than the cache. The size of the
 /// highest-level data or unified cache under
 /// `/sys/devices/system/cpu/cpu0/cache`, and 32 MiB where nothing says.
@@ -26473,30 +26316,17 @@ mod raw_ahead_tests {
         assert!(llc_bytes() > 0);
     }
 
-    /// The ask is the option's, and past the cache only where the option
-    /// for the line says so: a store within the cache walks without it.
+    /// The ask is past the cache alone: a store within the cache walks
+    /// without it.
     #[test]
     fn a_raw_walk_asks_ahead_only_past_the_cache() {
-        let o = Options::default();
-        assert!(o.scan_raw_ahead && o.scan_raw_ahead_past_llc);
-        assert!(!raw_ahead_on(&o, 0));
-        assert!(!raw_ahead_on(&o, llc_bytes()));
-        assert!(raw_ahead_on(&o, llc_bytes() + 1));
-        let always = Options {
-            scan_raw_ahead_past_llc: false,
-            ..Options::default()
-        };
-        assert!(raw_ahead_on(&always, 0));
-        let never = Options {
-            scan_raw_ahead: false,
-            scan_raw_ahead_past_llc: false,
-            ..Options::default()
-        };
-        assert!(!raw_ahead_on(&never, u64::MAX));
+        assert!(!raw_ahead_on(0));
+        assert!(!raw_ahead_on(llc_bytes()));
+        assert!(raw_ahead_on(llc_bytes() + 1));
     }
 }
 
-/// The most of a raw walk's records `Options::scan_raw_ahead` asks for at
+/// The most of a raw walk's records `Reader::raw_scan` asks for at
 /// its start: a scan of a hundred of the suite's records is thirteen
 /// kilobytes, and a walk past this much has the hardware's own stream.
 const SCAN_RAW_AHEAD_CAP: usize = 16 << 10;
@@ -26889,9 +26719,8 @@ struct Shared {
     /// (`Options::blocks_pool_bytes`), turned off with the gate.
     block_pool: Option<std::sync::Arc<blocks::BlockPool>>,
     /// Whether a raw walk asks for its records ahead of it
-    /// (`Options::scan_raw_ahead`): the option, and the partitions' key and
-    /// value bytes past the last-level cache where
-    /// `Options::scan_raw_ahead_past_llc` says so. Set at the open and at
+    /// (`raw_ahead_on`): the partitions' key and value bytes past the
+    /// last-level cache. Set at the open and at
     /// every segment publish, beside `State::data_bytes`, and read relaxed:
     /// a hint a walk takes or leaves.
     raw_ahead: std::sync::atomic::AtomicBool,
@@ -28993,7 +28822,7 @@ struct FormsState {
     /// The wide walks this handle made (`Db::wide_walks`).
     wide_walks: std::cell::Cell<u64>,
     /// Seeks whose stride window's directory lines were asked for ahead
-    /// of the heads' read (`Options::seek_prefetch_dir`), the window
+    /// of the heads' read (`Reader::scan_seek`), the window
     /// empty or not: one a scan's start on the block path.
     dir_prefetches: std::cell::Cell<u64>,
     /// Scans that started a copy walk at the seek's rank, and that
@@ -34076,9 +33905,11 @@ impl Reader {
     }
 
     /// A walk of `n` of the partition's raw records from `rank`, with its
-    /// records asked for ahead of it where `Options::scan_raw_ahead` says
-    /// so: paced through the walk at `scan_raw_ahead_lead` bytes, or the
-    /// run's span at its start, at most `SCAN_RAW_AHEAD_CAP` bytes.
+    /// records asked for ahead of it where the store is past the cache
+    /// (`Shared::raw_ahead`): the run's span at its start, at most
+    /// `SCAN_RAW_AHEAD_CAP` bytes. On three threads at ten million keys
+    /// under 1.25 GiB two thirds of an unasked walk's samples were on the
+    /// load of a record's header.
     #[inline]
     fn raw_scan<F: FnMut(&[u8], &[u8])>(
         &self,
@@ -34091,20 +33922,10 @@ impl Reader {
         // Through `scan_either`, which takes the walk by the piece where a
         // source lends by the piece refuses the walk over a section held
         // whole (`Blob::scan_whole`), in the branch a refused walk takes:
-        // a store under a cipher's segments (`Bytes::piecewise`). The paced
-        // walk refuses such a source as well, before it walks.
+        // a store under a cipher's segments (`Bytes::piecewise`).
         let r = if n > 1 && self.shared.raw_ahead.load(AtomicOrdering::Relaxed) {
-            if self.opts.scan_raw_ahead_lead > 0 {
-                match blob.scan_at_paced(rank, n, self.opts.scan_raw_ahead_lead, &mut *f) {
-                    Err(e) if e.kind() == std::io::ErrorKind::Unsupported => {
-                        blob.scan_either(rank, n, &mut *f)
-                    }
-                    r => r,
-                }
-            } else {
-                blob.prefetch_ranks(rank, n, SCAN_RAW_AHEAD_CAP);
-                blob.scan_either(rank, n, &mut *f)
-            }
+            blob.prefetch_ranks(rank, n, SCAN_RAW_AHEAD_CAP);
+            blob.scan_either(rank, n, &mut *f)
         } else {
             blob.scan_either(rank, n, &mut *f)
         };
@@ -34199,14 +34020,13 @@ impl Reader {
         seg: &'a Seg,
         cursor: &[u8],
         on: bool,
-        ahead: Option<usize>,
     ) -> (usize, bool, Option<zfile::ZCursor<'a>>) {
         if self.opts.zpages_seek_seeds && self.opts.zpages_scan_cursor && on {
             if let Some(seeded) = self.scan_seek_by_cursor(seg, cursor) {
                 return seeded;
             }
         }
-        let (rank, same) = self.scan_seek(seg, cursor, ahead);
+        let (rank, same) = self.scan_seek(seg, cursor);
         (rank, same, None)
     }
 
@@ -34226,11 +34046,15 @@ impl Reader {
     }
 
     /// The rank of the first of `seg`'s keys not below `cursor`, and
-    /// whether it is `cursor`; with `ahead` the partition's index in the
-    /// handle's tables, whose forms for the stride the seek's answer lies
-    /// in are asked for once the top level names it
-    /// (`Options::scan_form_ahead`).
-    fn scan_seek(&self, seg: &Seg, cursor: &[u8], ahead: Option<usize>) -> (usize, bool) {
+    /// whether it is `cursor`. The seek asks for the partition's directory
+    /// words of the stride window its answer lies in at the moment it asks
+    /// for the stride's heads, and the record hint after it estimates its
+    /// span from the index's mean record length: a scan's start was three
+    /// fills one behind the other -- the stride's heads, the directory word
+    /// the record hint had to read, the first record -- and the window is
+    /// known before a head is read, so the directory's fill rides the
+    /// heads' and the chain is two.
+    fn scan_seek(&self, seg: &Seg, cursor: &[u8]) -> (usize, bool) {
         if self.zc(seg).is_some() {
             return self.cache_seek_exact(seg, cursor, 0);
         }
@@ -34239,33 +34063,13 @@ impl Reader {
             cursor,
             |r| seg.raw().key_at(r),
             |lo, hi| {
-                if self.opts.scan_prefetch && self.opts.seek_prefetch_dir {
-                    seg.raw().prefetch_dir(lo, hi - lo + 1);
-                    let fs = self.fs();
-                    fs.dir_prefetches.set(fs.dir_prefetches.get() + 1);
-                }
-                if let Some(pi) = ahead {
-                    self.prefetch_form_heads(pi, lo / CACHE_BLOCK);
-                }
+                seg.raw().prefetch_dir(lo, hi - lo + 1);
+                let fs = self.fs();
+                fs.dir_prefetches.set(fs.dir_prefetches.get() + 1);
             },
         );
         let same = rank < keys && exact.unwrap_or_else(|| seg.raw().key_at(rank) == Some(cursor));
         (rank, same)
-    }
-
-    /// The form headers of blocks `b` and `b + 1` of partition `pi`'s table
-    /// asked for (`Options::scan_form_ahead`): what the walk after a seek
-    /// reads first of each, the enum in the slot's allocation. Nothing where
-    /// the table is missing or held, as it is at a seek a walk defers.
-    fn prefetch_form_heads(&self, pi: usize, b: usize) {
-        let tables = self.fs().tables.borrow();
-        let Some(cell) = tables.get(pi) else { return };
-        let Ok(held) = cell.try_borrow() else { return };
-        let Some(t) = held.as_ref() else { return };
-        let end = (b + 2).min(t.slots.len());
-        for arc in t.slots.get(b..end).into_iter().flatten().flatten() {
-            prefetch_lines(std::sync::Arc::as_ptr(arc) as *const u8, 128);
-        }
     }
 
     /// The block whose key range holds `key`, and the key's cut as the
@@ -41916,12 +41720,7 @@ impl Reader {
             };
             let (mut rank, mut same, mut seed) = match span_b {
                 Some(_) => (usize::MAX, false, None),
-                None => self.scan_seek_seeded(
-                    seg,
-                    cursor,
-                    shared.on,
-                    self.opts.scan_form_ahead.then_some(pi),
-                ),
+                None => self.scan_seek_seeded(seg, cursor, shared.on),
             };
             let owner = if same { rank } else { rank.saturating_sub(1) };
             // The block the seek found, kept for the next scan from this
@@ -42013,7 +41812,7 @@ impl Reader {
                 // walk makes it. Measured through the blocks it was a
                 // tenth slower, in first touches and bookkeeping.
                 if rank == usize::MAX {
-                    (rank, _) = self.scan_seek(seg, cursor, None);
+                    (rank, _) = self.scan_seek(seg, cursor);
                 }
                 if rank < keys {
                     let want = (keys - rank).min(limit - seen);
@@ -42225,7 +42024,7 @@ impl Reader {
                 // The rank the span left unsought, sought now for a form
                 // walked by rank; a copy needs none.
                 if first && rank == usize::MAX && !matches!(form, Cached::Block(_)) {
-                    (rank, same) = self.scan_seek(seg, cursor, None);
+                    (rank, same) = self.scan_seek(seg, cursor);
                     debug_assert_eq!(
                         (if same { rank } else { rank.saturating_sub(1) }) / CACHE_BLOCK,
                         b,
@@ -42307,17 +42106,14 @@ impl Reader {
                     (self.opts.copy_start_at_rank && rank != usize::MAX).then(|| (start - lo, true))
                 };
                 let mut pace: Option<Pace> = None;
-                if !fetched && self.opts.scan_prefetch {
+                if !fetched {
                     prefetch_block(
                         self.zc(seg).is_none().then(|| seg.raw()),
                         form,
                         copy_at,
                         start,
                         ahead,
-                        self.opts.scan_prefetch_bytes,
-                        self.opts.seek_prefetch_dir,
                         self.opts.copy_prefetch_whole,
-                        self.opts.scan_prefetch_sparse_span,
                         // A block after the scan's first is walked from
                         // its first entry, whatever its copy holds.
                         copy_span.then_some(!first),
@@ -42325,7 +42121,7 @@ impl Reader {
                     );
                 }
                 fetched = false;
-                if self.opts.scan_prefetch && hi - start < ahead && b + 1 < nblocks {
+                if hi - start < ahead && b + 1 < nblocks {
                     let next = match canonical.then(|| self.canonical(pi, b + 1)).flatten() {
                         Some(f) => {
                             takes += 1;
@@ -42347,10 +42143,7 @@ impl Reader {
                                 copy_at.map(|_| 0),
                                 hi,
                                 ahead - (hi - start),
-                                self.opts.scan_prefetch_bytes,
-                                self.opts.seek_prefetch_dir,
                                 self.opts.copy_prefetch_whole,
-                                self.opts.scan_prefetch_sparse_span,
                                 copy_span.then_some(true),
                                 Some((0, false)),
                             ),
@@ -45275,7 +45068,7 @@ impl Db {
             pager: held.as_ref().map(|h| h.vault().pager().clone()),
             readers: Readers::new(opts.asym_pins, opts.sweep_remembers_pin),
             retired: RetireList::new(),
-            raw_ahead: std::sync::atomic::AtomicBool::new(raw_ahead_on(&opts, data_bytes)),
+            raw_ahead: std::sync::atomic::AtomicBool::new(raw_ahead_on(data_bytes)),
             settle_write: std::sync::atomic::AtomicBool::new(settle_write_on(&opts, data_bytes)),
             advice_random: std::sync::atomic::AtomicBool::new(starts_random),
             retired_forms: RetireList::new(),
@@ -46691,7 +46484,7 @@ impl Db {
             pager: held.as_ref().map(|h| h.vault().pager().clone()),
             readers,
             retired: RetireList::new(),
-            raw_ahead: std::sync::atomic::AtomicBool::new(raw_ahead_on(&opts, data_bytes)),
+            raw_ahead: std::sync::atomic::AtomicBool::new(raw_ahead_on(data_bytes)),
             settle_write: std::sync::atomic::AtomicBool::new(settle_write_on(&opts, data_bytes)),
             advice_random: std::sync::atomic::AtomicBool::new(starts_random),
             retired_forms: RetireList::new(),
@@ -51256,7 +51049,7 @@ impl Db {
     }
 
     /// The writer's own seeks that hinted their stride window's
-    /// directory, over the store's life (`Options::seek_prefetch_dir`);
+    /// directory, over the store's life (`Reader::scan_seek`);
     /// a handle's are `Reader::dir_prefetches`.
     pub fn dir_prefetches(&self) -> u64 {
         self.take_back_upkeep();
@@ -51296,7 +51089,7 @@ impl Db {
 
 impl Reader {
     /// This handle's seeks that hinted their stride window's directory
-    /// (`Options::seek_prefetch_dir`); the writer's own count is
+    /// (`Reader::scan_seek`); the writer's own count is
     /// `Db::dir_prefetches`.
     pub fn dir_prefetches(&self) -> u64 {
         self.fs().dir_prefetches.get()
@@ -59428,18 +59221,6 @@ struct PartReader<'a> {
     /// the cursor is ahead of them. `usize::MAX` for a reader with no scan
     /// behind it -- a build's -- whose runs are all it reads.
     left: usize,
-    /// The raw records' walker the runs go through where the raw form
-    /// serves them (`Options::scan_runs_held`): resolved at the first run
-    /// that wants it, and `Held::No` where the form file or the ask ahead
-    /// takes the runs instead.
-    raw: Held<'a>,
-}
-
-/// What a partition reader knows of its raw walker (`PartReader::raw`).
-enum Held<'a> {
-    Unasked,
-    No,
-    Walk(crate::blob::RunWalk<'a, MmapBytes>),
 }
 
 impl<'a> PartReader<'a> {
@@ -59452,7 +59233,6 @@ impl<'a> PartReader<'a> {
             at: usize::MAX,
             on,
             left: usize::MAX,
-            raw: Held::Unasked,
         }
     }
 
@@ -59551,20 +59331,6 @@ impl<'a> PartReader<'a> {
         }
         let want = self.want_for(n);
         let Some(c) = self.cursor_at(rank, want) else {
-            let seg = self.seg;
-            if let Some(w) = self.raw_walk() {
-                // `Reader::cache_scan`'s raw arm, over the regions held.
-                seg.hot_scan(n);
-                let got = w
-                    .scan_at(rank, n, &mut *f)
-                    .map_err(|e| err(&format!("segment scan: {e}")))?;
-                if got < n {
-                    return Err(err(
-                        "segment scan: a partition's walk stopped short of its key count",
-                    ));
-                }
-                return Ok(got);
-            }
             return self.rd.cache_scan(self.seg, rank, n, f);
         };
         let (got, _) = c
@@ -59578,28 +59344,6 @@ impl<'a> PartReader<'a> {
             ));
         }
         Ok(got)
-    }
-
-    /// The raw walker the runs go through (`Options::scan_runs_held`):
-    /// none where the option is off, the form file serves the partition's
-    /// reads, or the raw records are asked for ahead of each run, all as
-    /// `Reader::cache_scan` and `Reader::raw_scan` decide them, once.
-    fn raw_walk(&mut self) -> Option<&crate::blob::RunWalk<'a, MmapBytes>> {
-        if let Held::Unasked = self.raw {
-            let rd = self.rd;
-            self.raw = if rd.opts.scan_runs_held
-                && rd.zc(self.seg).is_none()
-                && !rd.shared.raw_ahead.load(AtomicOrdering::Relaxed)
-            {
-                Held::Walk(self.seg.raw().run_walk())
-            } else {
-                Held::No
-            };
-        }
-        match &self.raw {
-            Held::Walk(w) => Some(w),
-            _ => None,
-        }
     }
 
     /// `Reader::cache_scan` to the cut of `key` and `Reader::cache_cut` in
@@ -62421,10 +62165,9 @@ impl Maint {
         let mean_key_bytes = Db::mean_key_bytes_of(&segs);
         let store_bytes = Db::store_bytes_of(&self.dir, &segs);
         let data_bytes = Db::data_bytes_of(&segs);
-        self.shared.raw_ahead.store(
-            raw_ahead_on(&self.opts, data_bytes),
-            AtomicOrdering::Relaxed,
-        );
+        self.shared
+            .raw_ahead
+            .store(raw_ahead_on(data_bytes), AtomicOrdering::Relaxed);
         self.shared.settle_write.store(
             settle_write_on(&self.opts, data_bytes),
             AtomicOrdering::Relaxed,

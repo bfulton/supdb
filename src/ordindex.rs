@@ -1320,7 +1320,7 @@ impl OrdIndex {
     /// asked for and before any is read, so a caller can ask for what it
     /// will read next by the window alone: the partition's directory
     /// words for those ranks, a fill that otherwise waits behind the
-    /// heads' (`Options::seek_prefetch_dir`). A query outside the common
+    /// heads' (the engine's scan seek). A query outside the common
     /// prefix is answered from the prefix with no window and no call;
     /// so is an empty index.
     pub fn seek_exact_hint<'a>(

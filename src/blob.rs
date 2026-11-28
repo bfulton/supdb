@@ -1633,7 +1633,7 @@ impl<B: Bytes> Blob<B> {
     /// record hint needs, then the first record -- and the stride's window
     /// is known before its heads are read, so the window's directory lines
     /// asked for with the heads make the directory's fill the heads' and
-    /// not a fill of its own (`Options::seek_prefetch_dir`).
+    /// not a fill of its own (`Reader::scan_seek`).
     #[cfg(not(target_family = "wasm"))]
     pub fn prefetch_dir(&self, rank: usize, n: usize) {
         let Some((sec, idx)) = self.flat() else {
