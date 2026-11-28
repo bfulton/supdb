@@ -2134,6 +2134,28 @@ fn a_store_whose_cache_follows_its_room_holds_what_the_room_allows() {
     };
     let dir = scratch("follows");
     let slack: u64 = 8 << 20;
+    // What the cache may hold past its budget and the slack: what was read
+    // into it while its evictor could not give back -- off its core, by the
+    // kernel's count of the thread's time waiting to run, or waiting out
+    // the readers' pins, by the pager's own -- at the rate the store read
+    // into it over its life. The bound is soft by design: a reader past the
+    // swamp line waits a breath and reads on (`Pager::breathe_swamped`), so
+    // a fixed slack read a busy machine's scheduling, and failed beside
+    // four busy loops with the evictor off its core for most of a scan.
+    let overshoot = |c: &supdb::PagerCounts, born: std::time::Instant| -> (u64, u64, u64) {
+        let delay_ns =
+            std::fs::read_to_string(format!("/proc/self/task/{}/schedstat", c.evictor_tid))
+                .ok()
+                .and_then(|s| s.split_whitespace().nth(1)?.parse::<u64>().ok())
+                .unwrap_or(0);
+        let off_ns = delay_ns.saturating_add(c.waited_us.saturating_mul(1000));
+        let wall_ns = (born.elapsed().as_nanos() as u64).max(1);
+        let read_in = c.evicted_bytes.saturating_add(c.held);
+        let allowed =
+            (u128::from(read_in) * u128::from(off_ns.min(wall_ns)) / u128::from(wall_ns)) as u64;
+        (allowed, off_ns, wall_ns)
+    };
+
     let until = |db: &Db, what: &str, done: &dyn Fn(&supdb::PagerCounts) -> bool| {
         let t = std::time::Instant::now();
         loop {
@@ -2149,6 +2171,7 @@ fn a_store_whose_cache_follows_its_room_holds_what_the_room_allows() {
         }
     };
     let mut db = Db::create(&dir, opts(&room)).unwrap();
+    let born = std::time::Instant::now();
     fill(&mut db, n);
     db.flush().unwrap();
     db.settle().unwrap();
@@ -2161,9 +2184,11 @@ fn a_store_whose_cache_follows_its_room_holds_what_the_room_allows() {
     let c = until(&db, "under the first room", &|c| c.held <= c.budget);
     assert!(c.rooms > 0, "the room was never read: {c:?}");
     assert!(c.budget <= 4 << 20, "a budget past the room: {c:?}");
+    let (allowed, off_ns, wall_ns) = overshoot(&c, born);
     assert!(
-        c.peak < (4 << 20) + slack,
-        "held {} of a room of four mebibytes: {c:?}",
+        c.peak < (4 << 20) + slack + allowed,
+        "held {} of a room of four mebibytes, a slack of {slack} and {allowed} read while the \
+         evictor was off for {off_ns} ns of {wall_ns}: {c:?}",
         c.peak
     );
     // The room falls to a half: given back with nobody reading, and the
