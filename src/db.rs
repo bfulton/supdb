@@ -12917,6 +12917,10 @@ pub struct SegmentWriter {
     /// Runs up to this many bytes go into the record's tail instead of a
     /// block (`Ext::INLINE`); zero keeps every run in blocks.
     inline_max: usize,
+    /// The most bytes one extent's run holds: an extent names its length
+    /// in 32 bits, so a key's run past it is cut into several extents
+    /// (`SegmentWriter::end_cut`). `u32::MAX` but under a test's seam.
+    max_extent: usize,
     /// Whether the records are hashed batch by batch for `mark`: on for
     /// a direct segment, off for a seal, which never marks.
     marks: bool,
@@ -13209,6 +13213,7 @@ impl SegmentWriter {
             sync_every: 0,
             since_sync: 0,
             inline_max: 0,
+            max_extent: u32::MAX as usize,
             marks: false,
             mark_crc: 0,
             mark_start: 0,
@@ -13895,6 +13900,14 @@ impl SegmentWriter {
         self.inline_max = bytes;
     }
 
+    /// A test's: the most bytes one extent's run holds, `u32::MAX` but
+    /// here, so that a test cuts a key's run into several extents with
+    /// small values (`end_cut`).
+    #[doc(hidden)]
+    pub fn set_max_extent(&mut self, bytes: usize) {
+        self.max_extent = bytes.clamp(1, u32::MAX as usize);
+    }
+
     /// Compress the blocks. Off by default, because a segment written by the
     /// the seal is read back by its own merge and the seal path
     /// has never paid for compression; a segment written as an index to be
@@ -14017,9 +14030,9 @@ impl SegmentWriter {
         Ok(())
     }
 
-    /// One value of the open key, in append order. A key whose values come
-    /// to more than [`MAX_VALUE_LEN`] bytes, one of them or all together, is
-    /// refused at `end`.
+    /// One value of the open key, in append order. A value longer than
+    /// [`MAX_VALUE_LEN`] bytes is refused at `end`; a key's values past it
+    /// all together are written as several extents (`end_cut`).
     pub fn value(&mut self, v: &[u8]) {
         debug_assert!(self.open_key.is_some(), "value without begin");
         // Raw bytes and a length: the encoding is chosen at `end`, when the
@@ -14043,14 +14056,17 @@ impl SegmentWriter {
             .take()
             .ok_or_else(|| err("segment writer: end without begin"))?;
         let value_len = if self.records == 1 { self.raw.len() } else { 0 };
-        // Before the run is encoded from lengths `value` took as 32 bits: a
-        // run whose values come to no more than that has no value past it.
-        if self.raw.len() > MAX_VALUE_LEN {
-            return Err(err(
-                "segment writer: a key's values exceed 4 GiB in one segment",
-            ));
+        // A run past what one extent's length holds is cut into several:
+        // its values' bytes held to the limit before the run is encoded,
+        // since `value` took each length as 32 bits and a run's offsets are
+        // 32 bits too, and the run, prefixed, after.
+        if self.raw.len() > self.max_extent {
+            return self.end_cut(start, len, tombstone);
         }
         let (last, flag) = crate::index::encode_run(&self.raw, &self.lens, &mut self.run);
+        if self.run.len() > self.max_extent {
+            return self.end_cut(start, len, tombstone);
+        }
         self.last = last as usize;
         // A put is its key and value and a delete its key and sixteen, as
         // the memtable counts them, so a sealed memtable's payload and the
@@ -14061,11 +14077,6 @@ impl SegmentWriter {
         self.raw.clear();
         self.lens.clear();
         let n = self.run.len();
-        if n > u32::MAX as usize {
-            return Err(err(
-                "segment writer: a key's values exceed 4 GiB in one segment",
-            ));
-        }
         if self.records >= Ext::FIXED {
             return Err(err(
                 "segment writer: a key's values exceed the extent's count",
@@ -14105,6 +14116,29 @@ impl SegmentWriter {
             }
             ext
         };
+        self.put_record(
+            layout,
+            start,
+            len,
+            std::slice::from_ref(&ext),
+            inline,
+            value_len,
+        )
+    }
+
+    /// The record of the key at `start` (`len` bytes in the arena), naming
+    /// `exts`, its run inline in the record where `inline` says so: written
+    /// to the records as the layout lays them, the one place either is.
+    #[inline(always)]
+    fn put_record(
+        &mut self,
+        layout: Layout,
+        start: usize,
+        len: usize,
+        exts: &[Ext],
+        inline: bool,
+        value_len: usize,
+    ) -> Result<()> {
         match layout {
             Layout::RecordsFirst => {
                 let key = &self.key_arena[start..start + len];
@@ -14113,7 +14147,7 @@ impl SegmentWriter {
                 let (wrote, tail_at) = flatindex::stream_record_tail_at(
                     &mut self.rec_buf,
                     key,
-                    &[ext],
+                    exts,
                     tail,
                     self.compact_records,
                 )
@@ -14155,15 +14189,97 @@ impl SegmentWriter {
                 if inline {
                     let ts = self.tails.len();
                     self.tails.extend_from_slice(&self.run);
-                    self.tail_spans.push((ts, n));
+                    self.tail_spans.push((ts, self.run.len()));
                 } else {
                     self.tail_spans.push((0, 0));
                 }
-                self.exts.push(Extents::One(ext));
+                self.exts.push(match exts {
+                    [one] => Extents::One(*one),
+                    many => Extents::Many(many.to_vec()),
+                });
             }
         }
         self.spans.push((start, len));
         Ok(())
+    }
+
+    /// `end_with` for a key whose run is past what one extent's length
+    /// holds (`max_extent`): its values cut, in order, into runs that each
+    /// fit, each its own extent in blocks, and one record naming them all,
+    /// as every reader reads a record of several extents: the counts
+    /// summed, the values walked extent after extent, a tombstone on any
+    /// one of them the record's. A value is never cut, and one of 4 GiB
+    /// less a byte, alone in its run, fits. Off every path but a key's run
+    /// past 4 GiB in one segment.
+    #[cold]
+    #[inline(never)]
+    fn end_cut(&mut self, start: usize, len: usize, tombstone: bool) -> Result<()> {
+        // `value` took each length as 32 bits: a value past them has bytes
+        // its length does not name.
+        let named: u64 = self.lens.iter().map(|&l| u64::from(l)).sum();
+        if named != self.raw.len() as u64 {
+            return Err(err("segment writer: a value exceeds 4 GiB"));
+        }
+        if self.records >= Ext::FIXED {
+            return Err(err(
+                "segment writer: a key's values exceed the extent's count",
+            ));
+        }
+        self.payload += (len * self.records as usize
+            + self.raw.len()
+            + if tombstone { len + 16 } else { 0 }) as u64;
+        let raw = std::mem::take(&mut self.raw);
+        let lens = std::mem::take(&mut self.lens);
+        let layout = self.layout()?;
+        let uvarint = |l: u32| (64 - (u64::from(l) | 1).leading_zeros() as usize).div_ceil(7);
+        let mut exts = Vec::new();
+        let (mut g, mut at, mut from) = (0usize, 0usize, 0usize);
+        while g < lens.len() {
+            // The group from `g`: one value at least, then each that keeps
+            // its run, prefixed, within the limit.
+            let mut end = g + 1;
+            let mut size = uvarint(lens[g]) + lens[g] as usize;
+            while end < lens.len() {
+                let more = uvarint(lens[end]) + lens[end] as usize;
+                if size + more > self.max_extent {
+                    break;
+                }
+                size += more;
+                end += 1;
+            }
+            let bytes: usize = lens[g..end].iter().map(|&l| l as usize).sum();
+            at += bytes;
+            let (last, flag) =
+                crate::index::encode_run(&raw[from..at], &lens[g..end], &mut self.run);
+            from = at;
+            let n = self.run.len();
+            if n > u32::MAX as usize {
+                return Err(err("segment writer: a value exceeds 4 GiB"));
+            }
+            if self.builder.would_overflow(n) {
+                self.flush_block()?;
+            }
+            let off = self.builder.push(&self.run);
+            exts.push(Ext {
+                block: self.blocks.len() as u32,
+                off,
+                len: n as u32,
+                last,
+                count: (end - g) as u32 | flag | if tombstone { Ext::TOMBSTONE } else { 0 },
+            });
+            if self.builder.len() >= self.block_size {
+                self.flush_block()?;
+            }
+            g = end;
+        }
+        // The buffers back, emptied, so the next key reuses them.
+        self.raw = raw;
+        self.raw.clear();
+        self.lens = lens;
+        self.lens.clear();
+        self.last = 0;
+        self.run.clear();
+        self.put_record(layout, start, len, &exts, false, 0)
     }
 
     /// `begin`, one `value` and `end`, as one call, for a key with one

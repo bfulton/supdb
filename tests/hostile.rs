@@ -775,3 +775,95 @@ fn a_value_past_4_gib_is_refused_at_every_write() {
     drop(map);
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// A key's run past what one extent's length holds: cut into several
+/// extents of one record, which every reader reads as one key. The cut's
+/// limit is 4 GiB less a byte; a test's seam (`set_max_extent`) sets it
+/// small, so runs of a few hundred bytes are cut as a run past 4 GiB is.
+/// Among the values: the empty value, one exactly at the limit, one past
+/// it (alone in its extent), and runs of one width (fixed) and of many.
+/// Each shape is read by every reader against what was written, and its
+/// premise held: the cut keys' records name several extents.
+#[test]
+fn a_run_past_an_extent_is_cut_into_several_and_read_as_one_key() {
+    const CUT: usize = 100;
+    let dir = scratch("cut");
+    for (shape, (compress, block)) in [(false, 4096), (true, 4096), (false, 512)]
+        .into_iter()
+        .enumerate()
+    {
+        let path = dir.join(format!("cut-{shape}.sup"));
+        let opts = SegmentOptions {
+            block_size: block,
+            ..SegmentOptions::default()
+        };
+        let mut w = SegmentWriter::create(&path, &opts).unwrap();
+        w.set_compress(compress);
+        w.set_inline_max(64);
+        w.set_max_extent(CUT);
+        let mut m = Model::new();
+        let mut r = 0xc07 ^ shape as u64;
+        let runs: Vec<(Vec<u8>, Vec<Vec<u8>>)> = vec![
+            (b"a-small".to_vec(), vec![b"x".to_vec()]),
+            (b"b-at-limit".to_vec(), vec![vec![7u8; CUT]]),
+            (
+                b"c-past-limit".to_vec(),
+                vec![vec![8u8; CUT + 1], b"after".to_vec()],
+            ),
+            (
+                b"d-fixed".to_vec(),
+                (0..40).map(|i| vec![i as u8; 8]).collect(),
+            ),
+            (
+                b"e-mixed".to_vec(),
+                (0..60)
+                    .map(|i| match i % 7 {
+                        0 => Vec::new(),
+                        3 => vec![9u8; CUT],
+                        _ => (0..splitmix(&mut r) % 50)
+                            .map(|_| splitmix(&mut r) as u8)
+                            .collect(),
+                    })
+                    .collect(),
+            ),
+            (b"f-empties".to_vec(), vec![Vec::new(); 300]),
+            (b"g-small".to_vec(), vec![b"y".to_vec(), b"z".to_vec()]),
+        ];
+        for (k, vs) in &runs {
+            w.begin(k).unwrap();
+            for v in vs {
+                w.value(v);
+            }
+            w.end().unwrap();
+            m.insert(k.clone(), vs.clone());
+        }
+        w.finish(1).unwrap();
+        let b = std::fs::read(&path).unwrap();
+        let blob = Blob::open(SliceBytes(&b)).unwrap();
+        let several: Vec<&[u8]> = (0..blob.keys())
+            .filter_map(|rank| {
+                blob.exts_at(rank)
+                    .filter(|(_, e)| e.len() > 1)
+                    .map(|(k, _)| k)
+            })
+            .collect();
+        for k in [&b"c-past-limit"[..], b"d-fixed", b"e-mixed", b"f-empties"] {
+            assert!(
+                several.contains(&k),
+                "shape {shape}: {k:?} names one extent: {several:?}"
+            );
+        }
+        assert!(
+            !several.contains(&&b"b-at-limit"[..]),
+            "shape {shape}: a run at the limit is cut"
+        );
+        drop(blob);
+        let id = 100 + shape;
+        dump_model(id, &m);
+        hold(&format!("pristine cut shape{shape}"), id, &b, &m, false);
+        for (reader, v, _) in every_reader(&b, &m) {
+            assert_eq!(v, Verdict::Answered, "cut shape {shape}: {reader}");
+        }
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}
