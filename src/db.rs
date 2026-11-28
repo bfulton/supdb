@@ -17228,6 +17228,16 @@ const HOLD_RMW_READ: u8 = 4;
 const HOLD_OWN_SEAL: u8 = 8;
 const OWN_SEAL_HELD: u8 = 16;
 
+/// A test's: the wait of the holds `Shared::cond_hold` keeps
+/// (`Reader::hold_cond`, `Db::hold_own_seal`), while any of `bits` is set,
+/// a millisecond between its looks.
+#[cold]
+fn cond_hold_wait(h: &std::sync::atomic::AtomicU8, bits: u8) {
+    while h.load(AtomicOrdering::Acquire) & bits != 0 {
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    }
+}
+
 /// What a shared read-modify-write came to (`MemTable::rmw_shared`).
 enum SharedRmw {
     /// Read and written in the one probe, or not, the table full.
@@ -30724,9 +30734,7 @@ impl Reader {
         if h.fetch_or(COND_HELD, AtomicOrdering::AcqRel) & COND_HELD != 0 {
             return;
         }
-        while h.load(AtomicOrdering::Acquire) & at != 0 {
-            std::thread::sleep(std::time::Duration::from_millis(1));
-        }
+        cond_hold_wait(h, at);
         h.fetch_and(!COND_HELD, AtomicOrdering::AcqRel);
     }
 
@@ -49512,9 +49520,7 @@ impl Db {
     fn hold_own_seal(&self) {
         let h = &self.shared.cond_hold;
         h.fetch_or(OWN_SEAL_HELD, AtomicOrdering::AcqRel);
-        while h.load(AtomicOrdering::Acquire) & OWN_SEAL_HELD != 0 {
-            std::thread::sleep(std::time::Duration::from_millis(1));
-        }
+        cond_hold_wait(h, OWN_SEAL_HELD);
     }
 
     /// The writer's own write to a shared live table, beside the handles'

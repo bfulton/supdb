@@ -176,3 +176,7 @@ tests/data/cost-entries.txt	Reader::hold_cond_inserts	0	1	a test seam that holds
 tests/data/cost-entries.txt	Reader::hold_rmw_reads	0	1	a test seam that holds a read-modify-write past its read, read by tests/shared.rs, at no key, entry, block or step of an operation
 tests/data/cost-entries.txt	Db::put_if	0	1	a write on condition on the writer (ROADMAP, a conditional write): a point read and Db::put's path, which the read probes and work and land count
 tests/data/cost-entries.txt	Db::delete_if	0	1	the conditional write's delete on the writer: a point read and Db::delete's path, which the read probes and work count
+tests/data/cost-entries.txt	Reader::hold_own_seals	0	1	a test seam that holds the writer's own write into a shared live table past its seals, read by tests/shared.rs, at no key, entry, block or step of an operation
+tests/data/cost-entries.txt	Reader::own_seal_held	0	1	a test seam that says the writer's own write waits in that hold, read by tests/shared.rs, at no key, entry, block or step of an operation
+tests/data/cost-entries.txt	Reader::release_own_seal	0	1	a test seam that lets that write go, read by tests/shared.rs, at no key, entry, block or step of an operation
+tests/data/door.txt	thread src/db.rs *	118	119	the conditional write's test holds (Reader::hold_cond_inserts, Reader::hold_rmw_reads, Reader::hold_own_seals) wait on their word in one sleep between looks (cond_hold_wait), as the other holds wait; no thread is made

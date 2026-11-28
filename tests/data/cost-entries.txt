@@ -428,5 +428,8 @@ Reader::cond_again	-	a test seam or a counter: reads or sets the store's bookkee
 Reader::cond_insert_held	-	a test seam or a counter: reads or sets the store's bookkeeping, at no key, entry, block or step of an operation
 Reader::hold_cond_inserts	-	a test seam that holds a conditional write between its probe and its insert, at no key, entry, block or step of an operation
 Reader::hold_rmw_reads	-	a test seam that holds a read-modify-write between its read and its put on condition, at no key, entry, block or step of an operation
+Reader::hold_own_seals	-	a test seam that holds the writer's own write into a shared live table past each seal it makes for room, at no key, entry, block or step of an operation
+Reader::own_seal_held	-	a test seam or a counter: reads or sets the store's bookkeeping, at no key, entry, block or step of an operation
+Reader::release_own_seal	-	a test seam that lets the writer's own write go from that hold, at no key, entry, block or step of an operation
 Db::put_if	-	a write on condition: a point read, which the read probes count through read_all, and Db::put's path past its pin, which work and land count through Db::put; no probe writes on condition
 Db::delete_if	-	the same write's delete: the point read, and Db::delete's path, which work counts
