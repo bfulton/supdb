@@ -6175,9 +6175,7 @@ fn blocks_watch_line(
     let mut parts: Vec<String> = census
         .iter()
         .take(12)
-        .map(|&(len, n, res, idle)| {
-            format!("{:.3}mb x{n} res {:.1} idle {idle}", mb(len), mb(res))
-        })
+        .map(|&(len, n, res, idle)| format!("{:.3}mb x{n} res {:.1} idle {idle}", mb(len), mb(res)))
         .collect();
     let rest = &census[census.len().min(12)..];
     if !rest.is_empty() {

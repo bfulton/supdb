@@ -979,6 +979,223 @@ fn an_upkeep_pass_that_pins_a_landed_table_gives_its_forms_up() {
     assert!(!db.upkeep_outran());
 }
 
+/// And a settle hears the ask between the writes it applies
+/// (`Options::settle_apply_looks`): a pass held inside its apply, pinned,
+/// as an apply that faults on every write is, while a table the writer
+/// froze lands behind the pin, gives its forms up at its next look there,
+/// before the batch is done; with the look off the same hold ends in the
+/// batch's end, nothing heard inside it.
+/// The batch is a burst's under the held log, lent to the thread with
+/// reads around and filed by it (the commit's own filing off, as in the
+/// test above). Both halves run, and the scan after each reads every
+/// write.
+#[test]
+fn a_settle_hears_the_ask_between_the_writes_it_applies() {
+    for looks in [true, false] {
+        let d = dir(&format!("apply-looks-{looks}"));
+        let mut db = Db::create(
+            &d,
+            Options {
+                upkeep: supdb::Upkeep::Background(1),
+                upkeep_keep_bytes: 1,
+                seal_bytes: 64 << 10,
+                partition_bytes: Some(256 << 10),
+                seal_max_pct: 0,
+                forms_settle_every: false,
+                forms_settle_builds: false,
+                // The held log, whose bursts are lent and never waited
+                // for (`Options::held_bursts_lend`): a store that syncs
+                // paces its writer behind the thread, which the hold
+                // would hold too.
+                sync: supdb::SyncPolicy::Explicit,
+                settle_apply_looks: looks,
+                ..common::options()
+            },
+        )
+        .unwrap();
+        let keys = 20_000u32;
+        let key = |k: u32| format!("key-{k:06}").into_bytes();
+        let mut want: HashMap<u32, String> = HashMap::new();
+        for k in 0..keys {
+            db.append(&key(k), b"0");
+        }
+        db.commit().unwrap();
+        db.flush().unwrap();
+        assert!(db.levels().0 > 0, "partitions for the forms to hang on");
+        let check = |db: &Reader, want: &HashMap<u32, String>, when: &str| {
+            let mut seen = 0u32;
+            db.scan(
+                &key(0),
+                keys as usize,
+                kv(&mut |k, v| {
+                    let kn: u32 = std::str::from_utf8(&k[4..]).unwrap().parse().unwrap();
+                    let expect = want.get(&kn).map_or("0", |s| s.as_str());
+                    assert_eq!(std::str::from_utf8(v).unwrap(), expect, "key {kn} {when}");
+                    seen += 1;
+                }),
+            )
+            .unwrap();
+            assert_eq!(seen, keys, "every key {when}");
+        };
+        check(&db, &want, "before the burst");
+        // The first commit after a scan files its batch at the commit.
+        db.put(&key(0), b"w");
+        want.insert(0, "w".to_string());
+        db.commit().unwrap();
+        db.settle().unwrap();
+        let settled0 = db.settle_density()[1];
+        // A burst's batches, lent to the thread, which files them and
+        // holds at its apply's first look.
+        db.hold_upkeep_applying(true);
+        let t = std::time::Instant::now();
+        let mut x = 0x2545_F491_4F6C_DD1Du64;
+        let mut round = 0u32;
+        while !db.upkeep_holding() {
+            assert!(
+                t.elapsed().as_secs() < 60,
+                "looks {looks}: the thread never held inside an apply"
+            );
+            for _ in 0..1000 {
+                x ^= x << 13;
+                x ^= x >> 7;
+                x ^= x << 17;
+                let k = (x % keys as u64) as u32;
+                db.put(&key(k), format!("b{round}").as_bytes());
+                want.insert(k, format!("b{round}"));
+            }
+            db.commit().unwrap();
+            round += 1;
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert_eq!(db.upkeep_abandons(), 0, "looks {looks}");
+        // One freeze past the pin, and its landing: what the pass's own
+        // pin holds and nobody else does.
+        let (_, _, lives0, _) = db.upkeep_abandon_state();
+        let landed0 = db.tables_landed();
+        while db.upkeep_abandon_state().2 == lives0 {
+            assert!(t.elapsed().as_secs() < 60, "looks {looks}: no freeze");
+            for _ in 0..100 {
+                x ^= x << 13;
+                x ^= x >> 7;
+                x ^= x << 17;
+                let k = (x % keys as u64) as u32;
+                db.put(&key(k), b"c");
+                want.insert(k, "c".to_string());
+            }
+            db.commit().unwrap();
+        }
+        while db.tables_landed() == landed0 {
+            assert!(
+                t.elapsed().as_secs() < 60,
+                "looks {looks}: the frozen table never landed"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+        assert_eq!(
+            db.upkeep_abandons(),
+            0,
+            "looks {looks}: held, nothing heard yet"
+        );
+        db.hold_upkeep_applying(false);
+        if looks {
+            while db.upkeep_abandons() == 0 {
+                assert!(
+                    t.elapsed().as_secs() < 60,
+                    "the pass never gave its forms up"
+                );
+                std::thread::sleep(std::time::Duration::from_millis(2));
+            }
+            assert_eq!(db.settle_apply_abandons(), 1, "heard inside the apply");
+            assert!(db.upkeep_outran());
+        }
+        // The thread's pass joined: off, the batch ran to its end with the
+        // ask unheard inside it, whatever a look after it made of the ask.
+        db.settle().unwrap();
+        assert_eq!(
+            db.settle_apply_abandons(),
+            u64::from(looks),
+            "looks {looks}: heard inside the apply where it looks, and only there"
+        );
+        // And the apply stopped there: the keys settled are the groups it
+        // entered before its look, short of the thousand-write batch it
+        // held in, where the apply that hears nothing settles that batch.
+        let settled = db.settle_density()[1] - settled0;
+        if looks {
+            assert!(settled < 256, "stopped at its look: {settled} keys settled");
+        } else {
+            assert!(
+                settled >= 900,
+                "the batch applied whole: {settled} keys settled"
+            );
+        }
+        check(&db, &want, "after the pass");
+        db.close().unwrap();
+        let _ = std::fs::remove_dir_all(&d);
+    }
+}
+
+/// A landing takes its table's copy for scans back
+/// (`Options::seal_copy_lands`): a seal near reads copies its table, the
+/// landing that retires the table counts the copy taken, and the scans
+/// after it, through the segment, read every write; with the option off
+/// the copy is set as before and no landing takes one.
+#[test]
+fn a_landing_takes_its_tables_copy_for_scans_back() {
+    for lands in [true, false] {
+        let d = dir(&format!("copy-lands-{lands}"));
+        let mut db = Db::create(
+            &d,
+            Options {
+                seal_bytes: 64 << 10,
+                seal_copy_lands: lands,
+                ..common::options()
+            },
+        )
+        .unwrap();
+        let mut model: BTreeMap<Vec<u8>, Vec<Vec<u8>>> = BTreeMap::new();
+        for round in 0..6u32 {
+            for i in 0..5_000u32 {
+                let k = format!("k{:08}", (i * 13 + round) % 20_000).into_bytes();
+                let v = format!("v{round}-{i}").into_bytes();
+                db.append(&k, &v);
+                model.entry(k).or_default().push(v);
+            }
+            db.commit().unwrap();
+            // A scan between the rounds keeps the seals near reads.
+            let mut n = 0;
+            db.scan(b"", 50, kv(&mut |_, _| n += 1)).unwrap();
+            assert!(n > 0);
+        }
+        db.sync().unwrap();
+        assert!(
+            db.seal_table_snapshots() > 0,
+            "lands {lands}: no seal copied its table, so nothing was put to the take"
+        );
+        if lands {
+            assert!(
+                db.seal_copies_landed() > 0,
+                "a landing took no copy back of {}",
+                db.seal_table_snapshots()
+            );
+        } else {
+            assert_eq!(db.seal_copies_landed(), 0, "off, no landing takes one");
+        }
+        let mut scanned: BTreeMap<Vec<u8>, Vec<Vec<u8>>> = BTreeMap::new();
+        db.scan(
+            b"",
+            usize::MAX,
+            kv(&mut |k, v| scanned.entry(k.to_vec()).or_default().push(v.to_vec())),
+        )
+        .unwrap();
+        assert!(
+            scanned == model,
+            "lands {lands}: the scan reads every write"
+        );
+        db.close().unwrap();
+        let _ = std::fs::remove_dir_all(&d);
+    }
+}
+
 /// A burst's batch lent to the upkeep thread while reads are around is
 /// filed by the thread at once (`Options::upkeep_files_bursts`), and not
 /// left to the first scan after it as the backlog bound would leave it: the

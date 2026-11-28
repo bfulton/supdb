@@ -5223,6 +5223,18 @@ pub struct Options {
     /// drops the tables when it falls behind. `supdb-noabandon` is the arm
     /// that files on.
     pub upkeep_abandons: bool,
+    /// The upkeep thread's settle hears the ask to give its forms up
+    /// between the writes it applies, every sixty-four, as it hears it
+    /// between the writes it resolves (`Reader::settle_each`). An apply
+    /// out of core reads the partition's records -- a conversion's walk of
+    /// its block, a patch's run -- a major fault each, which at a bound
+    /// waits on the group's reclaim; heard only after the batch, the pass
+    /// held its pin for seconds past the writer's ask, and every table
+    /// landed behind the pin with its copy for scans, until at ten million
+    /// keys under 1.25 GiB the group was killed in the lag sweep's full
+    /// rewrite. Off, the shape before, `supdb-applydeaf` and
+    /// `supdb-heldpartapplydeaf`.
+    pub settle_apply_looks: bool,
     /// Whether the upkeep thread files a burst's batch at once: a pass
     /// lent a commit of at least `UPKEEP_WAKE_WRITES` writes since the
     /// thread was last caught up, with reads around, settles what it was
@@ -6105,6 +6117,19 @@ pub struct Options {
     /// were taken in. On, `supdb-sealcopyfar` and
     /// `supdb-ingestsealcopyfar`.
     pub seal_snapshot_far: bool,
+    /// A landing takes its table's copy for scans back (`FrozenSnaps`,
+    /// `Snapshot::from_frozen`). The copy is for the seal's records and
+    /// for the scans over the store while the seal runs, and both are done
+    /// once the segments it wrote are published; the table is not, since
+    /// it outlives its landing in `State::replaced` for the upkeep's look
+    /// and behind every pin taken before the landing, and a copy kept on
+    /// it was freed only with it. On, the landing swaps the copy out of the
+    /// table, freed past every reader that could have loaded it as a
+    /// replaced snapshot is (`Shared::retired_snaps`), and leaves a word
+    /// that it was taken, so a reader of an older state that comes for it
+    /// after builds its own and leaves none on the table. Off, the shape
+    /// before, `supdb-copykept` and `supdb-heldpartcopykept`.
+    pub seal_copy_lands: bool,
     /// A landing far from reads takes its pieces' bounds -- and their
     /// ranks, under `piece_ranks_whole` -- against their partitions before
     /// it publishes, as every landing does near them
@@ -8613,6 +8638,7 @@ impl Default for Options {
             upkeep_keep_bytes: 0,
             frozen_bytes: 0,
             upkeep_abandons: true,
+            settle_apply_looks: true,
             upkeep_files_bursts: true,
             upkeep_yields: false,
             upkeep_fill_yields: true,
@@ -8663,6 +8689,7 @@ impl Default for Options {
             run_spare: true,
             drain_snapshot: true,
             seal_snapshot_far: false,
+            seal_copy_lands: true,
             land_ranks_far: false,
             piece_ranks_whole: false,
             pieces_willneed: true,
@@ -17260,7 +17287,11 @@ enum SharedInsert {
 /// and a thread that loses the race drops its own copy. Not a `OnceLock`,
 /// whose initialiser runs under a `Once` a second caller waits on: the
 /// first caller may be the niced keeper or a seal on the idle IO class,
-/// and a scan must never wait on either.
+/// and a scan must never wait on either. A value can be taken out once
+/// (`take_raw`), for its taker to free past every reader that could have
+/// loaded it, and the cell then holds a tombstone: it reads as empty and
+/// refuses every later value, so a reader that comes after the take
+/// builds its own and leaves none in its place.
 struct SetOnce<T> {
     p: AtomicPtr<T>,
     _owns: std::marker::PhantomData<std::sync::Arc<T>>,
@@ -17274,14 +17305,22 @@ impl<T> SetOnce<T> {
         }
     }
 
+    /// The tombstone a take leaves: an address no `Arc` has, its pointee
+    /// being past a count and never at the type's alignment from zero.
+    fn taken() -> *mut T {
+        std::ptr::dangling_mut::<T>()
+    }
+
     fn get(&self) -> Option<std::sync::Arc<T>> {
         let p = self.p.load(AtomicOrdering::Acquire);
-        if p.is_null() {
+        if p.is_null() || p == Self::taken() {
             return None;
         }
         // SAFETY: set from `Arc::into_raw` and never replaced, the cell's
-        // own count held until the cell drops, and the caller reaches the
-        // cell through an owner it holds.
+        // own count held until the cell drops or a take, whose taker frees
+        // it only past every reader that could be between this load and
+        // this count, and the caller reaches the cell through an owner it
+        // holds.
         unsafe {
             std::sync::Arc::increment_strong_count(p);
             Some(std::sync::Arc::from_raw(p))
@@ -17305,12 +17344,21 @@ impl<T> SetOnce<T> {
             }
         }
     }
+
+    /// The value taken out with the cell's count, the tombstone left in its
+    /// place; none where the cell held no value. The taker owns the count
+    /// and frees it past every reader that could have loaded the pointer
+    /// (`RetiredSnap`), never at once.
+    fn take_raw(&self) -> Option<*const T> {
+        let p = self.p.swap(Self::taken(), AtomicOrdering::AcqRel);
+        (!p.is_null() && p != Self::taken()).then_some(p as *const T)
+    }
 }
 
 impl<T> Drop for SetOnce<T> {
     fn drop(&mut self) {
         let p = *self.p.get_mut();
-        if !p.is_null() {
+        if !p.is_null() && p != Self::taken() {
             // SAFETY: the cell's own count, released once.
             drop(unsafe { std::sync::Arc::from_raw(p) });
         }
@@ -28121,6 +28169,12 @@ struct Shared {
     /// (`FrozenSnaps`), frozen or handed, counted after the set so a test
     /// that sees the count sees the cell; for a test.
     snap_on_table: AtomicU64,
+    /// Copies for scans a landing took back from the table it retired
+    /// (`Options::seal_copy_lands`); for a test, and the suite's counters.
+    copies_landed: AtomicU64,
+    /// Asks to give the forms up a settle heard between the writes it
+    /// applies (`Options::settle_apply_looks`); for a test.
+    apply_abandons: AtomicU64,
     /// The writer's upkeep while it is lent to the upkeep thread; see
     /// `Upkeep::Background`.
     upkeep: Lend,
@@ -28205,8 +28259,9 @@ struct Shared {
     /// and nobody else does.
     tables_landed: AtomicU64,
     /// A test's (`Db::hold_upkeep_pass`): bit 1 holds the upkeep thread
-    /// before it begins a pass, bit 2 holds it inside one, pinned; and
-    /// whether it is waiting at either.
+    /// before it begins a pass, bit 2 holds it inside one, pinned, and bit
+    /// 4 inside a settle's apply (`Db::hold_upkeep_applying`); and whether
+    /// it is waiting at any.
     upkeep_hold_at: std::sync::atomic::AtomicU8,
     upkeep_holding: std::sync::atomic::AtomicBool,
     /// A test's (`Db::hold_landing_swap`, `Db::look_after_a_landing`): bit
@@ -38411,8 +38466,9 @@ impl Reader {
         false
     }
 
-    /// A test's hold (`Db::hold_upkeep_pass`, `Db::hold_upkeep_pinned`):
-    /// the upkeep thread waits here while `bit` is set.
+    /// A test's hold (`Db::hold_upkeep_pass`, `Db::hold_upkeep_pinned`,
+    /// `Db::hold_upkeep_applying`): the upkeep thread waits here while `bit`
+    /// is set.
     fn upkeep_held(shared: &Shared, bit: u8) {
         if shared.upkeep_hold_at.load(AtomicOrdering::Acquire) & bit == 0 {
             return;
@@ -38461,6 +38517,18 @@ impl Reader {
         );
         self.shared.outran_at.store(at, AtomicOrdering::Release);
         self.shared.abandons.fetch_add(1, AtomicOrdering::Relaxed);
+        tables_trace(|| {
+            format!(
+                "abandon pinned {} landed {} unit_mb {} keep_mb {}",
+                self.fs().abandon_pinned.get(),
+                self.shared
+                    .tables_landed
+                    .load(AtomicOrdering::Acquire)
+                    .saturating_sub(self.fs().pass_landed.get()),
+                self.fs().pass_unit.get() >> 20,
+                self.shared.keep_bytes >> 20
+            )
+        });
         if self.fs().abandon_pinned.replace(false) {
             self.shared
                 .abandons_pinned
@@ -38807,7 +38875,9 @@ impl Reader {
         if cell.set(s.clone()) {
             s
         } else {
-            cell.get().expect("set by whoever won")
+            // Set by whoever won, or taken by the table's landing
+            // (`Options::seal_copy_lands`): this reader's own, kept nowhere.
+            cell.get().unwrap_or(s)
         }
     }
 
@@ -41911,6 +41981,28 @@ impl Reader {
         let mut asked = 0u64;
         let mut ahead_asks = [0u64; 2];
         for (i, &(at, b, cut, off, len, new, slot)) in resolved.iter().enumerate() {
+            // An apply out of core reads the partition's records too -- a
+            // conversion's walk of its block, a patch's run -- each a major
+            // fault, which at a bound waits on the group's reclaim: the ask
+            // to give up is heard between them as between the resolves,
+            // and what the batch has applied so far goes with the forms.
+            // Heard only after the batch, the upkeep's pass of a full
+            // rewrite at ten million keys under 1.25 GiB held its pin for
+            // seconds past the writer's ask, every table landed behind it
+            // with its copy, until the group was killed.
+            if i % 64 == 63 {
+                if self.understudy {
+                    Reader::upkeep_held(&self.shared, 4);
+                }
+                if self.opts.settle_apply_looks && self.abandon_asked() {
+                    // What was applied is counted as applied.
+                    self.fs().settle_density.set(density);
+                    self.shared
+                        .apply_abandons
+                        .fetch_add(1, AtomicOrdering::Relaxed);
+                    return Ok(());
+                }
+            }
             if i == group_end {
                 group_end = resolved[i..]
                     .iter()
@@ -46910,6 +47002,8 @@ impl Db {
             snaps_kept: AtomicU64::new(0),
             snap_sealed: AtomicU64::new(0),
             snap_on_table: AtomicU64::new(0),
+            copies_landed: AtomicU64::new(0),
+            apply_abandons: AtomicU64::new(0),
             upkeep: Lend::default(),
             upkeep_lives: AtomicU64::new(u64::MAX),
             keep_bytes: Db::resolve_keep_bytes(&opts),
@@ -48383,6 +48477,8 @@ impl Db {
             snaps_kept: AtomicU64::new(0),
             snap_sealed: AtomicU64::new(0),
             snap_on_table: AtomicU64::new(0),
+            copies_landed: AtomicU64::new(0),
+            apply_abandons: AtomicU64::new(0),
             upkeep: Lend::default(),
             upkeep_lives: AtomicU64::new(u64::MAX),
             keep_bytes: Db::resolve_keep_bytes(&opts),
@@ -51156,6 +51252,14 @@ impl Db {
         } else {
             near || self.opts.seal_snapshot_far
         };
+        tables_trace(|| {
+            format!(
+                "seal scans {scans} outran {} copy {build_copy} since_scan {} keys {keys} table_mb {}",
+                self.shared.outran(),
+                self.seal_since_scan,
+                table.kept_bytes() >> 21
+            )
+        });
         let put_one = self.opts.seal_put_one;
         let bloom_pieces_only = self.opts.bloom_pieces_only;
         // As the seal's writer has them (`Shared::job_buffers`, above).
@@ -51242,6 +51346,12 @@ impl Db {
                     None if !build_copy => return None,
                     None => {
                         let mut built = Snapshot::from_frozen(&mem, &order)?;
+                        tables_trace(|| {
+                            format!(
+                                "copy mb {}",
+                                (mem.key_bytes() + mem.value_bytes() + 8 * order.len()) >> 20
+                            )
+                        });
                         if let Some(h) = &have {
                             built.bounds = h.bounds.clone();
                         }
@@ -51252,7 +51362,8 @@ impl Db {
                             shared.snap_on_table.fetch_add(1, AtomicOrdering::Release);
                             built
                         } else {
-                            mem.snaps.copied.get().expect("set by whoever won")
+                            // Set by whoever won, or taken by a landing.
+                            mem.snaps.copied.get().unwrap_or(built)
                         }
                     }
                 };
@@ -51779,6 +51890,7 @@ impl Db {
                 SealCounts::add(&c.frozen_byte_waits, 1);
                 SealCounts::add(&c.frozen_byte_wait_ns, ns);
             }
+            tables_trace(|| format!("wait ms {} by_bytes {by_bytes}", ns / 1_000_000));
         }
         Ok(())
     }
@@ -52119,6 +52231,7 @@ impl Db {
             self.drop_blocks_for(5);
         }
         self.published(old);
+        self.trace_freeze(table);
         true
     }
 
@@ -52142,7 +52255,25 @@ impl Db {
         };
         self.published_away(old);
         Db::ask_abandon(&self.opts, &self.shared, self.state(), from);
+        self.trace_freeze(table);
         true
+    }
+
+    /// A freeze's line under `SUPDB_TABLES_TRACE`: the table frozen, at
+    /// what keeping it costs, and the tables the state now stands on --
+    /// frozen and kept for the upkeep's look.
+    fn trace_freeze(&self, table: &MemTable) {
+        tables_trace(|| {
+            let st = self.state();
+            format!(
+                "freeze table_mb {} frozen {} held_mb {} of {} kept {}",
+                table.kept_bytes() >> 21,
+                st.frozen.len(),
+                Db::frozen_held(st) >> 20,
+                self.shared.frozen_bytes >> 20,
+                st.replaced().len()
+            )
+        });
     }
 
     /// Shared: the live `table` closed to its handles' writes before its
@@ -52408,6 +52539,7 @@ impl Db {
             shared
                 .abandon_at
                 .store(shared.scans_all(), AtomicOrdering::Release);
+            tables_trace(|| format!("ask kept {}", st.replaced().len()));
         }
     }
 
@@ -53718,6 +53850,7 @@ impl Db {
                 SealCounts::add(&c.frozen_byte_waits, 1);
                 SealCounts::add(&c.frozen_byte_wait_ns, ns);
             }
+            tables_trace(|| format!("wait ms {} by_bytes {by_bytes}", ns / 1_000_000));
         }
         self.rehold();
         Ok(())
@@ -56459,6 +56592,41 @@ fn idle_cpu_priority() {
 /// The calling thread's time on a core so far, in nanoseconds, for the
 /// gap between a pass's wall time and its time running: zero where the
 /// clock is not had.
+/// `SUPDB_TABLES_TRACE`: the writer's tables through a stretch of writes,
+/// a line on stderr at each event that moves which tables stand -- a seal
+/// handed with whether its table is copied for scans, a freeze, a seal's
+/// copy built, a landing, the writer's ask that the upkeep give its forms
+/// up, the upkeep's giving them up, and a wait of the writer's for room
+/// among the frozen tables -- stamped on the monotonic clock as the suite
+/// stamps its passes (`SUPDB_LAG_MARK`) and the engine's mapped blocks
+/// (`SUPDB_BLOCKS_WATCH`), so that a reading of a pass's memory says which
+/// tables stood at a moment and why. Off, a load of a flag at each such
+/// event, a few a second at most, and the line's words are never made.
+fn tables_trace(what: impl FnOnce() -> String) {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if !*ON.get_or_init(|| std::env::var_os("SUPDB_TABLES_TRACE").is_some()) {
+        return;
+    }
+    eprintln!("tables {} {}", mono_stamp(), what());
+}
+
+/// The monotonic clock in seconds, to the nanosecond, as the suite stamps
+/// its marks; zero where the platform has no such clock to read.
+fn mono_stamp() -> String {
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    {
+        let mut t = libc::timespec {
+            tv_sec: 0,
+            tv_nsec: 0,
+        };
+        // SAFETY: a valid out-pointer for the clock's one write.
+        if unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut t) } == 0 {
+            return format!("{}.{:09}", t.tv_sec, t.tv_nsec);
+        }
+    }
+    String::from("0.000000000")
+}
+
 fn thread_cpu_ns() -> u64 {
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     {
@@ -56715,7 +56883,8 @@ impl Reader {
                         if cell.set(own.clone()) {
                             own
                         } else {
-                            live.snaps.best().expect("set by whoever won")
+                            // Set by whoever won, or taken by a landing.
+                            live.snaps.best().unwrap_or(own)
                         }
                     }
                 }
@@ -57071,6 +57240,49 @@ impl PaceRuns {
     fn hold_pays(&self) -> bool {
         let (ended, reached) = self.ends_here();
         PACE_READ_WEIGHT * ended > reached
+    }
+}
+
+#[cfg(test)]
+mod set_once_tests {
+    use super::*;
+
+    /// A take leaves the tombstone: the cell reads as empty, refuses a
+    /// later value and gives nothing to a second take, and the value taken
+    /// is the taker's to free -- the cell's count went with it, so the
+    /// cell's drop frees nothing, and readers' counts taken before stand.
+    #[test]
+    fn a_taken_cell_is_a_tombstone_and_hands_its_count_over() {
+        let cell: SetOnce<Vec<u8>> = SetOnce::new();
+        assert!(
+            cell.take_raw().is_none(),
+            "nothing to take from an empty cell"
+        );
+        let cell: SetOnce<Vec<u8>> = SetOnce::new();
+        let v = std::sync::Arc::new(vec![1u8, 2, 3]);
+        assert!(cell.set(v.clone()));
+        let read = cell.get().expect("set");
+        assert_eq!(
+            std::sync::Arc::strong_count(&v),
+            3,
+            "ours, the cell's, a reader's"
+        );
+        let p = cell.take_raw().expect("a value to take");
+        assert!(cell.get().is_none(), "taken: reads as empty");
+        assert!(cell.take_raw().is_none(), "and gives nothing again");
+        let late = std::sync::Arc::new(vec![9u8]);
+        assert!(!cell.set(late.clone()), "and refuses a later value");
+        assert_eq!(std::sync::Arc::strong_count(&late), 1, "which it dropped");
+        drop(cell);
+        assert_eq!(
+            std::sync::Arc::strong_count(&v),
+            3,
+            "the cell's drop freed nothing: its count is the taker's"
+        );
+        // SAFETY: the count the take handed over, given up once.
+        drop(unsafe { std::sync::Arc::from_raw(p) });
+        assert_eq!(std::sync::Arc::strong_count(&v), 2);
+        assert_eq!(*read, vec![1u8, 2, 3], "a reader's count stands");
     }
 }
 
@@ -58582,6 +58794,21 @@ impl Db {
         Db::set_hold_bit(&self.shared.upkeep_hold_at, 2, on);
     }
 
+    /// A test's: while `on`, the upkeep thread waits inside a settle's
+    /// apply, at its look between two writes (`Options::settle_apply_looks`),
+    /// its state pinned, as an apply that faults on every write does.
+    #[doc(hidden)]
+    pub fn hold_upkeep_applying(&self, on: bool) {
+        Db::set_hold_bit(&self.shared.upkeep_hold_at, 4, on);
+    }
+
+    /// The asks to give the forms up a settle heard between the writes it
+    /// applies, over this store's life (`Options::settle_apply_looks`).
+    #[doc(hidden)]
+    pub fn settle_apply_abandons(&self) -> u64 {
+        self.shared.apply_abandons.load(AtomicOrdering::Relaxed)
+    }
+
     /// Whether the upkeep thread is waiting at a hold: for a test.
     #[doc(hidden)]
     pub fn upkeep_holding(&self) -> bool {
@@ -58990,6 +59217,14 @@ impl Db {
     #[doc(hidden)]
     pub fn seal_table_snapshots(&self) -> u64 {
         self.shared.snap_on_table.load(AtomicOrdering::Acquire)
+    }
+
+    /// The copies for scans landings took back from the tables they
+    /// retired (`Options::seal_copy_lands`) over this store's life: the
+    /// count that says the take fired, for a test and the suite.
+    #[doc(hidden)]
+    pub fn seal_copies_landed(&self) -> u64 {
+        self.shared.copies_landed.load(AtomicOrdering::Acquire)
     }
 
     #[doc(hidden)]
@@ -64305,6 +64540,26 @@ impl Maint {
     /// with no forms, as a freeze that carries nothing does, and the
     /// writer's tables go at its next look at the log, which carries
     /// nothing across a changed live table.
+    /// The landed `table`'s copy for scans taken back
+    /// (`Options::seal_copy_lands`), now that the state just published
+    /// stands without the table: freed as a replaced snapshot is, past
+    /// every reader pinned before this, which is every reader that could
+    /// be between a load of the cell and its count; a reader pinned from
+    /// here on finds the tombstone. Nothing where the table held none.
+    fn retire_copy(&self, table: &MemTable) {
+        let Some(c) = table.snaps.copied.take_raw() else {
+            return;
+        };
+        let epoch = self.shared.readers.epoch.load(AtomicOrdering::SeqCst);
+        self.shared.retired_snaps.push(epoch + 1, RetiredSnap(c));
+        self.shared.readers.bump();
+        self.r.sweep_retired_snaps();
+        self.shared
+            .copies_landed
+            .fetch_add(1, AtomicOrdering::Release);
+        tables_trace(|| "copy taken at its landing".to_string());
+    }
+
     fn publish_segs_with(
         &mut self,
         mut segs: Vec<std::sync::Arc<Seg>>,
@@ -64455,9 +64710,25 @@ impl Maint {
                 .forms_rebased
                 .fetch_add(rebases, AtomicOrdering::Relaxed);
             if retired_table {
-                self.shared
+                let n = self
+                    .shared
                     .tables_landed
-                    .fetch_add(1, AtomicOrdering::Release);
+                    .fetch_add(1, AtomicOrdering::Release)
+                    + 1;
+                tables_trace(|| {
+                    // SAFETY: just published, and this operation is pinned.
+                    let st = unsafe { &*p };
+                    format!(
+                        "landed {n} frozen {} kept {}",
+                        st.frozen.len(),
+                        st.replaced().len()
+                    )
+                });
+                if self.opts.seal_copy_lands {
+                    if let Some(t) = landed {
+                        self.retire_copy(t);
+                    }
+                }
             }
             if swapped_live {
                 SealCounts::add(&self.shared.seal_counts.tail_by_landing, 1);

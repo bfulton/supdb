@@ -36,14 +36,18 @@ mapping lock and walks its page tables, a millisecond or so, so the
 period is longer than the group's: a tenth of a second, against the
 group's ten milliseconds up to a kill.
 
-`end` reads a pass's last moments, for every pass's process in the samples
-or the one PID names: the group's last sample and its largest charge, the
-last `maps` line and the last `blockwatch` line before the last sample,
-and from them who held the group's charge: the page cache, the kernel's
-memory, and of the anonymous bytes the engine's mapped blocks resident and
-the rest, beside what the allocator has mapped, which is mapped and not
-resident -- an arena's top and a chunk of its own are pages nobody touched
-until somebody does.
+`end` reads three moments of a pass, for every pass's process in the
+samples or the one PID names: its group's last sample, its largest charge,
+and its largest charge the kernel cannot take back (the anonymous, shared
+and kernel memory, which is what a bound kills on once the page cache is
+spent); each with the phase it fell in by the run's marks
+(`SUPDB_LAG_MARK`), the `maps` line and the `blockwatch` line at or before
+it, and from them who held the group's charge: the page cache, the
+kernel's memory, and of the anonymous bytes the engine's mapped blocks
+resident, their three lengths of the most bytes, and the rest, beside what
+the allocator has mapped, which is mapped and not resident -- an arena's
+top and a chunk of its own are pages nobody touched until somebody
+does.
 
 The kernel memory is what the cache's and the process's bytes leave out of
 a group's usage, and a group is bounded on the sum. A page the cache holds
@@ -249,6 +253,44 @@ def table(out_path, err_path, phases):
         )
 
 
+def owners(t, d, wl):
+    """Who held the group's charge at `t`, its sample `d`: the page cache,
+    the kernel, and of the anonymous bytes the engine's blocks by the last
+    census at or before `t` and the rest, beside the allocator's mapped
+    bytes."""
+    w = [x for x in wl if x[0] <= t + 0.001]
+    if not w:
+        return "  owners  no census before %.3f" % t
+    tw, arm, rep, why, rest = w[-1]
+    f = {k: float(v) for k, v in re.findall(r"(\w+_mb) ([\d.]+)", rest.split(" | ")[0])}
+    anon = f.get("anon_mb", 0)
+    engine = f.get("resident_mb", 0)
+    lengths = " | ".join(rest.split(" | ")[1:4])
+    return (
+        "  owners  at %.3f, the census %.3f s before: of %.0f MB anonymous, the engine's blocks %.1f (%s) and the rest %.1f, beside the allocator's %.1f mapped (arenas %.1f, %.1f of it free; its own mappings %.1f); of the group's %d MB, page cache %d, kernel %.0f"
+        % (
+            t,
+            t - tw,
+            anon,
+            engine,
+            lengths,
+            anon - engine,
+            f.get("heap_mb", 0) + f.get("mmapped_mb", 0),
+            f.get("heap_mb", 0),
+            f.get("free_mb", 0),
+            f.get("mmapped_mb", 0),
+            d.get("usage_kb", 0) >> 10,
+            d.get("cache", 0),
+            d.get("kmem_kb", 0) / 1024,
+        )
+    )
+
+
+def held(d):
+    """What of a sample's charge the kernel cannot take back, in MB."""
+    return d.get("rss", 0) + d.get("shmem", 0) + d.get("kmem_kb", 0) / 1024
+
+
 def end(out_path, err_path, only):
     mem, maps, watch = {}, {}, {}
     for line in open(out_path):
@@ -258,10 +300,26 @@ def end(out_path, err_path, only):
             mem.setdefault(p[3], []).append((float(p[1]), p[2], d))
         elif len(p) >= 4 and p[0] == "maps":
             maps.setdefault(p[3], []).append((float(p[1]), line.split(" ", 4)[4].strip()))
+    marks = []
     for line in open(err_path, errors="replace"):
         m = re.match(r"blockwatch (\d+) (\S+) (\d+) ([\d.]+) (\S+) (.*)", line)
         if m:
             watch.setdefault(m.group(1), []).append((float(m.group(4)), m.group(2), m.group(3), m.group(5), m.group(6)))
+        m = re.match(r"(?:phasemark \S+ (\S+)|lagmark \S+ (\d+)) (start|end) ([\d.]+)", line)
+        if m:
+            name = m.group(1) or "lag%spct" % m.group(2)
+            marks.append((float(m.group(4)), name, m.group(3)))
+    marks.sort()
+
+    def phase_at(t):
+        """The phase a moment fell in, or the last one ended before it."""
+        cur = None
+        for tm, name, edge in marks:
+            if tm > t:
+                break
+            cur = name if edge == "start" else "after " + name
+        return cur or "-"
+
     pids = [only] if only else sorted(mem, key=lambda q: mem[q][-1][0])
     if not pids or not any(q in mem for q in pids):
         sys.exit("groupmem: no samples of %s in %s" % (only or "any process", out_path))
@@ -270,54 +328,32 @@ def end(out_path, err_path, only):
             print("pid %s: no samples" % pid)
             continue
         ms = mem[pid]
-        t_end, group, last = ms[-1]
-        top = max(ms, key=lambda s: s[2].get("usage_kb", 0))
-        print("pid %s %s: %d samples, %.3f s to %.3f" % (pid, group, len(ms), ms[0][0], t_end))
-        for name, (t, _, d) in (("last", ms[-1]), ("largest", top)):
+        wl = watch.get(pid, [])
+        print("pid %s %s: %d samples, %.3f s to %.3f" % (pid, ms[-1][1], len(ms), ms[0][0], ms[-1][0]))
+        for name, (t, _, d) in (
+            ("last", ms[-1]),
+            ("largest", max(ms, key=lambda s: s[2].get("usage_kb", 0))),
+            ("held", max(ms, key=lambda s: held(s[2]))),
+        ):
             print(
-                "  %-7s %.3f usage %d MB = cache %d + rss %d + kernel %.0f; shmem %d mapped_file %d"
+                "  %-7s %.3f in %s: usage %d MB = cache %d + rss %d + kernel %.0f; shmem %d mapped_file %d; held %.0f"
                 % (
                     name,
                     t,
+                    phase_at(t),
                     d.get("usage_kb", 0) >> 10,
                     d.get("cache", 0),
                     d.get("rss", 0),
                     d.get("kmem_kb", 0) / 1024,
                     d.get("shmem", 0),
                     d.get("mapped_file", 0),
+                    held(d),
                 )
             )
-        mp = [x for x in maps.get(pid, []) if x[0] <= t_end + 0.001]
-        if mp:
-            t, text = mp[-1]
-            print("  maps    %.3f %s" % (t, text))
-        wl = [x for x in watch.get(pid, []) if x[0] <= t_end + 0.001]
-        if not wl:
-            continue
-        t, arm, rep, why, rest = wl[-1]
-        print("  engine  %.3f %s rep %s %s %s" % (t, arm, rep, why, rest))
-        f = dict(re.findall(r"(\w+_mb) ([\d.]+)", rest.split(" | ")[0]))
-        f = {k: float(v) for k, v in f.items()}
-        anon = f.get("anon_mb", 0)
-        engine = f.get("resident_mb", 0)
-        alloc = f.get("heap_mb", 0) + f.get("mmapped_mb", 0)
-        print(
-            "  owners  of %.0f MB anonymous at %.3f: the engine's blocks %.1f resident, the rest %.1f, beside the allocator's %.1f mapped (arenas %.1f, %.1f of it free; its own mappings %.1f); of the group's %d MB at %.3f: page cache %d, kernel %.0f"
-            % (
-                anon,
-                t,
-                engine,
-                anon - engine,
-                alloc,
-                f.get("heap_mb", 0),
-                f.get("free_mb", 0),
-                f.get("mmapped_mb", 0),
-                last.get("usage_kb", 0) >> 10,
-                t_end,
-                last.get("cache", 0),
-                last.get("kmem_kb", 0) / 1024,
-            )
-        )
+            mp = [x for x in maps.get(pid, []) if x[0] <= t + 0.001]
+            if mp:
+                print("  maps    %.3f %s" % (mp[-1][0], mp[-1][1][:200]))
+            print(owners(t, d, wl))
 
 
 def main():
