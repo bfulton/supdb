@@ -94,12 +94,6 @@
 //! - `ZFUZZ_FORMSOFF=1`, with `ZFUZZ_ZPAGES`: the `z` store's handles give
 //!   their block forms up for the merge path and take them back every few
 //!   scans (`Options::scan_forms_off_unreused`), a flag and not a draw.
-//! - `ZFUZZ_PARSE=1`: the `z` store's block-coded groups are written by the
-//!   parsing encoder (`Options::zpages_parse`), a flag and not a draw, so
-//!   that every seed's operations are the ones it had without it.
-//! - `ZFUZZ_FLEXDEC=1`: the `z` store's block-coded groups are decoded by
-//!   `lz4_flex` and not the engine's own decoder (`Options::zpages_own_decoder`
-//!   off), a flag and not a draw for the same reason.
 //! - `ZFUZZ_KEEPONE=1`: both stores keep one table, and a byte's worth, for
 //!   the upkeep's look (`Options::upkeep_keep_bytes`), so that a look a
 //!   table behind and a pass with a table landed under its pin give the
@@ -369,11 +363,6 @@ struct Cfg {
     /// (`Options::zpages_block_cursor`); off in some seeds under
     /// `ZFUZZ_OPTVARY`, so the shape before is read against the model too.
     block_cursor: bool,
-    /// The form file's groups coded record by record
-    /// (`Options::zpages_record_coding`, off as shipped); on in a quarter of
-    /// the seeds under `ZFUZZ_OPTVARY`, so the record coding is read against
-    /// the model too.
-    record_coding: bool,
     /// The fence searched through its tree (`Options::zpages_fence_tree`,
     /// off as shipped); on in a quarter of the seeds under `ZFUZZ_OPTVARY`,
     /// so the tree is read against the model too.
@@ -387,12 +376,8 @@ struct Cfg {
     /// `ZFUZZ_OPTVARY`, so a scan that takes its block from the cache is
     /// read against the model too.
     start_cache: bool,
-    /// Every group of the form stored verbatim (`Options::zpages_store_all`,
-    /// off); on in some seeds under `ZFUZZ_OPTVARY`, so the stored form is
-    /// read against the model too.
-    store_all: bool,
-    /// The record coding's tails stored raw (`Options::zpages_raw_tails`,
-    /// off), with the record coding on; on in some seeds under
+    /// The record coding with its tails stored raw
+    /// (`Options::zpages_raw_tails`, off); on in some seeds under
     /// `ZFUZZ_OPTVARY`.
     raw_tails: bool,
     /// A point read's first touch of a group decoded in part with the
@@ -892,12 +877,21 @@ fn pick_cfg(rng: &mut Rng, want_cache: bool) -> Cfg {
         trusted: !(std::env::var("ZFUZZ_OPTVARY").is_ok() && rng.chance(15)),
         memo_first: std::env::var("ZFUZZ_OPTVARY").is_ok() && rng.chance(15),
         block_cursor: !(std::env::var("ZFUZZ_OPTVARY").is_ok() && rng.chance(15)),
-        record_coding: std::env::var("ZFUZZ_OPTVARY").is_ok() && rng.chance(25),
-        fence_tree: std::env::var("ZFUZZ_OPTVARY").is_ok() && rng.chance(25),
+        fence_tree: {
+            // The draw the compressed record coding took
+            // (`Options::zpages_record_coding`, gone), kept so that no
+            // seed's draws after it move.
+            let _ = std::env::var("ZFUZZ_OPTVARY").is_ok() && rng.chance(25);
+            std::env::var("ZFUZZ_OPTVARY").is_ok() && rng.chance(25)
+        },
         memo_ahead: !(std::env::var("ZFUZZ_OPTVARY").is_ok() && rng.chance(15)),
         start_cache: std::env::var("ZFUZZ_OPTVARY").is_ok() && rng.chance(25),
-        store_all: std::env::var("ZFUZZ_OPTVARY").is_ok() && rng.chance(25),
-        raw_tails: std::env::var("ZFUZZ_OPTVARY").is_ok() && rng.chance(25),
+        raw_tails: {
+            // The draw the stored-whole form took (`Options::zpages_store_all`,
+            // gone), kept so that no seed's draws after it move.
+            let _ = std::env::var("ZFUZZ_OPTVARY").is_ok() && rng.chance(25);
+            std::env::var("ZFUZZ_OPTVARY").is_ok() && rng.chance(25)
+        },
         point_part: !(vary && part_off),
         point_keys: !(vary && keys_off),
         scan_admit: !(vary && scan_off),
@@ -947,7 +941,6 @@ fn opts(c: &Cfg) -> Options {
         zpages_trusted_views: c.trusted,
         zpages_memo_first: c.memo_first,
         zpages_block_cursor: c.block_cursor,
-        zpages_record_coding: c.record_coding || c.raw_tails,
         zpages_raw_tails: c.raw_tails,
         zpages_fence_tree: c.fence_tree,
         zpages_memo_ahead: c.memo_ahead,
@@ -975,7 +968,6 @@ fn opts(c: &Cfg) -> Options {
             Options::default().wal_hold_bytes
         },
         promote_starts: c.hot_starts,
-        zpages_store_all: c.store_all,
         scan_start_cache: if c.start_cache { 4096 } else { 0 },
         // The block form unless the seed draws the other (`opts_z`,
         // `ZFUZZ_STRIDE`), whichever the engine ships: the pair is read
@@ -1053,12 +1045,6 @@ fn opts_z(c: &Cfg) -> Options {
             o.forms_to_fit = true;
         }
     }
-    // Under `ZFUZZ_PARSE` the form's block-coded groups are the parsing
-    // encoder's (`Options::zpages_parse`): the same format in other
-    // sequences, read against the raw store.
-    if env_flag("ZFUZZ_PARSE") {
-        o.zpages_parse = true;
-    }
     // Under `ZFUZZ_FORMSOFF`, with the form forced so that the gate is the
     // compact form's, the `z` store's handles give their forms up for the
     // merge path and take them back every three scans whatever their
@@ -1073,12 +1059,6 @@ fn opts_z(c: &Cfg) -> Options {
         o.scan_forms_off_window = 3;
         o.scan_forms_off_flip = true;
         o.scan_forms_off_stale_writes = 3;
-    }
-    // Under `ZFUZZ_FLEXDEC` they are decoded by `lz4_flex` and not the
-    // engine's own decoder (`Options::zpages_own_decoder`), read against the
-    // raw store.
-    if env_flag("ZFUZZ_FLEXDEC") {
-        o.zpages_own_decoder = false;
     }
     // Under `ZFUZZ_CIPHER` the `z` store is kept under a cipher
     // (`Encryption::Cipher`) while `r` is in the clear over the same writes:

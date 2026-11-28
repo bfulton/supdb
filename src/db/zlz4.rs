@@ -110,8 +110,8 @@ impl Effort {
         greedy: false,
     };
 
-    /// The search a build asks for by its chain depth
-    /// (`Options::zpages_parse_chains`): zero the shipped lazy parse
+    /// The search a build asks for by its chain depth (the engine's
+    /// builds ask four, `db::ZPARSE_CHAINS`): zero the lazy parse
     /// ([`Effort::SHIPPED`]), else the greedy parse over `chains` positions
     /// of each position's chain. Priced on the form's own groups
     /// (`bench/examples/zdecode.rs`, `--rhc N:0:8:1:0:1`): at two and four

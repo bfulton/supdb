@@ -34,7 +34,7 @@
 //! file's own) and what it saves in decode: one run a group, the point
 //! read's decode, and all `k` runs, the scan's, each cycling the groups as
 //! above. The form as shipped cuts a page at two kibibytes of records
-//! (`Options::zpages_group_bytes`); a store built with the target at zero
+//! (`zpages::ZGROUP_BYTES`); a store built with the target at zero
 //! (one group a page) is what the split was first priced on.
 //!
 //! And the compressor's side of the decode: `--hc LEVEL` recompresses every

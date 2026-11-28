@@ -840,9 +840,6 @@ pub struct Supdb {
     /// The bulk walk searches the fence at every page and asks the memo
     /// twice a group (`Options::zpages_bulk_steps` off): `supdb-zbulksearch`.
     zbulksearch: bool,
-    /// The flat decoder lent the fast loop's slack alone
-    /// (`Options::zpages_flat_slack` off): `supdb-zflatshort`.
-    zflatshort: bool,
     /// The scans started in a block before its scans hold the blocks they
     /// walk as copies under the form (`Options::promote_starts`), `None`
     /// for the engine's: `supdb-zhotstarts2`, `supdb-zhotstarts3`,
@@ -1263,10 +1260,6 @@ pub struct Supdb {
     /// partition's reader's (`Options::zpages_seek_seeds` on):
     /// `supdb-zseekseed`.
     zseekseed: bool,
-    /// The compressed form files in the record coding, each record decoded
-    /// alone, where the controller picks a compressed coding
-    /// (`Options::zpages_record_coding` on): `supdb-zrecord`.
-    zrecorddefault: bool,
     /// A raw partition sent back to its form file once its reads a key fall
     /// under the median partition's (`Options::zpages_hot_cold_back` on):
     /// `supdb-zhotcoldback`.
@@ -1461,23 +1454,12 @@ pub struct Supdb {
     /// `supdb-cache64tofitautozpagesraw`, the pair against
     /// `supdb-cache64tofitautozpages`.
     zcacheraw: bool,
-    /// The coding the options name under the controller and not the
-    /// selector's (`Options::zpages_coding_auto` off), the shape before:
-    /// `supdb-cache64tofitautozpagescodingfixed` against
-    /// `supdb-cache64tofitautozpages`.
-    zcodingfixed: bool,
     /// The combined arm with a block read this many entries' worth held
     /// as a copy in its slot under the form (`Options::promote_entries`
     /// with `zpages_promote_copies`), zero for neither:
     /// `supdb-cache64tofitautozpagespromote`, the pair against
     /// `supdb-cache64tofitautozpages`.
     zpromote: usize,
-    /// The combined arm with the form's page cut into groups at this many
-    /// bytes of records (`Options::zpages_group_bytes`), `None` for the
-    /// engine's default: `supdb-cache64tofitautozpagesonegroup` at zero,
-    /// the page as one group, and `supdb-cache64tofitautozpagesgroup1k` at
-    /// a kibibyte, each the pair against `supdb-cache64tofitautozpages`.
-    zgroup: Option<usize>,
     /// The combined arm with the form files built ahead of the
     /// controller's decision once the store outgrows its budget
     /// (`Options::zpages_prebuild`): `supdb-cache64tofitautozpagesprebuild`,
@@ -1506,60 +1488,19 @@ pub struct Supdb {
     /// `supdb-nocachezpagescheckedviews`, the pair against
     /// `supdb-nocachezpages`, which prices the views by instruction in core.
     zcheckedviews: bool,
-    /// The form file's groups holding their records one by one
-    /// (`Options::zpages_record_coding` on): `supdb-cache64tofitautozpagesrecord`
-    /// and the forced `supdb-nocachezpagesrecord`, each the pair against the
-    /// arm without it.
-    zrecord: bool,
-    /// The form file's groups stored verbatim, no LZ4 (`Options::zpages_store_all`):
-    /// `supdb-nocachezpagesstored`, and `supdb-cache64tofitzpagesstored`
-    /// against `supdb-cache64tofitzpages`, the forced form with the block
-    /// cache.
-    zstored: bool,
     /// The record coding with every tail stored raw (`Options::zpages_raw_tails`
-    /// with `zpages_record_coding`): `supdb-nocachezpagesrecordraw`, and
+    /// and the record coding it implies): `supdb-nocachezpagesrecordraw`, and
     /// `supdb-cache64tofitzpagesrecordraw` against `supdb-cache64tofitzpages`.
     zrawtails: bool,
-    /// The raw-tail form's groups decoded whole for a scan instead of read
-    /// in place (`Options::zpages_inplace_walk` off), the shape before the
-    /// in-place walk: `supdb-cache64tofitzpagesrecordrawdecode` against
-    /// `supdb-cache64tofitzpagesrecordraw`.
-    zdecodewalk: bool,
     /// A partition's raw file and ordered index dropped from the page cache
     /// once its form file serves it (`Options::zpages_drop_raw`):
     /// `supdb-cache64tofitzpagesdrop` against the same without. `None` follows the engine; the
     /// `cache64tofit` arms pin the shape before the drop, since their pairs
     /// were priced against it.
     zdropraw: Option<bool>,
-    /// The block coding's groups written by the parsing encoder
-    /// (`Options::zpages_parse`): `supdb-cache64tofitzpagesdropparse`
-    /// against `supdb-cache64tofitzpagesdrop`, and
-    /// `supdb-cache64tofitautozpagesparse` against
-    /// `supdb-cache64tofitautozpages`.
-    zparse: bool,
-    /// The lazy parse at the controller's builds alone, a merge's finish
-    /// builds kept greedy (`Options::zpages_parse_finish` off,
-    /// `Options::zpages_parse_chains` at zero): `supdb-zparsestart` against
-    /// `supdb-zparse` and `supdb`.
-    zparsestart: bool,
-    /// Every group written by `lz4_flex`'s greedy encoder
-    /// (`Options::zpages_parse` off): `supdb-zgreedy`, the shape before the
-    /// parse over four chain positions at the controller's builds.
-    zgreedy: bool,
-    /// The engine's own decoder without its flat loop, the fast loop
-    /// alone (`Options::zpages_flat_decode` off): `supdb-znoflat` against
-    /// `supdb`.
-    znoflat: bool,
     /// The hot-raw policy without its fill (`Options::zpages_hot_fill`
     /// off), the shape before it: `supdb-znohotfill` against `supdb`.
     znohotfill: bool,
-    /// The form's groups decoded by `lz4_flex` and not the engine's own
-    /// decoder (`Options::zpages_own_decoder` off), the shape before it:
-    /// `supdb-cache64tofitzpagesdropflexdec` against
-    /// `supdb-cache64tofitzpagesdrop`, and
-    /// `supdb-cache64tofitautozpagesflexdec` against
-    /// `supdb-cache64tofitautozpages`.
-    zflexdec: bool,
     /// The builds ahead from this percent of the budget, beside the seals
     /// that land (`Options::zpages_land_pct`): the `...dropland<pct>` arms
     /// against `supdb-cache64tofitautozpagesdrop`. `None` follows the
@@ -2192,9 +2133,6 @@ struct Policy {
     /// The bulk walk searches the fence at every page and asks the memo
     /// twice a group (`Options::zpages_bulk_steps` off): `supdb-zbulksearch`.
     zbulksearch: bool,
-    /// The flat decoder lent the fast loop's slack alone
-    /// (`Options::zpages_flat_slack` off): `supdb-zflatshort`.
-    zflatshort: bool,
     /// The scans started in a block before its scans hold the blocks they
     /// walk as copies under the form (`Options::promote_starts`), `None`
     /// for the engine's: `supdb-zhotstarts2`, `supdb-zhotstarts3`,
@@ -2609,8 +2547,6 @@ struct Policy {
     zhotfillquiet: bool,
     /// The start placed once: `supdb-zseekseed`.
     zseekseed: bool,
-    /// The record coding where a compressed form is picked: `supdb-zrecord`.
-    zrecorddefault: bool,
     /// The cold way back: `supdb-zhotcoldback`.
     zhotcoldback: bool,
     /// The reader table walked at every end: `supdb-sweepwalks`.
@@ -2719,20 +2655,11 @@ struct Policy {
     /// controller's form (`Options::zpages_block_cache` off):
     /// `supdb-cache64tofitautozpagesraw`.
     zcacheraw: bool,
-    /// The coding the options name under the controller and not the
-    /// selector's (`Options::zpages_coding_auto` off), the shape before:
-    /// `supdb-cache64tofitautozpagescodingfixed` against
-    /// `supdb-cache64tofitautozpages`.
-    zcodingfixed: bool,
     /// Blocks read this many entries' worth held as copies in their slots
     /// under the form (`Options::promote_entries` with
     /// `zpages_promote_copies`), zero for neither:
     /// `supdb-cache64tofitautozpagespromote`.
     zpromote: usize,
-    /// The form's page cut into groups at this many bytes of records
-    /// (`Options::zpages_group_bytes`), `None` for the engine's default:
-    /// `supdb-cache64tofitautozpagesonegroup`, `...group1k`.
-    zgroup: Option<usize>,
     /// The form files built ahead past the budget
     /// (`Options::zpages_prebuild`): `supdb-cache64tofitautozpagesprebuild`.
     zprebuild: bool,
@@ -2749,42 +2676,15 @@ struct Policy {
     /// (`Options::zpages_trusted_views` off):
     /// `supdb-cache64tofitautozpagescheckedviews`.
     zcheckedviews: bool,
-    /// The form file's groups holding their records one by one
-    /// (`Options::zpages_record_coding` on): `supdb-cache64tofitautozpagesrecord`,
-    /// `supdb-nocachezpagesrecord`.
-    zrecord: bool,
-    /// The form file's groups stored verbatim (`Options::zpages_store_all`):
-    /// `supdb-nocachezpagesstored`, `supdb-cache64tofitzpagesstored`.
-    zstored: bool,
     /// The record coding with every tail stored raw (`Options::zpages_raw_tails`):
     /// `supdb-nocachezpagesrecordraw`, `supdb-cache64tofitzpagesrecordraw`.
     zrawtails: bool,
-    /// Its raw-tail groups decoded whole for a scan
-    /// (`Options::zpages_inplace_walk` off): `supdb-cache64tofitzpagesrecordrawdecode`.
-    zdecodewalk: bool,
     /// Its raw pages dropped behind the form (`Options::zpages_drop_raw`):
     /// `supdb-cache64tofitzpagesdrop`.
     zdropraw: Option<bool>,
-    /// Its block-coded groups the parsing encoder's (`Options::zpages_parse`):
-    /// `supdb-cache64tofitzpagesdropparse`, `supdb-cache64tofitautozpagesparse`.
-    zparse: bool,
-    /// The lazy parse at the controller's builds alone
-    /// (`Options::zpages_parse_finish` off, the chains at zero):
-    /// `supdb-zparsestart`.
-    zparsestart: bool,
-    /// The greedy encoder everywhere (`Options::zpages_parse` off):
-    /// `supdb-zgreedy`.
-    zgreedy: bool,
-    /// The fast decode loop alone (`Options::zpages_flat_decode` off):
-    /// `supdb-znoflat`.
-    znoflat: bool,
     /// The hot-raw policy without its fill (`Options::zpages_hot_fill`
     /// off): `supdb-znohotfill`.
     znohotfill: bool,
-    /// Its groups decoded by `lz4_flex` (`Options::zpages_own_decoder`
-    /// off): `supdb-cache64tofitzpagesdropflexdec`,
-    /// `supdb-cache64tofitautozpagesflexdec`.
-    zflexdec: bool,
     /// The builds ahead from this percent of the budget
     /// (`Options::zpages_land_pct`).
     zlandpct: Option<u32>,
@@ -3136,7 +3036,6 @@ impl Default for Policy {
             zbulkpart: false,
             zbulkaheadwithin: false,
             zbulksearch: false,
-            zflatshort: false,
             zhotstarts: None,
             nochainwrites: false,
             noland: false,
@@ -3223,7 +3122,6 @@ impl Default for Policy {
             zhotgrowth5: false,
             zhotfillquiet: false,
             zseekseed: false,
-            zrecorddefault: false,
             zhotcoldback: false,
             sweepwalks: false,
             zhotskewroom: false,
@@ -3267,13 +3165,7 @@ impl Default for Policy {
             zpages_noahead: false,
             zpages_buildeager: false,
             zcacheraw: false,
-            zcodingfixed: false,
-            zparse: false,
-            zparsestart: false,
-            zgreedy: false,
-            znoflat: false,
             znohotfill: false,
-            zflexdec: false,
             zlandpct: None,
             zsampleidle: false,
             zattachwarm: false,
@@ -3283,16 +3175,12 @@ impl Default for Policy {
             znobuildsync: false,
             zcoldskip: false,
             zpromote: 0,
-            zgroup: None,
             zprebuild: false,
             zspan: false,
             zmemolinear: false,
             zexactcut: false,
             zcheckedviews: false,
-            zrecord: false,
-            zstored: false,
             zrawtails: false,
-            zdecodewalk: false,
             zdropraw: None,
             settleevery: None,
             settlebuilds: None,
@@ -4286,20 +4174,6 @@ impl Supdb {
             path,
             Policy {
                 znopointfilter: true,
-                ..Policy::default()
-            },
-        )
-    }
-
-    /// `supdb` whose compressed form files are built in the record coding,
-    /// each record decodable alone, so a point read decodes one record and
-    /// not its group (`Options::zpages_record_coding` on; the controller's
-    /// pick of the raw tails is unchanged).
-    pub fn create_zrecord(path: &Path) -> Res<Supdb> {
-        Supdb::with_policy(
-            path,
-            Policy {
-                zrecorddefault: true,
                 ..Policy::default()
             },
         )
@@ -6191,34 +6065,6 @@ impl Supdb {
         )
     }
 
-    /// `supdb` with its block-coded groups written by the parsing encoder
-    /// (`Options::zpages_parse`), `supdb-zparse`: the same block format in
-    /// fewer sequences, a faster cold decode for the builders' CPU, priced
-    /// where the builds ahead carry the build beside the load.
-    pub fn create_zparse(path: &Path) -> Res<Supdb> {
-        Supdb::with_policy(
-            path,
-            Policy {
-                zparse: true,
-                ..Policy::default()
-            },
-        )
-    }
-
-    /// `supdb-zparse` whose merges' finish builds keep the greedy encoder
-    /// (`Options::zpages_parse_finish` off), `supdb-zparsestart`: the parse
-    /// at the controller's builds, which carry the load's partitions, and
-    /// not on the merge chain's path.
-    pub fn create_zparsestart(path: &Path) -> Res<Supdb> {
-        Supdb::with_policy(
-            path,
-            Policy {
-                zparsestart: true,
-                ..Policy::default()
-            },
-        )
-    }
-
     /// `supdb` whose hot-raw policy releases partitions by their skew alone
     /// and leaves the rest of the room the group measures empty
     /// (`Options::zpages_hot_fill` off), the shape before the fill:
@@ -6228,19 +6074,6 @@ impl Supdb {
             path,
             Policy {
                 znohotfill: true,
-                ..Policy::default()
-            },
-        )
-    }
-
-    /// `supdb` whose form's groups are decoded by the fast loop alone, the
-    /// shape before the flat loop (`Options::zpages_flat_decode` off),
-    /// `supdb-znoflat`.
-    pub fn create_znoflat(path: &Path) -> Res<Supdb> {
-        Supdb::with_policy(
-            path,
-            Policy {
-                znoflat: true,
                 ..Policy::default()
             },
         )
@@ -6555,28 +6388,6 @@ impl Supdb {
         )
     }
 
-    /// `supdb-cache64tofitautozpages` with the coding of the form files the
-    /// options' and not the selector's (`Options::zpages_coding_auto` off),
-    /// `supdb-cache64tofitautozpagescodingfixed`: the block coding wherever
-    /// the controller builds, the shape before the gear. The pair against
-    /// the combined arm prices the gear, which picks the raw-tail record
-    /// coding where the model predicts that form fits the fill share of the
-    /// budget (`zselect::FORM_FILL`) and the block coding otherwise.
-    pub fn create_cache64_tofit_auto_zpages_codingfixed(path: &Path) -> Res<Supdb> {
-        Supdb::with_policy(
-            path,
-            Policy {
-                budget: 64 << 20,
-                tofit: true,
-                zpages_auto: true,
-                zcodingfixed: true,
-                zdropraw: Some(false),
-                zlandpct: Some(0),
-                ..Policy::default()
-            },
-        )
-    }
-
     /// `supdb-cache64tofitautozpages` with a block that reads have walked
     /// a block's worth of entries (sixty-four) held as a merged copy in
     /// its slot under the form, a clean block included
@@ -6594,49 +6405,6 @@ impl Supdb {
                 tofit: true,
                 zpages_auto: true,
                 zpromote: 64,
-                zdropraw: Some(false),
-                zlandpct: Some(0),
-                ..Policy::default()
-            },
-        )
-    }
-
-    /// `supdb-cache64tofitautozpages` with the form's page as one group
-    /// (`Options::zpages_group_bytes` zero), the shape before the page
-    /// became a container of groups: a point read decodes the whole page
-    /// for its record. The pair against `supdb-cache64tofitautozpages`
-    /// prices the cut, which costs the form six percent of its bytes at
-    /// the suite's shape for a point read's decode a quarter of the
-    /// page's.
-    pub fn create_cache64_tofit_auto_zpages_onegroup(path: &Path) -> Res<Supdb> {
-        Supdb::with_policy(
-            path,
-            Policy {
-                budget: 64 << 20,
-                tofit: true,
-                zpages_auto: true,
-                zgroup: Some(0),
-                zdropraw: Some(false),
-                zlandpct: Some(0),
-                ..Policy::default()
-            },
-        )
-    }
-
-    /// `supdb-cache64tofitautozpages` with the page cut at a kibibyte of
-    /// records (`Options::zpages_group_bytes` 1024) where the default cuts
-    /// at two: twice the groups, twelve percent of the form's bytes against
-    /// six for a point read's decode a seventh of the page's against a
-    /// quarter. The pair against `supdb-cache64tofitautozpages` prices the
-    /// target.
-    pub fn create_cache64_tofit_auto_zpages_group1k(path: &Path) -> Res<Supdb> {
-        Supdb::with_policy(
-            path,
-            Policy {
-                budget: 64 << 20,
-                tofit: true,
-                zpages_auto: true,
-                zgroup: Some(1024),
                 zdropraw: Some(false),
                 zlandpct: Some(0),
                 ..Policy::default()
@@ -6740,27 +6508,6 @@ impl Supdb {
                 tofit: true,
                 zpages_auto: true,
                 zcheckedviews: true,
-                zdropraw: Some(false),
-                zlandpct: Some(0),
-                ..Policy::default()
-            },
-        )
-    }
-
-    /// `supdb-cache64tofitautozpages` with the form file's groups holding
-    /// their records one by one (`Options::zpages_record_coding` on): the
-    /// pair against `supdb-cache64tofitautozpages` prices a record decoded
-    /// against a group decoded, on every read through the form -- the
-    /// point-read mixes a quarter to a third faster and E's scans a fifth
-    /// slower at five million keys under 640 MiB.
-    pub fn create_cache64_tofit_auto_zpages_record(path: &Path) -> Res<Supdb> {
-        Supdb::with_policy(
-            path,
-            Policy {
-                budget: 64 << 20,
-                tofit: true,
-                zpages_auto: true,
-                zrecord: true,
                 zdropraw: Some(false),
                 zlandpct: Some(0),
                 ..Policy::default()
@@ -7746,21 +7493,6 @@ impl Supdb {
         )
     }
 
-    /// `supdb` with the form's pages cut into groups of a kibibyte of
-    /// records where the default cuts at two (`Options::zpages_group_bytes`
-    /// 1024): half the decode for a point read's first touch of a group,
-    /// for more of the form's bytes in directories and less for the
-    /// compressor to match against.
-    pub fn create_zgroup1k(path: &Path) -> Res<Supdb> {
-        Supdb::with_policy(
-            path,
-            Policy {
-                zgroup: Some(1024),
-                ..Policy::default()
-            },
-        )
-    }
-
     /// `supdb` whose fills' room is closed by any growth of the group's
     /// refaults (`Options::forms_settle_room_pressure` off).
     pub fn create_settleroomstill(path: &Path) -> Res<Supdb> {
@@ -8370,38 +8102,6 @@ impl Supdb {
         )
     }
 
-    /// `supdb-nocachezpages` with the form file's groups holding their
-    /// records one by one (`Options::zpages_record_coding` on): the pair
-    /// against `supdb-nocachezpages` prices the coding on the forced form,
-    /// in core as well as under a bound.
-    pub fn create_nocache_zpages_record(path: &Path) -> Res<Supdb> {
-        Supdb::with_policy(
-            path,
-            Policy {
-                block_cache: false,
-                zpages: true,
-                zrecord: true,
-                ..Policy::default()
-            },
-        )
-    }
-
-    /// `supdb-nocachezpages` with every group of the form stored verbatim
-    /// (`Options::zpages_store_all`), `supdb-nocachezpagesstored`: the pair
-    /// prices the LZ4 decode on every read through the form against the
-    /// form's size, which the stored one has at the records' own.
-    pub fn create_nocache_zpages_stored(path: &Path) -> Res<Supdb> {
-        Supdb::with_policy(
-            path,
-            Policy {
-                block_cache: false,
-                zpages: true,
-                zstored: true,
-                ..Policy::default()
-            },
-        )
-    }
-
     /// The forced form with the block cache and its 64 MB budget kept to fit,
     /// `supdb-cache64tofitzpages`: the combined arm's shape with the form
     /// installed from the start whatever the controller would decide, so
@@ -8428,23 +8128,6 @@ impl Supdb {
     /// cache as `supdb-nocachezstrideprefetch` prices it under none.
     pub fn create_cache64_tofit_zstride_prefetch(path: &Path) -> Res<Supdb> {
         Supdb::with_policy(path, Policy::cache64_tofit_zstride_prefetch())
-    }
-
-    /// `supdb-cache64tofitzpages` with every group stored verbatim,
-    /// `supdb-cache64tofitzpagesstored`: the E mix's walks over the form
-    /// with no decode, the hot head's copies beside them.
-    pub fn create_cache64_tofit_zpages_stored(path: &Path) -> Res<Supdb> {
-        Supdb::with_policy(
-            path,
-            Policy {
-                budget: 64 << 20,
-                tofit: true,
-                zpages: true,
-                zstored: true,
-                zdropraw: Some(false),
-                ..Policy::default()
-            },
-        )
     }
 
     /// `supdb-nocachezpages` under the record coding with every tail stored
@@ -8479,27 +8162,6 @@ impl Supdb {
         )
     }
 
-    /// `supdb-cache64tofitzpagesrecordraw` with a scan's groups decoded
-    /// whole instead of read in place (`Options::zpages_inplace_walk` off),
-    /// `supdb-cache64tofitzpagesrecordrawdecode`: the shape the raw-tail
-    /// form had when the scan pass read 0.70x of the block coding's. The
-    /// pair against `supdb-cache64tofitzpagesrecordraw` prices the in-place
-    /// walk.
-    pub fn create_cache64_tofit_zpages_record_raw_decode(path: &Path) -> Res<Supdb> {
-        Supdb::with_policy(
-            path,
-            Policy {
-                budget: 64 << 20,
-                tofit: true,
-                zpages: true,
-                zrawtails: true,
-                zdecodewalk: true,
-                zdropraw: Some(false),
-                ..Policy::default()
-            },
-        )
-    }
-
     /// `supdb-cache64tofitzpages` with each partition's raw file and ordered
     /// index dropped from the page cache once its form file serves it
     /// (`Options::zpages_drop_raw`), `supdb-cache64tofitzpagesdrop`: the
@@ -8519,62 +8181,6 @@ impl Supdb {
     /// want of the room.
     pub fn create_cache64_tofit_zstride_drop(path: &Path) -> Res<Supdb> {
         Supdb::with_policy(path, Policy::cache64_tofit_zstride_drop())
-    }
-
-    /// `supdb-cache64tofitzpagesdrop` with its block-coded groups written by
-    /// the parsing encoder (`Options::zpages_parse`),
-    /// `supdb-cache64tofitzpagesdropparse`: the same block format in fewer
-    /// sequences, priced on the forced form where nothing but the coding
-    /// differs.
-    pub fn create_cache64_tofit_zpages_drop_parse(path: &Path) -> Res<Supdb> {
-        Supdb::with_policy(
-            path,
-            Policy {
-                budget: 64 << 20,
-                tofit: true,
-                zpages: true,
-                zdropraw: Some(true),
-                zparse: true,
-                ..Policy::default()
-            },
-        )
-    }
-
-    /// `supdb-cache64tofitzpagesdrop` with its groups decoded by `lz4_flex`
-    /// (`Options::zpages_own_decoder` off),
-    /// `supdb-cache64tofitzpagesdropflexdec`: the same files read through
-    /// the decoder before the engine's own, priced where the decodes are
-    /// the most.
-    pub fn create_cache64_tofit_zpages_drop_flexdec(path: &Path) -> Res<Supdb> {
-        Supdb::with_policy(
-            path,
-            Policy {
-                budget: 64 << 20,
-                tofit: true,
-                zpages: true,
-                zdropraw: Some(true),
-                zflexdec: true,
-                ..Policy::default()
-            },
-        )
-    }
-
-    /// `supdb-cache64tofitautozpages` with its groups decoded by `lz4_flex`
-    /// (`Options::zpages_own_decoder` off),
-    /// `supdb-cache64tofitautozpagesflexdec`: the shipping combined arm.
-    pub fn create_cache64_tofit_auto_zpages_flexdec(path: &Path) -> Res<Supdb> {
-        Supdb::with_policy(
-            path,
-            Policy {
-                budget: 64 << 20,
-                tofit: true,
-                zpages_auto: true,
-                zflexdec: true,
-                zdropraw: Some(false),
-                zlandpct: Some(0),
-                ..Policy::default()
-            },
-        )
     }
 
     /// `supdb-cache64tofitautozpages` with the raw pages of a partition its
@@ -8750,26 +8356,6 @@ impl Supdb {
         )
     }
 
-    /// `supdb-cache64tofitautozpages` with its block-coded groups written by
-    /// the parsing encoder (`Options::zpages_parse`),
-    /// `supdb-cache64tofitautozpagesparse`: the shipping combined arm, where
-    /// the encoder's price is the builder's and the build is the install's
-    /// wait.
-    pub fn create_cache64_tofit_auto_zpages_parse(path: &Path) -> Res<Supdb> {
-        Supdb::with_policy(
-            path,
-            Policy {
-                budget: 64 << 20,
-                tofit: true,
-                zpages_auto: true,
-                zparse: true,
-                zdropraw: Some(false),
-                zlandpct: Some(0),
-                ..Policy::default()
-            },
-        )
-    }
-
     /// `supdb` whose commits leave their batches to the backlog bound and
     /// the first scans after them, and whose fill builds no block of its
     /// own (`Options::forms_settle_every` and `forms_settle_builds` off),
@@ -8915,26 +8501,6 @@ impl Supdb {
         )
     }
 
-    /// `supdb-nocachezpages` with the page as one group
-    /// (`Options::zpages_group_bytes` zero), the shape before the cut: the
-    /// pair against `supdb-nocachezpages` differs by that one option and
-    /// prices the cut on the point read through the form from the first
-    /// read of the pass, which the controller's pair
-    /// (`supdb-cache64tofitautozpagesonegroup`) cannot, since under the
-    /// controller the form lands after the read passes. Chosen by hand, as
-    /// `ab --arms supdb-nocachezpages,supdb-nocachezpagesonegroup`.
-    pub fn create_nocache_zpages_onegroup(path: &Path) -> Res<Supdb> {
-        Supdb::with_policy(
-            path,
-            Policy {
-                block_cache: false,
-                zpages: true,
-                zgroup: Some(0),
-                ..Policy::default()
-            },
-        )
-    }
-
     /// `supdb-nocachezpages` with no key table
     /// (`Options::zpages_point_keys` off): what the table costs a read of a
     /// key never read before, in core where nothing else moves.
@@ -8960,23 +8526,6 @@ impl Supdb {
                 block_cache: false,
                 zpages: true,
                 znopointfilter: true,
-                ..Policy::default()
-            },
-        )
-    }
-
-    /// `supdb-nocachezpages` with the page cut at a kibibyte of records
-    /// (`Options::zpages_group_bytes` 1024) where the default cuts at two:
-    /// with `supdb-nocachezpagesonegroup` at the other side, the cold point
-    /// read's cost a byte decoded, read off the forced form in core where
-    /// nothing else moves with the cut.
-    pub fn create_nocache_zpages_group1k(path: &Path) -> Res<Supdb> {
-        Supdb::with_policy(
-            path,
-            Policy {
-                block_cache: false,
-                zpages: true,
-                zgroup: Some(1024),
                 ..Policy::default()
             },
         )
@@ -9209,7 +8758,6 @@ impl Supdb {
             zbulkpart,
             zbulkaheadwithin,
             zbulksearch,
-            zflatshort,
             zhotstarts,
             nochainwrites,
             noland,
@@ -9314,7 +8862,6 @@ impl Supdb {
             zhotgrowth5,
             zhotfillquiet,
             zseekseed,
-            zrecorddefault,
             zhotcoldback,
             sweepwalks,
             zhotskewroom,
@@ -9358,25 +8905,15 @@ impl Supdb {
             zpages_noahead,
             zpages_buildeager,
             zcacheraw,
-            zcodingfixed,
             zpromote,
-            zgroup,
             zprebuild,
             zspan,
             zmemolinear,
             zexactcut,
             zcheckedviews,
-            zrecord,
-            zstored,
             zrawtails,
-            zdecodewalk,
             zdropraw,
-            zparse,
-            zparsestart,
-            zgreedy,
-            znoflat,
             znohotfill,
-            zflexdec,
             zlandpct,
             zsampleidle,
             zattachwarm,
@@ -9668,7 +9205,6 @@ impl Supdb {
             zpages_bulk_part: zbulkpart,
             zpages_bulk_ahead_within: zbulkaheadwithin,
             zpages_bulk_steps: !zbulksearch,
-            zpages_flat_slack: !zflatshort,
             promote_starts: zhotstarts.unwrap_or(supdb::Options::default().promote_starts),
             merge_chains_writes: !nochainwrites,
             zpages_land_scans_far: !landnearscans,
@@ -9825,30 +9361,15 @@ impl Supdb {
             },
             zpages_build_eager: zpages_buildeager,
             zpages_block_cache: !zcacheraw,
-            zpages_coding_auto: !zcodingfixed,
-            // The re-parse arm's builds keep the greedy encoder, as it was
-            // priced: the parse is bought there after the install.
-            zpages_parse: !zgreedy,
-            zpages_parse_finish: zparse,
-            zpages_parse_chains: if zparse || zparsestart {
-                0
-            } else {
-                supdb::Options::default().zpages_parse_chains
-            },
-            zpages_flat_decode: !znoflat,
             zpages_hot_fill: !znohotfill,
-            zpages_own_decoder: !zflexdec,
             promote_entries: zpromote,
             zpages_promote_copies: zpromote > 0,
-            zpages_group_bytes: zgroup.unwrap_or(supdb::Options::default().zpages_group_bytes),
             zpages_prebuild: zprebuild,
             zpages_seek_span: zspan,
             zpages_memo_hash: !zmemolinear,
             zpages_settle_span: !zexactcut,
             zpages_trusted_views: !zcheckedviews,
-            zpages_store_all: zstored,
             zpages_raw_tails: zrawtails,
-            zpages_inplace_walk: !zdecodewalk,
             zpages_drop_raw: zdropraw.unwrap_or(supdb::Options::default().zpages_drop_raw),
             zpages_land_pct: if noland {
                 0
@@ -9865,7 +9386,6 @@ impl Supdb {
             forms_settle_every: settleevery.unwrap_or(supdb::Options::default().forms_settle_every),
             forms_settle_builds: settlebuilds
                 .unwrap_or(supdb::Options::default().forms_settle_builds),
-            zpages_record_coding: zrecord || zrawtails || zrecorddefault,
             zpages_memo_first: zmemofirst,
             zpages_fence_tree: zfencetree,
             zpages_fence_words: !fencekeys,
@@ -10176,7 +9696,6 @@ impl Supdb {
             zbulkpart,
             zbulkaheadwithin,
             zbulksearch,
-            zflatshort,
             zhotstarts,
             nochainwrites,
             noland,
@@ -10281,7 +9800,6 @@ impl Supdb {
             zhotgrowth5,
             zhotfillquiet,
             zseekseed,
-            zrecorddefault,
             zhotcoldback,
             sweepwalks,
             zhotskewroom,
@@ -10325,25 +9843,15 @@ impl Supdb {
             zpages_noahead,
             zpages_buildeager,
             zcacheraw,
-            zcodingfixed,
             zpromote,
-            zgroup,
             zprebuild,
             zspan,
             zmemolinear,
             zexactcut,
             zcheckedviews,
-            zrecord,
-            zstored,
             zrawtails,
-            zdecodewalk,
             zdropraw,
-            zparse,
-            zparsestart,
-            zgreedy,
-            znoflat,
             znohotfill,
-            zflexdec,
             zlandpct,
             zsampleidle,
             zattachwarm,
@@ -10845,10 +10353,6 @@ impl Engine for Supdb {
             }
             return if self.settlebuilds == Some(true) {
                 "supdb-cache64tofitautozpagessettlebuilds"
-            } else if self.zparse {
-                "supdb-cache64tofitautozpagesparse"
-            } else if self.zflexdec {
-                "supdb-cache64tofitautozpagesflexdec"
             } else if zdropraw && self.znowritercensus {
                 "supdb-cache64tofitautozpagesdropnowritercensus"
             } else if zdropraw && self.zsampleidle {
@@ -10887,10 +10391,6 @@ impl Engine for Supdb {
                 "supdb-cache64tofitautozpagesexactcut"
             } else if self.zcheckedviews {
                 "supdb-cache64tofitautozpagescheckedviews"
-            } else if self.zrecord {
-                "supdb-cache64tofitautozpagesrecord"
-            } else if self.zcodingfixed {
-                "supdb-cache64tofitautozpagescodingfixed"
             } else if self.zmemofirst {
                 "supdb-cache64tofitautozpagesmemofirst"
             } else if self.zfencetree {
@@ -10908,11 +10408,7 @@ impl Engine for Supdb {
             } else if self.zmemo_mib == 32 {
                 "supdb-cache64tofitautozpagesmemo32"
             } else {
-                match self.zgroup {
-                    Some(0) => "supdb-cache64tofitautozpagesonegroup",
-                    Some(1024) => "supdb-cache64tofitautozpagesgroup1k",
-                    _ => "supdb-cache64tofitautozpages",
-                }
+                "supdb-cache64tofitautozpages"
             };
         }
         // The stride form's before every other forced shape, since each of
@@ -10927,18 +10423,10 @@ impl Engine for Supdb {
             };
         }
         if self.budget == 64 << 20 && self.tofit && self.zpages {
-            return if self.zstored {
-                "supdb-cache64tofitzpagesstored"
-            } else if self.zrawtails && zdropraw {
+            return if self.zrawtails && zdropraw {
                 "supdb-cache64tofitzpagesrecordrawdrop"
-            } else if zdropraw && self.zparse {
-                "supdb-cache64tofitzpagesdropparse"
-            } else if zdropraw && self.zflexdec {
-                "supdb-cache64tofitzpagesdropflexdec"
             } else if zdropraw {
                 "supdb-cache64tofitzpagesdrop"
-            } else if self.zrawtails && self.zdecodewalk {
-                "supdb-cache64tofitzpagesrecordrawdecode"
             } else if self.zrawtails {
                 "supdb-cache64tofitzpagesrecordraw"
             } else {
@@ -11025,9 +10513,6 @@ impl Engine for Supdb {
         }
         if self.zseekseed {
             return "supdb-zseekseed";
-        }
-        if self.zrecorddefault {
-            return "supdb-zrecord";
         }
         if self.zhotcoldback {
             return "supdb-zhotcoldback";
@@ -11520,18 +11005,6 @@ impl Engine for Supdb {
         if self.mergeahead {
             return "supdb-mergeahead";
         }
-        if self.zparse && self.budget == 0 {
-            return "supdb-zparse";
-        }
-        if self.zparsestart {
-            return "supdb-zparsestart";
-        }
-        if self.zgreedy {
-            return "supdb-zgreedy";
-        }
-        if self.znoflat {
-            return "supdb-znoflat";
-        }
         if self.znohotfill {
             return "supdb-znohotfill";
         }
@@ -11699,9 +11172,6 @@ impl Engine for Supdb {
         }
         if self.zbulksearch {
             return "supdb-zbulksearch";
-        }
-        if self.zflatshort {
-            return "supdb-zflatshort";
         }
         if let Some(n) = self.zhotstarts {
             return match n {
@@ -11965,9 +11435,6 @@ impl Engine for Supdb {
         if self.settleroomstill {
             return "supdb-settleroomstill";
         }
-        if self.zgroup == Some(1024) && !(self.zpages && !self.block_cache) {
-            return "supdb-zgroup1k";
-        }
         if self.settlespan {
             return "supdb-settlespan";
         }
@@ -12137,16 +11604,8 @@ impl Engine for Supdb {
                 "supdb-nocachezpagessettle"
             } else if self.zcheckedviews {
                 "supdb-nocachezpagescheckedviews"
-            } else if self.zrecord {
-                "supdb-nocachezpagesrecord"
-            } else if self.zstored {
-                "supdb-nocachezpagesstored"
             } else if self.zrawtails {
                 "supdb-nocachezpagesrecordraw"
-            } else if self.zgroup == Some(0) {
-                "supdb-nocachezpagesonegroup"
-            } else if self.zgroup == Some(1024) {
-                "supdb-nocachezpagesgroup1k"
             } else {
                 "supdb-nocachezpages"
             };
@@ -14529,17 +13988,11 @@ pub fn guarantee(arm: &str) -> Option<Guarantee> {
         | "supdb-nocachezpagesnowarm"
         | "supdb-nocachezpagesnomemo"
         | "supdb-nocachezpagescheckedviews"
-        | "supdb-nocachezpagesrecord"
-        | "supdb-nocachezpagesstored"
         | "supdb-nocachezpagesrecordraw"
         | "supdb-cache64tofitzpages"
-        | "supdb-cache64tofitzpagesstored"
         | "supdb-cache64tofitzpagesrecordraw"
         | "supdb-cache64tofitzpagesdrop"
-        | "supdb-cache64tofitzpagesdropparse"
-        | "supdb-cache64tofitzpagesdropflexdec"
         | "supdb-cache64tofitzpagesrecordrawdrop"
-        | "supdb-cache64tofitzpagesrecordrawdecode"
         | "supdb-nocachezpagesheads"
         | "supdb-nocachezpagesprefetch"
         | "supdb-nocachezstride"
@@ -14548,8 +14001,6 @@ pub fn guarantee(arm: &str) -> Option<Guarantee> {
         | "supdb-cache64tofitzstrideprefetch"
         | "supdb-cache64tofitzstridedrop"
         | "supdb-nocachezpagesrankwalk"
-        | "supdb-nocachezpagesonegroup"
-        | "supdb-nocachezpagesgroup1k"
         | "supdb-nocachezpagesnopointkeys"
         | "supdb-nocachezpagesnofilter"
         | "supdb-znofilter"
@@ -14565,9 +14016,6 @@ pub fn guarantee(arm: &str) -> Option<Guarantee> {
         | "supdb-cache128tofitautozpages"
         | "supdb-cache256tofitautozpages"
         | "supdb-cache64tofitautozpagesraw"
-        | "supdb-cache64tofitautozpagescodingfixed"
-        | "supdb-cache64tofitautozpagesparse"
-        | "supdb-cache64tofitautozpagesflexdec"
         | "supdb-cache64tofitautozpagesdrop"
         | "supdb-cache64tofitautozpagesdropland25"
         | "supdb-cache64tofitautozpagesdropland50"
@@ -14582,14 +14030,11 @@ pub fn guarantee(arm: &str) -> Option<Guarantee> {
         | "supdb-cache64tofitautozpagesdropnowritercensus"
         | "supdb-cache64tofitautozpagessettlebuilds"
         | "supdb-cache64tofitautozpagespromote"
-        | "supdb-cache64tofitautozpagesonegroup"
-        | "supdb-cache64tofitautozpagesgroup1k"
         | "supdb-cache64tofitautozpagesprebuild"
         | "supdb-cache64tofitautozpagesspan"
         | "supdb-cache64tofitautozpagesmemolinear"
         | "supdb-cache64tofitautozpagesexactcut"
         | "supdb-cache64tofitautozpagescheckedviews"
-        | "supdb-cache64tofitautozpagesrecord"
         | "supdb-cache64tofitautozpagesmemofirst"
         | "supdb-cache64tofitautozpagesfencetree"
         | "supdb-cache64tofitautozpagesmemonoahead"
@@ -14629,7 +14074,6 @@ pub fn guarantee(arm: &str) -> Option<Guarantee> {
         | "supdb-nozfinish"
         | "supdb-bgidle"
         | "supdb-mergeahead"
-        | "supdb-zparse"
         | "supdb-nozpagesnofitshort"
         | "supdb-nozpagesmergeone"
         | "supdb-boundarytop"
@@ -14665,7 +14109,6 @@ pub fn guarantee(arm: &str) -> Option<Guarantee> {
         | "supdb-zbulkpart"
         | "supdb-zbulkaheadwithin"
         | "supdb-zbulksearch"
-        | "supdb-zflatshort"
         | "supdb-zhotstarts2"
         | "supdb-zhotstarts3"
         | "supdb-nohotstarts"
@@ -14721,7 +14164,6 @@ pub fn guarantee(arm: &str) -> Option<Guarantee> {
         | "supdb-formson"
         | "supdb-snapdrops"
         | "supdb-settleroomstill"
-        | "supdb-zgroup1k"
         | "supdb-settlespan"
         | "supdb-nopacesyncs"
         | "supdb-pacesyncsraw"
@@ -14783,7 +14225,6 @@ pub fn guarantee(arm: &str) -> Option<Guarantee> {
         | "supdb-ingestsettlebuildsfiled"
         | "supdb-ingestpromote"
         | "supdb-zseekseed"
-        | "supdb-zrecord"
         | "supdb-zhotcoldback"
         | "supdb-sweepwalks"
         | "supdb-zhotskewroom"
@@ -14840,9 +14281,6 @@ pub fn guarantee(arm: &str) -> Option<Guarantee> {
         | "supdb-znodriveend"
         | "supdb-znocrossraw"
         | "supdb-zaskdropped"
-        | "supdb-zparsestart"
-        | "supdb-zgreedy"
-        | "supdb-znoflat"
         | "supdb-znohotfill"
         | "supdb-zwalkowns"
         | "supdb-zviewperopen"
@@ -15128,24 +14566,13 @@ pub fn open(arm: &str, dir: &Path, map_gb: usize) -> Res<Box<dyn Engine>> {
         "supdb-nocachezpagescheckedviews" => {
             supdb_arm(Supdb::create_nocache_zpages_checkedviews, dir)?
         }
-        "supdb-nocachezpagesrecord" => supdb_arm(Supdb::create_nocache_zpages_record, dir)?,
-        "supdb-nocachezpagesstored" => supdb_arm(Supdb::create_nocache_zpages_stored, dir)?,
         "supdb-nocachezpagesrecordraw" => supdb_arm(Supdb::create_nocache_zpages_record_raw, dir)?,
         "supdb-cache64tofitzpagesrecordraw" => {
             supdb_arm(Supdb::create_cache64_tofit_zpages_record_raw, dir)?
         }
         "supdb-cache64tofitzpagesdrop" => supdb_arm(Supdb::create_cache64_tofit_zpages_drop, dir)?,
-        "supdb-cache64tofitzpagesdropparse" => {
-            supdb_arm(Supdb::create_cache64_tofit_zpages_drop_parse, dir)?
-        }
-        "supdb-cache64tofitzpagesdropflexdec" => {
-            supdb_arm(Supdb::create_cache64_tofit_zpages_drop_flexdec, dir)?
-        }
         "supdb-cache64tofitzpagesrecordrawdrop" => {
             supdb_arm(Supdb::create_cache64_tofit_zpages_record_raw_drop, dir)?
-        }
-        "supdb-cache64tofitzpagesrecordrawdecode" => {
-            supdb_arm(Supdb::create_cache64_tofit_zpages_record_raw_decode, dir)?
         }
         "supdb-cache64tofitzpages" => supdb_arm(Supdb::create_cache64_tofit_zpages, dir)?,
         "supdb-cache64tofitzstride" => supdb_arm(Supdb::create_cache64_tofit_zstride, dir)?,
@@ -15155,16 +14582,11 @@ pub fn open(arm: &str, dir: &Path, map_gb: usize) -> Res<Box<dyn Engine>> {
         "supdb-cache64tofitzstridedrop" => {
             supdb_arm(Supdb::create_cache64_tofit_zstride_drop, dir)?
         }
-        "supdb-cache64tofitzpagesstored" => {
-            supdb_arm(Supdb::create_cache64_tofit_zpages_stored, dir)?
-        }
         "supdb-nocachezpagesheads" => supdb_arm(Supdb::create_nocache_zpages_heads, dir)?,
         "supdb-nocachezpagesprefetch" => supdb_arm(Supdb::create_nocache_zpages_prefetch, dir)?,
         "supdb-nocachezstride" => supdb_arm(Supdb::create_nocache_zstride, dir)?,
         "supdb-nocachezstrideprefetch" => supdb_arm(Supdb::create_nocache_zstride_prefetch, dir)?,
         "supdb-nocachezpagesrankwalk" => supdb_arm(Supdb::create_nocache_zpages_rankwalk, dir)?,
-        "supdb-nocachezpagesonegroup" => supdb_arm(Supdb::create_nocache_zpages_onegroup, dir)?,
-        "supdb-nocachezpagesgroup1k" => supdb_arm(Supdb::create_nocache_zpages_group1k, dir)?,
         "supdb-nocachezpagesnopointkeys" => {
             supdb_arm(Supdb::create_nocache_zpages_nopointkeys, dir)?
         }
@@ -15191,15 +14613,6 @@ pub fn open(arm: &str, dir: &Path, map_gb: usize) -> Res<Box<dyn Engine>> {
         }
         "supdb-cache64tofitautozpagessettlebuilds" => {
             supdb_arm(Supdb::create_cache64_tofit_auto_zpages_settlebuilds, dir)?
-        }
-        "supdb-cache64tofitautozpagescodingfixed" => {
-            supdb_arm(Supdb::create_cache64_tofit_auto_zpages_codingfixed, dir)?
-        }
-        "supdb-cache64tofitautozpagesparse" => {
-            supdb_arm(Supdb::create_cache64_tofit_auto_zpages_parse, dir)?
-        }
-        "supdb-cache64tofitautozpagesflexdec" => {
-            supdb_arm(Supdb::create_cache64_tofit_auto_zpages_flexdec, dir)?
         }
         "supdb-cache64tofitautozpagesdrop" => {
             supdb_arm(Supdb::create_cache64_tofit_auto_zpages_drop, dir)?
@@ -15251,12 +14664,6 @@ pub fn open(arm: &str, dir: &Path, map_gb: usize) -> Res<Box<dyn Engine>> {
         "supdb-cache64tofitautozpagespromote" => {
             supdb_arm(Supdb::create_cache64_tofit_auto_zpages_promote, dir)?
         }
-        "supdb-cache64tofitautozpagesonegroup" => {
-            supdb_arm(Supdb::create_cache64_tofit_auto_zpages_onegroup, dir)?
-        }
-        "supdb-cache64tofitautozpagesgroup1k" => {
-            supdb_arm(Supdb::create_cache64_tofit_auto_zpages_group1k, dir)?
-        }
         "supdb-cache64tofitautozpagesprebuild" => {
             supdb_arm(Supdb::create_cache64_tofit_auto_zpages_prebuild, dir)?
         }
@@ -15271,9 +14678,6 @@ pub fn open(arm: &str, dir: &Path, map_gb: usize) -> Res<Box<dyn Engine>> {
         }
         "supdb-cache64tofitautozpagescheckedviews" => {
             supdb_arm(Supdb::create_cache64_tofit_auto_zpages_checkedviews, dir)?
-        }
-        "supdb-cache64tofitautozpagesrecord" => {
-            supdb_arm(Supdb::create_cache64_tofit_auto_zpages_record, dir)?
         }
         "supdb-cache64tofitautozpagesmemofirst" => {
             supdb_arm(Supdb::create_cache64_tofit_auto_zpages_memofirst, dir)?
@@ -16154,7 +15558,6 @@ pub fn open(arm: &str, dir: &Path, map_gb: usize) -> Res<Box<dyn Engine>> {
             dir,
         )?,
         "supdb-zseekseed" => supdb_arm(Supdb::create_zseekseed, dir)?,
-        "supdb-zrecord" => supdb_arm(Supdb::create_zrecord, dir)?,
         "supdb-zhotcoldback" => supdb_arm(Supdb::create_zhotcoldback, dir)?,
         "supdb-sweepwalks" => supdb_arm(Supdb::create_sweepwalks, dir)?,
         "supdb-zhotskewroom" => supdb_arm(Supdb::create_zhotskewroom, dir)?,
@@ -16285,21 +15688,6 @@ pub fn open(arm: &str, dir: &Path, map_gb: usize) -> Res<Box<dyn Engine>> {
         "supdb-nozfinish" => supdb_arm(Supdb::create_nozfinish, dir)?,
         "supdb-bgidle" => supdb_arm(Supdb::create_bgidle, dir)?,
         "supdb-mergeahead" => supdb_arm(Supdb::create_mergeahead, dir)?,
-        "supdb-zparse" => supdb_arm(Supdb::create_zparse, dir)?,
-        "supdb-zparsestart" => supdb_arm(Supdb::create_zparsestart, dir)?,
-        "supdb-zgreedy" => supdb_arm(
-            |d| {
-                Supdb::with_policy(
-                    d,
-                    Policy {
-                        zgreedy: true,
-                        ..Policy::default()
-                    },
-                )
-            },
-            dir,
-        )?,
-        "supdb-znoflat" => supdb_arm(Supdb::create_znoflat, dir)?,
         "supdb-znohotfill" => supdb_arm(Supdb::create_znohotfill, dir)?,
         "supdb-nozpagesnofitshort" => supdb_arm(Supdb::create_nozpages_nofitshort, dir)?,
         "supdb-nozpagesmergeone" => supdb_arm(Supdb::create_nozpages_mergeone, dir)?,
@@ -16903,18 +16291,6 @@ pub fn open(arm: &str, dir: &Path, map_gb: usize) -> Res<Box<dyn Engine>> {
             },
             dir,
         )?,
-        "supdb-zflatshort" => supdb_arm(
-            |d| {
-                Supdb::with_policy(
-                    d,
-                    Policy {
-                        zflatshort: true,
-                        ..Policy::default()
-                    },
-                )
-            },
-            dir,
-        )?,
         // All three off: every miss of the memo a whole decode it takes,
         // for a point read and a walk alike, the memo as it stood.
         "supdb-zmemoplain" => supdb_arm(
@@ -17157,7 +16533,6 @@ pub fn open(arm: &str, dir: &Path, map_gb: usize) -> Res<Box<dyn Engine>> {
         "supdb-formson" => supdb_arm(Supdb::create_formson, dir)?,
         "supdb-snapdrops" => supdb_arm(Supdb::create_snapdrops, dir)?,
         "supdb-settleroomstill" => supdb_arm(Supdb::create_settleroomstill, dir)?,
-        "supdb-zgroup1k" => supdb_arm(Supdb::create_zgroup1k, dir)?,
         "supdb-settlespan" => supdb_arm(Supdb::create_settlespan, dir)?,
         "supdb-nopacesyncs" => supdb_arm(Supdb::create_nopacesyncs, dir)?,
         "supdb-pacesyncsraw" => supdb_arm(Supdb::create_pacesyncsraw, dir)?,
@@ -19266,74 +18641,6 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
-    /// `supdb-cache64tofitautozpagescodingfixed` is `supdb-cache64tofitautozpages`
-    /// with the coding the options' and not the selector's
-    /// (`Options::zpages_coding_auto` off) and nothing else: named, durable
-    /// like it, opened under its name by the dispatch, the codings the
-    /// options name off in both, and the engine's default on.
-    #[test]
-    fn the_fixed_coding_arm_differs_from_the_combined_arm_in_the_choice_alone() {
-        let root =
-            std::env::temp_dir().join(format!("supdb-bench-codingfixed-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&root);
-        let new = |name: &str, make: fn(&Path) -> Res<Supdb>| {
-            let d = root.join(name);
-            std::fs::create_dir_all(&d).unwrap();
-            make(&d).unwrap()
-        };
-        assert!(supdb::Options::default().zpages_coding_auto);
-        let base = new("base", Supdb::create_cache64_tofit_auto_zpages);
-        let arm = new("fixed", Supdb::create_cache64_tofit_auto_zpages_codingfixed);
-        assert_eq!(base.name(), "supdb-cache64tofitautozpages");
-        assert_eq!(arm.name(), "supdb-cache64tofitautozpagescodingfixed");
-        assert_eq!(guarantee(arm.name()), Some(Guarantee::Durable));
-        assert_eq!(guarantee(arm.name()), guarantee(base.name()));
-        assert!(arm.zcodingfixed && !base.zcodingfixed);
-        assert!(arm.zpages_auto && base.zpages_auto && arm.tofit && base.tofit);
-        assert_eq!(arm.features(), base.features());
-        let (a, b) = (
-            arm.db.as_ref().unwrap().options(),
-            base.db.as_ref().unwrap().options(),
-        );
-        assert!(
-            !a.zpages_coding_auto && b.zpages_coding_auto,
-            "the one option"
-        );
-        assert_eq!(
-            (
-                a.zpages,
-                a.zpages_record_coding,
-                a.zpages_raw_tails,
-                a.zpages_store_all,
-                a.scan_cache_bytes,
-                a.forms_to_fit,
-                a.zpages_block_cache
-            ),
-            (
-                b.zpages,
-                false,
-                false,
-                false,
-                b.scan_cache_bytes,
-                b.forms_to_fit,
-                b.zpages_block_cache
-            ),
-            "the rest as the combined arm's, the options' codings off"
-        );
-        let d = root.join("dispatch");
-        std::fs::create_dir_all(&d).unwrap();
-        let opened = open("supdb-cache64tofitautozpagescodingfixed", &d, 1).unwrap();
-        assert_eq!(opened.name(), "supdb-cache64tofitautozpagescodingfixed");
-        drop(opened);
-        drop(arm);
-        drop(base);
-        let _ = std::fs::remove_dir_all(&root);
-    }
-
-    /// The LZ4 arms are their bases with `Options::zpages_parse` or
-    /// `zpages_own_decoder` and nothing else: named, durable like them,
-    /// opened under their names by the dispatch, and the engine's defaults
-    /// off.
     /// The combined arm with the raw drop differs from its base in the
     /// drop's option alone, and opens under its name; the drop waits for
     /// the install, as the engine's default does.
@@ -19365,20 +18672,8 @@ mod tests {
             "{name}: the drop's options"
         );
         assert_eq!(
-            (
-                a.zpages,
-                a.zpages_coding_auto,
-                a.zpages_own_decoder,
-                a.scan_cache_bytes,
-                a.forms_to_fit
-            ),
-            (
-                b.zpages,
-                b.zpages_coding_auto,
-                b.zpages_own_decoder,
-                b.scan_cache_bytes,
-                b.forms_to_fit
-            ),
+            (a.zpages, a.scan_cache_bytes, a.forms_to_fit),
+            (b.zpages, b.scan_cache_bytes, b.forms_to_fit),
             "{name}: the rest as {base_name}'s"
         );
         drop(arm);
@@ -19510,14 +18805,12 @@ mod tests {
                 (
                     a.zpages,
                     a.zpages_drop_raw,
-                    a.zpages_coding_auto,
                     a.scan_cache_bytes,
                     a.forms_to_fit
                 ),
                 (
                     b.zpages,
                     b.zpages_drop_raw,
-                    b.zpages_coding_auto,
                     b.scan_cache_bytes,
                     b.forms_to_fit
                 ),
@@ -19543,97 +18836,6 @@ mod tests {
             let od = root.join(format!("{name}-open"));
             std::fs::create_dir_all(&od).unwrap();
             assert_eq!(open(name, &od, 1).unwrap().name(), name);
-        }
-        let _ = std::fs::remove_dir_all(&root);
-    }
-
-    #[test]
-    fn the_lz4_arms_differ_from_their_bases_in_the_codec_alone() {
-        let root = std::env::temp_dir().join(format!("supdb-bench-zparse-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&root);
-        assert!(supdb::Options::default().zpages_parse);
-        assert!(supdb::Options::default().zpages_own_decoder);
-        for (name, make, base_name, base_make, parse) in [
-            (
-                "supdb-cache64tofitzpagesdropparse",
-                Supdb::create_cache64_tofit_zpages_drop_parse as fn(&Path) -> Res<Supdb>,
-                "supdb-cache64tofitzpagesdrop",
-                Supdb::create_cache64_tofit_zpages_drop as fn(&Path) -> Res<Supdb>,
-                true,
-            ),
-            (
-                "supdb-cache64tofitautozpagesparse",
-                Supdb::create_cache64_tofit_auto_zpages_parse,
-                "supdb-cache64tofitautozpages",
-                Supdb::create_cache64_tofit_auto_zpages,
-                true,
-            ),
-            (
-                "supdb-cache64tofitzpagesdropflexdec",
-                Supdb::create_cache64_tofit_zpages_drop_flexdec,
-                "supdb-cache64tofitzpagesdrop",
-                Supdb::create_cache64_tofit_zpages_drop,
-                false,
-            ),
-            (
-                "supdb-cache64tofitautozpagesflexdec",
-                Supdb::create_cache64_tofit_auto_zpages_flexdec,
-                "supdb-cache64tofitautozpages",
-                Supdb::create_cache64_tofit_auto_zpages,
-                false,
-            ),
-        ] {
-            let d = root.join(name);
-            std::fs::create_dir_all(&d).unwrap();
-            let arm = make(&d).unwrap();
-            let bd = root.join(base_name);
-            std::fs::create_dir_all(&bd).unwrap();
-            let base = base_make(&bd).unwrap();
-            assert_eq!(arm.name(), name);
-            assert_eq!(base.name(), base_name);
-            assert_eq!(guarantee(arm.name()), guarantee(base.name()));
-            assert_eq!(arm.features(), base.features());
-            let (a, b) = (
-                arm.db.as_ref().unwrap().options(),
-                base.db.as_ref().unwrap().options(),
-            );
-            // A parse arm sets the lazy parse at every build and keeps the
-            // own decoder; a `flexdec` arm keeps its base's parse and sets
-            // the decoder alone.
-            let shape =
-                |o: &supdb::Options| (o.zpages_parse, o.zpages_parse_finish, o.zpages_parse_chains);
-            if parse {
-                assert_eq!(shape(a), (true, true, 0), "{name}: the lazy parse");
-                assert!(a.zpages_own_decoder, "{name}: the own decoder");
-            } else {
-                assert_eq!(shape(a), shape(b), "{name}: the base's parse");
-                assert!(!a.zpages_own_decoder, "{name}: the one option");
-            }
-            assert_eq!(shape(b), (true, false, 4), "{base_name}");
-            assert!(b.zpages_own_decoder, "{base_name}");
-            assert_eq!(
-                (
-                    a.zpages,
-                    a.zpages_drop_raw,
-                    a.zpages_coding_auto,
-                    a.scan_cache_bytes,
-                    a.forms_to_fit
-                ),
-                (
-                    b.zpages,
-                    b.zpages_drop_raw,
-                    b.zpages_coding_auto,
-                    b.scan_cache_bytes,
-                    b.forms_to_fit
-                ),
-                "{name}: the rest as {base_name}'s"
-            );
-            drop(arm);
-            drop(base);
-            let od = root.join(format!("{name}-open"));
-            std::fs::create_dir_all(&od).unwrap();
-            let opened = open(name, &od, 1).unwrap();
-            assert_eq!(opened.name(), name);
         }
         let _ = std::fs::remove_dir_all(&root);
     }
@@ -19730,7 +18932,6 @@ mod tests {
             "supdb-cacheraw",
             "supdb-nofitshort",
             "supdb-walkeep",
-            "supdb-zparse",
             "supdb-zaheadscans",
             "supdb-nozfinish",
             "supdb-bgidle",
@@ -20131,14 +19332,6 @@ mod tests {
                 assert_eq!(z.features(), base.features());
                 let o = z.db.as_ref().unwrap().options();
                 assert!(!o.zpages_point_filter && b.zpages_point_filter);
-            }
-            {
-                let z = Supdb::create_zrecord(&dir("zrecord")).unwrap();
-                assert_eq!(z.name(), "supdb-zrecord");
-                assert_eq!(z.features(), base.features());
-                let o = z.db.as_ref().unwrap().options();
-                assert!(o.zpages_record_coding && !b.zpages_record_coding);
-                assert!(!o.zpages_raw_tails && o.zpages_coding_auto);
             }
             {
                 let z = Supdb::create_zseekseed(&dir("zseekseed")).unwrap();
@@ -20663,32 +19856,11 @@ mod tests {
                 assert!(!o.zpages_bulk_steps && b.zpages_bulk_steps);
             }
             {
-                let z = Supdb::with_policy(
-                    &dir("zflatshort"),
-                    Policy {
-                        zflatshort: true,
-                        ..Policy::default()
-                    },
-                )
-                .unwrap();
-                assert_eq!(z.name(), "supdb-zflatshort");
-                assert_eq!(z.features(), base.features());
-                let o = z.db.as_ref().unwrap().options();
-                assert!(!o.zpages_flat_slack && b.zpages_flat_slack);
-            }
-            {
                 let z = Supdb::create_settleroomstill(&dir("settleroomstill")).unwrap();
                 assert_eq!(z.name(), "supdb-settleroomstill");
                 assert_eq!(z.features(), base.features());
                 let o = z.db.as_ref().unwrap().options();
                 assert!(!o.forms_settle_room_pressure && b.forms_settle_room_pressure);
-            }
-            {
-                let z = Supdb::create_zgroup1k(&dir("zgroup1k")).unwrap();
-                assert_eq!(z.name(), "supdb-zgroup1k");
-                assert_eq!(z.features(), base.features());
-                let o = z.db.as_ref().unwrap().options();
-                assert_eq!((o.zpages_group_bytes, b.zpages_group_bytes), (1024, 2048));
             }
             {
                 let z = Supdb::create_settlespan(&dir("settlespan")).unwrap();
@@ -21148,38 +20320,6 @@ mod tests {
                 assert_eq!(seven(o), (Forced, true, true, true, true, true, true));
             }
             {
-                let z = Supdb::create_zparsestart(&dir("zparsestart")).unwrap();
-                assert_eq!(z.name(), "supdb-zparsestart");
-                assert_eq!(z.features(), base.features());
-                let o = z.db.as_ref().unwrap().options();
-                assert!(o.zpages_parse && b.zpages_parse);
-                assert!(!o.zpages_parse_finish && !b.zpages_parse_finish);
-                assert_eq!((o.zpages_parse_chains, b.zpages_parse_chains), (0, 4));
-                let p = Supdb::create_zparse(&dir("zparsefinish")).unwrap();
-                let po = p.db.as_ref().unwrap().options();
-                assert!(po.zpages_parse && po.zpages_parse_finish);
-                assert_eq!(po.zpages_parse_chains, 0);
-                let c = Supdb::with_policy(
-                    &dir("zgreedy"),
-                    Policy {
-                        zgreedy: true,
-                        ..Policy::default()
-                    },
-                )
-                .unwrap();
-                assert_eq!(c.name(), "supdb-zgreedy");
-                assert_eq!(c.features(), base.features());
-                let co = c.db.as_ref().unwrap().options();
-                assert!(!co.zpages_parse && b.zpages_parse);
-            }
-            {
-                let z = Supdb::create_znoflat(&dir("znoflat")).unwrap();
-                assert_eq!(z.name(), "supdb-znoflat");
-                assert_eq!(z.features(), base.features());
-                let o = z.db.as_ref().unwrap().options();
-                assert!(!o.zpages_flat_decode && b.zpages_flat_decode);
-            }
-            {
                 let z = Supdb::create_znohotfill(&dir("znohotfill")).unwrap();
                 assert_eq!(z.name(), "supdb-znohotfill");
                 assert_eq!(z.features(), base.features());
@@ -21214,17 +20354,6 @@ mod tests {
                 let o = z.db.as_ref().unwrap().options();
                 assert!(!o.zpages_hot_raw && b.zpages_hot_raw);
                 assert_eq!(o.zpages, b.zpages);
-            }
-            {
-                let z = Supdb::create_zparse(&dir("zparse")).unwrap();
-                assert_eq!(z.features(), base.features());
-                let o = z.db.as_ref().unwrap().options();
-                assert!(o.zpages_parse && o.zpages_parse_finish && o.zpages_parse_chains == 0);
-                assert!(b.zpages_parse && !b.zpages_parse_finish && b.zpages_parse_chains == 4);
-                assert_eq!(
-                    (o.zpages, o.zpages_cover_resident),
-                    (b.zpages, b.zpages_cover_resident)
-                );
             }
             {
                 let z = Supdb::create_zaheadscans(&dir("zaheadscans")).unwrap();
@@ -21391,59 +20520,6 @@ mod tests {
         let opened = open("supdb-cache64tofitautozpagespromote", &d, 1).unwrap();
         assert_eq!(opened.name(), "supdb-cache64tofitautozpagespromote");
         drop(opened);
-        // The group arms: the combined arm with the form's page cut at
-        // another target, and nothing else moved; the default target is
-        // the engine's, not restated.
-        assert_eq!(
-            b.zpages_group_bytes,
-            supdb::Options::default().zpages_group_bytes
-        );
-        assert_eq!(b.zpages_group_bytes, supdb::db::zpages::ZGROUP_BYTES);
-        for (name, make, target) in [
-            (
-                "supdb-cache64tofitautozpagesonegroup",
-                Supdb::create_cache64_tofit_auto_zpages_onegroup as fn(&Path) -> Res<Supdb>,
-                0usize,
-            ),
-            (
-                "supdb-cache64tofitautozpagesgroup1k",
-                Supdb::create_cache64_tofit_auto_zpages_group1k,
-                1024,
-            ),
-        ] {
-            let arm = new(name, make);
-            assert_eq!(arm.name(), name);
-            assert_eq!(guarantee(arm.name()), guarantee(base.name()));
-            assert_eq!(arm.zgroup, Some(target));
-            assert!(base.zgroup.is_none() && !arm.zcacheraw && arm.zpromote == 0);
-            assert_eq!(arm.features(), base.features());
-            let g = arm.db.as_ref().unwrap().options();
-            assert_eq!(g.zpages_group_bytes, target, "{name}: the one option");
-            assert_eq!(
-                (
-                    g.zpages,
-                    g.scan_block_cache,
-                    g.scan_cache_bytes,
-                    g.forms_to_fit,
-                    g.zpages_block_cache,
-                    g.promote_entries
-                ),
-                (
-                    b.zpages,
-                    b.scan_block_cache,
-                    b.scan_cache_bytes,
-                    b.forms_to_fit,
-                    b.zpages_block_cache,
-                    b.promote_entries
-                )
-            );
-            let d = root.join(format!("dispatch-{name}"));
-            std::fs::create_dir_all(&d).unwrap();
-            let opened = open(name, &d, 1).unwrap();
-            assert_eq!(opened.name(), name);
-            drop(opened);
-            drop(arm);
-        }
         // The prebuild arm: the combined arm with the builds ahead on and
         // nothing else moved; off is the engine's default.
         assert!(!supdb::Options::default().zpages_prebuild && !b.zpages_prebuild);
@@ -21698,33 +20774,15 @@ mod tests {
             );
             drop(arm);
         }
-        for (name, make, stored, raw, decodewalk) in [
+        for (name, make, raw) in [
             (
                 "supdb-cache64tofitzpages",
                 Supdb::create_cache64_tofit_zpages as fn(&Path) -> Res<Supdb>,
-                false,
-                false,
-                false,
-            ),
-            (
-                "supdb-cache64tofitzpagesstored",
-                Supdb::create_cache64_tofit_zpages_stored as fn(&Path) -> Res<Supdb>,
-                true,
-                false,
                 false,
             ),
             (
                 "supdb-cache64tofitzpagesrecordraw",
                 Supdb::create_cache64_tofit_zpages_record_raw as fn(&Path) -> Res<Supdb>,
-                false,
-                true,
-                false,
-            ),
-            (
-                "supdb-cache64tofitzpagesrecordrawdecode",
-                Supdb::create_cache64_tofit_zpages_record_raw_decode as fn(&Path) -> Res<Supdb>,
-                false,
-                true,
                 true,
             ),
         ] {
@@ -21734,19 +20792,12 @@ mod tests {
             assert_eq!(arm.features(), base.features());
             let g = arm.db.as_ref().unwrap().options();
             assert_eq!(g.zpages, supdb::ZPages::Always, "{name}: the form forced");
-            assert_eq!(g.zpages_store_all, stored, "{name}: the coding");
             assert_eq!(g.zpages_raw_tails, raw, "{name}: the tails");
-            assert_eq!(g.zpages_record_coding, raw, "{name}: the record coding");
             assert!(g.zpages_memo, "{name}: the memo");
             assert_eq!(
                 g.forms_trim_bytes, b.forms_trim_bytes,
                 "{name}: the trim's stride"
             );
-            assert_eq!(
-                g.zpages_inplace_walk, !decodewalk,
-                "{name}: the in-place walk"
-            );
-            assert!(supdb::Options::default().zpages_inplace_walk);
             assert!(supdb::Options::default().zpages_memo);
             assert_eq!(
                 (
@@ -21784,21 +20835,19 @@ mod tests {
                 "{name}: the settle"
             );
             assert!(supdb::Options::default().zpages_drop_raw);
-            assert!(!g.zpages_raw_tails && !g.zpages_record_coding && g.zpages_memo);
+            assert!(!g.zpages_raw_tails && g.zpages_memo);
             assert_eq!(
                 (
                     g.scan_cache_bytes,
                     g.forms_to_fit,
                     g.scan_block_cache,
-                    g.zpages_memo_ahead,
-                    g.zpages_inplace_walk
+                    g.zpages_memo_ahead
                 ),
                 (
                     b.scan_cache_bytes,
                     b.forms_to_fit,
                     b.scan_block_cache,
-                    b.zpages_memo_ahead,
-                    b.zpages_inplace_walk
+                    b.zpages_memo_ahead
                 ),
                 "{name}: the rest as the combined arm's"
             );
@@ -21888,20 +20937,16 @@ mod tests {
             (
                 d.zpages,
                 d.zpages_raw_tails,
-                d.zpages_record_coding,
                 d.zpages_memo,
                 d.scan_cache_bytes,
-                d.forms_to_fit,
-                d.zpages_inplace_walk
+                d.forms_to_fit
             ),
             (
                 r.zpages,
                 r.zpages_raw_tails,
-                r.zpages_record_coding,
                 r.zpages_memo,
                 r.scan_cache_bytes,
-                r.forms_to_fit,
-                r.zpages_inplace_walk
+                r.forms_to_fit
             ),
             "the rest as the raw-tail arm's"
         );
@@ -21986,7 +21031,7 @@ mod tests {
         assert_eq!(pre.name(), "supdb-cache64tofitautozpagesprebuild");
         assert_eq!(guarantee(pre.name()), guarantee(base.name()));
         assert!(pre.zprebuild && !base.zprebuild);
-        assert!(pre.zgroup.is_none() && !pre.zcacheraw && pre.zpromote == 0);
+        assert!(!pre.zcacheraw && pre.zpromote == 0);
         assert_eq!(pre.features(), base.features());
         let g = pre.db.as_ref().unwrap().options();
         assert!(g.zpages_prebuild, "the one option");
@@ -21997,8 +21042,7 @@ mod tests {
                 g.scan_cache_bytes,
                 g.forms_to_fit,
                 g.zpages_block_cache,
-                g.promote_entries,
-                g.zpages_group_bytes
+                g.promote_entries
             ),
             (
                 b.zpages,
@@ -22006,8 +21050,7 @@ mod tests {
                 b.scan_cache_bytes,
                 b.forms_to_fit,
                 b.zpages_block_cache,
-                b.promote_entries,
-                b.zpages_group_bytes
+                b.promote_entries
             )
         );
         let d = root.join("dispatch-prebuild");
@@ -22088,16 +21131,6 @@ mod tests {
                 "rankwalk",
             ),
             (
-                "supdb-nocachezpagesonegroup",
-                Supdb::create_nocache_zpages_onegroup,
-                "onegroup",
-            ),
-            (
-                "supdb-nocachezpagesgroup1k",
-                Supdb::create_nocache_zpages_group1k,
-                "group1k",
-            ),
-            (
                 "supdb-nocachezpagesnopointkeys",
                 Supdb::create_nocache_zpages_nopointkeys,
                 "nopointkeys",
@@ -22118,11 +21151,6 @@ mod tests {
                 "checkedviews",
             ),
             (
-                "supdb-nocachezpagesstored",
-                Supdb::create_nocache_zpages_stored,
-                "stored",
-            ),
-            (
                 "supdb-nocachezpagesrecordraw",
                 Supdb::create_nocache_zpages_record_raw,
                 "recordraw",
@@ -22134,15 +21162,6 @@ mod tests {
             assert_eq!(guarantee(name), guarantee("supdb-nocachezpages"));
             assert!(arm.zpages && base.zpages, "both force the form");
             assert!(!arm.zpages_nodrop);
-            assert_eq!(
-                arm.zgroup,
-                match arm_dir {
-                    "onegroup" => Some(0),
-                    "group1k" => Some(1024),
-                    _ => None,
-                }
-            );
-            assert!(base.zgroup.is_none());
             assert_eq!(arm.zpages_nowarm, arm_dir == "nowarm");
             assert_eq!(arm.zpages_settle, arm_dir == "settle");
             assert_eq!(arm.zpages_nomemo, arm_dir == "nomemo");
@@ -22150,8 +21169,6 @@ mod tests {
             assert_eq!(arm.zpages_prefetch, arm_dir == "prefetch");
             assert_eq!(arm.zpages_rankwalk, arm_dir == "rankwalk");
             assert_eq!(arm.zcheckedviews, arm_dir == "checkedviews");
-            assert_eq!(arm.zrecord, arm_dir == "record");
-            assert_eq!(arm.zstored, arm_dir == "stored");
             assert_eq!(arm.zrawtails, arm_dir == "recordraw");
             assert_eq!(arm.znopointkeys, arm_dir == "nopointkeys");
             assert_eq!(arm.znopointfilter, arm_dir == "nofilter");
@@ -22164,16 +21181,6 @@ mod tests {
                 arm.db.as_ref().unwrap().options().zpages_raw_tails,
                 arm_dir == "recordraw",
                 "{name}: the raw tails"
-            );
-            assert_eq!(
-                arm.db.as_ref().unwrap().options().zpages_record_coding,
-                arm_dir == "record" || arm_dir == "recordraw",
-                "{name}: the record coding"
-            );
-            assert_eq!(
-                arm.db.as_ref().unwrap().options().zpages_store_all,
-                arm_dir == "stored",
-                "{name}: the stored option"
             );
             assert_eq!(arm.partition, base.partition, "the row's shape");
             assert_eq!(arm.drain, base.drain);
@@ -22210,16 +21217,6 @@ mod tests {
                 arm_dir != "rankwalk",
                 "{name}: the one option"
             );
-            assert_eq!(
-                a.zpages_group_bytes,
-                match arm_dir {
-                    "onegroup" => 0,
-                    "group1k" => 1024,
-                    _ => b.zpages_group_bytes,
-                },
-                "{name}: the one option"
-            );
-            assert_eq!(b.zpages_group_bytes, supdb::db::zpages::ZGROUP_BYTES);
             assert!(a.zpages == supdb::ZPages::Always && b.zpages == supdb::ZPages::Always);
             assert_eq!(a.zpages_drop_behind, b.zpages_drop_behind);
             assert_eq!(a.zpages_min_bytes, b.zpages_min_bytes);
@@ -22401,7 +21398,7 @@ mod tests {
             assert_eq!(a.scan_cache_bytes, b.scan_cache_bytes);
             assert_eq!(a.zpages_drop_raw, b.zpages_drop_raw);
             assert_eq!(a.zpages_drop_behind, b.zpages_drop_behind);
-            assert_eq!(a.zpages_record_coding, b.zpages_record_coding);
+            assert_eq!(a.zpages_raw_tails, b.zpages_raw_tails);
             assert_eq!(a.zpages_min_bytes, b.zpages_min_bytes);
             assert_eq!(
                 arm.zpages_state().map(|z| z.stride),

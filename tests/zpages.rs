@@ -382,7 +382,6 @@ fn forced_files(extra: impl FnOnce(&mut Options)) -> Options {
 fn oracle_opts(z: bool, inline: bool, raw_tails: bool) -> Options {
     let o = Options {
         zpages: if z { ZPages::Always } else { ZPages::Off },
-        zpages_record_coding: raw_tails,
         zpages_raw_tails: raw_tails,
         scan_block_cache: false,
         zpages_min_bytes: 0,
@@ -3002,22 +3001,15 @@ fn no_raw_touches(name: &str, cache: bool, via_form: bool) -> u64 {
 /// and the hits the rest, on the writer and a handle alike since the memo
 /// is the thread's. With it off every read of a compressed page decodes
 /// and the memo counts nothing. The memo serves groups decoded whole, the
-/// block coding's point read; under the record coding a point read of a
-/// verified page decodes its one record and asks the memo nothing, so the
-/// memo is never hit and every read decodes, with the memo on or off.
+/// block coding's point read.
 #[test]
 fn the_memo_serves_repeated_reads_of_a_partition_and_off_every_read_decodes() {
-    for (memo, record) in [(true, false), (false, false), (true, true), (false, true)] {
-        let dir = scratch(&format!(
-            "memo-{}-{}",
-            if memo { "on" } else { "off" },
-            if record { "record" } else { "block" }
-        ));
+    for memo in [true, false] {
+        let dir = scratch(&format!("memo-{}", if memo { "on" } else { "off" }));
         let mut db = Db::create(
             &dir,
             forced(|o| {
                 o.zpages_memo = memo;
-                o.zpages_record_coding = record;
                 // The memo as it serves every open: a point read's partial
                 // decode of a first touch and its key table have a test of
                 // their own below.
@@ -3053,17 +3045,7 @@ fn the_memo_serves_repeated_reads_of_a_partition_and_off_every_read_decodes() {
         let c = db.zpage_counts();
         let (reads, decodes) = (c.reads - c0.reads, c.decodes - c0.decodes);
         assert_eq!(reads, 6000, "{c:?}");
-        if record {
-            // The one-record point read: no memo asked once a page is
-            // verified, a decode a read; the memo's misses are the pages'
-            // first decodes, through the group opened whole.
-            assert_eq!(
-                c.memo_hits, 0,
-                "no read of a verified page asks the memo: {c:?}"
-            );
-            assert!(c.memo_misses <= 2 * 16 * c0.pages, "{c:?}");
-            assert_eq!(decodes, reads, "every read decodes its record: {c:?}");
-        } else if memo {
+        if memo {
             assert_eq!(
                 c.memo_hits + c.memo_misses,
                 reads,
@@ -6842,7 +6824,7 @@ fn an_eager_auto_store_buys_the_form_before_any_read() {
     }
 }
 
-/// Under `Options::zpages_coding_auto`, as shipped, the selector chooses
+/// Under `ZPages::Auto` the selector chooses
 /// the coding the form files are built in: the sampler sizes the raw-tail
 /// record coding beside the block coding, and the raw tails are built where
 /// the model predicts that form faults nothing against `zselect::FORM_FILL`
@@ -6853,8 +6835,7 @@ fn an_eager_auto_store_buys_the_form_before_any_read() {
 /// percent over the raw-tail form's own bytes, which that form fits whole
 /// and fills past the share -- the shape a line at the budget itself
 /// picked the raw tails for, at ten million keys under 1.25 GiB
-/// (`docs/engine.md`). With the option off the options' block coding is
-/// built under 64 MiB too, nothing chosen and nothing raw-tailed; and the
+/// (`docs/engine.md`). The
 /// first case's store with no reader before its pick builds the block
 /// coding, the raw tails waiting for a reader (`ZCounts::coding_unread`),
 /// since a pick made before any read is made partway through the store's
@@ -6867,10 +6848,6 @@ fn an_eager_auto_store_buys_the_form_before_any_read() {
 #[test]
 fn the_selector_builds_the_raw_tails_where_that_form_fits_the_fill_share_and_the_block_coding_otherwise(
 ) {
-    assert!(
-        Options::default().zpages_coding_auto,
-        "the selector's coding as shipped"
-    );
     // A case's budget: bytes, or a percentage of the first case's raw-tail
     // form, which every case's store sizes alike (the same keys and values,
     // the sampler's ranks evenly spaced).
@@ -6881,14 +6858,13 @@ fn the_selector_builds_the_raw_tails_where_that_form_fits_the_fill_share_and_the
     // The last case is the first's store with no reader before the pick:
     // the raw tails wait for one, and the block coding is chosen.
     let cases = [
-        (At::Bytes(64 << 20), true, true, true),
-        (At::Bytes(1536 << 10), true, false, true),
-        (At::OfRaw(105), true, false, true),
-        (At::Bytes(64 << 20), false, false, true),
-        (At::Bytes(64 << 20), true, false, false),
+        (At::Bytes(64 << 20), true, true),
+        (At::Bytes(1536 << 10), false, true),
+        (At::OfRaw(105), false, true),
+        (At::Bytes(64 << 20), false, false),
     ];
     let mut raw_w_z = 0u64;
-    for (i, (at, gear, raw, read)) in cases.into_iter().enumerate() {
+    for (i, (at, raw, read)) in cases.into_iter().enumerate() {
         let edge = matches!(at, At::OfRaw(_));
         let budget = match at {
             At::Bytes(b) => b,
@@ -6899,7 +6875,7 @@ fn the_selector_builds_the_raw_tails_where_that_form_fits_the_fill_share_and_the
         };
         let fill = supdb::db::zselect::form_fill(budget);
         let what = format!(
-            "case {i}: budget {budget} (fill {fill}), gear {gear}, raw tails expected {raw}, a reader {read}"
+            "case {i}: budget {budget} (fill {fill}), raw tails expected {raw}, a reader {read}"
         );
         let dir = scratch(&format!("coding-auto-{i}"));
         let inject = std::sync::Arc::new(supdb::ZInject::new());
@@ -6913,7 +6889,6 @@ fn the_selector_builds_the_raw_tails_where_that_form_fits_the_fill_share_and_the
                 zpages: ZPages::Auto,
                 zpages_min_bytes: 0,
                 zpages_build_eager: true,
-                zpages_coding_auto: gear && Options::default().zpages_coding_auto,
                 zpages_inject: Some(inject.clone()),
                 ..Options::default()
             },
@@ -6941,23 +6916,11 @@ fn the_selector_builds_the_raw_tails_where_that_form_fits_the_fill_share_and_the
         if i == 0 {
             raw_w_z = c.sample_w_z_raw_bytes;
         }
-        if !gear {
-            assert_eq!(
-                (c.coding_picks_raw, c.coding_picks_block, c.builds_raw_tails),
-                (0, 0, 0),
-                "{what}: nothing chosen, nothing raw-tailed: {c:?}"
-            );
-            assert!(
-                c.sample_w_z_bytes > 0 && c.sample_w_z_raw_bytes == 0,
-                "{what}: the options' coding sized alone: {c:?}"
-            );
-        } else {
-            assert!(
-                c.sample_w_z_raw_bytes > 0 && c.sample_w_z_bytes > 0,
-                "{what}: both codings sized: {c:?}"
-            );
-        }
-        if gear && raw {
+        assert!(
+            c.sample_w_z_raw_bytes > 0 && c.sample_w_z_bytes > 0,
+            "{what}: both codings sized: {c:?}"
+        );
+        if raw {
             assert!(
                 c.coding_picks_raw >= 1 && c.coding_picks_block == 0,
                 "{what}: the raw tails chosen: {c:?}"
@@ -6974,7 +6937,7 @@ fn the_selector_builds_the_raw_tails_where_that_form_fits_the_fill_share_and_the
                 c.sample_w_z_raw_bytes <= fill,
                 "{what}: the raw-tail form within the fill share: {c:?}"
             );
-        } else if gear && !read {
+        } else if !read {
             assert!(
                 c.coding_picks_block >= 1 && c.coding_picks_raw == 0 && c.coding_unread >= 1,
                 "{what}: the block coding chosen for want of a reader: {c:?}"
@@ -6984,7 +6947,7 @@ fn the_selector_builds_the_raw_tails_where_that_form_fits_the_fill_share_and_the
                 c.sample_w_z_raw_bytes <= fill,
                 "{what}: where the raw tails fit the fill share: {c:?}"
             );
-        } else if gear {
+        } else {
             assert!(
                 c.coding_picks_block >= 1 && c.coding_picks_raw == 0 && c.coding_unread == 0,
                 "{what}: the block coding chosen: {c:?}"
@@ -11512,7 +11475,6 @@ fn the_sample_waits_for_a_seal_in_flight_where_the_controller_suspects_at_the_cr
 #[cfg(target_os = "linux")]
 #[test]
 fn a_raw_tail_pick_is_taken_back_once_the_store_grows_past_the_fill_share() {
-    assert!(Options::default().zpages_coding_auto);
     for grow in [true, false] {
         let what = format!("grow {grow}");
         let (dir, mut db, mut model, inject) = auto_store_with(
@@ -11637,7 +11599,7 @@ fn a_raw_tail_pick_is_taken_back_once_the_store_grows_past_the_fill_share() {
 #[cfg(target_os = "linux")]
 #[test]
 fn a_form_file_built_at_a_merges_finish_in_a_coding_taken_back_is_built_again() {
-    assert!(Options::default().zpages_coding_auto && Options::default().zpages_build_at_finish);
+    assert!(Options::default().zpages_build_at_finish);
     let (dir, mut db, mut model, inject) = auto_store_with(
         "coding-repick-finish",
         1 << 40,
@@ -11738,7 +11700,6 @@ fn a_form_file_built_at_a_merges_finish_in_a_coding_taken_back_is_built_again() 
 #[cfg(target_os = "linux")]
 #[test]
 fn a_form_file_built_ahead_in_the_coding_the_pick_refuses_is_built_again() {
-    assert!(Options::default().zpages_coding_auto);
     let (dir, db, model, inject, raw) = land_store_with("auto-land-recode", 50, |o| {
         o.partition_bytes = Some(160 << 10);
         o.zpages_build_eager = true;
@@ -15092,25 +15053,20 @@ fn heat_up(db: &Db, keys: &[Vec<u8>], n: usize) {
     }
 }
 
-/// Every group stored verbatim (`Options::zpages_store_all`, off): the form
-/// answers reads, counts and scans as the compressed one does, its files are
-/// the records' own bytes and larger than the compressed ones by more than a
-/// quarter at the suite's shape, and a read through it decodes nothing,
-/// since a stored group's payload is the group.
+/// The record coding with its tails stored raw (`Options::zpages_raw_tails`,
+/// off): the form answers reads, counts and scans as the block coding does,
+/// its files are larger than the compressed ones, and a scan reads its
+/// groups in place, where the block coding's are LZ4 blocks.
 #[test]
-fn a_form_stored_whole_answers_as_the_compressed_one_and_decodes_nothing() {
+fn a_form_with_raw_tails_answers_as_the_compressed_one_and_its_scans_read_in_place() {
     let mut bytes = Vec::new();
-    // Compressed, stored whole, and the record coding with raw tails: the
-    // third answers as the others and sits between them in size.
-    for (stored, raw) in [(false, false), (true, false), (false, true)] {
-        let what = format!("stored {stored} raw tails {raw}");
-        let dir = scratch(&format!("stored-whole-{stored}-{raw}"));
+    for raw in [false, true] {
+        let what = format!("raw tails {raw}");
+        let dir = scratch(&format!("raw-tails-{raw}"));
         let mut db = Db::create(
             &dir,
             forced(|o| {
                 o.partition_bytes = Some(160 << 10);
-                o.zpages_store_all = stored;
-                o.zpages_record_coding = raw;
                 o.zpages_raw_tails = raw;
             }),
         )
@@ -15130,15 +15086,7 @@ fn a_form_stored_whole_answers_as_the_compressed_one_and_decodes_nothing() {
         }
         let c = db.zpage_counts();
         assert!(c.reads > 0, "{what}: the reads went through the form");
-        if stored {
-            assert_eq!(c.decodes, 0, "{what}: a stored group decodes nothing");
-        } else {
-            assert!(c.decodes > 0, "{what}: the compressed groups decode");
-        }
-        // A scan of the raw-tail form reads its groups in place
-        // (`Options::zpages_inplace_walk`); the block coding's are LZ4
-        // blocks and the stored form's are parsed where they lie as they
-        // were, neither through the in-place walk.
+        assert!(c.decodes > 0, "{what}: the compressed groups decode");
         assert_eq!(
             c.inplace_groups > 0,
             raw,
@@ -15155,96 +15103,32 @@ fn a_form_stored_whole_answers_as_the_compressed_one_and_decodes_nothing() {
         let _ = std::fs::remove_dir_all(&dir);
     }
     assert!(
-        bytes[1] > bytes[0] + bytes[0] / 4,
-        "the stored form is the records' bytes: {bytes:?}"
-    );
-    assert!(
-        bytes[0] < bytes[2] && bytes[2] < bytes[1],
-        "the raw-tail form sits between the compressed and the stored: {bytes:?}"
+        bytes[0] < bytes[1],
+        "the raw-tail form is larger than the compressed one: {bytes:?}"
     );
 }
 
-/// The form's groups decoded by the engine's own decoder
-/// (`Options::zpages_own_decoder`): a store opened with it reads every key,
-/// count and window as the model has it, as a store opened without does, and
-/// each store decodes by its own options while the other is open beside it.
+/// The block coding's groups written by the parsing encoder (`db::zlz4`)
+/// where the parse wins, many short matches: the same format in fewer
+/// sequences, so the form answers every read, count and scan as the model
+/// has it; the builder's own check decodes every group it writes against
+/// the records, so a group the encoder got wrong would have failed the
+/// build. The values are half random bytes and half words of four to seven
+/// letters drawn from a dozen, where the motif `suite_value` repeats is one
+/// long match either encoder finds.
 #[test]
-fn a_form_read_through_the_engines_own_decoder_answers_as_through_lz4_flexs() {
-    let mut open = Vec::new();
-    for own in [true, false] {
-        let what = format!("own decoder {own}");
-        let dir = scratch(&format!("own-decoder-{own}"));
-        let mut db = Db::create(
-            &dir,
-            forced(|o| {
-                o.partition_bytes = Some(160 << 10);
-                o.zpages_own_decoder = own;
-            }),
-        )
-        .unwrap();
-        let model = ordered_load(&mut db, 5000, 0x0D3C);
-        db.zpages_settle().unwrap();
-        let keys: Vec<Vec<u8>> = model.keys().cloned().collect();
-        check(&db, &model, &keys, &what);
-        check_scan(&db, &model, &what);
-        for (i, limit) in [(1234usize, 70usize), (0, 3), (4990, 40)] {
-            same_window(
-                &scanned(&db, &keys[i], limit),
-                &window(&model, &keys[i], limit),
-                &what,
-            );
-        }
-        let c = db.zpage_counts();
-        assert!(
-            c.reads > 0 && c.decodes > 0,
-            "{what}: read and decoded: {c:?}"
-        );
-        assert_eq!((c.fallbacks, c.bad_pages), (0, 0), "{what}: {c:?}");
-        assert!(c.form_files > 0, "{what}: {c:?}");
-        let by_own = if own { c.form_files } else { 0 };
-        assert_eq!(
-            c.own_decoder_files, by_own,
-            "{what}: the decoder its own: {c:?}"
-        );
-        open.push((db, model, keys, what, dir, by_own));
-    }
-    // Both read again with both open, the second opened last, each through
-    // the decoder of its own options.
-    for (db, model, keys, what, _, by_own) in &open {
-        check(db, model, keys, what);
-        check_scan(db, model, what);
-        assert_eq!(db.zpage_counts().own_decoder_files, *by_own, "{what}");
-    }
-    for (db, _, _, _, dir, _) in open {
-        drop(db);
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-}
-
-/// The block coding's groups written by the parsing encoder
-/// (`Options::zpages_parse`): the same format in fewer sequences, so the
-/// form answers every read, count and scan as the greedy encoder's does,
-/// through the same decoder, and its files are smaller; the builder's own
-/// check decodes every group it writes against the records, so a group the
-/// encoder got wrong would have failed the build. The values are the shape
-/// the parse wins on, many short matches: half random bytes and half words
-/// of four to seven letters drawn from a dozen, where the motif
-/// `suite_value` repeats is one long match either encoder finds.
-#[test]
-fn a_form_the_parsing_encoder_wrote_answers_as_the_greedy_ones_in_fewer_bytes() {
+fn a_form_the_parsing_encoder_wrote_over_short_matches_answers_as_the_model() {
     const WORDS: [&[u8]; 12] = [
         b"oak ", b"birch ", b"pine ", b"elm ", b"cedar ", b"fir ", b"ash ", b"larch ", b"maple ",
         b"yew ", b"alder ", b"beech ",
     ];
-    let mut bytes = Vec::new();
-    for parse in [false, true] {
-        let what = format!("parse {parse}");
-        let dir = scratch(&format!("parse-{parse}"));
+    {
+        let what = "parse".to_string();
+        let dir = scratch("parse");
         let mut db = Db::create(
             &dir,
             forced(|o| {
                 o.partition_bytes = Some(160 << 10);
-                o.zpages_parse = parse;
             }),
         )
         .unwrap();
@@ -15284,19 +15168,9 @@ fn a_form_the_parsing_encoder_wrote_answers_as_the_greedy_ones_in_fewer_bytes() 
             "{what}: read and decoded: {c:?}"
         );
         assert_eq!(c.fallbacks, 0, "{what}: nothing fell back to the raw form");
-        bytes.push(
-            form_files(&dir)
-                .iter()
-                .map(|p| common::store_file(p).len() as u64)
-                .sum::<u64>(),
-        );
         drop(db);
         let _ = std::fs::remove_dir_all(&dir);
     }
-    assert!(
-        bytes[1] < bytes[0],
-        "the parsing encoder's form is the smaller: {bytes:?}"
-    );
 }
 
 /// The census window's busy wall is taken from one operation in sixteen
@@ -21192,7 +21066,6 @@ fn the_words_kept_for_stride_files_are_held_to_the_live_partitions() {
 #[cfg(target_os = "linux")]
 #[test]
 fn a_stride_file_built_ahead_is_not_given_back_when_the_pick_moves() {
-    assert!(Options::default().zpages_coding_auto);
     let what = "a stride file built ahead, the pick the raw tails";
     let (dir, db, model, inject, raw) = land_store_loaded(
         "auto-land-stride-pick",
