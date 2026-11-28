@@ -449,11 +449,6 @@ pub fn open_ranges(head: &[u8], object_len: u64) -> Result<Vec<(u64, u64)>> {
     Ok(v)
 }
 
-/// Sort byte ranges and merge the overlapping and the adjacent.
-///
-/// Adjacency merges too, because the consumer of a plan is a range fetcher
-/// and two touching HTTP ranges are strictly worse than one. Zero-length
-/// entries are dropped: they name no byte.
 /// `base + off`, an offset into the object out of a sum of file words:
 /// one that does not fit a u64 is a damaged word.
 fn at(base: u64, off: usize) -> Result<u64> {
@@ -491,6 +486,11 @@ fn row_len(hdr: &flatindex::Header, sec_len: usize, base: u64) -> Result<usize> 
     }
 }
 
+/// Sort byte ranges and merge the overlapping and the adjacent.
+///
+/// Adjacency merges too, because the consumer of a plan is a range fetcher
+/// and two touching HTTP ranges are strictly worse than one. Zero-length
+/// entries are dropped: they name no byte.
 fn merge_ranges(v: &mut Vec<(u64, u64)>) {
     v.retain(|(_, len)| *len > 0);
     v.sort_unstable();
