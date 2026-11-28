@@ -57,7 +57,7 @@ static ALLOC: Counting = Counting;
 /// last one was given, which retires them, and the store closes with
 /// them retired and not yet swept, as a pass's closing threaded scans
 /// leave it.
-fn a_store_life(name: &str, blocks_mapped: bool) {
+fn a_store_life(name: &str) {
     let d = std::env::temp_dir().join(format!("supdb-next-leak-{name}-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&d);
     std::fs::create_dir_all(&d).unwrap();
@@ -65,7 +65,6 @@ fn a_store_life(name: &str, blocks_mapped: bool) {
         seal_bytes: 32 << 20,
         partition_bytes: Some(64 << 20),
         scan_block_cache: true,
-        blocks_mapped,
         ..common::options()
     };
     let mut db = Db::create(&d, opts).unwrap();
@@ -641,11 +640,9 @@ fn a_one_file_life(name: &str) {
     let _ = std::fs::remove_dir_all(&d);
 }
 
-/// A store's blocks come from the kernel by default (`Options::blocks_mapped`)
-/// and the allocator the count below sees nothing of them, so they are
-/// counted on their own (`Db::mapped_bytes`): zero past every store's
-/// close. The store life runs once with its blocks on the heap too, where
-/// the allocation count is what sees them.
+/// A store's blocks come from the kernel and the allocator the count
+/// below sees nothing of them, so they are counted on their own
+/// (`Db::mapped_bytes`): zero past every store's close.
 /// One store's life that shares its live table on demand
 /// (`Options::share_on_write`): scans that build the writer's block
 /// tables, a handle whose writes install a shared table over a table with
@@ -734,8 +731,7 @@ fn a_closed_store_gives_back_what_it_allocated() {
     // The first life allocates what lives for the process -- the test
     // harness's buffers, lazily built statics, the buffer a thread that
     // reads from a form file decodes into -- so the count starts after.
-    a_store_life("warm", true);
-    a_store_life("warm-heap", false);
+    a_store_life("warm");
     a_handed_life("warm-handed");
     a_three_frozen_life("warm-three");
     a_zpages_life("warm-zpages");
@@ -750,10 +746,9 @@ fn a_closed_store_gives_back_what_it_allocated() {
     );
     let before = LIVE.load(Ordering::SeqCst);
     let lives = 4;
-    let kinds = 9;
+    let kinds = 8;
     for i in 0..lives {
-        a_store_life(&format!("life-{i}"), true);
-        a_store_life(&format!("heap-{i}"), false);
+        a_store_life(&format!("life-{i}"));
         a_handed_life(&format!("handed-{i}"));
         a_three_frozen_life(&format!("three-{i}"));
         a_zpages_life(&format!("zpages-{i}"));

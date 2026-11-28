@@ -665,7 +665,7 @@ the lag sweep's full rewrite, not the engine's live bytes, and three
 things set that. The memtables' blocks came from the allocator's heap
 and stayed there when their tables dropped, so the default arm held
 1.3 GB at that point with the engine holding a third, until the engine
-mapped its blocks from the kernel itself (`Options::blocks_mapped`). The
+mapped its blocks from the kernel itself. The
 cache arm whose budget counts contents (`supdb-cache256`) keeps its
 budget only where a scan builds a block, so the full rewrite builds the
 whole store's forms and the first scan sheds them into the allocator's
@@ -989,9 +989,6 @@ other batch within the backlog bound (`Options::upkeep_pace_syncs_model`);
 buying commit has synced, where the default writes it ahead of the
 commit's frames on the writer's path (`Options::wal_ahead_beside`,
 refuted);
-`supdb-nopool` and `supdb-ingestnopool` unmap every block a table gives
-back at its drop, where the default keeps them for the next tables
-(`Options::blocks_pool_bytes`);
 `supdb-zhotresident` is `supdb` with the hot-raw fill asking for the
 partitions the reads have not skewed by how much of their records the cache
 holds, most first (`Options::zpages_hot_fill_resident_first`);

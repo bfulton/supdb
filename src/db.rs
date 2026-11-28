@@ -4720,40 +4720,6 @@ pub struct Options {
     /// core level, two passes cut a rep. Off, the default: the writer
     /// waits a pass out. `supdb-passyield` is the arm that yields.
     pub upkeep_yields: bool,
-    /// Whether the engine's large blocks -- a memtable's arena blocks,
-    /// its entry slabs and its hash index, a scan snapshot's arena
-    /// blocks -- are mapped from the kernel, from `blocks::MAP_FROM`
-    /// bytes, and unmapped at their drop, so what a store frees goes
-    /// back at once. Off, they come from the global allocator, which
-    /// keeps a freed block in its heap for the next allocation of its
-    /// size: glibc raises its mmap threshold to the size of the first
-    /// large chunk it frees, so every arena block after the first stayed
-    /// in the heap when its table dropped, and across the lag sweep at
-    /// ten million keys the process held 150-620 MB beyond its bytes in
-    /// use, page cache the store cannot have under a memory bound and
-    /// memory the compact form's budget subtracts, where glibc told to
-    /// map every allocation of a megabyte or more held 0-135. A mapped
-    /// block's pages are fresh at their first touch, where the heap's
-    /// were touched before. `supdb-heapblocks` is the arm that keeps the
-    /// heap shape.
-    pub blocks_mapped: bool,
-    /// The most bytes of a store's mapped blocks its tables gave back that
-    /// it keeps for its next tables instead of unmapping (`blocks::BlockPool`);
-    /// none keeps none. A table's blocks are mapped fresh and every page
-    /// of them faults at its first touch, about a microsecond and a half
-    /// on this guest, so the next table after a seal faulted once every
-    /// twenty updates or so of a write mix and the update paid it: by
-    /// samples of the update phase, half of an update's time was the
-    /// kernel's fault path where FASTER's takes none. The table after a
-    /// seal asks for the lengths the one before gave back, so a pool of
-    /// two tables' blocks gives it pages already touched. The pool keeps
-    /// nothing while the store is out of core -- the controller's gate
-    /// away from the raw form, or the form forced -- and gives back what
-    /// it holds as the gate leaves the raw form: its pages are resident
-    /// memory the page cache's tenants cannot have, which is why
-    /// `blocks_mapped` exists. Under `blocks_mapped` alone; zero:
-    /// `supdb-nopool`, and `supdb-ingestnopool` buffered.
-    pub blocks_pool_bytes: usize,
     /// A memtable's hash index, a zeroed block mapped fresh at every
     /// doubling, is populated for writing as it is mapped
     /// (`blocks::Source::alloc`, `MADV_POPULATE_WRITE`), so that the
@@ -4774,19 +4740,6 @@ pub struct Options {
     /// `supdb-indexzeropage`, and `supdb-heldindexzeropage` under the held
     /// log with no frames.
     pub index_populated: bool,
-    /// A memtable hashes a sixteen-byte key by a folded multiply of its two
-    /// words, seven instructions, where it took the key's FNV word, a
-    /// multiply a byte, and a finish over it: fifty instructions of every
-    /// put and of every read the live table ends, which need no other
-    /// source's hash. A memtable is the process's own, rebuilt from the
-    /// log at an open, so its hash is nobody else's; the segments' indexes
-    /// and filters keep FNV, and a read that goes on past the live table
-    /// takes that word as well. Linear probing at the half load the index
-    /// grows at reads 1.49 slots a lookup over the suite's numbered keys
-    /// and over random ids either way. Off, every key's hash is FNV's:
-    /// `supdb-memfnv`, and `supdb-heldmemfnv` under the held log with no
-    /// frames.
-    pub mem_hash_fold: bool,
     /// PROTOTYPE: under the held log (`SyncPolicy::Explicit`), which
     /// promises nothing of isolation, a put to a key whose live-table chain
     /// is one value over the tombstone a put lays down, and whose new value
@@ -4903,7 +4856,7 @@ pub struct Options {
     /// EXPERIMENT, under `shared_writers`: the shared table's value arena
     /// and its index are mapped at addresses a multiple of two megabytes and
     /// advised onto the kernel's transparent huge pages (`MADV_HUGEPAGE`,
-    /// `blocks::map_huge`; `Options::blocks_mapped`), neither taken from the
+    /// `blocks::map_huge`), neither taken from the
     /// block pool nor given to it. A get or a write of a key the table holds
     /// loads an index slot and then the key's record, each on a page of its
     /// own among the table's: over 4 KiB pages a table of a store's records
@@ -5012,7 +4965,7 @@ pub struct Options {
     /// merge's key list and the trailer a finish composes -- are mapped
     /// from the kernel once they are `blocks::MAP_FROM` bytes and unmapped
     /// when the job drops them (`blocks::BigVec`), as the memtables'
-    /// blocks are (`blocks_mapped`). From the allocator they are a
+    /// blocks are. From the allocator they are a
     /// hundred and thirty bytes for each key a merge writes and a hundred
     /// for each a seal does, on a thread that ends with the job, and the
     /// allocator keeps the top of that thread's arena up to twice the
@@ -5191,24 +5144,6 @@ pub struct Options {
     /// neither a wrong answer nor a format, so the arm stays for pricing
     /// as `supdb-rebasedrops`.
     pub rebase_recuts_sparse: bool,
-    /// EXPERIMENT: the writer's buffers have their pages populated ahead
-    /// of the fill, a window at a time, instead of faulting page by page
-    /// as the bytes land -- the memtable arena's blocks and the segment
-    /// writer's piece buffer, which together are most of the fresh pages
-    /// an ordered load touches, about six hundred of nine hundred at ten
-    /// thousand keys. A first touch costs this guest about a microsecond
-    /// a page by fault and half that by `madvise` (`MADV_POPULATE_WRITE`)
-    /// over a window, the kernel's zeroing being the half that stays, and
-    /// the window grows with the fill (`PREFAULT_MIN`, `PREFAULT_MAX`).
-    /// Priced, it moved the buffered ordered load's commits 8% at ten
-    /// thousand keys and the load nothing by rate in forty-eight pairs,
-    /// level at three hundred thousand, while the mixes' and the small
-    /// bursts' first writes into a fresh table paid the window. Off, and
-    /// the pages fault as they are touched; on as `supdb-populate` and
-    /// `supdb-ingestpopulate`. Linux only: elsewhere, and on a kernel
-    /// without the advice, nothing changes. A `Db` passes it to its
-    /// segment writers over `SegmentOptions::prefault`.
-    pub prefault: bool,
     /// Whether a drain that does not partition on flush names its first
     /// seal's piece as the partition at the close, where it fits one and
     /// holds no tombstone, rather than landing it as a piece and promoting
@@ -7416,8 +7351,7 @@ impl Options {
     }
 
     /// How a table's blocks are made, for `MemTable::new`.
-    /// How the store's tables make their blocks, from `pool`, the store's
-    /// (`Options::blocks_pool_bytes`).
+    /// How the store's tables make their blocks, from `pool`, the store's.
     /// The cap a fresh shared live table's values take: `shared_table_bytes`
     /// where it is set, and otherwise the seal's `threshold`.
     fn shared_cap(&self, threshold: usize) -> usize {
@@ -7430,32 +7364,27 @@ impl Options {
 
     fn block_shape(&self, pool: &Option<std::sync::Arc<blocks::BlockPool>>) -> BlockShape {
         BlockShape {
-            prefault: self.prefault,
             index_populated: self.index_populated,
-            fold_hash: self.mem_hash_fold,
-            mapped: self.blocks_mapped,
+            fold_hash: true,
             pool: pool.clone(),
         }
     }
 
     /// The store's pool of given-back blocks, where it keeps one: on
     /// from the start unless the compact form is forced, which is a store
-    /// read out of core (`blocks::BlockPool`, `Options::blocks_pool_bytes`).
+    /// read out of core (`blocks::BlockPool`).
     ///
-    /// Its cap is the option's, held to a sixty-fourth of the memory limit
+    /// Its cap is `BLOCK_POOL_BYTES`, held to a sixty-fourth of the memory limit
     /// the store opens under (`zfile::read_budget`): sixteen megabytes
-    /// under a gibibyte, the option's sixty-four from four gibibytes up. A
+    /// under a gibibyte, its sixty-four from four gibibytes up. A
     /// store under a bound runs at the raw form until the controller's
     /// census, and a shuffled load's tables there are a hundred megabytes
-    /// each, so a pool at the option's cap would hold a sixteenth of the
+    /// each, so a pool at its whole cap would hold a sixteenth of the
     /// bound through the load, where the loads at ten million keys have
     /// been killed for less.
     fn block_pool(&self) -> Option<std::sync::Arc<blocks::BlockPool>> {
-        if !self.blocks_mapped || self.blocks_pool_bytes == 0 {
-            return None;
-        }
         let limit = zfile::read_budget().map_or(u64::MAX, |b| b.limit);
-        let cap = (self.blocks_pool_bytes as u64).min(limit / 64) as usize;
+        let cap = (BLOCK_POOL_BYTES as u64).min(limit / 64) as usize;
         Some(std::sync::Arc::new(blocks::BlockPool::new(
             cap,
             self.zpages != ZPages::Always,
@@ -7696,10 +7625,7 @@ impl Default for Options {
             frozen_bytes: 0,
             upkeep_abandons: true,
             upkeep_yields: false,
-            blocks_mapped: true,
-            blocks_pool_bytes: 64 << 20,
             index_populated: true,
-            mem_hash_fold: true,
             put_in_place: false,
             shared_writers: false,
             shared_recycles: true,
@@ -7725,7 +7651,6 @@ impl Default for Options {
             convert_from_form: true,
             copy_exact: true,
             rebase_recuts_sparse: true,
-            prefault: false,
             drain_names_partition: true,
             manifest_spare: true,
             manifest_slots: true,
@@ -11073,10 +10998,6 @@ const STUCK_PIECE: u64 = 1 << 62;
 struct AlignedWriter {
     file: vault::File,
     buf: Vec<u8>,
-    /// `SegmentOptions::prefault`: the buffer's pages populated a window
-    /// ahead of the fill, and how far they are.
-    prefault: bool,
-    populated: usize,
     /// Bytes on the file so far: where the buffer's contents land.
     written: u64,
     /// The record stream a table keeps as the file's record section
@@ -11182,13 +11103,7 @@ struct HelperRow {
 }
 
 impl AlignedWriter {
-    fn new(
-        file: vault::File,
-        piece: usize,
-        writeback: bool,
-        ahead: u64,
-        prefault: bool,
-    ) -> AlignedWriter {
+    fn new(file: vault::File, piece: usize, writeback: bool, ahead: u64) -> AlignedWriter {
         let piece = piece.max(4096);
         // A file of a store's data file says so in the byte every write
         // and sync of the writer asks (`RUN_FILE_PLACED`), and hands its
@@ -11201,8 +11116,6 @@ impl AlignedWriter {
         AlignedWriter {
             file,
             buf: Vec::with_capacity(piece),
-            prefault,
-            populated: 0,
             written: 0,
             stream_src: None,
             held_from: 0,
@@ -12379,14 +12292,6 @@ impl std::io::Write for AlignedWriter {
         while !rest.is_empty() {
             let room = self.until_boundary() - self.buf.len();
             let take = room.min(rest.len());
-            if self.prefault {
-                populate_ahead(
-                    self.buf.as_ptr() as usize,
-                    self.buf.capacity(),
-                    &mut self.populated,
-                    self.buf.len() + take,
-                );
-            }
             if self.own_on && self.section.is_some() {
                 let at = self.pos() + self.buf.len() as u64;
                 self.own_hash(at, &rest[..take]);
@@ -12847,7 +12752,6 @@ impl SegmentWriter {
             opts.write_piece,
             opts.early_writeback,
             opts.sync_ahead,
-            opts.prefault,
         );
         out.set_row_on_write(opts.row_on_write);
         out.fail_helper = opts.fail_helper_syncs.clone();
@@ -13509,7 +13413,7 @@ impl SegmentWriter {
         // No helper thread and no row kept as the bytes land: the records
         // were written by another process, so the finish reads the
         // section back for its checksum row (`row_for`).
-        let mut out = AlignedWriter::new(file, opts.write_piece, opts.early_writeback, 0, false);
+        let mut out = AlignedWriter::new(file, opts.write_piece, opts.early_writeback, 0);
         out.written = run.end;
         let mut w = SegmentWriter::over(out, opts);
         w.pos = run.end;
@@ -14622,10 +14526,6 @@ pub struct SegmentOptions {
     /// the arm `supdb-fillplain` and `supdb-ingestfillplain`. The bytes
     /// are the same either way.
     pub lookahead: bool,
-    /// EXPERIMENT: the piece buffer's pages populated a window ahead of
-    /// the fill rather than faulted one by one as the records land; see
-    /// `Options::prefault`, which a `Db` sets this from. Off.
-    pub prefault: bool,
     /// A test's: every fdatasync the helper thread of a writer made with
     /// these options would issue is skipped and reported as `EIO`, as a
     /// device error the helper's fdatasync met would be, and each is
@@ -14776,7 +14676,6 @@ impl Default for SegmentOptions {
             sync_ahead: 8 << 20,
             row_on_write: true,
             lookahead: true,
-            prefault: false,
             fail_helper_syncs: None,
             helper_fault: None,
             buffers_mapped: false,
@@ -15735,30 +15634,24 @@ struct CommitMark {
 /// The writer is the store, made single by `&mut Db`; the writer-only
 /// fields are cells it alone touches, and that is the whole of what the
 /// `Sync` below asserts.
-/// How a table's blocks are made: populated ahead of the fill
-/// (`Options::prefault`) and mapped from the kernel (`Options::blocks_mapped`).
+/// How a table's blocks are made, mapped from the kernel and unmapped at
+/// their drop (`blocks::Source`).
 #[derive(Clone)]
 struct BlockShape {
-    prefault: bool,
     /// The hash index populated for writing as it is mapped
     /// (`Options::index_populated`).
     index_populated: bool,
-    /// Sixteen-byte keys hashed by a fold of their words
-    /// (`Options::mem_hash_fold`).
+    /// Sixteen-byte keys hashed by a fold of their words, every store's
+    /// tables; FNV for every key otherwise.
     fold_hash: bool,
-    mapped: bool,
-    /// The store's pool of blocks its tables gave back
-    /// (`Options::blocks_pool_bytes`); none where it keeps none.
+    /// The store's pool of blocks its tables gave back (`BLOCK_POOL_BYTES`);
+    /// none where it keeps none.
     pool: Option<std::sync::Arc<blocks::BlockPool>>,
 }
 
 struct MemTable {
-    /// Whether the table's blocks -- the arenas', the slabs', the index's
-    /// -- are mapped from the kernel (`Options::blocks_mapped`); the seal's
-    /// snapshot copy of the table follows it.
-    mapped: bool,
     /// Whether the index hashes a sixteen-byte key by the fold of its
-    /// words (`Options::mem_hash_fold`, `MemTable::hash`), fixed for the
+    /// words (`MemTable::hash`), fixed for the
     /// table's life: every hash handed to it is the table's own.
     fold_hash: bool,
     /// Every entry in the order it was made -- key order, when
@@ -16430,7 +16323,7 @@ fn mem_hash(key: &[u8]) -> u64 {
     mem_hash_of(crate::flatindex::key_hash(key))
 }
 
-/// A sixteen-byte key's memtable hash under `Options::mem_hash_fold`: the
+/// A sixteen-byte key's memtable hash in a table that folds: the
 /// two words' folded 128-bit product, each word moved off zero by a
 /// constant first, the halves of the product exclusive-or'd. Two loads, a
 /// multiply and a few operations, where FNV takes a multiply a byte.
@@ -16464,7 +16357,7 @@ struct Index {
 }
 
 /// The index's slots: `n` words, zero to begin with, in one block from
-/// `blocks::alloc` (`Options::blocks_mapped`) that goes with the index.
+/// `blocks::alloc` that goes with the index.
 struct Slots {
     ptr: *mut AtomicU64,
     n: usize,
@@ -16538,59 +16431,16 @@ const KEYS_BIAS: u32 = 1 << 31;
 /// Blocks an arena can address: sixteen gigabytes of the plain size.
 const ARENA_BLOCKS: usize = 1 << 12;
 
-/// The window a buffer's pages are populated by, ahead of its fill
-/// (`Options::prefault`): as much again as is populated, between these
-/// two, so the pages a buffer never fills are at most the fill's own size
-/// below a quarter megabyte and sixty-four pages past it. A fixed window
-/// of sixty-four pages cost a fresh table's first write thirty
-/// microseconds an arena, and the lag sweep's one-percent burst at ten
-/// thousand keys, a hundred writes over four pages, read its updates at
-/// 0.66x and ycsb-B at 0.87x. Read only by `populate_ahead`, which is
-/// Linux's.
-#[cfg(target_os = "linux")]
-const PREFAULT_MIN: usize = 16 << 10;
-#[cfg(target_os = "linux")]
-const PREFAULT_MAX: usize = 256 << 10;
-
-/// The pages of `base[..cap]` from `populated` to at least `need`, a
-/// window at a time, populated in one call so each costs the kernel's
-/// zeroing and not a fault's trap as well; `populated` is moved to where
-/// the next call continues from. The range is rounded inward to pages at
-/// its end, so the allocation's last partial page faults as it did, and
-/// outward at its start, where the page is the allocation's own. A
-/// failure -- a kernel without the advice -- leaves the pages to fault.
-// The door (tests/data/door.txt): advice on the writer's anonymous buffer, not a file.
-#[allow(clippy::disallowed_methods)]
-#[cfg(target_os = "linux")]
-fn populate_ahead(base: usize, cap: usize, populated: &mut usize, need: usize) {
-    if need <= *populated || *populated >= cap {
-        return;
-    }
-    let window = (*populated).clamp(PREFAULT_MIN, PREFAULT_MAX);
-    let end = need.max(*populated + window).min(cap);
-    let page = 4096usize;
-    let start = (base + *populated) & !(page - 1);
-    let stop = (base + end) & !(page - 1);
-    if stop > start {
-        // SAFETY: `[start, stop)` lies within the allocation at `base`, of
-        // `cap` bytes, bar the page-rounding at `start`, which stays on the
-        // page the allocation's first byte is on; the advice touches no
-        // byte's value.
-        unsafe {
-            libc::madvise(
-                start as *mut libc::c_void,
-                stop - start,
-                libc::MADV_POPULATE_WRITE,
-            );
-        }
-    }
-    *populated = end;
-}
-
-#[cfg(not(target_os = "linux"))]
-fn populate_ahead(_base: usize, cap: usize, populated: &mut usize, need: usize) {
-    *populated = need.max(*populated).min(cap);
-}
+/// The most bytes of a store's mapped blocks its tables gave back that it
+/// keeps for its next tables instead of unmapping (`blocks::BlockPool`,
+/// `Options::block_pool`). A table's blocks are mapped fresh and every
+/// page of them faults at its first touch, so the next table after a seal
+/// faulted once every twenty updates or so of a write mix and the update
+/// paid it; the table after a seal asks for the lengths the one before
+/// gave back, so a pool of two tables' blocks gives it pages already
+/// touched. The pool keeps nothing while the store is out of core and
+/// gives back what it holds as the gate leaves the raw form.
+const BLOCK_POOL_BYTES: usize = 64 << 20;
 
 struct ByteArena {
     blocks: Box<[AtomicPtr<u8>]>,
@@ -16598,9 +16448,6 @@ struct ByteArena {
     /// Writer-only.
     tail: UnsafeCell<ArenaTail>,
     used: AtomicUsize,
-    /// `Options::prefault`: the tail's block populated a window ahead of
-    /// the reservations.
-    prefault: bool,
     /// The block's size, as a shift: `ARENA_SHIFT` for a table's arenas,
     /// `STREAM_SHIFT` for a record stream whose blocks are recycled once
     /// the file holds them (`recycle_below`), where a smaller block is a
@@ -16612,9 +16459,8 @@ struct ByteArena {
     /// so reclaimed and waiting.
     retired: UnsafeCell<Vec<(u64, *mut u8)>>,
     free: UnsafeCell<Vec<*mut u8>>,
-    /// Where the blocks come from: mapped from the kernel or not
-    /// (`Options::blocks_mapped`), and the store's pool
-    /// (`Options::blocks_pool_bytes`).
+    /// Where the blocks come from: mapped from the kernel, and the store's
+    /// pool (`BLOCK_POOL_BYTES`).
     src: blocks::Source,
     /// A shared table's (`Options::shared_writers`): the arena's end, which
     /// every writer claims its strides from (`reserve_shared`), where a
@@ -16632,22 +16478,19 @@ struct ArenaTail {
     at: usize,
     block_end: usize,
     next_block: usize,
-    /// The tail's block: its logical start, its address, and how far
-    /// into it the pages are populated (`Options::prefault`).
+    /// The tail's block: its logical start.
     block_start: usize,
-    block_base: usize,
-    populated: usize,
     /// Blocks below this were offered to `recycle_below` already.
     recycled: usize,
 }
 
 impl ByteArena {
-    fn new(prefault: bool, src: blocks::Source) -> ByteArena {
-        ByteArena::with_shift(prefault, ARENA_SHIFT, src)
+    fn new(src: blocks::Source) -> ByteArena {
+        ByteArena::with_shift(ARENA_SHIFT, src)
     }
 
     /// An arena of blocks of `1 << shift` bytes.
-    fn with_shift(prefault: bool, shift: u32, src: blocks::Source) -> ByteArena {
+    fn with_shift(shift: u32, src: blocks::Source) -> ByteArena {
         ByteArena {
             blocks: (0..ARENA_BLOCKS)
                 .map(|_| AtomicPtr::new(std::ptr::null_mut()))
@@ -16655,7 +16498,6 @@ impl ByteArena {
             caps: (0..ARENA_BLOCKS).map(|_| AtomicUsize::new(0)).collect(),
             tail: UnsafeCell::new(ArenaTail::default()),
             used: AtomicUsize::new(0),
-            prefault,
             shift,
             retired: UnsafeCell::new(Vec::new()),
             free: UnsafeCell::new(Vec::new()),
@@ -16894,16 +16736,6 @@ impl ByteArena {
             t.block_end = t.at + cap;
             t.next_block = b + cap.div_ceil(self.block_len());
             t.block_start = t.at;
-            t.block_base = p as usize;
-            t.populated = 0;
-        }
-        if self.prefault {
-            populate_ahead(
-                t.block_base,
-                t.block_end - t.block_start,
-                &mut t.populated,
-                t.at + n - t.block_start,
-            );
         }
         let off = t.at;
         t.at += n;
@@ -16940,10 +16772,8 @@ impl ByteArena {
                     b < ARENA_BLOCKS,
                     "memtable arena: more bytes than it addresses"
                 );
-                let p = self.block_at(b);
+                self.block_at(b);
                 t.block_start = b << self.shift;
-                t.block_base = p as usize;
-                t.populated = 0;
                 t.block_end = t.block_start + self.block_len();
                 t.next_block = b + 1;
                 if left <= self.block_len() {
@@ -16952,14 +16782,6 @@ impl ByteArena {
                 }
                 left -= self.block_len();
             }
-        }
-        if self.prefault {
-            populate_ahead(
-                t.block_base,
-                t.block_end - t.block_start,
-                &mut t.populated,
-                t.at - t.block_start,
-            );
         }
         // One writer, so a load and a store: the locked add was twenty
         // cycles a reservation, three or four a put.
@@ -17047,10 +16869,8 @@ impl ByteArena {
         };
         if t.block_start != b << self.shift {
             t.block_start = b << self.shift;
-            t.block_base = self.blocks[b].load(AtomicOrdering::Acquire) as usize;
             t.block_end = t.block_start + self.block_len();
             t.next_block = b + 1;
-            t.populated = self.block_len();
         }
         t.at = to;
     }
@@ -18098,13 +17918,11 @@ impl MemTable {
     /// index is asked for, zero to size it from the cap.
     fn new_with(shape: BlockShape, shared: Option<(usize, usize, bool)>) -> MemTable {
         let BlockShape {
-            prefault,
             index_populated,
             fold_hash,
-            mapped,
             pool,
         } = shape;
-        let src = || blocks::Source::new(mapped, pool.clone());
+        let src = || blocks::Source::new(true, pool.clone());
         // A shared table's value arena and index on huge pages, where it
         // asks (`Options::shared_huge`): the two a probe loads from.
         let huge = shared.is_some_and(|(_, _, h)| h);
@@ -18117,7 +17935,6 @@ impl MemTable {
             slots.max(1024).next_power_of_two()
         });
         MemTable {
-            mapped,
             fold_hash,
             entries: if shared.is_some() {
                 Slab::new_shared(src())
@@ -18151,10 +17968,10 @@ impl MemTable {
             settled: std::sync::atomic::AtomicBool::new(false),
             rewrite_hold: std::sync::atomic::AtomicU8::new(0),
             slim: Slab::new(src()),
-            vals2: ByteArena::new(prefault, src()),
+            vals2: ByteArena::new(src()),
             staging: UnsafeCell::new(Staging::default()),
-            keys: ByteArena::new(prefault, src()),
-            vals: ByteArena::new(prefault, src().huge(huge)),
+            keys: ByteArena::new(src()),
+            vals: ByteArena::new(src().huge(huge)),
             tombs: AtomicUsize::new(0),
             marks: Default::default(),
             mark: AtomicU64::new(0),
@@ -18359,16 +18176,13 @@ impl MemTable {
         // An ordered table keeps no hash index, the one block a shape's
         // population and its hash are for.
         let BlockShape {
-            prefault,
             index_populated: _,
             fold_hash: _,
-            mapped,
             pool,
         } = shape;
-        let src = || blocks::Source::new(mapped, pool.clone());
+        let src = || blocks::Source::new(true, pool.clone());
         debug_assert!(!(refs && stream.is_some()), "two shapes of one table");
         MemTable {
-            mapped,
             fold_hash: false,
             entries: Slab::new(src()),
             index: AtomicPtr::new(std::ptr::null_mut()),
@@ -18390,13 +18204,13 @@ impl MemTable {
             log_range,
             slim_entries: stream.is_some() && keys_in_stream && slim_entries,
             slim: Slab::new(src()),
-            vals2: ByteArena::new(prefault, src()),
+            vals2: ByteArena::new(src()),
             staging: UnsafeCell::new(Staging::default()),
-            keys: ByteArena::new(prefault, src()),
+            keys: ByteArena::new(src()),
             vals: if stream.is_some() && recycle {
-                ByteArena::with_shift(prefault, STREAM_SHIFT, src())
+                ByteArena::with_shift(STREAM_SHIFT, src())
             } else {
-                ByteArena::new(prefault, src())
+                ByteArena::new(src())
             },
             tombs: AtomicUsize::new(0),
             marks: Default::default(),
@@ -19904,7 +19718,7 @@ impl MemTable {
     /// `probe` for the writer's put: the entry holding `key`, or the vacant
     /// slot its probe ended at, for `index_insert_at`.
     /// This table's hash of `key`: the fold of its words where the table
-    /// folds and the key is sixteen bytes (`Options::mem_hash_fold`), and
+    /// folds and the key is sixteen bytes, and
     /// otherwise the hash of its FNV word.
     #[inline(always)]
     fn hash(&self, key: &[u8]) -> u64 {
@@ -26098,8 +25912,8 @@ struct Shared {
     retired: RetireList<Box<State>>,
     /// Which form a read takes (`ZGate`).
     zgate: ZGate,
-    /// The store's pool of blocks its tables gave back
-    /// (`Options::blocks_pool_bytes`), turned off with the gate.
+    /// The store's pool of blocks its tables gave back,
+    /// turned off with the gate.
     block_pool: Option<std::sync::Arc<blocks::BlockPool>>,
     /// Whether a raw walk asks for its records ahead of it
     /// (`raw_ahead_on`): the partitions' key and value bytes past the
@@ -26871,7 +26685,7 @@ mod heap {
         let anon = super::zselect::parse_status_rss_anon(&text)? as usize;
         // SAFETY: reads the allocator's own totals under its own locks.
         let mi = unsafe { f() };
-        // The engine's own mapped blocks (`Options::blocks_mapped`) are
+        // The engine's own mapped blocks are
         // anonymous bytes the allocator knows nothing of, so what of them
         // is resident comes out too, read from the kernel and never the
         // blocks whole: a store's tables in flight map tens of megabytes
@@ -29502,8 +29316,7 @@ struct SnapArena {
     base_shift: u32,
     blocks: [AtomicPtr<u8>; SNAP_BLOCKS],
     tail: AtomicUsize,
-    /// Whether the blocks are mapped from the kernel (`blocks::alloc`,
-    /// `Options::blocks_mapped`).
+    /// Whether the blocks are mapped from the kernel (`blocks::alloc`).
     mapped: bool,
 }
 
@@ -29996,7 +29809,7 @@ impl Snapshot {
         if bytes > u32::MAX as usize {
             return None;
         }
-        let arena = SnapArena::with_capacity(bytes, mem.mapped);
+        let arena = SnapArena::with_capacity(bytes, true);
         let (base, buf) = arena.reserve_bytes(bytes);
         let mut p = 0usize;
         let mut ents: Vec<SnapKey> = Vec::with_capacity(n);
@@ -34283,8 +34096,8 @@ impl Reader {
             return None;
         }
         // The key's FNV word, which the partition's read takes, before the
-        // live table only where the table's hash is made from it
-        // (`Options::mem_hash_fold`), so a read the table ends takes none.
+        // live table only where the table's hash is made from it,
+        // so a read the table ends takes none.
         let folds = pre.is_none() && mem.folds(key);
         let fnv0 = match pre {
             Some((fnv, _)) => fnv,
@@ -34564,7 +34377,7 @@ impl Reader {
         let mut snap = Snapshot {
             live_len,
             log_at,
-            arena: std::sync::Arc::new(SnapArena::with_capacity(bytes, self.opts.blocks_mapped)),
+            arena: std::sync::Arc::new(SnapArena::with_capacity(bytes, true)),
             runs,
             bases: Vec::new(),
             ents: Vec::with_capacity(n),
@@ -44090,7 +43903,6 @@ impl Db {
 
     fn segment_opts(opts: &Options) -> SegmentOptions {
         let mut s = opts.segment.clone();
-        s.prefault = opts.prefault;
         // Whatever the store's memory, where the options say so; a job of
         // a store that maps only while short asks the store
         // (`Shared::jobs_map`).
@@ -52159,8 +51971,8 @@ impl Db {
     /// that writes every commit. The held bytes are as the last commit,
     /// sync or rotation left them: a landing since has dropped nothing
     /// until the writer next looks.
-    /// The store's pool of blocks its tables gave back
-    /// (`Options::blocks_pool_bytes`): the bytes it holds, and the blocks
+    /// The store's pool of blocks its tables gave back:
+    /// the bytes it holds, and the blocks
     /// its tables took from it and gave to it over its life. Zeros where
     /// it keeps none.
     pub fn block_pool_counts(&self) -> (usize, usize, usize) {
@@ -52171,8 +51983,8 @@ impl Db {
     }
 
     /// The blocks the store's tables asked of its pool that it held none
-    /// of the length of, so mapped fresh, and their bytes, over its life
-    /// (`Options::blocks_pool_bytes`). Zeros where it keeps none.
+    /// of the length of, so mapped fresh, and their bytes, over its life.
+    /// Zeros where it keeps none.
     pub fn block_pool_misses(&self) -> (usize, usize) {
         self.shared
             .block_pool
@@ -52180,8 +51992,8 @@ impl Db {
             .map_or((0, 0), |p| p.misses())
     }
 
-    /// Whether the store's pool of given-back blocks keeps blocks now
-    /// (`Options::blocks_pool_bytes`); false where it has none.
+    /// Whether the store's pool of given-back blocks keeps blocks now;
+    /// false where it has none.
     pub fn block_pool_on(&self) -> bool {
         self.shared.block_pool.as_ref().is_some_and(|p| p.is_on())
     }
@@ -56037,7 +55849,7 @@ impl Db {
     }
 
     /// The bytes of the engine's blocks mapped from the kernel and not yet
-    /// unmapped (`Options::blocks_mapped`), process-wide: zero past every
+    /// unmapped, process-wide: zero past every
     /// store's close, which the leak test holds it to, and what the suite
     /// reads beside the allocator's bytes in use.
     pub fn mapped_bytes() -> usize {
@@ -69289,10 +69101,8 @@ mod streaming_writes {
             let mem = MemTable::new_ordered(
                 false,
                 BlockShape {
-                    prefault: false,
                     index_populated: true,
                     fold_hash: false,
-                    mapped: true,
                     pool: None,
                 },
                 Some(compact),
@@ -70418,10 +70228,8 @@ mod threading {
         let mut want = std::collections::HashMap::new();
         want.insert(0usize, (0usize, 0u64));
         let dry = super::MemTable::new(super::BlockShape {
-            prefault: false,
             index_populated: true,
             fold_hash: false,
-            mapped: true,
             pool: None,
         });
         fill(
@@ -70432,10 +70240,8 @@ mod threading {
             }),
         );
         let mem = super::MemTable::new(super::BlockShape {
-            prefault: false,
             index_populated: true,
             fold_hash: false,
-            mapped: true,
             pool: None,
         });
         let stop = AtomicBool::new(false);
@@ -70538,10 +70344,8 @@ mod shared_table {
     fn shaped(cap: usize, recycles: bool) -> MemTable {
         MemTable::new_shared(
             BlockShape {
-                prefault: false,
                 index_populated: false,
                 fold_hash: true,
-                mapped: true,
                 pool: None,
             },
             cap,
@@ -70560,10 +70364,8 @@ mod shared_table {
     fn rewriting(cap: usize) -> MemTable {
         MemTable::new_shared(
             BlockShape {
-                prefault: false,
                 index_populated: false,
                 fold_hash: true,
-                mapped: true,
                 pool: None,
             },
             cap,
@@ -70774,10 +70576,8 @@ mod shared_table {
     #[test]
     fn a_shared_index_has_the_slots_it_was_asked_for_and_fills_at_half() {
         let shape = || BlockShape {
-            prefault: false,
             index_populated: false,
             fold_hash: true,
-            mapped: true,
             pool: None,
         };
         let asked = MemTable::new_shared(
@@ -71287,10 +71087,8 @@ mod shared_table {
     fn records_kept(cap: usize) -> MemTable {
         MemTable::new_shared(
             BlockShape {
-                prefault: false,
                 index_populated: false,
                 fold_hash: true,
-                mapped: true,
                 pool: None,
             },
             cap,
@@ -71474,10 +71272,8 @@ mod shared_table {
         // alone.
         let piled = MemTable::new_shared(
             BlockShape {
-                prefault: false,
                 index_populated: false,
                 fold_hash: true,
-                mapped: true,
                 pool: None,
             },
             1 << 20,
@@ -71716,10 +71512,8 @@ mod shared_table {
     fn whole(cap: usize, huge: bool, made: bool) -> MemTable {
         let m = MemTable::new_shared(
             BlockShape {
-                prefault: false,
                 index_populated: true,
                 fold_hash: true,
-                mapped: true,
                 pool: None,
             },
             cap,
@@ -71909,10 +71703,8 @@ mod shared_table {
         for huge in [true, false] {
             let m = MemTable::new_shared(
                 BlockShape {
-                    prefault: false,
                     index_populated: false,
                     fold_hash: true,
-                    mapped: true,
                     pool: None,
                 },
                 64 << 20,
@@ -71967,10 +71759,8 @@ mod put_index {
 
     fn table() -> MemTable {
         MemTable::new(BlockShape {
-            prefault: false,
             index_populated: true,
             fold_hash: false,
-            mapped: true,
             pool: None,
         })
     }
@@ -72008,7 +71798,7 @@ mod put_index {
         }
     }
 
-    /// A table that folds (`Options::mem_hash_fold`) hashes a sixteen-byte
+    /// A table that folds hashes a sixteen-byte
     /// key by the fold and every other key by its FNV word, the same way
     /// at the writer's entry (`MemTable::hash`) as at a reader's that has
     /// the word already (`hash_with`), and finds every key it was handed
@@ -72019,10 +71809,8 @@ mod put_index {
         let rd = Readers::new(false, true);
         for fold in [true, false] {
             let m = MemTable::new(BlockShape {
-                prefault: false,
                 index_populated: true,
                 fold_hash: fold,
-                mapped: true,
                 pool: None,
             });
             let keys: Vec<Vec<u8>> = (0..3_000u64)
@@ -72069,10 +71857,8 @@ mod put_index {
         let rd = Readers::new(false, true);
         for in_place in [true, false] {
             let m = MemTable::new(BlockShape {
-                prefault: false,
                 index_populated: true,
                 fold_hash: true,
-                mapped: true,
                 pool: None,
             });
             let k = b"overwritten-key".to_vec();

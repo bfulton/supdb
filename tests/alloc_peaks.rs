@@ -9,7 +9,7 @@
 //!
 //! Its own test binary, as `tests/leak.rs` is, because it counts every
 //! allocation the process makes. The memtables' blocks are mapped by the
-//! engine and are not in the count (`Options::blocks_mapped`); what is in it
+//! engine and are not in the count; what is in it
 //! is every `Vec` a seal, a merge, a run's close or a form file's build
 //! holds, which is what the allocator keeps in the arena of a thread that
 //! has ended (`docs/engine.md`, which form a workload calls for).

@@ -19,8 +19,7 @@ fn anon_resident() -> u64 {
     supdb::db::zselect::parse_status_rss_anon(&text).expect("RssAnon in /proc/self/status")
 }
 
-/// A store whose table holds tens of megabytes maps that much
-/// (`Options::blocks_mapped`); at its close the blocks are unmapped and
+/// A store whose table holds tens of megabytes maps that much; at its close the blocks are unmapped and
 /// the process's anonymous bytes fall by them, where the allocator would
 /// have kept the heap's. The write is a batch of appends and one commit,
 /// a seal never reached (`seal_bytes` above the table), so the table lives
@@ -34,7 +33,6 @@ fn a_closed_stores_blocks_are_not_resident() {
         seal_bytes: 1 << 30,
         ..common::options()
     };
-    assert!(opts.blocks_mapped, "the default maps");
     let mapped_before = Db::mapped_bytes();
     let anon_before = anon_resident();
     let mut db = Db::create(&d, opts).unwrap();

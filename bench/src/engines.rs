@@ -946,10 +946,6 @@ pub struct Supdb {
     /// `Options::flush_waits_manifest` was off. `supdb-waitmanifest`, and
     /// `supdb-ingestwaitmanifest` buffered.
     waitmanifest: bool,
-    /// The writer's buffers populated a window ahead of their fill
-    /// (`Options::prefault`). `supdb-populate`, and `supdb-ingestpopulate`
-    /// buffered.
-    populate: bool,
     /// Segments written in 256 KB pieces (`SegmentOptions::write_piece`),
     /// a quarter of the default's fresh pages for the piece buffer.
     /// `supdb-piece256`, and `supdb-ingestpiece256` buffered.
@@ -1165,14 +1161,6 @@ pub struct Supdb {
     /// before `Options::direct_recycle`. `supdb-norecycle`, and
     /// `supdb-ingestnorecycle` buffered.
     norecycle: bool,
-    /// The engine's large blocks from the global allocator, the shape
-    /// before `Options::blocks_mapped`. `supdb-heapblocks`, and
-    /// `supdb-ingestheapblocks` buffered.
-    heapblocks: bool,
-    /// No pool of the blocks a store's tables gave back, every one
-    /// unmapped at its drop (`Options::blocks_pool_bytes` of zero):
-    /// `supdb-nopool`, and `supdb-ingestnopool` buffered.
-    nopool: bool,
     /// A streamed table keeping a copy of every key, the shape before
     /// `Options::direct_keys_in_stream`. `supdb-keysarena`, and
     /// `supdb-ingestkeysarena` buffered.
@@ -1855,10 +1843,6 @@ pub struct Supdb {
     /// off): `supdb-indexzeropage`, and `supdb-heldindexzeropage` under
     /// the held log with no frames.
     indexzeropage: bool,
-    /// Every memtable key hashed by its FNV word and a finish, sixteen
-    /// bytes or not (`Options::mem_hash_fold` off): `supdb-memfnv`, and
-    /// `supdb-heldmemfnv` under the held log with no frames.
-    memfnv: bool,
     /// A put of a value of the length it replaces overwritten in place
     /// (`Options::put_in_place`), under the held log with no frames, the
     /// block cache off and the upkeep the writer's: `supdb-heldinplace`,
@@ -2395,10 +2379,6 @@ struct Policy {
     /// `Options::flush_waits_manifest` was off. `supdb-waitmanifest`, and
     /// `supdb-ingestwaitmanifest` buffered.
     waitmanifest: bool,
-    /// The writer's buffers populated a window ahead of their fill
-    /// (`Options::prefault`). `supdb-populate`, and `supdb-ingestpopulate`
-    /// buffered.
-    populate: bool,
     /// Segments written in 256 KB pieces (`SegmentOptions::write_piece`),
     /// a quarter of the default's fresh pages for the piece buffer.
     /// `supdb-piece256`, and `supdb-ingestpiece256` buffered.
@@ -2614,14 +2594,6 @@ struct Policy {
     /// before `Options::direct_recycle`. `supdb-norecycle`, and
     /// `supdb-ingestnorecycle` buffered.
     norecycle: bool,
-    /// The engine's large blocks from the global allocator, the shape
-    /// before `Options::blocks_mapped`. `supdb-heapblocks`, and
-    /// `supdb-ingestheapblocks` buffered.
-    heapblocks: bool,
-    /// No pool of the blocks a store's tables gave back, every one
-    /// unmapped at its drop (`Options::blocks_pool_bytes` of zero):
-    /// `supdb-nopool`, and `supdb-ingestnopool` buffered.
-    nopool: bool,
     /// A streamed table keeping a copy of every key, the shape before
     /// `Options::direct_keys_in_stream`. `supdb-keysarena`, and
     /// `supdb-ingestkeysarena` buffered.
@@ -3148,9 +3120,6 @@ struct Policy {
     /// (`Options::index_populated` off): `supdb-indexzeropage`,
     /// `supdb-heldindexzeropage`.
     indexzeropage: bool,
-    /// The memtable's hash taken from FNV for every key
-    /// (`Options::mem_hash_fold` off): `supdb-memfnv`, `supdb-heldmemfnv`.
-    memfnv: bool,
     /// Puts overwritten in place (`Options::put_in_place`):
     /// `supdb-heldinplace`.
     inplace: bool,
@@ -3343,7 +3312,6 @@ impl Default for Policy {
             manifestrename: false,
             manifestpending: false,
             waitmanifest: false,
-            populate: false,
             piece256: false,
             recordsteps: false,
             copyvals: false,
@@ -3395,8 +3363,6 @@ impl Default for Policy {
             walaheadbeside: false,
             zsettleloose: false,
             norecycle: false,
-            heapblocks: false,
-            nopool: false,
             keysarena: false,
             noalert: false,
             ordlog: false,
@@ -3533,7 +3499,6 @@ impl Default for Policy {
             holdmarch: false,
             noframes: false,
             indexzeropage: false,
-            memfnv: false,
             inplace: false,
             upkeepbatch: None,
             shared: false,
@@ -7509,31 +7474,6 @@ impl Supdb {
         )
     }
 
-    /// `supdb` with its buffers' pages populated ahead of the fill
-    /// (`Options::prefault`).
-    pub fn create_populate(path: &Path) -> Res<Supdb> {
-        Supdb::with_policy(
-            path,
-            Policy {
-                populate: true,
-                ..Policy::default()
-            },
-        )
-    }
-
-    /// `supdb-ingest` as `supdb-populate`.
-    pub fn create_ingest_populate(path: &Path) -> Res<Supdb> {
-        Supdb::with_policy(
-            path,
-            Policy {
-                partition: false,
-                durable: false,
-                populate: true,
-                ..Policy::default()
-            },
-        )
-    }
-
     /// `supdb` writing its segments in 256 KB pieces
     /// (`SegmentOptions::write_piece`).
     pub fn create_piece256(path: &Path) -> Res<Supdb> {
@@ -8507,31 +8447,6 @@ impl Supdb {
                 partition: false,
                 durable: false,
                 norecycle: true,
-                ..Policy::default()
-            },
-        )
-    }
-
-    /// `supdb` with its large blocks from the global allocator, the shape
-    /// before `Options::blocks_mapped`.
-    pub fn create_heapblocks(path: &Path) -> Res<Supdb> {
-        Supdb::with_policy(
-            path,
-            Policy {
-                heapblocks: true,
-                ..Policy::default()
-            },
-        )
-    }
-
-    /// `supdb-ingest` as `supdb-heapblocks`.
-    pub fn create_ingest_heapblocks(path: &Path) -> Res<Supdb> {
-        Supdb::with_policy(
-            path,
-            Policy {
-                partition: false,
-                durable: false,
-                heapblocks: true,
                 ..Policy::default()
             },
         )
@@ -9983,7 +9898,6 @@ impl Supdb {
             manifestrename,
             manifestpending,
             waitmanifest,
-            populate,
             piece256,
             recordsteps,
             copyvals,
@@ -10035,8 +9949,6 @@ impl Supdb {
             walaheadbeside,
             zsettleloose,
             norecycle,
-            heapblocks,
-            nopool,
             keysarena,
             noalert,
             ordlog,
@@ -10192,7 +10104,6 @@ impl Supdb {
             holdmarch,
             noframes,
             indexzeropage,
-            memfnv,
             inplace,
             upkeepbatch,
             shared,
@@ -10546,17 +10457,10 @@ impl Supdb {
             wal_ahead_small_runs: !walaheadflat,
             wal_ahead_beside: walaheadbeside,
             zpages_settle_joins_asks: !zsettleloose,
-            prefault: populate,
             direct_put_one: !recordsteps,
             direct_stream: !copyvals && !refvals,
             direct_derive_keys: !keycopies,
             direct_recycle: !norecycle,
-            blocks_mapped: !heapblocks,
-            blocks_pool_bytes: if nopool {
-                0
-            } else {
-                supdb::Options::default().blocks_pool_bytes
-            },
             direct_keys_in_stream: !keysarena,
             upkeep_alert: !noalert,
             direct_log_range: !ordlog,
@@ -10828,7 +10732,6 @@ impl Supdb {
             wal_hold_reuses: !holdmarch,
             held_frames: !noframes,
             index_populated: !indexzeropage,
-            mem_hash_fold: !memfnv,
             put_in_place: inplace,
             shared_writers: shared,
             share_on_write: !noshare,
@@ -11016,7 +10919,6 @@ impl Supdb {
             manifestrename,
             manifestpending,
             waitmanifest,
-            populate,
             piece256,
             recordsteps,
             copyvals,
@@ -11068,8 +10970,6 @@ impl Supdb {
             walaheadbeside,
             zsettleloose,
             norecycle,
-            heapblocks,
-            nopool,
             keysarena,
             noalert,
             ordlog,
@@ -11225,7 +11125,6 @@ impl Supdb {
             holdmarch,
             noframes,
             indexzeropage,
-            memfnv,
             inplace,
             upkeepbatch,
             shared,
@@ -11631,8 +11530,6 @@ impl Engine for Supdb {
                     "supdb-heldnfnocache"
                 } else if self.indexzeropage {
                     "supdb-heldindexzeropage"
-                } else if self.memfnv {
-                    "supdb-heldmemfnv"
                 } else if self.upkeepbatch.is_some() {
                     "supdb-heldbatch1"
                 } else if self.noalert {
@@ -11658,9 +11555,6 @@ impl Engine for Supdb {
         }
         if self.indexzeropage {
             return "supdb-indexzeropage";
-        }
-        if self.memfnv {
-            return "supdb-memfnv";
         }
         // The probe's combinations first, which the single fields below
         // would name by one of their parts.
@@ -12710,13 +12604,6 @@ impl Engine for Supdb {
                 "supdb-ingestmanifestpending"
             };
         }
-        if self.populate {
-            return if self.partition {
-                "supdb-populate"
-            } else {
-                "supdb-ingestpopulate"
-            };
-        }
         if self.piece256 {
             return if self.partition {
                 "supdb-piece256"
@@ -12948,20 +12835,6 @@ impl Engine for Supdb {
                 "supdb-norecycle"
             } else {
                 "supdb-ingestnorecycle"
-            };
-        }
-        if self.heapblocks {
-            return if self.partition {
-                "supdb-heapblocks"
-            } else {
-                "supdb-ingestheapblocks"
-            };
-        }
-        if self.nopool {
-            return if self.partition {
-                "supdb-nopool"
-            } else {
-                "supdb-ingestnopool"
             };
         }
         if self.keysarena {
@@ -15460,7 +15333,6 @@ pub fn guarantee(arm: &str) -> Option<Guarantee> {
         | "supdb-noadvice"
         | "supdb-advicerandom"
         | "supdb-indexzeropage"
-        | "supdb-memfnv"
         | "supdb-nocache"
         | "supdb-dirkey"
         | "supdb-cipher"
@@ -15660,7 +15532,6 @@ pub fn guarantee(arm: &str) -> Option<Guarantee> {
         | "supdb-cache256tofitnosweep"
         | "supdb-manifestrename"
         | "supdb-manifestpending"
-        | "supdb-populate"
         | "supdb-piece256"
         | "supdb-recordsteps"
         | "supdb-copyvals"
@@ -15714,8 +15585,6 @@ pub fn guarantee(arm: &str) -> Option<Guarantee> {
         | "supdb-walaheadbeside"
         | "supdb-zsettleloose"
         | "supdb-norecycle"
-        | "supdb-heapblocks"
-        | "supdb-nopool"
         | "supdb-keysarena"
         | "supdb-noalert"
         | "supdb-ordlog"
@@ -15910,7 +15779,6 @@ pub fn guarantee(arm: &str) -> Option<Guarantee> {
         | "supdb-ingesttofit"
         | "supdb-ingestmanifestrename"
         | "supdb-ingestmanifestpending"
-        | "supdb-ingestpopulate"
         | "supdb-ingestpiece256"
         | "supdb-ingestrecordsteps"
         | "supdb-ingestcopyvals"
@@ -15918,8 +15786,6 @@ pub fn guarantee(arm: &str) -> Option<Guarantee> {
         | "supdb-ingestfillplain"
         | "supdb-ingestlatesync"
         | "supdb-ingestnorecycle"
-        | "supdb-ingestheapblocks"
-        | "supdb-ingestnopool"
         | "supdb-ingestkeysarena"
         | "supdb-ingestnoalert"
         | "supdb-ingestordlog"
@@ -15965,7 +15831,6 @@ pub fn guarantee(arm: &str) -> Option<Guarantee> {
         | "supdb-heldnoalert"
         | "supdb-heldinline"
         | "supdb-heldindexzeropage"
-        | "supdb-heldmemfnv"
         | "supdb-heldinplace"
         | "supdb-heldnfinline"
         | "supdb-heldshared"
@@ -16400,34 +16265,6 @@ pub fn open(arm: &str, dir: &Path, map_gb: usize) -> Res<Box<dyn Engine>> {
                     d,
                     Policy {
                         indexzeropage: true,
-                        ..Policy::default()
-                    },
-                )
-            },
-            dir,
-        )?,
-        "supdb-heldmemfnv" => supdb_arm(
-            |d| {
-                Supdb::with_policy(
-                    d,
-                    Policy {
-                        partition: false,
-                        durable: false,
-                        held: true,
-                        noframes: true,
-                        memfnv: true,
-                        ..Policy::default()
-                    },
-                )
-            },
-            dir,
-        )?,
-        "supdb-memfnv" => supdb_arm(
-            |d| {
-                Supdb::with_policy(
-                    d,
-                    Policy {
-                        memfnv: true,
                         ..Policy::default()
                     },
                 )
@@ -18151,8 +17988,6 @@ pub fn open(arm: &str, dir: &Path, map_gb: usize) -> Res<Box<dyn Engine>> {
         "supdb-manifestpending" => supdb_arm(Supdb::create_manifestpending, dir)?,
         "supdb-ingestmanifestrename" => supdb_arm(Supdb::create_ingest_manifestrename, dir)?,
         "supdb-ingestmanifestpending" => supdb_arm(Supdb::create_ingest_manifestpending, dir)?,
-        "supdb-populate" => supdb_arm(Supdb::create_populate, dir)?,
-        "supdb-ingestpopulate" => supdb_arm(Supdb::create_ingest_populate, dir)?,
         "supdb-piece256" => supdb_arm(Supdb::create_piece256, dir)?,
         "supdb-ingestpiece256" => supdb_arm(Supdb::create_ingest_piece256, dir)?,
         "supdb-recordsteps" => supdb_arm(Supdb::create_recordsteps, dir)?,
@@ -18224,34 +18059,6 @@ pub fn open(arm: &str, dir: &Path, map_gb: usize) -> Res<Box<dyn Engine>> {
         "supdb-ingestlatesync" => supdb_arm(Supdb::create_ingest_latesync, dir)?,
         "supdb-norecycle" => supdb_arm(Supdb::create_norecycle, dir)?,
         "supdb-ingestnorecycle" => supdb_arm(Supdb::create_ingest_norecycle, dir)?,
-        "supdb-heapblocks" => supdb_arm(Supdb::create_heapblocks, dir)?,
-        "supdb-ingestheapblocks" => supdb_arm(Supdb::create_ingest_heapblocks, dir)?,
-        "supdb-nopool" => supdb_arm(
-            |d| {
-                Supdb::with_policy(
-                    d,
-                    Policy {
-                        nopool: true,
-                        ..Policy::default()
-                    },
-                )
-            },
-            dir,
-        )?,
-        "supdb-ingestnopool" => supdb_arm(
-            |d| {
-                Supdb::with_policy(
-                    d,
-                    Policy {
-                        partition: false,
-                        durable: false,
-                        nopool: true,
-                        ..Policy::default()
-                    },
-                )
-            },
-            dir,
-        )?,
         "supdb-keysarena" => supdb_arm(Supdb::create_keysarena, dir)?,
         "supdb-ingestkeysarena" => supdb_arm(Supdb::create_ingest_keysarena, dir)?,
         "supdb-noalert" => supdb_arm(Supdb::create_noalert, dir)?,
@@ -18691,7 +18498,6 @@ mod tests {
             ("supdb-heldnoalert", |a| !a.upkeep_alert),
             ("supdb-heldinline", |a| a.upkeep == supdb::Upkeep::Inline),
             ("supdb-heldindexzeropage", |a| !a.index_populated),
-            ("supdb-heldmemfnv", |a| !a.mem_hash_fold),
             ("supdb-heldbatch1", |a| a.upkeep_batch_pct == 1),
             ("supdb-heldnoshare", |a| !a.share_on_write),
             ("supdb-heldnopopulate", |a| !a.shared_populates),
@@ -18712,10 +18518,6 @@ mod tests {
                 },
                 "supdb-heldindexzeropage" => Policy {
                     indexzeropage: true,
-                    ..Policy::default()
-                },
-                "supdb-heldmemfnv" => Policy {
-                    memfnv: true,
                     ..Policy::default()
                 },
                 "supdb-heldbatch1" => Policy {
@@ -18759,17 +18561,6 @@ mod tests {
         assert_eq!(e.name(), "supdb-indexzeropage");
         assert_eq!(guarantee("supdb-indexzeropage"), guarantee("supdb"));
         drop(e);
-        let mf = Supdb::with_policy(
-            &root.join("memfnv-policy"),
-            Policy {
-                memfnv: true,
-                ..Policy::default()
-            },
-        )
-        .unwrap();
-        assert_eq!(mf.name(), "supdb-memfnv");
-        assert!(!mf.db.as_ref().unwrap().options().mem_hash_fold);
-        drop(mf);
         let e = open("supdb", &root.join("supdb"), 1).unwrap();
         drop((e, nof));
         assert!(
@@ -21110,21 +20901,6 @@ mod tests {
                 assert_eq!(z.features(), base.features());
                 let o = z.db.as_ref().unwrap().options();
                 assert!(o.forms_convert_from == 0 && b.forms_convert_from == 4);
-            }
-            {
-                let z = Supdb::with_policy(
-                    &dir("nopool"),
-                    Policy {
-                        nopool: true,
-                        ..Policy::default()
-                    },
-                )
-                .unwrap();
-                assert_eq!(z.name(), "supdb-nopool");
-                assert_eq!(z.features(), base.features());
-                let o = z.db.as_ref().unwrap().options();
-                assert!(o.blocks_pool_bytes == 0 && b.blocks_pool_bytes > 0);
-                assert!(o.blocks_mapped, "the one option moved");
             }
             {
                 let z = Supdb::with_policy(

@@ -771,7 +771,7 @@ fn counters_line(
     // The process's memory beside the structures that count their own: the
     // resident bytes, what the allocator has handed out and what it holds
     // free (`inuse`, `free`, and `mmapped` for the chunks it mapped),
-    // the engine's own mapped blocks (`mapped`, `Options::blocks_mapped`,
+    // the engine's own mapped blocks (`mapped`,
     // anonymous bytes the allocator knows nothing of), and the writer's
     // tables and the published forms by their counts. The gap between the resident bytes and the sum of the
     // structures is slack, retention and everything uncounted, which the
