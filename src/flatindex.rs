@@ -1528,7 +1528,11 @@ pub fn stream_trailer_in<'a, B: TrailerBuf>(
                 dir[i * 4..i * 4 + 4].copy_from_slice(&off.to_le_bytes());
                 (h, off)
             },
-            true,
+            // Asking ahead, as a value the compiler is not shown: told it
+            // is constant, the fill's loop kept one value more in flight
+            // than registers hold beside this function's own, a move out
+            // and back a key, which the switch taken at run time kept out.
+            std::hint::black_box(true),
         );
     }
     at += cap * SLOT;
