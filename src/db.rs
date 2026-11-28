@@ -24684,6 +24684,9 @@ const KEPT_HOLD_LOOK_TRIMMED: u8 = 16;
 /// `Shared::kept_holding`'s mark that the freeze held published after the
 /// look stored and trimmed.
 const KEPT_CHAINED: u8 = 32;
+/// `Shared::kept_hold`'s bit for the writer held between the two reads of
+/// its ask, in place of the freeze's (`Db::look_inside_a_freeze`).
+const KEPT_HOLD_ASK: u8 = 64;
 
 /// What a publish keeps in `State::replaced`: the tables live from the
 /// upkeep's last look, `from` (`u64::MAX` before any), on, within `bytes`
@@ -31185,7 +31188,7 @@ impl State {
     }
 
     /// Whether `replaced` keeps fewer tables than were live since the
-    /// upkeep's look, which stands at `look` (`Shared::upkeep_lives`): the
+    /// upkeep's look, which stands at `Shared::upkeep_lives`: the
     /// look is further behind than what was kept for it, and drops its
     /// tables when it comes. Asked of a state just published with `keep`,
     /// where that publish found a look to keep tables for.
@@ -31214,12 +31217,20 @@ impl State {
     /// rises, except to `u64::MAX` where the forms were given up, which
     /// asks nothing, so a position read here is never behind `keep.from`
     /// and this asks only where the old judgement asked.
-    fn keeps_short(&self, keep: Option<Keep>, look: &AtomicU64) -> bool {
+    ///
+    /// A test can hold the writer between the two reads
+    /// (`Db::look_inside_a_freeze`), where a look that lands there trims
+    /// this state's list: read in the other order, the list was short of
+    /// a position read before the look moved, and the ask came all the same.
+    fn keeps_short(&self, keep: Option<Keep>, shared: &Shared) -> bool {
         if !keep.is_some_and(|k| k.from != u64::MAX) {
             return false;
         }
         let kept = self.replaced().len() as u64;
-        let from = look.load(AtomicOrdering::SeqCst);
+        if shared.kept_hold.load(AtomicOrdering::Relaxed) & KEPT_HOLD_ASK != 0 {
+            Db::ask_held(shared, keep, self.lives);
+        }
+        let from = shared.upkeep_lives.load(AtomicOrdering::SeqCst);
         from != u64::MAX && self.lives.saturating_sub(from) > kept
     }
 
@@ -34799,7 +34810,7 @@ impl Reader {
                 // Once, until the freeze that read the look behind waits.
                 Db::set_hold_bit(&self.shared.kept_hold, KEPT_HOLD_LOOK_STORE, false);
                 Db::freeze_chain_wait(&self.shared, KEPT_HOLD_LOOK_STORE, |_, holding| {
-                    holding & KEPT_HOLD_FREEZE != 0
+                    holding & (KEPT_HOLD_FREEZE | KEPT_HOLD_ASK) != 0
                 });
             }
             self.shared
@@ -34820,7 +34831,9 @@ impl Reader {
             }
             if self.understudy
                 && self.shared.kept_hold.load(AtomicOrdering::Acquire) & KEPT_HOLD_LOOK_TRIMMED != 0
-                && self.shared.kept_holding.load(AtomicOrdering::Acquire) & KEPT_HOLD_FREEZE != 0
+                && self.shared.kept_holding.load(AtomicOrdering::Acquire)
+                    & (KEPT_HOLD_FREEZE | KEPT_HOLD_ASK)
+                    != 0
             {
                 // Until the test lets it go (`Db::let_the_look_go`).
                 Db::freeze_chain_wait(&self.shared, KEPT_HOLD_LOOK_TRIMMED, |hold, _| {
@@ -47695,6 +47708,29 @@ impl Db {
         }
     }
 
+    /// A test's hold (`Db::look_inside_a_freeze` between the reads): the
+    /// writer, between the two reads of its ask (`State::keeps_short`),
+    /// waits once, where the publish found the look behind the state it
+    /// made (`lives`), until the look has stored its position and trimmed
+    /// that state's list. Where it has, the chain is marked whole.
+    #[cold]
+    #[inline(never)]
+    fn ask_held(shared: &Shared, keep: Option<Keep>, lives: u64) {
+        if shared.kept_hold.load(AtomicOrdering::Acquire) & KEPT_HOLD_ASK == 0
+            || !keep.is_some_and(|k| k.from != u64::MAX && k.from < lives)
+        {
+            return;
+        }
+        Db::set_hold_bit(&shared.kept_hold, KEPT_HOLD_ASK, false);
+        if Db::freeze_chain_wait(shared, KEPT_HOLD_ASK, |_, holding| {
+            holding & KEPT_HOLD_LOOK_TRIMMED != 0
+        }) {
+            shared
+                .kept_holding
+                .fetch_or(KEPT_CHAINED, AtomicOrdering::AcqRel);
+        }
+    }
+
     /// A wait of `look_inside_a_freeze`'s holds: `mine` marked waiting in
     /// `Shared::kept_holding` until `go`, asked of the holds and of the
     /// waits, says to go on, a minute at most; whether it said so. It
@@ -49069,7 +49105,7 @@ impl Db {
     fn ask_abandon(opts: &Options, shared: &Shared, st: &State, keep: Option<Keep>) {
         if opts.upkeep_abandons
             && matches!(opts.upkeep, Upkeep::Background(_))
-            && st.keeps_short(keep, &shared.upkeep_lives)
+            && st.keeps_short(keep, shared)
         {
             shared
                 .abandon_at
@@ -55166,14 +55202,22 @@ impl Db {
     /// it moves what the freeze left. Each wait is a minute at most. The
     /// caller's commit is lent to the upkeep thread, and its seal is the
     /// freeze; `look_inside_a_freeze_held` says after whether it was.
+    /// `between_the_reads` holds the writer instead after the freeze's
+    /// publish, between the two reads of its ask (`State::keeps_short`),
+    /// so that the look stores and trims the published state there.
     #[doc(hidden)]
-    pub fn look_inside_a_freeze(&self) {
+    pub fn look_inside_a_freeze(&self, between_the_reads: bool) {
         self.shared
             .kept_holding
             .fetch_and(!KEPT_CHAINED, AtomicOrdering::AcqRel);
+        let writer = if between_the_reads {
+            KEPT_HOLD_ASK
+        } else {
+            KEPT_HOLD_FREEZE
+        };
         Db::set_hold_bit(
             &self.shared.kept_hold,
-            KEPT_HOLD_FREEZE | KEPT_HOLD_LOOK_STORE | KEPT_HOLD_LOOK_TRIMMED,
+            writer | KEPT_HOLD_LOOK_STORE | KEPT_HOLD_LOOK_TRIMMED,
             true,
         );
     }
@@ -55191,7 +55235,7 @@ impl Db {
     pub fn let_the_look_go(&self) {
         Db::set_hold_bit(
             &self.shared.kept_hold,
-            KEPT_HOLD_FREEZE | KEPT_HOLD_LOOK_STORE | KEPT_HOLD_LOOK_TRIMMED,
+            KEPT_HOLD_FREEZE | KEPT_HOLD_ASK | KEPT_HOLD_LOOK_STORE | KEPT_HOLD_LOOK_TRIMMED,
             false,
         );
     }
