@@ -28,7 +28,6 @@ on:
         default: '10'
 
 permissions:
-  actions: write
   contents: read
 
 concurrency:
@@ -37,12 +36,20 @@ concurrency:
 
 jobs:
   check:
-    uses: bfulton/localmost/.github/workflows/check.yaml@main
+    # check.yaml at the pinned commit reads the LOCALMOST_HEARTBEAT
+    # variable and sets an output: no checkout, no API call, so its token
+    # needs no scope. Read it again when the pin moves.
+    permissions: {}
+    uses: bfulton/localmost/.github/workflows/check.yaml@db24b1bbc01da0d740ac20204171251a426f6f97 # main, pinned on 2026-11-28
 
   pickup-watchdog:
     needs: [check]
     if: needs.check.outputs.runner == 'self-hosted'
     runs-on: ubuntu-24.04
+    # Lists the run's jobs and cancels the run: the one job that needs
+    # more than the tree. It checks out nothing and runs only `gh`.
+    permissions:
+      actions: write
     steps:
       - name: Wait for a self-hosted runner to claim the run
         env:
@@ -52,6 +59,9 @@ jobs:
           WINDOW: ${{ inputs.pickup_timeout_minutes || '10' }}
         run: |
           set -uo pipefail
+          # Digits only: bash evaluates a variable named in $(( )) as an
+          # expression, and an array subscript in it runs a command.
+          case "$WINDOW" in ''|*[!0-9]*) echo "pickup_timeout_minutes is whole minutes: '$WINDOW'" >&2; exit 2 ;; esac
           deadline=$(( WINDOW * 2 ))   # polls, at 30s each
           for i in $(seq 1 "$deadline"); do
             job=$(gh api "repos/$REPO/actions/runs/$RUN_ID/jobs" \
@@ -104,7 +114,9 @@ jobs:
     # days; this is three, and the pickup watchdog still bounds the queue.
     timeout-minutes: 4320
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
       # The toolchain rust-toolchain.toml names where this machine's cargo
       # is rustup's, which reads the file whatever this step does; a cargo
       # from anywhere else never sees the file, and the row is that
@@ -148,7 +160,7 @@ jobs:
       # the timeout or cancelled by hand still has the rungs that completed
       # on disk -- and this step being conditional on success is what threw
       # them away twice. `always()` covers cancellation too.
-      - uses: actions/upload-artifact@v7
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         if: always()
         with:
           name: full-row

@@ -34,6 +34,9 @@ on:
         required: false
         default: '1'
 
+permissions:
+  contents: read
+
 env:
   CARGO_TERM_COLOR: always
 
@@ -42,7 +45,9 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 360
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
       # The toolchain rust-toolchain.toml names, the one the local gate runs
       # under; no workflow names a version or a channel of its own.
       - name: The pinned toolchain
@@ -57,7 +62,7 @@ jobs:
       # `workspace -> target`, the target a path inside its workspace: see
       # the `test` job of ci.yml. The key is the one every job that builds
       # the suite's binary alone shares: see the `quick` job there.
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           workspaces: bench -> target
           shared-key: bench
@@ -83,6 +88,10 @@ jobs:
           REPS: ${{ inputs.reps }}
         run: |
           set -eu
+          # Digits only: bash evaluates a variable named in $(( )) as an
+          # expression, and an array subscript in it runs a command.
+          case "$BOUND_MIB" in ''|*[!0-9]*) echo "bound_mib is whole MiB: '$BOUND_MIB'" >&2; exit 2 ;; esac
+          case "$REPS" in ''|*[!0-9]*) echo "reps is a count: '$REPS'" >&2; exit 2 ;; esac
           BOUND=$(( BOUND_MIB * 1048576 ))
           ARM_FLAG=""
           if [ -n "$ARMS" ] && [ "$ARMS" != all ]; then ARM_FLAG="--arms $ARMS"; fi
@@ -107,7 +116,7 @@ jobs:
       - name: The figures from the row
         working-directory: bench
         run: ./target/release/bench figures --runs runs-ci --out runs-ci/figures --scale ooc
-      - uses: actions/upload-artifact@v7
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         if: always()
         with:
           name: ooc-row

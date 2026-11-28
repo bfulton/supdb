@@ -4753,36 +4753,58 @@ const CI_APT: &str = "sh scripts/apt.sh ";
 /// Actions a step may use, matched whole: each fetches, installs or
 /// publishes, and none checks.
 const CI_ACTIONS: &[(&str, &str)] = &[
-    ("actions/checkout@v7", "the tree"),
-    ("Swatinem/rust-cache@v2", "the build cache"),
-    ("actions/upload-artifact@v7", "publishes the quick row"),
+    (
+        "actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1",
+        "the tree",
+    ),
+    (
+        "Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0",
+        "the build cache",
+    ),
+    (
+        "actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9",
+        "publishes the quick row",
+    ),
 ];
 
 /// Inputs an action may be given, matched by action and name: none
 /// chooses what is checked.
 const CI_WITH: &[(&str, &str, &str)] = &[
     (
-        "actions/checkout@v7",
+        "actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1",
         "fetch-depth",
         "the whole history, which the base needs",
     ),
     (
-        "Swatinem/rust-cache@v2",
+        "actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1",
+        "persist-credentials",
+        "the job token is not left in .git/config for the steps after the checkout",
+    ),
+    (
+        "Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0",
         "workspaces",
         "which target directories to cache",
     ),
     (
-        "Swatinem/rust-cache@v2",
+        "Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0",
         "shared-key",
         "the one key every job that builds the suite's binary alone restores",
     ),
-    ("actions/upload-artifact@v7", "name", "the artifact's name"),
     (
-        "actions/upload-artifact@v7",
+        "actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9",
+        "name",
+        "the artifact's name",
+    ),
+    (
+        "actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9",
         "if-no-files-found",
         "a run that wrote no row publishes nothing",
     ),
-    ("actions/upload-artifact@v7", "path", "what is published"),
+    (
+        "actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9",
+        "path",
+        "what is published",
+    ),
 ];
 
 /// The environment a workflow, a job or a step may set, matched whole,
@@ -4823,7 +4845,7 @@ const CI_ENV: &[(&str, &str, &str)] = &[
 /// check runs.
 const CI_IF: &[(&str, &str, &str)] = &[(
     "always()",
-    "actions/upload-artifact@v7",
+    "actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9",
     "the quick row is published whether or not the run passed: it decides nothing",
 )];
 
@@ -5108,7 +5130,9 @@ fn ci_steps(yaml: &str, on: &[(&str, &str, &str)]) -> CiRead {
                         true
                     }
                     "uses" => {
-                        st.uses = Some((ln, v.to_string()));
+                        // A pin's tag rides after it as a comment.
+                        let a = v.split_once(" #").map_or(v, |(a, _)| a).trim_end();
+                        st.uses = Some((ln, a.to_string()));
                         true
                     }
                     "run" => {
@@ -6050,7 +6074,7 @@ fn a_ci_step_that_checks_outside_check_sh_fails() {
     let e = ci_check(
         &ci_edit(
             &yaml,
-            "uses: Swatinem/rust-cache@v2",
+            "uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3",
             "uses: actions-rs/clippy-check@v1",
         ),
         &sh,
@@ -6088,7 +6112,7 @@ fn a_ci_step_that_checks_outside_check_sh_fails() {
         ("  wasm:\n", "  wasm:\n    env:\n      COST_BASE: HEAD\n", "the environment `COST_BASE: HEAD`"),
         ("  wasm:\n", "  wasm:\n    defaults:\n      run:\n        working-directory: bench\n", "the key `defaults`"),
         (lists, "        working-directory: bench\n        run: sh scripts/check.sh lists\n", "the key `working-directory`"),
-        ("        with:\n          fetch-depth: 0\n", "        with:\n          fetch-depth: 0\n          ref: HEAD~1\n", "the input `ref` of `actions/checkout@v7`"),
+        ("          fetch-depth: 0\n", "          fetch-depth: 0\n          ref: HEAD~1\n", "the input `ref` of `actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1`"),
         (lists, "        uses: actions/checkout@v7\n        run: sh scripts/check.sh lists\n", "both a run and an action"),
         (cross, "      - <<: *anchor\n      - name: Build and test under emulation\n", "a step the test cannot read"),
         (cross, "      - name: x\n        <<: *anchor\n        run: cargo test\n      - name: Build and test under emulation\n", "a step the test cannot read"),
@@ -6098,7 +6122,7 @@ fn a_ci_step_that_checks_outside_check_sh_fails() {
         // A name the test lists, with a value it does not.
         ("          SUPDB_PR_BASE: ${{ github.event.pull_request.base.sha }}\n", "          SUPDB_PR_BASE: HEAD~1\n", "the environment `SUPDB_PR_BASE: HEAD~1`"),
         // An input the test lists for another action.
-        ("        with:\n          fetch-depth: 0\n", "        with:\n          fetch-depth: 0\n          path: elsewhere\n", "the input `path` of `actions/checkout@v7`"),
+        ("          fetch-depth: 0\n", "          fetch-depth: 0\n          path: elsewhere\n", "the input `path` of `actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1`"),
         // A list where the workflow has none, and a step's keys with no step.
         ("env:\n  CARGO_TERM_COLOR: always\n", "env:\n  - CARGO_TERM_COLOR: always\n", "a list outside a job's steps"),
         ("  wasm:\n", "  wasm:\n    steps:\n      name: x\n", "a key before any step"),

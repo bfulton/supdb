@@ -193,6 +193,40 @@ envelope both are held to: `tests/crypt.rs` requires the Rust writer to
 produce exactly those bytes, and `node web/crypt.test.mjs`, which
 `scripts/check.sh wasm` runs, requires `crypt.mjs` to read them.
 
+## What a page that embeds the reader trusts
+
+The reader has no third-party JavaScript: its modules import only each
+other (and `node:fs` in the test). Its cryptography is the browser's
+WebCrypto. A page that embeds it trusts:
+
+1. **The origin serving the `.mjs` files.** They run as the page's own
+   code, in the worker, with the origin's private storage and its
+   `fetch`, which sends cookies to same-origin URLs.
+2. **Whoever serves `supdb.wasm`.** `worker.mjs` fetches the module from
+   `wasmUrl` and instantiates it with no hash or integrity check. The
+   module can run no JavaScript (its only imports are `supdb_host_len`
+   and `supdb_host_read`), but every answer is the module's, so a module
+   replaced on the server answers wrongly without saying so. `supdb.wasm`
+   is not in git: whoever deploys the reader builds and serves it.
+3. **The object's server, for a plaintext object.** Blocks carry CRC32C,
+   which catches corruption and not a forger. A crafted object reaches the
+   module's parsers and `lz4_flex`'s decoder. They run inside the module's
+   linear memory, so the most a crafted object can do is cause wrong
+   answers or a trap.
+4. **The origin's storage, for an encrypted object.** Every chunk is
+   checked against its tag when it is fetched. What the cache keeps after
+   that is plaintext, and it is not checked again on a later load, so
+   anything running in the same origin can read or rewrite it. Name a
+   cache after the object's version (`s3.mjs` says so), so that a cache
+   resumed under a reused name never mixes two objects' pages.
+5. **The caller, with S3 credentials.** `s3RangeFetcher` keeps them in the
+   worker's closure for the fetcher's life and never stores them.
+   Short-lived STS credentials (`sessionToken`) are the shape to pass.
+6. **The page's Content Security Policy.** It has to allow
+   `'wasm-unsafe-eval'` in the worker's `script-src`, the worker script,
+   and `connect-src` to the module's and the object's hosts. The reader
+   needs no cross-origin isolation, since it uses no `SharedArrayBuffer`.
+
 ## What a lookup costs
 
 A point lookup touches the key index section, one or two hash slots, one

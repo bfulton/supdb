@@ -20,12 +20,15 @@ on:
   workflow_dispatch:
 
 permissions:
-  actions: read
   contents: read
 
 jobs:
   check:
-    uses: bfulton/localmost/.github/workflows/check.yaml@main
+    # check.yaml at the pinned commit reads the LOCALMOST_HEARTBEAT
+    # variable and sets an output: no checkout, no API call, so its token
+    # needs no scope. Read it again when the pin moves.
+    permissions: {}
+    uses: bfulton/localmost/.github/workflows/check.yaml@db24b1bbc01da0d740ac20204171251a426f6f97 # main, pinned on 2026-11-28
 
   smoke:
     needs: check

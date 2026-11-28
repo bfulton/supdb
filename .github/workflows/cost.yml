@@ -20,6 +20,9 @@ on:
         required: false
         default: ''
 
+permissions:
+  contents: read
+
 env:
   CARGO_TERM_COLOR: always
 
@@ -28,8 +31,9 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 150
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          persist-credentials: false
           fetch-depth: 0
       # The toolchain rust-toolchain.toml names, the one the local gate runs
       # under; no workflow names a version or a channel of its own.
