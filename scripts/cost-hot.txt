@@ -96,12 +96,14 @@ supdb::db::zlz4::
 ~supdb::db::Maint::sweep_spares 0.03
 ~supdb::db::Maint::z_step 0.025
 ~supdb::db::Maint::join_seal 0.02
-# In load_durable, a partition's records' residency, which the controller's
+# In the loads, a partition's records' residency, which the controller's
 # tick asks of the segment's mapping once a run (`Seg::records_resident`):
-# ten listings of b3a043dc counted against itself five times read 3,718
-# instructions in nine and none in the tenth, 0.037 an op, since where the
-# tick's steps fall against the partition's landing follows the clock.
-~load_durable: supdb::bytes::MmapBytes::resident_share 0.12
+# 3,718 instructions or none, 0.037 an op, since where the tick's steps fall
+# against the partition's landing follows the clock. load_durable read none
+# in one of ten listings of b3a043dc counted against itself five times and
+# in two of six counted three times with both sides built at one path,
+# load_buffered in one of those six.
+~load_durable,load_buffered: supdb::bytes::MmapBytes::resident_share 0.12
 # In the merge alone, whose writer's operations end while a background
 # thread's pin holds what they would free, so the sweep at an operation's
 # end walks the reader table for as long as the pin stands (two runs of one
@@ -134,14 +136,21 @@ supdb::db::zlz4::
 ~land: std::sys::pal::unix::time::Timespec::now 0.002
 ~commit_durable,commit_buffered: supdb::db::AlignedWriter::landed 0.002
 # A library function a `~` line names, under a toggle, is held to its bound
-# in place of the library tests (scripts/cost-diff.py): glibc's unlink of a
-# free chunk from its bin in scan_long_z, run where a free or an allocation
-# meets a free neighbour, so its count follows the heap the run has left
-# and not the scans. Ten listings of b3a043dc counted against itself five
-# times read it in two shapes, 9,543 to 10,719 and 16,662 to 17,085 over
-# the run's 1,000 operations, 7.5 an op between the least and the most and
-# red in one count of five (scan_z: 6,207 to 7,527, under LIB_SLACK).
-~scan_long_z: unlink_chunk.isra.0 23
+# in place of the library tests (scripts/cost-diff.py): here glibc's, whose
+# counts follow the heap the run has left and the addresses that gives its
+# inputs, not the scans. 22 listings of b3a043dc counted against itself --
+# eight counts with the two sides built at two paths, three with both built
+# at one path, the same binaries byte for byte -- read scan_long_z's unlink
+# of a free chunk from its bin at 4,605 to 19,128 instructions over the
+# run's 1,000 operations, 14.5 an op between the least and the most, red in
+# one count; its `_int_malloc` at 1,047,726 to 1,141,163, 93 an op, and two
+# of the one-path listings 5.9% apart, past the library tests; and libc's
+# compare in the stride form's scans at 19 or 23 instructions a scan, 4 an
+# op, red in scan_long_s in two one-path counts of three and in scan_s in
+# two two-path counts.
+~scan_long_z: unlink_chunk.isra.0 44
+~scan_long_z: _int_malloc 281
+~scan_s,scan_long_s: __memcmp_avx2_movbe 12
 # The writer (load_durable, load_buffered, work, merge): a commit, its log,
 # the memtable and the ordered run's stream.
 supdb::db::Db::commit

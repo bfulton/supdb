@@ -6,12 +6,31 @@
 # suite's build definition (bench/.cargo/config.toml) are the head's in both
 # builds, so the two differ in the engine alone.
 #
+# Both sides are built in one directory at one path, $COST_DIR/src, into one
+# target, one after the other: a worktree of BASE there, built, its probes
+# copied out to $COST_DIR/bin/base; then the head's tree synced over it --
+# each file that differs written, each file of BASE's the head lacks
+# removed, .git and the targets left alone -- built again, its probes copied
+# out to $COST_DIR/bin/head; and each side counted from its copies, whose
+# paths are as long as each other. Built at two paths, the two sides
+# differed in more than the engine: the path is in every crate's metadata
+# hash and in the paths the binaries carry, so their layout moved with it.
+# Counted against itself from two checkouts, b3a043dc read libc's compare in
+# scan_s at 19 instructions a scan on one side and 23 on the other, and at
+# one checkout's path valgrind read no symbols of scan_at_probe at all --
+# of sixteen probe binaries, the one whose RELRO segment ended on a page
+# boundary -- so the toggle never fired and the probe read empty on every
+# count.
+#
 #   sh scripts/cost.sh BASE [probe ...]
 #
 # Exits 1 where a hot function gains past its slack on any probe, or where
-# a probe's toggle collected nothing; 2 where BASE names no commit, a build
-# or a probe failed, or the suite's code a toggle counts differs between the
-# two sides. The verdict line is the last line: `cost: green` or `cost: RED`.
+# a probe's toggle collected nothing, or valgrind read no symbols of a
+# probe's binary (said so by name: it can name none of the binary's
+# functions, so a toggle collects nothing and no hot line matches); 2 where
+# BASE names no commit, a build or a probe failed, or the suite's code a
+# toggle counts differs between the two sides. The verdict line is the last
+# line: `cost: green` or `cost: RED`.
 # What is hot and its slack are scripts/cost-diff.py's, the one definition:
 # in a probe with a toggle, every function built from source that the
 # toggle collected, held to a few instructions over the whole run, and
@@ -21,28 +40,37 @@
 # scripts/cost-hot.txt; and a function a `~` line of that list names, to
 # the bound the line gives it.
 #
-# The environment:
-#   COST_DIR          the working directory (default $TMPDIR/supdb-cost-PID),
-#                     emptied at the start; the outputs stay in $COST_DIR/out
-#   COST_HEAD         the tree counted as the head (default this one): a
-#                     copy of it with an edit is how scripts/cost-red.sh
-#                     makes its red input
-#   COST_HEAD_TARGET  the head's cargo target (default $COST_HEAD/bench/target)
-#   COST_BASE_TARGET  the base's (default $COST_DIR/tb, removed at the end)
-#
-# Each side is built and then counted before the other is built, so the two
-# may share one target directory: a red copy built where the base was costs
-# the engine's and the suite's crates, not a second RocksDB. The base's
-# worktree and its target are removed at the end: a third of a gigabyte a
-# binary.
+# The environment, all of it that the script reads:
+#   COST_DIR     the working directory (default $TMPDIR/supdb-cost-PID),
+#                emptied at the start; the build directory and the copied
+#                probes are removed at the end, and the outputs stay in
+#                $COST_DIR/out
+#   COST_HEAD    the tree counted as the head (default this one), read and
+#                never written: its files as git lists them, tracked and
+#                untracked but not ignored, or every file but .git and the
+#                targets where it is no git work tree. A copy of this tree
+#                with an edit is how scripts/cost-red.sh makes its red input
+#   COST_TARGET  the one cargo target both sides build in (default
+#                $COST_DIR/t, removed at the end). A target kept from run to
+#                run builds RocksDB once between them (scripts/cost-red.sh
+#                shares one across its steps); never a checkout's own
+#                bench/target, whose binaries the count's would overwrite
+# COST_BASE_TARGET and COST_HEAD_TARGET, a target a side when the sides
+# were built at two paths, are refused: a caller still setting them is
+# counting with a layout this script no longer has.
 set -eu
 BASE=${1:?usage: cost.sh BASE [probe ...]}
 shift
 ROOT=$(git rev-parse --show-toplevel)
 HEAD_TREE=${COST_HEAD:-$ROOT}
-HT=${COST_HEAD_TARGET:-$HEAD_TREE/bench/target}
 W=${COST_DIR:-${TMPDIR:-/tmp}/supdb-cost-$$}
-TB=${COST_BASE_TARGET:-$W/tb}
+T=${COST_TARGET:-$W/t}
+# The build directory, the one path both sides are built at.
+SRC=$W/src
+if [ -n "${COST_BASE_TARGET:-}${COST_HEAD_TARGET:-}" ]; then
+    echo "cost: COST_BASE_TARGET and COST_HEAD_TARGET are gone: both sides build in COST_TARGET; nothing built"
+    exit 2
+fi
 PROBES=${*:-read read_z read_s scan scan_long scan_z scan_long_z scan_s scan_long_s load_durable load_buffered commit_durable commit_buffered work merge land seal scan_at}
 WHOLE=0
 [ $# -ne 0 ] || WHOLE=1
@@ -84,13 +112,16 @@ if ! git -C "$ROOT" rev-parse --verify --quiet "$BASE^{commit}" >/dev/null; then
     exit 2
 fi
 rm -rf "$W"
-mkdir -p "$W/out" || { echo "cost: cannot make $W/out"; exit 2; }
+mkdir -p "$W/out" "$T" || { echo "cost: cannot make $W/out or $T"; exit 2; }
+# Absolute, since the builds and the listings run from the build directory.
+W=$(cd "$W" && pwd -P) T=$(cd "$T" && pwd -P)
+SRC=$W/src
 cleanup() {
-    git -C "$ROOT" worktree remove --force "$W/base" 2>/dev/null || true
-    rm -rf "$W/tb" "$W/base"
+    git -C "$ROOT" worktree remove --force "$SRC" 2>/dev/null || true
+    rm -rf "$W/t" "$SRC" "$W/bin"
 }
 trap cleanup EXIT
-if ! git -C "$ROOT" worktree add --detach "$W/base" "$BASE" >"$W/out/worktree.log" 2>&1; then
+if ! git -C "$ROOT" worktree add --detach "$SRC" "$BASE" >"$W/out/worktree.log" 2>&1; then
     echo "cost: the worktree of BASE '$BASE' could not be made; see $W/out/worktree.log"
     exit 2
 fi
@@ -105,7 +136,7 @@ SUITE=""
 for p in $PROBES; do
     case $p in read | read_z | read_s | scan | scan_long | scan_z | scan_long_z | scan_s | scan_long_s | commit_durable | commit_buffered) SUITE=1 ;; esac
 done
-if [ -n "$SUITE" ] && ! python3 - "$W/base/bench/src/engines.rs" "$HEAD_TREE/bench/src/engines.rs" <<'PY'
+if [ -n "$SUITE" ] && ! python3 - "$SRC/bench/src/engines.rs" "$HEAD_TREE/bench/src/engines.rs" <<'PY'
 import sys
 # The suite's per-operation items: a toggle starts in one of them, or they
 # are inlined into one. Each from its first line to its closing brace.
@@ -150,7 +181,7 @@ then
 fi
 # The head's probe sources in the base, so the two builds run one probe.
 for e in $EX; do
-    cp "$HEAD_TREE/bench/examples/$e.rs" "$W/base/bench/examples/$e.rs" ||
+    cp "$HEAD_TREE/bench/examples/$e.rs" "$SRC/bench/examples/$e.rs" ||
         { echo "cost: the head's probe $e could not be copied into the base"; exit 2; }
 done
 # The head's build in the base, so the two sides are compiled alike:
@@ -161,38 +192,115 @@ done
 # instructions the flags' as well as the engine's. A head without the file
 # builds the base without it too.
 if [ -f "$HEAD_TREE/bench/.cargo/config.toml" ]; then
-    mkdir -p "$W/base/bench/.cargo"
-    cp "$HEAD_TREE/bench/.cargo/config.toml" "$W/base/bench/.cargo/config.toml" ||
+    mkdir -p "$SRC/bench/.cargo"
+    cp "$HEAD_TREE/bench/.cargo/config.toml" "$SRC/bench/.cargo/config.toml" ||
         { echo "cost: the head's build definition could not be copied into the base"; exit 2; }
 else
-    rm -f "$W/base/bench/.cargo/config.toml"
+    rm -f "$SRC/bench/.cargo/config.toml"
 fi
-# FASTER's sources, for a side whose suite builds the `faster` arm
+# FASTER's sources, for a suite that builds the `faster` arm
 # (bench/build.rs): they are fetched and never the repository's
-# (bench/scripts/faster.sh), so a worktree of the base and a scratch copy of
-# the tree (cost-red.sh) come without them, and the suite's build stops
-# there. Handed over from this tree where it holds the commit the side
-# pins; a side they do not fit fails its own build, which says what to run.
+# (bench/scripts/faster.sh), so a worktree of the base comes without them,
+# and the suite's build stops there. Handed over from this tree where it
+# holds the commit the build directory pins, before each side's build; git
+# ignores them, so the head's sync leaves them where its pin is the base's.
+# A pin they do not fit fails its own build, which says what to run.
 faster_for() { # tree
     v="$1/bench/vendor/faster"
-    if [ ! -f "$v/PIN" ] || [ -f "$v/src/core/faster.h" ]; then return 0; fi
+    [ -f "$v/PIN" ] || return 0
+    pin=$(tr -d '[:space:]' <"$v/PIN")
+    if [ "$(cat "$v/COMMIT" 2>/dev/null || true)" = "$pin" ] && [ -f "$v/src/core/faster.h" ]; then return 0; fi
     have="$ROOT/bench/vendor/faster"
-    if [ "$(cat "$have/COMMIT" 2>/dev/null || true)" != "$(tr -d '[:space:]' <"$v/PIN")" ]; then return 0; fi
+    if [ "$(cat "$have/COMMIT" 2>/dev/null || true)" != "$pin" ]; then return 0; fi
+    rm -rf "$v/src" "$v/COMMIT"
     cp -R "$have/src" "$v/src" && cp "$have/COMMIT" "$v/COMMIT"
 }
-faster_for "$W/base"
-faster_for "$HEAD_TREE"
-build() { # tree target side
+# The head's tree over the build directory: each file the head lists that
+# differs from the build directory's, or that it lacks, written there, which
+# gives it a time after the base's build and so has cargo build it again;
+# each file BASE tracks that the head lists not, removed; a file the two
+# hold alike left as it is, so what only BASE built stays built. The head's
+# files are the ones git lists in it, tracked and untracked but not ignored,
+# or, where it is no git work tree, every file but .git and the targets.
+sync_head() { # head-tree build-directory
+    python3 - "$1" "$2" >"$W/out/sync.log" <<'PY' || { echo "cost: the head's tree could not be synced into $2; see $W/out/sync.log"; exit 2; }
+import filecmp, os, shutil, subprocess, sys
+
+head, dest = sys.argv[1:3]
+
+
+def git_files(tree):
+    """The files git lists in `tree` where it is the top of a work tree."""
+    top = subprocess.run(["git", "-C", tree, "rev-parse", "--show-toplevel"],
+                         capture_output=True, text=True)
+    if top.returncode != 0 or os.path.realpath(top.stdout.strip()) != os.path.realpath(tree):
+        return None
+    out = subprocess.run(["git", "-C", tree, "ls-files", "-z", "-co", "--exclude-standard"],
+                         capture_output=True, check=True).stdout.decode()
+    return [p for p in out.split("\0") if p]
+
+
+def walked(tree):
+    out = []
+    for root, dirs, names in os.walk(tree):
+        rel = os.path.relpath(root, tree)
+        dirs[:] = [d for d in dirs
+                   if d != ".git" and not (d == "target" and rel in (".", "bench"))]
+        out += [os.path.normpath(os.path.join(rel, n)) for n in names]
+    return out
+
+
+files = git_files(head)
+files = walked(head) if files is None else files
+files = {f for f in files if os.path.lexists(os.path.join(head, f))}
+written = removed = 0
+for f in sorted(files):
+    s, d = os.path.join(head, f), os.path.join(dest, f)
+    if os.path.islink(s):
+        if os.path.islink(d) and os.readlink(d) == os.readlink(s):
+            continue
+        if os.path.lexists(d):
+            os.remove(d)
+        os.makedirs(os.path.dirname(d), exist_ok=True)
+        os.symlink(os.readlink(s), d)
+    else:
+        if (os.path.isfile(d) and not os.path.islink(d) and filecmp.cmp(s, d, shallow=False)
+                and os.stat(s).st_mode & 0o111 == os.stat(d).st_mode & 0o111):
+            continue
+        if os.path.lexists(d):
+            os.remove(d)
+        os.makedirs(os.path.dirname(d), exist_ok=True)
+        shutil.copyfile(s, d)
+        shutil.copymode(s, d)
+    written += 1
+    print(f"written {f}")
+tracked = subprocess.run(["git", "-C", dest, "ls-files", "-z"],
+                         capture_output=True, check=True).stdout.decode()
+for f in (p for p in tracked.split("\0") if p):
+    if f not in files and os.path.lexists(os.path.join(dest, f)):
+        os.remove(os.path.join(dest, f))
+        removed += 1
+        print(f"removed {f}")
+print(f"the head's {len(files)} files: {written} written, {removed} of BASE's removed")
+PY
+}
+build() { # side: the build directory built into the one target, its probes copied out
     args=""
     for e in $EX; do args="$args --example $e"; done
     # shellcheck disable=SC2086
-    if ! (cd "$1/bench" && CARGO_TARGET_DIR="$2" cargo build --release $args) >"$W/out/build-$3.log" 2>&1; then
-        echo "cost: the $3 build failed; see $W/out/build-$3.log"
+    if ! (cd "$SRC/bench" && CARGO_TARGET_DIR="$T" cargo build --release $args) >"$W/out/build-$1.log" 2>&1; then
+        echo "cost: the $1 build failed; see $W/out/build-$1.log"
         exit 2
     fi
+    mkdir -p "$W/bin/$1"
+    for e in $EX; do
+        cp "$T/release/examples/$e" "$W/bin/$1/$e" ||
+            { echo "cost: the $1 build's $e could not be copied out of $T"; exit 2; }
+    done
+    (cd "$W/bin/$1" && sha256sum $EX) >"$W/out/bin-$1.sha256"
 }
-run() { # side target-dir name
-    side=$1 dir=$2 name=$3
+run() { # side name
+    side=$1 name=$2
     set --
     spec=$(probe "$name")
     tog=$(echo "$spec" | cut -d'|' -f2)
@@ -203,23 +311,39 @@ run() { # side target-dir name
     if [ -n "$tog" ]; then
         set -- "$@" --collect-atstart=no "--toggle-collect=$tog"
     fi
+    # `-v` for valgrind's line that it read the binary's symbols, and
+    # nothing of the program's: valgrind's own messages go to the .vg file.
     # shellcheck disable=SC2086
-    if ! TMPDIR="$t" valgrind --tool=callgrind --callgrind-out-file="$W/out/$side.$name.out" "$@" \
-        "$dir/release/examples/$bin" $args >"$W/out/$side.$name.stdout" 2>"$W/out/$side.$name.vg"; then
+    if ! TMPDIR="$t" valgrind -v --tool=callgrind --callgrind-out-file="$W/out/$side.$name.out" "$@" \
+        "$W/bin/$side/$bin" $args >"$W/out/$side.$name.stdout" 2>"$W/out/$side.$name.vg"; then
         echo "cost: $side $name exited non-zero; see $W/out/$side.$name.vg"
         exit 2
     fi
     rm -rf "$t"
-    callgrind_annotate --auto=no --inclusive=no --threshold=100 "$W/out/$side.$name.out" >"$W/out/$side.$name.self"
+    # A binary valgrind read no symbols of has no function it can name: a
+    # toggle never fires and a listing names nothing of it. Said so, and red.
+    if ! grep -q "Reading syms from .*/bin/$side/$bin\$" "$W/out/$side.$name.vg"; then
+        echo "cost: valgrind read no symbols from $W/bin/$side/$bin ($side $name), so it can name none of its functions; see $W/out/$side.$name.vg"
+        echo "$side" >>"$W/out/$name.nosyms"
+    fi
+    # From the build directory: callgrind_annotate names a source under the
+    # directory it runs in by its path from there, so both sides' listings
+    # name the engine's, the suite's and the probes' sources by their place
+    # in the tree (`src/db.rs`), which is how scripts/cost-diff.py tells the
+    # workspace's from a library's.
+    (cd "$SRC" && callgrind_annotate --auto=no --inclusive=no --threshold=100 "$W/out/$side.$name.out") \
+        >"$W/out/$side.$name.self"
 }
-side() { # tree target side: build it, then count every probe on it
-    build "$1" "$2" "$3"
+side() { # side: build the build directory, then count every probe on its copies
+    faster_for "$SRC"
+    build "$1"
     for p in $PROBES; do
-        run "$3" "$2" "$p"
+        run "$1" "$p"
     done
 }
-side "$W/base" "$TB" base
-side "$HEAD_TREE" "$HT" head
+side base
+sync_head "$HEAD_TREE" "$SRC"
+side head
 status=0
 : >"$W/out/seen"
 for p in $PROBES; do
@@ -233,6 +357,10 @@ for p in $PROBES; do
     own="supdb::,supdb_bench::,$(echo "$spec" | cut -d'|' -f3)::"
     SEEN="$W/out/seen" python3 "$ROOT/scripts/cost-diff.py" "$W/out/base.$p.self" "$W/out/head.$p.self" \
         "$ops" "$ROOT/scripts/cost-hot.txt" "$p" "$mode" "$own" || status=1
+    if [ -f "$W/out/$p.nosyms" ]; then
+        echo "  NO SYMBOLS: valgrind read none from the probe's binary, side $(tr '\n' ' ' <"$W/out/$p.nosyms")"
+        status=1
+    fi
 done
 # The hot lines no probe of a whole run reached: inlined into their callers
 # on both sides today, or gone. Named, not failed: a probe that matched no
