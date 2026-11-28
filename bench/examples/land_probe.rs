@@ -86,7 +86,10 @@ fn main() {
     let rounds_n: usize = args.get(2).and_then(|a| a.parse().ok()).unwrap_or(8);
     let pieces: usize = args.get(3).and_then(|a| a.parse().ok()).unwrap_or(4);
     let tmp = std::env::var_os("TMPDIR").map_or_else(std::env::temp_dir, PathBuf::from);
-    let dir = tmp.join(format!("supdb-landprobe-{}", std::process::id()));
+    // Named without the process id, so its path is as long in every run:
+    // the cost count (scripts/cost.sh) compares two runs' file calls by
+    // their instructions. Two runs at once want a TMPDIR each.
+    let dir = tmp.join("supdb-landprobe");
     let _ = std::fs::remove_dir_all(&dir);
     let mut db = Db::create(&dir, opts(pieces)).expect("the store is made");
     let val = vec![b'v'; 100];

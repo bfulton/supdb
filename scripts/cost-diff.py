@@ -41,7 +41,8 @@ crate (`supdb::,supdb_bench::,read_only::`). What is hot, and its slack:
           instruction a read between two runs of one build, so it fails only
           where it gains past LIB_SLACK an operation and past LIB_REL of its
           own count both, which a copy of twice the bytes at a step of every
-          operation is.
+          operation is, or, where a `~` line names it, past that line's
+          bound alone.
   whole   Every function of OWN by name (`supdb::...`), and every function
           with a bare name and a file of the workspace (a `#[no_mangle]`
           helper), at WHOLE_SLACK an operation: these probes count the
@@ -55,11 +56,14 @@ Every line of HOT (scripts/cost-hot.txt, one path a line, as below) is hot
 in both modes, at the mode's slack. A line that begins with `!` takes the
 functions it matches back out in both modes. One that begins with `~` gives
 the functions it matches a bound of their own, `~path BOUND`, BOUND in
-instructions an operation, in place of the mode's slack: a function whose
-count follows the clock or another thread's timing, by as much as two runs
-of one build have been measured to move it, three times over. Written so it
-holds in every probe with no toggle; written `~probe,probe: path BOUND`, in
-those probes alone, whatever their mode. Where several apply, the largest.
+instructions an operation, in place of the mode's slack, and, for a library
+function under a toggle, of LIB_SLACK and LIB_REL both: a function whose
+count follows the clock, another thread's timing or the heap's layout, by
+as much as two runs of one build have been measured to move it, three times
+over. It makes no function hot, so a library function in a probe with no
+toggle is held to nothing still. Written so it holds in every probe with no
+toggle; written `~probe,probe: path BOUND`, in those probes alone, whatever
+their mode. Where several apply, the largest.
 A `~` line without its bound is refused: a line that took its function out
 with no bound let any gain in it through.
 
@@ -276,9 +280,10 @@ def main(argv):
         status = 1
     slack = TOGGLE_SLACK if mode == "toggle" else WHOLE_SLACK * ops
     # A `~` line's function is held to its own bound, the largest of the
-    # lines that name it, in place of the mode's slack.
+    # lines that name it, in place of the mode's slack, or of the library
+    # tests for a library function under a toggle.
     own_bound = {}
-    for f in exact:
+    for f in exact | libhot:
         bs = [b for line, b in bounds if matches(line, f)]
         if bs:
             own_bound[f] = max(bs) * ops
@@ -287,7 +292,7 @@ def main(argv):
         f"  {len(exact)} hot functions ran ({len(exact - listed)} on no line), {moved_exact} of"
         f" them moved, {sum(gain[f] for f in exact) / ops:+.3f} an op between them;"
         f" slack {slack:,.0f} instructions a function over the run,"
-        f" {len(own_bound)} of them held to a bound of their own"
+        f" {len(own_bound)} functions held to a bound of their own"
     )
     for f in sorted(own_bound):
         if gain[f]:
@@ -299,12 +304,15 @@ def main(argv):
             + (f" (its bound {own_bound[f] / ops:.3f} an op)" if f in own_bound else "")
         )
     libbad = sorted(
-        f for f in libhot if gain[f] > LIB_SLACK * ops and gain[f] > LIB_REL * b.get(f, 0)
+        f for f in libhot
+        if (gain[f] > own_bound[f] if f in own_bound
+            else gain[f] > LIB_SLACK * ops and gain[f] > LIB_REL * b.get(f, 0))
     )
     for f in libbad:
         print(
             f"  LIBRARY GAINED: {f} {gain[f] / ops:+.3f} an op,"
             f" {gain[f] / max(b.get(f, 0), 1):+.1%} of its count"
+            + (f" (its bound {own_bound[f] / ops:.3f} an op)" if f in own_bound else "")
         )
     return 1 if bad or libbad else status
 
