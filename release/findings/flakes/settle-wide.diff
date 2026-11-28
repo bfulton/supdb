@@ -1,0 +1,26 @@
+--- a/tests/settle.rs	2026-11-28 09:53:58.431829704 +0000
++++ b/tests/settle.rs	2026-11-28 09:53:58.428425448 +0000
+@@ -2173,6 +2173,8 @@
+         let rebased_before = db.forms_rebased();
+         let merges_before = db.seal_waits().merges;
+         let kept_before = db.seal_waits().keyseqs_kept;
++        let wide = std::env::var("PROBE_WIDE").is_ok();
++        if wide { db.hold_upkeep_pass(true); }
+         db.hold_seal_durable(true);
+         for round in 0..2u8 {
+             let v = [b'a' + round; 100];
+@@ -2184,6 +2186,14 @@
+             db.seal().unwrap();
+         }
+         db.hold_seal_durable(false);
++        if wide {
++            let t = std::time::Instant::now();
++            while db.seal_waits().merges == merges_before {
++                assert!(t.elapsed().as_secs() < 60, "probe: the merge never landed");
++                std::thread::sleep(std::time::Duration::from_millis(2));
++            }
++            db.hold_upkeep_pass(false);
++        }
+         merged_past(&mut db, merges_before);
+         // The writer's look across the landings, which carries its tables
+         // to the partitions as they stand, is its next read of the log: a

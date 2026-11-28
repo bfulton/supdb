@@ -1,0 +1,46 @@
+--- a/tests/settle.rs	2026-11-28 09:53:58.431829704 +0000
++++ b/tests/settle.rs	2026-11-28 09:53:58.446415479 +0000
+@@ -2164,6 +2164,7 @@
+             Options {
+                 identity_by_keys: by_keys,
+                 cursor_merge: cursors,
++                upkeep_keep_bytes: if std::env::var("PROBE_ABANDON").is_ok() { 1 } else { 0 },
+                 ..common::options()
+             },
+         );
+@@ -2173,6 +2174,9 @@
+         let rebased_before = db.forms_rebased();
+         let merges_before = db.seal_waits().merges;
+         let kept_before = db.seal_waits().keyseqs_kept;
++        let r0 = db.forms_drop_reasons();
++        let pinned = std::env::var("PROBE_ABANDON").is_ok();
++        if pinned { db.hold_upkeep_pinned(true); }
+         db.hold_seal_durable(true);
+         for round in 0..2u8 {
+             let v = [b'a' + round; 100];
+@@ -2184,6 +2188,14 @@
+             db.seal().unwrap();
+         }
+         db.hold_seal_durable(false);
++        if pinned {
++            let t = std::time::Instant::now();
++            while db.seal_waits().merges == merges_before {
++                assert!(t.elapsed().as_secs() < 60, "probe: the merge never landed");
++                std::thread::sleep(std::time::Duration::from_millis(2));
++            }
++            db.hold_upkeep_pinned(false);
++        }
+         merged_past(&mut db, merges_before);
+         // The writer's look across the landings, which carries its tables
+         // to the partitions as they stand, is its next read of the log: a
+@@ -2197,6 +2209,10 @@
+         );
+         let kept = db.seal_waits().keyseqs_kept - kept_before;
+         let (claimed, holds) = db.block_cache_identity();
++        let r1 = db.forms_drop_reasons();
++        let dd: Vec<u64> = (0..16).map(|i| r1.0[i] - r0.0[i]).collect();
++        let dr: Vec<u64> = (0..16).map(|i| r1.1[i] - r0.1[i]).collect();
++        eprintln!("PROBE ({claimed}, {holds}) drops {dd:?} refusals {dr:?} abandons {}", db.upkeep_abandons());
+         if by_keys {
+             assert_eq!(
+                 kept, partitions as u64,

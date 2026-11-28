@@ -1857,16 +1857,56 @@ fn run_arms() -> Vec<(&'static str, Options)> {
 }
 
 /// The open run's temp file in `d`: the run's own log until it closes.
-fn run_tmp_name(d: &Path) -> std::ffi::OsString {
-    std::fs::read_dir(d)
-        .unwrap()
-        .map(|e| e.unwrap().file_name())
-        .find(|n| {
-            // An open run has taken the spare, so its file is the one.
-            let n = n.to_string_lossy();
-            n.starts_with("direct-") && n.ends_with(".tmp")
-        })
-        .expect("an open run's temp file")
+/// The next run's file may stand beside it under a temp name of the same
+/// shape: the writer reserves the next run's id as a run begins, and the
+/// segment work makes that file at the first landing that syncs the
+/// directory after (`Options::run_spare`), which may fall before the
+/// test names the run's file. The first version took the first temp name
+/// the listing gave, and where the next run's file stood and the listing
+/// gave it first -- ext4 lists a small directory in the order of its
+/// names' hashes, which the filesystem's seed fixes, and tmpfs newest
+/// first -- a test named that file: a wait for the run's file's link that
+/// never came, or the run's name and its inode taken from two files.
+/// Every temp name of a run is below the next run's id, and the open
+/// run's is the greatest of them (a closed run's stays until the manifest
+/// names its segment), so the next run's file, where the store says it is
+/// made, is the greatest name and is passed over. The store's word is
+/// read on both sides of the listing, and the listing taken again where
+/// the file was made inside it.
+fn run_tmp_name(db: &Db, d: &Path) -> std::ffi::OsString {
+    loop {
+        let before = db.run_spare_state();
+        let mut runs: Vec<(u64, std::ffi::OsString)> = std::fs::read_dir(d)
+            .unwrap()
+            .filter_map(|e| {
+                let n = e.unwrap().file_name();
+                let id = n
+                    .to_str()?
+                    .strip_prefix("direct-")?
+                    .strip_suffix(".tmp")?
+                    .parse()
+                    .ok()?;
+                Some((id, n))
+            })
+            .collect();
+        if db.run_spare_state() != before {
+            continue;
+        }
+        runs.sort();
+        // 2: the next run's file made and its name synced; 4: made, its
+        // name behind no sync yet.
+        if matches!(before, 2 | 4) {
+            let (_, spare) = runs
+                .pop()
+                .expect("the next run's file the store says it made");
+            assert_eq!(
+                std::fs::metadata(d.join(&spare)).unwrap().len(),
+                0,
+                "the next run's file, {spare:?}, is empty until a run begins in it"
+            );
+        }
+        return runs.pop().expect("an open run's temp file").1;
+    }
 }
 
 /// A power cut of a store whose run is open: its files copied from `d` to
@@ -1897,9 +1937,11 @@ fn power_cut(db: &Db, d: &Path, crash: &Path, ino: u64, synced: u64) {
     }
 }
 
-fn run_ino(d: &Path) -> u64 {
+fn run_ino(db: &Db, d: &Path) -> u64 {
     use std::os::unix::fs::MetadataExt;
-    std::fs::metadata(d.join(run_tmp_name(d))).unwrap().ino()
+    std::fs::metadata(d.join(run_tmp_name(db, d)))
+        .unwrap()
+        .ino()
 }
 
 fn injected(r: std::io::Result<()>, what: &str) {
@@ -1961,7 +2003,7 @@ fn a_run_write_that_failed(tag: &str, opts: Options, again: Again, partial: bool
         Some(false),
         "{tag}: the run's writer still attends after the batch was paid"
     );
-    let ino = run_ino(&d);
+    let ino = run_ino(&db, &d);
     let synced = db.run_synced_bytes().expect("a run open");
     power_cut(&db, &d, &crash, ino, synced);
     let h = db.reader().unwrap();
@@ -2069,7 +2111,7 @@ fn a_failed_run_piece_write(tag: &str, opts: Options) {
     db.commit()
         .unwrap_or_else(|e| panic!("{tag}: the commit after the failed piece: {e}"));
     assert_eq!(db.levels(), (0, 0), "{tag}: the run is open");
-    let ino = run_ino(&d);
+    let ino = run_ino(&db, &d);
     let synced = db.run_synced_bytes().expect("a run open");
     power_cut(&db, &d, &crash, ino, synced);
     db.crash();
@@ -2109,7 +2151,7 @@ fn a_short_run_write(tag: &str, opts: Options, big: bool) {
     db.commit()
         .unwrap_or_else(|e| panic!("{tag}: the commit after: {e}"));
     assert_eq!(db.levels(), (0, 0), "{tag}: the run is open");
-    let ino = run_ino(&d);
+    let ino = run_ino(&db, &d);
     let synced = db.run_synced_bytes().expect("a run open");
     power_cut(&db, &d, &crash, ino, synced);
     db.crash();
@@ -2220,7 +2262,7 @@ fn a_failed_run_sync_is_kept(tag: &str, opts: Options) {
     kept(db.commit(), &format!("{tag}: a commit after"));
     kept(db.flush(), &format!("{tag}: a flush after"));
     reads(&db, "k1", "v1", &format!("{tag}: reads go on"));
-    let ino = run_ino(&d);
+    let ino = run_ino(&db, &d);
     let covered = db.run_synced_bytes().expect("the run is still open");
     power_cut(&db, &d, &crash, ino, covered);
     db.crash();
@@ -2270,7 +2312,7 @@ fn a_run_whose_fdatasync_failed_is_not_closed_into_a_named_segment() {
         db.fail_next_run_sync();
         db.append(b"k2", b"v2");
         assert!(db.commit().is_err(), "{tag}: the failed fdatasync");
-        let ino = run_ino(&d);
+        let ino = run_ino(&db, &d);
         let covered = db.run_synced_bytes().expect("the run is open");
         // Below the greatest: the run is left, and its close begins.
         db.put(b"a", b"A");
@@ -2639,7 +2681,7 @@ fn a_buffered_run_piece_write_that_failed(tag: &str, opts: Options, twice: bool)
         Some(false),
         "{tag}: the run's writer still attends after the sync paid it"
     );
-    let ino = run_ino(&d);
+    let ino = run_ino(&db, &d);
     let synced = db.run_synced_bytes().expect("a run open");
     power_cut(&db, &d, &crash, ino, synced);
     db.crash();
@@ -3039,7 +3081,11 @@ fn a_buffered_runs_failed_first_write_is_tried_again_before_its_sync() {
         db.append(b"k1", b"v1");
         db.commit()
             .unwrap_or_else(|e| panic!("{tag}: a commit the policy does not sync: {e}"));
-        let len = || std::fs::metadata(d.join(run_tmp_name(&d))).unwrap().len();
+        let len = || {
+            std::fs::metadata(d.join(run_tmp_name(&db, &d)))
+                .unwrap()
+                .len()
+        };
         assert!(len() > 0, "{tag}: the marker's stream tried the head again");
         db.append(b"k2", b"v2");
         db.commit()
@@ -3050,7 +3096,7 @@ fn a_buffered_runs_failed_first_write_is_tried_again_before_its_sync() {
         );
         db.sync()
             .unwrap_or_else(|e| panic!("{tag}: the sync that writes the rest: {e}"));
-        let ino = run_ino(&d);
+        let ino = run_ino(&db, &d);
         let synced = db.run_synced_bytes().expect("a run open");
         power_cut(&db, &d, &crash, ino, synced);
         db.crash();
@@ -3083,7 +3129,11 @@ fn a_run_write_failure_after_one_answered_is_answered_in_its_own_words() {
         db.append(b"k1", b"v1");
         db.commit()
             .unwrap_or_else(|e| panic!("{tag}: a commit the policy does not sync: {e}"));
-        let len = || std::fs::metadata(d.join(run_tmp_name(&d))).unwrap().len();
+        let len = || {
+            std::fs::metadata(d.join(run_tmp_name(&db, &d)))
+                .unwrap()
+                .len()
+        };
         assert_eq!(len(), 0, "{tag}: the premise, the head refused twice");
         let first = db.sync().expect_err("the sync answers the held failure");
         assert!(
@@ -3101,7 +3151,7 @@ fn a_run_write_failure_after_one_answered_is_answered_in_its_own_words() {
         );
         db.sync()
             .unwrap_or_else(|e| panic!("{tag}: the sync that writes the rest: {e}"));
-        let ino = run_ino(&d);
+        let ino = run_ino(&db, &d);
         let synced = db.run_synced_bytes().expect("a run open");
         power_cut(&db, &d, &crash, ino, synced);
         db.crash();
@@ -5118,7 +5168,7 @@ fn a_sync_makes_an_open_runs_commits_survive_a_power_cut() {
                 let synced = db
                     .run_synced_bytes()
                     .expect("the run is open after a sync that seals nothing");
-                power_cut(&db, &d, &crash, run_ino(&d), synced);
+                power_cut(&db, &d, &crash, run_ino(&db, &d), synced);
                 drop(db);
                 let opened = Db::open(&crash, opts).unwrap();
                 failures.extend(sr_missing(
@@ -5170,7 +5220,7 @@ fn a_sync_with_a_run_open_makes_the_logs_unsynced_frames_survive_a_power_cut() {
         );
         db.sync().unwrap();
         let synced = db.run_synced_bytes().expect("the run is open");
-        power_cut(&db, &d, &crash, run_ino(&d), synced);
+        power_cut(&db, &d, &crash, run_ino(&db, &d), synced);
     }));
     db.hold_seal_durable(false);
     if let Err(p) = caught {
@@ -5352,7 +5402,7 @@ fn a_sync_whose_write_of_the_runs_tail_fails_is_written_by_the_next_sync() {
         db.sync()
             .unwrap_or_else(|e| panic!("{tag}: the sync after writes the batch again: {e}"));
         let synced = db.run_synced_bytes().expect("the run is open");
-        power_cut(&db, &d, &crash, run_ino(&d), synced);
+        power_cut(&db, &d, &crash, run_ino(&db, &d), synced);
         drop(db);
         let opened = Db::open(&crash, opts).unwrap();
         if let Some(m) = sr_missing(&opened, 300, &format!("{tag}: a power cut after")) {
@@ -5391,7 +5441,7 @@ fn a_sync_with_a_run_open_syncs_the_log_before_the_run() {
         db.fail_next_wal_sync();
         kept(db.sync(), "the sync whose log sync failed");
         let synced = db.run_synced_bytes().expect("the run is open");
-        power_cut(&db, &d, &crash, run_ino(&d), synced);
+        power_cut(&db, &d, &crash, run_ino(&db, &d), synced);
     }));
     db.hold_seal_durable(false);
     if let Err(p) = caught {
@@ -5526,7 +5576,7 @@ fn a_run_commit_after_a_failed_due_write_is_due() {
     let opts = sr_opts(SyncPolicy::EveryN(3), Options::default());
     let mut db = Db::create(&d, opts.clone()).unwrap();
     sr_commits(&mut db, 0, 200, 100);
-    let ino = run_ino(&d);
+    let ino = run_ino(&db, &d);
     db.fail_next_run_write();
     for k in 200..300 {
         db.append(&sr_key(k), &sr_val(k));
@@ -5776,7 +5826,7 @@ fn a_sync_syncs_a_run_whose_commits_end_on_a_piece_boundary() {
         );
         db.sync().unwrap();
         let synced = db.run_synced_bytes().expect("the run is open");
-        power_cut(&db, &d, &crash, run_ino(&d), synced);
+        power_cut(&db, &d, &crash, run_ino(&db, &d), synced);
         drop(db);
         let opened = Db::open(&crash, opts).unwrap();
         failures.extend(sr_missing(
@@ -5824,7 +5874,7 @@ fn a_sync_with_a_run_open_pays_the_log_directorys_barrier() {
             "spare {spare}: the run took the spare"
         );
         let live = db.wal_durable().0;
-        let tmp = d.join(run_tmp_name(&d));
+        let tmp = d.join(run_tmp_name(&db, &d));
         db.fail_next_wal_dir_sync();
         db.sync()
             .unwrap_or_else(|e| panic!("spare {spare}: the barrier made by its guards: {e}"));
@@ -6732,7 +6782,7 @@ fn ss_run_close_fails(tag: &str, by_flush: bool, inline: bool, strict: bool) {
             db.commit().unwrap();
         }
     }
-    let ino = run_ino(&d);
+    let ino = run_ino(&db, &d);
     let synced = db.run_synced_bytes().expect("a run is open");
     db.fail_next_seal_sync();
     db.hold_seal_durable(true);
@@ -13062,7 +13112,7 @@ fn dl_until_due(db: &mut Db, next: &mut u32, what: &str) -> u32 {
 fn dl_power_cut(db: &Db, d: &Path, crash: &Path, lives: &[&[(PathBuf, Option<u64>)]]) {
     use std::os::unix::fs::MetadataExt;
     let synced = db.run_device_synced().expect("the run is open").0;
-    let ino = (open_run(d)).then(|| run_ino(d));
+    let ino = (open_run(d)).then(|| run_ino(db, d));
     copy_live(db, d, crash);
     if let Some(ino) = ino {
         for e in std::fs::read_dir(d).unwrap() {
@@ -13876,8 +13926,8 @@ fn a_runs_commits_its_close_synced_before_a_due_one_outlive_older_log_frames() {
     );
     let (upto, _) = db.run_written_and_held().expect("the run is open");
     assert!(upto > 0, "the premise, the run's records are on its file");
-    let ino = run_ino(&d);
-    let tmp = run_tmp_name(&d);
+    let ino = run_ino(&db, &d);
+    let tmp = run_tmp_name(&db, &d);
     let traced = db.wal_syncs_traced();
     let h = db.reader().unwrap();
     let (dd, cc) = (d.clone(), crash.clone());
@@ -14363,8 +14413,8 @@ fn a_runs_due_commit_after_a_run_closed_into_a_held_seal_outlives_that_runs_comm
     assert_eq!(db.run_synced_bytes(), Some(0), "the premise, A not due");
     let (a_written, _) = db.run_written_and_held().expect("A is open");
     assert!(a_written > 0, "the premise, A's records are on its file");
-    let a_ino = run_ino(&d);
-    let a_tmp = d.join(run_tmp_name(&d));
+    let a_ino = run_ino(&db, &d);
+    let a_tmp = d.join(run_tmp_name(&db, &d));
     let a_len = std::fs::metadata(&a_tmp).unwrap().len();
     let a_synced = db.run_device_synced().expect("A is open").0;
     assert!(!db.wal_unsynced(), "the premise, the log owes nothing");
