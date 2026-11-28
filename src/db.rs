@@ -1063,7 +1063,7 @@ pub struct ZCounts {
     /// (`Options::zpages_build_at_finish`, `Options::zpages_ahead_past_scans`).
     pub sample_refreshed: u64,
     /// Readings made from the form files on disk at the crossing in place
-    /// of a fill sample (`Options::zpages_reading_from_files`).
+    /// of a fill sample (`Maint::z_reading_from_files`).
     pub sample_from_files: u64,
     /// The price of a fault the last reading carried, nanoseconds; zero
     /// where its timed decodes took no fault.
@@ -6841,8 +6841,8 @@ pub struct Options {
     /// builds ahead while C's reads of the partitions built long before took
     /// the raw form's faults, half of C's time at ten million keys under
     /// 1.25 GiB. On as shipped, with `zpages_suspect_at_crossing`; off counts
-    /// attached partitions alone, and `supdb-zinstallwaits` is the arm with
-    /// both off.
+    /// attached partitions alone.
+    #[doc(hidden)]
     pub zpages_cover_resident: bool,
     /// Whether the controller chooses the compact form for a store under
     /// a cipher (`Encryption::Cipher`): with it off, `ZPages::Auto` reads
@@ -6882,28 +6882,9 @@ pub struct Options {
     /// step whose census saw reads (`zselect::ZSelect::set_attach_on_reads`),
     /// where it waited for the partitions to stand two seconds after the
     /// drain. On as shipped, with `zpages_cover_resident`; off waits for the
-    /// ticks, and `supdb-zinstallwaits` is the arm with both off.
+    /// ticks.
+    #[doc(hidden)]
     pub zpages_suspect_at_crossing: bool,
-    /// Whether the controller's reading at the crossing is made from the
-    /// form files on disk where they, with the partitions that stand in for
-    /// theirs (`zpages_cover_resident`), cover the keys the install needs
-    /// (`zselect::COVERED_ENOUGH`): their lengths, pages and resident parts
-    /// read from their trailers, a few pages of a few of them decoded for
-    /// the cost of a decode, the fill's price per record from the builds'
-    /// recorded CPU over the bytes they decoded, on the segment work's
-    /// thread in the tick that wants the reading; a partition without a
-    /// file is priced at the ratio of those with one. The fill sample ran
-    /// instead: every partition filled from thirty-two ranks three times in
-    /// each of two codings on a thread of its own, 0.4 s at ten million
-    /// keys under 1.25 GiB beside C's first reads, for a form whose bytes
-    /// were on disk to be read, and the reading it gave was bought only
-    /// when the model was next recomputed with it, up to a second later:
-    /// the install came 1.1 s after the crossing, two thirds of a divided
-    /// C of 1.4 s, every read before it raw at seven times the cost. On
-    /// as shipped; `supdb-zsamplefills` is the fill sample for every
-    /// reading, and a store whose files do not cover the keys samples as
-    /// before under both.
-    pub zpages_reading_from_files: bool,
     /// EXPERIMENT: under the controller (`ZPages::Auto`), once the form is
     /// installed, the re-code policy (`zpages_recode`) re-codes the hottest
     /// partitions to the raw tails while they serve, where their decodes
@@ -8555,7 +8536,6 @@ impl Default for Options {
             zpages_cover_resident: true,
             zpages_under_cipher: true,
             zpages_suspect_at_crossing: true,
-            zpages_reading_from_files: true,
             zpages_recode_auto: false,
             zpages_reparse: false,
             zpages_hot_raw: true,
@@ -67036,10 +67016,10 @@ impl Maint {
         }
     }
 
-    /// The reading at the crossing from the form files on disk
-    /// (`Options::zpages_reading_from_files`), in place of a fill sample:
-    /// where the files on disk, with the partitions that stand in for
-    /// theirs, cover the keys the install needs (`ZCover::covers`), each
+    /// The reading at the crossing from the form files on disk, in place of
+    /// a fill sample: where the files on disk, with the partitions that
+    /// stand in for theirs, cover the keys the install needs
+    /// (`ZCover::covers`), each
     /// file's length, pages and resident part are read from its trailer
     /// (`zfile::file_facts`), a few pages of the first few files are
     /// decoded and walked for the cost of a decode
@@ -67050,7 +67030,11 @@ impl Maint {
     /// records. Nothing runs on another thread: the reading stands in this
     /// tick, and the next step buys on it. `false` where the files do not
     /// cover, or one of them is not what its name says, and the fill
-    /// sample runs as before.
+    /// sample runs as before. The fill sample ran for every reading once:
+    /// every partition filled from thirty-two ranks three times in each of
+    /// two codings, 0.4 s at ten million keys under 1.25 GiB beside C's
+    /// first reads, for a form whose bytes were on disk to be read, and the
+    /// install came 1.1 s after the crossing, two thirds of a divided C.
     fn z_reading_from_files(&mut self) -> bool {
         self.z_repick();
         let c = self.z_files_cover();
@@ -67572,7 +67556,7 @@ impl Maint {
             && self.z_sample_ready.is_none()
             && !self.z_sample_held()
         {
-            if self.opts.zpages_reading_from_files && self.z_reading_from_files() {
+            if self.z_reading_from_files() {
                 return;
             }
             self.z_sample_start();

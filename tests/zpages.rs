@@ -12201,30 +12201,24 @@ fn a_buy_before_the_crossing_makes_the_crossing() {
 }
 
 /// The reading at the crossing comes from the form files on disk where
-/// they cover the keys the install needs (`Options::zpages_reading_from_files`):
-/// no fill sample runs, the reading stands in the tick that wanted it, and
-/// the buy on the prediction follows within a few steps -- the model
-/// recomputed at the step after the reading, not at its period. With the
-/// option off the fill sample runs as before and the install still comes;
-/// and where a third of the files are gone the files do not cover, so the
-/// fill sample runs under both.
+/// they cover the keys the install needs: no fill sample runs, the reading
+/// stands in the tick that wanted it, and the buy on the prediction follows
+/// within a few steps -- the model recomputed at the step after the
+/// reading, not at its period; and where a third of the files are gone the
+/// files do not cover, so the fill sample runs.
 #[cfg(target_os = "linux")]
 #[test]
 fn the_reading_at_the_crossing_comes_from_the_files_on_disk() {
-    for (from_files, gone) in [(true, 0usize), (false, 0), (true, usize::MAX)] {
-        let what = format!("reading from files {from_files}, files removed {gone}");
-        let (dir, db, model, inject, raw) = land_store_with(
-            &format!("auto-reading-files-{from_files}-{gone}"),
-            50,
-            |o| {
+    for gone in [0usize, usize::MAX] {
+        let what = format!("files removed {gone}");
+        let (dir, db, model, inject, raw) =
+            land_store_with(&format!("auto-reading-files-{gone}"), 50, |o| {
                 // A store of files: the test removes form files by their
                 // paths.
                 o.one_file = false;
                 o.partition_bytes = Some(160 << 10);
-                o.zpages_reading_from_files = from_files;
                 o.zpages_land_cold_past = false;
-            },
-        );
+            });
         inject.set_budget(raw * 3 / 2);
         assert!(
             tick_until(&db, 400, |c| c.prebuilt >= c.partitions),
@@ -12287,28 +12281,20 @@ fn the_reading_at_the_crossing_comes_from_the_files_on_disk() {
             db.zpage_counts()
         );
         let c = db.zpage_counts();
-        if from_files {
-            assert_eq!(
-                (c.sample_from_files, c.samples),
-                (1, 0),
-                "{what}: the reading from the files, no fill sample: {c:?}"
-            );
-            // The reading stands in the tick that wanted it and the model is
-            // recomputed at the next step: the buy within a few steps of the
-            // crossing, where a model recomputed at its period alone bought
-            // up to ten steps after the reading.
-            assert!(
-                c.sel_steps - before.sel_steps <= 6,
-                "{what}: bought within a few steps of the crossing: {} steps: {c:?}",
-                c.sel_steps - before.sel_steps
-            );
-        } else {
-            assert_eq!(
-                c.sample_from_files, 0,
-                "{what}: no reading from files: {c:?}"
-            );
-            assert!(c.samples >= 1, "{what}: the fill sample ran: {c:?}");
-        }
+        assert_eq!(
+            (c.sample_from_files, c.samples),
+            (1, 0),
+            "{what}: the reading from the files, no fill sample: {c:?}"
+        );
+        // The reading stands in the tick that wanted it and the model is
+        // recomputed at the next step: the buy within a few steps of the
+        // crossing, where a model recomputed at its period alone bought up
+        // to ten steps after the reading.
+        assert!(
+            c.sel_steps - before.sel_steps <= 6,
+            "{what}: bought within a few steps of the crossing: {} steps: {c:?}",
+            c.sel_steps - before.sel_steps
+        );
         assert!(
             tick_until(&db, 400, |c| c.attached >= n),
             "{what}: every partition attached: {:?}",
@@ -21908,7 +21894,6 @@ fn the_reading_from_files_prices_a_stride_file_as_on_disk() {
             |o| {
                 o.zpages_stride = ZStride::Forced;
                 o.partition_bytes = Some(160 << 10);
-                o.zpages_reading_from_files = true;
                 o.zpages_land_cold_past = false;
             },
             |db| {

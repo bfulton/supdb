@@ -764,12 +764,6 @@ pub struct Supdb {
     /// drops them a megabyte at a time (`Options::wal_drop_bytes` zero).
     /// `supdb-walkeep`, durable.
     walkeep: bool,
-    /// The install as it was before it came at the load's end: no
-    /// partition counted as covered but by its form file, and the
-    /// controller suspecting on two hot readings
-    /// (`Options::zpages_cover_resident`, `Options::zpages_suspect_at_crossing`
-    /// off). `supdb-zinstallwaits`, durable.
-    zinstallwaits: bool,
     /// The controller's re-code of its hottest partitions to the raw tails
     /// once the form is installed (`Options::zpages_recode_auto`).
     /// `supdb-zrecodeauto`, durable.
@@ -1388,11 +1382,6 @@ pub struct Supdb {
     /// A form file's fence searched over its keys, the shape before the
     /// flat words (`Options::zpages_fence_words` off): `supdb-fencekeys`.
     fencekeys: bool,
-    /// The controller's reading at the crossing taken by a fill sample of
-    /// every partition however many form files are on disk, the shape
-    /// before the reading from the files (`Options::zpages_reading_from_files`
-    /// off): `supdb-zsamplefills`.
-    zsamplefills: bool,
     /// Every covered partition served from its form file, the shape before
     /// the hot-raw policy (`Options::zpages_hot_raw` off): `supdb-znohotraw`.
     znohotraw: bool,
@@ -2413,12 +2402,6 @@ struct Policy {
     /// drops them a megabyte at a time (`Options::wal_drop_bytes` zero).
     /// `supdb-walkeep`, durable.
     walkeep: bool,
-    /// The install as it was before it came at the load's end: no
-    /// partition counted as covered but by its form file, and the
-    /// controller suspecting on two hot readings
-    /// (`Options::zpages_cover_resident`, `Options::zpages_suspect_at_crossing`
-    /// off). `supdb-zinstallwaits`, durable.
-    zinstallwaits: bool,
     /// The controller's re-code of its hottest partitions to the raw tails
     /// once the form is installed (`Options::zpages_recode_auto`).
     /// `supdb-zrecodeauto`, durable.
@@ -3041,8 +3024,6 @@ struct Policy {
     fillholds: bool,
     /// The fence searched over its keys: `supdb-fencekeys`.
     fencekeys: bool,
-    /// The reading at the crossing by a fill sample: `supdb-zsamplefills`.
-    zsamplefills: bool,
     /// No hot-raw policy: `supdb-znohotraw`.
     znohotraw: bool,
     /// Every operation's wall stamped onto the census window:
@@ -3662,7 +3643,6 @@ impl Default for Policy {
             sealfloorooc: false,
             nofitshort: false,
             walkeep: false,
-            zinstallwaits: false,
             zrecodeauto: false,
             zreparse: false,
             zaheadscans: false,
@@ -3796,7 +3776,6 @@ impl Default for Policy {
             noyield: false,
             fillholds: false,
             fencekeys: false,
-            zsamplefills: false,
             znohotraw: false,
             zbusyevery: false,
             zhotline: false,
@@ -4858,20 +4837,6 @@ impl Supdb {
             path,
             Policy {
                 notrim: true,
-                ..Policy::default()
-            },
-        )
-    }
-
-    /// `supdb` whose controller takes its reading at the crossing by a fill
-    /// sample of every partition, the form files on disk notwithstanding
-    /// (`Options::zpages_reading_from_files` off): the shape before the
-    /// reading from the files.
-    pub fn create_zsamplefills(path: &Path) -> Res<Supdb> {
-        Supdb::with_policy(
-            path,
-            Policy {
-                zsamplefills: true,
                 ..Policy::default()
             },
         )
@@ -7272,20 +7237,6 @@ impl Supdb {
             path,
             Policy {
                 nofitshort: true,
-                ..Policy::default()
-            },
-        )
-    }
-
-    /// `supdb` whose controller counts a partition as covered by its form
-    /// file alone and suspects on two hot readings a second apart
-    /// (`Options::zpages_cover_resident`, `Options::zpages_suspect_at_crossing`
-    /// off): against `supdb` it prices the install brought to the load's end.
-    pub fn create_zinstallwaits(path: &Path) -> Res<Supdb> {
-        Supdb::with_policy(
-            path,
-            Policy {
-                zinstallwaits: true,
                 ..Policy::default()
             },
         )
@@ -10844,7 +10795,6 @@ impl Supdb {
             sealfloorooc,
             nofitshort,
             walkeep,
-            zinstallwaits,
             zrecodeauto,
             zreparse,
             zaheadscans,
@@ -10997,7 +10947,6 @@ impl Supdb {
             noyield,
             fillholds,
             fencekeys,
-            zsamplefills,
             znohotraw,
             zbusyevery,
             zhotline,
@@ -11353,8 +11302,6 @@ impl Supdb {
             },
             seal_floor_out_of_core: sealfloorooc,
             forms_fit_when_short: !nofitshort,
-            zpages_cover_resident: !zinstallwaits,
-            zpages_suspect_at_crossing: !zinstallwaits,
             zpages_recode_auto: zrecodeauto,
             zpages_reparse: zreparse,
             zpages_ahead_past_scans: zaheadscans,
@@ -11662,7 +11609,6 @@ impl Supdb {
             zpages_memo_first: zmemofirst,
             zpages_fence_tree: zfencetree,
             zpages_fence_words: !fencekeys,
-            zpages_reading_from_files: !zsamplefills,
             zpages_hot_raw: !znohotraw,
             zpages_census_sample: !zbusyevery,
             zpages_hot_raw_slack: !zhotline,
@@ -11990,7 +11936,6 @@ impl Supdb {
             sealfloorooc,
             nofitshort,
             walkeep,
-            zinstallwaits,
             zrecodeauto,
             zreparse,
             zaheadscans,
@@ -12143,7 +12088,6 @@ impl Supdb {
             noyield,
             fillholds,
             fencekeys,
-            zsamplefills,
             znohotraw,
             zbusyevery,
             zhotline,
@@ -12962,9 +12906,6 @@ impl Engine for Supdb {
         if self.fencekeys {
             return "supdb-fencekeys";
         }
-        if self.zsamplefills {
-            return "supdb-zsamplefills";
-        }
         if self.znohotraw {
             return "supdb-znohotraw";
         }
@@ -13703,9 +13644,6 @@ impl Engine for Supdb {
         }
         if self.walkeep {
             return "supdb-walkeep";
-        }
-        if self.zinstallwaits {
-            return "supdb-zinstallwaits";
         }
         if self.zrecodeauto {
             return "supdb-zrecodeauto";
@@ -16947,7 +16885,6 @@ pub fn guarantee(arm: &str) -> Option<Guarantee> {
         | "supdb-cacheraw"
         | "supdb-nofitshort"
         | "supdb-walkeep"
-        | "supdb-zinstallwaits"
         | "supdb-zrecodeauto"
         | "supdb-zreparse"
         | "supdb-zaheadscans"
@@ -17094,7 +17031,6 @@ pub fn guarantee(arm: &str) -> Option<Guarantee> {
         | "supdb-fillholds"
         | "supdb-notrim"
         | "supdb-fencekeys"
-        | "supdb-zsamplefills"
         | "supdb-znohotraw"
         | "supdb-zbusyevery"
         | "supdb-zhotline"
@@ -18372,7 +18308,6 @@ pub fn open(arm: &str, dir: &Path, map_gb: usize) -> Res<Box<dyn Engine>> {
         "supdb-fillholds" => supdb_arm(Supdb::create_fillholds, dir)?,
         "supdb-notrim" => supdb_arm(Supdb::create_notrim, dir)?,
         "supdb-fencekeys" => supdb_arm(Supdb::create_fencekeys, dir)?,
-        "supdb-zsamplefills" => supdb_arm(Supdb::create_zsamplefills, dir)?,
         "supdb-znohotraw" => supdb_arm(Supdb::create_znohotraw, dir)?,
         "supdb-zbusyevery" => supdb_arm(Supdb::create_zbusyevery, dir)?,
         "supdb-zhotline" => supdb_arm(Supdb::create_zhotline, dir)?,
@@ -19277,7 +19212,6 @@ pub fn open(arm: &str, dir: &Path, map_gb: usize) -> Res<Box<dyn Engine>> {
         "supdb-cacheraw" => supdb_arm(Supdb::create_cacheraw, dir)?,
         "supdb-nofitshort" => supdb_arm(Supdb::create_nofitshort, dir)?,
         "supdb-walkeep" => supdb_arm(Supdb::create_walkeep, dir)?,
-        "supdb-zinstallwaits" => supdb_arm(Supdb::create_zinstallwaits, dir)?,
         "supdb-zrecodeauto" => supdb_arm(Supdb::create_zrecodeauto, dir)?,
         "supdb-zreparse" => supdb_arm(Supdb::create_zreparse, dir)?,
         "supdb-zaheadscans" => supdb_arm(Supdb::create_zaheadscans, dir)?,
@@ -22923,7 +22857,6 @@ mod tests {
             "supdb-cacheraw",
             "supdb-nofitshort",
             "supdb-walkeep",
-            "supdb-zinstallwaits",
             "supdb-zrecodeauto",
             "supdb-zparse",
             "supdb-zreparse",
@@ -22973,17 +22906,6 @@ mod tests {
                         b.merge_bytes_cap,
                         b.upkeep
                     )
-                );
-            }
-            {
-                let z = Supdb::create_zinstallwaits(&dir("zinstallwaits")).unwrap();
-                assert_eq!(z.features(), base.features());
-                let o = z.db.as_ref().unwrap().options();
-                assert!(b.zpages_cover_resident && b.zpages_suspect_at_crossing);
-                assert!(!o.zpages_cover_resident && !o.zpages_suspect_at_crossing);
-                assert_eq!(
-                    (o.zpages_ahead_builders, o.zpages, o.wal_drop_bytes),
-                    (b.zpages_ahead_builders, b.zpages, b.wal_drop_bytes)
                 );
             }
             {
@@ -24767,8 +24689,8 @@ mod tests {
                 let o = z.db.as_ref().unwrap().options();
                 assert!(!o.zpages_hot_raw && b.zpages_hot_raw);
                 assert_eq!(
-                    (o.zpages, o.zpages_recode_auto, o.zpages_reading_from_files),
-                    (b.zpages, b.zpages_recode_auto, b.zpages_reading_from_files)
+                    (o.zpages, o.zpages_recode_auto),
+                    (b.zpages, b.zpages_recode_auto)
                 );
             }
             {

@@ -6759,8 +6759,7 @@ pub(super) struct ZEvents {
     /// form files on disk, in place of a sample (`Maint::z_sample_refresh`).
     pub sample_refreshed: AtomicU64,
     /// Readings made from the form files on disk at the crossing, in place
-    /// of a fill sample (`Maint::z_reading_from_files`,
-    /// `Options::zpages_reading_from_files`).
+    /// of a fill sample (`Maint::z_reading_from_files`).
     pub sample_from_files: AtomicU64,
     /// The price of a fault the last reading carried, nanoseconds, zero
     /// where its timed decodes took none: their wait over their faults, or
