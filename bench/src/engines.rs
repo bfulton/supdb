@@ -1222,9 +1222,6 @@ pub struct Supdb {
     /// The merge trigger this arm pins, or none for the engine's own.
     /// `supdb-l0`.
     l0: Option<usize>,
-    /// The writer's operations pin nothing and hold no state, as before
-    /// `Options::writer_pins`. `supdb-nopin`.
-    nopin: bool,
     /// The sweep fences for the pins and the pin does not
     /// (`Options::asym_pins`). `supdb-asympin`.
     asympin: bool,
@@ -1331,10 +1328,6 @@ pub struct Supdb {
     /// under the median partition's (`Options::zpages_hot_cold_back` on):
     /// `supdb-zhotcoldback`.
     zhotcoldback: bool,
-    /// The sweep at an operation's end walking the reader table at every
-    /// end a pin holds it, the shape before the sweep remembered the pin
-    /// (`Options::sweep_remembers_pin` off): `supdb-sweepwalks`.
-    sweepwalks: bool,
     /// The hot-raw policy's skew bar relaxed to the median where the
     /// candidate fits the room (`Options::zpages_hot_skew_room` on):
     /// `supdb-zhotskewroom`.
@@ -2693,9 +2686,6 @@ struct Policy {
     /// The merge trigger this arm pins, or none for the engine's own.
     /// `supdb-l0`.
     l0: Option<usize>,
-    /// The writer's operations pin nothing and hold no state, as before
-    /// `Options::writer_pins`. `supdb-nopin`.
-    nopin: bool,
     /// The sweep fences for the pins and the pin does not
     /// (`Options::asym_pins`). `supdb-asympin`.
     asympin: bool,
@@ -2792,8 +2782,6 @@ struct Policy {
     zrecorddefault: bool,
     /// The cold way back: `supdb-zhotcoldback`.
     zhotcoldback: bool,
-    /// The reader table walked at every end: `supdb-sweepwalks`.
-    sweepwalks: bool,
     /// The skew bar relaxed where the room fits: `supdb-zhotskewroom`.
     zhotskewroom: bool,
     /// The room's bar under a margin: `supdb-zhotskewroomhyst`.
@@ -3298,7 +3286,6 @@ impl Default for Policy {
             lagcap: 0,
             sealcap: None,
             l0: None,
-            nopin: false,
             asympin: false,
             extsval: false,
             piecesonly: false,
@@ -3459,7 +3446,6 @@ impl Default for Policy {
             zseekseed: false,
             zrecorddefault: false,
             zhotcoldback: false,
-            sweepwalks: false,
             zhotskewroom: false,
             zhotskewroomhyst: false,
             zrewarmwait: false,
@@ -4632,19 +4618,6 @@ impl Supdb {
             Policy {
                 zhotcoldback: true,
                 znohotfill: true,
-                ..Policy::default()
-            },
-        )
-    }
-
-    /// `supdb` whose sweep at an operation's end walks the reader table at
-    /// every end a pin holds it (`Options::sweep_remembers_pin` off): the
-    /// shape before the sweep remembered the pin.
-    pub fn create_sweepwalks(path: &Path) -> Res<Supdb> {
-        Supdb::with_policy(
-            path,
-            Policy {
-                sweepwalks: true,
                 ..Policy::default()
             },
         )
@@ -5997,20 +5970,6 @@ impl Supdb {
                         .and_then(|v| v.parse().ok())
                         .unwrap_or(supdb::Options::default().l0_trigger),
                 ),
-                ..Policy::default()
-            },
-        )
-    }
-
-    /// `supdb` with the writer's operations pinning nothing, as before
-    /// `Options::writer_pins`, and so with the segment work inline, since
-    /// an unpinned writer must be the one publisher: against
-    /// `supdb-inlinemaint` it prices the pins alone.
-    pub fn create_nopin(path: &Path) -> Res<Supdb> {
-        Supdb::with_policy(
-            path,
-            Policy {
-                nopin: true,
                 ..Policy::default()
             },
         )
@@ -9874,7 +9833,6 @@ impl Supdb {
             lagcap,
             sealcap,
             l0,
-            nopin,
             asympin,
             extsval,
             piecesonly,
@@ -10053,7 +10011,6 @@ impl Supdb {
             zseekseed,
             zrecorddefault,
             zhotcoldback,
-            sweepwalks,
             zhotskewroom,
             zhotskewroomhyst,
             zrewarmwait,
@@ -10568,7 +10525,6 @@ impl Supdb {
             // cannot hold the whole of a store smaller than the floor.
             seal_max_pct: sealcap.unwrap_or(base_seal_max_pct),
             l0_trigger: l0.unwrap_or(supdb::Options::default().l0_trigger),
-            writer_pins: !nopin,
             asym_pins: asympin,
             exts_by_value: extsval,
             point_via_ord: ordread,
@@ -10666,7 +10622,6 @@ impl Supdb {
             zpages_hot_fill_quiet: zhotfillquiet,
             zpages_seek_seeds: zseekseed,
             zpages_hot_cold_back: zhotcoldback,
-            sweep_remembers_pin: !sweepwalks,
             zpages_hot_skew_room: zhotskewroom || zhotskewroomhyst,
             zpages_hot_room_margin_pct: if zhotskewroomhyst { 5 } else { 0 },
             zpages_rewarm_beside_merges: zrewarmbeside,
@@ -10783,7 +10738,7 @@ impl Supdb {
             forms_pieces_only: piecesonly,
             // Unpinned, the writer must be the one publisher, as it was
             // when the pins were priced: the store refuses the pair.
-            publish_in_background: !(inlinemaint || nopin),
+            publish_in_background: !inlinemaint,
             adaptive_shape: shape,
             seal_rotates_wal: rotate,
             frozen_snaps: !nofrozen,
@@ -10917,7 +10872,6 @@ impl Supdb {
             lagcap,
             sealcap,
             l0,
-            nopin,
             asympin,
             extsval,
             piecesonly,
@@ -11096,7 +11050,6 @@ impl Supdb {
             zseekseed,
             zrecorddefault,
             zhotcoldback,
-            sweepwalks,
             zhotskewroom,
             zhotskewroomhyst,
             zrewarmwait,
@@ -11889,9 +11842,6 @@ impl Engine for Supdb {
         if self.zhotcoldback {
             return "supdb-zhotcoldback";
         }
-        if self.sweepwalks {
-            return "supdb-sweepwalks";
-        }
         if self.zhotskewroom {
             return "supdb-zhotskewroom";
         }
@@ -12176,9 +12126,6 @@ impl Engine for Supdb {
         }
         if self.l0.is_some() {
             return "supdb-l0";
-        }
-        if self.nopin {
-            return "supdb-nopin";
         }
         if self.asympin {
             return "supdb-asympin";
@@ -13394,7 +13341,7 @@ impl Engine for Supdb {
             ("hot_starts", hs[0] as f64),
             ("hot_copy_starts", hs[1] as f64),
             // The sweeps answered from the remembered pin without a walk
-            // of the reader table (`Options::sweep_remembers_pin`).
+            // of the reader table (`Readers::oldest_for`).
             ("sweep_shortcuts", db.sweep_shortcuts() as f64),
             // The groups the walks decoded into their cursors' own buffers
             // (`Options::zpages_walk_owns_decodes`), over every form file.
@@ -15569,7 +15516,6 @@ pub fn guarantee(arm: &str) -> Option<Guarantee> {
         | "supdb-nocacheautozpageseager"
         | "supdb-cache256"
         | "supdb-l0"
-        | "supdb-nopin"
         | "supdb-asympin"
         | "supdb-extsval"
         | "supdb-piecesonly"
@@ -15770,7 +15716,6 @@ pub fn guarantee(arm: &str) -> Option<Guarantee> {
         | "supdb-zseekseed"
         | "supdb-zrecord"
         | "supdb-zhotcoldback"
-        | "supdb-sweepwalks"
         | "supdb-zhotskewroom"
         | "supdb-zhotskewroomhyst"
         | "supdb-zrewarmwait"
@@ -16847,7 +16792,6 @@ pub fn open(arm: &str, dir: &Path, map_gb: usize) -> Res<Box<dyn Engine>> {
         )?,
         "supdb-ingestleave" => supdb_arm(Supdb::create_ingest_leave, dir)?,
         "supdb-l0" => supdb_arm(Supdb::create_l0, dir)?,
-        "supdb-nopin" => supdb_arm(Supdb::create_nopin, dir)?,
         "supdb-asympin" => supdb_arm(Supdb::create_asympin, dir)?,
         "supdb-extsval" => supdb_arm(Supdb::create_extsval, dir)?,
         "supdb-piecesonly" => supdb_arm(Supdb::create_piecesonly, dir)?,
@@ -17288,7 +17232,6 @@ pub fn open(arm: &str, dir: &Path, map_gb: usize) -> Res<Box<dyn Engine>> {
         "supdb-zseekseed" => supdb_arm(Supdb::create_zseekseed, dir)?,
         "supdb-zrecord" => supdb_arm(Supdb::create_zrecord, dir)?,
         "supdb-zhotcoldback" => supdb_arm(Supdb::create_zhotcoldback, dir)?,
-        "supdb-sweepwalks" => supdb_arm(Supdb::create_sweepwalks, dir)?,
         "supdb-zhotskewroom" => supdb_arm(Supdb::create_zhotskewroom, dir)?,
         "supdb-zhotskewroomhyst" => supdb_arm(Supdb::create_zhotskewroomhyst, dir)?,
         "supdb-zrewarmwait" => supdb_arm(Supdb::create_zrewarmwait, dir)?,
@@ -19921,7 +19864,6 @@ mod tests {
         assert_eq!(a.promote, b.promote);
         assert_eq!(a.sync, b.sync);
         assert_eq!(a.upkeep, b.upkeep);
-        assert_eq!(a.writer_pins, b.writer_pins);
         assert_eq!(a.publish_in_background, b.publish_in_background);
         // The default is untouched: the shipping arm reads as it always did.
         assert!(!supdb::Options::default().point_via_ord);
@@ -20064,11 +20006,6 @@ mod tests {
         assert_eq!(a.promote, b.promote);
         assert_eq!(a.sync, b.sync);
         assert_eq!(a.upkeep, b.upkeep);
-        assert_eq!(a.writer_pins, b.writer_pins);
-        assert!(
-            a.writer_pins,
-            "the form is refused beside an unpinned writer"
-        );
         assert_eq!(a.publish_in_background, b.publish_in_background);
         // The default is the controller's, and the shipping arm carries it.
         assert_eq!(supdb::Options::default().zpages, supdb::ZPages::Auto);
@@ -22042,13 +21979,6 @@ mod tests {
                 assert!(!o.zpages_settle_joins_asks && b.zpages_settle_joins_asks);
             }
             {
-                let z = Supdb::create_sweepwalks(&dir("sweepwalks")).unwrap();
-                assert_eq!(z.name(), "supdb-sweepwalks");
-                assert_eq!(z.features(), base.features());
-                let o = z.db.as_ref().unwrap().options();
-                assert!(!o.sweep_remembers_pin && b.sweep_remembers_pin);
-            }
-            {
                 let z = Supdb::create_zhotskewroom(&dir("zhotskewroom")).unwrap();
                 assert_eq!(z.name(), "supdb-zhotskewroom");
                 assert_eq!(z.features(), base.features());
@@ -23641,7 +23571,6 @@ mod tests {
             assert_eq!(a.promote, b.promote);
             assert_eq!(a.sync, b.sync);
             assert_eq!(a.upkeep, b.upkeep);
-            assert_eq!(a.writer_pins, b.writer_pins);
             assert_eq!(a.publish_in_background, b.publish_in_background);
             drop(arm);
             let opened = root.join(format!("open-{arm_dir}"));
@@ -24060,7 +23989,6 @@ mod tests {
         assert_eq!(a.promote, b.promote);
         assert_eq!(a.sync, b.sync);
         assert_eq!(a.upkeep, b.upkeep);
-        assert_eq!(a.writer_pins, b.writer_pins);
         assert_eq!(a.publish_in_background, b.publish_in_background);
         // The engine's own default is the drop on, so an arm that pins
         // nothing has it.

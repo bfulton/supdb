@@ -1602,51 +1602,6 @@ fn the_probe_merge_arm_passes_the_same_oracle() {
     oracle(false, supdb::Upkeep::Inline);
 }
 
-/// An unpinned writer holds no state it reads, so a store refuses it
-/// beside any other thread that publishes: the segment work on its own
-/// thread replaced and freed a state under the writer's read, and the
-/// suite's unpinned arm faulted in a third of its runs. Inline, where the
-/// writer is the one publisher, it is the shape the pins were priced
-/// against, and the model holds there.
-#[test]
-fn an_unpinned_writer_is_refused_beside_another_publisher() {
-    let refused = |name: &str, opts: Options| {
-        let d = dir(name);
-        let e = Db::create(&d, opts.clone())
-            .err()
-            .expect("create refuses it");
-        assert!(e.to_string().contains("writer_pins"), "{e}");
-        assert!(Db::open(&d, opts).is_err(), "and so does open");
-    };
-    refused(
-        "nopin-background",
-        Options {
-            writer_pins: false,
-            ..common::options()
-        },
-    );
-    refused(
-        "nopin-keeper",
-        Options {
-            writer_pins: false,
-            publish_in_background: false,
-            snapshot_keeper: true,
-            ..common::options()
-        },
-    );
-    oracle_in(
-        "oracle-nopin-inline",
-        Options {
-            writer_pins: false,
-            publish_in_background: false,
-            // The forced form is refused beside an unpinned writer
-            // (`check_options`); the controller is inert there.
-            zpages: supdb::ZPages::Auto,
-            ..common::options()
-        },
-    );
-}
-
 /// The oracle with seals that take their end from the live WAL
 /// (`seal_rotates_wal` off) and a log small enough to rotate by size
 /// every few commits: files that span landed seals, files closed and
@@ -6984,27 +6939,25 @@ fn a_block_shed_from_any_partition_takes_its_published_form_with_it() {
 }
 
 /// The sweep at an operation's end that a handle's pin holds remembers
-/// the pin (`Options::sweep_remembers_pin`): under a snapshot held, a
+/// the pin (`Readers::oldest_for`): under a snapshot held, a
 /// flush's landing retires the state before it and the writer's scans
 /// after a commit retire snapshots, and each waits for that pin, so the
 /// sweep at every operation's end finds it. The first finds it by a walk
 /// of the reader table and remembers the slot; the ends after read that
 /// slot and walk no more -- the shortcut count moves by about one an
-/// operation and the walk count by a few, where without the option every
-/// end walks and nothing is shortcut. The pin released, the next
+/// operation and the walk count by a few. The pin released, the next
 /// commit's and scan's sweeps free what waited, so what the shortcut
 /// skipped was a walk and not a free.
 #[test]
 fn a_sweep_a_pin_holds_remembers_the_pin() {
-    for on in [true, false] {
-        let name = format!("sweep-remembers-{on}");
+    {
+        let name = "sweep-remembers".to_string();
         let (mut db, r, mut m) = shed_over_published_forms_with(&name, false, |o| {
             // The commits leave their batches to the reads, so the pin
             // this test releases is the one thing a sweep waits behind
             // (`Options::forms_settle_every` and `forms_settle_builds` off).
             o.forms_settle_every = false;
             o.forms_settle_builds = false;
-            o.sweep_remembers_pin = on;
             // Room for the forms the rounds below make: nothing sheds.
             o.scan_cache_bytes = 1 << 30;
         });
@@ -7037,17 +6990,10 @@ fn a_sweep_a_pin_holds_remembers_the_pin() {
         }
         let hits = db.sweep_shortcuts() - hits0;
         let walks = db.sweep_walks() - walks0;
-        if on {
-            assert!(
-                hits >= ops / 2 && walks <= ops / 4,
-                "{name}: the ends read the remembered pin: {hits} shortcuts, {walks} walks over {ops} operations"
-            );
-        } else {
-            assert!(
-                hits == 0 && walks >= ops,
-                "{name}: every end walks: {hits} shortcuts, {walks} walks over {ops} operations"
-            );
-        }
+        assert!(
+            hits >= ops / 2 && walks <= ops / 4,
+            "{name}: the ends read the remembered pin: {hits} shortcuts, {walks} walks over {ops} operations"
+        );
         let held = db.retired_waiting();
         assert!(
             held.0 + held.1 > 0,

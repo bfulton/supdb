@@ -15,7 +15,7 @@
 //! not been asked to open a store; the native legs run this file.
 //!
 //! The controller (`ZPages::Auto`) runs on Linux alone and is inert anywhere
-//! else, which `auto_degrades_where_it_cannot_run_and_always_is_refused_beside_an_unpinned_writer`
+//! else, which `auto_degrades_where_it_cannot_run`
 //! holds; the tests of what it does, and the helpers they share, are
 //! Linux's, as are the ones that read what the kernel's page cache holds.
 
@@ -1582,37 +1582,6 @@ fn a_partition_with_a_run_in_a_block_is_declined_and_read_raw() {
     let keys: Vec<Vec<u8>> = model.keys().step_by(9).cloned().collect();
     check(&db, &model, &keys, "blocks");
     let _ = std::fs::remove_dir_all(&dir);
-}
-
-#[test]
-fn the_form_is_refused_beside_an_unpinned_writer_and_off_is_not() {
-    let dir = scratch("refused");
-    let unpinned = |z: ZPages| Options {
-        zpages: z,
-        writer_pins: false,
-        publish_in_background: false,
-        ..Options::default()
-    };
-    let e = match Db::create(&dir, unpinned(ZPages::Always)) {
-        Ok(_) => panic!("Always beside an unpinned writer opened"),
-        Err(e) => e,
-    };
-    assert!(e.to_string().contains("writer_pins"), "{e}");
-    let _ = std::fs::remove_dir_all(&dir);
-    let dir = scratch("refused-off");
-    assert!(Db::create(&dir, unpinned(ZPages::Off)).is_ok());
-    let _ = std::fs::remove_dir_all(&dir);
-    // Pinned, with the segment work on a thread or inline, it opens.
-    for background in [true, false] {
-        let dir = scratch(&format!("refused-pinned-{background}"));
-        let opts = Options {
-            zpages: ZPages::Always,
-            publish_in_background: background,
-            ..Options::default()
-        };
-        assert!(Db::create(&dir, opts).is_ok());
-        let _ = std::fs::remove_dir_all(&dir);
-    }
 }
 
 /// The raw form alone: the engine's defaults with the second form off,
@@ -7545,27 +7514,18 @@ fn an_auto_store_that_fits_builds_nothing() {
     }
 }
 
-/// `Auto` where the controller cannot run opens and is inert, counted;
-/// `Always` beside an unpinned writer is refused, as before.
+/// `Auto` where the controller cannot run opens and is inert, counted.
 #[test]
-fn auto_degrades_where_it_cannot_run_and_always_is_refused_beside_an_unpinned_writer() {
-    for (name, extra) in [
-        (
-            "auto-inline",
-            &(|o: &mut Options| o.publish_in_background = false) as &dyn Fn(&mut Options),
-        ),
-        ("auto-nopin", &|o: &mut Options| {
-            o.writer_pins = false;
-            o.publish_in_background = false;
-        }),
-    ] {
+fn auto_degrades_where_it_cannot_run() {
+    {
+        let name = "auto-inline";
         let dir = scratch(name);
-        let mut o = Options {
+        let o = Options {
             zpages: ZPages::Auto,
             zpages_min_bytes: 0,
+            publish_in_background: false,
             ..Options::default()
         };
-        extra(&mut o);
         let mut db = Db::create(&dir, o).unwrap();
         let model = ordered_load(&mut db, 3000, 0x1B);
         db.settle().unwrap();
@@ -7582,18 +7542,6 @@ fn auto_degrades_where_it_cannot_run_and_always_is_refused_beside_an_unpinned_wr
         db.close().unwrap();
         let _ = std::fs::remove_dir_all(&dir);
     }
-    let dir = scratch("always-nopin");
-    let r = Db::create(
-        &dir,
-        Options {
-            zpages: ZPages::Always,
-            writer_pins: false,
-            publish_in_background: false,
-            ..Options::default()
-        },
-    );
-    assert!(r.is_err(), "Always beside an unpinned writer is refused");
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 /// The model moves the rung: a budget injected under the partitions'

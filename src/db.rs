@@ -649,9 +649,7 @@ pub enum ZPages {
     Off,
     /// Every partition has a form file, and every point read and count of a
     /// partition is answered from it. Built on demand by
-    /// `Db::zpages_settle`, attached at open, and refused beside
-    /// `writer_pins` off, since the cell it is read through is freed with
-    /// its segment under the epoch. A partition that has none -- being
+    /// `Db::zpages_settle` and attached at open. A partition that has none -- being
     /// built, declined, damaged -- is read from the raw form and counted.
     /// Scans of a covered partition are walked over the raw form, and
     /// counted, so a form file's mapping is advised `MADV_RANDOM` in every
@@ -1625,17 +1623,6 @@ pub struct Options {
     /// cache, which caches partition blocks, had nothing to hold. `false`
     /// is that shape, kept as an arm.
     pub flush_schedules: bool,
-    /// EXPERIMENT: the writer pins its slot in the reader table and holds
-    /// the state for the length of each of its operations, as a handle
-    /// does for each read. Nothing needs it while the writer is the only
-    /// thread that publishes; it is what lets another thread publish
-    /// without freeing or swapping a state under the writer. `false` is
-    /// the shape before it, kept to price it, and a store refuses it
-    /// beside another publisher -- `publish_in_background` or
-    /// `snapshot_keeper` -- since the segment work would free a state the
-    /// writer is reading, and under a cipher (`Encryption::Cipher`), whose
-    /// cache gives back the pages of a file no pinned reader holds.
-    pub writer_pins: bool,
     /// EXPERIMENT: the pin is a plain store and a load, and the sweep
     /// that frees fences for it, once, through `membarrier` (`Readers`);
     /// off, every pin fences -- a sequentially consistent store of the
@@ -1793,7 +1780,7 @@ pub struct Options {
     /// load of this field and one branch not taken. `Always` is the arm
     /// that prices the form (`supdb-nocachezpages`): a point read and a
     /// count of a partition is answered from its form file, a scan of one
-    /// is not. Refused beside `writer_pins` off.
+    /// is not.
     pub zpages: ZPages,
     /// The record bytes below which `ZPages::Always` declines a partition
     /// and writes no file. A test's: it lowers the floor to build form files
@@ -6548,18 +6535,6 @@ pub struct Options {
     /// sitting, the scans level: unresolved, so the two placements, the
     /// shape before, are the default and `supdb-zseekseed` is the arm.
     pub zpages_seek_seeds: bool,
-    /// The sweep at an operation's end that a pin holds remembers the pin
-    /// (`Readers::oldest_for`): the slot the last walk of the reader table
-    /// found pinned below every tag waiting, and the epoch it was pinned
-    /// at. While that slot still shows that epoch nothing retired since
-    /// can be freed -- a later pin is at a later epoch and a later
-    /// retirement has a later tag -- so the next end reads that one slot
-    /// and walks nothing. The walk was every slot of the table in
-    /// sequentially consistent loads at every operation's end for as long
-    /// as the pin stood, the upkeep thread's passes through E at ten
-    /// million keys under 1.25 GiB, 3% of its thread (`docs/engine.md`).
-    /// Off is the walk at every end; `supdb-sweepwalks` is the arm.
-    pub sweep_remembers_pin: bool,
     /// How many of a settle's keys ahead the header of the block form a
     /// key will be patched into is asked for, before the form's buffers
     /// are, one group ahead (0: the buffers alone, as it was). The patch
@@ -7644,7 +7619,6 @@ impl Default for Options {
             partition_bytes: Some(64 << 20),
             promote: true,
             flush_schedules: true,
-            writer_pins: true,
             asym_pins: false,
             exts_by_value: false,
             point_lone: true,
@@ -7947,7 +7921,6 @@ impl Default for Options {
             zpages_hot_fill_quiet: false,
             zpages_hot_fill_resident_first: false,
             zpages_seek_seeds: false,
-            sweep_remembers_pin: true,
             settle_form_ahead: 6,
             settle_seek_ahead: 8,
             settle_patch_at_cut: true,
@@ -17561,9 +17534,6 @@ pub(crate) struct Readers {
     /// Barriers issued, for the suite: each is a system call and an
     /// interrupt of every core a thread of the process is on.
     barriers: AtomicU64,
-    /// Whether a sweep remembers the pin that held it
-    /// (`Options::sweep_remembers_pin`).
-    remember: bool,
     /// The slot the last walk found pinned below every tag the sweep had
     /// waiting, and the epoch it was pinned at; a slot index past the
     /// table when the last walk found none.
@@ -17872,7 +17842,7 @@ impl Readers {
     /// `asym`: the sweep fences for the pins where the kernel lets it
     /// (`Options::asym_pins`); otherwise every pin fences and no sweep
     /// does.
-    fn new(asym: bool, remember: bool) -> Readers {
+    fn new(asym: bool) -> Readers {
         Readers {
             epoch: AtomicU64::new(1),
             slots: (0..ENGINE_SLOTS + READER_SLOTS)
@@ -17880,7 +17850,6 @@ impl Readers {
                 .collect(),
             asym: asym && register_membarrier(),
             barriers: AtomicU64::new(0),
-            remember,
             block_slot: AtomicUsize::new(usize::MAX),
             block_epoch: AtomicU64::new(0),
             block_hits: AtomicU64::new(0),
@@ -17987,20 +17956,18 @@ impl Readers {
     /// trusted only to say no: a pin it sees may be gone, which frees
     /// nothing early; a pin it misses is the barrier's to find.
     fn oldest_for(&self, lowest: u64) -> u64 {
-        // The pin the last walk found below every tag, still there
-        // (`Options::sweep_remembers_pin`): no pin since is below it, no
-        // tag since is at or below it, so the answer is the one that walk
-        // gave and nothing it did not free is freed now. A slot read as
-        // still pinned that has left frees nothing early; one read as
-        // gone takes the walk below, which is the protocol's.
-        if self.remember {
-            let at = self.block_slot.load(AtomicOrdering::Relaxed);
-            if let Some(slot) = self.slots.get(at) {
-                let epoch = self.block_epoch.load(AtomicOrdering::Relaxed);
-                if epoch < lowest && slot.epoch.load(AtomicOrdering::Relaxed) == epoch {
-                    self.block_hits.fetch_add(1, AtomicOrdering::Relaxed);
-                    return epoch;
-                }
+        // The pin the last walk found below every tag, still there: no
+        // pin since is below it, no tag since is at or below it, so the
+        // answer is the one that walk gave and nothing it did not free is
+        // freed now. A slot read as still pinned that has left frees
+        // nothing early; one read as gone takes the walk below, which is
+        // the protocol's.
+        let at = self.block_slot.load(AtomicOrdering::Relaxed);
+        if let Some(slot) = self.slots.get(at) {
+            let epoch = self.block_epoch.load(AtomicOrdering::Relaxed);
+            if epoch < lowest && slot.epoch.load(AtomicOrdering::Relaxed) == epoch {
+                self.block_hits.fetch_add(1, AtomicOrdering::Relaxed);
+                return epoch;
             }
         }
         let (oldest, at) = if self.asym {
@@ -18015,17 +17982,15 @@ impl Readers {
             self.walk_pins_at()
         };
         self.block_walks.fetch_add(1, AtomicOrdering::Relaxed);
-        if self.remember {
-            // The lowest pin seen is remembered whether or not it is below
-            // this list's tags: a sweep of another list, whose tags are
-            // all above it, is answered by it next. Cleared only where no
-            // slot was pinned at all.
-            if oldest == u64::MAX {
-                self.block_slot.store(usize::MAX, AtomicOrdering::Relaxed);
-            } else {
-                self.block_epoch.store(oldest, AtomicOrdering::Relaxed);
-                self.block_slot.store(at, AtomicOrdering::Relaxed);
-            }
+        // The lowest pin seen is remembered whether or not it is below this
+        // list's tags: a sweep of another list, whose tags are all above
+        // it, is answered by it next. Cleared only where no slot was pinned
+        // at all.
+        if oldest == u64::MAX {
+            self.block_slot.store(usize::MAX, AtomicOrdering::Relaxed);
+        } else {
+            self.block_epoch.store(oldest, AtomicOrdering::Relaxed);
+            self.block_slot.store(at, AtomicOrdering::Relaxed);
         }
         oldest
     }
@@ -21168,34 +21133,6 @@ fn check_options(opts: &Options) -> Result<()> {
              it needs SyncPolicy::Explicit with held_frames off, Upkeep::Inline, and \
              scan_block_cache, snapshot_keeper, forms_off_snapshot_kept, snapshot_runs, \
              direct_ingest, put_in_place and adaptive_shape off",
-        ));
-    }
-    if !opts.writer_pins && (opts.publish_in_background || opts.snapshot_keeper) {
-        return Err(err(
-            "writer_pins off needs every publish on the writer's thread: \
-             publish_in_background and snapshot_keeper off",
-        ));
-    }
-    // The cache a store under a cipher reads through gives a file's pages
-    // back once no reader pinned in the reader table could hold them
-    // (`pager`), and a writer that pins nothing is a reader it does not
-    // wait for: its reads, and the landings the segment work makes on its
-    // thread, would be of pages given back under them. The same rule as
-    // the one above, with the cache as the other party that frees.
-    if !opts.writer_pins && matches!(opts.encryption, Encryption::Cipher(_)) {
-        return Err(err(
-            "writer_pins off cannot run under a cipher: the store's cache gives a file's \
-             pages back once no pinned reader holds them, and an unpinned writer reads \
-             them unpinned",
-        ));
-    }
-    // The form file a read follows hangs on its segment and is freed with it,
-    // through the epoch like every state a publish replaces; a writer that
-    // pins nothing reads a segment nobody keeps alive for it.
-    if opts.zpages == ZPages::Always && !opts.writer_pins {
-        return Err(err(
-            "zpages Always needs writer_pins: a form file is freed with its segment \
-             under the epoch, and an unpinned writer reads it unpinned",
         ));
     }
     // The re-code policies tell a served form file's coding by
@@ -26166,8 +26103,7 @@ fn z_drop_now(opts: &Options, shared: &Shared) -> bool {
 /// read follows is freed through the epoch, and the budget is read from
 /// the platform's files.
 fn z_auto_inert(opts: &Options) -> bool {
-    opts.zpages == ZPages::Auto
-        && (!opts.publish_in_background || !opts.writer_pins || !cfg!(target_os = "linux"))
+    opts.zpages == ZPages::Auto && (!opts.publish_in_background || !cfg!(target_os = "linux"))
 }
 
 struct Shared {
@@ -30976,7 +30912,7 @@ impl Reader {
         if depth > 0 {
             return Entered { r: self };
         }
-        if let Some(slot) = self.pin_slot.filter(|_| self.opts.writer_pins) {
+        if let Some(slot) = self.pin_slot {
             // The writer's own: pinned and held, and read as its latest,
             // with no watermark and no log bound.
             self.shared.readers.pin(slot);
@@ -31057,7 +30993,7 @@ impl Reader {
         if depth > 0 {
             return;
         }
-        if let Some(slot) = self.pin_slot.filter(|_| self.opts.writer_pins) {
+        if let Some(slot) = self.pin_slot {
             self.held
                 .store(std::ptr::null_mut(), AtomicOrdering::Relaxed);
             self.shared.readers.unpin(slot);
@@ -31163,9 +31099,7 @@ impl Reader {
     #[cold]
     #[inline(never)]
     fn paged_begin(&self, p: &pager::Pager, snap: bool) {
-        let slot = self
-            .slot
-            .or(self.pin_slot.filter(|_| self.opts.writer_pins));
+        let slot = self.slot.or(self.pin_slot);
         let Some(slot) = slot else {
             return;
         };
@@ -34984,9 +34918,7 @@ impl Reader {
     /// another thread's work is the one place it is safe to say of code
     /// that was not written to it. A plain store's wait is the wait.
     fn unlent<R>(&self, wait: impl FnOnce() -> R) -> R {
-        let slot = self
-            .slot
-            .or(self.pin_slot.filter(|_| self.opts.writer_pins));
+        let slot = self.slot.or(self.pin_slot);
         match (&self.shared.pager, slot) {
             (Some(_), Some(slot)) if self.depth.get() > 0 && !self.page_snap.get() => {
                 self.shared.readers.page_idle(slot);
@@ -35004,9 +34936,7 @@ impl Reader {
     /// (`pager::Pager::crowded`), for a walk that would rather stop than
     /// read on. Nothing, and false, for a plain store.
     fn rest(&self) -> bool {
-        let slot = self
-            .slot
-            .or(self.pin_slot.filter(|_| self.opts.writer_pins));
+        let slot = self.slot.or(self.pin_slot);
         match (&self.shared.pager, slot) {
             (Some(p), Some(slot)) if self.depth.get() > 0 && !self.page_snap.get() => {
                 self.shared.readers.page_pin(slot);
@@ -35053,9 +34983,7 @@ impl Reader {
         let Some(p) = self.shared.pager.as_ref() else {
             return false;
         };
-        let slot = self
-            .slot
-            .or(self.pin_slot.filter(|_| self.opts.writer_pins));
+        let slot = self.slot.or(self.pin_slot);
         let Some(slot) = slot.filter(|_| !self.page_snap.get()) else {
             return p.crowded();
         };
@@ -35074,9 +35002,7 @@ impl Reader {
     /// names unlinked. Each is a wait on the device, milliseconds, pinned
     /// throughout.
     fn unlend(&self) -> Unlent {
-        let slot = self
-            .slot
-            .or(self.pin_slot.filter(|_| self.opts.writer_pins));
+        let slot = self.slot.or(self.pin_slot);
         match (&self.shared.pager, slot) {
             (Some(_), Some(slot)) if self.depth.get() > 0 && !self.page_snap.get() => {
                 self.shared.readers.page_idle(slot);
@@ -35105,9 +35031,7 @@ impl Reader {
         limit: usize,
         mut f: F,
     ) -> Result<usize> {
-        let slot = self
-            .slot
-            .or(self.pin_slot.filter(|_| self.opts.writer_pins));
+        let slot = self.slot.or(self.pin_slot);
         // A rest left standing when the scan ends is at or before the pin
         // of whatever this handle does next, and read as that pin
         // (`Readers::oldest_lent`).
@@ -36193,9 +36117,7 @@ impl Reader {
     /// (`pager::Pager::swamped`), as a long scan does between two walks.
     #[cold]
     fn rest_ahead(&self) {
-        let slot = self
-            .slot
-            .or(self.pin_slot.filter(|_| self.opts.writer_pins));
+        let slot = self.slot.or(self.pin_slot);
         if let Some(slot) = slot.filter(|_| !self.page_snap.get()) {
             self.read_rest(slot);
         }
@@ -44392,7 +44314,7 @@ impl Db {
         let shared = std::sync::Arc::new(Shared {
             state: AtomicPtr::new(Box::into_raw(Box::new(state))),
             pager: held.as_ref().map(|h| h.vault().pager().clone()),
-            readers: Readers::new(opts.asym_pins, opts.sweep_remembers_pin),
+            readers: Readers::new(opts.asym_pins),
             retired: RetireList::new(),
             raw_ahead: std::sync::atomic::AtomicBool::new(raw_ahead_on(data_bytes)),
             settle_write: std::sync::atomic::AtomicBool::new(settle_write_on(&opts, data_bytes)),
@@ -45477,7 +45399,7 @@ impl Db {
         let mem = opts.live_table(&block_pool, opts.seal_bytes);
         // Replay's own table, for the index resizes a replayed delete
         // frees through; nothing reads beside it.
-        let readers = Readers::new(false, true);
+        let readers = Readers::new(false);
         let mut mem_bytes = 0usize;
         let mut from = sealed;
         let mut valid_len = 0u64;
@@ -48524,23 +48446,14 @@ impl Db {
         // The handle the seal thread publishes the table's snapshot
         // through, pinned for that touch of the state and nothing else:
         // the build reads only the table it writes, which the job holds.
-        // Only where the writer pins: without its pins the writer's own
-        // handle adopts a published snapshot under no pin, and a swap
-        // from another thread between its load and its clone would free
-        // what it took.
-        let snap_reader = if self.opts.writer_pins {
-            let r = self.seal_reader();
-            // Every engine slot has a claimant by name, and one more would
-            // take a seal's silently: the fast path would go, and no
-            // count would say so.
-            debug_assert!(
-                r.is_some(),
-                "the seal found no engine slot for its snapshot"
-            );
-            r
-        } else {
-            None
-        };
+        let snap_reader = self.seal_reader();
+        // Every engine slot has a claimant by name, and one more would
+        // take a seal's silently: the fast path would go, and no count
+        // would say so.
+        debug_assert!(
+            snap_reader.is_some(),
+            "the seal found no engine slot for its snapshot"
+        );
         let frozen_snaps = self.opts.frozen_snaps;
         // Reads around the table being sealed, by the writes of the
         // tables sealed since the store's scan count last moved: a seal
@@ -50235,7 +50148,7 @@ impl Db {
     }
 
     /// The sweeps at an operation's end answered from the remembered pin
-    /// without a walk of the reader table (`Options::sweep_remembers_pin`).
+    /// without a walk of the reader table (`Readers::oldest_for`).
     pub fn sweep_shortcuts(&self) -> u64 {
         self.r
             .shared
@@ -50482,8 +50395,7 @@ impl Reader {
 
     /// A handle for the seal thread, which publishes the frozen table's
     /// snapshot into the state (`Options::seal_snapshot`): a caller's
-    /// handle in shape -- it pins through its slot under `Dirty`,
-    /// whatever `Options::writer_pins` says of the engine's own -- on an
+    /// handle in shape -- it pins through its slot under `Dirty` -- on an
     /// engine slot, counted as nobody's. None when the engine's slots
     /// are taken, and the seal publishes nothing.
     fn seal_reader(&self) -> Option<Reader> {
@@ -51255,16 +51167,10 @@ impl Db {
         answered
     }
 
-    /// `f` run on the store's segment work, inline: the writer's upkeep
-    /// and builder brought home first where the writer does not pin
-    /// (`Options::writer_pins`), since without its pins every publish had
-    /// them home, and the state the writer's operation holds moved to
-    /// whatever `f` published, as the writer's own publishes move it.
+    /// `f` run on the store's segment work, inline: the state the writer's
+    /// operation holds moved to whatever `f` published, as the writer's
+    /// own publishes move it.
     fn with_maint<T>(&mut self, f: impl FnOnce(&mut Maint) -> T) -> T {
-        if !self.opts.writer_pins {
-            self.take_back_upkeep();
-            self.stop_ahead();
-        }
         let MaintHome::Here(m) = &mut self.maint else {
             unreachable!("the segment work is inline where the writer drives it")
         };
@@ -69418,7 +69324,7 @@ mod streaming_writes {
     #[test]
     fn a_streamed_tables_keys_read_in_place_and_across_a_seam() {
         for (compact, lean) in [(false, false), (true, false), (false, true), (true, true)] {
-            let rd = Readers::new(false, true);
+            let rd = Readers::new(false);
             let mem = MemTable::new_ordered(
                 false,
                 BlockShape {
@@ -70536,7 +70442,7 @@ mod threading {
     #[test]
     fn a_reader_takes_a_commit_whole() {
         use std::sync::atomic::{AtomicBool, Ordering::Relaxed};
-        let rd = super::Readers::new(false, true);
+        let rd = super::Readers::new(false);
         let key = |i: u64| format!("k{:06}", i % 5000).into_bytes();
         let fill = |mem: &super::MemTable, mut on_commit: Box<dyn FnMut(&super::MemTable) + '_>| {
             let mut i = 0u64;
@@ -71104,7 +71010,7 @@ mod shared_table {
     #[test]
     fn a_writers_state_of_a_freed_table_is_not_taken_for_one_at_its_address() {
         as_records(|| {
-            let rd = Readers::new(false, true);
+            let rd = Readers::new(false);
             let mut l = TableLocal::default();
             let put = |m: &MemTable, l: &mut TableLocal, k: &[u8], v: &[u8]| {
                 assert!(m.write_shared(l, Some(&rd), m.hash(k), k, SharedWrite::Put(v)));
@@ -71148,7 +71054,7 @@ mod shared_table {
     #[test]
     fn a_put_reuses_what_it_replaced_once_no_reader_can_hold_it() {
         let m = shaped(64 << 20, true);
-        let rd = Readers::new(false, true);
+        let rd = Readers::new(false);
         let mut l = TableLocal::default();
         let k = key(1);
         let put = |l: &mut TableLocal, b: usize| {
@@ -71241,7 +71147,7 @@ mod shared_table {
         const PUTS: u64 = 150_000;
         const WRITERS: u64 = 3;
         let m = shaped(256 << 20, true);
-        let rd = Readers::new(false, true);
+        let rd = Readers::new(false);
         let stop = std::sync::atomic::AtomicBool::new(false);
         let uniform = |v: &[u8]| v.iter().all(|&b| b == v[0]);
         std::thread::scope(|s| {
@@ -72119,7 +72025,7 @@ mod put_index {
     #[test]
     fn the_index_population_reaches_every_index_a_table_grows() {
         assert!(Options::default().index_populated, "the default");
-        let rd = Readers::new(false, true);
+        let rd = Readers::new(false);
         for on in [true, false] {
             let opts = Options {
                 index_populated: on,
@@ -72152,7 +72058,7 @@ mod put_index {
     /// fold hashes every key by FNV.
     #[test]
     fn a_folding_table_hashes_one_way_at_both_ends() {
-        let rd = Readers::new(false, true);
+        let rd = Readers::new(false);
         for fold in [true, false] {
             let m = MemTable::new(BlockShape {
                 prefault: false,
@@ -72202,7 +72108,7 @@ mod put_index {
     /// overwrite appends every put.
     #[test]
     fn a_put_overwrites_a_put_of_its_length_and_appends_anything_else() {
-        let rd = Readers::new(false, true);
+        let rd = Readers::new(false);
         for in_place in [true, false] {
             let m = MemTable::new(BlockShape {
                 prefault: false,
@@ -72274,7 +72180,7 @@ mod put_index {
     /// would fill the index and probe for a vacant slot for ever.
     #[test]
     fn a_table_of_puts_alone_grows_its_index_at_half_load() {
-        let rd = Readers::new(false, true);
+        let rd = Readers::new(false);
         let m = table();
         let key = |i: u32| format!("put-{i:011}").into_bytes();
         let mut grew = 0;
@@ -72335,7 +72241,7 @@ mod put_index {
         let (ka, kb) = (key(a), key(b));
         assert_ne!(ka, kb);
         assert_eq!(mem_hash(&ka) >> 32, mem_hash(&kb) >> 32, "one tag");
-        let rd = Readers::new(false, true);
+        let rd = Readers::new(false);
         let m = table();
         m.put(mem_hash(&ka), &ka, b"a1", &rd, false);
         m.put(mem_hash(&kb), &kb, b"b1", &rd, false);
