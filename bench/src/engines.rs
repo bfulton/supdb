@@ -11880,7 +11880,6 @@ impl Engine for Supdb {
         if self.snaplean == Some(false) {
             return "supdb-snapfat";
         }
-        }
         if self.zbuycross == Some(true) {
             return "supdb-zbuycross";
         }
