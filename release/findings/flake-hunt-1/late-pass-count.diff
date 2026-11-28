@@ -1,15 +1,43 @@
 diff --git a/src/db.rs b/src/db.rs
-index 5b17b0a9..738dae99 100644
+index 5b17b0a9..080f5d6a 100644
 --- a/src/db.rs
 +++ b/src/db.rs
-@@ -54048,6 +54048,10 @@ impl Reader {
+@@ -54048,6 +54048,22 @@ impl Reader {
                  thread_cpu_ns().saturating_sub(cpu0),
                  AtomicOrdering::Relaxed,
              );
 +            // PROBE (flake-hunt-1): the count of a pass taken late.
-+            if std::env::var_os("PROBE_LATE_PASS_COUNT").is_some() {
++            // Only for a pass that published forms beside a frozen table:
++            // the carry's pass, and none before it.
++            let carried = std::env::var_os("PROBE_LATE_PASS_COUNT").is_some() && {
++                let _e = self.enter();
++                let st = self.state();
++                !st.frozen.is_empty() && st.forms_at.load(AtomicOrdering::Acquire) != usize::MAX
++            };
++            if carried {
++                eprintln!(
++                    "PROBE pass returned at {:?}: passes {}",
++                    std::time::Instant::now(),
++                    lend.passes.load(AtomicOrdering::Relaxed)
++                );
 +                std::thread::sleep(std::time::Duration::from_millis(300));
 +            }
              lend.passes.fetch_add(1, AtomicOrdering::Relaxed);
              match pass {
                  Ok((fs, ran, whole, done)) => {
+diff --git a/tests/db.rs b/tests/db.rs
+index b6890a18..87d7f94b 100644
+--- a/tests/db.rs
++++ b/tests/db.rs
+@@ -19711,6 +19711,11 @@ fn a_commit_that_freezes_leaves_the_carry_to_the_upkeep_thread() {
+         for k in (round % 7..1500u32).step_by(7) {
+             m.append(&mut db, &key(k), &value);
+         }
++        // PROBE (flake-hunt-1): the passes before the freezing commit
++        // counted before the sample.
++        if std::env::var_os("PROBE_LATE_PASS_COUNT").is_some() {
++            std::thread::sleep(std::time::Duration::from_millis(200));
++        }
+         passes = db.upkeep_counts()[0];
+         db.commit().unwrap();
+         round += 1;
