@@ -1365,8 +1365,6 @@ pub struct Supdb {
     /// A store with no partitions partitioned once it is read,
     /// `Options::adaptive_shape`. `supdb-ingestshape`.
     shape: bool,
-    adaptcap: Option<usize>,
-    adapttrig: bool,
     rotate: bool,
     defer: bool,
     firstfloor: bool,
@@ -3052,14 +3050,6 @@ struct Policy {
     /// A store with no partitions partitioned once it is read,
     /// `Options::adaptive_shape`. `supdb-ingestshape`.
     shape: bool,
-    /// The seal cap follows the reads, `Options::adaptive_cap`, to this
-    /// share of the store at the full lag level: `supdb-adapt` and
-    /// `supdb-ingestadapt` at 2, tighter than the cap; `supdb-adaptloose`
-    /// and `supdb-ingestadaptloose` at 30, looser.
-    adaptcap: Option<usize>,
-    /// The merge trigger follows them too, `Options::adaptive_trigger`,
-    /// with the cap. `supdb-adapttrig`, `supdb-ingestadapttrig`.
-    adapttrig: bool,
     /// A seal syncs and rotates the WAL, the shape before seals kept it,
     /// `Options::seal_rotates_wal`. `supdb-rotate`, `supdb-shaperotate`.
     rotate: bool,
@@ -3865,8 +3855,6 @@ impl Default for Policy {
             fatentries: false,
             rankrecords: false,
             shape: false,
-            adaptcap: None,
-            adapttrig: false,
             rotate: false,
             nofrozen: false,
             idle: false,
@@ -4725,58 +4713,6 @@ impl Supdb {
                 drain: false,
                 durable: false,
                 shape: true,
-                ..Policy::default()
-            },
-        )
-    }
-
-    /// EXPERIMENT: `supdb` with the seal cap following the reads
-    /// (`Options::adaptive_cap`): the cap as it stands while nothing
-    /// reads over lag, tighter while something does.
-    pub fn create_adapt(path: &Path) -> Res<Supdb> {
-        Supdb::with_policy(
-            path,
-            Policy {
-                adaptcap: Some(2),
-                ..Policy::default()
-            },
-        )
-    }
-
-    /// EXPERIMENT: `supdb-adapt` with the merge trigger following the
-    /// reads as well (`Options::adaptive_trigger`).
-    pub fn create_adapttrig(path: &Path) -> Res<Supdb> {
-        Supdb::with_policy(
-            path,
-            Policy {
-                adapttrig: true,
-                ..Policy::default()
-            },
-        )
-    }
-
-    /// EXPERIMENT: `supdb-ingest` with the seal cap following the reads.
-    pub fn create_ingest_adapt(path: &Path) -> Res<Supdb> {
-        Supdb::with_policy(
-            path,
-            Policy {
-                partition: false,
-                durable: false,
-                adaptcap: Some(2),
-                ..Policy::default()
-            },
-        )
-    }
-
-    /// EXPERIMENT: `supdb-ingestadapt` with the merge trigger following
-    /// the reads as well.
-    pub fn create_ingest_adapttrig(path: &Path) -> Res<Supdb> {
-        Supdb::with_policy(
-            path,
-            Policy {
-                partition: false,
-                durable: false,
-                adapttrig: true,
                 ..Policy::default()
             },
         )
@@ -6256,34 +6192,6 @@ impl Supdb {
                 shape: true,
                 defer: true,
                 firstfloor: true,
-                ..Policy::default()
-            },
-        )
-    }
-
-    /// EXPERIMENT: the seal cap following the reads the other way: the
-    /// cap as it stands while nothing reads over lag, three times it
-    /// while something does, for the store whose reads a seal costs more
-    /// than the lag it removes.
-    pub fn create_adaptloose(path: &Path) -> Res<Supdb> {
-        Supdb::with_policy(
-            path,
-            Policy {
-                adaptcap: Some(30),
-                ..Policy::default()
-            },
-        )
-    }
-
-    /// EXPERIMENT: `supdb-ingest` with the seal cap loosening under
-    /// reads, as `supdb-adaptloose` does.
-    pub fn create_ingest_adaptloose(path: &Path) -> Res<Supdb> {
-        Supdb::with_policy(
-            path,
-            Policy {
-                partition: false,
-                durable: false,
-                adaptcap: Some(30),
                 ..Policy::default()
             },
         )
@@ -11329,8 +11237,6 @@ impl Supdb {
             aheadpub,
             pubalways,
             leave,
-            adaptcap,
-            adapttrig,
             rotate,
             defer,
             firstfloor,
@@ -12184,11 +12090,6 @@ impl Supdb {
             // when the pins were priced: the store refuses the pair.
             publish_in_background: !(inlinemaint || nopin),
             adaptive_shape: shape,
-            // The cap and the trigger following the reads, or the cap
-            // as it stands whoever reads; the trigger arm takes both.
-            adaptive_cap: adaptcap.is_some() || adapttrig,
-            cap_reading_pct: adaptcap.unwrap_or(supdb::Options::default().cap_reading_pct),
-            adaptive_trigger: adapttrig,
             seal_rotates_wal: rotate,
             frozen_snaps: !nofrozen,
             overlay_merge: !sortover,
@@ -12510,8 +12411,6 @@ impl Supdb {
             aheadpub,
             pubalways,
             leave,
-            adaptcap,
-            adapttrig,
             rotate,
             defer,
             firstfloor,
@@ -14755,22 +14654,6 @@ impl Engine for Supdb {
         }
         if self.shape {
             return "supdb-ingestshape";
-        }
-        if self.adapttrig {
-            return if self.partition {
-                "supdb-adapttrig"
-            } else {
-                "supdb-ingestadapttrig"
-            };
-        }
-        if let Some(reading) = self.adaptcap {
-            let loose = reading > supdb::Options::default().seal_max_pct;
-            return match (self.partition, loose) {
-                (true, false) => "supdb-adapt",
-                (true, true) => "supdb-adaptloose",
-                (false, false) => "supdb-ingestadapt",
-                (false, true) => "supdb-ingestadaptloose",
-            };
         }
         if self.inlinemaint {
             return if self.partition {
@@ -17523,9 +17406,6 @@ pub fn guarantee(arm: &str) -> Option<Guarantee> {
         | "supdb-fatentries"
         | "supdb-waitmanifest"
         | "supdb-inlinemaint"
-        | "supdb-adapt"
-        | "supdb-adapttrig"
-        | "supdb-adaptloose"
         | "supdb-rotate"
         | "supdb-nofrozen"
         | "supdb-idle"
@@ -17691,9 +17571,6 @@ pub fn guarantee(arm: &str) -> Option<Guarantee> {
         | "supdb-ingestsync"
         | "supdb-ingestinline"
         | "supdb-ingestshape"
-        | "supdb-ingestadapt"
-        | "supdb-ingestadapttrig"
-        | "supdb-ingestadaptloose"
         | "supdb-shaperotate"
         | "supdb-shapedefer"
         | "supdb-shapefloor"
@@ -18821,11 +18698,6 @@ pub fn open(arm: &str, dir: &Path, map_gb: usize) -> Res<Box<dyn Engine>> {
         "supdb-ingestinline" => supdb_arm(Supdb::create_ingest_inline, dir)?,
         "supdb-ingestsync" => supdb_arm(Supdb::create_ingest_sync, dir)?,
         "supdb-ingestshape" => supdb_arm(Supdb::create_ingest_shape, dir)?,
-        "supdb-adapt" => supdb_arm(Supdb::create_adapt, dir)?,
-        "supdb-adapttrig" => supdb_arm(Supdb::create_adapttrig, dir)?,
-        "supdb-ingestadapt" => supdb_arm(Supdb::create_ingest_adapt, dir)?,
-        "supdb-ingestadapttrig" => supdb_arm(Supdb::create_ingest_adapttrig, dir)?,
-        "supdb-adaptloose" => supdb_arm(Supdb::create_adaptloose, dir)?,
         "supdb-rotate" => supdb_arm(Supdb::create_rotate, dir)?,
         "supdb-nofrozen" => supdb_arm(Supdb::create_nofrozen, dir)?,
         "supdb-shaperotate" => supdb_arm(Supdb::create_shape_rotate, dir)?,
@@ -20783,7 +20655,6 @@ pub fn open(arm: &str, dir: &Path, map_gb: usize) -> Res<Box<dyn Engine>> {
         "supdb-ingestbehindyield" => supdb_arm(Supdb::create_ingest_behindyield, dir)?,
         "supdb-idle" => supdb_arm(Supdb::create_idle, dir)?,
         "supdb-shapeidle" => supdb_arm(Supdb::create_shape_idle, dir)?,
-        "supdb-ingestadaptloose" => supdb_arm(Supdb::create_ingest_adaptloose, dir)?,
         "supdb-ingestnoseal" => supdb_arm(Supdb::create_ingest_noseal, dir)?,
         "supdb-segment" => Box::new(Segment::create(dir, Envelope::None, false)?),
         "supdb-segment-enc" => Box::new(Segment::create(dir, Envelope::Kept, false)?),
