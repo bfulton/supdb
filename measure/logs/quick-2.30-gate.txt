@@ -1,0 +1,29 @@
+
+=== quick ===
+
+== quick ==
+runs-ci/quick/20261128T110128Z-b3a043d.json
+gate: class x86_64/intel-r-xeon-r-processor-2.30ghz/4c/16g/hypervisor scale quick -- 10 prior rows (window 10)
+host: floors within the window (4 of 4)
+comparators: none below their window
+  flagged   load           faster              30000  ops_per_s              [121193, 167241] ops/s; prior CIs span [69949, 112928] (better than every prior row -- a win or a broken measurement)
+  flagged   load           supdb-forms         30000  ops_per_s              [1507863, 1711024] ops/s; prior CIs span [712204, 1478766] (better than every prior row -- a win or a broken measurement)
+  flagged   load-shuffled  faster              10000  ops_per_s              [53060, 90749] ops/s; prior CIs span [26349, 45163] (better than every prior row -- a win or a broken measurement)
+  REGRESSED recover-shuffled supdb-heldnoframes     30000  open_ms                [0.81, 1.13] ms; prior CIs span [0.37, 0.79]
+  flagged   scan-lag       lmdb                30000  updates_per_s_lag100pct [140593, 177762] ops/s; prior CIs span [87314, 139892] (better than every prior row -- a win or a broken measurement)
+  flagged   ycsb-A         supdb-forms         30000  ops_per_s              [655251, 713302] ops/s; prior CIs span [309294, 625683] (better than every prior row -- a win or a broken measurement)
+  flagged   ycsb-A         supdb-nocache       30000  ops_per_s              [650065, 724078] ops/s; prior CIs span [289678, 591959] (better than every prior row -- a win or a broken measurement)
+  flagged   ycsb-A         supdb-nozpages      30000  ops_per_s              [595860, 904636] ops/s; prior CIs span [158499, 544730] (better than every prior row -- a win or a broken measurement)
+  flagged   ycsb-A         rocksdb-tuned      100000  ops_per_s              [437169, 506503] ops/s; prior CIs span [153770, 432822] (better than every prior row -- a win or a broken measurement)
+  flagged   ycsb-A         supdb-forms        300000  ops_per_s              [656963, 791344] ops/s; prior CIs span [357152, 618921] (better than every prior row -- a win or a broken measurement)
+  flagged   ycsb-B         supdb-nocache       30000  ops_per_s              [2557899, 3267878] ops/s; prior CIs span [1179887, 2528353] (better than every prior row -- a win or a broken measurement)
+  flagged   ycsb-F         lmdb               100000  ops_per_s              [133066, 155678] ops/s; prior CIs span [80149, 129248] (better than every prior row -- a win or a broken measurement)
+  flagged   ycsb-F         supdb-nocache      100000  ops_per_s              [722931, 916353] ops/s; prior CIs span [384417, 679198] (better than every prior row -- a win or a broken measurement)
+  flagged   ycsb-F         supdb-nosnap       100000  ops_per_s              [698549, 824552] ops/s; prior CIs span [129007, 695126] (better than every prior row -- a win or a broken measurement)
+  flagged   ycsbs-A        supdb-nozpages      30000  ops_per_s              [503076, 670396] ops/s; prior CIs span [222721, 484584] (better than every prior row -- a win or a broken measurement)
+  flagged   ycsbs-A        lmdb               100000  ops_per_s              [95327, 105589] ops/s; prior CIs span [60041, 92372] (better than every prior row -- a win or a broken measurement)
+  flagged   ycsbs-A        supdb-noadvice     300000  ops_per_s              [666401, 688620] ops/s; prior CIs span [213308, 614299] (better than every prior row -- a win or a broken measurement)
+  flagged   ycsbs-F        supdb-noadvice      30000  ops_per_s              [826886, 1012237] ops/s; prior CIs span [267550, 816053] (better than every prior row -- a win or a broken measurement)
+  flagged   ycsbs-F        supdb-nozpages     100000  ops_per_s              [681698, 774684] ops/s; prior CIs span [277680, 671805] (better than every prior row -- a win or a broken measurement)
+  no band yet for 96 of 2228 quantities (fewer than 3 prior rows)
+REGRESSED: 1 of 2228 quantities are worse than every row in the window

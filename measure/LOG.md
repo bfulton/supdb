@@ -112,3 +112,15 @@ start; the cut ledger stays in `inflight/` as a record and is not used.
 No 2.10GHz row is compared with a 2.30GHz row as a verdict. Phase 6 pairs
 the kept C0 binaries against the last commit's on whatever host it gets.
 Same C0 binaries (`/home/user/c0/bench/target`, stamp `b3a043dc`, clean).
+
+## 7. Quick row, numbered keys, 2.30GHz class (the bridge)
+
+- Command: `cd /home/user/c0 && TMPDIR=/home/user/base/tmp/quick2 sh scripts/check.sh quick`
+- Start 2026-11-28T11:01:23Z, row written by 11:18:07Z (about 17 minutes). No kill.
+- Row: `measure/rows/quick/20261128T110128Z-b3a043d.json`.
+- Gate (`measure/logs/quick-2.30-gate.txt`): 10 prior rows of this class,
+  floors within the window (4 of 4). REGRESSED 1 of 2228:
+  supdb-heldnoframes recover-shuffled open_ms at 30,000 keys, [0.81, 1.13] ms
+  against prior [0.37, 0.79] (the same cell family the 2.10GHz row read as
+  no-verdict). The group stopped at the gate, so there is no
+  `all checks passed: quick` line and no figures were drawn; the row is whole.
