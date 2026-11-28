@@ -54,15 +54,6 @@ a tenth behind its comparator or behind a shape the engine already reaches.
   one thread reads 0.85x of FASTER in the quick row at `33bc663`; the cells
   at ten thousand keys that trailed before read ahead there. Done when a
   pairing in the row's order reads every threaded cell level or ahead.
-- [ ] **The one writer's read-modify-write on threads.** Each operation
-  takes the writer's lock for its put on condition, where the get and
-  batched put it replaced took the lock once a hundred puts and lost
-  updates: `supdb`'s `threads-RMW` and `threads-RMW-uniform` on two and
-  three threads read 0.53x to 0.64x of that shape, in four runs of four
-  across two sittings, with a refusal in a few hundred operations (`bench
-  ab --arms supdb,supdb --size 300000 --passes load,mixes-threaded --reps
-  3`, the binary at `53c4829` alternated with the one at `7f2da4e`). Done
-  when those cells read level with that shape with no update lost.
 - [ ] **The held log's small bursts.** The one-percent burst at ten
   thousand keys reads 0.85x of FASTER and the full rewrite at a hundred
   thousand 0.96x in the quick row at `33bc663`. Done when both read level
@@ -281,14 +272,6 @@ a tenth behind its comparator or behind a shape the engine already reaches.
 - [ ] **Two states of the settle no test builds.** A frozen batch cut by a
   budget, and the cache's bind at the fill's check. Done when a test builds
   each and its mutant fails, or the path is shown unreachable and removed.
-- [ ] **The packed copies' test beside an abandon.**
-  `a_copy_of_fixed_size_records_is_one_stream_until_a_write_it_cannot_take`
-  failed once in the test group at `f63ad99`: across its merges the upkeep
-  gave its forms up (`forms_drop_reasons` site 7) and the copies it holds
-  carried were dropped. Alone, beside its binary and beside three more
-  copies of it, it passed every run after, and the upkeep held inside its
-  pass across the writes does not make it. Done when the test holds the
-  upkeep to keeping up through a seam, or admits the abandon.
 - [ ] **Concurrent writers with conflict detection.** Transactions from
   several threads that commit or are refused on a conflict, as RocksDB's
   `TransactionDB` does, where today one writer applies every batch.

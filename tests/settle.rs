@@ -2183,6 +2183,13 @@ fn a_copys_identity_outlives_a_merge_that_kept_its_partitions_keys() {
             db.commit().unwrap();
             db.seal().unwrap();
         }
+        // The writer's look brought to the log's end before the tables land
+        // (`a_copy_of_fixed_size_records_is_one_stream_until_a_write_it_cannot_take`).
+        assert_eq!(
+            scan_model(&db),
+            want,
+            "the writer's scan before the landings"
+        );
         db.hold_seal_durable(false);
         merged_past(&mut db, merges_before);
         // The writer's look across the landings, which carries its tables
@@ -2767,6 +2774,9 @@ fn a_copy_of_fixed_size_records_is_one_stream_until_a_write_it_cannot_take() {
             db.commit().unwrap();
             db.seal().unwrap();
         }
+        // The writer's look brought to the log's end before the tables
+        // land: a scan takes the upkeep's pass home and reads the log.
+        answers(&db, &want, &from, "before the landings");
         let drops_before = db.forms_drop_reasons();
         db.hold_seal_durable(false);
         merged_past(&mut db, merges_before);
