@@ -1,0 +1,150 @@
+diff --git a/src/db.rs b/src/db.rs
+index 5b17b0a..4b0c033 100644
+--- a/src/db.rs
++++ b/src/db.rs
+@@ -24674,6 +24674,9 @@ const FIT_SWEEP_RETRY: u32 = 64;
+ 
+ /// The most live tables `State::replaced` keeps.
+ const REPLACED_CAP: usize = 8;
++static PROBE_LOOK_WAITING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
++static PROBE_ASKED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
++static PROBE_FREEZE_READ: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+ 
+ /// What a publish keeps in `State::replaced`: the tables live from the
+ /// upkeep's last look, `from` (`u64::MAX` before any), on, within `bytes`
+@@ -34752,9 +34755,26 @@ impl Reader {
+         });
+         if self.slot.is_none() {
+             Db::kept_held(&self.shared, 2);
++            if std::env::var_os("PROBE_FORCE").is_some() && self.understudy && st.lives == 2 {
++                PROBE_LOOK_WAITING.store(true, AtomicOrdering::SeqCst);
++                let t = std::time::Instant::now();
++                while !PROBE_FREEZE_READ.load(AtomicOrdering::SeqCst) && t.elapsed().as_secs() < 2 {
++                    std::thread::yield_now();
++                }
++                eprintln!("PROBE look at 2 let go, freeze read {}", PROBE_FREEZE_READ.load(AtomicOrdering::SeqCst));
++            }
+             self.shared
+                 .upkeep_lives
+                 .store(st.lives, AtomicOrdering::SeqCst);
++            eprintln!("PROBE look stores {} understudy {} thread {:?}", st.lives, self.understudy, std::thread::current().name());
++            if std::env::var_os("PROBE_FORCE").is_some() && self.understudy && st.lives == 2 {
++                st.replaced().clear();
++                let t = std::time::Instant::now();
++                while !PROBE_ASKED.load(AtomicOrdering::SeqCst) && t.elapsed().as_secs() < 2 {
++                    std::thread::yield_now();
++                }
++                eprintln!("PROBE look at 2 sees ask {}", PROBE_ASKED.load(AtomicOrdering::SeqCst));
++            }
+             // The tables kept for this look are read: dropped here, with
+             // the snapshot copies they hold, and not at the next publish.
+             st.replaced().clear();
+@@ -35414,6 +35434,7 @@ impl Reader {
+             return true;
+         }
+         if self.build_rest() {
++            eprintln!("PROBE abandon build_rest");
+             self.fs().abandoned.set(now);
+             return true;
+         }
+@@ -35469,6 +35490,7 @@ impl Reader {
+         let at = self.shared.abandon_at.load(AtomicOrdering::Acquire);
+         if at != u64::MAX {
+             if at == now {
++                eprintln!("PROBE abandon_by_writer at {at}");
+                 self.fs().abandoned.set(at);
+                 return true;
+             }
+@@ -35521,6 +35543,7 @@ impl Reader {
+             unit = self.pass_unit_measured();
+         }
+         if landed.saturating_mul(unit) > self.shared.keep_bytes {
++            eprintln!("PROBE abandon_by_pin landed {landed} unit {unit} keep {}", self.shared.keep_bytes);
+             self.fs().abandoned.set(now);
+             self.fs().abandon_pinned.set(true);
+             return true;
+@@ -35566,6 +35589,7 @@ impl Reader {
+         *self.fs().scan_keys.borrow_mut() = None;
+         self.fs().snap_added.borrow_mut().clear();
+         self.fs().snap_stale.borrow_mut().clear();
++        eprintln!("PROBE abandon_forms at {at} thread {:?}", std::thread::current().name());
+         self.drop_blocks_for(7);
+         self.shared
+             .upkeep_lives
+@@ -47604,7 +47628,18 @@ impl Db {
+     /// writer holds.
+     fn kept_from(&self, fresh: &MemTable) -> Option<Keep> {
+         let sharing = self.shared.shares && (fresh.shared.is_some() || self.state().sharing());
+-        Db::replaced_from_in(&self.opts, &self.shared, sharing)
++        let k = Db::replaced_from_in(&self.opts, &self.shared, sharing);
++        eprintln!("PROBE kept_from {:?} lives {}", k.map(|k| k.from), self.state().lives);
++        if std::env::var_os("PROBE_FORCE").is_some() && self.state().lives == 2 {
++            let t = std::time::Instant::now();
++            while !PROBE_LOOK_WAITING.load(AtomicOrdering::SeqCst) && t.elapsed().as_secs() < 2 {
++                std::thread::yield_now();
++            }
++            eprintln!("PROBE freeze read {:?}, look waiting {}", k.map(|k| k.from), PROBE_LOOK_WAITING.load(AtomicOrdering::SeqCst));
++            PROBE_FREEZE_READ.store(true, AtomicOrdering::SeqCst);
++            std::thread::sleep(std::time::Duration::from_millis(20));
++        }
++        k
+     }
+ 
+     /// `table`, a hashed memtable whose every write is committed and
+@@ -48886,6 +48921,7 @@ impl Db {
+             return false;
+         }
+         if let Some(keep) = Db::replaced_from(opts, shared) {
++            eprintln!("PROBE swap lives {} fresh from {} kept before trim {} thread {:?}", unsafe { &*p }.lives, keep.from, unsafe { &*p }.replaced().len(), std::thread::current().name());
+             // SAFETY: just published by this call, whose caller is pinned.
+             unsafe { &*p }.drop_replaced_before(keep.from);
+         }
+@@ -48958,6 +48994,8 @@ impl Db {
+             && matches!(opts.upkeep, Upkeep::Background(_))
+             && st.keeps_short(keep)
+         {
++            PROBE_ASKED.store(true, AtomicOrdering::SeqCst);
++            eprintln!("PROBE ask_abandon lives {} from {:?} kept {} keep_bytes {} scans {} look_now {}", st.lives, keep.map(|k| k.from), st.replaced().len(), shared.keep_bytes, shared.scans_all(), shared.upkeep_lives.load(AtomicOrdering::SeqCst));
+             shared
+                 .abandon_at
+                 .store(shared.scans_all(), AtomicOrdering::Release);
+@@ -60523,6 +60561,12 @@ impl Maint {
+                 Some(&self.r),
+             );
+             let from = Db::replaced_from(&self.opts, &self.shared);
++            if std::env::var_os("PROBE_STALE_LANDING").is_some()
++                && matches!(landed, Some(t) if std::sync::Arc::ptr_eq(&cur.mem, t))
++            {
++                eprintln!("PROBE landing swaps live, from {:?}, lives {}", from.map(|k| k.from), cur.lives);
++                std::thread::sleep(std::time::Duration::from_millis(30));
++            }
+             let mut swapped_live = false;
+             let mut retired_table = false;
+             let (mem, frozen) = match landed {
+diff --git a/tests/settle.rs b/tests/settle.rs
+index aeea4bc..2957019 100644
+--- a/tests/settle.rs
++++ b/tests/settle.rs
+@@ -2768,6 +2768,7 @@ fn a_copy_of_fixed_size_records_is_one_stream_until_a_write_it_cannot_take() {
+             db.seal().unwrap();
+         }
+         let drops_before = db.forms_drop_reasons();
++        let ab_before = (db.upkeep_abandons(), db.upkeep_abandons_pinned(), db.upkeep_abandon_state());
+         db.hold_seal_durable(false);
+         merged_past(&mut db, merges_before);
+         answers(&db, &want, &from, "across the merges");
+@@ -2775,10 +2776,12 @@ fn a_copy_of_fixed_size_records_is_one_stream_until_a_write_it_cannot_take() {
+             db.block_cache_packed(),
+             (p0, n0),
+             "{packed}: carried as they were; drops by site and refusals before {:?}, after {:?}, \
+-             merges {}",
++             merges {} PROBE abandons before {:?} after {:?}",
+             drops_before,
+             db.forms_drop_reasons(),
+-            db.seal_waits().merges - merges_before
++            db.seal_waits().merges - merges_before,
++            ab_before,
++            (db.upkeep_abandons(), db.upkeep_abandons_pinned(), db.upkeep_abandon_state())
+         );
+         let (claimed, holds) = db.block_cache_identity();
+         assert!(claimed == n0 && holds == n0, "{packed}: and their ranks");
