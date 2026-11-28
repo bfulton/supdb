@@ -1,0 +1,68 @@
+--- a/tests/zpages.rs	2026-11-28 15:04:45.421667814 +0000
++++ b/tests/zpages.rs	2026-11-28 15:04:45.436192489 +0000
+@@ -340,6 +340,31 @@
+     v
+ }
+ 
++/// PROBE (not for commit): with `PROBE_SWEEP=1`, the dead names in a
++/// listing waited out until the segment work's idle sweep has unlinked
++/// them, which puts the sweep between the listing and the reads.
++#[cfg(target_os = "linux")]
++fn probe_swept(listed: &[PathBuf]) {
++    if std::env::var_os("PROBE_SWEEP").is_none() {
++        return;
++    }
++    let dead: Vec<&PathBuf> = listed
++        .iter()
++        .filter(|f| f.to_string_lossy().contains("zpg-dead-"))
++        .collect();
++    eprintln!("PROBE listed {} of which dead {}: {dead:?}", listed.len(), dead.len());
++    let names = |d: &Path| common::store_names(d);
++    for f in &dead {
++        let dir = f.parent().unwrap();
++        let name = f.file_name().unwrap().to_string_lossy().into_owned();
++        let t = std::time::Instant::now();
++        while names(dir).contains(&name) && t.elapsed().as_secs() < 30 {
++            std::thread::sleep(std::time::Duration::from_millis(5));
++        }
++        eprintln!("PROBE {name} swept: {}", !names(dir).contains(&name));
++    }
++}
++
+ /// The keys a form file's fence names, read out of its file by the layout's
+ /// own decoder.
+ fn fence_keys(path: &Path) -> Vec<Vec<u8>> {
+@@ -17440,6 +17465,7 @@
+             "{what}: every output built at its finish a stride file: {c:?}"
+         );
+         let files = form_files(&dir);
++        probe_swept(&files);
+         assert!(!files.is_empty(), "{what}");
+         for f in &files {
+             let b = common::store_file(f);
+@@ -18893,7 +18919,9 @@
+         c.finish_builds >= 1 && c.stride_builds == 0 && c.stride_no_room >= 1,
+         "{what}: every output built in the block form, the refusals counted: {c:?}"
+     );
+-    let stride_on_disk = form_files(&dir)
++    let listed = form_files(&dir);
++    probe_swept(&listed);
++    let stride_on_disk = listed
+         .iter()
+         .filter(|f| {
+             let b = common::store_file(f);
+diff --git a/src/db.rs b/src/db.rs
+index 5b17b0a9..982085c8 100644
+--- a/src/db.rs
++++ b/src/db.rs
+@@ -67012,6 +67012,10 @@ impl Maint {
+     /// The spares the publishes left, unlinked: an inode freed is a
+     /// discard round trip here, paid where nobody waits.
+     fn sweep_spares(&mut self) {
++        // PROBE (not for commit): the sweep held past a test's listing.
++        if !self.spares.is_empty() && std::env::var_os("PROBE_HOLD_SWEEP").is_some() {
++            std::thread::sleep(std::time::Duration::from_secs(2));
++        }
+         for p in std::mem::take(&mut self.spares) {
+             let _ = vault::remove_file(p);
+         }

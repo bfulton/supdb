@@ -340,6 +340,25 @@ fn form_files(dir: &Path) -> Vec<PathBuf> {
     v
 }
 
+/// The form files of the store's segments, as `form_files` lists them
+/// less the names it has retired: a retired form file is renamed to a dead
+/// name at the landing that retires its segment (`zfile::zpg_dead_name`)
+/// and unlinked at the segment work's idle sweep, on its own thread, which
+/// no wait for a merge or a build covers. A test that reads every file it
+/// lists reads these, or the sweep between its listing and its reads takes
+/// a file from under it -- and a dead name read before the sweep is an
+/// old partition's form, which no claim about the store's files is about.
+#[cfg(target_os = "linux")]
+fn live_form_files(dir: &Path) -> Vec<PathBuf> {
+    form_files(dir)
+        .into_iter()
+        .filter(|f| {
+            !f.file_name()
+                .is_some_and(|n| n.to_string_lossy().starts_with("zpg-dead-"))
+        })
+        .collect()
+}
+
 /// The keys a form file's fence names, read out of its file by the layout's
 /// own decoder.
 fn fence_keys(path: &Path) -> Vec<Vec<u8>> {
@@ -17439,7 +17458,7 @@ fn a_merges_outputs_are_built_in_the_stride_form_at_their_finish() {
             c.stride_builds, c.finish_builds,
             "{what}: every output built at its finish a stride file: {c:?}"
         );
-        let files = form_files(&dir);
+        let files = live_form_files(&dir);
         assert!(!files.is_empty(), "{what}");
         for f in &files {
             let b = common::store_file(f);
@@ -18893,7 +18912,7 @@ fn a_merges_outputs_are_built_in_the_block_form_where_the_room_is_short() {
         c.finish_builds >= 1 && c.stride_builds == 0 && c.stride_no_room >= 1,
         "{what}: every output built in the block form, the refusals counted: {c:?}"
     );
-    let stride_on_disk = form_files(&dir)
+    let stride_on_disk = live_form_files(&dir)
         .iter()
         .filter(|f| {
             let b = common::store_file(f);
