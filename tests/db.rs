@@ -19716,15 +19716,22 @@ fn a_commit_that_freezes_leaves_the_carry_to_the_upkeep_thread() {
         round += 1;
         assert!(round < 200, "a commit froze");
     }
+    // The thread counts a pass once the pass has returned, which is after
+    // its publish: a wait for the position alone read the count in
+    // between, once on a hosted x86 runner under the stride switch. So
+    // the two are waited for together, and a publish that no pass of the
+    // thread made still fails.
     let t = std::time::Instant::now();
-    while db.forms_position() == usize::MAX {
+    while db.forms_position() == usize::MAX || db.upkeep_counts()[0] <= passes {
         assert!(
             t.elapsed() < std::time::Duration::from_secs(20),
-            "the thread published the carried forms"
+            "the thread made the pass and published the carried forms: position {}, \
+             passes {} against {passes}",
+            db.forms_position(),
+            db.upkeep_counts()[0]
         );
         std::thread::sleep(std::time::Duration::from_millis(1));
     }
-    assert!(db.upkeep_counts()[0] > passes, "the thread made the pass");
     m.check(&r, "a handle over the forms the thread carried");
     m.check(&db, "the writer");
     db.hold_seal_landing(false);
