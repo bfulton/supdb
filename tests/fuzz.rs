@@ -514,12 +514,6 @@ struct Cfg {
     /// `ZFUZZ_STRIDE` with the cache on is where the copies pack, and its
     /// deletes, runs and odd widths are what unpack them.
     copy_packed: bool,
-    /// Every batch a burst's (`Options::upkeep_inline_min` at one), so a
-    /// store of a few hundred keys reaches the rules a burst is handed by:
-    /// filed by its commit, or under the held log lent and never waited
-    /// for (`Options::held_bursts_lend`). In a quarter of the seeds under
-    /// `ZFUZZ_OPTVARY`, the side generator's draw after the packed copy's.
-    bursts_all: bool,
     /// A held log's bursts filed by their commits
     /// (`Options::held_bursts_lend` off): in a quarter of the seeds under
     /// `ZFUZZ_OPTVARY`, the side generator's next draw.
@@ -852,7 +846,9 @@ fn pick_cfg(rng: &mut Rng, want_cache: bool) -> Cfg {
     let copy_span = side.chance(25);
     let identity_blob = side.chance(25);
     let copy_packed = side.chance(50);
-    let (bursts_all, held_files) = (side.chance(25), side.chance(25));
+    // The draw `upkeep_inline_min` took, kept so that the draws after it
+    // stand.
+    let (_, held_files) = (side.chance(25), side.chance(25));
     let (settle_loads, settle_twice) = (side.chance(25), side.chance(25));
     let (settle_staged, settle_noconvert) = (side.chance(25), side.chance(25));
     let settle_quiet = side.chance(25);
@@ -936,7 +932,6 @@ fn pick_cfg(rng: &mut Rng, want_cache: bool) -> Cfg {
         copy_span: vary && copy_span,
         identity_keys: !(vary && identity_blob),
         copy_packed: !vary || copy_packed,
-        bursts_all: vary && bursts_all,
         held_files: vary && held_files,
         settle_loads: vary && settle_loads,
         settle_twice: vary && settle_twice,
@@ -1127,9 +1122,6 @@ fn opts_z(c: &Cfg) -> Options {
         o.zpages_promote_copies = true;
         o.scan_cache_bytes = 32 << 10;
         o.forms_to_fit = true;
-    }
-    if c.bursts_all {
-        o.upkeep_inline_min = 1;
     }
     o.held_bursts_lend = !c.held_files;
     o.settle_gathers = !c.settle_loads;

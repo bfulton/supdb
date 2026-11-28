@@ -4116,25 +4116,12 @@ pub struct Options {
     /// a page-copying one and the pass starts clean; what it gives up is
     /// the share the thread filed beside the burst, which a durable
     /// commit keeps because its thread works through the fsync. Off,
-    /// every commit lends: `supdb-ingestlendbursts` is that arm, and
-    /// `supdb-lendbursts` the durable store, whose commits lend either
-    /// way (`docs/engine.md`). With `upkeep_pace_pct`, only the first
+    /// every commit lends, a seam the tests hold that shape with
+    /// (`docs/engine.md`). With `upkeep_pace_pct`, only the first
     /// such batch after a scan is filed in the commit and the rest, up to
     /// a share of the store, are lent a batch behind the thread.
+    #[doc(hidden)]
     pub upkeep_inline_bursts: bool,
-    /// The smallest batch `upkeep_inline_bursts` files in the commit;
-    /// below it the batch is lent, as a mix's batches of a hundred are,
-    /// so the alert thread can file them beside the reads. The lag
-    /// sweep's one-percent burst at ten thousand keys is one batch of a
-    /// hundred: lent, and the scans start within a microsecond of the
-    /// commit's return, so the first scan takes it back before the
-    /// thread's first poll and pays the settle and the forms itself --
-    /// 570,000 instructions over a pass of a hundred scans, 41% of the
-    /// pass, and the one lag point on the ladder that read level with
-    /// LMDB for twelve rows while the three-hundred-write burst at
-    /// thirty thousand keys, filed inline, read 1.3x. `supdb-inlineall`
-    /// and `supdb-ingestinlineall` file every batch.
-    pub upkeep_inline_min: usize,
     /// Of the batches `upkeep_inline_bursts` would file in the commit,
     /// one of at most this percentage of the store's keys is instead
     /// lent to the thread and paced, unless it is the first after a scan:
@@ -4297,7 +4284,7 @@ pub struct Options {
     /// and the commits of a mix with no scan between them, hold only to
     /// the backlog bound (the share or the batch, the larger), whatever
     /// the batch's size, with no cut-off on the batch or the store -- a
-    /// batch under `upkeep_inline_min` was not paced before. Priced
+    /// batch under `UPKEEP_WAKE_WRITES` was not paced before. Priced
     /// against the cut-offs in the row's whole order from ten to three
     /// hundred thousand keys, in both orders: at ten thousand keys the
     /// full rewrite's burst read 1.14-1.18x, since the cut-offs held every
@@ -4343,22 +4330,6 @@ pub struct Options {
     /// it is off, and `supdb-oocz` is the arm with it on.
     #[doc(hidden)]
     pub out_of_core_installed: bool,
-    /// A buffered commit near reads whose batch is under
-    /// `upkeep_inline_min` settles it here when a scan ran since the last
-    /// commit, and lends the rest -- the forms the scans will walk, built
-    /// by those scans block by block as before. The shape it is for is a
-    /// small burst with scans at once behind it: the batch was lent to a
-    /// thread whose first poll comes two hundred microseconds later, and
-    /// the first scan took it back untouched a microsecond after the
-    /// commit returned and paid the settle itself, 145,000 instructions
-    /// of a pass of a hundred scans at ten thousand keys. Filing the whole
-    /// batch at the commit instead (`supdb-ingestinlineall`) cost the
-    /// burst 427,000, under LMDB's, and the mixes with no scan between
-    /// their commits a sixth to a half; the settle alone is a third of
-    /// that, and a mix whose commits no scan separates never reaches it.
-    /// `supdb-lazysettle` and `supdb-ingestlazysettle` leave the settle
-    /// to the scan.
-    pub upkeep_settle_after_scans: bool,
     /// Time the phases a scan runs before its walk -- the upkeep taken
     /// back, the log read, the settle, the snapshot's refresh, the builder
     /// started and its forms installed -- into `Db::scan_phases`, for the
@@ -4722,25 +4693,6 @@ pub struct Options {
     /// drops the tables when it falls behind. `supdb-noabandon` is the arm
     /// that files on.
     pub upkeep_abandons: bool,
-    /// Whether the upkeep thread files a burst's batch at once: a pass
-    /// lent a commit of at least `UPKEEP_WAKE_WRITES` writes since the
-    /// thread was last caught up, with reads around, settles what it was
-    /// lent whatever the backlog bound (`forms_settle_backlog_pct`) says.
-    /// The bound is for the mixes, whose commits are a hundred operations
-    /// with reads between them -- the commit's own size tells them apart,
-    /// never the sum lent, which three of a mix's commits cross -- and
-    /// for a commit that files on the writer's own path; a burst is
-    /// batches of a thousand writes over keys the writer never touches
-    /// again, lent to a thread that otherwise waits for two percent of
-    /// the store to pile up and leaves the rest to the first scan. At
-    /// three million keys under a bound the lag sweep's one-percent point
-    /// read a 1000-scan pass of 26 ms with 14 of it the first scan's
-    /// settle of the burst's thirty thousand keys, and the ten-percent
-    /// point 50 of 69, with the thread lent every batch and filing none:
-    /// 0.35x and 0.27x of LMDB, where the drained point reads 1.8x. Off:
-    /// the thread waits for the bound, as a commit that files itself
-    /// does. `supdb-deferbursts` is the arm that waits.
-    pub upkeep_files_bursts: bool,
     /// Whether a pass on the upkeep thread gives the writer its upkeep
     /// back at the pass's next step once the writer wants it: the log is
     /// read and settled `UPKEEP_YIELD_ENTRIES` entries at a time and the
@@ -4751,7 +4703,7 @@ pub struct Options {
     /// bounded by `upkeep_pass_pct` leaves it. The writer takes
     /// its upkeep back at every scan and at most of its publishes, waiting
     /// for the pass in flight, and with the thread filing a burst's
-    /// batches (`upkeep_files_bursts`) that pass covers whatever was lent
+    /// batches that pass covers whatever was lent
     /// since the thread's last: at three million keys under a bound the
     /// first scan after the ten-percent burst waited 30-65 ms for it in
     /// half the reps and 3-6 in the rest, a pass of two shapes, where the
@@ -7711,7 +7663,6 @@ impl Default for Options {
             upkeep_alert: true,
             upkeep_alert_poll_us: 200,
             upkeep_inline_bursts: true,
-            upkeep_inline_min: UPKEEP_WAKE_WRITES,
             upkeep_pace_pct: 0,
             upkeep_pace_holds: true,
             held_bursts_lend: true,
@@ -7720,7 +7671,6 @@ impl Default for Options {
             upkeep_pace_syncs_model: true,
             upkeep_pace_syncs_census: true,
             out_of_core_installed: false,
-            upkeep_settle_after_scans: true,
             scan_timers: false,
             upkeep_batch_pct: 0,
             upkeep_pass_pct: 0,
@@ -7745,7 +7695,6 @@ impl Default for Options {
             upkeep_keep_bytes: 0,
             frozen_bytes: 0,
             upkeep_abandons: true,
-            upkeep_files_bursts: true,
             upkeep_yields: false,
             blocks_mapped: true,
             blocks_pool_bytes: 64 << 20,
@@ -28309,8 +28258,8 @@ struct FormsState {
     pass_lent: std::cell::Cell<u64>,
     /// The largest commit lent to the pass in flight on the upkeep thread
     /// since the thread was last caught up (`UpkeepTo::big`), for
-    /// `settle_due` to tell a burst's batch from a mix's
-    /// (`Options::upkeep_files_bursts`); zero off the thread.
+    /// `settle_due` to tell a burst's batch from a mix's;
+    /// zero off the thread.
     pass_batch: std::cell::Cell<u64>,
     log_short: std::cell::Cell<bool>,
     /// A fill the upkeep thread left for a later pass because the writer
@@ -28904,7 +28853,7 @@ enum Hand {
     /// the settle bound says (`Options::upkeep_inline_bursts`).
     File,
     /// The batch settled here and its forms left to the scans that walk
-    /// them (`Options::upkeep_settle_after_scans`).
+    /// them.
     Settle,
     /// Lent, and the commit returns once the thread trails by at most
     /// this many writes, a share of the store's keys: a burst's batches
@@ -38039,13 +37988,11 @@ impl Reader {
             return Some(false);
         }
         let quiet = self.opts.seal_idle && self.mode_note.quiet.get() && far;
-        // A burst's batch on the upkeep thread is filed at once
-        // (`Options::upkeep_files_bursts`): the bound below is for a mix's
-        // small commits and for a commit that files on its own path.
-        let burst = self.understudy
-            && self.opts.upkeep_files_bursts
-            && !far
-            && self.fs().pass_batch.get() >= UPKEEP_WAKE_WRITES as u64;
+        // A burst's batch on the upkeep thread is filed at once: the bound
+        // below is for a mix's small commits and for a commit that files on
+        // its own path.
+        let burst =
+            self.understudy && !far && self.fs().pass_batch.get() >= UPKEEP_WAKE_WRITES as u64;
         let recent = !quiet
             && (self.opts.forms_settle_recent_pct == 0
                 || writes - self.fs().writes_at_scan.get()
@@ -54059,8 +54006,8 @@ struct UpkeepTo {
     cap: u64,
     /// The writes of the largest commit lent since the thread was last
     /// seen caught up, this one included: what tells a burst's batch,
-    /// a commit of a thousand writes, from a mix's hundred, for
-    /// `Options::upkeep_files_bursts`. The sum of the commits lent would
+    /// a commit of a thousand writes, from a mix's hundred, for the thread
+    /// to file a burst's at once. The sum of the commits lent would
     /// not, since three of a mix's commits unfiled sum past any burst's
     /// one.
     big: u64,
@@ -55200,8 +55147,7 @@ impl Db {
         // by a commit that does not sync, and the thread is lent nothing
         // of it; one that syncs lends it, since the thread works through
         // the fsync: see `Options::upkeep_inline_bursts`, and
-        // `Options::upkeep_inline_min` for where "worth waking for" is
-        // drawn.
+        // `UPKEEP_WAKE_WRITES` for where "worth waking for" is drawn.
         let mut pace = false;
         let mut pace_syncs = false;
         // The share of the store's keys a paced batch is within and the
@@ -55211,13 +55157,13 @@ impl Db {
         // or waited for (`Options::held_bursts_lend`).
         let burst_lent = self.opts.held_bursts_lend
             && matches!(self.opts.sync, SyncPolicy::Explicit)
-            && batch >= self.opts.upkeep_inline_min;
+            && batch >= UPKEEP_WAKE_WRITES;
         if level == 1
             && self.opts.upkeep_inline_bursts
             && !burst_lent
             && !syncs
             && reads_around
-            && batch >= self.opts.upkeep_inline_min
+            && batch >= UPKEEP_WAKE_WRITES
         {
             // The first such batch after a scan is filed here, and so is
             // one over the share of the store the first scan's wait is
@@ -55248,7 +55194,7 @@ impl Db {
             && self.opts.upkeep_pace_syncs_bp > 0
             && reads_around
             && batch > 0
-            && (self.opts.upkeep_pace_syncs_model || batch >= self.opts.upkeep_inline_min)
+            && (self.opts.upkeep_pace_syncs_model || batch >= UPKEEP_WAKE_WRITES)
             && in_core
         {
             share = (keys as u64).saturating_mul(self.opts.upkeep_pace_syncs_bp as u64) / 10_000;
@@ -55258,11 +55204,10 @@ impl Db {
         // A smaller batch with a scan since the last commit: the scans
         // behind it take the batch back before the thread's first poll,
         // so its settle runs here and the forms wait for the scans that
-        // walk them (`Options::upkeep_settle_after_scans`). `since_scan`
-        // is zero only where the scan count moved since the last commit.
+        // walk them. `since_scan` is zero only where the scan count moved
+        // since the last commit.
         if level == 1
             && self.opts.upkeep_inline_bursts
-            && self.opts.upkeep_settle_after_scans
             && !burst_lent
             && !syncs
             && reads_around

@@ -645,12 +645,6 @@ pub struct Supdb {
     /// Who keeps the writer's upkeep, where not the engine's own choice:
     /// the writer itself, as before the thread. `supdb-inline`.
     upkeep: Option<supdb::Upkeep>,
-    /// Every commit lends its batch to the upkeep thread, as before a
-    /// commit with no fsync filed a burst's batch itself
-    /// (`Options::upkeep_inline_bursts` off). `supdb-ingestlendbursts`,
-    /// and `supdb-lendbursts` durable, where the commits sync and so
-    /// lend either way.
-    lendbursts: bool,
     /// A buffered commit near reads lends the batches of a burst after
     /// its first, each at most a hundredth of the store's keys, and holds
     /// until the thread has filed each, where the engine files them in
@@ -667,16 +661,6 @@ pub struct Supdb {
     /// under any other policy, where the engine lends them
     /// (`Options::held_bursts_lend` off). `supdb-heldfiles`.
     heldfiles: bool,
-    /// A buffered commit near reads files any batch itself, however
-    /// small (`Options::upkeep_inline_min` at one). `supdb-ingestinlineall`,
-    /// and `supdb-inlineall` durable, where the commits sync and so lend
-    /// either way.
-    inlineall: bool,
-    /// A buffered commit near reads leaves a small batch's settle to the
-    /// next scan, as before (`Options::upkeep_settle_after_scans` off).
-    /// `supdb-ingestlazysettle`, and `supdb-lazysettle` durable, where the
-    /// commits sync and so lend either way.
-    lazysettle: bool,
     /// A flush fsyncs the WAL before its seal whatever the policy, as
     /// before (`Options::drain_syncs_wal`). `supdb-ingestwalsync`, and
     /// `supdb-walsync` durable, where every commit synced already.
@@ -998,10 +982,6 @@ pub struct Supdb {
     /// The upkeep thread files on however far the writes have outrun it,
     /// `Options::upkeep_abandons` off. `supdb-noabandon`.
     noabandon: bool,
-    /// The upkeep thread waits for the backlog bound before it files a
-    /// burst's batch, `Options::upkeep_files_bursts` off.
-    /// `supdb-deferbursts`.
-    deferbursts: bool,
     /// A pass on the upkeep thread gives the writer its upkeep back at
     /// its next step, `Options::upkeep_yields` on. `supdb-passyield`.
     passyield: bool,
@@ -2114,12 +2094,6 @@ struct Policy {
     /// Who keeps the writer's upkeep, where not the engine's own choice:
     /// the writer itself, as before the thread. `supdb-inline`.
     upkeep: Option<supdb::Upkeep>,
-    /// Every commit lends its batch to the upkeep thread, as before a
-    /// commit with no fsync filed a burst's batch itself
-    /// (`Options::upkeep_inline_bursts` off). `supdb-ingestlendbursts`,
-    /// and `supdb-lendbursts` durable, where the commits sync and so
-    /// lend either way.
-    lendbursts: bool,
     /// A buffered commit near reads lends the batches of a burst after
     /// its first, each at most a hundredth of the store's keys, and holds
     /// until the thread has filed each, where the engine files them in
@@ -2136,16 +2110,6 @@ struct Policy {
     /// under any other policy, where the engine lends them
     /// (`Options::held_bursts_lend` off). `supdb-heldfiles`.
     heldfiles: bool,
-    /// A buffered commit near reads files any batch itself, however
-    /// small (`Options::upkeep_inline_min` at one). `supdb-ingestinlineall`,
-    /// and `supdb-inlineall` durable, where the commits sync and so lend
-    /// either way.
-    inlineall: bool,
-    /// A buffered commit near reads leaves a small batch's settle to the
-    /// next scan, as before (`Options::upkeep_settle_after_scans` off).
-    /// `supdb-ingestlazysettle`, and `supdb-lazysettle` durable, where the
-    /// commits sync and so lend either way.
-    lazysettle: bool,
     /// A flush fsyncs the WAL before its seal whatever the policy, as
     /// before (`Options::drain_syncs_wal`). `supdb-ingestwalsync`, and
     /// `supdb-walsync` durable, where every commit synced already.
@@ -2467,10 +2431,6 @@ struct Policy {
     /// The upkeep thread files on however far the writes have outrun it,
     /// `Options::upkeep_abandons` off. `supdb-noabandon`.
     noabandon: bool,
-    /// The upkeep thread waits for the backlog bound before it files a
-    /// burst's batch, `Options::upkeep_files_bursts` off.
-    /// `supdb-deferbursts`.
-    deferbursts: bool,
     /// A pass on the upkeep thread gives the writer its upkeep back at
     /// its next step, `Options::upkeep_yields` on. `supdb-passyield`.
     passyield: bool,
@@ -3311,12 +3271,9 @@ impl Default for Policy {
             oidxsync: false,
             refvals: false,
             rowatclose: false,
-            lendbursts: false,
             paced: false,
             pacelends: false,
             heldfiles: false,
-            inlineall: false,
-            lazysettle: false,
             walsync: false,
             nodrainsnap: false,
             sealcopyfar: false,
@@ -3395,7 +3352,6 @@ impl Default for Policy {
             latesync: false,
             installreads: false,
             noabandon: false,
-            deferbursts: false,
             passyield: false,
             cachenoauto: false,
             cacheeighth: false,
@@ -6241,35 +6197,6 @@ impl Supdb {
         )
     }
 
-    /// `supdb` with every commit lending its batch to the upkeep thread
-    /// (`Options::upkeep_inline_bursts` off). Its commits sync, so they
-    /// lend either way: against `supdb` it is a null pairing.
-    pub fn create_lendbursts(path: &Path) -> Res<Supdb> {
-        Supdb::with_policy(
-            path,
-            Policy {
-                lendbursts: true,
-                ..Policy::default()
-            },
-        )
-    }
-
-    /// `supdb-ingest` with every commit lending its batch to the thread,
-    /// as before a buffered commit near reads filed a burst's batch
-    /// itself: against `supdb-ingest` it prices paying the filing in the
-    /// burst against the first scan after it paying it.
-    pub fn create_ingest_lendbursts(path: &Path) -> Res<Supdb> {
-        Supdb::with_policy(
-            path,
-            Policy {
-                partition: false,
-                durable: false,
-                lendbursts: true,
-                ..Policy::default()
-            },
-        )
-    }
-
     /// `supdb-ingest` with the batches of a burst after its first lent to
     /// the upkeep thread and held for until it has filed each
     /// (`Options::upkeep_pace_pct` at one), where the engine files them
@@ -6296,65 +6223,6 @@ impl Supdb {
                 durable: false,
                 paced: true,
                 pacelends: true,
-                ..Policy::default()
-            },
-        )
-    }
-
-    /// `supdb` with a commit near reads filing any batch itself, however
-    /// small (`Options::upkeep_inline_min` at one). Its commits sync, so
-    /// they lend either way: against `supdb` it is a null pairing.
-    pub fn create_inlineall(path: &Path) -> Res<Supdb> {
-        Supdb::with_policy(
-            path,
-            Policy {
-                inlineall: true,
-                ..Policy::default()
-            },
-        )
-    }
-
-    /// `supdb-ingest` with a commit near reads filing any batch itself,
-    /// however small: against `supdb-ingest` it prices paying the filing
-    /// of a batch under the threshold in the burst against the first
-    /// scan after it paying it, and the mixes' batches of a hundred with
-    /// it.
-    pub fn create_ingest_inlineall(path: &Path) -> Res<Supdb> {
-        Supdb::with_policy(
-            path,
-            Policy {
-                partition: false,
-                durable: false,
-                inlineall: true,
-                ..Policy::default()
-            },
-        )
-    }
-
-    /// `supdb` leaving a small batch's settle to the next scan
-    /// (`Options::upkeep_settle_after_scans` off). Its commits sync, so
-    /// they lend either way: against `supdb` it is a null pairing.
-    pub fn create_lazysettle(path: &Path) -> Res<Supdb> {
-        Supdb::with_policy(
-            path,
-            Policy {
-                lazysettle: true,
-                ..Policy::default()
-            },
-        )
-    }
-
-    /// `supdb-ingest` leaving a small batch's settle to the next scan, as
-    /// before a commit with a scan behind it settled the batch itself:
-    /// against `supdb-ingest` it prices the settle in the burst against
-    /// the settle in the first scan.
-    pub fn create_ingest_lazysettle(path: &Path) -> Res<Supdb> {
-        Supdb::with_policy(
-            path,
-            Policy {
-                partition: false,
-                durable: false,
-                lazysettle: true,
                 ..Policy::default()
             },
         )
@@ -7822,18 +7690,6 @@ impl Supdb {
             path,
             Policy {
                 noabandon: true,
-                ..Policy::default()
-            },
-        )
-    }
-
-    /// `supdb` with the upkeep thread waiting for the backlog bound before
-    /// it files a burst's batch.
-    pub fn create_deferbursts(path: &Path) -> Res<Supdb> {
-        Supdb::with_policy(
-            path,
-            Policy {
-                deferbursts: true,
                 ..Policy::default()
             },
         )
@@ -10055,12 +9911,9 @@ impl Supdb {
             oidxsync,
             refvals,
             rowatclose,
-            lendbursts,
             paced,
             pacelends,
             heldfiles,
-            inlineall,
-            lazysettle,
             walsync,
             nodrainsnap,
             sealcopyfar,
@@ -10139,7 +9992,6 @@ impl Supdb {
             latesync,
             installreads,
             noabandon,
-            deferbursts,
             passyield,
             cachenoauto,
             cacheeighth,
@@ -10504,7 +10356,6 @@ impl Supdb {
             forms_settle_keys_all: settleall,
             // The upkeep where the arm puts it, or where the engine does.
             upkeep: upkeep.unwrap_or(supdb::Options::default().upkeep),
-            upkeep_inline_bursts: !lendbursts,
             upkeep_pace_pct: if paced {
                 1
             } else {
@@ -10512,12 +10363,6 @@ impl Supdb {
             },
             upkeep_pace_holds: !pacelends,
             held_bursts_lend: !heldfiles,
-            upkeep_inline_min: if inlineall {
-                1
-            } else {
-                supdb::Options::default().upkeep_inline_min
-            },
-            upkeep_settle_after_scans: !lazysettle,
             drain_syncs_wal: walsync,
             drain_snapshot: !nodrainsnap,
             seal_snapshot_far: sealcopyfar,
@@ -10643,7 +10488,6 @@ impl Supdb {
             close_presync: !latesync,
             ahead_sends_bounds: !installreads,
             upkeep_abandons: !noabandon,
-            upkeep_files_bursts: !deferbursts,
             upkeep_yields: passyield,
             scan_cache_auto: !cachenoauto,
             scan_cache_auto_room: !cacheeighth,
@@ -11100,12 +10944,9 @@ impl Supdb {
             oidxsync,
             refvals,
             rowatclose,
-            lendbursts,
             paced,
             pacelends,
             heldfiles,
-            inlineall,
-            lazysettle,
             walsync,
             nodrainsnap,
             sealcopyfar,
@@ -11184,7 +11025,6 @@ impl Supdb {
             latesync,
             installreads,
             noabandon,
-            deferbursts,
             passyield,
             cachenoauto,
             cacheeighth,
@@ -12410,32 +12250,11 @@ impl Engine for Supdb {
                 "supdb-ingestrowatclose"
             };
         }
-        if self.lendbursts {
-            return if self.partition {
-                "supdb-lendbursts"
-            } else {
-                "supdb-ingestlendbursts"
-            };
-        }
         if self.pacelends {
             return "supdb-ingestpacelends";
         }
         if self.paced {
             return "supdb-ingestpaced";
-        }
-        if self.inlineall {
-            return if self.partition {
-                "supdb-inlineall"
-            } else {
-                "supdb-ingestinlineall"
-            };
-        }
-        if self.lazysettle {
-            return if self.partition {
-                "supdb-lazysettle"
-            } else {
-                "supdb-ingestlazysettle"
-            };
         }
         if self.settlebuilds == Some(false) {
             return if self.partition {
@@ -12945,9 +12764,6 @@ impl Engine for Supdb {
         }
         if self.noabandon {
             return "supdb-noabandon";
-        }
-        if self.deferbursts {
-            return "supdb-deferbursts";
         }
         if self.passyield {
             return "supdb-passyield";
@@ -15764,9 +15580,6 @@ pub fn guarantee(arm: &str) -> Option<Guarantee> {
         | "supdb-oidxsync"
         | "supdb-refvals"
         | "supdb-rowatclose"
-        | "supdb-lendbursts"
-        | "supdb-inlineall"
-        | "supdb-lazysettle"
         | "supdb-settlelate"
         | "supdb-walsync"
         | "supdb-nodrainsnap"
@@ -15856,7 +15669,6 @@ pub fn guarantee(arm: &str) -> Option<Guarantee> {
         | "supdb-latesync"
         | "supdb-installreads"
         | "supdb-noabandon"
-        | "supdb-deferbursts"
         | "supdb-passyield"
         | "supdb-cachenoauto"
         | "supdb-cacheeighth"
@@ -16056,7 +15868,6 @@ pub fn guarantee(arm: &str) -> Option<Guarantee> {
         | "supdb-ingestoidxsync"
         | "supdb-ingestrefvals"
         | "supdb-ingestrowatclose"
-        | "supdb-ingestlendbursts"
         | "supdb-ingestpaced"
         | "supdb-ingestsettleloads"
         | "supdb-ingestsettlesortstwice"
@@ -16065,8 +15876,6 @@ pub fn guarantee(arm: &str) -> Option<Guarantee> {
         | "supdb-ingestsettleconvertquiet"
         | "supdb-ingestsettlefat"
         | "supdb-ingestpacelends"
-        | "supdb-ingestinlineall"
-        | "supdb-ingestlazysettle"
         | "supdb-ingestsettlelate"
         | "supdb-ingestwalsync"
         | "supdb-ingestnodrainsnap"
@@ -17448,16 +17257,10 @@ pub fn open(arm: &str, dir: &Path, map_gb: usize) -> Res<Box<dyn Engine>> {
         "supdb-ingestbg" => supdb_arm(Supdb::create_ingest_bg, dir)?,
         "supdb-bglag" => supdb_arm(Supdb::create_bglag, dir)?,
         "supdb-ingestbglag" => supdb_arm(Supdb::create_ingest_bglag, dir)?,
-        "supdb-lendbursts" => supdb_arm(Supdb::create_lendbursts, dir)?,
-        "supdb-ingestlendbursts" => supdb_arm(Supdb::create_ingest_lendbursts, dir)?,
         "supdb-ingestpaced" => supdb_arm(Supdb::create_ingest_paced, dir)?,
         "supdb-ingestpacelends" => supdb_arm(Supdb::create_ingest_pacelends, dir)?,
-        "supdb-inlineall" => supdb_arm(Supdb::create_inlineall, dir)?,
-        "supdb-ingestinlineall" => supdb_arm(Supdb::create_ingest_inlineall, dir)?,
-        "supdb-lazysettle" => supdb_arm(Supdb::create_lazysettle, dir)?,
         "supdb-settlelate" => supdb_arm(Supdb::create_settlelate, dir)?,
         "supdb-ingestsettlelate" => supdb_arm(Supdb::create_ingest_settlelate, dir)?,
-        "supdb-ingestlazysettle" => supdb_arm(Supdb::create_ingest_lazysettle, dir)?,
         "supdb-walsync" => supdb_arm(Supdb::create_walsync, dir)?,
         "supdb-ingestwalsync" => supdb_arm(Supdb::create_ingest_walsync, dir)?,
         "supdb-nodrainsnap" => supdb_arm(Supdb::create_nodrainsnap, dir)?,
@@ -18363,7 +18166,6 @@ pub fn open(arm: &str, dir: &Path, map_gb: usize) -> Res<Box<dyn Engine>> {
         "supdb-latesync" => supdb_arm(Supdb::create_latesync, dir)?,
         "supdb-installreads" => supdb_arm(Supdb::create_installreads, dir)?,
         "supdb-noabandon" => supdb_arm(Supdb::create_noabandon, dir)?,
-        "supdb-deferbursts" => supdb_arm(Supdb::create_deferbursts, dir)?,
         "supdb-passyield" => supdb_arm(Supdb::create_passyield, dir)?,
         "supdb-cachenoauto" => supdb_arm(Supdb::create_cachenoauto, dir)?,
         "supdb-cacheeighth" => supdb_arm(Supdb::create_cacheeighth, dir)?,

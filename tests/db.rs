@@ -979,22 +979,20 @@ fn an_upkeep_pass_that_pins_a_landed_table_gives_its_forms_up() {
 }
 
 /// A burst's batch lent to the upkeep thread while reads are around is
-/// filed by the thread at once (`Options::upkeep_files_bursts`), and not
-/// left to the first scan after it as the backlog bound would leave it: the
-/// bound is set past the burst here, so the bound alone would file nothing,
-/// and with the option off nothing is filed until the scan. A mix's commits
-/// of a hundred, as many of them, are no burst under either, since the
-/// measure is the commit's own size and not the sum lent. Both halves run,
-/// and the scans after each read every key as the model has it.
+/// filed by the thread at once, and not left to the first scan after it as
+/// the backlog bound would leave it: the bound is set past the burst here,
+/// so the bound alone would file nothing. A mix's commits of a hundred, as
+/// many of them, are no burst, since the measure is the commit's own size
+/// and not the sum lent. The scans after each read every key as the model
+/// has it.
 #[test]
 fn a_burst_lent_to_the_upkeep_thread_is_filed_before_the_first_scan() {
-    let run = |name: &str, files_bursts: bool| {
+    let run = |name: &str| {
         let d = dir(name);
         let mut db = Db::create(
             &d,
             Options {
                 upkeep: supdb::Upkeep::Background(1),
-                upkeep_files_bursts: files_bursts,
                 // The bound unreachable by the burst below: 50% of 20,000.
                 forms_settle_backlog_pct: 50,
                 partition_bytes: Some(256 << 10),
@@ -1091,20 +1089,14 @@ fn a_burst_lent_to_the_upkeep_thread_is_filed_before_the_first_scan() {
     // A settle counts a key once, so three thousand writes drawn at random
     // from twenty thousand keys are two to three hundred short of three
     // thousand, and fewer settled in one than in three.
-    let (thread_on, scan_on, small_on) = run("burst-filed-on", true);
+    let (thread, scan, small) = run("burst-filed");
     assert!(
-        thread_on > 2_500 && scan_on == 0,
-        "the thread filed the burst before the scan: thread {thread_on}, scan {scan_on}"
-    );
-    let (thread_off, scan_off, small_off) = run("burst-filed-off", false);
-    assert!(
-        thread_off == 0 && scan_off > 2_500,
-        "under the bound alone the first scan files them: thread {thread_off}, scan {scan_off}"
+        thread > 2_500 && scan == 0,
+        "the thread filed the burst before the scan: thread {thread}, scan {scan}"
     );
     assert_eq!(
-        (small_on, small_off),
-        (0, 0),
-        "five commits of a hundred are a mix's, filed by the thread under neither"
+        small, 0,
+        "five commits of a hundred are a mix's, not filed by the thread"
     );
 }
 
@@ -11755,9 +11747,8 @@ fn reader_threads_over_blocks_tuned(
     let mut x = 42u64;
     // The thread is lent a batch only by a commit with no scan since the
     // commit before it: a buffered commit after a scan files or settles
-    // its batch itself (`Options::upkeep_inline_bursts`,
-    // `Options::upkeep_settle_after_scans`), and the threads scan
-    // between almost every two commits, so whether it made a pass at all
+    // its batch itself (`Options::upkeep_inline_bursts`), and the threads
+    // scan between almost every two commits, so whether it made a pass at all
     // was their timing -- none, one run in thirty, and nothing here
     // tested it. Halfway, the threads stop scanning, the writer commits
     // twice, and the pass the second commit lends is waited for.
